@@ -44,6 +44,7 @@ pub struct DirEntry {
     pub path: PathBuf,
     pub relative_path: String,
     pub is_dir: bool,
+    pub is_symlink: bool,
 }
 
 /// `uniform_list`에 그려지는 평탄화된 파일 트리 행.
@@ -278,15 +279,21 @@ impl Explorer {
     pub fn create_file(&mut self, parent_dir: &Path, name: &str) -> io::Result<PathBuf> {
         self.ensure_loaded();
         let rel = validate_relative_input(name)?;
-        if !parent_dir.starts_with(&self.repo) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "target directory is outside worktree",
-            ));
-        }
-        let full_path = parent_dir.join(&rel);
+        let (canon_repo, full_path) = ensure_worktree_create_path(&self.repo, parent_dir, &rel)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent)?;
+            let canon_parent = parent.canonicalize().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target directory is outside worktree",
+                )
+            })?;
+            if !canon_parent.starts_with(&canon_repo) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target directory is outside worktree",
+                ));
+            }
         }
         OpenOptions::new()
             .write(true)
@@ -304,18 +311,27 @@ impl Explorer {
     pub fn create_folder(&mut self, parent_dir: &Path, name: &str) -> io::Result<PathBuf> {
         self.ensure_loaded();
         let rel = validate_relative_input(name)?;
-        if !parent_dir.starts_with(&self.repo) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "target directory is outside worktree",
-            ));
-        }
-        let full_path = parent_dir.join(&rel);
-        if full_path.exists() {
+        let (canon_repo, full_path) = ensure_worktree_create_path(&self.repo, parent_dir, &rel)?;
+        if full_path.exists() || fs::symlink_metadata(&full_path).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "folder already exists",
             ));
+        }
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent)?;
+            let canon_parent = parent.canonicalize().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target directory is outside worktree",
+                )
+            })?;
+            if !canon_parent.starts_with(&canon_repo) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "target directory is outside worktree",
+                ));
+            }
         }
         fs::create_dir_all(&full_path)?;
         self.expand_ancestors_to(&full_path);
@@ -331,16 +347,25 @@ impl Explorer {
     /// 파일이나 폴더 이름을 바꾸고 트리에 반영한다.
     pub fn rename_path(&mut self, target: &Path, new_name: &str) -> io::Result<PathBuf> {
         self.ensure_loaded();
-        if !target.starts_with(&self.repo) || target == self.repo {
-            return Err(io::Error::new(
+        let denied = || {
+            io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "cannot rename outside worktree root",
-            ));
+            )
+        };
+        if !target.starts_with(&self.repo)
+            || target == self.repo
+            || target
+                .components()
+                .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+        {
+            return Err(denied());
         }
         let clean = new_name.trim();
         if clean.is_empty()
             || clean == "."
             || clean == ".."
+            || clean == ".git"
             || clean.contains('/')
             || clean.contains('\\')
         {
@@ -352,11 +377,32 @@ impl Explorer {
         let parent = target
             .parent()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing parent"))?;
+        let canon_repo = self.repo.canonicalize().map_err(|_| denied())?;
+        let parent_rel = parent.strip_prefix(&self.repo).map_err(|_| denied())?;
+        let mut cur = self.repo.clone();
+        for comp in parent_rel.components() {
+            let Component::Normal(part) = comp else {
+                return Err(denied());
+            };
+            if part == OsStr::new(".git") {
+                return Err(denied());
+            }
+            cur.push(part);
+            let canon_cur = cur.canonicalize().map_err(|_| denied())?;
+            if !canon_cur.starts_with(&canon_repo) {
+                return Err(denied());
+            }
+        }
+        let canon_parent = parent.canonicalize().map_err(|_| denied())?;
+        if !canon_parent.starts_with(&canon_repo) {
+            return Err(denied());
+        }
+        target.symlink_metadata()?;
         let new_path = parent.join(clean);
         if new_path == target {
             return Ok(new_path);
         }
-        if new_path.exists() {
+        if new_path.exists() || fs::symlink_metadata(&new_path).is_ok() {
             return Err(io::Error::new(
                 io::ErrorKind::AlreadyExists,
                 "target name already exists",
@@ -573,6 +619,50 @@ impl Explorer {
     }
 }
 
+fn ensure_worktree_create_path(
+    repo: &Path,
+    parent_dir: &Path,
+    rel: &Path,
+) -> io::Result<(PathBuf, PathBuf)> {
+    let denied = || {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "target directory is outside worktree",
+        )
+    };
+    if !parent_dir.starts_with(repo)
+        || parent_dir
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
+    {
+        return Err(denied());
+    }
+    let parent_rel = parent_dir.strip_prefix(repo).map_err(|_| denied())?;
+    let canon_repo = repo.canonicalize().map_err(|_| denied())?;
+    let full_path = parent_dir.join(rel);
+    let mut cur = repo.to_path_buf();
+    for comp in parent_rel.components().chain(rel.components()) {
+        let Component::Normal(part) = comp else {
+            return Err(denied());
+        };
+        if part == OsStr::new(".git") {
+            return Err(denied());
+        }
+        cur.push(part);
+        match fs::symlink_metadata(&cur) {
+            Ok(_) => {
+                let canon_cur = cur.canonicalize().map_err(|_| denied())?;
+                if !canon_cur.starts_with(&canon_repo) {
+                    return Err(denied());
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok((canon_repo, full_path))
+}
+
 fn validate_relative_input(raw: &str) -> io::Result<PathBuf> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -659,9 +749,10 @@ fn read_dir_entries(repo: &Path, dir: &Path) -> Vec<DirEntry> {
             continue;
         }
         let path = entry.path();
-        let is_dir = entry
-            .file_type()
-            .is_ok_and(|ft| ft.is_dir() || (ft.is_symlink() && path.is_dir()));
+        let (is_dir, is_symlink) = entry.file_type().map_or((false, false), |ft| {
+            let is_symlink = ft.is_symlink();
+            (ft.is_dir() || (is_symlink && path.is_dir()), is_symlink)
+        });
         let relative_path = path
             .strip_prefix(repo)
             .ok()
@@ -671,6 +762,7 @@ fn read_dir_entries(repo: &Path, dir: &Path) -> Vec<DirEntry> {
             path,
             relative_path,
             is_dir,
+            is_symlink,
         });
     }
     sort_entries(&mut out);
@@ -680,6 +772,10 @@ fn read_dir_entries(repo: &Path, dir: &Path) -> Vec<DirEntry> {
 fn scan_worktree_entries(repo: &Path, limit: usize) -> Vec<DirEntry> {
     let mut out = Vec::new();
     let mut queue = std::collections::VecDeque::new();
+    let mut visited = BTreeSet::new();
+    if let Ok(canon_root) = repo.canonicalize() {
+        visited.insert(canon_root);
+    }
     queue.push_back(repo.to_path_buf());
     while let Some(dir) = queue.pop_front() {
         if out.len() >= limit {
@@ -689,10 +785,16 @@ fn scan_worktree_entries(repo: &Path, limit: usize) -> Vec<DirEntry> {
             if out.len() >= limit {
                 break;
             }
-            let is_dir = entry.is_dir;
+            let recurse = entry.is_dir
+                && !entry.is_symlink
+                && entry.path.file_name() != Some(OsStr::new("node_modules"))
+                && entry
+                    .path
+                    .canonicalize()
+                    .is_ok_and(|canon| visited.insert(canon));
             let path = entry.path.clone();
             out.push(entry);
-            if is_dir && path.file_name() != Some(OsStr::new("node_modules")) {
+            if recurse {
                 queue.push_back(path);
             }
         }
