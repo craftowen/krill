@@ -1113,3 +1113,52 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+/// OWE-755: 여러 연결 스레드·spool 수거 스레드가 동시에 `maybe_rename_from_hook`을 호출해도
+/// `session-titles.json` 임시 파일 충돌이나 RMW 유실 없이 모든 세션 제목이 기록된다.
+#[test]
+fn owe755_concurrent_hook_auto_rename_preserves_all_session_titles() {
+    use std::sync::Barrier;
+
+    let dir = std::env::temp_dir().join(format!("owe755-reg-hook-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let reg = Arc::new(Registry::new(None, Some(&dir)));
+    let n = 10_u64;
+    let barrier = Arc::new(Barrier::new(usize::try_from(n).unwrap()));
+    let handles: Vec<_> = (1..=n)
+        .map(|i| {
+            let r = Arc::clone(&reg);
+            let b = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let payload = format!(
+                    r#"{{"hook_event_name":"UserPromptSubmit","prompt":"Fix hook bug {i}"}}"#
+                );
+                b.wait();
+                r.maybe_rename_from_hook(SessionId(i), payload.as_bytes());
+                // 같은 세션에 두 번째 프롬프트 훅이 와도 첫 제목이 유지되어야 한다.
+                let second =
+                    r#"{"hook_event_name":"UserPromptSubmit","prompt":"Second prompt ignored"}"#;
+                r.maybe_rename_from_hook(SessionId(i), second.as_bytes());
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().unwrap();
+    }
+
+    let titles = krill_proto::git::load_session_auto_titles(&dir);
+    assert_eq!(titles.len(), usize::try_from(n).unwrap());
+    for i in 1..=n {
+        let expected = format!("fix-hook-bug-{i}");
+        assert_eq!(
+            titles.get(&SessionId(i)).map(String::as_str),
+            Some(expected.as_str())
+        );
+    }
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}

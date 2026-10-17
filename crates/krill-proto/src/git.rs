@@ -385,6 +385,13 @@ pub fn extract_prompt_from_hook_payload(payload: &[u8]) -> Option<String> {
     None
 }
 
+/// `session-titles.json` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 내 잠금(OWE-755).
+/// 파일 IO만 안에서 하고 다른 잠금을 잡지 않는 리프라 잠금 순서 문제가 없다.
+static SESSION_TITLES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// 원자 쓰기 임시 파일명 중복 방지용 단조 증가 시퀀스 번호(OWE-755).
+static SESSION_TITLES_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const SESSION_TITLES_LOCK_FILE: &str = ".session-titles.lock";
+
 /// 세션의 첫 프롬프트 자동 제목을 상태 디렉터리에 기록한다(이미 기록된 세션은 덮어쓰지 않는다).
 pub fn record_session_auto_title(
     state_dir: &std::path::Path,
@@ -405,10 +412,22 @@ pub fn record_session_auto_title(
     if clean.is_empty() {
         return Ok(false);
     }
+    let _guard = SESSION_TITLES_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(state_dir)?;
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(state_dir.join(SESSION_TITLES_LOCK_FILE))?;
+    lock_file.lock()?;
+
     let path = state_dir.join(SESSION_TITLES_FILE);
     let mut map: BTreeMap<u64, String> = std::fs::read_to_string(&path)
         .ok()
@@ -426,16 +445,23 @@ pub fn record_session_auto_title(
     map.insert(session.0, clean);
     let mut bytes = serde_json::to_vec(&map).map_err(std::io::Error::other)?;
     bytes.push(b'\n');
-    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    file.write_all(&bytes)?;
-    drop(file);
-    std::fs::rename(&tmp, &path)?;
+    let seq = SESSION_TITLES_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+    let write_res = (|| -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(&bytes)?;
+        drop(file);
+        std::fs::rename(&tmp, &path)
+    })();
+    if write_res.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    write_res?;
     Ok(true)
 }
 
@@ -518,6 +544,75 @@ mod slug_tests {
             titles.get(&sid).map(String::as_str),
             Some("fix-cache-timer-countdown")
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn owe755_concurrent_record_session_auto_title_never_loses_titles_or_errors() {
+        use std::sync::{Arc, Barrier};
+
+        let dir = std::env::temp_dir().join(format!("owe755-titles-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+
+        let threads = 12_u64;
+        let per_thread = 10_u64;
+        let shared_sid = crate::SessionId(9999);
+        let barrier = Arc::new(Barrier::new(usize::try_from(threads).unwrap()));
+        let handles: Vec<_> = (0..threads)
+            .map(|t| {
+                let d = dir.clone();
+                let b = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    b.wait();
+                    let mut shared_won = 0_usize;
+                    for i in 0..per_thread {
+                        let sid = crate::SessionId(t * 100 + i + 1);
+                        let title = format!("task-{t}-{i}");
+                        assert!(
+                            record_session_auto_title(&d, sid, &title).unwrap(),
+                            "first record for {sid:?} must return Ok(true)"
+                        );
+                        assert!(
+                            !record_session_auto_title(&d, sid, "duplicate-ignored").unwrap(),
+                            "second record for {sid:?} must return Ok(false)"
+                        );
+                    }
+                    if record_session_auto_title(&d, shared_sid, &format!("shared-winner-{t}"))
+                        .unwrap()
+                    {
+                        shared_won += 1;
+                    }
+                    shared_won
+                })
+            })
+            .collect();
+
+        let total_shared_winners: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(
+            total_shared_winners, 1,
+            "exactly one thread must win first title for shared session"
+        );
+
+        let titles = load_session_auto_titles(&dir);
+        let expected_count = usize::try_from(threads * per_thread + 1).unwrap();
+        assert_eq!(titles.len(), expected_count);
+        for t in 0..threads {
+            for i in 0..per_thread {
+                let sid = crate::SessionId(t * 100 + i + 1);
+                let expected = format!("task-{t}-{i}");
+                assert_eq!(
+                    titles.get(&sid).map(String::as_str),
+                    Some(expected.as_str())
+                );
+            }
+        }
+        assert!(titles.contains_key(&shared_sid));
+
+        for entry in std::fs::read_dir(&dir).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.contains(".tmp."), "leftover tmp file: {name}");
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 }
