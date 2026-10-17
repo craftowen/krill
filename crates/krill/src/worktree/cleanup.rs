@@ -20,8 +20,8 @@ use krill_proto::worktree_space::{
 };
 
 use super::space::{
-    discover_cleanup_candidates, discover_repositories, execute_cleanup, normalize_repo_roots,
-    now_unix_secs, scan_workspace_space,
+    discover_cleanup_candidates, discover_repositories, execute_cleanup as run_cleanup_engine,
+    normalize_repo_roots, now_unix_secs, scan_workspace_space,
 };
 
 const CLEANUP_USAGE: &str = "usage: krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--worktree <path>]... [--dry-run] [--yes] [--json]";
@@ -67,7 +67,12 @@ pub fn run_cleanup(args: &[OsString]) -> ExitCode {
         CleanupSummary::default()
     } else {
         let paths = Paths::dev().ok();
-        execute_cleanup(&matched, !parsed.filter.exclude_dirty, paths.as_ref())
+        run_cleanup_engine(
+            &matched,
+            !parsed.filter.exclude_dirty,
+            paths.as_ref(),
+            state_dir.as_deref(),
+        )
     };
 
     if parsed.json {
@@ -345,7 +350,12 @@ fn execute_cleanup_with_state(
         CleanupSummary::default()
     } else {
         let paths = use_daemon.then(|| Paths::dev().ok()).flatten();
-        execute_cleanup(&matched, !parsed.filter.exclude_dirty, paths.as_ref())
+        run_cleanup_engine(
+            &matched,
+            !parsed.filter.exclude_dirty,
+            paths.as_ref(),
+            state_dir,
+        )
     };
     let out = CleanupReport {
         filter: parsed.filter.clone(),
@@ -533,8 +543,7 @@ mod tests {
         assert_eq!(picked_out.candidates[0].name, "wt-merged");
         assert!(wt_merged.exists(), "dry-run must not remove");
 
-        // 2. `krill worktree cleanup --repo <repo> --pr closed --idle-days 30` 실행:
-        //    wt-closed만 삭제되고 미머지 브랜치 feat-closed는 보존된다.
+        // OWE-758: 미추적(`??`) 파일이 남아 있는 동안은 안전 필터(`exclude_dirty: true`)가 삭제를 막아야 한다.
         let closed_args = [
             "--repo",
             repo.to_str().unwrap(),
@@ -545,6 +554,20 @@ mod tests {
             "--json",
         ]
         .map(OsString::from);
+        let (_, guarded_out) =
+            execute_cleanup_with_state(&closed_args, Some(&state), false).unwrap();
+        assert_eq!(guarded_out.summary.removed_count, 0);
+        assert!(
+            wt_closed.exists(),
+            "untracked files must be protected by safety filter"
+        );
+
+        // 미추적 아티팩트 디렉터리를 정리한 뒤에는 안전 필터(`exclude_dirty: true`, `force: false`)에서 정상 삭제된다.
+        fs::remove_dir_all(wt_closed.join("node_modules")).unwrap();
+        fs::remove_dir_all(wt_merged.join("target")).unwrap();
+
+        // 2. `krill worktree cleanup --repo <repo> --pr closed --idle-days 30` 실행:
+        //    wt-closed만 삭제되고 미머지 브랜치 feat-closed는 보존된다.
         let (_, closed_out) =
             execute_cleanup_with_state(&closed_args, Some(&state), false).unwrap();
         assert!(!wt_closed.exists());

@@ -420,6 +420,8 @@ pub fn discover_cleanup_candidates(
             |s| s.to_string_lossy().into_owned(),
         );
 
+        let symlinks = effective_worktree_symlinks(&main_path, state_dir);
+
         for (idx, entry) in entries.into_iter().enumerate() {
             let is_main = idx == 0 || entry.path == main_path;
             if is_main || !entry.path.is_dir() || !seen.insert(entry.path.clone()) {
@@ -429,7 +431,7 @@ pub fn discover_cleanup_candidates(
                 || entry.path.display().to_string(),
                 |s| s.to_string_lossy().into_owned(),
             );
-            let (dirty, dirty_count) = check_worktree_dirty(&main_path, &entry.path);
+            let (dirty, dirty_count) = check_worktree_dirty(&main_path, &entry.path, &symlinks);
             let merged_into_main = entry
                 .branch
                 .as_deref()
@@ -512,8 +514,18 @@ pub fn execute_cleanup(
     selected: &[WorktreeCleanupCandidate],
     force_dirty: bool,
     paths: Option<&Paths>,
+    state_dir: Option<&Path>,
 ) -> CleanupSummary {
     let mut summary = CleanupSummary::default();
+    let inferred_state = state_dir
+        .map(Path::to_path_buf)
+        .or_else(|| {
+            paths
+                .and_then(|p| p.socket.parent())
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .or_else(|| daemon::state_dir_override().map(PathBuf::from));
 
     for item in selected {
         if item.is_main {
@@ -542,7 +554,23 @@ pub fn execute_cleanup(
             });
             continue;
         }
-        let (live_dirty, _) = check_worktree_dirty(&item.repo, &item.path);
+        let symlinks = effective_worktree_symlinks(&item.repo, inferred_state.as_deref());
+        let live_dirty = match check_worktree_dirty_status(&item.repo, &item.path, &symlinks) {
+            Ok((dirty, _)) => dirty,
+            Err(err) => {
+                summary.failed_count = summary.failed_count.saturating_add(1);
+                summary.items.push(CleanupItemOutcome {
+                    path: item.path.clone(),
+                    branch: item.branch.clone(),
+                    removed: false,
+                    branch_deleted: false,
+                    freed_bytes: 0,
+                    warnings: Vec::new(),
+                    error: Some(err),
+                });
+                continue;
+            }
+        };
         if (item.dirty || live_dirty) && !force_dirty {
             summary.failed_count = summary.failed_count.saturating_add(1);
             summary.items.push(CleanupItemOutcome {
@@ -557,15 +585,14 @@ pub fn execute_cleanup(
             continue;
         }
 
-        // check_worktree_dirty로 미커밋 소스 변경 여부를 이미 검증했으므로,
-        // gitignore되었거나 빌드 아티팩트(target, node_modules 등)만 남아 있는 워크트리도
-        // git worktree remove가 거부하지 않도록 force 플래그를 전달한다(잠금·주 워크트리·미병합 브랜치 보호는 그대로 유지).
+        // 안전 필터(force_dirty == false)가 켜져 있을 때는 force: false를 전달해
+        // krilld 및 git worktree remove의 dirty·비심링크 보호 검사를 반드시 거치게 한다.
         let req = RemoveWorktree {
             repo: item.repo.as_os_str().as_bytes().to_vec(),
             path: item.path.as_os_str().as_bytes().to_vec(),
-            force: true,
+            force: force_dirty,
         };
-        match remove_worktree_live_or_git(paths, &req) {
+        match remove_worktree_live_or_git(paths, &req, inferred_state.as_deref()) {
             Ok(removed) => {
                 summary.removed_count = summary.removed_count.saturating_add(1);
                 summary.freed_bytes = summary.freed_bytes.saturating_add(item.disk_bytes);
@@ -607,6 +634,7 @@ pub fn execute_cleanup(
 fn remove_worktree_live_or_git(
     paths: Option<&Paths>,
     req: &RemoveWorktree,
+    state_dir: Option<&Path>,
 ) -> Result<RemovedWorktree, String> {
     if let Some(p) = paths
         && p.socket.exists()
@@ -614,7 +642,7 @@ fn remove_worktree_live_or_git(
     {
         return res;
     }
-    remove_worktree_git(req)
+    remove_worktree_git(req, state_dir)
 }
 
 fn remove_via_socket(
@@ -657,7 +685,10 @@ fn remove_via_socket(
 
 /// 데몬이 떠 있지 않은 환경에서도 `krilld::git::worktree::remove`와 동일한 안전 규칙으로
 /// 링크된 워크트리를 삭제하고 병합된 로컬 브랜치를 정리한다.
-pub fn remove_worktree_git(req: &RemoveWorktree) -> Result<RemovedWorktree, String> {
+pub fn remove_worktree_git(
+    req: &RemoveWorktree,
+    state_dir: Option<&Path>,
+) -> Result<RemovedWorktree, String> {
     let given = Path::new(OsStr::from_bytes(&req.repo));
     let entries = list_repo_worktrees(given);
     let main = entries.first().ok_or("repository has no worktrees")?;
@@ -674,13 +705,19 @@ pub fn remove_worktree_git(req: &RemoveWorktree) -> Result<RemovedWorktree, Stri
         return Err("worktree is locked; unlock it explicitly before removal".to_owned());
     }
     let repo = &main.path;
-    let (dirty, _) = check_worktree_dirty(repo, &path);
+    let symlinks = effective_worktree_symlinks(repo, state_dir);
+    let (dirty, _) = check_worktree_dirty_status(repo, &path, &symlinks)?;
     if !req.force && dirty {
         return Err("worktree is dirty; use --force to discard its files".to_owned());
     }
 
-    // 위에서 dirty 검사를 통과했으므로 빌드 아티팩트·gitignore 파일이 남아 있어도 제거되도록 --force를 넘긴다.
-    let mut args: Vec<OsString> = ["worktree", "remove", "--force"].map(OsString::from).into();
+    // 삭제 전 minikrill.toml / orca.yaml / 상태 디렉터리의 공유 심볼릭 링크를 먼저 해제한다.
+    unlink_worktree_symlinks(&path, &symlinks);
+
+    let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
+    if req.force {
+        args.push("--force".into());
+    }
     args.push("--".into());
     args.push(path.into_os_string());
     let rm_out = run_git(repo, args)?;
@@ -770,7 +807,136 @@ fn parse_porcelain_worktrees(bytes: &[u8]) -> Vec<GitWorktreeEntry> {
     entries
 }
 
-fn check_worktree_dirty(repo: &Path, worktree: &Path) -> (bool, usize) {
+fn effective_worktree_symlinks(repo: &Path, state_dir: Option<&Path>) -> Vec<String> {
+    let resolved_state = state_dir
+        .map(Path::to_path_buf)
+        .or_else(|| daemon::state_dir_override().map(PathBuf::from));
+    let mut symlinks =
+        krill_proto::orchestration::inspect_repo_hooks(repo, resolved_state.as_deref())
+            .effective_symlinks;
+    if let Some(dir) = resolved_state.as_deref()
+        && let Ok(store) = krill_proto::orchestration::WorktreeStore::load(dir)
+    {
+        for alias in path_aliases(repo) {
+            for item in store.symlinks_for(&alias) {
+                let trimmed = item.trim().trim_end_matches('/').to_owned();
+                if !trimmed.is_empty() && !symlinks.contains(&trimmed) {
+                    symlinks.push(trimmed);
+                }
+            }
+        }
+    }
+    symlinks
+}
+
+fn safe_parent(root: &Path, rel: &Path) -> std::io::Result<()> {
+    let mut path = root.to_path_buf();
+    for part in rel.components() {
+        path.push(part);
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_symlink() {
+            return Err(std::io::Error::other("refused, path has a symlink"));
+        }
+    }
+    Ok(())
+}
+
+fn is_valid_worktree_symlink(wt_real: &Path, raw: &str) -> bool {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let rel = Path::new(trimmed);
+    if trimmed.is_empty()
+        || trimmed.contains('\\')
+        || !rel.components().all(|c| {
+            matches!(
+                c,
+                std::path::Component::Normal(n) if !n.as_bytes().eq_ignore_ascii_case(b".git")
+            )
+        })
+    {
+        return false;
+    }
+    let parent = rel.parent().unwrap_or(Path::new(""));
+    if safe_parent(wt_real, parent).is_err() {
+        return false;
+    }
+    fs::symlink_metadata(wt_real.join(rel)).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+fn dir_contains_only_active_symlinks(
+    wt_real: &Path,
+    rel_dir: &Path,
+    active_symlinks: &[&str],
+) -> bool {
+    let dir_path = wt_real.join(rel_dir);
+    let Ok(meta) = fs::symlink_metadata(&dir_path) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() {
+        return rel_dir
+            .to_str()
+            .is_some_and(|s| active_symlinks.contains(&s.trim_end_matches('/')));
+    }
+    if !meta.is_dir() {
+        return false;
+    }
+    let Ok(read_dir) = fs::read_dir(&dir_path) else {
+        return false;
+    };
+    let mut has_entry = false;
+    for entry in read_dir {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        has_entry = true;
+        let child_rel = rel_dir.join(entry.file_name());
+        let Some(child_str) = child_rel.to_str() else {
+            return false;
+        };
+        if active_symlinks.contains(&child_str) {
+            continue;
+        }
+        if !dir_contains_only_active_symlinks(wt_real, &child_rel, active_symlinks) {
+            return false;
+        }
+    }
+    has_entry
+}
+
+fn unlink_worktree_symlinks(wt_real: &Path, symlinks: &[String]) {
+    for raw in symlinks {
+        if is_valid_worktree_symlink(wt_real, raw) {
+            let trimmed = raw.trim().trim_end_matches('/');
+            let rel = Path::new(trimmed);
+            fs::remove_file(wt_real.join(rel)).ok();
+            let mut parent = rel.parent();
+            while let Some(p) = parent {
+                if p.as_os_str().is_empty() {
+                    break;
+                }
+                if fs::remove_dir(wt_real.join(p)).is_err() {
+                    break;
+                }
+                parent = p.parent();
+            }
+        }
+    }
+}
+
+fn check_worktree_dirty(repo: &Path, worktree: &Path, symlinks: &[String]) -> (bool, usize) {
+    check_worktree_dirty_status(repo, worktree, symlinks).unwrap_or((true, 1))
+}
+
+fn check_worktree_dirty_status(
+    repo: &Path,
+    worktree: &Path,
+    symlinks: &[String],
+) -> Result<(bool, usize), String> {
+    if !worktree.is_dir() {
+        return Err(format!(
+            "worktree directory does not exist: {}",
+            worktree.display()
+        ));
+    }
     let args = [
         OsString::from("-C"),
         worktree.as_os_str().to_owned(),
@@ -778,41 +944,59 @@ fn check_worktree_dirty(repo: &Path, worktree: &Path) -> (bool, usize) {
         OsString::from("--porcelain"),
         OsString::from("-z"),
         OsString::from("--untracked-files=all"),
+        OsString::from("--ignored=matching"),
     ];
-    let Ok(out) = run_git(repo, args) else {
-        return (false, 0);
-    };
-    if !out.status.success() || out.stdout.is_empty() {
-        return (false, 0);
+    let out = run_git(repo, args)?;
+    if !out.status.success() {
+        return Err(git_err(&out, "cannot check worktree status"));
     }
+    if out.stdout.is_empty() {
+        return Ok((false, 0));
+    }
+    let wt_real = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
+    let active_symlinks: Vec<&str> = symlinks
+        .iter()
+        .map(|s| s.trim().trim_end_matches('/'))
+        .filter(|s| !s.is_empty() && is_valid_worktree_symlink(&wt_real, s))
+        .collect();
+
     let mut count = 0usize;
     let mut fields = out.stdout.split(|b| *b == 0);
     while let Some(entry) = fields.next() {
-        let [x, y, _, rel_bytes @ ..] = entry else {
+        if entry.is_empty() {
+            continue;
+        }
+        let [x, y, b' ', rel_bytes @ ..] = entry else {
+            count = count.saturating_add(1);
             continue;
         };
         if rel_bytes.is_empty() {
+            count = count.saturating_add(1);
             continue;
         }
-        let rel = Path::new(OsStr::from_bytes(rel_bytes));
         if *x == b'R' || *x == b'C' {
             // rename/copy의 원본 경로 토큰 소비
             let _ = fields.next();
-        }
-        if [*x, *y] == *b"!!" {
+            count = count.saturating_add(1);
             continue;
         }
-        if [*x, *y] == *b"??" && path_is_inside_artifact_dir(rel) {
-            continue;
+        if ([*x, *y] == *b"??" || [*x, *y] == *b"!!")
+            && !active_symlinks.is_empty()
+            && let Ok(rel_str) = std::str::from_utf8(rel_bytes)
+        {
+            let trimmed = rel_str.trim_end_matches('/');
+            if active_symlinks.contains(&trimmed) {
+                continue;
+            }
+            if rel_str.ends_with('/')
+                && dir_contains_only_active_symlinks(&wt_real, Path::new(trimmed), &active_symlinks)
+            {
+                continue;
+            }
         }
         count = count.saturating_add(1);
     }
-    (count > 0, count)
-}
-
-fn path_is_inside_artifact_dir(rel: &Path) -> bool {
-    rel.components()
-        .any(|comp| comp.as_os_str().to_str().is_some_and(is_artifact_dir_name))
+    Ok((count > 0, count))
 }
 
 fn is_branch_merged_into_head(main_repo: &Path, branch: &str) -> bool {
@@ -1202,7 +1386,7 @@ mod tests {
         assert_eq!(both_14d.len(), 2);
 
         // 일괄 삭제 실행: 머지된 브랜치는 삭제되고, 미병합 브랜치(branch-closed-old)는 경고 후 보존되어야 한다.
-        let summary = execute_cleanup(&both_14d, false, None);
+        let summary = execute_cleanup(&both_14d, false, None, Some(&state_dir));
         assert_eq!(summary.removed_count, 2);
         assert_eq!(summary.failed_count, 0);
         assert_eq!(summary.branches_deleted, 1);
@@ -1228,6 +1412,274 @@ mod tests {
         assert!(
             branches.contains("branch-closed-old"),
             "unmerged closed-PR branch must be preserved: {branches}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn git_status_failure_marks_worktree_dirty_and_blocks_cleanup() {
+        let root = temp_dir("owe758-status-fail");
+        let state_dir = root.join("state");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join("file.txt"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+
+        let wt_corrupt = root.join("wt-corrupt");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "branch-corrupt",
+                wt_corrupt.to_str().unwrap(),
+            ],
+        );
+        fs::write(wt_corrupt.join("file.txt"), "modified uncommitted work\n").unwrap();
+
+        // 워크트리의 git index를 손상시켜 `git status`가 비정상 종료(!status.success())하게 만든다.
+        let index_path = repo.join(".git/worktrees/wt-corrupt/index");
+        fs::write(&index_path, b"corrupt-index-bytes").unwrap();
+
+        assert!(check_worktree_dirty_status(&repo, &wt_corrupt, &[]).is_err());
+        assert_eq!(check_worktree_dirty(&repo, &wt_corrupt, &[]), (true, 1));
+
+        let now = 1_700_000_000_u64;
+        record_worktree_metadata(
+            &state_dir,
+            &wt_corrupt,
+            Some(CleanupPrState::Merged),
+            Some(201),
+            Some(now.saturating_sub(20 * SECS_PER_DAY)),
+        )
+        .unwrap();
+
+        let all = discover_cleanup_candidates(std::slice::from_ref(&repo), Some(&state_dir), now);
+        assert_eq!(all.len(), 1);
+        assert!(
+            all[0].dirty,
+            "git status failure must mark candidate as dirty"
+        );
+        assert_eq!(all[0].dirty_count, 1);
+
+        let safe_filtered = filter_cleanup_candidates(&all, &CleanupFilter::default());
+        assert!(
+            safe_filtered.is_empty(),
+            "safety filter must exclude worktree when git status failed"
+        );
+
+        // 후보를 직접 넘겨 실행하더라도 강제 삭제되지 않고 실패로 기록되어야 한다.
+        let summary = execute_cleanup(&all, false, None, Some(&state_dir));
+        assert_eq!(summary.removed_count, 0);
+        assert_eq!(summary.failed_count, 1);
+        assert!(wt_corrupt.exists(), "worktree must not be force-removed");
+        assert_eq!(
+            fs::read_to_string(wt_corrupt.join("file.txt")).unwrap(),
+            "modified uncommitted work\n"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn safety_filter_protects_untracked_artifact_named_dirs_and_gitignored_files() {
+        let root = temp_dir("owe758-artifact-and-ignored");
+        let state_dir = root.join("state");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(repo.join(".gitignore"), ".env\n").unwrap();
+        fs::write(repo.join("README.md"), "base\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "base"]);
+
+        let wt_vendor = root.join("wt-vendor");
+        let wt_build = root.join("wt-build");
+        let wt_env = root.join("wt-env");
+        let wt_race = root.join("wt-race");
+        for (wt, branch) in [
+            (&wt_vendor, "feat-vendor"),
+            (&wt_build, "feat-build"),
+            (&wt_env, "feat-env"),
+            (&wt_race, "feat-race"),
+        ] {
+            git(
+                &repo,
+                &["worktree", "add", "-b", branch, wt.to_str().unwrap()],
+            );
+        }
+
+        // KNOWN_ARTIFACT_DIRS 이름(`vendor`, `build`) 아래의 미추적(`??`) 새 소스 파일과
+        // 심링크되지 않은 로컬 gitignore(`!!`) `.env` 파일 생성
+        fs::create_dir_all(wt_vendor.join("vendor/pkg")).unwrap();
+        fs::write(
+            wt_vendor.join("vendor/pkg/new_source.rs"),
+            "pub fn a() {}\n",
+        )
+        .unwrap();
+        fs::create_dir_all(wt_build.join("build")).unwrap();
+        fs::write(wt_build.join("build/script.sh"), "#!/bin/sh\n").unwrap();
+        fs::write(wt_env.join(".env"), "LOCAL_SECRET=keep\n").unwrap();
+
+        let now = 1_700_000_000_u64;
+        for (idx, wt) in [&wt_vendor, &wt_build, &wt_env, &wt_race]
+            .into_iter()
+            .enumerate()
+        {
+            record_worktree_metadata(
+                &state_dir,
+                wt,
+                Some(CleanupPrState::Merged),
+                Some(300 + idx as u64),
+                Some(now.saturating_sub(30 * SECS_PER_DAY)),
+            )
+            .unwrap();
+        }
+
+        let all = discover_cleanup_candidates(std::slice::from_ref(&repo), Some(&state_dir), now);
+        assert_eq!(all.len(), 4);
+        for name in ["wt-vendor", "wt-build", "wt-env"] {
+            let cand = all.iter().find(|c| c.name == name).unwrap();
+            assert!(cand.dirty, "{name} must be detected as dirty");
+            assert!(cand.dirty_count >= 1);
+        }
+
+        // 안전 필터(exclude_dirty: true)는 깨끗한 wt-race 하나만 통과시켜야 한다.
+        let matched = filter_cleanup_candidates(&all, &CleanupFilter::default());
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].name, "wt-race");
+
+        // 스캔 직후 삭제 직전에 wt-race에 로컬 `.env`나 `out/result.txt`가 생기면
+        // execute_cleanup(force_dirty: false)이 이를 감지해 삭제를 거부해야 한다.
+        fs::write(wt_race.join(".env"), "RACE_SECRET=1\n").unwrap();
+        let summary = execute_cleanup(&matched, false, None, Some(&state_dir));
+        assert_eq!(summary.removed_count, 0);
+        assert_eq!(summary.failed_count, 1);
+        assert!(wt_race.join(".env").exists());
+        assert!(wt_vendor.join("vendor/pkg/new_source.rs").exists());
+        assert!(wt_build.join("build/script.sh").exists());
+        assert!(wt_env.join(".env").exists());
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn remove_worktree_git_unlinks_configured_symlinks_and_preserves_repo_targets() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("owe758-symlinks");
+        let state_dir = root.join("state");
+        let repo = root.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-b", "main"]);
+        fs::write(
+            repo.join(".gitignore"),
+            ".env\n.env.local\nsecret/\nshared-dir/\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("minikrill.toml"),
+            "[worktree]\nsymlinks = [\".env\", \"secret/nested.txt\"]\n",
+        )
+        .unwrap();
+        fs::write(
+            repo.join("orca.yaml"),
+            "worktree:\n  sharedDirectories:\n    - shared-dir/\n",
+        )
+        .unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-m", "init"]);
+
+        let repo_canon = fs::canonicalize(&repo).unwrap();
+        let repo_key = repo_canon.to_string_lossy().into_owned();
+        krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
+            store.add_symlink(&repo_key, ".env.local")?;
+            Ok(())
+        })
+        .unwrap();
+
+        fs::write(repo.join(".env"), "ROOT_ENV=1").unwrap();
+        fs::write(repo.join(".env.local"), "LOCAL_ENV=2").unwrap();
+        fs::create_dir_all(repo.join("secret")).unwrap();
+        fs::write(repo.join("secret/nested.txt"), "nested-secret").unwrap();
+        fs::create_dir_all(repo.join("shared-dir")).unwrap();
+        fs::write(repo.join("shared-dir/cache.txt"), "shared-cache").unwrap();
+
+        let wt_linked = root.join("wt-linked");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat-linked",
+                wt_linked.to_str().unwrap(),
+            ],
+        );
+        let wt_canon = fs::canonicalize(&wt_linked).unwrap();
+        symlink(repo_canon.join(".env"), wt_canon.join(".env")).unwrap();
+        symlink(repo_canon.join(".env.local"), wt_canon.join(".env.local")).unwrap();
+        fs::create_dir_all(wt_canon.join("secret")).unwrap();
+        symlink(
+            repo_canon.join("secret/nested.txt"),
+            wt_canon.join("secret/nested.txt"),
+        )
+        .unwrap();
+        symlink(repo_canon.join("shared-dir"), wt_canon.join("shared-dir")).unwrap();
+
+        let now = 1_700_000_000_u64;
+        record_worktree_metadata(
+            &state_dir,
+            &wt_linked,
+            Some(CleanupPrState::Merged),
+            Some(401),
+            Some(now.saturating_sub(20 * SECS_PER_DAY)),
+        )
+        .unwrap();
+
+        // 설정된 공유 심볼릭 링크만 있는 워크트리는 clean으로 판정되어야 한다.
+        let all = discover_cleanup_candidates(std::slice::from_ref(&repo), Some(&state_dir), now);
+        assert_eq!(all.len(), 1);
+        assert!(
+            !all[0].dirty,
+            "configured symlinks must not mark worktree dirty"
+        );
+        assert_eq!(all[0].dirty_count, 0);
+
+        // 심볼릭 링크 외 일반 미추적 파일이 있으면 force: false에서 거부하고 심볼릭 링크도 유지해야 한다.
+        fs::write(wt_canon.join("untracked.txt"), "keep").unwrap();
+        let blocked = execute_cleanup(&all, false, None, Some(&state_dir));
+        assert_eq!(blocked.removed_count, 0);
+        assert_eq!(blocked.failed_count, 1);
+        assert!(
+            fs::symlink_metadata(wt_canon.join(".env"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        // 일반 미추적 파일을 지우면 force: false에서도 공유 심링크를 먼저 해제한 뒤 워크트리를 깔끔히 삭제한다.
+        fs::remove_file(wt_canon.join("untracked.txt")).unwrap();
+        let summary = execute_cleanup(&all, false, None, Some(&state_dir));
+        assert_eq!(summary.removed_count, 1);
+        assert_eq!(summary.failed_count, 0);
+        assert!(!wt_linked.exists());
+        assert_eq!(fs::read_to_string(repo.join(".env")).unwrap(), "ROOT_ENV=1");
+        assert_eq!(
+            fs::read_to_string(repo.join(".env.local")).unwrap(),
+            "LOCAL_ENV=2"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("secret/nested.txt")).unwrap(),
+            "nested-secret"
+        );
+        assert_eq!(
+            fs::read_to_string(repo.join("shared-dir/cache.txt")).unwrap(),
+            "shared-cache"
         );
 
         fs::remove_dir_all(&root).ok();
