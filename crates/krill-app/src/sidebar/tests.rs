@@ -2495,3 +2495,171 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-759: 원격 호스트(`HostId::Remote`) 워크트리 카드를 Detailed 및 Compact 레이아웃에서 클릭할 때
+/// 로컬 스냅샷(`s.snapshot`)이 아니라 해당 원격 호스트 스냅샷(`s.snapshot_for(&row_host)`)에서 세션을 찾고,
+/// 세션이 있으면 `action_host`를 원격 호스트로 설정해 `Selected`를 내보내며,
+/// 세션이 없으면(로컬에 동명 경로 세션이 있더라도) 원격 호스트에 `NewSession`을 생성한다.
+#[gpui::test]
+fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
+    cx: &mut TestAppContext,
+) {
+    use gpui::Modifiers;
+    use krill_proto::control::Program;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+    });
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
+
+    let selected: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
+    let launched: Rc<RefCell<Vec<(HostId, NewSession)>>> = Rc::new(RefCell::new(Vec::new()));
+
+    let sel_out = selected.clone();
+    let _sub_sel = cx.update(|_, cx| {
+        cx.subscribe(&view, move |s, event: &Selected, cx| {
+            let host = s
+                .update(cx, |s, _| s.take_action_host())
+                .unwrap_or(HostId::Local);
+            sel_out.borrow_mut().push((host, event.0));
+        })
+    });
+    let new_out = launched.clone();
+    let _sub_new = cx.update(|_, cx| {
+        cx.subscribe(&view, move |s, event: &NewSession, cx| {
+            let host = s
+                .update(cx, |s, _| s.take_action_host())
+                .unwrap_or(HostId::Local);
+            new_out.borrow_mut().push((host, event.clone()));
+        })
+    });
+
+    let studio_id = HostId::Remote("studio".into());
+    let wt_with_remote_sess = PathBuf::from("/shared/repo/wt-active");
+    let wt_without_remote_sess = PathBuf::from("/shared/repo/wt-empty");
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            // 로컬에는 두 경로 모두에 로컬 세션(1, 2)이 존재함(경로 충돌 유도).
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, wt_with_remote_sess.to_str()),
+                    session(2, AgentState::Working, wt_without_remote_sess.to_str()),
+                ],
+                trees: BTreeMap::from([(
+                    PathBuf::from("/shared/repo"),
+                    vec![wt_with_remote_sess.clone(), wt_without_remote_sess.clone()],
+                )]),
+            };
+            // 원격 호스트 'studio'에는 wt_with_remote_sess에만 원격 세션(21)이 있고 wt_without_remote_sess에는 세션이 없음.
+            s.remote_hosts = vec![RemoteHost {
+                id: "studio".into(),
+                label: "Mac Studio".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![session(21, AgentState::Done, wt_with_remote_sess.to_str())],
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/shared/repo"),
+                        vec![wt_with_remote_sess.clone(), wt_without_remote_sess.clone()],
+                    )]),
+                },
+                meta: Meta::new(),
+                source: None,
+            }];
+            s.rebuild(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let find_remote_wt_index = |cx: &mut gpui::VisualTestContext, target: &Path| -> usize {
+        cx.update(|_, cx| {
+            let s = view.read(cx);
+            s.rows
+                .iter()
+                .enumerate()
+                .position(|(i, r)| {
+                    s.row_host(i) == &studio_id && matches!(r, Row::Worktree(p) if p == target)
+                })
+                .expect("remote worktree row")
+        })
+    };
+
+    let card_selector = |idx: usize| -> &'static str {
+        match idx {
+            0 => "worktree-card-0",
+            1 => "worktree-card-1",
+            2 => "worktree-card-2",
+            3 => "worktree-card-3",
+            4 => "worktree-card-4",
+            5 => "worktree-card-5",
+            6 => "worktree-card-6",
+            7 => "worktree-card-7",
+            8 => "worktree-card-8",
+            9 => "worktree-card-9",
+            10 => "worktree-card-10",
+            _ => panic!("unexpected worktree card row index {idx}"),
+        }
+    };
+
+    for layout in [CardLayout::Detailed, CardLayout::Compact] {
+        selected.borrow_mut().clear();
+        launched.borrow_mut().clear();
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| s.set_card_layout(layout, cx));
+        });
+        cx.run_until_parked();
+
+        let idx_active = find_remote_wt_index(cx, &wt_with_remote_sess);
+        let idx_empty = find_remote_wt_index(cx, &wt_without_remote_sess);
+
+        let bounds_active = cx
+            .debug_bounds(card_selector(idx_active))
+            .expect("remote active worktree card bounds");
+        cx.simulate_click(
+            gpui::point(
+                bounds_active.origin.x + gpui::px(8.),
+                bounds_active.center().y,
+            ),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            selected.borrow().as_slice(),
+            &[(studio_id.clone(), SessionId(21))],
+            "clicking remote worktree card with session in {layout:?} must select remote session on studio host"
+        );
+        assert!(
+            launched.borrow().is_empty(),
+            "clicking remote worktree card with session in {layout:?} must not spawn new session"
+        );
+
+        let bounds_empty = cx
+            .debug_bounds(card_selector(idx_empty))
+            .expect("remote empty worktree card bounds");
+        cx.simulate_click(
+            gpui::point(
+                bounds_empty.origin.x + gpui::px(8.),
+                bounds_empty.center().y,
+            ),
+            Modifiers::default(),
+        );
+        cx.run_until_parked();
+
+        assert_eq!(
+            launched.borrow().as_slice(),
+            &[(
+                studio_id.clone(),
+                NewSession {
+                    cwd: wt_without_remote_sess.clone(),
+                    program: Program::Login,
+                }
+            )],
+            "clicking remote worktree card without remote session in {layout:?} must spawn on studio host even if local has same path"
+        );
+    }
+}
