@@ -30,6 +30,13 @@ struct Home {
 impl Home {
     /// UDS 104바이트 안에 들게 `/tmp` 아래에 둔다.
     fn new(tag: &str) -> Self {
+        let bin = Path::new(MK).parent().unwrap();
+        for b in ["krill-holder", "krilld"] {
+            assert!(
+                bin.join(b).is_file(),
+                "{b} is not built next to krill (run the whole workspace: cargo nextest run --workspace)"
+            );
+        }
         let dir = PathBuf::from(format!("/tmp/mk170-{}-{tag}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
@@ -147,12 +154,47 @@ fn ppid(pid: u32) -> u32 {
     String::from_utf8(o.stdout).unwrap().trim().parse().unwrap()
 }
 
+fn kill_daemons_under(dir: &Path) {
+    let Ok(ps) = Command::new("/bin/ps")
+        .args(["-axwwo", "pid=,command="])
+        .output()
+    else {
+        return;
+    };
+    let needle = dir.to_string_lossy().into_owned();
+    let alt = needle
+        .strip_prefix("/private")
+        .map_or_else(|| format!("/private{needle}"), str::to_owned);
+    let canon = fs::canonicalize(dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let text = String::from_utf8_lossy(&ps.stdout);
+    for role in ["krill-holder", "krilld"] {
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some((pid_str, cmd)) = trimmed.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let matches_dir = cmd.contains(&needle)
+                || cmd.contains(&alt)
+                || canon.as_deref().is_some_and(|c| cmd.contains(c));
+            if matches_dir
+                && cmd.contains(role)
+                && let Ok(pid) = pid_str.trim().parse::<u32>()
+            {
+                kill9(pid);
+            }
+        }
+    }
+}
+
 impl Drop for Home {
     fn drop(&mut self) {
         // holder 먼저: krilld가 먼저 죽으면 holder가 다시 띄운다.
         for pid in &self.pids {
             kill9(*pid);
         }
+        kill_daemons_under(&self.dir);
         for child in &mut self.children {
             child.wait().ok();
         }

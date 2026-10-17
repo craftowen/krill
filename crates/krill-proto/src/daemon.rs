@@ -264,10 +264,11 @@ impl Paths {
         let state = state_dir()
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))?;
         let exe = std::env::current_exe()?;
+        let home = std::env::var_os("HOME").map(PathBuf::from);
         let mut apps = Vec::new();
-        if state_dir_override().is_none() {
-            if let Some(home) = std::env::var_os("HOME") {
-                apps.push(PathBuf::from(home).join("Applications/Krill.app"));
+        if allow_installed_apps(&exe, home.as_deref()) {
+            if let Some(home) = &home {
+                apps.push(home.join("Applications/Krill.app"));
             }
             apps.push(PathBuf::from("/Applications/Krill.app"));
         }
@@ -283,6 +284,59 @@ impl Paths {
             krilld: find_exe(bin, apps, "krilld"),
         })
     }
+}
+
+fn is_temp_home(home: &Path) -> bool {
+    let temp = std::env::temp_dir();
+    home.starts_with(&temp)
+        || home.starts_with("/tmp")
+        || home.starts_with("/private/tmp")
+        || home.starts_with("/var/folders")
+        || home.starts_with("/private/var/folders")
+}
+
+/// 설치본 `Krill.app`(`~/Applications`·`/Applications`) 헬퍼 후보를 허용할지 판정한다(OWE-771).
+///
+/// `KRILL_STATE_DIR` 오버라이드, Cargo 테스트 실행 파일(`target/.../deps/...`), 테스트·빌드 러너 환경변수,
+/// 임시 `HOME`(`HOME=/tmp/...` 등)에서는 호스트에 설치된 운영 `/Applications/Krill.app`의 헬퍼를
+/// 띄워 고아 holder·krilld를 남기지 않도록 제외한다.
+fn allow_installed_apps(exe: &Path, home: Option<&Path>) -> bool {
+    if cfg!(test) || state_dir_override().is_some() {
+        return false;
+    }
+    if !allow_installed_apps_for_paths(exe, home) {
+        return false;
+    }
+    for var in [
+        "KRILL_TEST_OFFLINE",
+        "NEXTEST",
+        "NEXTEST_EXECUTION_MODE",
+        "RUST_TEST_THREADS",
+        "CARGO",
+        "CARGO_MANIFEST_DIR",
+    ] {
+        if std::env::var_os(var).is_some() {
+            return false;
+        }
+    }
+    true
+}
+
+fn allow_installed_apps_for_paths(exe: &Path, home: Option<&Path>) -> bool {
+    let resolved = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    for candidate in [exe, resolved.as_path()] {
+        if candidate
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "deps")
+        {
+            return false;
+        }
+    }
+    if home.is_some_and(is_temp_home) {
+        return false;
+    }
+    true
 }
 
 /// 심볼릭 링크를 푼 지금 실행 파일 옆이나 같은 앱 번들(`Contents/Helpers`·`Contents/MacOS`)에서 `name`을 찾는다.

@@ -26,6 +26,15 @@ fn daemon_call() -> Call {
 }
 
 pub fn daemon_call_for(target: Option<HostTarget>) -> Call {
+    #[cfg(test)]
+    if target.is_none() {
+        return Arc::new(|_| {
+            Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "daemon disabled in unit tests",
+            ))
+        });
+    }
     Arc::new(move |req| {
         let hello = daemon::client_hello(ClientRole::App, "krill-app-history");
         let target = match &target {
