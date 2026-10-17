@@ -2700,10 +2700,14 @@ fn import_automations(
         return Ok(0);
     }
 
-    let sched_path = opts.state_dir.join(schedule::FILE);
-    let original = read_original(&sched_path)?;
+    let _guard = if opts.dry_run {
+        None
+    } else {
+        Some(Schedules::exclusive_edit(&opts.state_dir)?)
+    };
     let mut schedules = Schedules::load(&opts.state_dir)?;
     let projects = ProjectsStore::load(&opts.state_dir).unwrap_or_default();
+    let mut seen_ids = BTreeSet::new();
     let mut merged = 0usize;
 
     for auto in automations {
@@ -2724,12 +2728,9 @@ fn import_automations(
             id.truncate(64);
         }
         let cron = rrule_to_utc_cron(auto.rrule.as_deref(), auto.dtstart.as_deref());
-        if Cron::parse(&cron).is_err() {
-            warnings.push(format!("skipping automation '{}': invalid cron", auto.name));
-            continue;
-        }
         let cwd = resolve_automation_cwd(&opts.home, &auto, &projects);
         let command = resolve_automation_command(auto.agent_id.as_deref());
+        let existing_entry = schedules.schedule.iter().find(|s| s.id == id);
 
         let candidate = Schedule {
             id: id.clone(),
@@ -2737,32 +2738,115 @@ fn import_automations(
             cwd,
             command,
             prompt,
-            precheck: None,
-            workspace_mode: krill_proto::schedule::WorkspaceMode::default(),
+            precheck: existing_entry.and_then(|s| s.precheck.clone()),
+            workspace_mode: existing_entry
+                .map_or_else(schedule::WorkspaceMode::default, |s| s.workspace_mode),
         };
 
-        if let Some(existing) = schedules.schedule.iter_mut().find(|s| s.id == id) {
+        if let Err(reason) = validate_schedule_candidate(&candidate, &mut seen_ids) {
+            warnings.push(format!("skipping automation '{}': {reason}", auto.name));
+            continue;
+        }
+
+        if let Some(idx) = schedules.schedule.iter().position(|s| s.id == id) {
+            let Some(existing) = schedules.schedule.get_mut(idx) else {
+                continue;
+            };
             if existing.cron != candidate.cron
                 || existing.cwd != candidate.cwd
                 || existing.command != candidate.command
                 || existing.prompt != candidate.prompt
             {
-                *existing = candidate;
+                let prev = existing.clone();
+                existing.cron = candidate.cron;
+                existing.cwd = candidate.cwd;
+                existing.command = candidate.command;
+                existing.prompt = candidate.prompt;
+                if toml::to_string(&schedules)
+                    .ok()
+                    .and_then(|text| Schedules::parse(&text).ok())
+                    .is_none()
+                {
+                    if let Some(slot) = schedules.schedule.get_mut(idx) {
+                        *slot = prev;
+                    }
+                    warnings.push(format!(
+                        "skipping automation '{}': schedule file too large",
+                        auto.name
+                    ));
+                    continue;
+                }
                 merged = merged.saturating_add(1);
             }
         } else if schedules.schedule.len() < MAX_SCHEDULES {
             schedules.schedule.push(candidate);
+            if toml::to_string(&schedules)
+                .ok()
+                .and_then(|text| Schedules::parse(&text).ok())
+                .is_none()
+            {
+                schedules.schedule.pop();
+                warnings.push(format!(
+                    "skipping automation '{}': schedule file too large",
+                    auto.name
+                ));
+                continue;
+            }
             merged = merged.saturating_add(1);
+        } else {
+            warnings.push(format!(
+                "skipping automation '{}': too many schedules",
+                auto.name
+            ));
         }
     }
 
     if !opts.dry_run && merged > 0 {
-        let text = toml::to_string(&schedules).map_err(invalid_data)?;
-        Schedules::parse(&text)?;
-        write_atomic_0600(&sched_path, text.as_bytes(), original.as_deref())?;
+        schedules.save(&opts.state_dir)?;
     }
 
     Ok(merged)
+}
+
+fn validate_schedule_candidate(
+    entry: &Schedule,
+    seen_ids: &mut BTreeSet<String>,
+) -> Result<(), &'static str> {
+    if entry.id.is_empty()
+        || entry.id.len() > 64
+        || !entry
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return Err("schedule IDs must be unique ASCII letters, digits, _ or -");
+    }
+    if Cron::parse(&entry.cron).is_err() {
+        return Err("invalid cron");
+    }
+    if !Path::new(&entry.cwd).is_absolute()
+        || entry.cwd.contains('\0')
+        || entry.command.is_empty()
+        || entry.command.first().is_none_or(String::is_empty)
+        || entry.command.len() > 128
+        || entry
+            .command
+            .iter()
+            .any(|s| s.contains('\0') || s.len() > 8192)
+        || entry.prompt.is_empty()
+        || entry.prompt.contains('\0')
+        || entry.prompt.len() > 32 * 1024
+        || entry
+            .precheck
+            .as_ref()
+            .is_some_and(|s| s.trim().is_empty() || s.contains('\0') || s.len() > 8192)
+    {
+        return Err("invalid schedule cwd, command or prompt");
+    }
+    if !seen_ids.insert(entry.id.clone()) {
+        return Err("schedule IDs must be unique ASCII letters, digits, _ or -");
+    }
+    Ok(())
 }
 
 fn resolve_automation_cwd(home: &Path, auto: &OrcaAutomation, projects: &ProjectsStore) -> String {
@@ -3627,6 +3711,142 @@ mod tests {
         stop_flag.store(true, Ordering::Relaxed);
         std::os::unix::net::UnixStream::connect(&sock_path).ok();
         server_thread.join().ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn automations_import_respects_edit_lock_preserves_precheck_and_workspace_mode_and_skips_invalid_items()
+     {
+        let root = std::env::temp_dir().join(format!("owe749-auto-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        let state_dir = root.join("state");
+        let orca_dir = root.join("orca");
+        let profile_dir = orca_dir.join("profiles").join("default");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::create_dir_all(&profile_dir).unwrap();
+
+        let write_orca_automations = |automations: serde_json::Value| {
+            let doc = serde_json::json!({
+                "settings": {},
+                "automations": automations,
+            });
+            fs::write(profile_dir.join("orca-data.json"), doc.to_string()).unwrap();
+        };
+
+        // 1. Initial import of `nightly-check`
+        write_orca_automations(serde_json::json!([
+            {
+                "id": "nightly-check",
+                "name": "Nightly Check",
+                "prompt": "Initial prompt",
+                "agentId": "claude",
+                "rrule": "FREQ=DAILY;BYHOUR=6;BYMINUTE=0",
+                "enabled": true
+            }
+        ]));
+
+        let opts = ImportOptions {
+            home: home.clone(),
+            state_dir: state_dir.clone(),
+            orca_dir: orca_dir.clone(),
+            domains: vec![ImportDomain::Settings],
+            dry_run: false,
+        };
+        let first = run_import(&opts).unwrap();
+        assert_eq!(first.settings.schedules_merged, 1);
+
+        // User configures `precheck` and `workspace_mode = Isolate` in Krill
+        {
+            let _guard = Schedules::exclusive_edit(&state_dir).unwrap();
+            let mut schedules = Schedules::load(&state_dir).unwrap();
+            assert_eq!(schedules.schedule.len(), 1);
+            schedules.schedule[0].precheck = Some("git diff --quiet".to_owned());
+            schedules.schedule[0].workspace_mode = schedule::WorkspaceMode::Isolate;
+            schedules.save(&state_dir).unwrap();
+        }
+
+        // 2. Update prompt & schedule in Orca, plus add >32KiB prompt and colliding Korean-only names
+        let oversized_prompt = "x".repeat(32 * 1024 + 10);
+        write_orca_automations(serde_json::json!([
+            {
+                "id": "nightly-check",
+                "name": "Nightly Check",
+                "prompt": "Updated prompt from Orca",
+                "agentId": "codex",
+                "rrule": "FREQ=DAILY;BYHOUR=8;BYMINUTE=15",
+                "enabled": true
+            },
+            {
+                "id": "oversized-auto",
+                "name": "Oversized Prompt",
+                "prompt": oversized_prompt,
+                "agentId": "claude",
+                "rrule": "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+                "enabled": true
+            },
+            {
+                "id": "",
+                "name": "아침 점검",
+                "prompt": "Korean schedule 1",
+                "agentId": "claude",
+                "rrule": "FREQ=DAILY;BYHOUR=10;BYMINUTE=0",
+                "enabled": true
+            },
+            {
+                "id": "",
+                "name": "저녁 점검",
+                "prompt": "Korean schedule 2",
+                "agentId": "claude",
+                "rrule": "FREQ=DAILY;BYHOUR=18;BYMINUTE=0",
+                "enabled": true
+            }
+        ]));
+
+        // 3. While `schedules-edit.lock` is held, `run_import` must fail instead of bypassing the lock
+        {
+            let _held_lock = Schedules::exclusive_edit(&state_dir).unwrap();
+            assert!(run_import(&opts).is_err());
+            let unchanged = Schedules::load(&state_dir).unwrap();
+            assert_eq!(unchanged.schedule.len(), 1);
+            assert_eq!(unchanged.schedule[0].prompt, "Initial prompt");
+        }
+
+        // 4. After releasing the lock, `run_import` updates `nightly-check` (preserving `precheck` &
+        //    `workspace_mode`), imports the first Korean-named schedule, and skips the >32KiB and
+        //    colliding duplicate-ID schedules with warnings.
+        let second = run_import(&opts).unwrap();
+        assert_eq!(second.settings.schedules_merged, 2);
+        assert_eq!(second.warnings.len(), 2);
+        assert!(
+            second
+                .warnings
+                .iter()
+                .any(|w| w.contains("Oversized Prompt"))
+        );
+        assert!(second.warnings.iter().any(|w| w.contains("저녁 점검")));
+
+        let updated = Schedules::load(&state_dir).unwrap();
+        assert_eq!(updated.schedule.len(), 2);
+        let nightly = updated
+            .schedule
+            .iter()
+            .find(|s| s.id == "orca-nightly-check")
+            .unwrap();
+        assert_eq!(nightly.prompt, "Updated prompt from Orca");
+        assert_eq!(nightly.cron, "15 8 * * *");
+        assert_eq!(nightly.command, vec!["codex".to_owned(), "exec".to_owned()]);
+        assert_eq!(nightly.precheck.as_deref(), Some("git diff --quiet"));
+        assert_eq!(nightly.workspace_mode, schedule::WorkspaceMode::Isolate);
+
+        let korean = updated
+            .schedule
+            .iter()
+            .find(|s| s.id == "orca-item")
+            .unwrap();
+        assert_eq!(korean.prompt, "Korean schedule 1");
+
         fs::remove_dir_all(&root).ok();
     }
 }
