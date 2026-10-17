@@ -264,13 +264,22 @@ pub fn list_windows(app_selector: &str) -> Result<Vec<WindowSummary>, String> {
             })
             .collect());
     }
+    let app = resolve_live_app(app_selector)?;
+    list_windows_for_app(&app)
+}
+
+pub fn resolve_live_app(app_selector: &str) -> Result<AppSummary, String> {
     let apps = list_apps()?;
-    let Some(app) = apps
+    if let Some(app) = apps
         .into_iter()
         .find(|a| matches_app_selector(a, app_selector))
-    else {
-        return Err(format!("application not found: {app_selector}"));
-    };
+    {
+        return Ok(app);
+    }
+    Err(format!("application not found: {app_selector}"))
+}
+
+fn list_windows_for_app(app: &AppSummary) -> Result<Vec<WindowSummary>, String> {
     let script = r#"
 ObjC.import("CoreGraphics");
 const targetPid = Number($.NSProcessInfo.processInfo.arguments.js[4]);
@@ -455,14 +464,8 @@ pub fn get_app_state(
             "accessibility permission denied; enable in System Settings ({ACCESSIBILITY_SETTINGS_URL})"
         ));
     }
-    let apps = list_apps()?;
-    let Some(app) = apps
-        .into_iter()
-        .find(|a| matches_app_selector(a, app_selector))
-    else {
-        return Err(format!("application not found: {app_selector}"));
-    };
-    let windows = list_windows(app_selector)?;
+    let app = resolve_live_app(app_selector)?;
+    let windows = list_windows_for_app(&app)?;
     let selected_window = if let Some(id) = window_id {
         Some(
             windows
@@ -531,6 +534,16 @@ fn write_mock_screenshot(window_id: &str) -> Result<PathBuf, String> {
 }
 
 fn capture_live_window_screenshot(win: &WindowSummary) -> Result<ScreenshotMetadata, String> {
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
+        let path = write_mock_screenshot(&win.id)?;
+        return Ok(ScreenshotMetadata {
+            path: path.display().to_string(),
+            width: clamp_pixel_dim(win.bounds.width),
+            height: clamp_pixel_dim(win.bounds.height),
+            scale_factor: 2.0,
+            window_id: Some(win.id.clone()),
+        });
+    }
     let dir = daemon::state_dir().unwrap_or_else(std::env::temp_dir);
     let shots = dir.join("screenshots");
     fs::create_dir_all(&shots).map_err(|e| format!("create {}: {e}", shots.display()))?;
@@ -561,57 +574,162 @@ fn query_live_window_ax_tree(
     restore_window: bool,
 ) -> Result<ElementNode, String> {
     let script = r#"
-const targetName = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[4]);
-const restore = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[5]) === "1";
+const targetPid = Number($.NSProcessInfo.processInfo.arguments.js[4]);
+const targetName = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[5]);
+const restore = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[6]) === "1";
+const targetWinId = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[7]) || "";
+const targetWinIndex = Number($.NSProcessInfo.processInfo.arguments.js[8] || "0");
+const targetWinTitle = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[9]) || "";
+
 const se = Application("System Events");
-const proc = se.processes.byName(targetName);
+let proc = null;
+if (targetPid > 0) {
+  try {
+    const byPid = se.processes.whose({ unixId: targetPid })();
+    if (byPid && byPid.length > 0) proc = byPid[0];
+  } catch (_) {}
+}
+if (!proc) {
+  proc = se.processes.byName(targetName);
+}
 if (restore) {
   try { proc.visible = true; } catch (_) {}
 }
+
+function selectTargetWindow(wins, winId, winIndex, winTitle) {
+  if (!wins || wins.length === 0) return null;
+  if (winId) {
+    for (const cand of wins) {
+      try {
+        const axNum = cand.attributes.byName("AXWindowNumber").value();
+        if (axNum !== null && axNum !== undefined && String(axNum) === winId) return cand;
+      } catch (_) {}
+      try {
+        if (String(cand.id()) === winId) return cand;
+      } catch (_) {}
+    }
+  }
+  if (winIndex >= 1 && winIndex <= wins.length) {
+    const byIdx = wins[winIndex - 1];
+    if (!winTitle) return byIdx;
+    try {
+      if (String(byIdx.name() || "") === winTitle) return byIdx;
+    } catch (_) {}
+    for (const cand of wins) {
+      try {
+        if (String(cand.name() || "") === winTitle) return cand;
+      } catch (_) {}
+    }
+    return byIdx;
+  }
+  if (winTitle) {
+    for (const cand of wins) {
+      try {
+        if (String(cand.name() || "") === winTitle) return cand;
+      } catch (_) {}
+    }
+  }
+  if (!winId && !winTitle && winIndex === 0) {
+    return wins[0];
+  }
+  return null;
+}
+
+let budget = 160;
+function readNode(el, depth) {
+  budget -= 1;
+  let role = "AXGroup";
+  let subrole = null;
+  let title = null;
+  let description = null;
+  let val = null;
+  let b = null;
+  let enabled = true;
+  let focused = false;
+  let selected = false;
+  let actions = [];
+  try { role = String(el.role() || "AXGroup"); } catch (_) {}
+  try { const sr = el.subrole(); if (sr) subrole = String(sr); } catch (_) {}
+  try { const t = el.title(); if (t) title = String(t); } catch (_) {}
+  try { const d = el.description(); if (d) description = String(d); } catch (_) {}
+  try {
+    const v = el.value();
+    if (v !== null && v !== undefined && (typeof v === "string" || typeof v === "number" || typeof v === "boolean")) {
+      val = String(v).slice(0, 500);
+    }
+  } catch (_) {}
+  try {
+    const p = el.position();
+    const s = el.size();
+    b = { x: Number(p[0] || 0), y: Number(p[1] || 0), width: Number(s[0] || 0), height: Number(s[1] || 0) };
+  } catch (_) {}
+  try { enabled = Boolean(el.enabled()); } catch (_) {}
+  try { focused = Boolean(el.focused()); } catch (_) {}
+  try { selected = Boolean(el.selected()); } catch (_) {}
+  try {
+    const rawActs = el.actions();
+    for (let i = 0; i < Math.min(rawActs.length, 8); i++) {
+      try {
+        const an = rawActs[i].name();
+        if (an) actions.push(String(an));
+      } catch (_) {}
+    }
+  } catch (_) {}
+  const children = [];
+  if (depth < 4 && budget > 0) {
+    try {
+      const sub = el.uiElements();
+      for (let i = 0; i < Math.min(sub.length, 40) && budget > 0; i++) {
+        children.push(readNode(sub[i], depth + 1));
+      }
+    } catch (_) {}
+  }
+  return {
+    role,
+    subrole,
+    title,
+    description,
+    value: val,
+    bounds: b,
+    enabled,
+    focused,
+    selected,
+    actions,
+    children,
+  };
+}
+
+let winTitle = targetWinTitle || targetName;
 const winBounds = { x: 0, y: 0, width: 800, height: 600 };
 let children = [];
 try {
   const wins = proc.windows();
-  if (wins.length > 0) {
-    const w = wins[0];
-    const pos = w.position();
-    const sz = w.size();
-    winBounds.x = Number(pos[0] || 0);
-    winBounds.y = Number(pos[1] || 0);
-    winBounds.width = Number(sz[0] || 800);
-    winBounds.height = Number(sz[1] || 600);
+  const w = selectTargetWindow(wins, targetWinId, targetWinIndex, targetWinTitle);
+  if (w) {
+    if (restore) {
+      try { w.attributes.byName("AXMinimized").value = false; } catch (_) {}
+    }
+    try {
+      const nm = w.name();
+      if (nm) winTitle = String(nm);
+    } catch (_) {}
+    try {
+      const pos = w.position();
+      const sz = w.size();
+      winBounds.x = Number(pos[0] || 0);
+      winBounds.y = Number(pos[1] || 0);
+      winBounds.width = Number(sz[0] || 800);
+      winBounds.height = Number(sz[1] || 600);
+    } catch (_) {}
     const elems = w.uiElements();
-    for (let i = 0; i < Math.min(elems.length, 40); i++) {
-      const el = elems[i];
-      let role = "AXGroup";
-      let title = null;
-      let val = null;
-      let b = null;
-      try { role = String(el.role() || "AXGroup"); } catch (_) {}
-      try { title = el.title() ? String(el.title()) : (el.description() ? String(el.description()) : null); } catch (_) {}
-      try { val = el.value() !== null && el.value() !== undefined ? String(el.value()) : null; } catch (_) {}
-      try {
-        const p = el.position();
-        const s = el.size();
-        b = { x: Number(p[0] || 0), y: Number(p[1] || 0), width: Number(s[0] || 0), height: Number(s[1] || 0) };
-      } catch (_) {}
-      children.push({
-        role,
-        title,
-        value: val,
-        bounds: b,
-        enabled: true,
-        focused: false,
-        selected: false,
-        actions: ["AXPress"],
-        children: [],
-      });
+    for (let i = 0; i < Math.min(elems.length, 40) && budget > 0; i++) {
+      children.push(readNode(elems[i], 1));
     }
   }
 } catch (_) {}
 JSON.stringify({
   role: "AXWindow",
-  title: targetName,
+  title: winTitle,
   bounds: winBounds,
   enabled: true,
   focused: true,
@@ -620,17 +738,715 @@ JSON.stringify({
   children,
 });
 "#;
-    let out = run_jxa(script, &[&app.name, if restore_window { "1" } else { "0" }])?;
+    let pid_str = app.pid.to_string();
+    let restore_str = if restore_window { "1" } else { "0" };
+    let win_id_str = win.map_or("", |w| w.id.as_str());
+    let win_idx_str = win.map_or(0usize, |w| w.index).to_string();
+    let win_title_str = win.map_or("", |w| w.title.as_str());
+    let out = run_jxa(
+        script,
+        &[
+            &pid_str,
+            &app.name,
+            restore_str,
+            win_id_str,
+            &win_idx_str,
+            win_title_str,
+        ],
+    )?;
     let mut node: ElementNode =
         serde_json::from_str(&out).map_err(|e| format!("parse AX tree: {e}"))?;
     if let Some(w) = win {
-        node.title = Some(w.title.clone());
-        node.bounds = Some(w.bounds);
+        if node.title.as_deref().unwrap_or("").is_empty() {
+            node.title = Some(w.title.clone());
+        }
+        if node.bounds.is_none() {
+            node.bounds = Some(w.bounds);
+        }
     }
     Ok(node)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum LiveAction {
+    Click {
+        target_ref: Option<usize>,
+        point: Option<Point>,
+        button: String,
+        click_count: usize,
+        modifiers: Vec<String>,
+    },
+    SecondaryAction {
+        target_ref: usize,
+        point: Option<Point>,
+        action_name: String,
+    },
+    Scroll {
+        point: Option<Point>,
+        delta_x: f64,
+        delta_y: f64,
+    },
+    Drag {
+        from: Point,
+        to: Point,
+    },
+    TypeText {
+        target_ref: Option<usize>,
+        focus_point: Option<Point>,
+        text: String,
+    },
+    PressKey {
+        key: String,
+        modifiers: Vec<String>,
+        repeat: usize,
+    },
+    Hotkey {
+        modifiers: Vec<String>,
+        key: String,
+    },
+    SetValue {
+        target_ref: usize,
+        focus_point: Option<Point>,
+        value: String,
+    },
+    PasteText {
+        target_ref: Option<usize>,
+        focus_point: Option<Point>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LiveActionOutcome {
+    pub ok: bool,
+    pub status: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+pub fn build_live_action_payload(
+    app: &AppSummary,
+    win: Option<&WindowSummary>,
+    action: &LiveAction,
+) -> serde_json::Value {
+    let win_id = win.map(|w| w.id.clone());
+    let win_index = win.map_or(0, |w| w.index);
+    let win_title = win.map(|w| w.title.clone());
+    match action {
+        LiveAction::Click {
+            target_ref,
+            point,
+            button,
+            click_count,
+            modifiers,
+        } => serde_json::json!({
+            "kind": "click",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "targetRef": target_ref,
+            "point": point,
+            "button": button,
+            "clickCount": click_count,
+            "modifiers": modifiers,
+            "cgFlags": modifiers_to_cg_flags(modifiers),
+        }),
+        LiveAction::SecondaryAction {
+            target_ref,
+            point,
+            action_name,
+        } => serde_json::json!({
+            "kind": "secondaryAction",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "targetRef": target_ref,
+            "point": point,
+            "actionName": action_name,
+        }),
+        LiveAction::Scroll {
+            point,
+            delta_x,
+            delta_y,
+        } => serde_json::json!({
+            "kind": "scroll",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "point": point,
+            "deltaX": delta_x,
+            "deltaY": delta_y,
+        }),
+        LiveAction::Drag { from, to } => serde_json::json!({
+            "kind": "drag",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "from": from,
+            "to": to,
+        }),
+        LiveAction::TypeText {
+            target_ref,
+            focus_point,
+            text,
+        } => serde_json::json!({
+            "kind": "typeText",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "targetRef": target_ref,
+            "point": focus_point,
+            "text": text,
+        }),
+        LiveAction::PressKey {
+            key,
+            modifiers,
+            repeat,
+        } => {
+            let using_mods: Vec<&str> = modifiers
+                .iter()
+                .filter_map(|m| modifier_to_system_events_using(m))
+                .collect();
+            serde_json::json!({
+                "kind": "pressKey",
+                "pid": app.pid,
+                "appName": app.name,
+                "bundleId": app.bundle_id,
+                "winId": win_id,
+                "winIndex": win_index,
+                "winTitle": win_title,
+                "key": key,
+                "keyCode": key_to_macos_keycode(key),
+                "modifiers": modifiers,
+                "usingMods": using_mods,
+                "cgFlags": modifiers_to_cg_flags(modifiers),
+                "repeat": repeat,
+            })
+        }
+        LiveAction::Hotkey { modifiers, key } => {
+            let using_mods: Vec<&str> = modifiers
+                .iter()
+                .filter_map(|m| modifier_to_system_events_using(m))
+                .collect();
+            serde_json::json!({
+                "kind": "hotkey",
+                "pid": app.pid,
+                "appName": app.name,
+                "bundleId": app.bundle_id,
+                "winId": win_id,
+                "winIndex": win_index,
+                "winTitle": win_title,
+                "key": key,
+                "keyCode": key_to_macos_keycode(key),
+                "modifiers": modifiers,
+                "usingMods": using_mods,
+                "cgFlags": modifiers_to_cg_flags(modifiers),
+                "repeat": 1usize,
+            })
+        }
+        LiveAction::SetValue {
+            target_ref,
+            focus_point,
+            value,
+        } => serde_json::json!({
+            "kind": "setValue",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "targetRef": target_ref,
+            "point": focus_point,
+            "value": value,
+        }),
+        LiveAction::PasteText {
+            target_ref,
+            focus_point,
+        } => serde_json::json!({
+            "kind": "pasteText",
+            "pid": app.pid,
+            "appName": app.name,
+            "bundleId": app.bundle_id,
+            "winId": win_id,
+            "winIndex": win_index,
+            "winTitle": win_title,
+            "targetRef": target_ref,
+            "point": focus_point,
+        }),
+    }
+}
+
+const LIVE_ACTION_JXA_SCRIPT: &str = r#"
+ObjC.import("AppKit");
+ObjC.import("CoreGraphics");
+ObjC.import("Foundation");
+
+const req = JSON.parse(ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[4]));
+const se = Application("System Events");
+
+function activateTargetApp() {
+  let activated = false;
+  if (req.pid && Number(req.pid) > 0) {
+    try {
+      const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(req.pid));
+      if (running && !running.isNil()) {
+        activated = Boolean(running.activateWithOptions(3));
+      }
+    } catch (_) {}
+  }
+  if (!activated && req.bundleId) {
+    try {
+      const app = Application(String(req.bundleId));
+      app.activate();
+      activated = true;
+    } catch (_) {}
+  }
+  if (!activated && req.appName) {
+    try {
+      const app = Application(String(req.appName));
+      app.activate();
+      activated = true;
+    } catch (_) {}
+  }
+  return activated;
+}
+
+function getProcess() {
+  if (req.pid && Number(req.pid) > 0) {
+    try {
+      const byPid = se.processes.whose({ unixId: Number(req.pid) })();
+      if (byPid && byPid.length > 0) return byPid[0];
+    } catch (_) {}
+  }
+  return se.processes.byName(String(req.appName || ""));
+}
+
+function selectTargetWindow(wins, winId, winIndex, winTitle) {
+  if (!wins || wins.length === 0) return null;
+  const idStr = winId ? String(winId) : "";
+  const idxNum = Number(winIndex || 0);
+  const titleStr = winTitle ? String(winTitle) : "";
+  if (idStr) {
+    for (const cand of wins) {
+      try {
+        const axNum = cand.attributes.byName("AXWindowNumber").value();
+        if (axNum !== null && axNum !== undefined && String(axNum) === idStr) return cand;
+      } catch (_) {}
+      try {
+        if (String(cand.id()) === idStr) return cand;
+      } catch (_) {}
+    }
+  }
+  if (idxNum >= 1 && idxNum <= wins.length) {
+    const byIdx = wins[idxNum - 1];
+    if (!titleStr) return byIdx;
+    try {
+      if (String(byIdx.name() || "") === titleStr) return byIdx;
+    } catch (_) {}
+    for (const cand of wins) {
+      try {
+        if (String(cand.name() || "") === titleStr) return cand;
+      } catch (_) {}
+    }
+    return byIdx;
+  }
+  if (titleStr) {
+    for (const cand of wins) {
+      try {
+        if (String(cand.name() || "") === titleStr) return cand;
+      } catch (_) {}
+    }
+  }
+  if (!idStr && !titleStr && idxNum === 0) {
+    return wins[0];
+  }
+  return null;
+}
+
+const INTERACTIVE_ROLES = {
+  AXButton: true,
+  AXTextField: true,
+  AXTextArea: true,
+  AXCheckBox: true,
+  AXRadioButton: true,
+  AXPopUpButton: true,
+  AXComboBox: true,
+  AXMenuItem: true,
+  AXLink: true,
+  AXTab: true,
+  AXSlider: true,
+  AXRow: true,
+  AXCell: true,
+};
+
+function findInteractiveElementByRef(win, targetRef) {
+  if (!win || !targetRef || targetRef < 1) return null;
+  let budget = 160;
+  let nextRef = 1;
+  function visit(el, depth) {
+    budget -= 1;
+    let role = "AXGroup";
+    let hasActions = false;
+    try { role = String(el.role() || "AXGroup"); } catch (_) {}
+    try {
+      const rawActs = el.actions();
+      hasActions = rawActs && rawActs.length > 0;
+    } catch (_) {}
+    if (hasActions || INTERACTIVE_ROLES[role]) {
+      const assigned = nextRef;
+      nextRef += 1;
+      if (assigned === targetRef) return el;
+    }
+    if (depth < 4 && budget > 0) {
+      try {
+        const sub = el.uiElements();
+        for (let i = 0; i < Math.min(sub.length, 40) && budget > 0; i++) {
+          const found = visit(sub[i], depth + 1);
+          if (found) return found;
+        }
+      } catch (_) {}
+    }
+    return null;
+  }
+  try {
+    const elems = win.uiElements();
+    for (let i = 0; i < Math.min(elems.length, 40) && budget > 0; i++) {
+      const found = visit(elems[i], 1);
+      if (found) return found;
+    }
+  } catch (_) {}
+  return null;
+}
+
+function postMouseClick(pt, button, clickCount, cgFlags) {
+  if (!pt) return false;
+  const loc = { x: Number(pt.x), y: Number(pt.y) };
+  let downType = 1;
+  let upType = 2;
+  let mouseBtn = 0;
+  if (button === "right") {
+    downType = 3;
+    upType = 4;
+    mouseBtn = 1;
+  } else if (button === "middle") {
+    downType = 25;
+    upType = 26;
+    mouseBtn = 2;
+  }
+  const count = Math.max(1, Number(clickCount || 1));
+  const flags = Number(cgFlags || 0);
+  for (let i = 1; i <= count; i++) {
+    const downEv = $.CGEventCreateMouseEvent(null, downType, loc, mouseBtn);
+    const upEv = $.CGEventCreateMouseEvent(null, upType, loc, mouseBtn);
+    if (!downEv || !upEv) return false;
+    $.CGEventSetIntegerValueField(downEv, 1, i);
+    $.CGEventSetIntegerValueField(upEv, 1, i);
+    if (flags > 0) {
+      $.CGEventSetFlags(downEv, flags);
+      $.CGEventSetFlags(upEv, flags);
+    }
+    $.CGEventPost(0, downEv);
+    $.CGEventPost(0, upEv);
+  }
+  return true;
+}
+
+function focusTargetElementIfAny() {
+  if (!req.targetRef) return true;
+  try {
+    const proc = getProcess();
+    const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+    const el = findInteractiveElementByRef(w, Number(req.targetRef));
+    if (el) {
+      try {
+        el.focused = true;
+        return true;
+      } catch (_) {}
+    }
+  } catch (_) {}
+  if (req.point) {
+    return postMouseClick(req.point, "left", 1, 0);
+  }
+  return false;
+}
+
+function executeRequest() {
+  activateTargetApp();
+  const kind = String(req.kind || "");
+
+  if (kind === "click") {
+    const isSimpleLeft = (!req.button || req.button === "left") &&
+      Number(req.clickCount || 1) === 1 &&
+      (!req.modifiers || req.modifiers.length === 0);
+    if (req.targetRef && isSimpleLeft) {
+      try {
+        const proc = getProcess();
+        const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+        const el = findInteractiveElementByRef(w, Number(req.targetRef));
+        if (el) {
+          try { el.focused = true; } catch (_) {}
+          try {
+            el.actions.byName("AXPress").perform();
+            return { ok: true, status: "verified", reason: null, note: "performed AXPress" };
+          } catch (_) {}
+        }
+      } catch (_) {}
+    }
+    if (req.point && postMouseClick(req.point, req.button || "left", req.clickCount || 1, req.cgFlags || 0)) {
+      return { ok: true, status: "verified", reason: null, note: "posted CGEvent click" };
+    }
+    return {
+      ok: false,
+      status: "unverified",
+      reason: "target element could not be clicked via AXPress or CGEvent coordinates",
+      note: null,
+    };
+  }
+
+  if (kind === "secondaryAction") {
+    const actionName = String(req.actionName || "AXShowMenu");
+    try {
+      const proc = getProcess();
+      const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+      const el = findInteractiveElementByRef(w, Number(req.targetRef));
+      if (el) {
+        try { el.focused = true; } catch (_) {}
+        el.actions.byName(actionName).perform();
+        return { ok: true, status: "verified", reason: null, note: "performed " + actionName };
+      }
+    } catch (_) {}
+    if (actionName === "AXShowMenu" && req.point && postMouseClick(req.point, "right", 1, 0)) {
+      return { ok: true, status: "verified", reason: null, note: "fallback right-click for AXShowMenu" };
+    }
+    return {
+      ok: false,
+      status: "unverified",
+      reason: "failed to perform secondary AX action " + actionName + " on element #" + req.targetRef,
+      note: null,
+    };
+  }
+
+  if (kind === "scroll") {
+    if (req.point) {
+      const moveEv = $.CGEventCreateMouseEvent(null, 5, { x: Number(req.point.x), y: Number(req.point.y) }, 0);
+      if (moveEv) $.CGEventPost(0, moveEv);
+    }
+    const dy = Math.round(Number(req.deltaY || 0));
+    const dx = Math.round(Number(req.deltaX || 0));
+    const scrollEv = $.CGEventCreateScrollWheelEvent(null, 0, 2, dy, dx);
+    if (!scrollEv) {
+      return { ok: false, status: "unverified", reason: "failed to create CGEvent scroll event", note: null };
+    }
+    $.CGEventPost(0, scrollEv);
+    return { ok: true, status: "verified", reason: null, note: "posted CGEvent scroll" };
+  }
+
+  if (kind === "drag") {
+    const fromPt = { x: Number(req.from.x), y: Number(req.from.y) };
+    const toPt = { x: Number(req.to.x), y: Number(req.to.y) };
+    const moveEv = $.CGEventCreateMouseEvent(null, 5, fromPt, 0);
+    const downEv = $.CGEventCreateMouseEvent(null, 1, fromPt, 0);
+    if (!moveEv || !downEv) {
+      return { ok: false, status: "unverified", reason: "failed to create CGEvent drag start", note: null };
+    }
+    $.CGEventPost(0, moveEv);
+    $.CGEventPost(0, downEv);
+    const steps = 5;
+    for (let s = 1; s <= steps; s++) {
+      const ratio = s / steps;
+      const stepPt = {
+        x: fromPt.x + (toPt.x - fromPt.x) * ratio,
+        y: fromPt.y + (toPt.y - fromPt.y) * ratio,
+      };
+      const dragEv = $.CGEventCreateMouseEvent(null, 6, stepPt, 0);
+      if (dragEv) $.CGEventPost(0, dragEv);
+      $.NSThread.sleepForTimeInterval(0.01);
+    }
+    const upEv = $.CGEventCreateMouseEvent(null, 2, toPt, 0);
+    if (!upEv) {
+      return { ok: false, status: "unverified", reason: "failed to create CGEvent drag end", note: null };
+    }
+    $.CGEventPost(0, upEv);
+    return { ok: true, status: "verified", reason: null, note: "posted CGEvent drag" };
+  }
+
+  if (kind === "typeText") {
+    if (req.targetRef && !focusTargetElementIfAny()) {
+      return {
+        ok: false,
+        status: "unverified",
+        reason: "could not focus target element #" + req.targetRef + " before typing",
+        note: null,
+      };
+    }
+    try {
+      const text = String(req.text || "");
+      const lines = text.split(/\r?\n/);
+      for (let li = 0; li < lines.length; li++) {
+        if (li > 0) se.keyCode(36);
+        const tabs = lines[li].split("\t");
+        for (let ti = 0; ti < tabs.length; ti++) {
+          if (ti > 0) se.keyCode(48);
+          if (tabs[ti].length > 0) se.keystroke(tabs[ti]);
+        }
+      }
+      return { ok: true, status: "verified", reason: null, note: "typed text via System Events" };
+    } catch (err) {
+      return { ok: false, status: "unverified", reason: "System Events keystroke failed: " + String(err), note: null };
+    }
+  }
+
+  if (kind === "pressKey" || kind === "hotkey") {
+    try {
+      const repeat = Math.max(1, Number(req.repeat || 1));
+      const usingMods = Array.isArray(req.usingMods) ? req.usingMods : [];
+      const opts = usingMods.length > 0 ? { using: usingMods } : undefined;
+      for (let r = 0; r < repeat; r++) {
+        if (req.keyCode !== null && req.keyCode !== undefined) {
+          if (opts) {
+            se.keyCode(Number(req.keyCode), opts);
+          } else {
+            se.keyCode(Number(req.keyCode));
+          }
+        } else {
+          if (opts) {
+            se.keystroke(String(req.key), opts);
+          } else {
+            se.keystroke(String(req.key));
+          }
+        }
+      }
+      return { ok: true, status: "verified", reason: null, note: "dispatched key event via System Events" };
+    } catch (err) {
+      return { ok: false, status: "unverified", reason: "System Events key dispatch failed: " + String(err), note: null };
+    }
+  }
+
+  if (kind === "setValue") {
+    try {
+      const proc = getProcess();
+      const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+      const el = findInteractiveElementByRef(w, Number(req.targetRef));
+      if (!el) {
+        return {
+          ok: false,
+          status: "unverified",
+          reason: "element #" + req.targetRef + " not found in live window AX tree",
+          note: null,
+        };
+      }
+      try { el.focused = true; } catch (_) {}
+      let updated = false;
+      try {
+        el.value = String(req.value);
+        updated = true;
+      } catch (_) {}
+      if (!updated) {
+        try {
+          el.attributes.byName("AXValue").value = String(req.value);
+          updated = true;
+        } catch (_) {}
+      }
+      if (!updated) {
+        return {
+          ok: false,
+          status: "unverified",
+          reason: "AXValue attribute is not writable on element #" + req.targetRef,
+          note: null,
+        };
+      }
+      return { ok: true, status: "verified", reason: null, note: "updated AXValue" };
+    } catch (err) {
+      return { ok: false, status: "unverified", reason: "setValue failed: " + String(err), note: null };
+    }
+  }
+
+  if (kind === "pasteText") {
+    if (req.targetRef && !focusTargetElementIfAny()) {
+      return {
+        ok: false,
+        status: "unverified",
+        reason: "could not focus target element #" + req.targetRef + " before paste",
+        note: null,
+      };
+    }
+    try {
+      se.keystroke("v", { using: "command down" });
+      $.NSThread.sleepForTimeInterval(0.05);
+      return { ok: true, status: "verified", reason: null, note: "pasted via Cmd+V" };
+    } catch (err) {
+      return { ok: false, status: "unverified", reason: "paste keystroke failed: " + String(err), note: null };
+    }
+  }
+
+  return { ok: false, status: "unverified", reason: "unsupported live action kind: " + kind, note: null };
+}
+
+JSON.stringify(executeRequest());
+"#;
+
+pub fn execute_live_action(
+    app_selector: &str,
+    resolved_app: Option<&AppSummary>,
+    win: Option<&WindowSummary>,
+    action: &LiveAction,
+) -> Result<LiveActionOutcome, String> {
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some()
+        && std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN").is_none()
+    {
+        return Ok(LiveActionOutcome {
+            ok: false,
+            status: "unverified".to_owned(),
+            reason: Some(
+                "live OS action skipped because KRILL_TEST_OFFLINE is set without mock environment"
+                    .to_owned(),
+            ),
+            note: None,
+        });
+    }
+    let owned_app;
+    let app = if let Some(a) = resolved_app {
+        a
+    } else {
+        owned_app = resolve_live_app(app_selector)?;
+        &owned_app
+    };
+    let payload = build_live_action_payload(app, win, action);
+    let payload_str = serde_json::to_string(&payload).map_err(|e| e.to_string())?;
+    let raw = run_jxa(LIVE_ACTION_JXA_SCRIPT, &[&payload_str])?;
+    serde_json::from_str(&raw).map_err(|e| format!("parse live action outcome: {e}"))
+}
+
 pub fn read_system_clipboard() -> Result<String, String> {
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
+        let Some(dir) = daemon::state_dir() else {
+            return Ok(String::new());
+        };
+        let path = dir.join("computer-clipboard.txt");
+        return match fs::read_to_string(path) {
+            Ok(s) => Ok(s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
+            Err(e) => Err(format!("read offline clipboard: {e}")),
+        };
+    }
     let out = Command::new("/usr/bin/pbpaste")
         .stdin(Stdio::null())
         .output()
@@ -639,6 +1455,14 @@ pub fn read_system_clipboard() -> Result<String, String> {
 }
 
 pub fn write_system_clipboard(text: &str) -> Result<(), String> {
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
+        let Some(dir) = daemon::state_dir() else {
+            return Ok(());
+        };
+        fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+        return fs::write(dir.join("computer-clipboard.txt"), text)
+            .map_err(|e| format!("write offline clipboard: {e}"));
+    }
     let mut child = Command::new("/usr/bin/pbcopy")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -659,7 +1483,9 @@ pub fn write_system_clipboard(text: &str) -> Result<(), String> {
 }
 
 pub fn run_jxa(script: &str, args: &[&str]) -> Result<String, String> {
-    let mut cmd = Command::new("/usr/bin/osascript");
+    let bin = std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN")
+        .map_or_else(|| PathBuf::from("/usr/bin/osascript"), PathBuf::from);
+    let mut cmd = Command::new(bin);
     cmd.args(["-l", "JavaScript", "-e", script]);
     for arg in args {
         cmd.arg(arg);

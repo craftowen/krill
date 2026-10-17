@@ -214,3 +214,102 @@ fn cli_usage_and_validation_errors_return_exit_code_2() {
     };
     assert_eq!(mock.apps.len(), 1);
 }
+
+#[test]
+fn element_ref_parsing_and_bounded_stdin_enforced() {
+    use super::actions::read_bounded_text;
+    use super::parse_element_ref;
+    use krill_proto::input::MAX_INPUT;
+
+    assert_eq!(parse_element_ref("1", "--ref").unwrap(), 1);
+    assert_eq!(parse_element_ref("@e1", "--ref").unwrap(), 1);
+    assert_eq!(parse_element_ref("@E42", "--ref").unwrap(), 42);
+    assert_eq!(parse_element_ref("e7", "--ref").unwrap(), 7);
+    assert_eq!(parse_element_ref("#9", "--ref").unwrap(), 9);
+    assert!(parse_element_ref("0", "--ref").is_err());
+    assert!(parse_element_ref("bogus", "--ref").is_err());
+
+    let exact = vec![b'a'; MAX_INPUT];
+    let ok_text = read_bounded_text(std::io::Cursor::new(exact), "type-text").unwrap();
+    assert_eq!(ok_text.len(), MAX_INPUT);
+
+    // Infinite stream must terminate immediately at MAX_INPUT + 1 bytes without OOM
+    let err = read_bounded_text(std::io::repeat(b'x'), "type-text").unwrap_err();
+    match err {
+        super::CliError::Runtime(msg) => assert!(msg.contains("exceeds maximum length"), "{msg}"),
+        super::CliError::Usage(msg) => panic!("expected runtime error, got usage: {msg}"),
+    }
+}
+
+#[test]
+fn live_action_payload_includes_resolved_pid_window_and_keycodes() {
+    use super::engine::{LiveAction, WindowSummary, build_live_action_payload};
+    use super::model::{key_to_macos_keycode, modifiers_to_cg_flags};
+
+    assert_eq!(key_to_macos_keycode("return"), Some(36));
+    assert_eq!(key_to_macos_keycode("escape"), Some(53));
+    assert_eq!(key_to_macos_keycode("a"), None);
+    assert_eq!(
+        modifiers_to_cg_flags(&["command".to_owned(), "shift".to_owned()]),
+        0x0010_0000 | 0x0002_0000
+    );
+
+    let app = AppSummary {
+        name: "TextEdit".to_owned(),
+        bundle_id: Some("com.apple.TextEdit".to_owned()),
+        pid: 7777,
+        is_active: true,
+        is_hidden: false,
+    };
+    let win = WindowSummary {
+        id: "502".to_owned(),
+        index: 2,
+        title: "Second Document".to_owned(),
+        app_name: "TextEdit".to_owned(),
+        bundle_id: Some("com.apple.TextEdit".to_owned()),
+        pid: 7777,
+        bounds: Rect {
+            x: 50.0,
+            y: 60.0,
+            width: 600.0,
+            height: 400.0,
+        },
+        is_focused: false,
+        is_main: false,
+        is_minimized: false,
+    };
+
+    let click_payload = build_live_action_payload(
+        &app,
+        Some(&win),
+        &LiveAction::Click {
+            target_ref: Some(1),
+            point: Some(Point { x: 100.0, y: 120.0 }),
+            button: "left".to_owned(),
+            click_count: 1,
+            modifiers: vec!["command".to_owned()],
+        },
+    );
+    assert_eq!(click_payload["kind"], "click");
+    assert_eq!(click_payload["pid"], 7777);
+    assert_eq!(click_payload["appName"], "TextEdit");
+    assert_eq!(click_payload["winId"], "502");
+    assert_eq!(click_payload["winIndex"], 2);
+    assert_eq!(click_payload["winTitle"], "Second Document");
+    assert_eq!(click_payload["targetRef"], 1);
+    assert_eq!(click_payload["cgFlags"], 0x0010_0000);
+
+    let key_payload = build_live_action_payload(
+        &app,
+        Some(&win),
+        &LiveAction::PressKey {
+            key: "return".to_owned(),
+            modifiers: vec!["shift".to_owned()],
+            repeat: 2,
+        },
+    );
+    assert_eq!(key_payload["kind"], "pressKey");
+    assert_eq!(key_payload["keyCode"], 36);
+    assert_eq!(key_payload["usingMods"][0], "shift down");
+    assert_eq!(key_payload["repeat"], 2);
+}

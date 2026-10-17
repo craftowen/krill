@@ -1406,5 +1406,233 @@ fn computer_cli_subcommands_and_skill_work_offline() {
     .unwrap();
     assert_eq!(hotkey_res["action"], "hotkey");
 
+    // 3. Live mode verification (without computer-mock.json) using fake osascript binary (OWE-746)
+    fs::remove_file(dir.join("computer-mock.json")).unwrap();
+    fs::remove_file(dir.join("computer-state.json")).ok();
+
+    let fake_osascript = dir.join("fake-osascript.sh");
+    let action_log = dir.join("jxa-actions.jsonl");
+    let value_file = dir.join("live-value.txt");
+    fs::write(&value_file, "initial-doc2").unwrap();
+    fs::write(
+        &fake_osascript,
+        format!(
+            r#"#!/bin/sh
+SCRIPT="$4"
+shift 4
+case "$SCRIPT" in
+  *"runningApplications"*)
+    printf '[{{"name":"TextEdit","bundleId":"com.apple.TextEdit","pid":7777,"isActive":true,"isHidden":false}}]\n'
+    ;;
+  *"CGWindowListCopyWindowInfo"*)
+    printf '[{{"id":"501","index":1,"title":"Doc 1","appName":"TextEdit","bundleId":"com.apple.TextEdit","pid":7777,"bounds":{{"x":10.0,"y":10.0,"width":500.0,"height":400.0}},"isFocused":true,"isMain":true,"isMinimized":false}},{{"id":"502","index":2,"title":"Doc 2","appName":"TextEdit","bundleId":"com.apple.TextEdit","pid":7777,"bounds":{{"x":600.0,"y":10.0,"width":500.0,"height":400.0}},"isFocused":false,"isMain":false,"isMinimized":false}}]\n'
+    ;;
+  *"selectTargetWindow"* )
+    case "$SCRIPT" in
+      *"executeRequest"*)
+        REQ="$1"
+        printf '%s\n' "$REQ" >> "{log}"
+        case "$REQ" in
+          *'"kind":"setValue"'*)
+            printf 'abc' > "{val}"
+            ;;
+        esac
+        if [ -n "$FAKE_JXA_FAIL" ]; then
+          printf '{{"ok":false,"status":"unverified","reason":"simulated live failure","note":null}}\n'
+        else
+          printf '{{"ok":true,"status":"verified","reason":null,"note":"simulated live dispatch"}}\n'
+        fi
+        ;;
+      *)
+        WIN_ID="$4"
+        WIN_IDX="$5"
+        WIN_TITLE="$6"
+        CUR_VAL="$(cat "{val}")"
+        if [ "$WIN_IDX" = "2" ] || [ "$WIN_ID" = "502" ]; then
+          printf '{{"role":"AXWindow","title":"%s","bounds":{{"x":600.0,"y":10.0,"width":500.0,"height":400.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXTextArea","title":"SecondWindowEditor","value":"%s","bounds":{{"x":620.0,"y":40.0,"width":400.0,"height":300.0}},"enabled":true,"focused":true,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n' "$WIN_TITLE" "$CUR_VAL"
+        else
+          printf '{{"role":"AXWindow","title":"Doc 1","bounds":{{"x":10.0,"y":10.0,"width":500.0,"height":400.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXTextArea","title":"FirstWindowEditor","value":"%s","bounds":{{"x":20.0,"y":40.0,"width":400.0,"height":300.0}},"enabled":true,"focused":true,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n' "$CUR_VAL"
+        fi
+        ;;
+    esac
+    ;;
+esac
+"#,
+            log = action_log.display(),
+            val = value_file.display(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&fake_osascript, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let ok_live = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(&bin_path)
+            .args(args)
+            .env("KRILL_STATE_DIR", &dir)
+            .env("HOME", &dir)
+            .env("KRILL_TEST_OFFLINE", "1")
+            .env("KRILL_COMPUTER_OSASCRIPT_BIN", &fake_osascript)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_str(&String::from_utf8(out.stdout).unwrap()).unwrap()
+    };
+
+    // Scenario 2: snapshot --window-index 2 queries Window 2's AX tree instead of wins[0]
+    let snap2 = ok_live(&[
+        "computer",
+        "snapshot",
+        "--app",
+        "TextEdit",
+        "--window-index",
+        "2",
+        "--json",
+    ]);
+    assert_eq!(snap2["window"]["id"], "502");
+    assert_eq!(snap2["window"]["index"], 2);
+    assert_eq!(snap2["elements"][0]["label"], "SecondWindowEditor");
+
+    // Scenario 1 & 3: live actions with --ref @e1, --dy, and --app pid:<PID>
+    let live_click = ok_live(&[
+        "computer", "click", "--app", "TextEdit", "--ref", "@e1", "--json",
+    ]);
+    assert_eq!(live_click["ok"], true);
+    assert_eq!(live_click["verification"]["status"], "verified");
+
+    let live_pid_click = ok_live(&[
+        "computer", "click", "--app", "pid:7777", "--x", "100", "--y", "100", "--json",
+    ]);
+    assert_eq!(live_pid_click["ok"], true);
+    assert_eq!(live_pid_click["appState"]["app"]["name"], "TextEdit");
+
+    let live_type = ok_live(&[
+        "computer",
+        "type-text",
+        "--app",
+        "TextEdit",
+        "--text",
+        "hello",
+        "--json",
+    ]);
+    assert_eq!(live_type["ok"], true);
+
+    let live_key = ok_live(&[
+        "computer",
+        "press-key",
+        "--app",
+        "TextEdit",
+        "--key",
+        "Return",
+        "--json",
+    ]);
+    assert_eq!(live_key["ok"], true);
+
+    let live_hotkey = ok_live(&[
+        "computer", "hotkey", "--app", "TextEdit", "--keys", "cmd+a", "--json",
+    ]);
+    assert_eq!(live_hotkey["ok"], true);
+
+    let live_scroll = ok_live(&[
+        "computer", "scroll", "--app", "TextEdit", "--dy", "-120", "--json",
+    ]);
+    assert_eq!(live_scroll["ok"], true);
+
+    let live_drag = ok_live(&[
+        "computer", "drag", "--app", "TextEdit", "--from-x", "10", "--from-y", "10", "--to-x",
+        "50", "--to-y", "50", "--json",
+    ]);
+    assert_eq!(live_drag["ok"], true);
+
+    let live_set = ok_live(&[
+        "computer",
+        "set-value",
+        "--app",
+        "TextEdit",
+        "--ref",
+        "@e1",
+        "--value",
+        "abc",
+        "--json",
+    ]);
+    assert_eq!(live_set["ok"], true);
+    assert_eq!(live_set["verification"]["status"], "verified");
+
+    // Verify logged JXA payloads resolved pid:7777 -> appName "TextEdit" & pid 7777
+    let logged = fs::read_to_string(&action_log).unwrap();
+    let payloads: Vec<serde_json::Value> = logged
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(payloads.len(), 8);
+    assert!(
+        payloads
+            .iter()
+            .all(|p| p["appName"] == "TextEdit" && p["pid"] == 7777)
+    );
+    assert_eq!(payloads[0]["kind"], "click");
+    assert_eq!(payloads[0]["targetRef"], 1);
+    assert_eq!(payloads[1]["kind"], "click");
+    assert_eq!(payloads[2]["kind"], "typeText");
+    assert_eq!(payloads[3]["kind"], "pressKey");
+    assert_eq!(payloads[4]["kind"], "hotkey");
+    assert_eq!(payloads[5]["kind"], "scroll");
+    assert_eq!(payloads[6]["kind"], "drag");
+    assert_eq!(payloads[7]["kind"], "setValue");
+
+    // Verify failed/unverified live JXA outcome is reported honestly as ok: false, status: "unverified"
+    let fail_out = Command::new(&bin_path)
+        .args([
+            "computer", "click", "--app", "TextEdit", "--ref", "@e1", "--json",
+        ])
+        .env("KRILL_STATE_DIR", &dir)
+        .env("HOME", &dir)
+        .env("KRILL_TEST_OFFLINE", "1")
+        .env("KRILL_COMPUTER_OSASCRIPT_BIN", &fake_osascript)
+        .env("FAKE_JXA_FAIL", "1")
+        .output()
+        .unwrap();
+    assert!(fail_out.status.success());
+    let fail_json: serde_json::Value = serde_json::from_slice(&fail_out.stdout).unwrap();
+    assert_eq!(fail_json["ok"], false);
+    assert_eq!(fail_json["verification"]["status"], "unverified");
+
+    // Scenario 4: oversized --text-stdin stream (> 65536 bytes) is rejected
+    let mut child = Command::new(&bin_path)
+        .args([
+            "computer",
+            "type-text",
+            "--app",
+            "TextEdit",
+            "--text-stdin",
+            "--json",
+        ])
+        .env("KRILL_STATE_DIR", &dir)
+        .env("HOME", &dir)
+        .env("KRILL_TEST_OFFLINE", "1")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write as _;
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(&vec![b'a'; 70_000]).ok();
+    }
+    let big_out = child.wait_with_output().unwrap();
+    assert_eq!(big_out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&big_out.stderr).contains("exceeds maximum length"),
+        "{}",
+        String::from_utf8_lossy(&big_out.stderr)
+    );
+
     fs::remove_dir_all(&dir).ok();
 }
