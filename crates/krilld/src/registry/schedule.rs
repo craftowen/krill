@@ -6,17 +6,26 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::control::CaptureFormat;
 use krill_proto::schedule::{
-    Cron, MAX_RUNS, PREVIOUS_RUNS, RUN_NOW, RUNS, ScheduleRun as Run, Schedules, WorkspaceMode,
-    take_run_now, truncate_output,
+    Cron, MAX_OUTPUT_BYTES, MAX_RUNS, PREVIOUS_RUNS, RUN_NOW, RUNS, ScheduleRun as Run, Schedules,
+    WorkspaceMode, take_run_now, truncate_output,
 };
 
 use super::{Create, Peer, Program, Registry, Reply, Scope, lock};
+
+/// Default execution timeout for schedule `precheck` shell commands.
+#[cfg(not(test))]
+pub const PRECHECK_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+pub const PRECHECK_TIMEOUT: Duration = Duration::from_millis(500);
+
+const PRECHECK_STREAM_LIMIT: usize = MAX_OUTPUT_BYTES.saturating_add(64);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrecheckResult {
@@ -27,45 +36,188 @@ pub struct PrecheckResult {
 }
 
 /// Runs `/bin/sh -c <command>` in `cwd` as a precheck gate (MK-186).
-/// Exit code `0` passes; any non-zero exit or spawn error marks the run as skipped.
+/// Exit code `0` passes; any non-zero exit, timeout, or spawn error marks the run as skipped.
 #[must_use]
 pub fn run_precheck(cwd: &Path, command: &str) -> PrecheckResult {
-    match Command::new("/bin/sh")
+    run_precheck_with_timeout(cwd, command, PRECHECK_TIMEOUT)
+}
+
+#[must_use]
+pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -> PrecheckResult {
+    let mut child = match Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .process_group(0)
+        .spawn()
     {
-        Ok(output) => {
-            let code = output.status.code();
-            let passed = output.status.success();
-            let mut combined = String::from_utf8_lossy(&output.stdout).into_owned();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                if !combined.is_empty() && !combined.ends_with('\n') {
-                    combined.push('\n');
-                }
-                combined.push_str(&stderr);
-            }
-            let out = truncate_output(&combined);
-            PrecheckResult {
-                passed,
-                status: code,
-                output: (!out.is_empty()).then_some(out),
-                error: (!passed)
-                    .then(|| format!("precheck exited with status {}", code.unwrap_or(-1))),
-            }
+        Ok(child) => child,
+        Err(e) => {
+            return PrecheckResult {
+                passed: false,
+                status: None,
+                output: None,
+                error: Some(format!("precheck failed: {e}")),
+            };
         }
-        Err(e) => PrecheckResult {
+    };
+    let Some(mut stdout) = child.stdout.take() else {
+        kill_precheck(&mut child);
+        return PrecheckResult {
+            passed: false,
+            status: None,
+            output: None,
+            error: Some("precheck failed: missing stdout pipe".into()),
+        };
+    };
+    let Some(mut stderr) = child.stderr.take() else {
+        kill_precheck(&mut child);
+        return PrecheckResult {
+            passed: false,
+            status: None,
+            output: None,
+            error: Some("precheck failed: missing stderr pipe".into()),
+        };
+    };
+    if let Err(e) = set_nonblocking(&stdout).and_then(|()| set_nonblocking(&stderr)) {
+        kill_precheck(&mut child);
+        return PrecheckResult {
             passed: false,
             status: None,
             output: None,
             error: Some(format!("precheck failed: {e}")),
-        },
+        };
     }
+
+    let mut out_bytes = Vec::new();
+    let mut err_bytes = Vec::new();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Err(e) = drain_pipe(&mut stdout, &mut out_bytes, PRECHECK_STREAM_LIMIT, deadline)
+            .and_then(|()| drain_pipe(&mut stderr, &mut err_bytes, PRECHECK_STREAM_LIMIT, deadline))
+        {
+            kill_precheck(&mut child);
+            return PrecheckResult {
+                passed: false,
+                status: None,
+                output: combine_precheck_output(&out_bytes, &err_bytes),
+                error: Some(format!("precheck failed: {e}")),
+            };
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let post_deadline = Instant::now() + Duration::from_millis(50);
+                drain_pipe(
+                    &mut stdout,
+                    &mut out_bytes,
+                    PRECHECK_STREAM_LIMIT,
+                    post_deadline,
+                )
+                .ok();
+                drain_pipe(
+                    &mut stderr,
+                    &mut err_bytes,
+                    PRECHECK_STREAM_LIMIT,
+                    post_deadline,
+                )
+                .ok();
+                kill_precheck(&mut child);
+                let code = status.code();
+                let passed = status.success();
+                return PrecheckResult {
+                    passed,
+                    status: code,
+                    output: combine_precheck_output(&out_bytes, &err_bytes),
+                    error: (!passed)
+                        .then(|| format!("precheck exited with status {}", code.unwrap_or(-1))),
+                };
+            }
+            Ok(None) => {}
+            Err(e) => {
+                kill_precheck(&mut child);
+                return PrecheckResult {
+                    passed: false,
+                    status: None,
+                    output: combine_precheck_output(&out_bytes, &err_bytes),
+                    error: Some(format!("precheck failed: {e}")),
+                };
+            }
+        }
+        if Instant::now() >= deadline {
+            kill_precheck(&mut child);
+            return PrecheckResult {
+                passed: false,
+                status: None,
+                output: combine_precheck_output(&out_bytes, &err_bytes),
+                error: Some("precheck timed out".into()),
+            };
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn combine_precheck_output(stdout: &[u8], stderr: &[u8]) -> Option<String> {
+    let mut combined = String::from_utf8_lossy(stdout).into_owned();
+    let err = String::from_utf8_lossy(stderr);
+    if !err.is_empty() {
+        if !combined.is_empty() && !combined.ends_with('\n') {
+            combined.push('\n');
+        }
+        combined.push_str(&err);
+    }
+    let out = truncate_output(&combined);
+    (!out.is_empty()).then_some(out)
+}
+
+fn drain_pipe(
+    pipe: &mut impl io::Read,
+    dst: &mut Vec<u8>,
+    limit: usize,
+    deadline: Instant,
+) -> io::Result<()> {
+    let mut discard = [0_u8; 4096];
+    loop {
+        let remaining = u64::try_from(limit.saturating_sub(dst.len())).unwrap_or(0);
+        let res = if remaining > 0 {
+            pipe.by_ref().take(remaining).read_to_end(dst)
+        } else {
+            pipe.read(&mut discard)
+        };
+        match res {
+            Ok(0) => return Ok(()),
+            Ok(_) => {
+                if Instant::now() >= deadline {
+                    return Ok(());
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn set_nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
+}
+
+fn kill_precheck(child: &mut Child) {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
+    }
+    child.kill().ok();
+    child.wait().ok();
 }
 
 impl Registry {
@@ -100,14 +252,17 @@ impl Registry {
         }
         let calendar = crate::sys::cron_calendar(seconds)?;
         let _guard = exclusive(dir)?;
-        let forced_ids = take_run_now(dir)?;
         let cron_due = last.is_none_or(|previous| previous < minute);
         *last = Some(minute);
         let schedules = Schedules::load(dir)?;
-        if schedules.schedule.is_empty() && forced_ids.is_empty() && !dir.join(RUNS).exists() {
+        if schedules.schedule.is_empty() && !dir.join(RUNS).exists() {
+            if dir.join(RUN_NOW).exists() {
+                take_run_now(dir)?;
+            }
             return Ok(());
         }
         let mut journal = Journal::open(dir)?;
+        let forced_ids = take_run_now(dir)?;
         // Reap only processes whose exit the holder has already reported. Live
         // PTYs are never closed by scheduling. Segment output remains on disk.
         for (session, mut run) in journal.sessions.clone() {
@@ -290,7 +445,18 @@ impl<'a> Journal<'a> {
                 if line.last() != Some(&b'\n') {
                     break;
                 }
-                let run: Run = serde_json::from_slice(line).map_err(io::Error::other)?;
+                valid = valid.saturating_add(u64::try_from(line.len()).map_err(io::Error::other)?);
+                let run: Run = match serde_json::from_slice(line) {
+                    Ok(run) => run,
+                    Err(error) => {
+                        tracing::warn!(
+                            file = name,
+                            ?error,
+                            "skipping corrupted schedule journal line"
+                        );
+                        continue;
+                    }
+                };
                 latest
                     .entry(run.id.clone())
                     .and_modify(|m| *m = (*m).max(run.minute))
@@ -302,7 +468,6 @@ impl<'a> Journal<'a> {
                         sessions.remove(&session);
                     }
                 }
-                valid = valid.saturating_add(u64::try_from(line.len()).map_err(io::Error::other)?);
             }
             // Discard a SIGKILL-truncated final record before the next append.
             if name == RUNS {

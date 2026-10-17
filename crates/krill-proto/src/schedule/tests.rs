@@ -184,6 +184,66 @@ fn run_now_queue_and_coalesced_journal_roundtrip() {
     fs::remove_dir_all(&state).ok();
 }
 
+#[test]
+fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
+    use std::sync::{Arc, Barrier};
+
+    let state = std::env::temp_dir().join(format!("owe754-proto-{}", std::process::id()));
+    fs::remove_dir_all(&state).ok();
+    fs::create_dir_all(&state).unwrap();
+
+    let count = 32_usize;
+    let schedules = Schedules {
+        schedule: (0..count)
+            .map(|i| Schedule {
+                id: format!("job-{i}"),
+                cron: "* * * * *".into(),
+                cwd: "/tmp".into(),
+                command: vec!["/bin/echo".into()],
+                prompt: "ok".into(),
+                precheck: None,
+                workspace_mode: WorkspaceMode::Reuse,
+            })
+            .collect(),
+    };
+    schedules.save(&state).unwrap();
+
+    let barrier = Arc::new(Barrier::new(2));
+    let writer_dir = state.clone();
+    let writer_barrier = Arc::clone(&barrier);
+    let writer = std::thread::spawn(move || {
+        writer_barrier.wait();
+        for i in 0..count {
+            request_run_now(&writer_dir, &format!("job-{i}")).unwrap();
+        }
+    });
+
+    let reader_dir = state.clone();
+    let reader_barrier = Arc::clone(&barrier);
+    let reader = std::thread::spawn(move || {
+        reader_barrier.wait();
+        let mut collected = HashSet::new();
+        for _ in 0..count.saturating_mul(2) {
+            for id in take_run_now(&reader_dir).unwrap() {
+                collected.insert(id);
+            }
+        }
+        collected
+    });
+
+    writer.join().unwrap();
+    let mut collected = reader.join().unwrap();
+    for id in take_run_now(&state).unwrap() {
+        collected.insert(id);
+    }
+    assert_eq!(collected.len(), count);
+    for i in 0..count {
+        assert!(collected.contains(&format!("job-{i}")), "missing job-{i}");
+    }
+
+    fs::remove_dir_all(&state).ok();
+}
+
 proptest::proptest! {
     #[test]
     fn parsers_never_panic(text in ".{0,2048}", values in proptest::array::uniform5(0_u32..100)) {
