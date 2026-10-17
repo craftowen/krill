@@ -1,0 +1,54 @@
+# cargo-deny 0.20.2에서 검증(docs/research/C1-final.md §3.4). 실행: cargo deny --locked check
+[graph]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+all-features = false
+
+[advisories]
+yanked = "deny"
+unmaintained = "workspace"
+unsound = "all"
+ignore = []  # { id = "RUSTSEC-…", reason = "…" } 형식만, 사유 필수
+
+[licenses]
+allow = ["Apache-2.0", "MIT", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Unicode-3.0", "Zlib"]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+
+[licenses.private]
+ignore = true
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+allow-wildcard-paths = true
+workspace-dependencies = { duplicates = "deny", include-path-dependencies = true, unused = "deny" }
+deny = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+required-git-spec = "rev"
+allow-git = []
+
+# gpui 의존성 때문에 허용 목록 밖 라이선스가 필요한 크레이트만 예외로 둔다(2026-10-15 야간 지휘자 결정, 아침 검토 대상).
+# MPL-2.0: 파일 단위 약한 카피레프트 — 수정하지 않고 쓰면 배포 제약 없음. 0BSD·CC0-1.0: 사실상 제약 없음.
+[[licenses.exceptions]]
+crate = "cbindgen"          # gpui-pre-apple macOS build-dependency(빌드 도구, 배포 바이너리에 안 들어감)
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "option-ext"        # zed-font-kit → dirs → dirs-sys
+allow = ["MPL-2.0"]
+[[licenses.exceptions]]
+crate = "enum-iterator"     # gpui-component
+allow = ["0BSD"]
+[[licenses.exceptions]]
+crate = "enum-iterator-derive"
+allow = ["0BSD"]
+[[licenses.exceptions]]
+crate = "notify"            # gpui-component
+allow = ["CC0-1.0"]
+# iroh(원격 연결 mk-link, MK-133) — 2026-10-16 오웬 승인. portmapper(attohttpc MPL-2.0)는 기능을 꺼서 들이지 않는다.
+# CDLA-Permissive-2.0: Mozilla 루트 인증서 데이터 번들의 퍼미시브 데이터 라이선스(docs/spikes/mk-130-iroh.md §3.b).
+[[licenses.exceptions]]
+crate = "webpki-roots"      # iroh-relay · iroh-dns → n0-dns-resolver
+allow = ["CDLA-Permissive-2.0"]

@@ -1,0 +1,116 @@
+# 도메인·소개 사이트·아티팩트 공유 (`krill.page` / `share.krill.page`)
+
+Krill의 공식 소개·문서 사이트(`https://krill.page`)와 HTML·Markdown 아티팩트 공개 공유 서비스(`https://share.krill.page`), 그리고 로컬 CLI(`krill artifacts`)의 아키텍처·와이어 규약·운영 방법을 정리한다.
+
+---
+
+## 1. 인프라 및 도메인 요약
+
+| 구분 | 값 | 비고 |
+|---|---|---|
+| **Cloudflare 계정** | `tnlvof@gmail.com` (`f0fe98b1edd6d8cc19273314869c1e05`) | Cloudflare Registrar 원가 등록 (US$10.20/년, 자동 갱신) |
+| **Zone** | `krill.page` (`ff7d21e8509e003e7e3640972a627fd6`) | `rachel.ns.cloudflare.com`, `viddy.ns.cloudflare.com` |
+| **소개·문서 사이트** | `https://krill.page`, `https://www.krill.page` | Worker: `krill-site` ([`cloud/site/`](../cloud/site/)) |
+| **아티팩트 공유 서버** | `https://share.krill.page` | Worker: `krill-share` ([`cloud/share/`](../cloud/share/)) |
+| **D1 데이터베이스** | `krill-artifacts` (`1a4feae2-e3de-420e-aaa2-2eaa01b07a97`) | 메타데이터·소유/수정 토큰 해시·만료 시각 저장 ([`schema.sql`](../cloud/share/schema.sql)) |
+| **R2 버킷** | `krill-artifacts` | 아티팩트 원본 본문 저장 (`artifacts/<slug>`) |
+
+---
+
+## 2. `krill artifacts` CLI 사용법
+
+구현 위치: [`crates/krill/src/artifacts.rs`](../crates/krill/src/artifacts.rs)
+
+```sh
+# 1. HTML 또는 Markdown 파일 공개 공유 (이미 공유된 파일이면 동일 링크를 자동 덮어씀)
+krill artifacts share ./report.html [--title "성능 리포트"] [--api-url <url>] [--json]
+krill artifacts share ./notes.md --json
+
+# 2. 이전에 공유한 로컬 파일의 아티팩트 강제 갱신
+krill artifacts update ./report.html [--title "새 제목"] [--api-url <url>] [--json]
+
+# 3. 로컬 파일과 연결된 공개 링크 회수(삭제)
+krill artifacts unshare ./report.html [--api-url <url>] [--json]
+
+# 4. 내 로컬 토큰이 소유한 공유 아티팩트 목록 조회 (커서 페이지네이션)
+krill artifacts list [--cursor <cursor>] [--api-url <url>] [--json]
+
+# 5. 원본 파일 없이 슬러그(ID)로 직접 삭제
+krill artifacts delete <slug> [--api-url <url>] [--json]
+krill artifacts rm <slug> [--json]
+```
+
+### 동작 및 로컬 상태 파일
+
+- **지원 확장자·용량**: `.html`, `.htm`, `.md`, `.markdown` 단일 파일(최대 10 MiB). 상대 경로 로컬 에셋은 업로드하지 않으므로 단일 완결형 HTML이거나 절대 URL 에셋을 사용한다.
+- **기본 서버 주소**: `https://share.krill.page` (`--api-url <url>` 플래그 또는 `KRILL_ARTIFACTS_API_URL` 환경변수로 재정의 가능; HTTPS 필수, 로컬 개발 시에만 `http://127.0.0.1`·`http://localhost` 허용).
+- **계정 없는 로컬 인증 (0600 권한)**:
+  - `<state_dir>/artifact-token`: 최초 실행 시 256-bit 무작위 소유자 토큰을 자동 생성해 보관한다(`KRILL_ARTIFACTS_AUTH_TOKEN`으로 재정의 가능).
+  - `<state_dir>/artifact-shares.json`: 정규화된 로컬 파일 경로(`canonical_path`) ↔ `{ slug, edit_token, share_url, api_origin, expires_at }` 매핑을 저장한다.
+  - 외부 프로세스 실행 시 토큰이나 본문이 프로세스 인자(`ps`)에 노출되지 않도록 임시 `0600` 헤더 파일과 `stdin`으로 `curl`을 구동한다.
+
+---
+
+## 3. 아티팩트 서버 (`share.krill.page`) API 및 보안 모델
+
+구현 위치: [`cloud/share/src/index.ts`](../cloud/share/src/index.ts)
+
+### 3.1 REST API (`/v1/artifacts`)
+
+Orca 아티팩트 클라이언트 규약과 호환된다.
+
+| 메서드 및 경로 | 인증 헤더 | 설명 |
+|---|---|---|
+| `POST /v1/artifacts` | `Authorization: Bearer <token>` (생략 시 임시 토큰 발급), 선택 `Idempotency-Key` | `{ content, contentType, fileName, title? }` 업로드. 90일 만료 설정 후 `{ change: "created", artifact, editToken, shareUrl }` 반환 |
+| `PUT /v1/artifacts/:slug` | `x-krill-edit-token` 또는 `x-orca-edit-token` (또는 소유자 Bearer 토큰) | 본문·제목·만료 시각(+90일) 갱신 후 `{ artifact, shareUrl }` 반환 |
+| `DELETE /v1/artifacts/:slug` | 수정 토큰 또는 소유자 Bearer 토큰 | R2 객체 삭제 및 D1 `deleted_at` 마킹 후 `204 No Content` 반환 |
+| `GET /v1/artifacts?cursor=...` | `Authorization: Bearer <token>` | 해당 소유자 토큰 해시의 활성 아티팩트 페이지 조회 (`{ artifacts, nextCursor? }`) |
+
+### 3.2 열람 라우트 및 샌드박스 격리
+
+| 경로 | 동작 |
+|---|---|
+| `GET /` | 브라우저 드래그 앤 드롭·붙여넣기 업로드 웹 포털 및 CLI 사용 안내 |
+| `GET /a/:slug` | 아티팩트 렌더링 뷰어 (`?embed=1` 쿼리 시 상단 배너 숨김) |
+| `GET /a/:slug/raw` | 원본 UTF-8 텍스트(`text/plain; charset=utf-8`) 반환 |
+
+- **HTML 아티팩트 (`text/html`) 보안 헤더**:
+  ```http
+  Content-Security-Policy: sandbox allow-scripts allow-forms allow-popups allow-popups-to-escape-sandbox allow-modals allow-downloads;
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  ```
+  `allow-same-origin`을 제외한 `sandbox` 지시어로 서빙하므로, 업로드된 HTML 내의 JavaScript·차트·인터랙티브 UI는 정상 실행되면서도 `krill.page`나 `share.krill.page`의 쿠키·스토리지에는 접근할 수 없는 불투명 Origin(Opaque Origin)으로 격리된다.
+- **Markdown 아티팩트 (`text/markdown`)**:
+  서버에서 HTML로 변환하고 `<script>`·`<iframe>`·인라인 이벤트 핸들러(`on*=`)·`javascript:` URI를 제거한 뒤 다크/라이트 스타일 뷰어로 응답한다.
+
+---
+
+## 4. 공식 소개·문서 사이트 (`krill.page`)
+
+구현 위치: [`cloud/site/`](../cloud/site/)
+
+- **런타임 의존성 0**: HTML·셸 스크립트를 Wrangler Text 모듈로 번들하여 Cold Start 1~2ms 내외로 응답한다.
+- **제공 경로**:
+  - `GET /`: 제품 소개 랜딩 페이지 (한/영 토글, 인터랙티브 앱 프리뷰 및 `⌘K` Jump Palette 체험, 3계층 데몬 생존 아키텍처, 오케스트레이션 DAG, 아티팩트 공유 안내, CLI 레퍼런스)
+  - `GET /docs` (`/docs/*`): 빠른 시작·설치·아키텍처·CLI 전체 레퍼런스 문서
+  - `GET /install.sh`: `curl -fsSL https://krill.page/install.sh | sh` 설치 스크립트
+
+---
+
+## 5. 배포 및 검증 명령
+
+```sh
+# 1. 소개 사이트 배포 (krill.page, www.krill.page)
+(cd cloud/site && npx wrangler deploy)
+
+# 2. 아티팩트 서버 D1 스키마 적용 및 배포 (share.krill.page)
+(cd cloud/share && npx wrangler d1 execute krill-artifacts --remote --file=schema.sql)
+(cd cloud/share && npx wrangler deploy)
+
+# 3. 아티팩트 서버 라이브 E2E 검증
+(cd cloud/share && ./e2e.sh https://share.krill.page)
+
+# 4. Rust CLI 테스트
+cargo nextest run -p krill artifacts
+```

@@ -1,0 +1,13 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-print-in-tests = true
+avoid-breaking-exported-api = false
+disallowed-methods = [
+  { path = "std::env::set_var", reason = "멀티스레드 데몬에서 UB 위험. 자식 환경은 Command::env로" },
+  { path = "std::env::remove_var", reason = "멀티스레드 데몬에서 UB 위험. 자식 환경은 Command::env_remove로" },
+]
+disallowed-types = [
+  { path = "std::os::fd::RawFd", reason = "OwnedFd/BorrowedFd를 쓴다(FFI 경계만 #[expect])" },
+]

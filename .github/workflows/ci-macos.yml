@@ -1,0 +1,81 @@
+# Krill CI — macOS 전체 게이트 (OWE-382, MK-017).
+# clippy · nextest(PTY e2e 포함) · doctest를 전체 워크스페이스에 실행한다.
+# 비공개 저장소 macOS 분 절약을 위해 Rust·빌드 관련 경로가 바뀔 때만 실행하고,
+# 그 외(문서 등) PR에서는 건너뛴다. 필요하면 Actions에서 수동 실행한다.
+# Linux 고속 게이트(krill-proto·krill-term + deny)는 ci.yml이 모든 PR에서 실행한다.
+# 로컬 재현은 scripts/check.sh.
+name: ci-macos
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'clippy.toml'
+      - 'rustfmt.toml'
+      - 'vendor/**'
+      - '.github/workflows/**'
+      - 'scripts/check.sh'
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - 'clippy.toml'
+      - 'rustfmt.toml'
+      - 'vendor/**'
+      - '.github/workflows/**'
+      - 'scripts/check.sh'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_NET_RETRY: 10
+
+jobs:
+  check:
+    name: clippy · nextest · doctest (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 1.98 + clippy
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+
+      - name: nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        timeout-minutes: 60
+
+      - name: nextest
+        # PTY e2e(krill-holder survive, krill CLI 실PTY 테스트, krilld 통합) 포함.
+        run: cargo nextest run --workspace --locked --no-tests=pass
+        timeout-minutes: 60
+
+      - name: doctest
+        run: cargo test --workspace --doc --locked -q
+        timeout-minutes: 30
+
+      # cargo deny는 Linux 잡(ci.yml)이 담당하므로 여기서 중복 실행하지 않는다.

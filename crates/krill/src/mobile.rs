@@ -1,0 +1,274 @@
+//! 모바일 페어링·조회·회수. 게이트웨이·터널은 krilld가 소유하므로 CLI가 끝나도 유지된다.
+use krill_proto::mobile::{self, ConnectMode, MobileReply, MobileRequest};
+use std::ffi::OsString;
+use std::io;
+use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
+
+const HELP: &str = "usage: krill mobile pair [--tunnel] [--address <ip:port>] [--json]\n       krill mobile devices [--json]\n       krill mobile revoke <device_id|--all> [--json]\n       krill mobile serve [--tunnel]";
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Pair {
+        mode: ConnectMode,
+        address: Option<String>,
+        json: bool,
+    },
+    Devices {
+        json: bool,
+    },
+    Revoke {
+        id: Option<String>,
+        all: bool,
+        json: bool,
+    },
+    Serve {
+        tunnel: bool,
+    },
+    Help,
+}
+fn parse(args: &[OsString]) -> Result<Command, &'static str> {
+    let mut a = args
+        .iter()
+        .map(|v| v.to_str().ok_or("arguments must be UTF-8"));
+    let command = a.next().transpose()?.unwrap_or("--help");
+    let mut tunnel = false;
+    let mut address = None;
+    let mut json = false;
+    let mut all = false;
+    let mut id = None;
+    while let Some(arg) = a.next() {
+        match arg? {
+            "--json" if !json => json = true,
+            "--tunnel" if !tunnel => tunnel = true,
+            "--address" if address.is_none() => {
+                address = Some(
+                    a.next()
+                        .transpose()?
+                        .ok_or("--address requires IPv4:port")?
+                        .to_owned(),
+                );
+            }
+            "--all" if !all => all = true,
+            arg if !arg.starts_with('-') && id.is_none() => id = Some(arg.to_owned()),
+            _ => return Err(HELP),
+        }
+    }
+    match command {
+        "--help" | "-h" if !tunnel && !json && !all && id.is_none() && address.is_none() => {
+            Ok(Command::Help)
+        }
+        "pair" if !all && id.is_none() => Ok(Command::Pair {
+            mode: if tunnel {
+                ConnectMode::Tunnel
+            } else {
+                ConnectMode::Lan
+            },
+            address,
+            json,
+        }),
+        "devices" if !all && !tunnel && id.is_none() && address.is_none() => {
+            Ok(Command::Devices { json })
+        }
+        "revoke" if !tunnel && address.is_none() && (all != id.is_some()) => {
+            Ok(Command::Revoke { id, all, json })
+        }
+        "serve" if !all && !json && id.is_none() && address.is_none() => {
+            Ok(Command::Serve { tunnel })
+        }
+        _ => Err(HELP),
+    }
+}
+pub fn run(args: &[OsString]) -> ExitCode {
+    match parse(args) {
+        Ok(command) => match execute(command) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("mobile: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Err(message) => {
+            eprintln!("{message}");
+            ExitCode::from(2)
+        }
+    }
+}
+fn call(request: &MobileRequest) -> io::Result<MobileReply> {
+    mobile::client::request(
+        &krill_proto::daemon::Paths::dev()?,
+        request,
+        krill_proto::ipc::ClientRole::Cli,
+    )
+}
+fn execute(command: Command) -> io::Result<()> {
+    match command {
+        Command::Help => println!("{HELP}"),
+        Command::Pair {
+            mode,
+            address,
+            json,
+        } => {
+            let before = match call(&MobileRequest::ListDevices)? {
+                MobileReply::Devices(devices) => devices
+                    .into_iter()
+                    .map(|d| d.device_id)
+                    .collect::<std::collections::BTreeSet<_>>(),
+                _ => std::collections::BTreeSet::new(),
+            };
+            let reply = call(&MobileRequest::MintPairingTicket {
+                mode,
+                custom_address: address,
+                rotate: true,
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&reply).map_err(io::Error::other)?
+                );
+                return Ok(());
+            }
+            let MobileReply::PairingOffer {
+                url, expires_at_ms, ..
+            } = reply
+            else {
+                return Err(io::Error::other("expected pairing offer"));
+            };
+            let qr = mobile::qr::Qr::encode(&url).map_err(io::Error::other)?;
+            println!(
+                "\x1b[30;47m{}\x1b[0m\n{url}\nWaiting for pairing (5 minutes)…",
+                qr.terminal()
+            );
+            loop {
+                if mobile::client::now_ms() >= expires_at_ms {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "pairing offer expired",
+                    ));
+                }
+                if let MobileReply::GatewayStatus {
+                    devices,
+                    active_offer,
+                    ..
+                } = call(&MobileRequest::Status)?
+                {
+                    if devices
+                        .iter()
+                        .any(|d| d.revoked_at_ms.is_none() && !before.contains(&d.device_id))
+                    {
+                        println!("Pairing completed");
+                        break;
+                    }
+                    if !active_offer {
+                        return Err(io::Error::new(
+                            io::ErrorKind::Interrupted,
+                            "pairing offer cancelled",
+                        ));
+                    }
+                }
+                if let MobileReply::PairingOffer { url: current, .. } =
+                    call(&MobileRequest::CurrentPairingOffer)?
+                    && current != url
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "pairing offer replaced",
+                    ));
+                }
+                thread::sleep(Duration::from_millis(500));
+            }
+        }
+        Command::Devices { json } => {
+            let MobileReply::Devices(devices) = call(&MobileRequest::ListDevices)? else {
+                return Err(io::Error::other("expected device list"));
+            };
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&devices).map_err(io::Error::other)?
+                );
+            } else {
+                for device in devices {
+                    println!(
+                        "{}\t{}\t{}",
+                        device.device_id,
+                        device.label,
+                        if device.revoked_at_ms.is_some() {
+                            "revoked"
+                        } else {
+                            "paired"
+                        }
+                    );
+                }
+            }
+        }
+        Command::Revoke { id, all, json } => {
+            let reply = call(&MobileRequest::RevokeDevice { device_id: id, all })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string(&reply).map_err(io::Error::other)?
+                );
+            } else if let MobileReply::Revoked { count } = reply {
+                println!("Revoked {count} device(s)");
+            }
+        }
+        Command::Serve { tunnel } => {
+            if tunnel {
+                let reply = call(&MobileRequest::MintPairingTicket {
+                    mode: ConnectMode::Tunnel,
+                    custom_address: None,
+                    rotate: false,
+                })?;
+                if let MobileReply::PairingOffer { url, .. } = reply {
+                    println!("{url}");
+                }
+                loop {
+                    thread::sleep(Duration::from_secs(30));
+                    call(&MobileRequest::MintPairingTicket {
+                        mode: ConnectMode::Tunnel,
+                        custom_address: None,
+                        rotate: false,
+                    })?;
+                }
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string(&call(&MobileRequest::Status)?)
+                        .map_err(io::Error::other)?
+                );
+            }
+        }
+    }
+    Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args(a: &[&str]) -> Vec<OsString> {
+        a.iter().map(OsString::from).collect()
+    }
+    #[test]
+    fn command_validation() {
+        assert_eq!(
+            parse(&args(&["devices", "--json"])).unwrap(),
+            Command::Devices { json: true }
+        );
+        assert!(matches!(
+            parse(&args(&["pair", "--tunnel", "--address", "127.0.0.1:1234"])),
+            Ok(Command::Pair {
+                mode: ConnectMode::Tunnel,
+                ..
+            })
+        ));
+        for a in [
+            vec!["revoke"],
+            vec!["revoke", "phone", "--all"],
+            vec!["pair", "--address"],
+            vec!["devices", "--tunnel"],
+            vec!["serve", "--json"],
+        ] {
+            assert!(parse(&args(&a)).is_err());
+        }
+    }
+}

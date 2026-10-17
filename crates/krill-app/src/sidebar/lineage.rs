@@ -1,0 +1,626 @@
+//! 부모-자식 워크트리 계보 트리(Worktree Lineage, MK-176 / OWE-730).
+//!
+//! 계보 정렬·접기/펼치기·사이클 방지·자손 일괄 작업 참고:
+//! `.ref/orca/src/renderer/src/components/sidebar/worktree-lineage.ts`
+//! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
+
+use gpui::{AppContext as _, Context, Window};
+use krill_proto::control::{RemoveWorktree, Reply};
+use serde::{Deserialize, Serialize};
+
+use super::{Selected, Sidebar};
+use crate::worktree;
+
+/// 시각적 들여쓰기 최대 깊이(너무 깊은 중첩에서 카드 폭이 무너지지 않게 제한).
+pub const MAX_LINEAGE_DEPTH: usize = 4;
+
+/// 사이클 방어용 최대 조상 탐색 단계.
+const MAX_CYCLE_STEPS: usize = 64;
+
+/// `sidebar.bin`에 추가로 영속화되는 계보 상태.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct LineageState {
+    pub parents: BTreeMap<PathBuf, PathBuf>,
+    pub collapsed_lineage: BTreeSet<PathBuf>,
+    #[serde(default)]
+    pub sleeping_worktrees: BTreeSet<PathBuf>,
+}
+
+impl LineageState {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.parents.is_empty()
+            && self.collapsed_lineage.is_empty()
+            && self.sleeping_worktrees.is_empty()
+    }
+}
+
+/// `worktree`의 부모로 `candidate_parent`를 지정해도 자기 참조나 사이클이 생기지 않는지 검사한다.
+#[must_use]
+pub fn can_assign_parent(
+    parents: &BTreeMap<PathBuf, PathBuf>,
+    worktree: &Path,
+    candidate_parent: &Path,
+) -> bool {
+    if worktree == candidate_parent {
+        return false;
+    }
+    let mut visited = BTreeSet::new();
+    visited.insert(worktree);
+    let mut cur = Some(candidate_parent);
+    let mut steps = 0usize;
+    while let Some(node) = cur {
+        if !visited.insert(node) {
+            return false;
+        }
+        steps += 1;
+        if steps > MAX_CYCLE_STEPS {
+            return false;
+        }
+        cur = parents.get(node).map(PathBuf::as_path);
+    }
+    true
+}
+
+/// 현재 그룹(`group_set`) 안에서 유효한 부모 워크트리를 찾는다(사이클이나 그룹 밖 부모는 루트로 취급).
+pub(super) fn effective_parent<'a>(
+    path: &Path,
+    parents: &'a BTreeMap<PathBuf, PathBuf>,
+    group_set: &BTreeSet<&Path>,
+) -> Option<&'a PathBuf> {
+    let direct = parents.get(path)?;
+    if direct.as_path() == path || !group_set.contains(direct.as_path()) {
+        return None;
+    }
+    let mut visited = BTreeSet::new();
+    visited.insert(path);
+    let mut cur: Option<&Path> = Some(direct.as_path());
+    let mut steps = 0usize;
+    while let Some(node) = cur {
+        if !visited.insert(node) {
+            return None;
+        }
+        steps += 1;
+        if steps > MAX_CYCLE_STEPS {
+            return None;
+        }
+        cur = parents
+            .get(node)
+            .map(PathBuf::as_path)
+            .filter(|next| group_set.contains(next));
+    }
+    Some(direct)
+}
+
+/// 이미 정렬된 그룹 내 워크트리 목록을 부모-자식 계보 DFS 순서로 재배치하고,
+/// `collapsed_lineage`에 포함된 부모의 자손 워크트리는 결과에서 숨긴다.
+pub(super) fn order_lineage_worktrees<'a>(
+    sorted: Vec<&'a PathBuf>,
+    parents: Option<&BTreeMap<PathBuf, PathBuf>>,
+    collapsed_lineage: Option<&BTreeSet<PathBuf>>,
+) -> Vec<&'a PathBuf> {
+    let Some(parents) = parents.filter(|m| !m.is_empty()) else {
+        return sorted;
+    };
+    let group_set: BTreeSet<&Path> = sorted.iter().map(|p| p.as_path()).collect();
+    let mut roots: Vec<&'a PathBuf> = Vec::with_capacity(sorted.len());
+    let mut children_by_parent: BTreeMap<&Path, Vec<&'a PathBuf>> = BTreeMap::new();
+
+    for tree in &sorted {
+        if let Some(parent) = effective_parent(tree.as_path(), parents, &group_set) {
+            children_by_parent
+                .entry(parent.as_path())
+                .or_default()
+                .push(*tree);
+        } else {
+            roots.push(*tree);
+        }
+    }
+
+    let mut out = Vec::with_capacity(sorted.len());
+    let mut visited: BTreeSet<&Path> = BTreeSet::new();
+
+    #[expect(
+        clippy::items_after_statements,
+        reason = "local recursive DFS helper for lineage projection"
+    )]
+    fn visit<'a>(
+        node: &'a PathBuf,
+        children_by_parent: &BTreeMap<&Path, Vec<&'a PathBuf>>,
+        collapsed_lineage: Option<&BTreeSet<PathBuf>>,
+        visited: &mut BTreeSet<&'a Path>,
+        out: &mut Vec<&'a PathBuf>,
+    ) {
+        if !visited.insert(node.as_path()) {
+            return;
+        }
+        out.push(node);
+        if collapsed_lineage.is_some_and(|c| c.contains(node.as_path())) {
+            return;
+        }
+        if let Some(children) = children_by_parent.get(node.as_path()) {
+            for &child in children {
+                visit(child, children_by_parent, collapsed_lineage, visited, out);
+            }
+        }
+    }
+
+    for root in roots {
+        visit(
+            root,
+            &children_by_parent,
+            collapsed_lineage,
+            &mut visited,
+            &mut out,
+        );
+    }
+
+    out
+}
+
+impl Sidebar {
+    /// 디스크(`WorktreeStore`)와 메모리(`self.parents`)를 합친 부모 맵을 돌려준다.
+    pub(super) fn merged_parents(&self) -> BTreeMap<PathBuf, PathBuf> {
+        let mut map = BTreeMap::new();
+        if let Some(dir) = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let store = krill_proto::orchestration::WorktreeStore::load_cached(dir);
+            for (child, parent) in &store.parents {
+                let c = PathBuf::from(child);
+                let p = PathBuf::from(parent);
+                if can_assign_parent(&map, &c, &p) {
+                    map.insert(c, p);
+                }
+            }
+        }
+        for (child, parent) in &self.parents {
+            if can_assign_parent(&map, child, parent) {
+                map.insert(child.clone(), parent.clone());
+            }
+        }
+        map
+    }
+
+    /// 지정한 워크트리의 부모 경로를 돌려준다.
+    #[must_use]
+    pub fn worktree_parent(&self, path: &Path) -> Option<PathBuf> {
+        self.merged_parents().remove(path)
+    }
+
+    /// `path`의 부모를 `parent`로 설정할 수 있는지(자기 참조·사이클·다른 저장소 방지).
+    #[must_use]
+    pub fn can_set_worktree_parent(&self, path: &Path, parent: &Path) -> bool {
+        if path == parent {
+            return false;
+        }
+        if let (Some(r1), Some(r2)) = (self.repo_for_worktree(path), self.repo_for_worktree(parent))
+            && r1 != r2
+        {
+            return false;
+        }
+        let mut parents = self.merged_parents();
+        parents.remove(path);
+        can_assign_parent(&parents, path, parent)
+    }
+
+    /// 워크트리의 부모를 설정하고 `sidebar.bin` 및 `worktree-comments.toml`에 저장한다.
+    pub fn set_worktree_parent(
+        &mut self,
+        path: PathBuf,
+        parent: PathBuf,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.can_set_worktree_parent(&path, &parent) {
+            return false;
+        }
+        if let Some(dir) = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let child_str = path.to_string_lossy().into_owned();
+            let parent_str = parent.to_string_lossy().into_owned();
+            krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
+                store.set_parent(&child_str, Some(&parent_str))
+            })
+            .ok();
+        }
+        self.parents.insert(path, parent);
+        self.persist(cx);
+        true
+    }
+
+    /// 워크트리의 부모 연결을 해제한다.
+    pub fn clear_worktree_parent(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
+        let removed_mem = self.parents.remove(path).is_some();
+        let mut removed_disk = false;
+        if let Some(dir) = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let child_str = path.to_string_lossy().into_owned();
+            removed_disk = krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
+                store.set_parent(&child_str, None)
+            })
+            .is_ok();
+        }
+        if removed_mem || removed_disk {
+            self.persist(cx);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 스냅샷에 저장소·워크트리 목록이 하나라도 있는지.
+    #[must_use]
+    pub fn has_trees(&self) -> bool {
+        !self.snapshot.trees.is_empty()
+    }
+
+    /// 지정한 경로가 현재 스냅샷의 저장소 또는 워크트리에 존재하는지.
+    #[must_use]
+    pub fn contains_worktree(&self, path: &Path) -> bool {
+        self.repo_for_worktree(path).is_some()
+    }
+
+    /// 워크트리가 속한 저장소 루트 경로를 찾는다.
+    pub(super) fn repo_for_worktree(&self, path: &Path) -> Option<PathBuf> {
+        self.snapshot
+            .trees
+            .iter()
+            .find(|&(repo, list)| repo == path || list.iter().any(|t| t == path))
+            .map(|(repo, _)| repo.clone())
+    }
+
+    /// 같은 저장소 안에서 `path`의 부모가 될 수 있는 후보 워크트리 목록.
+    #[must_use]
+    pub fn eligible_parent_worktrees(&self, path: &Path) -> Vec<PathBuf> {
+        let Some(repo) = self.repo_for_worktree(path) else {
+            return Vec::new();
+        };
+        let Some(trees) = self.snapshot.trees.get(&repo) else {
+            return Vec::new();
+        };
+        trees
+            .iter()
+            .filter(|cand| cand.as_path() != path && self.can_set_worktree_parent(path, cand))
+            .cloned()
+            .collect()
+    }
+
+    /// `path`의 직계 자식 워크트리 목록(현재 스냅샷에 존재하는 워크트리만).
+    #[must_use]
+    pub fn lineage_children(&self, path: &Path) -> Vec<PathBuf> {
+        let parents = self.merged_parents();
+        let known: BTreeSet<&Path> = self
+            .snapshot
+            .trees
+            .values()
+            .flatten()
+            .map(PathBuf::as_path)
+            .collect();
+        known
+            .iter()
+            .filter(|&&cand| {
+                effective_parent(cand, &parents, &known).is_some_and(|p| p.as_path() == path)
+            })
+            .map(|&p| p.to_path_buf())
+            .collect()
+    }
+
+    /// `path`의 모든 자손 워크트리 목록(부모 → 자식 BFS/DFS 순서, 사이클 안전).
+    #[must_use]
+    pub fn lineage_descendants(&self, path: &Path) -> Vec<PathBuf> {
+        let parents = self.merged_parents();
+        let known: BTreeSet<&Path> = self
+            .snapshot
+            .trees
+            .values()
+            .flatten()
+            .map(PathBuf::as_path)
+            .collect();
+        let mut children_map: BTreeMap<&Path, Vec<&Path>> = BTreeMap::new();
+        for &cand in &known {
+            if let Some(p) = effective_parent(cand, &parents, &known) {
+                children_map.entry(p.as_path()).or_default().push(cand);
+            }
+        }
+        let mut out = Vec::new();
+        let mut visited = BTreeSet::new();
+        visited.insert(path);
+        let mut stack: Vec<&Path> = children_map
+            .get(path)
+            .map(|c| c.iter().rev().copied().collect())
+            .unwrap_or_default();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(node) {
+                continue;
+            }
+            out.push(node.to_path_buf());
+            if let Some(children) = children_map.get(node) {
+                for &child in children.iter().rev() {
+                    stack.push(child);
+                }
+            }
+        }
+        out
+    }
+
+    /// 현재 표시 기준에서 `path`의 계보 들여쓰기 깊이(`0..=MAX_LINEAGE_DEPTH`).
+    #[must_use]
+    pub fn lineage_depth(&self, path: &Path) -> usize {
+        let parents = self.merged_parents();
+        if parents.is_empty() {
+            return 0;
+        }
+        let scope: BTreeSet<&Path> = match self.options.group_by {
+            super::GroupBy::Repo => self
+                .repo_for_worktree(path)
+                .and_then(|r| self.snapshot.trees.get(&r))
+                .map(|list| list.iter().map(PathBuf::as_path).collect())
+                .unwrap_or_default(),
+            _ => self
+                .snapshot
+                .trees
+                .values()
+                .flatten()
+                .map(PathBuf::as_path)
+                .collect(),
+        };
+        let mut depth = 0usize;
+        let mut visited = BTreeSet::new();
+        visited.insert(path);
+        let mut cur = path;
+        while let Some(parent) = effective_parent(cur, &parents, &scope) {
+            if !visited.insert(parent.as_path()) {
+                break;
+            }
+            depth += 1;
+            if depth >= MAX_LINEAGE_DEPTH {
+                return MAX_LINEAGE_DEPTH;
+            }
+            cur = parent.as_path();
+        }
+        depth
+    }
+
+    /// `path`의 자식 워크트리 트리가 접혀 있는지.
+    #[must_use]
+    pub fn is_lineage_collapsed(&self, path: &Path) -> bool {
+        self.collapsed_lineage.contains(path)
+    }
+
+    /// `path`의 자식 워크트리 트리를 접거나 펼친다.
+    pub fn toggle_lineage(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if !self.collapsed_lineage.remove(path) {
+            self.collapsed_lineage.insert(path.to_path_buf());
+        }
+        self.persist(cx);
+    }
+
+    /// `path`의 조상 중 접혀 있는 계보가 있으면 모두 펼쳐 `path`가 사이드바에 드러나게 한다.
+    pub(super) fn expand_lineage_ancestors(&mut self, path: &Path) -> bool {
+        let parents = self.merged_parents();
+        let mut changed = false;
+        let mut visited = BTreeSet::new();
+        let mut cur = Some(path);
+        while let Some(node) = cur {
+            if !visited.insert(node) {
+                break;
+            }
+            if let Some(parent) = parents.get(node) {
+                if self.collapsed_lineage.remove(parent.as_path()) {
+                    changed = true;
+                }
+                cur = Some(parent.as_path());
+            } else {
+                break;
+            }
+        }
+        changed
+    }
+
+    /// 부모 워크트리 아래에 자식 워크트리를 만드는 대화상자를 연다.
+    pub fn new_child_worktree(
+        &mut self,
+        parent: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repo = self
+            .repo_for_worktree(&parent)
+            .unwrap_or_else(|| parent.clone());
+        self.open_worktree_dialog(repo, Some(parent), window, cx);
+    }
+
+    pub(super) fn open_worktree_dialog(
+        &mut self,
+        repo: PathBuf,
+        parent: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        let parent_for_event = parent.clone();
+        let dialog =
+            cx.new(|cx| worktree::Dialog::new_with_parent(repo, parent, source, window, cx));
+        let events = cx.subscribe(
+            &dialog,
+            move |s, _, event: &worktree::Event, cx| match event {
+                worktree::Event::Created(w) => {
+                    if let Some(parent_path) = &parent_for_event {
+                        let created_path = PathBuf::from(std::ffi::OsStr::from_bytes(&w.path));
+                        s.set_worktree_parent(created_path, parent_path.clone(), cx);
+                    }
+                    s.refresh(cx);
+                    if let Some(id) = w.setup {
+                        cx.emit(Selected(id));
+                    }
+                }
+                worktree::Event::Close => {
+                    s.creating = None;
+                    cx.notify();
+                }
+            },
+        );
+        self.creating = Some((dialog, events));
+        cx.notify();
+    }
+
+    /// 워크트리가 수동 수면 상태인지.
+    #[must_use]
+    pub fn is_worktree_sleeping(&self, path: &Path) -> bool {
+        self.sleeping_worktrees.contains(path)
+    }
+
+    /// 워크트리를 수면 상태로 전환한다.
+    pub fn sleep_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.expanded_cards.remove(&path);
+        self.collapsed.insert(path.clone());
+        self.sleeping_worktrees.insert(path);
+        self.persist(cx);
+    }
+
+    /// 수면 상태인 워크트리를 깨운다.
+    pub fn wake_worktree(&mut self, path: &Path, cx: &mut Context<Self>) {
+        if self.sleeping_worktrees.remove(path) {
+            self.persist(cx);
+        }
+    }
+
+    /// 워크트리와 모든 자손 워크트리를 함께 수면 상태로 전환한다.
+    pub fn sleep_with_descendants(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let descendants = self.lineage_descendants(&path);
+        for target in std::iter::once(path).chain(descendants) {
+            self.expanded_cards.remove(&target);
+            self.collapsed.insert(target.clone());
+            self.sleeping_worktrees.insert(target);
+        }
+        self.persist(cx);
+    }
+
+    fn remove_worktree_lineage_local(&mut self, target: &Path) {
+        let direct_children: Vec<PathBuf> = self
+            .parents
+            .iter()
+            .filter(|&(_, p)| p == target)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let parent_of_target = self.parents.remove(target);
+        for child in direct_children {
+            if let Some(grandparent) = &parent_of_target
+                && child != *grandparent
+            {
+                self.parents.insert(child, grandparent.clone());
+            } else {
+                self.parents.remove(&child);
+            }
+        }
+        self.collapsed_lineage.remove(target);
+        self.sleeping_worktrees.remove(target);
+        if let Some(dir) = self
+            .path
+            .as_deref()
+            .and_then(Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+        {
+            let target_str = target.to_string_lossy().into_owned();
+            krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
+                store.remove_worktree_lineage(&target_str);
+                Ok(())
+            })
+            .ok();
+        }
+    }
+
+    /// 단일 워크트리를 삭제하고 계보 연결을 정리한다.
+    pub fn delete_worktree(&mut self, path: PathBuf, force: bool, cx: &mut Context<Self>) {
+        self.delete_worktrees_batch(vec![path], force, cx);
+    }
+
+    /// 워크트리와 모든 자손 워크트리를 리프(하위 자손)부터 순서대로 삭제한다.
+    pub fn delete_with_descendants(&mut self, path: PathBuf, force: bool, cx: &mut Context<Self>) {
+        let mut targets = self.lineage_descendants(&path);
+        targets.reverse();
+        targets.push(path);
+        self.delete_worktrees_batch(targets, force, cx);
+    }
+
+    fn delete_worktrees_batch(
+        &mut self,
+        targets: Vec<PathBuf>,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let mut ipc_targets = Vec::new();
+        for target in targets {
+            let is_primary = self.snapshot.trees.contains_key(&target);
+            let repo = self
+                .repo_for_worktree(&target)
+                .unwrap_or_else(|| target.clone());
+            self.remove_worktree_lineage_local(&target);
+            if is_primary {
+                continue;
+            }
+            for list in self.snapshot.trees.values_mut() {
+                list.retain(|t| t != &target);
+            }
+            ipc_targets.push((repo, target));
+        }
+        self.persist(cx);
+        let Some(source) = self.source.clone() else {
+            return;
+        };
+        if ipc_targets.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let bg = cx.background_executor().clone();
+            let mut any_removed = false;
+            let mut last_err = None;
+            for (repo, target) in ipc_targets {
+                let src = source.clone();
+                let req = RemoveWorktree {
+                    repo: repo.as_os_str().as_bytes().to_vec(),
+                    path: target.as_os_str().as_bytes().to_vec(),
+                    force,
+                };
+                let reply = bg.spawn(async move { src.remove_worktree(req) }).await;
+                match reply {
+                    Ok(Reply::WorktreeRemoved(_)) => any_removed = true,
+                    Ok(Reply::WorktreeFailed(e)) => last_err = Some(e),
+                    Ok(Reply::Failed(f)) => last_err = Some(f.to_string()),
+                    Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
+                    Err(e) => last_err = Some(e.to_string()),
+                    _ => {}
+                }
+            }
+            this.update(cx, |s, cx| {
+                if let Some(err) = last_err {
+                    s.notice = Some(err);
+                }
+                if any_removed {
+                    s.refresh(cx);
+                } else {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+}

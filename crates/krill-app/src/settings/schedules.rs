@@ -1,0 +1,906 @@
+//! 스케줄 자동화 GUI(OWE-740, MK-186): `Settings > Workflows` 탭의 스케줄 목록, 추가/편집 모달
+//! (`precheck` 셸 게이트 · `workspace_mode` 격리 워크트리 선택 포함), 즉시 실행(`Run Now`), 최근 실행
+//! 기록(`runs`) 배지 및 터미널 출력 로그 뷰어.
+
+use std::io::Write as _;
+use std::path::Path;
+use std::time::Duration;
+
+use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, prelude::*};
+use gpui_component::Sizable as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::{Input, InputState};
+use krill_proto::schedule::{
+    FILE, Schedule, ScheduleRun, Schedules, WorkspaceMode, load_coalesced_runs, request_run_now,
+};
+
+use super::{SettingsView, layout, open_file, state_dir, text};
+
+/// 스케줄 추가/편집 모달 입력 상태.
+pub(super) struct ScheduleModal {
+    pub editing_id: Option<String>,
+    pub id: gpui::Entity<InputState>,
+    pub cron: gpui::Entity<InputState>,
+    pub cwd: gpui::Entity<InputState>,
+    pub command: gpui::Entity<InputState>,
+    pub prompt: gpui::Entity<InputState>,
+    pub precheck: gpui::Entity<InputState>,
+    pub workspace_mode: WorkspaceMode,
+    pub error: Option<SharedString>,
+}
+
+/// 선택된 실행 기록의 상세 로그 뷰어 상태.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleLogView {
+    pub id: String,
+    pub minute: u64,
+    pub phase: String,
+    pub cwd: Option<String>,
+    pub output: String,
+}
+
+/// 실행 단계 문자열을 시맨틱 배지 톤과 다국어 라벨로 매핑한다.
+#[must_use]
+pub fn run_phase_badge_spec(phase: &str) -> (crate::ui::BadgeTone, &'static str) {
+    use crate::ui::BadgeTone;
+    match phase {
+        "skipped" => (BadgeTone::Muted, text::SCHEDULE_STATUS_SKIPPED.get()),
+        "spawned" | "started" => (BadgeTone::Accent, text::SCHEDULE_STATUS_SPAWNED.get()),
+        "finished" => (BadgeTone::Success, text::SCHEDULE_STATUS_FINISHED.get()),
+        "failed" => (BadgeTone::Destructive, text::SCHEDULE_STATUS_FAILED.get()),
+        _ => (BadgeTone::Neutral, text::SCHEDULE_STATUS_SPAWNED.get()),
+    }
+}
+
+fn capture_session_output(dir: &Path, session: krill_proto::SessionId) -> Option<String> {
+    use krill_proto::control::{CaptureFormat, FEAT_CLI, FEAT_CONTROL, Reply, Request};
+    use krill_proto::screen::Msg as _;
+    use std::path::PathBuf;
+
+    let socket = dir.join("run/krilld.sock");
+    if !socket.exists() {
+        return None;
+    }
+    let paths = krill_proto::daemon::Paths {
+        socket,
+        holder: PathBuf::new(),
+        krilld: PathBuf::new(),
+    };
+    let target = crate::hosts::HostTarget::from(paths);
+    let mut hello = krill_proto::daemon::client_hello(
+        krill_proto::ipc::ClientRole::Cli,
+        "krill-app schedule-log",
+    );
+    hello.features = FEAT_CONTROL | FEAT_CLI;
+    let mut conn = target.connect(&hello).ok()?;
+    if conn.negotiated.features & FEAT_CLI == 0 {
+        return None;
+    }
+    let timeout = Some(Duration::from_secs(2));
+    conn.stream.set_read_timeout(timeout).ok();
+    conn.stream.set_write_timeout(timeout).ok();
+    let frame = (Request::Capture {
+        session,
+        format: CaptureFormat::Plain,
+    })
+    .encode()
+    .ok()?;
+    conn.stream.write_all(&frame).ok()?;
+    let (kind, body) = krill_proto::ipc::read_frame(&mut conn.stream).ok()??;
+    if let Ok(Reply::Captured { bytes, .. }) = Reply::decode(kind, &body) {
+        let text = String::from_utf8_lossy(&bytes);
+        let trimmed = text.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    None
+}
+
+impl SettingsView {
+    /// 스케줄 추가(`existing == None`) 또는 편집(`existing == Some(..)`) 모달을 연다.
+    pub fn open_schedule_modal(
+        &mut self,
+        existing: Option<&Schedule>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editing_id = existing.map(|s| s.id.clone());
+        let init_id = existing.map_or("", |s| s.id.as_str()).to_owned();
+        let init_cron = existing.map_or("0 9 * * *", |s| s.cron.as_str()).to_owned();
+        let init_cwd = existing.map_or("", |s| s.cwd.as_str()).to_owned();
+        let init_cmd = existing.map_or_else(|| "claude -p".to_owned(), |s| s.command.join(" "));
+        let init_prompt = existing.map_or("", |s| s.prompt.as_str()).to_owned();
+        let init_precheck = existing
+            .and_then(|s| s.precheck.as_deref())
+            .unwrap_or("")
+            .to_owned();
+        let workspace_mode = existing.map_or(WorkspaceMode::Reuse, |s| s.workspace_mode);
+
+        let make_input = |placeholder: &'static str,
+                          value: String,
+                          window: &mut Window,
+                          cx: &mut Context<Self>| {
+            cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder(placeholder);
+                if !value.is_empty() {
+                    state.set_value(value, window, cx);
+                }
+                state
+            })
+        };
+
+        self.schedule_modal = Some(ScheduleModal {
+            editing_id,
+            id: make_input(
+                text::SCHEDULE_FIELD_ID_PLACEHOLDER.get(),
+                init_id,
+                window,
+                cx,
+            ),
+            cron: make_input(
+                text::SCHEDULE_FIELD_CRON_PLACEHOLDER.get(),
+                init_cron,
+                window,
+                cx,
+            ),
+            cwd: make_input(
+                text::SCHEDULE_FIELD_CWD_PLACEHOLDER.get(),
+                init_cwd,
+                window,
+                cx,
+            ),
+            command: make_input(
+                text::SCHEDULE_FIELD_COMMAND_PLACEHOLDER.get(),
+                init_cmd,
+                window,
+                cx,
+            ),
+            prompt: make_input(
+                text::SCHEDULE_FIELD_PROMPT_PLACEHOLDER.get(),
+                init_prompt,
+                window,
+                cx,
+            ),
+            precheck: make_input(
+                text::SCHEDULE_FIELD_PRECHECK_PLACEHOLDER.get(),
+                init_precheck,
+                window,
+                cx,
+            ),
+            workspace_mode,
+            error: None,
+        });
+        cx.notify();
+    }
+
+    pub fn close_schedule_modal(&mut self, cx: &mut Context<Self>) {
+        if self.schedule_modal.is_some() {
+            self.schedule_modal = None;
+            cx.notify();
+        }
+    }
+
+    /// 열린 스케줄 모달의 입력 값을 일괄 설정한다.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "스케줄 모달의 7개 필드를 한 번에 채우는 헬퍼"
+    )]
+    pub fn set_schedule_modal_values(
+        &mut self,
+        id: &str,
+        cron: &str,
+        cwd: &str,
+        command: &str,
+        prompt: &str,
+        precheck: &str,
+        workspace_mode: WorkspaceMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(modal) = &mut self.schedule_modal else {
+            return;
+        };
+        modal
+            .id
+            .update(cx, |s, cx| s.set_value(id.to_owned(), window, cx));
+        modal
+            .cron
+            .update(cx, |s, cx| s.set_value(cron.to_owned(), window, cx));
+        modal
+            .cwd
+            .update(cx, |s, cx| s.set_value(cwd.to_owned(), window, cx));
+        modal
+            .command
+            .update(cx, |s, cx| s.set_value(command.to_owned(), window, cx));
+        modal
+            .prompt
+            .update(cx, |s, cx| s.set_value(prompt.to_owned(), window, cx));
+        modal
+            .precheck
+            .update(cx, |s, cx| s.set_value(precheck.to_owned(), window, cx));
+        modal.workspace_mode = workspace_mode;
+        modal.error = None;
+        cx.notify();
+    }
+
+    /// 모달 입력을 검증해 `schedules.toml`에 저장한다.
+    pub fn submit_schedule_modal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(modal) = &mut self.schedule_modal else {
+            return;
+        };
+        let id = modal.id.read(cx).value().trim().to_owned();
+        let cron = modal.cron.read(cx).value().trim().to_owned();
+        let cwd = modal.cwd.read(cx).value().trim().to_owned();
+        let cmd_raw = modal.command.read(cx).value().trim().to_owned();
+        let command: Vec<String> = if cmd_raw.is_empty() {
+            vec!["claude".to_owned(), "-p".to_owned()]
+        } else {
+            cmd_raw.split_whitespace().map(str::to_owned).collect()
+        };
+        let prompt = modal.prompt.read(cx).value().trim().to_owned();
+        let precheck_raw = modal.precheck.read(cx).value().trim().to_owned();
+        let precheck = (!precheck_raw.is_empty()).then_some(precheck_raw);
+        let workspace_mode = modal.workspace_mode;
+        let editing_id = modal.editing_id.clone();
+
+        let entry = Schedule {
+            id,
+            cron,
+            cwd,
+            command,
+            prompt,
+            precheck,
+            workspace_mode,
+        };
+        let Some(dir) = state_dir(cx) else {
+            modal.error = Some(text::NO_STATE_DIR.get().into());
+            cx.notify();
+            return;
+        };
+        let res: std::io::Result<()> = (|| {
+            let _guard = Schedules::exclusive_edit(&dir)?;
+            let mut schedules = Schedules::load(&dir)?;
+            if let Some(old_id) = editing_id.as_deref() {
+                schedules.schedule.retain(|s| s.id != old_id);
+            }
+            schedules.schedule.retain(|s| s.id != entry.id);
+            schedules.schedule.push(entry);
+            schedules.save(&dir)
+        })();
+        match res {
+            Ok(()) => {
+                self.schedule_modal = None;
+                cx.notify();
+            }
+            Err(err) => {
+                if let Some(m) = &mut self.schedule_modal {
+                    m.error = Some(err.to_string().into());
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    pub fn remove_schedule(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(dir) = state_dir(cx) else {
+            return;
+        };
+        let res: std::io::Result<()> = (|| {
+            let _guard = Schedules::exclusive_edit(&dir)?;
+            let mut schedules = Schedules::load(&dir)?;
+            schedules.schedule.retain(|s| s.id != id);
+            schedules.save(&dir)
+        })();
+        if res.is_ok() {
+            if self.schedule_log.as_ref().is_some_and(|lv| lv.id == id) {
+                self.schedule_log = None;
+            }
+            cx.notify();
+        }
+    }
+
+    /// 스케줄을 즉시 실행(`Run Now`)한다. 데몬 소켓이 살아 있을 때만 `request_run_now`로
+    /// 데몬에 실행을 요청하며, 데몬이 없으면 데몬 필요 오류를 표시한다.
+    pub fn trigger_schedule_run_now(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(dir) = state_dir(cx) else {
+            self.schedule_error = Some(text::NO_STATE_DIR.get().into());
+            cx.notify();
+            return;
+        };
+        let sock = dir.join("run/krilld.sock");
+        let daemon_live = sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok();
+        if !daemon_live {
+            self.schedule_error = Some(text::ACCOUNTS_DAEMON_REQUIRED.get().into());
+            cx.notify();
+            return;
+        }
+        match request_run_now(&dir, id) {
+            Ok(()) => {
+                self.schedule_error = None;
+            }
+            Err(err) => {
+                self.schedule_error = Some(err.to_string().into());
+            }
+        }
+        cx.notify();
+    }
+
+    /// 실행 기록 항목의 터미널 출력 로그 뷰어를 연다.
+    pub fn open_schedule_run_log(&mut self, run: &ScheduleRun, cx: &mut Context<Self>) {
+        let output = if let Some(out) = run.output.as_deref().filter(|s| !s.trim().is_empty()) {
+            out.to_owned()
+        } else if let Some(sid) = run.session
+            && let Some(dir) = state_dir(cx)
+            && let Some(captured) = capture_session_output(&dir, krill_proto::SessionId(sid))
+        {
+            captured
+        } else if let Some(err) = run.error.as_deref().filter(|s| !s.trim().is_empty()) {
+            err.to_owned()
+        } else if let Some(st) = run.status {
+            format!("exit status {st}")
+        } else {
+            text::SCHEDULE_LOG_EMPTY.get().to_owned()
+        };
+
+        self.schedule_log = Some(ScheduleLogView {
+            id: run.id.clone(),
+            minute: run.minute,
+            phase: run.phase.clone(),
+            cwd: run.cwd.clone(),
+            output,
+        });
+        cx.notify();
+    }
+
+    pub fn close_schedule_run_log(&mut self, cx: &mut Context<Self>) {
+        if self.schedule_log.is_some() {
+            self.schedule_log = None;
+            cx.notify();
+        }
+    }
+
+    #[must_use]
+    pub fn schedule_log(&self) -> Option<&ScheduleLogView> {
+        self.schedule_log.as_ref()
+    }
+
+    pub(super) fn render_schedules_section(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let p = crate::ui::palette(cx);
+        let dir = state_dir(cx);
+        let schedules = dir
+            .as_deref()
+            .and_then(|d| Schedules::load(d).ok())
+            .map(|s| s.schedule)
+            .unwrap_or_default();
+        let runs = dir
+            .as_deref()
+            .and_then(|d| load_coalesced_runs(d).ok())
+            .unwrap_or_default();
+
+        let add_btn = Button::new("admin-schedule-add")
+            .small()
+            .primary()
+            .label(text::SCHEDULE_ADD_BTN.get())
+            .debug_selector(|| "admin-schedule-add".into())
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_schedule_modal(None, window, cx);
+            }));
+
+        let open_toml_btn =
+            layout::secondary("admin-schedule-open-toml", text::SCHEDULE_OPEN_TOML.get())
+                .debug_selector(|| "admin-schedule-open-toml".into())
+                .on_click(|_, _, cx| {
+                    open_file(FILE, "# [[schedule]]\n", cx);
+                });
+
+        let mut card = layout::card(p)
+            .id("admin-schedules-card")
+            .debug_selector(|| "admin-schedules-card".into())
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(layout::label(
+                        p,
+                        text::SCHEDULES_TITLE.get(),
+                        Some(text::SCHEDULES_DESC.get()),
+                    ))
+                    .child(layout::controls().child(open_toml_btn).child(add_btn)),
+            );
+
+        if let Some(err) = &self.schedule_error {
+            card = card.child(
+                crate::ui::error_banner(p, err.clone())
+                    .id("admin-schedule-error")
+                    .debug_selector(|| "admin-schedule-error".into()),
+            );
+        }
+
+        if schedules.is_empty() {
+            card = card.child(
+                div()
+                    .id("admin-schedules-empty")
+                    .debug_selector(|| "admin-schedules-empty".into())
+                    .p_2p5()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .bg(p.background)
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SCHEDULE_EMPTY.get()),
+            );
+        } else {
+            let mut list = div().flex().flex_col().gap_2();
+            for sched in &schedules {
+                let row_id = format!("admin-schedule-row-{}", sched.id);
+                let run_now_id = format!("admin-schedule-run-now-{}", sched.id);
+                let edit_id = format!("admin-schedule-edit-{}", sched.id);
+                let rm_id = format!("admin-schedule-remove-{}", sched.id);
+                let sched_for_edit = sched.clone();
+                let id_for_run = sched.id.clone();
+                let id_for_rm = sched.id.clone();
+
+                let mode_badge = match sched.workspace_mode {
+                    WorkspaceMode::Reuse => crate::ui::badge(
+                        p,
+                        crate::ui::BadgeTone::Neutral,
+                        text::SCHEDULE_MODE_REUSE.get(),
+                    ),
+                    WorkspaceMode::Isolate => crate::ui::badge(
+                        p,
+                        crate::ui::BadgeTone::Accent,
+                        text::SCHEDULE_MODE_ISOLATE.get(),
+                    ),
+                };
+
+                let cmd_str = sched.command.join(" ");
+                let mut meta_line = format!("{} · {} · {}", sched.cron, cmd_str, sched.cwd);
+                if let Some(pre) = &sched.precheck {
+                    meta_line.push_str(" · precheck: ");
+                    meta_line.push_str(pre);
+                }
+
+                list = list.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .debug_selector(move || row_id.clone())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .p_2p5()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .bg(p.background)
+                        .border_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_size(crate::ui::TEXT_SM)
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .child(sched.id.clone()),
+                                        )
+                                        .child(mode_badge),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(crate::ui::FONT_MONO)
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .truncate()
+                                        .child(meta_line),
+                                ),
+                        )
+                        .child(
+                            layout::controls()
+                                .child(
+                                    Button::new(gpui::ElementId::Name(run_now_id.clone().into()))
+                                        .small()
+                                        .primary()
+                                        .label(text::SCHEDULE_RUN_NOW.get())
+                                        .debug_selector(move || run_now_id.clone())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.trigger_schedule_run_now(&id_for_run, cx);
+                                        })),
+                                )
+                                .child(
+                                    layout::secondary(
+                                        gpui::ElementId::Name(edit_id.clone().into()),
+                                        text::SCHEDULE_EDIT.get(),
+                                    )
+                                    .debug_selector(move || edit_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.open_schedule_modal(
+                                                Some(&sched_for_edit),
+                                                window,
+                                                cx,
+                                            );
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    Button::new(gpui::ElementId::Name(rm_id.clone().into()))
+                                        .small()
+                                        .ghost()
+                                        .label(text::SCHEDULE_REMOVE.get())
+                                        .debug_selector(move || rm_id.clone())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.remove_schedule(&id_for_rm, cx);
+                                        })),
+                                ),
+                        ),
+                );
+            }
+            card = card.child(list);
+        }
+
+        // 최근 실행 기록(Runs) 섹션
+        let mut runs_col = div()
+            .id("admin-schedule-runs")
+            .debug_selector(|| "admin-schedule-runs".into())
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .pt_2()
+            .border_t_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.muted_foreground)
+                    .child(text::SCHEDULE_RUNS_TITLE.get()),
+            );
+
+        if runs.is_empty() {
+            runs_col = runs_col.child(
+                div()
+                    .id("admin-schedule-runs-empty")
+                    .debug_selector(|| "admin-schedule-runs-empty".into())
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SCHEDULE_RUNS_EMPTY.get()),
+            );
+        } else {
+            for (idx, run) in runs.iter().take(15).enumerate() {
+                let (tone, badge_label) = run_phase_badge_spec(&run.phase);
+                let badge_id = format!("admin-schedule-run-badge-{idx}");
+                let log_btn_id = format!("admin-schedule-run-log-{idx}");
+                let row_id = format!("admin-schedule-run-row-{idx}");
+                let run_for_row = run.clone();
+                let run_for_btn = run.clone();
+
+                let mut summary = format!("{} · min {}", run.id, run.minute);
+                if let Some(sid) = run.session {
+                    summary.push_str(" · #");
+                    summary.push_str(&sid.to_string());
+                }
+                if let Some(cwd) = &run.cwd {
+                    summary.push_str(" · ");
+                    summary.push_str(cwd);
+                }
+                if let Some(st) = run.status {
+                    summary.push_str(" · exit=");
+                    summary.push_str(&st.to_string());
+                }
+                if let Some(err) = &run.error {
+                    summary.push_str(" · ");
+                    summary.push_str(err);
+                }
+
+                runs_col = runs_col.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .debug_selector(move || row_id.clone())
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .p_2()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .bg(p.background)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_schedule_run_log(&run_for_row, cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    crate::ui::badge(p, tone, badge_label)
+                                        .id(SharedString::from(badge_id.clone()))
+                                        .debug_selector(move || badge_id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .font_family(crate::ui::FONT_MONO)
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .truncate()
+                                        .child(summary),
+                                ),
+                        )
+                        .child(
+                            layout::secondary(
+                                gpui::ElementId::Name(log_btn_id.clone().into()),
+                                text::SCHEDULE_VIEW_LOG.get(),
+                            )
+                            .debug_selector(move || log_btn_id.clone())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.open_schedule_run_log(&run_for_btn, cx);
+                                },
+                            )),
+                        ),
+                );
+            }
+        }
+        card = card.child(runs_col);
+
+        // 실행 상세 로그 뷰어
+        if let Some(log) = &self.schedule_log {
+            let (tone, badge_label) = run_phase_badge_spec(&log.phase);
+            let title = text::SCHEDULE_LOG_TITLE
+                .format(&[("id", &log.id), ("minute", &log.minute.to_string())]);
+            let mut log_box = div()
+                .id("admin-schedule-log-viewer")
+                .debug_selector(|| "admin-schedule-log-viewer".into())
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .rounded(crate::ui::RADIUS_SM)
+                .bg(p.background)
+                .border_1()
+                .border_color(p.border)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(title),
+                                )
+                                .child(crate::ui::badge(p, tone, badge_label)),
+                        )
+                        .child(
+                            Button::new("admin-schedule-log-close")
+                                .small()
+                                .ghost()
+                                .label(text::SCHEDULE_CLOSE_LOG.get())
+                                .debug_selector(|| "admin-schedule-log-close".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.close_schedule_run_log(cx);
+                                })),
+                        ),
+                );
+            if let Some(cwd) = &log.cwd {
+                log_box = log_box.child(
+                    div()
+                        .id("admin-schedule-log-cwd")
+                        .debug_selector(|| "admin-schedule-log-cwd".into())
+                        .font_family(crate::ui::FONT_MONO)
+                        .text_size(crate::ui::TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .child(cwd.clone()),
+                );
+            }
+            log_box = log_box.child(
+                div()
+                    .id("admin-schedule-log-content")
+                    .debug_selector(|| "admin-schedule-log-content".into())
+                    .p_2()
+                    .rounded(crate::ui::RADIUS_XS)
+                    .bg(p.card)
+                    .border_1()
+                    .border_color(p.border)
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_XS)
+                    .child(log.output.clone()),
+            );
+            card = card.child(log_box);
+        }
+
+        card
+    }
+
+    pub(super) fn render_schedule_modal(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Deferred> {
+        let modal = self.schedule_modal.as_ref()?;
+        let p = crate::ui::palette(cx);
+        let heading = match &modal.editing_id {
+            Some(id) => text::SCHEDULE_MODAL_EDIT_TITLE.format(&[("id", id)]),
+            None => text::SCHEDULE_MODAL_ADD_TITLE.get().to_owned(),
+        };
+
+        let field =
+            |label_text: &'static str, selector: &'static str, input: &gpui::Entity<InputState>| {
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(crate::ui::field_label(label_text, None, p))
+                    .child(
+                        div()
+                            .id(selector)
+                            .debug_selector(move || selector.into())
+                            .child(Input::new(input).small()),
+                    )
+            };
+
+        let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
+        let reuse_btn = Button::new("admin-schedule-mode-reuse")
+            .small()
+            .label(text::SCHEDULE_MODE_REUSE.get())
+            .debug_selector(|| "admin-schedule-mode-reuse".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(m) = &mut this.schedule_modal {
+                    m.workspace_mode = WorkspaceMode::Reuse;
+                    cx.notify();
+                }
+            }));
+        let isolate_btn = Button::new("admin-schedule-mode-isolate")
+            .small()
+            .label(text::SCHEDULE_MODE_ISOLATE.get())
+            .debug_selector(|| "admin-schedule-mode-isolate".into())
+            .on_click(cx.listener(|this, _, _, cx| {
+                if let Some(m) = &mut this.schedule_modal {
+                    m.workspace_mode = WorkspaceMode::Isolate;
+                    cx.notify();
+                }
+            }));
+
+        let mode_row = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(crate::ui::field_label(
+                text::SCHEDULE_FIELD_WORKSPACE_MODE.get(),
+                None,
+                p,
+            ))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(if reuse_active {
+                        reuse_btn.primary()
+                    } else {
+                        reuse_btn.ghost()
+                    })
+                    .child(if reuse_active {
+                        isolate_btn.ghost()
+                    } else {
+                        isolate_btn.primary()
+                    }),
+            );
+
+        let mut dialog = div()
+            .id("admin-schedule-modal")
+            .debug_selector(|| "admin-schedule-modal".into())
+            .occlude()
+            .role(gpui::Role::Dialog)
+            .w(crate::ui::DIALOG_WIDTH)
+            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
+            .p_6()
+            .rounded(crate::ui::RADIUS_LG)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_LG)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(heading),
+            )
+            .child(field(
+                text::SCHEDULE_FIELD_ID.get(),
+                "admin-schedule-input-id",
+                &modal.id,
+            ))
+            .child(field(
+                text::SCHEDULE_FIELD_CRON.get(),
+                "admin-schedule-input-cron",
+                &modal.cron,
+            ))
+            .child(field(
+                text::SCHEDULE_FIELD_CWD.get(),
+                "admin-schedule-input-cwd",
+                &modal.cwd,
+            ))
+            .child(field(
+                text::SCHEDULE_FIELD_COMMAND.get(),
+                "admin-schedule-input-command",
+                &modal.command,
+            ))
+            .child(field(
+                text::SCHEDULE_FIELD_PROMPT.get(),
+                "admin-schedule-input-prompt",
+                &modal.prompt,
+            ))
+            .child(field(
+                text::SCHEDULE_FIELD_PRECHECK.get(),
+                "admin-schedule-input-precheck",
+                &modal.precheck,
+            ))
+            .child(mode_row);
+
+        if let Some(err) = &modal.error {
+            dialog = dialog.child(
+                crate::ui::error_banner(p, err.clone())
+                    .id("admin-schedule-modal-error")
+                    .debug_selector(|| "admin-schedule-modal-error".into()),
+            );
+        }
+
+        dialog = dialog.child(
+            div()
+                .flex()
+                .justify_end()
+                .gap_2()
+                .pt_2()
+                .child(
+                    Button::new("admin-schedule-modal-cancel")
+                        .small()
+                        .ghost()
+                        .label(text::SCHEDULE_CANCEL.get())
+                        .debug_selector(|| "admin-schedule-modal-cancel".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_schedule_modal(cx);
+                        })),
+                )
+                .child(
+                    Button::new("admin-schedule-modal-save")
+                        .small()
+                        .primary()
+                        .label(text::SCHEDULE_SAVE.get())
+                        .debug_selector(|| "admin-schedule-modal-save".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.submit_schedule_modal(window, cx);
+                        })),
+                ),
+        );
+
+        Some(crate::ui::modal_backdrop(window.viewport_size(), dialog))
+    }
+}

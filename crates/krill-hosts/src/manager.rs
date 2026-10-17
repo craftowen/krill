@@ -1,0 +1,506 @@
+//! MK-131: 원격 호스트 Connection Manager.
+//!
+//! - 원격 호스트당 활성 터널 1개만 유지한다(매 명령·폴링마다 새 SSH 핸드셰이크 금지).
+//! - 터널 프로세스 종료 또는 원격 데몬 응답 불능 감지 시 지수 백오프로 재연결을 예약하고,
+//!   백그라운드 실행자에서 재시도할 때 기존 패인 재연결 경로(`Known`)가 그대로 복구되게 한다.
+//! - 호스트별 슬롯 잠금을 분리해 원격 호스트 하나의 지연·장애가 로컬 세션이나 다른 원격 호스트,
+//!   UI 스레드를 절대 막지 않게 한다.
+
+use std::collections::BTreeMap;
+use std::io;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use krill_proto::daemon::Paths;
+
+use crate::ssh::{self, SshOptions, Tunnel};
+use crate::{HostId, HostStatus, HostTarget, RemoteConnector};
+
+const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// 백그라운드에서 수집한 전송 상태. UI에서는 이 스냅샷만 읽는다.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HostConnectionInfo {
+    pub status: HostStatus,
+    pub detail: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct ExternalHost {
+    pub spec: RemoteHostSpec,
+    pub socket: PathBuf,
+    pub info: HostConnectionInfo,
+    factory: Arc<dyn Fn() -> RemoteConnector + Send + Sync>,
+}
+
+impl std::fmt::Debug for ExternalHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExternalHost")
+            .field("spec", &self.spec)
+            .field("info", &self.info)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExternalHost {
+    pub fn new(
+        spec: RemoteHostSpec,
+        socket: PathBuf,
+        info: HostConnectionInfo,
+        factory: impl Fn() -> RemoteConnector + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            spec,
+            socket,
+            info,
+            factory: Arc::new(factory),
+        }
+    }
+}
+
+/// UI·사이드바·설정 계층과 주고받는 전송 무관 원격 호스트 명세.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteHostSpec {
+    pub id: String,
+    pub label: String,
+    pub address: String,
+    pub port: Option<u16>,
+    pub identity_file: Option<String>,
+    pub remote_socket: Option<String>,
+}
+
+impl RemoteHostSpec {
+    pub fn display_name(&self) -> &str {
+        let trimmed = self.label.trim();
+        if trimmed.is_empty() {
+            &self.address
+        } else {
+            trimmed
+        }
+    }
+
+    fn to_ssh_options(&self) -> SshOptions {
+        SshOptions {
+            destination: self.address.clone(),
+            port: self.port,
+            identity_file: self.identity_file.clone(),
+            remote_socket: self.remote_socket.clone(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RemoteSlot {
+    /// 연결 작업끼리만 직렬화한다. UI가 읽는 상태 잠금은 네트워크 IO 동안 풀어 둔다.
+    connection_gate: Arc<Mutex<()>>,
+    spec: RemoteHostSpec,
+    status: HostStatus,
+    tunnel: Option<Tunnel>,
+    placeholder_socket: PathBuf,
+    failures: u32,
+    next_retry_at: Option<Instant>,
+    last_error: Option<String>,
+    tunnel_starts: usize,
+    generation: u64,
+}
+
+impl RemoteSlot {
+    fn new(spec: RemoteHostSpec) -> Self {
+        let placeholder_socket = ssh::local_socket(&spec.address)
+            .unwrap_or_else(|_| std::env::temp_dir().join(format!("mk-fwd-{}.sock", spec.id)));
+        Self {
+            connection_gate: Arc::new(Mutex::new(())),
+            spec,
+            status: HostStatus::Connecting,
+            tunnel: None,
+            placeholder_socket,
+            failures: 0,
+            next_retry_at: None,
+            last_error: None,
+            tunnel_starts: 0,
+            generation: 0,
+        }
+    }
+
+    fn current_socket(&self) -> PathBuf {
+        self.tunnel.as_ref().map_or_else(
+            || self.placeholder_socket.clone(),
+            |t| t.socket().to_path_buf(),
+        )
+    }
+}
+
+/// 다중 원격 호스트 연결 관리자.
+#[derive(Debug, Clone, Default)]
+pub struct HostManager {
+    external: Arc<Mutex<BTreeMap<String, ExternalHost>>>,
+    slots: Arc<Mutex<BTreeMap<String, Arc<Mutex<RemoteSlot>>>>>,
+    order: Arc<Mutex<Vec<String>>>,
+    local_dir: Option<PathBuf>,
+    ssh_bin: Option<std::ffi::OsString>,
+}
+
+impl HostManager {
+    /// 외부 전송 목록 갱신은 SSH 슬롯을 제거하지 않는다. 팩토리는 타깃을 요청할 때만 호출한다.
+    pub fn sync_external_hosts(&self, hosts: Vec<ExternalHost>) {
+        if let Ok(mut map) = self.external.lock() {
+            *map = hosts
+                .into_iter()
+                .map(|host| (host.spec.id.clone(), host))
+                .collect();
+        }
+    }
+
+    pub fn connection_info(&self, id: &str) -> Option<HostConnectionInfo> {
+        self.external
+            .lock()
+            .ok()?
+            .get(id)
+            .map(|host| host.info.clone())
+    }
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 테스트·격리 환경에서 로컬 터널 소켓 디렉터리와 `ssh` 실행 파일을 주입해 생성한다.
+    pub fn with_ssh_program(local_dir: PathBuf, ssh_bin: std::ffi::OsString) -> Self {
+        Self {
+            local_dir: Some(local_dir),
+            ssh_bin: Some(ssh_bin),
+            ..Self::default()
+        }
+    }
+
+    /// 연속 실패 횟수에 따른 지수 백오프 지연(200ms → 400ms → 800ms → 1.6s → 3.2s → 최대 5s).
+    pub fn backoff_delay(failures: u32) -> Duration {
+        let shift = failures.saturating_sub(1).min(5);
+        let factor = 1u32.checked_shl(shift).unwrap_or(32);
+        INITIAL_BACKOFF.saturating_mul(factor).min(MAX_BACKOFF)
+    }
+
+    /// 설정된 원격 호스트 목록을 동기화한다. 기존 호스트의 살아 있는 터널은 그대로 유지하고,
+    /// 주소·포트·키가 바뀐 경우에만 기존 터널을 내린다.
+    pub fn sync_specs(&self, specs: &[RemoteHostSpec]) {
+        let Ok(mut map) = self.slots.lock() else {
+            return;
+        };
+        let Ok(mut order) = self.order.lock() else {
+            return;
+        };
+        order.clear();
+        let mut keep = BTreeMap::new();
+        for spec in specs {
+            if spec.id.trim().is_empty() || spec.address.trim().is_empty() {
+                continue;
+            }
+            order.push(spec.id.clone());
+            if let Some(existing) = map.remove(&spec.id) {
+                if let Ok(mut slot) = existing.lock() {
+                    let transport_changed = slot.spec.address != spec.address
+                        || slot.spec.port != spec.port
+                        || slot.spec.identity_file != spec.identity_file
+                        || slot.spec.remote_socket != spec.remote_socket;
+                    slot.spec = spec.clone();
+                    if transport_changed {
+                        slot.generation = slot.generation.wrapping_add(1);
+                        slot.tunnel = None;
+                        slot.failures = 0;
+                        slot.next_retry_at = None;
+                        slot.status = HostStatus::Connecting;
+                    }
+                }
+                keep.insert(spec.id.clone(), existing);
+            } else {
+                keep.insert(
+                    spec.id.clone(),
+                    Arc::new(Mutex::new(RemoteSlot::new(spec.clone()))),
+                );
+            }
+        }
+        *map = keep;
+    }
+
+    pub fn specs(&self) -> Vec<RemoteHostSpec> {
+        let Ok(map) = self.slots.lock() else {
+            return Vec::new();
+        };
+        let Ok(order) = self.order.lock() else {
+            return Vec::new();
+        };
+        let mut specs: Vec<_> = order
+            .iter()
+            .filter_map(|id| map.get(id))
+            .filter_map(|slot| slot.lock().ok().map(|s| s.spec.clone()))
+            .collect();
+        if let Ok(external) = self.external.lock() {
+            specs.extend(external.values().map(|h| h.spec.clone()));
+        }
+        specs
+    }
+
+    /// 등록된 원격 호스트와 현재 연결 상태를 등록 순서대로 돌려준다.
+    pub fn statuses(&self) -> Vec<(RemoteHostSpec, HostStatus)> {
+        let Ok(map) = self.slots.lock() else {
+            return Vec::new();
+        };
+        let Ok(order) = self.order.lock() else {
+            return Vec::new();
+        };
+        let mut statuses: Vec<_> = order
+            .iter()
+            .filter_map(|id| map.get(id))
+            .filter_map(|slot| {
+                let mut s = slot.lock().ok()?;
+                if let Some(t) = &mut s.tunnel
+                    && !t.is_alive()
+                {
+                    s.tunnel = None;
+                    s.status = HostStatus::Disconnected;
+                }
+                Some((s.spec.clone(), s.status))
+            })
+            .collect();
+        if let Ok(external) = self.external.lock() {
+            statuses.extend(external.values().map(|h| (h.spec.clone(), h.info.status)));
+        }
+        statuses
+    }
+
+    pub fn status(&self, id: &str) -> HostStatus {
+        if let Some(info) = self.connection_info(id) {
+            return info.status;
+        }
+        let Some(slot) = self.slot(id) else {
+            return HostStatus::Disconnected;
+        };
+        let Ok(mut s) = slot.lock() else {
+            return HostStatus::Disconnected;
+        };
+        if let Some(t) = &mut s.tunnel
+            && !t.is_alive()
+        {
+            s.tunnel = None;
+            s.status = HostStatus::Disconnected;
+        }
+        s.status
+    }
+
+    /// 터널 기동 횟수(단위·통합 테스트에서 호스트당 터널 재사용 검증용).
+    pub fn tunnel_starts(&self, id: &str) -> usize {
+        self.slot(id)
+            .and_then(|slot| slot.lock().ok().map(|s| s.tunnel_starts))
+            .unwrap_or(0)
+    }
+
+    /// 현재 살아 있는 터널의 자식 PID(테스트에서 터널 강제 종료 검증용).
+    pub fn tunnel_pid(&self, id: &str) -> Option<u32> {
+        let slot = self.slot(id)?;
+        let mut s = slot.lock().ok()?;
+        let t = s.tunnel.as_mut()?;
+        t.is_alive().then(|| t.pid())
+    }
+
+    /// 사용자가 사이드바에서 '다시 연결'을 눌렀을 때 백오프를 즉시 해제하고 재연결 상태로 만든다.
+    pub fn reconnect_now(&self, id: &str) {
+        let Some(slot) = self.slot(id) else {
+            return;
+        };
+        let Ok(mut s) = slot.lock() else {
+            return;
+        };
+        if let Some(t) = &mut s.tunnel
+            && !t.is_alive()
+        {
+            s.tunnel = None;
+        }
+        s.next_retry_at = None;
+        s.status = HostStatus::Connecting;
+    }
+
+    /// 지정한 [`HostId`]에 대한 전송 무관 [`HostTarget`]을 돌려준다.
+    ///
+    /// - `HostId::Local`: `allow_local_launch == true` (로컬 `krill-holder`/`krilld` 기동 허용).
+    /// - `HostId::Remote(id)`: `allow_local_launch == false` (절대 로컬 데몬을 기동하지 않으며,
+    ///   이 매니저가 관리하는 단일 공유 터널 소켓을 통해 통신).
+    pub fn target_for(&self, host: &HostId, local_paths: Option<&Paths>) -> Option<HostTarget> {
+        match host {
+            HostId::Local => {
+                let paths = local_paths.cloned().or_else(|| Paths::dev().ok())?;
+                Some(HostTarget::local(paths))
+            }
+            HostId::Remote(id) => {
+                if let Some(host) = self.external.lock().ok()?.get(id).cloned() {
+                    return Some(HostTarget::remote_with_connector(
+                        id.clone(),
+                        host.socket,
+                        (host.factory)(),
+                    ));
+                }
+                let slot = self.slot(id)?;
+                let initial_socket = slot.lock().ok()?.current_socket();
+                let manager = self.clone();
+                let host_id = id.clone();
+                let connector =
+                    RemoteConnector::new(move || manager.ensure_tunnel_socket(&host_id), {
+                        let manager = self.clone();
+                        let host_id = id.clone();
+                        move |ok, err| manager.record_ipc_outcome(&host_id, ok, err)
+                    });
+                Some(HostTarget::remote_with_connector(
+                    id.clone(),
+                    initial_socket,
+                    connector,
+                ))
+            }
+        }
+    }
+
+    fn slot(&self, id: &str) -> Option<Arc<Mutex<RemoteSlot>>> {
+        self.slots.lock().ok()?.get(id).cloned()
+    }
+
+    fn ensure_tunnel_socket(&self, id: &str) -> io::Result<PathBuf> {
+        let slot = self.slot(id).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::ConnectionRefused, "unknown remote host")
+        })?;
+        let gate = slot
+            .lock()
+            .map_err(|_| io::Error::other("remote host slot poisoned"))?
+            .connection_gate
+            .clone();
+        let _connecting = gate
+            .lock()
+            .map_err(|_| io::Error::other("remote connection gate poisoned"))?;
+        let mut s = slot
+            .lock()
+            .map_err(|_| io::Error::other("remote host slot poisoned"))?;
+
+        if let Some(t) = &mut s.tunnel
+            && !t.is_alive()
+        {
+            s.tunnel = None;
+        }
+
+        if let Some(t) = &s.tunnel {
+            return Ok(t.socket().to_path_buf());
+        }
+
+        if let Some(until) = s.next_retry_at {
+            if Instant::now() < until {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    s.last_error
+                        .clone()
+                        .unwrap_or_else(|| "remote host backoff active".to_owned()),
+                ));
+            }
+            s.next_retry_at = None;
+            s.status = HostStatus::Connecting;
+        }
+
+        s.status = HostStatus::Connecting;
+        let opts = s.spec.to_ssh_options();
+        let generation = s.generation;
+        drop(s);
+        let started = if let (Some(local_dir), Some(ssh_bin)) = (&self.local_dir, &self.ssh_bin) {
+            opts.validate()
+                .and_then(|()| ssh::resolve_remote_socket_with_program(&opts, ssh_bin))
+                .and_then(|remote| {
+                    let local = ssh::local_socket_in(local_dir, &opts.destination)?;
+                    Tunnel::start_at_with_program(&opts, local, &remote, ssh_bin)
+                })
+        } else {
+            Tunnel::start_with_options(&opts)
+        };
+        let mut s = slot
+            .lock()
+            .map_err(|_| io::Error::other("remote host slot poisoned"))?;
+        if s.generation != generation {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "remote host settings changed while connecting",
+            ));
+        }
+        match started {
+            Ok(tunnel) => {
+                let sock = tunnel.socket().to_path_buf();
+                s.placeholder_socket.clone_from(&sock);
+                s.tunnel = Some(tunnel);
+                s.tunnel_starts = s.tunnel_starts.saturating_add(1);
+                Ok(sock)
+            }
+            Err(err) => {
+                s.failures = s.failures.saturating_add(1);
+                let delay = Self::backoff_delay(s.failures);
+                s.next_retry_at = Some(Instant::now() + delay);
+                s.last_error = Some(err.to_string());
+                s.status = HostStatus::Disconnected;
+                // Normalize NotFound so callers (e.g. shell::is_permanent_error) treat remote
+                // tunnel setup failure as transient and keep retrying with backoff.
+                let kind = if err.kind() == io::ErrorKind::NotFound {
+                    io::ErrorKind::ConnectionRefused
+                } else {
+                    err.kind()
+                };
+                Err(io::Error::new(kind, err.to_string()))
+            }
+        }
+    }
+
+    /// 활성 터널을 강제 종료하고 상태를 `Disconnected`(백오프 포함)로 전환한다.
+    pub fn kill_tunnel(&self, id: &str) {
+        let Some(slot) = self.slot(id) else {
+            return;
+        };
+        let Ok(mut s) = slot.lock() else {
+            return;
+        };
+        s.generation = s.generation.wrapping_add(1);
+        s.tunnel = None;
+        s.failures = s.failures.saturating_add(1);
+        let delay = Self::backoff_delay(s.failures);
+        s.next_retry_at = Some(Instant::now() + delay);
+        s.status = HostStatus::Disconnected;
+    }
+
+    fn record_ipc_outcome(&self, id: &str, ok: bool, err: Option<&io::Error>) {
+        let Some(slot) = self.slot(id) else {
+            return;
+        };
+        let Ok(mut s) = slot.lock() else {
+            return;
+        };
+        if ok {
+            s.failures = 0;
+            s.next_retry_at = None;
+            s.last_error = None;
+            s.status = HostStatus::Connected;
+            return;
+        }
+        // 이미 ensure_tunnel_socket에서 백오프가 걸린 상태(WouldBlock)라면 실패 횟수를 중복 증가시키지 않는다.
+        if err.is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock) {
+            s.status = HostStatus::Disconnected;
+            return;
+        }
+        if let Some(t) = &mut s.tunnel
+            && !t.is_alive()
+        {
+            s.tunnel = None;
+        }
+        s.failures = s.failures.saturating_add(1);
+        if s.tunnel.is_none() {
+            let delay = Self::backoff_delay(s.failures);
+            s.next_retry_at = Some(Instant::now() + delay);
+        }
+        if let Some(e) = err {
+            s.last_error = Some(e.to_string());
+        }
+        s.status = HostStatus::Disconnected;
+    }
+}
+
+#[cfg(test)]
+mod tests;

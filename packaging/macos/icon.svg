@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="krill-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#141824"/>
+      <stop offset="1" stop-color="#08090E"/>
+    </linearGradient>
+    <radialGradient id="krill-glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#FF5238" stop-opacity="0.34"/>
+      <stop offset="0.6" stop-color="#FF5238" stop-opacity="0.08"/>
+      <stop offset="1" stop-color="#FF5238" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="krill-shell" gradientUnits="userSpaceOnUse" x1="150" y1="90" x2="380" y2="420">
+      <stop offset="0" stop-color="#FFC4A8"/>
+      <stop offset="0.42" stop-color="#FF5238"/>
+      <stop offset="1" stop-color="#B8261A"/>
+    </linearGradient>
+    <linearGradient id="krill-rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.26"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.02"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0.08"/>
+    </linearGradient>
+    <filter id="krill-shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#000000" flood-opacity="0.55"/>
+    </filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="108" fill="url(#krill-bg)"/>
+  <circle cx="256" cy="262" r="210" fill="url(#krill-glow)"/>
+  <rect x="25.5" y="25.5" width="461" height="461" rx="106.5" fill="none" stroke="url(#krill-rim)" stroke-width="3"/>
+  <g transform="translate(6 16)">
+    <g fill="url(#krill-shell)" filter="url(#krill-shadow)">
+      <path d="M356 138C310 78 200 62 106 128C198 76 304 94 348 142Z"/>
+      <path d="M346 144C300 104 220 96 150 140C218 108 294 118 338 148Z"/>
+      <path d="M204.6 160.8A118 118 0 0 0 147.8 228.5L204.8 247.1A58 58 0 0 1 232.8 213.8Z"/>
+      <path d="M151.3 237.9A112 112 0 0 0 161.1 317.5L204.4 294.5A63 63 0 0 1 198.9 249.8Z"/>
+      <path d="M171.8 320.1A104 104 0 0 0 227.9 363.9L239 329.7A68 68 0 0 1 202.3 301Z"/>
+      <path d="M242 340Q300 318 368 330Q336 356 262 362Z"/>
+      <path d="M262 366Q330 368 362 404Q296 404 242 368Z"/>
+      <path d="M248 360Q302 360 352 372Q300 372 248 368Z"/>
+      <path d="M392 148C360 126 300 112 252 128C236 134 226 142 219.6 154.1L240.2 210.5C280 214 330 198 360 176C372 167 382 158 392 148Z"/>
+    </g>
+    <circle cx="318" cy="154" r="11" fill="#08090E"/>
+    <circle cx="314.5" cy="150.5" r="3" fill="#FFC4A8" opacity="0.7"/>
+    <g fill="none" stroke="#FFE6D8" stroke-linecap="round" stroke-width="3" opacity="0.6">
+      <path d="M264 133C302 123 344 131 374 147"/>
+      <path d="M207.5 166.1A112 112 0 0 0 154.8 226.7"/>
+      <path d="M156.3 243A106 106 0 0 0 163.2 308.1"/>
+      <path d="M178.8 319.8A98 98 0 0 0 223.3 355.8"/>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,2135 @@
+//! 사이드바 행과 패널 렌더(OWE-576). 색·글꼴·치수는 `crate::ui` 토큰.
+//! MK-131: 호스트 섹션 헤더(`HostHeader`), 상태 점(`연결됨` / `연결 중` / `끊김`), 세션 수,
+//! 끊긴 호스트 흐리게 유지 + '다시 연결' 버튼.
+//! 호스트 섹션 헤더 배치 참고:
+//! `.ref/orca/src/renderer/src/components/sidebar/worktree-list/rows/HostSectionHeader.tsx`
+//! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
+
+use std::path::PathBuf;
+
+use gpui::{AnyElement, Context, Window, div, prelude::*, px, uniform_list};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::input::Input;
+use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
+use gpui_component::{Icon, IconName, Sizable as _};
+use krill_proto::control::{AgentProfile, Program};
+
+use super::{
+    Activate, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2, NewAgent3, NewAgent4,
+    OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP, ROW_HEIGHT, Rename, Row,
+    SelectNext, SelectPrev, Sidebar, Target, TogglePin, basename, state_text, text,
+};
+use crate::hosts::{HostId, HostStatus};
+use crate::ui;
+use crate::ui::status::{self, Size};
+
+#[derive(Clone)]
+struct TreeMenuMeta {
+    path: PathBuf,
+    pinned: bool,
+    is_primary: bool,
+    current_parent: Option<PathBuf>,
+    parent_candidates: Vec<(PathBuf, String)>,
+    descendant_count: usize,
+    sleeping: bool,
+}
+
+/// 행 컨텍스트 메뉴: 여기서 새 터미널·에이전트(N4), Open in(폴더가 있을 때), 워크트리면 핀·이름 변경·계보 작업(MK-176).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "context menu builder receives row state, host, worktree lineage meta, and gpui contexts"
+)]
+fn row_menu(
+    mut menu: PopupMenu,
+    this: &gpui::WeakEntity<Sidebar>,
+    host: &HostId,
+    folder: Option<&PathBuf>,
+    tree: Option<&TreeMenuMeta>,
+    agents: &[AgentProfile],
+    pr: Option<&crate::pull_request::Status>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    if let Some(folder) = folder {
+        let (term_this, term_host, term_folder) = (this.clone(), host.clone(), folder.clone());
+        menu = menu.item(
+            PopupMenuItem::new(text::NEW_TERMINAL.get())
+                .icon(IconName::SquareTerminal)
+                .on_click(move |_, window, cx| {
+                    term_this
+                        .update(cx, |s, cx| {
+                            s.new_session_on(
+                                term_host.clone(),
+                                term_folder.clone(),
+                                Program::Login,
+                                Some(window),
+                                cx,
+                            );
+                        })
+                        .ok();
+                }),
+        );
+        for profile in agents {
+            let (this, host, folder, id) = (
+                this.clone(),
+                host.clone(),
+                folder.clone(),
+                profile.id.clone(),
+            );
+            menu = menu.item(
+                PopupMenuItem::new(profile.name.clone())
+                    .icon(Icon::default().data(ui::icons::agent_svg_bytes(&id)))
+                    .on_click(move |_, window, cx| {
+                        this.update(cx, |s, cx| {
+                            s.new_session_on(
+                                host.clone(),
+                                folder.clone(),
+                                Program::Agent { id: id.clone() },
+                                Some(window),
+                                cx,
+                            );
+                        })
+                        .ok();
+                    }),
+            );
+        }
+        if host.is_local() {
+            menu = menu.separator();
+            for target in Target::ALL {
+                let (this, folder) = (this.clone(), folder.clone());
+                menu = menu.item(
+                    PopupMenuItem::new(format!("{}{}", target.label(), text::OPEN_IN.get()))
+                        .icon(IconName::ExternalLink)
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |s, cx| s.open_in(target, folder.clone(), cx))
+                                .ok();
+                        }),
+                );
+            }
+        }
+    }
+    if let Some(meta) = tree {
+        let (pin, edit) = (meta.path.clone(), meta.path.clone());
+        let (a, b) = (this.clone(), this.clone());
+        let (creator, create_path) = (this.clone(), meta.path.clone());
+        menu = menu
+            .item(
+                PopupMenuItem::new(
+                    pr.and_then(crate::pull_request::Status::guidance)
+                        .unwrap_or(crate::pull_request::CREATE.get()),
+                )
+                .disabled(pr.and_then(crate::pull_request::Status::guidance).is_some())
+                .on_click(move |_, _, cx| {
+                    creator
+                        .update(cx, |s, cx| s.create_pr(create_path.clone(), cx))
+                        .ok();
+                }),
+            )
+            .separator()
+            .item(
+                PopupMenuItem::new(text::PIN.get())
+                    .icon(IconName::Star)
+                    .checked(meta.pinned)
+                    .on_click(move |_, _, cx| {
+                        a.update(cx, |s, cx| s.toggle_pin(pin.clone(), cx)).ok();
+                    }),
+            )
+            .item(
+                PopupMenuItem::new(text::RENAME.get()).on_click(move |_, window, cx| {
+                    b.update(cx, |s, cx| s.rename(edit.clone(), window, cx))
+                        .ok();
+                }),
+            );
+
+        if host.is_local() {
+            let (child_this, child_parent) = (this.clone(), meta.path.clone());
+            menu = menu.separator().item(
+                PopupMenuItem::new(text::CREATE_CHILD_WORKTREE.get())
+                    .icon(IconName::Plus)
+                    .on_click(move |_, window, cx| {
+                        child_this
+                            .update(cx, |s, cx| {
+                                s.new_child_worktree(child_parent.clone(), window, cx);
+                            })
+                            .ok();
+                    }),
+            );
+
+            if !meta.parent_candidates.is_empty() {
+                let (sub_this, sub_path, candidates, cur_parent) = (
+                    this.clone(),
+                    meta.path.clone(),
+                    meta.parent_candidates.clone(),
+                    meta.current_parent.clone(),
+                );
+                menu = menu.submenu(
+                    text::SET_PARENT_WORKSPACE.get(),
+                    window,
+                    cx,
+                    move |mut sub, _, _| {
+                        for (cand_path, cand_label) in &candidates {
+                            let (this, child, parent) =
+                                (sub_this.clone(), sub_path.clone(), cand_path.clone());
+                            sub = sub.item(
+                                PopupMenuItem::new(cand_label.clone())
+                                    .checked(cur_parent.as_ref() == Some(cand_path))
+                                    .on_click(move |_, _, cx| {
+                                        this.update(cx, |s, cx| {
+                                            s.set_worktree_parent(
+                                                child.clone(),
+                                                parent.clone(),
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                    }),
+                            );
+                        }
+                        sub
+                    },
+                );
+            }
+
+            if meta.current_parent.is_some() {
+                let (rm_this, rm_path) = (this.clone(), meta.path.clone());
+                menu = menu.item(PopupMenuItem::new(text::REMOVE_PARENT.get()).on_click(
+                    move |_, _, cx| {
+                        rm_this
+                            .update(cx, |s, cx| {
+                                s.clear_worktree_parent(&rm_path, cx);
+                            })
+                            .ok();
+                    },
+                ));
+            }
+
+            menu = menu.separator();
+            if meta.sleeping {
+                let (wake_this, wake_path) = (this.clone(), meta.path.clone());
+                menu = menu.item(PopupMenuItem::new(text::WAKE_WORKTREE.get()).on_click(
+                    move |_, _, cx| {
+                        wake_this
+                            .update(cx, |s, cx| s.wake_worktree(&wake_path, cx))
+                            .ok();
+                    },
+                ));
+            } else {
+                let (sleep_this, sleep_path) = (this.clone(), meta.path.clone());
+                menu = menu.item(PopupMenuItem::new(text::SLEEP_WORKTREE.get()).on_click(
+                    move |_, _, cx| {
+                        sleep_this
+                            .update(cx, |s, cx| s.sleep_worktree(sleep_path.clone(), cx))
+                            .ok();
+                    },
+                ));
+            }
+
+            if meta.descendant_count > 0 {
+                let (sleep_all_this, sleep_all_path) = (this.clone(), meta.path.clone());
+                let label = text::SLEEP_WITH_DESCENDANTS
+                    .format(&[("n", &meta.descendant_count.to_string())]);
+                menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                    sleep_all_this
+                        .update(cx, |s, cx| {
+                            s.sleep_with_descendants(sleep_all_path.clone(), cx);
+                        })
+                        .ok();
+                }));
+            }
+
+            if !meta.is_primary || meta.descendant_count > 0 {
+                menu = menu.separator();
+                if !meta.is_primary {
+                    let (del_this, del_path) = (this.clone(), meta.path.clone());
+                    menu = menu.item(
+                        PopupMenuItem::new(text::DELETE_WORKTREE.get())
+                            .icon(IconName::Delete)
+                            .on_click(move |_, _, cx| {
+                                del_this
+                                    .update(cx, |s, cx| {
+                                        s.delete_worktree(del_path.clone(), false, cx);
+                                    })
+                                    .ok();
+                            }),
+                    );
+                }
+                if meta.descendant_count > 0 {
+                    let (del_all_this, del_all_path) = (this.clone(), meta.path.clone());
+                    let label = text::DELETE_WITH_DESCENDANTS
+                        .format(&[("n", &meta.descendant_count.to_string())]);
+                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Delete).on_click(
+                        move |_, _, cx| {
+                            del_all_this
+                                .update(cx, |s, cx| {
+                                    s.delete_with_descendants(del_all_path.clone(), false, cx);
+                                })
+                                .ok();
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    menu
+}
+
+impl Sidebar {
+    /// MK-078: 행마다 스크린 리더 역할(목록 항목)·이름·"n개 중 m번째"를 붙인다. 가상 리스트라 위치는 직접 알린다.
+    pub(super) fn render_row(
+        &self,
+        index: usize,
+        row: &Row,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = ui::palette(cx);
+        let selected = self.cursor == Some(index);
+        let dimmed = self.is_row_dimmed(index);
+        let row_host = self.row_host(index).clone();
+        let base = div()
+            .id(index)
+            .group(ROW_GROUP)
+            .role(gpui::Role::ListItem)
+            .aria_position_in_set(index + 1)
+            .aria_size_of_set(self.rows.len())
+            .aria_selected(selected)
+            .flex_none()
+            .overflow_hidden()
+            .when(dimmed, |d| d.opacity(0.45));
+        let single_line = |d: gpui::Stateful<gpui::Div>| {
+            d.h(px(ROW_HEIGHT))
+                .px_2()
+                .mx_1()
+                .rounded(ui::RADIUS_SM)
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_size(ui::TEXT_SM)
+                .when(selected, |d| d.bg(p.sidebar_accent))
+        };
+        let heading = |d: gpui::Stateful<gpui::Div>| {
+            single_line(d)
+                .text_size(ui::TEXT_XS)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(p.muted_foreground)
+        };
+        let repo_heading = |d: gpui::Stateful<gpui::Div>| {
+            d.h(px(28.))
+                .px_2()
+                .mx_1()
+                .rounded(ui::RADIUS_SM)
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .text_size(ui::TEXT_MD)
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(p.sidebar_foreground)
+                .when(selected, |d| d.bg(p.sidebar_accent))
+        };
+        match row {
+            Row::HostHeader {
+                host,
+                label,
+                status,
+                sessions,
+            } => {
+                let info = host.remote_id().and_then(|id| self.remote_info.get(id));
+                let detail = info.and_then(|i| i.detail.clone());
+                let error = info.and_then(|i| i.error.clone());
+                let closed = self.collapsed_hosts.contains(host);
+                let (dot_color, status_label) = match status {
+                    HostStatus::Connected => (p.success, text::HOST_CONNECTED.get()),
+                    HostStatus::Connecting => (p.warning, text::HOST_CONNECTING.get()),
+                    HostStatus::Disconnected => (p.destructive, text::HOST_DISCONNECTED.get()),
+                };
+                let fold_host = host.clone();
+                let header_key = host.as_key().to_owned();
+                let status_key = header_key.clone();
+                let count_key = header_key.clone();
+                let detail_key = header_key.clone();
+                let error_key = header_key.clone();
+                let a11y = format!(
+                    "{label}, {status_label}, {} {sessions}",
+                    text::SESSIONS.get()
+                );
+                heading(base)
+                    .debug_selector(move || format!("host-header-{header_key}"))
+                    .aria_label(a11y)
+                    .aria_expanded(!closed)
+                    .cursor_pointer()
+                    .pl_1()
+                    .pr_1p5()
+                    .hover(|d| d.bg(p.sidebar_accent))
+                    .child(
+                        Button::new(("host-fold", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(if closed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if closed {
+                                text::UNFOLD.get()
+                            } else {
+                                text::FOLD.get()
+                            })
+                            .on_click({
+                                let fold_host = fold_host.clone();
+                                cx.listener(move |s, _, _, cx| {
+                                    cx.stop_propagation();
+                                    s.fold_host(&fold_host, None, cx);
+                                })
+                            }),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("host-status-{status_key}"))
+                            .size(px(6.))
+                            .rounded_full()
+                            .flex_none()
+                            .bg(dot_color),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.sidebar_foreground)
+                            .child(div().truncate().child(label.clone()))
+                            .when_some(detail, |d, detail| {
+                                d.child(
+                                    div()
+                                        .debug_selector(move || format!("host-route-{detail_key}"))
+                                        .text_size(ui::TEXT_2XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(detail),
+                                )
+                            })
+                            .when_some(error, |d, error| {
+                                d.child(
+                                    div()
+                                        .debug_selector(move || format!("host-error-{error_key}"))
+                                        .truncate()
+                                        .text_size(ui::TEXT_2XS)
+                                        .text_color(p.destructive)
+                                        .child(error),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(status_label),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("host-count-{count_key}"))
+                            .flex_none()
+                            .px_1()
+                            .rounded(ui::RADIUS_XS)
+                            .bg(p.muted)
+                            .font_family(ui::FONT_MONO)
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(sessions.to_string()),
+                    )
+                    .when(
+                        *status == HostStatus::Disconnected && host.is_remote(),
+                        |d| {
+                            let reconnect_host = host.clone();
+                            let reconnect_key = host.as_key().to_owned();
+                            d.child(
+                                Button::new(("host-reconnect", index))
+                                    .debug_selector(move || {
+                                        format!("host-reconnect-{reconnect_key}")
+                                    })
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::RefreshCw)
+                                    .label(text::HOST_RECONNECT.get())
+                                    .accessibility_label(text::HOST_RECONNECT.get())
+                                    .tooltip(text::HOST_RECONNECT.get())
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.reconnect_host(reconnect_host.clone(), cx);
+                                    })),
+                            )
+                        },
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.cursor = Some(index);
+                        s.fold_host(&fold_host, None, cx);
+                    }))
+            }
+            Row::GroupHeader { key, count } => {
+                let closed = self.collapsed_groups.contains(key);
+                let slug = key.slug();
+                let count_slug = slug;
+                let group_key = *key;
+                let label = key.label();
+                heading(base)
+                    .debug_selector(move || format!("group-header-{slug}"))
+                    .aria_label(format!("{label} ({count})"))
+                    .aria_expanded(!closed)
+                    .cursor_pointer()
+                    .pl_1()
+                    .pr_1p5()
+                    .hover(|d| d.bg(p.sidebar_accent))
+                    .child(
+                        Button::new(("group-fold", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(if closed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if closed {
+                                text::UNFOLD.get()
+                            } else {
+                                text::FOLD.get()
+                            })
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                cx.stop_propagation();
+                                s.fold_group(group_key, None, cx);
+                            })),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.sidebar_foreground)
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(move || format!("group-count-{count_slug}"))
+                            .flex_none()
+                            .px_1()
+                            .rounded(ui::RADIUS_XS)
+                            .bg(p.muted)
+                            .font_family(ui::FONT_MONO)
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(count.to_string()),
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.cursor = Some(index);
+                        s.fold_group(group_key, None, cx);
+                    }))
+            }
+            Row::NeedsYou => heading(base)
+                .aria_label(text::NEEDS_YOU.get())
+                .text_color(p.agent_question)
+                .child(Icon::new(IconName::Bell).xsmall())
+                .child(text::NEEDS_YOU.get()),
+            Row::Loose => heading(base)
+                .aria_label(text::SESSIONS.get())
+                .child(Icon::new(IconName::SquareTerminal).xsmall())
+                .child(text::SESSIONS.get()),
+            Row::Repository(path) => {
+                let repo = path.clone();
+                repo_heading(base)
+                    .aria_label(format!("{} {}", text::REPOSITORY.get(), basename(path)))
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .with_size(px(14.))
+                            .text_color(p.muted_foreground),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(basename(path)))
+                    .when(row_host.is_local(), |d| {
+                        d.child(
+                            div()
+                                .invisible()
+                                .group_hover(ROW_GROUP, Styled::visible)
+                                .child(
+                                    Button::new(("new-worktree", index))
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .accessibility_label(text::NEW_WORKTREE.get())
+                                        .tooltip(text::NEW_WORKTREE.get())
+                                        .on_click(cx.listener(move |s, _, window, cx| {
+                                            s.new_worktree(repo.clone(), window, cx);
+                                        })),
+                                ),
+                        )
+                    })
+            }
+            Row::Folder(path) => {
+                let (fold, fresh, fresh_host) = (path.clone(), path.clone(), row_host.clone());
+                let closed = self.collapsed.contains(path);
+                repo_heading(base)
+                    .aria_label(format!("{} {}", text::FOLDER.get(), basename(path)))
+                    .aria_expanded(!closed)
+                    .cursor_pointer()
+                    .child(
+                        Icon::new(IconName::Folder)
+                            .with_size(px(14.))
+                            .text_color(p.muted_foreground),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(basename(path)))
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover(ROW_GROUP, Styled::visible)
+                            .child(
+                                Button::new(("folder-new-session", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Plus)
+                                    .accessibility_label(text::NEW_TERMINAL.get())
+                                    .tooltip(text::NEW_TERMINAL.get())
+                                    .on_click(cx.listener(move |s, _, window, cx| {
+                                        s.new_session_on(
+                                            fresh_host.clone(),
+                                            fresh.clone(),
+                                            Program::Login,
+                                            Some(window),
+                                            cx,
+                                        );
+                                    })),
+                            ),
+                    )
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.cursor = Some(index);
+                        s.fold(&fold, None, cx);
+                    }))
+            }
+            Row::HiddenWorktrees(repo, count, expanded) => {
+                super::external::render_hidden_row(base, repo, *count, *expanded, cx)
+            }
+            Row::Worktree(path) => self.render_worktree(base, index, path, cx),
+            Row::Session(session, nested) => {
+                let id = session.id;
+                let unread = row_host.is_local() && self.is_unread(id);
+                let state = state_text(session.status.state);
+                let (name, detail) = self.session_label(session);
+                let badge = session
+                    .status
+                    .badge()
+                    .map(|_| crate::i18n::catalog::general::INFERRED.get());
+                // OWE-707: 실행 당시 계정 배지(라벨 축약 2자, 툴팁 전체 이름).
+                // OWE-662 상태 글리프·에이전트 아이콘 옆이 아니라 행 끝 배지들과 함께 둬
+                // 좁은 행에서도 이름이 밀리지 않게 한다. 이어가기 칩은 OWE-699까지 숨긴다.
+                let account_label = session
+                    .account
+                    .as_ref()
+                    .map(|a| a.label.trim())
+                    .filter(|l| !l.is_empty());
+                let app_settings = crate::settings::current(cx);
+                let session_cache_secs = app_settings
+                    .prompt_cache_timer_enabled
+                    .then(|| {
+                        status::session_cache_remaining_secs(
+                            &session.status.agent,
+                            session.status.state,
+                            session.status.since_unix_ns,
+                            self.now_unix_ns(),
+                            app_settings.prompt_cache_ttl_secs,
+                        )
+                    })
+                    .flatten();
+                single_line(base)
+                    .h(px(if *nested { 26. } else { ROW_HEIGHT }))
+                    .aria_label(format!(
+                        "{name}{}, {state}{}{}{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {detail}")
+                        },
+                        account_label
+                            .map(|l| {
+                                crate::i18n::catalog::sidebar::SESSION_ACCOUNT
+                                    .format(&[("label", l)])
+                            })
+                            .map(|b| format!(", {b}"))
+                            .unwrap_or_default(),
+                        badge.map(|b| format!(", {b}")).unwrap_or_default(),
+                        if unread {
+                            format!(", {}", text::UNREAD.get())
+                        } else {
+                            String::new()
+                        }
+                    ))
+                    .when(*nested, |d| d.pl(px(30.)).pr_2())
+                    .cursor_pointer()
+                    .text_color(p.sidebar_foreground)
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .child(status::status_glyph(
+                        session.status.state,
+                        unread,
+                        Size::Sm,
+                        cx,
+                    ))
+                    .child(status::agent_icon(
+                        &session.status.agent,
+                        12.,
+                        p.muted_foreground,
+                    ))
+                    .child(
+                        div()
+                            .flex_none()
+                            .max_w_3_4()
+                            .truncate()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(detail),
+                    )
+                    .children(
+                        row_host
+                            .is_local()
+                            .then(|| {
+                                super::external::session_orch_badge(self.path.as_deref(), id.0)
+                            })
+                            .flatten()
+                            .map(|ob| {
+                                div()
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded(ui::RADIUS_XS)
+                                    .bg(p.muted)
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(p.accent_foreground)
+                                    .child(ob)
+                            }),
+                    )
+                    .children(session_cache_secs.map(|secs| {
+                        let tip = text::CACHE_TIMER_TOOLTIP.get().to_owned();
+                        div()
+                            .id(("session-cache-timer", index))
+                            .aria_label(format!(
+                                "{}: {}",
+                                tip,
+                                status::format_cache_countdown(secs)
+                            ))
+                            .debug_selector(move || format!("session-cache-timer-{index}"))
+                            .flex_none()
+                            .child(status::cache_timer_chip(secs, cx))
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                            })
+                    }))
+                    .children(account_label.map(|l| {
+                        let short = status::abbreviate_account_label(l);
+                        let full = l.to_owned();
+                        let tip = text::SESSION_ACCOUNT.format(&[("label", &full)]);
+                        div()
+                            .id(("account-badge", index))
+                            .aria_label(tip.clone())
+                            .debug_selector(move || format!("account-badge-{index}"))
+                            .flex_none()
+                            .px_1()
+                            .rounded(ui::RADIUS_XS)
+                            .bg(p.muted)
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(short)
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                            })
+                    }))
+                    .children(badge.map(|b| {
+                        div()
+                            .flex_none()
+                            .px_1p5()
+                            .rounded(ui::RADIUS_XS)
+                            .bg(p.muted)
+                            .text_size(ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(b)
+                    }))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.select_session(index, id, cx);
+                    }))
+            }
+        }
+    }
+
+    fn render_worktree(
+        &self,
+        base: gpui::Stateful<gpui::Div>,
+        index: usize,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use krill_proto::control::AgentState;
+
+        let p = ui::palette(cx);
+        let selected = self.cursor == Some(index);
+        let row_host = self.row_host(index).clone();
+        let is_default_tree = self.snapshot_for(&row_host).trees.contains_key(path);
+        let is_first_default = self
+            .snapshot_for(&row_host)
+            .trees
+            .keys()
+            .next()
+            .is_some_and(|first| first == path);
+        let focused_wt = self.focused.and_then(|id| self.folder(id)).filter(|wt| {
+            self.snapshot_for(&row_host)
+                .trees
+                .values()
+                .any(|list| list.iter().any(|t| t == wt))
+        });
+        let is_active_worktree = selected
+            || focused_wt == Some(path)
+            || (focused_wt.is_none() && self.cursor.is_none() && is_first_default);
+        let (fold, pin, edit, fresh, card_path, fresh_host) = (
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            path.to_path_buf(),
+            row_host.clone(),
+        );
+        let closed = self.collapsed.contains(path);
+        let card_expanded = self.expanded_cards.contains(path);
+        let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
+        let name = self.name(path);
+        // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
+        let branch = self
+            .branch_on(&row_host, path)
+            .filter(|b| *b != name)
+            .map(str::to_owned);
+        let custom_name = self
+            .prefs
+            .get(path)
+            .map(|v| v.name.as_str())
+            .filter(|s| !s.is_empty());
+        let raw_branch = self.branch_on(&row_host, path);
+        let folder_name = basename(path);
+        let auto_title = row_host
+            .is_local()
+            .then(|| self.worktree_auto_title(path))
+            .flatten();
+        let card_title = if let Some(custom) =
+            custom_name.filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n))
+        {
+            custom.to_owned()
+        } else if is_default_tree {
+            raw_branch.unwrap_or(&folder_name).to_owned()
+        } else if let Some(b) =
+            raw_branch.filter(|b| !krill_proto::git::is_default_branch_or_worktree_name(b))
+        {
+            b.rsplit('/').next().unwrap_or(b).replace('-', " ")
+        } else if let Some(auto) = auto_title {
+            auto.to_owned()
+        } else if let Some(custom) = custom_name {
+            custom.to_owned()
+        } else if let Some(b) = raw_branch {
+            b.rsplit('/').next().unwrap_or(b).replace('-', " ")
+        } else {
+            folder_name.replace('-', " ")
+        };
+        let branch_subtitle = raw_branch.map_or_else(|| folder_name, str::to_owned);
+        let dirty = self
+            .meta_for(&row_host)
+            .get(path)
+            .and_then(|m| m.dirty)
+            .filter(|n| *n > 0);
+        let (summary, unread) = self.tree_summary_on(&row_host, path);
+        let tree_sessions: Vec<_> = self
+            .snapshot_for(&row_host)
+            .sessions
+            .iter()
+            .filter(|s| s.worktree.as_deref() == Some(path))
+            .collect();
+        let tree_session_count = tree_sessions.len();
+        let states = summary
+            .groups
+            .iter()
+            .map(|g| state_text(g.state).to_owned())
+            .chain(unread.then(|| text::UNREAD.get().to_owned()))
+            .collect::<Vec<_>>();
+        let comment = row_host.is_local().then(|| self.comment(path)).flatten();
+        let checkpoint_badge = row_host
+            .is_local()
+            .then(|| super::external::checkpoint_badge_for(self.path.as_deref(), path))
+            .flatten();
+        let mut label = super::external::worktree_a11y_label(text::TITLE.get(), &name, comment);
+        for part in [
+            branch.clone(),
+            checkpoint_badge.clone(),
+            dirty.map(|n| format!("{} {n}", text::DIRTY.get())),
+        ]
+        .into_iter()
+        .flatten()
+        .chain(states)
+        {
+            label.push_str(", ");
+            label.push_str(&part);
+        }
+        let hover_only = |d: gpui::Div| d.invisible().group_hover(ROW_GROUP, Styled::visible);
+
+        // 500행 가상화 벤치마크 모드: 고정 높이(ROW_HEIGHT) 1줄 행.
+        if self.rows.len() >= 100 {
+            return base
+                .aria_label(label)
+                .aria_expanded(!closed)
+                .h(px(ROW_HEIGHT))
+                .pl_1()
+                .pr_1p5()
+                .mx_1()
+                .rounded(ui::RADIUS_SM)
+                .flex()
+                .items_center()
+                .gap_1()
+                .text_size(ui::TEXT_SM)
+                .text_color(p.worktree_sidebar_foreground)
+                .child(div().flex_1().min_w_0().truncate().child(name));
+        }
+
+        let left_status = if unread {
+            status::status_glyph(AgentState::Done, true, Size::Md, cx).into_any_element()
+        } else if let Some(top) = summary.groups.first().filter(|g| {
+            matches!(
+                g.state,
+                AgentState::Waiting | AgentState::Blocked | AgentState::Working
+            )
+        }) {
+            status::status_glyph(top.state, false, Size::Md, cx).into_any_element()
+        } else {
+            div()
+                .size(px(7.))
+                .rounded_full()
+                .bg(p.success)
+                .into_any_element()
+        };
+
+        let new_session_btn = {
+            let button = Button::new(("new-session", index))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Plus)
+                .accessibility_label(text::NEW_TERMINAL.get())
+                .tooltip(text::NEW_TERMINAL.get())
+                .on_click(cx.listener(move |s, _, window, cx| {
+                    cx.stop_propagation();
+                    s.new_session_on(
+                        fresh_host.clone(),
+                        fresh.clone(),
+                        Program::Login,
+                        Some(window),
+                        cx,
+                    );
+                }));
+            let frame = div().flex_none();
+            #[cfg(test)]
+            let frame = frame.debug_selector(|| format!("worktree-new-session-{index}"));
+            hover_only(frame).child(button)
+        };
+
+        let pin_btn = div().flex_none().flex().when(!pinned, hover_only).child(
+            Button::new(("pin", index))
+                .ghost()
+                .xsmall()
+                .icon(if pinned {
+                    IconName::StarFill
+                } else {
+                    IconName::Star
+                })
+                .accessibility_label(text::PIN.get())
+                .toggled(pinned)
+                .tooltip(text::PIN.get())
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    cx.stop_propagation();
+                    s.toggle_pin(pin.clone(), cx);
+                })),
+        );
+
+        let rename_btn = hover_only(div().flex_none()).child(
+            Button::new(("rename", index))
+                .ghost()
+                .xsmall()
+                .icon(IconName::Ellipsis)
+                .accessibility_label(text::RENAME.get())
+                .tooltip(text::RENAME.get())
+                .on_click(cx.listener(move |s, _, window, cx| {
+                    cx.stop_propagation();
+                    s.rename(edit.clone(), window, cx);
+                })),
+        );
+
+        let dirty_badge = dirty.map(|n| {
+            let dirty_label = text::DIRTY_COUNT.format(&[("n", &n.to_string())]);
+            div()
+                .id(("dirty-badge", index))
+                .aria_label(dirty_label.clone())
+                .debug_selector(move || format!("dirty-badge-{index}"))
+                .flex_none()
+                .px_1()
+                .rounded(ui::RADIUS_XS)
+                .font_family(ui::FONT_MONO)
+                .text_size(ui::TEXT_2XS)
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(p.warning)
+                .child(format!("±{n}"))
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(dirty_label.clone()).build(window, cx)
+                })
+        });
+
+        let props = self.options.card_properties;
+        let pr_badge = props
+            .pr
+            .then(|| {
+                self.prs
+                    .get(path)
+                    .and_then(crate::pull_request::Status::badge)
+            })
+            .flatten()
+            .map(|badge| {
+                div()
+                    .id(("pr-badge", index))
+                    .role(gpui::Role::Status)
+                    .aria_label(badge)
+                    .debug_selector(move || format!("pr-badge-{index}"))
+                    .flex_none()
+                    .px_1()
+                    .rounded(ui::RADIUS_XS)
+                    .bg(p.muted)
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(badge)
+            });
+
+        let app_settings = crate::settings::current(cx);
+        let worktree_cache_badge = app_settings
+            .prompt_cache_timer_enabled
+            .then(|| {
+                status::worktree_most_urgent_cache_remaining_secs(
+                    tree_sessions.iter().map(|s| {
+                        (
+                            s.status.agent.as_str(),
+                            s.status.state,
+                            s.status.since_unix_ns,
+                        )
+                    }),
+                    self.now_unix_ns(),
+                    app_settings.prompt_cache_ttl_secs,
+                )
+            })
+            .flatten()
+            .map(|secs| {
+                let tip = text::CACHE_TIMER_TOOLTIP.get().to_owned();
+                div()
+                    .id(("worktree-cache-timer", index))
+                    .aria_label(format!("{}: {}", tip, status::format_cache_countdown(secs)))
+                    .debug_selector(move || format!("worktree-cache-timer-{index}"))
+                    .flex_none()
+                    .child(status::cache_timer_chip(secs, cx))
+                    .tooltip(move |window, cx| {
+                        gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                    })
+            });
+
+        let issue_badge = props
+            .issue
+            .then(|| self.issue_for(path))
+            .flatten()
+            .map(|iss| {
+                div()
+                    .id(("issue-badge", index))
+                    .role(gpui::Role::Status)
+                    .aria_label(iss.clone())
+                    .debug_selector(move || format!("issue-badge-{index}"))
+                    .flex_none()
+                    .px_1()
+                    .rounded(ui::RADIUS_XS)
+                    .bg(p.muted)
+                    .font_family(ui::FONT_MONO)
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(p.accent_foreground)
+                    .child(iss)
+            });
+
+        let ports_list = if props.ports {
+            self.ports_for(&row_host, path)
+        } else {
+            Vec::new()
+        };
+        let ports_badge = (!ports_list.is_empty()).then(|| {
+            let text_str = ports_list
+                .iter()
+                .map(|port| format!(":{port}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            div()
+                .id(("ports-badge", index))
+                .role(gpui::Role::Status)
+                .aria_label(text_str.clone())
+                .debug_selector(move || format!("ports-badge-{index}"))
+                .flex_none()
+                .px_1()
+                .rounded(ui::RADIUS_XS)
+                .bg(p.muted)
+                .font_family(ui::FONT_MONO)
+                .text_size(ui::TEXT_2XS)
+                .text_color(p.success)
+                .child(text_str)
+        });
+
+        let host_badge = props
+            .host
+            .then(|| self.host_badge_for(&row_host, path))
+            .flatten()
+            .map(|hb| {
+                div()
+                    .id(("host-badge", index))
+                    .role(gpui::Role::Status)
+                    .aria_label(hb.clone())
+                    .debug_selector(move || format!("host-badge-{index}"))
+                    .flex_none()
+                    .px_1()
+                    .rounded(ui::RADIUS_XS)
+                    .bg(p.muted)
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(hb)
+            });
+
+        let visible_comment = props.comment.then_some(comment).flatten();
+        let has_agent_pill = !summary.groups.is_empty() || tree_session_count > 0;
+        let has_line3 = visible_comment.is_some() || has_agent_pill;
+
+        let lineage_depth = if row_host.is_local() {
+            self.lineage_depth(path)
+        } else {
+            0
+        };
+        let lineage_child_count = if row_host.is_local() {
+            self.lineage_children(path).len()
+        } else {
+            0
+        };
+        let lineage_collapsed = row_host.is_local() && self.is_lineage_collapsed(path);
+        let depth_px = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
+        let left_margin = px(6. + depth_px * 14.);
+        let lineage_toggle_btn = (lineage_child_count > 0).then(|| {
+            let fold_path = path.to_path_buf();
+            let count_str = lineage_child_count.to_string();
+            let tip = if lineage_collapsed {
+                text::UNFOLD_CHILDREN.format(&[("n", &count_str)])
+            } else {
+                text::FOLD_CHILDREN.format(&[("n", &count_str)])
+            };
+            div()
+                .id(("lineage-fold", index))
+                .debug_selector(move || format!("worktree-lineage-toggle-{index}"))
+                .aria_label(tip.clone())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .px_1()
+                .py(px(1.))
+                .rounded(ui::RADIUS_XS)
+                .bg(p.muted)
+                .hover(|d| d.bg(p.sidebar_accent))
+                .text_size(ui::TEXT_2XS)
+                .font_family(ui::FONT_MONO)
+                .text_color(p.muted_foreground)
+                .cursor_pointer()
+                .child(
+                    Icon::new(if lineage_collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .with_size(px(10.))
+                    .text_color(p.muted_foreground),
+                )
+                .child(count_str)
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    cx.stop_propagation();
+                    s.toggle_lineage(&fold_path, cx);
+                }))
+        });
+
+        if self.options.card_layout == super::CardLayout::Compact {
+            let compact_path = card_path.clone();
+            let compact_fold = fold.clone();
+            return base
+                .debug_selector(move || format!("worktree-card-{index}"))
+                .aria_label(label)
+                .aria_expanded(!closed)
+                .h(px(28.))
+                .mr_1p5()
+                .ml(left_margin)
+                .my_0p5()
+                .px_2p5()
+                .rounded(ui::RADIUS_MD)
+                .border_1()
+                .when(is_active_worktree, |d| {
+                    d.bg(p.worktree_sidebar)
+                        .border_color(p.sidebar_ring.opacity(0.65))
+                })
+                .when(!is_active_worktree, |d| {
+                    let d = d
+                        .border_color(gpui::transparent_black())
+                        .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
+                    if lineage_depth > 0 {
+                        d.border_l_2().border_color(p.worktree_sidebar_border)
+                    } else {
+                        d
+                    }
+                })
+                .text_color(p.worktree_sidebar_foreground)
+                .cursor_pointer()
+                .relative()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .child(
+                    div()
+                        .w(px(14.))
+                        .h(px(14.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(left_status),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(card_title),
+                        )
+                        .children(lineage_toggle_btn)
+                        .when(props.branch, |d| {
+                            d.child(
+                                div()
+                                    .debug_selector(move || format!("worktree-branch-{index}"))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(branch_subtitle),
+                            )
+                        })
+                        .when_some(visible_comment, |d, cm| {
+                            d.child(
+                                div()
+                                    .debug_selector(move || format!("worktree-comment-{index}"))
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(cm.to_owned()),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .children(host_badge)
+                        .children(issue_badge)
+                        .children(ports_badge)
+                        .children(dirty_badge)
+                        .children(pr_badge)
+                        .when(has_agent_pill, |d| {
+                            d.child(
+                                div()
+                                    .id(("fold", index))
+                                    .cursor_pointer()
+                                    .child(
+                                        Icon::new(if card_expanded {
+                                            IconName::ChevronDown
+                                        } else {
+                                            IconName::ChevronRight
+                                        })
+                                        .with_size(px(12.))
+                                        .text_color(p.muted_foreground),
+                                    )
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.toggle_card_sessions(&compact_fold, cx);
+                                    })),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .right_2()
+                        .top_0()
+                        .h(px(28.))
+                        .flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(new_session_btn)
+                        .child(pin_btn)
+                        .child(rename_btn),
+                )
+                .on_click(cx.listener(move |s, _, window, cx| {
+                    s.cursor = Some(index);
+                    if let Some(sess) = s
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .find(|sess| sess.worktree.as_ref() == Some(&compact_path))
+                    {
+                        cx.emit(super::Selected(sess.id));
+                        cx.notify();
+                    } else {
+                        s.new_session(compact_path.clone(), Program::Login, Some(window), cx);
+                    }
+                }));
+        }
+
+        base.debug_selector(move || format!("worktree-card-{index}"))
+            .aria_label(label)
+            .aria_expanded(!closed)
+            .mr_1p5()
+            .ml(left_margin)
+            .my_0p5()
+            .px_2p5()
+            .py_1p5()
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .when(is_active_worktree, |d| {
+                d.bg(p.worktree_sidebar)
+                    .border_color(p.sidebar_ring.opacity(0.65))
+            })
+            .when(!is_active_worktree, |d| {
+                let d = d
+                    .border_color(gpui::transparent_black())
+                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
+                if lineage_depth > 0 {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                } else {
+                    d
+                }
+            })
+            .text_color(p.worktree_sidebar_foreground)
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 + 자식 접기/펼치기 버튼 + 호버 액션 버튼 오버레이
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(20.))
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(left_status),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_MD)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(card_title),
+                            )
+                            .when(is_default_tree, |d| {
+                                d.child(
+                                    div()
+                                        .flex_none()
+                                        .px_1p5()
+                                        .py(px(1.))
+                                        .rounded(ui::RADIUS_XS)
+                                        .border_1()
+                                        .border_color(p.worktree_sidebar_border)
+                                        .text_size(ui::TEXT_2XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(crate::i18n::catalog::general::DEFAULT.get()),
+                                )
+                            })
+                            .children(lineage_toggle_btn),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .right_0()
+                            .top_0()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(new_session_btn)
+                            .child(pin_btn)
+                            .child(rename_btn),
+                    ),
+            )
+            // 2행: 들여쓴 브랜치 이름 + 체크포인트·캐시 타이머·호스트·이슈·포트·미커밋·PR 배지
+            .child(
+                div()
+                    .w_full()
+                    .h(px(18.))
+                    .pl(px(20.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_1p5()
+                    .child(div().flex_1().min_w_0().when(props.branch, |d| {
+                        d.debug_selector(move || format!("worktree-branch-{index}"))
+                            .truncate()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(branch_subtitle)
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .children(checkpoint_badge.map(|cb| {
+                                div()
+                                    .flex_none()
+                                    .max_w(px(88.))
+                                    .truncate()
+                                    .px_1()
+                                    .rounded(ui::RADIUS_XS)
+                                    .bg(p.muted)
+                                    .font_family(ui::FONT_MONO)
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(p.accent_foreground)
+                                    .child(cb)
+                            }))
+                            .children(worktree_cache_badge)
+                            .children(host_badge)
+                            .children(issue_badge)
+                            .children(ports_badge)
+                            .children(dirty_badge)
+                            .children(pr_badge),
+                    ),
+            )
+            // 3행: 코멘트 또는 에이전트 상태 요약(1개 세션이면 인라인 요약 줄, 다중 세션이면 알약 바)
+            .when(has_line3, |d| {
+                let single_session = if tree_session_count == 1 && !card_expanded {
+                    tree_sessions.first().copied()
+                } else {
+                    None
+                };
+                d.child(
+                    div()
+                        .w_full()
+                        .pl(px(20.))
+                        .pt_0p5()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .children(
+                            super::external::render_comment(visible_comment, p.muted_foreground)
+                                .map(|el| {
+                                    div()
+                                        .debug_selector(move || format!("worktree-comment-{index}"))
+                                        .child(el)
+                                }),
+                        )
+                        .when(has_agent_pill, |d| {
+                            if let Some(sess) = single_session {
+                                let (sess_name, _) = self.session_label(sess);
+                                let sess_unread = self.is_unread(sess.id);
+                                d.child(
+                                    div()
+                                        .id(("fold", index))
+                                        .w_full()
+                                        .h(px(20.))
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .cursor_pointer()
+                                        .child(status::status_glyph(
+                                            sess.status.state,
+                                            sess_unread,
+                                            Size::Sm,
+                                            cx,
+                                        ))
+                                        .child(status::agent_icon(
+                                            &sess.status.agent,
+                                            13.,
+                                            p.muted_foreground,
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .text_size(ui::TEXT_XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(sess_name),
+                                        )
+                                        .on_click(cx.listener(move |s, _, _, cx| {
+                                            cx.stop_propagation();
+                                            s.toggle_card_sessions(&fold, cx);
+                                        })),
+                                )
+                            } else {
+                                d.child(
+                                    div()
+                                        .id(("fold", index))
+                                        .w_full()
+                                        .h(px(25.))
+                                        .px_1p5()
+                                        .rounded(px(5.))
+                                        .border_1()
+                                        .border_color(p.worktree_sidebar_border)
+                                        .bg(if is_active_worktree {
+                                            p.sidebar.opacity(0.75)
+                                        } else {
+                                            p.sidebar_accent.opacity(0.65)
+                                        })
+                                        .hover(|d| d.bg(p.sidebar_accent))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .cursor_pointer()
+                                        .child(if summary.groups.is_empty() {
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded(ui::RADIUS_XS)
+                                                .bg(p.worktree_sidebar_accent.opacity(0.65))
+                                                .child(status::status_glyph(
+                                                    AgentState::Unknown,
+                                                    unread,
+                                                    Size::Sm,
+                                                    cx,
+                                                ))
+                                                .child(status::agent_icon(
+                                                    "",
+                                                    13.,
+                                                    p.muted_foreground,
+                                                ))
+                                                .when(tree_session_count > 1, |d| {
+                                                    d.child(
+                                                        div()
+                                                            .text_size(ui::TEXT_2XS)
+                                                            .text_color(p.muted_foreground)
+                                                            .child(format!(
+                                                                "+{}",
+                                                                tree_session_count - 1
+                                                            )),
+                                                    )
+                                                })
+                                                .into_any_element()
+                                        } else {
+                                            status::summary_element(&summary, cx).into_any_element()
+                                        })
+                                        .child(
+                                            Icon::new(if card_expanded {
+                                                IconName::ChevronDown
+                                            } else {
+                                                IconName::ChevronRight
+                                            })
+                                            .with_size(px(12.))
+                                            .text_color(p.muted_foreground),
+                                        )
+                                        .on_click(cx.listener(move |s, _, _, cx| {
+                                            cx.stop_propagation();
+                                            s.toggle_card_sessions(&fold, cx);
+                                        })),
+                                )
+                            }
+                        }),
+                )
+            })
+            .on_click(cx.listener(move |s, _, window, cx| {
+                s.cursor = Some(index);
+                if let Some(sess) = s
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .find(|sess| sess.worktree.as_ref() == Some(&card_path))
+                {
+                    cx.emit(super::Selected(sess.id));
+                    cx.notify();
+                } else {
+                    s.new_session(card_path.clone(), Program::Login, Some(window), cx);
+                }
+            }))
+    }
+
+    /// 행 + 우클릭 메뉴(여기서 새 터미널·에이전트·Open in·핀·이름 변경·계보 작업).
+    fn render_row_with_menu(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
+        let element = self.render_row(index, row, cx);
+        let host = self.row_host(index).clone();
+        let (folder, tree) = match row {
+            Row::Worktree(path) => {
+                let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
+                let is_primary = self.snapshot_for(&host).trees.contains_key(path);
+                let current_parent = host
+                    .is_local()
+                    .then(|| self.worktree_parent(path))
+                    .flatten();
+                let parent_candidates = if host.is_local() {
+                    self.eligible_parent_worktrees(path)
+                        .into_iter()
+                        .map(|cand| {
+                            let label = self.name(&cand);
+                            (cand, label)
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let descendant_count = if host.is_local() {
+                    self.lineage_descendants(path).len()
+                } else {
+                    0
+                };
+                let sleeping = host.is_local() && self.is_worktree_sleeping(path);
+                (
+                    Some(path.clone()),
+                    Some(TreeMenuMeta {
+                        path: path.clone(),
+                        pinned,
+                        is_primary,
+                        current_parent,
+                        parent_candidates,
+                        descendant_count,
+                        sleeping,
+                    }),
+                )
+            }
+            Row::Session(s, _) => (s.worktree.clone().or_else(|| s.cwd.clone()), None),
+            Row::Folder(path) => (Some(path.clone()), None),
+            _ => return element.into_any_element(),
+        };
+        let this = cx.weak_entity();
+        let agents = self.agents.clone();
+        let pr = tree
+            .as_ref()
+            .and_then(|meta| self.prs.get(&meta.path))
+            .cloned();
+        element
+            .context_menu(move |menu, window, cx| {
+                row_menu(
+                    menu,
+                    &this,
+                    &host,
+                    folder.as_ref(),
+                    tree.as_ref(),
+                    &agents,
+                    pr.as_ref(),
+                    window,
+                    cx,
+                )
+            })
+            .into_any_element()
+    }
+
+    /// 가상 리스트(보이는 행만 만든다). 스크린 리더에는 이름 붙은 목록 하나로 보인다.
+    pub(super) fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let content: AnyElement = if self.rows.len() >= 100 {
+            uniform_list(
+                "worktree-list",
+                self.rows.len(),
+                cx.processor(|s, range: std::ops::Range<usize>, _, cx| {
+                    #[cfg(test)]
+                    {
+                        s.rendered_rows += range.len();
+                    }
+                    range
+                        .filter_map(|i| {
+                            let row = s.rows.get(i)?.clone();
+                            Some(s.render_row_with_menu(i, &row, cx))
+                        })
+                        .collect()
+                }),
+            )
+            .track_scroll(&self.scroll)
+            .size_full()
+            .into_any_element()
+        } else {
+            let cursor_in_wt: Option<PathBuf> =
+                self.cursor.and_then(|c| match self.rows.get(c)? {
+                    Row::Session(s, true) => s.worktree.clone(),
+                    _ => None,
+                });
+            let items: Vec<AnyElement> = self
+                .rows
+                .clone()
+                .into_iter()
+                .enumerate()
+                .filter(|(_, row)| match row {
+                    Row::Session(s, true) => {
+                        if let Some(wt) = &s.worktree
+                            && self.snapshot.trees.values().any(|list| list.contains(wt))
+                        {
+                            self.expanded_cards.contains(wt) || cursor_in_wt.as_ref() == Some(wt)
+                        } else {
+                            true
+                        }
+                    }
+                    _ => true,
+                })
+                .map(|(i, row)| self.render_row_with_menu(i, &row, cx))
+                .collect();
+            #[cfg(test)]
+            {
+                self.rendered_rows += items.len();
+            }
+            div()
+                .id("worktree-list")
+                .size_full()
+                .overflow_y_scroll()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .children(items)
+                .into_any_element()
+        };
+        div()
+            .id("worktree-list-a11y")
+            .role(gpui::Role::List)
+            .aria_label(text::PROJECTS.get())
+            .flex_1()
+            .min_h_0()
+            .py_1()
+            .child(content)
+    }
+
+    fn render_rename(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
+        let p = ui::palette(cx);
+        let (_, input) = self.editing.as_ref()?;
+        Some(
+            div()
+                .p_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .border_b_1()
+                .border_color(p.sidebar_border)
+                .child(Input::new(input).h(px(30.)))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(
+                            Button::new("rename-save")
+                                .ghost()
+                                .label(text::SAVE.get())
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    s.finish_rename(Some(window), cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("rename-cancel")
+                                .ghost()
+                                .label(text::CANCEL.get())
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    s.editing = None;
+                                    s.edit_subscription = None;
+                                    if let Some(focus) = &s.focus {
+                                        window.focus(focus, cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    /// MK-174: Setup 스크립트 감지 인앱 프롬프트 카드(`SetupScriptPromptCard`).
+    /// 참고: `.ref/orca/src/renderer/src/components/sidebar/SetupScriptPromptCard.tsx`
+    /// (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
+    fn render_setup_prompt_card(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let state_dir = self
+            .path
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .or_else(|| crate::settings::state_dir(cx))?;
+        let summary = self
+            .snapshot
+            .trees
+            .keys()
+            .map(|repo| krill_proto::orchestration::inspect_repo_hooks(repo, Some(&state_dir)))
+            .find(krill_proto::orchestration::RepoHookSummary::should_show_setup_prompt)?;
+        let script = summary.suggested_setup.clone()?;
+        let source = summary
+            .suggested_source
+            .clone()
+            .unwrap_or_else(|| "orca.yaml".to_owned());
+        let repo_key = summary.repo_key.clone();
+        let p = ui::palette(cx);
+        let wt_text = crate::i18n::catalog::worktree::PROMPT_TITLE.format(&[("source", &source)]);
+        let (enable_dir, enable_key, enable_script) =
+            (state_dir.clone(), repo_key.clone(), script.clone());
+        let (dismiss_dir, dismiss_key) = (state_dir, repo_key);
+        Some(
+            div()
+                .id("setup-script-prompt-card")
+                .debug_selector(|| "setup-script-prompt-card".into())
+                .mx_2()
+                .my_1()
+                .p_2p5()
+                .rounded(ui::RADIUS_MD)
+                .border_1()
+                .border_color(p.border)
+                .bg(p.card)
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_size(ui::TEXT_XS)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.sidebar_foreground)
+                        .child(wt_text),
+                )
+                .child(
+                    div()
+                        .text_size(ui::TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .child(crate::i18n::catalog::worktree::PROMPT_DESC.get()),
+                )
+                .child(
+                    div()
+                        .id("setup-script-prompt-preview")
+                        .debug_selector(|| "setup-script-prompt-preview".into())
+                        .px_2()
+                        .py_1()
+                        .rounded(ui::RADIUS_XS)
+                        .bg(p.muted)
+                        .font_family(ui::FONT_MONO)
+                        .text_size(ui::TEXT_2XS)
+                        .truncate()
+                        .child(script),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Button::new("setup-prompt-enable")
+                                .primary()
+                                .xsmall()
+                                .label(crate::i18n::catalog::worktree::PROMPT_ENABLE.get())
+                                .debug_selector(|| "setup-prompt-enable".into())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let key = enable_key.clone();
+                                    let script = enable_script.clone();
+                                    krill_proto::orchestration::WorktreeStore::mutate(
+                                        &enable_dir,
+                                        |store| {
+                                            store.set_setup_script(&key, &script)?;
+                                            Ok(())
+                                        },
+                                    )
+                                    .ok();
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("setup-prompt-settings")
+                                .ghost()
+                                .xsmall()
+                                .label(crate::i18n::catalog::worktree::PROMPT_SETTINGS.get())
+                                .debug_selector(|| "setup-prompt-settings".into())
+                                .on_click(cx.listener(|_, _, _, cx| {
+                                    crate::settings::open_window_at_tab(
+                                        crate::settings::AdminTab::Workflows,
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .child(
+                            Button::new("setup-prompt-dismiss")
+                                .ghost()
+                                .xsmall()
+                                .label(crate::i18n::catalog::worktree::PROMPT_DISMISS.get())
+                                .debug_selector(|| "setup-prompt-dismiss".into())
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    let key = dismiss_key.clone();
+                                    krill_proto::orchestration::WorktreeStore::mutate(
+                                        &dismiss_dir,
+                                        |store| {
+                                            store.set_setup_prompt_dismissed(&key, true);
+                                            Ok(())
+                                        },
+                                    )
+                                    .ok();
+                                    cx.notify();
+                                })),
+                        ),
+                ),
+        )
+    }
+}
+
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.orca_import_subscription.is_none() {
+            self.orca_import_subscription = Some(
+                cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
+                    if crate::orca_import::state(cx)
+                        .is_some_and(|st| !st.importing && st.last_result.is_some())
+                    {
+                        this.reload_external(cx);
+                    }
+                }),
+            );
+        }
+        #[cfg(test)]
+        {
+            self.renders += 1;
+        }
+        let p = ui::palette(cx);
+        let list = self.render_list(cx);
+        let setup_prompt = self.render_setup_prompt_card(cx);
+        let rename = self.render_rename(cx);
+        let default_repo = self.snapshot.trees.keys().next().cloned();
+        div()
+            .id("sidebar")
+            .when(self.editing.is_none() && self.creating.is_none(), |d| {
+                d.key_context(KEY_CONTEXT)
+            })
+            .when_some(self.focus.as_ref(), InteractiveElement::track_focus)
+            .on_action(cx.listener(|s, _: &SelectPrev, _, cx| s.step(-1, cx)))
+            .on_action(cx.listener(|s, _: &SelectNext, _, cx| s.step(1, cx)))
+            .on_action(cx.listener(|s, _: &Activate, window, cx| s.activate(window, cx)))
+            .on_action(cx.listener(|s, _: &Collapse, _, cx| s.fold_cursor(false, cx)))
+            .on_action(cx.listener(|s, _: &Expand, _, cx| s.fold_cursor(true, cx)))
+            .on_action(cx.listener(|s, _: &Dismiss, window, cx| s.leave(window, cx)))
+            .on_action(cx.listener(|s, _: &TogglePin, _, cx| s.toggle_pin_cursor(cx)))
+            .on_action(cx.listener(|s, _: &Rename, window, cx| s.rename_cursor(window, cx)))
+            .on_action(cx.listener(|s, _: &OpenInFinder, _, cx| {
+                s.open_in_cursor(Target::Finder, cx);
+            }))
+            .on_action(cx.listener(|s, _: &OpenInVsCode, _, cx| {
+                s.open_in_cursor(Target::VsCode, cx);
+            }))
+            .on_action(cx.listener(|s, _: &OpenInCursor, _, cx| {
+                s.open_in_cursor(Target::Cursor, cx);
+            }))
+            .on_action(cx.listener(|s, _: &OpenInZed, _, cx| {
+                s.open_in_cursor(Target::Zed, cx);
+            }))
+            .on_action(cx.listener(|s, _: &NewAgent1, window, cx| {
+                s.new_agent_cursor(0, window, cx);
+            }))
+            .on_action(cx.listener(|s, _: &NewAgent2, window, cx| {
+                s.new_agent_cursor(1, window, cx);
+            }))
+            .on_action(cx.listener(|s, _: &NewAgent3, window, cx| {
+                s.new_agent_cursor(2, window, cx);
+            }))
+            .on_action(cx.listener(|s, _: &NewAgent4, window, cx| {
+                s.new_agent_cursor(3, window, cx);
+            }))
+            .size_full()
+            .flex()
+            .flex_col()
+            .text_color(p.sidebar_foreground)
+            .child(
+                div()
+                    .id("sidebar-header")
+                    .debug_selector(|| "sidebar-header".into())
+                    .h(ui::SIDEBAR_HEADER_HEIGHT)
+                    .pl_3()
+                    .pr_1p5()
+                    .flex()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(ui::TEXT_XS)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.muted_foreground)
+                            .child(text::PROJECTS.get()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_color(p.muted_foreground)
+                            .child(
+                                Button::new("sidebar-add-folder")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::default().data(ui::icons::FOLDER_PLUS_SVG))
+                                    .accessibility_label(
+                                        crate::i18n::catalog::shell::OPEN_FOLDER.get(),
+                                    )
+                                    .tooltip(crate::i18n::catalog::shell::OPEN_FOLDER.get())
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| cx.emit(super::OpenFolder)),
+                                    ),
+                            )
+                            .when_some(default_repo, |d, repo| {
+                                d.child(
+                                    Button::new("sidebar-new-worktree")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Plus)
+                                        .accessibility_label(text::NEW_WORKTREE.get())
+                                        .tooltip(text::NEW_WORKTREE.get())
+                                        .on_click(cx.listener(move |s, _, window, cx| {
+                                            s.new_worktree(repo.clone(), window, cx);
+                                        })),
+                                )
+                            })
+                            .child(self.render_options_button(cx))
+                            .child(
+                                Button::new("sidebar-refresh")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::RefreshCw)
+                                    .accessibility_label(text::REFRESH.get())
+                                    .tooltip(text::REFRESH.get())
+                                    .on_click(cx.listener(|s, _, _, cx| s.refresh(cx))),
+                            ),
+                    ),
+            )
+            .children(self.error.clone().map(|e| {
+                div()
+                    .id("sidebar-preference-error")
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.warning)
+                    .child(crate::i18n::cached_notice(&e))
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.error = None;
+                        cx.notify();
+                    }))
+            }))
+            .children(self.poll_error.clone().map(|e| {
+                div()
+                    .px_3()
+                    .py_1()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.warning)
+                    .child(crate::i18n::cached_notice(&e))
+            }))
+            .children(
+                self.prs
+                    .values()
+                    .find_map(crate::pull_request::Status::guidance)
+                    .map(|hint| {
+                        div()
+                            .px_3()
+                            .py_1()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(hint)
+                    }),
+            )
+            .children(self.notice.clone().map(|e| {
+                div()
+                    .id("sidebar-notice")
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.warning)
+                    .child(crate::i18n::cached_notice(&e))
+                    .on_click(cx.listener(|s, _, _, cx| {
+                        s.notice = None;
+                        cx.notify();
+                    }))
+            }))
+            .children(setup_prompt)
+            .children(rename)
+            .children(self.creating.as_ref().map(|(dialog, _)| dialog.clone()))
+            .when(self.rows.is_empty(), |d| {
+                d.child(
+                    div()
+                        .id("sidebar-empty")
+                        .debug_selector(|| "sidebar-empty".into())
+                        // Orca 빈 상태(`px-4 py-6 text-center text-[11px]`): 가운데 정렬.
+                        .px_4()
+                        .py(ui::SIDEBAR_EMPTY_PY)
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .gap_2()
+                        .text_center()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(
+                            div()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(p.sidebar_foreground)
+                                .child(text::EMPTY.get()),
+                        )
+                        .child(text::EMPTY_HINT.get())
+                        .child(
+                            div()
+                                .mt_1()
+                                .debug_selector(|| "sidebar-open-folder".into())
+                                .child(
+                                    Button::new("sidebar-open-folder")
+                                        .outline()
+                                        .small()
+                                        .icon(IconName::FolderOpen)
+                                        .label(crate::i18n::catalog::shell::OPEN_FOLDER.get())
+                                        .on_click(
+                                            cx.listener(|_, _, _, cx| cx.emit(super::OpenFolder)),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .child(list)
+    }
+}

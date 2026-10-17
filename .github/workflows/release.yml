@@ -1,0 +1,114 @@
+name: Release macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '릴리스 태그 (예: v0.1.2, 비우면 Cargo.toml 버전 기준)'
+        required: false
+        type: string
+      clobber:
+        description: '기존 릴리스 자산 덮어쓰기 허용 여부'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+
+      - name: Resolve release version and URLs
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          CARGO_VER=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          if [[ -n "${INPUT_TAG}" ]]; then
+            TAG="${INPUT_TAG}"
+          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${CARGO_VER}"
+          fi
+          VERSION="${TAG#v}"
+          if [[ "${VERSION}" != "${CARGO_VER}" ]]; then
+            echo "tag version (${VERSION}) does not match Cargo.toml (${CARGO_VER})" >&2
+            exit 1
+          fi
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "repo_url=${REPO_URL}" >> "${GITHUB_OUTPUT}"
+          echo "source_url=${REPO_URL}/releases/download/${TAG}/Krill-${VERSION}-source.tar.gz" >> "${GITHUB_OUTPUT}"
+          echo "dmg_url=${REPO_URL}/releases/download/${TAG}/Krill-${VERSION}.dmg" >> "${GITHUB_OUTPUT}"
+
+      - name: Build Krill.app and ZIP (MK-061)
+        run: bash packaging/bundle.sh
+
+      - name: Build DMG and Homebrew tap (MK-072)
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          REPO_URL: ${{ steps.meta.outputs.repo_url }}
+          SOURCE_URL: ${{ steps.meta.outputs.source_url }}
+          DMG_URL: ${{ steps.meta.outputs.dmg_url }}
+        run: |
+          bash packaging/release.sh \
+            "${VERSION}" \
+            "${REPO_URL}" \
+            "${SOURCE_URL}" \
+            "${DMG_URL}" \
+            packaging/dist/Krill.app \
+            packaging/dist
+
+      - name: Upload Homebrew tap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-krill-${{ steps.meta.outputs.version }}
+          path: packaging/dist/homebrew-krill/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          CLOBBER: ${{ inputs.clobber }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          ASSETS=(
+            "packaging/dist/Krill-${VERSION}.dmg"
+            packaging/dist/Krill-"${VERSION}"-*-adhoc.zip
+            packaging/dist/Krill-"${VERSION}"-*-adhoc.zip.sha256
+            "packaging/dist/Krill-${VERSION}-source.tar.gz"
+            "packaging/dist/homebrew-krill/SHA256SUMS"
+            "packaging/install.sh"
+          )
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            if [[ "${CLOBBER}" == "true" ]]; then
+              gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+            else
+              echo "Release ${TAG} already exists; skipping upload to preserve signed release assets (set clobber=true to overwrite)."
+            fi
+          else
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "Krill ${TAG}" \
+              --generate-notes
+          fi
