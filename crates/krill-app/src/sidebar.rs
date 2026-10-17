@@ -1050,24 +1050,29 @@ impl Sidebar {
     }
 
     pub(super) fn snapshot_for(&self, host: &HostId) -> &Snapshot {
+        static EMPTY_SNAPSHOT: Snapshot = Snapshot {
+            sessions: Vec::new(),
+            trees: BTreeMap::new(),
+        };
         match host {
             HostId::Local => &self.snapshot,
             HostId::Remote(id) => self
                 .remote_hosts
                 .iter()
                 .find(|r| r.id == *id)
-                .map_or(&self.snapshot, |r| &r.snapshot),
+                .map_or(&EMPTY_SNAPSHOT, |r| &r.snapshot),
         }
     }
 
     pub(super) fn meta_for(&self, host: &HostId) -> &Meta {
+        static EMPTY_META: Meta = BTreeMap::new();
         match host {
             HostId::Local => &self.meta,
             HostId::Remote(id) => self
                 .remote_hosts
                 .iter()
                 .find(|r| r.id == *id)
-                .map_or(&self.meta, |r| &r.meta),
+                .map_or(&EMPTY_META, |r| &r.meta),
         }
     }
 
@@ -1543,10 +1548,46 @@ impl Sidebar {
     }
 
     pub(crate) fn select_session(&mut self, index: usize, id: SessionId, cx: &mut Context<Self>) {
+        let host = self.row_host(index).clone();
+        self.select_session_on(index, host, id, cx);
+    }
+
+    pub(crate) fn select_session_on(
+        &mut self,
+        index: usize,
+        host: HostId,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
         self.cursor = Some(index);
-        self.action_host = Some(self.row_host(index).clone());
+        self.action_host = Some(host);
         cx.emit(Selected(id));
         cx.notify();
+    }
+
+    pub(crate) fn activate_worktree_card(
+        &mut self,
+        index: usize,
+        host: HostId,
+        path: PathBuf,
+        window: Option<&mut Window>,
+        cx: &mut Context<Self>,
+    ) {
+        self.cursor = Some(index);
+        if let Some(sess_id) = self
+            .snapshot_for(&host)
+            .sessions
+            .iter()
+            .find(|sess| {
+                sess.worktree.as_ref() == Some(&path)
+                    || (sess.worktree.is_none() && sess.cwd.as_ref() == Some(&path))
+            })
+            .map(|sess| sess.id)
+        {
+            self.select_session_on(index, host, sess_id, cx);
+        } else {
+            self.new_session_on(host, path, Program::Login, window, cx);
+        }
     }
 
     pub(crate) fn new_session_on(

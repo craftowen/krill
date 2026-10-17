@@ -783,12 +783,15 @@ impl Sidebar {
             .keys()
             .next()
             .is_some_and(|first| first == path);
-        let focused_wt = self.focused.and_then(|id| self.folder(id)).filter(|wt| {
-            self.snapshot_for(&row_host)
-                .trees
-                .values()
-                .any(|list| list.iter().any(|t| t == wt))
-        });
+        let focused_wt = self
+            .focused
+            .and_then(|id| self.folder_on(&row_host, id))
+            .filter(|wt| {
+                self.snapshot_for(&row_host)
+                    .trees
+                    .values()
+                    .any(|list| list.iter().any(|t| t == wt))
+            });
         let is_active_worktree = selected
             || focused_wt == Some(path)
             || (focused_wt.is_none() && self.cursor.is_none() && is_first_default);
@@ -1170,6 +1173,7 @@ impl Sidebar {
         if self.options.card_layout == super::CardLayout::Compact {
             let compact_path = card_path.clone();
             let compact_fold = fold.clone();
+            let compact_host = row_host.clone();
             return base
                 .debug_selector(move || format!("worktree-card-{index}"))
                 .aria_label(label)
@@ -1296,18 +1300,13 @@ impl Sidebar {
                         .child(rename_btn),
                 )
                 .on_click(cx.listener(move |s, _, window, cx| {
-                    s.cursor = Some(index);
-                    if let Some(sess) = s
-                        .snapshot
-                        .sessions
-                        .iter()
-                        .find(|sess| sess.worktree.as_ref() == Some(&compact_path))
-                    {
-                        cx.emit(super::Selected(sess.id));
-                        cx.notify();
-                    } else {
-                        s.new_session(compact_path.clone(), Program::Login, Some(window), cx);
-                    }
+                    s.activate_worktree_card(
+                        index,
+                        compact_host.clone(),
+                        compact_path.clone(),
+                        Some(window),
+                        cx,
+                    );
                 }));
         }
 
@@ -1583,18 +1582,13 @@ impl Sidebar {
                 )
             })
             .on_click(cx.listener(move |s, _, window, cx| {
-                s.cursor = Some(index);
-                if let Some(sess) = s
-                    .snapshot
-                    .sessions
-                    .iter()
-                    .find(|sess| sess.worktree.as_ref() == Some(&card_path))
-                {
-                    cx.emit(super::Selected(sess.id));
-                    cx.notify();
-                } else {
-                    s.new_session(card_path.clone(), Program::Login, Some(window), cx);
-                }
+                s.activate_worktree_card(
+                    index,
+                    row_host.clone(),
+                    card_path.clone(),
+                    Some(window),
+                    cx,
+                );
             }))
     }
 
