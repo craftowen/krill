@@ -48,7 +48,21 @@ use krill_proto::daemon;
 const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill computer <cmd> | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]";
 
 fn main() -> ExitCode {
-    let raw: Vec<_> = std::env::args_os().skip(1).collect();
+    run(std::env::args_os().skip(1).collect())
+}
+
+fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
+    if matches!(
+        raw.as_slice(),
+        [flag] if matches!(flag.to_str(), Some("-h" | "--help" | "help"))
+    ) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    if raw.is_empty() {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    }
     // Hook stdout and its 50 ms budget take precedence over diagnostics.
     // statusline run mode is also tick-hot: no log init, like hooks.
     let hook_run = raw.first().is_some_and(|s| s == "hook")
@@ -249,7 +263,18 @@ fn agent_list() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::USAGE;
+    use std::ffi::OsString;
+    use std::process::ExitCode;
+
+    use super::{USAGE, run};
+
+    #[test]
+    fn top_level_help_exits_zero_and_empty_args_exits_two() {
+        for flag in ["-h", "--help", "help"] {
+            assert_eq!(run(vec![OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
+        }
+        assert_eq!(run(Vec::new()), ExitCode::from(2));
+    }
 
     #[test]
     fn usage_lists_m10_worktree_and_set_subcommands() {

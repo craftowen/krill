@@ -127,3 +127,51 @@ fn regression_corrupt_comments_refuse_write_and_preserve_bytes() {
         fs::remove_dir_all(dir).unwrap();
     }
 }
+
+#[test]
+fn top_level_help_writes_usage_to_stdout_and_exits_zero() {
+    let dir = std::env::temp_dir().join(format!("mk-cli-help-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    for flag in ["--help", "-h", "help"] {
+        let out = Command::new(MK)
+            .arg(flag)
+            .env("HOME", &dir)
+            .env("KRILL_STATE_DIR", dir.join("state"))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{flag}: {out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.starts_with("usage: krill "),
+            "{flag} stdout should contain usage: {stdout:?}"
+        );
+        assert!(
+            out.stderr.is_empty(),
+            "{flag} stderr should be empty: {:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    let no_args = Command::new(MK)
+        .env("HOME", &dir)
+        .env("KRILL_STATE_DIR", dir.join("state"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(no_args.status.code(), Some(2), "{no_args:?}");
+    assert!(
+        no_args.stdout.is_empty(),
+        "no-arg stdout should be empty: {:?}",
+        String::from_utf8_lossy(&no_args.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&no_args.stderr).starts_with("usage: krill "),
+        "no-arg stderr should contain usage: {:?}",
+        String::from_utf8_lossy(&no_args.stderr)
+    );
+
+    fs::remove_dir_all(dir).ok();
+}
