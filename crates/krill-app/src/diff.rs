@@ -638,6 +638,9 @@ impl Panel {
             .set_repo(repo.clone(), self.tab == PanelTab::Files);
         self.search
             .set_repo(repo.clone(), self.tab == PanelTab::Search);
+        if self.tab == PanelTab::Search && !self.search.options.query.trim().is_empty() {
+            self.spawn_async_search(cx);
+        }
         self.pending_diff_path = None;
         self.checks.reset();
         let old_repo = std::mem::replace(&mut self.repo, repo);
@@ -1185,8 +1188,7 @@ impl Panel {
                                         this.explorer.refresh();
                                         cx.notify();
                                     } else if this.tab == PanelTab::Search {
-                                        this.search.run_sync();
-                                        cx.notify();
+                                        this.spawn_async_search(cx);
                                     } else {
                                         this.refresh(cx);
                                     }

@@ -93,8 +93,9 @@ impl Panel {
             && !self.search.options.query.is_empty()
             && self.search.result.files.is_empty()
             && self.search.error.is_none()
+            && !self.search.searching
         {
-            self.search.run_sync();
+            self.spawn_async_search(cx);
         }
         if tab == PanelTab::Checks && self.checks.inspection.is_none() && !self.checks.loading {
             self.refresh_checks(cx);
