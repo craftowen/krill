@@ -406,11 +406,31 @@ fn file_stamps(dir: &Path) -> [Option<SystemTime>; 7] {
     ]
 }
 
-/// 설정 디렉터리 경로. `init_at`으로 지정된 경로가 있으면 우선하고, 없으면 기본 상태 디렉터리를 돌려준다.
+/// 설정 디렉터리 경로. `init_at`으로 지정된 경로가 있으면 우선하고, 비테스트 실행에서만 기본 상태 디렉터리를 돌려준다.
 pub fn state_dir(cx: &App) -> Option<PathBuf> {
-    cx.try_global::<Config>()
-        .and_then(|c| c.dir.clone())
-        .or_else(krill_proto::daemon::state_dir)
+    let configured = cx.try_global::<Config>().and_then(|c| c.dir.clone());
+    #[cfg(test)]
+    {
+        configured
+    }
+    #[cfg(not(test))]
+    {
+        configured.or_else(krill_proto::daemon::state_dir)
+    }
+}
+
+/// 지정된 설정 디렉터리가 실제 데몬이 관리하는 기본 상태 디렉터리인지 판정한다(OWE-771).
+/// 단위 테스트(`#[cfg(test)]`)에서는 전역 데몬(`Paths::dev()`)을 자동 기동하지 않도록 항상 `false`를 돌려준다.
+fn is_daemon_state_dir(dir: Option<&Path>) -> bool {
+    #[cfg(test)]
+    {
+        let _ = dir;
+        false
+    }
+    #[cfg(not(test))]
+    {
+        dir.is_some() && dir == krill_proto::daemon::state_dir().as_deref()
+    }
 }
 
 /// `accounts.toml`·`hosts.toml` 등이 바뀌었음을 전역 설정 관찰자(`Shell`·`SettingsView`)에 알린다.
@@ -2080,7 +2100,7 @@ impl SettingsView {
             return;
         }
         let dir = state_dir(cx);
-        if dir == krill_proto::daemon::state_dir() {
+        if is_daemon_state_dir(dir.as_deref()) {
             self.spawn_account_rule_request(
                 async move { crate::accounts::upsert_auto_switch_rule(rule) },
                 cx,
@@ -2106,7 +2126,7 @@ impl SettingsView {
             return;
         }
         let dir = state_dir(cx);
-        if dir == krill_proto::daemon::state_dir() {
+        if is_daemon_state_dir(dir.as_deref()) {
             let from_account_id = from_account_id.to_owned();
             self.spawn_account_rule_request(
                 async move { crate::accounts::remove_auto_switch_rule(provider, &from_account_id) },
@@ -2231,7 +2251,7 @@ impl SettingsView {
             .and_then(|s| s.home_override.clone())
             .unwrap_or_else(crate::accounts::default_home);
         let dir = state_dir(cx);
-        let daemon = dir == krill_proto::daemon::state_dir();
+        let daemon = is_daemon_state_dir(dir.as_deref());
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
@@ -2372,7 +2392,7 @@ impl SettingsView {
             return;
         }
         let dir = state_dir(cx);
-        if dir != krill_proto::daemon::state_dir() {
+        if !is_daemon_state_dir(dir.as_deref()) {
             let home = crate::accounts::default_home();
             crate::accounts::request_local(
                 &home,
@@ -2508,7 +2528,7 @@ impl SettingsView {
         }
         let dir = state_dir(cx);
         // 테스트용 임시 상태 디렉터리에서는 데몬 없이 로컬 파일로 동기 처리한다.
-        if dir != krill_proto::daemon::state_dir() {
+        if !is_daemon_state_dir(dir.as_deref()) {
             let home = crate::accounts::default_home();
             match crate::accounts::request_local(&home, dir.as_deref(), &req) {
                 Ok(snap) => {
@@ -2887,7 +2907,7 @@ impl SettingsView {
             cx.notify();
             return;
         }
-        if state_dir(cx) != krill_proto::daemon::state_dir() {
+        if !is_daemon_state_dir(state_dir(cx).as_deref()) {
             // 테스트용 임시 상태 디렉터리에서는 실제 데몬을 건드리지 않는다.
             self.recording_status = Some(text::RECORDING_DELETE_UNAVAILABLE.get().into());
             cx.notify();
@@ -2924,7 +2944,7 @@ impl SettingsView {
     /// 앱 시작 시 저장된 일시중지 값을 데몬에 전달한다. 실제 상태 디렉터리에서만 보내고,
     /// 실패는 조용히 둔다(토글을 누르면 다시 확인한다).
     pub fn sync_recording_paused(cx: &mut Context<Self>) {
-        if state_dir(cx) != krill_proto::daemon::state_dir() {
+        if !is_daemon_state_dir(state_dir(cx).as_deref()) {
             return;
         }
         let paused = current(cx).recording_paused;
@@ -2954,12 +2974,13 @@ impl SettingsView {
         self.history_status = Some(text::RECORDING_DELETING.get().into());
         cx.notify();
         let dir = state_dir(cx);
+        let daemon = is_daemon_state_dir(dir.as_deref());
         cx.spawn(async move |this, cx| {
             let msg = cx
                 .background_executor()
                 .spawn(async move {
                     // 테스트용 임시 상태 디렉터리에서는 실제 데몬 기록을 건드리지 않는다.
-                    if dir == krill_proto::daemon::state_dir() {
+                    if daemon {
                         match request_history_clear(krill_proto::daemon::Paths::dev().ok().as_ref())
                         {
                             Ok(()) => text::RECORDING_DELETED.get().to_owned(),

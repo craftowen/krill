@@ -21,10 +21,75 @@ const MK: &str = env!("CARGO_BIN_EXE_krill");
 /// 기다린다(OWE-484, 부하 중 재현). 파이프 생성과 spawn을 한 스레드씩 한다.
 static SPAWN: Mutex<()> = Mutex::new(());
 
-fn state_dir(name: &str) -> PathBuf {
+struct StateDir(PathBuf);
+
+impl std::ops::Deref for StateDir {
+    type Target = PathBuf;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for StateDir {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<OsStr> for StateDir {
+    fn as_ref(&self) -> &OsStr {
+        self.0.as_os_str()
+    }
+}
+
+impl Drop for StateDir {
+    fn drop(&mut self) {
+        kill_daemons_under(&self.0);
+        fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+fn state_dir(name: &str) -> StateDir {
     let d = std::env::temp_dir().join(format!("mk025-{}-{name}", std::process::id()));
     fs::remove_dir_all(&d).ok();
-    d
+    StateDir(d)
+}
+
+fn kill_daemons_under(dir: &Path) {
+    let Ok(ps) = Command::new("/bin/ps")
+        .args(["-axwwo", "pid=,command="])
+        .output()
+    else {
+        return;
+    };
+    let needle = dir.to_string_lossy().into_owned();
+    let alt = needle
+        .strip_prefix("/private")
+        .map_or_else(|| format!("/private{needle}"), str::to_owned);
+    let canon = fs::canonicalize(dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned());
+    let text = String::from_utf8_lossy(&ps.stdout);
+    for role in ["krill-holder", "krilld"] {
+        for line in text.lines() {
+            let trimmed = line.trim_start();
+            let Some((pid_str, cmd)) = trimmed.split_once(char::is_whitespace) else {
+                continue;
+            };
+            let matches_dir = cmd.contains(&needle)
+                || cmd.contains(&alt)
+                || canon.as_deref().is_some_and(|c| cmd.contains(c));
+            if matches_dir
+                && cmd.contains(role)
+                && let Ok(pid) = pid_str.trim().parse::<u32>()
+            {
+                Command::new("/bin/kill")
+                    .args(["-9", &pid.to_string()])
+                    .status()
+                    .ok();
+            }
+        }
+    }
 }
 
 fn doctor(state: &Path) -> Output {
@@ -100,6 +165,7 @@ impl Drop for Daemon {
                 .status()
                 .ok();
         }
+        kill_daemons_under(&self.dir);
         fs::remove_dir_all(&self.dir).ok();
     }
 }
@@ -148,7 +214,7 @@ fn concurrent_first_runs_launch_once() {
     for (o, t) in outs.iter().zip(&texts) {
         assert!(o.status.success(), "{t}");
     }
-    let _d = Daemon::new(instance(&texts[0]), dir);
+    let _d = Daemon::new(instance(&texts[0]), dir.clone());
     assert_eq!(texts.iter().filter(|t| t.contains("(launched)")).count(), 1);
     assert!(texts.iter().all(|t| instance(t) == instance(&texts[0])));
 }

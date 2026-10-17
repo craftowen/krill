@@ -1117,12 +1117,7 @@ impl Shell {
                     ),
                 )
             });
-        let state_dir = self
-            .paths
-            .as_ref()
-            .and_then(|path| path.socket.parent().and_then(std::path::Path::parent))
-            .map(std::path::Path::to_path_buf)
-            .or_else(krill_proto::daemon::state_dir);
+        let state_dir = self.state_dir(cx);
         let orch_store = state_dir
             .as_deref()
             .map(krill_proto::orchestration::OrchestrationStore::load_cached)

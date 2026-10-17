@@ -719,6 +719,7 @@ impl Panel {
         if self.editing.busy {
             return;
         }
+        #[cfg(not(test))]
         if self.source.is_none()
             && let Ok(target) = HostTarget::local_dev()
         {
