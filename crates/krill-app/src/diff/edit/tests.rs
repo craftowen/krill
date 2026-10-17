@@ -408,7 +408,9 @@ fn ai_commit_message_generation_and_recovery_banner_prompt_injection(cx: &mut Te
     drop(prompts);
 
     // 4. Simulate Shell confirming prompt delivery -> banner clears and status note updates.
-    panel.update(cx, |p, cx| p.comments_sent(true, cx));
+    panel.update(cx, |p, cx| {
+        p.comments_sent(crate::diff::CommentSource::GitRecovery, true, cx);
+    });
     cx.run_until_parked();
     assert!(cx.debug_bounds("git-recovery-banner").is_none());
     panel.read_with(cx, |p, _| {

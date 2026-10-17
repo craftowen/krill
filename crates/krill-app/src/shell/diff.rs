@@ -9,6 +9,7 @@ use super::Shell;
 impl Shell {
     pub(super) fn subscribe_diff(panel: &Entity<Panel>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(panel, |this, panel, event: &SendComments, cx| {
+            let source = event.1;
             let Some(live) = this
                 .layout
                 .focused()
@@ -20,7 +21,7 @@ impl Shell {
                         && !l.pane.is_closed()
                 })
             else {
-                panel.update(cx, Panel::no_agent);
+                panel.update(cx, |p, cx| p.no_agent(source, cx));
                 return;
             };
             let out = Output {
@@ -28,7 +29,7 @@ impl Shell {
                 discard_ime: false,
             };
             let accepted = this.send(&out, None, cx);
-            panel.update(cx, |p, cx| p.comments_sent(accepted, cx));
+            panel.update(cx, |p, cx| p.comments_sent(source, accepted, cx));
         })
     }
 }
@@ -46,7 +47,7 @@ mod tests {
         assert!(cx.debug_bounds("comments-no-agent").is_none());
         cx.update(|_, cx| {
             let panel = shell.read(cx).diff.clone();
-            panel.update(cx, |_, cx| cx.emit(SendComments("review".into())));
+            panel.update(cx, |_, cx| cx.emit(SendComments::review("review".into())));
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("comments-no-agent").is_some());

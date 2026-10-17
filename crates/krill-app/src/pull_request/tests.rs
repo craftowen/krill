@@ -608,7 +608,139 @@ fn pr_checks_tab_displays_failed_logs_and_sends_combined_fix_prompt_to_active_ag
     assert!(prompt.contains("Please handle empty log tail gracefully."));
     assert!(prompt.contains("@review-bot[bot] [bot]: Verified reproduction in CI."));
 
-    panel.update(cx, |p, cx| p.comments_sent(true, cx));
+    panel.update(cx, |p, cx| {
+        p.comments_sent(crate::diff::CommentSource::ChecksFix, true, cx);
+    });
     cx.run_until_parked();
     assert!(cx.debug_bounds("pr-fix-status").is_some());
+}
+
+#[test]
+fn inspect_shares_budget_and_enforces_max_concurrent_slots() {
+    use std::sync::{Condvar, mpsc};
+
+    struct BlockingInspect {
+        calls: AtomicUsize,
+        started: Mutex<mpsc::Sender<()>>,
+        gate: (Mutex<bool>, Condvar),
+    }
+    impl Runner for BlockingInspect {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Status::Open)
+        }
+
+        fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.lock().unwrap().send(()).unwrap();
+            let (lock, cvar) = &self.gate;
+            let mut released = lock.lock().unwrap();
+            while !*released {
+                released = cvar.wait(released).unwrap();
+            }
+            Ok(PrInspection::default())
+        }
+    }
+
+    let (started_tx, started_rx) = mpsc::channel();
+    let runner = Arc::new(BlockingInspect {
+        calls: AtomicUsize::new(0),
+        started: Mutex::new(started_tx),
+        gate: (Mutex::new(false), Condvar::new()),
+    });
+    let service = Arc::new(Service::new(runner.clone()));
+    let now = Instant::now();
+    let repo = PathBuf::from("/repo");
+    let max_conc = u32::try_from(MAX_CONCURRENT).unwrap();
+
+    // 1. Hold MAX_CONCURRENT (4) concurrent `inspect_at` slots spaced by GAP in chronological order.
+    let mut handles = Vec::new();
+    for i in 0..max_conc {
+        let svc = Arc::clone(&service);
+        let r = repo.clone();
+        let at = now + GAP * i;
+        handles.push(std::thread::spawn(move || svc.inspect_at(&r, "main", at)));
+        started_rx.recv().unwrap();
+    }
+
+    // 2. While 4 slots are in-flight, a 5th `inspect_at` or `create` (even after GAP) is rejected with PACED.
+    assert_eq!(
+        service.inspect_at(&repo, "main", now + GAP * max_conc),
+        Err(PACED.get())
+    );
+    assert_eq!(
+        service.create(&repo, "main", now + GAP * (max_conc + 1)),
+        Err(PACED.get())
+    );
+
+    // 3. Release in-flight workers; slots are returned on Drop, and minimum GAP pacing still applies.
+    {
+        let (lock, cvar) = &runner.gate;
+        *lock.lock().unwrap() = true;
+        cvar.notify_all();
+    }
+    for h in handles {
+        assert!(h.join().unwrap().is_ok());
+    }
+    assert_eq!(runner.calls.load(Ordering::SeqCst), MAX_CONCURRENT);
+
+    // Calling within GAP of the last reserved timestamp (`now + GAP * 3`) is rejected by Budget.
+    let last_at = now + GAP * (max_conc - 1);
+    assert_eq!(
+        service.inspect_at(&repo, "main", last_at + Duration::from_secs(9)),
+        Err(PACED.get())
+    );
+    // After GAP, slot and budget are both available again.
+    assert!(service.create(&repo, "main", last_at + GAP).is_ok());
+}
+
+#[test]
+fn parse_repo_owner_and_name_supports_ghe_hosts_and_graphql_uses_raw_fields_for_numeric_names() {
+    assert_eq!(
+        parse_repo_owner_and_name("https://github.com/acme/krill/pull/739"),
+        Some(("acme".into(), "krill".into()))
+    );
+    assert_eq!(
+        parse_repo_owner_and_name("https://ghe.corp.example.com/org/2026/pull/42"),
+        Some(("org".into(), "2026".into()))
+    );
+    assert_eq!(
+        parse_repo_owner_and_name(
+            "http://git.internal:8443/ghe-prefix/team/true/pulls/7?tab=checks#discussion_r1"
+        ),
+        Some(("team".into(), "true".into()))
+    );
+    assert_eq!(
+        parse_repo_owner_and_name("https://github.com/acme/krill/issues/739"),
+        None
+    );
+    assert_eq!(parse_repo_owner_and_name("https://github.com/pull/1"), None);
+    assert_eq!(parse_repo_owner_and_name("not-a-url"), None);
+
+    for (owner, name) in [("12345", "2026"), ("true", "false"), ("@org", "@repo")] {
+        let cmd = graphql_review_threads_command(Path::new("/tmp/repo"), owner, name, 739);
+        let args: Vec<_> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+        let owner_arg = format!("owner={owner}");
+        let name_arg = format!("name={name}");
+        assert!(
+            args.windows(2).any(|w| w == ["-f", owner_arg.as_str()]),
+            "owner must use -f (--raw-field), got: {args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-f", name_arg.as_str()]),
+            "name must use -f (--raw-field), got: {args:?}"
+        );
+        assert!(
+            !args.windows(2).any(|w| w == ["-F", owner_arg.as_str()]),
+            "owner must not use -F (--field)"
+        );
+        assert!(
+            !args.windows(2).any(|w| w == ["-F", name_arg.as_str()]),
+            "name must not use -F (--field)"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["-F", "prNumber=739"]),
+            "prNumber must remain -F for GraphQL Int!"
+        );
+    }
 }

@@ -42,7 +42,6 @@ pub(super) struct State {
     pub selected_checks: BTreeSet<usize>,
     pub expanded_logs: BTreeSet<usize>,
     pub selected_comments: BTreeSet<usize>,
-    pub fix_pending: bool,
     pub fix_status: Option<crate::i18n::Message>,
     pub generation: u64,
     pub task: Option<Task<()>>,
@@ -266,9 +265,8 @@ impl Panel {
             return;
         }
         let prompt = build_fix_with_ai_prompt(&self.repo, pr, &selected_checks, &selected_comments);
-        self.checks.fix_pending = true;
         self.checks.fix_status = None;
-        cx.emit(SendComments(prompt));
+        cx.emit(SendComments::checks_fix(prompt));
         cx.notify();
     }
 
@@ -846,6 +844,7 @@ impl Panel {
             text::FIX_WITH_AI.get().to_owned()
         };
         let no_agent = self.checks.fix_status == Some(text::FIX_NO_AGENT);
+        let is_error = no_agent || self.checks.fix_status == Some(text::FIX_FAILED);
 
         let footer = div()
             .id("pr-fix-footer")
@@ -907,7 +906,7 @@ impl Panel {
                             }
                         })
                         .text_size(crate::ui::TEXT_XS)
-                        .text_color(if no_agent {
+                        .text_color(if is_error {
                             p.destructive
                         } else {
                             p.muted_foreground
