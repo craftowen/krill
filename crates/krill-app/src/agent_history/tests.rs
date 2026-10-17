@@ -296,3 +296,82 @@ fn vault_panel_filters_by_scope_and_agent_and_one_click_resumes(cx: &mut TestApp
     );
     assert_eq!(*opened.lock().unwrap(), [SessionId(77)]);
 }
+
+/// OWE-768: 초기 스캔(`Action::Scan`)이나 직전 검색(`Action::Search`) 진행 중(`busy`)에
+/// 검색어·범위·에이전트 필터가 바뀌면 유실하지 않고 완료 직후 최신 조건으로 재검색한다.
+#[gpui::test]
+fn query_and_filter_changes_while_busy_run_latest_vault_search(cx: &mut TestAppContext) {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let call: Call = Arc::new(move |r| {
+        seen.lock().unwrap().push(r.clone());
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: vec![sample()],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(q)) => Response::Searched(SearchSnapshot {
+                hits: if q.query == "refresh"
+                    && q.agents == vec![VaultAgent::Claude]
+                    && q.paths == vec!["/tmp/proj-a/wt-1".to_string()]
+                {
+                    vec![VaultHit {
+                        agent: VaultAgent::Claude,
+                        id: "11111111-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/proj-a/wt-1".into(),
+                        modified: 300,
+                        title: "Refresh Handler".into(),
+                        summary: "Token refresh".into(),
+                        snippet: "refresh_token_now()".into(),
+                        role: "assistant".into(),
+                        score: 150,
+                    }]
+                } else {
+                    Vec::new()
+                },
+                truncated: false,
+                skipped: false,
+            }),
+            _ => unreachable!(),
+        }))
+    });
+    let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
+
+    // `toggle()`이 `Action::Scan`을 시작해 `busy = true`인 같은 프레임에서
+    // 검색어("r" -> "refresh")·범위(Workspace)·에이전트(Claude)를 잇달아 바꾼다.
+    panel.update(cx, |p, cx| {
+        p.set_scope_paths(
+            Some("/tmp/proj-a/wt-1".into()),
+            vec!["/tmp/proj-a/wt-1".into(), "/tmp/proj-a/wt-2".into()],
+        );
+        p.toggle(cx);
+        assert!(p.busy);
+        p.set_query("r", cx);
+        p.set_scope(VaultScope::Workspace, cx);
+        p.set_agent_filter(Some(VaultAgent::Claude), cx);
+        p.set_query("refresh", cx);
+        assert!(p.pending_search);
+    });
+    cx.run_until_parked();
+
+    let requests = log.lock().unwrap().clone();
+    assert_eq!(
+        requests,
+        vec![
+            Request::AgentHistory(Action::Scan),
+            Request::AgentHistory(Action::Search(SearchQuery {
+                query: "refresh".into(),
+                agents: vec![VaultAgent::Claude],
+                paths: vec!["/tmp/proj-a/wt-1".into()],
+                limit: 50,
+            })),
+        ]
+    );
+    panel.read_with(cx, |p, _| {
+        assert!(!p.busy && !p.pending_search);
+        let hits = p.visible_hits();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "Refresh Handler");
+    });
+}

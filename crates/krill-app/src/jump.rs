@@ -219,6 +219,8 @@ pub struct Palette {
     query: String,
     input: Entity<InputState>,
     scroll: UniformListScrollHandle,
+    history: Option<Entity<crate::agent_history::Panel>>,
+    history_sub: Option<Subscription>,
     _observe: Subscription,
 }
 
@@ -247,6 +249,15 @@ impl Palette {
                 p.recompute_vault_matches();
                 p.selected = 0;
                 p.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                if let Some(history) = p.history.clone() {
+                    let query = p.query.clone();
+                    history.update(cx, |h, cx| {
+                        h.set_query(query, cx);
+                        if !h.is_open() {
+                            h.search_vault(cx);
+                        }
+                    });
+                }
                 cx.notify();
             }
         });
@@ -264,8 +275,42 @@ impl Palette {
             query: String::new(),
             input,
             scroll: UniformListScrollHandle::new(),
+            history: None,
+            history_sub: None,
             _observe: observe,
         }
+    }
+
+    pub fn connect_history(
+        &mut self,
+        history: &Entity<crate::agent_history::Panel>,
+        cx: &mut Context<Self>,
+    ) {
+        let initial_hits = history.read(cx).loaded_hits();
+        if !initial_hits.is_empty() {
+            self.vault_hits = initial_hits;
+            self.recompute_vault_matches();
+        }
+        let sub = cx.observe(history, |this, history, cx| {
+            let (has_loaded, hits) =
+                history.read_with(cx, |h, _| (h.has_loaded(), h.loaded_hits()));
+            if has_loaded && this.vault_hits != hits {
+                this.set_vault_hits(hits, cx);
+            }
+        });
+        self.history = Some(history.clone());
+        self.history_sub = Some(sub);
+        let query = self.query.clone();
+        let scope = self.scope;
+        let agent_filter = self.agent_filter;
+        history.update(cx, |h, cx| {
+            h.set_query(query, cx);
+            h.set_scope(scope, cx);
+            h.set_agent_filter(agent_filter, cx);
+            if !h.is_open() {
+                h.scan(cx);
+            }
+        });
     }
 
     pub fn focus(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -299,6 +344,11 @@ impl Palette {
         self.agent_filter
     }
 
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
     pub fn set_vault_hits(&mut self, hits: Vec<VaultHit>, cx: &mut Context<Self>) {
         self.vault_hits = hits;
         self.recompute_vault_matches();
@@ -309,6 +359,14 @@ impl Palette {
         if self.scope != scope {
             self.scope = scope;
             self.recompute_vault_matches();
+            if let Some(history) = self.history.clone() {
+                history.update(cx, |h, cx| {
+                    h.set_scope(scope, cx);
+                    if !h.is_open() {
+                        h.search_vault(cx);
+                    }
+                });
+            }
             cx.notify();
         }
     }
@@ -317,6 +375,14 @@ impl Palette {
         if self.agent_filter != agent {
             self.agent_filter = agent;
             self.recompute_vault_matches();
+            if let Some(history) = self.history.clone() {
+                history.update(cx, |h, cx| {
+                    h.set_agent_filter(agent, cx);
+                    if !h.is_open() {
+                        h.search_vault(cx);
+                    }
+                });
+            }
             cx.notify();
         }
     }
@@ -327,6 +393,11 @@ impl Palette {
         project: Vec<String>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(history) = self.history.clone() {
+            let ws = workspace.clone();
+            let prj = project.clone();
+            history.update(cx, |h, _| h.set_scope_paths(ws, prj));
+        }
         self.workspace_path = workspace;
         self.project_paths = project;
         self.recompute_vault_matches();
@@ -348,6 +419,12 @@ impl Palette {
             self.workspace_path.as_deref(),
             &self.project_paths,
         );
+        let total = self.matches.len() + self.vault_matches.len();
+        if total == 0 {
+            self.selected = 0;
+        } else if self.selected >= total {
+            self.selected = total - 1;
+        }
     }
 
     pub fn set_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
@@ -367,17 +444,27 @@ impl Palette {
     }
 
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let last = self.matches.len().saturating_sub(1);
+        let total = self.matches.len() + self.vault_matches.len();
+        if total == 0 {
+            self.selected = 0;
+            return;
+        }
+        let last = total.saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
-        self.scroll
-            .scroll_to_item(self.selected, gpui::ScrollStrategy::Center);
+        if self.selected < self.matches.len() {
+            self.scroll
+                .scroll_to_item(self.selected, gpui::ScrollStrategy::Center);
+        }
         cx.notify();
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
         if let Some(item) = self.matches().nth(self.selected) {
             cx.emit(Event::Confirm(item.id));
-        } else if let Some(&vault_idx) = self.vault_matches.first() {
+        } else if let Some(&vault_idx) = self
+            .vault_matches
+            .get(self.selected.saturating_sub(self.matches.len()))
+        {
             cx.emit(Event::ResumeVault(vault_idx));
         }
     }
@@ -467,7 +554,10 @@ impl Render for Palette {
         .track_scroll(&self.scroll)
         .h(px(height));
 
-        let vault_section = (!self.vault_hits.is_empty()).then(|| {
+        let show_vault = !self.vault_hits.is_empty()
+            || self.scope != VaultScope::All
+            || self.agent_filter.is_some();
+        let vault_section = show_vault.then(|| {
             let mut filter_bar = div()
                 .flex()
                 .flex_wrap()
@@ -549,12 +639,17 @@ impl Render for Palette {
             }
 
             let mut rows_div = div()
+                .id("jump-vault-list")
                 .flex()
                 .flex_col()
                 .gap_1()
+                .max_h(px(ROW_HEIGHT * 6.))
+                .overflow_y_scroll()
                 .text_size(crate::ui::TEXT_XS);
-            for &hit_idx in self.vault_matches.iter().take(6) {
+            for (vault_pos, &hit_idx) in self.vault_matches.iter().enumerate() {
                 if let Some(hit) = self.vault_hits.get(hit_idx) {
+                    let row_index = rows + vault_pos;
+                    let is_selected = self.selected == row_index;
                     let title = if hit.title.is_empty() {
                         format!("{} · {}", hit.agent.profile(), hit.id)
                     } else {
@@ -576,12 +671,19 @@ impl Render for Palette {
                     rows_div = rows_div.child(
                         div()
                             .id(("jump-vault-row", hit_idx))
+                            .debug_selector(move || format!("jump-vault-row-{hit_idx}"))
                             .px_2()
                             .py_1()
                             .rounded(crate::ui::RADIUS_XS)
                             .flex()
                             .items_center()
                             .gap_2()
+                            .cursor_pointer()
+                            .when(is_selected, |d| d.bg(accent))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = row_index;
+                                this.resume_vault_at(hit_idx, cx);
+                            }))
                             .child(col)
                             .child(
                                 div()
@@ -595,6 +697,7 @@ impl Render for Palette {
                                     .cursor_pointer()
                                     .child(vault_text::RESUME.get())
                                     .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.selected = row_index;
                                         this.resume_vault_at(hit_idx, cx);
                                     })),
                             ),

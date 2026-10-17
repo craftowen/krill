@@ -1012,13 +1012,11 @@ impl Shell {
         let ws = Some(self.folder().display().to_string());
         self.history
             .update(cx, |h, _| h.set_scope_paths(ws.clone(), Vec::new()));
-        let vault_hits = self.history.read(cx).visible_hits();
+        let history = self.history.clone();
         let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
         palette.update(cx, |p, cx| {
             p.set_scope_paths(ws, Vec::new(), cx);
-            if !vault_hits.is_empty() {
-                p.set_vault_hits(vault_hits, cx);
-            }
+            p.connect_history(&history, cx);
             p.focus(window, cx);
         });
         let events = cx.subscribe_in(
