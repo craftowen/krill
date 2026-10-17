@@ -1875,7 +1875,11 @@ struct WorkflowRepoForm {
     symlink_path: gpui::Entity<gpui_component::input::InputState>,
     setup_script: gpui::Entity<gpui_component::input::InputState>,
     archive_script: gpui::Entity<gpui_component::input::InputState>,
+    loaded_repo: Option<String>,
+    loaded_setup: String,
+    loaded_archive: String,
     status: Option<(SharedString, bool)>,
+    _subs: Vec<Subscription>,
 }
 
 impl std::fmt::Debug for SettingsView {
@@ -6143,6 +6147,7 @@ impl SettingsView {
 
     fn ensure_workflow_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workflow_form.is_some() {
+            self.sync_workflow_repo_hooks(window, cx);
             return;
         }
         let default_repo = std::env::current_dir()
@@ -6155,8 +6160,11 @@ impl SettingsView {
             .as_deref()
             .map(krill_proto::orchestration::WorktreeStore::load_cached)
             .unwrap_or_default();
+        let loaded_repo = Self::normalize_repo_key(&default_repo);
         let default_setup = store.setup_script_for(&default_repo).unwrap_or_default();
         let default_archive = store.archive_script_for(&default_repo).unwrap_or_default();
+        let loaded_setup = default_setup.clone();
+        let loaded_archive = default_archive.clone();
         let repo_path = cx.new(|cx| {
             let mut input = gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::HOOKS_REPO_PLACEHOLDER.get());
@@ -6185,13 +6193,145 @@ impl SettingsView {
             }
             input
         });
+        let repo_obs = cx.observe_in(&repo_path, window, |this, _, window, cx| {
+            this.sync_workflow_repo_hooks(window, cx);
+        });
+        let repo_sub = cx.subscribe_in(
+            &repo_path,
+            window,
+            |this, _, _: &gpui_component::input::InputEvent, window, cx| {
+                this.sync_workflow_repo_hooks(window, cx);
+            },
+        );
+        let setup_obs = cx.observe(&setup_script, |this, inp, cx| {
+            if let Some(form) = &mut this.workflow_form
+                && Self::normalize_repo_key(&form.repo_path.read(cx).value()) == form.loaded_repo
+            {
+                form.loaded_setup = inp.read(cx).value().to_string();
+            }
+        });
+        let archive_obs = cx.observe(&archive_script, |this, inp, cx| {
+            if let Some(form) = &mut this.workflow_form
+                && Self::normalize_repo_key(&form.repo_path.read(cx).value()) == form.loaded_repo
+            {
+                form.loaded_archive = inp.read(cx).value().to_string();
+            }
+        });
         self.workflow_form = Some(WorkflowRepoForm {
             repo_path,
             symlink_path,
             setup_script,
             archive_script,
+            loaded_repo,
+            loaded_setup,
+            loaded_archive,
             status: None,
+            _subs: vec![repo_obs, repo_sub, setup_obs, archive_obs],
         });
+    }
+
+    fn sync_workflow_repo_hooks(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &self.workflow_form else {
+            return;
+        };
+        let raw_repo = form.repo_path.read(cx).value().to_string();
+        let next_repo = Self::normalize_repo_key(&raw_repo);
+        if next_repo == form.loaded_repo {
+            return;
+        }
+        let prev_setup = form.loaded_setup.clone();
+        let prev_archive = form.loaded_archive.clone();
+        let cur_setup = form.setup_script.read(cx).value().to_string();
+        let cur_archive = form.archive_script.read(cx).value().to_string();
+        let setup_inp = form.setup_script.clone();
+        let archive_inp = form.archive_script.clone();
+        let symlink_inp = form.symlink_path.clone();
+
+        let store = state_dir(cx)
+            .as_deref()
+            .and_then(|d| krill_proto::orchestration::WorktreeStore::load(d).ok())
+            .unwrap_or_default();
+        let repo_setup = next_repo
+            .as_deref()
+            .and_then(|k| store.setup_script_for(k))
+            .unwrap_or_default();
+        let repo_archive = next_repo
+            .as_deref()
+            .and_then(|k| store.archive_script_for(k))
+            .unwrap_or_default();
+
+        let target_setup = if cur_setup == prev_setup {
+            repo_setup
+        } else {
+            cur_setup.clone()
+        };
+        let target_archive = if cur_archive == prev_archive {
+            repo_archive
+        } else {
+            cur_archive.clone()
+        };
+
+        if let Some(form) = &mut self.workflow_form {
+            form.loaded_repo = next_repo;
+            form.loaded_setup.clone_from(&target_setup);
+            form.loaded_archive.clone_from(&target_archive);
+            form.status = None;
+        }
+        if cur_setup != target_setup {
+            setup_inp.update(cx, |inp, cx| inp.set_value(target_setup, window, cx));
+        }
+        if cur_archive != target_archive {
+            archive_inp.update(cx, |inp, cx| inp.set_value(target_archive, window, cx));
+        }
+        if !symlink_inp.read(cx).value().is_empty() {
+            symlink_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// 지정한 저장소 경로의 setup/archive 훅 설정을 워크플로 입력 폼에 불러온다.
+    pub fn load_repo_hooks_for(
+        &mut self,
+        repo_raw: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_workflow_form(window, cx);
+        let Some(form) = &self.workflow_form else {
+            return;
+        };
+        let repo_inp = form.repo_path.clone();
+        let setup_inp = form.setup_script.clone();
+        let archive_inp = form.archive_script.clone();
+        let symlink_inp = form.symlink_path.clone();
+        let next_repo = Self::normalize_repo_key(repo_raw);
+        let store = state_dir(cx)
+            .as_deref()
+            .and_then(|d| krill_proto::orchestration::WorktreeStore::load(d).ok())
+            .unwrap_or_default();
+        let repo_setup = next_repo
+            .as_deref()
+            .and_then(|k| store.setup_script_for(k))
+            .unwrap_or_default();
+        let repo_archive = next_repo
+            .as_deref()
+            .and_then(|k| store.archive_script_for(k))
+            .unwrap_or_default();
+        if let Some(form) = &mut self.workflow_form {
+            form.loaded_repo = next_repo;
+            form.loaded_setup.clone_from(&repo_setup);
+            form.loaded_archive.clone_from(&repo_archive);
+            form.status = None;
+        }
+        if repo_inp.read(cx).value().as_str() != repo_raw {
+            repo_inp.update(cx, |inp, cx| inp.set_value(repo_raw.to_owned(), window, cx));
+        }
+        setup_inp.update(cx, |inp, cx| inp.set_value(repo_setup, window, cx));
+        archive_inp.update(cx, |inp, cx| inp.set_value(repo_archive, window, cx));
+        if !symlink_inp.read(cx).value().is_empty() {
+            symlink_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        }
+        cx.notify();
     }
 
     fn normalize_repo_key(raw: &str) -> Option<String> {
@@ -6296,14 +6436,28 @@ impl SettingsView {
             cx.notify();
             return Err(msg);
         };
+        let setup_trimmed = setup_cmd.unwrap_or("").trim().to_owned();
+        let archive_trimmed = archive_cmd.unwrap_or("").trim().to_owned();
         let result = krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-            store.set_setup_script(&repo_key, setup_cmd.unwrap_or(""))?;
-            store.set_archive_script(&repo_key, archive_cmd.unwrap_or(""))?;
+            store.set_setup_script(&repo_key, &setup_trimmed)?;
+            store.set_archive_script(&repo_key, &archive_trimmed)?;
             Ok(())
         });
         match result {
             Ok(()) => {
                 if let Some(form) = &mut self.workflow_form {
+                    let cur_repo = Self::normalize_repo_key(&form.repo_path.read(cx).value());
+                    if cur_repo.as_deref() == Some(repo_key.as_str()) {
+                        let cur_setup = form.setup_script.read(cx).value().trim().to_owned();
+                        let cur_archive = form.archive_script.read(cx).value().trim().to_owned();
+                        if cur_setup == setup_trimmed && cur_archive == archive_trimmed {
+                            form.loaded_repo = Some(repo_key);
+                            form.loaded_setup = setup_trimmed;
+                            form.loaded_archive = archive_trimmed;
+                        } else {
+                            form.loaded_repo = None;
+                        }
+                    }
                     form.status = Some((text::HOOKS_SAVED.get().into(), false));
                 }
                 cx.defer(notify_external_change);
@@ -6767,7 +6921,8 @@ impl SettingsView {
                                 .primary()
                                 .label(text::HOOKS_SAVE.get())
                                 .debug_selector(|| "admin-repo-hooks-save".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.sync_workflow_repo_hooks(window, cx);
                                     let Some(form) = &this.workflow_form else {
                                         return;
                                     };
@@ -6797,16 +6952,21 @@ impl SettingsView {
                     .unwrap_or_else(|| "—".to_owned());
                 let summary = format!("{repo_key} · setup={setup_val} · archive={archive_val}");
                 let row_id = format!("admin-repo-hook-row-{idx}");
+                let repo_for_click = repo_key.clone();
                 hooks_card = hooks_card.child(
                     div()
                         .id(gpui::ElementId::Name(row_id.clone().into()))
                         .debug_selector(move || row_id.clone())
+                        .cursor_pointer()
                         .p_2()
                         .rounded(crate::ui::RADIUS_SM)
                         .bg(p.background)
                         .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_XS)
                         .truncate()
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.load_repo_hooks_for(&repo_for_click, window, cx);
+                        }))
                         .child(summary),
                 );
             }
