@@ -256,10 +256,13 @@ impl NavHistory {
             },
         ) = (self.entries.get_mut(self.index), &entry)
             && cur_pane == pane
-            && cur_wt == worktree
+            && (cur_wt == worktree || cur_wt.is_none() || worktree.is_none())
         {
             if cur_session.is_none() && session.is_some() {
                 *cur_session = *session;
+            }
+            if cur_wt.is_none() && worktree.is_some() {
+                cur_wt.clone_from(worktree);
             }
             return;
         }
@@ -724,12 +727,41 @@ impl Shell {
             confirm_close_tab: None,
             nav_history: NavHistory::default(),
         };
-        shell.record_workspace_nav();
+        shell.record_workspace_nav(cx);
         shell
     }
 
+    /// 칸이 사이드바의 로컬 git 워크트리에 속할 때만 그 워크트리 루트 경로를 돌려준다.
+    /// 비-git 폴더 탭·에디터 파일 탭·원격 호스트 탭은 `None`이다(OWE-757).
+    pub(super) fn worktree_for_pane(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
+        if self.layout.file(pane).is_some() || self.layout.host(pane).is_remote() {
+            return None;
+        }
+        let sidebar = self.sidebar.read(cx);
+        if let Some(sid) = self.layout.session(pane)
+            && let Some(folder) = sidebar.folder_on(&krill_app::hosts::HostId::Local, sid)
+            && let Some(wt) = sidebar.worktree_for_path(folder)
+        {
+            return Some(wt);
+        }
+        let launch = self.layout.launch(pane)?;
+        let cwd = std::path::Path::new(std::ffi::OsStr::from_bytes(&launch.cwd));
+        sidebar.worktree_for_path(cwd)
+    }
+
+    fn find_pane_for_worktree(&self, wt: &std::path::Path, cx: &App) -> Option<(usize, PaneId)> {
+        for i in 0..self.layout.tabs().len() {
+            for p in self.layout.tab_panes(i) {
+                if self.worktree_for_pane(p, cx).as_deref() == Some(wt) {
+                    return Some((i, p));
+                }
+            }
+        }
+        None
+    }
+
     /// 현재 포커스된 워크스페이스 칸(탭·세션·워크트리)을 탐색 히스토리에 기록한다.
-    pub(super) fn record_workspace_nav(&mut self) {
+    pub(super) fn record_workspace_nav(&mut self, cx: &App) {
         if self.settings.is_some() {
             return;
         }
@@ -737,7 +769,7 @@ impl Shell {
             return;
         };
         let session = self.layout.session(pane);
-        let worktree = Some(self.folder());
+        let worktree = self.worktree_for_pane(pane, cx);
         self.nav_history.push(NavEntry::Workspace {
             pane,
             session,
@@ -753,23 +785,33 @@ impl Shell {
                 session,
                 worktree,
             } => {
-                let sidebar = self.sidebar.read(cx);
-                if sidebar.has_trees()
-                    && let Some(wt) = worktree
-                    && !sidebar.contains_worktree(wt)
-                {
-                    return false;
-                }
-                let pane_exists = (0..self.layout.tabs().len()).any(|i| {
-                    let mut l = self.layout.clone();
-                    l.activate(i);
-                    l.visible().contains(pane)
-                });
-                if pane_exists {
+                if self.layout.pane_exists(*pane) {
                     return true;
+                }
+                let sidebar = self.sidebar.read(cx);
+                if let Some(wt) = worktree {
+                    if sidebar.has_trees() && !sidebar.contains_worktree(wt) {
+                        return false;
+                    }
+                    if self.find_pane_for_worktree(wt, cx).is_some() {
+                        return true;
+                    }
                 }
                 session.is_some_and(|sid| sidebar.session(sid).is_some())
             }
+        }
+    }
+
+    fn is_same_nav_target(cur: Option<&NavEntry>, cand: &NavEntry) -> bool {
+        match (cur, cand) {
+            (
+                Some(NavEntry::Workspace { pane: cur_pane, .. }),
+                NavEntry::Workspace {
+                    pane: cand_pane, ..
+                },
+            ) => cur_pane == cand_pane,
+            (Some(cur), cand) => cur == cand,
+            (None, _) => false,
         }
     }
 
@@ -777,7 +819,7 @@ impl Shell {
         let cur = self.nav_history.entries.get(self.nav_history.index);
         (0..self.nav_history.index).rev().find(|&i| {
             let cand = &self.nav_history.entries[i];
-            cur != Some(cand) && self.is_entry_reachable(cand, cx)
+            !Self::is_same_nav_target(cur, cand) && self.is_entry_reachable(cand, cx)
         })
     }
 
@@ -785,7 +827,7 @@ impl Shell {
         let cur = self.nav_history.entries.get(self.nav_history.index);
         ((self.nav_history.index + 1)..self.nav_history.entries.len()).find(|&i| {
             let cand = &self.nav_history.entries[i];
-            cur != Some(cand) && self.is_entry_reachable(cand, cx)
+            !Self::is_same_nav_target(cur, cand) && self.is_entry_reachable(cand, cx)
         })
     }
 
@@ -845,28 +887,16 @@ impl Shell {
                 if self.settings.is_some() {
                     self.close_settings(window.as_deref_mut(), cx);
                 }
-                let mut target_tab_pane = None;
-                for i in 0..self.layout.tabs().len() {
-                    let mut l = self.layout.clone();
-                    l.activate(i);
-                    if l.visible().contains(&pane) {
-                        target_tab_pane = Some((i, pane));
-                        break;
-                    }
-                }
+                let mut target_tab_pane = self
+                    .layout
+                    .tabs()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(i, t)| t.root.contains(pane).then_some((i, pane)));
                 if target_tab_pane.is_none()
                     && let Some(wt) = &worktree
                 {
-                    for i in 0..self.layout.tabs().len() {
-                        let mut l = self.layout.clone();
-                        l.activate(i);
-                        if let Some(p) = l.visible().into_iter().find(|&p| {
-                            std::ffi::OsStr::from_bytes(&self.launch_for(p).cwd) == wt.as_os_str()
-                        }) {
-                            target_tab_pane = Some((i, p));
-                            break;
-                        }
-                    }
+                    target_tab_pane = self.find_pane_for_worktree(wt, cx);
                 }
                 if let Some((tab_idx, target_pane)) = target_tab_pane {
                     self.change(true, cx, |l| {
@@ -877,7 +907,12 @@ impl Shell {
                         w.focus(&self.focus, cx);
                     }
                 } else if let Some(sid) = session {
-                    self.open_session(sid, cx);
+                    let host = self
+                        .sidebar
+                        .read(cx)
+                        .host_for_session(sid)
+                        .unwrap_or(krill_app::hosts::HostId::Local);
+                    self.open_session_on(host, sid, cx);
                 }
                 self.sidebar.update(cx, sidebar::Sidebar::reveal_focused);
             }
@@ -944,7 +979,7 @@ impl Shell {
         if self.settings.take().is_none() {
             return;
         }
-        self.record_workspace_nav();
+        self.record_workspace_nav(cx);
         let session = self.layout.focused().and_then(|p| {
             self.layout
                 .session(p)
@@ -1816,6 +1851,7 @@ impl Shell {
                     self.layout.clear_session(pane);
                 }
                 self.layout.set_session(pane, session);
+                self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
             }
@@ -1880,6 +1916,7 @@ impl Shell {
         if self.layout.session(pane) != Some(session) {
             self.layout.clear_session(pane);
             self.layout.set_session(pane, session);
+            self.record_workspace_nav(cx);
             self.save();
             self.refresh_detached(cx);
         }
@@ -2468,7 +2505,7 @@ impl Shell {
         self.sync(cx);
         if save && self.layout != before {
             self.close_settings(None, cx);
-            self.record_workspace_nav();
+            self.record_workspace_nav(cx);
             self.save();
             self.refresh_detached(cx);
         }

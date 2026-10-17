@@ -4494,3 +4494,155 @@ fn navigation_history_back_forward_shortcuts_and_buttons(cx: &mut TestAppContext
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).active(), 0);
 }
+
+/// OWE-757: 사이드바에 git 저장소가 열려 있을 때(`sidebar.has_trees() == true`)도
+/// (a) 비-git 폴더/기본 셸 탭, (b) 워크트리 하위 디렉터리 탭, (c) 에디터 파일 탭, (d) 원격 호스트 탭으로
+/// `⌘⌥←`/`⌘⌥→` 탐색 히스토리 이동이 누락되지 않는지 검증한다.
+#[gpui::test]
+fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_trees(
+    cx: &mut TestAppContext,
+) {
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    let snapshot = sidebar::Snapshot {
+        sessions: Vec::new(),
+        trees: [(
+            PathBuf::from("/repo"),
+            vec![PathBuf::from("/repo/main"), PathBuf::from("/repo/feature")],
+        )]
+        .into(),
+    };
+
+    let path = state_path("nav-history-owe-757");
+    let (view, cx) = open(cx, path);
+    cx.update(|_, cx| {
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |s, cx| s.connect_source(Arc::new(Memory(snapshot)), cx));
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        assert!(view.read(cx).sidebar.read(cx).has_trees());
+    });
+
+    // 탭 0: 초기 기본 셸 탭 ($HOME 등 비-git 폴더)
+    // 탭 1 (a): 명시적 비-git 폴더 탭 (`/tmp/plain-folder`)
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_folder_tab(
+                std::path::Path::new("/tmp/plain-folder"),
+                Program::Login,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active(), 1);
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let p = s.layout.focused().expect("focused pane");
+        assert_eq!(s.worktree_for_pane(p, cx), None);
+    });
+
+    // 탭 2 (b): 워크트리 하위 디렉터리에서 열린 탭 (`/repo/main/crates/sub`)
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_folder_tab(
+                std::path::Path::new("/repo/main/crates/sub"),
+                Program::Login,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active(), 2);
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let p = s.layout.focused().expect("focused pane");
+        assert_eq!(
+            s.worktree_for_pane(p, cx),
+            Some(PathBuf::from("/repo/main"))
+        );
+    });
+
+    // 탭 3 (c): 에디터 파일 탭 (`open_file`)
+    let tmp_file = std::env::temp_dir().join(format!("krill-owe-757-{}.rs", std::process::id()));
+    std::fs::write(&tmp_file, "fn main() {}\n").expect("write temp file");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.open_file(tmp_file.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active(), 3);
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let p = s.layout.focused().expect("focused pane");
+        assert_eq!(s.worktree_for_pane(p, cx), None);
+    });
+
+    // 탭 4 (d): 원격 호스트 탭 (`HostId::Remote`)
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_folder_tab_on(
+                krill_app::hosts::HostId::Remote("remote-dev".into()),
+                std::path::Path::new("/home/dev/project"),
+                Program::Login,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active(), 4);
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        let p = s.layout.focused().expect("focused pane");
+        assert_eq!(s.worktree_for_pane(p, cx), None);
+    });
+
+    // 탭 5: 워크트리 루트 탭 (`/repo/feature`)
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_folder_tab(std::path::Path::new("/repo/feature"), Program::Login, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active(), 5);
+
+    // ⌘⌥← 로 탭 5 -> 4(원격) -> 3(파일) -> 2(하위 디렉터리) -> 1(비-git 폴더) -> 0(기본 셸) 순서대로 역탐색.
+    for expected_tab in (0..=4).rev() {
+        cx.simulate_keystrokes("cmd-alt-left");
+        cx.run_until_parked();
+        assert_eq!(
+            layout_of(&view, cx).active(),
+            expected_tab,
+            "expected NavigateBack to reach tab {expected_tab}"
+        );
+    }
+    cx.update(|_, cx| {
+        assert!(!view.read(cx).can_navigate_back(cx));
+        assert!(view.read(cx).can_navigate_forward(cx));
+    });
+
+    // ⌘⌥→ 로 탭 0 -> 1 -> 2 -> 3 -> 4 -> 5 순서대로 정탐색.
+    for expected_tab in 1..=5 {
+        cx.simulate_keystrokes("cmd-alt-right");
+        cx.run_until_parked();
+        assert_eq!(
+            layout_of(&view, cx).active(),
+            expected_tab,
+            "expected NavigateForward to reach tab {expected_tab}"
+        );
+    }
+    cx.update(|_, cx| {
+        assert!(view.read(cx).can_navigate_back(cx));
+        assert!(!view.read(cx).can_navigate_forward(cx));
+    });
+
+    std::fs::remove_file(&tmp_file).ok();
+}

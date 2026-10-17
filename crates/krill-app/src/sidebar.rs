@@ -1034,6 +1034,21 @@ impl Sidebar {
         self.snapshot_for(host).sessions.iter().find(|s| s.id == id)
     }
 
+    /// 세션이 속한 호스트(로컬 또는 원격)를 찾는다.
+    #[must_use]
+    pub fn host_for_session(&self, id: SessionId) -> Option<HostId> {
+        if self.snapshot.sessions.iter().any(|s| s.id == id) {
+            return Some(HostId::Local);
+        }
+        self.remote_hosts.iter().find_map(|r| {
+            r.snapshot
+                .sessions
+                .iter()
+                .any(|s| s.id == id)
+                .then(|| HostId::Remote(r.id.clone()))
+        })
+    }
+
     pub(super) fn snapshot_for(&self, host: &HostId) -> &Snapshot {
         match host {
             HostId::Local => &self.snapshot,
