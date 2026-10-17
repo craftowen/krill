@@ -45,7 +45,7 @@ use std::process::ExitCode;
 use krill_proto::agent::{self, Agents, Permission};
 use krill_proto::daemon;
 
-const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill artifacts share|update|unshare|list|delete | krill computer <cmd> | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill set --comment <text> | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree new <name> | krill worktree rm <path>";
+const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill computer <cmd> | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]";
 
 fn main() -> ExitCode {
     let raw: Vec<_> = std::env::args_os().skip(1).collect();
@@ -245,4 +245,28 @@ fn agent_list() -> ExitCode {
         println!("{id:<10} {:<12} {status}{badge}", p.name);
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::USAGE;
+
+    #[test]
+    fn usage_lists_m10_worktree_and_set_subcommands() {
+        for expected in [
+            "krill set --comment <text> [--parent <path>|--clear-parent]",
+            "krill worktree new <name>",
+            "krill worktree rm <path>",
+            "krill worktree cleanup",
+            "krill worktree space",
+            "krill worktree set",
+            "krill worktree symlink",
+            "krill worktree hooks",
+        ] {
+            assert!(
+                USAGE.contains(expected),
+                "missing {expected:?} in main USAGE: {USAGE}"
+            );
+        }
+    }
 }

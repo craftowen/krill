@@ -345,11 +345,16 @@ fn cmd_worker_start(state_dir: &Path, args: &[String]) -> io::Result<()> {
     };
 
     let delivered = dispatch.session_id.map_or(Ok(()), |sid| {
+        let target = crate::remote::Target::establish(None).map_err(|e| e.to_string())?;
         let preamble = worker_preamble(&dispatch).replace('\n', " | ");
         if newly_spawned {
-            crate::session::wait_for_spawned_agent_ready(sid, crate::session::BOOT_TIMEOUT)?;
+            crate::session::wait_for_spawned_agent_ready(
+                &target,
+                sid,
+                crate::session::BOOT_TIMEOUT,
+            )?;
         }
-        crate::session::send_session_line(sid, &preamble)
+        crate::session::send_session_line(&target, sid, &preamble)
     });
 
     if json {
