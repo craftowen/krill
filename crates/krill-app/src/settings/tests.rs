@@ -4465,3 +4465,317 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     fs::remove_dir_all(d).ok();
     fs::remove_dir_all(d2).ok();
 }
+
+/// OWE-760: 스케줄 모달이 빈 id·cwd·잘못된 cron·빈/미종료 따옴표 command를 검증해 오류 배너를 표시하고
+/// 모달을 닫지 않으며, 편집/저장 시 공백이 포함된 다중 단어 command 인자(`["bash", "-c", "cargo test --workspace"]`)를 보존한다.
+#[gpui::test]
+fn owe760_schedule_modal_validates_fields_and_preserves_quoted_command_args(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::schedule::{Schedules, WorkspaceMode};
+
+    let d = dir("owe760-schedule-modal");
+    let repo = d.join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let repo_str = fs::canonicalize(&repo)
+        .unwrap_or_else(|_| repo.clone())
+        .display()
+        .to_string();
+
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(4000.)));
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+    });
+    vcx.run_until_parked();
+
+    let click_sel = |vcx: &mut gpui::VisualTestContext, sel: &'static str| {
+        let b = vcx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("missing selector {sel}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    click_sel(vcx, "admin-schedule-add");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_some());
+
+    // 1. 빈 id, 빈/상대 cwd, 잘못된 cron, 빈 command, 미종료 따옴표 command, 빈 prompt 검증
+    for (id, cron, cwd, cmd, prompt) in [
+        ("", "0 9 * * *", repo_str.as_str(), "claude -p", "check"),
+        (
+            "bad id",
+            "0 9 * * *",
+            repo_str.as_str(),
+            "claude -p",
+            "check",
+        ),
+        ("valid-id", "0 9 * * *", "", "claude -p", "check"),
+        (
+            "valid-id",
+            "0 9 * * *",
+            "relative/path",
+            "claude -p",
+            "check",
+        ),
+        (
+            "valid-id",
+            "invalid",
+            repo_str.as_str(),
+            "claude -p",
+            "check",
+        ),
+        ("valid-id", "0 9 * * *", repo_str.as_str(), "", "check"),
+        (
+            "valid-id",
+            "0 9 * * *",
+            repo_str.as_str(),
+            "bash -c 'unclosed",
+            "check",
+        ),
+        ("valid-id", "0 9 * * *", repo_str.as_str(), "claude -p", ""),
+    ] {
+        vcx.update(|window, cx| {
+            view.update(cx, |v, cx| {
+                v.set_schedule_modal_values(
+                    id,
+                    cron,
+                    cwd,
+                    cmd,
+                    prompt,
+                    "",
+                    WorkspaceMode::Reuse,
+                    window,
+                    cx,
+                );
+            });
+        });
+        vcx.run_until_parked();
+        click_sel(vcx, "admin-schedule-modal-save");
+        assert!(
+            vcx.debug_bounds("admin-schedule-modal").is_some(),
+            "modal should remain open for invalid input ({id:?}, {cron:?}, {cwd:?}, {cmd:?}, {prompt:?})"
+        );
+        assert!(vcx.debug_bounds("admin-schedule-modal-error").is_some());
+        vcx.update(|_, cx| {
+            assert!(view.read(cx).schedule_modal_error().is_some());
+        });
+        assert!(Schedules::load(&d).unwrap().schedule.is_empty());
+    }
+
+    // 2. 공백 포함 인자를 가진 스케줄 저장 및 편집 모달 왕복 보존 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_schedule_modal_values(
+                "multi-arg-job",
+                "0 9 * * *",
+                &repo_str,
+                "bash -c 'cargo test --workspace'",
+                "run suite",
+                "",
+                WorkspaceMode::Reuse,
+                window,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_none());
+
+    let saved = Schedules::load(&d).unwrap();
+    assert_eq!(saved.schedule.len(), 1);
+    assert_eq!(
+        saved.schedule[0].command,
+        vec![
+            "bash".to_owned(),
+            "-c".to_owned(),
+            "cargo test --workspace".to_owned()
+        ]
+    );
+
+    // 편집 모달을 다시 열어 그대로 저장해도 공백 포함 인자가 쪼개지지 않고 보존된다.
+    click_sel(vcx, "admin-schedule-edit-multi-arg-job");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_some());
+    vcx.update(|_, cx| {
+        let cmd_val = view
+            .read(cx)
+            .schedule_modal
+            .as_ref()
+            .unwrap()
+            .command
+            .read(cx)
+            .value()
+            .to_string();
+        assert_eq!(cmd_val, "bash -c 'cargo test --workspace'");
+    });
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_none());
+
+    let after_edit = Schedules::load(&d).unwrap();
+    assert_eq!(
+        after_edit.schedule[0].command,
+        vec![
+            "bash".to_owned(),
+            "-c".to_owned(),
+            "cargo test --workspace".to_owned()
+        ]
+    );
+
+    // JSON 배열 형태 입력 및 작은따옴표가 포함된 인자 왕복 검증
+    click_sel(vcx, "admin-schedule-edit-multi-arg-job");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_schedule_modal_values(
+                "multi-arg-job",
+                "0 9 * * *",
+                &repo_str,
+                r#"["/bin/sh", "-c", "printf 'hello world\n' && cargo check"]"#,
+                "run suite",
+                "",
+                WorkspaceMode::Reuse,
+                window,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    click_sel(vcx, "admin-schedule-modal-save");
+    let after_json = Schedules::load(&d).unwrap();
+    assert_eq!(
+        after_json.schedule[0].command,
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'hello world\n' && cargo check".to_owned()
+        ]
+    );
+
+    click_sel(vcx, "admin-schedule-edit-multi-arg-job");
+    click_sel(vcx, "admin-schedule-modal-save");
+    let after_roundtrip = Schedules::load(&d).unwrap();
+    assert_eq!(
+        after_roundtrip.schedule[0].command,
+        vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            "printf 'hello world\n' && cargo check".to_owned()
+        ]
+    );
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-761: Workflows 탭에서 저장소 경로(`admin-workflow-repo-input`)를 변경하면
+/// 해당 저장소의 setup/archive 훅 입력창이 즉시 동기화되어 다른 저장소의 훅을 덮어쓰지 않는다.
+#[gpui::test]
+fn owe761_workflow_repo_path_change_syncs_hooks_without_clobbering_other_repo(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe761-repo-hooks-sync");
+    let repo_a_dir = d.join("repo-a");
+    let repo_b_dir = d.join("repo-b");
+    fs::create_dir_all(&repo_a_dir).unwrap();
+    fs::create_dir_all(&repo_b_dir).unwrap();
+    let repo_a = fs::canonicalize(&repo_a_dir)
+        .unwrap_or_else(|_| repo_a_dir.clone())
+        .display()
+        .to_string();
+    let repo_b = fs::canonicalize(&repo_b_dir)
+        .unwrap_or_else(|_| repo_b_dir.clone())
+        .display()
+        .to_string();
+
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(4000.)));
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Workflows, cx);
+            v.save_repo_hooks_for(
+                &repo_a,
+                Some("pnpm install"),
+                Some("./scripts/cleanup-a.sh"),
+                cx,
+            )
+            .unwrap();
+            v.save_repo_hooks_for(
+                &repo_b,
+                Some("cargo fetch"),
+                Some("./scripts/keep-b-archive.sh"),
+                cx,
+            )
+            .unwrap();
+            v.load_repo_hooks_for(&repo_a, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|_, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.setup_script.read(cx).value().as_str(), "pnpm install");
+        assert_eq!(
+            form.archive_script.read(cx).value().as_str(),
+            "./scripts/cleanup-a.sh"
+        );
+    });
+
+    // 저장소 경로를 repo_b로 바꾸면 setup/archive 입력창이 repo_b의 기존 설정으로 자동 동기화된다.
+    vcx.update(|window, cx| {
+        let repo_input = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .repo_path
+            .clone();
+        repo_input.update(cx, |inp, cx| inp.set_value(repo_b.clone(), window, cx));
+    });
+    vcx.run_until_parked();
+
+    vcx.update(|window, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.setup_script.read(cx).value().as_str(), "cargo fetch");
+        assert_eq!(
+            form.archive_script.read(cx).value().as_str(),
+            "./scripts/keep-b-archive.sh"
+        );
+        // setup_script만 수정
+        let setup_inp = form.setup_script.clone();
+        setup_inp.update(cx, |inp, cx| {
+            inp.set_value("cargo check --workspace", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+
+    let save_bounds = vcx
+        .debug_bounds("admin-repo-hooks-save")
+        .expect("admin-repo-hooks-save");
+    vcx.simulate_click(save_bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    let store = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
+    assert_eq!(
+        store.setup_script_for(&repo_b).as_deref(),
+        Some("cargo check --workspace")
+    );
+    assert_eq!(
+        store.archive_script_for(&repo_b).as_deref(),
+        Some("./scripts/keep-b-archive.sh"),
+        "repo B archive hook must not be overwritten by repo A's hook"
+    );
+    assert_eq!(
+        store.setup_script_for(&repo_a).as_deref(),
+        Some("pnpm install")
+    );
+    assert_eq!(
+        store.archive_script_for(&repo_a).as_deref(),
+        Some("./scripts/cleanup-a.sh")
+    );
+
+    fs::remove_dir_all(d).ok();
+}

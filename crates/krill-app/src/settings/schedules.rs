@@ -97,6 +97,147 @@ fn capture_session_output(dir: &Path, session: krill_proto::SessionId) -> Option
     None
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Quote {
+    Single,
+    Double,
+}
+
+/// 명령 인자 배열을 공백·따옴표가 보존되는 셸 문자열로 직렬화한다.
+#[must_use]
+pub fn format_command_args(args: &[String]) -> String {
+    args.iter()
+        .enumerate()
+        .map(|(idx, arg)| {
+            let looks_like_json_array =
+                idx == 0 && args.len() == 1 && arg.starts_with('[') && arg.ends_with(']');
+            if !arg.is_empty()
+                && !looks_like_json_array
+                && !arg
+                    .chars()
+                    .any(|c| c.is_whitespace() || matches!(c, '\'' | '"' | '\\'))
+            {
+                arg.clone()
+            } else if !arg.is_empty()
+                && !arg.contains(['\'', '\n', '\r', '\t'])
+                && !looks_like_json_array
+            {
+                format!("'{arg}'")
+            } else {
+                let mut out = String::with_capacity(arg.len() + 2);
+                out.push('"');
+                for ch in arg.chars() {
+                    match ch {
+                        '\\' => out.push_str("\\\\"),
+                        '"' => out.push_str("\\\""),
+                        '\n' => out.push_str("\\n"),
+                        '\r' => out.push_str("\\r"),
+                        '\t' => out.push_str("\\t"),
+                        _ => out.push(ch),
+                    }
+                }
+                out.push('"');
+                out
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 셸 따옴표(`'...'`, `"..."`, `\`) 또는 JSON 문자열 배열(`["bash", "-c", "..."]`)을 파싱한다.
+pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("schedule command must not be empty".to_owned());
+    }
+    if trimmed.starts_with('[')
+        && trimmed.ends_with(']')
+        && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
+    {
+        if arr.is_empty()
+            || arr.first().is_none_or(|s| s.trim().is_empty())
+            || arr.iter().any(|s| s.contains('\0'))
+        {
+            return Err("invalid schedule command".to_owned());
+        }
+        return Ok(arr);
+    }
+
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut in_token = false;
+    let mut quote: Option<Quote> = None;
+    let mut chars = trimmed.chars();
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(Quote::Single) => {
+                if ch == '\'' {
+                    quote = None;
+                } else {
+                    cur.push(ch);
+                }
+            }
+            Some(Quote::Double) => {
+                if ch == '"' {
+                    quote = None;
+                } else if ch == '\\' {
+                    let Some(next) = chars.next() else {
+                        return Err("unterminated escape in schedule command".to_owned());
+                    };
+                    match next {
+                        '\\' | '"' => cur.push(next),
+                        'n' => cur.push('\n'),
+                        'r' => cur.push('\r'),
+                        't' => cur.push('\t'),
+                        _ => {
+                            cur.push('\\');
+                            cur.push(next);
+                        }
+                    }
+                } else {
+                    cur.push(ch);
+                }
+            }
+            None => {
+                if ch.is_whitespace() {
+                    if in_token {
+                        args.push(std::mem::take(&mut cur));
+                        in_token = false;
+                    }
+                } else if ch == '\'' {
+                    in_token = true;
+                    quote = Some(Quote::Single);
+                } else if ch == '"' {
+                    in_token = true;
+                    quote = Some(Quote::Double);
+                } else if ch == '\\' {
+                    let Some(next) = chars.next() else {
+                        return Err("unterminated escape in schedule command".to_owned());
+                    };
+                    in_token = true;
+                    cur.push(next);
+                } else {
+                    in_token = true;
+                    cur.push(ch);
+                }
+            }
+        }
+    }
+    if quote.is_some() {
+        return Err("unclosed quote in schedule command".to_owned());
+    }
+    if in_token {
+        args.push(cur);
+    }
+    if args.is_empty()
+        || args.first().is_none_or(|s| s.trim().is_empty())
+        || args.iter().any(|s| s.contains('\0'))
+    {
+        return Err("schedule command must not be empty".to_owned());
+    }
+    Ok(args)
+}
+
 impl SettingsView {
     /// 스케줄 추가(`existing == None`) 또는 편집(`existing == Some(..)`) 모달을 연다.
     pub fn open_schedule_modal(
@@ -109,7 +250,10 @@ impl SettingsView {
         let init_id = existing.map_or("", |s| s.id.as_str()).to_owned();
         let init_cron = existing.map_or("0 9 * * *", |s| s.cron.as_str()).to_owned();
         let init_cwd = existing.map_or("", |s| s.cwd.as_str()).to_owned();
-        let init_cmd = existing.map_or_else(|| "claude -p".to_owned(), |s| s.command.join(" "));
+        let init_cmd = existing.map_or_else(
+            || "claude -p".to_owned(),
+            |s| format_command_args(&s.command),
+        );
         let init_prompt = existing.map_or("", |s| s.prompt.as_str()).to_owned();
         let init_precheck = existing
             .and_then(|s| s.precheck.as_deref())
@@ -181,6 +325,13 @@ impl SettingsView {
         }
     }
 
+    #[must_use]
+    pub fn schedule_modal_error(&self) -> Option<&str> {
+        self.schedule_modal
+            .as_ref()
+            .and_then(|m| m.error.as_ref().map(SharedString::as_ref))
+    }
+
     /// 열린 스케줄 모달의 입력 값을 일괄 설정한다.
     #[expect(
         clippy::too_many_arguments,
@@ -233,16 +384,65 @@ impl SettingsView {
         let cron = modal.cron.read(cx).value().trim().to_owned();
         let cwd = modal.cwd.read(cx).value().trim().to_owned();
         let cmd_raw = modal.command.read(cx).value().trim().to_owned();
-        let command: Vec<String> = if cmd_raw.is_empty() {
-            vec!["claude".to_owned(), "-p".to_owned()]
-        } else {
-            cmd_raw.split_whitespace().map(str::to_owned).collect()
-        };
         let prompt = modal.prompt.read(cx).value().trim().to_owned();
         let precheck_raw = modal.precheck.read(cx).value().trim().to_owned();
         let precheck = (!precheck_raw.is_empty()).then_some(precheck_raw);
         let workspace_mode = modal.workspace_mode;
         let editing_id = modal.editing_id.clone();
+
+        let fail = |modal: &mut ScheduleModal,
+                    schedule_error: &mut Option<SharedString>,
+                    msg: String,
+                    cx: &mut Context<Self>| {
+            let shared: SharedString = msg.into();
+            modal.error = Some(shared.clone());
+            *schedule_error = Some(shared);
+            cx.notify();
+        };
+
+        if id.is_empty()
+            || id.len() > 64
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+        {
+            fail(
+                modal,
+                &mut self.schedule_error,
+                "schedule ID must be 1..=64 ASCII letters, digits, _ or -".to_owned(),
+                cx,
+            );
+            return;
+        }
+        if cwd.is_empty() || !Path::new(&cwd).is_absolute() || cwd.contains('\0') {
+            fail(
+                modal,
+                &mut self.schedule_error,
+                "schedule cwd must be a non-empty absolute path".to_owned(),
+                cx,
+            );
+            return;
+        }
+        if let Err(err) = krill_proto::schedule::Cron::parse(&cron) {
+            fail(modal, &mut self.schedule_error, err.to_string(), cx);
+            return;
+        }
+        let command = match parse_command_args(&cmd_raw) {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                fail(modal, &mut self.schedule_error, err, cx);
+                return;
+            }
+        };
+        if prompt.is_empty() || prompt.contains('\0') {
+            fail(
+                modal,
+                &mut self.schedule_error,
+                "schedule prompt must not be empty".to_owned(),
+                cx,
+            );
+            return;
+        }
 
         let entry = Schedule {
             id,
@@ -254,8 +454,12 @@ impl SettingsView {
             workspace_mode,
         };
         let Some(dir) = state_dir(cx) else {
-            modal.error = Some(text::NO_STATE_DIR.get().into());
-            cx.notify();
+            fail(
+                modal,
+                &mut self.schedule_error,
+                text::NO_STATE_DIR.get().to_owned(),
+                cx,
+            );
             return;
         };
         let res: std::io::Result<()> = (|| {
@@ -271,13 +475,13 @@ impl SettingsView {
         match res {
             Ok(()) => {
                 self.schedule_modal = None;
+                self.schedule_error = None;
                 cx.notify();
             }
             Err(err) => {
                 if let Some(m) = &mut self.schedule_modal {
-                    m.error = Some(err.to_string().into());
+                    fail(m, &mut self.schedule_error, err.to_string(), cx);
                 }
-                cx.notify();
             }
         }
     }
@@ -458,7 +662,7 @@ impl SettingsView {
                     ),
                 };
 
-                let cmd_str = sched.command.join(" ");
+                let cmd_str = format_command_args(&sched.command);
                 let mut meta_line = format!("{} · {} · {}", sched.cron, cmd_str, sched.cwd);
                 if let Some(pre) = &sched.precheck {
                     meta_line.push_str(" · precheck: ");
