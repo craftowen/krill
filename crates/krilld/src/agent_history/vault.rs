@@ -140,35 +140,126 @@ fn add_account_roots(
 }
 
 /// 볼트 재개 시 해당 대화가 실제로 들어 있는 격리 프로필 디렉터리를 찾는다.
+#[cfg(test)]
 pub(crate) fn profile_dir_for_vault_target(
     accounts: &crate::usage::accounts::AccountsFile,
     target: &VaultTarget,
     host: Option<&Path>,
 ) -> Option<PathBuf> {
-    if let Some(h) = host
-        && root_contains_target(h, target)
-    {
-        return Some(h.to_path_buf());
-    }
-    for account in &accounts.accounts {
-        let dir = account.config_dir();
-        if !dir.is_absolute() {
-            continue;
-        }
-        let matches_provider = match target.agent {
-            VaultAgent::Claude => account.provider.eq_ignore_ascii_case("claude"),
-            VaultAgent::Codex => account.provider.eq_ignore_ascii_case("codex"),
-            VaultAgent::Agy => {
-                account.provider.eq_ignore_ascii_case("agy")
-                    || account.provider.eq_ignore_ascii_case("antigravity")
-            }
-            VaultAgent::OpenCode => account.provider.eq_ignore_ascii_case("opencode"),
+    profile_dir_for_vault_target_in(accounts, target, host, None)
+}
+
+pub(crate) fn profile_dir_for_vault_target_in(
+    accounts: &crate::usage::accounts::AccountsFile,
+    target: &VaultTarget,
+    host: Option<&Path>,
+    state_dir: Option<&Path>,
+) -> Option<PathBuf> {
+    if matches!(target.agent, VaultAgent::Claude | VaultAgent::Codex) {
+        let entry = krill_proto::agent_history::Entry {
+            agent: if target.agent == VaultAgent::Claude {
+                krill_proto::agent_history::Agent::Claude
+            } else {
+                krill_proto::agent_history::Agent::Codex
+            },
+            id: target.id.clone(),
+            cwd: target.cwd.clone(),
+            modified: target.modified,
         };
-        if matches_provider && root_contains_target(dir, target) {
-            return Some(dir.to_path_buf());
+        let found = match host {
+            Some(h) => super::profile_dir_for_entry_in(accounts, &entry, h),
+            None => super::profile_dir_for_entry(accounts, &entry),
+        };
+        if found.is_some() {
+            return found;
+        }
+    } else {
+        if let Some(h) = host
+            && root_contains_target(h, target)
+        {
+            return Some(h.to_path_buf());
+        }
+        for account in &accounts.accounts {
+            let dir = account.config_dir();
+            if !dir.is_absolute() {
+                continue;
+            }
+            let matches_provider = match target.agent {
+                VaultAgent::Claude => account.provider.eq_ignore_ascii_case("claude"),
+                VaultAgent::Codex => account.provider.eq_ignore_ascii_case("codex"),
+                VaultAgent::Agy => {
+                    account.provider.eq_ignore_ascii_case("agy")
+                        || account.provider.eq_ignore_ascii_case("antigravity")
+                }
+                VaultAgent::OpenCode => account.provider.eq_ignore_ascii_case("opencode"),
+            };
+            if matches_provider && root_contains_target(dir, target) {
+                return Some(dir.to_path_buf());
+            }
+        }
+    }
+    if let Some(state) = state_dir {
+        let sub = match target.agent {
+            VaultAgent::Claude => "claude",
+            VaultAgent::Codex => "codex",
+            VaultAgent::Agy => "agy",
+            VaultAgent::OpenCode => "opencode",
+        };
+        if let Ok(entries) = fs::read_dir(state.join("profiles").join(sub)) {
+            for item in entries.take(64).flatten() {
+                if item.file_type().is_ok_and(|k| k.is_dir()) {
+                    let path = item.path();
+                    if root_contains_target(&path, target) {
+                        return Some(path);
+                    }
+                }
+            }
         }
     }
     None
+}
+
+fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
+    let mut dirs = vec![
+        dir.to_path_buf(),
+        dir.join(".gemini/antigravity-cli"),
+        dir.join(".gemini/antigravity"),
+        dir.join(".gemini"),
+        dir.join("antigravity-cli"),
+        dir.join("antigravity"),
+    ];
+    if include_sibling
+        && dir.file_name().is_some_and(|n| n == "antigravity-cli")
+        && let Some(parent) = dir.parent()
+    {
+        dirs.push(parent.join("antigravity"));
+    }
+    dirs
+}
+
+fn opencode_candidate_bases(dir: &Path) -> Vec<PathBuf> {
+    let mut bases = Vec::new();
+    for sub in [
+        "storage/session",
+        "session",
+        "sessions",
+        "data/opencode/storage/session",
+        "data/opencode/session",
+        "data/opencode/sessions",
+        "data/storage/session",
+        "data/session",
+        "data/sessions",
+    ] {
+        bases.push(dir.join(sub));
+    }
+    if dir.ends_with(".config/opencode")
+        && let Some(home) = dir.parent().and_then(Path::parent)
+    {
+        for sub in ["storage/session", "session", "sessions"] {
+            bases.push(home.join(".local/share/opencode").join(sub));
+        }
+    }
+    bases
 }
 
 fn root_contains_target(dir: &Path, target: &VaultTarget) -> bool {
@@ -191,16 +282,15 @@ fn root_contains_target(dir: &Path, target: &VaultTarget) -> bool {
                 modified: target.modified,
             },
         ),
-        VaultAgent::Agy => {
-            dir.join("brain").join(&target.id).is_dir()
-                || dir
+        VaultAgent::Agy => agy_candidate_dirs(dir, true).into_iter().any(|cand| {
+            cand.join("brain").join(&target.id).is_dir()
+                || cand
                     .join("sessions")
                     .join(format!("{}.jsonl", target.id))
                     .is_file()
-        }
+        }),
         VaultAgent::OpenCode => {
-            for sub in ["storage/session", "session", "sessions"] {
-                let base = dir.join(sub);
+            for base in opencode_candidate_bases(dir) {
                 if base.join(format!("{}.json", target.id)).is_file()
                     || base.join(format!("{}.jsonl", target.id)).is_file()
                 {
@@ -679,8 +769,21 @@ impl Indexer {
     }
 
     fn scan_agy(&mut self, root: &Path) {
-        let history = self.read_agy_history(root);
+        for cand in agy_candidate_dirs(root, false) {
+            if self.exhausted() {
+                break;
+            }
+            self.scan_agy_dir(&cand);
+        }
+    }
+
+    fn scan_agy_dir(&mut self, root: &Path) {
         let brain = root.join("brain");
+        let sessions = root.join("sessions");
+        if !brain.is_dir() && !sessions.is_dir() {
+            return;
+        }
+        let history = self.read_agy_history(root);
         if let Ok(dir) = fs::read_dir(&brain) {
             for item in dir {
                 if self.exhausted() {
@@ -713,7 +816,6 @@ impl Indexer {
                 }
             }
         }
-        let sessions = root.join("sessions");
         if sessions.is_dir() {
             self.walk_jsonl(&sessions, 2, false, |this, path| {
                 let stem = path
@@ -726,8 +828,7 @@ impl Indexer {
     }
 
     fn scan_opencode(&mut self, root: &Path) {
-        for rel in ["storage/session", "session", "sessions"] {
-            let session_dir = root.join(rel);
+        for session_dir in opencode_candidate_bases(root) {
             if !session_dir.is_dir() {
                 continue;
             }

@@ -65,10 +65,13 @@ impl Registry {
                 .or_else(|| {
                     let home = crate::usage::accounts::default_home();
                     let file = crate::usage::accounts::load_file(&home, state.as_deref());
-                    let dir = crate::agent_history::vault::profile_dir_for_vault_target(
-                        &file, &target, None,
+                    let dir = crate::agent_history::vault::profile_dir_for_vault_target_in(
+                        &file,
+                        &target,
+                        None,
+                        state.as_deref(),
                     )?;
-                    let env_key = config_var?;
+                    let env_key = config_var.unwrap_or("ANTIGRAVITY_CLI_HOME");
                     Some(crate::agent::control::LaunchAccount {
                         id: String::new(),
                         env_key: env_key.to_owned(),
@@ -244,5 +247,109 @@ mod tests {
             drop(client);
             server_thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn resume_vault_agy_preserves_isolated_account_profile_and_records_launch_account() {
+        use std::os::fd::{AsFd as _, OwnedFd};
+        use std::sync::Arc;
+
+        use crate::holder::Holder;
+        use krill_holder::link::Link;
+        use krill_proto::holder::{FromHolder, ToHolder, VERSION};
+
+        let dir = std::env::temp_dir().join(format!("owe753-reg-vault-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let ws = dir.join("workspace");
+        let agy_profile = dir.join("profiles/agy/work-slot");
+        let conv_id = "55555555-2222-4333-8444-555555555555";
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(
+            agy_profile
+                .join(".gemini/antigravity-cli/brain")
+                .join(conv_id),
+        )
+        .unwrap();
+
+        let (krilld_end, holder_end) = UnixStream::pair().unwrap();
+        let mut holder_link = Link::new(OwnedFd::from(holder_end));
+        for m in [
+            FromHolder::Hello {
+                version: VERSION,
+                holder_pid: 1,
+            },
+            FromHolder::Ready,
+        ] {
+            holder_link.send(&m.encode().unwrap(), &[]).unwrap();
+        }
+        let (holder, link, _, _) = Holder::connect(OwnedFd::from(krilld_end)).unwrap();
+        let reg = Arc::new(Registry::new(Some((holder, Vec::new())), Some(&dir)));
+        let reg_reader = Arc::clone(&reg);
+        let reader_worker = std::thread::spawn(move || {
+            reg_reader.holder.as_ref().unwrap().run(link, |_, _| {});
+        });
+
+        let expected_gemini_flag =
+            format!("--gemini_dir={}", agy_profile.join(".gemini").display());
+        let holder_worker = std::thread::spawn(move || {
+            let pkt = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Spawn { req, id, argv, .. } = ToHolder::decode(pkt.frame()).unwrap()
+            else {
+                panic!("expected Spawn");
+            };
+            let args: Vec<_> = argv
+                .iter()
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            assert!(
+                args.iter().any(|a| a == &expected_gemini_flag),
+                "expected {expected_gemini_flag} in {args:?}"
+            );
+            assert_eq!(
+                &args[args.len() - 2..],
+                ["--conversation", conv_id],
+                "args={args:?}"
+            );
+            let (master, _pty) = UnixStream::pair().unwrap();
+            holder_link
+                .send(
+                    &FromHolder::Spawned { req, id, pid: 900 }.encode().unwrap(),
+                    &[master.as_fd()],
+                )
+                .unwrap();
+            id
+        });
+
+        let full = Peer {
+            pid: None,
+            scope: Scope::Full,
+        };
+        let reply = reg
+            .agent_history(
+                &full,
+                Action::ResumeVault(VaultTarget {
+                    agent: VaultAgent::Agy,
+                    id: conv_id.into(),
+                    cwd: ws.display().to_string(),
+                    modified: 1,
+                }),
+            )
+            .unwrap();
+        let spawned_id = holder_worker.join().unwrap();
+        reader_worker.join().unwrap();
+        assert_eq!(
+            reply,
+            Reply::AgentHistory(Response::Resumed {
+                session: spawned_id
+            })
+        );
+        let stored = reg.agents.stored(spawned_id).unwrap().unwrap();
+        assert_eq!(stored.profile, "agy");
+        assert_eq!(stored.session_id.as_deref(), Some(conv_id));
+        let recorded_acc = stored.account.unwrap();
+        assert_eq!(recorded_acc.env_key, "ANTIGRAVITY_CLI_HOME");
+        assert_eq!(recorded_acc.dir, agy_profile.display().to_string());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

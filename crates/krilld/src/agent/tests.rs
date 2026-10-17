@@ -876,6 +876,120 @@ fn fork_in_builds_claude_and_codex_fork_argv() {
         ["fork", "--last"]
     );
 
+    // OWE-752: Claude 포크 세션은 `--session-id`를 주입하지 않으므로 hook 수신 전 `claude::session_id`가
+    // 미주입 UUID를 반환하지 않아야 하며, ID 없는 `--resume` 후에도 마찬가지여야 한다.
+    assert_eq!(claude::session_id(&dir, krill_proto::SessionId(10)), None);
+    assert_eq!(claude::session_id(&dir, krill_proto::SessionId(11)), None);
+    let (resumed_without_id, resumed_sid, _) = resume_in(
+        &claude,
+        Permission::Manual,
+        krill_proto::SessionId(14),
+        Some(&dir),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(resumed_sid, None);
+    assert_eq!(
+        resumed_without_id.argv.last().map(Vec::as_slice),
+        Some(b"--resume".as_slice())
+    );
+    assert_eq!(claude::session_id(&dir, krill_proto::SessionId(14)), None);
+
+    // OWE-752: 격리 계정이 지정된 Antigravity(`agy`·`antigravity`) 세션을 포크할 때도
+    // `--gemini_dir=<account.dir>/.gemini` 플래그가 보존되어야 한다.
+    for prog in ["agy", "antigravity"] {
+        let agy_prof = profile(&[prog]);
+        let agy_acc = LaunchAccount {
+            id: "agy-b".into(),
+            env_key: "ANTIGRAVITY_CLI_HOME".into(),
+            dir: "/fixture/agy-b".into(),
+        };
+        let (agy_fork, agy_fork_sid, agy_recorded) = fork_in(
+            &agy_prof,
+            Permission::Yolo,
+            krill_proto::SessionId(15),
+            Some(&dir),
+            Some("33333333-2222-4333-8444-555555555555"),
+            Some(&agy_acc),
+        )
+        .unwrap();
+        assert_eq!(agy_fork_sid, None);
+        assert_eq!(agy_recorded, Some(agy_acc));
+        assert!(
+            agy_fork
+                .argv
+                .iter()
+                .any(|arg| arg == b"--gemini_dir=/fixture/agy-b/.gemini"),
+            "{prog} fork argv={:?}",
+            agy_fork.argv
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// OWE-753: Antigravity(`agy`)·`OpenCode` 볼트 재개 시 `accounts.toml` 및 `<state_dir>/profiles/*`의
+/// 격리 프로필 디렉터리(`.gemini/antigravity-cli/brain/<id>` 등)를 찾아 실행 계정을 결정한다.
+#[test]
+fn resume_account_resolves_agy_and_opencode_vault_profiles() {
+    let dir = std::env::temp_dir().join(format!("owe753-resume-acc-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let state = dir.join("state");
+    let home = accounts::default_home();
+    let agy_acc_dir = dir.join("agy-account-a");
+    let agy_state_profile = state.join("profiles/agy/work-slot");
+    let oc_state_profile = state.join("profiles/opencode/oc-slot");
+    let conv_a = "aaaaaaaa-1111-4222-8333-444444444444";
+    let conv_b = "bbbbbbbb-1111-4222-8333-444444444444";
+    let oc_conv = "ses_owe753_opencode";
+
+    std::fs::create_dir_all(
+        agy_acc_dir
+            .join(".gemini/antigravity-cli/brain")
+            .join(conv_a),
+    )
+    .unwrap();
+    std::fs::create_dir_all(
+        agy_state_profile
+            .join(".gemini/antigravity/brain")
+            .join(conv_b),
+    )
+    .unwrap();
+    std::fs::create_dir_all(oc_state_profile.join("data/opencode/storage/session/global")).unwrap();
+    std::fs::write(
+        oc_state_profile
+            .join("data/opencode/storage/session/global")
+            .join(format!("{oc_conv}.json")),
+        "{}\n",
+    )
+    .unwrap();
+
+    let mut file = accounts::AccountsFile::default();
+    file.accounts.push(accounts::StoredAccount {
+        id: "agy-a".into(),
+        provider: "antigravity".into(),
+        label: "Agy A".into(),
+        email: None,
+        profile_dir: agy_acc_dir.display().to_string(),
+    });
+    accounts::save_file(&home, Some(&state), &file).unwrap();
+
+    let agy_prof = profile(&["agy"]);
+    let resolved_a = resume_account(&agy_prof, Some(&state), None, Some(conv_a)).unwrap();
+    assert_eq!(resolved_a.id, "agy-a");
+    assert_eq!(resolved_a.env_key, "ANTIGRAVITY_CLI_HOME");
+    assert_eq!(resolved_a.dir, agy_acc_dir.display().to_string());
+
+    let resolved_b = resume_account(&agy_prof, Some(&state), None, Some(conv_b)).unwrap();
+    assert_eq!(resolved_b.env_key, "ANTIGRAVITY_CLI_HOME");
+    assert_eq!(resolved_b.dir, agy_state_profile.display().to_string());
+
+    let oc_prof = profile(&["opencode"]);
+    let resolved_oc = resume_account(&oc_prof, Some(&state), None, Some(oc_conv)).unwrap();
+    assert_eq!(resolved_oc.env_key, "OPENCODE_CONFIG_DIR");
+    assert_eq!(resolved_oc.dir, oc_state_profile.display().to_string());
+
     std::fs::remove_dir_all(&dir).ok();
 }
 

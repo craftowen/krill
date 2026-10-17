@@ -298,5 +298,51 @@ fn vault_search_indexes_claude_codex_agy_opencode_titles_summaries_and_bodies() 
         );
     }
 
+    // OWE-753: 격리 프로필(`<profile_dir>/.gemini/antigravity-cli/brain/<id>`) 및
+    // `<state_dir>/profiles/agy/*` 하위 대화도 검색·프로필 역추적에 모두 잡혀야 한다.
+    let state_dir = root.join("state");
+    let state_agy_profile = state_dir.join("profiles/agy/slot-two");
+    let state_agy_id = "44444444-2222-4333-8444-555555555555";
+    let state_agy_logs = state_agy_profile
+        .join(".gemini/antigravity-cli/brain")
+        .join(state_agy_id)
+        .join(".system_generated/logs");
+    fs::create_dir_all(&state_agy_logs).unwrap();
+    fs::write(
+        state_agy_profile.join(".gemini/antigravity-cli/history.jsonl"),
+        format!(
+            "{{\"conversationId\":\"{state_agy_id}\",\"workspace\":\"/tmp/repo-gamma\",\"display\":\"Isolated Agy Slot\"}}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        state_agy_logs.join("transcript.jsonl"),
+        "{\"step_index\":1,\"source\":\"USER_EXPLICIT\",\"type\":\"USER_INPUT\",\"content\":\"<USER_REQUEST>Resume isolated agy profile</USER_REQUEST>\"}\n",
+    )
+    .unwrap();
+    let iso_hits = search_in(
+        &VaultRoots {
+            agy: vec![state_agy_profile.clone()],
+            ..VaultRoots::default()
+        },
+        &SearchQuery::default(),
+    );
+    assert_eq!(iso_hits.hits.len(), 1);
+    assert_eq!(iso_hits.hits[0].id, state_agy_id);
+    assert_eq!(
+        vault::profile_dir_for_vault_target_in(
+            &crate::usage::accounts::AccountsFile::default(),
+            &VaultTarget {
+                agent: VaultAgent::Agy,
+                id: state_agy_id.into(),
+                cwd: "/tmp/repo-gamma".into(),
+                modified: 0,
+            },
+            None,
+            Some(&state_dir),
+        ),
+        Some(state_agy_profile)
+    );
+
     fs::remove_dir_all(&root).ok();
 }
