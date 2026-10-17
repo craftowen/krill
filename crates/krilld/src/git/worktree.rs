@@ -202,6 +202,12 @@ pub fn create_with_pool(
     let _transaction = transaction(q, &top)?;
     let config = compat::read_config_with_state(&top, trust.parent())?;
 
+    if let (Some(archive), Setup::Approve(h)) = (config.worktree.archive.as_deref(), &req.setup)
+        && *h == digest(&top, archive)
+    {
+        remember(trust, h).map_err(|e| format!("cannot record setup trust: {e}"))?;
+    }
+
     let setup = match (config.worktree.setup, &req.setup) {
         (None, _) | (_, Setup::Skip) => None,
         (Some(script), mode) => {
@@ -428,7 +434,7 @@ fn output_path(mut out: Output, what: &str) -> Result<PathBuf, String> {
 }
 
 /// 신뢰 키: 레포 경로와 스크립트. 다른 레포의 같은 스크립트는 따로 묻는다.
-fn digest(top: &Path, script: &str) -> Vec<u8> {
+pub(crate) fn digest(top: &Path, script: &str) -> Vec<u8> {
     let mut h = Sha256::new();
     h.update(top.as_os_str().as_bytes());
     h.update([0]);
@@ -436,14 +442,14 @@ fn digest(top: &Path, script: &str) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().fold(String::new(), |mut s, x| {
         write!(s, "{x:02x}").ok();
         s
     })
 }
 
-fn trusted(file: &Path, hash: &[u8]) -> io::Result<bool> {
+pub(crate) fn trusted(file: &Path, hash: &[u8]) -> io::Result<bool> {
     match fs::read_to_string(file) {
         Ok(s) => Ok(s.lines().any(|l| l == hex(hash))),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
@@ -451,7 +457,7 @@ fn trusted(file: &Path, hash: &[u8]) -> io::Result<bool> {
     }
 }
 
-fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
+pub(crate) fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
     if trusted(file, hash)? {
         return Ok(());
     }
@@ -464,6 +470,45 @@ fn remember(file: &Path, hash: &[u8]) -> io::Result<()> {
         .mode(0o600)
         .open(file)?
         .write_all(format!("{}\n", hex(hash)).as_bytes())
+}
+
+/// `state_dir/setup-trust`에 `(top, script)` SHA-256 해시가 승인돼 있거나
+/// 사용자가 `state_dir`의 `WorktreeStore`에 직접 설정한 `archive` 스크립트인지 확인한다(OWE-751).
+pub(crate) fn is_setup_trusted(
+    state_dir: Option<&Path>,
+    top: &Path,
+    script: &str,
+) -> Result<bool, String> {
+    let Some(dir) = state_dir else {
+        return Ok(false);
+    };
+    let trust_file = dir.join(TRUST_FILE);
+    let hash = digest(top, script);
+    if trusted(&trust_file, &hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+        return Ok(true);
+    }
+    if let Ok(canon) = fs::canonicalize(top)
+        && canon != top
+    {
+        let canon_hash = digest(&canon, script);
+        if trusted(&trust_file, &canon_hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+            return Ok(true);
+        }
+    }
+    if let Ok(rest) = top.strip_prefix("/private") {
+        let alias = Path::new("/").join(rest);
+        let alias_hash = digest(&alias, script);
+        if trusted(&trust_file, &alias_hash).map_err(|e| format!("cannot read setup trust: {e}"))? {
+            return Ok(true);
+        }
+    }
+    if let Ok(store) = krill_proto::orchestration::WorktreeStore::load(dir) {
+        let top_key = top.to_string_lossy();
+        if store.archive_script_for(&top_key).as_deref() == Some(script) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 사용자가 입력한 이름 → 디렉터리·브랜치 이름. 공백 묶음은 `-` 하나로. 한글 등 비ASCII는 그대로 둔다.

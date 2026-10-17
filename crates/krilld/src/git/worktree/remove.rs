@@ -3,12 +3,31 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
+use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use krill_proto::control::{RemoveWorktree, RemovedWorktree, Reply};
 
 use super::{GitQueue, git, output_path, queue, text, transaction};
+
+/// archive 훅 실행 상한. 잠금을 쥔 채 무기한 대기하지 않게 한다(OWE-751).
+#[cfg(not(test))]
+const ARCHIVE_HOOK_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const ARCHIVE_HOOK_TIMEOUT: Duration = Duration::from_millis(500);
+/// 타임아웃 SIGKILL 전 SIGTERM 유예.
+#[cfg(not(test))]
+const ARCHIVE_TERMINATE_GRACE: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const ARCHIVE_TERMINATE_GRACE: Duration = Duration::from_millis(100);
+/// archive 훅 stdout·stderr 파이프 보관 상한(64 KiB) 및 에러 메시지 길이 상한(4 KiB).
+const MAX_ARCHIVE_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_ARCHIVE_ERROR_CHARS: usize = 4096;
 
 /// 삭제 요청은 클라이언트 연결이 끊겨도 끝까지 처리한다.
 pub fn serve_remove(req: &RemoveWorktree) -> Reply {
@@ -71,8 +90,25 @@ pub fn remove_with_state(
     if !req.force && dirty {
         return Err("worktree is dirty; use --force to discard its files".to_owned());
     }
+    let mut warnings = Vec::new();
     if let Some(script) = config.worktree.archive.as_deref() {
-        run_archive_hook(q, &path, script)?;
+        if !super::is_setup_trusted(state_dir, repo, script)? {
+            let hash = super::hex(&super::digest(repo, script));
+            let msg = format!(
+                "archive hook is not trusted (SHA-256: {hash}); approve it in setup-trust or use --force to remove without running it"
+            );
+            if req.force {
+                warnings.push(msg);
+            } else {
+                return Err(msg);
+            }
+        } else if let Err(e) = run_archive_hook(q, &path, script) {
+            if req.force {
+                warnings.push(e);
+            } else {
+                return Err(e);
+            }
+        }
     }
     unlink_symlinks(&path, &config.worktree.symlinks);
     let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
@@ -86,7 +122,7 @@ pub fn remove_with_state(
     let mut result = RemovedWorktree {
         branch: target.branch.clone(),
         branch_deleted: false,
-        warnings: Vec::new(),
+        warnings,
     };
     if let Some(branch) = &result.branch {
         match delete_merged_branch(q, repo, branch) {
@@ -231,26 +267,160 @@ fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String>
     cmd.arg("-c")
         .arg(script)
         .current_dir(wt)
-        .stdin(std::process::Stdio::null());
+        .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
     for (k, v) in envs {
         cmd.env(OsStr::from_bytes(&k), OsStr::from_bytes(&v));
     }
-    let out = cmd
-        .output()
-        .map_err(|e| format!("archive hook failed to start: {e}"))?;
+    let out = run_bounded_command(&mut cmd, ARCHIVE_HOOK_TIMEOUT)?;
     if out.status.success() {
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-    let detail = if !stderr.is_empty() {
+    let raw_detail = if !stderr.is_empty() {
         stderr
     } else if !stdout.is_empty() {
         stdout
     } else {
         format!("exit status {}", out.status)
     };
+    let detail = truncate_chars(&raw_detail, MAX_ARCHIVE_ERROR_CHARS);
     Err(format!("archive hook failed: {detail}"))
+}
+
+struct Reap(Child);
+
+impl Drop for Reap {
+    fn drop(&mut self) {
+        kill_and_reap(&mut self.0);
+    }
+}
+
+fn run_bounded_command(
+    cmd: &mut std::process::Command,
+    timeout: Duration,
+) -> Result<Output, String> {
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("archive hook failed to start: {e}"))?;
+    let mut child = Reap(child);
+    let mut stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| "archive hook failed: missing stdout".to_owned())?;
+    let mut stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| "archive hook failed: missing stderr".to_owned())?;
+    nonblocking(&stdout)
+        .and_then(|()| nonblocking(&stderr))
+        .map_err(|e| format!("archive hook failed: {e}"))?;
+    let mut out = Vec::new();
+    let mut err = Vec::new();
+    let mut buf = [0u8; 8192];
+    let deadline = Instant::now() + timeout;
+    loop {
+        let a = drain_capped(&mut stdout, &mut out, &mut buf);
+        let b = drain_capped(&mut stderr, &mut err, &mut buf);
+        if let Err(e) = a.and(b) {
+            return Err(format!("archive hook failed: {e}"));
+        }
+        match child.0.try_wait() {
+            Ok(Some(status)) => {
+                drain_capped(&mut stdout, &mut out, &mut buf).ok();
+                drain_capped(&mut stderr, &mut err, &mut buf).ok();
+                return Ok(Output {
+                    status,
+                    stdout: out,
+                    stderr: err,
+                });
+            }
+            Ok(None) => {}
+            Err(e) => return Err(format!("archive hook failed: {e}")),
+        }
+        if Instant::now() >= deadline {
+            terminate_gracefully(&mut child.0);
+            return Err("archive hook failed: timed out".to_owned());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<()> {
+    loop {
+        match pipe.read(buf) {
+            Ok(0) => return Ok(()),
+            Ok(n) => {
+                let remaining = MAX_ARCHIVE_OUTPUT_BYTES.saturating_sub(dst.len());
+                if remaining > 0 {
+                    dst.extend(buf.iter().take(n.min(remaining)).copied());
+                }
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+fn nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
+    let flags = rustix::fs::fcntl_getfl(pipe)?;
+    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
+    Ok(())
+}
+
+fn kill_and_reap(child: &mut Child) {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
+    }
+    child.kill().ok();
+    child.wait().ok();
+}
+
+fn terminate_gracefully(child: &mut Child) {
+    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
+        rustix::process::kill_process_group(pid, rustix::process::Signal::TERM).ok();
+    } else {
+        child.kill().ok();
+    }
+    let deadline = Instant::now() + ARCHIVE_TERMINATE_GRACE;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                kill_and_reap(child);
+                return;
+            }
+            Ok(None) => {}
+            Err(_) => break,
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    kill_and_reap(child);
+}
+
+fn truncate_chars(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let head: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{head}… (truncated)")
+    } else {
+        head
+    }
 }
 
 fn delete_merged_branch(q: &GitQueue, repo: &Path, branch: &str) -> Result<(), String> {
