@@ -108,6 +108,14 @@ fn worktree_root_prefers_override_then_home_default() {
     let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
     assert_eq!(root_in(home), Ok(PathBuf::from("/h/Minikrill/worktrees")));
     assert!(root_in(|_| None).is_err());
+    assert_eq!(
+        isolated_root_in(Path::new("/state"), override_dir),
+        PathBuf::from("/KRILL_WORKTREES_DIR")
+    );
+    assert_eq!(
+        isolated_root_in(Path::new("/state"), home),
+        PathBuf::from("/state/worktrees")
+    );
 }
 
 /// 완료 조건: 한글 이름 입력, 충돌 시 -2. 경로는 `<루트>/<레포 이름>/<이름>`, base는 감지(main).
