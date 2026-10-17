@@ -1764,7 +1764,6 @@ fn fake_rule_transport(
 #[gpui::test]
 fn account_rule_transport_applies_in_memory_success_snapshot(cx: &mut TestAppContext) {
     use krill_proto::usage::{AccountsSnapshot, AutoSwitchMetric, AutoSwitchRule, ProviderKind};
-    cx.update(gpui_component::init);
     let view = cx.new(SettingsView::new);
     let mut snapshot = AccountsSnapshot::default();
     snapshot.auto_switch.rules.push(AutoSwitchRule {
@@ -4778,4 +4777,33 @@ fn owe761_workflow_repo_path_change_syncs_hooks_without_clobbering_other_repo(
     );
 
     fs::remove_dir_all(d).ok();
+}
+
+/// OWE-771: `settings::init_at`이 호출되지 않았거나 `None`인 단위 테스트에서 `SettingsView::new`·
+/// `agent_history`·`resources` 기본 핸들러가 전역 데몬(`Paths::dev()`)을 기동하거나 오프라인으로 전환하지 않는다.
+#[gpui::test]
+fn owe771_uninitialized_settings_and_default_panels_never_probe_daemon(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        assert_eq!(
+            state_dir(cx),
+            None,
+            "uninitialized settings::state_dir must not fall back to process daemon::state_dir in tests"
+        );
+    });
+    let view = cx.new(SettingsView::new);
+    cx.run_until_parked();
+    view.update(cx, |v, _| {
+        assert!(
+            !v.accounts_offline,
+            "uninitialized SettingsView in unit test must not probe daemon or enter offline mode"
+        );
+    });
+    let hist_err =
+        (crate::agent_history::daemon_call_for(None))(&krill_proto::control::Request::List)
+            .unwrap_err();
+    assert_eq!(hist_err.kind(), std::io::ErrorKind::NotConnected);
+    let res_err = (crate::resources::daemon_call_for(None))(&krill_proto::control::Request::List)
+        .unwrap_err();
+    assert_eq!(res_err.kind(), std::io::ErrorKind::NotConnected);
 }

@@ -33,6 +33,13 @@ pub(super) trait EditSource: Send + Sync {
 struct Daemon(Option<HostTarget>);
 impl EditSource for Daemon {
     fn edit(&self, repo: &Path, edit: Edit) -> io::Result<()> {
+        #[cfg(test)]
+        if self.0.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "daemon disabled in unit tests",
+            ));
+        }
         let hello = daemon::client_hello(ClientRole::App, "krill-app-git");
         let target = match &self.0 {
             Some(target) => target.clone(),
@@ -54,6 +61,10 @@ impl EditSource for Daemon {
     }
 
     fn supports_sync(&self) -> bool {
+        #[cfg(test)]
+        if self.0.is_none() {
+            return true;
+        }
         let hello = daemon::client_hello(ClientRole::App, "krill-app-git");
         let target = if let Some(target) = &self.0 {
             target.clone()

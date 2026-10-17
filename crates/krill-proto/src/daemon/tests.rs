@@ -482,3 +482,41 @@ fn unsupported_daemon_falls_back_to_eof_watch() {
     drop(server);
     wait_responsive(&mut client, 0).unwrap();
 }
+
+/// OWE-771: Cargo 테스트 실행 파일(`deps/`)이나 임시 `HOME`(`HOME=/tmp/...`)에서는
+/// 설치본 `/Applications/Krill.app` 또는 `~/Applications/Krill.app`을 후보로 쓰지 않는다.
+#[test]
+fn paths_dev_excludes_installed_krill_app_in_tests_and_temp_home() {
+    assert!(!allow_installed_apps_for_paths(
+        Path::new("/Volumes/krill-build/targets/shared/debug/deps/krill_app-1234"),
+        Some(Path::new("/Users/me")),
+    ));
+    assert!(!allow_installed_apps_for_paths(
+        Path::new("/usr/local/bin/krill"),
+        Some(Path::new("/tmp/kint-home.abc")),
+    ));
+    assert!(!allow_installed_apps_for_paths(
+        Path::new("/usr/local/bin/krill"),
+        Some(Path::new("/private/tmp/krill-home-123")),
+    ));
+    assert!(!allow_installed_apps_for_paths(
+        Path::new("/usr/local/bin/krill"),
+        Some(&std::env::temp_dir().join("owe728-home")),
+    ));
+    assert!(allow_installed_apps_for_paths(
+        Path::new("/usr/local/bin/krill"),
+        Some(Path::new("/Users/me")),
+    ));
+
+    let dev = Paths::dev().unwrap();
+    assert!(
+        !dev.holder.starts_with("/Applications/Krill.app"),
+        "test Paths::dev() must not fall back to /Applications/Krill.app: {:?}",
+        dev.holder
+    );
+    assert!(
+        !dev.krilld.starts_with("/Applications/Krill.app"),
+        "test Paths::dev() must not fall back to /Applications/Krill.app: {:?}",
+        dev.krilld
+    );
+}

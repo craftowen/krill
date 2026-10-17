@@ -14,8 +14,10 @@ pub(super) fn open(
     cx: &mut TestAppContext,
     path: PathBuf,
 ) -> (Entity<Shell>, &mut VisualTestContext) {
+    let state_dir = path.parent().map(std::path::Path::to_path_buf);
     cx.update(|cx| {
         gpui_component::init(cx);
+        krill_app::settings::init_at(state_dir, cx);
         bind_keys(cx);
     });
     let (view, cx) = cx.add_window_view(|_, cx| Shell::new(Some(path), cx));
