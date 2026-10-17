@@ -191,6 +191,10 @@ fn archive_hook_gate_blocks_on_failure_and_allows_on_success() {
     let f = Fixture::new("archive-hook", "[worktree]\nsymlinks = ['.env']\n");
     fs::write(f.repo.join(".env"), "ENV_VAL=ok").unwrap();
     let marker = f.dir.join("archive-ran.txt");
+    let failing_script = format!(
+        "printf '%s' \"$ORCA_WORKSPACE_NAME\" > {}\nexit 1\n",
+        marker.display()
+    );
     fs::write(
         f.repo.join("orca.yaml"),
         format!(
@@ -205,7 +209,20 @@ fn archive_hook_gate_blocks_on_failure_and_allows_on_success() {
     let (w, _) = f.created("gate-test", Setup::Skip);
     let wt_path = path(&w);
 
-    // Failing archive hook must block removal and leave both the worktree and its symlinks intact.
+    // 1. Untrusted repo archive hook must NOT execute on remove(force=false).
+    let untrusted_err = f.remove(&w, false).unwrap_err();
+    assert!(
+        untrusted_err.contains("not trusted"),
+        "unexpected error: {untrusted_err}"
+    );
+    assert!(
+        !marker.exists(),
+        "untrusted archive hook must never execute"
+    );
+    assert!(wt_path.exists());
+
+    // 2. Approving the archive script in setup-trust allows it to run; failing exit code blocks non-force removal.
+    remember(&f.trust, &digest(&f.repo, &failing_script)).unwrap();
     let err = f.remove(&w, false).unwrap_err();
     assert!(
         err.contains("archive hook failed"),
@@ -220,7 +237,7 @@ fn archive_hook_gate_blocks_on_failure_and_allows_on_success() {
             .is_symlink()
     );
 
-    // Store override with a succeeding archive hook runs in the worktree and allows removal.
+    // 3. Store override with a succeeding archive hook runs in the worktree and allows removal.
     let state_dir = f.trust.parent().unwrap();
     let repo_key = fs::canonicalize(&f.repo)
         .unwrap()
@@ -245,5 +262,100 @@ fn archive_hook_gate_blocks_on_failure_and_allows_on_success() {
     assert_eq!(
         fs::read_to_string(&ok_marker).unwrap(),
         "gate-test:ENV_VAL=ok"
+    );
+}
+
+#[test]
+fn owe751_archive_hook_trust_force_removal_timeout_and_output_cap() {
+    let f = Fixture::new("owe751-archive", "");
+    let marker = f.dir.join("untrusted-pwned.txt");
+    fs::write(
+        f.repo.join(CONFIG),
+        format!(
+            "[worktree]\narchive = \"printf pwned > {}\"\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    f.git(&["add", CONFIG]);
+    f.git(&["commit", "-q", "-m", "untrusted archive in minikrill.toml"]);
+
+    // 1. Untrusted minikrill.toml archive hook is refused on normal remove and skipped with warning on --force, never executing.
+    let (w_untrusted, _) = f.created("untrusted-wt", Setup::Skip);
+    let wt_untrusted_path = path(&w_untrusted);
+    let err = f.remove(&w_untrusted, false).unwrap_err();
+    assert!(err.contains("not trusted"), "unexpected: {err}");
+    assert!(!marker.exists(), "untrusted hook must not run");
+    assert!(wt_untrusted_path.exists());
+
+    let forced_untrusted = f.remove(&w_untrusted, true).unwrap();
+    assert!(!marker.exists(), "untrusted hook must not run on --force");
+    assert!(!wt_untrusted_path.exists());
+    assert!(
+        forced_untrusted
+            .warnings
+            .iter()
+            .any(|w| w.contains("not trusted")),
+        "warnings: {:?}",
+        forced_untrusted.warnings
+    );
+
+    // 2. Trusted failing hook with noisy output (> 64 KiB) is capped and still allows --force removal with warning.
+    let state_dir = f.trust.parent().unwrap();
+    let repo_key = fs::canonicalize(&f.repo)
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    fs::write(f.repo.join(CONFIG), "").unwrap();
+    f.git(&["add", CONFIG]);
+    f.git(&["commit", "-q", "-m", "clear native config"]);
+
+    krill_proto::orchestration::WorktreeStore::mutate(state_dir, |store| {
+        store.set_archive_script(&repo_key, "yes 'x' | head -c 100000 >&2; exit 1")?;
+        Ok(())
+    })
+    .unwrap();
+
+    let (w_fail, _) = f.created("failing-wt", Setup::Skip);
+    let wt_fail_path = path(&w_fail);
+    let fail_err = f.remove(&w_fail, false).unwrap_err();
+    assert!(fail_err.contains("archive hook failed"), "{fail_err}");
+    assert!(fail_err.contains("truncated"), "{fail_err}");
+    assert!(fail_err.len() < 8192, "error length: {}", fail_err.len());
+    assert!(wt_fail_path.exists());
+
+    let forced_fail = f.remove(&w_fail, true).unwrap();
+    assert!(!wt_fail_path.exists(), "--force must remove worktree");
+    assert!(
+        forced_fail
+            .warnings
+            .iter()
+            .any(|w| w.contains("archive hook failed")),
+        "warnings: {:?}",
+        forced_fail.warnings
+    );
+
+    // 3. Trusted hanging archive hook times out, kills process group, and allows --force removal.
+    krill_proto::orchestration::WorktreeStore::mutate(state_dir, |store| {
+        store.set_archive_script(&repo_key, "sleep 30")?;
+        Ok(())
+    })
+    .unwrap();
+
+    let (w_hang, _) = f.created("hanging-wt", Setup::Skip);
+    let wt_hang_path = path(&w_hang);
+    let hang_err = f.remove(&w_hang, false).unwrap_err();
+    assert!(
+        hang_err.contains("timed out"),
+        "expected timeout error, got: {hang_err}"
+    );
+    assert!(wt_hang_path.exists());
+
+    let forced_hang = f.remove(&w_hang, true).unwrap();
+    assert!(!wt_hang_path.exists(), "--force must remove hung worktree");
+    assert!(
+        forced_hang.warnings.iter().any(|w| w.contains("timed out")),
+        "warnings: {:?}",
+        forced_hang.warnings
     );
 }
