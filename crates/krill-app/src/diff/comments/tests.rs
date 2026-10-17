@@ -115,10 +115,96 @@ fn compose_two_files_click_send_and_deliver_one_existing_input(cx: &mut TestAppC
     assert!(wire.is_empty(), "one input frame for the entire review");
     cx.update(|_, cx| {
         panel.update(cx, |p, cx| {
-            p.comments_sent(false, cx);
+            p.comments_sent(CommentSource::ReviewComments, false, cx);
             assert_eq!(p.review.comments.len(), 2);
-            p.comments_sent(true, cx);
+            p.comments_sent(CommentSource::ReviewComments, true, cx);
             assert!(p.review.comments.is_empty());
+        });
+    });
+}
+
+#[gpui::test]
+fn comment_sources_isolate_review_git_recovery_and_checks_fix_states_and_errors(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (panel, cx) = cx.add_window_view(|_, cx| Panel::unconnected("/review".into(), cx));
+
+    cx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            // Seed saved review comments + active git recovery banner.
+            p.review.comments = vec![comment(
+                "src/lib.rs",
+                DiffSide::Modified,
+                "keep this review",
+            )];
+            p.editing.failure = Some(crate::diff::edit::GitFailure {
+                kind: crate::diff::edit::FailureKind::Push,
+                error: "non-fast-forward".into(),
+            });
+            p.editing.note = "non-fast-forward".into();
+
+            // 1. GitRecovery no_agent / failure / success must never clear or pollute review comments or checks status.
+            p.no_agent(CommentSource::GitRecovery, cx);
+            assert_eq!(p.review.comments.len(), 1);
+            assert_eq!(p.review.status, None);
+            assert_eq!(p.checks.fix_status, None);
+            assert!(p.editing.failure.is_some());
+            assert_eq!(
+                p.editing.note,
+                crate::i18n::catalog::diff_edit::RECOVERY_NO_AGENT.get()
+            );
+
+            p.comments_sent(CommentSource::GitRecovery, false, cx);
+            assert_eq!(p.review.comments.len(), 1);
+            assert!(p.editing.failure.is_some());
+            assert_eq!(
+                p.editing.note,
+                crate::i18n::catalog::diff_edit::RECOVERY_FAILED.get()
+            );
+
+            // 2. ChecksFix no_agent / failure / success must only update `checks.fix_status`,
+            // even if GitRecovery or ReviewComments is also active.
+            p.no_agent(CommentSource::ChecksFix, cx);
+            assert_eq!(
+                p.checks.fix_status,
+                Some(crate::i18n::catalog::pull_request::FIX_NO_AGENT)
+            );
+            assert_eq!(p.review.comments.len(), 1);
+            assert_eq!(p.review.status, None);
+            assert!(p.editing.failure.is_some());
+
+            p.comments_sent(CommentSource::ChecksFix, false, cx);
+            assert_eq!(
+                p.checks.fix_status,
+                Some(crate::i18n::catalog::pull_request::FIX_FAILED)
+            );
+            assert_eq!(p.review.comments.len(), 1);
+
+            p.comments_sent(CommentSource::ChecksFix, true, cx);
+            assert_eq!(
+                p.checks.fix_status,
+                Some(crate::i18n::catalog::pull_request::FIX_SENT)
+            );
+            assert_eq!(p.review.comments.len(), 1);
+            assert!(p.editing.failure.is_some());
+
+            // 3. GitRecovery success clears only the git recovery banner and leaves review comments intact.
+            p.comments_sent(CommentSource::GitRecovery, true, cx);
+            assert!(p.editing.failure.is_none());
+            assert_eq!(
+                p.editing.note,
+                crate::i18n::catalog::diff_edit::RECOVERY_SENT.get()
+            );
+            assert_eq!(p.review.comments.len(), 1);
+
+            // 4. ReviewComments delivery updates only review state.
+            p.no_agent(CommentSource::ReviewComments, cx);
+            assert_eq!(p.review.status, Some(text::NO_TARGET));
+            assert_eq!(p.review.comments.len(), 1);
+            p.comments_sent(CommentSource::ReviewComments, true, cx);
+            assert!(p.review.comments.is_empty());
+            assert_eq!(p.review.status, Some(text::QUEUED));
         });
     });
 }

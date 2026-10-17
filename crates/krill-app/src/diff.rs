@@ -40,7 +40,7 @@ use crate::hosts::HostTarget;
 mod checks;
 pub use checks::PanelTab;
 mod comments;
-pub use comments::{SendComments, input_bytes};
+pub use comments::{CommentSource, SendComments, input_bytes};
 mod explorer;
 pub use explorer::{DirEntry, EditKind, Explorer, TreeRow};
 pub mod search;
@@ -414,6 +414,51 @@ fn is_not_git_error(err: &str) -> bool {
     lower.contains("not a git repository") || lower.contains("invalid .git")
 }
 
+fn probe_file_status(repo: &Path, clean_rel: &str, staged: bool) -> [u8; 2] {
+    let rel_path = Path::new(clean_rel);
+    if !rel_path.as_os_str().is_empty()
+        && rel_path
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+        && let Ok(out) = crate::pull_request::git_output(
+            repo,
+            &[
+                "--literal-pathspecs",
+                "-c",
+                "diff.autoRefreshIndex=false",
+                "status",
+                "--porcelain=v2",
+                "--untracked-files=all",
+                "--",
+                clean_rel,
+            ],
+        )
+    {
+        for line in out.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("? ") {
+                return *b"??";
+            }
+            if (trimmed.starts_with("1 ") || trimmed.starts_with("2 ") || trimmed.starts_with("u "))
+                && let Some(xy) = trimmed
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| <[u8; 2]>::try_from(s.as_bytes()).ok())
+            {
+                return xy;
+            }
+        }
+    }
+    let full = repo.join(clean_rel);
+    if !full.exists() {
+        if staged { *b"D." } else { *b".D" }
+    } else if staged {
+        *b"M."
+    } else {
+        *b".M"
+    }
+}
+
 /// AS-26: 패치 실패 문구를 카탈로그 한글로 바꾼다. `patch`의 원문 영어는 그대로 둬
 /// 로그·테스트(`4 MiB` 단언)가 깨지지 않게 한다.
 fn patch_error_message(err: &io::Error) -> String {
@@ -726,11 +771,12 @@ impl Panel {
                 changes,
             }) => {
                 self.watch_gen = generation;
-                let selected_path = self.pending_diff_path.take().or_else(|| {
-                    self.selected
-                        .and_then(|i| self.changes.files.get(i))
-                        .map(|f| f.path.clone())
-                });
+                let pending_path = self.pending_diff_path.take();
+                let selected_path = self
+                    .selected
+                    .and_then(|i| self.changes.files.get(i))
+                    .map(|f| f.path.clone())
+                    .or(pending_path);
                 self.refresh_branch_sync(cx);
                 match watch_action(
                     self.loaded,
@@ -821,17 +867,17 @@ impl Panel {
             .iter()
             .position(|f| f.path == target_bytes)
         {
-            self.pending_diff_path = None;
+            if let Some(existing) = self.changes.files.get_mut(idx)
+                && existing.staged.is_none()
+                && existing.unstaged.is_none()
+            {
+                existing.status = probe_file_status(&self.repo, clean_rel, staged);
+            } else {
+                self.pending_diff_path = None;
+            }
             self.select(idx, cx);
         } else {
-            let full = self.repo.join(clean_rel);
-            let status = if !full.exists() {
-                if staged { *b"D." } else { *b".D" }
-            } else if staged {
-                *b"M."
-            } else {
-                *b".M"
-            };
+            let status = probe_file_status(&self.repo, clean_rel, staged);
             self.changes.files.push(ChangedFile {
                 path: target_bytes,
                 old_path: None,
@@ -841,6 +887,7 @@ impl Panel {
             });
             let idx = self.changes.files.len() - 1;
             self.select(idx, cx);
+            self.force_next = true;
             if self.source.is_some() {
                 self.refresh(cx);
             }

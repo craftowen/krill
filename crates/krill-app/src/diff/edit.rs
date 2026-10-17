@@ -320,7 +320,6 @@ pub(super) struct State {
     pub ahead: u64,
     pub behind: u64,
     pub failure: Option<GitFailure>,
-    pub recovery_pending: bool,
     pub pr_dialog: Option<(Entity<crate::pull_request::Dialog>, Subscription)>,
     language: crate::i18n::Language,
     input: Option<Entity<InputState>>,
@@ -339,7 +338,6 @@ impl Default for State {
             ahead: 0,
             behind: 0,
             failure: None,
-            recovery_pending: false,
             pr_dialog: None,
             language: crate::i18n::language(),
             input: None,
@@ -603,8 +601,7 @@ impl Panel {
             return;
         };
         let prompt = build_recovery_prompt(&self.repo, failure.kind, &failure.error, &self.changes);
-        self.editing.recovery_pending = true;
-        cx.emit(SendComments(prompt));
+        cx.emit(SendComments::git_recovery(prompt));
         cx.notify();
     }
 

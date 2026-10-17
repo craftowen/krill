@@ -146,19 +146,30 @@ pub fn parse_actions_ids(url: &str) -> (Option<String>, Option<String>) {
     (run_id, job_id)
 }
 
-/// GitHub PR URL(`https://github.com/<owner>/<repo>/pull/<n>`)에서 `(owner, repo)`를 추출한다.
+/// GitHub 및 GitHub Enterprise PR URL(`http(s)://<host>/.../<owner>/<repo>/pull(s)/<n>`)에서 `(owner, repo)`를 추출한다.
 #[must_use]
 pub fn parse_repo_owner_and_name(pr_url: &str) -> Option<(String, String)> {
-    let rest = pr_url
-        .strip_prefix("https://github.com/")
-        .or_else(|| pr_url.strip_prefix("http://github.com/"))?;
-    let mut parts = rest.split('/').filter(|s| !s.is_empty());
-    let owner = parts.next()?;
-    let repo = parts.next()?;
-    let pull_seg = parts.next()?;
-    if pull_seg != "pull" && pull_seg != "pulls" {
+    let trimmed = pr_url.trim();
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))?;
+    let path_part = without_scheme
+        .split_once(['?', '#'])
+        .map_or(without_scheme, |(before, _)| before);
+    let mut segments = path_part.split('/').filter(|s| !s.is_empty());
+    let host = segments.next()?;
+    if host.is_empty() {
         return None;
     }
+    let path_segments: Vec<&str> = segments.collect();
+    let pull_idx = path_segments
+        .iter()
+        .position(|&seg| seg == "pull" || seg == "pulls")?;
+    if pull_idx < 2 {
+        return None;
+    }
+    let owner = *path_segments.get(pull_idx - 2)?;
+    let repo = *path_segments.get(pull_idx - 1)?;
     Some((owner.to_owned(), repo.to_owned()))
 }
 
@@ -801,20 +812,7 @@ pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspe
     }
 
     if let Some((owner, name)) = parse_repo_owner_and_name(&inspection.url) {
-        let mut gql_cmd = gh_base_command(folder);
-        let pr_num_arg = format!("prNumber={pr_number}");
-        gql_cmd.args([
-            "api",
-            "graphql",
-            "-F",
-            &format!("owner={owner}"),
-            "-F",
-            &format!("name={name}"),
-            "-F",
-            &pr_num_arg,
-            "-f",
-            &format!("query={REVIEW_THREADS_QUERY}"),
-        ]);
+        let mut gql_cmd = graphql_review_threads_command(folder, &owner, &name, pr_number);
         if let Ok(gql_bytes) = execute(&mut gql_cmd, TIMEOUT)
             && let Ok(comments) = parse_review_threads_json(&gql_bytes)
         {
@@ -823,4 +821,26 @@ pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspe
     }
 
     Ok(inspection)
+}
+
+pub(super) fn graphql_review_threads_command(
+    folder: &Path,
+    owner: &str,
+    name: &str,
+    pr_number: u64,
+) -> Command {
+    let mut gql_cmd = gh_base_command(folder);
+    gql_cmd.args([
+        "api",
+        "graphql",
+        "-f",
+        &format!("owner={owner}"),
+        "-f",
+        &format!("name={name}"),
+        "-F",
+        &format!("prNumber={pr_number}"),
+        "-f",
+        &format!("query={REVIEW_THREADS_QUERY}"),
+    ]);
+    gql_cmd
 }

@@ -1131,3 +1131,95 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| view.read(cx).search_rows().len()), 1);
 }
+
+#[gpui::test]
+fn open_diff_file_renders_untracked_file_and_apply_watch_recomputes_provisional_patch(
+    cx: &mut gpui::TestAppContext,
+) {
+    let repo = Repo::new();
+    std::fs::write(
+        repo.0.join("untracked_new.rs"),
+        "pub fn brand_new() -> usize {\n    42\n}\n",
+    )
+    .unwrap();
+
+    cx.update(gpui_component::init);
+    let repo_path = repo.0.clone();
+    let (view, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo_path, cx));
+    cx.run_until_parked();
+
+    // 1. Opening an untracked file before `apply_watch` has populated `changes.files`
+    // probes its actual git status (`??`) and renders the added lines immediately.
+    let r = repo.0.clone();
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.open_diff_file(r, "untracked_new.rs", false, cx);
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cx.debug_bounds("diff-viewer").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "open_diff_file must render untracked file diff without waiting for next watch cycle"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert_eq!(p.changes.files[0].status, *b"??");
+        assert!(p.force_next);
+    });
+
+    // 2. Even if a provisional entry was inserted with `.M` (`staged: None, unstaged: None`)
+    // and produced an empty patch, receiving the authoritative `??` snapshot via `apply_watch`
+    // (`WatchAction::Keep`) must re-run `select` and populate the diff viewer.
+    std::fs::write(
+        repo.0.join("provisional.rs"),
+        "pub const FIXED: bool = true;\n",
+    )
+    .unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.changes = Changes {
+                files: vec![ChangedFile {
+                    path: b"provisional.rs".to_vec(),
+                    old_path: None,
+                    status: *b".M",
+                    staged: None,
+                    unstaged: None,
+                }],
+                limited: false,
+            };
+            p.selected = Some(0);
+            p.loaded = false;
+            p.state.update(cx, |s, cx| s.set_files([], cx));
+            p.apply_watch(
+                Ok(GitWatchReply::Changed {
+                    generation: 1,
+                    changes: Changes {
+                        files: vec![ChangedFile {
+                            path: b"provisional.rs".to_vec(),
+                            old_path: None,
+                            status: *b"??",
+                            staged: None,
+                            unstaged: None,
+                        }],
+                        limited: false,
+                    },
+                }),
+                cx,
+            );
+        });
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while cx.debug_bounds("diff-viewer").is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "apply_watch Keep on provisional entry must recompute patch for untracked file"
+        );
+        cx.run_until_parked();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(cx.debug_bounds("diff-viewer").is_some());
+}

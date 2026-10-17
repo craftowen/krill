@@ -23,6 +23,7 @@ pub use checks::*;
 const WINDOW: Duration = Duration::from_secs(300);
 const GAP: Duration = Duration::from_secs(10);
 const REFRESH: Duration = Duration::from_secs(60);
+pub const MAX_CONCURRENT: usize = 4;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_OUTPUT: u64 = 256 * 1024;
 
@@ -126,8 +127,28 @@ struct Entry {
 #[derive(Default)]
 struct State {
     budget: Budget,
+    in_flight: usize,
     cache: BTreeMap<PathBuf, Entry>,
 }
+impl State {
+    fn reserve(&mut self, now: Instant) -> bool {
+        if self.in_flight >= MAX_CONCURRENT || !self.budget.reserve(now) {
+            return false;
+        }
+        self.in_flight += 1;
+        true
+    }
+}
+
+struct SlotGuard<'a>(&'a Mutex<State>);
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.0.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+    }
+}
+
 pub struct Service {
     state: Mutex<State>,
     runner: Arc<dyn Runner>,
@@ -144,6 +165,15 @@ impl Service {
             state: Mutex::new(State::default()),
             runner,
         }
+    }
+
+    fn reserve_slot(&self, now: Instant) -> Result<SlotGuard<'_>, &'static str> {
+        let mut state = self.state.lock().map_err(|_| FAILED.get())?;
+        if !state.reserve(now) {
+            return Err(PACED.get());
+        }
+        drop(state);
+        Ok(SlotGuard(&self.state))
     }
 
     /// Refresh at most one due branch; oldest entries win so large sidebars do not starve.
@@ -173,8 +203,8 @@ impl Service {
                 .min_by_key(|(path, _)| state.cache.get(*path).map(|entry| entry.at))
                 .map(|(path, branch)| (path.clone(), branch.clone()));
             candidate
-                .filter(|_| state.budget.reserve(now))
-                .inspect(|(path, branch)| {
+                .filter(|_| state.reserve(now))
+                .map(|(path, branch)| {
                     state
                         .cache
                         .entry(path.clone())
@@ -184,9 +214,10 @@ impl Service {
                             at: now,
                             status: Status::NoPr,
                         });
+                    (path, branch, SlotGuard(&self.state))
                 })
         };
-        if let Some((path, branch)) = candidate {
+        if let Some((path, branch, _slot)) = candidate {
             let status = self
                 .runner
                 .run(&path, &branch, Action::Refresh)
@@ -212,15 +243,7 @@ impl Service {
     }
 
     pub fn create(&self, folder: &Path, branch: &str, now: Instant) -> Result<(), &'static str> {
-        if !self
-            .state
-            .lock()
-            .map_err(|_| FAILED.get())?
-            .budget
-            .reserve(now)
-        {
-            return Err(PACED.get());
-        }
+        let _slot = self.reserve_slot(now)?;
         self.runner
             .run(folder, branch, Action::Create)
             .map(|_| ())
@@ -241,15 +264,7 @@ impl Service {
         body: &str,
         now: Instant,
     ) -> Result<(), &'static str> {
-        if !self
-            .state
-            .lock()
-            .map_err(|_| FAILED.get())?
-            .budget
-            .reserve(now)
-        {
-            return Err(PACED.get());
-        }
+        let _slot = self.reserve_slot(now)?;
         self.runner
             .create_pr(folder, branch, title, body)
             .map(|_| ())
@@ -269,6 +284,16 @@ impl Service {
     }
 
     pub fn inspect(&self, folder: &Path, branch: &str) -> Result<PrInspection, &'static str> {
+        self.inspect_at(folder, branch, Instant::now())
+    }
+
+    pub fn inspect_at(
+        &self,
+        folder: &Path,
+        branch: &str,
+        now: Instant,
+    ) -> Result<PrInspection, &'static str> {
+        let _slot = self.reserve_slot(now)?;
         self.runner.inspect_pr(folder, branch).map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 MISSING.get()

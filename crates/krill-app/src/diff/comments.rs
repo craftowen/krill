@@ -14,8 +14,33 @@ use crate::i18n::catalog::diff_comments as text;
 const MAX_COMMENTS: usize = 32;
 const MAX_PROMPT: usize = 48 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CommentSource {
+    #[default]
+    ReviewComments,
+    GitRecovery,
+    ChecksFix,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SendComments(pub String);
+pub struct SendComments(pub String, pub CommentSource);
+
+impl SendComments {
+    #[must_use]
+    pub const fn review(prompt: String) -> Self {
+        Self(prompt, CommentSource::ReviewComments)
+    }
+
+    #[must_use]
+    pub const fn git_recovery(prompt: String) -> Self {
+        Self(prompt, CommentSource::GitRecovery)
+    }
+
+    #[must_use]
+    pub const fn checks_fix(prompt: String) -> Self {
+        Self(prompt, CommentSource::ChecksFix)
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Comment {
@@ -144,59 +169,55 @@ impl Panel {
         cx.notify();
     }
 
-    pub fn comments_sent(&mut self, accepted: bool, cx: &mut Context<Self>) {
-        if self.editing.recovery_pending {
-            self.editing.recovery_pending = false;
-            if accepted {
-                self.editing.failure = None;
-                self.editing.note = crate::i18n::catalog::diff_edit::RECOVERY_SENT.get().into();
-            } else {
-                self.editing.note = crate::i18n::catalog::diff_edit::RECOVERY_FAILED
-                    .get()
-                    .into();
+    pub fn comments_sent(&mut self, source: CommentSource, accepted: bool, cx: &mut Context<Self>) {
+        match source {
+            CommentSource::GitRecovery => {
+                if accepted {
+                    self.editing.failure = None;
+                    self.editing.note = crate::i18n::catalog::diff_edit::RECOVERY_SENT.get().into();
+                } else {
+                    self.editing.note = crate::i18n::catalog::diff_edit::RECOVERY_FAILED
+                        .get()
+                        .into();
+                }
             }
-            cx.notify();
-            return;
-        }
-        if self.checks.fix_pending {
-            self.checks.fix_pending = false;
-            if accepted {
-                self.checks.selected_checks.clear();
-                self.checks.selected_comments.clear();
-                self.checks.fix_status = Some(crate::i18n::catalog::pull_request::FIX_SENT);
-            } else {
-                self.checks.fix_status = Some(crate::i18n::catalog::pull_request::FIX_FAILED);
+            CommentSource::ChecksFix => {
+                if accepted {
+                    self.checks.selected_checks.clear();
+                    self.checks.selected_comments.clear();
+                    self.checks.fix_status = Some(crate::i18n::catalog::pull_request::FIX_SENT);
+                } else {
+                    self.checks.fix_status = Some(crate::i18n::catalog::pull_request::FIX_FAILED);
+                }
             }
-            cx.notify();
-            return;
+            CommentSource::ReviewComments => {
+                if accepted {
+                    self.review.comments.clear();
+                }
+                self.review.status = if accepted {
+                    Some(text::QUEUED)
+                } else {
+                    Some(text::FAILED)
+                };
+            }
         }
-        if accepted {
-            self.review.comments.clear();
-        }
-        self.review.status = if accepted {
-            Some(text::QUEUED)
-        } else {
-            Some(text::FAILED)
-        };
         cx.notify();
     }
 
-    pub fn no_agent(&mut self, cx: &mut Context<Self>) {
-        if self.editing.recovery_pending {
-            self.editing.recovery_pending = false;
-            self.editing.note = crate::i18n::catalog::diff_edit::RECOVERY_NO_AGENT
-                .get()
-                .into();
-            cx.notify();
-            return;
+    pub fn no_agent(&mut self, source: CommentSource, cx: &mut Context<Self>) {
+        match source {
+            CommentSource::GitRecovery => {
+                self.editing.note = crate::i18n::catalog::diff_edit::RECOVERY_NO_AGENT
+                    .get()
+                    .into();
+            }
+            CommentSource::ChecksFix => {
+                self.checks.fix_status = Some(crate::i18n::catalog::pull_request::FIX_NO_AGENT);
+            }
+            CommentSource::ReviewComments => {
+                self.review.status = Some(text::NO_TARGET);
+            }
         }
-        if self.checks.fix_pending {
-            self.checks.fix_pending = false;
-            self.checks.fix_status = Some(crate::i18n::catalog::pull_request::FIX_NO_AGENT);
-            cx.notify();
-            return;
-        }
-        self.review.status = Some(text::NO_TARGET);
         cx.notify();
     }
 
@@ -306,7 +327,7 @@ impl Panel {
                 .disabled(self.review.comments.is_empty() || self.review.draft.is_some())
                 .on_click(cx.listener(|this, _, _, cx| {
                     if !this.review.comments.is_empty() && this.review.draft.is_none() {
-                        cx.emit(SendComments(prompt(&this.review.comments)));
+                        cx.emit(SendComments::review(prompt(&this.review.comments)));
                     }
                 })),
         )
