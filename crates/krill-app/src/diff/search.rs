@@ -44,8 +44,23 @@ const MAX_RG_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 /// `rg` 프로세스 실행 제한 시간.
 const RG_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `git check-ignore` 프로세스 실행 제한 시간.
+const GIT_IGNORE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// `git check-ignore` 표준 출력 최대 바이트 상한(2 MiB).
+const MAX_GIT_IGNORE_STDOUT_BYTES: usize = 2 * 1024 * 1024;
+
 /// 결과 줄 미리보기 최대 문자 수.
 const MAX_PREVIEW_CHARS: usize = 300;
+
+/// 긴 줄에서 매치 시작 위치 앞쪽에 유지할 문맥 문자 수.
+const PREVIEW_CONTEXT_BEFORE: usize = 40;
+
+/// 단일 시작 위치에서 허용하는 정규식 백트래킹 최대 스텝 수.
+const MAX_REGEX_STEPS_PER_MATCH: usize = 4_096;
+
+/// 한 줄 전체에서 허용하는 정규식 백트래킹 최대 스텝 수.
+const MAX_REGEX_STEPS_PER_LINE: usize = 100_000;
 
 /// 가상 리스트 행 높이(px).
 const ROW_HEIGHT: f32 = 24.0;
@@ -197,12 +212,9 @@ impl WorkspaceSearch {
         self.error = None;
         self.generation = self.generation.wrapping_add(1);
         self.search_task = None;
-        if active && !self.options.query.trim().is_empty() {
-            self.run_sync();
-        } else {
-            self.result = SearchResult::default();
-            self.rows.clear();
-        }
+        self.searching = active && !self.options.query.trim().is_empty();
+        self.result = SearchResult::default();
+        self.rows.clear();
     }
 
     pub fn run_sync(&mut self) {
@@ -427,8 +439,12 @@ impl LineMatcher {
         let n = line_chars.len();
         let mut out = Vec::new();
         let mut i = 0usize;
+        let mut line_steps = 0usize;
 
         while i < n {
+            if line_steps >= MAX_REGEX_STEPS_PER_LINE {
+                break;
+            }
             let matched_end = match self {
                 Self::Literal {
                     query,
@@ -439,7 +455,19 @@ impl LineMatcher {
                     pieces,
                     case_sensitive,
                     whole_word,
-                } => match_regex_at(&line_chars, i, pieces, *case_sensitive, *whole_word),
+                } => {
+                    let mut steps = 0usize;
+                    let matched = match_regex_at(
+                        &line_chars,
+                        i,
+                        pieces,
+                        *case_sensitive,
+                        *whole_word,
+                        &mut steps,
+                    );
+                    line_steps = line_steps.saturating_add(steps);
+                    matched
+                }
             };
             if let Some(end_idx) = matched_end
                 && end_idx > i
@@ -506,23 +534,40 @@ fn parse_regex_pieces(pattern: &str) -> Result<Vec<RegexPiece>, String> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut i = 0usize;
     let mut pieces: Vec<RegexPiece> = Vec::new();
-    let mut open_parens = 0usize;
+    let mut group_starts: Vec<usize> = Vec::new();
 
     while let Some(&ch) = chars.get(i) {
         match ch {
             '(' => {
-                open_parens = open_parens.saturating_add(1);
+                group_starts.push(pieces.len());
                 i = i.saturating_add(1);
                 if chars.get(i) == Some(&'?') && chars.get(i.saturating_add(1)) == Some(&':') {
                     i = i.saturating_add(2);
                 }
             }
             ')' => {
-                if open_parens == 0 {
+                let Some(group_start) = group_starts.pop() else {
                     return Err("unmatched closing parenthesis in regular expression".to_owned());
-                }
-                open_parens -= 1;
+                };
                 i = i.saturating_add(1);
+                let (quant, next_i) = consume_quantifier(&chars, i);
+                i = next_i;
+                if quant != Quantifier::Once {
+                    let group_slice = pieces.get(group_start..).unwrap_or(&[]).to_vec();
+                    if group_slice.len() == 1
+                        && let Some(last) = pieces.last_mut()
+                        && last.quant == Quantifier::Once
+                    {
+                        last.quant = quant;
+                    } else if !group_slice.is_empty() {
+                        for mut gp in group_slice {
+                            if gp.quant == Quantifier::OneOrMore || gp.quant == Quantifier::Once {
+                                gp.quant = Quantifier::ZeroOrMore;
+                            }
+                            pieces.push(gp);
+                        }
+                    }
+                }
             }
             '^' => {
                 pieces.push(RegexPiece {
@@ -630,7 +675,7 @@ fn parse_regex_pieces(pattern: &str) -> Result<Vec<RegexPiece>, String> {
             }
         }
     }
-    if open_parens != 0 {
+    if !group_starts.is_empty() {
         return Err("unclosed group in regular expression".to_owned());
     }
     Ok(pieces)
@@ -651,8 +696,9 @@ fn match_regex_at(
     pieces: &[RegexPiece],
     case_sensitive: bool,
     whole_word: bool,
+    steps: &mut usize,
 ) -> Option<usize> {
-    let end = match_regex_pieces(line_chars, start, pieces, case_sensitive)?;
+    let end = match_regex_pieces(line_chars, start, pieces, case_sensitive, steps)?;
     if whole_word
         && (!is_word_boundary_at(line_chars, start) || !is_word_boundary_at(line_chars, end))
     {
@@ -666,7 +712,13 @@ fn match_regex_pieces(
     pos: usize,
     pieces: &[RegexPiece],
     case_sensitive: bool,
+    steps: &mut usize,
 ) -> Option<usize> {
+    if *steps >= MAX_REGEX_STEPS_PER_MATCH {
+        return None;
+    }
+    *steps = steps.saturating_add(1);
+
     let Some(piece) = pieces.first() else {
         return Some(pos);
     };
@@ -675,21 +727,21 @@ fn match_regex_pieces(
     match &piece.atom {
         RegexAtom::Start => {
             if pos == 0 {
-                match_regex_pieces(line_chars, pos, rest, case_sensitive)
+                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
             } else {
                 None
             }
         }
         RegexAtom::End => {
             if pos == line_chars.len() {
-                match_regex_pieces(line_chars, pos, rest, case_sensitive)
+                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
             } else {
                 None
             }
         }
         RegexAtom::WordBoundary => {
             if is_word_boundary_at(line_chars, pos) {
-                match_regex_pieces(line_chars, pos, rest, case_sensitive)
+                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
             } else {
                 None
             }
@@ -697,19 +749,30 @@ fn match_regex_pieces(
         atom => match piece.quant {
             Quantifier::Once => {
                 if atom_matches_char(atom, line_chars, pos, case_sensitive) {
-                    match_regex_pieces(line_chars, pos.saturating_add(1), rest, case_sensitive)
+                    match_regex_pieces(
+                        line_chars,
+                        pos.saturating_add(1),
+                        rest,
+                        case_sensitive,
+                        steps,
+                    )
                 } else {
                     None
                 }
             }
             Quantifier::ZeroOrOne => {
                 if atom_matches_char(atom, line_chars, pos, case_sensitive)
-                    && let Some(end) =
-                        match_regex_pieces(line_chars, pos.saturating_add(1), rest, case_sensitive)
+                    && let Some(end) = match_regex_pieces(
+                        line_chars,
+                        pos.saturating_add(1),
+                        rest,
+                        case_sensitive,
+                        steps,
+                    )
                 {
                     return Some(end);
                 }
-                match_regex_pieces(line_chars, pos, rest, case_sensitive)
+                match_regex_pieces(line_chars, pos, rest, case_sensitive, steps)
             }
             Quantifier::ZeroOrMore | Quantifier::OneOrMore => {
                 let min_count = usize::from(piece.quant == Quantifier::OneOrMore);
@@ -726,11 +789,15 @@ fn match_regex_pieces(
                     return None;
                 }
                 for count in (min_count..=max_count).rev() {
+                    if *steps >= MAX_REGEX_STEPS_PER_MATCH {
+                        return None;
+                    }
                     if let Some(end) = match_regex_pieces(
                         line_chars,
                         pos.saturating_add(count),
                         rest,
                         case_sensitive,
+                        steps,
                     ) {
                         return Some(end);
                     }
@@ -785,7 +852,8 @@ fn shorthand_matches(kind: char, ch: char) -> bool {
     }
 }
 
-enum RgError {
+#[derive(Debug)]
+pub(crate) enum RgError {
     Unavailable,
     Execution(String),
 }
@@ -818,11 +886,22 @@ fn search_with_rg(
     root: &Path,
     options: &SearchOptions,
 ) -> Result<SearchResult, RgError> {
+    search_with_rg_limits(rg_bin, root, options, RG_TIMEOUT, MAX_RG_STDOUT_BYTES)
+}
+
+pub(crate) fn search_with_rg_limits(
+    rg_bin: &Path,
+    root: &Path,
+    options: &SearchOptions,
+    timeout: Duration,
+    max_stdout_bytes: usize,
+) -> Result<SearchResult, RgError> {
     let max_results = if options.max_results == 0 {
         DEFAULT_MAX_RESULTS
     } else {
         options.max_results
     };
+    let max_count = max_results.saturating_add(1).to_string();
     let include_globs = parse_glob_patterns(&options.include_pattern);
     let exclude_globs = parse_glob_patterns(&options.exclude_pattern);
 
@@ -839,6 +918,8 @@ fn search_with_rg(
             "--hidden",
             "--max-filesize",
             "4M",
+            "--max-count",
+            &max_count,
             "--color",
             "never",
             "--glob",
@@ -880,16 +961,18 @@ fn search_with_rg(
         .take()
         .ok_or_else(|| RgError::Execution("missing rg stdout".to_owned()))?;
 
+    let cap = u64::try_from(max_stdout_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        stdout
-            .take(u64::try_from(MAX_RG_STDOUT_BYTES).unwrap_or(u64::MAX))
-            .read_to_end(&mut bytes)?;
+        stdout.take(cap).read_to_end(&mut bytes)?;
         Ok::<_, io::Error>(bytes)
     });
 
-    let deadline = Instant::now() + RG_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut exit_code = None;
+    let mut timed_out = false;
     loop {
         match child.0.try_wait() {
             Ok(Some(status)) => {
@@ -898,6 +981,7 @@ fn search_with_rg(
             }
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
             Ok(None) => {
+                timed_out = true;
                 child.0.kill().ok();
                 child.0.wait().ok();
                 break;
@@ -908,16 +992,25 @@ fn search_with_rg(
     child.0.kill().ok();
     child.0.wait().ok();
 
-    let output = reader
+    let mut output = reader
         .join()
         .map_err(|_| RgError::Execution("rg reader thread panicked".to_owned()))?
         .map_err(|e| RgError::Execution(e.to_string()))?;
 
-    if exit_code == Some(2) && output.is_empty() {
+    if exit_code == Some(2) && output.is_empty() && !timed_out {
         return Err(RgError::Execution("invalid search pattern".to_owned()));
     }
 
-    Ok(parse_rg_json_lines(root, &output, max_results))
+    let stdout_capped = output.len() >= max_stdout_bytes;
+    if output.len() > max_stdout_bytes {
+        output.truncate(max_stdout_bytes);
+    }
+
+    let mut result = parse_rg_json_lines(root, &output, max_results);
+    if timed_out || stdout_capped {
+        result.truncated = true;
+    }
+    Ok(result)
 }
 
 #[derive(serde::Deserialize)]
@@ -961,6 +1054,7 @@ fn parse_rg_json_lines(root: &Path, stdout: &[u8], max_results: usize) -> Search
             continue;
         }
         let Ok(envelope) = serde_json::from_slice::<RgEnvelope<'_>>(raw_line) else {
+            truncated = true;
             continue;
         };
         if envelope.kind != "match" {
@@ -1021,6 +1115,14 @@ fn normalize_rel_path(raw: &str) -> String {
         .to_owned()
 }
 
+fn preview_window_start(col0: usize, len_chars: usize) -> usize {
+    if col0.saturating_add(len_chars) <= MAX_PREVIEW_CHARS {
+        0
+    } else {
+        col0.saturating_sub(PREVIEW_CONTEXT_BEFORE)
+    }
+}
+
 fn match_from_byte_span(
     raw_line: &str,
     line_number: u32,
@@ -1042,8 +1144,10 @@ fn match_from_byte_span(
             break;
         }
     }
+    let window_start = preview_window_start(col0, len_chars);
     let preview: String = clean_line
         .chars()
+        .skip(window_start)
         .take(MAX_PREVIEW_CHARS)
         .map(|c| if c == '\t' || c.is_control() { ' ' } else { c })
         .collect();
@@ -1196,11 +1300,27 @@ fn collect_candidate_files(root: &Path, limit: usize) -> Vec<(PathBuf, String)> 
 }
 
 fn query_git_ignored_set(repo: &Path, relative_paths: &[String]) -> BTreeSet<String> {
+    query_git_ignored_set_with_limits(
+        repo,
+        relative_paths,
+        GIT_IGNORE_TIMEOUT,
+        MAX_GIT_IGNORE_STDOUT_BYTES,
+    )
+}
+
+pub(crate) fn query_git_ignored_set_with_limits(
+    repo: &Path,
+    relative_paths: &[String],
+    timeout: Duration,
+    max_stdout_bytes: usize,
+) -> BTreeSet<String> {
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return BTreeSet::new();
     }
-    let Ok(mut child) = Command::new("git")
+    let Ok(spawned) = Command::new("git")
         .current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .args(["check-ignore", "--stdin", "-z"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1209,19 +1329,58 @@ fn query_git_ignored_set(repo: &Path, relative_paths: &[String]) -> BTreeSet<Str
     else {
         return BTreeSet::new();
     };
-    if let Some(mut stdin) = child.stdin.take() {
+    let mut child = Reap(spawned);
+    let Some(stdout) = child.0.stdout.take() else {
+        return BTreeSet::new();
+    };
+    let writer = child.0.stdin.take().map(|mut stdin| {
         let mut payload = Vec::new();
         for rel in relative_paths {
             payload.extend_from_slice(rel.as_bytes());
             payload.push(0);
         }
-        stdin.write_all(&payload).ok();
+        std::thread::spawn(move || {
+            stdin.write_all(&payload).ok();
+        })
+    });
+    let cap = u64::try_from(max_stdout_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.take(cap).read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.0.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) | Err(_) => {
+                child.0.kill().ok();
+                child.0.wait().ok();
+                break;
+            }
+        }
     }
-    let Ok(output) = child.wait_with_output() else {
+    child.0.kill().ok();
+    child.0.wait().ok();
+    if let Some(w) = writer {
+        w.join().ok();
+    }
+    let Ok(Ok(mut stdout_bytes)) = reader.join() else {
         return BTreeSet::new();
     };
-    output
-        .stdout
+    if stdout_bytes.len() > max_stdout_bytes {
+        stdout_bytes.truncate(max_stdout_bytes);
+        let valid_len = stdout_bytes
+            .iter()
+            .rposition(|&b| b == 0)
+            .map_or(0, |idx| idx + 1);
+        stdout_bytes.truncate(valid_len);
+    }
+    stdout_bytes
         .split(|b| *b == 0)
         .filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).trim_end_matches('/').to_owned())
@@ -1349,8 +1508,15 @@ pub fn split_highlighted_preview(
     column: u32,
     match_length: u32,
 ) -> (String, String, String) {
-    let start_char = usize::try_from(column.saturating_sub(1)).unwrap_or(0);
+    let col0 = usize::try_from(column.saturating_sub(1)).unwrap_or(0);
     let len_chars = usize::try_from(match_length).unwrap_or(0);
+    let line_char_count = line_content.chars().count();
+    let window_start = if line_char_count <= MAX_PREVIEW_CHARS {
+        preview_window_start(col0, len_chars)
+    } else {
+        0
+    };
+    let start_char = col0.saturating_sub(window_start);
     let end_char = start_char.saturating_add(len_chars);
 
     let mut before = String::new();
@@ -1399,46 +1565,40 @@ impl Panel {
         &self.search.rows
     }
 
-    /// 검색어를 설정하고 즉시 검색을 갱신한다.
+    /// 검색어를 설정하고 비동기 검색을 갱신한다.
     pub fn set_search_query(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
         self.search.options.query = query.into();
-        self.search.run_sync();
-        cx.notify();
+        self.spawn_async_search(cx);
     }
 
-    /// 포함 glob 필터(`files to include`)를 설정하고 즉시 검색을 갱신한다.
+    /// 포함 glob 필터(`files to include`)를 설정하고 비동기 검색을 갱신한다.
     pub fn set_search_include(&mut self, include: impl Into<String>, cx: &mut Context<Self>) {
         self.search.options.include_pattern = include.into();
-        self.search.run_sync();
-        cx.notify();
+        self.spawn_async_search(cx);
     }
 
-    /// 제외 glob 필터(`files to exclude`)를 설정하고 즉시 검색을 갱신한다.
+    /// 제외 glob 필터(`files to exclude`)를 설정하고 비동기 검색을 갱신한다.
     pub fn set_search_exclude(&mut self, exclude: impl Into<String>, cx: &mut Context<Self>) {
         self.search.options.exclude_pattern = exclude.into();
-        self.search.run_sync();
-        cx.notify();
+        self.spawn_async_search(cx);
     }
 
-    /// 대소문자 구분(`Aa`) 옵션을 토글하고 검색을 갱신한다.
+    /// 대소문자 구분(`Aa`) 옵션을 토글하고 비동기 검색을 갱신한다.
     pub fn toggle_search_case_sensitive(&mut self, cx: &mut Context<Self>) {
         self.search.options.case_sensitive = !self.search.options.case_sensitive;
-        self.search.run_sync();
-        cx.notify();
+        self.spawn_async_search(cx);
     }
 
-    /// 단어 단위 일치(`ab`) 옵션을 토글하고 검색을 갱신한다.
+    /// 단어 단위 일치(`ab`) 옵션을 토글하고 비동기 검색을 갱신한다.
     pub fn toggle_search_whole_word(&mut self, cx: &mut Context<Self>) {
         self.search.options.whole_word = !self.search.options.whole_word;
-        self.search.run_sync();
-        cx.notify();
+        self.spawn_async_search(cx);
     }
 
-    /// 정규식(`.*`) 옵션을 토글하고 검색을 갱신한다.
+    /// 정규식(`.*`) 옵션을 토글하고 비동기 검색을 갱신한다.
     pub fn toggle_search_regex(&mut self, cx: &mut Context<Self>) {
         self.search.options.use_regex = !self.search.options.use_regex;
-        self.search.run_sync();
-        cx.notify();
+        self.spawn_async_search(cx);
     }
 
     /// 특정 파일 그룹의 접기/펼치기를 토글한다.
@@ -1474,7 +1634,7 @@ impl Panel {
         }
     }
 
-    fn spawn_async_search(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn spawn_async_search(&mut self, cx: &mut Context<Self>) {
         self.search.generation = self.search.generation.wrapping_add(1);
         let generation = self.search.generation;
         if self.search.options.query.is_empty() {
@@ -1555,8 +1715,7 @@ impl Panel {
             InputEvent::PressEnter { .. } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.query = val;
-                this.search.run_sync();
-                cx.notify();
+                this.spawn_async_search(cx);
             }
             _ => {}
         });
@@ -1591,8 +1750,7 @@ impl Panel {
             InputEvent::PressEnter { .. } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.include_pattern = val;
-                this.search.run_sync();
-                cx.notify();
+                this.spawn_async_search(cx);
             }
             _ => {}
         });
@@ -1627,8 +1785,7 @@ impl Panel {
             InputEvent::PressEnter { .. } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.exclude_pattern = val;
-                this.search.run_sync();
-                cx.notify();
+                this.spawn_async_search(cx);
             }
             _ => {}
         });
@@ -1780,7 +1937,7 @@ impl Panel {
                     ),
             );
 
-        let summary_bar = (has_query && file_count > 0).then(|| {
+        let summary_bar = (has_query && (file_count > 0 || truncated)).then(|| {
             let msg = if truncated {
                 text::SEARCH_TRUNCATED.format(&[
                     ("files", &file_count.to_string()),

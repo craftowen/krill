@@ -1223,3 +1223,135 @@ fn open_diff_file_renders_untracked_file_and_apply_watch_recomputes_provisional_
     }
     assert!(cx.debug_bounds("diff-viewer").is_some());
 }
+
+#[test]
+fn workspace_search_long_line_highlight_regex_step_cap_and_rg_truncation_work() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let repo = Repo::new();
+    std::fs::create_dir_all(repo.0.join("src")).unwrap();
+
+    // 1. Long line (> 300 chars) match windowing and relative highlight splitting.
+    let prefix = "x".repeat(350);
+    let suffix = "y".repeat(60);
+    let long_line = format!("{prefix}LongLineNeedle{suffix}\n");
+    std::fs::write(repo.0.join("src/minified.js"), &long_line).unwrap();
+
+    for run_fn in [search_worktree, search_worktree_fallback] {
+        let opts = SearchOptions {
+            query: "LongLineNeedle".to_owned(),
+            case_sensitive: true,
+            ..SearchOptions::default()
+        };
+        let res = run_fn(&repo.0, &opts).unwrap();
+        assert_eq!(res.files.len(), 1);
+        let hit = &res.files[0].matches[0];
+        assert_eq!(hit.line, 1);
+        assert_eq!(hit.column, 351);
+        assert_eq!(hit.match_length, 14);
+        assert!(hit.line_content.chars().count() <= 300);
+        let (before, matched, after) =
+            split_highlighted_preview(&hit.line_content, hit.column, hit.match_length);
+        assert_eq!(matched, "LongLineNeedle");
+        assert!(!before.is_empty());
+        assert_eq!(after, suffix);
+    }
+
+    // 2. Catastrophic backtracking regex in fallback engine completes bounded by step cap.
+    std::fs::write(
+        repo.0.join("src/backtrack.txt"),
+        format!("{}!\naaaaaab\n", "a".repeat(60)),
+    )
+    .unwrap();
+    for pattern in ["(a+)+b", "a+a+a+a+a+a+b"] {
+        let started = std::time::Instant::now();
+        let res = search_worktree_fallback(
+            &repo.0,
+            &SearchOptions {
+                query: pattern.to_owned(),
+                use_regex: true,
+                case_sensitive: true,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "fallback regex {pattern} must be bounded by step cap"
+        );
+        let bt_file = res
+            .files
+            .iter()
+            .find(|f| f.relative_path == "src/backtrack.txt")
+            .unwrap();
+        assert_eq!(bt_file.matches.len(), 1);
+        assert_eq!(bt_file.matches[0].line, 2);
+    }
+
+    // 3. `search_with_rg_limits` sets `truncated = true` when stdout cap or timeout is hit
+    // even when parsed matches < max_results.
+    let bin_dir = repo.0.join("mock_bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let mock_rg_cap = bin_dir.join("rg_cap");
+    std::fs::write(
+        &mock_rg_cap,
+        "#!/bin/sh\nprintf '{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"src/minified.js\"},\"lines\":{\"text\":\"LongLineNeedle\\\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":14}]}}\\n'\nprintf '{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"src/minified.js\"},\"lines\":{\"text\":\"truncated_line'\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mock_rg_cap, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let cap_res = super::search::search_with_rg_limits(
+        &mock_rg_cap,
+        &repo.0,
+        &SearchOptions {
+            query: "LongLineNeedle".to_owned(),
+            max_results: 100,
+            ..SearchOptions::default()
+        },
+        Duration::from_secs(2),
+        180,
+    )
+    .unwrap();
+    assert_eq!(cap_res.total_matches, 1);
+    assert!(
+        cap_res.truncated,
+        "stdout byte cap must mark result as truncated even when total_matches < max_results"
+    );
+
+    let mock_rg_slow = bin_dir.join("rg_slow");
+    std::fs::write(
+        &mock_rg_slow,
+        "#!/bin/sh\nprintf '{\"type\":\"match\",\"data\":{\"path\":{\"text\":\"src/minified.js\"},\"lines\":{\"text\":\"LongLineNeedle\\\\n\"},\"line_number\":1,\"submatches\":[{\"start\":0,\"end\":14}]}}\\n'\nsleep 2\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mock_rg_slow, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let slow_res = super::search::search_with_rg_limits(
+        &mock_rg_slow,
+        &repo.0,
+        &SearchOptions {
+            query: "LongLineNeedle".to_owned(),
+            max_results: 100,
+            ..SearchOptions::default()
+        },
+        Duration::from_millis(40),
+        1024 * 1024,
+    )
+    .unwrap();
+    assert!(
+        slow_res.truncated,
+        "rg timeout must mark result as truncated even when total_matches < max_results"
+    );
+
+    // 4. `query_git_ignored_set_with_limits` respects stdout byte cap and drops incomplete trailing entry.
+    std::fs::write(repo.0.join(".gitignore"), "*.ignored\n").unwrap();
+    let paths: Vec<String> = (0..20).map(|i| format!("file_{i:02}.ignored")).collect();
+    let ignored = super::search::query_git_ignored_set_with_limits(
+        &repo.0,
+        &paths,
+        Duration::from_secs(2),
+        40,
+    );
+    assert!(ignored.contains("file_00.ignored"));
+    assert!(ignored.iter().all(|entry| entry.ends_with(".ignored")));
+}
