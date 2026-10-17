@@ -1861,7 +1861,9 @@ fn import_projects_domain(
 ) -> io::Result<ProjectsImportSummary> {
     let original = read_original(&opts.state_dir.join(PROJECTS_FILE))?;
     let mut store = ProjectsStore::load(&opts.state_dir)?;
-    let mut wt_store = WorktreeStore::load(&opts.state_dir)?;
+    // worktree-comments.toml은 저장 시점에 잠금 안에서 다시 읽어 병합한다(OWE-748). 여기엔 이관분만 모은다.
+    let mut wt_store = WorktreeStore::default();
+    let mut lineage_parents: Vec<(String, String)> = Vec::new();
     let mut summary = ProjectsImportSummary::default();
 
     let projects_by_id: BTreeMap<String, OrcaProject> = domains
@@ -2140,17 +2142,13 @@ fn import_projects_domain(
                 if wt_path.is_empty() {
                     continue;
                 }
-                // 부모 계보 단일 원천은 WorktreeStore(OWE-756). 사용자가 이미 정한 부모는 덮어쓰지 않는다.
                 if let Some(parent) = lin
                     .parent_worktree_path
                     .as_deref()
-                    .map(str::trim)
+                    .map(|p| split_worktree_key(p).1)
                     .filter(|s| !s.is_empty())
-                    && !wt_store
-                        .parents
-                        .contains_key(&worktree_key(Path::new(&wt_path)))
                 {
-                    wt_store.set_parent(&wt_path, Some(parent)).ok();
+                    lineage_parents.push((wt_path.clone(), parent));
                 }
                 store.lineage.insert(
                     wt_path.clone(),
@@ -2174,7 +2172,17 @@ fn import_projects_domain(
 
     if !opts.dry_run {
         store.save(&opts.state_dir, original.as_deref())?;
-        if let Err(e) = wt_store.save(&opts.state_dir) {
+        let saved = WorktreeStore::mutate(&opts.state_dir, |current| {
+            merge_imported_worktree_meta(current, wt_store);
+            // 부모 계보 단일 원천은 WorktreeStore(OWE-756). 사용자가 이미 정한 부모는 덮어쓰지 않는다.
+            for (child, parent) in &lineage_parents {
+                if current.parent_of(&worktree_key(Path::new(child))).is_none() {
+                    current.set_parent(child, Some(parent)).ok();
+                }
+            }
+            Ok(())
+        });
+        if let Err(e) = saved {
             warnings.push(format!("failed to save worktree-comments.toml: {e}"));
         }
     }
@@ -2270,6 +2278,21 @@ fn split_worktree_key(raw: &str) -> (Option<String>, String) {
         )
     } else {
         (None, raw.trim().to_owned())
+    }
+}
+
+/// 이관으로 모은 워크트리 메타(`src`)를 잠금 안에서 다시 읽은 저장본(`dst`)에 덮어쓴다.
+fn merge_imported_worktree_meta(dst: &mut WorktreeStore, src: WorktreeStore) {
+    dst.comments.extend(src.comments);
+    dst.statuses.extend(src.statuses);
+    dst.unread.extend(src.unread);
+    dst.prs.extend(src.prs);
+    dst.issues.extend(src.issues);
+    dst.updated_at.extend(src.updated_at);
+    for (key, urls) in src.references {
+        for url in urls {
+            dst.add_reference(&key, &url).ok();
+        }
     }
 }
 

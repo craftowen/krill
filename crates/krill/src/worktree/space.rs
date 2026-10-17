@@ -486,26 +486,23 @@ pub fn record_worktree_metadata(
     pr_number: Option<u64>,
     updated_at_secs: Option<u64>,
 ) -> std::io::Result<()> {
-    fs::create_dir_all(state_dir)?;
-    let file = state_dir.join(krill_proto::orchestration::COMMENTS_FILE);
-    let mut store = load_metadata_store(state_dir).unwrap_or_default();
-    let canon = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-    let key = canon.to_string_lossy().into_owned();
-    if let Some(st) = pr_state {
-        if st == CleanupPrState::None {
-            store.pr_states.remove(&key);
-        } else {
-            store.pr_states.insert(key.clone(), st.as_str().to_owned());
+    let key = krill_proto::orchestration::worktree_key(worktree);
+    krill_proto::orchestration::WorktreeStore::mutate(state_dir, |store| {
+        if let Some(st) = pr_state {
+            if st == CleanupPrState::None {
+                store.pr_states.remove(&key);
+            } else {
+                store.pr_states.insert(key.clone(), st.as_str().to_owned());
+            }
         }
-    }
-    if let Some(num) = pr_number {
-        store.prs.insert(key.clone(), num);
-    }
-    if let Some(ts) = updated_at_secs {
-        store.updated_at.insert(key, ts);
-    }
-    let body = krill_proto::config_document::save_toml(&file, &store)?;
-    fs::write(&file, body)
+        if let Some(num) = pr_number {
+            store.prs.insert(key.clone(), num);
+        }
+        if let Some(ts) = updated_at_secs {
+            store.updated_at.insert(key, ts);
+        }
+        Ok(())
+    })
 }
 
 /// 선택된 클린업 후보 워크트리들을 일괄 삭제하고 병합된 로컬 브랜치를 안전하게 정리한다.
@@ -592,8 +589,18 @@ pub fn execute_cleanup(
             path: item.path.as_os_str().as_bytes().to_vec(),
             force: force_dirty,
         };
+        // 삭제 뒤에는 canonicalize가 실패하므로 계보 키는 삭제 전에 정규화해 둔다.
+        let lineage_key = krill_proto::orchestration::worktree_key(&item.path);
         match remove_worktree_live_or_git(paths, &req, inferred_state.as_deref()) {
             Ok(removed) => {
+                // `krill worktree rm`과 같이 삭제된 워크트리의 계보를 지워 고아 항목을 남기지 않는다.
+                if let Some(dir) = inferred_state.as_deref() {
+                    krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
+                        store.remove_worktree_lineage(&lineage_key);
+                        Ok(())
+                    })
+                    .ok();
+                }
                 summary.removed_count = summary.removed_count.saturating_add(1);
                 summary.freed_bytes = summary.freed_bytes.saturating_add(item.disk_bytes);
                 if removed.branch.is_some() {
@@ -1385,8 +1392,23 @@ mod tests {
         );
         assert_eq!(both_14d.len(), 2);
 
+        let key = |p: &Path| krill_proto::orchestration::worktree_key(p);
+        let (merged_key, closed_key, dirty_key) =
+            (key(&wt_merged_old), key(&wt_closed_old), key(&wt_dirty_old));
+        krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
+            store.set_parent(&merged_key, Some(&key(&repo)))?;
+            store.set_parent(&closed_key, Some(&key(&repo)))?;
+            store.set_parent(&dirty_key, Some(&closed_key))
+        })
+        .unwrap();
+
         // 일괄 삭제 실행: 머지된 브랜치는 삭제되고, 미병합 브랜치(branch-closed-old)는 경고 후 보존되어야 한다.
         let summary = execute_cleanup(&both_14d, false, None, Some(&state_dir));
+        // 삭제된 워크트리를 자식·부모로 가진 계보는 남지 않는다(OWE-748).
+        let parents = krill_proto::orchestration::WorktreeStore::load(&state_dir)
+            .unwrap()
+            .parents;
+        assert!(parents.is_empty(), "orphan lineage left: {parents:?}");
         assert_eq!(summary.removed_count, 2);
         assert_eq!(summary.failed_count, 0);
         assert_eq!(summary.branches_deleted, 1);
