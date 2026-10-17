@@ -397,8 +397,6 @@ struct ImportedWorktreeLineage {
     worktree_path: String,
     #[serde(default)]
     branch: Option<String>,
-    #[serde(default)]
-    parent_worktree_path: Option<String>,
 }
 
 fn load_imported_projects(state_dir: &Path) -> Option<ImportedProjectsFile> {
@@ -495,8 +493,8 @@ pub fn include_imported_projects(
     }
 }
 
-/// `<state_dir>/projects.toml`의 표시 이름·고정 여부·코멘트·이슈·상태·계보(부모 워크트리)를
-/// 사이드바 인메모리 상태에 반영한다.
+/// `<state_dir>/projects.toml`의 표시 이름·고정 여부·코멘트·이슈·상태를
+/// 사이드바 인메모리 상태에 반영한다. 계보(부모 워크트리)는 이관기가 `WorktreeStore`(단일 원천)에 기록한다.
 ///
 /// `pinned`와 `display_name`은 `prefs`에 해당 경로 엔트리가 아직 없을 때(`Entry::Vacant`)만
 /// 초기값으로 주입해, 이미 사용자가 수정한 `sidebar.bin` 설정(핀 해제·이름 초기화)을 덮어쓰지 않는다(`OWE-767`).
@@ -506,8 +504,6 @@ pub(super) fn apply_imported_project_prefs(
     comments: &mut BTreeMap<PathBuf, String>,
     issues: &mut BTreeMap<PathBuf, String>,
     statuses: &mut BTreeMap<PathBuf, krill_proto::orchestration::WorkspaceStatus>,
-    parents: &mut BTreeMap<PathBuf, PathBuf>,
-    seeded_parents: &mut std::collections::BTreeSet<PathBuf>,
 ) {
     let Some(file) = load_imported_projects(state_dir) else {
         return;
@@ -562,32 +558,6 @@ pub(super) fn apply_imported_project_prefs(
             && let Ok(st) = krill_proto::orchestration::WorkspaceStatus::parse(st_str)
         {
             statuses.entry(wt_path).or_insert(st);
-        }
-    }
-    for (lin_key, lin) in &file.lineage {
-        let wt_str = if lin.worktree_path.trim().is_empty() {
-            lin_key.trim()
-        } else {
-            lin.worktree_path.trim()
-        };
-        let Some(parent_str) = lin
-            .parent_worktree_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        else {
-            continue;
-        };
-        if wt_str.is_empty() {
-            continue;
-        }
-        let child = PathBuf::from(wt_str);
-        let parent = PathBuf::from(parent_str);
-        if seeded_parents.insert(child.clone())
-            && !parents.contains_key(&child)
-            && super::lineage::can_assign_parent(parents, &child, &parent)
-        {
-            parents.insert(child, parent);
         }
     }
 }
@@ -1051,7 +1021,7 @@ fn as12_sidebar_comment_save_preserves_future_fields() {
 
 #[cfg(test)]
 #[test]
-fn owe767_imported_prefs_do_not_clobber_unpin_or_cleared_name_and_seed_lineage_parent() {
+fn owe767_imported_prefs_do_not_clobber_unpin_or_cleared_name() {
     let dir = std::env::temp_dir().join(format!("owe767-sidebar-prefs-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).unwrap();
@@ -1085,19 +1055,9 @@ parent_worktree_path = "/Users/test/repo"
     let mut comments = BTreeMap::new();
     let mut issues = BTreeMap::new();
     let mut statuses = BTreeMap::new();
-    let mut parents = BTreeMap::new();
-    let mut seeded_parents = std::collections::BTreeSet::new();
 
-    // First sync seeds vacant prefs and lineage parent
-    apply_imported_project_prefs(
-        &dir,
-        &mut prefs,
-        &mut comments,
-        &mut issues,
-        &mut statuses,
-        &mut parents,
-        &mut seeded_parents,
-    );
+    // First sync seeds vacant prefs
+    apply_imported_project_prefs(&dir, &mut prefs, &mut comments, &mut issues, &mut statuses);
     assert_eq!(
         prefs.get(&repo),
         Some(&super::Preference {
@@ -1112,26 +1072,15 @@ parent_worktree_path = "/Users/test/repo"
             name: "Imported Worktree".to_owned(),
         })
     );
-    assert_eq!(parents.get(&wt), Some(&repo));
 
     // User unpins and clears custom names (as Sidebar::toggle_pin and Sidebar::finish_rename do),
-    // and unlinks the worktree parent
     prefs.get_mut(&repo).unwrap().pinned = false;
     prefs.get_mut(&repo).unwrap().name.clear();
     prefs.get_mut(&wt).unwrap().pinned = false;
     prefs.get_mut(&wt).unwrap().name.clear();
-    parents.remove(&wt);
 
-    // Subsequent polling sync must NOT overwrite the occupied prefs or re-insert cleared parent
-    apply_imported_project_prefs(
-        &dir,
-        &mut prefs,
-        &mut comments,
-        &mut issues,
-        &mut statuses,
-        &mut parents,
-        &mut seeded_parents,
-    );
+    // Subsequent polling sync must NOT overwrite the occupied prefs
+    apply_imported_project_prefs(&dir, &mut prefs, &mut comments, &mut issues, &mut statuses);
     assert_eq!(
         prefs.get(&repo),
         Some(&super::Preference {
@@ -1146,7 +1095,6 @@ parent_worktree_path = "/Users/test/repo"
             name: String::new(),
         })
     );
-    assert_eq!(parents.get(&wt), None);
 
     fs::remove_dir_all(dir).unwrap();
 }

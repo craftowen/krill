@@ -1881,7 +1881,7 @@ mod tests {
             assert_eq!(
                 sb.worktree_parent(&wt_path),
                 Some(repo_path.clone()),
-                "Imported lineage parent_worktree_path should be reflected in Sidebar::merged_parents"
+                "Imported lineage parent_worktree_path should land in WorktreeStore (lineage SSOT) and reach Sidebar::merged_parents"
             );
         });
 
