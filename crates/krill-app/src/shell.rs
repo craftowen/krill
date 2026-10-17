@@ -1112,6 +1112,7 @@ impl Shell {
             Ok(p) => p,
             Err(e) => {
                 self.link = Link::Failed(daemon::Error::Io(e).to_string());
+                krill_app::orca_import::set_daemon_link_up(false, cx);
                 return;
             }
         };
@@ -1399,6 +1400,7 @@ impl Shell {
             self.appearance = None;
         }
         self.link = link;
+        krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
             self.load_agents(None, cx);

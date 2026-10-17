@@ -9,10 +9,10 @@
 //!   사이드바 프로젝트/워크트리 트리, `Settings > Accounts`, `Settings > Ssh`, 상태바를 갱신한다.
 
 use std::collections::BTreeSet;
-use std::io;
-use std::os::unix::net::UnixStream;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
@@ -361,6 +361,13 @@ pub struct SettingsImportSummary {
     pub schedules_merged: usize,
 }
 
+/// `krill import orca` 서브프로세스 기본 실행 제한 시간(`OWE-767`).
+pub const IMPORT_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(15);
+/// `krill import orca --json` 표준출력 최대 바이트(4 MiB, `OWE-767`).
+pub const MAX_IMPORT_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
+/// `krill import orca` 표준에러 최대 바이트(64 KiB, `OWE-767`).
+pub const MAX_IMPORT_STDERR_BYTES: u64 = 64 * 1024;
+
 /// 앱 전역 Orca 마이그레이션 상태(온보딩 마법사 및 `Settings > General` / `Accounts` 공유).
 #[derive(Debug, Clone)]
 pub struct OrcaImportState {
@@ -368,6 +375,9 @@ pub struct OrcaImportState {
     pub krill_bin_override: Option<PathBuf>,
     pub home_override: Option<PathBuf>,
     pub state_dir_override: Option<PathBuf>,
+    pub subprocess_timeout_override: Option<Duration>,
+    pub daemon_link_up: Option<bool>,
+    pub daemon_available: Option<bool>,
     pub preview: Option<OrcaImportReport>,
     pub last_result: Option<OrcaImportReport>,
     pub selected: BTreeSet<ImportDomain>,
@@ -384,6 +394,9 @@ impl Default for OrcaImportState {
             krill_bin_override: None,
             home_override: None,
             state_dir_override: None,
+            subprocess_timeout_override: None,
+            daemon_link_up: None,
+            daemon_available: None,
             preview: None,
             last_result: None,
             selected: ImportDomain::ALL.into_iter().collect(),
@@ -406,6 +419,17 @@ pub fn ensure_state(cx: &mut App) {
 #[must_use]
 pub fn state(cx: &App) -> Option<&OrcaImportState> {
     cx.try_global::<OrcaImportState>()
+}
+
+/// 셸의 데몬 링크 상태(`Link::Up`) 변경을 동기화한다(`OWE-767`).
+pub fn set_daemon_link_up(up: bool, cx: &mut App) {
+    ensure_state(cx);
+    let st = cx.global_mut::<OrcaImportState>();
+    if st.daemon_link_up != Some(up) {
+        st.daemon_link_up = Some(up);
+        st.daemon_available = Some(up);
+        cx.refresh_windows();
+    }
 }
 
 /// 온보딩 `Env` 또는 테스트 픽스처의 격리된 `home`/`orca_dir`/`state_dir`/`krill_bin`을 주입한다.
@@ -435,6 +459,7 @@ pub fn set_env_paths(
         && st.state_dir_override.as_ref() != Some(&s)
     {
         st.state_dir_override = Some(s);
+        st.daemon_available = None;
         changed = true;
     }
     if let Some(k) = krill_bin
@@ -502,14 +527,42 @@ pub fn is_orca_detected(cx: &App) -> bool {
     detect_orca_dir(cx).is_some()
 }
 
-/// 현재 상태 디렉터리의 `krilld.sock`에 데몬이 응답 가능한지 확인한다.
+/// 데몬 연결 여부를 돌려준다(`OWE-767`).
+///
+/// 매 UI 렌더마다 `krilld.sock`에 새 소켓을 열지 않고, 셸의 데몬 링크 상태(`daemon_link_up`),
+/// 백그라운드 스캔·이관 시점 캐시 값(`daemon_available`), 또는 온보딩 점검 스냅샷(`ChecksSnapshot`)을 읽는다.
 #[must_use]
 pub fn daemon_available(cx: &App) -> bool {
-    let Some(dir) = effective_state_dir(cx) else {
+    if let Some(st) = state(cx) {
+        if let Some(up) = st.daemon_link_up {
+            return up;
+        }
+        if let Some(avail) = st.daemon_available {
+            return avail;
+        }
+    }
+    if let Some(snap) = cx.try_global::<crate::onboarding::ChecksSnapshot>()
+        && let Some(check) = snap.checks.iter().find(|c| c.id == "daemon.connect")
+    {
+        return check.status == krill_proto::doctor::Status::Ok;
+    }
+    false
+}
+
+/// 백그라운드 스캔·이관 시점에 데몬 소켓이 정식 `ClientHello` 핸드셰이크에 응답하는지 확인한다.
+fn probe_daemon_handshake(state_dir: Option<&Path>) -> bool {
+    let Some(dir) = state_dir else {
         return false;
     };
     let sock = dir.join("run").join("krilld.sock");
-    UnixStream::connect(sock).is_ok()
+    if !sock.exists() {
+        return false;
+    }
+    let hello = krill_proto::daemon::client_hello(
+        krill_proto::ipc::ClientRole::App,
+        "krill-app orca-import probe",
+    );
+    krill_proto::daemon::handshake(&sock, &hello, Duration::from_secs(2)).is_ok()
 }
 
 /// 스테이징된 `krill` CLI 바이너리 경로를 찾는다.
@@ -549,6 +602,15 @@ pub fn resolve_krill_bin(cx: &App) -> Option<PathBuf> {
     None
 }
 
+struct ReapChild(Child);
+
+impl Drop for ReapChild {
+    fn drop(&mut self) {
+        self.0.kill().ok();
+        self.0.wait().ok();
+    }
+}
+
 /// 서브프로세스로 `krill import orca`를 실행하고 JSON 리포트를 파싱한다.
 pub fn run_krill_import(
     krill_bin: &Path,
@@ -557,6 +619,27 @@ pub fn run_krill_import(
     home_dir: Option<&Path>,
     domains: &[ImportDomain],
     dry_run: bool,
+) -> io::Result<OrcaImportReport> {
+    run_krill_import_with_timeout(
+        krill_bin,
+        orca_dir,
+        state_dir,
+        home_dir,
+        domains,
+        dry_run,
+        IMPORT_SUBPROCESS_TIMEOUT,
+    )
+}
+
+/// 실행 타임아웃과 stdout/stderr `take` 바이트 상한을 적용해 `krill import orca`를 실행한다(`OWE-767`).
+pub fn run_krill_import_with_timeout(
+    krill_bin: &Path,
+    orca_dir: &Path,
+    state_dir: Option<&Path>,
+    home_dir: Option<&Path>,
+    domains: &[ImportDomain],
+    dry_run: bool,
+    timeout: Duration,
 ) -> io::Result<OrcaImportReport> {
     if !krill_bin.is_file() {
         return Err(io::Error::new(
@@ -590,20 +673,79 @@ pub fn run_krill_import(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let mut child = ReapChild(cmd.spawn()?);
+    let stdout = child
+        .0
+        .stdout
+        .take()
+        .ok_or_else(|| io::Error::other("missing krill import stdout"))?;
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing krill import stderr"))?;
+
+    let out_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(MAX_IMPORT_STDOUT_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .take(MAX_IMPORT_STDERR_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(None) => {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "krill import orca timed out",
+                ));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    child.0.kill().ok();
+    child.0.wait().ok();
+    let status = status?;
+    let stdout_bytes = out_reader
+        .join()
+        .map_err(|_| io::Error::other("krill import stdout reader failed"))??;
+    let stderr_bytes = err_reader
+        .join()
+        .map_err(|_| io::Error::other("krill import stderr reader failed"))?
+        .unwrap_or_default();
+
+    if u64::try_from(stdout_bytes.len()).unwrap_or(u64::MAX) > MAX_IMPORT_STDOUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "krill import orca output exceeds size limit",
+        ));
+    }
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes).trim().to_owned();
+        let stdout = String::from_utf8_lossy(&stdout_bytes).trim().to_owned();
         let detail = if !stderr.is_empty() {
             stderr
         } else if !stdout.is_empty() {
             stdout
         } else {
-            output.status.to_string()
+            status.to_string()
         };
         return Err(io::Error::other(detail));
     }
-    serde_json::from_slice::<OrcaImportReport>(&output.stdout)
+    serde_json::from_slice::<OrcaImportReport>(&stdout_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
@@ -636,29 +778,42 @@ pub fn scan_preview(cx: &mut App) {
         return;
     };
     let state_dir = effective_state_dir(cx);
-    let home_dir = state(cx).and_then(|s| s.home_override.clone());
-    {
+    let (home_dir, timeout, link_known) = {
         let st = cx.global_mut::<OrcaImportState>();
         st.scanning = true;
         st.error = None;
-    }
+        (
+            st.home_override.clone(),
+            st.subprocess_timeout_override
+                .unwrap_or(IMPORT_SUBPROCESS_TIMEOUT),
+            st.daemon_link_up.is_some(),
+        )
+    };
     cx.refresh_windows();
 
     let rx = cx.background_executor().spawn(async move {
-        run_krill_import(
+        let res = run_krill_import_with_timeout(
             &krill_bin,
             &orca_dir,
             state_dir.as_deref(),
             home_dir.as_deref(),
             &ImportDomain::ALL,
             true,
-        )
+            timeout,
+        );
+        let daemon_ok = (!link_known).then(|| probe_daemon_handshake(state_dir.as_deref()));
+        (res, daemon_ok)
     });
     cx.spawn(async move |cx| {
-        let res = rx.await;
+        let (res, daemon_ok) = rx.await;
         cx.update(|cx| {
             let st = cx.global_mut::<OrcaImportState>();
             st.scanning = false;
+            if st.daemon_link_up.is_none()
+                && let Some(ok) = daemon_ok
+            {
+                st.daemon_available = Some(ok);
+            }
             match res {
                 Ok(report) => {
                     st.preview = Some(report);
@@ -728,30 +883,48 @@ pub fn import_selected(cx: &mut App) {
         return;
     };
     let state_dir = effective_state_dir(cx);
-    let home_dir = state(cx).and_then(|s| s.home_override.clone());
-    {
+    let (home_dir, timeout, link_known) = {
         let st = cx.global_mut::<OrcaImportState>();
         st.importing = true;
         st.error = None;
-    }
+        (
+            st.home_override.clone(),
+            st.subprocess_timeout_override
+                .unwrap_or(IMPORT_SUBPROCESS_TIMEOUT),
+            st.daemon_link_up.is_some(),
+        )
+    };
     cx.refresh_windows();
 
     let rx = cx.background_executor().spawn(async move {
-        run_krill_import(
+        let res = run_krill_import_with_timeout(
             &krill_bin,
             &orca_dir,
             state_dir.as_deref(),
             home_dir.as_deref(),
             &domains,
             false,
-        )
+            timeout,
+        );
+        let daemon_ok = (!link_known).then(|| match &res {
+            Ok(report) if domains.contains(&ImportDomain::Accounts) => {
+                report.accounts_skipped_daemon_reason().is_none()
+            }
+            _ => probe_daemon_handshake(state_dir.as_deref()),
+        });
+        (res, daemon_ok)
     });
     cx.spawn(async move |cx| {
-        let res = rx.await;
+        let (res, daemon_ok) = rx.await;
         cx.update(|cx| {
             {
                 let st = cx.global_mut::<OrcaImportState>();
                 st.importing = false;
+                if st.daemon_link_up.is_none()
+                    && let Some(ok) = daemon_ok
+                {
+                    st.daemon_available = Some(ok);
+                }
                 match res {
                     Ok(report) => {
                         if st.preview.is_none() {
@@ -1143,6 +1316,7 @@ mod tests {
     use std::fs;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1704,6 +1878,11 @@ mod tests {
                 sb.worktree_statuses().get(&wt_path),
                 Some(&krill_proto::orchestration::WorkspaceStatus::InProgress)
             );
+            assert_eq!(
+                sb.worktree_parent(&wt_path),
+                Some(repo_path.clone()),
+                "Imported lineage parent_worktree_path should be reflected in Sidebar::merged_parents"
+            );
         });
 
         // Step B: Start mock krilld on `<state_dir>/run/krilld.sock` and import `accounts` domain only.
@@ -1819,5 +1998,119 @@ mod tests {
         stop_flag.store(true, Ordering::Relaxed);
         UnixStream::connect(&sock_path).ok();
         server_thread.join().ok();
+    }
+
+    #[gpui::test]
+    fn owe767_no_per_render_socket_connect_and_import_enforces_timeout_and_byte_cap(
+        cx: &mut TestAppContext,
+    ) {
+        let fx = setup_orca_fixture("owe767");
+        let run_dir = fx.state_dir.join("run");
+        fs::create_dir_all(&run_dir).unwrap();
+        let sock_path = run_dir.join("krilld.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        listener.set_nonblocking(true).unwrap();
+
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::settings::init_at(Some(fx.state_dir.clone()), cx);
+            set_env_paths(
+                Some(fx.home.clone()),
+                Some(fx.orca_dir.clone()),
+                Some(fx.state_dir.clone()),
+                None,
+                cx,
+            );
+            set_daemon_link_up(false, cx);
+        });
+
+        // 1. Repeatedly call render_banner / daemon_available on the UI thread and verify 0 socket connects
+        cx.read(|cx| {
+            for _ in 0..10 {
+                assert!(!daemon_available(cx));
+                assert!(render_banner("test", cx).is_some());
+            }
+        });
+        assert!(
+            listener.accept().is_err(),
+            "render_banner / daemon_available must never connect to krilld.sock on UI render frames"
+        );
+
+        cx.update(|cx| set_daemon_link_up(true, cx));
+        cx.read(|cx| {
+            assert!(daemon_available(cx));
+            assert!(render_banner("test", cx).is_some());
+        });
+        assert!(
+            listener.accept().is_err(),
+            "set_daemon_link_up(true) must satisfy daemon_available without opening a socket"
+        );
+
+        // 2. Verify subprocess timeout resets scanning/importing and surfaces TimedOut error
+        let slow_bin = fx.root.join("krill-slow.sh");
+        fs::write(&slow_bin, "#!/bin/sh\nsleep 10\n").unwrap();
+        fs::set_permissions(&slow_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = run_krill_import_with_timeout(
+            &slow_bin,
+            &fx.orca_dir,
+            Some(&fx.state_dir),
+            Some(&fx.home),
+            &ImportDomain::ALL,
+            true,
+            Duration::from_millis(60),
+        )
+        .expect_err("slow subprocess must time out");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        cx.update(|cx| {
+            set_env_paths(
+                Some(fx.home.clone()),
+                Some(fx.orca_dir.clone()),
+                Some(fx.state_dir.clone()),
+                Some(slow_bin.clone()),
+                cx,
+            );
+            cx.global_mut::<OrcaImportState>()
+                .subprocess_timeout_override = Some(Duration::from_millis(60));
+            scan_preview(cx);
+        });
+        wait_until(cx, |cx| {
+            cx.read(|cx| state(cx).is_some_and(|st| !st.scanning))
+        });
+        cx.read(|cx| {
+            let st = state(cx).unwrap();
+            assert!(!st.scanning);
+            assert!(
+                st.error.as_deref().is_some_and(|e| e.contains("timed out")),
+                "expected timeout error, got {:?}",
+                st.error
+            );
+        });
+
+        // 3. Verify stdout byte cap rejects oversized output with InvalidData
+        let huge_bin = fx.root.join("krill-huge.sh");
+        fs::write(
+            &huge_bin,
+            format!(
+                "#!/bin/sh\nhead -c {} /dev/zero\n",
+                MAX_IMPORT_STDOUT_BYTES + 1024
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&huge_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = run_krill_import_with_timeout(
+            &huge_bin,
+            &fx.orca_dir,
+            Some(&fx.state_dir),
+            Some(&fx.home),
+            &ImportDomain::ALL,
+            true,
+            Duration::from_secs(5),
+        )
+        .expect_err("oversized stdout must be rejected");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("exceeds size limit"), "{err}");
     }
 }
