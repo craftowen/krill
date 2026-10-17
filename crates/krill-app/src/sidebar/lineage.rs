@@ -162,25 +162,90 @@ pub(super) fn order_lineage_worktrees<'a>(
     out
 }
 
+type ParentsCacheEntry = (
+    PathBuf,
+    Option<std::time::SystemTime>,
+    u64,
+    BTreeMap<PathBuf, PathBuf>,
+);
+
+static PARENTS_CACHE: std::sync::LazyLock<std::sync::Mutex<Option<ParentsCacheEntry>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+pub(super) fn invalidate_parents_cache() {
+    if let Ok(mut guard) = PARENTS_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+fn load_store_parents(dir: &Path) -> BTreeMap<PathBuf, PathBuf> {
+    let file = dir.join(super::external::COMMENTS_FILE);
+    let Ok(meta) = std::fs::metadata(&file) else {
+        if let Ok(mut guard) = PARENTS_CACHE.lock()
+            && guard.as_ref().is_some_and(|(d, _, _, _)| d == dir)
+        {
+            *guard = None;
+        }
+        return BTreeMap::new();
+    };
+    let mtime = meta.modified().ok();
+    let len = meta.len();
+    if let Ok(guard) = PARENTS_CACHE.lock()
+        && let Some((cached_dir, cached_mtime, cached_len, cached_map)) = guard.as_ref()
+        && cached_dir == dir
+        && *cached_mtime == mtime
+        && *cached_len == len
+    {
+        return cached_map.clone();
+    }
+    let store = krill_proto::orchestration::WorktreeStore::load(dir).unwrap_or_default();
+    let mut map = BTreeMap::new();
+    for (child, parent) in &store.parents {
+        let c = PathBuf::from(child);
+        let p = PathBuf::from(parent);
+        if can_assign_parent(&map, &c, &p) {
+            map.insert(c, p);
+        }
+    }
+    if let Ok(mut guard) = PARENTS_CACHE.lock() {
+        *guard = Some((dir.to_path_buf(), mtime, len, map.clone()));
+    }
+    map
+}
+
+fn splice_lineage_in_map<K: Ord + Clone>(map: &mut BTreeMap<K, K>, target: &K) {
+    let direct_children: Vec<K> = map
+        .iter()
+        .filter(|&(_, p)| p == target)
+        .map(|(c, _)| c.clone())
+        .collect();
+    let parent_of_target = map.remove(target);
+    for child in direct_children {
+        if let Some(grandparent) = &parent_of_target
+            && &child != grandparent
+        {
+            map.insert(child, grandparent.clone());
+        } else {
+            map.remove(&child);
+        }
+    }
+}
+
 impl Sidebar {
-    /// 디스크(`WorktreeStore`)와 메모리(`self.parents`)를 합친 부모 맵을 돌려준다.
-    pub(super) fn merged_parents(&self) -> BTreeMap<PathBuf, PathBuf> {
-        let mut map = BTreeMap::new();
-        if let Some(dir) = self
-            .path
+    pub(super) fn state_dir(&self) -> Option<&Path> {
+        self.path
             .as_deref()
             .and_then(Path::parent)
             .filter(|p| !p.as_os_str().is_empty())
-        {
-            let store = krill_proto::orchestration::WorktreeStore::load_cached(dir);
-            for (child, parent) in &store.parents {
-                let c = PathBuf::from(child);
-                let p = PathBuf::from(parent);
-                if can_assign_parent(&map, &c, &p) {
-                    map.insert(c, p);
-                }
-            }
+    }
+
+    /// 디스크(`WorktreeStore`)를 단일 진실 공급원(SSOT)으로 삼아 부모 맵을 돌려준다.
+    /// 상태 디렉터리가 없는 인메모리 인스턴스(`path == None`)에서만 `self.parents`를 사용한다.
+    pub(super) fn merged_parents(&self) -> BTreeMap<PathBuf, PathBuf> {
+        if let Some(dir) = self.state_dir() {
+            return load_store_parents(dir);
         }
+        let mut map = BTreeMap::new();
         for (child, parent) in &self.parents {
             if can_assign_parent(&map, child, parent) {
                 map.insert(child.clone(), parent.clone());
@@ -211,7 +276,7 @@ impl Sidebar {
         can_assign_parent(&parents, path, parent)
     }
 
-    /// 워크트리의 부모를 설정하고 `sidebar.bin` 및 `worktree-comments.toml`에 저장한다.
+    /// 워크트리의 부모를 설정하고 `worktree-comments.toml`에 저장한다.
     pub fn set_worktree_parent(
         &mut self,
         path: PathBuf,
@@ -221,39 +286,44 @@ impl Sidebar {
         if !self.can_set_worktree_parent(&path, &parent) {
             return false;
         }
-        if let Some(dir) = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty())
-        {
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let child_str = path.to_string_lossy().into_owned();
             let parent_str = parent.to_string_lossy().into_owned();
-            krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
-                store.set_parent(&child_str, Some(&parent_str))
+            if krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                store.set_parent(&child_str, Some(&parent_str))?;
+                if store.parents.get(&child_str) != Some(&parent_str) {
+                    store.parents.insert(child_str, parent_str);
+                }
+                Ok(())
             })
-            .ok();
+            .is_err()
+            {
+                return false;
+            }
+            invalidate_parents_cache();
+            self.parents = self.merged_parents();
+        } else {
+            self.parents.insert(path, parent);
         }
-        self.parents.insert(path, parent);
         self.persist(cx);
         true
     }
 
     /// 워크트리의 부모 연결을 해제한다.
     pub fn clear_worktree_parent(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
+        let had_parent = self.worktree_parent(path).is_some();
         let removed_mem = self.parents.remove(path).is_some();
         let mut removed_disk = false;
-        if let Some(dir) = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty())
-        {
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let child_str = path.to_string_lossy().into_owned();
-            removed_disk = krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
-                store.set_parent(&child_str, None)
+            removed_disk = krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                let removed_raw = store.parents.remove(&child_str).is_some();
+                store.set_parent(&child_str, None)?;
+                Ok(removed_raw || had_parent)
             })
-            .is_ok();
+            .unwrap_or(false);
+            invalidate_parents_cache();
+            self.parents = self.merged_parents();
         }
         if removed_mem || removed_disk {
             self.persist(cx);
@@ -529,36 +599,23 @@ impl Sidebar {
     }
 
     fn remove_worktree_lineage_local(&mut self, target: &Path) {
-        let direct_children: Vec<PathBuf> = self
-            .parents
-            .iter()
-            .filter(|&(_, p)| p == target)
-            .map(|(c, _)| c.clone())
-            .collect();
-        let parent_of_target = self.parents.remove(target);
-        for child in direct_children {
-            if let Some(grandparent) = &parent_of_target
-                && child != *grandparent
-            {
-                self.parents.insert(child, grandparent.clone());
-            } else {
-                self.parents.remove(&child);
-            }
-        }
+        splice_lineage_in_map(&mut self.parents, &target.to_path_buf());
         self.collapsed_lineage.remove(target);
         self.sleeping_worktrees.remove(target);
-        if let Some(dir) = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty())
-        {
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let target_str = target.to_string_lossy().into_owned();
-            krill_proto::orchestration::WorktreeStore::mutate(dir, |store| {
+            let norm_key = krill_proto::orchestration::worktree_key(target);
+            krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                splice_lineage_in_map(&mut store.parents, &target_str);
+                if norm_key != target_str {
+                    splice_lineage_in_map(&mut store.parents, &norm_key);
+                }
                 store.remove_worktree_lineage(&target_str);
                 Ok(())
             })
             .ok();
+            invalidate_parents_cache();
+            self.parents = self.merged_parents();
         }
     }
 
@@ -581,33 +638,32 @@ impl Sidebar {
         force: bool,
         cx: &mut Context<Self>,
     ) {
-        let mut ipc_targets = Vec::new();
-        for target in targets {
-            let is_primary = self.snapshot.trees.contains_key(&target);
-            let repo = self
-                .repo_for_worktree(&target)
-                .unwrap_or_else(|| target.clone());
-            self.remove_worktree_lineage_local(&target);
-            if is_primary {
-                continue;
-            }
-            for list in self.snapshot.trees.values_mut() {
-                list.retain(|t| t != &target);
-            }
-            ipc_targets.push((repo, target));
-        }
-        self.persist(cx);
         let Some(source) = self.source.clone() else {
             return;
         };
+        let parents = self.merged_parents();
+        let mut ipc_targets = Vec::new();
+        for target in targets {
+            if self.snapshot.trees.contains_key(&target) {
+                continue;
+            }
+            let repo = self
+                .repo_for_worktree(&target)
+                .unwrap_or_else(|| target.clone());
+            ipc_targets.push((repo, target));
+        }
         if ipc_targets.is_empty() {
             return;
         }
         cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
-            let mut any_removed = false;
+            let mut removed_paths = Vec::new();
+            let mut blocked_ancestors = BTreeSet::new();
             let mut last_err = None;
             for (repo, target) in ipc_targets {
+                if blocked_ancestors.contains(&target) {
+                    continue;
+                }
                 let src = source.clone();
                 let req = RemoveWorktree {
                     repo: repo.as_os_str().as_bytes().to_vec(),
@@ -616,22 +672,48 @@ impl Sidebar {
                 };
                 let reply = bg.spawn(async move { src.remove_worktree(req) }).await;
                 match reply {
-                    Ok(Reply::WorktreeRemoved(_)) => any_removed = true,
-                    Ok(Reply::WorktreeFailed(e)) => last_err = Some(e),
-                    Ok(Reply::Failed(f)) => last_err = Some(f.to_string()),
-                    Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {}
-                    Err(e) => last_err = Some(e.to_string()),
-                    _ => {}
+                    Ok(Reply::WorktreeRemoved(_)) => {
+                        removed_paths.push(target);
+                    }
+                    other => {
+                        match other {
+                            Ok(Reply::WorktreeFailed(e)) => last_err = Some(e),
+                            Ok(Reply::Failed(f)) => last_err = Some(f.to_string()),
+                            Err(e) if e.kind() != std::io::ErrorKind::Unsupported => {
+                                last_err = Some(e.to_string());
+                            }
+                            _ => {}
+                        }
+                        let mut cur = parents.get(&target);
+                        let mut visited = BTreeSet::new();
+                        visited.insert(target);
+                        while let Some(anc) = cur {
+                            if !visited.insert(anc.clone()) {
+                                break;
+                            }
+                            blocked_ancestors.insert(anc.clone());
+                            cur = parents.get(anc);
+                        }
+                    }
                 }
             }
             this.update(cx, |s, cx| {
                 if let Some(err) = last_err {
                     s.notice = Some(err);
                 }
-                if any_removed {
-                    s.refresh(cx);
-                } else {
+                if removed_paths.is_empty() {
                     cx.notify();
+                } else {
+                    for removed in &removed_paths {
+                        s.remove_worktree_lineage_local(removed);
+                        for list in s.snapshot.trees.values_mut() {
+                            list.retain(|t| t != removed);
+                        }
+                    }
+                    s.persist(cx);
+                    if s.task.is_some() {
+                        s.refresh(cx);
+                    }
                 }
             })
             .ok();

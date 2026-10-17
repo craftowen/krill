@@ -2288,6 +2288,15 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
         fn fetch(&self) -> io::Result<Snapshot> {
             Ok(Snapshot::default())
         }
+        fn remove_worktree(&self, _req: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
+            Ok(Reply::WorktreeRemoved(
+                krill_proto::control::RemovedWorktree {
+                    branch: None,
+                    branch_deleted: false,
+                    warnings: Vec::new(),
+                },
+            ))
+        }
     }
 
     cx.update(gpui_component::init);
@@ -2442,7 +2451,6 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
         assert_eq!(dlg_parent.as_deref(), Some(parent.as_path()));
         view.update(cx, |s, cx| {
             s.creating = None;
-            s.source = None;
             cx.notify();
         });
     });
@@ -2461,7 +2469,7 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
         assert!(!s.is_worktree_sleeping(&solo));
     });
 
-    // `sidebar.bin`에 계보·수면 상태가 영속화되는지 검증한다.
+    // `worktree-comments.toml` 및 `sidebar.bin`에 계보·수면 상태가 영속화되는지 검증한다.
     let restored = Sidebar::new(Some(sidebar_bin));
     assert_eq!(
         restored.worktree_parent(&child_a).as_deref(),
@@ -2474,13 +2482,16 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     assert!(restored.is_worktree_sleeping(&parent));
     assert!(restored.is_worktree_sleeping(&grandchild));
 
-    // 깨우기 후 자손 포함 삭제(Delete with Descendants) 시 부모와 자손이 모두 제거된다.
+    // 깨우기 후 자손 포함 삭제(Delete with Descendants) 시 데몬 확인 뒤 부모와 자손이 모두 제거된다.
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.wake_worktree(&parent, cx);
             assert!(!s.is_worktree_sleeping(&parent));
             s.delete_with_descendants(parent.clone(), false, cx);
         });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
         let wt_rows: Vec<_> = view
             .read(cx)
             .rows
@@ -2662,4 +2673,217 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
             "clicking remote worktree card without remote session in {layout:?} must spawn on studio host even if local has same path"
         );
     }
+}
+
+#[gpui::test]
+fn delete_worktree_failure_preserves_lineage_and_ssot_respects_cli_changes(
+    cx: &mut TestAppContext,
+) {
+    struct SelectiveRemoveSource {
+        fail_paths: std::sync::Mutex<BTreeSet<PathBuf>>,
+        attempted: std::sync::Mutex<Vec<PathBuf>>,
+    }
+    impl Source for SelectiveRemoveSource {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(Snapshot::default())
+        }
+        fn remove_worktree(&self, req: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
+            use std::os::unix::ffi::OsStrExt as _;
+            let target = PathBuf::from(std::ffi::OsStr::from_bytes(&req.path));
+            self.attempted.lock().unwrap().push(target.clone());
+            if self.fail_paths.lock().unwrap().contains(&target) {
+                Ok(Reply::WorktreeFailed(format!(
+                    "worktree is dirty: {}",
+                    target.display()
+                )))
+            } else {
+                Ok(Reply::WorktreeRemoved(
+                    krill_proto::control::RemovedWorktree {
+                        branch: None,
+                        branch_deleted: false,
+                        warnings: Vec::new(),
+                    },
+                ))
+            }
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-owe-756-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+
+    let repo = PathBuf::from("/repo");
+    let parent = PathBuf::from("/repo/parent");
+    let child_a = PathBuf::from("/repo/child-a");
+    let grandchild = PathBuf::from("/repo/grandchild");
+    let child_b = PathBuf::from("/repo/child-b");
+    let solo = PathBuf::from("/repo/solo");
+
+    let source = Arc::new(SelectiveRemoveSource {
+        fail_paths: std::sync::Mutex::new(BTreeSet::from([child_a.clone(), grandchild.clone()])),
+        attempted: std::sync::Mutex::new(Vec::new()),
+    });
+    let dyn_source: Arc<dyn Source> = source.clone();
+
+    let snap = Snapshot {
+        sessions: Vec::new(),
+        trees: BTreeMap::from([(
+            repo.clone(),
+            vec![
+                parent.clone(),
+                child_a.clone(),
+                grandchild.clone(),
+                child_b.clone(),
+                solo.clone(),
+            ],
+        )]),
+    };
+
+    let sb_path = sidebar_bin.clone();
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sb_path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_group_by(GroupBy::None, cx);
+            s.set_sort_by(SortBy::Name, cx);
+            s.snapshot = snap;
+            s.source = Some(dyn_source);
+            s.set_worktree_parent(child_a.clone(), parent.clone(), cx);
+            s.set_worktree_parent(grandchild.clone(), child_a.clone(), cx);
+            s.set_worktree_parent(child_b.clone(), parent.clone(), cx);
+            s.sleep_worktree(child_a.clone(), cx);
+            s.toggle_lineage(&child_a, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 1. 단일 워크트리 삭제가 거부(Reply::WorktreeFailed)되면 스냅샷·계보·접기·수면 상태가 모두 보존된다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.delete_worktree(child_a.clone(), false, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert!(s.contains_worktree(&child_a));
+        assert_eq!(
+            s.worktree_parent(&child_a).as_deref(),
+            Some(parent.as_path())
+        );
+        assert_eq!(
+            s.worktree_parent(&grandchild).as_deref(),
+            Some(child_a.as_path())
+        );
+        assert!(s.is_worktree_sleeping(&child_a));
+        assert!(s.is_lineage_collapsed(&child_a));
+        assert!(
+            s.notice
+                .as_deref()
+                .is_some_and(|msg| msg.contains("worktree is dirty"))
+        );
+        let store = krill_proto::orchestration::WorktreeStore::load(&dir).unwrap();
+        assert_eq!(
+            store.checkpoint("/repo/child-a").parent.as_deref(),
+            Some("/repo/parent")
+        );
+        assert_eq!(
+            store.checkpoint("/repo/grandchild").parent.as_deref(),
+            Some("/repo/child-a")
+        );
+    });
+
+    // 2. delete_with_descendants에서 자손(grandchild) 삭제가 실패하면 조상(child_a, parent)은 건너뛰고
+    //    독립 자손(child_b)만 삭제된다.
+    source.attempted.lock().unwrap().clear();
+    source.fail_paths.lock().unwrap().remove(&child_a);
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.toggle_lineage(&child_a, cx);
+            s.delete_with_descendants(parent.clone(), false, cx);
+        });
+    });
+    cx.run_until_parked();
+    {
+        let attempted = source.attempted.lock().unwrap().clone();
+        assert!(attempted.contains(&grandchild));
+        assert!(attempted.contains(&child_b));
+        assert!(
+            !attempted.contains(&child_a),
+            "ancestor child_a must be skipped when grandchild fails: {attempted:?}"
+        );
+        assert!(
+            !attempted.contains(&parent),
+            "ancestor parent must be skipped when grandchild fails: {attempted:?}"
+        );
+    }
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert!(!s.contains_worktree(&child_b));
+        assert!(s.contains_worktree(&grandchild));
+        assert!(s.contains_worktree(&child_a));
+        assert!(s.contains_worktree(&parent));
+        assert_eq!(
+            s.worktree_parent(&child_a).as_deref(),
+            Some(parent.as_path())
+        );
+        assert_eq!(
+            s.worktree_parent(&grandchild).as_deref(),
+            Some(child_a.as_path())
+        );
+        assert_eq!(s.worktree_parent(&child_b), None);
+    });
+
+    // 3. 중간 노드(child_a) 단독 삭제 성공 시 자손(grandchild)이 조부모(parent)로 승계(splice)된다.
+    source.fail_paths.lock().unwrap().clear();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.delete_worktree(child_a.clone(), false, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert!(!s.contains_worktree(&child_a));
+        assert!(s.contains_worktree(&grandchild));
+        assert_eq!(
+            s.worktree_parent(&grandchild).as_deref(),
+            Some(parent.as_path())
+        );
+        let store = krill_proto::orchestration::WorktreeStore::load(&dir).unwrap();
+        assert_eq!(
+            store.checkpoint("/repo/grandchild").parent.as_deref(),
+            Some("/repo/parent")
+        );
+    });
+
+    // 4. CLI(WorktreeStore)에서 부모를 변경하거나 해제하면 sidebar.bin의 과거 상태가 덮어쓰지 않는다.
+    krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+        store.set_parent("/repo/grandchild", Some("/repo/solo"))
+    })
+    .unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, Sidebar::reload_external);
+        let s = view.read(cx);
+        assert_eq!(
+            s.worktree_parent(&grandchild).as_deref(),
+            Some(solo.as_path())
+        );
+    });
+
+    krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+        store.set_parent("/repo/grandchild", None)
+    })
+    .unwrap();
+    cx.update(|_, cx| {
+        view.update(cx, Sidebar::reload_external);
+        let s = view.read(cx);
+        assert_eq!(s.worktree_parent(&grandchild), None);
+    });
+
+    let reloaded = Sidebar::new(Some(sidebar_bin));
+    assert_eq!(reloaded.worktree_parent(&grandchild), None);
+
+    fs::remove_dir_all(dir).ok();
 }
