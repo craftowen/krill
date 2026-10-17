@@ -594,6 +594,129 @@ fn jump_palette_opens_session(cx: &mut TestAppContext) {
     assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
 }
 
+/// OWE-768: AI Vault 팝오버를 먼저 열지 않아도 `Cmd+J`가 볼트 스캔·검색을 연동하고
+/// 방향키와 Enter로 볼트 항목을 선택해 새 탭에서 재개한다.
+#[gpui::test]
+fn jump_palette_loads_vault_without_opening_popover_and_resumes_by_keyboard(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::SessionId;
+    use krill_proto::agent_history::{
+        Action, Agent, Entry, Response, SearchSnapshot, Snapshot, VaultAgent, VaultHit, VaultTarget,
+    };
+    use krill_proto::control::{Reply, Request};
+    use std::sync::{Arc, Mutex};
+
+    let resumed = Arc::new(Mutex::new(Vec::new()));
+    let resumed_seen = resumed.clone();
+    let call: krill_app::agent_history::Call = Arc::new(move |r| {
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: vec![Entry {
+                    agent: Agent::Claude,
+                    id: "11111111-2222-4333-8444-555555555555".into(),
+                    cwd: "/tmp/vault-a".into(),
+                    modified: 10,
+                }],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
+                hits: vec![
+                    VaultHit {
+                        agent: VaultAgent::Claude,
+                        id: "11111111-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/vault-a".into(),
+                        modified: 20,
+                        title: "Vault First".into(),
+                        summary: String::new(),
+                        snippet: "oauth token".into(),
+                        role: "assistant".into(),
+                        score: 100,
+                    },
+                    VaultHit {
+                        agent: VaultAgent::Codex,
+                        id: "22222222-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/vault-b".into(),
+                        modified: 15,
+                        title: "Vault Second".into(),
+                        summary: String::new(),
+                        snippet: "oauth refresh".into(),
+                        role: "assistant".into(),
+                        score: 90,
+                    },
+                ],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::ResumeVault(target)) => {
+                resumed_seen.lock().unwrap().push(target.clone());
+                Response::Resumed {
+                    session: SessionId(88),
+                }
+            }
+            _ => unreachable!(),
+        }))
+    });
+
+    let (view, cx) = open(cx, state_path("jump-vault"));
+    cx.update(|_, cx| {
+        let history = view.read(cx).history.clone();
+        history.update(cx, |h, _| h.set_call(call));
+        assert!(!history.read(cx).is_open());
+    });
+
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    // 팝오버를 열지 않았어도 Cmd+J 오픈 시 초기 스캔 결과가 들어온다.
+    assert_eq!(
+        cx.update(|_, cx| {
+            view.read(cx)
+                .jump
+                .as_ref()
+                .unwrap()
+                .0
+                .read(cx)
+                .vault_matches()
+                .count()
+        }),
+        1
+    );
+
+    // 검색어 입력 시 전문 검색 결과(2건)가 연동되고, 방향키(down)와 Enter로 2번째 볼트 항목을 재개한다.
+    cx.simulate_input("oauth");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| {
+            view.read(cx)
+                .jump
+                .as_ref()
+                .unwrap()
+                .0
+                .read(cx)
+                .vault_matches()
+                .count()
+        }),
+        2
+    );
+
+    cx.simulate_keystrokes("down enter");
+    cx.run_until_parked();
+
+    assert_eq!(
+        resumed.lock().unwrap().as_slice(),
+        &[VaultTarget {
+            agent: VaultAgent::Codex,
+            id: "22222222-2222-4333-8444-555555555555".into(),
+            cwd: "/tmp/vault-b".into(),
+            modified: 15,
+        }]
+    );
+    let l = layout_of(&view, cx);
+    assert_eq!(l.tabs().len(), 2);
+    assert_eq!(l.session(l.active_tab().focused), Some(SessionId(88)));
+}
+
 /// CLI에서 만든 세션을 사이드바로 열어도 해당 워크트리·일반 폴더가 Open in의 대상이다.
 #[gpui::test]
 fn sidebar_selection_sets_folder_for_open_in_and_new_agent(cx: &mut TestAppContext) {

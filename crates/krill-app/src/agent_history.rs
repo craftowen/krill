@@ -151,6 +151,7 @@ pub struct Panel {
     call: Call,
     open: bool,
     busy: bool,
+    pending_search: bool,
     data: Option<Snapshot>,
     vault: Option<SearchSnapshot>,
     query: String,
@@ -172,6 +173,7 @@ impl std::fmt::Debug for Panel {
         f.debug_struct("Panel")
             .field("open", &self.open)
             .field("busy", &self.busy)
+            .field("pending_search", &self.pending_search)
             .field("scope", &self.scope)
             .field("agent_filter", &self.agent_filter)
             .finish_non_exhaustive()
@@ -190,6 +192,7 @@ impl Panel {
             call,
             open: false,
             busy: false,
+            pending_search: false,
             data: None,
             vault: None,
             query: String::new(),
@@ -206,12 +209,20 @@ impl Panel {
         }
     }
 
+    pub fn set_call(&mut self, call: Call) {
+        self.call = call;
+    }
+
     pub fn toggle(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.close(cx);
             return;
         }
         self.open = true;
+        self.scan(cx);
+    }
+
+    pub fn scan(&mut self, cx: &mut Context<Self>) {
         if self.has_vault_filters() {
             self.search_vault(cx);
         } else {
@@ -223,8 +234,11 @@ impl Panel {
     pub fn close(&mut self, cx: &mut Context<Self>) {
         if self.open {
             self.open = false;
+            self.busy = false;
+            self.pending_search = false;
             self.data = None;
             self.vault = None;
+            self.task = None;
             cx.notify();
         }
     }
@@ -253,7 +267,7 @@ impl Panel {
     pub fn set_scope(&mut self, scope: VaultScope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
-            if self.open && !self.busy {
+            if self.open {
                 self.search_vault(cx);
             } else {
                 cx.notify();
@@ -264,7 +278,7 @@ impl Panel {
     pub fn set_agent_filter(&mut self, agent: Option<VaultAgent>, cx: &mut Context<Self>) {
         if self.agent_filter != agent {
             self.agent_filter = agent;
-            if self.open && !self.busy {
+            if self.open {
                 self.search_vault(cx);
             } else {
                 cx.notify();
@@ -276,7 +290,7 @@ impl Panel {
         let next = query.into();
         if self.query != next {
             self.query = next;
-            if self.open && !self.busy {
+            if self.open {
                 self.search_vault(cx);
             } else {
                 cx.notify();
@@ -285,6 +299,12 @@ impl Panel {
     }
 
     pub fn search_vault(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.pending_search = true;
+            cx.notify();
+            return;
+        }
+        self.pending_search = false;
         let req = self.build_search_query();
         self.run(Action::Search(req), cx);
     }
@@ -319,16 +339,30 @@ impl Panel {
             || (self.scope != VaultScope::All && !self.active_scope_paths().is_empty())
     }
 
-    /// 현재 범위·에이전트·검색어 필터가 적용된 결과 목록을 돌려준다.
     #[must_use]
-    pub fn visible_hits(&self) -> Vec<VaultHit> {
-        let base: Vec<VaultHit> = if let Some(vault) = &self.vault {
+    pub fn has_loaded(&self) -> bool {
+        self.vault.is_some() || self.data.is_some()
+    }
+
+    /// 스캔·검색으로 적재된 볼트 항목 목록(범위·에이전트·검색어 재필터링 전).
+    #[must_use]
+    pub fn loaded_hits(&self) -> Vec<VaultHit> {
+        if let Some(vault) = &self.vault {
             vault.hits.clone()
         } else if let Some(data) = &self.data {
             data.entries.iter().map(VaultHit::from).collect()
         } else {
+            Vec::new()
+        }
+    }
+
+    /// 현재 범위·에이전트·검색어 필터가 적용된 결과 목록을 돌려준다.
+    #[must_use]
+    pub fn visible_hits(&self) -> Vec<VaultHit> {
+        let base = self.loaded_hits();
+        if base.is_empty() {
             return Vec::new();
-        };
+        }
         let scope_paths = self.active_scope_paths();
         let terms: Vec<String> = self
             .query
@@ -398,17 +432,15 @@ impl Panel {
                 this.busy = false;
                 match got {
                     Ok(Reply::AgentHistory(Response::Scanned(data))) => {
-                        if this.open {
-                            this.data = Some(data);
-                        }
+                        this.data = Some(data);
+                        this.vault = None;
                     }
                     Ok(Reply::AgentHistory(Response::Searched(vault))) => {
-                        if this.open {
-                            this.vault = Some(vault);
-                        }
+                        this.vault = Some(vault);
                     }
                     Ok(Reply::AgentHistory(Response::Resumed { session })) => {
                         this.open = false;
+                        this.pending_search = false;
                         this.data = None;
                         this.vault = None;
                         cx.emit(Open(session));
@@ -420,7 +452,11 @@ impl Panel {
                     Err(e) => this.error = Some(e.to_string()),
                     Ok(_) => this.error = Some(io::ErrorKind::InvalidData.to_string()),
                 }
-                cx.notify();
+                if this.pending_search {
+                    this.search_vault(cx);
+                } else {
+                    cx.notify();
+                }
             })
             .ok();
         }));

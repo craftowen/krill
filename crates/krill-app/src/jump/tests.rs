@@ -218,3 +218,99 @@ fn jump_palette_filters_vault_hits_and_emits_resume_vault(cx: &mut TestAppContex
     cx.run_until_parked();
     assert_eq!(events.borrow().last(), Some(&Event::ResumeVault(1)));
 }
+
+/// OWE-768: 열린 세션이 있을 때와 0개일 때 모두 방향키(↑/↓)·Enter로
+/// AI Vault 섹션의 원하는 항목을 탐색·선택해 재개할 수 있고,
+/// 팝오버를 미리 열지 않아도 팔레트 오픈·쿼리 입력 시 볼트 스캔·검색이 연동된다.
+#[gpui::test]
+fn jump_palette_keyboard_navigates_vault_items_and_syncs_history_search(cx: &mut TestAppContext) {
+    use krill_proto::agent_history::{Action, Agent, Entry, Response, SearchSnapshot, Snapshot};
+    use krill_proto::control::{Reply, Request};
+    use std::sync::{Arc, Mutex};
+
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let seen = log.clone();
+    let call: crate::agent_history::Call = Arc::new(move |r| {
+        seen.lock().unwrap().push(r.clone());
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: vec![
+                    Entry {
+                        agent: Agent::Claude,
+                        id: "11111111-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/repo-a".into(),
+                        modified: 30,
+                    },
+                    Entry {
+                        agent: Agent::Codex,
+                        id: "22222222-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/repo-b".into(),
+                        modified: 20,
+                    },
+                ],
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(q)) => Response::Searched(SearchSnapshot {
+                hits: vec![
+                    VaultHit {
+                        agent: VaultAgent::Claude,
+                        id: "11111111-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/repo-a".into(),
+                        modified: 30,
+                        title: format!("First hit for {}", q.query),
+                        summary: String::new(),
+                        snippet: "first snippet".into(),
+                        role: "assistant".into(),
+                        score: 120,
+                    },
+                    VaultHit {
+                        agent: VaultAgent::Agy,
+                        id: "33333333-2222-4333-8444-555555555555".into(),
+                        cwd: "/tmp/repo-b".into(),
+                        modified: 20,
+                        title: format!("Second hit for {}", q.query),
+                        summary: String::new(),
+                        snippet: "second snippet".into(),
+                        role: "assistant".into(),
+                        score: 100,
+                    },
+                ],
+                truncated: false,
+                skipped: false,
+            }),
+            _ => unreachable!(),
+        }))
+    });
+
+    let (view, events, cx) = open(cx, vec![item(1, "claude 1 · main · 작업 중", false)]);
+    let history = cx.update(|_, cx| cx.new(|_| crate::agent_history::Panel::new(call)));
+
+    // AI Vault 팝오버를 한 번도 열지 않은 상태(`!history.is_open()`)에서 팔레트 연결:
+    // 즉시 스캔이 실행되어 볼트 항목 2건이 적재된다.
+    cx.update(|_, cx| {
+        assert!(!history.read(cx).is_open());
+        view.update(cx, |p, cx| p.connect_history(&history, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 2);
+
+    // 열린 세션 1개(index 0) + 볼트 2개(index 1, 2):
+    // down 두 번으로 2번째 볼트 항목(index 2)까지 이동 후 Enter로 선택.
+    cx.simulate_keystrokes("down down enter");
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 2);
+    assert_eq!(events.borrow().as_slice(), &[Event::ResumeVault(1)]);
+
+    // 열린 세션과 일치하지 않는 검색어("snippet") 입력:
+    // 백엔드 `Action::Search`가 연동되고, 열린 세션 매치가 0개여도
+    // down/up/enter로 볼트 2번째 항목을 선택할 수 있다.
+    events.borrow_mut().clear();
+    cx.simulate_input("snippet");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).matches().count()), 0);
+    assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 2);
+
+    cx.simulate_keystrokes("down down up down enter");
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 1);
+    assert_eq!(events.borrow().as_slice(), &[Event::ResumeVault(1)]);
+}
