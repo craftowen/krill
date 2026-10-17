@@ -2140,6 +2140,18 @@ fn import_projects_domain(
                 if wt_path.is_empty() {
                     continue;
                 }
+                // 부모 계보 단일 원천은 WorktreeStore(OWE-756). 사용자가 이미 정한 부모는 덮어쓰지 않는다.
+                if let Some(parent) = lin
+                    .parent_worktree_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    && !wt_store
+                        .parents
+                        .contains_key(&worktree_key(Path::new(&wt_path)))
+                {
+                    wt_store.set_parent(&wt_path, Some(parent)).ok();
+                }
                 store.lineage.insert(
                     wt_path.clone(),
                     StoredWorktreeLineage {
@@ -3686,6 +3698,12 @@ mod tests {
             cp.references,
             vec!["https://github.com/org/krill/pull/726".to_owned()]
         );
+        // 계보 부모는 WorktreeStore(단일 원천)에 기록된다(OWE-756).
+        let wt_key = worktree_key(Path::new("/Users/test/krill-wt-1"));
+        assert_eq!(
+            wt_store.parents.get(&wt_key).map(String::as_str),
+            Some("/Users/test/krill")
+        );
 
         // Verify `Schedules`
         let schedules = Schedules::load(&state_dir).unwrap();
@@ -3693,8 +3711,22 @@ mod tests {
         assert_eq!(schedules.schedule[0].cron, "30 7 * * 1,3,5");
         assert_eq!(schedules.schedule[0].cwd, "/Users/test/krill");
 
+        // 사용자가 CLI로 바꾼 부모는 재이관이 덮어쓰지 않는다.
+        WorktreeStore::mutate(&state_dir, |s| {
+            s.set_parent("/Users/test/krill-wt-1", Some("/Users/test/notes"))
+        })
+        .unwrap();
+
         // 10. Run full import a second time to verify complete idempotency
         let second = run_import(&full_opts).unwrap();
+        assert_eq!(
+            WorktreeStore::load(&state_dir)
+                .unwrap()
+                .parents
+                .get(&wt_key)
+                .map(String::as_str),
+            Some("/Users/test/notes")
+        );
         assert_eq!(second.accounts.claude_added, 0);
         assert_eq!(second.accounts.claude_updated, 0);
         assert_eq!(second.accounts.codex_added, 0);

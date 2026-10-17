@@ -455,7 +455,6 @@ pub struct Sidebar {
     cli_worktrees: BTreeSet<PathBuf>,
     comments: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
-    seeded_imported_parents: BTreeSet<PathBuf>,
     collapsed_lineage: BTreeSet<PathBuf>,
     sleeping_worktrees: BTreeSet<PathBuf>,
     shown_external: BTreeSet<PathBuf>,
@@ -565,7 +564,6 @@ impl Sidebar {
         };
         let comments = external::load_comments_from_sidebar_path(path.as_deref());
         let auto_titles = load_auto_titles_from_sidebar_path(path.as_deref());
-        let seeded_imported_parents: BTreeSet<PathBuf> = lin.parents.keys().cloned().collect();
         let mut this = Self {
             snapshot: Snapshot::default(),
             meta: Meta::new(),
@@ -593,7 +591,6 @@ impl Sidebar {
             cli_worktrees: BTreeSet::new(),
             comments,
             parents: lin.parents,
-            seeded_imported_parents,
             collapsed_lineage: lin.collapsed_lineage,
             sleeping_worktrees: lin.sleeping_worktrees,
             shown_external: BTreeSet::new(),
@@ -697,8 +694,6 @@ impl Sidebar {
             &mut self.comments,
             &mut self.issues,
             &mut self.worktree_statuses,
-            &mut self.parents,
-            &mut self.seeded_imported_parents,
         );
         self.snapshot.trees != prev_trees || !self.snapshot.trees.is_empty()
     }
