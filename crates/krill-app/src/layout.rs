@@ -368,6 +368,12 @@ impl Layout {
         out
     }
 
+    /// 지정한 칸(`pane`)이 현재 열린 탭 중 하나의 분할 트리에 살아 있는지 돌려준다.
+    #[must_use]
+    pub fn pane_exists(&self, pane: PaneId) -> bool {
+        self.tabs.iter().any(|t| t.root.contains(pane))
+    }
+
     pub fn is_tab_pinned(&self, index: usize) -> bool {
         self.tabs.get(index).is_some_and(|t| t.pinned)
     }

@@ -275,6 +275,21 @@ impl Sidebar {
         self.repo_for_worktree(path).is_some()
     }
 
+    /// 지정한 경로가 속한 로컬 스냅샷의 워크트리 루트 경로를 찾는다(하위 디렉터리 포함).
+    #[must_use]
+    pub fn worktree_for_path(&self, path: &Path) -> Option<PathBuf> {
+        if path.as_os_str().is_empty() {
+            return None;
+        }
+        self.snapshot
+            .trees
+            .keys()
+            .chain(self.snapshot.trees.values().flatten())
+            .filter(|wt| !wt.as_os_str().is_empty() && path.starts_with(wt.as_path()))
+            .max_by_key(|wt| wt.as_os_str().len())
+            .cloned()
+    }
+
     /// 워크트리가 속한 저장소 루트 경로를 찾는다.
     pub(super) fn repo_for_worktree(&self, path: &Path) -> Option<PathBuf> {
         self.snapshot
