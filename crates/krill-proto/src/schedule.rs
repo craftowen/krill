@@ -156,8 +156,17 @@ impl Schedules {
             .write(true)
             .mode(0o600)
             .open(dir.join("schedules-edit.lock"))?;
-        file.try_lock().map_err(io::Error::other)?;
-        Ok(file)
+        let mut attempts = 0_u32;
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(file),
+                Err(fs::TryLockError::WouldBlock) if attempts < 500 => {
+                    attempts = attempts.saturating_add(1);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(e) => return Err(io::Error::other(e)),
+            }
+        }
     }
 
     pub fn save(&self, dir: &Path) -> io::Result<()> {
@@ -280,12 +289,19 @@ pub fn request_run_now(dir: &Path, id: &str) -> io::Result<()> {
 }
 
 pub fn take_run_now(dir: &Path) -> io::Result<Vec<String>> {
+    let _guard = Schedules::exclusive_edit(dir)?;
     let path = dir.join(RUN_NOW);
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
+    let mut file = match OpenOptions::new().read(true).write(true).open(&path) {
+        Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
+    let mut text = String::new();
+    (&mut file)
+        .take(MAX_FILE.saturating_add(1))
+        .read_to_string(&mut text)?;
+    file.set_len(0)?;
+    drop(file);
     fs::remove_file(&path).ok();
     let mut out = Vec::new();
     for line in text.lines() {

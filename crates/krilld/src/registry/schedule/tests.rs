@@ -356,3 +356,93 @@ workspace_mode = "isolate"
         2
     );
 }
+
+#[test]
+fn run_now_survives_load_or_journal_error_and_corrupted_journal_lines_are_skipped() {
+    let dir = Temp::new("owe754-journal-run-now");
+    let valid_toml = r#"[[schedule]]
+id = "manual-job"
+cron = "0 0 31 2 *"
+cwd = "/tmp"
+command = ["/bin/echo"]
+prompt = "run-now"
+precheck = "printf 'ran-after-recovery\n' && exit 4"
+"#;
+    fs::write(dir.0.join(krill_proto::schedule::FILE), valid_toml).unwrap();
+    krill_proto::schedule::request_run_now(&dir.0, "manual-job").unwrap();
+
+    // 1. Corrupt schedules.toml AFTER request_run_now was queued: poll_schedules fails on
+    //    Schedules::load, but MUST NOT consume schedule-run-now.
+    fs::write(dir.0.join(krill_proto::schedule::FILE), "invalid = [toml").unwrap();
+    let now = UNIX_EPOCH + Duration::from_mins(60);
+    let registry = Registry::new(None, Some(&dir.0));
+    assert!(registry.poll_schedules(now).is_err());
+    assert!(
+        dir.0.join(RUN_NOW).exists(),
+        "schedule-run-now must survive Schedules::load failure"
+    );
+
+    // 2. Restore valid schedules.toml, and write a journal with a corrupted middle line
+    //    plus a valid line after it and a truncated tail without newline.
+    fs::write(dir.0.join(krill_proto::schedule::FILE), valid_toml).unwrap();
+    let mut prior = claim(58);
+    prior.id = "other-job".into();
+    let mut after_corrupt = claim(59);
+    after_corrupt.id = "other-job".into();
+    let raw_journal = format!(
+        "{}\n{{\"corrupted_line\": true, \"id\": 123}}\n{}\n{{\"half-written-tail",
+        serde_json::to_string(&prior).unwrap(),
+        serde_json::to_string(&after_corrupt).unwrap()
+    );
+    fs::write(dir.0.join(RUNS), raw_journal).unwrap();
+
+    // 3. Next poll in the same minute skips the corrupted line, preserves valid records,
+    //    and consumes the preserved Run Now request.
+    registry.poll_schedules(now).unwrap();
+    assert!(!dir.0.join(RUN_NOW).exists());
+
+    let coalesced = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    let manual = coalesced
+        .iter()
+        .find(|r| r.id == "manual-job")
+        .expect("preserved run_now request must execute after recovery");
+    assert_eq!(manual.phase, "skipped");
+    assert_eq!(manual.status, Some(4));
+    assert_eq!(manual.output.as_deref(), Some("ran-after-recovery"));
+
+    let journal = Journal::open(&dir.0).unwrap();
+    assert!(journal.claimed("other-job", 59));
+}
+
+#[test]
+fn precheck_enforces_timeout_and_caps_pipe_output_bytes() {
+    let dir = Temp::new("owe754-precheck");
+
+    // 1. Hanging precheck command must time out and kill its process group without blocking forever.
+    let started = Instant::now();
+    let timed_out = run_precheck_with_timeout(
+        &dir.0,
+        "printf 'before-hang\n'; sleep 30",
+        Duration::from_millis(120),
+    );
+    assert!(!timed_out.passed);
+    assert_eq!(timed_out.status, None);
+    assert_eq!(timed_out.output.as_deref(), Some("before-hang"));
+    assert_eq!(timed_out.error.as_deref(), Some("precheck timed out"));
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "timed-out precheck must kill child process group promptly"
+    );
+
+    // 2. Large output (>100 KiB) must not stall the pipe or exceed MAX_OUTPUT_BYTES.
+    let noisy = run_precheck_with_timeout(
+        &dir.0,
+        "dd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'A' && exit 7",
+        Duration::from_secs(5),
+    );
+    assert!(!noisy.passed);
+    assert_eq!(noisy.status, Some(7));
+    let out = noisy.output.expect("captured bounded output");
+    assert_eq!(out.len(), MAX_OUTPUT_BYTES);
+    assert!(out.bytes().all(|b| b == b'A'));
+}
