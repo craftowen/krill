@@ -186,7 +186,11 @@ pub(crate) fn resume_in(
         let state = state.ok_or(io::ErrorKind::NotFound)?;
         let krill = mk_bin()?;
         let version = claude::probe(profile, &login);
-        let settings = claude::Settings::create(state, &krill, session, version.as_deref())?;
+        let settings = if kept_id.is_some() {
+            claude::Settings::create(state, &krill, session, version.as_deref())?
+        } else {
+            claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?
+        };
         let launch = settings.resume(profile, permission, login, kept_id.as_deref())?;
         return Ok((launch, kept_id, account));
     }
@@ -242,7 +246,7 @@ pub(crate) fn fork_in(
     if is(profile, "codex") {
         let hooked = codex_hooks(profile, state);
         let profile = hooked.as_ref().unwrap_or(profile);
-        let mut launch = wrap(profile, permission, login);
+        let mut launch = wrap_account(profile, permission, login, account.as_ref());
         launch.argv.push(b"fork".to_vec());
         if let Some(id) = &kept_id {
             launch.argv.push(id.as_bytes().to_vec());
@@ -255,53 +259,69 @@ pub(crate) fn fork_in(
         let state = state.ok_or(io::ErrorKind::NotFound)?;
         let krill = mk_bin()?;
         let version = claude::probe(profile, &login);
-        let settings = claude::Settings::create(state, &krill, session, version.as_deref())?;
+        let settings =
+            claude::Settings::create_for_fork(state, &krill, session, version.as_deref())?;
         let launch = settings.fork(profile, permission, login, kept_id.as_deref())?;
         return Ok((launch, None, account));
     }
-    Ok((wrap(profile, permission, login), None, account))
+    Ok((
+        wrap_account(profile, permission, login, account.as_ref()),
+        None,
+        account,
+    ))
 }
 
-/// 재개·휴면 깨우기에 쓸 계정(OWE-698). 기록된 계정은 프로필 폴더가 남아 있으면 그대로 쓴다(계정을
+/// 재개·휴면 깨우기에 쓸 계정(OWE-698, OWE-753). 기록된 계정은 프로필 폴더가 남아 있으면 그대로 쓴다(계정을
 /// 바꾼 뒤에도 원래 프로필로 이어 간다). 폴더가 없거나 구 기록이면 대화가 실제로 든 프로필(K-13
-/// `profile_dir_for_entry_in`)을 찾고, 그래도 없으면 `None`(지금 활성 계정)이다.
+/// `profile_dir_for_vault_target_in`)을 찾고, 그래도 없으면 `None`(지금 활성 계정)이다.
 pub(crate) fn resume_account(
     profile: &Profile,
     state: Option<&Path>,
     recorded: Option<&LaunchAccount>,
     session_id: Option<&str>,
 ) -> Option<LaunchAccount> {
-    use krill_proto::agent_history::{Agent as History, Entry};
+    use krill_proto::agent_history::{VaultAgent, VaultTarget};
     let program = Path::new(profile.program()?).file_name()?.to_str()?;
     let provider = ProviderKind::parse(program)?;
     // 프로필의 프로그램이 바뀌었으면(다른 프로바이더) 기록을 쓰지 않는다.
     if let Some(account) = recorded.filter(|a| {
-        a.env_key == provider.env_var() && (a.dir.is_empty() || Path::new(&a.dir).is_dir())
+        (a.env_key == provider.env_var()
+            || (provider == ProviderKind::Antigravity && a.env_key.is_empty()))
+            && (a.dir.is_empty() || Path::new(&a.dir).is_dir())
     }) {
         return Some(account.clone());
     }
     let agent = match provider {
-        ProviderKind::Claude => History::Claude,
-        ProviderKind::Codex => History::Codex,
-        _ => return None,
+        ProviderKind::Claude => VaultAgent::Claude,
+        ProviderKind::Codex => VaultAgent::Codex,
+        ProviderKind::Antigravity => VaultAgent::Agy,
+        ProviderKind::OpenCode => VaultAgent::OpenCode,
+        ProviderKind::Gemini => return None,
     };
     let id = session_id.filter(|id| control::valid_session_id(id))?;
     let home = accounts::default_home();
     let key = provider.env_var();
-    let inherited = std::env::var_os(key)
+    let inherited = (provider != ProviderKind::Antigravity)
+        .then(|| std::env::var_os(key))
+        .flatten()
         .filter(|v| !v.is_empty())
         .map(PathBuf::from);
     let host = inherited
         .clone()
         .unwrap_or_else(|| accounts::host_default_dir(&home, provider));
-    let entry = Entry {
+    let target = VaultTarget {
         agent,
         id: id.to_owned(),
         cwd: String::new(),
         modified: 0,
     };
     let file = accounts::load_file(&home, state);
-    let dir = crate::agent_history::profile_dir_for_entry_in(&file, &entry, &host)?;
+    let dir = crate::agent_history::vault::profile_dir_for_vault_target_in(
+        &file,
+        &target,
+        Some(&host),
+        state,
+    )?;
     // 기본 프로필이면 새 실행처럼 env를 덮어쓰지 않는다.
     let dir = if inherited.is_none() && dir == host {
         String::new()

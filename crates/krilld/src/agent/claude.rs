@@ -36,6 +36,28 @@ impl Settings {
         session: SessionId,
         version: Option<&str>,
     ) -> io::Result<Self> {
+        Self::create_named(state, krill, session, version, false)
+    }
+
+    /// `--session-id`를 주입하지 않는 실행(`--fork-session`·ID 없는 `--resume`)용 설정 파일.
+    /// 파일 이름을 `<세션 id>-fork-<uuid>.json`으로 두어 [`discard`]·[`sweep`]은 세션 소유로 정리하되
+    /// [`session_id`] 폴백은 미주입 UUID를 반환하지 않는다(OWE-752).
+    pub(crate) fn create_for_fork(
+        state: &Path,
+        krill: &Path,
+        session: SessionId,
+        version: Option<&str>,
+    ) -> io::Result<Self> {
+        Self::create_named(state, krill, session, version, true)
+    }
+
+    fn create_named(
+        state: &Path,
+        krill: &Path,
+        session: SessionId,
+        version: Option<&str>,
+        fork_only: bool,
+    ) -> io::Result<Self> {
         let dir = state.join(DIR);
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let state = state.canonicalize()?;
@@ -72,7 +94,12 @@ impl Settings {
         }
         let bytes = serde_json::to_vec(&serde_json::Value::Object(root))?;
         let id = uuid()?;
-        let path = state.join(DIR).join(format!("{}-{id}.json", session.0));
+        let filename = if fork_only {
+            format!("{}-fork-{id}.json", session.0)
+        } else {
+            format!("{}-{id}.json", session.0)
+        };
+        let path = state.join(DIR).join(filename);
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -124,13 +151,23 @@ impl Settings {
     }
 
     pub(crate) fn fork(
-        self,
+        mut self,
         profile: &Profile,
         permission: Permission,
         login: Launch,
         session_id: Option<&str>,
     ) -> io::Result<Launch> {
         self.check_profile(profile, permission)?;
+        if let Some(name) = self.path.file_name().and_then(OsStr::to_str)
+            && let Some((sid, rest)) = name.strip_suffix(".json").and_then(|s| s.split_once('-'))
+            && is_uuid(rest)
+            && let Some(parent) = self.path.parent()
+        {
+            let fork_path = parent.join(format!("{sid}-fork-{rest}.json"));
+            if std::fs::rename(&self.path, &fork_path).is_ok() {
+                self.path = fork_path;
+            }
+        }
         let mut launch = wrap(profile, permission, login);
         launch.argv.extend([
             b"--settings".to_vec(),
@@ -172,12 +209,14 @@ impl Settings {
 }
 
 /// 세션 `id`의 settings 파일 이름에서 사전 발급한 `<uuid>`를 찾는다.
+/// `--session-id`를 주입하지 않은 `<id>-fork-<uuid>.json`은 제외한다(OWE-752).
 pub(crate) fn session_id(state: &Path, id: SessionId) -> Option<String> {
     let dir = std::fs::read_dir(state.join(DIR)).ok()?;
     for entry in dir.flatten() {
         let name = entry.file_name();
         if owner(&name) == Some(id)
             && let Some((_, uuid)) = name.to_str()?.strip_suffix(".json")?.split_once('-')
+            && is_uuid(uuid)
         {
             return Some(uuid.to_owned());
         }
@@ -220,19 +259,24 @@ pub(crate) fn sweep(state: &Path, live: &[SessionId]) -> usize {
     removed
 }
 
-/// `<세션 id>-<uuid>.json`의 세션 id. uuid 자리가 36자 `8-4-4-4-12` 16진이 아니면 `None`이라
-/// 첫 덩어리가 전부 숫자인 구버전 `<uuid>.json`을 세션 파일로 오인하지 않는다.
-fn owner(name: &OsStr) -> Option<SessionId> {
-    let (sid, uuid) = name.to_str()?.strip_suffix(".json")?.split_once('-')?;
-    let is_uuid = uuid.len() == 36
+fn is_uuid(uuid: &str) -> bool {
+    uuid.len() == 36
         && uuid.bytes().enumerate().all(|(i, b)| {
             if matches!(i, 8 | 13 | 18 | 23) {
                 b == b'-'
             } else {
                 b.is_ascii_hexdigit()
             }
-        });
-    if !is_uuid || !sid.bytes().all(|b| b.is_ascii_digit()) {
+        })
+}
+
+/// `<세션 id>-<uuid>.json` 또는 `<세션 id>-fork-<uuid>.json`의 세션 id.
+/// uuid 자리가 36자 `8-4-4-4-12` 16진이 아니면 `None`이라
+/// 첫 덩어리가 전부 숫자인 구버전 `<uuid>.json`을 세션 파일로 오인하지 않는다.
+fn owner(name: &OsStr) -> Option<SessionId> {
+    let (sid, rest) = name.to_str()?.strip_suffix(".json")?.split_once('-')?;
+    let uuid = rest.strip_prefix("fork-").unwrap_or(rest);
+    if !is_uuid(uuid) || !sid.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     sid.parse().ok().map(SessionId)

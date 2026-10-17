@@ -1072,7 +1072,82 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
                 &[master_new.as_fd()],
             )
             .unwrap();
-        id
+        // 2번째 Spawn: 포크된 세션(spawned_id)을 hook 수신 전에 다시 포크할 때 미주입 UUID가 아니라 `--continue --fork-session`이 넘어간다(OWE-752).
+        let pkt2 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req: req2,
+            id: id2,
+            argv: argv2,
+            ..
+        } = ToHolder::decode(pkt2.frame()).unwrap()
+        else {
+            panic!("expected second Spawn");
+        };
+        let args2: Vec<_> = argv2
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert!(
+            args2.iter().any(|a| a == "--continue"),
+            "re-fork before hook must use --continue, got {args2:?}"
+        );
+        assert!(
+            !args2.iter().any(|a| a.starts_with("--resume=")),
+            "re-fork before hook must not pass uninjected UUID: {args2:?}"
+        );
+        assert_eq!(args2.last().map(String::as_str), Some("--fork-session"));
+        let (master2, _pty2) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req: req2,
+                    id: id2,
+                    pid: 801,
+                }
+                .encode()
+                .unwrap(),
+                &[master2.as_fd()],
+            )
+            .unwrap();
+
+        // 3번째 Spawn: 포크된 세션(spawned_id)이 hook 수신 전에 종료된 뒤 Resume할 때 `--resume`만 넘어간다(OWE-752).
+        let pkt3 = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req: req3,
+            id: id3,
+            argv: argv3,
+            ..
+        } = ToHolder::decode(pkt3.frame()).unwrap()
+        else {
+            panic!("expected third Spawn");
+        };
+        let args3: Vec<_> = argv3
+            .iter()
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        assert_eq!(
+            args3.last().map(String::as_str),
+            Some("--resume"),
+            "resume before hook must use bare --resume, got {args3:?}"
+        );
+        assert!(
+            !args3.iter().any(|a| a.starts_with("--resume=")),
+            "resume before hook must not pass uninjected UUID: {args3:?}"
+        );
+        let (master3, _pty3) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned {
+                    req: req3,
+                    id: id3,
+                    pid: 802,
+                }
+                .encode()
+                .unwrap(),
+                &[master3.as_fd()],
+            )
+            .unwrap();
+        (id, id2, id3)
     });
 
     let full = Peer {
@@ -1092,15 +1167,51 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
         }),
         &mut HashMap::new(),
     );
-    let spawned_id = holder_worker.join().unwrap();
-    reader_worker.join().unwrap();
-    assert_eq!(
-        reply,
-        Reply::Created {
-            session: spawned_id,
-            pid: 800,
-        }
+    let spawned_id = match reply {
+        Reply::Created { session, pid: 800 } => session,
+        other => panic!("unexpected reply: {other:?}"),
+    };
+    // OWE-752: 포크된 세션의 settings 파일에서 미주입 UUID가 폴백으로 읽히지 않아야 한다.
+    assert_eq!(crate::agent::claude::session_id(&dir, spawned_id), None);
+    let refork_reply = reg.handle(
+        &full,
+        Request::Create(Create {
+            account: None,
+            program: Program::Agent {
+                id: format!("fork:{}", spawned_id.0),
+            },
+            cwd: Vec::new(),
+            cols: 80,
+            rows: 24,
+        }),
+        &mut HashMap::new(),
     );
+    let refork_id = match refork_reply {
+        Reply::Created { session, pid: 801 } => session,
+        other => panic!("unexpected refork reply: {other:?}"),
+    };
+
+    // 포크된 세션(refork_id)이 hook 수신 전에 콜드 상태가 된 뒤 Resume해도 미주입 UUID가 넘어가지 않는다.
+    lock(&reg.state).sessions.remove(&refork_id);
+    let resume_reply = reg.handle(
+        &full,
+        Request::Resume {
+            session: refork_id,
+            create: Create {
+                account: None,
+                program: Program::Login,
+                cwd: Vec::new(),
+                cols: 80,
+                rows: 24,
+            },
+        },
+        &mut HashMap::new(),
+    );
+    assert!(matches!(resume_reply, Reply::Resumed { pid: 802, .. }));
+
+    let (joined_id, _, _) = holder_worker.join().unwrap();
+    reader_worker.join().unwrap();
+    assert_eq!(joined_id, spawned_id);
     // 원 세션(7)과 포크된 세션(spawned_id) 모두 살아 있어야 한다(세션 불멸).
     let st = lock(&reg.state);
     assert!(st.sessions.contains_key(&SessionId(7)));
@@ -1109,6 +1220,7 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
     let stored_fork = reg.agents.stored(spawned_id).unwrap().unwrap();
     assert_eq!(stored_fork.profile, "claude");
     assert_eq!(stored_fork.permission, Permission::Yolo);
+    assert_eq!(stored_fork.session_id, None);
     assert_eq!(stored_fork.cwd, b"/tmp/owe736-cwd");
 
     fs::remove_dir_all(&dir).ok();
