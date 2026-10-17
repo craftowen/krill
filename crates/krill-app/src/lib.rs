@@ -1,0 +1,42 @@
+//! 앱 라이브러리: 터미널 렌더러(MK-027), 입력 에코 즉시 그리기(OWE-480), 데몬 연결 상태·입력 알림 문구(MK-026),
+//! 레이아웃 모델(MK-030), 칸 ↔ 세션 연결·키 바이트(OWE-490), Jump 팔레트(MK-057), 워크트리 생성 대화상자(OWE-496), 첫 실행 온보딩(MK-073), 설정·키 바인딩 파일(MK-070), 알림·배지·잠자기 방지(MK-044). gpui 셸은 바이너리(`main.rs`)에 있다.
+
+pub mod accounts;
+pub mod add_project;
+pub mod agent_history;
+pub mod alert;
+pub mod appearance;
+pub mod commands;
+pub mod continue_session;
+pub mod crash;
+pub mod detached;
+pub mod diff;
+pub mod echo;
+pub mod editor;
+pub mod file_format;
+pub mod hosts;
+pub mod i18n;
+pub mod jump;
+pub mod keys;
+pub mod layout;
+pub mod link;
+pub mod link_ui;
+pub mod menu_bar;
+pub mod onboarding;
+pub mod open_in;
+pub mod orca_import;
+pub mod pane;
+pub mod platform;
+pub mod pull_request;
+pub mod recording;
+pub mod resources;
+pub mod search;
+pub mod security;
+pub mod settings;
+pub mod sidebar;
+pub mod ssh_hosts;
+pub mod terminal;
+pub mod ui;
+pub mod updater;
+pub mod webhook;
+pub mod worktree;

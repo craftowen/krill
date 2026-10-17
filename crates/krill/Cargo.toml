@@ -1,0 +1,25 @@
+[package]
+name = "krill"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+krill-hosts = { workspace = true }
+krill-log = { workspace = true }
+tracing = { workspace = true }
+krill-proto = { workspace = true }
+rustix = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+rustix-openpty = { workspace = true }
+
+[lints]
+workspace = true

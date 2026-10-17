@@ -1,0 +1,220 @@
+use super::*;
+use gpui::{EntityInputHandler as _, TestAppContext};
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+fn item(id: u64, label: &str, needs_you: bool) -> Item {
+    Item::new(SessionId(id), label.into(), needs_you)
+}
+
+fn ids(items: &[Item], query: &str) -> Vec<u64> {
+    search(items, query)
+        .into_iter()
+        .map(|i| items[i].id.0)
+        .collect()
+}
+
+#[test]
+fn fuzzy_order_hangul_and_needs_you() {
+    let items = [
+        item(1, "claude 1 · minikrill · 작업 중", false),
+        item(2, "codex 2 · 미니크릴 · 입력 대기", true),
+        item(3, "claude 3 · mk-owe-422 · 완료", false),
+        item(4, "claude 4 · main · 입력 대기", true),
+    ];
+    // 빈 검색어: 입력 대기 세션이 맨 위, 나머지는 원래 순서.
+    assert_eq!(ids(&items, ""), [2, 4, 1, 3]);
+    // 부분 수열·대소문자·공백 무시.
+    assert_eq!(ids(&items, "MKO"), [3]);
+    assert_eq!(ids(&items, "mini krill"), [1]);
+    // 한글 음절 단위 퍼지, 연속 일치가 흩어진 일치보다 앞.
+    assert_eq!(ids(&items, "미니"), [2]);
+    assert_eq!(ids(&items, "대기"), [2, 4]);
+    assert_eq!(ids(&items, "작중"), [1]);
+    assert!(ids(&items, "없는말").is_empty());
+    // 초성·조합 중 음절.
+    assert_eq!(ids(&items, "ㅁㄴㅋ"), [2]);
+    assert_eq!(ids(&items, "미ㄴ"), [2]);
+    assert_eq!(ids(&items, "이"), [2, 4]);
+    assert!(ids(&items, "읻").is_empty());
+    // 연속 일치("main")가 흩어진 일치보다 높다.
+    assert_eq!(ids(&items, "main")[0], 4);
+}
+
+fn thousand() -> Vec<Item> {
+    let states = ["작업 중", "입력 대기", "승인 대기", "완료", "종료"];
+    (0..1000u64)
+        .map(|i| {
+            let state = states[usize::try_from(i).unwrap() % states.len()];
+            item(
+                i,
+                &format!("claude {i} · 워크트리-{i:04}-feature-branch · {state}"),
+                i % 7 == 0,
+            )
+        })
+        .collect()
+}
+
+/// 완료 조건: 1,000개 항목 응답 ≤ 50ms. 검색 함수만 잰다(디버그 빌드).
+#[test]
+fn thousand_items_search_under_50ms() {
+    let items = thousand();
+    for query in ["", "c", "워크", "0999", "feat대기", "zzz"] {
+        let start = Instant::now();
+        let hits = search(&items, query);
+        let took = start.elapsed();
+        eprintln!("search 1000 {query:?}: {} hits in {took:?}", hits.len());
+        assert!(took < Duration::from_millis(50), "{query}: {took:?}");
+    }
+}
+
+fn open(
+    cx: &mut TestAppContext,
+    items: Vec<Item>,
+) -> (
+    Entity<Palette>,
+    Rc<RefCell<Vec<Event>>>,
+    &mut gpui::VisualTestContext,
+) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|window, cx| Palette::new(items, window, cx));
+    cx.update(|window, cx| view.update(cx, |p, cx| p.focus(window, cx)));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let got = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, e: &Event, _| got.borrow_mut().push(*e))
+            .detach();
+    });
+    cx.run_until_parked();
+    (view, events, cx)
+}
+
+fn shown(view: &Entity<Palette>, cx: &mut gpui::VisualTestContext) -> Vec<u64> {
+    cx.update(|_, cx| view.read(cx).matches().map(|i| i.id.0).collect())
+}
+
+/// 한글 IME: 조합 중 글자(preedit)로 바로 거르고, 확정·이동·Enter로 고른다. Esc는 닫기.
+#[gpui::test]
+fn hangul_preedit_filters_and_keys_confirm(cx: &mut TestAppContext) {
+    let items = vec![
+        item(1, "claude 1 · 한글 작업", false),
+        item(2, "codex 2 · 하늘", false),
+        item(3, "claude 3 · 한강 대기", true),
+        item(4, "claude 4 · main", false),
+    ];
+    let (view, events, cx) = open(cx, items);
+    assert_eq!(shown(&view, cx), [3, 1, 2, 4]);
+
+    let input = cx.update(|_, cx| view.read(cx).input().clone());
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, "하", None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(shown(&view, cx), [3, 1, 2]);
+    cx.update(|window, cx| {
+        input.update(cx, |s, cx| {
+            s.replace_and_mark_text_in_range(None, "한", None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(shown(&view, cx), [3, 1]);
+    // 확정은 IME 입력 경로(insertText)로.
+    cx.simulate_input("한");
+    assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "한");
+    assert_eq!(shown(&view, cx), [3, 1]);
+
+    cx.simulate_keystrokes("down down up down enter");
+    assert_eq!(*events.borrow(), [Event::Confirm(SessionId(1))]);
+    // 단일 행 입력이 위·아래를 먹지 않았다(커서·값 그대로).
+    assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "한");
+
+    cx.simulate_keystrokes("escape");
+    assert_eq!(events.borrow().last(), Some(&Event::Dismiss));
+}
+
+/// 1,000개 항목에서 키 입력 → 거른 목록이 다시 그려질 때까지(테스트 플랫폼, 디버그 빌드).
+#[gpui::test]
+fn thousand_items_keystroke_to_render_under_50ms(cx: &mut TestAppContext) {
+    let (view, _, cx) = open(cx, thousand());
+    let mut last = usize::MAX;
+    for query in ["0", "09", "099", "0999"] {
+        let start = Instant::now();
+        cx.simulate_input(query.get(query.len() - 1..).unwrap());
+        cx.run_until_parked();
+        let took = start.elapsed();
+        let hits = shown(&view, cx);
+        eprintln!("palette 1000 {query:?}: {} hits in {took:?}", hits.len());
+        assert!(hits.contains(&999) && hits.len() <= last, "{query}");
+        last = hits.len();
+        assert!(took < Duration::from_millis(50), "{query}: {took:?}");
+    }
+}
+
+#[gpui::test]
+fn jump_palette_filters_vault_hits_and_emits_resume_vault(cx: &mut TestAppContext) {
+    let (view, events, cx) = open(cx, vec![item(1, "claude 1 · main · 작업 중", false)]);
+    let vault_hits = vec![
+        VaultHit {
+            agent: VaultAgent::Codex,
+            id: "22222222-2222-4333-8444-555555555555".into(),
+            cwd: "/tmp/repo-a/wt-1".into(),
+            modified: 20,
+            title: "Zstd Scrollback".into(),
+            summary: "Segment writer".into(),
+            snippet: "Compressed 64KB segments".into(),
+            role: "assistant".into(),
+            score: 100,
+        },
+        VaultHit {
+            agent: VaultAgent::OpenCode,
+            id: "ses_oc_1".into(),
+            cwd: "/tmp/repo-b".into(),
+            modified: 10,
+            title: "Payments Schema".into(),
+            summary: "Foreign key".into(),
+            snippet: "ALTER TABLE payments".into(),
+            role: "user".into(),
+            score: 80,
+        },
+    ];
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.set_scope_paths(
+                Some("/tmp/repo-a/wt-1".into()),
+                vec!["/tmp/repo-a/wt-1".into()],
+                cx,
+            );
+            p.set_vault_hits(vault_hits, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 2);
+
+    // Filter by Workspace scope
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_scope(VaultScope::Workspace, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 1);
+
+    // Filter by OpenCode agent in All scope
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.set_scope(VaultScope::All, cx);
+            p.set_agent_filter(Some(VaultAgent::OpenCode), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 1);
+
+    // One-click Resume on OpenCode vault hit (index 1)
+    let btn = cx
+        .debug_bounds("jump-vault-resume-1")
+        .expect("jump vault resume button");
+    cx.simulate_click(btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(events.borrow().last(), Some(&Event::ResumeVault(1)));
+}

@@ -1,0 +1,32 @@
+# 하네스: 테스트 하나가 멈춰 check.sh 전체가 무한 대기하는 것을 막는다(2026-10-15 야간, krill::doctor 병렬 실행 중 600s+ 정지 관측).
+# 60초마다 SLOW 표시, 3회(180초) 넘으면 강제 종료·실패.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 3 }
+# 워커 10개 동시 빌드(load 100+)에서 매번 다른 테스트가 간헐 실패했다(2026-10-15 10:40~11:08, 단독 재실행은 모두 통과).
+# 모든 테스트 재시도 1회. 결정적 실패는 두 번 다 실패하므로 그대로 잡힌다. nextest는 재시도 통과를 FLAKY로 표시한다.
+retries = 1
+# 워커 10개+가 동시에 전체 검사를 돌리면 load 137(12코어)까지 오른다. 검사 하나당 테스트 스레드 6개로 제한.
+test-threads = 6
+
+# PTY를 수백 개 여는 테스트(세션 상한 256)는 다른 테스트와 겹치면 시스템 PTY 한도(kern.tty.ptmx_max=511)를 넘긴다(2026-10-15 OWE-489).
+# 무거운 PTY 테스트 바이너리는 한 번에 하나만 돈다.
+[test-groups]
+pty-heavy = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(teardown)'
+test-group = 'pty-heavy'
+threads-required = "num-test-threads"
+
+# 지연(p95 ms)을 재는 생존 테스트는 부하에 민감하다. 2026-10-15 워커 9개 동시 빌드(load avg 44~50)에서
+# krilld_kill·exec_handoff·krilld_sigkill_is_detected_and_recovered가 기준을 넘겼다(단독 실행은 통과).
+# 2026-10-15 10:41 워커 10개(load 124)에서 krilld::attach p95 재연결 테스트 2개, 10:52 holder 1초 감지 테스트도 넘겼다.
+# 단독 실행 + 재시도 2회. 재시도로도 실패하면 진짜 회귀로 본다.
+[test-groups.latency]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
+test-group = 'latency'
+threads-required = "num-test-threads"
+retries = 2

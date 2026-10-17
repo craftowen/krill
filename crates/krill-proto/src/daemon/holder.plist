@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>dev.krill.app.holder</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Applications/Krill.app/Contents/Helpers/R&amp;D/krill-holder</string>
+		<string>/Applications/Krill.app/Contents/Helpers/R&amp;D/krilld</string>
+		<string>/Users/me/Library/Application Support/dev.krill.app/run/krilld.sock</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<false/>
+	<key>AbandonProcessGroup</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Interactive</string>
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>dev.krill.app</string>
+	</array>
+	<key>SoftResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>10240</integer>
+	</dict>
+</dict>
+</plist>

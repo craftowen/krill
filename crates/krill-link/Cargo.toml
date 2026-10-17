@@ -1,0 +1,35 @@
+[package]
+name = "krill-link"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "krill_link"
+path = "src/lib.rs"
+
+[[bin]]
+name = "krill-link"
+path = "src/main.rs"
+
+[dependencies]
+iroh = { workspace = true }
+tokio = { workspace = true }
+krill-proto = { workspace = true }
+krill-log = { workspace = true }
+tracing = { workspace = true }
+postcard = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+ring = { workspace = true }
+zeroize = { workspace = true }
+rustix = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

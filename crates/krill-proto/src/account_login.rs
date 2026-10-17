@@ -1,0 +1,534 @@
+//! Claude·Codex 로그인 명령과 비밀값 없는 로그인 상태 조회(OWE-700).
+
+use std::io::Read as _;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use crate::control::Program;
+use crate::usage::ProviderKind;
+
+/// OWE-705 신원 정보. 토큰·키체인 값은 포함하지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub email: String,
+    pub org_id: Option<String>,
+    pub org_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthStatus {
+    pub logged_in: bool,
+    pub identity: Option<Identity>,
+}
+
+/// `dir`이 `None`이면 호스트 기본 계정이다. env를 지워 실행한다: Claude는 `CLAUDE_CONFIG_DIR`이 있기만 해도
+/// (값이 `~/.claude`여도) 다른 키체인 항목을 쓰는데, 호스트 세션은 env 없이 뜬다.
+pub fn login_program(provider: ProviderKind, dir: Option<&Path>) -> Option<Program> {
+    let tail: &[&str] = match provider {
+        ProviderKind::Claude => &["claude", "auth", "login", "--claudeai"],
+        ProviderKind::Codex => &["codex", "login"],
+        ProviderKind::Antigravity => &["login"],
+        _ => return None,
+    };
+    let mut args = if provider == ProviderKind::Antigravity {
+        let mut args = vec![b"agy".to_vec()];
+        if let Some(dir) = dir.filter(|dir| !dir.as_os_str().is_empty()) {
+            args.insert(0, b"SSH_CONNECTION=krill".to_vec());
+            args.push(format!("--gemini_dir={}", dir.join(".gemini").to_str()?).into_bytes());
+        }
+        args
+    } else {
+        match dir {
+            Some(dir) if dir.as_os_str().is_empty() => return None,
+            Some(dir) => vec![format!("{}={}", provider.env_var(), dir.to_str()?).into_bytes()],
+            None => vec![b"-u".to_vec(), provider.env_var().as_bytes().to_vec()],
+        }
+    };
+    args.extend(tail.iter().map(|s| s.as_bytes().to_vec()));
+    Some(Program::Custom {
+        program: b"/usr/bin/env".to_vec(),
+        args,
+    })
+}
+
+pub fn parse_claude_status(json: &str) -> Option<AuthStatus> {
+    let v: serde_json::Value = serde_json::from_str(json).ok()?;
+    let logged_in = v.get("loggedIn")?.as_bool()?;
+    let text = |key: &str| {
+        v.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let identity = if logged_in {
+        text("email").map(|email| Identity {
+            email,
+            org_id: text("orgId"),
+            org_name: text("orgName"),
+        })
+    } else {
+        None
+    };
+    Some(AuthStatus {
+        logged_in,
+        identity,
+    })
+}
+
+/// 비밀값을 출력하지 않는 CLI 상태 조회. stdout·stderr를 함께 읽되 결과에는 신원만 남긴다.
+/// Codex는 상태를 stderr에 쓰며 로그아웃이면 비영(非零) 종료한다. `dir`이 `None`이면 호스트 기본 계정([`login_program`]).
+pub fn probe(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<AuthStatus> {
+    if provider == ProviderKind::Antigravity {
+        let dir = dir?;
+        let token = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        let metadata = std::fs::symlink_metadata(token).ok()?;
+        return Some(AuthStatus {
+            logged_in: metadata.is_file()
+                && !metadata.file_type().is_symlink()
+                && metadata.len() > 0,
+            identity: None,
+        });
+    }
+    probe_with_environment(exe, provider, dir, None, None)
+}
+
+/// 데몬 로그인 셸 PATH와 대상 HOME을 명시한다. 부모 환경은 바꾸지 않는다.
+pub fn probe_with_environment(
+    exe: &Path,
+    provider: ProviderKind,
+    dir: Option<&Path>,
+    home: Option<&Path>,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<AuthStatus> {
+    let args: &[&str] = match provider {
+        ProviderKind::Claude => &["auth", "status", "--json"],
+        ProviderKind::Codex => &["login", "status"],
+        ProviderKind::OpenCode => &["auth", "list"],
+        _ => return None,
+    };
+    let mut cmd = Command::new(exe);
+    if let Some(home) = home {
+        cmd.env("HOME", home);
+    }
+    if let Some(path) = path {
+        cmd.env("PATH", path);
+    }
+    match dir {
+        Some(dir) if provider == ProviderKind::OpenCode => {
+            cmd.env("XDG_DATA_HOME", dir.join("data"));
+            cmd.env("XDG_STATE_HOME", dir.join("state"));
+            cmd.env_remove("OPENCODE_CONFIG_DIR");
+        }
+        Some(dir) => {
+            cmd.env(provider.env_var(), dir);
+        }
+        None => {
+            cmd.env_remove(provider.env_var());
+        }
+    }
+    let mut child = cmd
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let pipes: [Box<dyn std::io::Read + Send>; 2] = [Box::new(stdout), Box::new(stderr)];
+    for mut pipe in pipes {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let result = pipe
+                .by_ref()
+                .take(64 * 1024)
+                .read_to_string(&mut text)
+                .map(|_| text);
+            tx.send(result).ok();
+        });
+    }
+    drop(tx);
+    let deadline = Instant::now().checked_add(Duration::from_secs(5))?;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                break None;
+            }
+        }
+    }?;
+    let mut outputs = Vec::new();
+    for _ in 0..2 {
+        outputs.push(
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .ok()?
+                .ok()?,
+        );
+    }
+    if provider == ProviderKind::Claude {
+        // Claude JSON은 stdout, 진단은 stderr. 결합 순서에 기대지 않는다.
+        return outputs.iter().find_map(|output| {
+            parse_claude_status(output).or_else(|| output.lines().find_map(parse_claude_status))
+        });
+    }
+    let output = outputs.join("\n");
+    let lower = strip_ansi(&output).to_ascii_lowercase();
+    let logged_in = if provider == ProviderKind::OpenCode {
+        if !status.success() {
+            return None;
+        }
+        // auth list는 토큰 대신 저장된 자격증명 건수만 반환한다.
+        let count = lower
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(2)
+            .find_map(|pair| {
+                pair.first()?
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|_| pair.get(1).is_some_and(|s| s.starts_with("credential")))
+            })?;
+        count > 0
+    } else if lower.contains("not logged in") {
+        false
+    } else if status.success() && lower.contains("logged in") {
+        true
+    } else {
+        return None;
+    };
+    Some(AuthStatus {
+        logged_in,
+        identity: None,
+    })
+}
+
+fn strip_ansi(text: &str) -> String {
+    let mut result = String::new();
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            match chars.next() {
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut escape = false;
+                    for c in chars.by_ref() {
+                        if c == '\u{7}' || (escape && c == '\\') {
+                            break;
+                        }
+                        escape = c == '\u{1b}';
+                    }
+                }
+                _ => {}
+            }
+        } else {
+            result.push(c);
+        }
+    }
+    result
+}
+
+/// 실패·취소 시 이번에 만든 빈 폴더만 제거한다. 내용·심볼릭 링크는 절대 지우지 않는다.
+pub fn cleanup_empty_profile(dir: &Path) -> bool {
+    std::fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
+        && std::fs::remove_dir(dir).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_uses_env_and_literal_profile_argument() {
+        for (provider, expected) in [
+            (
+                ProviderKind::Claude,
+                vec![
+                    "CLAUDE_CONFIG_DIR=/tmp/a b;$x",
+                    "claude",
+                    "auth",
+                    "login",
+                    "--claudeai",
+                ],
+            ),
+            (
+                ProviderKind::Codex,
+                vec!["CODEX_HOME=/tmp/a b;$x", "codex", "login"],
+            ),
+        ] {
+            assert_eq!(
+                login_program(provider, Some(Path::new("/tmp/a b;$x"))),
+                Some(Program::Custom {
+                    program: b"/usr/bin/env".to_vec(),
+                    args: expected
+                        .into_iter()
+                        .map(|s| s.as_bytes().to_vec())
+                        .collect(),
+                })
+            );
+        }
+        assert_eq!(
+            login_program(ProviderKind::Claude, Some(Path::new(""))),
+            None
+        );
+        assert_eq!(
+            login_program(ProviderKind::OpenCode, Some(Path::new("/tmp/a"))),
+            None
+        );
+        assert_eq!(
+            login_program(ProviderKind::Antigravity, Some(Path::new("/tmp/a"))),
+            Some(Program::Custom {
+                program: b"/usr/bin/env".to_vec(),
+                args: [
+                    "SSH_CONNECTION=krill",
+                    "agy",
+                    "--gemini_dir=/tmp/a/.gemini",
+                    "login"
+                ]
+                .into_iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
+            })
+        );
+    }
+
+    /// 호스트 기본 계정은 env 없이 다룬다. Claude는 `CLAUDE_CONFIG_DIR`이 설정되기만 해도(값이 `~/.claude`여도)
+    /// 키체인 항목 이름에 해시 접미사를 붙여 다른 로그인을 본다(claude 2.1.302 `D1`).
+    #[test]
+    fn host_account_login_and_probe_drop_config_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            login_program(ProviderKind::Claude, None),
+            Some(Program::Custom {
+                program: b"/usr/bin/env".to_vec(),
+                args: [
+                    "-u",
+                    "CLAUDE_CONFIG_DIR",
+                    "claude",
+                    "auth",
+                    "login",
+                    "--claudeai"
+                ]
+                .into_iter()
+                .map(|s| s.as_bytes().to_vec())
+                .collect(),
+            })
+        );
+        let root = std::env::temp_dir().join(format!("owe700-host-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("fake-cli");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\n[ -z \"${CLAUDE_CONFIG_DIR+x}\" ] || { echo '{\"loggedIn\":false}'; exit 0; }\necho '{\"loggedIn\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(probe(&exe, ProviderKind::Claude, None).unwrap().logged_in);
+        assert!(
+            !probe(&exe, ProviderKind::Claude, Some(&root))
+                .unwrap()
+                .logged_in
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn logged_out_is_distinct_from_missing_email_or_bad_output() {
+        assert_eq!(
+            parse_claude_status(r#"{"loggedIn":false}"#),
+            Some(AuthStatus {
+                logged_in: false,
+                identity: None
+            })
+        );
+        assert_eq!(
+            parse_claude_status(r#"{"loggedIn":true}"#),
+            Some(AuthStatus {
+                logged_in: true,
+                identity: None
+            })
+        );
+        assert_eq!(parse_claude_status("invalid"), None);
+    }
+
+    #[test]
+    fn fake_cli_probes_isolated_profile_and_codex_stderr() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("owe700-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("fake-cli");
+        let profile = root.join("profile with spaces");
+        std::fs::create_dir_all(&profile).unwrap();
+        let write = |script: &str| {
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        write(
+            "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth status --json' ] || exit 9\n[ -d \"$CLAUDE_CONFIG_DIR\" ] || exit 9\nprintf '%s\\n' '{\"loggedIn\":true,\"email\":\"test@example.invalid\",\"orgName\":\"Test\"}'\n",
+        );
+        let status = probe(&exe, ProviderKind::Claude, Some(&profile)).unwrap();
+        assert!(status.logged_in);
+        assert_eq!(status.identity.unwrap().email, "test@example.invalid");
+        write(
+            "#!/bin/sh\necho 'diagnostic' >&2\nprintf '{\\n  \"loggedIn\": true,\\n  \"email\": \"pretty@example.invalid\"\\n}\\n'\n",
+        );
+        assert_eq!(
+            probe(&exe, ProviderKind::Claude, Some(&profile))
+                .unwrap()
+                .identity
+                .unwrap()
+                .email,
+            "pretty@example.invalid"
+        );
+        write(
+            "#!/bin/sh\n[ \"$1 $2\" = 'login status' ] || exit 9\n[ -d \"$CODEX_HOME\" ] || exit 9\necho 'Not logged in' >&2\nexit 1\n",
+        );
+        assert!(
+            !probe(&exe, ProviderKind::Codex, Some(&profile))
+                .unwrap()
+                .logged_in
+        );
+        write("#!/bin/sh\necho 'Logged in using ChatGPT' >&2\n");
+        assert!(
+            probe(&exe, ProviderKind::Codex, Some(&profile))
+                .unwrap()
+                .logged_in
+        );
+        write("#!/bin/sh\necho 'unknown option' >&2\nexit 2\n");
+        assert_eq!(probe(&exe, ProviderKind::Codex, Some(&profile)), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opencode_probe_uses_profile_xdg_paths() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("owe706-opencode-probe-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("opencode");
+        let profile = root.join("profile");
+        std::fs::write(
+            &exe,
+            format!(
+                "#!/bin/sh\ntest \"$1 $2\" = 'auth list' && test \"$XDG_DATA_HOME\" = '{}/data' && test \"$XDG_STATE_HOME\" = '{}/state' && test -z \"${{OPENCODE_CONFIG_DIR+x}}\" || exit 9\nprintf '1 credential\\n'\n",
+                profile.display(), profile.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let status = probe(&exe, ProviderKind::OpenCode, Some(&profile)).unwrap();
+        assert!(status.logged_in);
+        assert_eq!(status.identity, None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agy_profile_login_state_comes_from_its_token_file() {
+        let root = std::env::temp_dir().join(format!("owe706-agy-auth-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let token = root.join(".gemini/antigravity-cli/antigravity-oauth-token");
+        std::fs::create_dir_all(token.parent().unwrap()).unwrap();
+        std::fs::write(&token, b"fixture token contents").unwrap();
+        assert!(
+            probe(Path::new("/unused"), ProviderKind::Antigravity, Some(&root))
+                .unwrap()
+                .logged_in
+        );
+        std::fs::remove_file(&token).unwrap();
+        assert!(probe(Path::new("/unused"), ProviderKind::Antigravity, Some(&root)).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_probe_uses_requested_home_path_and_distinguishes_cli_failures() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("owe719-env-probe-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let exe = root.join("fake-cli");
+        let write = |script: &str| {
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        write(
+            "#!/bin/sh\n[ \"$HOME\" = \"$CLAUDE_CONFIG_DIR\" ] || exit 5\n[ \"$PATH\" = /fixture/bin ] || exit 6\necho '{\"loggedIn\":true}'\n",
+        );
+        assert!(
+            probe_with_environment(
+                &exe,
+                ProviderKind::Claude,
+                Some(&root),
+                Some(&root),
+                Some(std::ffi::OsStr::new("/fixture/bin"))
+            )
+            .unwrap()
+            .logged_in
+        );
+        let runtime_name = format!("owe719-runtime-{}", std::process::id());
+        let runtime = root.join(&runtime_name);
+        std::fs::write(&runtime, "#!/bin/sh\necho '{\"loggedIn\":true}'\n").unwrap();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        write(&format!("#!/usr/bin/env {runtime_name}\n"));
+        assert!(
+            probe(&exe, ProviderKind::Claude, Some(&root)).is_none(),
+            "데몬의 축소된 PATH에서는 런처 실행 실패"
+        );
+        assert!(
+            probe_with_environment(
+                &exe,
+                ProviderKind::Claude,
+                Some(&root),
+                Some(&root),
+                Some(root.as_os_str())
+            )
+            .unwrap()
+            .logged_in
+        );
+        write("#!/bin/sh\nprintf '\\033[90m1 credentials\\033[0m\\n'\n");
+        assert!(probe(&exe, ProviderKind::OpenCode, None).unwrap().logged_in);
+        write("#!/bin/sh\necho '0 credentials'\n");
+        assert!(!probe(&exe, ProviderKind::OpenCode, None).unwrap().logged_in);
+        write("#!/bin/sh\necho 'authentication timed out' >&2\nexit 9\n");
+        assert!(probe(&exe, ProviderKind::Codex, None).is_none());
+        assert!(probe(&root.join("missing"), ProviderKind::Claude, None).is_none());
+        write("#!/bin/sh\nexec /bin/sleep 10\n");
+        let started = Instant::now();
+        assert!(probe(&exe, ProviderKind::Claude, None).is_none());
+        assert!(started.elapsed() < Duration::from_secs(8));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn cleanup_preserves_existing_data_and_symlinks() {
+        let root = std::env::temp_dir().join(format!("owe700-cleanup-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let empty = root.join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        assert!(cleanup_empty_profile(&empty));
+        let data = root.join("data");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("credentials"), "keep").unwrap();
+        assert!(!cleanup_empty_profile(&data));
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&data, &link).unwrap();
+        assert!(!cleanup_empty_profile(&link));
+        assert_eq!(
+            std::fs::read_to_string(data.join("credentials")).unwrap(),
+            "keep"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

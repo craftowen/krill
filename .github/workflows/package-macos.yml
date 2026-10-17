@@ -1,0 +1,44 @@
+name: Package macOS (ad-hoc)
+
+# 비공개 저장소 macOS 실행 비용을 피하기 위해 수동 실행만 허용한다.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Cargo build profile
+        type: choice
+        default: release
+        options:
+          - release
+          - dev
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      BUILD_PROFILE: ${{ inputs.profile }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal
+          rustup override set 1.98.1
+      - name: Packaging regression tests
+        run: python3 packaging/macos/test_pipeline.py
+      - name: Build, sign, verify and archive
+        run: packaging/bundle.sh --profile "$BUILD_PROFILE"
+      # ZIP 내부에 실행 권한과 코드 서명을 보존한다. 앱 디렉터리 자체는 업로드하지 않는다.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: krill-macos-adhoc
+          path: |
+            packaging/dist/*.zip
+            packaging/dist/*.zip.sha256
+          if-no-files-found: error
+          retention-days: 7

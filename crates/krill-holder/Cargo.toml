@@ -1,0 +1,18 @@
+[package]
+name = "krill-holder"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+krill-log = { workspace = true }
+tracing = { workspace = true }
+krill-proto = { workspace = true }
+rustix = { workspace = true }
+rustix-openpty = { workspace = true }
+libc = { workspace = true }
+
+[lints]
+workspace = true

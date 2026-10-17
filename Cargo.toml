@@ -1,0 +1,150 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+exclude = ["vendor"]
+
+[workspace.package]
+version = "0.1.2"
+edition = "2024"
+rust-version = "1.98"
+license = "Apache-2.0"
+repository = "https://github.com/craftowen/krill"
+homepage = "https://krill.page"
+
+[workspace.dependencies]
+krill-proto = { path = "crates/krill-proto" }
+krill-term = { path = "crates/krill-term" }
+krill-holder = { path = "crates/krill-holder" }
+krill-log = { path = "crates/krill-log" }
+krill-hosts = { path = "crates/krill-hosts" }
+krill-link = { path = "crates/krill-link" }
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+krilld = { path = "crates/krilld" }
+# IPC 제어 메시지(MK-021). postcard 기본 기능(heapless-cas)은 RUSTSEC-2023-0089로 cargo-deny 실패(C2 실측).
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
+serde = { version = "1.0.229", default-features = false, features = ["derive"] }
+# krilld hook payload 정규화(MK-039). gpui 빌드 의존성으로 이미 Cargo.lock에 있는 버전.
+serde_json = { version = "1.0.154", default-features = false, features = ["std"] }
+proptest = "1.12.0"
+# MK-047 화면 정규식. 이미 Cargo.lock에 있는 버전.
+regex = "1.13.1"
+# 에이전트 프로필 agents.toml(MK-037). gpui 빌드 의존성으로 이미 Cargo.lock에 있는 버전.
+toml = { version = "1.1.8", default-features = false, features = ["parse", "display", "serde", "std"] }
+# AS-12: 설정 원문의 미지 키·주석을 보존하는 편집기(기존 잠금 버전).
+toml_edit = { version = "=0.25.17", default-features = false, features = ["parse", "display"] }
+# krill-holder: PTY·fd 전달·kqueue. rustix-openpty는 MK-004 결정 2.
+rustix = { version = "1.1.5", default-features = false, features = ["std", "event", "fs", "net", "process", "pty", "stdio", "termios", "time"] }
+rustix-openpty = "0.2.0"
+libc = "0.2.190"
+# krilld 세션 Term(ARCHITECTURE §4 버전 핀). serde 기본 기능은 키프레임(MK-023)이 자체 포맷이라 끈다.
+alacritty_terminal = { version = "=0.26.0", default-features = false }
+# krilld 세그먼트 저장소(MK-024): zstd 하나(ARCHITECTURE §3), 청크 체크섬.
+zstd = { version = "0.14.2", default-features = false }
+crc32fast = "1.5.2"
+# krilld 전역 할당기: macOS 기본 malloc은 해제한 핫 스크롤백(200열 행 4,800B)을 footprint로 돌려주지 않는다.
+# decay 설정은 ctl의 안전 API로 한다.
+tikv-jemallocator = "0.7.0"
+tikv-jemalloc-ctl = "0.7.0"
+# krill-term IME 오버레이 셀 폭. alacritty_terminal과 같은 크레이트라 그리드 폭 판정과 일치한다.
+unicode-width = "0.2.2"
+# krilld setup 스크립트 신뢰 해시(MK-042). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
+sha2 = "0.10.9"
+# MK-063: 자체 업데이터 latest.json Ed25519 서명 검증(T4-D14). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
+ring = "0.17.14"
+# MK-097: 키체인 키와 임시 키 버퍼 소거. 기존 gpui 의존성 버전을 재사용한다.
+security-framework = "3.7.0"
+zeroize = "1.9.1"
+# MK-080 Orca setup YAML 읽기 호환. 기존 gpui 묶음의 잠금 버전을 재사용한다.
+serde-saphyr = { version = "1.3.0", default-features = false, features = ["deserialize"] }
+# MK-053: macOS FSEvents 감시. 기존 gpui 의존성 묶음과 같은 버전.
+notify = "8.2.0"
+# krilld 피어 코드서명 검증(MK-096): LOCAL_PEERTOKEN → SecCode 손님 → 서명 정보(식별자·팀).
+core-foundation = { version = "0.10.1" }
+# gpui 묶음: gpui-pre·gpui-pre-platform·gpui-component를 `=`로 고정한다. gpui-pre-*는 gpui-pre가 내부에서 `=`로 고정하고,
+# 나머지 전이 의존성은 Cargo.lock이 고정한다. 한 묶음으로만 올린다(MK-003).
+# 이름 바꾸기(`package =`)는 cargo-deny가 미사용으로 오판해서 쓰지 않는다.
+gpui-pre = "=0.3.9"  # lib 이름이 `gpui`
+# font-kit: 없으면 macOS에서 글리프가 안 그려진다. runtime_shaders: Xcode(metal 컴파일러) 없이 셰이더를 실행 시 컴파일.
+gpui-pre-platform = { version = "=0.3.9", features = ["font-kit", "runtime_shaders"] }
+gpui-component = "=0.7.3"
+# gpui-component 아이콘(Lucide SVG) AssetSource. gpui-component가 이미 쓰는 묶음 크레이트(Cargo.lock·vendor)라 새 크레이트가 아니다.
+gpui-kit-assets = "=0.7.3"
+# krill-app platform 모듈(AppKit 직접 호출, CONVENTIONS U1). 둘 다 gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
+objc2 = "0.6.5"
+# MK-130 앱 전용 점검(타입 UN 조회). gpui 묶음과 같은 버전·기본 기능에 필요한 피처만 킨다.
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSBundle", "NSError", "NSString", "NSURL", "std"] }
+objc2-user-notifications = { version = "0.3.2", default-features = false, features = ["std", "block2", "UNNotificationSettings", "UNUserNotificationCenter"] }
+raw-window-handle = "0.6.2"
+# MK-133a: krill-link 원격 연결(iroh 1.3). portmapper(attohttpc MPL-2.0)는 끄고 fast-apple-datapath·tls-ring만 켠다.
+iroh = { version = "1.3.0", default-features = false, features = ["fast-apple-datapath", "tls-ring"] }
+tokio = { version = "1.44.1", default-features = false, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+# gpui 묶음 vendor 사본(원본 그대로, 패치는 MK-103).
+[patch.crates-io]
+gpui-base = { path = "vendor/gpui-base" }
+gpui-component = { path = "vendor/gpui-component" }
+gpui-component-macros = { path = "vendor/gpui-component-macros" }
+gpui-kit-assets = { path = "vendor/gpui-kit-assets" }
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-pre-apple = { path = "vendor/gpui-pre-apple" }
+gpui-pre-collections = { path = "vendor/gpui-pre-collections" }
+gpui-pre-derive-refineable = { path = "vendor/gpui-pre-derive-refineable" }
+gpui-pre-http-client = { path = "vendor/gpui-pre-http-client" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+gpui-pre-macos = { path = "vendor/gpui-pre-macos" }
+gpui-pre-macros = { path = "vendor/gpui-pre-macros" }
+gpui-pre-platform = { path = "vendor/gpui-pre-platform" }
+gpui-pre-refineable = { path = "vendor/gpui-pre-refineable" }
+gpui-pre-reqwest = { path = "vendor/gpui-pre-reqwest" }
+gpui-pre-scheduler = { path = "vendor/gpui-pre-scheduler" }
+gpui-pre-shared-string = { path = "vendor/gpui-pre-shared-string" }
+gpui-pre-sum-tree = { path = "vendor/gpui-pre-sum-tree" }
+gpui-pre-util = { path = "vendor/gpui-pre-util" }
+gpui-pre-web = { path = "vendor/gpui-pre-web" }
+gpui-pre-wgpu = { path = "vendor/gpui-pre-wgpu" }
+gpui-pre-windows = { path = "vendor/gpui-pre-windows" }
+gpui-pre-ztracing = { path = "vendor/gpui-pre-ztracing" }
+gpui-pre-ztracing-macro = { path = "vendor/gpui-pre-ztracing-macro" }
+# 터미널 좁은 포크: crates.io 원본 + 접근자 + 상류 버그 수정 3줄.
+# 변경 기록은 vendor/alacritty_terminal/PATCH-MINIKRILL.md · vendor/vte/PATCH-MINIKRILL.md.
+alacritty_terminal = { path = "vendor/alacritty_terminal" }
+vte = { path = "vendor/vte" }
+
+# 린트 정책은 docs/CONVENTIONS.md가 근거다(docs/research/C1-final.md §3에서 rustc 1.98.1로 실측). 바꾸려면 사람 승인 필요.
+[workspace.lints.rust]
+unsafe_code = "deny"                 # FFI 모듈만 #![expect(unsafe_code, reason = "...")]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+similar_names = "allow"
+missing_errors_doc = "allow"    # CONVENTIONS P9는 리뷰(SHOULD)로 본다
+missing_panics_doc = "allow"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+unnecessary_safety_comment = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+mem_forget = "deny"
+exit = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+let_underscore_must_use = "deny"
+string_slice = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+split-debuginfo = "packed"
+overflow-checks = true

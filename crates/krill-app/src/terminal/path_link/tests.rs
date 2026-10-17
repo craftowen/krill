@@ -1,0 +1,155 @@
+use std::fs;
+use std::sync::atomic::{AtomicU32, Ordering};
+
+use super::*;
+
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "mk-path-link-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(dir.join("src")).unwrap();
+        fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.join("한글.txt"), "x").unwrap();
+        Self(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        fs::remove_dir_all(&self.0).ok();
+    }
+}
+
+/// 한 행. 2칸 글자(한글)는 WIDE + SPACER 두 칸이다.
+fn row(text: &str) -> Vec<Cell> {
+    let mut out = Vec::new();
+    for ch in text.chars() {
+        let wide = ('가'..='힣').contains(&ch);
+        out.push(Cell {
+            ch,
+            flags: if wide { Flags::WIDE } else { Flags::default() },
+            ..Cell::default()
+        });
+        if wide {
+            out.push(Cell {
+                flags: Flags::SPACER,
+                ..Cell::default()
+            });
+        }
+    }
+    out
+}
+
+fn at(text: &str, column: u16, cwd: &Path) -> Option<PathLink> {
+    Cache::default().link_at_with_home(&row(text), column, Some(cwd), Some(cwd))
+}
+
+#[test]
+fn parses_compiler_grep_and_git_formats() {
+    let dir = TempDir::new("formats");
+    let file = dir.0.join("src/main.rs");
+    // rustc: "  --> src/main.rs:12:5"
+    let l = at("  --> src/main.rs:12:5", 8, &dir.0).unwrap();
+    assert_eq!(
+        l,
+        PathLink {
+            column: 6,
+            cols: 16,
+            path: file.clone(),
+            line: Some(12),
+            col: Some(5),
+        }
+    );
+    // grep -n: "src/main.rs:3:fn main" — 링크는 `:3`까지, 뒤 내용 위는 링크가 아니다.
+    let l = at("src/main.rs:3:fn main", 0, &dir.0).unwrap();
+    assert_eq!((l.cols, l.line, l.col), (13, Some(3), None));
+    assert_eq!(at("src/main.rs:3:fn main", 15, &dir.0), None);
+    // git diff: "+++ b/src/main.rs"
+    let l = at("+++ b/src/main.rs", 6, &dir.0).unwrap();
+    assert_eq!((l.column, l.cols, &l.path), (4, 13, &file));
+    // 따옴표·괄호·문장 끝 점은 경로에 넣지 않는다.
+    let l = at("error in 'src/main.rs'.", 12, &dir.0).unwrap();
+    assert_eq!((l.column, l.cols), (10, 11));
+    let l = at("see src/main.rs.", 5, &dir.0).unwrap();
+    assert_eq!((l.column, l.cols, l.line), (4, 11, None));
+}
+
+#[test]
+fn resolves_relative_to_cwd_absolute_and_home() {
+    let dir = TempDir::new("resolve");
+    let file = dir.0.join("src/main.rs");
+    let abs = format!("{}:7", file.display());
+    let l = at(&abs, 1, Path::new("/nonexistent")).unwrap();
+    assert_eq!((l.path, l.line), (file.clone(), Some(7)));
+    // 상대 경로는 cwd 기준: 다른 cwd에서는 같은 글자가 링크가 아니다.
+    assert_eq!(at("src/main.rs", 0, &dir.0).unwrap().path, file);
+    assert_eq!(
+        at("./src/main.rs", 0, &dir.0).unwrap().path,
+        dir.0.join("./src/main.rs")
+    );
+    assert_eq!(at("src/main.rs", 0, Path::new("/")), None);
+    // `~/`는 홈 기준(테스트는 홈을 임시 폴더로 준다).
+    assert_eq!(
+        at("~/src/main.rs", 3, &dir.0).unwrap().path,
+        dir.0.join("src/main.rs")
+    );
+    // 없는 cwd(아직 모름)면 상대 경로는 링크가 아니다.
+    let mut cache = Cache::default();
+    assert_eq!(
+        cache.link_at_with_home(&row("src/main.rs"), 0, None, None),
+        None
+    );
+}
+
+#[test]
+fn ignores_missing_files_directories_and_urls() {
+    let dir = TempDir::new("ignore");
+    assert_eq!(at("src/nope.rs:1:1", 2, &dir.0), None);
+    assert_eq!(at("src", 1, &dir.0), None, "폴더는 파일 링크가 아니다");
+    assert_eq!(at("https://example.com/src/main.rs", 10, &dir.0), None);
+    assert_eq!(at("file:///etc/hosts", 10, &dir.0), None);
+    assert_eq!(
+        at("a  src/main.rs", 1, &dir.0),
+        None,
+        "공백 위는 링크가 아니다"
+    );
+    assert_eq!(at("src/main.rs", 40, &dir.0), None, "행 밖");
+    // 양방향 제어 문자는 경로를 끊는다(위장 방지).
+    assert_eq!(at("src/ma\u{202e}in.rs", 1, &dir.0), None);
+}
+
+#[test]
+fn wide_characters_map_to_cells() {
+    let dir = TempDir::new("wide");
+    // "보기 한글.txt": '보'(0-1) '기'(2-3) ' '(4) '한'(5-6) '글'(7-8) ".txt"(9-12)
+    let text = "보기 한글.txt";
+    for column in [5, 6, 8, 12] {
+        let l = at(text, column, &dir.0).unwrap();
+        assert_eq!((l.column, l.cols), (5, 8), "칸 {column}");
+    }
+    assert_eq!(at(text, 4, &dir.0), None);
+}
+
+#[test]
+fn cache_skips_disk_for_same_candidate() {
+    let dir = TempDir::new("cache");
+    let mut cache = Cache::default();
+    let r = row("src/main.rs:1");
+    assert!(cache.link_at_with_home(&r, 0, Some(&dir.0), None).is_some());
+    // 같은 글자열이면 디스크를 다시 보지 않는다(지운 뒤에도 같은 결과 = 캐시를 탔다).
+    fs::remove_file(dir.0.join("src/main.rs")).unwrap();
+    assert!(cache.link_at_with_home(&r, 3, Some(&dir.0), None).is_some());
+    // 다른 cwd면 다시 본다.
+    assert!(
+        cache
+            .link_at_with_home(&r, 3, Some(Path::new("/")), None)
+            .is_none()
+    );
+    assert!(cache.link_at_with_home(&r, 3, Some(&dir.0), None).is_none());
+}

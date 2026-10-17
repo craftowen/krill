@@ -1,0 +1,61 @@
+# Krill CI — Linux 고속 게이트 (OWE-382, MK-017).
+# krill-proto·krill-term 단위 테스트 + clippy + cargo deny만. 모든 PR에서 항상 실행.
+# macOS 전체(clippy·nextest·PTY e2e)는 ci-macos.yml이 관련 경로 변경 시만 실행한다
+# (비공개 저장소 macOS 분 절약, 2026-10-15 오웬 결정).
+# 로컬 재현은 scripts/check.sh.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_NET_RETRY: 10
+
+jobs:
+  linux:
+    name: fmt · clippy · nextest · deny (krill-proto·krill-term)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust 1.98 + clippy
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+          components: rustfmt, clippy
+
+      - name: nextest · cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest,cargo-deny
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy (krill-proto·krill-term)
+        run: cargo clippy -p krill-proto -p krill-term --all-targets --locked -- -D warnings
+        timeout-minutes: 20
+
+      - name: nextest (krill-proto·krill-term)
+        run: cargo nextest run -p krill-proto -p krill-term --locked --no-tests=pass
+        timeout-minutes: 20
+
+      - name: doctest (krill-proto·krill-term)
+        run: cargo test -p krill-proto -p krill-term --doc --locked -q
+        timeout-minutes: 10
+
+      - name: cargo deny
+        # deny.toml [graph] 타깃은 apple-darwin이지만 검사는 메타데이터
+        # 해석이라 Linux에서도 동일하게 통과한다. macOS 잡(ci-macos.yml)은
+        # 중복 실행하지 않는다.
+        run: cargo deny --locked check --hide-inclusion-graph

@@ -1,0 +1,42 @@
+[package]
+name = "krilld"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+krill-log = { workspace = true }
+tracing = { workspace = true }
+krill-proto = { workspace = true }
+krill-holder = { workspace = true }
+alacritty_terminal = { workspace = true }
+rustix = { workspace = true }
+libc = { workspace = true }
+zstd = { workspace = true }
+crc32fast = { workspace = true }
+tikv-jemallocator = { workspace = true }
+tikv-jemalloc-ctl = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+# 워크트리 설정 minikrill.toml(MK-042)과 setup 신뢰 해시.
+toml = { workspace = true }
+sha2 = { workspace = true }
+# 피어 코드서명 검증(MK-096). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
+security-framework = { workspace = true }
+core-foundation = { workspace = true }
+serde-saphyr = { workspace = true }
+notify = { workspace = true }
+ring = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+rustix-openpty = { workspace = true }
+proptest = { workspace = true }
+# 서명 규칙 루프백 테스트(MK-091). 본 의존성이 아니라 테스트용이며 새 외부 크레이트가 아니다.
+ring = { workspace = true }
+
+[lints]
+workspace = true

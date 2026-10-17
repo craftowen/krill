@@ -1,0 +1,258 @@
+//! CLI 상태 조회는 `SAVE_LOCK` 밖에서 한다. 캐시는 비밀값을 포함하지 않는다.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::ffi::OsStrExt as _;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant, SystemTime};
+
+use krill_proto::account_login::{AuthStatus, probe_with_environment};
+use krill_proto::usage::{ConnectionStatus, ProviderKind};
+
+use super::{host_default_dir, load_file};
+use crate::session::lock;
+
+type CacheKey = (ProviderKind, PathBuf);
+pub(super) type Statuses = BTreeMap<CacheKey, AuthStatus>;
+type Stamp = Vec<Option<SystemTime>>;
+type Cached = (Instant, Stamp, Option<AuthStatus>);
+static STATES: Mutex<BTreeMap<CacheKey, ConnectionStatus>> = Mutex::new(BTreeMap::new());
+
+pub(super) fn connection(provider: ProviderKind, dir: &Path) -> ConnectionStatus {
+    lock(&STATES)
+        .get(&(provider, dir.to_path_buf()))
+        .copied()
+        .unwrap_or_default()
+}
+
+static CACHE: Mutex<BTreeMap<CacheKey, Cached>> = Mutex::new(BTreeMap::new());
+
+/// 캐시된 로그인 상태만 돌려준다. CLI 조회(프로필마다 최대 5초)는 백그라운드 스레드가 하므로
+/// 실행·재개·hook(레지스트리 잠금 안)·자동전환 경로가 CLI를 기다리지 않는다. 조회 중이면 "모름"(항목 없음)이다.
+pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
+    let mut profiles: Vec<_> = load_file(home, state)
+        .accounts
+        .into_iter()
+        .filter_map(|a| {
+            Some((
+                ProviderKind::parse(&a.provider)?,
+                PathBuf::from(a.profile_dir),
+                false,
+            ))
+        })
+        .collect();
+    for provider in ProviderKind::ALL {
+        profiles.push((provider, host_default_dir(home, provider), true));
+    }
+    let mut found = BTreeMap::new();
+    for (provider, dir, host) in profiles {
+        let key = (provider, dir.clone());
+        let Some(exe) = executable(provider) else {
+            lock(&STATES).insert(key, ConnectionStatus::NotInstalled);
+            continue;
+        };
+        // 삭제된 사용자 프로필을 상태 CLI가 다시 만들지 않게 한다.
+        if !host && !dir.is_dir() {
+            lock(&STATES).insert(key, ConnectionStatus::CheckFailed);
+            continue;
+        }
+        let stamp: Stamp = [
+            "",
+            ".claude.json",
+            "auth.json",
+            ".credentials.json",
+            ".krill-login-completed",
+            ".gemini/antigravity-cli/antigravity-oauth-token",
+        ]
+        .iter()
+        .map(|name| {
+            std::fs::metadata(dir.join(name))
+                .and_then(|m| m.modified())
+                .ok()
+        })
+        .collect();
+        let cached = lock(&CACHE).get(&key).cloned();
+        let status = match cached {
+            Some((at, prior, status)) if prior == stamp => {
+                if at.elapsed() >= Duration::from_secs(30) {
+                    spawn_probe(exe, &key, stamp, host, home.to_path_buf());
+                }
+                status
+            }
+            // 처음이거나 파일이 바뀌었다(로그인·로그아웃): 새 결과가 올 때까지 모름.
+            _ => {
+                lock(&STATES).insert(key.clone(), ConnectionStatus::Checking);
+                spawn_probe(exe, &key, stamp, host, home.to_path_buf());
+                None
+            }
+        };
+        if let Some(status) = status {
+            found.insert((provider, dir), status);
+        }
+    }
+    found
+}
+
+/// 같은 프로필은 한 번에 하나만 조회한다.
+static PROBING: Mutex<BTreeSet<CacheKey>> = Mutex::new(BTreeSet::new());
+
+fn spawn_probe(exe: PathBuf, key: &CacheKey, stamp: Stamp, host: bool, home: PathBuf) {
+    if !lock(&PROBING).insert(key.clone()) {
+        return;
+    }
+    let job = key.clone();
+    let spawned = std::thread::Builder::new()
+        .name("account-auth".into())
+        .spawn(move || {
+            let (provider, dir) = &job;
+            // 호스트 기본 계정은 env 없이 묻는다(Claude는 env가 있으면 다른 키체인 항목을 본다).
+            let status = std::panic::catch_unwind(|| {
+                if *provider == ProviderKind::Antigravity {
+                    return super::super::direct::antigravity_auth(dir, host);
+                }
+                let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
+                probe_with_environment(
+                    &exe,
+                    *provider,
+                    (!host).then_some(dir.as_path()),
+                    Some(&home),
+                    Some(path),
+                )
+            })
+            .ok()
+            .flatten();
+            lock(&STATES).insert(
+                job.clone(),
+                status.as_ref().map_or(ConnectionStatus::CheckFailed, |s| {
+                    if s.logged_in {
+                        ConnectionStatus::Connected
+                    } else {
+                        ConnectionStatus::NeedsLogin
+                    }
+                }),
+            );
+            let mut cache = lock(&CACHE);
+            cache.retain(|_, (at, _, _)| at.elapsed() < Duration::from_secs(60));
+            cache.insert(job.clone(), (Instant::now(), stamp, status));
+            drop(cache);
+            lock(&PROBING).remove(&job);
+        });
+    if let Err(error) = spawned {
+        lock(&STATES).insert(key.clone(), ConnectionStatus::CheckFailed);
+        tracing::warn!(%error, "account auth probe thread failed to start");
+        lock(&PROBING).remove(key);
+    }
+}
+
+#[cfg(not(test))]
+fn executable(provider: ProviderKind) -> Option<PathBuf> {
+    if cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
+        return None;
+    }
+    let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
+    krill_proto::agent::which(provider.as_str(), path)
+}
+
+// 단위 테스트에서는 실제 CLI/네트워크/사용자 자격증명을 조회하지 않는다.
+// fake CLI의 명령·환경·응답 검증은 krill_proto::account_login::tests에서 수행한다.
+#[cfg(test)]
+fn executable(_: ProviderKind) -> Option<PathBuf> {
+    FAKE_EXE.with(|exe| exe.borrow().clone())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// 테스트가 지정한 가짜 CLI(기본 없음 = 조회하지 않음).
+    static FAKE_EXE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_probe_is_check_failed_and_login_marker_invalidates_cache() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("owe719-cache-{}", std::process::id()));
+        let home = root.join("home");
+        let state = root.join("state");
+        let dir = home.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(statuses(&home, Some(&state)).is_empty());
+        assert_eq!(
+            connection(ProviderKind::Claude, &dir),
+            ConnectionStatus::NotInstalled
+        );
+        let exe = root.join("fake-cli");
+        let write = |script: &str| {
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        };
+        write("#!/bin/sh\necho 'authentication timed out' >&2\nexit 1\n");
+        FAKE_EXE.with(|e| *e.borrow_mut() = Some(exe.clone()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            statuses(&home, Some(&state));
+            if connection(ProviderKind::Claude, &dir) == ConnectionStatus::CheckFailed {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        write("#!/bin/sh\necho '{\"loggedIn\":true}'\n");
+        std::fs::write(dir.join(".krill-login-completed"), "new").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let found = statuses(&home, Some(&state));
+            if found
+                .get(&(ProviderKind::Claude, dir.clone()))
+                .is_some_and(|s| s.logged_in)
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            connection(ProviderKind::Claude, &dir),
+            ConnectionStatus::Connected
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// 느린 CLI가 실행·hook 경로를 막지 않고(캐시만 읽음), 호스트 기본 계정은 env 없이 조회한다.
+    #[test]
+    fn slow_cli_never_blocks_and_host_probe_drops_config_env() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("owe700-bg-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join(".claude")).unwrap();
+        let exe = root.join("claude");
+        std::fs::write(
+            &exe,
+            "#!/bin/sh\nsleep 1\n[ -z \"${CLAUDE_CONFIG_DIR+x}\" ] || { echo '{\"loggedIn\":false}'; exit 0; }\necho '{\"loggedIn\":true}'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+        FAKE_EXE.with(|e| *e.borrow_mut() = Some(exe));
+        let state = root.join("state");
+        let started = Instant::now();
+        assert!(statuses(&home, Some(&state)).is_empty(), "조회 중에는 모름");
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "CLI를 기다리면 안 된다"
+        );
+        let key = (ProviderKind::Claude, home.join(".claude"));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let found = loop {
+            let found = statuses(&home, Some(&state));
+            if found.contains_key(&key) || Instant::now() > deadline {
+                break found;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(found.get(&key).is_some_and(|s| s.logged_in), "{found:?}");
+        std::fs::remove_dir_all(root).ok();
+    }
+}
