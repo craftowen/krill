@@ -18,7 +18,7 @@ use krill_proto::daemon::{self, Paths};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg;
 
-const USAGE: &str = "usage: krill worktree new <name> [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--json]";
+const USAGE: &str = "usage: krill worktree new <name> [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--repo <path>] [--force]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--json]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedNew {
@@ -27,6 +27,16 @@ struct ParsedNew {
 }
 
 pub fn run(args: &[OsString]) -> ExitCode {
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
+        || args
+            .get(1)
+            .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help")))
+    {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     if args.first().is_some_and(|a| a == "rm") {
         return remove::run(&args[1..]);
     }
@@ -496,5 +506,24 @@ mod tests {
         assert_eq!(parsed.req.repo, canon_parent.as_os_str().as_bytes());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn worktree_help_exits_zero_and_lists_all_subcommands() {
+        for flag in ["-h", "--help", "help"] {
+            assert_eq!(run(&[OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
+        }
+        for sub in ["new", "rm", "cleanup", "space", "set", "symlink", "hooks"] {
+            assert_eq!(
+                run(&[OsString::from(sub), OsString::from("--help")]),
+                ExitCode::SUCCESS,
+                "{sub} --help"
+            );
+            assert!(
+                USAGE.contains(&format!("krill worktree {sub}")),
+                "missing {sub} in USAGE: {USAGE}"
+            );
+        }
+        assert_eq!(run(&[]), ExitCode::from(2));
     }
 }

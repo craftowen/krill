@@ -505,3 +505,60 @@ fn remote_new_rejects_relative_cwd_and_worktree() {
     );
     assert_eq!(r.remote_sessions(), 0);
 }
+
+#[test]
+fn remote_fork_with_prompt_delivers_to_remote_and_never_touches_local() {
+    let r = Remote::new("f");
+    fs::write(
+        r.daemon_dir.join("agents.toml"),
+        r#"
+[agent.fork_probe]
+name = "Fork probe"
+launch = ["/bin/sh", "-c", "stty -echo; printf 'fork-probe-ready\n> '; IFS= read -r line; printf 'fork-probe-got:%s\n' \"$line\"; exec sleep 60"]
+"#,
+    )
+    .unwrap();
+    let orig = r.ok(&[
+        "--host",
+        HOST,
+        "new",
+        "--cwd",
+        r.daemon_dir.to_str().unwrap(),
+        "--agent",
+        "fork_probe",
+    ]);
+    let orig = orig.trim();
+    r.wait_text(orig, "fork-probe-ready");
+
+    let forked_raw = r.ok(&[
+        "--host",
+        HOST,
+        "fork",
+        orig,
+        "--prompt",
+        "이어서 진행해",
+        "--json",
+    ]);
+    let parsed: serde_json::Value = serde_json::from_str(&forked_raw).unwrap();
+    let forked_id = parsed["session"].as_u64().unwrap().to_string();
+    assert_eq!(parsed["from"].as_u64().unwrap().to_string().as_str(), orig);
+    assert_ne!(forked_id.as_str(), orig);
+
+    // 로컬 데몬은 절대 기동되거나 참조되지 않아야 한다(OWE-747).
+    assert!(
+        !r.local_dir.join("run/krilld.sock").exists(),
+        "remote fork --prompt must not touch or start local daemon"
+    );
+
+    let forked_screen = r.wait_text(&forked_id, "fork-probe-got:이어서 진행해");
+    assert!(
+        forked_screen.contains("fork-probe-got:이어서 진행해"),
+        "{forked_screen}"
+    );
+    let orig_screen = r.ok(&["--host", HOST, "read", orig]);
+    assert!(
+        !orig_screen.contains("fork-probe-got:"),
+        "original session must not receive forked prompt: {orig_screen}"
+    );
+    assert_eq!(r.remote_sessions(), 2);
+}

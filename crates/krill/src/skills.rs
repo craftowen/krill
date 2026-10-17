@@ -267,10 +267,15 @@ fn dispatch_handoff(args: &[String]) -> io::Result<()> {
     );
 
     let delivered = target_session.map_or(Ok(()), |sid| {
+        let target = crate::remote::Target::establish(None).map_err(|e| e.to_string())?;
         if newly_spawned {
-            crate::session::wait_for_spawned_agent_ready(sid, crate::session::BOOT_TIMEOUT)?;
+            crate::session::wait_for_spawned_agent_ready(
+                &target,
+                sid,
+                crate::session::BOOT_TIMEOUT,
+            )?;
         }
-        crate::session::send_session_line(sid, &packet)
+        crate::session::send_session_line(&target, sid, &packet)
     });
 
     if json {

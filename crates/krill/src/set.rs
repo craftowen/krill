@@ -85,6 +85,13 @@ struct Args {
 }
 
 pub fn run(args: &[OsString]) -> ExitCode {
+    if args
+        .first()
+        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
+    {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let parsed = match parse(args) {
         Ok(parsed) => parsed,
         Err(e) => {

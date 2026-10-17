@@ -453,9 +453,10 @@ fn fork(target: &Target, args: &[OsString]) -> Result<()> {
     )?;
     let mut conn = connect(target, FEAT_CONTROL | FEAT_SESSION_FORK)?;
     let (session, pid) = fork_on_stream(conn.negotiated.features, &mut conn.stream, &parsed)?;
+    drop(conn);
     if let Some(prompt) = parsed.prompt.filter(|s| !s.is_empty()) {
-        wait_for_spawned_agent_ready(session.0, BOOT_TIMEOUT).map_err(fail)?;
-        send_session_line(session.0, &prompt).map_err(fail)?;
+        wait_for_spawned_agent_ready(target, session.0, BOOT_TIMEOUT).map_err(fail)?;
+        send_session_line(target, session.0, &prompt).map_err(fail)?;
     }
     if parsed.json {
         let out = serde_json::to_string_pretty(&serde_json::json!({
@@ -710,14 +711,12 @@ pub(crate) fn spawn_agent_session(
 /// 부팅 중 종료(실행 파일 없음 등)하거나 trust·권한 메뉴에 멈추면 오류다 — 그 위에 프롬프트를 치면 메뉴 입력이 된다.
 // ponytail: 시간 초과면 계속 진행한다(스피너만 도는 TUI도 입력은 받는다). 잃는 사례가 나오면 오류로 바꾼다.
 pub(crate) fn wait_for_spawned_agent_ready(
+    target: &Target,
     session_id: u64,
     timeout: Duration,
 ) -> std::result::Result<(), String> {
-    let Ok(target) = Target::establish(None) else {
-        return Ok(());
-    };
     let Ok(mut conn) = connect(
-        &target,
+        target,
         FEAT_CONTROL | FEAT_CLI | krill_proto::control::FEAT_WAIT_STATUS,
     ) else {
         std::thread::sleep(Duration::from_millis(1500));
@@ -772,22 +771,25 @@ fn boot_verdict(
     ready.then_some(Ok(()))
 }
 
-pub(crate) fn send_session_line(session_id: u64, line: &str) -> std::result::Result<(), String> {
-    let target = Target::establish(None).map_err(|e| e.to_string())?;
+pub(crate) fn send_session_line(
+    target: &Target,
+    session_id: u64,
+    line: &str,
+) -> std::result::Result<(), String> {
     if !line.is_empty() {
         let text_args = [
             OsString::from(session_id.to_string()),
             OsString::from("--"),
             OsString::from(line),
         ];
-        send(&target, &text_args).map_err(|e| e.text)?;
+        send(target, &text_args).map_err(|e| e.text)?;
         std::thread::sleep(Duration::from_millis(50));
     }
     let enter_args = [
         OsString::from(session_id.to_string()),
         OsString::from("--enter"),
     ];
-    send(&target, &enter_args).map_err(|e| e.text)
+    send(target, &enter_args).map_err(|e| e.text)
 }
 
 pub(crate) fn close_session(session_id: u64) -> std::result::Result<(), String> {
