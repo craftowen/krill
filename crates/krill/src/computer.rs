@@ -79,9 +79,9 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         "permissions" => cmd_permissions(rest),
         "list-apps" => cmd_list_apps(rest),
         "list-windows" => cmd_list_windows(rest),
-        "get-app-state" => cmd_get_app_state(rest),
+        "get-app-state" | "snapshot" => cmd_get_app_state(rest),
         "click" => cmd_click(rest),
-        "perform-secondary-action" => cmd_secondary_action(rest),
+        "perform-secondary-action" | "secondary-action" => cmd_secondary_action(rest),
         "scroll" => cmd_scroll(rest),
         "drag" => cmd_drag(rest),
         "type-text" => cmd_type_text(rest),
@@ -123,6 +123,27 @@ pub(super) fn take_val(args: &[String], idx: &mut usize, flag: &str) -> Result<S
 pub(super) fn parse_usize(val: &str, flag: &str) -> Result<usize, CliError> {
     val.parse::<usize>()
         .map_err(|_| CliError::Usage(format!("invalid integer for {flag}: {val}")))
+}
+
+pub(super) fn parse_element_ref(val: &str, flag: &str) -> Result<usize, CliError> {
+    let trimmed = val.trim();
+    let stripped = trimmed
+        .strip_prefix("@e")
+        .or_else(|| trimmed.strip_prefix("@E"))
+        .or_else(|| trimmed.strip_prefix('@'))
+        .or_else(|| trimmed.strip_prefix('#'))
+        .or_else(|| trimmed.strip_prefix('e'))
+        .or_else(|| trimmed.strip_prefix('E'))
+        .unwrap_or(trimmed);
+    let parsed = stripped
+        .parse::<usize>()
+        .map_err(|_| CliError::Usage(format!("invalid element reference for {flag}: {val}")))?;
+    if parsed == 0 {
+        return Err(CliError::Usage(format!(
+            "element reference for {flag} must be >= 1"
+        )));
+    }
+    Ok(parsed)
 }
 
 pub(super) fn parse_f64(val: &str, flag: &str) -> Result<f64, CliError> {
@@ -402,9 +423,19 @@ pub(super) fn ensure_current_snapshot(
     common: &CommonWindowOpts,
 ) -> Result<AppStateSnapshot, CliError> {
     let app_name = resolve_target_app_name(common)?;
+    let cached_win_id =
+        if common.app.is_none() && common.window_id.is_none() && common.window_index.is_none() {
+            load_cached_snapshot()
+                .ok()
+                .flatten()
+                .and_then(|s| s.window.map(|w| w.id))
+        } else {
+            None
+        };
+    let effective_window_id = common.window_id.as_deref().or(cached_win_id.as_deref());
     let snap = get_app_state(
         &app_name,
-        common.window_id.as_deref(),
+        effective_window_id,
         common.window_index,
         common.restore_window,
         common.no_screenshot,

@@ -4,16 +4,29 @@
 
 //! `krill computer` 포인터·키보드·클립보드·값 설정 액션 서브커맨드 구현(MK-187 / OWE-741).
 
+use std::io::Read as _;
+
+use krill_proto::input::MAX_INPUT;
+
 use super::engine::{
-    ActionResultPayload, ClipboardMetadata, Point, VerificationMetadata, index_and_render_tree,
-    load_mock_env, matches_app_selector, mutate_element_by_ref, mutate_focused_element,
-    normalize_key_name, normalize_modifier_name, parse_hotkey_chord, read_system_clipboard,
-    run_jxa, save_mock_env, write_system_clipboard,
+    ActionResultPayload, AppSummary, ClipboardMetadata, LiveAction, LiveActionOutcome, Point,
+    VerificationMetadata, WindowSummary, execute_live_action, index_and_render_tree, load_mock_env,
+    matches_app_selector, mutate_element_by_ref, mutate_focused_element, normalize_key_name,
+    normalize_modifier_name, parse_hotkey_chord, read_system_clipboard, save_mock_env,
+    write_system_clipboard,
 };
 use super::{
-    CliError, CommonWindowOpts, ensure_current_snapshot, parse_f64, parse_usize,
+    CliError, CommonWindowOpts, ensure_current_snapshot, parse_element_ref, parse_f64, parse_usize,
     print_action_result, take_val, try_parse_common_opt,
 };
+
+fn verification_from_outcome(outcome: &LiveActionOutcome) -> VerificationMetadata {
+    VerificationMetadata {
+        status: outcome.status.clone(),
+        reason: outcome.reason.clone(),
+        retried: false,
+    }
+}
 
 pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
     let mut common = CommonWindowOpts::default();
@@ -22,6 +35,7 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
     let mut y: Option<f64> = None;
     let mut button = "left".to_owned();
     let mut click_count = 1usize;
+    let mut modifiers: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         if try_parse_common_opt(args, &mut i, &mut common)? {
@@ -29,9 +43,9 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--element" | "--element-index" => {
+            "--element" | "--element-index" | "--ref" => {
                 let raw = take_val(args, &mut i, "--element")?;
-                element = Some(parse_usize(&raw, "--element")?);
+                element = Some(parse_element_ref(&raw, "--element")?);
             }
             "--x" => {
                 let raw = take_val(args, &mut i, "--x")?;
@@ -64,7 +78,12 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                 {
-                    normalize_modifier_name(part).map_err(CliError::Usage)?;
+                    let norm = normalize_modifier_name(part)
+                        .map_err(CliError::Usage)?
+                        .to_owned();
+                    if !modifiers.contains(&norm) {
+                        modifiers.push(norm);
+                    }
                 }
             }
             other => return Err(CliError::Usage(format!("unknown flag: {other}"))),
@@ -77,12 +96,8 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
         ));
     }
     let before = ensure_current_snapshot(&common)?;
-    let mut verification = VerificationMetadata {
-        status: "verified".to_owned(),
-        reason: None,
-        retried: false,
-    };
-    let target_point = if let Some(ref_id) = element {
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let (target_point, outcome, bounds_unverified) = if let Some(ref_id) = element {
         let Some(found) = before.elements.iter().find(|e| e.reference_id == ref_id) else {
             return Err(CliError::Runtime(format!(
                 "element #{ref_id} not found in snapshot"
@@ -91,45 +106,74 @@ pub(super) fn cmd_click(args: &[String]) -> Result<(), CliError> {
         if !found.enabled {
             return Err(CliError::Runtime(format!("element #{ref_id} is disabled")));
         }
-        apply_mock_or_live_element_mutation(
-            &before.app.name,
+        let pt = found.bounds.map(super::model::Rect::center);
+        let out = apply_mock_or_live_element_mutation(
+            selector,
+            Some(&before.app),
+            before.window.as_ref(),
             ref_id,
             None,
             None,
             true,
             &format!("click:{button}:{click_count}:#{ref_id}"),
+            &LiveAction::Click {
+                target_ref: Some(ref_id),
+                point: pt,
+                button: button.clone(),
+                click_count,
+                modifiers: modifiers.clone(),
+            },
         )?;
-        found.bounds.map(super::model::Rect::center)
+        (pt, out, false)
     } else {
         let pt = Point {
             x: x.unwrap_or(0.0),
             y: y.unwrap_or(0.0),
         };
-        if let Some(w) = &before.window
-            && !w.bounds.contains(pt)
-        {
-            verification = VerificationMetadata {
-                status: "unverified".to_owned(),
-                reason: Some("target coordinates are outside window bounds".to_owned()),
-                retried: true,
-            };
-        }
-        record_mock_or_live_action(
-            &before.app.name,
+        let out_of_bounds = before
+            .window
+            .as_ref()
+            .is_some_and(|w| !w.bounds.contains(pt));
+        let out = record_mock_or_live_action(
+            selector,
+            Some(&before.app),
+            before.window.as_ref(),
             &format!("click:{button}:{click_count}:{:.1},{:.1}", pt.x, pt.y),
+            &LiveAction::Click {
+                target_ref: None,
+                point: Some(pt),
+                button: button.clone(),
+                click_count,
+                modifiers: modifiers.clone(),
+            },
         )?;
-        Some(pt)
+        (Some(pt), out, out_of_bounds)
+    };
+    let verification = if !outcome.ok || outcome.status != "verified" {
+        verification_from_outcome(&outcome)
+    } else if bounds_unverified {
+        VerificationMetadata {
+            status: "unverified".to_owned(),
+            reason: Some("target coordinates are outside window bounds".to_owned()),
+            retried: true,
+        }
+    } else {
+        verification_from_outcome(&outcome)
     };
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!("button={button} count={click_count}")];
+    if let Some(note) = outcome.note {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "click".to_owned(),
-        ok: true,
+        ok: outcome.ok,
         verification,
         target_reference_id: element,
         target_point,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!("button={button} count={click_count}")],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -145,9 +189,9 @@ pub(super) fn cmd_secondary_action(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--element" | "--element-index" => {
+            "--element" | "--element-index" | "--ref" => {
                 let raw = take_val(args, &mut i, "--element")?;
-                element = Some(parse_usize(&raw, "--element")?);
+                element = Some(parse_element_ref(&raw, "--element")?);
             }
             "--action" => action_name = take_val(args, &mut i, "--action")?,
             other => return Err(CliError::Usage(format!("unknown flag: {other}"))),
@@ -165,28 +209,37 @@ pub(super) fn cmd_secondary_action(args: &[String]) -> Result<(), CliError> {
     if !found.enabled {
         return Err(CliError::Runtime(format!("element #{ref_id} is disabled")));
     }
-    apply_mock_or_live_element_mutation(
-        &before.app.name,
+    let pt = found.bounds.map(super::model::Rect::center);
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let outcome = apply_mock_or_live_element_mutation(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
         ref_id,
         None,
         None,
         true,
         &format!("secondary:{action_name}:#{ref_id}"),
+        &LiveAction::SecondaryAction {
+            target_ref: ref_id,
+            point: pt,
+            action_name: action_name.clone(),
+        },
     )?;
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!("axAction={action_name}")];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "performSecondaryAction".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: Some(ref_id),
-        target_point: found.bounds.map(super::model::Rect::center),
+        target_point: pt,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!("axAction={action_name}")],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -207,9 +260,9 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--element" | "--element-index" => {
+            "--element" | "--element-index" | "--ref" => {
                 let raw = take_val(args, &mut i, "--element")?;
-                element = Some(parse_usize(&raw, "--element")?);
+                element = Some(parse_element_ref(&raw, "--element")?);
             }
             "--x" => {
                 let raw = take_val(args, &mut i, "--x")?;
@@ -219,11 +272,11 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
                 let raw = take_val(args, &mut i, "--y")?;
                 y = Some(parse_f64(&raw, "--y")?);
             }
-            "--delta-x" => {
+            "--delta-x" | "--dx" => {
                 let raw = take_val(args, &mut i, "--delta-x")?;
                 delta_x = parse_f64(&raw, "--delta-x")?;
             }
-            "--delta-y" => {
+            "--delta-y" | "--dy" => {
                 let raw = take_val(args, &mut i, "--delta-y")?;
                 delta_y = parse_f64(&raw, "--delta-y")?;
             }
@@ -270,24 +323,32 @@ pub(super) fn cmd_scroll(args: &[String]) -> Result<(), CliError> {
     } else {
         before.window.as_ref().map(|w| w.bounds.center())
     };
-    record_mock_or_live_action(
-        &before.app.name,
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let outcome = record_mock_or_live_action(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
         &format!("scroll:{delta_x:.1},{delta_y:.1}"),
+        &LiveAction::Scroll {
+            point: target_point,
+            delta_x,
+            delta_y,
+        },
     )?;
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!("delta=({delta_x:.1}, {delta_y:.1})")];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "scroll".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: element,
         target_point,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!("delta=({delta_x:.1}, {delta_y:.1})")],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -307,13 +368,13 @@ pub(super) fn cmd_drag(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--from-element" | "--from-element-index" => {
+            "--from-element" | "--from-element-index" | "--from-ref" => {
                 let raw = take_val(args, &mut i, "--from-element")?;
-                from_element = Some(parse_usize(&raw, "--from-element")?);
+                from_element = Some(parse_element_ref(&raw, "--from-element")?);
             }
-            "--to-element" | "--to-element-index" => {
+            "--to-element" | "--to-element-index" | "--to-ref" => {
                 let raw = take_val(args, &mut i, "--to-element")?;
-                to_element = Some(parse_usize(&raw, "--to-element")?);
+                to_element = Some(parse_element_ref(&raw, "--to-element")?);
             }
             "--from-x" => {
                 let raw = take_val(args, &mut i, "--from-x")?;
@@ -376,30 +437,37 @@ pub(super) fn cmd_drag(args: &[String]) -> Result<(), CliError> {
             y: to_y.unwrap_or(0.0),
         }
     };
-    record_mock_or_live_action(
-        &before.app.name,
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let outcome = record_mock_or_live_action(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
         &format!(
             "drag:{:.1},{:.1}->{:.1},{:.1}",
             start_pt.x, start_pt.y, end_pt.x, end_pt.y
         ),
+        &LiveAction::Drag {
+            from: start_pt,
+            to: end_pt,
+        },
     )?;
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!(
+        "from=({:.1},{:.1}) to=({:.1},{:.1})",
+        start_pt.x, start_pt.y, end_pt.x, end_pt.y
+    )];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "drag".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: to_element.or(from_element),
         target_point: Some(end_pt),
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!(
-            "from=({:.1},{:.1}) to=({:.1},{:.1})",
-            start_pt.x, start_pt.y, end_pt.x, end_pt.y
-        )],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -416,9 +484,9 @@ pub(super) fn cmd_type_text(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--element" | "--element-index" => {
+            "--element" | "--element-index" | "--ref" => {
                 let raw = take_val(args, &mut i, "--element")?;
-                element = Some(parse_usize(&raw, "--element")?);
+                element = Some(parse_element_ref(&raw, "--element")?);
             }
             "--text" => text = Some(take_val(args, &mut i, "--text")?),
             "--text-stdin" => text_stdin = true,
@@ -429,32 +497,54 @@ pub(super) fn cmd_type_text(args: &[String]) -> Result<(), CliError> {
     let text = resolve_text_or_stdin(text, text_stdin, "type-text", "--text", "--text-stdin")?;
     let before = ensure_current_snapshot(&common)?;
     let target_ref = element.or(before.focused_element_id);
-    if let Some(ref_id) = target_ref {
+    let focus_point = target_ref.and_then(|ref_id| {
+        before
+            .elements
+            .iter()
+            .find(|e| e.reference_id == ref_id)
+            .and_then(|e| e.bounds.map(super::model::Rect::center))
+    });
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let live_action = LiveAction::TypeText {
+        target_ref: element,
+        focus_point,
+        text: text.clone(),
+    };
+    let outcome = if let Some(ref_id) = target_ref {
         apply_mock_or_live_element_mutation(
-            &before.app.name,
+            selector,
+            Some(&before.app),
+            before.window.as_ref(),
             ref_id,
             None,
             Some(&text),
             true,
             &format!("type-text:{text}"),
-        )?;
+            &live_action,
+        )?
     } else {
-        record_mock_or_live_action(&before.app.name, &format!("type-text:{text}"))?;
-    }
+        record_mock_or_live_action(
+            selector,
+            Some(&before.app),
+            before.window.as_ref(),
+            &format!("type-text:{text}"),
+            &live_action,
+        )?
+    };
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!("typed {} chars", text.chars().count())];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "typeText".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: target_ref,
         target_point: None,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!("typed {} chars", text.chars().count())],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -474,7 +564,11 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
             "--key" => key = Some(take_val(args, &mut i, "--key")?),
             "--modifiers" => {
                 let raw = take_val(args, &mut i, "--modifiers")?;
-                for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                for part in raw
+                    .split([',', '+'])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                {
                     let norm = normalize_modifier_name(part)
                         .map_err(CliError::Usage)?
                         .to_owned();
@@ -497,29 +591,37 @@ pub(super) fn cmd_press_key(args: &[String]) -> Result<(), CliError> {
     let raw_key = key.ok_or_else(|| CliError::Usage("press-key requires --key <name>".into()))?;
     let norm_key = normalize_key_name(&raw_key).map_err(CliError::Usage)?;
     let before = ensure_current_snapshot(&common)?;
-    record_mock_or_live_action(
-        &before.app.name,
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let outcome = record_mock_or_live_action(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
         &format!(
             "press-key:{norm_key}:mods={}:repeat={repeat}",
             modifiers.join("+")
         ),
+        &LiveAction::PressKey {
+            key: norm_key.clone(),
+            modifiers: modifiers.clone(),
+            repeat,
+        },
     )?;
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!(
+        "key={norm_key} modifiers={modifiers:?} repeat={repeat}"
+    )];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "pressKey".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: after.focused_element_id,
         target_point: None,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!(
-            "key={norm_key} modifiers={modifiers:?} repeat={repeat}"
-        )],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -542,24 +644,31 @@ pub(super) fn cmd_hotkey(args: &[String]) -> Result<(), CliError> {
     let raw_chord = keys.ok_or_else(|| CliError::Usage("hotkey requires --keys <chord>".into()))?;
     let (mods, key) = parse_hotkey_chord(&raw_chord).map_err(CliError::Usage)?;
     let before = ensure_current_snapshot(&common)?;
-    record_mock_or_live_action(
-        &before.app.name,
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let outcome = record_mock_or_live_action(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
         &format!("hotkey:{}+{}", mods.join("+"), key),
+        &LiveAction::Hotkey {
+            modifiers: mods.clone(),
+            key: key.clone(),
+        },
     )?;
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!("chord={}+{}", mods.join("+"), key)];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "hotkey".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: after.focused_element_id,
         target_point: None,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!("chord={}+{}", mods.join("+"), key)],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -576,9 +685,9 @@ pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--element" | "--element-index" => {
+            "--element" | "--element-index" | "--ref" => {
                 let raw = take_val(args, &mut i, "--element")?;
-                element = Some(parse_usize(&raw, "--element")?);
+                element = Some(parse_element_ref(&raw, "--element")?);
             }
             "--text" => text = Some(take_val(args, &mut i, "--text")?),
             "--text-stdin" => text_stdin = true,
@@ -589,18 +698,35 @@ pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
     let text = resolve_text_or_stdin(text, text_stdin, "paste-text", "--text", "--text-stdin")?;
     let before = ensure_current_snapshot(&common)?;
     let target_ref = element.or(before.focused_element_id);
-    let previous_clipboard =
-        execute_paste_with_clipboard_preservation(&before.app.name, target_ref, &text)
-            .map_err(CliError::Runtime)?;
+    let focus_point = target_ref.and_then(|ref_id| {
+        before
+            .elements
+            .iter()
+            .find(|e| e.reference_id == ref_id)
+            .and_then(|e| e.bounds.map(super::model::Rect::center))
+    });
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let (previous_clipboard, outcome) = execute_paste_with_clipboard_preservation(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
+        target_ref,
+        focus_point,
+        &text,
+    )
+    .map_err(CliError::Runtime)?;
     let after = ensure_current_snapshot(&common)?;
+    let mut notes = vec![format!(
+        "pasted {} chars with clipboard restoration",
+        text.chars().count()
+    )];
+    if let Some(note) = outcome.note.clone() {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "pasteText".to_owned(),
-        ok: true,
-        verification: VerificationMetadata {
-            status: "verified".to_owned(),
-            reason: None,
-            retried: false,
-        },
+        ok: outcome.ok,
+        verification: verification_from_outcome(&outcome),
         target_reference_id: target_ref,
         target_point: None,
         app_state: Some(after),
@@ -609,10 +735,7 @@ pub(super) fn cmd_paste_text(args: &[String]) -> Result<(), CliError> {
             restored: true,
             previous_text: Some(previous_clipboard),
         }),
-        notes: vec![format!(
-            "pasted {} chars with clipboard restoration",
-            text.chars().count()
-        )],
+        notes,
     };
     print_action_result(&res, common.json)
 }
@@ -629,9 +752,9 @@ pub(super) fn cmd_set_value(args: &[String]) -> Result<(), CliError> {
             continue;
         }
         match args[i].as_str() {
-            "--element" | "--element-index" => {
+            "--element" | "--element-index" | "--ref" => {
                 let raw = take_val(args, &mut i, "--element")?;
-                element = Some(parse_usize(&raw, "--element")?);
+                element = Some(parse_element_ref(&raw, "--element")?);
             }
             "--value" => value = Some(take_val(args, &mut i, "--value")?),
             "--value-stdin" => value_stdin = true,
@@ -643,21 +766,41 @@ pub(super) fn cmd_set_value(args: &[String]) -> Result<(), CliError> {
         element.ok_or_else(|| CliError::Usage("set-value requires --element <n>".into()))?;
     let value = resolve_text_or_stdin(value, value_stdin, "set-value", "--value", "--value-stdin")?;
     let before = ensure_current_snapshot(&common)?;
-    apply_mock_or_live_element_mutation(
-        &before.app.name,
+    let Some(found) = before.elements.iter().find(|e| e.reference_id == ref_id) else {
+        return Err(CliError::Runtime(format!(
+            "element #{ref_id} not found in snapshot"
+        )));
+    };
+    if !found.enabled {
+        return Err(CliError::Runtime(format!("element #{ref_id} is disabled")));
+    }
+    let focus_point = found.bounds.map(super::model::Rect::center);
+    let selector = common.app.as_deref().unwrap_or(&before.app.name);
+    let outcome = apply_mock_or_live_element_mutation(
+        selector,
+        Some(&before.app),
+        before.window.as_ref(),
         ref_id,
         Some(&value),
         None,
         true,
         &format!("set-value:#{ref_id}={value}"),
+        &LiveAction::SetValue {
+            target_ref: ref_id,
+            focus_point,
+            value: value.clone(),
+        },
     )?;
     let after = ensure_current_snapshot(&common)?;
-    let verified = after
-        .elements
-        .iter()
-        .find(|e| e.reference_id == ref_id)
-        .is_some_and(|e| e.value.as_deref() == Some(value.as_str()));
-    let verification = if verified {
+    let verified = outcome.ok
+        && after
+            .elements
+            .iter()
+            .find(|e| e.reference_id == ref_id)
+            .is_some_and(|e| e.value.as_deref() == Some(value.as_str()));
+    let verification = if !outcome.ok || outcome.status != "verified" {
+        verification_from_outcome(&outcome)
+    } else if verified {
         VerificationMetadata {
             status: "verified".to_owned(),
             reason: None,
@@ -670,27 +813,38 @@ pub(super) fn cmd_set_value(args: &[String]) -> Result<(), CliError> {
             retried: true,
         }
     };
+    let mut notes = vec![format!("set value on #{ref_id}")];
+    if let Some(note) = outcome.note {
+        notes.push(note);
+    }
     let res = ActionResultPayload {
         action: "setValue".to_owned(),
-        ok: true,
+        ok: outcome.ok,
         verification,
         target_reference_id: Some(ref_id),
         target_point: None,
         app_state: Some(after),
         clipboard: None,
-        notes: vec![format!("set value on #{ref_id}")],
+        notes,
     };
     print_action_result(&res, common.json)
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "internal helper unifies mock tree mutation and live OS action dispatch"
+)]
 fn apply_mock_or_live_element_mutation(
     app_selector: &str,
+    resolved_app: Option<&AppSummary>,
+    selected_window: Option<&WindowSummary>,
     target_ref: usize,
     new_value: Option<&str>,
     append_text: Option<&str>,
     focus: bool,
     action_record: &str,
-) -> Result<(), CliError> {
+    live_action: &LiveAction,
+) -> Result<LiveActionOutcome, CliError> {
     if let Some(mut mock) = load_mock_env().map_err(CliError::Runtime)? {
         mock.last_action = Some(action_record.to_owned());
         let Some(app) = mock
@@ -702,7 +856,17 @@ fn apply_mock_or_live_element_mutation(
                 "application not found: {app_selector}"
             )));
         };
-        if let Some(win) = app.windows.first_mut() {
+        let win_opt = if let Some(target_win) = selected_window {
+            let idx = target_win.index.saturating_sub(1);
+            if let Some(pos) = app.windows.iter().position(|w| w.id == target_win.id) {
+                app.windows.get_mut(pos)
+            } else {
+                app.windows.get_mut(idx)
+            }
+        } else {
+            app.windows.first_mut()
+        };
+        if let Some(win) = win_opt {
             let _ = index_and_render_tree(&mut win.root);
             let Some((_, enabled)) =
                 mutate_element_by_ref(&mut win.root, target_ref, new_value, append_text, focus)
@@ -718,35 +882,46 @@ fn apply_mock_or_live_element_mutation(
             }
         }
         save_mock_env(&mock).map_err(CliError::Runtime)?;
-        return Ok(());
+        return Ok(LiveActionOutcome {
+            ok: true,
+            status: "verified".to_owned(),
+            reason: None,
+            note: None,
+        });
     }
-    record_mock_or_live_action(app_selector, action_record)
+    execute_live_action(app_selector, resolved_app, selected_window, live_action)
+        .map_err(CliError::Runtime)
 }
 
-fn record_mock_or_live_action(app_selector: &str, action_record: &str) -> Result<(), CliError> {
+fn record_mock_or_live_action(
+    app_selector: &str,
+    resolved_app: Option<&AppSummary>,
+    selected_window: Option<&WindowSummary>,
+    action_record: &str,
+    live_action: &LiveAction,
+) -> Result<LiveActionOutcome, CliError> {
     if let Some(mut mock) = load_mock_env().map_err(CliError::Runtime)? {
         mock.last_action = Some(action_record.to_owned());
         save_mock_env(&mock).map_err(CliError::Runtime)?;
-        return Ok(());
+        return Ok(LiveActionOutcome {
+            ok: true,
+            status: "verified".to_owned(),
+            reason: None,
+            note: None,
+        });
     }
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
-        return Ok(());
-    }
-    let script = r#"
-const targetName = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[4]);
-const app = Application(targetName);
-app.activate();
-"ok";
-"#;
-    run_jxa(script, &[app_selector]).map_err(CliError::Runtime)?;
-    Ok(())
+    execute_live_action(app_selector, resolved_app, selected_window, live_action)
+        .map_err(CliError::Runtime)
 }
 
 fn execute_paste_with_clipboard_preservation(
     app_selector: &str,
+    resolved_app: Option<&AppSummary>,
+    selected_window: Option<&WindowSummary>,
     target_ref: Option<usize>,
+    focus_point: Option<Point>,
     text: &str,
-) -> Result<String, String> {
+) -> Result<(String, LiveActionOutcome), String> {
     if let Some(mut mock) = load_mock_env()? {
         let prev = mock.clipboard.clone();
         text.clone_into(&mut mock.clipboard);
@@ -754,40 +929,90 @@ fn execute_paste_with_clipboard_preservation(
             .apps
             .iter_mut()
             .find(|a| matches_app_selector(&a.summary(), app_selector))
-            && let Some(win) = app.windows.first_mut()
         {
-            let _ = index_and_render_tree(&mut win.root);
-            if let Some(ref_id) = target_ref {
-                let _ = mutate_element_by_ref(&mut win.root, ref_id, None, Some(text), true);
+            let win_opt = if let Some(target_win) = selected_window {
+                let idx = target_win.index.saturating_sub(1);
+                if let Some(pos) = app.windows.iter().position(|w| w.id == target_win.id) {
+                    app.windows.get_mut(pos)
+                } else {
+                    app.windows.get_mut(idx)
+                }
             } else {
-                let _ = mutate_focused_element(&mut win.root, None, Some(text));
+                app.windows.first_mut()
+            };
+            if let Some(win) = win_opt {
+                let _ = index_and_render_tree(&mut win.root);
+                if let Some(ref_id) = target_ref {
+                    let _ = mutate_element_by_ref(&mut win.root, ref_id, None, Some(text), true);
+                } else {
+                    let _ = mutate_focused_element(&mut win.root, None, Some(text));
+                }
             }
         }
         mock.clipboard.clone_from(&prev);
         mock.clipboard_restore_count = mock.clipboard_restore_count.saturating_add(1);
         mock.last_action = Some(format!("paste-text:{text}"));
         save_mock_env(&mock)?;
-        return Ok(prev);
+        return Ok((
+            prev,
+            LiveActionOutcome {
+                ok: true,
+                status: "verified".to_owned(),
+                reason: None,
+                note: None,
+            },
+        ));
     }
-    if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
-        return Ok(String::new());
+    if std::env::var_os("KRILL_TEST_OFFLINE").is_some()
+        && std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN").is_none()
+    {
+        return Ok((
+            String::new(),
+            LiveActionOutcome {
+                ok: false,
+                status: "unverified".to_owned(),
+                reason: Some(
+                    "live paste skipped because KRILL_TEST_OFFLINE is set without mock environment"
+                        .to_owned(),
+                ),
+                note: None,
+            },
+        ));
     }
     let prev = read_system_clipboard()?;
     write_system_clipboard(text)?;
-    let paste_res = run_jxa(
-        r#"
-const targetName = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[4]);
-Application(targetName).activate();
-const se = Application("System Events");
-se.keystroke("v", { using: "command down" });
-"ok";
-"#,
-        &[app_selector],
+    let paste_res = execute_live_action(
+        app_selector,
+        resolved_app,
+        selected_window,
+        &LiveAction::PasteText {
+            target_ref,
+            focus_point,
+        },
     );
     let restore_res = write_system_clipboard(&prev);
-    paste_res?;
+    let outcome = paste_res?;
     restore_res?;
-    Ok(prev)
+    Ok((prev, outcome))
+}
+
+pub(super) fn read_bounded_text(
+    reader: impl std::io::Read,
+    subcommand: &str,
+) -> Result<String, CliError> {
+    let limit = u64::try_from(MAX_INPUT + 1).unwrap_or(u64::MAX);
+    let mut buf = Vec::new();
+    reader
+        .take(limit)
+        .read_to_end(&mut buf)
+        .map_err(|e| CliError::Runtime(format!("read stdin: {e}")))?;
+    if buf.len() > MAX_INPUT {
+        return Err(CliError::Runtime(format!(
+            "{subcommand} input exceeds maximum length of {MAX_INPUT} bytes"
+        )));
+    }
+    String::from_utf8(buf)
+        .map_err(|e| CliError::Runtime(format!("{subcommand} stdin must be valid UTF-8: {e}")))
 }
 
 fn resolve_text_or_stdin(
@@ -803,11 +1028,15 @@ fn resolve_text_or_stdin(
         )));
     }
     if let Some(text) = inline {
+        if text.len() > MAX_INPUT {
+            return Err(CliError::Runtime(format!(
+                "{subcommand} input exceeds maximum length of {MAX_INPUT} bytes"
+            )));
+        }
         return Ok(text);
     }
     if from_stdin {
-        return std::io::read_to_string(std::io::stdin())
-            .map_err(|e| CliError::Runtime(format!("read stdin: {e}")));
+        return read_bounded_text(std::io::stdin(), subcommand);
     }
     Err(CliError::Usage(format!(
         "{subcommand} requires {inline_flag} <string> or {stdin_flag}"

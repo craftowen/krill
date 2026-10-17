@@ -382,6 +382,63 @@ pub fn parse_hotkey_chord(raw: &str) -> Result<(Vec<String>, String), String> {
     Ok((modifiers, key))
 }
 
+pub fn key_to_macos_keycode(normalized_key: &str) -> Option<u16> {
+    match normalized_key {
+        "return" => Some(36),
+        "tab" => Some(48),
+        "space" => Some(49),
+        "delete" => Some(51),
+        "forwarddelete" => Some(117),
+        "escape" => Some(53),
+        "up" => Some(126),
+        "down" => Some(125),
+        "left" => Some(123),
+        "right" => Some(124),
+        "home" => Some(115),
+        "end" => Some(119),
+        "pageup" => Some(116),
+        "pagedown" => Some(121),
+        "f1" => Some(122),
+        "f2" => Some(120),
+        "f3" => Some(99),
+        "f4" => Some(118),
+        "f5" => Some(96),
+        "f6" => Some(97),
+        "f7" => Some(98),
+        "f8" => Some(100),
+        "f9" => Some(101),
+        "f10" => Some(109),
+        "f11" => Some(103),
+        "f12" => Some(111),
+        _ => None,
+    }
+}
+
+pub fn modifier_to_system_events_using(normalized_mod: &str) -> Option<&'static str> {
+    match normalized_mod {
+        "command" => Some("command down"),
+        "control" => Some("control down"),
+        "option" => Some("option down"),
+        "shift" => Some("shift down"),
+        _ => None,
+    }
+}
+
+pub fn modifiers_to_cg_flags(modifiers: &[String]) -> u64 {
+    let mut flags = 0u64;
+    for m in modifiers {
+        match m.as_str() {
+            "command" => flags |= 0x0010_0000,
+            "shift" => flags |= 0x0002_0000,
+            "option" => flags |= 0x0008_0000,
+            "control" => flags |= 0x0004_0000,
+            "fn" => flags |= 0x0080_0000,
+            _ => {}
+        }
+    }
+    flags
+}
+
 fn is_interactive_node(node: &ElementNode) -> bool {
     if !node.actions.is_empty() {
         return true;
