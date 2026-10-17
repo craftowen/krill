@@ -1,54 +1,22 @@
 //! `krill set --comment <text> [--worktree <path>]`(MK-093): 워크트리 코멘트를 상태 디렉터리에 저장한다.
 //! 사이드바(`krill-app::sidebar`)가 같은 파일을 읽어 워크트리 행에 표시한다. 빈 문자열은 코멘트를 지운다.
 
-use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use krill_proto::daemon;
-use serde::{Deserialize, Serialize};
+use krill_proto::orchestration::WorktreeStore;
 
-pub const COMMENTS_FILE: &str = "worktree-comments.toml";
-const LOCK_FILE: &str = "worktree-comments.lock";
-const MAX_FILE_BYTES: u64 = 256 * 1024;
+#[cfg(test)]
+pub const COMMENTS_FILE: &str = krill_proto::orchestration::COMMENTS_FILE;
 const MAX_COMMENTS: usize = 1_024;
 const MAX_COMMENT_CHARS: usize = 256;
 
 const USAGE: &str = "usage: krill set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Store {
-    #[serde(default)]
-    comments: BTreeMap<String, String>,
-    /// 코멘트별 마지막 기록 시각(UNIX 초). 상한 도달 시 사전순이 아닌 가장 오래된 항목을
-    /// 지우기 위한 기록이며, 구 파일에는 없어 0으로 읽혀 가장 먼저 지워진다.
-    #[serde(default)]
-    updated_at: BTreeMap<String, u64>,
-    #[serde(default)]
-    statuses: BTreeMap<String, String>,
-    #[serde(default)]
-    unread: BTreeMap<String, bool>,
-    #[serde(default)]
-    prs: BTreeMap<String, u64>,
-    #[serde(default)]
-    issues: BTreeMap<String, String>,
-    #[serde(default)]
-    references: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    symlinks: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    setup_scripts: BTreeMap<String, String>,
-    #[serde(default)]
-    archive_scripts: BTreeMap<String, String>,
-    #[serde(default)]
-    setup_prompt_dismissed: BTreeMap<String, bool>,
-    #[serde(default)]
-    parents: BTreeMap<String, String>,
-}
+type Store = WorktreeStore;
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -135,9 +103,7 @@ fn parse_parent_arg(val: &str) -> String {
     if matches!(trimmed, "" | "none" | "clear") {
         String::new()
     } else {
-        resolve_worktree(Path::new(trimmed))
-            .to_string_lossy()
-            .into_owned()
+        krill_proto::orchestration::worktree_key(Path::new(trimmed))
     }
 }
 
@@ -298,119 +264,83 @@ pub fn save_comment(state_dir: &Path, worktree: &Path, comment: &str) -> io::Res
 }
 
 fn apply_checkpoint(state_dir: &Path, worktree: &Path, args: &Args) -> io::Result<()> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state_dir)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(state_dir.join(LOCK_FILE))?;
-    lock.lock()?;
-    let file = state_dir.join(COMMENTS_FILE);
-    let mut store = load_store(&file)?;
-    let key = worktree.to_string_lossy().into_owned();
+    let key = krill_proto::orchestration::worktree_key(worktree);
     let now = now_secs();
-
-    if args.has_comment {
-        let clean = sanitize(&args.comment);
-        if clean.is_empty() {
-            store.comments.remove(&key);
-            store.updated_at.remove(&key);
-        } else {
-            if store.comments.len() >= MAX_COMMENTS
-                && !store.comments.contains_key(&key)
-                && let Some(oldest) = oldest_key(&store)
-            {
-                store.comments.remove(&oldest);
-                store.updated_at.remove(&oldest);
+    let cp = WorktreeStore::mutate(state_dir, |store| {
+        if args.has_comment {
+            let clean = sanitize(&args.comment);
+            if clean.is_empty() {
+                store.comments.remove(&key);
+                store.updated_at.remove(&key);
+            } else {
+                if store.comments.len() >= MAX_COMMENTS
+                    && !store.comments.contains_key(&key)
+                    && let Some(oldest) = oldest_key(store)
+                {
+                    store.comments.remove(&oldest);
+                    store.updated_at.remove(&oldest);
+                }
+                store.comments.insert(key.clone(), clean);
+                store.updated_at.insert(key.clone(), now);
             }
-            store.comments.insert(key.clone(), clean);
-            store.updated_at.insert(key.clone(), now);
         }
-    }
-    if let Some(ref status) = args.workspace_status {
-        if status.is_empty() {
-            store.statuses.remove(&key);
-        } else {
-            store.statuses.insert(key.clone(), status.clone());
-            store.updated_at.insert(key.clone(), now);
-        }
-    }
-    if let Some(unread) = args.unread {
-        if unread {
-            store.unread.insert(key.clone(), true);
-        } else {
-            store.unread.remove(&key);
-        }
-        store.updated_at.insert(key.clone(), now);
-    }
-    if let Some(pr) = args.pr {
-        if pr == 0 {
-            store.prs.remove(&key);
-        } else {
-            store.prs.insert(key.clone(), pr);
-        }
-        store.updated_at.insert(key.clone(), now);
-    }
-    if let Some(ref issue) = args.issue {
-        if issue.is_empty() {
-            store.issues.remove(&key);
-        } else {
-            store.issues.insert(key.clone(), issue.clone());
-        }
-        store.updated_at.insert(key.clone(), now);
-    }
-    if let Some(ref r) = args.reference
-        && !r.is_empty()
-    {
-        let list = store.references.entry(key.clone()).or_default();
-        if !list.iter().any(|u| u == r) {
-            list.push(r.clone());
-        }
-        store.updated_at.insert(key.clone(), now);
-    }
-    if let Some(ref parent) = args.parent {
-        if parent.is_empty() {
-            store.parents.remove(&key);
-            store.updated_at.insert(key.clone(), now);
-        } else {
-            if !can_assign_parent(&store.parents, &key, parent) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "cannot assign worktree as its own parent or create a lineage cycle",
-                ));
+        if let Some(ref status) = args.workspace_status {
+            if status.is_empty() {
+                store.statuses.remove(&key);
+            } else {
+                store.statuses.insert(key.clone(), status.clone());
+                store.updated_at.insert(key.clone(), now);
             }
-            store.parents.insert(key.clone(), parent.clone());
+        }
+        if let Some(unread) = args.unread {
+            if unread {
+                store.unread.insert(key.clone(), true);
+            } else {
+                store.unread.remove(&key);
+            }
             store.updated_at.insert(key.clone(), now);
         }
-    }
-
-    let body = krill_proto::config_document::save_toml(&file, &store)?;
-    let tmp = file.with_extension("toml.tmp");
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    out.write_all(body.as_bytes())?;
-    drop(out);
-    fs::rename(tmp, file)?;
+        if let Some(pr) = args.pr {
+            if pr == 0 {
+                store.prs.remove(&key);
+            } else {
+                store.prs.insert(key.clone(), pr);
+            }
+            store.updated_at.insert(key.clone(), now);
+        }
+        if let Some(ref issue) = args.issue {
+            if issue.is_empty() {
+                store.issues.remove(&key);
+            } else {
+                store.issues.insert(key.clone(), issue.clone());
+            }
+            store.updated_at.insert(key.clone(), now);
+        }
+        if let Some(ref r) = args.reference
+            && !r.is_empty()
+        {
+            let list = store.references.entry(key.clone()).or_default();
+            if !list.iter().any(|u| u == r) {
+                list.push(r.clone());
+            }
+            store.updated_at.insert(key.clone(), now);
+        }
+        if let Some(ref parent) = args.parent {
+            store.set_parent(&key, Some(parent.as_str()).filter(|p| !p.is_empty()))?;
+        }
+        Ok(store.checkpoint(&key))
+    })?;
 
     if args.json {
         let payload = serde_json::json!({
             "worktree": key,
-            "comment": store.comments.get(&key),
-            "workspace_status": store.statuses.get(&key),
-            "unread": store.unread.get(&key).copied().unwrap_or(false),
-            "pr": store.prs.get(&key),
-            "issue": store.issues.get(&key),
-            "references": store.references.get(&key).cloned().unwrap_or_default(),
-            "parent": store.parents.get(&key),
+            "comment": cp.comment,
+            "workspace_status": cp.workspace_status,
+            "unread": cp.unread,
+            "pr": cp.pr,
+            "issue": cp.issue,
+            "references": cp.references,
+            "parent": cp.parent,
         });
         let text = serde_json::to_string_pretty(&payload).map_err(io::Error::other)?;
         println!("{text}");
@@ -418,69 +348,10 @@ fn apply_checkpoint(state_dir: &Path, worktree: &Path, args: &Args) -> io::Resul
     Ok(())
 }
 
-fn can_assign_parent(
-    parents: &BTreeMap<String, String>,
-    child: &str,
-    candidate_parent: &str,
-) -> bool {
-    if child.is_empty() || candidate_parent.is_empty() || child == candidate_parent {
-        return false;
-    }
-    let mut cursor = Some(candidate_parent);
-    let mut visited = std::collections::BTreeSet::new();
-    while let Some(cur) = cursor {
-        if cur == child {
-            return false;
-        }
-        if !visited.insert(cur) {
-            return false;
-        }
-        cursor = parents.get(cur).map(String::as_str);
-    }
-    true
-}
-
-fn load_store(path: &Path) -> io::Result<Store> {
-    let mut bytes = Vec::new();
-    match fs::File::open(path) {
-        Ok(f) => {
-            f.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Store::default()),
-        Err(e) => return Err(e),
-    }
-    if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_FILE_BYTES) {
-        return corrupt_store(path, "comments file exceeds size limit");
-    }
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return corrupt_store(path, "comments file is not UTF-8");
-    };
-    match toml::from_str(text) {
-        Ok(store) => Ok(store),
-        Err(_) => corrupt_store(path, "invalid comments TOML"),
-    }
-}
-
-/// 원본과 최초 손상 사본을 덮어쓰지 않고 저장을 거부한다.
-fn corrupt_store(path: &Path, reason: &str) -> io::Result<Store> {
-    let backup = path.with_extension("toml.corrupt");
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(backup)
-    {
-        Ok(mut out) => {
-            io::copy(&mut fs::File::open(path)?, &mut out)?;
-        }
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
-    Err(io::Error::new(io::ErrorKind::InvalidData, reason))
-}
-
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use super::*;
 
     #[test]
@@ -519,7 +390,7 @@ mod tests {
         };
         apply_checkpoint(&dir, worktree, &args)?;
         apply_checkpoint(&dir, worktree, &args)?;
-        let store = load_store(&dir.join(COMMENTS_FILE))?;
+        let store = WorktreeStore::load(&dir)?;
         assert_eq!(store.comments.get(key.as_ref()), Some(&args.comment));
         assert_eq!(
             store.statuses.get(key.as_ref()),
@@ -572,7 +443,7 @@ mod tests {
                 ..Args::default()
             },
         )?;
-        let store = load_store(&dir.join(COMMENTS_FILE))?;
+        let store = WorktreeStore::load(&dir)?;
         assert!(!store.comments.contains_key(key.as_ref()));
         assert!(!store.statuses.contains_key(key.as_ref()));
         assert!(!store.unread.contains_key(key.as_ref()));
@@ -581,6 +452,38 @@ mod tests {
         assert!(!store.parents.contains_key(key.as_ref()));
         assert!(store.references.contains_key(key.as_ref()));
         fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn symlink_parent_normalization_and_cycle_rejection() -> io::Result<()> {
+        let root = std::env::temp_dir().join(format!("mk-set-symlink-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state_dir = root.join("state");
+        let real_base = root.join("real");
+        let wt_a = real_base.join("wt-a");
+        let wt_b = real_base.join("wt-b");
+        fs::create_dir_all(&wt_a)?;
+        fs::create_dir_all(&wt_b)?;
+        let link_base = root.join("alias");
+        std::os::unix::fs::symlink(&real_base, &link_base)?;
+        let alias_a = link_base.join("wt-a").to_string_lossy().into_owned();
+        let alias_b = link_base.join("wt-b");
+        let parent = |p: &str| Args {
+            parent: Some(p.to_owned()),
+            ..Args::default()
+        };
+
+        // 심링크 별칭으로 자기 자신을 부모로 지정할 수 없다.
+        assert!(apply_checkpoint(&state_dir, &wt_a, &parent(&alias_a)).is_err());
+        // 별칭으로 등록한 계보도 정규화된 키로 저장되고, 별칭을 통한 순환도 거부한다.
+        apply_checkpoint(&state_dir, &alias_b, &parent(&alias_a))?;
+        let store = WorktreeStore::load(&state_dir)?;
+        let canon_a = krill_proto::orchestration::worktree_key(&wt_a);
+        let canon_b = krill_proto::orchestration::worktree_key(&wt_b);
+        assert_eq!(store.parents.get(&canon_b), Some(&canon_a));
+        let alias_b = alias_b.to_string_lossy().into_owned();
+        assert!(apply_checkpoint(&state_dir, &wt_a, &parent(&alias_b)).is_err());
+        fs::remove_dir_all(&root)
     }
 
     #[test]
@@ -700,6 +603,7 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn as12_cli_comment_save_preserves_future_fields() {
+    use std::fs;
     let dir = std::env::temp_dir().join(format!("as12-cli-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join(COMMENTS_FILE);

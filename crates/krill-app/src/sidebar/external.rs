@@ -3,47 +3,26 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::fs;
+use std::io::{self, Read as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
 use gpui::{Context, Div, Hsla, Stateful, div, prelude::*, px};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use super::Sidebar;
 
-pub const COMMENTS_FILE: &str = "worktree-comments.toml";
+pub const COMMENTS_FILE: &str = krill_proto::orchestration::COMMENTS_FILE;
 
-const LOCK_FILE: &str = "worktree-comments.lock";
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 const MAX_COMMENTS: usize = 1_024;
 const MAX_COMMENT_CHARS: usize = 256;
 const MAX_CLAUDE_WORKTREES: usize = 64;
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Store {
-    #[serde(default)]
-    comments: BTreeMap<String, String>,
-    /// 코멘트별 마지막 기록 시각(UNIX 초). 상한 도달 시 사전순이 아닌 가장 오래된 항목을
-    /// 지우기 위한 기록이며, 구 파일에는 없어 0으로 읽혀 가장 먼저 지워진다.
-    #[serde(default)]
-    updated_at: BTreeMap<String, u64>,
-    #[serde(default)]
-    statuses: BTreeMap<String, String>,
-    #[serde(default)]
-    unread: BTreeMap<String, bool>,
-    #[serde(default)]
-    prs: BTreeMap<String, u64>,
-    #[serde(default)]
-    issues: BTreeMap<String, String>,
-    #[serde(default)]
-    references: BTreeMap<String, Vec<String>>,
-    #[serde(default)]
-    parents: BTreeMap<String, String>,
-}
+type Store = krill_proto::orchestration::WorktreeStore;
 
 /// 워크트리 경로의 체크포인트 배지(`● REVIEW #128 OWE-626 🔗2`)를 구성한다(MK-116, MK-118).
 pub fn checkpoint_badge_for(sidebar_path: Option<&Path>, worktree: &Path) -> Option<String> {
@@ -204,57 +183,27 @@ pub fn load_comments(state_dir: &Path) -> BTreeMap<PathBuf, String> {
 /// 테스트·내부 호출에서 워크트리 코멘트를 상태 디렉터리에 기록한다.
 /// 시각 기록(`updated_at`)을 함께 읽어 상한 도달 시 가장 오래된 항목을 지운다.
 pub fn save_comment(state_dir: &Path, worktree: &Path, comment: &str) -> io::Result<()> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(state_dir)?;
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(state_dir.join(LOCK_FILE))?;
-    lock.lock()?;
-    let file = state_dir.join(COMMENTS_FILE);
-    let mut store: Store = match fs::read_to_string(&file) {
-        Ok(body) => toml::from_str(&body).map_err(io::Error::other)?,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Store::default(),
-        Err(e) => return Err(e),
-    };
-    // 손상된 값·시각이 어긋난 항목을 정리한다(표시 경로와 같은 sanitize 기준).
-    store.comments.retain(|_, v| !sanitize(v).is_empty());
-    store
-        .updated_at
-        .retain(|k, _| store.comments.contains_key(k));
-    let resolved = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-    let key = resolved.to_string_lossy().into_owned();
+    let key = krill_proto::orchestration::worktree_key(worktree);
     let clean = sanitize(comment);
-    if clean.is_empty() {
-        store.comments.remove(&key);
-        store.updated_at.remove(&key);
-    } else {
-        if store.comments.len() >= MAX_COMMENTS
-            && !store.comments.contains_key(&key)
-            && let Some(oldest) = oldest_key(&store)
-        {
-            store.comments.remove(&oldest);
-            store.updated_at.remove(&oldest);
+    Store::mutate(state_dir, |store| {
+        // 손상된 코멘트 값을 정리한다(표시 경로와 같은 sanitize 기준).
+        store.comments.retain(|_, v| !sanitize(v).is_empty());
+        if clean.is_empty() {
+            store.comments.remove(&key);
+            store.updated_at.remove(&key);
+        } else {
+            if store.comments.len() >= MAX_COMMENTS
+                && !store.comments.contains_key(&key)
+                && let Some(oldest) = oldest_key(store)
+            {
+                store.comments.remove(&oldest);
+                store.updated_at.remove(&oldest);
+            }
+            store.comments.insert(key.clone(), clean);
+            store.updated_at.insert(key, now_secs());
         }
-        store.comments.insert(key.clone(), clean);
-        store.updated_at.insert(key, now_secs());
-    }
-    let body = krill_proto::config_document::save_toml(&file, &store)?;
-    let tmp = file.with_extension("toml.tmp");
-    let mut out = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)?;
-    out.write_all(body.as_bytes())?;
-    drop(out);
-    fs::rename(tmp, file)
+        Ok(())
+    })
 }
 
 /// 워크트리 경로로 등록된 코멘트를 찾는다.

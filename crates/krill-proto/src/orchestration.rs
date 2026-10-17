@@ -9,7 +9,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 #[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1180,6 +1180,9 @@ pub struct WorktreeStore {
     pub setup_prompt_dismissed: BTreeMap<String, bool>,
     #[serde(default)]
     pub parents: BTreeMap<String, String>,
+    /// `krill worktree cleanup`가 읽는 워크트리별 PR 상태(`merged`·`closed`·`open`).
+    #[serde(default)]
+    pub pr_states: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1283,18 +1286,22 @@ impl WorktreeStore {
 
     pub fn load(state_dir: &Path) -> io::Result<Self> {
         let path = state_dir.join(COMMENTS_FILE);
-        let file = match fs::File::open(path) {
-            Ok(f) => f,
+        let mut bytes = Vec::new();
+        match fs::File::open(&path) {
+            Ok(f) => {
+                f.take(MAX_COMMENTS_BYTES.saturating_add(1))
+                    .read_to_end(&mut bytes)?;
+            }
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(e) => return Err(e),
-        };
-        let mut raw = String::new();
-        file.take(MAX_COMMENTS_BYTES.saturating_add(1))
-            .read_to_string(&mut raw)?;
-        if u64::try_from(raw.len()).unwrap_or(u64::MAX) > MAX_COMMENTS_BYTES {
-            return Err(invalid("worktree-comments.toml exceeds size limit"));
         }
-        toml::from_str(&raw).map_err(invalid)
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_COMMENTS_BYTES {
+            return corrupt_comments_store(&path, "worktree-comments.toml exceeds size limit");
+        }
+        let Ok(raw) = std::str::from_utf8(&bytes) else {
+            return corrupt_comments_store(&path, "worktree-comments.toml is not UTF-8");
+        };
+        toml::from_str(raw).or_else(|e| corrupt_comments_store(&path, &e.to_string()))
     }
 
     pub fn save(&self, state_dir: &Path) -> io::Result<()> {
@@ -1314,7 +1321,11 @@ impl WorktreeStore {
     where
         F: FnOnce(&mut Self) -> io::Result<T>,
     {
-        fs::create_dir_all(state_dir)?;
+        let mut dir = fs::DirBuilder::new();
+        dir.recursive(true);
+        #[cfg(unix)]
+        dir.mode(0o700);
+        dir.create(state_dir)?;
         let _guard = LockGuard::acquire(&state_dir.join(COMMENTS_LOCK))?;
         let mut store = Self::load(state_dir)?;
         let out = f(&mut store)?;
@@ -1343,18 +1354,29 @@ impl WorktreeStore {
         if child.is_empty() || candidate.is_empty() || child == candidate {
             return false;
         }
-        let mut cursor = Some(candidate.as_str());
+        let mut cursor = Some(candidate);
         let mut visited = BTreeSet::new();
         while let Some(cur) = cursor {
-            if cur == child {
+            if cur == child || !visited.insert(cur.clone()) {
                 return false;
             }
-            if !visited.insert(cur) {
-                return false;
-            }
-            cursor = self.parents.get(cur).map(String::as_str);
+            cursor = self.parent_of(&cur);
         }
         true
+    }
+
+    /// 정규화된 `key`의 부모를 찾는다. 정규화 전 별칭(`/var`↔`/private/var`)으로 저장된 구 항목도 찾는다.
+    /// 놓치면 모든 항목을 canonicalize하므로 쓰기 경로에서만 쓴다(`checkpoint`는 정확 일치만).
+    pub fn parent_of(&self, key: &str) -> Option<String> {
+        self.parents
+            .get(key)
+            .or_else(|| {
+                self.parents
+                    .iter()
+                    .find(|(k, _)| normalize_store_key(k) == key)
+                    .map(|(_, v)| v)
+            })
+            .map(|v| normalize_store_key(v))
     }
 
     pub fn set_parent(&mut self, child: &str, parent: Option<&str>) -> io::Result<()> {
@@ -1366,10 +1388,13 @@ impl WorktreeStore {
                     "cannot assign worktree as its own parent or create a lineage cycle",
                 ));
             }
+            self.parents
+                .retain(|k, _| normalize_store_key(k) != child_key);
             self.parents.insert(child_key.clone(), parent_key);
             self.updated_at.insert(child_key, now_secs());
         } else {
-            self.parents.remove(&child_key);
+            self.parents
+                .retain(|k, _| normalize_store_key(k) != child_key);
             self.updated_at.insert(child_key, now_secs());
         }
         Ok(())
@@ -1377,8 +1402,12 @@ impl WorktreeStore {
 
     pub fn remove_worktree_lineage(&mut self, removed: &str) {
         let removed_key = normalize_store_key(removed);
-        self.parents
-            .retain(|c, p| c != &removed_key && p != &removed_key);
+        self.parents.retain(|c, p| {
+            c != removed
+                && p != removed
+                && normalize_store_key(c) != removed_key
+                && normalize_store_key(p) != removed_key
+        });
     }
 
     pub fn add_reference(&mut self, key: &str, url: &str) -> io::Result<Vec<String>> {
@@ -1978,6 +2007,22 @@ impl LockGuard {
         file.lock()?;
         Ok(Self { _file: file })
     }
+}
+
+/// 손상된 `worktree-comments.toml`의 최초 사본을 `.toml.corrupt`로 남기고 덮어쓰기를 거부한다.
+fn corrupt_comments_store(path: &Path, reason: &str) -> io::Result<WorktreeStore> {
+    let mut opts = OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    match opts.open(path.with_extension("toml.corrupt")) {
+        Ok(mut out) => {
+            io::copy(&mut fs::File::open(path)?, &mut out)?;
+        }
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e),
+    }
+    Err(io::Error::new(io::ErrorKind::InvalidData, reason))
 }
 
 fn invalid(msg: impl std::fmt::Display) -> io::Error {
