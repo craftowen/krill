@@ -654,6 +654,90 @@ fn explorer_lazy_tree_filter_toggles_and_crud() {
             .is_err()
     );
 
+    // Security (OWE-762): symlink directories pointing outside the worktree cannot be escaped via
+    // create_file, create_folder, or rename_path, and circular/external symlinks do not explode filter scan.
+    let outside = tmp_home.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret\n").unwrap();
+    let ext_link = repo.0.join("ext_link");
+    std::os::unix::fs::symlink(&outside, &ext_link).unwrap();
+    let loop_link = repo.0.join("loop");
+    std::os::unix::fs::symlink(&repo.0, &loop_link).unwrap();
+
+    assert_eq!(
+        ex.create_file(&ext_link, "escape.txt").unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        ex.create_file(&repo.0, "ext_link/escape.txt")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        ex.create_file(&repo.0, "ext_link/sub/escape.txt")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!outside.join("escape.txt").exists());
+    assert!(!outside.join("sub").exists());
+
+    assert_eq!(
+        ex.create_folder(&ext_link, "escape_dir")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(
+        ex.create_folder(&repo.0, "ext_link/escape_dir")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(!outside.join("escape_dir").exists());
+
+    assert_eq!(
+        ex.rename_path(&ext_link.join("secret.txt"), "pwned.txt")
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert!(outside.join("secret.txt").is_file());
+    assert!(!outside.join("pwned.txt").exists());
+
+    ex.refresh();
+    let root_entries = ex.dir_cache.get(&repo.0).unwrap();
+    assert!(
+        root_entries
+            .iter()
+            .any(|e| e.relative_path == "ext_link" && e.is_symlink)
+    );
+    assert!(
+        root_entries
+            .iter()
+            .any(|e| e.relative_path == "loop" && e.is_symlink)
+    );
+
+    ex.set_filter_query("deep");
+    let filtered_rels: Vec<&str> = ex.rows.iter().map(|r| r.relative_path.as_str()).collect();
+    assert_eq!(
+        filtered_rels,
+        vec!["src", "src/nested", "src/nested/deep.rs"]
+    );
+    let cached = ex.filter_files_cache.as_ref().unwrap();
+    assert!(
+        !cached.iter().any(|e| e.relative_path.starts_with("loop/")),
+        "recursive filter scan must not descend into self-referential symlink"
+    );
+    assert!(
+        !cached
+            .iter()
+            .any(|e| e.relative_path.starts_with("ext_link/")),
+        "recursive filter scan must not descend into external symlink directory"
+    );
+    ex.set_filter_query("");
+
     // If moving to ~/.Trash fails, never fall back to permanent deletion and record error.
     let bad_home = tmp_home.join("bad-home");
     std::fs::create_dir_all(&bad_home).unwrap();
