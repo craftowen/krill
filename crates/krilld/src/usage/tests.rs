@@ -666,13 +666,15 @@ fn stale_preferred_target_is_skipped_for_fresh_fallback() {
     std::fs::remove_dir_all(root).ok();
 }
 
-/// K-12: 수동 전환 직후 자동전환이 덮어쓰지 않고, 저장·응답이 모두 사용자 선택을 가리킨다.
+/// K-12·OWE-770: 수동 전환 직후뿐 아니라 같은 사용량이 유지되는 동안 주기 새로고침(`refresh_accounts`)을
+/// 반복해도 사용자 선택이 유지되고, 사용량이 늘어나면 자동전환이 다시 동작한다.
 #[test]
 fn manual_switch_is_not_overridden_by_auto_switch() {
     use krill_proto::usage::ProviderKind;
 
     let home = dir("k12-home");
     let state = dir("k12-state");
+    let high_profile = home.join("claude-High");
     for (label, five) in [("High", 95), ("Low", 10)] {
         let profile = home.join(format!("claude-{label}"));
         accounts::add_account(
@@ -709,10 +711,68 @@ fn manual_switch_is_not_overridden_by_auto_switch() {
             .map(String::as_str),
         Some(high_id)
     );
-    // 다음 폴링에서는 자동전환이 정상 동작한다(수동 고정이 영구가 아님).
+    // OWE-770: 사용량이 그대로(95%)인 동안 주기 새로고침·ListAccounts가 반복돼도 수동 고정이 유지된다.
+    for _ in 0..3 {
+        let polled = accounts::refresh_accounts(&home, Some(&state));
+        assert!(polled.switched.is_empty(), "{polled:?}");
+        assert!(polled.advanced.history.is_empty(), "{polled:?}");
+        assert_eq!(
+            polled
+                .accounts
+                .iter()
+                .find(|a| a.provider == ProviderKind::Claude && a.active)
+                .map(|a| a.id.as_str()),
+            Some(high_id)
+        );
+    }
+    // 사용량이 증가(95% -> 96%)하면 수동 고정이 풀리고 자동전환이 정상 동작한다.
+    fs::write(
+        high_profile.join(CLAUDE_CACHE),
+        r#"{"five_hour":{"utilization":96,"resets_at":"2099-01-01T00:00:00Z"}}"#,
+    )
+    .unwrap();
     let next = accounts::refresh_accounts(&home, Some(&state));
     assert_eq!(next.switched.len(), 1);
+    assert_eq!(next.switched[0].from_id, high_id);
     assert_eq!(next.switched[0].to_id, "claude-low");
+    assert_eq!(next.switched[0].reason_percent, 96);
+
+    // 다시 수동 고정한 뒤 퍼센트는 같아도 리셋 시각이 바뀌면 고정이 풀려 자동전환된다.
+    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, high_id).unwrap();
+    assert!(
+        accounts::refresh_accounts(&home, Some(&state))
+            .switched
+            .is_empty()
+    );
+    fs::write(
+        high_profile.join(CLAUDE_CACHE),
+        r#"{"five_hour":{"utilization":96,"resets_at":"2099-01-02T00:00:00Z"}}"#,
+    )
+    .unwrap();
+    let reset_changed = accounts::refresh_accounts(&home, Some(&state));
+    assert_eq!(reset_changed.switched.len(), 1);
+    assert_eq!(reset_changed.switched[0].to_id, "claude-low");
+
+    // 다시 수동 고정한 뒤 자동전환 정책이 바뀌면 고정이 풀려 즉시 자동전환된다.
+    accounts::switch_account(&home, Some(&state), ProviderKind::Claude, high_id).unwrap();
+    assert!(
+        accounts::refresh_accounts(&home, Some(&state))
+            .switched
+            .is_empty()
+    );
+    let policy_changed = accounts::set_auto_switch(
+        &home,
+        Some(&state),
+        &krill_proto::usage::AutoSwitchPolicy {
+            enabled: true,
+            threshold_percent: 85,
+            switch_on_rate_limit: true,
+            rules: Vec::new(),
+        },
+    )
+    .unwrap();
+    assert_eq!(policy_changed.switched.len(), 1);
+    assert_eq!(policy_changed.switched[0].to_id, "claude-low");
 
     fs::remove_dir_all(&home).ok();
     fs::remove_dir_all(&state).ok();
