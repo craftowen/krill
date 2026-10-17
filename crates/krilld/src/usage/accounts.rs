@@ -62,6 +62,73 @@ fn rate_limited_at(
         .get(&(provider.as_str().to_owned(), account_id.to_owned()))
         .copied()
 }
+
+const MAX_MANUAL_PINS: usize = 256;
+
+/// K-12·OWE-770: 수동 전환(`switch_account`)으로 고른 계정의 런타임 고정 상태.
+/// 선택 시점의 사용량·정책이 유지되는 동안 주기 `refresh_accounts`/`ListAccounts` 자동전환에서 제외하며,
+/// 사용량·리셋 시각 변화, 한도(`RATE_LIMITED`) 도달, 자동전환 정책 변경, 데몬 재기동 시 해제된다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManualPin {
+    account_id: String,
+    usage: Snapshot,
+    policy: AutoSwitchPolicy,
+    advanced_policy: krill_proto::usage::AdvancedPolicy,
+}
+
+static MANUAL_PINS: Mutex<BTreeMap<(PathBuf, ProviderKind), ManualPin>> =
+    Mutex::new(BTreeMap::new());
+
+fn set_manual_pin(
+    home: &Path,
+    state_dir: Option<&Path>,
+    provider: ProviderKind,
+    account_id: &str,
+    usage: Snapshot,
+    file: &AccountsFile,
+) {
+    let key = (config_path(home, state_dir), provider);
+    let pin = ManualPin {
+        account_id: account_id.to_owned(),
+        usage,
+        policy: AutoSwitchPolicy::from(file.auto_switch.clone()),
+        advanced_policy: file.advanced_policy.clone(),
+    };
+    let mut pins = lock(&MANUAL_PINS);
+    if !pins.contains_key(&key) && pins.len() >= MAX_MANUAL_PINS {
+        pins.pop_first();
+    }
+    pins.insert(key, pin);
+}
+
+fn manually_pinned(
+    home: &Path,
+    state_dir: Option<&Path>,
+    provider: ProviderKind,
+    active_acc: &AccountInfo,
+    limited_active: bool,
+    policy: &AutoSwitchPolicy,
+    advanced_policy: &krill_proto::usage::AdvancedPolicy,
+) -> bool {
+    let key = (config_path(home, state_dir), provider);
+    let mut pins = lock(&MANUAL_PINS);
+    let Some(pin) = pins.get(&key) else {
+        return false;
+    };
+    if pin.account_id != active_acc.id
+        || limited_active
+        || &pin.policy != policy
+        || &pin.advanced_policy != advanced_policy
+    {
+        pins.remove(&key);
+        return false;
+    }
+    if active_acc.usage.is_empty() || pin.usage == active_acc.usage {
+        return true;
+    }
+    pins.remove(&key);
+    false
+}
 /// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09). 파일 IO만 안에서 하고
 /// 다른 잠금을 잡지 않는 리프라 잠금 순서 문제가 없다.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
@@ -909,12 +976,22 @@ fn refresh_accounts_authenticated(
         // 규칙에는 전용 플래그가 없어 전역 값을 쓴다.
         // OWE-712 쿨다운은 사용률 왕복만 막는다. 실제 한도 기록이 있는 활성 계정에는 묶어 두지 않는다.
         if allow_auto_switch
-            && (file.advanced_policy.cooldown_secs == 0
-                || rate_limited_at(&limited, provider, &current_id).is_some()
-                || !runtime.cooling(provider, now_secs))
             && let Some(active_acc) = all
                 .iter()
                 .find(|a| a.provider == provider && a.id == current_id)
+            && !manually_pinned(
+                home,
+                state_dir,
+                provider,
+                active_acc,
+                matches!(trigger, RefreshTrigger::RateLimit)
+                    || rate_limited_at(&limited, provider, &current_id).is_some(),
+                &policy,
+                &file.advanced_policy,
+            )
+            && (file.advanced_policy.cooldown_secs == 0
+                || rate_limited_at(&limited, provider, &current_id).is_some()
+                || !runtime.cooling(provider, now_secs))
         {
             let rule = policy.rule_for(provider, &current_id);
             let (enabled, threshold, metric, target) = rule.map_or(
@@ -1270,12 +1347,14 @@ pub fn switch_account(
             format!("account has no krill profile dir: {account_id}"),
         ));
     }
+    let pinned_usage = target.usage.clone();
     {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
         file.active
             .insert(provider.as_str().to_owned(), account_id.to_owned());
         save_inner(home, state_dir, &file)?;
+        set_manual_pin(home, state_dir, provider, account_id, pinned_usage, &file);
     }
 
     Ok(refresh_accounts_with(home, state_dir, false))
