@@ -166,12 +166,15 @@ pub fn create(
     create_with_pool(q, req, root, trust, None)
 }
 
+/// 스케줄 격리 실행용 워크트리 루트. `KRILL_WORKTREES_DIR`가 있으면 그것, 없으면 `<state_dir>/worktrees`.
+fn isolated_root_in(state_dir: &Path, get: impl Fn(&str) -> Option<OsString>) -> PathBuf {
+    get("KRILL_WORKTREES_DIR").map_or_else(|| state_dir.join("worktrees"), PathBuf::from)
+}
+
 /// 스케줄 격리 실행용 새 워크트리를 만든다(MK-186). 비대화형 크론이므로 setup 스크립트는 건너뛴다.
 pub fn create_isolated(repo: &Path, name: &str, state_dir: &Path) -> Result<PathBuf, String> {
     let q = queue()?;
-    let root = std::env::var_os("KRILL_WORKTREES_DIR")
-        .or_else(|| std::env::var_os("MK_WORKTREES_DIR"))
-        .map_or_else(|| state_dir.join("worktrees"), PathBuf::from);
+    let root = isolated_root_in(state_dir, |key| std::env::var_os(key));
     let trust = state_dir.join(TRUST_FILE);
     let req = NewWorktree {
         repo: repo.as_os_str().as_bytes().to_vec(),
