@@ -636,6 +636,25 @@ impl Sidebar {
             #[cfg(test)]
             renders: 0,
         };
+        if let Some(dir) = this.state_dir().map(Path::to_path_buf) {
+            if !this.parents.is_empty() && !dir.join(external::COMMENTS_FILE).exists() {
+                let legacy = std::mem::take(&mut this.parents);
+                krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                    for (child, parent) in legacy {
+                        let c = child.to_string_lossy().into_owned();
+                        let p = parent.to_string_lossy().into_owned();
+                        store.set_parent(&c, Some(&p)).ok();
+                        if store.parents.get(&c) != Some(&p) {
+                            store.parents.insert(c, p);
+                        }
+                    }
+                    Ok(())
+                })
+                .ok();
+                lineage::invalidate_parents_cache();
+            }
+            this.parents = this.merged_parents();
+        }
         if this.sync_imported_projects_from_disk() {
             this.rows = if this.options.filters.contains_host(&HostId::Local) {
                 this.local_rows()
@@ -686,6 +705,7 @@ impl Sidebar {
 
     /// 외부 파일(`projects.toml`, `worktree-comments.toml`) 변경을 즉시 반영해 사이드바 트리를 다시 그린다.
     pub fn reload_external(&mut self, cx: &mut Context<Self>) {
+        lineage::invalidate_parents_cache();
         self.comments = external::load_comments_from_sidebar_path(self.path.as_deref());
         self.sync_imported_projects_from_disk();
         self.rebuild(cx);
@@ -1266,6 +1286,9 @@ impl Sidebar {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        if self.state_dir().is_some() {
+            self.parents = self.merged_parents();
+        }
         if self.remote_hosts.is_empty() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
                 self.local_rows()
@@ -1341,10 +1364,13 @@ impl Sidebar {
                 // 워크트리 발견·메타 IO는 connect_source의 백그라운드 단계에서 끝낸다.
                 let status_changed = self.local_status != HostStatus::Connected;
                 self.local_status = HostStatus::Connected;
+                let parents_changed =
+                    self.state_dir().is_some() && self.merged_parents() != self.parents;
                 if snapshot != self.snapshot
                     || meta != self.meta
                     || comments != self.comments
                     || auto_titles != self.auto_titles
+                    || parents_changed
                     || self.poll_error.is_some()
                     || status_changed
                     || crate::alert::needs_snapshot(cx)
@@ -1466,9 +1492,14 @@ impl Sidebar {
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
+        let persisted_parents = if self.state_dir().is_some() {
+            BTreeMap::new()
+        } else {
+            self.parents.clone()
+        };
         if let Some(path) = &self.path {
             let lin = lineage::LineageState {
-                parents: self.parents.clone(),
+                parents: persisted_parents,
                 collapsed_lineage: self.collapsed_lineage.clone(),
                 sleeping_worktrees: self.sleeping_worktrees.clone(),
             };
