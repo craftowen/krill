@@ -2113,4 +2113,45 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
         assert!(err.to_string().contains("exceeds size limit"), "{err}");
     }
+
+    #[test]
+    fn owe794_modal_category_descriptions_match_hosts_toml_and_profile_dir_registration() {
+        let mut report = OrcaImportReport::default();
+        report.accounts.claude_added = 2;
+        report.accounts.codex_added = 1;
+        report.ssh.hosts_added = 3;
+
+        let accounts_desc = ImportDomain::Accounts.description(Some(&report));
+        assert!(
+            accounts_desc.contains("Claude 2") && accounts_desc.contains("Codex 1"),
+            "{accounts_desc}"
+        );
+        assert!(
+            accounts_desc.contains("프로필 디렉터리 경로 등록")
+                || accounts_desc.contains("profile directory paths registered"),
+            "{accounts_desc}"
+        );
+        assert!(
+            !accounts_desc.contains("Keychain")
+                && !accounts_desc.contains("인증 토큰")
+                && !accounts_desc.contains("auth tokens"),
+            "{accounts_desc}"
+        );
+        let acc_ko = text::CAT_ACCOUNTS_DESC.in_language(crate::i18n::Language::Ko);
+        let acc_en = text::CAT_ACCOUNTS_DESC.in_language(crate::i18n::Language::En);
+        assert!(!acc_ko.contains("Keychain"));
+        assert!(!acc_ko.contains("인증 토큰"));
+        assert!(!acc_en.contains("Keychain"));
+        assert!(!acc_en.contains("auth tokens"));
+
+        let ssh_desc = ImportDomain::Ssh.description(Some(&report));
+        assert!(ssh_desc.contains("hosts.toml"), "{ssh_desc}");
+        assert!(!ssh_desc.contains("ssh-hosts.toml"), "{ssh_desc}");
+        let ssh_ko = text::CAT_SSH_DESC.in_language(crate::i18n::Language::Ko);
+        let ssh_en = text::CAT_SSH_DESC.in_language(crate::i18n::Language::En);
+        assert!(ssh_ko.contains("hosts.toml"));
+        assert!(!ssh_ko.contains("ssh-hosts.toml"));
+        assert!(ssh_en.contains("hosts.toml"));
+        assert!(!ssh_en.contains("ssh-hosts.toml"));
+    }
 }
