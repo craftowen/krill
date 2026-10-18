@@ -9,7 +9,7 @@ use krill_app::layout::Layout;
 const DELAY: Duration = Duration::from_millis(150);
 
 enum Message {
-    Save(Layout),
+    Save(Box<Layout>),
     #[cfg(test)]
     Flush(mpsc::Sender<()>),
 }
@@ -41,7 +41,10 @@ impl Saver {
             }
         }
         if let Some(worker) = worker.as_ref() {
-            worker.send.send(Message::Save(layout.clone())).ok();
+            worker
+                .send
+                .send(Message::Save(Box::new(layout.clone())))
+                .ok();
         }
     }
 
@@ -73,7 +76,7 @@ impl Drop for Saver {
 }
 
 fn run(path: &Path, recv: &mpsc::Receiver<Message>) {
-    let mut pending = None;
+    let mut pending: Option<Box<Layout>> = None;
     loop {
         let message = if pending.is_some() {
             recv.recv_timeout(DELAY)
@@ -98,7 +101,7 @@ fn run(path: &Path, recv: &mpsc::Receiver<Message>) {
     }
 }
 
-fn write(path: &std::path::Path, pending: &mut Option<Layout>) {
+fn write(path: &std::path::Path, pending: &mut Option<Box<Layout>>) {
     if let Some(layout) = pending.take()
         && let Err(err) = layout.save(path)
     {
