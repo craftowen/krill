@@ -211,7 +211,7 @@ ASSETS=(
   "$OUT_DIR/latest.json"
   "$OUT_DIR/install.sh"
   "$OUT_DIR/install-linux.sh"
-  "${LINUX_ASSETS[@]}"
+  ${LINUX_ASSETS[@]+"${LINUX_ASSETS[@]}"}
 )
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
