@@ -312,7 +312,7 @@ impl Hub {
         req: &krill_proto::git::GitWatchRequest,
     ) -> krill_proto::git::GitWatchReply {
         use krill_proto::git::GitWatchReply;
-        use std::os::unix::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::OsStrExt as _;
         let now = Instant::now();
         let raw_key = PathBuf::from(std::ffi::OsStr::from_bytes(&req.repo));
         if !req.visible {
@@ -509,7 +509,7 @@ fn metadata_dirs(repo: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn path_from_line(bytes: &[u8]) -> &Path {
-    use std::os::unix::ffi::OsStrExt as _;
+    use krill_proto::os::ffi::OsStrExt as _;
     let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
     Path::new(std::ffi::OsStr::from_bytes(bytes))
 }
@@ -553,4 +553,5 @@ fn relevant(path: &Path, repo: &Path, metadata: &[PathBuf]) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

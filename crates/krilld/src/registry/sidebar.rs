@@ -1,7 +1,7 @@
 //! Read-only MK-046 metadata. No session lock is held during git or process queries.
 
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use std::collections::BTreeMap;
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 

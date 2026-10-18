@@ -186,8 +186,8 @@ fn unnegotiated_agent_requests_and_observer_mutations_are_rejected() {
 /// 붙잡아 두고, 그동안 세션이 목록에 남아 있는지 본다.
 #[test]
 fn closed_session_leaves_list_only_after_release_reaches_holder() {
+    use krill_proto::os::net::UnixStream;
     use std::io::Read;
-    use std::os::unix::net::UnixStream;
     use std::time::Duration;
 
     use krill_proto::holder::{FromHolder, VERSION};
@@ -788,8 +788,8 @@ fn cross_review_resume_claims_are_per_session() {
 /// 셸·구 기록·라벨 없는 세션은 빠져 배지를 숨기고, 원 세션 PTY는 절대 닫지 않는다.
 #[test]
 fn session_accounts_returns_launch_account_with_label() {
+    use krill_proto::os::net::UnixStream;
     use std::io::Write as _;
-    use std::os::unix::net::UnixStream;
 
     use krill_proto::control::SessionAccount;
     use krill_proto::holder::{FromHolder, VERSION};
@@ -996,10 +996,10 @@ fn provisioning_requests_without_management_bit_are_rejected_by_daemon() {
 /// 포크된 새 에이전트 세션을 띄운다.
 #[test]
 fn fork_creates_new_session_and_keeps_original_session_alive() {
-    use std::os::fd::AsFd as _;
-    use std::os::unix::net::UnixStream;
+    use crate::os::AsFd as _;
+    use krill_proto::os::net::UnixStream;
 
-    use krill_holder::link::Link;
+    use crate::holder::link::Link;
     use krill_proto::holder::{FromHolder, ToHolder, VERSION};
 
     let dir = std::env::temp_dir().join(format!("owe736-reg-fork-{}", std::process::id()));

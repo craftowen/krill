@@ -2,9 +2,9 @@
 //!
 //! 서명 규칙 파일(MK-091)이 있고 서명이 맞으면 프로필·화면 규칙을 겹친다. 없거나
 //! 틀리면 내장 규칙을 유지한다. 전역 권한은 서명 파일로 바꾸지 않는다.
+use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -170,7 +170,10 @@ impl Control {
         self.launch_path(session).is_ok_and(|p| p.exists())
     }
 
-    #[cfg_attr(not(test), expect(dead_code, reason = "단위 테스트용 축약 진입점"))]
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(dead_code, reason = "단위 테스트용 축약 진입점")
+    )]
     pub fn remember(&self, session: SessionId, launch: &AgentLaunch) -> io::Result<()> {
         self.remember_session(session, launch, None, Vec::new(), None)
     }
@@ -341,4 +344,5 @@ fn save(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

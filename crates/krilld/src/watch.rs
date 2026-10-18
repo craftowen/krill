@@ -1,10 +1,10 @@
 //! holder 감시 연결(OWE-493). 초기 상태와 구독 등록을 같은 잠금에서 처리해 상실 통보 경합을 막는다.
 //! 고아 인계 소켓이 준비된 뒤만 `Orphan`을 알린다. 클라이언트가 없어도 기존 세션은 계속 서빙한다.
 
+use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::sync::Mutex;
 use std::time::Duration;
 

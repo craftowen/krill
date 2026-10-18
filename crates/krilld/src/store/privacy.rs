@@ -1,7 +1,6 @@
 //! 기록 설정·Time Machine 제외·삭제(MK-075). 잠정 MK-024 저장소에 대한 의존을 이 모듈에 둔다.
 
 use super::{Store, lock, mkdir};
-use std::os::fd::AsFd as _;
 use std::{
     fs::{self, File},
     io,
@@ -55,7 +54,12 @@ pub(super) fn initial_pause(root: &Path) -> io::Result<bool> {
 
 pub(super) fn prepare(sessions: &Path) -> io::Result<()> {
     mkdir(sessions)?;
-    crate::sys::exclude_from_backup(File::open(sessions)?.as_fd())
+    let file = File::open(sessions)?;
+    #[cfg(unix)]
+    let dir = std::os::fd::AsFd::as_fd(&file);
+    #[cfg(windows)]
+    let dir = std::os::windows::io::AsHandle::as_handle(&file);
+    crate::sys::exclude_from_backup(dir)
 }
 
 // 이름은 상태 디렉터리 안에서만 쓰며 동시에 진행되는 삭제끼리 겹치지 않는다.
@@ -113,8 +117,8 @@ impl Store {
 
 /// 정적 경고만 남긴다. 경로·OS 에러·키·터미널 본문은 파일 내용에 넣지 않는다.
 pub(super) fn warn(root: &Path) {
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     let warning = root.join(krill_proto::history::RECORDING_WARNING_FILE);
     if let Ok(mut file) = fs::OpenOptions::new()
         .write(true)

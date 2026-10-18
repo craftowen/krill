@@ -1,9 +1,9 @@
 //! Reproduce MK-095 with a synthetic 36,000-file repository, entirely under a temporary directory.
 //! Build krilld and this example, then run `target/debug/examples/worktree_preparation_bench`.
 //! `--expiry` also measures production five-minute collection. Timings include the daemon IPC roundtrip.
+use krill_proto::os::ffi::OsStrExt as _;
 use std::fs;
 use std::io::{self, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;

@@ -1,12 +1,11 @@
 //! MK-101 daemon-owned scheduling. A durable claim precedes holder spawn; uncertain
 //! attempts are never automatically replayed. No catch-up of past cron minutes.
 
+use krill_proto::os::ffi::OsStrExt as _;
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -46,14 +45,13 @@ pub fn run_precheck(cwd: &Path, command: &str) -> PrecheckResult {
 
 #[must_use]
 pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -> PrecheckResult {
-    let mut child = match Command::new("/bin/sh")
+    let mut child = match crate::child::own_group(&mut Command::new("/bin/sh"))
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .spawn()
     {
         Ok(child) => child,
@@ -518,4 +516,5 @@ impl<'a> Journal<'a> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

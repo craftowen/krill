@@ -1,9 +1,9 @@
 //! 세션별 기록기. 쓰기 허용 read 잠금 → 개인정보 gate 순서로만 잠근다.
 //! 압축·열린 파일 쓰기는 gate 밖에서 하고, 일시중지 ACK는 쓰기 read 잠금이 풀린 뒤 반환한다.
 
+use krill_proto::os::fs::OpenOptionsExt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::Ordering};
 use std::time::Instant;

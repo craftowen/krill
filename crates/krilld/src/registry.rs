@@ -12,16 +12,16 @@
 //! - 에이전트 상태([`crate::status`], MK-039): hook 연결(첫 프레임이 hook 이벤트)과 spool을 세션에 붙여 반영한다.
 //!   세션은 피어가 세션 후손이면 그 세션, 외부(전체 범위)·spool이면 이벤트의 `ppid` 계보로 정한다.
 
+use crate::os::{AsFd, OwnedFd};
+use krill_proto::os::net::UnixStream;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
-use krill_holder::link::Link;
+use crate::holder::link::Link;
 use krill_proto::SessionId;
 use krill_proto::control::{
     self, Create, FEAT_CONTROL, Failure, Info, Program, Reply, Request, SessionAccount,
@@ -52,6 +52,12 @@ pub mod usage_tick;
 
 /// `Terminate`가 없는 holder(v2 이하)에 닫기를 보내는 방법.
 const TERMINATE_SINCE: u16 = 3;
+/// v3 미만 holder에 보내는 `Kill` 신호.
+#[cfg(unix)]
+const SIGHUP: i32 = libc::SIGHUP;
+/// holder 프로토콜 값(POSIX 번호). Windows holder는 아직 없다(Phase 3).
+#[cfg(windows)]
+const SIGHUP: i32 = 1;
 /// 감시 스레드에서 보존 기간·전역 디스크 상한을 확인하는 간격.
 const GC_INTERVAL: Duration = Duration::from_secs(60);
 /// holder가 `Session`에 크기를 싣지 않아 PTY에서 읽지 못했을 때.
@@ -213,13 +219,9 @@ impl Registry {
             }
             // 보관 세션의 PTY 크기를 그대로 쓰면 세션 안 `stty`로 키운 거대 winsize가
             // 재기동 때 Term에 들어가 수백 MB를 할당한다(K-01). 엔진·PTY 모두 자른다.
-            let size = crate::term::clamp_size(rustix::termios::tcgetwinsize(&k.master).map_or(
-                FALLBACK_SIZE,
-                |w| WinSize {
-                    cols: w.ws_col,
-                    rows: w.ws_row,
-                },
-            ));
+            let size = crate::term::clamp_size(
+                crate::session::pty::size(&k.master).unwrap_or(FALLBACK_SIZE),
+            );
             st.next = st.next.max(k.id.0.saturating_add(1));
             let Ok(session) = reg.start(k.id, k.master, size) else {
                 // master는 holder가 계속 쥔다. 다음 krilld 기동 때 다시 온다.
@@ -732,6 +734,7 @@ impl Registry {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     fn handle(
         &self,
         peer: &Peer,
@@ -969,7 +972,7 @@ impl Registry {
     }
 
     fn same_cwd(&self, id: SessionId, target: &[u8]) -> bool {
-        use std::os::unix::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::OsStrExt as _;
         if target.is_empty() {
             return false;
         }
@@ -1137,7 +1140,7 @@ impl Registry {
             {
                 c.cwd.clone_from(&s.cwd);
             } else if let Some(dir) = self.session_cwd(old) {
-                use std::os::unix::ffi::OsStrExt as _;
+                use krill_proto::os::ffi::OsStrExt as _;
                 c.cwd = dir.as_os_str().as_bytes().to_vec();
             }
         }
@@ -1374,7 +1377,7 @@ impl Registry {
         cols: u16,
         rows: u16,
     ) -> Result<(SessionId, u32), Failure> {
-        use std::os::unix::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::OsStrExt as _;
         env.extend(crate::agent::pane_env_in(id, self.state_dir().as_deref()));
         // daemon `Create`의 거대 cols·rows도 여기서 자른다(K-01, CLI만 막는다).
         let size = crate::term::clamp_size(WinSize { cols, rows });
@@ -1567,7 +1570,7 @@ impl Registry {
     /// OWE-737: 첫 프롬프트 hook(`UserPromptSubmit` 등)이 오면 세션 자동 제목을 기록하고,
     /// 현재 디렉터리가 기본 이름(`worktree-1`, `claude-1` 등)의 git 브랜치이면 슬러그로 개명한다.
     pub(crate) fn maybe_rename_from_hook(&self, id: SessionId, payload: &[u8]) {
-        use std::os::unix::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::OsStrExt as _;
         let state_dir = self.state_dir();
         if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
             return;
@@ -1668,7 +1671,7 @@ impl Registry {
                         ToHolder::Kill {
                             req,
                             id,
-                            signal: libc::SIGHUP,
+                            signal: SIGHUP,
                         }
                     }
                 };
@@ -1920,4 +1923,5 @@ fn read_only(req: &Request) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

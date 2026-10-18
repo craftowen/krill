@@ -2,6 +2,11 @@
 use super::devices::hex;
 use super::e2ee::{invalid, random};
 use crate::registry::Registry;
+use krill_proto::os::{
+    ffi::OsStringExt,
+    fs::{DirBuilderExt, OpenOptionsExt},
+    net::UnixStream,
+};
 use krill_proto::{
     SessionId,
     control::{self, CaptureFormat, Reply, Request},
@@ -16,11 +21,6 @@ use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::{
-    ffi::OsStringExt,
-    fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
-    net::UnixStream,
-};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Weak;
@@ -428,19 +428,13 @@ fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
         .mode(0o700)
         .create(&dir)?;
     let meta = fs::symlink_metadata(&dir)?;
-    if !meta.is_dir()
-        || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o077 != 0
-    {
+    if !meta.is_dir() || !crate::os::private_to_me(&meta, 0o077) {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     let path = dir.join(format!("mobile-{}.{extension}", hex(&random()?)));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&path)?;
+    let mut file =
+        crate::os::no_follow(OpenOptions::new().create_new(true).write(true).mode(0o600))
+            .open(&path)?;
     file.write_all(&bytes)?;
     Ok(path)
 }
