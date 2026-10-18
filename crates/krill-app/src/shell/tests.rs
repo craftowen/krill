@@ -4180,8 +4180,8 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(cx.update(|_, cx| view.read(cx).live.is_empty()));
     assert_eq!(Layout::load(&path).unwrap(), empty);
 
-    // 빈 탭 상태에서 닫기·분할·탭 순환 단축키를 눌러도 패닉이나 유령 탭이 생기지 않는다.
-    cx.simulate_keystrokes("cmd-w cmd-shift-w cmd-d cmd-shift-] cmd-shift-[");
+    // 빈 탭 상태에서 닫기·탭 순환 단축키를 눌러도 패닉이나 유령 탭이 생기지 않는다.
+    cx.simulate_keystrokes("cmd-w cmd-shift-w cmd-shift-] cmd-shift-[");
     cx.run_until_parked();
     assert!(layout_of(&view, cx).tabs().is_empty());
 
@@ -4771,6 +4771,86 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
 
     std::fs::remove_file(&tmp_file).ok();
 }
+
+/// OWE-869: 탭이 0개인 상태에서 새 에이전트 탭·플로팅 터미널·분할·빈 화면 가이드 버튼을 실행해도 패닉 없이 동작한다.
+#[gpui::test]
+fn empty_tabs_actions_and_guide_never_panic(cx: &mut TestAppContext) {
+    let path = state_path("empty-tabs-actions");
+    let (view, cx) = open(cx, path);
+    cx.run_until_parked();
+
+    // 마지막 기본 탭 닫기 → 빈 화면 가이드 노출.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("empty-workspace").is_some());
+    assert!(cx.debug_bounds("empty-new-terminal").is_some());
+    assert!(cx.debug_bounds("empty-new-agent").is_some());
+    assert!(cx.debug_bounds("empty-open-file").is_some());
+
+    // 1. 탭 0개 상태에서 플로팅 터미널 호출 → 패닉 없이 무시.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.float_terminal(krill_proto::SessionId(999), cx);
+            assert!(s.layout.tabs().is_empty());
+        });
+    });
+
+    // 2. 탭 0개 상태에서 new_agent 직접 호출 → 패닉 없이 에이전트 탭 1개 생성.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_agent("claude".into(), cx);
+        });
+    });
+    cx.run_until_parked();
+    let after_agent = layout_of(&view, cx);
+    assert_eq!(after_agent.tabs().len(), 1);
+    let pane = after_agent.focused().expect("focused agent pane");
+    assert_eq!(
+        after_agent.launch(pane).map(|c| &c.program),
+        Some(&Program::Agent {
+            id: "claude".into()
+        })
+    );
+
+    // 3. 다시 닫고 ⌘D (SplitRight) → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+
+    // 4. 다시 닫고 ⌘⇧D (SplitDown) → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    cx.simulate_keystrokes("cmd-shift-d");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+
+    // 5. 다시 닫고 빈 화면의 '새 터미널' 버튼 클릭 → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    let new_term_btn = cx
+        .debug_bounds("empty-new-terminal")
+        .expect("empty-new-terminal button");
+    cx.simulate_click(new_term_btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+
+    // 6. 다시 닫고 빈 화면의 '새 에이전트' 버튼 클릭 → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    let new_agent_btn = cx
+        .debug_bounds("empty-new-agent")
+        .expect("empty-new-agent button");
+    cx.simulate_click(new_agent_btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+}
+
+/// OWE-866: 더블클릭 단어 선택·트리플클릭 줄 선택·Shift+클릭 확장이 동작하고,
 /// 단어·줄 선택은 한 칸짜리라도 클릭 해제에 지워지지 않는다.
 #[gpui::test]
 fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {

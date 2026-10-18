@@ -452,7 +452,7 @@ impl Shell {
                             .accessibility_label(text::SPLIT_RIGHT.get())
                             .tooltip(text::SPLIT_RIGHT.get())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.change(true, cx, |l| l.split(Axis::Horizontal));
+                                this.split_active(Axis::Horizontal, cx);
                             })),
                     )
                     .child(
@@ -463,7 +463,7 @@ impl Shell {
                             .accessibility_label(text::SPLIT_DOWN.get())
                             .tooltip(text::SPLIT_DOWN.get())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.change(true, cx, |l| l.split(Axis::Vertical));
+                                this.split_active(Axis::Vertical, cx);
                             })),
                     )
                     .child(

@@ -1080,7 +1080,7 @@ impl Shell {
     }
 
     /// ⌘P: 작업 폴더의 파일을 퍼지 검색해 연다. 목록은 백그라운드에서 만든 뒤 팔레트를 띄운다.
-    fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.files.quick_open.take().is_some() {
             self.files.refocus = true;
             cx.notify();
