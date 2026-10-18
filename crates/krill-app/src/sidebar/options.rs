@@ -362,7 +362,7 @@ impl WorkspaceOptions {
 }
 
 /// PR 상태 그룹(`GroupBy::PrStatus`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum PrGroup {
     Merged,
     Open,
@@ -420,7 +420,7 @@ impl PrGroup {
 }
 
 /// 상태별·PR 상태별 그룹 헤더 키.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GroupKey {
     WorkspaceStatus(WorkspaceStatus),
     PrStatus(PrGroup),
@@ -722,6 +722,9 @@ pub(super) fn rows_with_options<'a>(
                     continue;
                 }
                 out.push(Row::Repository(repo.clone()));
+                if collapsed.contains(repo) {
+                    continue;
+                }
                 sort_worktrees(&mut vis, snapshot, prefs, options.sort_by, ctx);
                 let (normal, claude_ext) = external::partition_trees(repo, vis);
                 let normal = super::lineage::order_lineage_worktrees(
@@ -1059,7 +1062,7 @@ impl Sidebar {
         } else {
             self.collapsed_groups.insert(key);
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     pub fn set_worktree_status(
