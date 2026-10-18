@@ -74,7 +74,9 @@ pub fn record_consent(state: &Path, now: SystemTime) -> io::Result<()> {
 /// 여기서 필요한 최소 형태(0600·고유 임시 파일·fsync·rename·실패 시 임시 파일 정리)만 둔다.
 /// 상태기계(`state.rs`)의 `onboarding.toml` 저장도 쓴다.
 pub(crate) fn atomic_write_0600(path: &Path, body: &str) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use krill_proto::os::fs::OpenOptionsExt as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -93,6 +95,7 @@ pub(crate) fn atomic_write_0600(path: &Path, body: &str) -> io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
+    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let result = (|| {
         use std::io::Write as _;
