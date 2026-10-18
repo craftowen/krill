@@ -442,6 +442,103 @@ pub fn include_imported_projects(
     }
 }
 
+/// `<state_dir>/projects.toml`에서 지정한 저장소·폴더 프로젝트와 소속 워크트리·계보 항목을 제거한다(OWE-845).
+pub fn remove_imported_project(state_dir: &Path, project_path: &Path) {
+    let path = state_dir.join(PROJECTS_FILE);
+    let mut bytes = Vec::new();
+    let Ok(file) = fs::File::open(&path) else {
+        return;
+    };
+    if file
+        .take(MAX_PROJECTS_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || u64::try_from(bytes.len()).map_or(true, |n| n > MAX_PROJECTS_BYTES)
+    {
+        return;
+    }
+    let Ok(text) = std::str::from_utf8(&bytes) else {
+        return;
+    };
+    let Ok(mut doc) = toml::from_str::<toml::Value>(text) else {
+        return;
+    };
+    let Some(root) = doc.as_table_mut() else {
+        return;
+    };
+    let aliases = path_aliases(project_path);
+    let matches_project = |candidate: &str| {
+        let trimmed = candidate.trim();
+        !trimmed.is_empty()
+            && aliases
+                .iter()
+                .any(|a| trimmed == a || Path::new(trimmed).starts_with(a))
+    };
+    let mut removed_ids = Vec::new();
+    let mut changed = false;
+    if let Some(toml::Value::Array(projects)) = root.get_mut("projects") {
+        let before = projects.len();
+        projects.retain(|item| {
+            let Some(tbl) = item.as_table() else {
+                return true;
+            };
+            let p = tbl.get("path").and_then(toml::Value::as_str).unwrap_or("");
+            if aliases.iter().any(|a| p.trim() == a) {
+                if let Some(id) = tbl.get("id").and_then(toml::Value::as_str)
+                    && !id.trim().is_empty()
+                {
+                    removed_ids.push(id.trim().to_owned());
+                }
+                false
+            } else {
+                true
+            }
+        });
+        changed |= projects.len() != before;
+    }
+    if let Some(toml::Value::Table(worktrees)) = root.get_mut("worktrees") {
+        let before = worktrees.len();
+        worktrees.retain(|wt_key, val| {
+            let repo_id = val
+                .as_table()
+                .and_then(|t| t.get("repo_id"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim);
+            let by_id = repo_id.is_some_and(|id| removed_ids.iter().any(|r| r == id));
+            !(by_id || matches_project(wt_key))
+        });
+        changed |= worktrees.len() != before;
+    }
+    if let Some(toml::Value::Table(lineage)) = root.get_mut("lineage") {
+        let before = lineage.len();
+        lineage.retain(|lin_key, val| {
+            let tbl = val.as_table();
+            let repo_id = tbl
+                .and_then(|t| t.get("repo_id"))
+                .and_then(toml::Value::as_str)
+                .map(str::trim);
+            let wt_path = tbl
+                .and_then(|t| t.get("worktree_path"))
+                .and_then(toml::Value::as_str)
+                .unwrap_or(lin_key);
+            let by_id = repo_id.is_some_and(|id| removed_ids.iter().any(|r| r == id));
+            !(by_id || matches_project(lin_key) || matches_project(wt_path))
+        });
+        changed |= lineage.len() != before;
+    }
+    if !changed {
+        return;
+    }
+    let Ok(serialized) = toml::to_string_pretty(&doc) else {
+        return;
+    };
+    let tmp = path.with_extension("toml.tmp");
+    if fs::write(&tmp, serialized.as_bytes()).is_err() {
+        return;
+    }
+    fs::rename(&tmp, &path).ok();
+}
+
 /// `<state_dir>/projects.toml`의 표시 이름·고정 여부·코멘트·이슈·상태를
 /// 사이드바 인메모리 상태에 반영한다. 계보(부모 워크트리)는 이관기가 `WorktreeStore`(단일 원천)에 기록한다.
 ///

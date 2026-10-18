@@ -45,6 +45,7 @@ fn row_menu(
     host: &HostId,
     folder: Option<&PathBuf>,
     tree: Option<&TreeMenuMeta>,
+    header: Option<&PathBuf>,
     agents: &[AgentProfile],
     pr: Option<&crate::pull_request::Status>,
     window: &mut Window,
@@ -269,6 +270,19 @@ fn row_menu(
                 }
             }
         }
+    }
+    // OWE-845: 저장소·폴더 헤더 우클릭 메뉴(목록에서 제거).
+    if let Some(header) = header {
+        let (remove_this, remove_path) = (this.clone(), header.clone());
+        menu = menu.separator().item(
+            PopupMenuItem::new(text::REMOVE_PROJECT.get())
+                .icon(IconName::Delete)
+                .on_click(move |_, _, cx| {
+                    remove_this
+                        .update(cx, |s, cx| s.remove_project(remove_path.clone(), cx))
+                        .ok();
+                }),
+        );
     }
     menu
 }
@@ -535,8 +549,35 @@ impl Sidebar {
                 .child(text::SESSIONS.get()),
             Row::Repository(path) => {
                 let repo = path.clone();
+                let fold_btn = path.clone();
+                let fold_row = path.clone();
+                let closed = self.collapsed.contains(path);
                 repo_heading(base)
+                    .debug_selector(move || format!("repo-header-{index}"))
                     .aria_label(format!("{} {}", text::REPOSITORY.get(), basename(path)))
+                    .aria_expanded(!closed)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(p.sidebar_accent))
+                    .child(
+                        Button::new(("repo-fold", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(if closed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if closed {
+                                text::UNFOLD.get()
+                            } else {
+                                text::FOLD.get()
+                            })
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                cx.stop_propagation();
+                                s.cursor = Some(index);
+                                s.fold(&fold_btn, None, cx);
+                            })),
+                    )
                     .child(
                         Icon::new(IconName::Folder)
                             .with_size(px(14.))
@@ -561,14 +602,41 @@ impl Sidebar {
                                 ),
                         )
                     })
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.cursor = Some(index);
+                        s.fold(&fold_row, None, cx);
+                    }))
             }
             Row::Folder(path) => {
-                let (fold, fresh, fresh_host) = (path.clone(), path.clone(), row_host.clone());
+                let (fold_btn, fold_row, fresh, fresh_host) =
+                    (path.clone(), path.clone(), path.clone(), row_host.clone());
                 let closed = self.collapsed.contains(path);
                 repo_heading(base)
+                    .debug_selector(move || format!("folder-header-{index}"))
                     .aria_label(format!("{} {}", text::FOLDER.get(), basename(path)))
                     .aria_expanded(!closed)
                     .cursor_pointer()
+                    .hover(|d| d.bg(p.sidebar_accent))
+                    .child(
+                        Button::new(("folder-fold", index))
+                            .ghost()
+                            .xsmall()
+                            .icon(if closed {
+                                IconName::ChevronRight
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .accessibility_label(if closed {
+                                text::UNFOLD.get()
+                            } else {
+                                text::FOLD.get()
+                            })
+                            .on_click(cx.listener(move |s, _, _, cx| {
+                                cx.stop_propagation();
+                                s.cursor = Some(index);
+                                s.fold(&fold_btn, None, cx);
+                            })),
+                    )
                     .child(
                         Icon::new(IconName::Folder)
                             .with_size(px(14.))
@@ -599,7 +667,7 @@ impl Sidebar {
                     )
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.cursor = Some(index);
-                        s.fold(&fold, None, cx);
+                        s.fold(&fold_row, None, cx);
                     }))
             }
             Row::HiddenWorktrees(repo, count, expanded) => {
@@ -1593,10 +1661,11 @@ impl Sidebar {
     }
 
     /// 행 + 우클릭 메뉴(여기서 새 터미널·에이전트·Open in·핀·이름 변경·계보 작업).
+    /// 저장소·폴더 헤더는 접기 대상 경로를 `header`로 넘겨 '프로젝트 제거' 메뉴를 붙인다(OWE-845).
     fn render_row_with_menu(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let element = self.render_row(index, row, cx);
         let host = self.row_host(index).clone();
-        let (folder, tree) = match row {
+        let (folder, tree, header) = match row {
             Row::Worktree(path) => {
                 let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
                 let is_primary = self.snapshot_for(&host).trees.contains_key(path);
@@ -1632,10 +1701,13 @@ impl Sidebar {
                         descendant_count,
                         sleeping,
                     }),
+                    None,
                 )
             }
-            Row::Session(s, _) => (s.worktree.clone().or_else(|| s.cwd.clone()), None),
-            Row::Folder(path) => (Some(path.clone()), None),
+            Row::Session(s, _) => (s.worktree.clone().or_else(|| s.cwd.clone()), None, None),
+            Row::Repository(path) | Row::Folder(path) => {
+                (Some(path.clone()), None, Some(path.clone()))
+            }
             _ => return element.into_any_element(),
         };
         let this = cx.weak_entity();
@@ -1652,6 +1724,7 @@ impl Sidebar {
                     &host,
                     folder.as_ref(),
                     tree.as_ref(),
+                    header.as_ref(),
                     &agents,
                     pr.as_ref(),
                     window,
