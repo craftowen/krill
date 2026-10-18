@@ -225,6 +225,13 @@ actions!(
 
 const MAX_NAV_HISTORY: usize = 50;
 
+/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingRunningClose {
+    Tab(usize),
+    Pane(PaneId),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NavEntry {
     Workspace {
@@ -474,6 +481,8 @@ pub struct Shell {
     pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
     /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
     pub(super) confirm_close_tab: Option<usize>,
+    /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
+    pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
     /// OWE-870: 탭 이름 변경 대화상자(인라인 편집 대신 모달 + `InputState`).
     tab_rename: Option<tabs::TabRename>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
@@ -736,6 +745,7 @@ impl Shell {
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
             confirm_close_tab: None,
+            pending_running_close: None,
             tab_rename: None,
             nav_history: NavHistory::default(),
         };
@@ -1622,6 +1632,39 @@ impl Shell {
         }
     }
 
+    /// 칸이 아직 레이아웃에 있으면 true(확인 대화상자를 기다리는 동안 닫혔을 수 있다).
+    fn has_pane(&self, pane: PaneId) -> bool {
+        self.layout.tabs().iter().any(|t| t.root.contains(pane))
+    }
+
+    /// OWE-872: 칸을 닫기 전에 실행 중인지 본다. 실행 중이면 확인 대화상자를 띄우고,
+    /// 아니면 바로 닫는다.
+    pub(super) fn maybe_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.has_pane(pane)
+            && self.pane_is_running(pane, cx)
+            && krill_app::settings::confirm_running_close(cx)
+        {
+            self.pending_running_close = Some((PendingRunningClose::Pane(pane), false));
+            cx.notify();
+            return;
+        }
+        self.do_close_pane(pane, cx);
+    }
+
+    /// OWE-872: 칸을 실제로 닫는다(줌 해제·닫은 기록 포함).
+    pub(super) fn do_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if !self.has_pane(pane) {
+            cx.notify();
+            return;
+        }
+        self.zoomed_pane = None;
+        self.record_closed_pane(pane);
+        self.change(true, cx, |l| {
+            l.focus(pane);
+            l.close_pane();
+        });
+    }
+
     fn record_closed_tab(&mut self, tab_idx: usize) {
         if let Some(tab) = self.layout.tabs().get(tab_idx) {
             let mut l = self.layout.clone();
@@ -2172,6 +2215,16 @@ impl Shell {
             match e.keystroke.key.as_str() {
                 "escape" => self.cancel_close_pinned_tab(cx),
                 "enter" => self.confirm_close_pinned_tab(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // OWE-872: 실행 중 닫기 확인 대화상자가 열려 있으면 Enter로 닫고 Esc로 취소한다.
+        if self.pending_running_close.is_some() {
+            match e.keystroke.key.as_str() {
+                "escape" => self.cancel_running_close(cx),
+                "enter" => self.confirm_running_close(cx),
                 _ => {}
             }
             cx.stop_propagation();
@@ -3105,12 +3158,8 @@ impl Shell {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
-                                    this.zoomed_pane = None;
-                                    this.record_closed_pane(id);
-                                    this.change(true, cx, |l| {
-                                        l.focus(id);
-                                        l.close_pane();
-                                    });
+                                    // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
+                                    this.maybe_close_pane(id, cx);
                                 })),
                         )
                     }),
@@ -3630,17 +3679,16 @@ impl Render for Shell {
                     this.close_settings(Some(window), cx);
                     return;
                 }
-                this.zoomed_pane = None;
                 if this.layout.visible().len() == 1
                     && this.layout.is_tab_pinned(this.layout.active())
                 {
                     this.request_close_tab(this.layout.active(), cx);
                     return;
                 }
+                // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다(줌 해제·기록은 확정 뒤에).
                 if let Some(pane) = this.layout.focused() {
-                    this.record_closed_pane(pane);
+                    this.maybe_close_pane(pane, cx);
                 }
-                this.change(true, cx, Layout::close_pane);
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
                 if this.settings.is_some() {
@@ -3954,6 +4002,7 @@ impl Render for Shell {
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
+            .children(self.render_running_close_dialog(window, cx))
             .children(self.render_tab_rename_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
             .children(
