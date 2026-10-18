@@ -11,7 +11,21 @@ use gpui::{
 };
 use std::path::PathBuf;
 
-actions!(minikrill, [NewWindow, CloseWindow]);
+actions!(
+    minikrill,
+    [
+        NewWindow,
+        CloseWindow,
+        HideApp,
+        HideOthers,
+        ShowAll,
+        MinimizeWindow,
+        ZoomWindow,
+        ToggleFullscreen,
+        BringAllToFront,
+        ShowShortcuts
+    ]
+);
 
 fn main() -> std::process::ExitCode {
     // MK-170: 경로를 정하기 전에 옛 번들 id 데이터를 옮긴다(옛 holder가 살아 있으면 그대로 둔다).
@@ -195,9 +209,46 @@ fn init(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-n", NewWindow, None),
         KeyBinding::new("cmd-alt-w", CloseWindow, None),
+        // OWE-864: macOS 표준 창·앱 동작. 터미널 문맥 바인딩과 겹치지 않는 전역 키만 쓴다.
+        KeyBinding::new("cmd-h", HideApp, None),
+        KeyBinding::new("cmd-alt-h", HideOthers, None),
+        KeyBinding::new("cmd-m", MinimizeWindow, None),
+        KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
     ]);
     cx.on_action(|_: &NewWindow, cx| {
         let _ = new_window(cx);
+    });
+    cx.on_action(|_: &HideApp, cx| cx.hide());
+    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+    cx.on_action(|_: &MinimizeWindow, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.minimize_window())
+                .ok();
+        }
+    });
+    cx.on_action(|_: &ZoomWindow, cx| {
+        if let Some(window) = cx.active_window() {
+            window.update(cx, |_, window, _| window.zoom_window()).ok();
+        }
+    });
+    cx.on_action(|_: &ToggleFullscreen, cx| {
+        if let Some(window) = cx.active_window() {
+            window
+                .update(cx, |_, window, _| window.toggle_fullscreen())
+                .ok();
+        }
+    });
+    cx.on_action(|_: &BringAllToFront, cx| {
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        }
+    });
+    cx.on_action(|_: &ShowShortcuts, cx| {
+        krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Shortcuts, cx);
     });
     cx.on_action(|_: &CloseWindow, cx| {
         if let Some(window) = cx.active_window() {
@@ -245,6 +296,14 @@ fn refresh_menus(cx: &mut App) {
             )
             .checked(secure),
             MenuItem::separator(),
+            // OWE-864: macOS 표준 가리기. `cx.hide` 계열이라 창이 없어도 동작한다.
+            MenuItem::action(krill_app::i18n::catalog::general::HIDE_APP.get(), HideApp),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::HIDE_OTHERS.get(),
+                HideOthers,
+            ),
+            MenuItem::action(krill_app::i18n::catalog::general::SHOW_ALL.get(), ShowAll),
+            MenuItem::separator(),
             MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
         ]),
         Menu::new(krill_app::i18n::catalog::general::FILE.get()).items([
@@ -261,11 +320,102 @@ fn refresh_menus(cx: &mut App) {
                 krill_app::i18n::catalog::general::CLOSE_PANE.get(),
                 shell::ClosePane,
             ),
+            // OWE-864: 탭 닫기(⇧⌘W). 칸 닫기(⌘W)와 다른 동작이라 별도 항목으로 둔다.
+            MenuItem::action(
+                krill_app::i18n::catalog::general::CLOSE_TAB.get(),
+                shell::CloseTab,
+            ),
             MenuItem::action(
                 krill_app::i18n::catalog::general::CLOSE_WINDOW.get(),
                 CloseWindow,
             ),
         ]),
+        // OWE-864: 편집 메뉴. 실행 취소·다시 실행·잘라내기는 포커스된 입력이 처리하고
+        // 복사·붙여넣기·모두 선택은 셸(터미널 선택)이 처리한다. 둘 다 `os_action`이라
+        // macOS가 네이티브 선택자·단축키 표기로 연결한다.
+        Menu::new(krill_app::i18n::catalog::general::EDIT.get()).items([
+            MenuItem::os_action(
+                krill_app::i18n::catalog::general::UNDO.get(),
+                gpui_component::input::Undo,
+                gpui::OsAction::Undo,
+            ),
+            MenuItem::os_action(
+                krill_app::i18n::catalog::general::REDO.get(),
+                gpui_component::input::Redo,
+                gpui::OsAction::Redo,
+            ),
+            MenuItem::separator(),
+            MenuItem::os_action(
+                krill_app::i18n::catalog::general::CUT.get(),
+                gpui_component::input::Cut,
+                gpui::OsAction::Cut,
+            ),
+            MenuItem::os_action(
+                krill_app::i18n::catalog::general::COPY_ITEM.get(),
+                shell::Copy,
+                gpui::OsAction::Copy,
+            ),
+            MenuItem::os_action(
+                krill_app::i18n::catalog::general::PASTE_ITEM.get(),
+                shell::Paste,
+                gpui::OsAction::Paste,
+            ),
+            MenuItem::os_action(
+                krill_app::i18n::catalog::general::SELECT_ALL_ITEM.get(),
+                shell::SelectAll,
+                gpui::OsAction::SelectAll,
+            ),
+        ]),
+        // OWE-864: 보기 메뉴. 전부 이미 동작하는 액션만 올린다.
+        Menu::new(krill_app::i18n::catalog::general::VIEW.get()).items([
+            MenuItem::action(
+                krill_app::i18n::catalog::general::SIDEBAR_TOGGLE.get(),
+                shell::ToggleSidebar,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::PANEL_TOGGLE.get(),
+                shell::TogglePanel,
+            ),
+            MenuItem::separator(),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::ZOOM_IN_ITEM.get(),
+                krill_app::settings::ZoomIn,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::ZOOM_OUT_ITEM.get(),
+                krill_app::settings::ZoomOut,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::ZOOM_RESET_ITEM.get(),
+                krill_app::settings::ZoomReset,
+            ),
+            MenuItem::separator(),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::FULLSCREEN_TOGGLE.get(),
+                ToggleFullscreen,
+            ),
+        ]),
+        // OWE-864: 윈도우 메뉴. 최소화·확대/축소·모두 앞으로 가져오기는 활성 창에 직접 건다.
+        Menu::new(krill_app::i18n::catalog::general::WINDOW_MENU.get()).items([
+            MenuItem::action(
+                krill_app::i18n::catalog::general::MINIMIZE.get(),
+                MinimizeWindow,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::ZOOM_WINDOW.get(),
+                ZoomWindow,
+            ),
+            MenuItem::separator(),
+            MenuItem::action(
+                krill_app::i18n::catalog::general::BRING_ALL_FRONT.get(),
+                BringAllToFront,
+            ),
+        ]),
+        // OWE-864: 도움말 메뉴. 단축키 탭으로 바로 가는 실제 항목만 둔다.
+        Menu::new(krill_app::i18n::catalog::general::HELP.get()).items([MenuItem::action(
+            krill_app::i18n::catalog::general::SHORTCUTS_HELP.get(),
+            ShowShortcuts,
+        )]),
     ]);
 }
 
