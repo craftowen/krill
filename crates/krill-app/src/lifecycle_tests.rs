@@ -26,9 +26,10 @@ fn app_menu_is_available_without_windows(cx: &mut gpui::TestAppContext) {
             "Krill 종료",
             "새 창",
             "창 닫기",
-            krill_app::i18n::catalog::settings::SC_ZOOM_IN.get(),
-            krill_app::i18n::catalog::settings::SC_ZOOM_OUT.get(),
-            krill_app::i18n::catalog::settings::SC_ZOOM_RESET.get(),
+            // OWE-864: 보기 메뉴의 확대/축소 항목은 `ZOOM_*_ITEM` 라벨을 쓴다.
+            krill_app::i18n::catalog::general::ZOOM_IN_ITEM.get(),
+            krill_app::i18n::catalog::general::ZOOM_OUT_ITEM.get(),
+            krill_app::i18n::catalog::general::ZOOM_RESET_ITEM.get(),
         ] {
             assert!(labels.contains(&expected), "missing {expected}");
         }
@@ -343,7 +344,7 @@ fn language_switch_rebuilds_native_menus_and_keeps_the_security_check(
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// OWE-859: `⌘N`은 `shell::NewWorktree`에만 바인딩되어 `NewWindow`와 충돌하지 않고,
+/// OWE-859: `⌘N`은 셸 문맥에서 `shell::NewWorktree`가 이기고(OWE-864 전역 `NewWindow`와 공존),
 /// `NewWindow` 액션은 이미 열린 메인 `Shell` 창을 재사용해 레이아웃 저장 경로 유실을 막는다.
 #[gpui::test]
 fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
@@ -359,7 +360,8 @@ fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
             .into_iter()
             .map(|b| b.action().name())
             .collect();
-        assert_eq!(actions, ["shell::NewWorktree"]);
+        // OWE-864: 창 없는 곳에서는 전역 `NewWindow`가, 셸 문맥에서는 `NewWorktree`가 동작한다.
+        assert_eq!(actions, ["minikrill::NewWindow", "shell::NewWorktree"]);
 
         let first = open_shell(cx, Some(path.clone())).unwrap();
         let second = new_window(cx).unwrap();
