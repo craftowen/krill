@@ -6,11 +6,11 @@ use crate::registry::Registry;
 use crate::session::lock;
 use krill_proto::ipc::{self, ServerHello};
 use krill_proto::mobile::{ConnectMode, MobileReply, MobileRequest, NetworkInterface};
+use krill_proto::os::net::UnixStream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
@@ -556,4 +556,5 @@ fn bridge(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

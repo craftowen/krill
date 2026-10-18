@@ -5,10 +5,14 @@
 //!
 //! 재현: `cargo nextest run -p krill --test reconnect --no-capture` (측정값은 `mk026 reconnect:` 줄).
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
+#![cfg_attr(
+    unix,
+    expect(
+        clippy::unwrap_used,
+        reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
+    )
 )]
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

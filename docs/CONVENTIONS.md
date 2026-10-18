@@ -34,11 +34,11 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 
 ## 3. unsafe·FFI
 
-- **U1 MUST** 워크스페이스 기본 `unsafe_code = "deny"`. FFI 모듈(`krill-holder`·`krilld`의 `sys` 모듈, `krill-app`의 `platform` 모듈)만 모듈 첫 줄에 `#![expect(unsafe_code, reason = "…")]`. `krill-proto`·`krill-term`·`krill`은 `#![forbid(unsafe_code)]`.
+- **U1 MUST** 워크스페이스 기본 `unsafe_code = "deny"`. FFI 모듈(`krill-holder`·`krilld`의 `sys` 모듈 — `sys/windows.rs` 같은 Windows FFI 포함, `krill-app`의 `platform` 모듈 — objc2·Win32)만 모듈 첫 줄에 `#![expect(unsafe_code, reason = "…")]`. `krill-proto`·`krill-term`·`krill`은 `#![forbid(unsafe_code)]`.
 - **U2 MUST** 모든 `unsafe` 블록 바로 위 `// SAFETY:` 주석, 블록 하나에 unsafe 연산 하나.
 - **U3 MUST** `unsafe fn`·`unsafe trait`에 `# Safety` 문서.
-- **U5 MUST** fd는 `OwnedFd`/`BorrowedFd`로만 주고받는다. 정수 fd를 받는 안전 함수 금지.
-- **U7 MUST** fork~exec 사이(`pre_exec`)는 async-signal-safe 호출만(할당·`std::env`·락·로깅 금지). 자식 setsid는 `pre_exec` 안에서 libc `setsid`. WezTerm처럼 `pre_exec`에서 fd를 나열하는 코드는 따라 하지 않는다.
+- **U5 MUST** fd는 `OwnedFd`/`BorrowedFd`로만 주고받는다. 정수 fd를 받는 안전 함수 금지. Windows는 `OwnedHandle`/`BorrowedHandle`(소켓은 `OwnedSocket`/`BorrowedSocket`)로만 주고받고, 원시 `HANDLE`·`RawHandle`을 받는 안전 함수 금지. 다른 프로세스로 넘기는 핸들 값(`DuplicateHandle` 결과)은 FFI 모듈 안에서만 원시값으로 다룬다.
+- **U7 MUST** fork~exec 사이(`pre_exec`)는 async-signal-safe 호출만(할당·`std::env`·락·로깅 금지). 자식 setsid는 `pre_exec` 안에서 libc `setsid`. WezTerm처럼 `pre_exec`에서 fd를 나열하는 코드는 따라 하지 않는다. Windows에는 fork·`pre_exec`가 없다: 자식은 `std::process::Command`(+ `CommandExt::creation_flags`)로 만들고, ConPTY·Job Object처럼 `STARTUPINFOEX` 속성이 필요할 때만 FFI 모듈에서 `CreateProcessW`를 부른다. 자식에게 넘길 핸들은 `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`로 명시하고 전체 상속에 기대지 않는다.
 - **U8 MUST** `std::env::set_var`/`remove_var` 금지(`clippy.toml disallowed-methods`). 자식 환경은 `Command::env`.
 - **U10 MUST** C·objc2 콜백 밖으로 panic이 나가지 않게 한다(`extern "C"` 안 panic은 abort).
 - **MUST** PTY 열기는 alacritty_terminal이 쓰는 `rustix-openpty` 또는 `nix::pty::openpty`(rustix 본체에는 openpty 없음). 선택은 MK-004에서.
@@ -63,6 +63,7 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 - **T3 SHOULD** `as_`/`to_`/`into_` 규약, `get_` 접두어 금지, 약어는 한 단어(`Pty`, `Uds`).
 - **T4 SHOULD** 바이너리 크레이트는 `main.rs`를 얇게, 로직은 `lib.rs`.
 - **T5 MUST** `krill-proto`·`krill-term`은 gpui·tokio·nix·objc2에 의존하지 않는다.
+- **MUST** `krill-holder` 줄 수 상한(AGENTS 구조, 결정 12-2, 2026-10-18 개정)은 플랫폼별로 센다: macOS 빌드(공통 코드 + macOS 분기) 1,250줄 이하, Linux 전용 `sys/linux.rs` 300줄 이하, Windows 빌드(공통 코드 + Windows 전용 `windows.rs`·`sys/windows.rs`·`link/windows.rs`) 1,700줄 이하(2026-10-18 개정: 1,200은 스파이크 추정치였고 ConPTY·Job/IOCP·핸들 전달·핸드오프 실구현이 약 1,620줄, OWE-832). 다른 OS 전용 파일은 그 플랫폼 몫에만 들어간다.
 - **SHOULD** 파일 하나 800줄 넘으면 나눈다. 모듈은 기능 단위(`session/`, `ipc/`, `store/`), `utils.rs` 같은 잡동사니 모듈 금지.
 - 주석·문서·커밋·로그 메시지는 한국어 또는 영어 중 하나로 일관되게(코드 식별자는 영어). 사용자에게 보이는 문자열은 ko/en 다국어 대비로 한곳에 모은다(MK-094 전까지는 상수로).
 
@@ -94,11 +95,12 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 
 ## 9. Apple·데몬 운영
 
+- A1~A3은 macOS launchd·서명 조항이다. Windows 데몬 기동 방식은 S-W4(MK-210/OWE-829)에서 정한다.
 - **A1 MUST** launchd가 띄우는 `krill-holder`는 `daemon(3)` 호출·fork 후 부모 종료·자기 setsid 금지. SIGTERM에 빠르게 정리 후 종료.
 - **A2 MUST** 생성 plist에 `AssociatedBundleIdentifiers`. plist는 스냅샷 테스트.
 - **A3 MUST** 헬퍼는 앱과 같은 팀, **각자 고유 identifier**(`<앱 id>.holder` 등)로 서명. 서명할 때 `--deep` 금지. (같은 identifier로 TCC를 상속한다는 가정은 근거 없음 — MK-007에서 실측.)
-- **A5 MUST** 실행 중 번들에 쓰지 않는다. 상태·세그먼트는 `~/Library/Application Support/<bundle id>/`(`.noindex`), 캐시는 `~/Library/Caches/<bundle id>/`.
-- **A6 MUST** UDS 경로는 104바이트 이하 검사(넘으면 오류, 자르지 않음).
+- **A5 MUST** 실행 중 번들에 쓰지 않는다. 상태·세그먼트는 `~/Library/Application Support/<bundle id>/`(`.noindex`), 캐시는 `~/Library/Caches/<bundle id>/`. Windows는 상태·세그먼트를 `%LOCALAPPDATA%\Krill\`, 로그를 `%LOCALAPPDATA%\Krill\Logs\`에 두고(`%APPDATA%` 로밍 프로필 금지), 설치 디렉터리에 쓰지 않는다.
+- **A6 MUST** UDS 경로는 104바이트 이하 검사(넘으면 오류, 자르지 않음). Windows AF_UNIX 소켓도 `%LOCALAPPDATA%\Krill\` 아래에 두고 같은 방식으로 플랫폼 상한(`SUN_PATH_MAX` cfg, MK-195)을 검사한다.
 - **A8 SHOULD** 로그에 명령줄·경로·터미널 내용을 그대로 남기지 않는다(리댁션).
 
 ## 10. Git·작업

@@ -1,6 +1,7 @@
-//! MK-134: direct, relay-free QUIC outages with persistent Unix connections.
+//! MK-134: direct, relay-free QUIC outages with persistent local-socket connections.
 #![expect(clippy::unwrap_used, reason = "integration assertions")]
 
+use krill_link::local::{Listener as UnixListener, Stream as UnixStream};
 use krill_link::{
     ConnectOptions, DeviceIdentity, LinkConfig, RelaySetting, RemoteHost, ServeOptions,
     ServerHandle, StreamPhase, TunnelHandle, start_server, start_tunnel, upsert_device,
@@ -11,7 +12,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{UnixListener, UnixStream};
+
+/// Short socket base: macOS `temp_dir()` is long, Windows has no `/tmp`.
+fn tmp() -> PathBuf {
+    if cfg!(unix) {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    }
+}
 
 const WAIT: Duration = Duration::from_secs(8);
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -27,8 +36,8 @@ impl Fixture {
         Self::with_graces(grace_ms, grace_ms, buffer).await
     }
     async fn with_graces(grace_ms: u64, client_grace_ms: u64, buffer: usize) -> Self {
-        let base = PathBuf::from(format!(
-            "/tmp/m134-{}-{}",
+        let base = tmp().join(format!(
+            "m134-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -572,7 +581,7 @@ async fn zero_byte_fin_survives_an_outage_in_both_directions() {
 
 #[tokio::test]
 async fn slow_ready_does_not_discard_input_before_resume_grace() {
-    let base = PathBuf::from(format!("/tmp/m134-slow-{}", std::process::id()));
+    let base = tmp().join(format!("m134-slow-{}", std::process::id()));
     LinkConfig {
         relay: RelaySetting::Off,
         resume_grace_ms: 7000,

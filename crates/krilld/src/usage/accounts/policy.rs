@@ -68,7 +68,7 @@ impl Runtime {
     }
 
     pub fn save(&self, home: &Path, state: Option<&Path>) -> io::Result<()> {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use krill_proto::os::fs::OpenOptionsExt as _;
         let path = path(home, state);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;

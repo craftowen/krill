@@ -124,7 +124,10 @@ fn unwritable_state_fails_with_ls_hint() {
     let checks = super::checks::decide(&f);
     let c = checks.iter().find(|c| c.id == "state.writable").unwrap();
     assert_eq!(c.status, Status::Fail);
+    #[cfg(unix)]
     assert!(c.fix.value.starts_with("ls -ld "), "{}", c.fix.value);
+    #[cfg(windows)]
+    assert!(c.fix.value.starts_with("icacls "), "{}", c.fix.value);
 }
 
 #[test]

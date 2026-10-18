@@ -1,5 +1,6 @@
 //! MK-047: wait modes through real holder/krilld, without an application or agent CLI.
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs;
 use std::io::Write as _;

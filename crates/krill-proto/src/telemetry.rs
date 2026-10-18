@@ -12,9 +12,9 @@
 //!   호출자가 넣는 [`Transport`]로만 나가고, 꺼져 있으면 [`emit`]이 트랜스포트를 건드리지
 //!   않는다. 실제 HTTPS 엔드포인트 연결(계정·키·수집 서버 결정)은 별도 작업이다.
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 

@@ -5,7 +5,6 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _};
-use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
@@ -577,7 +576,7 @@ pub fn resolve_claude_bin(explicit: Option<&str>, path_env: &OsStr, home: &Path)
 
 fn is_executable(path: &Path) -> bool {
     path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
 }
 
 /// `ps -eo pid,ppid` 출력 파서(pid → ppid). 헤더·깨진 행은 건너뛴다.
@@ -721,6 +720,7 @@ pub fn render_hidden_row(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use krill_proto::orchestration::{OrchestrationStore, WorktreeStore};

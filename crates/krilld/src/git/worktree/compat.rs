@@ -1,10 +1,10 @@
 //! Orca 저장소 설정 읽기 호환(MK-080). 원본 파일을 수정하지 않는다.
 
+use krill_proto::os::ffi::OsStrExt as _;
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::ffi::OsStr;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 use serde::Deserialize;
@@ -267,10 +267,7 @@ fn copy_with(
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
         Err(_) => {}
     }
-    let mut source = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(src)?;
+    let mut source = crate::os::open_no_follow(OpenOptions::new().read(true), src)?;
     let mut target = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -281,4 +278,5 @@ fn copy_with(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

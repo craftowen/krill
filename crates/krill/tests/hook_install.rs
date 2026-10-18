@@ -1,5 +1,6 @@
 //! MK-048 real CLI tests. Every child gets temporary HOME/state/config roots; no real user settings.
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs;
 use std::io::{Read as _, Write as _};

@@ -230,6 +230,7 @@ remote_socket = "/Users/alice/custom/krilld.sock"
 /// MK-170 규칙 3: 원격 질의를 실제 `/bin/sh`로 돌려 소켓을 새 번들 → 옛 번들 → Linux 순으로 찾는지 본다.
 /// 원격 맥은 이관 전(옛 holder가 옛 경로)이거나 구버전일 수 있다. Linux는 찾기 전에 늘 원격 krill로 깨우고,
 /// krill이 없거나 실패하면 표식으로 원인을 알린다. macOS는 깨우지 않는다.
+#[cfg(unix)]
 #[test]
 fn remote_query_prefers_new_socket_then_legacy() {
     let home = PathBuf::from(format!("/tmp/mk170-remote-{}", std::process::id()));
@@ -304,10 +305,12 @@ fn remote_query_prefers_new_socket_then_legacy() {
     std::fs::remove_dir_all(&home).unwrap();
 }
 
+#[cfg(unix)]
 const ORPHAN_DIR: &str = "KRILL_HOSTS_ORPHAN_DIR";
 
 /// 터널을 연 프로세스가 kill -9로 죽어도 ssh가 고아로 남지 않는다: stdin 파이프가 닫혀 원격 명령(`cat`)이 끝난다.
 /// 가짜 ssh는 진짜처럼 stdin을 원격 명령에 흘리고, 끝나면 표식을 남긴다.
+#[cfg(unix)]
 #[test]
 fn tunnel_ssh_exits_when_its_owner_is_killed() {
     let dir = PathBuf::from(format!("/tmp/krill-orphan-{}", std::process::id()));
@@ -344,6 +347,7 @@ fn tunnel_ssh_exits_when_its_owner_is_killed() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+#[cfg(unix)]
 #[test]
 #[ignore = "tunnel_ssh_exits_when_its_owner_is_killed가 자식으로 실행한다"]
 fn tunnel_owner_child() {

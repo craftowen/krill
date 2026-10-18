@@ -6,6 +6,7 @@
 //!
 //! 측정값(release)은 docs/spikes/MK-023.md. 재현: `cargo test --release -p krilld --test attach -- --nocapture`.
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

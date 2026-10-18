@@ -7,7 +7,8 @@
 //!
 //! 재현: `cargo nextest run -p krill --test bundle_migration`
 
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs;
 use std::path::{Path, PathBuf};

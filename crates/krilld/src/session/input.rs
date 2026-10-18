@@ -1,15 +1,18 @@
 //! 연결 취소를 관찰하는 입력 직렬화와 프레임 경계를 넘는 bracketed paste 복구.
 
-use std::os::fd::{AsFd as _, OwnedFd};
+use crate::os::OwnedFd;
 use std::sync::TryLockError;
 
-use super::{
-    BorrowedFd, Duration, Errno, MutexGuard, PollFd, PollFlags, Tap, Timespec, io, lock, poll,
-    thread, write,
-};
+use super::{BorrowedFd, Duration, MutexGuard, Tap, io, lock, thread};
+use crate::os::AsFd as _;
+use rustix::event::{PollFd, PollFlags, Timespec, poll};
+use rustix::io::Errno;
+#[cfg(unix)]
+use rustix::io::write;
 
 const START: &[u8] = b"\x1b[200~";
 const END: &[u8] = b"\x1b[201~";
+#[cfg(unix)]
 const WAIT: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 20_000_000,
@@ -108,8 +111,17 @@ fn write_all(
     while !bytes.is_empty() {
         alive(tap, None)?;
         let result = {
+            #[cfg(unix)]
             let _live = lock(&tap.0.live);
-            write(&tap.0.master, bytes)
+            #[cfg(unix)]
+            let result = write(&tap.0.master, bytes).map_err(io::Error::from);
+            #[cfg(windows)]
+            let result = {
+                use std::io::Write as _;
+                let handle = tap.0.master.input.try_clone()?;
+                std::fs::File::from(handle).write(bytes)
+            };
+            result
         };
         match result {
             Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
@@ -120,19 +132,24 @@ fn write_all(
                 }
                 bytes = bytes.get(n..).unwrap_or_default();
             }
-            Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) => {
-                let mut fds = [PollFd::new(&tap.0.master, PollFlags::OUT)]
-                    .into_iter()
-                    .chain(peer.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::HUP)))
-                    .collect::<Vec<_>>();
-                match poll(&mut fds, Some(&WAIT)) {
-                    Ok(_) | Err(Errno::INTR) => {}
-                    Err(err) => return Err(err.into()),
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
+                #[cfg(unix)]
+                {
+                    let mut fds = [PollFd::new(&tap.0.master, PollFlags::OUT)]
+                        .into_iter()
+                        .chain(peer.map(|fd| PollFd::from_borrowed_fd(fd, PollFlags::HUP)))
+                        .collect::<Vec<_>>();
+                    match poll(&mut fds, Some(&WAIT)) {
+                        Ok(_) | Err(Errno::INTR) => {}
+                        Err(err) => return Err(err.into()),
+                    }
                 }
+                #[cfg(windows)]
+                thread::sleep(Duration::from_millis(20));
                 alive(tap, peer)?;
             }
-            Err(err) => return Err(err.into()),
+            Err(err) => return Err(err),
         }
     }
     Ok(())

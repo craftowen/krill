@@ -92,6 +92,7 @@ impl Tunnel {
             .is_none_or(|c| c.try_wait().is_ok_and(|s| s.is_none()))
     }
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn fixture(port: u16) -> io::Result<Self> {
         if port == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -133,6 +134,7 @@ pub fn parse_url(text: &str) -> Option<String> {
     None
 }
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

@@ -1,7 +1,7 @@
 //! MK-088: index 변경·커밋은 데몬 큐에서 완료한다. 앱 소켓이 닫혀도 작업은 계속된다.
 
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 use std::sync::mpsc;
@@ -233,4 +233,5 @@ fn checked(output: Output) -> Result<Vec<u8>, String> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

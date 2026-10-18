@@ -1,17 +1,18 @@
 //! 워크트리 삭제(MK-043). 잠금·dirty 검사 → remove → branch -d → prune.
 //! 브랜치 정리 실패는 작업 내용을 보존하고 경고한다. force로 잠금이나 미병합 브랜치를 무시하지 않는다.
 
+use krill_proto::os::ffi::{OsStrExt, OsStringExt};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::control::{RemoveWorktree, RemovedWorktree, Reply};
+
+use crate::child::{kill_and_reap, nonblocking};
 
 use super::{GitQueue, git, output_path, queue, text, transaction};
 
@@ -264,14 +265,14 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
     let envs = super::compat::environment_in(q, wt)?;
     let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c")
+    crate::child::own_group(&mut cmd)
+        .arg("-c")
         .arg(script)
         .current_dir(wt)
         .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
     for (k, v) in envs {
         cmd.env(OsStr::from_bytes(&k), OsStr::from_bytes(&v));
     }
@@ -375,42 +376,8 @@ fn drain_capped(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> 
     }
 }
 
-fn nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
-}
-
-fn kill_and_reap(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
-        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
-    }
-    child.kill().ok();
-    child.wait().ok();
-}
-
 fn terminate_gracefully(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
-        rustix::process::kill_process_group(pid, rustix::process::Signal::TERM).ok();
-    } else {
-        child.kill().ok();
-    }
-    let deadline = Instant::now() + ARCHIVE_TERMINATE_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                kill_and_reap(child);
-                return;
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    kill_and_reap(child);
+    crate::child::terminate_gracefully(child, ARCHIVE_TERMINATE_GRACE);
 }
 
 fn truncate_chars(s: &str, max_chars: usize) -> String {

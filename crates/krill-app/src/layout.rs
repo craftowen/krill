@@ -2,10 +2,10 @@
 //!
 //! gpui에 의존하지 않는다. UI 프레임워크가 바뀌어도(MK-002 잠정 결정) 이 모듈과 저장 파일은 그대로 쓴다.
 
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use krill_proto::SessionId;
@@ -1000,7 +1000,12 @@ pub(crate) fn preserve_corrupt(path: &Path) -> io::Result<()> {
     }
 }
 
+/// 이름 바꾸기·삭제를 디스크에 남기려고 부모 디렉터리를 fsync한다. Windows는 디렉터리를 `File::open`으로
+/// 열 수 없어(os error 5, OWE-835 실측) 건너뛴다. 모든 호출처(레이아웃·사이드바·편집기 저장)가 이 함수를 지난다.
 pub(crate) fn sync_parent(path: &Path) -> io::Result<()> {
+    if cfg!(not(unix)) {
+        return Ok(());
+    }
     fs::File::open(
         path.parent()
             .filter(|p| !p.as_os_str().is_empty())
@@ -1030,4 +1035,5 @@ pub fn clamp_column(width: f32, total: f32, other: f32) -> f32 {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

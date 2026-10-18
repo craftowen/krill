@@ -1,12 +1,25 @@
-//! krilld의 unsafe 전부: libc FFI와 커널 이벤트 대기. OS별 구현은 `macos`·`linux` 하위 모듈이다.
-#![expect(
-    unsafe_code,
-    reason = "getpeereid·LOCAL_PEERPID·proc_pidinfo·proc_listallpids·getpwuid_r은 libc에만 있다(rustix의 피어 자격 조회는 Linux 전용, T2-C2. passwd·libproc 조회는 rustix에 없음). rustix kevent는 unsafe API다"
+//! krilld의 unsafe 전부: libc FFI와 커널 이벤트 대기. OS별 구현은 `macos`·`linux`·`windows` 하위 모듈이다.
+#![cfg_attr(
+    unix,
+    expect(
+        unsafe_code,
+        reason = "getpeereid·LOCAL_PEERPID·proc_pidinfo·proc_listallpids·getpwuid_r은 libc에만 있다(rustix의 피어 자격 조회는 Linux 전용, T2-C2. passwd·libproc 조회는 rustix에 없음). rustix kevent는 unsafe API다"
+    )
+)]
+#![cfg_attr(
+    windows,
+    expect(
+        unsafe_code,
+        reason = "Toolhelp·psapi·토큰 SID·WSAIoctl(SIO_AF_UNIX_GETPEERPID)·DPAPI는 windows-sys FFI뿐이다(OWE-833)"
+    )
 )]
 
+#[cfg(unix)]
 use std::ffi::{CStr, c_char};
 use std::io;
+#[cfg(unix)]
 use std::mem::MaybeUninit;
+#[cfg(unix)]
 use std::ptr;
 
 #[cfg(target_os = "linux")]
@@ -17,30 +30,32 @@ mod macos;
 pub use linux::*;
 #[cfg(target_os = "macos")]
 pub use macos::*;
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::*;
 
-/// UTC cron calendar fields, independent of process timezone and daylight saving.
+/// UTC cron calendar fields `[분, 시, 일, 월(1~12), 요일(일=0)]`, independent of process timezone and daylight saving.
+/// 그레고리력 날짜 계산(Howard Hinnant `civil_from_days`)이라 OS 호출이 없다.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "호출자가 실패를 견디는 시그니처(예전 gmtime_r 판)"
+)]
 pub(crate) fn cron_calendar(seconds: u64) -> io::Result<[u32; 5]> {
-    let timestamp = libc::time_t::try_from(seconds).map_err(io::Error::other)?;
-    let mut calendar = MaybeUninit::<libc::tm>::uninit();
-    // SAFETY: timestamp is initialized and calendar points to writable tm storage.
-    if unsafe { libc::gmtime_r(&raw const timestamp, calendar.as_mut_ptr()) }.is_null() {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: successful gmtime_r initialized every tm field.
-    let calendar = unsafe { calendar.assume_init() };
-    [
-        calendar.tm_min,
-        calendar.tm_hour,
-        calendar.tm_mday,
-        calendar.tm_mon.saturating_add(1),
-        calendar.tm_wday,
-    ]
-    .map(u32::try_from)
-    .into_iter()
-    .collect::<Result<Vec<_>, _>>()
-    .map_err(io::Error::other)?
-    .try_into()
-    .map_err(|_| io::Error::other("invalid UTC calendar"))
+    let days = seconds / 86_400;
+    let rem = seconds % 86_400;
+    let minute = rem / 60 % 60;
+    let hour = rem / 3_600;
+    let weekday = (days + 4) % 7; // 1970-01-01은 목요일
+    // 0000-03-01 기준 일수. 400년 주기(146,097일) 안에서 연·월·일을 구한다.
+    let z = days + 719_468;
+    let doe = z % 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    Ok([minute, hour, day, month, weekday].map(|v| u32::try_from(v).unwrap_or(u32::MAX)))
 }
 
 /// `LOCAL_PEERTOKEN`이 돌려주는 감사 토큰 바이트 수(`audit_token_t` 8×u32).
@@ -74,6 +89,7 @@ pub struct User {
 }
 
 /// `getpwuid_r(getuid())`. 버퍼가 모자라면(ERANGE) 1MiB까지 늘려 다시 묻는다.
+#[cfg(unix)]
 pub fn user() -> io::Result<User> {
     let uid = rustix::process::getuid().as_raw();
     let mut buf = vec![0 as c_char; 1_024];
@@ -113,6 +129,7 @@ pub fn user() -> io::Result<User> {
 /// # Safety
 ///
 /// `p`는 null이거나, 읽는 동안 살아 있는 NUL 종료 문자열을 가리켜야 한다.
+#[cfg(unix)]
 unsafe fn field(p: *const c_char) -> Vec<u8> {
     if p.is_null() {
         return Vec::new();
@@ -122,6 +139,7 @@ unsafe fn field(p: *const c_char) -> Vec<u8> {
 }
 
 /// 활성 비루프백 IPv4 인터페이스. getifaddrs 목록은 이 함수 안에서만 빌리고 반드시 반환한다.
+#[cfg(unix)]
 pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr)>> {
     let mut head = ptr::null_mut();
     // SAFETY: head는 getifaddrs가 목록 포인터를 쓸 유효한 위치다.

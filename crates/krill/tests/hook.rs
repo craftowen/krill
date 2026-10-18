@@ -4,10 +4,14 @@
 //!
 //! 지연 측정(200회 p50·p95)은 `bench_200`(`--run-ignored only`, docs/spikes/MK-038.md).
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
+#![cfg_attr(
+    unix,
+    expect(
+        clippy::unwrap_used,
+        reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
+    )
 )]
+#![cfg(unix)]
 
 use std::fs;
 use std::io::{Read as _, Write as _};

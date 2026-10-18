@@ -201,6 +201,7 @@ pub(crate) fn valid(entry: &Entry) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn scan_in(claude: Option<&Path>, codex: Option<&Path>) -> Snapshot {
     let claude_roots: Vec<PathBuf> = claude.into_iter().map(Path::to_path_buf).collect();
     let codex_roots: Vec<PathBuf> = codex.into_iter().map(Path::to_path_buf).collect();
@@ -413,26 +414,29 @@ mod multi_account_tests {
         let id_shared = "11111111-2222-4333-8444-555555555555";
         let id_second = "22222222-2222-4333-8444-555555555555";
         let id_codex = "33333333-2222-4333-8444-555555555555";
+        // 이 OS의 절대 경로(JSON 문자열, Windows 역슬래시 이스케이프 포함).
+        let cwd = |name: &str| serde_json::to_string(&root.join(name)).unwrap();
+        let (cwd_a, cwd_b, cwd_c) = (cwd("a"), cwd("b"), cwd("c"));
 
         fs::write(
             claude_a.join("a.jsonl"),
-            format!("{{\"sessionId\":\"{id_shared}\",\"cwd\":\"/tmp/a\",\"isSidechain\":false}}\n"),
+            format!("{{\"sessionId\":\"{id_shared}\",\"cwd\":{cwd_a},\"isSidechain\":false}}\n"),
         )
         .unwrap();
         fs::write(
             claude_b.join("dup.jsonl"),
-            format!("{{\"sessionId\":\"{id_shared}\",\"cwd\":\"/tmp/a\",\"isSidechain\":false}}\n"),
+            format!("{{\"sessionId\":\"{id_shared}\",\"cwd\":{cwd_a},\"isSidechain\":false}}\n"),
         )
         .unwrap();
         fs::write(
             claude_b.join("b.jsonl"),
-            format!("{{\"sessionId\":\"{id_second}\",\"cwd\":\"/tmp/b\",\"isSidechain\":false}}\n"),
+            format!("{{\"sessionId\":\"{id_second}\",\"cwd\":{cwd_b},\"isSidechain\":false}}\n"),
         )
         .unwrap();
         fs::write(
             codex_a.join("rollout-1.jsonl"),
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id_codex}\",\"cwd\":\"/tmp/c\"}}}}\n"
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id_codex}\",\"cwd\":{cwd_c}}}}}\n"
             ),
         )
         .unwrap();
@@ -595,4 +599,5 @@ mod resume_profile_tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

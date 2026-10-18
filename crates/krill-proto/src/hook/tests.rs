@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
 use super::*;
@@ -123,9 +124,12 @@ fn append_spool_creates_private_file_and_appends() {
         read_spool(&std::fs::read(&path).unwrap()),
         vec![event(), event()]
     );
-    let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode(&path), 0o600);
-    assert_eq!(mode(path.parent().unwrap()), 0o700);
+    #[cfg(unix)]
+    {
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        assert_eq!(mode(path.parent().unwrap()), 0o700);
+    }
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -147,7 +151,8 @@ fn append_spool_waits_for_lock_then_gives_up_on_deadline() {
     let dir = temp("lock");
     let path = dir.join(SPOOL_FILE);
     std::fs::create_dir_all(&dir).unwrap();
-    let held = File::create(&path).unwrap();
+    let data = File::create(&path).unwrap();
+    let held = spool_lock(&path, &data).unwrap();
     held.lock().unwrap();
     let start = Instant::now();
     append_spool(

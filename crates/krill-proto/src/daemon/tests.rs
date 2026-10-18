@@ -28,7 +28,7 @@ fn explicit_handshake_timeout_is_respected() {
         let d = dir(&format!("explicit-hello-{role:?}"));
         std::fs::create_dir_all(&d).unwrap();
         let socket = d.join("k.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
         let worker = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             thread::sleep(Duration::from_secs(2));
@@ -71,7 +71,7 @@ fn default_connect_allows_slow_signature_verification() {
         let d = dir(&format!("default-hello-{role:?}"));
         std::fs::create_dir_all(d.join("run")).unwrap();
         let socket = d.join("run/krilld.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let listener = crate::os::net::UnixListener::bind(&socket).unwrap();
         let worker = thread::spawn(move || {
             // 감시 handshake 한 번 + 실제 handshake 한 번.
             for _ in 0..2 {
@@ -160,7 +160,21 @@ fn missing_holder_is_reported() {
 #[test]
 fn holder_that_dies_is_reported() {
     let d = dir("dies");
-    let e = connect(&paths(&d, "/usr/bin/false", "/usr/bin/true"), &hello()).unwrap_err();
+    #[cfg(unix)]
+    let p = paths(&d, "/usr/bin/false", "/usr/bin/true");
+    #[cfg(windows)]
+    let p = {
+        let system = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap()
+            .join("System32");
+        Paths {
+            socket: d.join("run/krilld.sock"),
+            holder: system.join("where.exe"),
+            krilld: system.join("cmd.exe"),
+        }
+    };
+    let e = connect(&p, &hello()).unwrap_err();
     assert!(matches!(e, Error::HolderExited(s) if !s.success()), "{e}");
     std::fs::remove_dir_all(&d).ok();
 }
@@ -197,7 +211,7 @@ fn handshake_survives_server_closing_after_hello() {
     let d = dir("close");
     std::fs::create_dir_all(&d).unwrap();
     let sock = d.join("k.sock");
-    let lis = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let lis = crate::os::net::UnixListener::bind(&sock).unwrap();
     let server = ServerHello {
         proto_min: ipc::PROTO_MIN,
         proto_max: ipc::PROTO_MAX,
@@ -298,7 +312,7 @@ fn old_daemon_watch_needs_no_status_frame() {
     let d = dir("old-watch");
     std::fs::create_dir_all(&d).unwrap();
     let sock = d.join("k.sock");
-    let lis = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+    let lis = crate::os::net::UnixListener::bind(&sock).unwrap();
     let t = thread::spawn(move || {
         let (mut s, _) = lis.accept().unwrap();
         s.write_all(
@@ -322,6 +336,7 @@ fn old_daemon_watch_needs_no_status_frame() {
 }
 
 #[test]
+#[cfg(unix)]
 fn preflight_validates_executable() {
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -387,6 +402,7 @@ proptest::proptest! {
 }
 
 #[test]
+#[cfg(unix)]
 fn paths_resolves_symlink_and_bundle_candidates() {
     use std::os::unix::fs::symlink;
 
@@ -520,4 +536,19 @@ fn paths_dev_excludes_installed_krill_app_in_tests_and_temp_home() {
         "test Paths::dev() must not fall back to /Applications/Krill.app: {:?}",
         dev.krilld
     );
+}
+
+#[test]
+fn absent_socket_errors_are_platform_specific() {
+    assert!(is_absent(&io::Error::from(io::ErrorKind::NotFound)));
+    assert!(is_absent(&io::Error::from(
+        io::ErrorKind::ConnectionRefused
+    )));
+    assert_eq!(
+        is_absent(&io::Error::from_raw_os_error(10050)),
+        cfg!(windows)
+    );
+    assert!(!is_absent(&io::Error::from(
+        io::ErrorKind::PermissionDenied
+    )));
 }

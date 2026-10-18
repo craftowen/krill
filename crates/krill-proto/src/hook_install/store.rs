@@ -1,8 +1,8 @@
 //! Private backups, durable receipts, same-directory atomic replacement and optimistic conflict checks.
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -111,7 +111,13 @@ pub fn replace(path: &Path, expected: Option<&str>, next: Option<&str>) -> io::R
     if expected == next {
         return Ok(());
     }
-    let mode = fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777);
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::metadata(path).map_or(0o600, |m| m.permissions().mode() & 0o777)
+    };
+    #[cfg(windows)]
+    let mode = 0o600; // 쓰기 측 mode는 Windows에서 무시된다(crate::os).
     if let Some(text) = expected {
         backup(path, text)?;
     }
@@ -134,5 +140,8 @@ pub fn replace(path: &Path, expected: Option<&str>, next: Option<&str>) -> io::R
         }
         fs::remove_file(path)?;
     }
-    File::open(parent)?.sync_all()
+    // Windows는 디렉터리를 `File::open`으로 열 수 없다.
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
