@@ -5118,9 +5118,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
 
-    // 기본값: 자동 이름 변경·캐시 타이머는 켜짐, 워크스페이스 신뢰 프리셋은 꺼짐(동의 전).
+    // 기본값: 자동 이름 변경·캐시 타이머·워크스페이스 신뢰 프리셋 모두 기본 켜짐.
     assert!(krill_proto::git::is_auto_rename_enabled(Some(&d)));
-    assert!(!krill_proto::git::is_workspace_trust_preset_enabled(Some(
+    assert!(krill_proto::git::is_workspace_trust_preset_enabled(Some(
         &d
     )));
     assert!(vcx.debug_bounds("workspace-trust-preset-confirm").is_none());
@@ -5129,10 +5129,21 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         assert!(s.auto_rename_branch_from_work);
         assert!(s.prompt_cache_timer_enabled);
         assert_eq!(s.prompt_cache_ttl_secs, 300);
-        assert!(!s.workspace_trust_preset_enabled);
+        assert!(s.workspace_trust_preset_enabled);
     });
 
-    // 신뢰 프리셋 토글 첫 클릭 시 바로 켜지지 않고 변경 파일·키 diff 확인 상자가 열린다.
+    // 신뢰 프리셋 토글 클릭 시 꺼지고 플래그 파일이 지워진다.
+    let trust_off_at = vcx
+        .debug_bounds("workspace-trust-preset-toggle")
+        .unwrap()
+        .center();
+    vcx.simulate_click(trust_off_at, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(!krill_proto::git::is_workspace_trust_preset_enabled(Some(
+        &d
+    )));
+
+    // 꺼진 상태에서 다시 켜기 클릭 시 바로 켜지지 않고 변경 파일·키 diff 확인 상자가 열린다.
     let trust_on_at = vcx
         .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
@@ -5191,16 +5202,6 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     assert_eq!(saved.prompt_cache_ttl_secs, 3_600);
     assert!(saved.workspace_trust_preset_enabled);
 
-    // 신뢰 프리셋 다시 토글 클릭 시 즉시 비활성화되고 플래그 파일이 지워진다.
-    let trust_off_at = vcx
-        .debug_bounds("workspace-trust-preset-toggle")
-        .unwrap()
-        .center();
-    vcx.simulate_click(trust_off_at, gpui::Modifiers::default());
-    vcx.run_until_parked();
-    assert!(!krill_proto::git::is_workspace_trust_preset_enabled(Some(
-        &d
-    )));
     fs::remove_dir_all(d).ok();
 }
 
