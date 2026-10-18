@@ -1315,18 +1315,70 @@ fn apply_account_env(
 }
 
 /// 숨은 agy 플래그가 사라진 업데이트 뒤 잘못된 프로필로 조용히 실행하지 않도록 격리 HOME에서 확인한다.
+///
+/// 결과는 (실행 경로, mtime, 길이, `--version` 문자열) 키로 캐시한다(OWE-901).
+/// 키에 버전이 들어 있어 agy 업그레이드하면 자동으로 다시 보고, 실패해도 최대 1시간만 기억한다.
+/// 호스트 폴백(`apply_account_env`) 알림은 기존 warn 로그 + 기록 계정(호스트 id)이 맡는다.
+/// 전용 배너·세션 배지는 새 IPC가 필요해 넣지 않았다(OWE-901).
 fn agy_gemini_dir_supported() -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
     let Some(exe) = krill_proto::agent::which("agy", path) else {
         return false;
     };
+    agy_gemini_dir_supported_cached(&exe)
+}
+
+#[cfg(test)]
+pub(crate) fn agy_guard_cache_len_for_tests() -> usize {
+    crate::session::lock(&AGY_GUARD_CACHE).len()
+}
+
+#[cfg(test)]
+pub(crate) fn clear_agy_guard_cache_for_tests() {
+    crate::session::lock(&AGY_GUARD_CACHE).clear();
+}
+
+fn agy_gemini_dir_supported_cached(exe: &Path) -> bool {
+    let (mtime, len) = std::fs::symlink_metadata(exe)
+        .and_then(|m| {
+            m.modified().map(|t| {
+                (
+                    t.duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs()),
+                    m.len(),
+                )
+            })
+        })
+        .unwrap_or((0, 0));
+    let version = crate::usage::direct::agy::version_text_for_guard(exe);
+    let key = (exe.to_path_buf(), mtime, len, version);
+    if let Some(supported) = crate::session::lock(&AGY_GUARD_CACHE)
+        .get(&key)
+        .filter(|(at, _)| at.elapsed() < AGY_GUARD_TTL)
+        .map(|(_, supported)| *supported)
+    {
+        return supported;
+    }
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let root = std::env::temp_dir().join(format!("krill-agy-guard-{}-{nonce}", std::process::id()));
-    agy_gemini_dir_supported_with(&exe, &root)
+    let supported = agy_gemini_dir_supported_with(exe, &root);
+    let mut cache = crate::session::lock(&AGY_GUARD_CACHE);
+    if cache.len() >= 64 {
+        cache.pop_first();
+    }
+    cache.insert(key, (Instant::now(), supported));
+    supported
 }
+
+/// agy 가드 결과 캐시(OWE-901). 키는 (실행 경로, mtime, 길이, 버전 문자열).
+type AgyGuardKey = (PathBuf, u64, u64, String);
+static AGY_GUARD_CACHE: std::sync::Mutex<std::collections::BTreeMap<AgyGuardKey, (Instant, bool)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// 가드 결과 기억 상한. 키가 바뀌면(업그레이드) 그 전에 다시 본다.
+const AGY_GUARD_TTL: Duration = Duration::from_hours(1);
 
 fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
     use std::os::unix::fs::DirBuilderExt as _;

@@ -315,21 +315,42 @@ pub fn stop_failure_rate_limited(payload: &[u8]) -> bool {
     krill_proto::agent::claude::is_rate_limit(payload)
 }
 
+/// agy 한도 도달 감지(OWE-901). `Stop`·`PostInvocation`의 `error: "rate_limit"` 완전 일치만 본다.
+/// Claude `StopFailure`와 같은 상수를 공유해 오탐을 막는다. 그 밖의 문구(쿼터·429 등)는 다루지 않는다.
+pub fn agy_rate_limited(payload: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    struct AgyFields {
+        #[serde(alias = "hookEventName", alias = "event")]
+        hook_event_name: Option<String>,
+        error: Option<String>,
+    }
+    let Ok(fields): Result<AgyFields, _> = serde_json::from_slice(payload) else {
+        return false;
+    };
+    matches!(
+        fields.hook_event_name.as_deref(),
+        Some("Stop" | "PostInvocation")
+    ) && fields.error.as_deref() == Some(krill_proto::agent::claude::STOP_FAILURE_RATE_LIMIT)
+}
+
 /// Claude `StopFailure` 한도 도달이면 자동전환 평가를 즉시 트리거한다(OWE-710).
 /// 평가는 `accounts::refresh_accounts_on_rate_limit`으로 기존 정책(활성 계정·임계치·히스테리시스·
 /// 수동 선택·후보 제외·`switch_on_rate_limit`)을 그대로 따른다. 실행 중 세션의 env는 바꾸지 않는다
 /// (다음 실행부터 적용 — "실행 중 세션은 계정 유지" 원칙).
-/// Claude가 아닌 에이전트·한도 외 오류·비JSON payload면 평가하지 않고 `None`을 돌려준다.
+/// Claude·Antigravity가 아닌 에이전트·한도 외 오류·비JSON payload면 평가하지 않고 `None`을 돌려준다.
+/// agy는 같은 `rate_limit` 봉투(`Stop`·`PostInvocation`의 `error: "rate_limit"`)로 오면 전환한다(OWE-901).
 pub fn auto_switch_on_rate_limit(
     home: &Path,
     state_dir: Option<&Path>,
     agent: &str,
     payload: &[u8],
 ) -> Option<Vec<AutoSwitchEvent>> {
-    if ProviderKind::parse(agent) != Some(ProviderKind::Claude) {
-        return None;
-    }
-    if !stop_failure_rate_limited(payload) {
+    let limited = match ProviderKind::parse(agent) {
+        Some(ProviderKind::Claude) => stop_failure_rate_limited(payload),
+        Some(ProviderKind::Antigravity) => agy_rate_limited(payload),
+        _ => return None,
+    };
+    if !limited {
         return None;
     }
     Some(accounts::refresh_accounts_on_rate_limit(home, state_dir).switched)
