@@ -72,6 +72,12 @@ echo "installed $(basename "$SRC") -> $PREFIX/bin"
 if [ -S "${KRILL_STATE_DIR:-$HOME/.local/share/dev.krill.app}/run/krilld.sock" ]; then
     "$PREFIX/bin/krill" update || echo "warning: running daemon was not upgraded; sessions keep running on the old version" >&2
 fi
+# holder·krilld는 데몬을 처음 깨운 ssh 세션의 systemd scope 안에서 돈다. logind가 로그아웃 때 사용자 프로세스를
+# 죽이도록 설정돼 있으면 세션이 함께 죽는다(Ubuntu·Debian 기본값은 no).
+if grep -qs '^[[:space:]]*KillUserProcesses[[:space:]]*=[[:space:]]*yes' /etc/systemd/logind.conf /etc/systemd/logind.conf.d/*.conf; then
+    echo "warning: systemd-logind KillUserProcesses=yes kills Krill sessions when the SSH login that started the daemon ends." >&2
+    echo "         set KillUserProcesses=no (or KillExcludeUsers=$(id -un)) in /etc/systemd/logind.conf and restart systemd-logind." >&2
+fi
 case ":${PATH}:" in
     *":$PREFIX/bin:"*) ;;
     *) echo "note: $PREFIX/bin is not on PATH for this shell (the Mac app finds it anyway)" ;;
