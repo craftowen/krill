@@ -2037,3 +2037,121 @@ fn unfocused_panel_keeps_git_watch_and_manual_refresh_working(cx: &mut gpui::Tes
         "manual diff refresh must execute immediately while window is unfocused"
     );
 }
+
+#[gpui::test]
+fn comparison_tabs_filter_worktree_and_index_files_and_clear_mismatched_selection(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(PathBuf::from("/repo"), cx);
+        p.visible = false;
+        p.changes = Changes {
+            files: vec![
+                ChangedFile {
+                    path: b"src/unstaged_only.rs".to_vec(),
+                    old_path: None,
+                    status: *b".M",
+                    staged: None,
+                    unstaged: Some(Numstat {
+                        added: Some(4),
+                        deleted: Some(1),
+                    }),
+                },
+                ChangedFile {
+                    path: b"src/untracked.rs".to_vec(),
+                    old_path: None,
+                    status: *b"??",
+                    staged: None,
+                    unstaged: None,
+                },
+                ChangedFile {
+                    path: b"src/staged_only.rs".to_vec(),
+                    old_path: None,
+                    status: *b"M.",
+                    staged: Some(Numstat {
+                        added: Some(10),
+                        deleted: Some(2),
+                    }),
+                    unstaged: None,
+                },
+                ChangedFile {
+                    path: b"src/both.rs".to_vec(),
+                    old_path: None,
+                    status: *b"MM",
+                    staged: Some(Numstat {
+                        added: Some(3),
+                        deleted: Some(0),
+                    }),
+                    unstaged: Some(Numstat {
+                        added: Some(1),
+                        deleted: Some(1),
+                    }),
+                },
+            ],
+            limited: false,
+        };
+        p
+    });
+    cx.run_until_parked();
+
+    // 1. Default tab is `Comparison::Worktree`: shows indices 0, 1, 3 and hides staged-only index 2.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).visible_file_indices(Comparison::Worktree)),
+        vec![0, 1, 3]
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).visible_file_indices(Comparison::Index)),
+        vec![2, 3]
+    );
+    assert!(cx.debug_bounds("changed-file-0").is_some());
+    assert!(cx.debug_bounds("changed-file-1").is_some());
+    assert!(cx.debug_bounds("changed-file-2").is_none());
+    assert!(cx.debug_bounds("changed-file-3").is_some());
+
+    // Select unstaged-only file 0, then click `comparison-1` (`Index`):
+    // selection must be cleared to `None` (`diff-empty-unselected`), and only indices 2 and 3 are rendered.
+    let row0 = cx.debug_bounds("changed-file-0").unwrap();
+    cx.simulate_click(row0.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).selected_path()),
+        Some("src/unstaged_only.rs".to_owned())
+    );
+
+    let index_tab = cx.debug_bounds("comparison-1").unwrap();
+    cx.simulate_click(index_tab.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).comparison()),
+        Comparison::Index
+    );
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected_path()), None);
+    assert!(cx.debug_bounds("diff-empty-unselected").is_some());
+    assert!(cx.debug_bounds("changed-file-0").is_none());
+    assert!(cx.debug_bounds("changed-file-1").is_none());
+    assert!(cx.debug_bounds("changed-file-2").is_some());
+    assert!(cx.debug_bounds("changed-file-3").is_some());
+
+    // Select `src/both.rs` (index 3, which is in both Index and Worktree) and switch back to Worktree:
+    // selection stays on `src/both.rs`.
+    let row3 = cx.debug_bounds("changed-file-3").unwrap();
+    cx.simulate_click(row3.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).selected_path()),
+        Some("src/both.rs".to_owned())
+    );
+
+    let worktree_tab = cx.debug_bounds("comparison-0").unwrap();
+    cx.simulate_click(worktree_tab.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).comparison()),
+        Comparison::Worktree
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).selected_path()),
+        Some("src/both.rs".to_owned())
+    );
+}

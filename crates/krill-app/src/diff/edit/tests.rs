@@ -5,6 +5,7 @@ use std::sync::Mutex;
 #[derive(Default)]
 struct Fake {
     edits: Mutex<Vec<Edit>>,
+    discards: Mutex<Vec<Vec<u8>>>,
     fail: Mutex<bool>,
     no_sync_feature: Mutex<bool>,
     sync: Mutex<(u64, u64)>,
@@ -15,6 +16,15 @@ impl EditSource for Fake {
         self.edits.lock().unwrap().push(edit);
         if *self.fail.lock().unwrap() {
             Err(io::Error::other("hook rejected"))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn discard(&self, _: &Path, _: &Path, file: &ChangedFile) -> io::Result<()> {
+        self.discards.lock().unwrap().push(file.path.clone());
+        if *self.fail.lock().unwrap() {
+            Err(io::Error::other("discard failed"))
         } else {
             Ok(())
         }
@@ -38,7 +48,7 @@ impl EditSource for Fake {
 }
 
 #[gpui::test]
-fn stage_unstage_commit_confirmation_failure_and_retry(cx: &mut TestAppContext) {
+fn stage_unstage_discard_multiline_commit_cmd_enter_failure_and_retry(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let fake = Arc::new(Fake::default());
     let (panel, cx) = cx.add_window_view(|window, cx| {
@@ -59,8 +69,35 @@ fn stage_unstage_commit_confirmation_failure_and_retry(cx: &mut TestAppContext) 
         p
     });
     cx.run_until_parked();
+
+    // Worktree tab shows Discard + Stage buttons and hides Unstage button.
+    assert!(cx.debug_bounds("git-discard-0").is_some());
+    assert!(cx.debug_bounds("git-stage-0").is_some());
+    assert!(cx.debug_bounds("git-unstage-0").is_none());
+
+    // Discard opens confirmation prompt; Cancel leaves discards empty, Confirm runs discard.
+    click("git-discard-0", cx);
+    assert!(cx.pending_prompt().is_some());
+    cx.simulate_prompt_answer(text::CANCEL.get());
+    cx.run_until_parked();
+    assert!(fake.discards.lock().unwrap().is_empty());
+
+    click("git-discard-0", cx);
+    assert!(cx.pending_prompt().is_some());
+    cx.simulate_prompt_answer(text::DISCARD.get());
+    cx.run_until_parked();
+    assert_eq!(*fake.discards.lock().unwrap(), [b"file".to_vec()]);
+
     click("git-stage-0", cx);
     cx.run_until_parked();
+
+    // Switching to Staged (`comparison-1`) shows Unstage button and hides Stage + Discard buttons.
+    click("comparison-1", cx);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("git-unstage-0").is_some());
+    assert!(cx.debug_bounds("git-stage-0").is_none());
+    assert!(cx.debug_bounds("git-discard-0").is_none());
+
     click("git-unstage-0", cx);
     cx.run_until_parked();
     assert_eq!(
@@ -76,38 +113,48 @@ fn stage_unstage_commit_confirmation_failure_and_retry(cx: &mut TestAppContext) 
             }
         ]
     );
+
+    // Empty commit message shows validation note without OS prompt.
     click("git-commit", cx);
     cx.run_until_parked();
     assert!(cx.pending_prompt().is_none());
     assert_eq!(fake.edits.lock().unwrap().len(), 2);
+
+    // Multiline commit message submits directly without an OS warning prompt.
+    let multiline_msg = "한글 커밋 제목\n\n- 본문 첫 줄\n- 본문 둘째 줄";
     panel.update_in(cx, |p, window, cx| {
-        p.editing
-            .input
-            .as_ref()
-            .unwrap()
-            .update(cx, |input, cx| input.set_value("한글 커밋", window, cx));
+        p.editing.input.as_ref().unwrap().update(cx, |input, cx| {
+            input.set_value(multiline_msg, window, cx);
+            input.focus(window, cx);
+        });
     });
     cx.run_until_parked();
-    click("git-commit", cx);
-    assert_eq!(cx.pending_prompt().unwrap().0, text::CONFIRM.get());
-    cx.simulate_prompt_answer(text::CANCEL.get());
-    cx.run_until_parked();
-    assert_eq!(fake.edits.lock().unwrap().len(), 2);
     *fake.fail.lock().unwrap() = true;
-    panel.update_in(cx, Panel::confirm_commit);
-    cx.simulate_prompt_answer(text::COMMIT.get());
+    click("git-commit", cx);
+    assert!(
+        cx.pending_prompt().is_none(),
+        "normal commit must not pop up an OS warning confirmation dialog"
+    );
     cx.run_until_parked();
     panel.read_with(cx, |p, cx| {
         assert_eq!(p.editing.note, "hook rejected");
         assert!(!p.editing.busy);
         assert_eq!(
             p.editing.input.as_ref().unwrap().read(cx).value(),
-            "한글 커밋"
+            multiline_msg
         );
     });
+
+    // Pressing Cmd+Enter inside the commit textarea submits the multiline commit directly.
     *fake.fail.lock().unwrap() = false;
-    panel.update_in(cx, Panel::confirm_commit);
-    cx.simulate_prompt_answer(text::COMMIT.get());
+    panel.update_in(cx, |p, window, cx| {
+        p.editing
+            .input
+            .as_ref()
+            .unwrap()
+            .update(cx, |input, cx| input.focus(window, cx));
+    });
+    cx.simulate_keystrokes("cmd-enter");
     cx.run_until_parked();
     panel.read_with(cx, |p, cx| {
         assert!(
@@ -120,9 +167,58 @@ fn stage_unstage_commit_confirmation_failure_and_retry(cx: &mut TestAppContext) 
     assert_eq!(
         fake.edits.lock().unwrap().last(),
         Some(&Edit::Commit {
-            message: "한글 커밋".into()
+            message: multiline_msg.into()
         })
     );
+}
+
+#[gpui::test]
+fn commit_textarea_plain_enter_inserts_newline(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let fake = Arc::new(Fake::default());
+    let (panel, cx) = cx.add_window_view(|window, cx| {
+        let mut p = Panel::unconnected("/repo".into(), cx);
+        p.visible = false;
+        p.editing.source = fake.clone();
+        p.changes = Changes {
+            files: vec![ChangedFile {
+                path: b"file".into(),
+                old_path: None,
+                status: *b"MM",
+                staged: None,
+                unstaged: None,
+            }],
+            limited: false,
+        };
+        drop(p.render_editor(window, cx));
+        p
+    });
+    cx.run_until_parked();
+    panel.update_in(cx, |p, window, cx| {
+        p.editing.input.as_ref().unwrap().update(cx, |input, cx| {
+            input.focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    // Type "hi" then plain Enter: inserts exactly one newline natively and
+    // must not submit (no staged-commit edit recorded).
+    cx.simulate_keystrokes("h i");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    panel.read_with(cx, |p, cx| {
+        assert_eq!(
+            p.editing
+                .input
+                .as_ref()
+                .unwrap()
+                .read(cx)
+                .value()
+                .to_string(),
+            "hi\n"
+        );
+    });
+    assert!(fake.edits.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -225,8 +321,7 @@ fn peer_without_feat_git_sync_disables_sync_buttons_and_never_sends_sync_edits(
     click("git-stage-0", cx);
     cx.run_until_parked();
     click("git-commit", cx);
-    assert_eq!(cx.pending_prompt().unwrap().0, text::CONFIRM.get());
-    cx.simulate_prompt_answer(text::COMMIT.get());
+    assert!(cx.pending_prompt().is_none());
     cx.run_until_parked();
     assert_eq!(
         *fake.edits.lock().unwrap(),
@@ -249,7 +344,7 @@ fn click(selector: &'static str, cx: &mut VisualTestContext) {
 }
 
 #[gpui::test]
-fn repository_switch_cancels_pending_commit_confirmation(cx: &mut TestAppContext) {
+fn repository_switch_cancels_pending_discard_confirmation(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let fake = Arc::new(Fake::default());
     let (panel, cx) = cx.add_window_view(|window, cx| {
@@ -259,7 +354,7 @@ fn repository_switch_cancels_pending_commit_confirmation(cx: &mut TestAppContext
         p.changes.files.push(ChangedFile {
             path: b"file".into(),
             old_path: None,
-            status: *b"M.",
+            status: *b".M",
             staged: None,
             unstaged: None,
         });
@@ -267,18 +362,13 @@ fn repository_switch_cancels_pending_commit_confirmation(cx: &mut TestAppContext
         p
     });
     panel.update_in(cx, |p, window, cx| {
-        p.editing
-            .input
-            .as_ref()
-            .unwrap()
-            .update(cx, |input, cx| input.set_value("message", window, cx));
-        p.confirm_commit(window, cx);
+        p.confirm_discard_file(0, window, cx);
     });
     assert!(cx.pending_prompt().is_some());
     panel.update(cx, |p, cx| p.set_repo("/new".into(), cx));
-    cx.simulate_prompt_answer(text::COMMIT.get());
+    cx.simulate_prompt_answer(text::DISCARD.get());
     cx.run_until_parked();
-    assert!(fake.edits.lock().unwrap().is_empty());
+    assert!(fake.discards.lock().unwrap().is_empty());
     panel.read_with(cx, |p, _| assert!(!p.editing.busy));
 }
 
@@ -325,11 +415,7 @@ fn push_pull_sync_commit_and_push_and_sync_count_badges(cx: &mut TestAppContext)
     });
     cx.run_until_parked();
     click("git-commit-push", cx);
-    assert_eq!(
-        cx.pending_prompt().unwrap().0,
-        text::CONFIRM_COMMIT_AND_PUSH.get()
-    );
-    cx.simulate_prompt_answer(text::COMMIT_AND_PUSH.get());
+    assert!(cx.pending_prompt().is_none());
     cx.run_until_parked();
 
     assert_eq!(
@@ -391,7 +477,7 @@ fn ai_commit_message_generation_and_recovery_banner_prompt_injection(cx: &mut Te
     // 2. Trigger a failed commit (e.g. pre-commit hook failure) and verify recovery banner appears.
     *fake.fail.lock().unwrap() = true;
     click("git-commit", cx);
-    cx.simulate_prompt_answer(text::COMMIT.get());
+    assert!(cx.pending_prompt().is_none());
     cx.run_until_parked();
     assert!(cx.debug_bounds("git-recovery-banner").is_some());
     assert!(cx.debug_bounds("git-recovery-fix").is_some());
@@ -416,6 +502,94 @@ fn ai_commit_message_generation_and_recovery_banner_prompt_injection(cx: &mut Te
     panel.read_with(cx, |p, _| {
         assert_eq!(p.editing.note, text::RECOVERY_SENT.get());
     });
+}
+
+#[test]
+fn discard_worktree_file_restores_tracked_changes_and_trashes_untracked_files() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-discard-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let repo = dir.join("repo");
+    let home = dir.join("home");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .status()
+            .unwrap()
+            .success()
+    );
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+
+    std::fs::write(repo.join("tracked.rs"), "pub fn v1() {}\n").unwrap();
+    Command::new("git")
+        .args(["add", "tracked.rs"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(&repo)
+        .status()
+        .unwrap();
+
+    // Modify tracked file and create untracked file.
+    std::fs::write(repo.join("tracked.rs"), "pub fn dirty() {}\n").unwrap();
+    std::fs::write(repo.join("untracked.txt"), "scratch\n").unwrap();
+
+    discard_worktree_file(
+        &repo,
+        &home,
+        &ChangedFile {
+            path: b"tracked.rs".to_vec(),
+            old_path: None,
+            status: *b".M",
+            staged: None,
+            unstaged: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(repo.join("tracked.rs")).unwrap(),
+        "pub fn v1() {}\n"
+    );
+
+    discard_worktree_file(
+        &repo,
+        &home,
+        &ChangedFile {
+            path: b"untracked.txt".to_vec(),
+            old_path: None,
+            status: *b"??",
+            staged: None,
+            unstaged: None,
+        },
+    )
+    .unwrap();
+    assert!(!repo.join("untracked.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(home.join(".Trash/untracked.txt")).unwrap(),
+        "scratch\n"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

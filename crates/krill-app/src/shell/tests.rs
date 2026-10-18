@@ -2578,7 +2578,7 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
     cx.simulate_keystrokes("cmd-shift-enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), None);
 
-    // Toggle right diff panel via cmd-l and cmd-shift-g (Orca parity).
+    // Toggle right diff panel via cmd-l and cmd-shift-g (Orca parity: cmd-shift-g switches to Changes tab if another tab is active, and collapses only when Changes is already active).
     let before_panel = cx.update(|_, cx| view.read(cx).panel_collapsed);
     cx.simulate_keystrokes("cmd-l");
     assert_eq!(
@@ -2590,6 +2590,29 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
         cx.update(|_, cx| view.read(cx).panel_collapsed),
         before_panel
     );
+    cx.simulate_keystrokes("cmd-shift-e");
+    assert!(!cx.update(|_, cx| view.read(cx).panel_collapsed));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app::diff::PanelTab::Files
+    );
+    cx.simulate_keystrokes("cmd-shift-g");
+    assert!(
+        !cx.update(|_, cx| view.read(cx).panel_collapsed),
+        "cmd-shift-g from Files tab must switch to Changes without collapsing the panel"
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).diff.read(cx).active_tab()),
+        krill_app::diff::PanelTab::Changes
+    );
+    cx.simulate_keystrokes("cmd-shift-g");
+    assert!(
+        cx.update(|_, cx| view.read(cx).panel_collapsed),
+        "cmd-shift-g when Changes tab is already active must collapse the panel"
+    );
+    if !before_panel {
+        cx.simulate_keystrokes("cmd-shift-g");
+    }
 
     // Create 3 tabs and verify ctrl-2, ctrl-tab, ctrl-shift-tab, ctrl-pagedown, ctrl-pageup switch tabs.
     cx.simulate_keystrokes("cmd-t cmd-t");

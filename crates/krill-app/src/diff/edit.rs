@@ -7,7 +7,7 @@ use std::sync::Arc;
 use gpui::{AnyElement, PromptLevel};
 use gpui_component::Disableable as _;
 use gpui_component::button::Button;
-use gpui_component::input::{Input, InputState};
+use gpui_component::input::{InputEvent, Textarea, TextareaState};
 use krill_proto::control::{FEAT_GIT_EDIT, FEAT_GIT_SYNC};
 use krill_proto::git::{Edit, MAX_MESSAGE};
 
@@ -17,6 +17,10 @@ use crate::i18n::catalog::diff_edit as text;
 
 pub(super) trait EditSource: Send + Sync {
     fn edit(&self, repo: &Path, edit: Edit) -> io::Result<()>;
+
+    fn discard(&self, repo: &Path, home: &Path, file: &ChangedFile) -> io::Result<()> {
+        discard_worktree_file(repo, home, file)
+    }
 
     fn supports_sync(&self) -> bool {
         true
@@ -322,6 +326,80 @@ impl SyncCapability {
     }
 }
 
+pub(super) fn discard_worktree_file(
+    repo: &Path,
+    home: &Path,
+    file: &ChangedFile,
+) -> io::Result<()> {
+    let rel_path = Path::new(OsStr::from_bytes(&file.path));
+    if rel_path.as_os_str().is_empty()
+        || rel_path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid git path",
+        ));
+    }
+    if file.status == *b"??" {
+        let target = repo.join(rel_path);
+        return krill_proto::usage::profiles::move_path_to_trash(home, repo, &target).map(|_| ());
+    }
+    let mut child = super::Reap(
+        Command::new("git")
+            .current_dir(repo)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(["--literal-pathspecs", "checkout", "--"])
+            .arg(rel_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing git stderr"))?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "git checkout timed out",
+                ));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    child.0.kill().ok();
+    child.0.wait().ok();
+    let err_bytes = reader
+        .join()
+        .map_err(|_| io::Error::other("git reader failed"))??;
+    let status = status?;
+    if status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&err_bytes).trim().to_owned();
+        Err(io::Error::other(if msg.is_empty() {
+            "git checkout failed".to_owned()
+        } else {
+            msg
+        }))
+    }
+}
+
 pub(super) struct State {
     pub source: Arc<dyn EditSource>,
     pub pr_service: Arc<crate::pull_request::Service>,
@@ -333,7 +411,8 @@ pub(super) struct State {
     pub failure: Option<GitFailure>,
     pub pr_dialog: Option<(Entity<crate::pull_request::Dialog>, Subscription)>,
     language: crate::i18n::Language,
-    input: Option<Entity<InputState>>,
+    input: Option<Entity<TextareaState>>,
+    input_enter_sub: Option<Subscription>,
     pub note: String,
     task: Option<Task<()>>,
     sync_task: Option<Task<()>>,
@@ -352,6 +431,7 @@ impl Default for State {
             pr_dialog: None,
             language: crate::i18n::language(),
             input: None,
+            input_enter_sub: None,
             note: String::new(),
             task: None,
             sync_task: None,
@@ -407,26 +487,109 @@ impl Panel {
         }));
     }
 
-    fn edit_file(&mut self, index: usize, comparison: Comparison, cx: &mut Context<Self>) {
+    pub(super) fn edit_file(
+        &mut self,
+        index: usize,
+        comparison: Comparison,
+        cx: &mut Context<Self>,
+    ) {
         if self.editing.busy {
             return;
         }
         let Some(file) = self.changes.files.get(index) else {
             return;
         };
+        if !Self::matches_comparison(file, comparison) {
+            return;
+        }
         let edit = match comparison {
-            Comparison::Worktree if file.status[1] != b'.' => Edit::Stage {
+            Comparison::Worktree => Edit::Stage {
                 path: file.path.clone(),
                 old_path: file.old_path.clone(),
             },
-            Comparison::Index if file.status[0] != b'.' && file.status != *b"??" => Edit::Unstage {
+            Comparison::Index => Edit::Unstage {
                 path: file.path.clone(),
                 old_path: file.old_path.clone(),
             },
-            _ => return,
         };
         self.editing.busy = true;
         self.submit_edit(edit, cx);
+    }
+
+    pub(super) fn confirm_discard_file(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.editing.busy || self.editing.generating {
+            return;
+        }
+        let Some(file) = self.changes.files.get(index).cloned() else {
+            return;
+        };
+        if !Self::matches_comparison(&file, Comparison::Worktree) {
+            return;
+        }
+        self.editing.busy = true;
+        let path_display = String::from_utf8_lossy(&file.path).into_owned();
+        let prompt_title = if file.status == *b"??" {
+            text::CONFIRM_DISCARD_UNTRACKED.format(&[("path", &path_display)])
+        } else {
+            text::CONFIRM_DISCARD.format(&[("path", &path_display)])
+        };
+        let detail = self.repo.display().to_string();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &prompt_title,
+            Some(&detail),
+            &[text::DISCARD.get(), text::CANCEL.get()],
+            cx,
+        );
+        self.editing.task = Some(cx.spawn(async move |this, cx| {
+            let confirmed = answer.await == Ok(0);
+            this.update(cx, |this, cx| {
+                if confirmed {
+                    this.submit_discard(file, cx);
+                } else {
+                    this.editing.busy = false;
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn submit_discard(&mut self, file: ChangedFile, cx: &mut Context<Self>) {
+        self.editing.note = text::BUSY.get().into();
+        self.editing.failure = None;
+        let source = Arc::clone(&self.editing.source);
+        let repo = self.repo.clone();
+        let home = self.explorer.home.clone();
+        self.editing.task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { source.discard(&repo, &home, &file) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.editing.busy = false;
+                match result {
+                    Ok(()) => {
+                        this.editing.failure = None;
+                        this.editing.note = text::DONE.get().into();
+                        this.explorer.refresh();
+                        this.refresh(cx);
+                    }
+                    Err(e) => {
+                        this.editing.note = e.to_string();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     pub(super) fn run_git_action(&mut self, edit: Edit, cx: &mut Context<Self>) {
@@ -475,6 +638,7 @@ impl Panel {
                     Ok(()) => {
                         if committed {
                             this.editing.input = None;
+                            this.editing.input_enter_sub = None;
                         }
                         this.editing.failure = None;
                         this.editing.note = text::DONE.get().into();
@@ -498,20 +662,15 @@ impl Panel {
         cx.notify();
     }
 
-    fn confirm_commit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_commit_inner(false, window, cx);
+    fn confirm_commit(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_commit_inner(false, cx);
     }
 
-    fn confirm_commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_commit_inner(true, window, cx);
+    fn confirm_commit_and_push(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_commit_inner(true, cx);
     }
 
-    fn confirm_commit_inner(
-        &mut self,
-        and_push: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn confirm_commit_inner(&mut self, and_push: bool, cx: &mut Context<Self>) {
         if self.editing.busy
             || self.editing.generating
             || !self.has_staged()
@@ -529,42 +688,12 @@ impl Panel {
             return;
         }
         self.editing.busy = true;
-        let detail = format!("{}\n\n{}", self.repo.display(), message);
-        let prompt_title = if and_push {
-            text::CONFIRM_COMMIT_AND_PUSH.get()
+        let edit = if and_push {
+            Edit::CommitAndPush { message }
         } else {
-            text::CONFIRM.get()
+            Edit::Commit { message }
         };
-        let confirm_btn = if and_push {
-            text::COMMIT_AND_PUSH.get()
-        } else {
-            text::COMMIT.get()
-        };
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            prompt_title,
-            Some(&detail),
-            &[confirm_btn, text::CANCEL.get()],
-            cx,
-        );
-        self.editing.task = Some(cx.spawn(async move |this, cx| {
-            let confirmed = answer.await == Ok(0);
-            this.update(cx, |this, cx| {
-                if confirmed {
-                    let edit = if and_push {
-                        Edit::CommitAndPush { message }
-                    } else {
-                        Edit::Commit { message }
-                    };
-                    this.submit_edit(edit, cx);
-                } else {
-                    this.editing.busy = false;
-                    cx.notify();
-                }
-            })
-            .ok();
-        }));
-        cx.notify();
+        self.submit_edit(edit, cx);
     }
 
     pub(super) fn generate_commit_message(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -584,15 +713,7 @@ impl Panel {
                 this.editing.generating = false;
                 match result {
                     Ok(msg) => {
-                        let input = this
-                            .editing
-                            .input
-                            .get_or_insert_with(|| {
-                                cx.new(|cx| {
-                                    InputState::new(window, cx).placeholder(text::MESSAGE.get())
-                                })
-                            })
-                            .clone();
+                        let input = this.ensure_commit_input(window, cx);
                         input.update(cx, |input, cx| input.set_value(msg, window, cx));
                         this.editing.note.clear();
                     }
@@ -649,7 +770,36 @@ impl Panel {
         self.changes
             .files
             .iter()
-            .any(|file| file.status[0] != b'.' && file.status != *b"??")
+            .any(|file| Self::matches_comparison(file, Comparison::Index))
+    }
+
+    pub(super) fn discard_button(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(file) = self.changes.files.get(index) else {
+            return div().into_any_element();
+        };
+        let path = file.path.clone();
+        let enabled = Self::matches_comparison(file, Comparison::Worktree);
+        let label = text::DISCARD.get();
+        Button::new(("git-discard", index))
+            .debug_selector(move || format!("git-discard-{index}"))
+            .icon(Icon::default().data(crate::ui::icons::ROTATE_CCW_SVG))
+            .tooltip(label)
+            .accessibility_label(label)
+            .xsmall()
+            .ghost()
+            .disabled(self.editing.busy || !enabled)
+            .on_click(cx.listener(move |this, _, window, cx| {
+                cx.stop_propagation();
+                if this
+                    .changes
+                    .files
+                    .get(index)
+                    .is_some_and(|file| file.path == path)
+                {
+                    this.confirm_discard_file(index, window, cx);
+                }
+            }))
+            .into_any_element()
     }
 
     pub(super) fn edit_button(
@@ -663,21 +813,23 @@ impl Panel {
         };
         let path = file.path.clone();
         let stage = comparison == Comparison::Worktree;
-        let enabled = if stage {
-            file.status[1] != b'.'
+        let enabled = Self::matches_comparison(file, comparison);
+        let label = if stage {
+            text::STAGE.get()
         } else {
-            file.status[0] != b'.' && file.status != *b"??"
+            text::UNSTAGE.get()
         };
         Button::new((if stage { "git-stage" } else { "git-unstage" }, index))
             .debug_selector(move || {
                 format!("git-{}-{index}", if stage { "stage" } else { "unstage" })
             })
-            .label(if stage { "+" } else { "−" })
-            .tooltip(if stage {
-                text::STAGE.get()
+            .icon(if stage {
+                IconName::Plus
             } else {
-                text::UNSTAGE.get()
+                IconName::Minus
             })
+            .tooltip(label)
+            .accessibility_label(label)
             .xsmall()
             .ghost()
             .disabled(self.editing.busy || !enabled)
@@ -695,19 +847,64 @@ impl Panel {
             .into_any_element()
     }
 
+    /// Commit message input, created lazily. `submit_on_enter(true)` suppresses
+    /// the native newline for `⌘Enter` (`secondary-enter`) so it submits
+    /// without leaving a stray newline in the message; plain/shift `Enter`
+    /// still insert exactly one newline natively. Element-level
+    /// `capture_key_down` cannot intercept it: the input's `secondary-enter`
+    /// binding consumes the keystroke before element handlers run, so this
+    /// helper subscribes to `InputEvent::PressEnter` instead.
+    fn ensure_commit_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
+        let input = self
+            .editing
+            .input
+            .get_or_insert_with(|| {
+                cx.new(|cx| {
+                    TextareaState::new(window, cx)
+                        .placeholder(text::MESSAGE.get())
+                        .submit_on_enter(true)
+                })
+            })
+            .clone();
+        input.update(cx, |state, cx| state.set_submit_on_enter(true, cx));
+        if self.editing.input_enter_sub.is_none() {
+            let sub = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { secondary, shift } = event
+                    && *secondary
+                {
+                    if *shift {
+                        this.confirm_commit_and_push(window, cx);
+                    } else {
+                        this.confirm_commit(window, cx);
+                    }
+                }
+            });
+            self.editing.input_enter_sub = Some(sub);
+        }
+        input
+    }
+
+    /// 변경 사항 탭으로 전환하고 커밋 메시지 입력창에 포커스를 둔다.
+    /// `show_files`/`show_search`와 대칭: 탭만 바꾸면 이전 탭의 입력창에
+    /// 남아 있던 포커스가 언마운트와 함께 사라져 이후 단축키가 동작하지 않는다.
+    pub fn show_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.set_tab(super::PanelTab::Changes, cx);
+        let input = self.ensure_commit_input(window, cx);
+        input.update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
     pub(super) fn render_editor(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let p = crate::ui::palette(cx);
-        let input = self
-            .editing
-            .input
-            .get_or_insert_with(|| {
-                cx.new(|cx| InputState::new(window, cx).placeholder(text::MESSAGE.get()))
-            })
-            .clone();
+        let input = self.ensure_commit_input(window, cx);
         if self.editing.language != crate::i18n::language() {
             self.editing.language = crate::i18n::language();
             input.update(cx, |input, cx| {
@@ -801,31 +998,60 @@ impl Panel {
             .border_color(p.sidebar_border)
             .child(
                 div()
+                    .id("git-commit-input")
+                    .debug_selector(|| "git-commit-input".into())
+                    .w_full()
+                    .child(
+                        Textarea::new(&input)
+                            .h(crate::ui::SPACE_4 * 3.5)
+                            .disabled(busy),
+                    ),
+            )
+            .child(
+                div()
                     .flex()
-                    .gap_1()
                     .items_center()
+                    .justify_between()
+                    .gap_1()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(Input::new(&input).disabled(busy)),
-                    )
-                    .child(
-                        Button::new("git-ai-commit")
-                            .debug_selector(|| "git-ai-commit".into())
-                            .xsmall()
-                            .ghost()
-                            .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
-                            .tooltip(text::AI_GENERATE.get())
-                            .accessibility_label(text::AI_GENERATE.get())
-                            .disabled(busy)
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.generate_commit_message(window, cx);
-                            })),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .child(
+                                Button::new("git-ai-commit")
+                                    .debug_selector(|| "git-ai-commit".into())
+                                    .xsmall()
+                                    .ghost()
+                                    .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
+                                    .tooltip(text::AI_GENERATE.get())
+                                    .accessibility_label(text::AI_GENERATE.get())
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.generate_commit_message(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("git-commit-push")
+                                    .debug_selector(|| "git-commit-push".into())
+                                    .xsmall()
+                                    .outline()
+                                    .label(text::COMMIT_AND_PUSH.get())
+                                    .tooltip(if sync_supported {
+                                        text::COMMIT_AND_PUSH.get()
+                                    } else {
+                                        text::OUTDATED.get()
+                                    })
+                                    .disabled(sync_disabled || !has_staged)
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.confirm_commit_and_push(window, cx);
+                                    })),
+                            ),
                     )
                     .child(
                         Button::new("git-commit")
                             .debug_selector(|| "git-commit".into())
+                            .small()
                             .label(text::COMMIT.get())
                             .primary()
                             .disabled(busy || !has_staged)
@@ -847,22 +1073,6 @@ impl Panel {
                             .flex_wrap()
                             .items_center()
                             .gap_1()
-                            .child(
-                                Button::new("git-commit-push")
-                                    .debug_selector(|| "git-commit-push".into())
-                                    .xsmall()
-                                    .outline()
-                                    .label(text::COMMIT_AND_PUSH.get())
-                                    .tooltip(if sync_supported {
-                                        text::COMMIT_AND_PUSH.get()
-                                    } else {
-                                        text::OUTDATED.get()
-                                    })
-                                    .disabled(sync_disabled || !has_staged)
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.confirm_commit_and_push(window, cx);
-                                    })),
-                            )
                             .child(
                                 Button::new("git-pull")
                                     .debug_selector(|| "git-pull".into())
