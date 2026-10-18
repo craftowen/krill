@@ -64,3 +64,19 @@ fn no_crash_no_prompt(cx: &mut TestAppContext) {
     assert!(!cx.has_pending_prompt());
     fs::remove_dir_all(&state).ok();
 }
+
+/// 번들 쓰기에 실패하면 오류 대화상자를 띄우고 확인 처리하지 않아 다음 실행에 다시 묻는다.
+#[gpui::test]
+fn bundle_failure_shows_error_and_keeps_logs_pending(cx: &mut TestAppContext) {
+    let state = state("bundle-fail");
+    fs::write(diag::crash_dir(&state).join("crash-1-1-krill-app.txt"), "x").unwrap();
+    // 번들 디렉터리 자리에 파일을 두어 디렉터리 생성이 실패하게 한다.
+    fs::write(state.join("diagnostics"), "not a dir").unwrap();
+    let cx = open(cx, &state);
+    cx.simulate_prompt_answer(text::BUNDLE.get());
+    cx.run_until_parked();
+    let (title, _) = cx.pending_prompt().expect("bundle failure dialog");
+    assert_eq!(title, text::BUNDLE_FAILED.get());
+    assert_eq!(diag::pending(&state).len(), 1);
+    fs::remove_dir_all(&state).ok();
+}
