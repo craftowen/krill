@@ -1,8 +1,13 @@
 //! 모바일 탭. IPC는 콜백 뒤에 두고 QR·선택 상태는 창 하나가 소유한다.
+//!
+//! 레이아웃과 선택형 경로 카드·QR/티켓 복사·기기 목록 구조는
+//! `.ref/orca/src/renderer/src/components/settings/{MobilePane,MobilePairingConnectionOptions,MobilePairingPathOption,MobilePairingQrSection,MobilePairedDevicesSection}.tsx`를
+//! 참고해 순수 Rust/gpui로 옮겼다.
+//! 출처·저작권: Copyright (c) 2026 Lovecast Inc. (MIT License, `.ref/orca/LICENSE`).
 use super::{SettingsView, layout};
 use crate::i18n::catalog::mobile as text;
-use gpui::{Context, Task, Window, div, prelude::*, px};
-use gpui_component::{Disableable as _, button::Button};
+use gpui::{Context, FontWeight, SharedString, Task, Window, div, prelude::*, px};
+use gpui_component::{Disableable as _, IconName};
 use krill_proto::mobile::{
     ConnectMode, MobileReply, MobileRequest, NetworkInterface, PairedMobileDevice,
     qr::{Qr, SIZE},
@@ -16,6 +21,7 @@ pub struct Panel {
     pub mode: ConnectMode,
     pub address: Option<String>,
     pub offer: Option<(String, u64, Qr)>,
+    pub copied_url: Option<String>,
     pub devices: Vec<PairedMobileDevice>,
     pub interfaces: Vec<NetworkInterface>,
     pub connected: BTreeSet<String>,
@@ -50,6 +56,7 @@ impl Panel {
             mode: ConnectMode::Lan,
             address: None,
             offer: None,
+            copied_url: None,
             devices: Vec::new(),
             interfaces: Vec::new(),
             connected: BTreeSet::new(),
@@ -68,6 +75,9 @@ impl Panel {
                 interfaces,
                 ..
             } => {
+                if self.copied_url.as_deref() != Some(url.as_str()) {
+                    self.copied_url = None;
+                }
                 match Qr::encode(&url) {
                     Ok(q) => self.offer = Some((url, expires_at_ms, q)),
                     Err(e) => self.error = Some(e.into()),
@@ -95,6 +105,7 @@ impl SettingsView {
                 | MobileRequest::RevokeDevice { all: true, .. }
         ) {
             self.mobile.offer = None;
+            self.mobile.copied_url = None;
         }
         self.mobile.generation = self.mobile.generation.wrapping_add(1);
         self.mobile.pending = true;
@@ -156,12 +167,14 @@ impl SettingsView {
                                 this.mobile.accept(reply);
                             } else {
                                 this.mobile.offer = None;
+                                this.mobile.copied_url = None;
                             }
                         }
                         if this.mobile.offer.as_ref().is_some_and(|(_, expires, _)| {
                             *expires <= krill_proto::mobile::client::now_ms()
                         }) {
                             this.mobile.offer = None;
+                            this.mobile.copied_url = None;
                         }
                         cx.notify();
                     })
@@ -205,42 +218,106 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(text::TITLE.get());
-        let modes = [
-            (ConnectMode::Lan, "mobile-lan", text::LAN.get()),
+            .child(layout::section_title(
+                p,
+                "admin-mobile-pair-section",
+                text::PAIR_SECTION.get(),
+            ));
+
+        let mode_options = [
+            (
+                ConnectMode::Lan,
+                "mobile-lan",
+                text::LAN.get(),
+                text::LAN_DESC.get(),
+            ),
             (
                 ConnectMode::Tailscale,
                 "mobile-tailscale",
                 text::TAILSCALE.get(),
+                text::TAILSCALE_DESC.get(),
             ),
-            (ConnectMode::Tunnel, "mobile-tunnel", text::TUNNEL.get()),
-        ]
-        .into_iter()
-        .map(|(mode, id, label)| {
+            (
+                ConnectMode::Tunnel,
+                "mobile-tunnel",
+                text::TUNNEL.get(),
+                text::TUNNEL_DESC.get(),
+            ),
+        ];
+        let mut mode_card = layout::card(p)
+            .id("mobile-mode-card")
+            .debug_selector(|| "mobile-mode-card".into())
+            .p_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+        for (idx, (mode, id, title, desc)) in mode_options.into_iter().enumerate() {
             let selected = self.mobile.mode == mode;
-            layout::segment(id, label, selected)
-                .disabled(self.mobile.pending)
+            let pending = self.mobile.pending;
+            let radio = div()
+                .mt_0p5()
+                .flex_none()
+                .size(px(14.))
+                .rounded_full()
+                .border_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .when(selected, |d| {
+                    d.border_color(p.foreground)
+                        .bg(p.foreground)
+                        .child(div().size(px(6.)).rounded_full().bg(p.background))
+                })
+                .when(!selected, |d| {
+                    d.border_color(p.muted_foreground.opacity(0.4))
+                });
+            let option_row = div()
+                .id(id)
                 .debug_selector(move || id.into())
-                .on_click(cx.listener(move |this, _, _, cx| this.mobile_pair(mode, None, cx)))
-        });
-        root = root.child(layout::card(p).child(layout::segmented_control(p, modes)));
+                .w_full()
+                .min_w_0()
+                .px_3()
+                .py_2p5()
+                .flex()
+                .items_start()
+                .gap_3()
+                .when(idx > 0, |d| d.border_t_1().border_color(p.border))
+                .when(selected, |d| d.bg(p.accent.opacity(0.45)))
+                .when(!selected && !pending, |d| {
+                    d.hover(|h| h.bg(p.accent.opacity(0.25)))
+                })
+                .when(pending, |d| d.opacity(0.5).cursor_default())
+                .when(!pending, |d| {
+                    d.cursor_pointer().on_click(
+                        cx.listener(move |this, _, _, cx| this.mobile_pair(mode, None, cx)),
+                    )
+                })
+                .child(radio)
+                .child(layout::label(p, title, Some(desc)));
+            mode_card = mode_card.child(option_row);
+        }
+        root = root.child(mode_card);
+
         if !self.mobile.interfaces.is_empty() && self.mobile.mode != ConnectMode::Tunnel {
-            let mut interfaces = layout::card(p).flex().flex_wrap().gap_2();
+            let mut interfaces = layout::card(p).flex().flex_wrap().gap_1p5();
+            let auto_selected = self.mobile.address.is_none();
             interfaces = interfaces.child(
-                Button::new("mobile-network-auto")
-                    .label(text::AUTO.get())
+                layout::segment("mobile-network-auto", text::AUTO.get(), auto_selected)
                     .disabled(self.mobile.pending)
+                    .debug_selector(|| "mobile-network-auto".into())
                     .on_click(
                         cx.listener(|this, _, _, cx| this.mobile_pair(this.mobile.mode, None, cx)),
                     ),
             );
             for (index, interface) in self.mobile.interfaces.iter().enumerate() {
                 let address = format!("{}:0", interface.address);
+                let selected = self.mobile.address.as_deref() == Some(address.as_str());
                 let label = format!("{} ({})", interface.name, interface.address);
+                let if_id = format!("mobile-if-{index}");
                 interfaces = interfaces.child(
-                    Button::new(("mobile-interface", index))
-                        .label(label)
+                    layout::segment(("mobile-interface", index), label, selected)
                         .disabled(self.mobile.pending)
+                        .debug_selector(move || if_id.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.mobile_pair(this.mobile.mode, Some(address.clone()), cx);
                         })),
@@ -248,6 +325,38 @@ impl SettingsView {
             }
             root = root.child(interfaces);
         }
+
+        let pair_actions = layout::row(p)
+            .id("mobile-pair-actions-row")
+            .debug_selector(|| "mobile-pair-actions-row".into())
+            .flex_wrap()
+            .child(
+                layout::label(p, text::PAIR_TITLE.get(), Some(text::PAIR_DESC.get()))
+                    .min_w(px(200.)),
+            )
+            .child(
+                layout::controls()
+                    .flex_wrap()
+                    .child(
+                        layout::primary("mobile-new-qr", text::NEW_QR.get())
+                            .disabled(self.mobile.pending)
+                            .debug_selector(|| "mobile-new-qr".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mobile_pair(this.mobile.mode, this.mobile.address.clone(), cx);
+                            })),
+                    )
+                    .child(
+                        layout::secondary("mobile-refresh", text::REFRESH.get())
+                            .icon(IconName::RefreshCw)
+                            .disabled(self.mobile.pending)
+                            .debug_selector(|| "mobile-refresh".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.mobile_action(MobileRequest::Status, cx);
+                            })),
+                    ),
+            );
+        root = root.child(pair_actions);
+
         if let Some((url, expires, qr)) = &self.mobile.offer {
             let seconds = expires.saturating_sub(krill_proto::mobile::client::now_ms()) / 1000;
             let matrix = qr.clone();
@@ -273,113 +382,220 @@ impl SettingsView {
                     }
                 },
             )
-            .size(px(260.));
+            .size(px(220.));
+            let copied = self.mobile.copied_url.as_deref() == Some(url.as_str());
+            let copy_label = if copied {
+                text::COPIED.get()
+            } else {
+                text::COPY.get()
+            };
+            let copy_icon = if copied {
+                IconName::Check
+            } else {
+                IconName::Copy
+            };
             let link = url.clone();
-            root = root.child(
-                layout::card(p)
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(visual)
-                    .child(format!(
-                        "{} {:02}:{:02}",
-                        text::EXPIRES.get(),
-                        seconds / 60,
-                        seconds % 60
-                    ))
-                    .child(
-                        Button::new("mobile-copy-link")
-                            .label(text::COPY.get())
-                            .on_click(move |_, _, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                    link.clone(),
-                                ));
-                            }),
-                    ),
-            );
-        }
-        root = root.child(
-            div()
+            let ticket_row = div()
+                .w_full()
+                .min_w_0()
+                .p_2()
+                .rounded(crate::ui::RADIUS_SM)
+                .bg(p.background)
+                .border_1()
+                .border_color(p.border)
                 .flex()
+                .items_center()
+                .justify_between()
                 .gap_2()
+                .flex_wrap()
                 .child(
-                    Button::new("mobile-new-qr")
-                        .label(text::NEW_QR.get())
-                        .disabled(self.mobile.pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.mobile_pair(this.mobile.mode, this.mobile.address.clone(), cx);
-                        })),
+                    div()
+                        .id("mobile-ticket-url")
+                        .debug_selector(|| "mobile-ticket-url".into())
+                        .flex_1()
+                        .min_w_0()
+                        .font_family(crate::ui::FONT_MONO)
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .truncate()
+                        .child(url.clone()),
                 )
                 .child(
-                    Button::new("mobile-refresh")
-                        .label(text::REFRESH.get())
-                        .disabled(self.mobile.pending)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.mobile_action(MobileRequest::Status, cx);
+                    layout::secondary("mobile-copy-link", copy_label)
+                        .icon(copy_icon)
+                        .debug_selector(|| "mobile-copy-link".into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                            this.mobile.copied_url = Some(link.clone());
+                            cx.notify();
                         })),
-                ),
-        );
-        root = root.child(
-            Button::new("mobile-revoke-all")
-                .label(text::REVOKE_ALL.get())
-                .disabled(self.mobile.pending)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.mobile_action(
-                        MobileRequest::RevokeDevice {
-                            device_id: None,
-                            all: true,
-                        },
-                        cx,
-                    );
-                })),
-        );
+                );
+            root = root.child(
+                layout::card(p)
+                    .id("mobile-qr-card")
+                    .debug_selector(|| "mobile-qr-card".into())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_3()
+                    .child(visual)
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(format!(
+                                "{} {:02}:{:02}",
+                                text::EXPIRES.get(),
+                                seconds / 60,
+                                seconds % 60
+                            )),
+                    )
+                    .child(ticket_row),
+            );
+        }
+
+        root = root.child(layout::section_title(
+            p,
+            "admin-mobile-devices-section",
+            text::DEVICES_TITLE.get(),
+        ));
         let now = krill_proto::mobile::client::now_ms();
-        for (device_index, device) in self
+        let active_devices: Vec<&PairedMobileDevice> = self
             .mobile
             .devices
             .iter()
             .filter(|d| d.revoked_at_ms.is_none())
-            .enumerate()
-        {
-            let id = device.device_id.clone();
-            let connected = self.mobile.connected.contains(&id);
+            .collect();
+        if active_devices.is_empty() {
             root = root.child(
                 layout::card(p)
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(device.label.clone())
-                    .child(format!(
-                        "{} {} · {}: {} · {}: {}",
-                        if connected { "●" } else { "○" },
-                        if connected {
-                            text::CONNECTED.get()
-                        } else {
-                            text::PAIRED.get()
-                        },
-                        text::PAIRED.get(),
-                        ago(now, device.created_at_ms),
-                        text::LAST_ACTIVE.get(),
-                        ago(now, device.last_seen_ms)
-                    ))
-                    .child(
-                        Button::new(("mobile-revoke", device_index))
-                            .label(text::REVOKE.get())
-                            .disabled(self.mobile.pending)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.mobile_action(
-                                    MobileRequest::RevokeDevice {
-                                        device_id: Some(id.clone()),
-                                        all: false,
-                                    },
-                                    cx,
-                                );
-                            })),
-                    ),
+                    .id("mobile-devices-empty")
+                    .debug_selector(|| "mobile-devices-empty".into())
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::DEVICES_EMPTY.get()),
             );
+        } else {
+            for (device_index, device) in active_devices.into_iter().enumerate() {
+                let id = device.device_id.clone();
+                let connected = self.mobile.connected.contains(&id);
+                let row_id = format!("mobile-device-row-{device_index}");
+                let revoke_id = format!("mobile-revoke-{device_index}");
+                let status_badge = crate::ui::badge(
+                    p,
+                    if connected {
+                        crate::ui::BadgeTone::Success
+                    } else {
+                        crate::ui::BadgeTone::Muted
+                    },
+                    if connected {
+                        text::CONNECTED.get()
+                    } else {
+                        text::PAIRED.get()
+                    },
+                );
+                let meta = format!(
+                    "{}: {} · {}: {}",
+                    text::PAIRED.get(),
+                    ago(now, device.created_at_ms),
+                    text::LAST_ACTIVE.get(),
+                    ago(now, device.last_seen_ms)
+                );
+                root = root.child(
+                    layout::row(p)
+                        .id(SharedString::from(row_id.clone()))
+                        .debug_selector(move || row_id.clone())
+                        .flex_wrap()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .flex_wrap()
+                                        .child(
+                                            div()
+                                                .text_size(crate::ui::TEXT_SM)
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .truncate()
+                                                .child(device.label.clone()),
+                                        )
+                                        .child(status_badge),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(meta),
+                                ),
+                        )
+                        .child(
+                            layout::controls().child(
+                                layout::secondary(
+                                    ("mobile-revoke", device_index),
+                                    text::REVOKE.get(),
+                                )
+                                .disabled(self.mobile.pending)
+                                .debug_selector(move || revoke_id.clone())
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.mobile_action(
+                                            MobileRequest::RevokeDevice {
+                                                device_id: Some(id.clone()),
+                                                all: false,
+                                            },
+                                            cx,
+                                        );
+                                    },
+                                )),
+                            ),
+                        ),
+                );
+            }
         }
+        root = root.child(
+            layout::row(p)
+                .id("mobile-revoke-all-row")
+                .debug_selector(|| "mobile-revoke-all-row".into())
+                .flex_wrap()
+                .child(
+                    layout::label(p, text::REVOKE_ALL.get(), Some(text::REVOKE_ALL_DESC.get()))
+                        .min_w(px(200.)),
+                )
+                .child(
+                    layout::controls().child(
+                        layout::danger(
+                            "mobile-revoke-all",
+                            text::REVOKE_ALL.get(),
+                            text::REVOKE_ALL.get(),
+                            false,
+                        )
+                        .disabled(self.mobile.pending)
+                        .debug_selector(|| "mobile-revoke-all".into())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.mobile_action(
+                                MobileRequest::RevokeDevice {
+                                    device_id: None,
+                                    all: true,
+                                },
+                                cx,
+                            );
+                        })),
+                    ),
+                ),
+        );
         if let Some(error) = &self.mobile.error {
-            root = root.child(div().text_color(p.warning).child(error.clone()));
+            root = root.child(
+                crate::ui::error_banner(p, error.clone())
+                    .id("mobile-error-banner")
+                    .debug_selector(|| "mobile-error-banner".into()),
+            );
         }
         div().child(root)
     }

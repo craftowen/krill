@@ -7462,10 +7462,12 @@ impl SettingsView {
         let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
         // 구 데몬이면 토글 대신 업데이트 안내만 보인다(요청을 보내지 않는다).
         let recording_controls = if self.history_pause_supported == Some(false) {
-            div()
-                .text_size(crate::ui::TEXT_XS)
-                .text_color(p.warning)
-                .child(text::RECORDING_UPDATE_NEEDED.get())
+            layout::controls().child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.warning)
+                    .child(text::RECORDING_UPDATE_NEEDED.get()),
+            )
         } else {
             let view = cx.entity();
             layout::controls().child(layout::switch(
