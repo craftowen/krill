@@ -9,6 +9,7 @@ fn app_menu_is_available_without_windows(cx: &mut gpui::TestAppContext) {
             .expect("app menu must exist even with no windows");
         assert!(menus.iter().any(|m| m.name.as_ref() == "Krill"));
         assert!(menus.iter().any(|m| m.name.as_ref() == "파일"));
+        assert!(menus.iter().any(|m| m.name.as_ref() == "보기"));
         let labels: Vec<_> = menus
             .iter()
             .flat_map(|menu| &menu.items)
@@ -20,7 +21,15 @@ fn app_menu_is_available_without_windows(cx: &mut gpui::TestAppContext) {
                 }
             })
             .collect();
-        for expected in ["설정…", "Krill 종료", "새 창", "창 닫기"] {
+        for expected in [
+            "설정…",
+            "Krill 종료",
+            "새 창",
+            "창 닫기",
+            krill_app::i18n::catalog::settings::SC_ZOOM_IN.get(),
+            krill_app::i18n::catalog::settings::SC_ZOOM_OUT.get(),
+            krill_app::i18n::catalog::settings::SC_ZOOM_RESET.get(),
+        ] {
             assert!(labels.contains(&expected), "missing {expected}");
         }
         assert!(cx.is_action_available(&NewWindow));

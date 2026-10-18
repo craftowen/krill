@@ -192,7 +192,7 @@ fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
         assert_eq!(cx.global::<Config>().error, None);
     });
 
-    fs::write(d.join(SETTINGS_FILE), "theme = \"dark\"\nzoom = 1.5").unwrap();
+    fs::write(d.join(SETTINGS_FILE), "theme = \"dark\"\nui_zoom = 1.5").unwrap();
     fs::write(
         d.join(KEYS_FILE),
         "[bindings]\n\"cmd-alt-9\" = \"settings::ZoomIn\"\n\"cmd-=\" = \"\"",
@@ -225,6 +225,35 @@ fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(cx.theme().mode, ThemeMode::Light));
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert_eq!(saved.theme, ThemeChoice::Light);
+    fs::remove_dir_all(&d).ok();
+}
+
+#[gpui::test]
+fn legacy_zoom_migrates_to_terminal_font_size_and_resets_ui_zoom(cx: &mut TestAppContext) {
+    let d = dir("owe843-legacy-zoom");
+    let path = d.join(SETTINGS_FILE);
+    // 사용자가 터미널 글꼴을 줄이려다 ⌘-를 눌러 기존 zoom = 0.8로 저장된 상태.
+    fs::write(&path, "# keep comment\ntheme = \"dark\"\nzoom = 0.8\n").unwrap();
+    init(cx, &d);
+    cx.update(|cx| {
+        assert_eq!(bound(cx, "cmd-="), Some(ZoomIn.name()));
+        assert_eq!(bound(cx, "cmd-+"), Some(ZoomIn.name()));
+        assert_eq!(bound(cx, "cmd--"), Some(ZoomOut.name()));
+        assert_eq!(bound(cx, "cmd-0"), Some(ZoomReset.name()));
+        // 13 * 0.8 = 10.4 -> 10pt로 이관되고 UI 배율은 1.0으로 초기화된다.
+        assert_eq!(terminal_font_pt(cx), 10);
+        assert!((current(cx).zoom() - 1.0).abs() < f32::EPSILON);
+    });
+    let on_disk = fs::read_to_string(&path).unwrap();
+    assert!(on_disk.contains("# keep comment"), "{on_disk}");
+    assert!(on_disk.contains("ui_zoom = 1.0"), "{on_disk}");
+    assert!(on_disk.contains("terminal_font_size = 10"), "{on_disk}");
+    // 재로드해도 중복 이관되지 않는다.
+    cx.update(reload);
+    cx.update(|cx| {
+        assert_eq!(terminal_font_pt(cx), 10);
+        assert!((current(cx).zoom() - 1.0).abs() < f32::EPSILON);
+    });
     fs::remove_dir_all(&d).ok();
 }
 
@@ -292,10 +321,10 @@ fn regression_settings_edit_replaces_inode(cx: &mut TestAppContext) {
 fn regression_settings_edit_applies_on_disk_value(cx: &mut TestAppContext) {
     let d = dir("external-edit");
     let path = d.join(SETTINGS_FILE);
-    fs::write(&path, "theme = \"dark\"\nzoom = 1.0").unwrap();
+    fs::write(&path, "theme = \"dark\"\nui_zoom = 1.0").unwrap();
     init(cx, &d);
     // 1초 폴링 전에 외부 편집기로 바꾼 유효한 최신 값을 edit()이 바탕으로 삼는다.
-    fs::write(&path, "theme = \"light\"\nzoom = 1.5").unwrap();
+    fs::write(&path, "theme = \"light\"\nui_zoom = 1.5").unwrap();
     cx.update(|cx| edit(cx, |s| s.zoom = s.zoom_step(1)));
     cx.update(|cx| {
         assert_eq!(cx.global::<Config>().settings.theme, ThemeChoice::Light);
@@ -2002,6 +2031,9 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         "font-dec",
         "font-inc",
         "font-reset",
+        "editor-font-dec",
+        "editor-font-inc",
+        "editor-font-reset",
         "opacity-dec",
         "opacity-inc",
         "opacity-reset",
@@ -2019,6 +2051,11 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
     vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), 14));
     click(vcx, "font-reset");
     vcx.update(|_, cx| assert_eq!(current(cx).terminal_font_size(), 13));
+    // OWE-843: 에디터 글꼴 행도 같은 탭에서 조절·영속된다.
+    click(vcx, "editor-font-inc");
+    vcx.update(|_, cx| assert_eq!(current(cx).editor_font_size(), 13));
+    click(vcx, "editor-font-reset");
+    vcx.update(|_, cx| assert_eq!(current(cx).editor_font_size(), 12));
     assert_eq!(
         Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap())
             .unwrap()
