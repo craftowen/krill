@@ -858,7 +858,9 @@ fn shell_quote(s: &str) -> String {
     {
         s.to_owned()
     } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
+        // i18n_lint 토크나이저가 `'\\''` 이스케이프를 문자 리터럴로 못 읽어 탈선하므로
+        // 같은 문자(U+0027)를 `\u{27}`로 적는다. 동작은 POSIX single-quote 감싸기와 동일하다.
+        format!("'{}'", s.replace('\u{27}', "'\\''"))
     }
 }
 
