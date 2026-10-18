@@ -3191,3 +3191,62 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-898: 스냅샷에서 사라진 워크트리의 파생 상태(상태·갱신시각·이슈·포트·호스트 라벨·자동화/CLI 표시)는
+/// 다음 폴링 적용 시 정리된다. 디스크 저장소가 삭제된 항목을 계속 내놓아도 누적되지 않게 한다.
+/// 사용자 접힘·핀·부모 설정은 건드리지 않는다.
+#[gpui::test]
+fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
+    use krill_proto::orchestration::WorkspaceStatus;
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let wt_live = PathBuf::from("/repo/wt");
+    let wt_gone = PathBuf::from("/repo/gone");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_worktree_status(wt_live.clone(), WorkspaceStatus::InProgress, cx);
+            s.set_worktree_status(wt_gone.clone(), WorkspaceStatus::Todo, cx);
+            s.set_worktree_updated_at(wt_live.clone(), 7, cx);
+            s.set_worktree_updated_at(wt_gone.clone(), 8, cx);
+            s.set_worktree_issue(wt_live.clone(), "live-issue", cx);
+            s.set_worktree_issue(wt_gone.clone(), "gone-issue", cx);
+            s.set_worktree_ports(wt_live.clone(), vec![3000], cx);
+            s.set_worktree_ports(wt_gone.clone(), vec![8080], cx);
+            s.set_worktree_host_label(wt_live.clone(), "live-host", cx);
+            s.set_worktree_host_label(wt_gone.clone(), "gone-host", cx);
+            s.mark_automation_worktree(wt_gone.clone(), cx);
+            s.mark_cli_worktree(wt_gone.clone(), cx);
+            // 사용자 접힘은 유지돼야 한다.
+            s.collapsed.insert(wt_gone.clone());
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).worktree_statuses.contains_key(&wt_gone)));
+
+    // 라이브 집합에 `/repo/wt`만 남긴 스냅샷을 적용한다.
+    let snapshot = Snapshot {
+        sessions: vec![session(1, AgentState::Working, Some("/repo/wt"))],
+        trees: BTreeMap::from([(PathBuf::from("/repo"), vec![wt_live.clone()])]),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.apply(Ok((snapshot, Meta::new())), BTreeMap::new(), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert!(s.worktree_statuses.contains_key(&wt_live));
+        assert!(!s.worktree_statuses.contains_key(&wt_gone));
+        assert!(!s.worktree_updated_at.contains_key(&wt_gone));
+        assert!(!s.issues.contains_key(&wt_gone));
+        assert!(!s.ports.contains_key(&wt_gone));
+        assert!(!s.worktree_hosts.contains_key(&wt_gone));
+        assert!(!s.automation_worktrees.contains(&wt_gone));
+        assert!(!s.cli_worktrees.contains(&wt_gone));
+        // 라이브 항목과 사용자 접힘은 유지.
+        assert!(s.issues.contains_key(&wt_live));
+        assert!(s.ports.contains_key(&wt_live));
+        assert!(s.collapsed.contains(&wt_gone));
+    });
+}

@@ -700,11 +700,42 @@ impl Sidebar {
         self.snapshot.trees != prev_trees || !self.snapshot.trees.is_empty()
     }
 
+    /// OWE-898: 라이브 워크트리 집합에 없는 파생 상태(상태·갱신시각·이슈·포트·호스트 라벨·자동/CLI 표시)를
+    /// 정리한다. 디스크 저장소(`WorktreeStore`)가 삭제된 워크트리 항목을 계속 내놓아도 메모리·디스크
+    /// 재삽입으로 누적되지 않게 한다. 사용자 접힘·핀·부모·이름 설정은 건드리지 않는다.
+    fn prune_stale_worktree_state(&mut self) {
+        use std::collections::BTreeSet;
+        let mut live: BTreeSet<&Path> = BTreeSet::new();
+        for wts in self.snapshot.trees.values() {
+            for wt in wts {
+                live.insert(wt.as_path());
+            }
+        }
+        for s in &self.snapshot.sessions {
+            if let Some(wt) = s.worktree.as_deref() {
+                live.insert(wt);
+            }
+        }
+        self.worktree_statuses
+            .retain(|path, _| live.contains(path.as_path()));
+        self.worktree_updated_at
+            .retain(|path, _| live.contains(path.as_path()));
+        self.issues.retain(|path, _| live.contains(path.as_path()));
+        self.ports.retain(|path, _| live.contains(path.as_path()));
+        self.worktree_hosts
+            .retain(|path, _| live.contains(path.as_path()));
+        self.automation_worktrees
+            .retain(|path| live.contains(path.as_path()));
+        self.cli_worktrees
+            .retain(|path| live.contains(path.as_path()));
+    }
+
     /// 외부 파일(`projects.toml`, `worktree-comments.toml`) 변경을 즉시 반영해 사이드바 트리를 다시 그린다.
     pub fn reload_external(&mut self, cx: &mut Context<Self>) {
         lineage::invalidate_parents_cache();
         self.comments = external::load_comments_from_sidebar_path(self.path.as_deref());
         self.sync_imported_projects_from_disk();
+        self.prune_stale_worktree_state();
         self.rebuild(cx);
     }
 
@@ -1428,6 +1459,9 @@ impl Sidebar {
                     self.titles.retain(|id, _| live.iter().any(|s| s.id == *id));
                     self.auto_titles
                         .retain(|id, _| live.iter().any(|s| s.id == *id));
+                    // OWE-898: 사라진 워크트리의 파생 상태가 폴링마다 누적되지 않게
+                    // 라이브 집합에 없는 키를 정리한다(사용자 접힘·핀·부모 설정은 유지).
+                    self.prune_stale_worktree_state();
                     if !crate::menu_bar::is_monitoring(cx) {
                         crate::alert::sync_snapshot(&self.snapshot, cx);
                     }
