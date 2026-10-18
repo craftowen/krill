@@ -401,6 +401,7 @@ catalog! {
         PINNED_CLOSE_CONFIRM => ("탭 닫기", "Close Tab"),
         PINNED_CLOSE_CANCEL => ("취소", "Cancel"),
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
+        SIDEBAR_NO_WINDOW => ("창을 사용할 수 없어 작업을 건너뜁니다", "Window unavailable; action skipped"),
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),
@@ -441,6 +442,9 @@ catalog! {
         SESSIONS => ("세션", "Session"),
         SESSION => ("세션", "Session"),
         NEW_TERMINAL => ("여기서 새 터미널", "New terminal here"),
+        OPEN_SESSION => ("세션 열기", "Open session"),
+        CONTINUE_SESSION => ("새 세션에 이어하기…", "Continue in new session…"),
+        CLOSE_SESSION => ("세션 종료…", "End session…"),
         NEW_WORKTREE => ("새 워크트리", "New worktree"),
         REPOSITORY => ("저장소", "Repository"),
         DIRTY => ("미커밋 파일", "Uncommitted files"),
