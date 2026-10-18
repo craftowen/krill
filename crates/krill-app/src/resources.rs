@@ -8,7 +8,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{Context, PromptLevel, Task, Window, div, prelude::*};
+use gpui::{Context, Entity, EventEmitter, PromptLevel, Task, WeakEntity, Window, div, prelude::*};
 use gpui_component::Sizable as _;
 use krill_proto::SessionId;
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
@@ -23,6 +23,12 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 use crate::hosts::HostTarget;
 use crate::i18n::catalog::resources as text;
+use crate::sidebar::Sidebar;
+
+/// 행 클릭으로 해당 세션을 메인 창에 보인다. [`krill_app::agent_history::Open`]과 같은 규약.
+#[derive(Debug, Clone, Copy)]
+pub struct Open(pub SessionId);
+impl EventEmitter<Open> for Panel {}
 
 /// 제어 요청 하나. gpui 테스트는 인메모리 구현을 쓴다(CONVENTIONS §6).
 pub type Call = Arc<dyn Fn(&Request) -> io::Result<Reply> + Send + Sync>;
@@ -84,6 +90,8 @@ pub struct Panel {
     poll: Option<Task<()>>,
     /// OWE-652: 바깥 클릭으로 닫힌 시각. 같은 제스처의 헤더 클릭이 다시 열지 않게 한다.
     dismissed_at: Option<std::time::Instant>,
+    /// OWE-851: 세션 행에 `세션 N` 대신 워크트리·에이전트 이름을 보이기 위한 사이드바.
+    sidebar: Option<WeakEntity<Sidebar>>,
 }
 
 impl std::fmt::Debug for Panel {
@@ -112,7 +120,32 @@ impl Panel {
             note: None,
             poll: None,
             dismissed_at: None,
+            sidebar: None,
         }
+    }
+
+    /// OWE-851: 세션 행 라벨용 사이드바를 연결한다(읽기만 하고 구독하지 않는다).
+    pub fn set_sidebar(&mut self, sidebar: &Entity<Sidebar>) {
+        self.sidebar = Some(sidebar.downgrade());
+    }
+
+    /// OWE-851: `Esc`로 닫기 위한 열림 상태.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// OWE-851: 행 라벨. 에이전트 → 워크트리 이름 순으로, 모르면 `세션 N`.
+    fn session_name(&self, cx: &gpui::App, id: SessionId) -> String {
+        let named = self
+            .sidebar
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .and_then(|sidebar| {
+                let sidebar = sidebar.read(cx);
+                sidebar.session(id).map(|s| sidebar.session_who(s))
+            });
+        named.unwrap_or_else(|| format!("{} {}", text::SESSION.get(), id.0))
     }
 
     /// 펼치면 조회를 시작하고, 접으면 멈춘다(접힌 동안 데몬에 묻지 않는다).
@@ -351,17 +384,35 @@ impl Render for Panel {
                             } else {
                                 mb(s.footprint)
                             };
-                            row(format!("{} {}", text::SESSION.get(), id.0), value, p).child(
-                                div()
-                                    .id(("resources-kill", id.0))
-                                    .pl_1()
-                                    .cursor_pointer()
-                                    .text_color(p.destructive)
-                                    .child(text::KILL.get())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.confirm_kill(id, window, cx);
-                                    })),
-                            )
+                            // OWE-851: `세션 N` 대신 워크트리·에이전트 이름을 보이고,
+                            // 클릭하면 메인 창 해당 세션으로 이동한다.
+                            div()
+                                .id(("resources-session", id.0))
+                                .debug_selector(move || format!("resources-session-{}", id.0))
+                                .cursor_pointer()
+                                .rounded(crate::ui::RADIUS_XS)
+                                .hover(|d| d.bg(p.accent))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close(cx);
+                                    cx.emit(Open(id));
+                                }))
+                                .child(
+                                    row(self.session_name(cx, id), value, p).child(
+                                        div()
+                                            .id(("resources-kill", id.0))
+                                            .ml_2()
+                                            .pl_2()
+                                            .border_l_1()
+                                            .border_color(p.border)
+                                            .cursor_pointer()
+                                            .text_color(p.destructive)
+                                            .child(text::KILL.get())
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.confirm_kill(id, window, cx);
+                                            })),
+                                    ),
+                                )
                         }))
                         .child(row(text::DISK.get(), mb(r.disk), p))
                         .child(

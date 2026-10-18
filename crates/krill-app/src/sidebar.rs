@@ -506,6 +506,7 @@ pub struct Sidebar {
     row_hosts: Vec<HostId>,
     action_host: Option<HostId>,
     prs: BTreeMap<PathBuf, crate::pull_request::Status>,
+    pr_guidance_dismissed: bool,
     pr_task: Option<Task<()>>,
     pr_service: Option<Arc<crate::pull_request::Service>>,
     rows: Vec<Row>,
@@ -650,6 +651,7 @@ impl Sidebar {
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
+            pr_guidance_dismissed: false,
             pr_task: None,
             pr_service: None,
             rows: Vec::new(),
@@ -1969,6 +1971,24 @@ impl Sidebar {
     }
 
     /// MK-057 Jump 팔레트 항목: 세션마다 "에이전트 id · 워크트리 이름(바꾼 이름 우선) · 상태".
+    /// OWE-851: 에이전트명이 비면 워크트리 이름, 그것마저 비면 세션 번호를 보여
+    /// `1 ·  · 알 수 없음` 같은 빈 칸 라벨이 나가지 않게 한다.
+    pub fn session_who(&self, session: &Session) -> String {
+        let agent = session.status.agent.trim();
+        if !agent.is_empty() {
+            return agent.to_owned();
+        }
+        let tree = session
+            .worktree
+            .as_deref()
+            .map(|p| self.name(p))
+            .unwrap_or_default();
+        if !tree.trim().is_empty() {
+            return tree;
+        }
+        format!("{} {}", text::SESSION.get(), session.id.0)
+    }
+
     pub fn jump_items(&self) -> Vec<Item> {
         self.snapshot
             .sessions
@@ -1979,12 +1999,19 @@ impl Sidebar {
                     .as_deref()
                     .map(|p| self.name(p))
                     .unwrap_or_default();
-                let label = format!(
-                    "{} {} · {tree} · {}",
-                    s.status.agent,
-                    s.id.0,
-                    state_text(s.status.state)
-                );
+                let agent = s.status.agent.trim();
+                let label = if agent.is_empty() {
+                    // OWE-851: 빈 에이전트명은 워크트리·세션 이름으로 대신하고 빈 칸을 두지 않는다.
+                    format!("{} · {}", self.session_who(s), state_text(s.status.state))
+                } else if tree.trim().is_empty() {
+                    format!("{agent} {} · {}", s.id.0, state_text(s.status.state))
+                } else {
+                    format!(
+                        "{agent} {} · {tree} · {}",
+                        s.id.0,
+                        state_text(s.status.state)
+                    )
+                };
                 Item::new(s.id, label, needs_you(&s.status))
             })
             .collect()

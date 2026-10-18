@@ -477,6 +477,9 @@ pub struct Shell {
     search: Option<(gpui::Entity<krill_app::search::Bar>, Subscription)>,
     /// Resource Manager(MK-071).
     resources: gpui::Entity<krill_app::resources::Panel>,
+    _resources_open: Subscription,
+    /// OWE-851: 열려 있는 상태바 드롭다운 메뉴 수. 0이 아니면 호버 툴팁을 숨긴다.
+    status_menus_open: usize,
     history: gpui::Entity<krill_app::agent_history::Panel>,
     _history_open: Subscription,
     appearance: Option<Box<dyn std::io::Write>>,
@@ -632,6 +635,17 @@ impl Shell {
                 this.open_session(s, cx);
             },
         );
+        // OWE-851: 리소스 행 클릭도 메인 창 해당 세션으로 이동한다.
+        let resources_sidebar = sidebar.clone();
+        let resources = cx.new(|_| {
+            let mut panel = krill_app::resources::Panel::default();
+            panel.set_sidebar(&resources_sidebar);
+            panel
+        });
+        let resources_open =
+            cx.subscribe(&resources, |this, _, &krill_app::resources::Open(s), cx| {
+                this.open_session(s, cx);
+            });
         let folder = layout
             .focused()
             .and_then(|p| layout.launch(p))
@@ -789,7 +803,9 @@ impl Shell {
             search: None,
             history,
             _history_open: history_open,
-            resources: cx.new(|_| krill_app::resources::Panel::default()),
+            resources,
+            _resources_open: resources_open,
+            status_menus_open: 0,
             security: krill_app::security::State::default(),
             zoomed_pane: None,
             files: files::Files::default(),
@@ -2399,6 +2415,20 @@ impl Shell {
             }
         }
         // MK-156: 우하단 플로팅 UpdateCard가 열려 있을 때 Esc 키를 누르면 상태바 배지로 축소한다.
+        // OWE-851: 상태바 팝오버(리소스·히스토리)가 열려 있을 때도 Esc로 닫는다.
+        // 닫지 않으면 `\x1b`가 터미널 PTY로 전달된다.
+        if e.keystroke.key == "escape"
+            && !e.keystroke.modifiers.modified()
+            && (self.resources.read(cx).is_open() || self.history.read(cx).is_open())
+        {
+            self.resources
+                .update(cx, krill_app::resources::Panel::close);
+            self.history
+                .update(cx, krill_app::agent_history::Panel::close);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if self.role == WindowRole::Main
             && e.keystroke.key == "escape"
             && !e.keystroke.modifiers.modified()

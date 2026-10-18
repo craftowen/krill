@@ -232,7 +232,10 @@ impl Panel {
         let Some(pr) = &self.checks.inspection else {
             return;
         };
-        if idx >= pr.checks.len() {
+        let Some(check) = pr.checks.get(idx) else {
+            return;
+        };
+        if check.state != CheckState::Failed {
             return;
         }
         if !self.checks.selected_checks.remove(&idx) {
@@ -240,6 +243,38 @@ impl Panel {
         }
         self.checks.fix_status = None;
         cx.notify();
+    }
+
+    pub(super) fn open_external_url(url: &str, cx: &mut Context<Self>) {
+        let url = url.trim();
+        if url.is_empty() {
+            return;
+        }
+        cx.open_url(url);
+    }
+
+    pub(super) fn open_review_comment_location(&mut self, idx: usize, cx: &mut Context<Self>) {
+        let Some(pr) = &self.checks.inspection else {
+            return;
+        };
+        let Some(comment) = pr.review_comments.get(idx) else {
+            return;
+        };
+        let rel = comment.path.trim();
+        if rel.is_empty() {
+            return;
+        }
+        let path = if Path::new(rel).is_absolute() {
+            std::path::PathBuf::from(rel)
+        } else {
+            self.repo.join(rel)
+        };
+        let line = comment.display_line().unwrap_or(1).max(1);
+        cx.emit(super::OpenFileAt {
+            path,
+            line,
+            column: 1,
+        });
     }
 
     pub(super) fn toggle_check_log(&mut self, idx: usize, cx: &mut Context<Self>) {
@@ -367,7 +402,8 @@ impl Panel {
         cx: &mut Context<Self>,
     ) -> Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let selected = self.checks.selected_checks.contains(&idx);
+        let is_failed = check.state == CheckState::Failed;
+        let selected = is_failed && self.checks.selected_checks.contains(&idx);
         let expanded = self.checks.expanded_logs.contains(&idx);
         let (icon_name, status_color) = match check.state {
             CheckState::Passed => (IconName::CircleCheck, p.success),
@@ -376,6 +412,12 @@ impl Panel {
             CheckState::Skipped => (IconName::Minus, p.muted_foreground),
         };
         let checkbox_mark = if selected { "☑" } else { "☐" };
+        let details_url = check
+            .details_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|u| !u.is_empty())
+            .map(str::to_owned);
 
         let mut card = div()
             .id(("pr-check-row", idx))
@@ -390,40 +432,63 @@ impl Panel {
             .flex_col()
             .gap_1();
 
+        if let Some(url) = details_url.clone() {
+            card = card
+                .cursor_pointer()
+                .hover(|s| s.border_color(p.ring))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    Self::open_external_url(&url, cx);
+                }));
+        }
+
+        let mut name_el = div()
+            .id(("pr-check-link", idx))
+            .debug_selector(move || format!("pr-check-link-{idx}"))
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_size(crate::ui::TEXT_XS)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(p.sidebar_foreground)
+            .child(check.name.clone());
+        if let Some(url) = details_url {
+            name_el = name_el
+                .cursor_pointer()
+                .hover(|s| s.text_color(p.primary))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    Self::open_external_url(&url, cx);
+                }));
+        }
+
         let top_row = div()
             .flex()
             .items_center()
             .gap_1p5()
             .min_w_0()
-            .child(
-                div()
-                    .id(("pr-check-select", idx))
-                    .debug_selector(move || format!("pr-check-select-{idx}"))
-                    .cursor_pointer()
-                    .px_1()
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(if selected {
-                        p.sidebar_foreground
-                    } else {
-                        p.muted_foreground
-                    })
-                    .child(checkbox_mark)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_check_selection(idx, cx);
-                    })),
-            )
+            .when(is_failed, |d| {
+                d.child(
+                    div()
+                        .id(("pr-check-select", idx))
+                        .debug_selector(move || format!("pr-check-select-{idx}"))
+                        .cursor_pointer()
+                        .px_1()
+                        .font_family(crate::ui::FONT_MONO)
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(if selected {
+                            p.sidebar_foreground
+                        } else {
+                            p.muted_foreground
+                        })
+                        .child(checkbox_mark)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_check_selection(idx, cx);
+                        })),
+                )
+            })
             .child(Icon::new(icon_name).size(px(13.)).text_color(status_color))
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(p.sidebar_foreground)
-                    .child(check.name.clone()),
-            )
+            .child(name_el)
             .child(
                 div()
                     .flex_none()
@@ -448,6 +513,7 @@ impl Panel {
                         .xsmall()
                         .label(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
                             this.toggle_check_log(idx, cx);
                         })),
                 )
@@ -510,6 +576,7 @@ impl Panel {
         let p = crate::ui::palette(cx);
         let selected = self.checks.selected_comments.contains(&idx);
         let checkbox_mark = if selected { "☑" } else { "☐" };
+        let has_path = !comment.path.trim().is_empty();
 
         let mut card = div()
             .id(("pr-comment-row", idx))
@@ -523,6 +590,36 @@ impl Panel {
             .flex()
             .flex_col()
             .gap_1();
+
+        if has_path {
+            card = card
+                .cursor_pointer()
+                .hover(|s| s.border_color(p.ring))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.open_review_comment_location(idx, cx);
+                }));
+        }
+
+        let mut location_el = div()
+            .id(("pr-comment-location", idx))
+            .debug_selector(move || format!("pr-comment-location-{idx}"))
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .font_family(crate::ui::FONT_MONO)
+            .text_size(crate::ui::TEXT_2XS)
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(p.sidebar_foreground)
+            .child(comment.location());
+        if has_path {
+            location_el = location_el
+                .cursor_pointer()
+                .hover(|s| s.text_color(p.primary))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_review_comment_location(idx, cx);
+                }));
+        }
 
         let header = div()
             .flex()
@@ -544,20 +641,11 @@ impl Panel {
                     })
                     .child(checkbox_mark)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
                         this.toggle_comment_selection(idx, cx);
                     })),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_2XS)
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(p.sidebar_foreground)
-                    .child(comment.location()),
-            )
+            .child(location_el)
             .child(
                 div()
                     .flex_none()
@@ -698,91 +786,114 @@ impl Panel {
         let pending = pr.count(CheckState::Pending);
         let skipped = pr.count(CheckState::Skipped);
         let badge_text = pr.status.badge().unwrap_or(text::OPEN.get());
+        let pr_url = pr.url.trim().to_owned();
 
-        let pr_header =
+        let mut pr_header = div()
+            .id("pr-checks-header")
+            .debug_selector(|| "pr-checks-header".into())
+            .px_2p5()
+            .py_2()
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .border_b_1()
+            .border_color(p.sidebar_border);
+
+        if !pr_url.is_empty() {
+            let url = pr_url.clone();
+            pr_header = pr_header
+                .cursor_pointer()
+                .hover(|s| s.bg(p.sidebar_accent))
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    Self::open_external_url(&url, cx);
+                }));
+        }
+
+        let mut title_row = div()
+            .id("pr-checks-title-link")
+            .debug_selector(|| "pr-checks-title-link".into())
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .min_w_0()
+            .child(
+                div()
+                    .flex_none()
+                    .px_1p5()
+                    .py_0p5()
+                    .rounded(crate::ui::RADIUS_XS)
+                    .bg(p.sidebar_accent)
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_2XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.sidebar_accent_foreground)
+                    .child(badge_text),
+            )
+            .when_some(pr.number, |d, num| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .font_family(crate::ui::FONT_MONO)
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(format!("#{num}")),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(p.sidebar_foreground)
+                    .child(if pr.title.is_empty() {
+                        self.checks.branch.clone()
+                    } else {
+                        pr.title.clone()
+                    }),
+            );
+
+        if !pr_url.is_empty() {
+            title_row = title_row
+                .cursor_pointer()
+                .on_click(cx.listener(move |_, _, _, cx| {
+                    cx.stop_propagation();
+                    Self::open_external_url(&pr_url, cx);
+                }));
+        }
+
+        let pr_header = pr_header.child(title_row).child(
             div()
-                .id("pr-checks-header")
-                .debug_selector(|| "pr-checks-header".into())
-                .px_2p5()
-                .py_2()
-                .flex_none()
                 .flex()
-                .flex_col()
-                .gap_1()
-                .border_b_1()
-                .border_color(p.sidebar_border)
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .text_size(crate::ui::TEXT_2XS)
                 .child(
                     div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .flex_none()
-                                .px_1p5()
-                                .py_0p5()
-                                .rounded(crate::ui::RADIUS_XS)
-                                .bg(p.sidebar_accent)
-                                .font_family(crate::ui::FONT_MONO)
-                                .text_size(crate::ui::TEXT_2XS)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(p.sidebar_accent_foreground)
-                                .child(badge_text),
-                        )
-                        .when_some(pr.number, |d, num| {
-                            d.child(
-                                div()
-                                    .flex_none()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(format!("#{num}")),
-                            )
-                        })
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(crate::ui::TEXT_XS)
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(p.sidebar_foreground)
-                                .child(if pr.title.is_empty() {
-                                    self.checks.branch.clone()
-                                } else {
-                                    pr.title.clone()
-                                }),
-                        ),
+                        .text_color(p.destructive)
+                        .child(text::SUMMARY_FAILED.format(&[("n", &failed.to_string())])),
                 )
                 .child(
                     div()
-                        .flex()
-                        .flex_wrap()
-                        .items_center()
-                        .gap_2()
-                        .text_size(crate::ui::TEXT_2XS)
-                        .child(
-                            div()
-                                .text_color(p.destructive)
-                                .child(text::SUMMARY_FAILED.format(&[("n", &failed.to_string())])),
-                        )
-                        .child(
-                            div().text_color(p.warning).child(
-                                text::SUMMARY_PENDING.format(&[("n", &pending.to_string())]),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .text_color(p.success)
-                                .child(text::SUMMARY_PASSED.format(&[("n", &passed.to_string())])),
-                        )
-                        .when(skipped > 0, |d| {
-                            d.child(div().text_color(p.muted_foreground).child(
-                                text::SUMMARY_SKIPPED.format(&[("n", &skipped.to_string())]),
-                            ))
-                        }),
-                );
+                        .text_color(p.warning)
+                        .child(text::SUMMARY_PENDING.format(&[("n", &pending.to_string())])),
+                )
+                .child(
+                    div()
+                        .text_color(p.success)
+                        .child(text::SUMMARY_PASSED.format(&[("n", &passed.to_string())])),
+                )
+                .when(skipped > 0, |d| {
+                    d.child(
+                        div()
+                            .text_color(p.muted_foreground)
+                            .child(text::SUMMARY_SKIPPED.format(&[("n", &skipped.to_string())])),
+                    )
+                }),
+        );
 
         let check_rows: Vec<AnyElement> = pr
             .checks
