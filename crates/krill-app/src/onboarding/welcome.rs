@@ -1005,7 +1005,7 @@ impl Wizard {
             .flex()
             .flex_col()
             .gap_4()
-            .child(div().flex_1().min_h_0().child(consent));
+            .child(div().flex_none().child(consent));
         if !self.consent_only {
             let detected = self.survey.as_ref().map(detected_agents);
             let choices: gpui::AnyElement = match detected {
@@ -1451,7 +1451,8 @@ impl Render for Wizard {
             Step::Checklist | Step::Connect | Step::Done => self.render_checks(cx),
         };
         // OWE-903: 별도 OS 창 대신 메인 창 안 중앙 모달. 가짜 타이틀바는 그리지 않는다.
-        // 본문이 스크롤되도록 카드 높이를 고정한다(기존 고정 창 680×620 계승).
+        // 카드는 내용 높이에 맞추고 최대 높이만 둔다(넘치면 본문이 스크롤). 고정 높이는
+        // 동의 화면에 큰 빈 공백을 남겼다(맥미니-설 실기).
         let card = div()
             .id("onboarding-wizard")
             .debug_selector(|| "onboarding-wizard".into())
@@ -1462,8 +1463,7 @@ impl Render for Wizard {
             .occlude()
             .w(ui::SETTINGS_MODAL_WIDTH)
             .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
-            .h(window.viewport_size().height - ui::SPACE_4 * 2.)
-            .max_h(px(620.))
+            .max_h((window.viewport_size().height - ui::SPACE_4 * 2.).min(px(620.)))
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)

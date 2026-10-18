@@ -81,7 +81,7 @@ impl Render for ConsentView {
             .debug_selector(|| "consent-dialog".into())
             .role(gpui::Role::Group)
             .aria_label(text::TITLE.get())
-            .size_full()
+            .w_full()
             .flex()
             .flex_col()
             .gap_3()
@@ -94,8 +94,10 @@ impl Render for ConsentView {
                     .children(summary),
             )
             .child(
+                // 열 정렬에서 늘어나지 않게 글자 폭만 차지한다(전체 폭 + 가운데 정렬 방지).
                 div()
                     .flex_none()
+                    .self_start()
                     .debug_selector(|| "consent-more".into())
                     .child(
                         ui::ghost(
@@ -117,17 +119,16 @@ impl Render for ConsentView {
                         })),
                     ),
             )
-            .child(
-                div()
-                    .id("consent-sections")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .when(more, |d| {
-                        d.children(SECTIONS.iter().enumerate().map(|(index, (title, body))| {
+            // 접혀 있으면 자리를 차지하지 않는다(빈 공백 방지). 스크롤은 마법사 본문이 맡는다.
+            .when(more, |d| {
+                d.child(
+                    div()
+                        .id("consent-sections")
+                        .flex_none()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .children(SECTIONS.iter().enumerate().map(|(index, (title, body))| {
                             div()
                                 .debug_selector(move || format!("consent-detail-{index}"))
                                 .flex()
@@ -147,9 +148,9 @@ impl Render for ConsentView {
                                         .text_color(p.muted_foreground)
                                         .child(detail(*body, &self.state)),
                                 )
-                        }))
-                    }),
-            )
+                        })),
+                )
+            })
             .child(
                 div()
                     .flex_none()
