@@ -184,9 +184,8 @@ enum Shown {
     Image(gpui::Entity<ImageView>),
 }
 
-/// 에디터 내용으로 미리보기를 만든다. SVG는 디스크 파일을 그린다(저장한 내용).
-// ponytail: SVG 미리보기는 미저장 편집을 반영하지 않는다 — 필요하면 `gpui::Image::from_bytes`로 그린다.
-fn build_preview(preview: Preview, text: &str, path: &Path, cx: &mut App) -> Shown {
+/// 에디터 내용으로 미리보기를 만든다. SVG도 디스크가 아니라 지금 버퍼로 그린다(OWE-874).
+fn build_preview(preview: Preview, text: &str, _path: &Path, cx: &mut App) -> Shown {
     static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     match preview {
         Preview::Markdown => {
@@ -204,7 +203,9 @@ fn build_preview(preview: Preview, text: &str, path: &Path, cx: &mut App) -> Sho
             Shown::Table(cx.new(|_| CsvView::new(table)))
         }
         Preview::Notebook => Shown::Notebook(ipynb::parse(text)),
-        Preview::Svg => Shown::Image(cx.new(|_| ImageView::new(path.to_owned(), None))),
+        Preview::Svg => {
+            Shown::Image(cx.new(|_| ImageView::new_svg_bytes(text.as_bytes().to_vec())))
+        }
     }
 }
 
@@ -755,12 +756,7 @@ impl Shell {
         else {
             return;
         };
-        if matches!(shown, Some(Shown::Image(_))) || (on && *preview == Preview::Svg) {
-            // 그사이 저장했을 수 있으니 SVG 캐시를 버리고 다시 그린다. 나갈 때도 디코드 결과를 놓는다.
-            if let Some(doc) = &tab.doc {
-                self.files.released.push(doc.path().to_owned());
-            }
-        }
+        // SVG 미리보기는 경로 캐시가 아니라 그때그때 버퍼로 그리므로(OWE-874) 놓을 캐시가 없다.
         *shown = if on {
             let text = state.read(cx).text().to_string();
             let path = tab
@@ -815,6 +811,40 @@ impl Shell {
         if changed {
             self.save();
         }
+    }
+
+    /// OWE-874: 파일 탭이 포커스된 상태에서 ⌘F — 미리보기면 편집 모드로 돌린 뒤 에디터 내장 검색을
+    /// 연다. 에디터 본문이 없으면(이미지·표·자리표시자) false를 돌려 호출자가 터미널 검색으로 이어가게 한다.
+    pub(super) fn open_editor_search(
+        &mut self,
+        pane: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self
+            .files
+            .tabs
+            .get(&pane)
+            .is_some_and(|t| matches!(t.body, Body::Text { .. }))
+        {
+            return false;
+        }
+        self.set_preview(pane, false, window, cx);
+        let Some(state) = self
+            .files
+            .tabs
+            .get(&pane)
+            .and_then(FileTab::focus_editor)
+            .cloned()
+        else {
+            return false;
+        };
+        state.update(cx, |s, cx| {
+            s.open_search(false, cx);
+            s.focus(window, cx);
+        });
+        cx.notify();
+        true
     }
 
     /// 탭 바의 파일 탭 앞 아이콘(파일 + 미저장 점). 세션 칸이면 `None`.
@@ -1033,6 +1063,8 @@ impl Shell {
                     EditorState::new(window, cx)
                         .language(language)
                         .line_number(true)
+                        // OWE-874: 긴 줄은 자동 줄 바꿈(기본값 true를 고정 — 잘려서 못 보는 일이 없게).
+                        .soft_wrap(true)
                         .default_value(text)
                 });
                 // 에디터가 받은 그대로를 기준으로 삼는다(정규화가 있어도 열자마자 dirty가 되지 않게).
@@ -1168,10 +1200,7 @@ impl Shell {
                     s.set_cursor_position(cursor, window, cx);
                 });
                 let text = state.read(cx).text().to_string();
-                if let (Some(preview), Some(old)) = (*preview, shown.as_ref()) {
-                    if matches!(old, Shown::Image(_)) {
-                        self.files.released.push(doc.path().to_owned());
-                    }
+                if let (Some(preview), Some(_)) = (*preview, shown.as_ref()) {
                     *shown = Some(build_preview(preview, &text, doc.path(), cx));
                 }
                 doc.reloaded(text, stamp);

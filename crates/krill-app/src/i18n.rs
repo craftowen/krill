@@ -424,6 +424,7 @@ catalog! {
         CLOSE_OTHER_TABS => ("다른 탭 모두 닫기", "Close Others"),
         CLOSE_TABS_TO_RIGHT => ("오른쪽 탭 닫기", "Close Tabs to the Right"),
         CLOSE_ALL_EDITOR_TABS => ("모든 에디터 탭 닫기", "Close All Editor Tabs"),
+        SCROLL_TO_BOTTOM => ("맨 아래로", "Scroll to bottom"),
         PINNED_CLOSE_TITLE => ("고정된 탭을 닫을까요?", "Close pinned tab?"),
         PINNED_CLOSE_DETAIL => ("'{title}' 탭은 고정되어 있습니다. 그래도 닫을까요?", "'{title}' is pinned. Are you sure you want to close it?"),
         PINNED_CLOSE_CONFIRM => ("탭 닫기", "Close Tab"),

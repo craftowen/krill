@@ -800,6 +800,25 @@ impl<W: Write> Pane<W> {
         changed
     }
 
+    /// 화면 바닥 위로 올린 행 수(0 = 라이브). 셸이 스크롤바·바닥 복귀 배지를 그릴 때 쓴다(OWE-873).
+    pub fn scroll_offset(&self) -> usize {
+        self.history.visible()
+    }
+
+    /// 받아 둔 스크롤백 행 수(화면 바로 위부터). 아직 도착하지 않은 요청분은 세지 않는다(OWE-873).
+    pub fn scrollback_len(&self) -> usize {
+        self.history.rows.len()
+    }
+
+    /// 로컬 스크롤백을 버리고 바닥으로 돌아간다(⌘K, OWE-873). 데몬 쪽 핫·콜드 기록은 그대로라
+    /// 다시 위로 스크롤하면 데몬에서 다시 받는다 — 데몬 기록까지 지우려면 krilld IPC가 필요하다.
+    pub fn clear_scrollback(&mut self) {
+        if self.history.offset != 0 || !self.history.rows.is_empty() {
+            self.history.reset();
+            self.refresh();
+        }
+    }
+
     /// krilld에서 온 프레임 하나. 연결을 끊어야 하는 오류(모르는 kind·디코드 실패·쓰기 실패)면 `Err`.
     ///
     /// # Errors
