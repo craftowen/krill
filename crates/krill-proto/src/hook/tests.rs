@@ -151,7 +151,8 @@ fn append_spool_waits_for_lock_then_gives_up_on_deadline() {
     let dir = temp("lock");
     let path = dir.join(SPOOL_FILE);
     std::fs::create_dir_all(&dir).unwrap();
-    let held = File::create(&path).unwrap();
+    let data = File::create(&path).unwrap();
+    let held = spool_lock(&path, &data).unwrap();
     held.lock().unwrap();
     let start = Instant::now();
     append_spool(
