@@ -188,17 +188,19 @@ fn payloads_carry_no_free_text() {
 /// 동의 파일 만들기·지우기 왕복. 파일 권한은 0600.
 #[test]
 fn enable_disable_roundtrip() {
-    use std::os::unix::fs::PermissionsExt as _;
-
     let dir = state_dir();
     let target = dir.join("nested");
     enable(&target).unwrap();
-    let mode = fs::metadata(target.join(CONSENT_FILE))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(target.join(CONSENT_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
     assert_eq!(consent(Some(&target), &Env::stub(&[])), Consent::Enabled);
     disable(&target).unwrap();
     disable(&target).unwrap();

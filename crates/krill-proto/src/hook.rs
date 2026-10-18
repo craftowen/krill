@@ -18,9 +18,9 @@
 //! `write`로 쓴다. 수거하는 쪽은 같은 flock 아래에서 다 읽고 길이를 0으로 자른다. [`read_spool`]은 경계가 온전한
 //! 손상 레코드만 건너뛰고, 잘린 꼬리·잘못된 길이에서는 멈춘다. 파일이 [`SPOOL_MAX`]를 넘으면 더 쓰지 않는다.
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};

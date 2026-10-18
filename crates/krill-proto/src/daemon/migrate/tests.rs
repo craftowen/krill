@@ -1,3 +1,4 @@
+#![cfg(target_os = "macos")]
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU32, Ordering};
 
