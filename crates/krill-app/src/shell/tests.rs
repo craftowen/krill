@@ -6727,6 +6727,58 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// 하-3: 사이드바·우측 패널 분할선을 더블클릭하면 기본 너비로 돌아간다.
+#[gpui::test]
+fn column_divider_double_click_resets_width(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("divider-reset"));
+    let defaults = Layout::default();
+    let size = cx.update(|window, _| window.viewport_size());
+    let (w, y) = (f32::from(size.width), f32::from(size.height) * 0.75);
+    drag(cx, point(px(242.), px(y)), point(px(400.), px(y)));
+    drag(cx, point(px(w - 283.), px(y)), point(px(w - 400.), px(y)));
+    let l = layout_of(&view, cx);
+    assert!((l.sidebar_width - 400.).abs() < 0.5, "{}", l.sidebar_width);
+    assert!(
+        (l.panel_width - defaults.panel_width).abs() > 50.,
+        "{}",
+        l.panel_width
+    );
+
+    let double = |cx: &mut VisualTestContext, x: f32| {
+        let at = point(px(x), px(y));
+        for click_count in 1..=2 {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count,
+            });
+        }
+        cx.run_until_parked();
+    };
+    let panel = layout_of(&view, cx).panel_width;
+    double(cx, w - panel - 3.);
+    double(cx, 402.);
+    let l = layout_of(&view, cx);
+    assert!(
+        (l.sidebar_width - defaults.sidebar_width).abs() < 0.5,
+        "{}",
+        l.sidebar_width
+    );
+    assert!(
+        (l.panel_width - defaults.panel_width).abs() < 0.5,
+        "{}",
+        l.panel_width
+    );
+}
+
 /// K11: 탭이 없는 빈 작업 공간에서 ⌘W는 창을 닫는다(macOS 관례).
 #[gpui::test]
 fn cmd_w_in_empty_workspace_closes_window(cx: &mut TestAppContext) {
