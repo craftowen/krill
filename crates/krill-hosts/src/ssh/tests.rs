@@ -71,6 +71,8 @@ fn ssh_options_argv_builder_includes_port_key_and_stability_flags() {
         tunnel,
         vec![
             "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
             "ServerAliveInterval=15",
             "-o",
             "ServerAliveCountMax=3",
@@ -84,10 +86,11 @@ fn ssh_options_argv_builder_includes_port_key_and_stability_flags() {
             "ExitOnForwardFailure=yes",
             "-o",
             "StreamLocalBindUnlink=yes",
-            "-N",
+            "-T",
             "-L",
             "/tmp/local-fwd.sock:/Users/alice/custom/krilld.sock",
             "alice@mac-studio.local",
+            "cat >/dev/null",
         ]
     );
 
@@ -95,6 +98,8 @@ fn ssh_options_argv_builder_includes_port_key_and_stability_flags() {
     assert_eq!(
         home_query,
         vec![
+            "-o",
+            "StrictHostKeyChecking=accept-new",
             "-o",
             "ServerAliveInterval=15",
             "-o",
@@ -160,10 +165,17 @@ fn remote_socket_for_home_computes_remote_user_path() {
         )
     );
     assert_eq!(
-        remote_socket_for_home("/Users/remoteuser\r\ndev.minikrill.app").unwrap(),
+        remote_socket_for_home(
+            "/Users/remoteuser\r\nLibrary/Application Support/dev.minikrill.app"
+        )
+        .unwrap(),
         PathBuf::from(
             "/Users/remoteuser/Library/Application Support/dev.minikrill.app/run/krilld.sock"
         )
+    );
+    assert_eq!(
+        remote_socket_for_home("/home/ubuntu\n.local/share/dev.krill.app").unwrap(),
+        PathBuf::from("/home/ubuntu/.local/share/dev.krill.app/run/krilld.sock")
     );
     // 모르는 둘째 줄은 새 경로로 본다.
     assert_eq!(
@@ -215,33 +227,152 @@ remote_socket = "/Users/alice/custom/krilld.sock"
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// MK-170 규칙 3: 원격 질의를 실제 `/bin/sh`로 돌려 소켓을 새 번들 → 옛 번들 순으로 찾는지 본다.
-/// 원격 맥은 이관 전(옛 holder가 옛 경로)이거나 구버전일 수 있다.
+/// MK-170 규칙 3: 원격 질의를 실제 `/bin/sh`로 돌려 소켓을 새 번들 → 옛 번들 → Linux 순으로 찾는지 본다.
+/// 원격 맥은 이관 전(옛 holder가 옛 경로)이거나 구버전일 수 있다. Linux는 찾기 전에 늘 원격 krill로 깨우고,
+/// krill이 없거나 실패하면 표식으로 원인을 알린다. macOS는 깨우지 않는다.
 #[cfg(unix)]
 #[test]
 fn remote_query_prefers_new_socket_then_legacy() {
     let home = PathBuf::from(format!("/tmp/mk170-remote-{}", std::process::id()));
     std::fs::remove_dir_all(&home).ok();
+    let bin = home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
     let sock = |bundle: &str| {
         home.join(format!(
             "Library/Application Support/{bundle}/run/krilld.sock"
         ))
     };
-    let resolve = || {
+    let raw = || {
         let out = Command::new("/bin/sh")
             .args(["-c", &remote_query()])
             .env("HOME", &home)
+            // 이 맥의 진짜 krill로 데몬을 깨우지 않는다(`/usr/local/bin`·Homebrew 경로 제외).
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .output()
             .unwrap();
         assert!(out.status.success());
-        remote_socket_for_home(&String::from_utf8(out.stdout).unwrap()).unwrap()
+        String::from_utf8(out.stdout).unwrap()
     };
-    assert_eq!(resolve(), sock("dev.krill.app"), "no socket: new path");
+    let resolve = || remote_socket_for_home(&raw());
+    let linux_os = cfg!(target_os = "linux");
+    let linux = home.join(".local/share/dev.krill.app/run/krilld.sock");
+    // krill이 없다: Linux는 원인 오류, macOS는 새 번들 경로(깨우지 않음).
+    if linux_os {
+        let err = resolve().unwrap_err().to_string();
+        assert!(err.contains("not installed"), "{err}");
+    } else {
+        assert_eq!(resolve().unwrap(), sock("dev.krill.app"));
+    }
+    // 실패하는 krill: Linux는 오류 첫 줄을 그대로 알린다.
+    let wake = home.join(".local/bin/krill");
+    std::fs::create_dir_all(wake.parent().unwrap()).unwrap();
+    let script = |body: &str| {
+        std::fs::write(&wake, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&wake, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+    };
+    script("echo 'version `GLIBC_2.34` not found' >&2; exit 1");
+    if linux_os {
+        let err = resolve().unwrap_err().to_string();
+        assert!(err.contains("GLIBC_2.34"), "{err}");
+    }
+    // 깨우는 krill: 소켓 유무와 무관하게 Linux는 매번 부른다(holder만 죽은 원격의 재결합).
+    script("echo \"$1\" >> \"$HOME/woke\"");
+    let woke = || std::fs::read_to_string(home.join("woke")).unwrap_or_default();
+    if linux_os {
+        assert_eq!(resolve().unwrap(), linux, "no socket on Linux: Linux path");
+        assert_eq!(woke(), "ls\n");
+    } else {
+        assert_eq!(resolve().unwrap(), sock("dev.krill.app"));
+        assert_eq!(woke(), "", "macOS 원격은 깨우지 않는다");
+    }
+    std::fs::create_dir_all(linux.parent().unwrap()).unwrap();
+    let _linux = UnixListener::bind(&linux).unwrap();
+    assert_eq!(resolve().unwrap(), linux, "Linux remote");
     std::fs::create_dir_all(sock("dev.minikrill.app").parent().unwrap()).unwrap();
     let _old = UnixListener::bind(sock("dev.minikrill.app")).unwrap();
-    assert_eq!(resolve(), sock("dev.minikrill.app"), "legacy remote");
+    assert_eq!(
+        resolve().unwrap(),
+        sock("dev.minikrill.app"),
+        "legacy remote"
+    );
     std::fs::create_dir_all(sock("dev.krill.app").parent().unwrap()).unwrap();
     let _new = UnixListener::bind(sock("dev.krill.app")).unwrap();
-    assert_eq!(resolve(), sock("dev.krill.app"), "new wins");
+    assert_eq!(resolve().unwrap(), sock("dev.krill.app"), "new wins");
+    if linux_os {
+        assert_eq!(woke(), "ls\nls\nls\nls\n");
+    }
     std::fs::remove_dir_all(&home).unwrap();
+}
+
+#[cfg(unix)]
+const ORPHAN_DIR: &str = "KRILL_HOSTS_ORPHAN_DIR";
+
+/// 터널을 연 프로세스가 kill -9로 죽어도 ssh가 고아로 남지 않는다: stdin 파이프가 닫혀 원격 명령(`cat`)이 끝난다.
+/// 가짜 ssh는 진짜처럼 stdin을 원격 명령에 흘리고, 끝나면 표식을 남긴다.
+#[cfg(unix)]
+#[test]
+fn tunnel_ssh_exits_when_its_owner_is_killed() {
+    let dir = PathBuf::from(format!("/tmp/krill-orphan-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut owner = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "ssh::tests::tunnel_owner_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env(ORPHAN_DIR, &dir)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !dir.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "owner never opened the tunnel"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    owner.kill().unwrap(); // SIGKILL: Drop은 돌지 않는다
+    owner.wait().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !dir.join("ssh-exited").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tunnel ssh outlived its owner"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "tunnel_ssh_exits_when_its_owner_is_killed가 자식으로 실행한다"]
+fn tunnel_owner_child() {
+    let Some(dir) = std::env::var_os(ORPHAN_DIR).map(PathBuf::from) else {
+        return;
+    };
+    let ssh = dir.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            "#!/bin/sh\nprev=''\nfor a in \"$@\"; do [ \"$prev\" = -L ] && fwd=\"$a\"; prev=\"$a\"; done\n\
+             : > \"${{fwd%%:*}}\"\ncat >/dev/null\ntouch '{}'\n",
+            dir.join("ssh-exited").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let opts = SshOptions::new("owner@test");
+    let _tunnel = Tunnel::start_at_with_program(
+        &opts,
+        dir.join("l.sock"),
+        Path::new("/tmp/r.sock"),
+        ssh.as_os_str(),
+    )
+    .unwrap();
+    std::fs::write(dir.join("ready"), "").unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(60));
 }

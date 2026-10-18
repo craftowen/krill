@@ -74,7 +74,7 @@ impl SshHost {
             "-o".to_owned(),
             "StrictHostKeyChecking=accept-new".to_owned(),
             self.destination.clone(),
-            "uname -sr && (command -v krill >/dev/null 2>&1 && echo 'krill: ready' || echo 'krill: not installed')".to_owned(),
+            "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
         args
     }
@@ -651,6 +651,7 @@ pub fn has_default_ssh_key(home: Option<&Path>) -> bool {
 
 /// `~/.ssh/id_ed25519` 키가 없으면 빈 패스프레이즈로 새로 생성한다.
 pub fn generate_default_ssh_key(home: Option<&Path>) -> io::Result<PathBuf> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     let key_path = default_ssh_key_path(home);
@@ -659,6 +660,7 @@ pub fn generate_default_ssh_key(home: Option<&Path>) -> io::Result<PathBuf> {
     }
     if let Some(ssh_dir) = key_path.parent() {
         std::fs::create_dir_all(ssh_dir)?;
+        #[cfg(unix)]
         std::fs::set_permissions(ssh_dir, std::fs::Permissions::from_mode(0o700)).ok();
     }
     let keygen_bin = std::env::var_os("KRILL_SSH_KEYGEN_BIN")
@@ -986,8 +988,10 @@ Host dev-box
         assert!(home_args.windows(2).any(|w| w == ["-p", "2201"]));
         assert_eq!(home_args.last().unwrap(), &krill_hosts::ssh::remote_query());
         assert_eq!(
-            host.resolve_remote_socket_from_home("/Users/remoteowen\ndev.minikrill.app\n")
-                .unwrap(),
+            host.resolve_remote_socket_from_home(
+                "/Users/remoteowen\nLibrary/Application Support/dev.minikrill.app\n",
+            )
+            .unwrap(),
             PathBuf::from(
                 "/Users/remoteowen/Library/Application Support/dev.minikrill.app/run/krilld.sock"
             )

@@ -63,7 +63,7 @@ ponytail 스킬(게으른 시니어: YAGNI → 기존 코드 → std → 플랫�
 - **T3 SHOULD** `as_`/`to_`/`into_` 규약, `get_` 접두어 금지, 약어는 한 단어(`Pty`, `Uds`).
 - **T4 SHOULD** 바이너리 크레이트는 `main.rs`를 얇게, 로직은 `lib.rs`.
 - **T5 MUST** `krill-proto`·`krill-term`은 gpui·tokio·nix·objc2에 의존하지 않는다.
-- **MUST** `krill-holder` 1,200줄 상한(AGENTS 구조, 결정 12-2)은 플랫폼별로 센다: 공통 코드 + 해당 OS `sys` 모듈(예: macOS 빌드 = 공통 + `sys/macos.rs`, Windows 빌드 = 공통 + `sys/windows.rs`). 다른 OS의 `sys` 파일은 그 플랫폼 몫에만 들어간다.
+- **MUST** `krill-holder` 줄 수 상한(AGENTS 구조, 결정 12-2, 2026-10-18 개정)은 플랫폼별로 센다: macOS 빌드(공통 코드 + macOS 분기) 1,250줄 이하, Linux 전용 `sys/linux.rs` 300줄 이하, Windows 빌드(공통 코드 + `windows.rs`) 1,200줄 이하. 다른 OS 전용 파일은 그 플랫폼 몫에만 들어간다.
 - **SHOULD** 파일 하나 800줄 넘으면 나눈다. 모듈은 기능 단위(`session/`, `ipc/`, `store/`), `utils.rs` 같은 잡동사니 모듈 금지.
 - 주석·문서·커밋·로그 메시지는 한국어 또는 영어 중 하나로 일관되게(코드 식별자는 영어). 사용자에게 보이는 문자열은 ko/en 다국어 대비로 한곳에 모은다(MK-094 전까지는 상수로).
 

@@ -2,6 +2,8 @@
 //! 운영 중인 구 holder는 `MK_HOLDER_STATE`로 새 holder를 exec한다. 새 holder가 이 이름을 읽지 않으면
 //! 넘겨받은 세션 fd를 버리고 빈 holder로 시작해 세션을 잃는다.
 
+#![cfg(unix)]
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 

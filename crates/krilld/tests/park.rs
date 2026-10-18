@@ -149,6 +149,7 @@ fn wait_until(what: &str, f: impl Fn() -> bool) {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: /usr/bin/footprint")]
 fn only_shown_terminals_keep_hot_rows_and_switch_rebuilds_fast() {
     krilld::alloc::return_freed_pages().unwrap();
     let dir = env::temp_dir().join(format!("mk035-park-{}", std::process::id()));

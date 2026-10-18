@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! MK-134: direct, relay-free QUIC outages with persistent Unix connections.
 #![expect(clippy::unwrap_used, reason = "integration assertions")]
 

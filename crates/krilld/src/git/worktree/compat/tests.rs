@@ -19,6 +19,7 @@ proptest::proptest! {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: APFS clonefile")]
 fn clone_and_fallback_preserve_independent_files_and_never_overwrite() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 

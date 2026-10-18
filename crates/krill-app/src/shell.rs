@@ -29,12 +29,12 @@ mod release;
 pub(crate) mod security;
 mod tabs;
 
+use krill_proto::os::ffi::OsStringExt as _;
+use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::Shutdown;
 use std::ops::Range;
-use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -71,7 +71,7 @@ use krill_app::layout::{self, Axis, Branch, Layout, PaneId, PaneTree};
 
 use krill_app::{jump, sidebar};
 use krill_proto::control::{Create, Program};
-use std::os::unix::ffi::OsStrExt as _;
+use krill_proto::os::ffi::OsStrExt as _;
 
 const KEY_CONTEXT: &str = "Shell";
 /// 커서 깜박임 반주기(OWE-658, macOS 기본 텍스트 커서와 비슷한 값 — 추정).
@@ -3310,7 +3310,7 @@ impl Shell {
                 this.on_scroll(id, e, window, cx);
             }))
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
-                use std::os::unix::ffi::OsStrExt as _;
+                use krill_proto::os::ffi::OsStrExt as _;
                 this.change(true, cx, |l| l.focus(id));
                 let text = krill_term::paste::dropped(
                     paths.paths().iter().map(|p| p.as_os_str().as_bytes()),

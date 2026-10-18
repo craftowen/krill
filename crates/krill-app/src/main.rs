@@ -225,28 +225,36 @@ pub(crate) fn set_menus(security: &krill_app::security::State, cx: &mut App) {
 
 fn refresh_menus(cx: &mut App) {
     let secure = cx.try_global::<MenuSecurity>().is_some_and(|state| state.0);
-    cx.set_menus([
-        Menu::new(krill_app::i18n::catalog::security::APP_MENU.get()).items([
-            MenuItem::action(
-                krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
-                krill_app::settings::OpenSettings,
-            ),
-            MenuItem::action(
-                krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
-                krill_app::onboarding::OpenChecks,
-            ),
-            MenuItem::action(
-                krill_app::i18n::catalog::onboarding::MENU_RERUN.get(),
-                krill_app::onboarding::RerunOnboarding,
-            ),
+    let mut app_items = vec![
+        MenuItem::action(
+            krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
+            krill_app::settings::OpenSettings,
+        ),
+        MenuItem::action(
+            krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
+            krill_app::onboarding::OpenChecks,
+        ),
+        MenuItem::action(
+            krill_app::i18n::catalog::onboarding::MENU_RERUN.get(),
+            krill_app::onboarding::RerunOnboarding,
+        ),
+    ];
+    // Secure Keyboard Entry는 macOS 전용이다(규칙 10).
+    if cfg!(target_os = "macos") {
+        app_items.push(
             MenuItem::action(
                 krill_app::security::text::SECURE_KEYBOARD_MENU.get(),
                 shell::security::ToggleSecureInput,
             )
             .checked(secure),
-            MenuItem::separator(),
-            MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
-        ]),
+        );
+    }
+    app_items.extend([
+        MenuItem::separator(),
+        MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
+    ]);
+    cx.set_menus([
+        Menu::new(krill_app::i18n::catalog::security::APP_MENU.get()).items(app_items),
         Menu::new(krill_app::i18n::catalog::general::FILE.get()).items([
             MenuItem::action(
                 krill_app::i18n::catalog::general::NEW_WINDOW.get(),

@@ -15,10 +15,10 @@
 pub mod ed25519;
 mod relaunch;
 
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -916,7 +916,11 @@ fn stage_update_manifest(
 }
 
 /// 현재 실행 중인 앱 번들의 업데이트를 점검·스테이징한다(Settings UI 및 CLI에서 사용).
+/// 자체 업데이터는 macOS `.app` 번들(`codesign`·`ditto`) 전용이다. 다른 OS는 점검하지 않는다.
 pub fn check_and_stage_current_app(state_dir: &Path) -> Result<CheckStatus, Error> {
+    if !cfg!(target_os = "macos") {
+        return Err(io::Error::from(io::ErrorKind::Unsupported).into());
+    }
     let exe = std::env::current_exe()?;
     let bundle_env = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
     let app_bundle = current_app_bundle_in(bundle_env.as_deref(), &exe)
@@ -940,6 +944,9 @@ pub fn check_and_stage_bundle(app_bundle: &Path, state_dir: &Path) -> Result<Che
 /// `KRILL_UPDATE_RELAUNCH_NOW=1`이면 즉시 별도 relauncher를 띄운다.
 /// 환경변수 읽기는 여기에만 있고 본체는 [`poll_update_with`]라 테스트에서 값을 직접 넣는다.
 pub fn poll_env_update(state_dir: &Path) -> Result<Option<StagedUpdate>, Error> {
+    if !cfg!(target_os = "macos") {
+        return Ok(None);
+    }
     let manifest_url = std::env::var("KRILL_UPDATE_MANIFEST_URL").ok();
     let bundle_path = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
     let relaunch_now = std::env::var("KRILL_UPDATE_RELAUNCH_NOW").ok().as_deref() == Some("1");

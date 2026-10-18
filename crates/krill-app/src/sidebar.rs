@@ -8,10 +8,10 @@
 //! `.ref/orca/src/renderer/src/components/sidebar/worktree-list/rows/HostSectionHeader.tsx`
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
 
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -392,7 +392,7 @@ fn save_state(
         ));
     }
     if let Some(parent) = path.parent() {
-        std::os::unix::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
+        krill_proto::os::fs::DirBuilderExt::mode(fs::DirBuilder::new().recursive(true), 0o700)
             .create(parent)?;
     }
     let temp = path.with_extension("tmp");

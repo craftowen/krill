@@ -47,7 +47,7 @@ mod status_negotiation_tests {
             holder: root.join("unused-holder"),
             krilld: root.join("unused-daemon"),
         };
-        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let listener = krill_proto::os::net::UnixListener::bind(&paths.socket).unwrap();
         let worker = std::thread::spawn(move || {
             let server = ServerHello {
                 proto_min: ipc::PROTO_MIN,
@@ -193,7 +193,11 @@ pub fn orphans_ipc(paths: &Paths, req: &UsageRequest) -> Result<Vec<OrphanProfil
 
 /// 사용 중 세션 때문에 거부된 삭제(`EBUSY`)는 사용자 문구로 바꾼다(OWE-704).
 fn failure_text(e: krill_proto::control::Failure) -> String {
-    if e == krill_proto::control::Failure::Os(rustix::io::Errno::BUSY.raw_os_error()) {
+    #[cfg(unix)]
+    let busy = e == krill_proto::control::Failure::Os(rustix::io::Errno::BUSY.raw_os_error());
+    #[cfg(not(unix))]
+    let busy = false;
+    if busy {
         crate::i18n::catalog::settings::ACCOUNT_DELETE_BUSY
             .get()
             .to_owned()
@@ -465,7 +469,8 @@ fn run_browser_login(
     program: &[u8],
     args: &[Vec<u8>],
 ) {
-    use std::os::unix::ffi::OsStrExt as _;
+    use krill_proto::os::ffi::OsStrExt as _;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -475,6 +480,7 @@ fn run_browser_login(
         cleanup_failed_login(paths, account, newly_added);
         return;
     }
+    #[cfg(unix)]
     if std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).is_err() {
         std::fs::remove_dir_all(&temp).ok();
         cleanup_failed_login(paths, account, newly_added);
@@ -495,6 +501,7 @@ fn run_browser_login(
         cleanup_failed_login(paths, account, newly_added);
         return;
     }
+    #[cfg(unix)]
     if std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).is_err() {
         std::fs::remove_dir_all(&temp).ok();
         cleanup_failed_login(paths, account, newly_added);
@@ -748,7 +755,7 @@ pub fn load_problem(home: &Path, state_dir: Option<&Path>) -> Option<String> {
 }
 
 fn save_file(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
