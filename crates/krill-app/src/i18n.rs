@@ -117,7 +117,7 @@ catalog! {
         REVEAL => ("파일 탐색기에서 보기", "Show in File Explorer"),
         SUMMARY_LOCAL => ("터미널 기록은 이 컴퓨터에만 저장되고, 텔레메트리는 없습니다.", "Terminal history stays on this computer. There is no telemetry."),
         HOST_LOCAL => ("내 컴퓨터", "My computer"),
-        HOST_LOCAL_MAC => ("이 컴퓨터", "This computer"),
+        LAN_DESC => ("휴대폰이 이 컴퓨터와 같은 Wi-Fi에 연결되어 있어야 합니다. 별도 계정이 필요하지 않습니다.", "Phone must be on the same Wi-Fi network as this computer. No account needed."),
         THEME_DESC => ("앱과 터미널의 라이트·다크 모양입니다. 시스템은 OS 설정을 따릅니다.", "Light or dark look for the app and terminals. System follows the OS setting."),
         NOTIFICATIONS_DESC => ("에이전트 입력 대기·완료 알림을 보냅니다.", "Notify when an agent waits for input or finishes."),
         KEEP_AWAKE_DESC => ("컴퓨터가 유휴 잠자기에 들어가지 않게 합니다.", "Prevent the computer from idle sleep."),
