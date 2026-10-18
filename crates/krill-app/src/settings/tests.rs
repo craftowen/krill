@@ -2388,12 +2388,13 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
 
 /// OWE-799: 단축키 액션이 6개 기능 영역 카테고리에 빠짐없이 분류되고, 로컬 검색·수정 여부가 정확히 판별된다.
 /// (OWE-868에서 `shell::FindNext`·`shell::FindPrev`, OWE-848에서 `shell::ToggleChanges`,
-/// OWE-862에서 `shell::CommandPalette`가 추가되어 50개에서 54개가 되었다.)
+/// OWE-862에서 `shell::CommandPalette`, OWE-871에서 `shell::FocusPane{Left,Right,Up,Down}`이
+/// 추가되어 50개에서 58개가 되었다.)
 #[test]
 fn owe799_category_mapping_and_search_matching() {
     use shortcuts::{ACTIONS, Category, action_category, is_modified, matches_query};
 
-    assert_eq!(ACTIONS.len(), 54);
+    assert_eq!(ACTIONS.len(), 58);
     for &cat in Category::ALL {
         let count = ACTIONS
             .iter()
