@@ -158,7 +158,8 @@ pub struct Settings {
     /// '다시 묻지 않기'를 고르면 false로 저장된다.
     #[serde(default = "default_true")]
     pub confirm_running_close: bool,
-    /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 false, 동의 후 활성화, OWE-737).
+    /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 true, OWE-737).
+    #[serde(default = "default_true")]
     pub workspace_trust_preset_enabled: bool,
 }
 
@@ -255,7 +256,7 @@ impl Default for Settings {
             prompt_cache_ttl_secs: DEFAULT_PROMPT_CACHE_TTL_SECS,
             auto_rename_branch_from_work: true,
             confirm_running_close: true,
-            workspace_trust_preset_enabled: false,
+            workspace_trust_preset_enabled: true,
         }
     }
 }
