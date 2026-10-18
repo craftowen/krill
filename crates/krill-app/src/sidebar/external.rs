@@ -24,9 +24,49 @@ const MAX_CLAUDE_WORKTREES: usize = 64;
 
 type Store = krill_proto::orchestration::WorktreeStore;
 
-/// 워크트리 경로의 체크포인트 배지(`● REVIEW #128 OWE-626 🔗2`)를 구성한다(MK-116, MK-118).
+/// 워크트리 경로의 체크포인트 배지(`REVIEW #128 OWE-626 links 2`)를 구성한다(MK-116, MK-118).
+///
+/// 미확인 여부·참조 수 같은 도형 정보는 문자열에 유니코드 글리프(`●`·`🔗`)로 넣지 않고
+/// [`CheckpointParts`]와 [`checkpoint_badge_element`]에서 `ui::status::unread_dot()`·
+/// Lucide 아이콘(`IconName::Link`)+`ui::badge`로 그린다(`docs/STYLEGUIDE.md` §6.4).
 pub fn checkpoint_badge_for(sidebar_path: Option<&Path>, worktree: &Path) -> Option<String> {
     checkpoint_badge_for_card(sidebar_path, worktree, false)
+}
+
+/// 체크포인트 배지의 구조화된 내용(문자열 뱃지와 그래픽 뱃지가 공유).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckpointParts {
+    pub unread: bool,
+    pub status: Option<String>,
+    pub pr: Option<u64>,
+    pub issue: Option<String>,
+    pub refs_len: usize,
+}
+
+impl CheckpointParts {
+    /// 카드·행에 그리는 라벨 텍스트. 미확인 점과 참조 수는 아이콘으로 그리므로
+    /// 문자열에는 상태·PR·이슈·참조 수(`links {n}`)만 남긴다. 미확인은
+    /// 행 상태 묶음의 `UNREAD`와 미확인 점이 이미 알리므로 여기서 덧붙이지 않는다.
+    #[must_use]
+    pub fn label(&self, omit_issue: bool) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(st) = &self.status {
+            parts.push(st.clone());
+        }
+        if let Some(n) = self.pr {
+            parts.push(format!("#{n}"));
+        }
+        if !omit_issue && let Some(iss) = &self.issue {
+            parts.push(iss.clone());
+        }
+        if self.refs_len > 0 {
+            parts.push(format!("links {}", self.refs_len));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join(" "))
+    }
 }
 
 /// 카드 렌더링용 체크포인트 배지. 별도 `issue_badge`가 이미 표시될 때(`omit_issue == true`)는
@@ -36,6 +76,14 @@ pub fn checkpoint_badge_for_card(
     worktree: &Path,
     omit_issue: bool,
 ) -> Option<String> {
+    checkpoint_badge_parts(sidebar_path, worktree).and_then(|p| p.label(omit_issue))
+}
+
+/// 체크포인트 배지의 구조화된 내용을 읽는다. 표시할 정보가 하나도 없으면 `None`.
+pub fn checkpoint_badge_parts(
+    sidebar_path: Option<&Path>,
+    worktree: &Path,
+) -> Option<CheckpointParts> {
     let dir = sidebar_path
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty())?;
@@ -47,38 +95,73 @@ pub fn checkpoint_badge_for_card(
             .statuses
             .get(&key)
             .and_then(|s| krill_proto::orchestration::WorkspaceStatus::parse(s).ok())
-            .map(krill_proto::orchestration::WorkspaceStatus::badge_label);
+            .map(krill_proto::orchestration::WorkspaceStatus::badge_label)
+            .map(str::to_owned);
         let pr = store.prs.get(&key).copied();
-        let issue = (!omit_issue)
-            .then(|| store.issues.get(&key).map(String::as_str))
-            .flatten();
+        let issue = store.issues.get(&key).map(String::as_str);
         let refs_len = store.references.get(&key).map_or(0, Vec::len);
         if !unread && status.is_none() && pr.is_none() && issue.is_none() && refs_len == 0 {
             continue;
         }
-        let mut parts = Vec::new();
-        if unread {
-            parts.push("●".to_owned());
-        }
-        if let Some(st) = status {
-            parts.push(st.to_owned());
-        }
-        if let Some(n) = pr {
-            parts.push(format!("#{n}"));
-        }
-        if let Some(iss) = issue {
-            parts.push(iss.to_owned());
-        }
-        if refs_len > 0 {
-            parts.push(format!("🔗{refs_len}"));
-        }
-        return Some(parts.join(" "));
+        return Some(CheckpointParts {
+            unread,
+            status,
+            pr,
+            issue: issue.map(str::to_owned),
+            refs_len,
+        });
     }
     None
 }
 
+/// 체크포인트 배지 그래픽 요소: [미확인 점][라벨 텍스트][링크 아이콘 + 참조 수].
+/// 워크트리 카드(`p.worktree_sidebar`) 위에서는 카드보다 밝은 `p.worktree_sidebar_accent`
+/// 배경과 `p.muted_foreground` 전경을 쓴다(다크 모드 `#262626` 역전 방지, STYLEGUIDE §3.1).
+pub fn checkpoint_badge_element(parts: &CheckpointParts, p: &crate::ui::Palette) -> Div {
+    use gpui_component::{Icon, Sizable as _};
+    let mut row = div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1()
+        .rounded(crate::ui::RADIUS_XS)
+        .bg(p.worktree_sidebar_accent)
+        .font_family(crate::ui::FONT_MONO)
+        .text_size(crate::ui::TEXT_2XS)
+        .text_color(p.muted_foreground);
+    if parts.unread {
+        row = row.child(crate::ui::status::unread_dot());
+    }
+    row = row.children(parts.status.iter().map(|st| div().child(st.clone())));
+    row = row.children(parts.pr.map(|n| div().child(format!("#{n}"))));
+    row = row.children(parts.issue.iter().map(|iss| div().child(iss.clone())));
+    if parts.refs_len > 0 {
+        row = row.child(
+            div()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .child(
+                    Icon::new(gpui_kit_assets::IconName::Link)
+                        .with_size(px(10.))
+                        .text_color(p.muted_foreground),
+                )
+                .child(parts.refs_len.to_string()),
+        );
+    }
+    row
+}
+
+/// 세션 오케스트레이션 배지의 구조화된 내용(워커 이름 또는 지휘자).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrchBadge {
+    Worker(String),
+    Coordinator,
+}
+
 /// 세션이 오케스트레이션 워커 또는 지휘자로 등록되어 있으면 배지를 돌려준다(MK-114, MK-118).
-pub fn session_orch_badge(sidebar_path: Option<&Path>, session_id: u64) -> Option<String> {
+pub fn session_orch_parts(sidebar_path: Option<&Path>, session_id: u64) -> Option<OrchBadge> {
     let dir = sidebar_path
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty())?;
@@ -89,17 +172,58 @@ pub fn session_orch_badge(sidebar_path: Option<&Path>, session_id: u64) -> Optio
         .rev()
         .find(|d| d.session_id == Some(session_id))
     {
-        return Some(format!("⚡ {}", disp.worker_name));
+        return Some(OrchBadge::Worker(disp.worker_name.clone()));
     }
     if orch
         .runs
         .iter()
         .any(|r| r.coordinator_session_id == Some(session_id))
     {
-        // AS-26: 사용자 노출 배지는 카탈로그 키로(한국어 UI에서 영어 노출 금지).
-        return Some(crate::i18n::catalog::sidebar::COORD_BADGE.get().to_owned());
+        return Some(OrchBadge::Coordinator);
     }
     None
+}
+
+/// 세션이 오케스트레이션 워커 또는 지휘자로 등록되어 있으면 배지 라벨을 돌려준다(MK-114, MK-118).
+///
+/// 행 그래픽은 [`session_orch_element`]가 Lucide 워크플로 아이콘(`WORKFLOW_SVG`) +
+/// `ui::badge`로 그리며, 이 함수는 스크린 리더·테스트용 텍스트만 돌려준다.
+pub fn session_orch_badge(sidebar_path: Option<&Path>, session_id: u64) -> Option<String> {
+    match session_orch_parts(sidebar_path, session_id)? {
+        OrchBadge::Worker(name) => Some(name),
+        // AS-26: 사용자 노출 배지는 카탈로그 키로(한국어 UI에서 영어 노출 금지).
+        OrchBadge::Coordinator => Some(crate::i18n::catalog::sidebar::COORD_BADGE.get().to_owned()),
+    }
+}
+
+/// 세션 오케스트레이션 배지 그래픽 요소: [워크플로 아이콘][워커 이름 또는 지휘자].
+/// `ui::badge` 톤(`BadgeTone::Muted`)과 같은 배경·테두리·전경을 써서
+/// 사이드바 표면 위에서도 명도 대비를 유지한다(STYLEGUIDE §3.1·§6.2).
+pub fn session_orch_element(badge: &OrchBadge, p: &crate::ui::Palette) -> Div {
+    let (bg, border, fg) = crate::ui::BadgeTone::Muted.colors(p);
+    let label = match badge {
+        OrchBadge::Worker(name) => name.clone(),
+        OrchBadge::Coordinator => crate::i18n::catalog::sidebar::COORD_BADGE.get().to_owned(),
+    };
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .py_0p5()
+        .rounded_full()
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .text_size(crate::ui::TEXT_2XS)
+        .text_color(fg)
+        .child(crate::ui::icons::svg_icon(
+            crate::ui::icons::WORKFLOW_SVG,
+            10.,
+            fg,
+        ))
+        .child(label)
 }
 
 pub(super) fn path_aliases(worktree: &Path) -> Vec<String> {
@@ -1203,18 +1327,17 @@ mod tests {
 
         assert_eq!(
             checkpoint_badge_for(Some(&sidebar), Path::new(full)).as_deref(),
-            Some("● REVIEW #128 OWE-626 🔗2")
+            Some("REVIEW #128 OWE-626 links 2")
         );
         assert_eq!(
             checkpoint_badge_for(Some(&sidebar), Path::new("/private/tmp/minikrill-review"))
                 .as_deref(),
-            Some("● REVIEW #128 OWE-626 🔗2")
+            Some("REVIEW #128 OWE-626 links 2")
         );
         for (path, badge) in [
             ("/repo/todo", "TODO"),
             ("/repo/wip", "WIP"),
             ("/repo/done", "DONE"),
-            ("/repo/unread", "●"),
             ("/repo/linked", "OWE-627"),
         ] {
             assert_eq!(
@@ -1227,6 +1350,7 @@ mod tests {
             "/repo/read",
             "/repo/comment-only",
             "/repo/invalid",
+            "/repo/unread",
             "/tmp/minikrill-review/child",
         ] {
             assert_eq!(checkpoint_badge_for(Some(&sidebar), Path::new(path)), None);
@@ -1282,11 +1406,11 @@ mod tests {
 
         assert_eq!(
             session_orch_badge(Some(&sidebar), 10).as_deref(),
-            Some("⚡ latest-worker")
+            Some("latest-worker")
         );
         assert_eq!(
             session_orch_badge(Some(&sidebar), 1).as_deref(),
-            Some("⚡ coordinator-worker")
+            Some("coordinator-worker")
         );
         assert_eq!(
             session_orch_badge(Some(&sidebar), 2).as_deref(),

@@ -293,7 +293,7 @@ fn row_menu(
                     let (confirm_this, confirm_path) = (this.clone(), meta.path.clone());
                     menu = menu.item(
                         PopupMenuItem::new(text::DELETE_WORKTREE.get())
-                            .icon(IconName::Delete)
+                            .icon(Icon::default().data(ui::icons::TRASH_SVG))
                             .on_click(move |_, _, cx| {
                                 confirm_this
                                     .update(cx, |s, cx| {
@@ -307,15 +307,17 @@ fn row_menu(
                     let (del_all_this, del_all_path) = (this.clone(), meta.path.clone());
                     let label = text::DELETE_WITH_DESCENDANTS
                         .format(&[("n", &meta.descendant_count.to_string())]);
-                    menu = menu.item(PopupMenuItem::new(label).icon(IconName::Delete).on_click(
-                        move |_, _, cx| {
-                            del_all_this
-                                .update(cx, |s, cx| {
-                                    s.request_delete_worktree(del_all_path.clone(), true, cx);
-                                })
-                                .ok();
-                        },
-                    ));
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .icon(Icon::default().data(ui::icons::TRASH_SVG))
+                            .on_click(move |_, _, cx| {
+                                del_all_this
+                                    .update(cx, |s, cx| {
+                                        s.request_delete_worktree(del_all_path.clone(), true, cx);
+                                    })
+                                    .ok();
+                            }),
+                    );
                 }
             }
         }
@@ -325,7 +327,7 @@ fn row_menu(
         let (remove_this, remove_path) = (this.clone(), header.clone());
         menu = menu.separator().item(
             PopupMenuItem::new(text::REMOVE_PROJECT.get())
-                .icon(IconName::Delete)
+                .icon(Icon::default().data(ui::icons::TRASH_SVG))
                 .on_click(move |_, _, cx| {
                     remove_this
                         .update(cx, |s, cx| s.remove_project(remove_path.clone(), cx))
@@ -366,17 +368,21 @@ impl Sidebar {
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .text_size(ui::TEXT_SM)
-                .when(selected, |d| d.bg(p.sidebar_accent))
+                .text_size(ui::TEXT_MD)
+                .when(selected, |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
         };
         let heading = |d: gpui::Stateful<gpui::Div>| {
             single_line(d)
                 .text_size(ui::TEXT_XS)
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(p.muted_foreground)
+                .when(selected, |d| d.text_color(p.sidebar_accent_foreground))
         };
         let repo_heading = |d: gpui::Stateful<gpui::Div>| {
-            d.h(px(28.))
+            d.h(ui::SIDEBAR_HEADER_HEIGHT)
                 .px_2()
                 .mx_1()
                 .rounded(ui::RADIUS_SM)
@@ -386,7 +392,10 @@ impl Sidebar {
                 .text_size(ui::TEXT_MD)
                 .font_weight(gpui::FontWeight::SEMIBOLD)
                 .text_color(p.sidebar_foreground)
-                .when(selected, |d| d.bg(p.sidebar_accent))
+                .when(selected, |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
         };
         match row {
             Row::HostHeader {
@@ -421,7 +430,10 @@ impl Sidebar {
                     .cursor_pointer()
                     .pl_1()
                     .pr_1p5()
-                    .hover(|d| d.bg(p.sidebar_accent))
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
                     .child(
                         Button::new(("host-fold", index))
                             .ghost()
@@ -447,7 +459,7 @@ impl Sidebar {
                     .child(
                         div()
                             .debug_selector(move || format!("host-status-{status_key}"))
-                            .size(px(6.))
+                            .size(ui::STATE_DOT)
                             .rounded_full()
                             .flex_none()
                             .bg(dot_color),
@@ -541,7 +553,10 @@ impl Sidebar {
                     .cursor_pointer()
                     .pl_1()
                     .pr_1p5()
-                    .hover(|d| d.bg(p.sidebar_accent))
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
                     .child(
                         Button::new(("group-fold", index))
                             .ghost()
@@ -621,7 +636,10 @@ impl Sidebar {
                     ))
                     .aria_expanded(!closed)
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.sidebar_accent))
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
                     .child(
                         Button::new(("repo-fold", index))
                             .ghost()
@@ -675,6 +693,7 @@ impl Sidebar {
                                         .accessibility_label(text::NEW_WORKTREE.get())
                                         .tooltip(text::NEW_WORKTREE.get())
                                         .on_click(cx.listener(move |s, _, window, cx| {
+                                            cx.stop_propagation();
                                             s.new_worktree(repo.clone(), window, cx);
                                         })),
                                 ),
@@ -694,7 +713,10 @@ impl Sidebar {
                     .aria_label(format!("{} {}", text::FOLDER.get(), basename(path)))
                     .aria_expanded(!closed)
                     .cursor_pointer()
-                    .hover(|d| d.bg(p.sidebar_accent))
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
                     .child(
                         Button::new(("folder-fold", index))
                             .ghost()
@@ -733,6 +755,7 @@ impl Sidebar {
                                     .accessibility_label(text::NEW_TERMINAL.get())
                                     .tooltip(text::NEW_TERMINAL.get())
                                     .on_click(cx.listener(move |s, _, window, cx| {
+                                        cx.stop_propagation();
                                         s.new_session_on(
                                             fresh_host.clone(),
                                             fresh.clone(),
@@ -844,19 +867,10 @@ impl Sidebar {
                         row_host
                             .is_local()
                             .then(|| {
-                                super::external::session_orch_badge(self.path.as_deref(), id.0)
+                                super::external::session_orch_parts(self.path.as_deref(), id.0)
                             })
                             .flatten()
-                            .map(|ob| {
-                                div()
-                                    .flex_none()
-                                    .px_1()
-                                    .rounded(ui::RADIUS_XS)
-                                    .bg(p.muted)
-                                    .text_size(ui::TEXT_2XS)
-                                    .text_color(p.accent_foreground)
-                                    .child(ob)
-                            }),
+                            .map(|ob| super::external::session_orch_element(&ob, p)),
                     )
                     .children(session_cache_secs.map(|secs| {
                         let tip = text::CACHE_TIMER_TOOLTIP.get().to_owned();
@@ -926,7 +940,7 @@ impl Sidebar {
                 .debug_selector(move || format!("rename-inline-{index}"))
                 .flex_1()
                 .min_w_0()
-                .child(Input::new(&input).h(px(28.)))
+                .child(Input::new(&input).small())
                 .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
                     if e.keystroke.key == "escape" {
                         cx.stop_propagation();
@@ -1069,18 +1083,15 @@ impl Sidebar {
 
         let left_status = if unread {
             status::status_glyph(AgentState::Done, true, Size::Md, cx).into_any_element()
-        } else if let Some(top) = summary.groups.first().filter(|g| {
-            matches!(
-                g.state,
-                AgentState::Waiting | AgentState::Blocked | AgentState::Working
-            )
-        }) {
+        } else if let Some(top) = summary.groups.first() {
+            // 완료(`Done`)는 체크 글리프, 그 외(작업 중·대기·종료·알 수 없음)는
+            // 묶음 선두 상태의 글리프를 그대로 보인다. 유휴(묶음 없음)는 흐릿한 점.
             status::status_glyph(top.state, false, Size::Md, cx).into_any_element()
         } else {
             div()
-                .size(px(7.))
+                .size(ui::STATE_DOT)
                 .rounded_full()
-                .bg(p.success)
+                .bg(p.muted_foreground.opacity(0.5))
                 .into_any_element()
         };
 
@@ -1208,7 +1219,7 @@ impl Sidebar {
                     .flex_none()
                     .px_1()
                     .rounded(ui::RADIUS_XS)
-                    .bg(p.muted)
+                    .bg(p.worktree_sidebar_accent)
                     .text_size(ui::TEXT_2XS)
                     .text_color(p.muted_foreground)
                     .child(badge)
@@ -1255,21 +1266,15 @@ impl Sidebar {
                 .flex_none()
                 .px_1()
                 .rounded(ui::RADIUS_XS)
-                .bg(p.muted)
+                .bg(p.worktree_sidebar_accent)
                 .font_family(ui::FONT_MONO)
                 .text_size(ui::TEXT_2XS)
-                .text_color(p.accent_foreground)
+                .text_color(p.muted_foreground)
                 .child(iss)
         });
-        let card_checkpoint_badge = row_host
+        let card_checkpoint_parts = row_host
             .is_local()
-            .then(|| {
-                super::external::checkpoint_badge_for_card(
-                    self.path.as_deref(),
-                    path,
-                    has_issue_badge,
-                )
-            })
+            .then(|| super::external::checkpoint_badge_parts(self.path.as_deref(), path))
             .flatten();
 
         let ports_list = if props.ports {
@@ -1291,7 +1296,7 @@ impl Sidebar {
                 .flex_none()
                 .px_1()
                 .rounded(ui::RADIUS_XS)
-                .bg(p.muted)
+                .bg(p.worktree_sidebar_accent)
                 .font_family(ui::FONT_MONO)
                 .text_size(ui::TEXT_2XS)
                 .text_color(p.success)
@@ -1311,7 +1316,7 @@ impl Sidebar {
                     .flex_none()
                     .px_1()
                     .rounded(ui::RADIUS_XS)
-                    .bg(p.muted)
+                    .bg(p.worktree_sidebar_accent)
                     .text_size(ui::TEXT_2XS)
                     .text_color(p.muted_foreground)
                     .child(hb)
@@ -1353,8 +1358,8 @@ impl Sidebar {
                 .px_1()
                 .py(px(1.))
                 .rounded(ui::RADIUS_XS)
-                .bg(p.muted)
-                .hover(|d| d.bg(p.sidebar_accent))
+                .bg(p.worktree_sidebar_accent)
+                .hover(|d| d.bg(p.worktree_sidebar_accent))
                 .text_size(ui::TEXT_2XS)
                 .font_family(ui::FONT_MONO)
                 .text_color(p.muted_foreground)
@@ -1377,12 +1382,6 @@ impl Sidebar {
                     s.toggle_lineage(&fold_path, cx);
                 }))
         });
-
-        let action_hover_bg = if is_active_worktree {
-            p.worktree_sidebar
-        } else {
-            p.sidebar_accent
-        };
 
         // OWE-900: 가상화 구간(`rows >= VIRTUALIZED_ROWS`)에서는 `uniform_list` 고정 높이
         // 제약으로 가변 높이 상세 카드를 그릴 수 없어, 평문 행 대신 고정 높이 컴팩트 카드를
@@ -1472,7 +1471,6 @@ impl Sidebar {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .when(pinned, |d| d.pr(px(26.)))
                         .children(host_badge)
                         .children(issue_badge)
                         .children(ports_badge)
@@ -1501,13 +1499,7 @@ impl Sidebar {
                 )
                 .child(
                     div()
-                        .absolute()
-                        .right_2()
-                        .top_0()
-                        .h(px(28.))
-                        .pl_1()
-                        .rounded(ui::RADIUS_SM)
-                        .group_hover(ROW_GROUP, move |d| d.bg(action_hover_bg))
+                        .flex_none()
                         .flex()
                         .items_center()
                         .gap_0p5()
@@ -1526,7 +1518,10 @@ impl Sidebar {
                 }));
         }
 
-        let badge_count = usize::from(card_checkpoint_badge.is_some())
+        let checkpoint_visible = card_checkpoint_parts
+            .as_ref()
+            .is_some_and(|parts| parts.label(has_issue_badge).is_some() || parts.unread);
+        let badge_count = usize::from(checkpoint_visible)
             + usize::from(worktree_cache_badge.is_some())
             + usize::from(host_badge.is_some())
             + usize::from(issue_badge.is_some())
@@ -1535,21 +1530,16 @@ impl Sidebar {
             + usize::from(pr_badge.is_some());
         let has_badges = badge_count > 0;
         let has_line2 = show_branch_subtitle || has_badges;
-        let dense_badges = badge_count >= 2 || card_checkpoint_badge.is_some();
-        let checkpoint_pill = card_checkpoint_badge.map(|cb| {
+        let dense_badges = badge_count >= 2 || checkpoint_visible;
+        let checkpoint_pill = card_checkpoint_parts.as_ref().map(|parts| {
+            let label = parts.label(has_issue_badge);
+            let a11y = label.clone().unwrap_or_default();
             div()
                 .id(("checkpoint-badge", index))
                 .role(gpui::Role::Status)
-                .aria_label(cb.clone())
+                .aria_label(a11y)
                 .debug_selector(move || format!("checkpoint-badge-{index}"))
-                .flex_none()
-                .px_1()
-                .rounded(ui::RADIUS_XS)
-                .bg(p.muted)
-                .font_family(ui::FONT_MONO)
-                .text_size(ui::TEXT_2XS)
-                .text_color(p.accent_foreground)
-                .child(cb)
+                .child(super::external::checkpoint_badge_element(parts, p))
         });
 
         base.debug_selector(move || format!("worktree-card-{index}"))
@@ -1607,7 +1597,6 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .when(pinned, |d| d.pr(px(26.)))
                             .child(self.card_title_el(path, card_title, ui::TEXT_MD, index, cx))
                             .when(is_default_tree, |d| {
                                 d.child(
@@ -1630,13 +1619,7 @@ impl Sidebar {
                     )
                     .child(
                         div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .h(px(20.))
-                            .pl_1()
-                            .rounded(ui::RADIUS_SM)
-                            .group_hover(ROW_GROUP, move |d| d.bg(action_hover_bg))
+                            .flex_none()
                             .flex()
                             .items_center()
                             .gap_0p5()
@@ -1756,10 +1739,13 @@ impl Sidebar {
                                         .debug_selector(move || format!("card-session-{index}"))
                                         .w_full()
                                         .h(px(20.))
+                                        .px_1()
+                                        .rounded(ui::RADIUS_XS)
                                         .flex()
                                         .items_center()
                                         .gap_1p5()
                                         .cursor_pointer()
+                                        .hover(|d| d.bg(p.worktree_sidebar_accent))
                                         .child(status::status_glyph(
                                             sess.status.state,
                                             sess_unread,
@@ -1805,7 +1791,7 @@ impl Sidebar {
                                         .w_full()
                                         .h(px(25.))
                                         .px_1p5()
-                                        .rounded(px(5.))
+                                        .rounded(ui::RADIUS_XS)
                                         .border_1()
                                         .border_color(p.worktree_sidebar_border)
                                         .bg(if is_active_worktree {
@@ -1841,6 +1827,7 @@ impl Sidebar {
                                                 .when(tree_session_count > 1, |d| {
                                                     d.child(
                                                         div()
+                                                            .font_family(ui::FONT_MONO)
                                                             .text_size(ui::TEXT_2XS)
                                                             .text_color(p.muted_foreground)
                                                             .child(format!(
@@ -2055,18 +2042,17 @@ impl Sidebar {
                 .gap_1()
                 .border_b_1()
                 .border_color(p.sidebar_border)
-                .child(Input::new(&input).h(px(30.)))
+                .child(Input::new(&input).small())
                 .child(
                     div()
                         .flex()
                         .gap_1()
                         .child(
-                            Button::new("rename-save")
-                                .primary()
-                                .label(text::SAVE.get())
-                                .on_click(cx.listener(|s, _, window, cx| {
+                            ui::primary("rename-save", text::SAVE.get()).on_click(cx.listener(
+                                |s, _, window, cx| {
                                     s.finish_rename(Some(window), cx);
-                                })),
+                                },
+                            )),
                         )
                         .child(
                             Button::new("rename-cancel")
@@ -2222,6 +2208,8 @@ impl Sidebar {
             div()
                 .id("setup-script-prompt-card")
                 .debug_selector(|| "setup-script-prompt-card".into())
+                .w_full()
+                .min_w_0()
                 .mx_2()
                 .my_1()
                 .p_2p5()
@@ -2229,6 +2217,7 @@ impl Sidebar {
                 .border_1()
                 .border_color(p.border)
                 .bg(p.card)
+                .text_color(p.card_foreground)
                 .flex()
                 .flex_col()
                 .gap_1p5()
@@ -2450,14 +2439,13 @@ impl Render for Sidebar {
                     ),
             )
             .children(self.error.clone().map(|e| {
-                div()
+                ui::error_banner(p, crate::i18n::cached_notice(&e))
                     .id("sidebar-preference-error")
-                    .px_3()
-                    .py_1()
+                    .debug_selector(|| "sidebar-preference-error".into())
+                    .mx_2()
+                    .my_0p5()
                     .cursor_pointer()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.warning)
-                    .child(crate::i18n::cached_notice(&e))
+                    .hover(|d| d.bg(p.destructive.opacity(0.15)))
                     .on_click(cx.listener(|s, _, _, cx| {
                         s.error = None;
                         cx.notify();
@@ -2465,8 +2453,14 @@ impl Render for Sidebar {
             }))
             .children(self.poll_error.clone().map(|e| {
                 div()
+                    .mx_2()
+                    .my_0p5()
                     .px_3()
-                    .py_1()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.warning.opacity(0.3))
+                    .bg(p.warning.opacity(0.1))
                     .text_size(ui::TEXT_XS)
                     .text_color(p.warning)
                     .child(crate::i18n::cached_notice(&e))
@@ -2498,31 +2492,38 @@ impl Render for Sidebar {
                             }))
                             .child(div().flex_1().min_w_0().child(hint))
                             .child(
-                                div()
-                                    .id("sidebar-pr-guidance-dismiss")
-                                    .debug_selector(|| "sidebar-pr-guidance-dismiss".into())
-                                    .flex_none()
-                                    .px_1()
-                                    .rounded(ui::RADIUS_XS)
-                                    .text_color(p.muted_foreground)
-                                    .hover(|s| {
-                                        s.bg(p.sidebar_accent).text_color(p.sidebar_foreground)
-                                    })
-                                    .child("×")
-                                    .on_click(cx.listener(|s, _, _, cx| {
+                                ui::button_with_tooltip(
+                                    Button::new("sidebar-pr-guidance-dismiss")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Close),
+                                    "sidebar-pr-guidance-dismiss",
+                                    text::CANCEL.get(),
+                                )
+                                .debug_selector(|| "sidebar-pr-guidance-dismiss".into())
+                                .on_click(cx.listener(
+                                    |s, _, _, cx| {
                                         cx.stop_propagation();
                                         s.pr_guidance_dismissed = true;
                                         cx.notify();
-                                    })),
+                                    },
+                                )),
                             )
                     }),
             )
             .children(self.notice.clone().map(|e| {
                 div()
                     .id("sidebar-notice")
+                    .mx_2()
+                    .my_0p5()
                     .px_3()
-                    .py_1()
+                    .py_2()
+                    .rounded(ui::RADIUS_SM)
+                    .border_1()
+                    .border_color(p.warning.opacity(0.3))
+                    .bg(p.warning.opacity(0.1))
                     .cursor_pointer()
+                    .hover(|d| d.bg(p.warning.opacity(0.15)))
                     .text_size(ui::TEXT_XS)
                     .text_color(p.warning)
                     .child(crate::i18n::cached_notice(&e))
