@@ -689,24 +689,31 @@ impl SettingsView {
                 text::CLEANUP_PR_ANY.get(),
             ),
         ];
-        let mut pr_row = div().flex().items_center().gap_1p5().flex_wrap().child(
-            div()
-                .text_size(crate::ui::TEXT_XS)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.muted_foreground)
-                .child(text::CLEANUP_FILTER_PR.get()),
+        let pr_seg = layout::segmented_control(
+            p,
+            pr_filters.iter().map(|&(mode, id_str, label)| {
+                let active = self.space.filter.pr_filter == mode;
+                layout::segment(id_str, label, active)
+                    .debug_selector(move || id_str.into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_cleanup_pr_filter(mode, cx);
+                    }))
+            }),
         );
-        for &(mode, id_str, label) in pr_filters {
-            let active = self.space.filter.pr_filter == mode;
-            let btn = Button::new(id_str)
-                .small()
-                .label(label)
-                .debug_selector(move || id_str.into())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_cleanup_pr_filter(mode, cx);
-                }));
-            pr_row = pr_row.child(if active { btn.primary() } else { btn.ghost() });
-        }
+        let pr_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.muted_foreground)
+                    .child(text::CLEANUP_FILTER_PR.get()),
+            )
+            .child(pr_seg);
 
         let idle_presets: &[(IdleDaysPreset, &'static str, &'static str)] = &[
             (
@@ -730,34 +737,43 @@ impl SettingsView {
                 text::CLEANUP_IDLE_30D.get(),
             ),
         ];
-        let mut idle_row = div().flex().items_center().gap_1p5().flex_wrap().child(
-            div()
-                .text_size(crate::ui::TEXT_XS)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.muted_foreground)
-                .child(text::CLEANUP_FILTER_IDLE.get()),
+        let idle_seg = layout::segmented_control(
+            p,
+            idle_presets.iter().map(|&(preset, id_str, label)| {
+                let days = preset.days();
+                let active = self.space.filter.min_idle_days == days;
+                layout::segment(id_str, label, active)
+                    .debug_selector(move || id_str.into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_cleanup_idle_days(days, cx);
+                    }))
+            }),
         );
-        for &(preset, id_str, label) in idle_presets {
-            let days = preset.days();
-            let active = self.space.filter.min_idle_days == days;
-            let btn = Button::new(id_str)
-                .small()
-                .label(label)
-                .debug_selector(move || id_str.into())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_cleanup_idle_days(days, cx);
-                }));
-            idle_row = idle_row.child(if active { btn.primary() } else { btn.ghost() });
-        }
+        let idle_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.muted_foreground)
+                    .child(text::CLEANUP_FILTER_IDLE.get()),
+            )
+            .child(idle_seg);
 
         let exclude_dirty = self.space.filter.exclude_dirty;
-        let safety_btn = Button::new("admin-cleanup-exclude-dirty")
-            .small()
-            .label(text::CLEANUP_EXCLUDE_DIRTY.get())
-            .debug_selector(|| "admin-cleanup-exclude-dirty".into())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_cleanup_exclude_dirty(!exclude_dirty, cx);
-            }));
+        let safety_btn = layout::segment(
+            "admin-cleanup-exclude-dirty",
+            text::CLEANUP_EXCLUDE_DIRTY.get(),
+            exclude_dirty,
+        )
+        .debug_selector(|| "admin-cleanup-exclude-dirty".into())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.set_cleanup_exclude_dirty(!exclude_dirty, cx);
+        }));
         let safety_row = div()
             .flex()
             .items_center()
@@ -776,11 +792,7 @@ impl SettingsView {
                             .text_color(p.muted_foreground)
                             .child(text::CLEANUP_FILTER_SAFETY.get()),
                     )
-                    .child(if exclude_dirty {
-                        safety_btn.primary()
-                    } else {
-                        safety_btn.ghost()
-                    }),
+                    .child(safety_btn),
             )
             .child(
                 div()
@@ -944,7 +956,7 @@ impl SettingsView {
             .debug_selector(|| "admin-cleanup-modal".into())
             .occlude()
             .role(gpui::Role::Dialog)
-            .w(px(640.))
+            .w(crate::ui::SETTINGS_MODAL_WIDTH)
             .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
@@ -1024,10 +1036,7 @@ impl SettingsView {
                             .items_center()
                             .gap_2()
                             .child(
-                                Button::new("admin-cleanup-cancel")
-                                    .small()
-                                    .ghost()
-                                    .label(text::CLEANUP_CLOSE.get())
+                                layout::ghost("admin-cleanup-cancel", text::CLEANUP_CLOSE.get())
                                     .debug_selector(|| "admin-cleanup-cancel".into())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.close_cleanup_modal(cx);

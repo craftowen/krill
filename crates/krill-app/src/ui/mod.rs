@@ -14,17 +14,19 @@ pub const MENU_BAR_ICON: gpui_kit_assets::IconName = gpui_kit_assets::IconName::
 pub const MENU_BAR_ICON_SIZE: i32 = 18;
 
 pub use primitives::{
-    BadgeTone, badge, card, controls, danger_confirm, error_banner, field_label, keycap, label,
-    modal_backdrop, row, secondary, section_title,
+    BadgeTone, LabelDesc, badge, card, controls, danger_confirm, error_banner, field_label, ghost,
+    keycap, label, modal_backdrop, primary, row, secondary, section_title, segment,
+    segmented_control, switch,
 };
 pub use theme::{
     AGENT_HISTORY_MAX_HEIGHT, AGENT_HISTORY_WIDTH, AGENT_UNREAD, COMMAND_PALETTE_WIDTH, DARK,
     DASHBOARD_SIZE, DIALOG_WIDTH, DIVIDER_HIT_PX, FLOATING_SIZE, FONT_MONO, FONT_UI, LIGHT,
     MODAL_BACKDROP, PANEL_DEFAULT_WIDTH, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, RADIUS_XL,
-    RADIUS_XS, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_EMPTY_PY, SIDEBAR_HEADER_HEIGHT, SPACE_1, SPACE_2,
-    SPACE_3, SPACE_4, STATE_DOT, STATUS_BAR_HEIGHT, TAB_BAR_HEIGHT, TAB_INACTIVE_OPACITY,
-    TAB_MAX_WIDTH, TERMINAL_DARK, TERMINAL_LIGHT, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XS,
-    TITLEBAR_HEIGHT, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, agent_state_color, apply,
-    git_status_color, hex, hexa, palette, palette_for, sync, tab_tag_color, terminal_surface,
-    terminal_surface_alpha, terminal_theme,
+    RADIUS_XS, SETTINGS_CONTENT_MAX_WIDTH, SETTINGS_MODAL_WIDTH, SETTINGS_NAV_WIDTH,
+    SIDEBAR_DEFAULT_WIDTH, SIDEBAR_EMPTY_PY, SIDEBAR_HEADER_HEIGHT, SPACE_1, SPACE_2, SPACE_3,
+    SPACE_4, STATE_DOT, STATUS_BAR_HEIGHT, SWITCH_HEIGHT, SWITCH_THUMB, SWITCH_WIDTH,
+    TAB_BAR_HEIGHT, TAB_INACTIVE_OPACITY, TAB_MAX_WIDTH, TERMINAL_DARK, TERMINAL_LIGHT, TEXT_2XS,
+    TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XS, TITLEBAR_HEIGHT, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD,
+    agent_state_color, apply, git_status_color, hex, hexa, palette, palette_for, sync,
+    tab_tag_color, terminal_surface, terminal_surface_alpha, terminal_theme,
 };
