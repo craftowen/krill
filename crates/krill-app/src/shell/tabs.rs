@@ -160,8 +160,14 @@ impl Shell {
                     .and_then(|s| s.account.as_ref())
                     .map(|a| a.label.trim())
                     .filter(|l| !l.is_empty());
+                // OWE-851: 에이전트명이 비면 `home ·  · 알 수 없음` 같은 빈 칸을 두지 않는다.
+                let agent_segment = if agent.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {agent}")
+                };
                 let description = format!(
-                    "{label} · {agent} · {} {inferred}{}{}",
+                    "{label}{agent_segment} · {} {inferred}{}{}",
                     state_label(state),
                     account_label
                         .map(|l| {

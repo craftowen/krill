@@ -596,6 +596,31 @@ fn jump_palette_opens_session(cx: &mut TestAppContext) {
     assert!(cx.update(|window, cx| view.read(cx).focus.is_focused(window)));
 }
 
+/// OWE-851: 상태바 팝오버(리소스·히스토리)는 Esc로 닫힌다(PTY로 `\x1b`가 새지 않게 먼저 삼킨다).
+#[gpui::test]
+fn status_popovers_close_on_escape(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("esc-popovers"));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.resources.update(cx, krill_app::resources::Panel::toggle);
+            s.history
+                .update(cx, krill_app::agent_history::Panel::toggle);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).resources.read(cx).is_open()));
+    assert!(cx.update(|_, cx| view.read(cx).history.read(cx).is_open()));
+    cx.update(|window, cx| {
+        let focus = view.read(cx).focus.clone();
+        window.focus(&focus, cx);
+    });
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).resources.read(cx).is_open()));
+    assert!(!cx.update(|_, cx| view.read(cx).history.read(cx).is_open()));
+}
+
 /// OWE-768: AI Vault 팝오버를 먼저 열지 않아도 `Cmd+J`가 볼트 스캔·검색을 연동하고
 /// 방향키와 Enter로 볼트 항목을 선택해 새 탭에서 재개한다.
 #[gpui::test]

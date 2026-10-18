@@ -960,6 +960,53 @@ fn corrupt_and_unreadable_sidebar_prefs_preserve_original_and_prevent_overwrite(
     fs::remove_dir_all(dir).ok();
 }
 
+#[test]
+fn jump_items_fall_back_to_worktree_and_session_names() {
+    use krill_proto::control::{AgentState, AgentStatus};
+    let mut sidebar = Sidebar::new(None);
+    let session = |id: u64, agent: &str, state: AgentState, worktree: Option<&str>| Session {
+        id: SessionId(id),
+        status: AgentStatus {
+            agent: agent.into(),
+            state,
+            ..AgentStatus::UNKNOWN
+        },
+        worktree: worktree.map(PathBuf::from),
+        cwd: None,
+        account: None,
+    };
+    sidebar.snapshot.sessions = vec![
+        session(1, "codex", AgentState::Working, Some("/repo/alpha")),
+        session(2, "", AgentState::Unknown, Some("/repo/beta")),
+        session(3, "", AgentState::Unknown, None),
+    ];
+    let items = sidebar.jump_items();
+    assert_eq!(items.len(), 3);
+    assert_eq!(
+        items[0].label,
+        format!("codex 1 · alpha · {}", state_text(AgentState::Working))
+    );
+    assert_eq!(
+        items[1].label,
+        format!("beta · {}", state_text(AgentState::Unknown))
+    );
+    assert_eq!(
+        items[2].label,
+        format!(
+            "{} 3 · {}",
+            text::SESSION.get(),
+            state_text(AgentState::Unknown)
+        )
+    );
+    for item in &items {
+        assert!(
+            !item.label.contains("  ") && !item.label.contains("·  ·"),
+            "no blank slots, got {:?}",
+            item.label
+        );
+    }
+}
+
 #[gpui::test]
 fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAppContext) {
     use crate::pull_request::Status;
