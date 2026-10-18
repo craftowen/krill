@@ -1,5 +1,6 @@
 //! 전송로 계약: 스트림 소켓 + `SCM_RIGHTS`에서 fd가 자기 프레임에 붙어 오는지(macOS 실측).
 
+#![cfg(unix)]
 #![expect(clippy::unwrap_used, reason = "테스트 헬퍼")]
 
 use std::os::fd::{AsFd, OwnedFd};
