@@ -58,10 +58,10 @@ pub(crate) fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// Windows에는 UID가 없다. 어떤 피어와도 같지 않은 값(피어 UID 조회도 실패한다, `sys::peer_uid`).
+/// Windows에는 UID가 없다. `sys::peer_uid`가 같은 사용자 SID인 피어에게만 주는 값.
 #[cfg(windows)]
 pub(crate) fn euid() -> u32 {
-    u32::MAX
+    crate::sys::SAME_USER
 }
 
 /// 소유자가 나(유효 UID)이고 `mask` 권한 비트가 모두 꺼져 있나.
