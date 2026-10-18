@@ -607,6 +607,7 @@ fn fetch_from(
             let mut status = states.remove(&s.session).unwrap_or(AgentStatus::UNKNOWN);
             if s.status.is_some() {
                 status.state = AgentState::Exited;
+                status.foreground = None;
             } else if status.state == AgentState::Unknown
                 && let Some(cwd) = dirs.get(&s.session)
                 && let Some(&hit) = external_states.get(cwd)
