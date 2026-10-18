@@ -1404,7 +1404,7 @@ impl Sidebar {
                 })
                 .when(!is_active_worktree, |d| {
                     let d = d
-                        .border_color(gpui::transparent_black())
+                        .border_color(ui::TRANSPARENT)
                         .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
                     if lineage_depth > 0 {
                         d.border_l_2().border_color(p.worktree_sidebar_border)
@@ -1562,7 +1562,7 @@ impl Sidebar {
             })
             .when(!is_active_worktree, |d| {
                 let d = d
-                    .border_color(gpui::transparent_black())
+                    .border_color(ui::TRANSPARENT)
                     .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
                 if lineage_depth > 0 {
                     d.border_l_2().border_color(p.worktree_sidebar_border)

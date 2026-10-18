@@ -29,7 +29,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 | 에이전트 상태 글리프·스피너·워크트리 요약·계정 배지 | [`ui/status.rs`](../crates/krill-app/src/ui/status.rs) | `AgentStateDot.tsx`, `AgentWorkingSpinner.tsx`, `worktree-card-compact-agents.tsx` |
 | UI 디자인 규칙·UX 리뷰 기준 | 이 문서 (`docs/STYLEGUIDE.md`) | `docs/STYLEGUIDE.md` |
 
-- **금지**: `crates/krill-app/src/ui/`와 터미널 셀 렌더러(`src/terminal.rs`) 바깥에서 `gpui::rgb(...)`, `gpui::hsla(...)`, `gpui::black()`, `gpui::white()`, `ui::hex(...)`, `ui::hexa(...)`를 직접 호출하지 않는다.
+- **금지**: `crates/krill-app/src/ui/`와 터미널 셀 렌더러(`src/terminal.rs`) 바깥에서 `gpui::rgb(...)`, `gpui::hsla(...)`, `gpui::black()`, `gpui::white()`, `gpui::transparent_black()`, `gpui::red()` / `green()` / `blue()` / `yellow()`, `ui::hex(...)`, `ui::hexa(...)`, 비수식 `hex(0x...)` / `hexa(0x...)`(임포트 우회)를 직접 호출하지 않는다. 그림자는 `.shadow_lg()`만 허용하고 `.shadow_xs()` / `.shadow_sm()` / `.shadow_md()` / `.shadow_xl()` / `.shadow_2xl()`을 쓰지 않는다.
 - 새 시맨틱 색이나 치수가 필요하면 먼저 [`ui/theme.rs`](../crates/krill-app/src/ui/theme.rs)의 `Palette`(`LIGHT`와 `DARK` 양쪽 모두) 또는 상수에 추가하고 이 문서에 기록한 뒤 사용한다.
 
 ---
@@ -68,6 +68,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 ### 3.2 특수 상태 상수 및 헬퍼 함수
 
 - **`AGENT_UNREAD`** (`#f59e0b`, 호박색 `amber-500`): 미확인 완료 알림 벨·워크트리 미확인 점(`ui::status::unread_dot`).
+- **`TRANSPARENT`** / **`ui::transparent()`**: 완전 투명(유휴 행 투명 테두리·겹침 마스크 등). `gpui::transparent_black()` 직접 호출 대신 사용한다.
 - **`MODAL_BACKDROP`** (`rgba(0, 0, 0, 0.55)`): 창 중앙 모달 대화상자의 어두운 배경 스크림(`ui::modal_backdrop`).
 - **에이전트 상태 색 (`ui::agent_state_color(state, cx)`)**:
   - `AgentState::Working` → `p.warning` (노랑 회전 스피너)
@@ -140,7 +141,9 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **탭 규칙**: `TAB_MAX_WIDTH = 220px`, 비활성 탭 아이콘·상태 점 투명도 `TAB_INACTIVE_OPACITY = 0.7`, 상태 점 지름 `STATE_DOT = 6px`.
 - **사이드바·패널·상태바**:
   - `SIDEBAR_DEFAULT_WIDTH = 240pt`, `SIDEBAR_HEADER_HEIGHT = 32px`, `SIDEBAR_EMPTY_PY = 24px`
+  - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
   - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 24px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
+  - 상태 요약 겹친 아이콘: `STATUS_GROUP_ICON = 15px`, 겹침 음수 마진 `STATUS_GROUP_OVERLAP = -3px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
@@ -154,7 +157,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 1. **Inset hairline (기본)**: `border_1()` + `border_color(p.border)`. 거의 모든 카드·패널·구분선이 이 단계에 놓인다.
 2. **Subtle lift**: `bg(p.card)` + `border_1()` + `border_color(p.border)` (`ui::card`). 캔버스 위에 얹힌 설정 행·그룹 카드.
-3. **Floating**: `bg(p.popover)` + `border_1()` + `border_color(p.border)` + `.shadow_lg()`. 편집기/터미널 표면을 벗어나는 팝오버, 드롭다운, Jump 팔레트, 그리고 `MODAL_BACKDROP`(`ui::modal_backdrop`) 위에 뜨는 중앙 모달 대화상자에만 사용한다.
+3. **Floating**: `bg(p.popover)` + `border_1()` + `border_color(p.border)` + `.shadow_lg()`. 편집기/터미널 표면을 벗어나는 팝오버, 드롭다운, Jump 팔레트, 그리고 `MODAL_BACKDROP`(`ui::modal_backdrop`) 위에 뜨는 중앙 모달 대화상자에만 사용한다. `.shadow_lg()` 외의 그림자 단계(`.shadow_xs()` / `.shadow_sm()` / `.shadow_md()` / `.shadow_xl()` / `.shadow_2xl()`)는 쓰지 않는다.
 
 ---
 
@@ -289,6 +292,6 @@ UI 화면·스크린샷·PR을 검토할 때 아래 기준으로 판단한다.
 
 이 디자인 시스템은 문서에만 머물지 않고 `scripts/check.sh`(`cargo nextest run -p krill-app`)에서 자동으로 검증된다([`crates/krill-app/src/ui/theme.rs`](../crates/krill-app/src/ui/theme.rs) 테스트 모듈):
 
-1. **생 색상 및 임의 픽셀 글자 크기 차단 (`no_raw_colors_or_arbitrary_font_sizes_outside_ui_module`)**: `crates/krill-app/src/` 아래의 모든 `.rs` 파일(`src/ui/` 및 터미널 셀 렌더러 `src/terminal.rs` 제외)을 스캔하여 `gpui::rgb(`, `gpui::hsla(`, `gpui::black(`, `gpui::white(`, `ui::hex(`, `ui::hexa(`, `.text_size(px(` 호출이 발견되면 테스트가 즉시 실패한다.
+1. **생 색상 및 임의 픽셀 글자 크기 차단 (`no_raw_colors_or_arbitrary_font_sizes_outside_ui_module`)**: `crates/krill-app/src/` 아래의 모든 `.rs` 파일(`src/ui/` 및 터미널 셀 렌더러 `src/terminal.rs` 제외)을 스캔하여 `gpui::rgb(`, `gpui::hsla(`, `gpui::black(`, `gpui::white(`, `gpui::transparent_black(`, `gpui::red(` / `green(` / `blue(` / `yellow(`, `ui::hex(`, `ui::hexa(`, 비수식 `hex(0x` / `hexa(0x`, 비허용 그림자 단계(`.shadow_xs(` / `.shadow_sm(` / `.shadow_md(` / `.shadow_xl(` / `.shadow_2xl(`), `.text_size(px(` 호출이 발견되면 테스트가 즉시 실패한다.
 2. **문서-코드 토큰 동기화 검증 (`styleguide_doc_stays_in_sync_with_palette_and_tokens`)**: `Palette`의 모든 시맨틱 색 필드와 타이포그래피·반경·간격·프리미티브 식별자가 이 문서(`docs/STYLEGUIDE.md`)에 빠짐없이 문서화되어 있는지 검사한다.
 3. **Orca 패리티 토큰 회귀 검사 (`orca_parity_tokens`, `palettes_distinguish_light_and_dark_surfaces`)**: 라이트·다크 대비와 주요 치수 상수가 흔들리지 않도록 보장한다.
