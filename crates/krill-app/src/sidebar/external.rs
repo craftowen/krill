@@ -435,6 +435,9 @@ const MAX_PROJECTS_BYTES: u64 = 512 * 1024;
 /// 보관(`archived`)된 동일 경로는 보관 해제하고 `Ok(true)`를 돌려준다.
 /// 파싱 실패·상한 초과 등에서는 폴더 열기를 막지 않도록 `Ok(false)`로 조용히 넘어간다.
 pub fn register_project(state_dir: &Path, path: &Path) -> io::Result<bool> {
+    // linked 워크트리(⌘N으로 만든 탭 등)는 독립 프로젝트가 아니라 주 워크트리(저장소)로 등록한다.
+    let main = main_worktree(path);
+    let path = main.as_deref().unwrap_or(path);
     let normalized = normalize_project_path(path);
     if normalized.is_empty() {
         return Ok(false);
@@ -546,6 +549,19 @@ pub fn register_project(state_dir: &Path, path: &Path) -> io::Result<bool> {
     list.push(toml::Value::Table(item));
     write_projects_file(&file_path, &value)?;
     Ok(true)
+}
+
+/// linked git 워크트리면 주 워크트리 경로. `.git` 파일 → `gitdir` → `commondir`를 따라간다.
+/// 주 워크트리(`.git` 디렉터리)·서브모듈(`commondir` 없음)·git 아님은 `None`.
+fn main_worktree(path: &Path) -> Option<PathBuf> {
+    let link = fs::read_to_string(path.join(".git")).ok()?;
+    let gitdir = path.join(link.strip_prefix("gitdir:")?.trim());
+    let common = fs::read_to_string(gitdir.join("commondir")).ok()?;
+    let common = fs::canonicalize(gitdir.join(common.trim())).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    common.parent().map(Path::to_path_buf)
 }
 
 fn normalize_project_path(path: &Path) -> String {
@@ -784,7 +800,10 @@ pub fn include_imported_projects(
             continue;
         }
         let repo = normalize_imported_path(Path::new(proj.path.trim()));
-        let list = trees.entry(repo.clone()).or_default();
+        // v0.1.8이 linked 워크트리를 프로젝트로 등록했다. 주 저장소 그룹 안에 넣어 중복 그룹을 막는다.
+        let key =
+            main_worktree(&repo).map_or_else(|| repo.clone(), |m| normalize_imported_path(&m));
+        let list = trees.entry(key).or_default();
         if !list.contains(&repo) {
             list.push(repo);
         }
@@ -1568,6 +1587,52 @@ fn owe803_symlink_alias_imports_merge_into_single_repo() {
     assert!(prefs.contains_key(&canon));
 
     fs::remove_dir_all(root).unwrap();
+}
+
+/// 설 실기(v0.1.8): ⌘N으로 만든 linked 워크트리가 독립 프로젝트로 등록돼 "저장소 wt1" 그룹이 하나 더 생겼다.
+/// 등록은 주 워크트리로, 이미 잘못 등록된 항목은 주 저장소 그룹 안으로 들어가야 한다.
+#[cfg(test)]
+#[test]
+fn linked_worktree_registers_and_groups_under_main_repo() {
+    let base = std::env::temp_dir().join(format!("mk-linked-wt-{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    let (state, demo, wt) = (base.join("state"), base.join("demo"), base.join("wt1"));
+    let gitdir = demo.join(".git/worktrees/wt1");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&gitdir).unwrap();
+    fs::create_dir_all(&wt).unwrap();
+    fs::write(gitdir.join("commondir"), "../..\n").unwrap();
+    fs::write(wt.join(".git"), format!("gitdir: {}\n", gitdir.display())).unwrap();
+    let canon = |p: &Path| fs::canonicalize(p).unwrap();
+
+    assert_eq!(main_worktree(&wt), Some(canon(&demo)));
+    assert_eq!(main_worktree(&demo), None);
+    assert!(register_project(&state, &wt).unwrap());
+    assert!(
+        !register_project(&state, &demo).unwrap(),
+        "same repo as the worktree"
+    );
+    let body = fs::read_to_string(state.join(PROJECTS_FILE)).unwrap();
+    let value: toml::Value = toml::from_str(&body).unwrap();
+    let projects = value["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(
+        projects[0]["path"].as_str().unwrap(),
+        canon(&demo).to_string_lossy()
+    );
+
+    // v0.1.8이 남긴 잘못된 항목(linked 워크트리 경로)도 주 저장소 그룹으로 합친다.
+    fs::write(
+        state.join(PROJECTS_FILE),
+        format!("[[projects]]\npath = \"{}\"\n", canon(&wt).display()),
+    )
+    .unwrap();
+    let mut trees = BTreeMap::new();
+    let mut meta = super::Meta::default();
+    include_imported_projects(&state, &mut trees, &mut meta);
+    assert_eq!(trees.keys().collect::<Vec<_>>(), vec![&canon(&demo)]);
+    assert_eq!(trees[&canon(&demo)], vec![canon(&wt)]);
+    fs::remove_dir_all(&base).ok();
 }
 
 #[cfg(test)]

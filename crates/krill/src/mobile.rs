@@ -81,13 +81,29 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
 }
 pub fn run(args: &[OsString]) -> ExitCode {
     match parse(args) {
-        Ok(command) => match execute(command) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("mobile: {e}");
-                ExitCode::FAILURE
+        Ok(command) => {
+            let tunnel = matches!(
+                command,
+                Command::Pair {
+                    mode: ConnectMode::Tunnel,
+                    ..
+                } | Command::Serve { tunnel: true }
+            );
+            match execute(command) {
+                Ok(()) => ExitCode::SUCCESS,
+                // 데몬은 오류 종류만 넘기므로 cloudflared가 없을 때 "entity not found"만 보였다(설 실기, v0.1.8).
+                Err(e) if tunnel && e.kind() == std::io::ErrorKind::NotFound => {
+                    eprintln!(
+                        "mobile: cloudflared not found; install it with `brew install cloudflared` and retry ({e})"
+                    );
+                    ExitCode::FAILURE
+                }
+                Err(e) => {
+                    eprintln!("mobile: {e}");
+                    ExitCode::FAILURE
+                }
             }
-        },
+        }
         Err(message) => {
             eprintln!("{message}");
             ExitCode::from(2)

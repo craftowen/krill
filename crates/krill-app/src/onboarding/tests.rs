@@ -1509,3 +1509,31 @@ fn cancelled_fix_shows_no_error_and_failed_fix_shows_only_error_cause(cx: &mut T
     .unwrap();
     assert!(present(cx, "wizard-fix-error-bin.helpers"));
 }
+
+/// 설 실기(v0.1.8): 번들 설치본은 holder·krilld가 Contents/Helpers에 있어 빠른 점검이 늘 "helpers 없음"으로
+/// 실패하고 버전 비교도 건너뛰었다. 번들 배치에서 두 점검이 통과해야 한다.
+#[test]
+fn quick_checks_find_helpers_in_app_bundle() {
+    let root = std::env::temp_dir().join(format!("mk-bundle-helpers-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let contents = root.join("Krill.app/Contents");
+    let script = "#!/bin/sh\necho 'krill 0.1.8'\n";
+    for rel in ["MacOS/krill", "Helpers/krill-holder", "Helpers/krilld"] {
+        let path = contents.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let env = Env {
+        shell: "/bin/sh".into(),
+        krill: contents.join("MacOS/krill"),
+        state: root.join("state"),
+        home: root.join("home"),
+        state_overridden: true,
+    };
+    let checks = super::quick_checks(&env);
+    let status = |id: &str| checks.iter().find(|c| c.id == id).map(|c| c.status);
+    assert_eq!(status("bin.helpers"), Some(Status::Ok));
+    assert_eq!(status("bin.version"), Some(Status::Ok));
+    fs::remove_dir_all(&root).ok();
+}

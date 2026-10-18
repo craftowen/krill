@@ -186,9 +186,10 @@ impl Shell {
                 } else {
                     format!(" · {agent}")
                 };
+                let state_text = format!("{} {inferred}", state_label(state));
                 let description = format!(
-                    "{label}{agent_segment} · {} {inferred}{}{}",
-                    state_label(state),
+                    "{label}{agent_segment} · {}{}{}",
+                    state_text.trim_end(),
                     account_label
                         .map(|l| {
                             krill_app::i18n::catalog::sidebar::SESSION_ACCOUNT
@@ -203,6 +204,12 @@ impl Shell {
                     }
                 );
                 let pane = tab.focused;
+                // 파일 탭에는 에이전트 상태가 없어 스크린리더에도 이름만 읽힌다.
+                let description = if self.layout.file(pane).is_some() {
+                    label.clone()
+                } else {
+                    description
+                };
                 let file_prefix = self.file_tab_prefix(pane, cx);
                 Tab::new()
                     .label(SharedString::from(label.clone()))
