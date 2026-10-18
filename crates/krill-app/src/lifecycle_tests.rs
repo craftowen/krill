@@ -392,3 +392,34 @@ fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
     assert_eq!(restored.tabs().len(), 2);
     std::fs::remove_file(path).ok();
 }
+
+/// OWE-842: 어느 화면과도 겹치지 않는 저장 위치는 저장 크기로 주 화면 가운데에 연다. 화면 안이면 그대로 둔다.
+#[gpui::test]
+fn saved_window_bounds_off_every_display_open_centered(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let display = cx.primary_display().unwrap().bounds();
+        let inside = WindowBounds::Windowed(Bounds::new(
+            gpui::point(px(100.), px(80.)),
+            size(px(900.), px(600.)),
+        ));
+        assert_eq!(on_screen(inside, cx), inside);
+
+        let off = WindowBounds::Maximized(Bounds::new(
+            gpui::point(px(-90_000.), px(5_000.)),
+            size(px(900.), px(600.)),
+        ));
+        let WindowBounds::Maximized(b) = on_screen(off, cx) else {
+            panic!("window mode must be kept");
+        };
+        assert_eq!(b.size, size(px(900.), px(600.)));
+        assert!(display.intersects(&b));
+
+        // 저장 크기가 화면보다 크면 화면 크기로 줄인다.
+        let huge = WindowBounds::Windowed(Bounds::new(
+            gpui::point(px(-90_000.), px(0.)),
+            size(px(9_000.), px(9_000.)),
+        ));
+        let b = on_screen(huge, cx).get_bounds();
+        assert!(b.size.width <= display.size.width && b.size.height <= display.size.height);
+    });
+}
