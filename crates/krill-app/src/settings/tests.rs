@@ -1706,6 +1706,57 @@ fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-858: `#admin-content`는 뷰포트 높이로 제한(`min_h_0`)되어 짧은 창에서도
+/// 스크롤 컨테이너로 동작해야 한다. 단축키 탭(50행) 본문이 창 밖으로 새지 않고,
+/// 탭 전환 시 스크롤 id가 바뀌어 최상단부터 다시 보인다.
+#[gpui::test]
+fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &mut TestAppContext) {
+    let d = dir("owe858-content-scroll");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    // 짧은 창: 단축키 탭 전체(약 50행)는 460px 안에 다 들어갈 수 없다.
+    vcx.simulate_resize(size(px(1200.), px(500.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+
+    let content = vcx
+        .debug_bounds("admin-content")
+        .expect("missing admin-content");
+    assert!(
+        content.size.height <= px(500.),
+        "admin-content height {:?} escapes the 500px viewport (min_h_0 missing?)",
+        content.size.height
+    );
+    // 페이지 헤더는 본문 최상단에 보인다.
+    let header = vcx
+        .debug_bounds("admin-page-header")
+        .expect("missing admin-page-header");
+    assert!(
+        header.origin.y >= content.origin.y,
+        "page header {:?} is clipped above the scroll container {:?}",
+        header.origin,
+        content.origin
+    );
+
+    // 다른 탭으로 갔다가 돌아와도 본문 높이는 계속 창 안에 머문다.
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+    let content = vcx
+        .debug_bounds("admin-content")
+        .expect("missing admin-content after tab switch");
+    assert!(
+        content.size.height <= px(500.),
+        "admin-content height {:?} escapes the viewport after tab switch",
+        content.size.height
+    );
+    assert!(vcx.debug_bounds("admin-page-header").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
+
 #[test]
 fn agent_card_save_writes_args_env_and_rejects_bad_lines() {
     let d = dir("owe657");
