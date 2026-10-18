@@ -132,3 +132,15 @@ impl fmt::Display for Error {
 }
 
 impl std::error::Error for Error {}
+
+/// Platform operations fail explicitly until a native transport is implemented.
+#[cfg(any(test, not(target_os = "macos")))]
+pub(crate) fn unsupported_platform() -> Error {
+    Error::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "krill-link is not supported on this platform",
+    ))
+}
+
+#[cfg(test)]
+mod unsupported_tests;
