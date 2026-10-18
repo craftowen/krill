@@ -3,7 +3,7 @@ use super::*;
 const TEST_CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
 
 fn parse_fixture(text: &str) -> io::Result<Schedules> {
-    Schedules::parse(&text.replace("/tmp", TEST_CWD))
+    Schedules::parse(&text.replace("\"/tmp\"", &format!("\"{TEST_CWD}\"")))
 }
 
 #[test]
