@@ -4,10 +4,12 @@
 //! - fd: krilld가 fd로 다루는 것(holder 링크·클라이언트 소켓·PTY master) 중 Windows에서 지금 실제로 있는 것은
 //!   `AF_UNIX` 소켓뿐이라 소켓 타입을 쓴다. holder 링크([`crate::holder`])가 늘 실패해 PTY master는 만들어지지
 //!   않는다. `ConPTY` 핸들 모델은 Phase 3(OWE-833)에서 정한다.
-//! - 권한: 소유자·모드 검사와 `O_NOFOLLOW`는 없다(`krill_proto::os`처럼 `%LOCALAPPDATA%` ACL 상속에 맡김, 추정).
-//!   DACL 검사와 `FILE_FLAG_OPEN_REPARSE_POINT`는 Phase 3(OWE-833).
+//! - 권한: 소유자·모드 검사는 없다(`krill_proto::os`처럼 `%LOCALAPPDATA%` ACL 상속에 맡김, 추정). DACL 검사는 후속.
+//!   `O_NOFOLLOW` 대신 `FILE_FLAG_OPEN_REPARSE_POINT`로 열고 심볼릭 링크·정션이면 거부한다([`open_no_follow`]).
 
-use std::fs::{Metadata, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io;
+use std::path::Path;
 
 #[cfg(unix)]
 pub(crate) use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -58,10 +60,10 @@ pub(crate) fn euid() -> u32 {
     rustix::process::geteuid().as_raw()
 }
 
-/// Windows에는 UID가 없다. 어떤 피어와도 같지 않은 값(피어 UID 조회도 실패한다, `sys::peer_uid`).
+/// Windows에는 UID가 없다. `sys::peer_uid`가 같은 사용자 SID인 피어에게만 주는 값.
 #[cfg(windows)]
 pub(crate) fn euid() -> u32 {
-    u32::MAX
+    crate::sys::SAME_USER
 }
 
 /// 소유자가 나(유효 UID)이고 `mask` 권한 비트가 모두 꺼져 있나.
@@ -77,11 +79,28 @@ pub(crate) fn private_to_me(_meta: &Metadata, _mask: u32) -> bool {
     true
 }
 
-/// 마지막 경로 성분이 심볼릭 링크면 열기를 실패시킨다(`O_NOFOLLOW`). Windows는 그대로 둔다(모듈 설명).
-pub(crate) fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW);
-    options
+/// `path`를 연다. 마지막 경로 성분이 심볼릭 링크면 실패한다(`O_NOFOLLOW`, `ELOOP`).
+#[cfg(unix)]
+pub(crate) fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW).open(path)
+}
+
+/// Windows: reparse point를 따라가지 않고 그 자체를 연 뒤, 이름 대리(심볼릭 링크·정션·마운트 지점)면 닫고
+/// `ERROR_STOPPED_ON_SYMLINK`로 실패한다. std `is_symlink`가 그 태그 판정이다. 클라우드 자리표시자 같은 다른 reparse
+/// point는 파일 자체라 그대로 쓴다(비수화 `OneDrive` 파일 읽기는 미확인).
+#[cfg(windows)]
+pub(crate) fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let file = options
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_type().is_symlink() {
+        let code = windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(code).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(file)
 }
 
 /// 디스크에 실제로 잡힌 바이트(희소 파일은 길이보다 작다). Windows는 길이.
@@ -91,4 +110,32 @@ pub(crate) fn allocated(meta: &Metadata) -> u64 {
     #[cfg(windows)]
     let bytes = meta.len();
     bytes
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_no_follow_refuses_symlinks() {
+        let dir = std::env::temp_dir().join(format!("krilld-nofollow-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("real");
+        std::fs::write(&file, b"x").unwrap();
+        let link = dir.join("link");
+        if let Err(e) = std::os::windows::fs::symlink_file(&file, &link) {
+            // 심볼릭 링크 권한(관리자·개발자 모드)이 없는 환경.
+            eprintln!("skip: symlink_file {e}");
+            return;
+        }
+        assert!(open_no_follow(OpenOptions::new().read(true), &file).is_ok());
+        let err = open_no_follow(OpenOptions::new().read(true), &link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(681));
+        let err =
+            open_no_follow(OpenOptions::new().create_new(true).write(true), &link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

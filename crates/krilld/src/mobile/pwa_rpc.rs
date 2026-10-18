@@ -432,9 +432,10 @@ fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     let path = dir.join(format!("mobile-{}.{extension}", hex(&random()?)));
-    let mut file =
-        crate::os::no_follow(OpenOptions::new().create_new(true).write(true).mode(0o600))
-            .open(&path)?;
+    let mut file = crate::os::open_no_follow(
+        OpenOptions::new().create_new(true).write(true).mode(0o600),
+        &path,
+    )?;
     file.write_all(&bytes)?;
     Ok(path)
 }
@@ -607,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // /bin/sh
     fn subprocess_output_and_time_are_bounded() {
         let mut good = Command::new("/bin/sh");
         good.args(["-c", "printf hello"]);

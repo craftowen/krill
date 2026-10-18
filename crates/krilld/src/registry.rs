@@ -843,12 +843,9 @@ impl Registry {
                     .iter()
                     .filter(|(id, _)| peer.scope.allows(**id, &st.roots))
                     .map(|(&id, e)| {
-                        (
-                            id,
-                            e.pid,
-                            !st.exited.contains_key(&id)
-                                && scope::session_of(e.pid, &st.roots) == Some(id),
-                        )
+                        let live = !st.exited.contains_key(&id)
+                            && scope::session_of(e.pid, &st.roots) == Some(id);
+                        (id, e.pid, live.then(|| e.session.tap()))
                     })
                     .collect();
                 drop(st);
@@ -994,14 +991,14 @@ impl Registry {
     }
 
     fn session_cwd(&self, id: SessionId) -> Option<PathBuf> {
-        let (pid, live, initial) = {
+        let (pid, live, initial, tap) = {
             let st = lock(&self.state);
             let e = st.sessions.get(&id)?;
             let live =
                 !st.exited.contains_key(&id) && scope::session_of(e.pid, &st.roots) == Some(id);
-            (e.pid, live, e.cwd.clone())
+            (e.pid, live, e.cwd.clone(), e.session.tap())
         };
-        if live && let Ok(dir) = crate::sys::current_directory(pid) {
+        if live && let Some(dir) = tap.cwd(pid) {
             return Some(std::fs::canonicalize(&dir).unwrap_or(dir));
         }
         (!initial.as_os_str().is_empty())
