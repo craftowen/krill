@@ -144,7 +144,7 @@ impl Registry {
         for (id, tap, pid) in candidates {
             // 런타임 cwd를 확인하지 못하면 그 세션은 묶음에서 뺀다(종료하지 않는다).
             // 예전에는 여기서 전체 검사를 중단했다.
-            let Ok(cwd) = crate::sys::current_directory(pid) else {
+            let Some(cwd) = tap.cwd(pid) else {
                 continue;
             };
             groups

@@ -127,7 +127,9 @@ pub fn append_spool(path: &Path, frame: &[u8], deadline: Instant) -> io::Result<
     if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
+    // Windows LockFileEx는 GENERIC_READ/WRITE 핸들을 요구하는데 append 전용 핸들은 FILE_APPEND_DATA뿐이라 read를 더한다.
     let mut f = OpenOptions::new()
+        .read(true)
         .append(true)
         .create(true)
         .mode(0o600)

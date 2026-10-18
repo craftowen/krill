@@ -9,9 +9,13 @@
 //!   nvm·mise 활성화 흔적(`NVM_BIN`, `__MISE_*` 등)·`MK_*` 내부 값이 새지 않아, rc 파일이 같은 입력에서
 //!   같은 PATH를 만든다.
 //!
-//! Windows(OWE-819)는 셸 후보와 기본값만 있다: passwd가 없어 [`SHELL_CANDIDATES`]→`%COMSPEC%` 순으로 고르고,
-//! 로그인 셸 `PATH` 탐침은 하지 않는다.
-//! ponytail: 환경은 아직 Unix 규칙(KEEP 필터)이라 `SystemRoot`·`USERPROFILE` 등이 빠진다. `ConPTY` 셸을 띄우는 Phase 3(OWE-833)에서 Windows용 상속 목록을 만든다.
+//! Windows(OWE-833, windows-spike-OWE-830.md)는 로그인 셸이 없다.
+//! - 기본 셸은 `PATH`의 [`SHELL_CANDIDATES`](pwsh → powershell) → `%COMSPEC%` → `cmd.exe`. `SHELL`은 보지 않는다
+//!   (Git Bash가 남긴 `/usr/bin/bash` 같은 POSIX 경로라 `CreateProcess`가 못 띄운다).
+//! - 환경은 탐색기가 준 사용자 환경 중 [`KEEP_WINDOWS`]와 `PATH`를 그대로 물려준다(로그인 셸 `PATH` 탐침 없음).
+//!   변수 이름은 대소문자를 가리지 않는다(`Path`).
+//! - 사용자 지정 프로그램은 `PATH`에서 `.exe`·`.cmd` 등을 붙여 절대 경로로 고정한다(`claude` → `claude.cmd`).
+//!   `CreateProcess`는 확장자 없는 이름으로 `.cmd`를 찾지 못한다(실측).
 
 use std::process::Stdio;
 
@@ -37,6 +41,40 @@ const FALLBACK_SHELL: &[u8] = b"/bin/sh";
 /// Windows 기본 셸 후보(앞이 우선, `PATH`에서 찾는다). 모두 없으면 `%COMSPEC%`, 그것도 없으면 `cmd.exe`.
 #[cfg(windows)]
 const SHELL_CANDIDATES: &[&str] = &["pwsh.exe", "powershell.exe"];
+/// Windows 사용자 환경 중 그대로 물려줄 변수(대소문자 무시). 셸·Node·Git이 홈·임시·시스템 경로를 찾는 데 쓴다.
+#[cfg(windows)]
+const KEEP_WINDOWS: &[&[u8]] = &[
+    b"ALLUSERSPROFILE",
+    b"APPDATA",
+    b"CommonProgramFiles",
+    b"CommonProgramFiles(x86)",
+    b"CommonProgramW6432",
+    b"COMPUTERNAME",
+    b"ComSpec",
+    b"DriverData",
+    b"HOMEDRIVE",
+    b"HOMEPATH",
+    b"LOCALAPPDATA",
+    b"LOGONSERVER",
+    b"NUMBER_OF_PROCESSORS",
+    b"OS",
+    b"PATHEXT",
+    b"PROCESSOR_ARCHITECTURE",
+    b"ProgramData",
+    b"ProgramFiles",
+    b"ProgramFiles(x86)",
+    b"ProgramW6432",
+    b"PSModulePath",
+    b"PUBLIC",
+    b"SystemDrive",
+    b"SystemRoot",
+    b"TEMP",
+    b"TMP",
+    b"USERDOMAIN",
+    b"USERNAME",
+    b"USERPROFILE",
+    b"windir",
+];
 /// `AppleLocale`을 읽지 못했을 때의 LANG. launchd GUI 부모 없이 띄운 개발 셸에서만 나온다.
 #[cfg(not(target_os = "linux"))]
 const FALLBACK_LANG: &[u8] = b"en_US.UTF-8";
@@ -167,7 +205,7 @@ impl Shell {
         let from_env = |key: &[u8]| {
             inherited
                 .iter()
-                .find(|(k, _)| k == key)
+                .find(|(k, _)| same_key(k, key))
                 .map(|(_, v)| v.clone())
                 .filter(|v| !v.is_empty())
         };
@@ -176,14 +214,14 @@ impl Shell {
                 .map(<[u8]>::to_vec)
                 .or_else(|| from_env(key))
         };
-        let login_shell =
-            pick(user.map(|u| u.shell.as_slice()), b"SHELL").unwrap_or_else(fallback_shell);
+        let login_shell = if cfg!(windows) {
+            fallback_shell(from_env(b"PATH").as_deref())
+        } else {
+            pick(user.map(|u| u.shell.as_slice()), b"SHELL").unwrap_or_else(|| fallback_shell(None))
+        };
 
-        let mut env: Vec<(Vec<u8>, Vec<u8>)> = inherited
-            .iter()
-            .filter(|(k, _)| KEEP.contains(&k.as_slice()) || k.starts_with(b"LC_"))
-            .cloned()
-            .collect();
+        let mut env: Vec<(Vec<u8>, Vec<u8>)> =
+            inherited.iter().filter(|(k, _)| keep(k)).cloned().collect();
         let has_locale = env
             .iter()
             .any(|(k, _)| matches!(k.as_slice(), b"LANG" | b"LC_ALL" | b"LC_CTYPE"));
@@ -205,7 +243,13 @@ impl Shell {
         }
         env.extend([
             (b"SHELL".to_vec(), login_shell.clone()),
-            (b"PATH".to_vec(), LAUNCHD_PATH.to_vec()),
+            (
+                b"PATH".to_vec(),
+                // Windows는 로그인 셸 탐침이 없어 물려받은 PATH가 기준이다.
+                from_env(b"PATH")
+                    .filter(|_| cfg!(windows))
+                    .unwrap_or_else(|| LAUNCHD_PATH.to_vec()),
+            ),
             (b"TERM".to_vec(), b"xterm-256color".to_vec()),
             (b"COLORTERM".to_vec(), b"truecolor".to_vec()),
         ]);
@@ -214,32 +258,68 @@ impl Shell {
             // pwsh·powershell·cmd에는 `-l`이 없다.
             Self::Login if cfg!(windows) => vec![login_shell],
             Self::Login => vec![login_shell, b"-l".to_vec()],
-            Self::Custom { program, args } => std::iter::once(program.clone())
-                .chain(args.iter().cloned())
-                .collect(),
+            Self::Custom { program, args } => {
+                std::iter::once(resolve(program, from_env(b"PATH").as_deref()))
+                    .chain(args.iter().cloned())
+                    .collect()
+            }
         };
         Launch { argv, env }
     }
 }
 
+/// 환경 변수 이름 비교. Windows는 대소문자를 가리지 않는다.
+fn same_key(a: &[u8], b: &[u8]) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
 #[cfg(unix)]
-fn fallback_shell() -> Vec<u8> {
-    FALLBACK_SHELL.to_vec()
+fn keep(key: &[u8]) -> bool {
+    KEEP.contains(&key) || key.starts_with(b"LC_")
 }
 
 #[cfg(windows)]
-fn fallback_shell() -> Vec<u8> {
-    let path = std::env::var_os("PATH").unwrap_or_default();
+fn keep(key: &[u8]) -> bool {
+    KEEP.iter().chain(KEEP_WINDOWS).any(|k| same_key(k, key)) || key.starts_with(b"LC_")
+}
+
+#[cfg(unix)]
+fn fallback_shell(_path: Option<&[u8]>) -> Vec<u8> {
+    FALLBACK_SHELL.to_vec()
+}
+
+/// `path`(물려받은 PATH)에서 [`SHELL_CANDIDATES`]를 찾는다. 없으면 `%COMSPEC%`, 그것도 없으면 `cmd.exe`.
+#[cfg(windows)]
+fn fallback_shell(path: Option<&[u8]>) -> Vec<u8> {
+    use krill_proto::os::ffi::OsStrExt as _;
+    let path = std::ffi::OsStr::from_bytes(path.unwrap_or_default());
     SHELL_CANDIDATES
         .iter()
-        .find_map(|c| {
-            std::env::split_paths(&path)
-                .map(|dir| dir.join(c))
-                .find(|p| p.is_file())
-        })
+        .find_map(|c| krill_proto::agent::which(c, path))
         .map(std::path::PathBuf::into_os_string)
         .or_else(|| std::env::var_os("COMSPEC"))
         .map_or_else(|| b"cmd.exe".to_vec(), OsStringExt::into_vec)
+}
+
+/// Unix는 프로그램 이름을 그대로 둔다(holder의 `execvp`가 PATH를 찾는다).
+#[cfg(unix)]
+fn resolve(program: &[u8], _path: Option<&[u8]>) -> Vec<u8> {
+    program.to_vec()
+}
+
+/// Windows: `path`에서 확장자까지 찾아 절대 경로로 고정한다(`claude` → `…\claude.cmd`). 못 찾으면 그대로 둔다
+/// (holder 실행이 실패로 알린다).
+#[cfg(windows)]
+fn resolve(program: &[u8], path: Option<&[u8]>) -> Vec<u8> {
+    use krill_proto::os::ffi::OsStrExt as _;
+    std::str::from_utf8(program)
+        .ok()
+        .and_then(|p| krill_proto::agent::which(p, std::ffi::OsStr::from_bytes(path?)))
+        .map_or_else(|| program.to_vec(), |p| p.into_os_string().into_vec())
 }
 
 /// Terminal.app처럼 시스템 로케일(`AppleLocale`→`ko_KR`)에서 LANG(`ko_KR.UTF-8`)을 만든다.
@@ -454,10 +534,15 @@ fn probe_path(login: &Launch) -> Option<Vec<u8>> {
     extract_path(&out)
 }
 
-/// Windows는 로그인 셸 탐침이 없다. 호출자가 [`LAUNCHD_PATH`]를 쓴다.
+/// Windows는 로그인 셸 탐침이 없다. 셸에 줄 PATH(물려받은 값)가 곧 답이다.
 #[cfg(windows)]
-fn probe_path(_login: &Launch) -> Option<Vec<u8>> {
-    None
+fn probe_path(login: &Launch) -> Option<Vec<u8>> {
+    login
+        .env
+        .iter()
+        .find(|(k, _)| k.as_slice() == b"PATH")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
 }
 
 #[cfg(unix)]
@@ -481,3 +566,69 @@ fn kill_probe(child: &mut std::process::Child) {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use super::*;
+
+    fn inherited(path: &std::path::Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut env: Vec<_> = std::env::vars_os()
+            .map(|(k, v)| (k.into_encoded_bytes(), v.into_encoded_bytes()))
+            .filter(|(k, _)| !k.eq_ignore_ascii_case(b"PATH"))
+            .collect();
+        let system = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = path.as_os_str().to_owned();
+        joined.push(";");
+        joined.push(system);
+        env.push((b"Path".to_vec(), joined.into_encoded_bytes()));
+        env
+    }
+
+    #[test]
+    fn login_shell_env_and_cmd_resolution() {
+        let dir = std::env::temp_dir().join(format!("krilld-shell 한글-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fake-agent.cmd"), "@echo off\r\n").unwrap();
+        let env = inherited(&dir);
+
+        let login = Shell::Login.launch_with_lang(None, env.clone(), None);
+        let shell = String::from_utf8(login.argv[0].clone()).unwrap();
+        eprintln!("login shell: {shell}");
+        assert_eq!(login.argv.len(), 1);
+        assert!(
+            std::path::Path::new(&shell).is_absolute() || shell.eq_ignore_ascii_case("cmd.exe")
+        );
+        let get = |k: &[u8]| {
+            login
+                .env
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(k))
+        };
+        assert!(get(b"SystemRoot").is_some());
+        assert!(get(b"USERPROFILE").is_some());
+        let path = get(b"PATH").unwrap();
+        assert_eq!(path.0, b"PATH");
+        assert!(path.1.starts_with(dir.as_os_str().as_encoded_bytes()));
+
+        let custom = Shell::Custom {
+            program: b"fake-agent".to_vec(),
+            args: vec![b"has space".to_vec()],
+        }
+        .launch_with_lang(None, env.clone(), None);
+        assert_eq!(
+            custom.argv[0],
+            dir.join("fake-agent.cmd")
+                .into_os_string()
+                .into_encoded_bytes()
+        );
+        assert_eq!(custom.argv[1], b"has space");
+        let missing = Shell::Custom {
+            program: b"no-such-agent".to_vec(),
+            args: Vec::new(),
+        }
+        .launch_with_lang(None, env, None);
+        assert_eq!(missing.argv[0], b"no-such-agent");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

@@ -32,6 +32,10 @@ zeroize = { workspace = true }
 tikv-jemallocator = { workspace = true }
 tikv-jemalloc-ctl = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+# DPAPI 키 보호·Toolhelp/psapi 프로세스 조회·AF_UNIX 피어 PID·토큰 SID 비교(OWE-833). 모두 `sys/windows.rs`만 쓴다.
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 # 피어 코드서명 검증(MK-096). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
 security-framework = { workspace = true }
