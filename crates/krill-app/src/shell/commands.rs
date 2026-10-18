@@ -49,56 +49,55 @@ impl Shell {
         let can_inject = live.is_some_and(|l| l.pane.is_linked() && !l.pane.is_closed());
         let can_copy = live.is_some_and(|l| !l.pane.screen().rows.is_empty());
         let this = cx.weak_entity();
-        let quick = Button::new("quick-commands")
-            .icon(IconName::Play)
-            .accessibility_label(text::QUICK.get())
-            .tooltip(format!(
-                "{} · {}",
-                text::QUICK.get(),
-                text::QUICK_HINT.get()
-            ))
-            .ghost()
-            .xsmall()
-            .debug_selector(|| "quick-commands".into())
-            .dropdown_menu(move |mut menu, _, _| {
-                if settings.quick_commands.is_empty() {
-                    return menu.label(text::EMPTY.get());
-                }
-                for command in &settings.quick_commands {
-                    let this = this.clone();
-                    let command = command.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(command.name.clone())
-                            .disabled(!can_inject || command.text.is_empty())
-                            .on_click(move |_, window, cx| {
-                                this.update(cx, |s, cx| s.inject_command(&command, window, cx))
-                                    .ok();
-                            }),
-                    );
-                }
-                menu
-            });
+        let quick_tooltip = format!("{} · {}", text::QUICK.get(), text::QUICK_HINT.get());
+        let quick = krill_app::ui::button_with_tooltip(
+            Button::new("quick-commands")
+                .icon(IconName::Play)
+                .ghost()
+                .xsmall()
+                .debug_selector(|| "quick-commands".into()),
+            "quick-commands",
+            quick_tooltip,
+        )
+        .dropdown_menu(move |mut menu, _, _| {
+            if settings.quick_commands.is_empty() {
+                return menu.label(text::EMPTY.get());
+            }
+            for command in &settings.quick_commands {
+                let this = this.clone();
+                let command = command.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(command.name.clone())
+                        .disabled(!can_inject || command.text.is_empty())
+                        .on_click(move |_, window, cx| {
+                            this.update(cx, |s, cx| s.inject_command(&command, window, cx))
+                                .ok();
+                        }),
+                );
+            }
+            menu
+        });
         div()
             .flex()
             .flex_none()
             .items_center()
             .gap_0p5()
             .child(quick)
-            .child(
+            .child(krill_app::ui::button_with_tooltip(
                 Button::new("copy-context")
                     .icon(IconName::Copy)
-                    .accessibility_label(text::COPY.get())
                     .ghost()
                     .xsmall()
-                    .tooltip(format!(
-                        "{} · {}",
-                        text::COPY.get(),
-                        text::COPY_HINT.format(&[("n", &lines.to_string())])
-                    ))
                     .disabled(!can_copy)
                     .debug_selector(|| "copy-context".into())
                     .on_click(cx.listener(move |s, _, _, cx| s.copy_context(lines, cx))),
-            )
+                "copy-context",
+                format!(
+                    "{} · {}",
+                    text::COPY.get(),
+                    text::COPY_HINT.format(&[("n", &lines.to_string())])
+                ),
+            ))
     }
 }
 

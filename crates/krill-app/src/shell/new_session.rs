@@ -162,127 +162,128 @@ impl Shell {
         let launch_host = self.launch_host.clone();
         let (this, focus) = (cx.weak_entity(), self.focus.clone());
         let (working_count, done_count) = self.sidebar.read(cx).agent_counts();
-        let menu = Button::new("new-session")
-            .icon(IconName::Plus)
-            .ghost()
-            .xsmall()
-            .tooltip(text::NEW_SESSION.get())
-            .accessibility_label(text::NEW_SESSION.get())
-            .dropdown_menu(move |mut menu, window, cx| {
-                menu = menu
-                    .action_context(focus.clone())
-                    .min_w(gpui::px(220.))
-                    .item(
-                        PopupMenuItem::new(text::NEW_TERMINAL.get())
-                            .icon(IconName::SquareTerminal)
-                            .action(Box::new(NewTab)),
-                    );
-                for (i, profile) in settings.iter().flat_map(visible_profiles).enumerate() {
-                    let icon = krill_app::ui::icons::agent_menu_icon(&profile.id);
-                    let click_this = this.clone();
-                    let mut item = PopupMenuItem::new(profile.name.clone())
-                        .icon(icon.clone())
-                        .disabled(disabled)
-                        .on_click(move |_, _, cx| {
-                            click_this.update(cx, |s, cx| s.new_agent_at(i, cx)).ok();
-                        });
-                    if let Some(action) = shortcut(i) {
-                        item = item.action(action);
-                    }
-                    let choices = session_accounts(&accounts, &profile.id);
-                    if disabled || choices.len() <= 1 {
-                        menu = menu.item(item);
-                    } else {
-                        let this = this.clone();
-                        let profile_id = profile.id.clone();
-                        menu = menu.submenu_with_icon(
-                            Some(krill_app::ui::icons::agent_menu_icon(&profile.id)),
-                            profile.name.clone(),
-                            window,
-                            cx,
-                            move |mut sub, _, _| {
-                                let default_this = this.clone();
-                                let default_id = profile_id.clone();
-                                let mut default_item =
-                                    PopupMenuItem::new(text::ACCOUNT_DEFAULT.get())
+        let menu = krill_app::ui::button_with_tooltip(
+            Button::new("new-session")
+                .icon(IconName::Plus)
+                .ghost()
+                .xsmall(),
+            "new-session",
+            text::NEW_SESSION.get(),
+        )
+        .dropdown_menu(move |mut menu, window, cx| {
+            menu = menu
+                .action_context(focus.clone())
+                .min_w(gpui::px(220.))
+                .item(
+                    PopupMenuItem::new(text::NEW_TERMINAL.get())
+                        .icon(IconName::SquareTerminal)
+                        .action(Box::new(NewTab)),
+                );
+            for (i, profile) in settings.iter().flat_map(visible_profiles).enumerate() {
+                let icon = krill_app::ui::icons::agent_menu_icon(&profile.id);
+                let click_this = this.clone();
+                let mut item = PopupMenuItem::new(profile.name.clone())
+                    .icon(icon.clone())
+                    .disabled(disabled)
+                    .on_click(move |_, _, cx| {
+                        click_this.update(cx, |s, cx| s.new_agent_at(i, cx)).ok();
+                    });
+                if let Some(action) = shortcut(i) {
+                    item = item.action(action);
+                }
+                let choices = session_accounts(&accounts, &profile.id);
+                if disabled || choices.len() <= 1 {
+                    menu = menu.item(item);
+                } else {
+                    let this = this.clone();
+                    let profile_id = profile.id.clone();
+                    menu = menu.submenu_with_icon(
+                        Some(krill_app::ui::icons::agent_menu_icon(&profile.id)),
+                        profile.name.clone(),
+                        window,
+                        cx,
+                        move |mut sub, _, _| {
+                            let default_this = this.clone();
+                            let default_id = profile_id.clone();
+                            let mut default_item = PopupMenuItem::new(text::ACCOUNT_DEFAULT.get())
+                                .disabled(disabled)
+                                .on_click(move |_, _, cx| {
+                                    default_this
+                                        .update(cx, |s, cx| {
+                                            s.new_agent(default_id.clone(), cx);
+                                        })
+                                        .ok();
+                                });
+                            if let Some(action) = shortcut(i) {
+                                default_item = default_item.action(action);
+                            }
+                            sub = sub.item(default_item);
+                            for account in &choices {
+                                let this = this.clone();
+                                let id = profile_id.clone();
+                                let account_id = account.id.clone();
+                                sub = sub.item(
+                                    PopupMenuItem::new(account.label.clone())
+                                        .checked(account.active)
                                         .disabled(disabled)
                                         .on_click(move |_, _, cx| {
-                                            default_this
-                                                .update(cx, |s, cx| {
-                                                    s.new_agent(default_id.clone(), cx);
-                                                })
-                                                .ok();
-                                        });
-                                if let Some(action) = shortcut(i) {
-                                    default_item = default_item.action(action);
-                                }
-                                sub = sub.item(default_item);
-                                for account in &choices {
-                                    let this = this.clone();
-                                    let id = profile_id.clone();
-                                    let account_id = account.id.clone();
-                                    sub = sub.item(
-                                        PopupMenuItem::new(account.label.clone())
-                                            .checked(account.active)
-                                            .disabled(disabled)
-                                            .on_click(move |_, _, cx| {
-                                                this.update(cx, |s, cx| {
-                                                    s.new_agent_with_account(
-                                                        id.clone(),
-                                                        account_id.clone(),
-                                                        cx,
-                                                    );
-                                                })
-                                                .ok();
-                                            }),
-                                    );
-                                }
-                                sub
-                            },
-                        );
-                    }
-                }
-                menu = menu.separator().label(text::EXECUTION_LOCATION.get());
-                for (host_id, label) in &locations {
-                    let this = this.clone();
-                    let chosen = host_id.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label.clone())
-                            .checked(&launch_host == host_id)
-                            .on_click(move |_, _, cx| {
-                                this.update(cx, |s, cx| s.set_launch_host(chosen.clone(), cx))
-                                    .ok();
-                            }),
+                                            this.update(cx, |s, cx| {
+                                                s.new_agent_with_account(
+                                                    id.clone(),
+                                                    account_id.clone(),
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                        }),
+                                );
+                            }
+                            sub
+                        },
                     );
                 }
-                menu = menu.separator().label(text::PERMISSION.get());
-                for (choice, label) in [
-                    (Permission::Manual, text::MANUAL.get()),
-                    (Permission::Yolo, text::YOLO.get()),
-                ] {
-                    let this = this.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .checked(permission == choice)
-                            .disabled(disabled)
-                            .on_click(move |_, _, cx| {
-                                this.update(cx, |s, cx| {
-                                    s.load_agents(Some(choice), cx);
-                                    cx.notify();
-                                })
-                                .ok();
-                            }),
-                    );
-                }
+            }
+            menu = menu.separator().label(text::EXECUTION_LOCATION.get());
+            for (host_id, label) in &locations {
                 let this = this.clone();
-                menu.separator().item(
-                    PopupMenuItem::new(text::OPEN_FOLDER.get())
-                        .icon(IconName::FolderOpen)
+                let chosen = host_id.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label.clone())
+                        .checked(&launch_host == host_id)
                         .on_click(move |_, _, cx| {
-                            this.update(cx, |_, cx| Self::choose_folder(cx)).ok();
+                            this.update(cx, |s, cx| s.set_launch_host(chosen.clone(), cx))
+                                .ok();
                         }),
-                )
-            });
+                );
+            }
+            menu = menu.separator().label(text::PERMISSION.get());
+            for (choice, label) in [
+                (Permission::Manual, text::MANUAL.get()),
+                (Permission::Yolo, text::YOLO.get()),
+            ] {
+                let this = this.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(label)
+                        .checked(permission == choice)
+                        .disabled(disabled)
+                        .on_click(move |_, _, cx| {
+                            this.update(cx, |s, cx| {
+                                s.load_agents(Some(choice), cx);
+                                cx.notify();
+                            })
+                            .ok();
+                        }),
+                );
+            }
+            let this = this.clone();
+            menu.separator().item(
+                PopupMenuItem::new(text::OPEN_FOLDER.get())
+                    .icon(IconName::FolderOpen)
+                    .on_click(move |_, _, cx| {
+                        this.update(cx, |_, cx| Self::choose_folder(cx)).ok();
+                    }),
+            )
+        });
 
         let nav_icon_color = p.sidebar_foreground.opacity(0.4);
         let nav_text_color = p.sidebar_foreground.opacity(0.68);
@@ -383,10 +384,12 @@ impl Shell {
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .child(krill_app::i18n::catalog::general::YOLO.get())
                                         .tooltip(|window, cx| {
-                                            gpui_component::tooltip::Tooltip::new(
+                                            krill_app::ui::tooltip_view(
+                                                "yolo-global",
                                                 text::YOLO_TOGGLE.get(),
+                                                window,
+                                                cx,
                                             )
-                                            .build(window, cx)
                                         }),
                                 )
                             })
@@ -425,9 +428,16 @@ impl Shell {
                                         .gap_1()
                                         .text_color(p.sidebar_foreground.opacity(0.6))
                                         .child(
-                                            div().size(gpui::px(7.)).rounded_full().bg(p.warning),
+                                            div()
+                                                .size(krill_app::ui::STATE_DOT)
+                                                .rounded_full()
+                                                .bg(p.warning),
                                         )
-                                        .child(working_count.to_string()),
+                                        .child(
+                                            div()
+                                                .font_family(krill_app::ui::FONT_MONO)
+                                                .child(working_count.to_string()),
+                                        ),
                                 )
                             })
                             .when(done_count > 0, |d| {
@@ -438,9 +448,16 @@ impl Shell {
                                         .gap_1()
                                         .text_color(p.sidebar_foreground.opacity(0.6))
                                         .child(
-                                            div().size(gpui::px(7.)).rounded_full().bg(p.success),
+                                            div()
+                                                .size(krill_app::ui::STATE_DOT)
+                                                .rounded_full()
+                                                .bg(p.success),
                                         )
-                                        .child(done_count.to_string()),
+                                        .child(
+                                            div()
+                                                .font_family(krill_app::ui::FONT_MONO)
+                                                .child(done_count.to_string()),
+                                        ),
                                 )
                             }),
                     )
