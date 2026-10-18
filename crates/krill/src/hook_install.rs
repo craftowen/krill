@@ -46,9 +46,9 @@ fn execute(action: &str, args: &[&str]) -> io::Result<()> {
     {
         return Err(usage_error(USAGE));
     }
-    let home = std::fs::canonicalize(
-        std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is unset"))?,
-    )?;
+    let home = canonicalize(Path::new(
+        &home_dir().ok_or_else(|| io::Error::other("HOME is unset"))?,
+    ))?;
     let state = absolute(
         daemon::state_dir().ok_or_else(|| io::Error::other("state directory unavailable"))?,
     )?;
@@ -118,11 +118,34 @@ fn absolute(path: PathBuf) -> io::Result<PathBuf> {
             .parent()
             .ok_or_else(|| io::Error::other("missing configuration root"))?;
     }
-    let mut result = std::fs::canonicalize(ancestor)?;
+    let mut result = canonicalize(ancestor)?;
     for component in tail.into_iter().rev() {
         result.push(component);
     }
     Ok(result)
+}
+
+/// 에이전트 설정이 놓이는 사용자 홈. Windows는 Claude Code·Cursor·Codex가 `~`로 쓰는 `%USERPROFILE%`이 우선이다
+/// (Git Bash가 넘기는 `HOME`은 그 다음).
+pub fn home_dir() -> Option<std::ffi::OsString> {
+    #[cfg(windows)]
+    if let Some(home) = std::env::var_os("USERPROFILE").filter(|h| !h.is_empty()) {
+        return Some(home);
+    }
+    std::env::var_os("HOME").filter(|h| !h.is_empty())
+}
+
+/// [`std::fs::canonicalize`]. Windows는 드라이브 경로의 `\\?\` 접두사를 뗀다: 접두사가 붙으면 `/`가 구분자로
+/// 안 읽혀 `.cursor/hooks.json` 같은 하위 경로가 깨지고, 사용자에게 보이는 diff·receipt 경로도 낯설어진다.
+pub fn canonicalize(path: &Path) -> io::Result<PathBuf> {
+    let path = std::fs::canonicalize(path)?;
+    #[cfg(windows)]
+    if let Some(rest) = path.to_str().and_then(|p| p.strip_prefix(r"\\?\"))
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        return Ok(PathBuf::from(rest));
+    }
+    Ok(path)
 }
 
 fn directory_override(variable: &str, default: PathBuf) -> io::Result<PathBuf> {

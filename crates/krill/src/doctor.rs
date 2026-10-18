@@ -113,7 +113,10 @@ fn render_head(collected: &Collected) {
         println!("krill-holder  unknown ({error})");
         println!("krilld     unknown ({error})");
     }
+    #[cfg(unix)]
     println!("launch     dev build (posix_spawn + setsid; TCC attribution follows the launcher)");
+    #[cfg(windows)]
+    println!("launch     SKIP: starting krilld is not supported on Windows yet");
 }
 
 /// 현행 줄 형식을 그대로 그리는 항목(helpers·state·crash·record·telemetry·git·daemon·history).
@@ -260,7 +263,7 @@ fn collect(no_start: bool) -> Collected {
         Some(p) if !helpers_ok || !state_ok => Daemon::Skipped {
             reason: "fix the failures above first".to_owned(),
         },
-        Some(p) if no_start => ping_daemon(p),
+        Some(p) if no_start && cfg!(unix) => ping_daemon(p),
         Some(p) => connect_daemon(p),
     };
     let daemon_build = match &daemon {
@@ -284,7 +287,7 @@ fn collect(no_start: bool) -> Collected {
         .map(str::to_owned)
         .collect();
     let krill_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("krill"));
-    let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
+    let home: Option<PathBuf> = crate::hook_install::home_dir().map(PathBuf::from);
     let facts = Facts {
         helpers: Helpers {
             ok: helpers_ok,
@@ -388,6 +391,7 @@ fn probe_holder(paths: &Paths) -> Option<HolderStatus> {
 }
 
 /// krilld에 붙는다. 없으면 holder를 띄워 재결합까지 기다린다(현행 doctor).
+#[cfg(unix)]
 fn connect_daemon(paths: &Paths) -> Daemon {
     let hello = daemon::client_hello(ClientRole::Cli, "krill doctor");
     match daemon::connect(paths, &hello) {
@@ -611,10 +615,37 @@ fn login_path() -> Option<OsString> {
     std::env::var_os("PATH")
 }
 
-/// Unix 소유자/접근 권한 진단은 Windows ACL 검사 구현 전까지 성공으로 보고하지 않는다.
+/// Windows에는 아직 데몬 기동 경로가 없다(holder exec 핸드오프는 Unix 전용). 떠 있으면 ping으로 붙고,
+/// 아니면 고장이 아니라 미지원으로 건너뛴다(`--no-start`도 같다).
 #[cfg(windows)]
-fn state_writable(_state: &Path) -> bool {
-    false
+fn connect_daemon(paths: &Paths) -> Daemon {
+    match ping_daemon(paths) {
+        Daemon::Down { error } => Daemon::Skipped {
+            reason: format!(
+                "{} (ping: {error})",
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "starting krilld is not supported on Windows yet",
+                )
+            ),
+        },
+        up => up,
+    }
+}
+
+/// 상태 디렉터리·`run/`에 실제로 써 본다. Unix 소유자(uid) 검사는 Windows ACL에 대응하는 것이 없어 건너뛴다
+/// ([`checks`]가 이유를 보인다). 없는 디렉터리는 데몬이 만든다.
+#[cfg(windows)]
+fn state_writable(state: &Path) -> bool {
+    [state.to_path_buf(), state.join("run")]
+        .iter()
+        .filter(|dir| dir.exists())
+        .all(|dir| {
+            let probe = dir.join(format!(".krill-doctor-{}", std::process::id()));
+            let written = std::fs::write(&probe, b"").is_ok();
+            std::fs::remove_file(&probe).ok();
+            written
+        })
 }
 
 #[cfg(windows)]

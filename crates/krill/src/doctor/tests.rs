@@ -127,7 +127,7 @@ fn unwritable_state_fails_with_ls_hint() {
     #[cfg(unix)]
     assert!(c.fix.value.starts_with("ls -ld "), "{}", c.fix.value);
     #[cfg(windows)]
-    assert!(c.detail.contains("Windows ACL"));
+    assert!(c.fix.value.starts_with("icacls "), "{}", c.fix.value);
 }
 
 #[test]
