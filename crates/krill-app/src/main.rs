@@ -221,7 +221,8 @@ fn init(cx: &mut App) {
     })
     .detach();
     cx.bind_keys([
-        KeyBinding::new("cmd-n", NewWindow, None),
+        // OWE-859: ⌘N은 메인 창 안 새 워크트리(Orca와 같음), 새 창은 ⇧⌘N(메뉴 표기도 여기서 나온다).
+        KeyBinding::new("cmd-shift-n", NewWindow, None),
         KeyBinding::new("cmd-alt-w", CloseWindow, None),
         // OWE-864: macOS 표준 창·앱 동작. 터미널 문맥 바인딩과 겹치지 않는 전역 키만 쓴다.
         KeyBinding::new("cmd-h", HideApp, None),
