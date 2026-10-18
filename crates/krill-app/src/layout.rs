@@ -961,15 +961,9 @@ impl Layout {
         }
     }
 
+    /// 새 탭은 활성 탭 바로 오른쪽에 연다(포크 탭 `new_tab_after`와 같은 위치).
     pub fn new_tab(&mut self) {
-        let launch = self.inherited_launch();
-        let pane = self.alloc_pane();
-        self.tabs.push(Tab::single(pane));
-        if let Some(launch) = launch {
-            self.launches.insert(pane, launch);
-        }
-        self.active = self.tabs.len() - 1;
-        self.record_mru(self.active);
+        self.new_tab_after(self.active);
     }
 
     /// `index` 탭 바로 오른쪽(`index + 1`)에 새 탭을 만들고 활성화한다(OWE-736).
