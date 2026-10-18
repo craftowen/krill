@@ -406,20 +406,18 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     let card = visual.debug_bounds("dashboard-session-2").unwrap();
     visual.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    let floating = cx.read(|cx| existing::<Floating>(cx).unwrap());
-    floating
-        .update(cx, |f, _, cx| {
-            let s = f.shell.read(cx);
-            assert_eq!(
-                s.layout.session(s.layout.active_tab().focused),
-                Some(SessionId(2))
-            );
-        })
-        .unwrap();
+    // OWE-851: 카드 클릭은 별도 플로팅 창 대신 메인 창 해당 세션으로 포커스한다.
+    assert_eq!(cx.windows().len(), 2);
+    assert!(cx.read(|cx| existing::<Floating>(cx).is_none()));
+    let focused = main.read_with(cx, |s, _| {
+        s.layout.focused().and_then(|p| s.layout.session(p))
+    });
+    assert_eq!(focused, Some(SessionId(2)));
     // 새 세션 선택은 같은 플로팅 창을 재사용한다.
     cx.update(|cx| main.update(cx, |s, cx| s.float_terminal(SessionId(5), cx)));
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 3);
+    let floating = cx.read(|cx| existing::<Floating>(cx).unwrap());
     floating
         .update(cx, |f, _, cx| {
             let s = f.shell.read(cx);
@@ -432,6 +430,19 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(dashboard.into(), "cmd-w");
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 2);
+}
+
+/// OWE-851: 대시보드는 Esc로도 닫힌다.
+#[gpui::test]
+fn dashboard_escape_closes_window(cx: &mut TestAppContext) {
+    let (_main, main_window) = open(cx);
+    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 2);
+    let dashboard = cx.read(|cx| existing::<Dashboard>(cx).unwrap());
+    cx.simulate_keystrokes(dashboard.into(), "escape");
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1);
 }
 
 #[gpui::test]

@@ -42,6 +42,8 @@ actions!(popout, [FloatTerminal, DashboardPopout, CloseDashboard]);
 pub(super) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-w", CloseDashboard, Some("Dashboard")),
+        // OWE-851: 대시보드도 Esc로 닫힌다(터미널 입력이 없어 PTY 전달 걱정이 없다).
+        KeyBinding::new("escape", CloseDashboard, Some("Dashboard")),
         KeyBinding::new("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
         KeyBinding::new("alt-cmd-shift-a", DashboardPopout, Some(super::KEY_CONTEXT)),
     ]);
@@ -873,15 +875,27 @@ impl Shell {
             return;
         }
         let owner = cx.weak_entity();
-        let target = self.local_target();
         let opts = options(text::DASHBOARD.get(), ui::DASHBOARD_SIZE, cx);
         let opened = cx.open_window(opts, |window, cx| {
             window.set_rem_size(px(16. * krill_app::settings::current(cx).zoom()));
-            cx.new(|cx| Dashboard::new(owner, target, window, cx))
+            cx.new(|cx| Dashboard::new(owner, window, cx))
         });
         if let Err(error) = opened {
             self.notice = Some(error.to_string());
             cx.notify();
+        }
+    }
+
+    /// OWE-851: 대시보드 카드·리소스 행 클릭 → 메인 창 해당 세션으로 포커스하고 메인 창을 앞으로.
+    pub(super) fn focus_session_window(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.open_session(session, cx);
+        if let Some(win) = self.window {
+            let focus = self.focus.clone();
+            win.update(cx, |_, window, cx| {
+                window.activate_window();
+                window.focus(&focus, cx);
+            })
+            .ok();
         }
     }
 
@@ -1742,25 +1756,13 @@ pub(crate) struct Dashboard {
     _changes: Subscription,
     _frames: Option<Subscription>,
     _activation: Subscription,
-    target: Option<krill_app::hosts::HostTarget>,
     focus: gpui::FocusHandle,
 }
 
 impl Dashboard {
-    fn new(
-        owner: WeakEntity<Shell>,
-        target: Option<krill_app::hosts::HostTarget>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    fn new(owner: WeakEntity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         // 기존 sidebar source를 재사용하되 메인 창 비활성화와 독립적으로 갱신한다.
-        let sidebar = cx.new(|cx| {
-            let mut sidebar = sidebar::Sidebar::new(None);
-            if let Some(target) = target.clone() {
-                sidebar.connect(target, cx);
-            }
-            sidebar
-        });
+        let sidebar = cx.new(|_| sidebar::Sidebar::new(None));
         let changes = cx.observe(&sidebar, |_, _, cx| cx.notify());
         let frames = owner
             .upgrade()
@@ -1777,7 +1779,6 @@ impl Dashboard {
             _changes: changes,
             _frames: frames,
             _activation: activation,
-            target,
             focus,
         }
     }
@@ -1790,36 +1791,136 @@ impl Render for Dashboard {
         let sidebar = self.sidebar.read(cx);
         let items = sidebar.jump_items();
         let owner = self.owner.upgrade();
-        div().key_context("Dashboard").track_focus(&self.focus)
+        div()
+            .key_context("Dashboard")
+            .track_focus(&self.focus)
             .on_action(|_: &CloseDashboard, window, _| window.remove_window())
-            .size_full().flex().flex_col().bg(p.background).text_color(p.foreground)
-            .font_family(ui::FONT_UI).text_size(ui::TEXT_SM)
-            .child(div().h(ui::TITLEBAR_HEIGHT).pl(ui::TRAFFIC_LIGHT_PAD).flex().items_center().child(text::DASHBOARD.get()))
-            .child(div().id("dashboard-lanes").flex_1().min_h_0().flex().gap_2().p(ui::SPACE_2)
-                .children(LANES.iter().enumerate().map(|(column, title)| {
-                    let cards: Vec<_> = items.iter().filter(|i| sidebar.session(i.id).is_some_and(|s| lane(s.status.state) == column)).collect();
-                    div().id(("dashboard-lane", column)).flex_1().min_w_0().flex().flex_col().gap_2().p(ui::SPACE_2)
-                        .bg(p.sidebar).rounded(ui::RADIUS_SM)
-                        .child(format!("{} ({})", title.get(), cards.len()))
-                        .child(div().id(("dashboard-cards", column)).flex_1().min_h_0().overflow_y_scroll().flex().flex_col().gap_2()
-                            .when(cards.is_empty(), |d| d.child(div().text_color(p.muted_foreground).child(text::EMPTY.get())))
-                            .children(cards.into_iter().map(|item| {
-                                let session = item.id;
-                                let screen = owner.as_ref().and_then(|o| o.read(cx).live.values().find(|l| l.pane.session() == Some(session))).map(|l| preview(&l.pane.shown()));
-                                div().id(("dashboard-session", session.0)).debug_selector(move || format!("dashboard-session-{}", session.0))
-                                    .p(ui::SPACE_2).rounded(ui::RADIUS_XS).bg(p.card).cursor_pointer()
-                                    .hover(|d| d.bg(p.accent)).flex().flex_col().gap_2()
-                                    .child(item.label.clone())
-                                    .when_some(screen, |d, screen| d.child(div().text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::PREVIEW.get()))
-                                        .child(div().font_family(ui::FONT_MONO).text_size(ui::TEXT_2XS).overflow_hidden().child(screen)))
-                                    .child(div().text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::NO_PREVIEW.get()))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Err(error) = open_floating(session, this.target.clone(), ui::terminal_theme(cx), cx) {
-                                            tracing::warn!(%error, "floating terminal failed");
-                                        }
-                                    }))
-                            })))
-                })))
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(p.background)
+            .text_color(p.foreground)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .child(
+                div()
+                    .h(ui::TITLEBAR_HEIGHT)
+                    .pl(ui::TRAFFIC_LIGHT_PAD)
+                    .flex()
+                    .items_center()
+                    .child(text::DASHBOARD.get()),
+            )
+            .child(
+                div()
+                    .id("dashboard-lanes")
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .gap_2()
+                    .p(ui::SPACE_2)
+                    .children(LANES.iter().enumerate().map(|(column, title)| {
+                        let cards: Vec<_> = items
+                            .iter()
+                            .filter(|i| {
+                                sidebar
+                                    .session(i.id)
+                                    .is_some_and(|s| lane(s.status.state) == column)
+                            })
+                            .collect();
+                        div()
+                            .id(("dashboard-lane", column))
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .p(ui::SPACE_2)
+                            // OWE-876: 레인 배경에는 전경색을 쌍으로 지정한다.
+                            .bg(p.sidebar)
+                            .text_color(p.sidebar_foreground)
+                            .rounded(ui::RADIUS_SM)
+                            .child(format!("{} ({})", title.get(), cards.len()))
+                            .child(
+                                div()
+                                    .id(("dashboard-cards", column))
+                                    .flex_1()
+                                    .min_h_0()
+                                    .overflow_y_scroll()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_2()
+                                    .when(cards.is_empty(), |d| {
+                                        d.child(
+                                            div()
+                                                .text_color(p.muted_foreground)
+                                                .child(text::EMPTY.get()),
+                                        )
+                                    })
+                                    .children(cards.into_iter().map(|item| {
+                                        let session = item.id;
+                                        let screen = owner
+                                            .as_ref()
+                                            .and_then(|o| {
+                                                o.read(cx)
+                                                    .live
+                                                    .values()
+                                                    .find(|l| l.pane.session() == Some(session))
+                                            })
+                                            .map(|l| preview(&l.pane.shown()));
+                                        // OWE-851: 미리보기가 있으면 안내 문구를 덧붙이지 않는다.
+                                        let has_preview = screen.is_some();
+                                        div()
+                                            .id(("dashboard-session", session.0))
+                                            .debug_selector(move || {
+                                                format!("dashboard-session-{}", session.0)
+                                            })
+                                            .p(ui::SPACE_2)
+                                            .rounded(ui::RADIUS_XS)
+                                            .bg(p.card)
+                                            // OWE-876: 세션 카드에도 카드 테두리를 둔다.
+                                            .border_1()
+                                            .border_color(p.border)
+                                            .cursor_pointer()
+                                            .hover(|d| d.bg(p.accent))
+                                            .flex()
+                                            .flex_col()
+                                            .gap_2()
+                                            .child(item.label.clone())
+                                            .when_some(screen, |d, screen| {
+                                                d.child(
+                                                    div()
+                                                        .text_size(ui::TEXT_2XS)
+                                                        .text_color(p.muted_foreground)
+                                                        .child(text::PREVIEW.get()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(ui::FONT_MONO)
+                                                        .text_size(ui::TEXT_2XS)
+                                                        .overflow_hidden()
+                                                        .child(screen),
+                                                )
+                                            })
+                                            .when(!has_preview, |d| {
+                                                d.child(
+                                                    div()
+                                                        .text_size(ui::TEXT_2XS)
+                                                        .text_color(p.muted_foreground)
+                                                        .child(text::NO_PREVIEW.get()),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                // OWE-851: 별도 플로팅 창 대신 메인 창 해당 세션으로 포커스한다.
+                                                this.owner
+                                                    .update(cx, |shell, cx| {
+                                                        shell.focus_session_window(session, cx);
+                                                    })
+                                                    .ok();
+                                            }))
+                                    })),
+                            )
+                    })),
+            )
     }
 }
 
