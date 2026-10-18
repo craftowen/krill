@@ -4,10 +4,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, ElementId, ObjectFit, SharedString, UniformListScrollHandle, Window,
-    div, img, prelude::*, px, uniform_list,
+    AnyElement, App, Context, ElementId, Image, ImageFormat, ObjectFit, SharedString,
+    UniformListScrollHandle, Window, div, img, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::text::TextView;
@@ -30,18 +31,42 @@ const CSV_WIDTH_SAMPLE_ROWS: usize = 100;
 
 #[derive(Debug)]
 pub struct ImageView {
-    path: PathBuf,
+    source: ImageSource,
     /// SVG처럼 헤더로 크기를 모르면 `None` — 맞춤만 쓴다.
     dims: Option<Dimensions>,
     zoom: Zoom,
 }
 
+/// 이미지 출처: 디스크 경로(래스터·저장된 파일) 또는 미리보기용 메모리 버퍼(SVG 편집 중 내용).
+#[derive(Debug, Clone)]
+enum ImageSource {
+    Path(PathBuf),
+    SvgBytes(Arc<Image>),
+}
+
 impl ImageView {
     pub fn new(path: PathBuf, dims: Option<Dimensions>) -> Self {
         Self {
-            path,
+            source: ImageSource::Path(path),
             dims,
             zoom: Zoom::Fit,
+        }
+    }
+
+    /// SVG 미리보기용: 디스크가 아니라 지금 에디터 버퍼로 그린다(OWE-874 — 미저장 수정 반영).
+    pub fn new_svg_bytes(svg: Vec<u8>) -> Self {
+        Self {
+            source: ImageSource::SvgBytes(Arc::new(Image::from_bytes(ImageFormat::Svg, svg))),
+            dims: None,
+            zoom: Zoom::Fit,
+        }
+    }
+
+    /// 메모리 SVG 바이트(경로 기반이면 `None`). 미리보기가 버퍼 기준인지 확인할 때 쓴다.
+    pub fn svg_bytes(&self) -> Option<Vec<u8>> {
+        match &self.source {
+            ImageSource::SvgBytes(image) => Some(image.bytes.clone()),
+            ImageSource::Path(_) => None,
         }
     }
 
@@ -106,7 +131,10 @@ impl Render for ImageView {
                         .child(label),
                 )
             });
-        let image = img(self.path.clone());
+        let image = match &self.source {
+            ImageSource::Path(path) => img(path.clone()),
+            ImageSource::SvgBytes(image) => img(image.clone()),
+        };
         let body = match (self.zoom, self.dims) {
             (Zoom::Scale(scale), Some(dims)) => {
                 #[expect(

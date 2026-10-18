@@ -621,6 +621,8 @@ impl Shell {
         let peer_supports_fork = self.peer_supports_fork(pane);
         let can_fork = self.can_fork_pane(pane, cx);
         let can_continue = self.can_continue_pane(pane);
+        // OWE-874: 파일 탭이면 경로 복사·Finder 메뉴를 맨 위에 둔다(Orca EditorFileTabContextMenu).
+        let file_path = self.layout.file(pane).map(ToOwned::to_owned);
 
         let p = ui::palette(cx);
         let viewport = window.viewport_size();
@@ -629,6 +631,11 @@ impl Shell {
             px(300.)
         } else {
             px(236.)
+        } + if file_path.is_some() {
+            // 복사 2항목 + Finder 보기 + 구분선(항목당 약 28pt).
+            px(100.)
+        } else {
+            px(0.)
         };
         let x = pos
             .x
@@ -729,6 +736,59 @@ impl Shell {
                 }),
         );
 
+        // OWE-874: 파일 탭 경로 메뉴(절대·상대 복사, Finder 보기). 세션 탭에는 두지 않는다.
+        let mut file_items: Vec<AnyElement> = Vec::new();
+        if let Some(path) = file_path {
+            let abs = path.display().to_string();
+            let rel = path
+                .strip_prefix(self.folder())
+                .map_or_else(|_| abs.clone(), |p| p.display().to_string());
+            for (id, label, value) in [
+                (
+                    "tab-menu-copy-path",
+                    krill_app::i18n::catalog::diff::EXPLORER_COPY_PATH.get(),
+                    abs,
+                ),
+                (
+                    "tab-menu-copy-relative-path",
+                    krill_app::i18n::catalog::diff::EXPLORER_COPY_REL_PATH.get(),
+                    rel,
+                ),
+            ] {
+                file_items.push(
+                    menu_item(id, label, true, None)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab_context_menu = None;
+                            cx.write_to_clipboard(ClipboardItem::new_string(value.clone()));
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                );
+            }
+            file_items.push(
+                menu_item(
+                    "tab-menu-reveal-finder",
+                    krill_app::i18n::catalog::diff::EXPLORER_REVEAL_FINDER.get(),
+                    true,
+                    None,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.tab_context_menu = None;
+                    cx.reveal_path(&path);
+                    cx.notify();
+                }))
+                .into_any_element(),
+            );
+            file_items.push(
+                div()
+                    .my_1()
+                    .h(px(1.))
+                    .w_full()
+                    .bg(p.border)
+                    .into_any_element(),
+            );
+        }
+
         let menu =
             div()
                 .id("tab-context-menu")
@@ -751,6 +811,7 @@ impl Shell {
                 .gap_0p5()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .children(file_items)
                 .child(
                     div()
                         .id("tab-menu-pin")
@@ -884,6 +945,7 @@ impl Shell {
                 gpui::anchored().position(point(px(0.), px(0.))).child(
                     div()
                         .id("tab-context-menu-backdrop")
+                        .debug_selector(|| "tab-context-menu-backdrop".into())
                         .occlude()
                         .w(viewport.width)
                         .h(viewport.height)

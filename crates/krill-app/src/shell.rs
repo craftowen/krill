@@ -1044,7 +1044,8 @@ impl Shell {
         cx.notify();
     }
 
-    /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
+    /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 파일 탭이 포커스면
+    /// 에디터 내장 검색을 열며(OWE-874), 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(settings) = self.settings.clone() {
             settings.update(cx, |v, cx| v.focus_search(window, cx));
@@ -1056,6 +1057,11 @@ impl Shell {
             }
             window.focus(&self.focus, cx);
             cx.notify();
+            return;
+        }
+        if let Some(pane) = self.layout.focused()
+            && self.open_editor_search(pane, window, cx)
+        {
             return;
         }
         if let Some(pane) = self.layout.focused() {
