@@ -59,6 +59,12 @@ fi
 tar -xzf "$TARBALL" -C "$WORK"
 SRC=$(find "$WORK" -mindepth 1 -maxdepth 1 -type d -name 'krill-*-linux-*' | head -n 1)
 [ -n "$SRC" ] || { echo "archive has no krill-*-linux-* directory" >&2; exit 1; }
+# 이 머신에서 실제로 돌아가는지 먼저 본다(glibc가 낮으면 동적 로더가 거부한다). 깨진 설치를 남기지 않는다.
+if ! err=$("$SRC/krill" help 2>&1 >/dev/null); then
+    echo "error: this build does not run here: $(printf '%s' "$err" | head -n 1)" >&2
+    echo "       Krill for Linux needs glibc 2.34+ (Ubuntu 22.04+, Debian 12+, RHEL/Rocky 9+) and Linux 5.9+." >&2
+    exit 1
+fi
 mkdir -p "$PREFIX/bin"
 for bin in krill krill-holder krilld; do
     [ -x "$SRC/$bin" ] || { echo "missing $bin in archive" >&2; exit 1; }
@@ -74,9 +80,11 @@ if [ -S "${KRILL_STATE_DIR:-$HOME/.local/share/dev.krill.app}/run/krilld.sock" ]
 fi
 # holder·krilld는 데몬을 처음 깨운 ssh 세션의 systemd scope 안에서 돈다. logind가 로그아웃 때 사용자 프로세스를
 # 죽이도록 설정돼 있으면 세션이 함께 죽는다(Ubuntu·Debian 기본값은 no).
-if grep -qs '^[[:space:]]*KillUserProcesses[[:space:]]*=[[:space:]]*yes' /etc/systemd/logind.conf /etc/systemd/logind.conf.d/*.conf; then
-    echo "warning: systemd-logind KillUserProcesses=yes kills Krill sessions when the SSH login that started the daemon ends." >&2
-    echo "         set KillUserProcesses=no (or KillExcludeUsers=$(id -un)) in /etc/systemd/logind.conf and restart systemd-logind." >&2
+if grep -qs '^[[:space:]]*KillUserProcesses[[:space:]]*=[[:space:]]*yes' /etc/systemd/logind.conf /etc/systemd/logind.conf.d/*.conf &&
+    ! grep -qsE "^[[:space:]]*KillExcludeUsers[[:space:]]*=.*(^|[[:space:]=])$(id -un)([[:space:]]|\$)" /etc/systemd/logind.conf /etc/systemd/logind.conf.d/*.conf; then
+    echo "warning: systemd-logind KillUserProcesses=yes kills the Krill daemon as soon as the SSH login that started it ends;" >&2
+    echo "         the Mac app cannot stay connected. Add KillExcludeUsers=$(id -un) (or KillUserProcesses=no) under [Login]" >&2
+    echo "         in /etc/systemd/logind.conf, then: sudo systemctl restart systemd-logind" >&2
 fi
 case ":${PATH}:" in
     *":$PREFIX/bin:"*) ;;
