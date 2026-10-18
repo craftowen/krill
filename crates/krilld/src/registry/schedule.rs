@@ -1,14 +1,13 @@
 //! MK-101 daemon-owned scheduling. A durable claim precedes holder spawn; uncertain
 //! attempts are never automatically replayed. No catch-up of past cron minutes.
 
+use krill_proto::os::ffi::OsStrExt as _;
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::OpenOptionsExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::control::CaptureFormat;
@@ -16,6 +15,8 @@ use krill_proto::schedule::{
     Cron, MAX_OUTPUT_BYTES, MAX_RUNS, PREVIOUS_RUNS, RUN_NOW, RUNS, ScheduleRun as Run, Schedules,
     WorkspaceMode, take_run_now, truncate_output,
 };
+
+use crate::child::{kill_and_reap as kill_precheck, nonblocking as set_nonblocking};
 
 use super::{Create, Peer, Program, Registry, Reply, Scope, lock};
 
@@ -44,14 +45,13 @@ pub fn run_precheck(cwd: &Path, command: &str) -> PrecheckResult {
 
 #[must_use]
 pub fn run_precheck_with_timeout(cwd: &Path, command: &str, timeout: Duration) -> PrecheckResult {
-    let mut child = match Command::new("/bin/sh")
+    let mut child = match crate::child::own_group(&mut Command::new("/bin/sh"))
         .arg("-c")
         .arg(command)
         .current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0)
         .spawn()
     {
         Ok(child) => child,
@@ -204,20 +204,6 @@ fn drain_pipe(
             Err(e) => return Err(e),
         }
     }
-}
-
-fn set_nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
-}
-
-fn kill_precheck(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
-        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
-    }
-    child.kill().ok();
-    child.wait().ok();
 }
 
 impl Registry {
@@ -531,4 +517,5 @@ impl<'a> Journal<'a> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

@@ -12,10 +12,10 @@
 //! - UI 배치·상태 코드 표기 참고: `.ref/orca/src/renderer/src/components/right-sidebar/`
 //!   (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
 
+use krill_proto::os::ffi::OsStrExt as _;
+use krill_proto::os::net::UnixStream;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -1682,7 +1682,9 @@ impl Render for Panel {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 use krill_proto::daemon::Paths;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

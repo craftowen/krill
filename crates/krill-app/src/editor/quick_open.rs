@@ -1,8 +1,8 @@
 //! ⌘P 빠른 열기의 파일 목록. git 저장소면 `git ls-files`(추적 + .gitignore를 존중한 미추적), 아니면 폴더를 훑는다.
 //! 검색·팔레트는 Jump 팔레트([`crate::jump`])를 그대로 쓴다.
 
+use krill_proto::os::ffi::OsStrExt as _;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 

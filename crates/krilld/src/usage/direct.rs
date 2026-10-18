@@ -444,10 +444,14 @@ mod tests {
         );
         assert!(parse_antigravity_auth(b"invalid").is_none());
         assert!(parse_antigravity_auth(b"go-keyring-encoded:7").is_none());
-        let encoded = pipe_command("/usr/bin/base64", &[], raw).unwrap();
-        let mut wrapped = b"go-keyring-base64:".to_vec();
-        wrapped.extend_from_slice(&encoded);
-        assert!(parse_antigravity_auth(&wrapped).unwrap().logged_in);
+        // go-keyring base64 풀기는 /usr/bin/base64에 맡긴다(Unix 전용 경로).
+        #[cfg(unix)]
+        {
+            let encoded = pipe_command("/usr/bin/base64", &[], raw).unwrap();
+            let mut wrapped = b"go-keyring-base64:".to_vec();
+            wrapped.extend_from_slice(&encoded);
+            assert!(parse_antigravity_auth(&wrapped).unwrap().logged_in);
+        }
         assert_eq!(
             claude_service(Some(Path::new("/tmp/é"))),
             claude_service(Some(Path::new("/tmp/e\u{301}")))

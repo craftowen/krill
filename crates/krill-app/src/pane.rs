@@ -19,9 +19,9 @@
 mod context;
 mod hibernation;
 
+use krill_proto::os::net::UnixStream;
 use std::io::{self, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::thread;
@@ -1123,4 +1123,5 @@ fn after_overlap(page: &[Vec<Cell>], hot: &[Vec<Cell>]) -> usize {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

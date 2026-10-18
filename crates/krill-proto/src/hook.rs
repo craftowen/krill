@@ -15,12 +15,13 @@
 //!
 //! `<상태 디렉터리>/`[`SPOOL_FILE`](0600). 내용은 소켓으로 보낼 [`HookEvent`] 프레임을 그대로 이어 붙인 것이다
 //! ([`crate::ipc`] 프레임 형식). 쓰는 쪽([`append_spool`])은 파일 flock을 잡고 `O_APPEND`로 프레임 하나를 한 번의
-//! `write`로 쓴다. 수거하는 쪽은 같은 flock 아래에서 다 읽고 길이를 0으로 자른다. [`read_spool`]은 경계가 온전한
+//! `write`로 쓴다. 수거하는 쪽은 같은 락 아래에서 다 읽고 길이를 0으로 자른다. Windows는 데이터 파일 대신
+//! `<spool>.lock`을 잠가 mandatory lock이 deadline 뒤 fail-open append를 막지 않게 한다. [`read_spool`]은 경계가 온전한
 //! 손상 레코드만 건너뛰고, 잘린 꼬리·잘못된 길이에서는 멈춘다. 파일이 [`SPOOL_MAX`]를 넘으면 더 쓰지 않는다.
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fs::{DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -128,15 +129,41 @@ pub fn append_spool(path: &Path, frame: &[u8], deadline: Instant) -> io::Result<
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     }
     let mut f = OpenOptions::new()
+        .read(true)
         .append(true)
         .create(true)
         .mode(0o600)
         .open(path)?;
-    lock_until(&f, deadline)?;
+    let lock = spool_lock(path, &f)?;
+    lock_until(&lock, deadline)?;
     if f.metadata()?.len() >= SPOOL_MAX {
         return Err(io::Error::other("hook spool is full"));
     }
     f.write_all(frame)
+}
+
+/// 쓰기·수거가 공유할 spool 잠금 핸들. Unix는 데이터 파일의 같은 open-file description을
+/// 복제하여 기존 flock을 유지한다. Windows는 mandatory data lock을 피하려 별도 `.lock` 파일을 쓴다.
+/// 이 핸들은 spool IO가 끝날 때까지 보관하며 잠금 파일을 개별 삭제하지 않는다.
+pub fn spool_lock(path: &Path, data: &File) -> io::Result<File> {
+    #[cfg(unix)]
+    {
+        let _ = path;
+        data.try_clone()
+    }
+    #[cfg(windows)]
+    {
+        let _ = data;
+        let mut name = path.as_os_str().to_os_string();
+        name.push(".lock");
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(name)
+    }
 }
 
 /// `f`의 flock을 `deadline`까지 시도한다. 시간이 다 되면 락 없이 돌아온다.

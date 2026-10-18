@@ -1,9 +1,9 @@
 //! MK-081: opt-in 자동 종료. MK-052 의존은 재개 표식과 앱의 한 경계에 격리한다.
 //! Orca 문서의 조건을 독립 구현했다. 소스 코드는 차용하지 않았다.
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -144,7 +144,7 @@ impl Registry {
         for (id, tap, pid) in candidates {
             // 런타임 cwd를 확인하지 못하면 그 세션은 묶음에서 뺀다(종료하지 않는다).
             // 예전에는 여기서 전체 검사를 중단했다.
-            let Ok(cwd) = crate::sys::current_directory(pid) else {
+            let Some(cwd) = tap.cwd(pid) else {
                 continue;
             };
             groups
@@ -274,4 +274,5 @@ impl Registry {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

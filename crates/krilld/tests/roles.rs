@@ -1,5 +1,6 @@
 //! MK-050: 앱 + CLI interactive + observer 둘의 실제 PTY·UDS 계약.
 
+#![cfg(unix)]
 #![expect(clippy::unwrap_used, reason = "통합 테스트 헬퍼")]
 
 use std::collections::VecDeque;
@@ -552,6 +553,7 @@ fn creator_session_can_wait_read_and_send_to_created_child_while_unrelated_sessi
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {

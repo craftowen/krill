@@ -14,8 +14,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
-    Render, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    Render, Subscription, Task, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
@@ -152,11 +151,7 @@ pub(super) fn window_options(cx: &App) -> WindowOptions {
             size(px(w), px(h)),
             cx,
         ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(text::TITLE.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(ui::titlebar(text::TITLE.get())),
         is_resizable: false,
         is_minimizable: false,
         ..Default::default()
@@ -746,11 +741,19 @@ impl Wizard {
             (FixKind::Command | FixKind::Copy, _, _) if !check.fix.value.is_empty() => {
                 Some((Fix::Copy, text::FIX_COPY.get()))
             }
-            (FixKind::OpenUrl, _, _) if check.fix.value == perm::APPLICATIONS_URL => {
-                Some((Fix::Reveal, text::FIX_REVEAL.get()))
-            }
+            (FixKind::OpenUrl, _, _) if check.fix.value == perm::APPLICATIONS_URL => Some((
+                Fix::Reveal,
+                text::FIX_REVEAL
+                    .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                    .get(),
+            )),
             (FixKind::OpenUrl, _, _) => Some((Fix::OpenSettings, text::FIX_OPEN_SETTINGS.get())),
-            (FixKind::Reinstall, _, _) => Some((Fix::Reveal, text::FIX_REVEAL.get())),
+            (FixKind::Reinstall, _, _) => Some((
+                Fix::Reveal,
+                text::FIX_REVEAL
+                    .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                    .get(),
+            )),
             (FixKind::None, perm::NOTIFICATIONS_ID, Status::Warn) => {
                 Some((Fix::AllowNotifications, text::FIX_ALLOW_NOTIFICATIONS.get()))
             }
@@ -1403,25 +1406,28 @@ impl Render for Wizard {
             .text_color(p.foreground)
             .font_family(ui::FONT_UI)
             .text_size(ui::TEXT_SM)
-            .child(
-                div()
-                    .id("onboarding-titlebar")
-                    .debug_selector(|| "onboarding-titlebar".into())
-                    .h(ui::TITLEBAR_HEIGHT)
-                    .w_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(p.worktree_sidebar)
-                    .border_b_1()
-                    .border_color(p.border)
-                    .window_control_area(gpui::WindowControlArea::Drag)
-                    .text_size(ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(p.muted_foreground)
-                    .child(text::TITLE.get()),
-            )
+            // 신호등 아래 제목 띠. OS 제목 표시줄을 쓰는 OS(Windows)는 같은 제목이 두 번 보이므로 그리지 않는다.
+            .when(cfg!(target_os = "macos"), |d| {
+                d.child(
+                    div()
+                        .id("onboarding-titlebar")
+                        .debug_selector(|| "onboarding-titlebar".into())
+                        .h(ui::TITLEBAR_HEIGHT)
+                        .w_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(p.worktree_sidebar)
+                        .border_b_1()
+                        .border_color(p.border)
+                        .window_control_area(gpui::WindowControlArea::Drag)
+                        .text_size(ui::TEXT_XS)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(p.muted_foreground)
+                        .child(text::TITLE.get()),
+                )
+            })
             .child(self.render_header(cx))
             .child(body)
             .child(self.render_footer(cx))

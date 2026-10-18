@@ -1,11 +1,11 @@
 //! 상태 파일(`link/devices.toml`, `link/hosts.toml`, `link/invites.toml`) 원자적 저장소.
 
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
 use std::net::SocketAddr;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;

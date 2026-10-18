@@ -6,8 +6,8 @@
 mod shell;
 
 use gpui::{
-    App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, QuitMode, TitlebarOptions,
-    WindowBounds, WindowHandle, WindowOptions, actions, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, QuitMode, WindowBounds, WindowHandle,
+    WindowOptions, actions, px, size,
 };
 use std::path::PathBuf;
 
@@ -141,11 +141,9 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
     let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions {
-            title: Some(krill_app::i18n::catalog::security::APP_MENU.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(krill_app::ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(krill_app::ui::titlebar(
+            krill_app::i18n::catalog::security::APP_MENU.get(),
+        )),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
@@ -182,7 +180,8 @@ fn init(cx: &mut App) {
     krill_app::ui::apply(gpui_component::ThemeMode::Dark, cx);
     shell::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
-    cx.set_quit_mode(QuitMode::Explicit);
+    // macOS는 마지막 창을 닫아도 메뉴바·Dock에 남는다. 메뉴바 항목이 없는 Windows는 마지막 창을 닫으면 끝낸다(트레이는 후속).
+    cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
         let services = krill_app::hosts::link::begin_shutdown();
         cx.background_executor().spawn(async move {
@@ -193,8 +192,8 @@ fn init(cx: &mut App) {
     })
     .detach();
     cx.bind_keys([
-        KeyBinding::new("cmd-n", NewWindow, None),
-        KeyBinding::new("cmd-alt-w", CloseWindow, None),
+        krill_app::keys::bind("cmd-n", NewWindow, None),
+        krill_app::keys::bind("cmd-alt-w", CloseWindow, None),
     ]);
     cx.on_action(|_: &NewWindow, cx| {
         let _ = new_window(cx);
@@ -225,28 +224,36 @@ pub(crate) fn set_menus(security: &krill_app::security::State, cx: &mut App) {
 
 fn refresh_menus(cx: &mut App) {
     let secure = cx.try_global::<MenuSecurity>().is_some_and(|state| state.0);
-    cx.set_menus([
-        Menu::new(krill_app::i18n::catalog::security::APP_MENU.get()).items([
-            MenuItem::action(
-                krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
-                krill_app::settings::OpenSettings,
-            ),
-            MenuItem::action(
-                krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
-                krill_app::onboarding::OpenChecks,
-            ),
-            MenuItem::action(
-                krill_app::i18n::catalog::onboarding::MENU_RERUN.get(),
-                krill_app::onboarding::RerunOnboarding,
-            ),
+    let mut app_items = vec![
+        MenuItem::action(
+            krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
+            krill_app::settings::OpenSettings,
+        ),
+        MenuItem::action(
+            krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
+            krill_app::onboarding::OpenChecks,
+        ),
+        MenuItem::action(
+            krill_app::i18n::catalog::onboarding::MENU_RERUN.get(),
+            krill_app::onboarding::RerunOnboarding,
+        ),
+    ];
+    // Secure Keyboard Entry는 macOS 전용이다(규칙 10).
+    if cfg!(target_os = "macos") {
+        app_items.push(
             MenuItem::action(
                 krill_app::security::text::SECURE_KEYBOARD_MENU.get(),
                 shell::security::ToggleSecureInput,
             )
             .checked(secure),
-            MenuItem::separator(),
-            MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
-        ]),
+        );
+    }
+    app_items.extend([
+        MenuItem::separator(),
+        MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
+    ]);
+    cx.set_menus([
+        Menu::new(krill_app::i18n::catalog::security::APP_MENU.get()).items(app_items),
         Menu::new(krill_app::i18n::catalog::general::FILE.get()).items([
             MenuItem::action(
                 krill_app::i18n::catalog::general::NEW_WINDOW.get(),

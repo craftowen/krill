@@ -432,3 +432,38 @@ fn giant_winsize_is_clamped_to_wire_max() {
         "screen cols {widest} > MAX_COLS {MAX_COLS}"
     );
 }
+
+/// OSC 7·OSC 9;9 cwd 보고: 청크 경계를 넘어도 잇고, 이 OS의 절대 경로가 아니면 버린다.
+#[test]
+fn shell_cwd_reports() {
+    let look = fresh();
+    let mut e = Engine::new(SIZE);
+    assert_eq!(e.cwd(), None);
+    #[cfg(unix)]
+    let (url, expected, quoted) = ("file://host/tmp/a%20b", "/tmp/a b", "\"/tmp/c;d\"");
+    #[cfg(windows)]
+    let (url, expected, quoted) = (
+        "file://host/C:/Users/a%20b",
+        "C:/Users/a b",
+        "\"C:\\Users\\c;d\"",
+    );
+    let osc7 = format!("\x1b]7;{url}\x07");
+    let (head, tail) = osc7.split_at(7);
+    e.feed(head.as_bytes(), Feed::Live, &look);
+    e.feed(tail.as_bytes(), Feed::Live, &look);
+    assert_eq!(e.cwd(), Some(Path::new(expected)));
+    e.feed(
+        format!("\x1b]9;9;{quoted}\x1b\\").as_bytes(),
+        Feed::Live,
+        &look,
+    );
+    let quoted = quoted.trim_matches('"');
+    assert_eq!(e.cwd(), Some(Path::new(quoted)));
+    // 상대 경로·원격 꼴·다른 OSC는 마지막 값을 바꾸지 않는다.
+    e.feed(
+        b"\x1b]9;9;\"relative\"\x07\x1b]7;file:\x07\x1b]2;title\x07",
+        Feed::Live,
+        &look,
+    );
+    assert_eq!(e.cwd(), Some(Path::new(quoted)));
+}

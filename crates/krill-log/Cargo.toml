@@ -8,6 +8,8 @@ publish = false
 
 [dependencies]
 tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 
 [lints]

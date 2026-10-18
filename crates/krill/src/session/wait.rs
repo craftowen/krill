@@ -192,7 +192,7 @@ fn connection(
 }
 
 fn done_since(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut krill_proto::os::net::UnixStream,
     session: krill_proto::SessionId,
 ) -> Result<Option<u64>> {
     let Reply::States(states) = request(stream, &Request::States)? else {

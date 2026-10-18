@@ -351,4 +351,5 @@ pub mod direct;
 pub mod provision;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

@@ -9,15 +9,18 @@ use std::time::{Duration, Instant};
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 
+use crate::Error;
 use crate::config::{LinkConfig, RelaySetting};
 use crate::identity::DeviceIdentity;
 use crate::qr::{QrMatrix, encode_qr, render_qr_unicode};
 use crate::serve::build_iroh_endpoint;
 use crate::store::{
-    DEFAULT_INVITE_TTL, InviteToken, RemoteHost, compact_endpoint_addr, create_invite, decode_hex,
-    encode_hex, now_unix_secs, sanitize_id_slug, upsert_host,
+    InviteToken, RemoteHost, compact_endpoint_addr, create_invite, decode_hex, encode_hex,
 };
-use crate::{ALPN_PAIR, Error};
+use crate::{
+    ALPN_PAIR,
+    store::{DEFAULT_INVITE_TTL, now_unix_secs, sanitize_id_slug, upsert_host},
+};
 
 /// 짝짓기 링크 스킴 접두어.
 pub const PAIR_URI_PREFIX: &str = "krill://pair?";

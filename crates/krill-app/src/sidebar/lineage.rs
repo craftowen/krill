@@ -4,8 +4,8 @@
 //! `.ref/orca/src/renderer/src/components/sidebar/worktree-lineage.ts`
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
 
+use krill_proto::os::ffi::OsStrExt as _;
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext as _, Context, Window};

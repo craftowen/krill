@@ -128,6 +128,7 @@ fn resolve_krill_app_exe(app_bundle: Option<&Path>) -> PathBuf {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     #[cfg(not(target_os = "linux"))]

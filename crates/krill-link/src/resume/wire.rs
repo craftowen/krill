@@ -1,7 +1,6 @@
 //! Versioned link-only framing. This never parses or changes krilld frames.
+use super::StreamId;
 use iroh::endpoint::{RecvStream, SendStream};
-use ring::rand::{SecureRandom as _, SystemRandom};
-use serde::{Deserialize, Serialize};
 
 use crate::Error;
 
@@ -9,19 +8,6 @@ pub const MAGIC: [u8; 4] = *b"MKL2";
 pub const CHUNK: usize = 8 * 1024;
 pub const HEADER_LEN: usize = 14;
 pub const HELLO_LEN: usize = 54;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-pub struct StreamId(pub [u8; 16]);
-
-impl StreamId {
-    pub fn random() -> Result<Self, Error> {
-        let mut bytes = [0; 16];
-        SystemRandom::new()
-            .fill(&mut bytes)
-            .map_err(|_| Error::Crypto("stream id generation failed"))?;
-        Ok(Self(bytes))
-    }
-}
 
 /// Open retries are idempotent until the creating connection generation ends.
 /// Once that generation is lost, only Resume is allowed (even when Ready was lost).

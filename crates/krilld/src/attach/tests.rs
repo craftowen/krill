@@ -203,7 +203,7 @@ fn snapshot_meta_and_filter() {
 /// OWE-586: 감시 연결 ping에 nonce를 되돌린 pong으로 답한다. 모르는 kind는 기존대로 거부한다.
 #[test]
 fn watch_answers_ping_with_pong() {
-    use std::os::unix::net::UnixStream;
+    use krill_proto::os::net::UnixStream;
 
     let (mut client, server) = UnixStream::pair().unwrap();
     client

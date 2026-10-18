@@ -2,19 +2,23 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{App, PromptLevel, Window};
+use krill_proto::os::fs::DirBuilderExt as _;
+#[cfg(unix)]
 use rustix::process::{Pid, test_kill_process};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CodeVerifier, CodesignVerifier, Config, Error, READY_ENV, RELAUNCH_ARG, UPDATE_DIR, append_ext,
-    journal_path, prev_path, ready_path, staging_path, write_private_file,
+    APP_EXE, CodeVerifier, CodesignVerifier, Config, Error, READY_ENV, RELAUNCH_ARG, UPDATE_DIR,
+    append_ext, journal_path, prev_path, ready_path, rename, staging_path, trash_path,
+    write_private_file,
 };
 
 const RELAUNCHER_BIN: &str = "relauncher";
@@ -76,9 +80,45 @@ impl Journal {
     }
 }
 
-/// `<app_bundle>.staging`을 검증한 뒤 `.prev` 백업 생성 및 제자리 동기화(`staging -> 현재`)로
-/// `.app` 디렉터리 inode는 보존하고 일반 파일은 새 vnode로 원자 교체(Apple Silicon XNU `cs_blob` `SIGKILL` 방지)한다.
+/// 번들 교체 방식.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Mode {
+    /// macOS: `.app` 디렉터리 inode를 보존하고 일반 파일만 새 vnode로 바꾸는 제자리 동기화.
+    InPlace,
+    /// Windows: 실행 중 exe를 덮어쓸 수 없어 파일 단위로 `.prev`에 옮기고 새 파일을 놓는다([`rename`]).
+    Rename,
+}
+
+pub(super) const MODE: Mode = if cfg!(windows) {
+    Mode::Rename
+} else {
+    Mode::InPlace
+};
+
+/// `<app_bundle>.staging`을 검증한 뒤 `.prev` 백업을 만들고 새 버전으로 교체한다.
+/// macOS는 제자리 동기화(`staging -> 현재`)로 `.app` 디렉터리 inode는 보존하고 일반 파일은 새 vnode로
+/// 원자 교체(Apple Silicon XNU `cs_blob` `SIGKILL` 방지)한다. Windows는 파일 단위 이름 바꾸기([`Mode::Rename`]).
 pub fn swap_bundles(
+    app_bundle: &Path,
+    state_dir: &Path,
+    from_version: &str,
+    to_version: &str,
+    health_timeout: Duration,
+    verifier: &dyn CodeVerifier,
+) -> Result<Journal, Error> {
+    swap_with(
+        MODE,
+        app_bundle,
+        state_dir,
+        from_version,
+        to_version,
+        health_timeout,
+        verifier,
+    )
+}
+
+pub(super) fn swap_with(
+    mode: Mode,
     app_bundle: &Path,
     state_dir: &Path,
     from_version: &str,
@@ -88,10 +128,17 @@ pub fn swap_bundles(
 ) -> Result<Journal, Error> {
     let staging = staging_path(app_bundle);
     let prev = prev_path(app_bundle);
+    let trash = trash_path(app_bundle);
     verifier.verify(&staging)?;
 
-    if prev.exists() {
-        fs::remove_dir_all(&prev)?;
+    match mode {
+        Mode::InPlace if prev.exists() => fs::remove_dir_all(&prev)?,
+        Mode::InPlace => {}
+        Mode::Rename => {
+            rename::check_install_entries(app_bundle, &staging)?;
+            rename::purge(&trash);
+            rename::clear(&prev, &trash)?;
+        }
     }
     let timeout_ms = u64::try_from(health_timeout.as_millis()).unwrap_or(u64::MAX);
     let mut journal = Journal {
@@ -110,10 +157,16 @@ pub fn swap_bundles(
                 "source or staging bundle missing",
             )));
         }
-        sync_bundle_in_place(app_bundle, &prev)?;
+        match mode {
+            Mode::InPlace => sync_bundle_in_place(app_bundle, &prev)?,
+            Mode::Rename => rename::move_tree(app_bundle, &prev, &trash)?,
+        }
         journal.stage = Stage::MovingStagingToTarget;
         journal.save(state_dir)?;
-        sync_bundle_in_place(&staging, app_bundle)?;
+        match mode {
+            Mode::InPlace => sync_bundle_in_place(&staging, app_bundle)?,
+            Mode::Rename => rename::move_tree(&staging, app_bundle, &trash)?,
+        }
         fs::remove_dir_all(&staging)?;
         journal.stage = Stage::VerifyingLaunch;
         journal.save(state_dir)
@@ -122,7 +175,7 @@ pub fn swap_bundles(
         // 어느 단계가 실패해도 원래 번들을 복원한 후에만 RolledBack을 기록한다.
         if prev.exists() {
             if app_bundle.exists() {
-                rollback(app_bundle, state_dir, &error.to_string())?;
+                rollback_with(mode, app_bundle, state_dir, &error.to_string())?;
             } else {
                 fs::rename(&prev, app_bundle)?;
             }
@@ -157,7 +210,13 @@ fn copy_dir_in_place(src: &Path, dst: &Path) -> io::Result<()> {
                 fs::remove_file(&t)?;
             }
             let target = fs::read_link(&s)?;
+            #[cfg(unix)]
             std::os::unix::fs::symlink(target, &t)?;
+            #[cfg(not(unix))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("bundle symlink {}", target.display()),
+            ));
         } else {
             let file_name = entry.file_name();
             let tmp = dst.join(format!(
@@ -205,7 +264,15 @@ fn prune_extraneous_entries(src: &Path, dst: &Path) -> io::Result<()> {
 ///   `RolledBack`으로 오표기하지 않고(AS-09) 검증 단계로 이어간다.
 /// - 번들·스테이징이 둘 다 멀쩡하면 교체 전에 죽은 것이다. 복원할 게 없으니
 ///   거짓 롤백 대화상자를 남기지 않고 저널을 버린다.
+///
+/// Windows([`Mode::Rename`])는 설치 폴더가 사라지지 않으므로 단계로 판정한다. 옮기기 전(`MovingToPrev`)에
+/// 멈췄으면 `.prev`의 파일을 되돌리고 저널을 버린다. 새 파일을 놓다가(`MovingStagingToTarget`) 멈췄으면
+/// 이미 검증된 남은 스테이징을 마저 옮겨 검증 단계로 이어간다.
 pub fn recover_journal(state_dir: &Path) -> Result<Option<Journal>, Error> {
+    recover_with(MODE, state_dir)
+}
+
+pub(super) fn recover_with(mode: Mode, state_dir: &Path) -> Result<Option<Journal>, Error> {
     let Some(mut journal) = Journal::load(state_dir)? else {
         return Ok(None);
     };
@@ -215,6 +282,23 @@ pub fn recover_journal(state_dir: &Path) -> Result<Option<Journal>, Error> {
     ) {
         let staging = staging_path(&journal.bundle);
         let prev = prev_path(&journal.bundle);
+        if mode == Mode::Rename {
+            let trash = trash_path(&journal.bundle);
+            if journal.stage == Stage::MovingToPrev {
+                if prev.exists() {
+                    rename::move_tree(&prev, &journal.bundle, &trash)?;
+                }
+                fs::remove_file(journal_path(state_dir)).ok();
+                return Ok(None);
+            }
+            if staging.exists() {
+                rename::move_tree(&staging, &journal.bundle, &trash)?;
+                fs::remove_dir_all(&staging)?;
+            }
+            journal.stage = Stage::VerifyingLaunch;
+            journal.save(state_dir)?;
+            return Ok(Some(journal));
+        }
         if !journal.bundle.exists() && prev.exists() {
             fs::rename(&prev, &journal.bundle)?;
             journal.stage = Stage::RolledBack {
@@ -240,13 +324,33 @@ pub fn recover_journal(state_dir: &Path) -> Result<Option<Journal>, Error> {
     Ok(Some(journal))
 }
 
-/// `<app_bundle>.prev` 백업으로 `<app_bundle>`을 제자리 롤백하고 저널을 `Stage::RolledBack`으로 갱신한다.
+/// `<app_bundle>.prev` 백업으로 `<app_bundle>`을 롤백하고 저널을 `Stage::RolledBack`으로 갱신한다.
 pub fn rollback(app_bundle: &Path, state_dir: &Path, reason: &str) -> Result<(), Error> {
+    rollback_with(MODE, app_bundle, state_dir, reason)
+}
+
+pub(super) fn rollback_with(
+    mode: Mode,
+    app_bundle: &Path,
+    state_dir: &Path,
+    reason: &str,
+) -> Result<(), Error> {
     let prev = prev_path(app_bundle);
     if !prev.exists() {
         return Err(Error::NoBackup(prev));
     }
-    if app_bundle.exists() {
+    if mode == Mode::Rename {
+        // 옮기는 도중(`MovingToPrev`) 실패면 설치 폴더에 남은 것은 아직 안 옮긴 구 파일이라 지우지 않는다.
+        // 그 뒤 단계면 설치 폴더의 파일은 새 버전이므로 치우고 구 파일을 되돌린다.
+        let trash = trash_path(app_bundle);
+        let partial =
+            matches!(Journal::load(state_dir), Ok(Some(j)) if j.stage == Stage::MovingToPrev);
+        if !partial {
+            rename::clear(app_bundle, &trash)?;
+        }
+        rename::move_tree(&prev, app_bundle, &trash)?;
+        fs::remove_dir_all(&prev).ok();
+    } else if app_bundle.exists() {
         sync_bundle_in_place(&prev, app_bundle)?;
         fs::remove_dir_all(&prev)?;
     } else {
@@ -353,8 +457,7 @@ fn spawn_bundle_app(
     state_dir: &Path,
     ready_file: Option<&Path>,
 ) -> io::Result<Child> {
-    let exe = app_bundle.join("Contents/MacOS/krill-app");
-    let mut cmd = Command::new(exe);
+    let mut cmd = Command::new(app_bundle.join(APP_EXE));
     cmd.env("KRILL_STATE_DIR", state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -365,6 +468,7 @@ fn spawn_bundle_app(
     cmd.spawn()
 }
 
+#[cfg(unix)]
 fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
     let pid = i32::try_from(raw_pid)
         .ok()
@@ -389,6 +493,41 @@ fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
     }
 }
 
+/// Windows: `tasklist`로 PID가 사라질 때까지 기다린다(unsafe FFI는 platform 모듈 밖에 두지 않는다, AGENTS 5).
+// ponytail: tasklist 한 번에 수십 ms. 대기는 업데이트 때 한 번뿐이라 OpenProcess+WaitForSingleObject로 바꾸지 않는다.
+#[cfg(windows)]
+fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let filter = format!("PID eq {raw_pid}");
+    let needle = format!("\"{raw_pid}\"");
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        let out = Command::new("tasklist")
+            .args(["/FI", &filter, "/NH", "/FO", "CSV"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .output()?;
+        if !String::from_utf8_lossy(&out.stdout).contains(&needle) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "old app did not exit; replacement aborted",
+            ));
+        }
+        thread::sleep(POLL_INTERVAL);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn wait_process_exit(_raw_pid: u32, _timeout: Duration) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 /// 현재 실행 파일을 `<state_dir>/update/relauncher`로 복사한 뒤 별도 프로세스로 띄운다.
 pub fn spawn_detached_relauncher(
     relauncher_source_exe: &Path,
@@ -401,12 +540,21 @@ pub fn spawn_detached_relauncher(
 ) -> Result<Child, Error> {
     let dir = state_dir.join(UPDATE_DIR);
     DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-    let bin = dir.join(RELAUNCHER_BIN);
+    let bin = dir.join(format!("{RELAUNCHER_BIN}{}", std::env::consts::EXE_SUFFIX));
     fs::remove_file(&bin).ok();
     fs::copy(relauncher_source_exe, &bin)?;
+    #[cfg(unix)]
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
 
     let mut cmd = Command::new(&bin);
+    // Windows: 앱 콘솔·프로세스 그룹과 분리한다(앱이 끝나도 relauncher는 남아야 한다, OWE-829).
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
     cmd.arg(RELAUNCH_ARG)
         .arg(app_bundle)
         .arg(state_dir)
@@ -547,6 +695,7 @@ pub fn offer_rollback(state_dir: PathBuf, window: &mut Window, cx: &mut App) {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

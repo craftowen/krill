@@ -3326,7 +3326,13 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
             assert_eq!(
                 s.execution_locations(cx),
                 vec![
-                    (HostId::Local, text::HOST_LOCAL.get().to_owned()),
+                    (
+                        HostId::Local,
+                        text::HOST_LOCAL
+                            .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
+                            .get()
+                            .to_owned()
+                    ),
                     (studio_id.clone(), "Mac Studio".to_owned()),
                 ]
             );
@@ -3672,7 +3678,9 @@ fn multi_host_local_and_remote_krilld_survive_remote_kill_and_auto_reconnect() {
         argv.contains("-p\n2222\n-i\n/tmp/key with spaces\n"),
         "{argv}"
     );
+    // 터널은 -N 대신 -T + 원격 `cat >/dev/null`(부모 kill -9 시 ssh 종료, linux-host 0282c391 B1).
     assert!(argv.contains("-T\n-L\n"), "{argv}");
+    assert!(argv.ends_with("cat >/dev/null\n"), "{argv}");
     assert!(argv.contains("ServerAliveInterval=15\n"), "{argv}");
     assert!(
         !argv.contains("$HOME"),

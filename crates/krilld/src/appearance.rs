@@ -5,9 +5,9 @@
 //!   첫 화면이 0.25~0.7초 늦었다).
 //! - 셀 픽셀 크기는 저장하지 않는다. 받기 전에는 `CSI 14t`에 답하지 않는다(MK-008 §2 8번: 침묵해도 지연 없음).
 
+use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
@@ -84,6 +84,7 @@ impl Appearance {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
 

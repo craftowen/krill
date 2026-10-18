@@ -24,7 +24,7 @@
 //!
 //! - krilld가 (재)기동되면 holder가 먼저 `Hello` → 보관 중인 세션마다 `Session`(+master fd) →
 //!   보관 중인 listen 소켓이 있으면 `Listener`(+fd) → `Ready`를 보낸다.
-//! - 요청(`Spawn`·`Kill`·`Release`·`HoldListener`·`UpgradeKrilld`·`UpgradeHolder`·`Adopt`·`Terminate`)에는
+//! - 요청(`Spawn`·`Kill`·`Release`·`HoldListener`·`UpgradeKrilld`·`UpgradeHolder`·`Adopt`·`Terminate`·`Resize`)에는
 //!   `Spawned`/`Done`/`Failed` 중 하나가 같은 `req`로 온다. `Exited`는 아무 때나 온다.
 //! - `UpgradeHolder`를 보낸 krilld는 답이 올 때까지 아무것도 보내지 않는다. 성공하면 새 holder 이미지가
 //!   `Hello`(새 버전) → `Done{req}`를 보낸다(세션 목록은 다시 보내지 않는다).
@@ -45,16 +45,45 @@
 //!   v2 이하 holder는 `ENOSYS`로 답하므로 krilld는 `Hello.version`이 3 이상일 때만 보낸다.
 //! - 세션 상한: holder가 보관하는 세션(끝났지만 `Release` 전인 것 포함)이 [`MAX_SESSIONS`]개면
 //!   `Spawn`은 `Failed{errno: `[`SESSION_LIMIT_ERRNO`]`}`. `Adopt`는 상한을 보지 않는다(재결합 중 세션을 잃지 않게).
+//!
+//! # v4 추가 (OWE-831, Windows `ConPTY` — docs/research/windows-spike-OWE-826.md §7)
+//!
+//! - 요청 `Resize`(kind `0x09`): 세션 PTY 크기를 바꾼다. 답은 `Done`/`Failed`. 끝난·없는 세션은 `ESRCH`.
+//!   Windows holder는 `ResizePseudoConsole`을 부른다. **Unix는 기존 경로를 유지한다**: krilld가 master fd에
+//!   직접 `TIOCSWINSZ`하고 이 요청을 보내지 않으며, Unix holder는 받더라도 `ENOSYS`로 답한다.
+//!   v3 이하 holder도 모르는 kind라 `ENOSYS`로 답하므로 krilld는 `Hello.version`이 4 이상일 때만 보낸다.
+//!   픽셀 크기는 `ConPTY`가 쓰지 않아 싣지 않는다(필요하면 body 끝에 붙인다).
+//! - Windows 핸들 값 전달: Windows에는 `SCM_RIGHTS`가 없으므로 보내는 쪽이 받는 프로세스로 핸들을
+//!   `DuplicateHandle`해 넣고(holder는 자식 krilld의 pid, krilld는 `Hello.holder_pid`로 연다) 그 값을 프레임에 싣는다.
+//!   ```text
+//!   [u32 LE len][u8 kind][u8 n][n × u64 LE 핸들 값][body]
+//!   ```
+//!   `n`은 Unix의 `fds` 자리이고 `len`은 핸들 값까지 센다. 값은 **받는 프로세스 안에서** 유효한 핸들이다.
+//!   핸들을 싣지 않는 kind(`n` = 0)는 Unix와 바이트가 같고, Unix 인코딩([`ToHolder::encode`]·[`FromHolder::encode`])은
+//!   바뀌지 않는다. Windows는 [`ToHolder::encode_handles`]·[`ToHolder::decode_handles`](와 `FromHolder`의 같은 이름)를 쓴다.
+//!   - 세션 프레임(`Session`·`Spawned`·`Adopt`): `[in, out, sig, ref, proc]` 순서. 앞 3개(`n` ≥ 3)는 필수,
+//!     `ref`(conhost 참조)·`proc`(conhost 프로세스)는 선택이다. krilld가 `sig` 사본을 쥐어야 holder만 죽어도 세션이
+//!     살고, `ref`·`proc`가 있어야 새 holder가 `Adopt`로 HPCON을 다시 묶을 수 있다(스파이크 §1·§3).
+//!   - `Listener`·`HoldListener`: 소켓 1개(`n` = 1). (OWE-832) Windows는 핸들 대신 아래 `info`를 싣는다(`n` = 0).
+//!   - 받는 쪽은 쓰지 않는 핸들과 거절한 프레임의 핸들을 닫는다([`Frame::handles`]로 kind와 무관하게 꺼낸다).
+//! - (OWE-832) body 끝 필드 두 개. 둘 다 Unix에서는 비어 있어 Unix 바이트가 v4와 같다.
+//!   - `Hello.inbox`: `[u8 1]`이면 Windows holder가 번들 `OpenConsole` 없이 kernel32 `ConPTY` 축소 모드다(질의 응답자
+//!     예외·충실도 저하, 세션이 있으면 `UpgradeHolder`를 `EBUSY`로 거절). 없으면 거짓으로 읽는다(v3·v4 피어).
+//!   - `HoldListener.info`·`Listener.info`: `WSADuplicateSocketW`가 받는 프로세스 앞으로 만든 `WSAPROTOCOL_INFOW`
+//!     바이트(`[u32 길이][바이트]`). 소켓은 `DuplicateHandle`로 넘기지 않는다. `info`가 있으면 핸들 수는 0,
+//!     없으면(Unix) fd·핸들 1개다.
 
 use std::fmt;
 
 use crate::SessionId;
 
 /// 프로토콜 버전. 동결 규칙 안에서 기능을 더하면 올린다.
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 /// "종료 코드 없음" 표시값(v2). `waitpid` 원시 상태로 -1은 하위 7비트가 `0x7f`(`WIFSTOPPED`)라
 /// 종료 상태(`WIFEXITED`·`WIFSIGNALED`)와 겹치지 않는다.
 pub const STATUS_UNKNOWN: i32 = -1;
+/// (v4, Windows) 세션 프레임(`Session`·`Spawned`·`Adopt`)에 필수인 핸들 수: `in`·`out`·`sig`.
+pub const WIN_SESSION_HANDLES: u8 = 3;
 /// (v3) holder가 보관하는 세션 수 상한. macOS 전체 PTY 한도 `kern.tty.ptmx_max`(511)의 절반(T2 §3.5).
 pub const MAX_SESSIONS: usize = 256;
 /// (v3) 세션 상한에 걸린 `Spawn`의 errno: macOS `EPROCLIM`(67, "Too many processes").
@@ -93,7 +122,8 @@ pub enum ToHolder {
     /// holder가 보관하던 master fd와 종료 상태를 버린다.
     Release { req: u32, id: SessionId },
     /// fd 1개(listen 소켓)를 맡긴다. krilld가 다시 뜨면 `Listener`로 돌려준다. 이전 것은 닫는다.
-    HoldListener { req: u32 },
+    /// (Windows) fd 대신 `info`(holder 앞 `WSAPROTOCOL_INFOW`). Unix는 비어 있다.
+    HoldListener { req: u32, info: Vec<u8> },
     /// 다음 krilld 기동부터 `path`를 실행한다. 이 요청 뒤 krilld가 끝나면 백오프 없이 바로 띄운다.
     UpgradeKrilld { req: u32, path: Vec<u8> },
     /// holder가 `path`로 exec 핸드오프한다(PID·자식·fd 유지).
@@ -102,6 +132,12 @@ pub enum ToHolder {
     Adopt { req: u32, id: SessionId, pid: u32 },
     /// (v3) 세션 프로세스 그룹과 빠져나간 후손을 SIGHUP → SIGTERM → SIGKILL 단계로 끝낸다.
     Terminate { req: u32, id: SessionId },
+    /// (v4) 세션 PTY 크기를 바꾼다. Windows 전용(Unix holder는 `ENOSYS`).
+    Resize {
+        req: u32,
+        id: SessionId,
+        size: WinSize,
+    },
 }
 
 /// holder → krilld 메시지.
@@ -110,6 +146,8 @@ pub enum FromHolder {
     Hello {
         version: u16,
         holder_pid: u32,
+        /// (Windows) kernel32 `ConPTY` 축소 모드. Unix는 늘 거짓이고 싣지 않는다.
+        inbox: bool,
     },
     /// 보관 중인 세션 하나(+master fd). `status`는 이미 끝났으면 `waitpid` 원시 상태 또는 [`STATUS_UNKNOWN`].
     Session {
@@ -117,8 +155,10 @@ pub enum FromHolder {
         pid: u32,
         status: Option<i32>,
     },
-    /// 맡겨 둔 listen 소켓(+fd).
-    Listener,
+    /// 맡겨 둔 listen 소켓(+fd). (Windows) fd 대신 `info`(krilld 앞 `WSAPROTOCOL_INFOW`).
+    Listener {
+        info: Vec<u8>,
+    },
     /// 복원 목록 끝.
     Ready,
     /// `Spawn` 성공(+master fd).
@@ -151,6 +191,7 @@ mod kind {
     pub const UPGRADE_HOLDER: u8 = 0x06;
     pub const ADOPT: u8 = 0x07;
     pub const TERMINATE: u8 = 0x08;
+    pub const RESIZE: u8 = 0x09;
     pub const HELLO: u8 = 0x81;
     pub const SESSION: u8 = 0x82;
     pub const LISTENER: u8 = 0x83;
@@ -169,7 +210,7 @@ pub enum Error {
     Truncated,
     /// 이 버전이 모르는 kind.
     UnknownKind(u8),
-    /// 프레임의 `fds`가 kind가 요구하는 수와 다르다.
+    /// 프레임의 `fds`(Windows는 핸들 수)가 kind가 요구하는 수와 다르다.
     FdCount { kind: u8, got: u8 },
     /// 잘못된 `Option` 태그.
     BadTag(u8),
@@ -195,6 +236,19 @@ pub struct Frame<'a> {
     pub kind: u8,
     pub fds: u8,
     pub body: &'a [u8],
+}
+
+impl Frame<'_> {
+    /// (v4, Windows) body 앞의 핸들 값 `fds`개와 나머지 body. kind를 몰라도 꺼낼 수 있어 거절한 프레임의 핸들도 닫을 수 있다.
+    pub fn handles(&self) -> Result<(Vec<u64>, &[u8]), Error> {
+        let (head, body) = self
+            .body
+            .split_at_checked(usize::from(self.fds) * 8)
+            .ok_or(Error::Truncated)?;
+        let mut r = Reader(head);
+        let handles = (0..self.fds).map(|_| r.u64()).collect::<Result<_, _>>()?;
+        Ok((handles, body))
+    }
 }
 
 /// `buf` 앞에서 완성된 프레임 하나와 그 전체 길이를 꺼낸다. 아직 덜 왔으면 `Ok(None)`.
@@ -225,10 +279,11 @@ pub fn request_id(body: &[u8]) -> Option<u32> {
 impl ToHolder {
     /// 이 메시지에 붙는 fd 수.
     pub fn fds(&self) -> u8 {
-        u8::from(matches!(
-            self,
-            Self::HoldListener { .. } | Self::Adopt { .. }
-        ))
+        u8::from(match self {
+            Self::HoldListener { info, .. } => info.is_empty(),
+            Self::Adopt { .. } => true,
+            _ => false,
+        })
     }
 
     pub fn req(&self) -> u32 {
@@ -236,17 +291,49 @@ impl ToHolder {
             Self::Spawn { req, .. }
             | Self::Kill { req, .. }
             | Self::Release { req, .. }
-            | Self::HoldListener { req }
+            | Self::HoldListener { req, .. }
             | Self::UpgradeKrilld { req, .. }
             | Self::UpgradeHolder { req, .. }
             | Self::Adopt { req, .. }
-            | Self::Terminate { req, .. } => *req,
+            | Self::Terminate { req, .. }
+            | Self::Resize { req, .. } => *req,
         }
     }
 
-    /// 프레임 전체를 만든다. [`MAX_FRAME`]을 넘으면 `BadLength`.
+    /// (v4, Windows) 이 메시지에 필요한 최소 핸들 수(0이면 핸들을 싣지 않는다).
+    fn min_handles(&self) -> u8 {
+        match self {
+            Self::Adopt { .. } => WIN_SESSION_HANDLES,
+            Self::HoldListener { info, .. } => u8::from(info.is_empty()),
+            _ => 0,
+        }
+    }
+
+    /// 프레임 전체를 만든다(Unix: fd는 `SCM_RIGHTS`로 따로). [`MAX_FRAME`]을 넘으면 `BadLength`.
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
+        let kind = self.write(&mut w)?;
+        w.finish(kind, self.fds())
+    }
+
+    /// (v4, Windows) 받는 프로세스에 복제해 둔 핸들 값을 body 앞에 실은 프레임.
+    pub fn encode_handles(&self, handles: &[u64]) -> Result<Vec<u8>, Error> {
+        let mut w = Writer::new();
+        let n = w.handles(handles)?;
+        let kind = self.write(&mut w)?;
+        check_handles(kind, self.min_handles(), n)?;
+        w.finish(kind, n)
+    }
+
+    /// (v4, Windows) [`encode_handles`](Self::encode_handles)로 만든 프레임을 읽는다.
+    pub fn decode_handles(f: Frame<'_>) -> Result<(Self, Vec<u64>), Error> {
+        let (handles, body) = f.handles()?;
+        let m = Self::read(f.kind, body)?;
+        check_handles(f.kind, m.min_handles(), f.fds)?;
+        Ok((m, handles))
+    }
+
+    fn write(&self, w: &mut Writer) -> Result<u8, Error> {
         w.u32(self.req());
         let kind = match self {
             Self::Spawn {
@@ -281,7 +368,10 @@ impl ToHolder {
                 w.u64(id.0);
                 kind::RELEASE
             }
-            Self::HoldListener { .. } => kind::HOLD_LISTENER,
+            Self::HoldListener { info, .. } => {
+                w.tail(info)?;
+                kind::HOLD_LISTENER
+            }
             Self::UpgradeKrilld { path, .. } => {
                 w.bytes(path)?;
                 kind::UPGRADE_KRILLD
@@ -299,14 +389,26 @@ impl ToHolder {
                 w.u64(id.0);
                 kind::TERMINATE
             }
+            Self::Resize { id, size, .. } => {
+                w.u64(id.0);
+                w.u16(size.cols);
+                w.u16(size.rows);
+                kind::RESIZE
+            }
         };
-        w.finish(kind, self.fds())
+        Ok(kind)
     }
 
     pub fn decode(f: Frame<'_>) -> Result<Self, Error> {
-        let mut r = Reader(f.body);
+        let m = Self::read(f.kind, f.body)?;
+        check_fds(f, m.fds())?;
+        Ok(m)
+    }
+
+    fn read(kind: u8, body: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader(body);
         let req = r.u32()?;
-        let m = match f.kind {
+        Ok(match kind {
             kind::SPAWN => {
                 let id = SessionId(r.u64()?);
                 let mut argv = Vec::new();
@@ -340,7 +442,10 @@ impl ToHolder {
                 req,
                 id: SessionId(r.u64()?),
             },
-            kind::HOLD_LISTENER => Self::HoldListener { req },
+            kind::HOLD_LISTENER => Self::HoldListener {
+                req,
+                info: r.tail()?,
+            },
             kind::UPGRADE_KRILLD => Self::UpgradeKrilld {
                 req,
                 path: r.bytes()?,
@@ -358,32 +463,74 @@ impl ToHolder {
                 req,
                 id: SessionId(r.u64()?),
             },
+            kind::RESIZE => Self::Resize {
+                req,
+                id: SessionId(r.u64()?),
+                size: WinSize {
+                    cols: r.u16()?,
+                    rows: r.u16()?,
+                },
+            },
             k => return Err(Error::UnknownKind(k)),
-        };
-        check_fds(f, m.fds())?;
-        Ok(m)
+        })
     }
 }
 
 impl FromHolder {
     /// 이 메시지에 붙는 fd 수.
     pub fn fds(&self) -> u8 {
-        u8::from(matches!(
-            self,
-            Self::Session { .. } | Self::Listener | Self::Spawned { .. }
-        ))
+        u8::from(match self {
+            Self::Session { .. } | Self::Spawned { .. } => true,
+            Self::Listener { info } => info.is_empty(),
+            _ => false,
+        })
     }
 
-    /// 프레임 전체를 만든다.
+    /// (v4, Windows) 이 메시지에 필요한 최소 핸들 수(0이면 핸들을 싣지 않는다).
+    fn min_handles(&self) -> u8 {
+        match self {
+            Self::Session { .. } | Self::Spawned { .. } => WIN_SESSION_HANDLES,
+            Self::Listener { info } => u8::from(info.is_empty()),
+            _ => 0,
+        }
+    }
+
+    /// 프레임 전체를 만든다(Unix: fd는 `SCM_RIGHTS`로 따로).
     pub fn encode(&self) -> Result<Vec<u8>, Error> {
         let mut w = Writer::new();
-        let kind = match self {
+        let kind = self.write(&mut w);
+        w.finish(kind, self.fds())
+    }
+
+    /// (v4, Windows) 받는 프로세스에 복제해 둔 핸들 값을 body 앞에 실은 프레임.
+    pub fn encode_handles(&self, handles: &[u64]) -> Result<Vec<u8>, Error> {
+        let mut w = Writer::new();
+        let n = w.handles(handles)?;
+        let kind = self.write(&mut w);
+        check_handles(kind, self.min_handles(), n)?;
+        w.finish(kind, n)
+    }
+
+    /// (v4, Windows) [`encode_handles`](Self::encode_handles)로 만든 프레임을 읽는다.
+    pub fn decode_handles(f: Frame<'_>) -> Result<(Self, Vec<u64>), Error> {
+        let (handles, body) = f.handles()?;
+        let m = Self::read(f.kind, body)?;
+        check_handles(f.kind, m.min_handles(), f.fds)?;
+        Ok((m, handles))
+    }
+
+    fn write(&self, w: &mut Writer) -> u8 {
+        match self {
             Self::Hello {
                 version,
                 holder_pid,
+                inbox,
             } => {
                 w.u16(*version);
                 w.u32(*holder_pid);
+                if *inbox {
+                    w.u8(1);
+                }
                 kind::HELLO
             }
             Self::Session { id, pid, status } => {
@@ -398,7 +545,11 @@ impl FromHolder {
                 }
                 kind::SESSION
             }
-            Self::Listener => kind::LISTENER,
+            Self::Listener { info } => {
+                // 에러는 MAX_FRAME 검사(finish)가 다시 잡는다.
+                w.tail(info).ok();
+                kind::LISTENER
+            }
             Self::Ready => kind::READY,
             Self::Spawned { req, id, pid } => {
                 w.u32(*req);
@@ -420,16 +571,22 @@ impl FromHolder {
                 w.i32(*errno);
                 kind::FAILED
             }
-        };
-        w.finish(kind, self.fds())
+        }
     }
 
     pub fn decode(f: Frame<'_>) -> Result<Self, Error> {
-        let mut r = Reader(f.body);
-        let m = match f.kind {
+        let m = Self::read(f.kind, f.body)?;
+        check_fds(f, m.fds())?;
+        Ok(m)
+    }
+
+    fn read(kind: u8, body: &[u8]) -> Result<Self, Error> {
+        let mut r = Reader(body);
+        Ok(match kind {
             kind::HELLO => Self::Hello {
                 version: r.u16()?,
                 holder_pid: r.u32()?,
+                inbox: r.0.first() == Some(&1),
             },
             kind::SESSION => Self::Session {
                 id: SessionId(r.u64()?),
@@ -440,7 +597,7 @@ impl FromHolder {
                     t => return Err(Error::BadTag(t)),
                 },
             },
-            kind::LISTENER => Self::Listener,
+            kind::LISTENER => Self::Listener { info: r.tail()? },
             kind::READY => Self::Ready,
             kind::SPAWNED => Self::Spawned {
                 req: r.u32()?,
@@ -457,9 +614,7 @@ impl FromHolder {
                 errno: r.i32()?,
             },
             k => return Err(Error::UnknownKind(k)),
-        };
-        check_fds(f, m.fds())?;
-        Ok(m)
+        })
     }
 }
 
@@ -471,6 +626,15 @@ fn check_fds(f: Frame<'_>, want: u8) -> Result<(), Error> {
             kind: f.kind,
             got: f.fds,
         })
+    }
+}
+
+/// (v4, Windows) 핸들을 싣지 않는 kind는 0개, 싣는 kind는 `min`개 이상.
+fn check_handles(kind: u8, min: u8, got: u8) -> Result<(), Error> {
+    if if min == 0 { got == 0 } else { got >= min } {
+        Ok(())
+    } else {
+        Err(Error::FdCount { kind, got })
     }
 }
 
@@ -499,10 +663,21 @@ impl Writer {
     fn u64(&mut self, v: u64) {
         self.0.extend_from_slice(&v.to_le_bytes());
     }
+    fn handles(&mut self, v: &[u64]) -> Result<u8, Error> {
+        let n = u8::try_from(v.len()).map_err(|_| Error::BadLength(u32::MAX))?;
+        for h in v {
+            self.u64(*h);
+        }
+        Ok(n)
+    }
     fn bytes(&mut self, v: &[u8]) -> Result<(), Error> {
         self.u32(len32(v.len())?);
         self.0.extend_from_slice(v);
         Ok(())
+    }
+    /// 끝 필드 바이트열: 비어 있으면 아무것도 쓰지 않는다(이전 버전과 바이트가 같다).
+    fn tail(&mut self, v: &[u8]) -> Result<(), Error> {
+        if v.is_empty() { Ok(()) } else { self.bytes(v) }
     }
     fn finish(mut self, kind: u8, fds: u8) -> Result<Vec<u8>, Error> {
         let n = self.0.len().saturating_sub(4);
@@ -546,6 +721,14 @@ impl Reader<'_> {
         let (head, rest) = self.0.split_at_checked(n).ok_or(Error::Truncated)?;
         self.0 = rest;
         Ok(head.to_vec())
+    }
+    /// [`Writer::tail`]의 짝: 남은 바이트가 없으면 빈 값.
+    fn tail(&mut self) -> Result<Vec<u8>, Error> {
+        if self.0.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.bytes()
+        }
     }
 }
 

@@ -1312,11 +1312,12 @@ fn render_domain_row(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
+    use krill_proto::os::net::UnixStream;
     use std::fs;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
-    use std::os::unix::net::UnixStream;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1890,7 +1891,7 @@ mod tests {
         let run_dir = fx.state_dir.join("run");
         fs::create_dir_all(&run_dir).unwrap();
         let sock_path = run_dir.join("krilld.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let listener = krill_proto::os::net::UnixListener::bind(&sock_path).unwrap();
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop_flag);
         let mock_home = fx.home.clone();
@@ -2008,7 +2009,7 @@ mod tests {
         let run_dir = fx.state_dir.join("run");
         fs::create_dir_all(&run_dir).unwrap();
         let sock_path = run_dir.join("krilld.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let listener = krill_proto::os::net::UnixListener::bind(&sock_path).unwrap();
         listener.set_nonblocking(true).unwrap();
 
         cx.update(|cx| {

@@ -1,0 +1,52 @@
+# Windows 네이티브 검사. WIN-23 통합 검증 전까지 수동 실행만 허용한다.
+name: ci-windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_NET_RETRY: 10
+
+jobs:
+  check:
+    name: check (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Preserve LF before checkout
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Rust 1.98
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --locked
+
+  build:
+    name: release app (fxc shaders)
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Preserve LF before checkout
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v4
+
+      - name: Rust 1.98
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+
+      - name: Build app and release shaders
+        run: cargo build -p krill-app --release --locked

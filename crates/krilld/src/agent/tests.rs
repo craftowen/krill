@@ -1,7 +1,7 @@
 //! MK-037: YOLO는 토글 시만, 자식 env에 내부 값 없음, preflight 안내와 실제 실행.
 
+use krill_proto::os::ffi::OsStrExt;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
 use std::process::{Command, Output, Stdio};
 
 use krill_proto::agent::Agents;

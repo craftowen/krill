@@ -1,6 +1,6 @@
 # cargo-deny 0.20.2에서 검증(docs/research/C1-final.md §3.4). 실행: cargo deny --locked check
 [graph]
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin"]
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
 all-features = false
 
 [advisories]
@@ -52,3 +52,7 @@ allow = ["CC0-1.0"]
 [[licenses.exceptions]]
 crate = "webpki-roots"      # iroh-relay · iroh-dns → n0-dns-resolver
 allow = ["CDLA-Permissive-2.0"]
+# M11 Windows 포팅(OWE-812) — 승인됨. Apple+Windows 그래프를 합치면 잡히는 오탐: dwrote는 zed-font-kit → gpui-pre-apple 경유라 실제로 빌드되지 않는다.
+[[licenses.exceptions]]
+crate = "dwrote"
+allow = ["MPL-2.0"]
