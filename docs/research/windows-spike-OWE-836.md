@@ -130,3 +130,14 @@ VM에서 직접 실행할 때는 `win_survival_e2e-*.exe --ignored --exact <테�
 - 메모리.
 - nextest 러너의 Job 안에서 holder bootstrap breakaway. 테스트 바이너리를 직접 실행했다.
 - 시나리오 2의 Gap이 29개(30이 아님)인 정확한 이유.
+
+## 후속 수정 (코디네이터, 2026-10-19)
+
+`daemon::connect`가 Windows에서 고아 krilld를 보면 새 holder를 띄우던 동작을 바꿨다: Adopt가 구현될 때까지 Windows는 고아 krilld에 그대로 붙고(`ready_handshake`), 감시 연결(`wait_closed`·`watch_for`)도 `Orphan` 통보로 깨지 않는다(깨면 같은 고아에 다시 붙는 바쁜 루프가 된다). Unix 동작은 그대로다. 재실측(같은 시나리오 3, release·비밀번호 로그온):
+
+| 모드 | 앱식 재접속 | 잔여 프로세스 | 고아 서빙 |
+|---|---|---|---|
+| inbox | 고아 krilld에 연결, 19ms | 0 | 누락 0, SHA 일치, 새 세션 `NoHolder` |
+| 번들 | 고아 krilld에 연결, 21ms | 0 | 누락 0, SHA 일치, 새 세션 `NoHolder` |
+
+`strays` 조회가 조회용 powershell 자신을 잡던 것도 제외했다(수정 전 잔여 2개 중 holder·krilld만 실제 잔여였다).
