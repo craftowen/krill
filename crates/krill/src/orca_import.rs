@@ -1079,6 +1079,10 @@ fn import_accounts_domain(
     }
 
     let mut summary = AccountsImportSummary::default();
+    // OWE-901: agy 계정은 Orca 암호화 저장소라 이관하지 않는다. 새로 로그인을 안내한다.
+    if let Some(note) = detect_agy_import_note(opts, domains) {
+        warnings.push(note);
+    }
     if planned.is_empty() {
         return summary;
     }
@@ -1307,6 +1311,46 @@ fn record_active_summary(
         ProviderKind::Codex => summary.active_codex = Some(account_id.to_owned()),
         ProviderKind::Antigravity | ProviderKind::OpenCode | ProviderKind::Gemini => {}
     }
+}
+
+/// OWE-901: Orca 쪽 agy 계정 흔적이 있으면 이관 불가 안내를 돌려준다.
+/// Orca는 agy 자격증명을 암호화 저장소에 두어 Krill이 읽을 수 없으므로,
+/// 개수만 세고 `warnings`에 "Krill에서 새로 로그인" 안내를 남긴다(스키마 변경 없음).
+fn detect_agy_import_note(
+    opts: &ImportOptions,
+    domains: &BTreeMap<String, Json>,
+) -> Option<String> {
+    let mut count = 0usize;
+    if let Some(settings) = domains.get("settings").and_then(Json::as_object) {
+        for (key, val) in settings {
+            let lower = key.to_ascii_lowercase();
+            if lower == "antigravitymanagedaccounts" || lower == "agymanagedaccounts" {
+                count += val.as_array().map_or(1, Vec::len);
+            } else if lower == "activeantigravitymanagedaccountid"
+                || lower == "activeagymanagedaccountid"
+            {
+                count += val
+                    .as_str()
+                    .map_or(0, |s| usize::from(!s.trim().is_empty()));
+            }
+        }
+    }
+    // 디스크 흔적(`antigravity-accounts` 등, claude/codex 스캔과 같은 방식).
+    for subdir in [
+        "antigravity-accounts",
+        "antigravity-profiles",
+        "agy-accounts",
+        "agy-profiles",
+    ] {
+        if let Ok(entries) = std::fs::read_dir(opts.orca_dir.join(subdir)) {
+            count += entries.filter_map(Result::ok).count();
+        }
+    }
+    (count > 0).then(|| {
+        format!(
+            "agy 계정 {count}개 감지: 이관 불가(Orca 암호화 저장소) — Krill에서 새로 로그인하십시오"
+        )
+    })
 }
 
 /// `snap.accounts`에서 이미 `accounts.toml`에 등록된(`!host_default && !profile_dir.is_empty()`)
@@ -3903,6 +3947,47 @@ mod tests {
             .unwrap();
         assert_eq!(korean.prompt, "Korean schedule 1");
 
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// OWE-901: agy 계정은 암호화 저장소라 이관하지 않고 새로 로그인을 안내한다(스키마 변경 없음).
+    #[test]
+    fn agy_import_note_reports_non_transferable_accounts() {
+        let root = std::env::temp_dir().join(format!("owe901-agy-import-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let orca_dir = root.join("orca");
+        fs::create_dir_all(&orca_dir).unwrap();
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: root.join("state"),
+            orca_dir: orca_dir.clone(),
+            domains: vec![ImportDomain::Accounts],
+            dry_run: true,
+        };
+        // 설정 흔적이 없으면 안내 없음.
+        let empty: BTreeMap<String, Json> = BTreeMap::from([(
+            "settings".to_owned(),
+            serde_json::json!({"claudeManagedAccounts": []}),
+        )]);
+        assert!(detect_agy_import_note(&opts, &empty).is_none());
+        // 배열 + 활성 id 흔적이면 개수와 함께 안내한다.
+        let domains: BTreeMap<String, Json> = BTreeMap::from([(
+            "settings".to_owned(),
+            serde_json::json!({
+                "antigravityManagedAccounts": [{"id": "a1"}, {"id": "a2"}],
+                "activeAgyManagedAccountId": "x",
+            }),
+        )]);
+        let note = detect_agy_import_note(&opts, &domains).unwrap();
+        assert!(note.contains("3개"), "{note}");
+        assert!(note.contains("이관 불가(Orca 암호화 저장소)"), "{note}");
+        assert!(note.contains("새로 로그인"), "{note}");
+        // 디스크 흔적만 있어도 안내한다.
+        fs::create_dir_all(orca_dir.join("antigravity-accounts").join("a1")).unwrap();
+        let disk_only: BTreeMap<String, Json> =
+            BTreeMap::from([("settings".to_owned(), serde_json::json!({}))]);
+        let note = detect_agy_import_note(&opts, &disk_only).unwrap();
+        assert!(note.contains("1개"), "{note}");
         fs::remove_dir_all(&root).ok();
     }
 }
