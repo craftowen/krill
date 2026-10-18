@@ -4771,3 +4771,64 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
 
     std::fs::remove_file(&tmp_file).ok();
 }
+
+/// OWE-873: 스크롤 중이면 스크롤바·맨 아래로 배지가 보이고, 배지를 누르면 바닥으로 돌아간다.
+#[gpui::test]
+fn scrolled_terminal_shows_scrollbar_and_bottom_badge(cx: &mut TestAppContext) {
+    use krill_proto::control::Cold;
+    use krill_proto::screen::{Cell, Op};
+    use std::os::unix::net::UnixStream;
+
+    fn row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    let (view, cx) = open(cx, state_path("scroll-chrome"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(3), ours, cx);
+            s.live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .show_cold(
+                    krill_proto::SessionId(3),
+                    Cold {
+                        screen: vec![Op::Reset { cols: 10, lines: 3 }],
+                        history: vec![row("h0"), row("h1")],
+                    },
+                )
+                .unwrap();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("scrollbar").is_none());
+    assert!(cx.debug_bounds("scroll-to-bottom").is_none());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert!(s.live.get_mut(&pane).unwrap().pane.scroll(1));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let badge = cx
+        .debug_bounds("scroll-to-bottom")
+        .expect("badge while scrolled");
+    assert!(cx.debug_bounds("scrollbar-thumb").is_some());
+
+    // 배지를 누르면 바닥으로 돌아가고 배지·막대가 사라진다.
+    cx.simulate_click(badge.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("scroll-to-bottom").is_none());
+    assert!(cx.debug_bounds("scrollbar").is_none());
+    let offset = cx.update(|_, cx| view.read(cx).live.get(&pane).unwrap().pane.scroll_offset());
+    assert_eq!(offset, 0);
+}
