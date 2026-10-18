@@ -425,6 +425,10 @@ pub struct AgentStatus {
     pub agent: String,
     /// 지금 상태가 된 시각(UNIX epoch 나노초, hook 이벤트면 hook 프로세스 시작 시각). 모르면 0.
     pub since_unix_ns: u64,
+    /// OWE-872: 셸이 아닌 전경 프로세스 이름. 루트 셸이거나 없으면 `None`.
+    /// [`Reply::States`] 프레임 끝 꼬리로만 오가 구버전(`Record`·v1 fixture)과 상호 호환한다.
+    #[serde(default, skip)]
+    pub foreground: Option<String>,
 }
 
 impl AgentStatus {
@@ -440,6 +444,7 @@ impl AgentStatus {
         confidence: Confidence::Low,
         agent: String::new(),
         since_unix_ns: 0,
+        foreground: None,
     };
 }
 
@@ -912,6 +917,50 @@ impl Msg for Request {
 }
 impl Msg for Reply {
     const KIND: u8 = kind::REPLY;
+
+    fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
+        if let Self::States(rows) = self {
+            let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
+            if rows.iter().any(|r| r.status.foreground.is_some()) {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(&row.status.foreground)
+                            .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            return crate::ipc::encode_frame(Self::KIND, &body);
+        }
+        crate::ipc::encode(Self::KIND, self)
+    }
+
+    fn decode(kind: u8, body: &[u8]) -> Result<Self, crate::ipc::Error> {
+        if kind == Self::KIND && body.first() == Some(&4) {
+            let (mut reply, rest) =
+                postcard::take_from_bytes::<Self>(body).map_err(crate::ipc::Error::Codec)?;
+            if !rest.is_empty()
+                && let Self::States(rows) = &mut reply
+            {
+                let mut tail = rest;
+                for row in rows {
+                    let (fg, next) = postcard::take_from_bytes::<Option<String>>(tail)
+                        .map_err(crate::ipc::Error::Codec)?;
+                    if fg
+                        .as_ref()
+                        .is_some_and(|name| name.is_empty() || name.len() > MAX_AGENT_TEXT)
+                    {
+                        return Err(crate::ipc::Error::Codec(
+                            postcard::Error::DeserializeBadEncoding,
+                        ));
+                    }
+                    row.status.foreground = fg;
+                    tail = next;
+                }
+            }
+            return Ok(reply);
+        }
+        crate::ipc::decode(Self::KIND, kind, body)
+    }
 }
 
 #[cfg(test)]

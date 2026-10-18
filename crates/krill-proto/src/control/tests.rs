@@ -111,6 +111,7 @@ fn fixtures_v1() {
                         confidence: Confidence::High,
                         agent: "claude".to_owned(),
                         since_unix_ns: 1_760_000_000_000_000_000,
+                        foreground: None,
                     },
                 },
             ])),
@@ -993,5 +994,60 @@ fn os_failure_errno_travels_in_macos_numbering() {
             "050000003103069c01",
             "macOS 와이어 바이트 불변"
         );
+    }
+}
+
+/// OWE-872: `Reply::States` 전경 프로세스 이름 꼬리는 구버전 프레임과 양방향 호환한다.
+#[test]
+fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
+    let base = vec![
+        SessionStatus {
+            session: SessionId(1),
+            status: AgentStatus::UNKNOWN,
+        },
+        SessionStatus {
+            session: SessionId(2),
+            status: AgentStatus {
+                state: AgentState::Working,
+                source: Some(Source::Hook),
+                confidence: Confidence::High,
+                agent: "claude".into(),
+                since_unix_ns: 42,
+                foreground: None,
+            },
+        },
+    ];
+    let old_frame = Reply::States(base.clone()).encode().unwrap();
+    let (kind, old_body) = read_frame(&mut old_frame.as_slice()).unwrap().unwrap();
+    assert_eq!(
+        Reply::decode(kind, &old_body).unwrap(),
+        Reply::States(base.clone())
+    );
+
+    let mut with_fg = base.clone();
+    with_fg[0].status.foreground = Some("npm".into());
+    let new_reply = Reply::States(with_fg);
+    let new_frame = new_reply.encode().unwrap();
+    let (kind, new_body) = read_frame(&mut new_frame.as_slice()).unwrap().unwrap();
+    assert!(new_body.starts_with(&old_body));
+    assert_eq!(Reply::decode(kind, &new_body).unwrap(), new_reply);
+    // 구 디코더(postcard::from_bytes)는 꼬리를 무시하고 기존 상태만 읽는다.
+    assert_eq!(
+        postcard::from_bytes::<Reply>(&new_body).unwrap(),
+        Reply::States(base)
+    );
+
+    for bad in [String::new(), "x".repeat(MAX_AGENT_TEXT + 1)] {
+        let invalid = Reply::States(vec![SessionStatus {
+            session: SessionId(1),
+            status: AgentStatus {
+                foreground: Some(bad),
+                ..AgentStatus::UNKNOWN
+            },
+        }])
+        .encode()
+        .unwrap();
+        let (kind, body) = read_frame(&mut invalid.as_slice()).unwrap().unwrap();
+        assert!(Reply::decode(kind, &body).is_err());
     }
 }

@@ -1532,19 +1532,27 @@ impl Registry {
     }
 
     fn states(&self, peer: &Peer) -> Reply {
-        let ids: Vec<_> = {
+        let sessions: Vec<_> = {
             let st = lock(&self.state);
             st.sessions
-                .keys()
-                .copied()
-                .filter(|&id| peer.scope.allows(id, &st.roots))
+                .iter()
+                .filter(|(id, _)| peer.scope.allows(**id, &st.roots))
+                .map(|(&session, e)| {
+                    let exited = st.exited.contains_key(&session) || e.session.is_closed();
+                    (session, e.pid, exited, e.session.tap())
+                })
                 .collect()
         };
         Reply::States(
-            ids.into_iter()
-                .map(|session| SessionStatus {
-                    session,
-                    status: self.status.get(session),
+            sessions
+                .into_iter()
+                .map(|(session, root, exited, tap)| {
+                    let mut status = self.status.get(session);
+                    status.foreground =
+                        status::foreground_process(root, tap.foreground(), exited, |pid| {
+                            crate::sys::process_name(pid).ok()
+                        });
+                    SessionStatus { session, status }
                 })
                 .collect(),
         )
