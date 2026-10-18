@@ -4912,3 +4912,40 @@ fn jump_palette_opens_sessionless_worktree_in_new_tab(cx: &mut TestAppContext) {
         .unwrap_or_default();
     assert_eq!(cwd, b"/repo/empty");
 }
+
+/// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 뒤에 연 것이 앞의 것을 닫는다.
+#[gpui::test]
+fn jump_and_quick_open_are_mutually_exclusive(cx: &mut TestAppContext) {
+    use std::fs;
+    let dir = std::env::temp_dir().join(format!("mk-shell-mutex-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("a.rs"), "fn a() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("palette-mutex"));
+    view.update(cx, |s, cx| {
+        s.new_folder_tab(&dir, Program::Login, cx);
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_some()));
+    assert!(cx.update(|_, cx| view.read(cx).quick_open_palette().is_none()));
+
+    // ⌘P 스캔이 끝나면 Jump는 닫히고 파일 팔레트만 남는다(파일 모드).
+    cx.simulate_keystrokes("cmd-p");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).quick_open_palette().is_some()));
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_none()));
+    assert_eq!(
+        cx.update(|_, cx| { view.read(cx).quick_open_palette().unwrap().read(cx).mode() }),
+        krill_app::jump::Mode::Files
+    );
+
+    // ⌘J를 다시 열면 파일 팔레트가 닫힌다.
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_some()));
+    assert!(cx.update(|_, cx| view.read(cx).quick_open_palette().is_none()));
+    fs::remove_dir_all(&dir).ok();
+}

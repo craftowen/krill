@@ -126,7 +126,8 @@ fn hangul_preedit_filters_and_keys_confirm(cx: &mut TestAppContext) {
     assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "한");
     assert_eq!(shown(&view, cx), [3, 1]);
 
-    cx.simulate_keystrokes("down down up down enter");
+    // OWE-862: ↑↓는 순환한다. 2행에서 down 3번은 0→1→0→1.
+    cx.simulate_keystrokes("down down down enter");
     assert_eq!(*events.borrow(), [Event::Confirm(SessionId(1))]);
     // 단일 행 입력이 위·아래를 먹지 않았다(커서·값 그대로).
     assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "한");
@@ -310,7 +311,8 @@ fn jump_palette_keyboard_navigates_vault_items_and_syncs_history_search(cx: &mut
     assert_eq!(cx.update(|_, cx| view.read(cx).matches().count()), 0);
     assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 2);
 
-    cx.simulate_keystrokes("down down up down enter");
+    // OWE-862: ↑↓는 순환한다. 2행에서 down 3번은 0→1→0→1.
+    cx.simulate_keystrokes("down down down enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 1);
     assert_eq!(events.borrow().as_slice(), &[Event::ResumeVault(1)]);
 }
@@ -433,4 +435,38 @@ fn palette_sections_and_digit_jump_emit_events(cx: &mut TestAppContext) {
         events.borrow().as_slice(),
         &[Event::Action(ActionKind::NewWorktree)]
     );
+}
+
+/// OWE-862: ↑↓ 순환(끝에서 반대쪽으로) — 위·아래 모두 감싼다.
+#[gpui::test]
+fn palette_step_wraps_around(cx: &mut TestAppContext) {
+    let (view, events, cx) = open(cx, vec![item(1, "a", false), item(2, "b", false)]);
+    // 0에서 위로 가면 마지막 행, 마지막에서 아래로 가면 첫 행.
+    cx.simulate_keystrokes("up");
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 1);
+    cx.simulate_keystrokes("down");
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 0);
+    cx.simulate_keystrokes("enter");
+    assert_eq!(*events.borrow(), [Event::Confirm(SessionId(1))]);
+}
+
+/// OWE-862: ⌘P 파일 모드는 파일용 빈 문구·플레이스홀더를 쓰고 세션만 보여준다.
+#[gpui::test]
+fn files_mode_uses_file_empty_text(cx: &mut TestAppContext) {
+    let (view, _, cx) = open(cx, vec![item(1, "src/lib.rs", false)]);
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_mode(Mode::Files, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).mode()), Mode::Files);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).empty_text()),
+        "일치하는 파일 없음"
+    );
+    // 일치 없음 → 빈 행 0개, 힌트·빈 문구 선택자가 있다.
+    cx.simulate_input("없는파일zzz");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).row_count()), 0);
+    assert!(cx.debug_bounds("jump-empty").is_some());
+    assert!(cx.debug_bounds("jump-hint").is_some());
 }

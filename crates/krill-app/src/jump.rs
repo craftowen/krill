@@ -8,8 +8,8 @@
 use std::cmp::Reverse;
 
 use gpui::{
-    Context, Entity, EventEmitter, Subscription, UniformListScrollHandle, Window, deferred, div,
-    prelude::*, px, uniform_list,
+    Context, Entity, EventEmitter, ScrollHandle, Subscription, UniformListScrollHandle, Window,
+    deferred, div, prelude::*, px, uniform_list,
 };
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
 use krill_proto::SessionId;
@@ -202,11 +202,13 @@ pub fn action_search(actions: &[ActionEntry], query: &str) -> Vec<usize> {
 }
 
 /// 팔레트 진입점별 섹션 순서(OWE-865): ⌘J는 세션부터, ⇧⌘P는 액션부터 보여준다.
+/// OWE-862: ⌘P 파일 열기는 세션 목록만 쓰고 파일용 빈 문구·플레이스홀더를 쓴다.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Mode {
     #[default]
     Jump,
     Commands,
+    Files,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,7 +223,7 @@ enum Section {
 impl Mode {
     fn sections(self) -> [Section; 5] {
         match self {
-            Mode::Jump => [
+            Mode::Jump | Mode::Files => [
                 Section::Sessions,
                 Section::Worktrees,
                 Section::Actions,
@@ -235,6 +237,21 @@ impl Mode {
                 Section::Worktrees,
                 Section::Vault,
             ],
+        }
+    }
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            Mode::Jump => text::PLACEHOLDER.get(),
+            Mode::Commands => text::PLACEHOLDER_COMMANDS.get(),
+            Mode::Files => text::PLACEHOLDER_FILES.get(),
+        }
+    }
+
+    fn empty_text(self) -> &'static str {
+        match self {
+            Mode::Files => text::EMPTY_FILES.get(),
+            Mode::Jump | Mode::Commands => text::EMPTY.get(),
         }
     }
 }
@@ -355,6 +372,9 @@ pub struct Palette {
     query: String,
     input: Entity<InputState>,
     scroll: UniformListScrollHandle,
+    worktree_scroll: ScrollHandle,
+    quick_scroll: ScrollHandle,
+    vault_scroll: ScrollHandle,
     history: Option<Entity<crate::agent_history::Panel>>,
     history_sub: Option<Subscription>,
     _observe: Subscription,
@@ -385,7 +405,7 @@ impl Palette {
                 p.recompute_entry_matches();
                 p.recompute_vault_matches();
                 p.selected = 0;
-                p.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+                p.scroll_to_top();
                 if let Some(history) = p.history.clone() {
                     let query = p.query.clone();
                     history.update(cx, |h, cx| {
@@ -420,6 +440,9 @@ impl Palette {
             query: String::new(),
             input,
             scroll: UniformListScrollHandle::new(),
+            worktree_scroll: ScrollHandle::new(),
+            quick_scroll: ScrollHandle::new(),
+            vault_scroll: ScrollHandle::new(),
             history: None,
             history_sub: None,
             _observe: observe,
@@ -621,9 +644,22 @@ impl Palette {
         if self.mode != mode {
             self.mode = mode;
             self.selected = 0;
-            self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+            self.scroll_to_top();
             cx.notify();
         }
+    }
+
+    /// OWE-862: 빈 상태 문구(⌘P 파일 모드와 그 외를 구분한다).
+    #[must_use]
+    pub fn empty_text(&self) -> &'static str {
+        self.mode.empty_text()
+    }
+
+    fn scroll_to_top(&self) {
+        self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+        self.worktree_scroll.scroll_to_item(0);
+        self.quick_scroll.scroll_to_item(0);
+        self.vault_scroll.scroll_to_item(0);
     }
 
     pub fn set_worktrees(&mut self, worktrees: Vec<WorktreeEntry>, cx: &mut Context<Self>) {
@@ -718,20 +754,33 @@ impl Palette {
         base
     }
 
+    /// OWE-862: ↑↓는 끝에서 반대쪽으로 순환하고, 고른 행이 속한
+    /// 목록(세션·워크트리·빠른 명령·볼트)을 함께 스크롤한다.
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
         let total = self.row_count();
         if total == 0 {
             self.selected = 0;
             return;
         }
-        let last = total.saturating_sub(1);
-        self.selected = self.selected.saturating_add_signed(delta).min(last);
-        if self
-            .row_at(self.selected)
-            .is_some_and(|(s, _)| s != Section::Vault)
-        {
-            self.scroll
-                .scroll_to_item(self.selected, gpui::ScrollStrategy::Center);
+        let total_isize = isize::try_from(total).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.selected).unwrap_or(0);
+        let wrapped = current.saturating_add(delta).rem_euclid(total_isize);
+        self.selected = usize::try_from(wrapped).unwrap_or(0);
+        match self.row_at(self.selected) {
+            Some((Section::Sessions, pos)) => {
+                self.scroll
+                    .scroll_to_item(pos, gpui::ScrollStrategy::Center);
+            }
+            Some((Section::Worktrees, pos)) => {
+                self.worktree_scroll.scroll_to_item(pos);
+            }
+            Some((Section::QuickCommands, pos)) => {
+                self.quick_scroll.scroll_to_item(pos);
+            }
+            Some((Section::Vault, pos)) => {
+                self.vault_scroll.scroll_to_item(pos);
+            }
+            Some((Section::Actions, _)) | None => {}
         }
         cx.notify();
     }
@@ -816,10 +865,7 @@ impl Render for Palette {
         if self.language != crate::i18n::language() || self.placeholder_mode != self.mode {
             self.language = crate::i18n::language();
             self.placeholder_mode = self.mode;
-            let holder = match self.mode {
-                Mode::Jump => text::PLACEHOLDER.get(),
-                Mode::Commands => text::PLACEHOLDER_COMMANDS.get(),
-            };
+            let holder = self.mode.placeholder();
             self.input.update(cx, |input, cx| {
                 input.set_placeholder(holder, window, cx);
             });
@@ -943,6 +989,7 @@ impl Render for Palette {
                         .flex_col()
                         .max_h(px(ROW_HEIGHT * 6.))
                         .overflow_y_scroll()
+                        .track_scroll(&self.worktree_scroll)
                         .children(worktree_rows),
                 )
         });
@@ -1029,6 +1076,7 @@ impl Render for Palette {
                         .flex_col()
                         .max_h(px(ROW_HEIGHT * 6.))
                         .overflow_y_scroll()
+                        .track_scroll(&self.quick_scroll)
                         .children(quick_rows),
                 )
         });
@@ -1124,6 +1172,7 @@ impl Render for Palette {
                 .gap_1()
                 .max_h(px(ROW_HEIGHT * 6.))
                 .overflow_y_scroll()
+                .track_scroll(&self.vault_scroll)
                 .text_size(crate::ui::TEXT_XS);
             // 볼트 행의 절대 번호(워크트리·액션·빠른 명령이 앞에 올 수 있다).
             let vault_base = self.section_base(Section::Vault);
@@ -1193,6 +1242,30 @@ impl Render for Palette {
                 .child(rows_div)
         });
 
+        // OWE-862: 콘텐츠 높이에 맞춘 상단 플로팅 모달. 전체 높이는 max-h로 묶고,
+        // 하단 힌트(↑↓ 이동·Enter 열기·Esc 닫기)를 고정한다.
+        let hint_item = |keys: &str, label: &str| {
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(crate::ui::keycap(pal, keys))
+                .child(div().child(label.to_owned()))
+        };
+        let hint = div()
+            .id("jump-hint")
+            .debug_selector(|| "jump-hint".into())
+            .flex()
+            .items_center()
+            .gap_3()
+            .pt_1p5()
+            .border_t_1()
+            .border_color(border)
+            .text_size(crate::ui::TEXT_XS)
+            .text_color(muted)
+            .child(hint_item("↑↓", text::HINT_MOVE.get()))
+            .child(hint_item("Enter", text::HINT_OPEN.get()))
+            .child(hint_item("Esc", text::HINT_CLOSE.get()));
         // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc 처리를 대신한다.
         let mut palette = div()
             .w(crate::ui::COMMAND_PALETTE_WIDTH)
@@ -1206,6 +1279,7 @@ impl Render for Palette {
             .border_color(border)
             .rounded(crate::ui::RADIUS_LG)
             .shadow_lg()
+            .max_h(px(480.))
             .capture_action(cx.listener(|p, _: &MoveUp, _, cx| {
                 cx.stop_propagation();
                 p.step(-1, cx);
@@ -1227,13 +1301,15 @@ impl Render for Palette {
         if self.row_count() == 0 {
             palette = palette.child(
                 div()
+                    .id("jump-empty")
+                    .debug_selector(|| "jump-empty".into())
                     .p_2()
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(muted)
-                    .child(text::EMPTY.get()),
+                    .child(self.mode.empty_text()),
             );
         }
-        // OWE-865: ⇧⌘P 명령 팔레트에서는 액션부터, ⌘J에서는 세션부터 보여준다.
+        // OWE-865: ⇧⌘P 명령 팔레트에서는 액션부터, ⌘J·⌘P에서는 세션부터 보여준다.
         match self.mode {
             Mode::Commands => {
                 palette = palette
@@ -1243,7 +1319,7 @@ impl Render for Palette {
                     .children(worktree_section)
                     .children(vault_section);
             }
-            Mode::Jump => {
+            Mode::Jump | Mode::Files => {
                 palette = palette
                     .child(list)
                     .children(worktree_section)
@@ -1252,6 +1328,7 @@ impl Render for Palette {
                     .children(vault_section);
             }
         }
+        palette = palette.child(hint);
         deferred(
             div()
                 .absolute()
@@ -1261,6 +1338,7 @@ impl Render for Palette {
                 .flex()
                 .justify_center()
                 .pt(px(80.))
+                .bg(crate::ui::MODAL_BACKDROP)
                 .child(palette),
         )
     }
