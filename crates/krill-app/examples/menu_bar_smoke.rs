@@ -53,6 +53,7 @@ fn main() -> ExitCode {
             return;
         };
         probe.set_title("MK-087 재현");
+        #[cfg_attr(windows, expect(clippy::drop_non_drop, reason = "Windows 스텁 StatusItem은 Drop이 없다"))]
         drop(probe);
         let state = Arc::new(Mutex::new(AgentState::Working));
         menu_bar::init(Arc::new(Memory(state.clone())), |_, _| {}, cx);
