@@ -37,7 +37,7 @@ pub fn base64(bytes: &[u8], url: bool) -> String {
 }
 
 /// 요청 하나만 읽는다. body·pipelining은 처리하지 않는다. 정적 에셋은 MK-125가 이 라우터에 등록한다.
-pub fn upgrade(stream: &mut TcpStream) -> io::Result<bool> {
+pub fn upgrade(stream: &mut TcpStream, allowed_origin: Option<&str>) -> io::Result<bool> {
     let mut bytes = Vec::new();
     while !bytes.ends_with(b"\r\n\r\n") {
         if bytes.len() >= 8192 {
@@ -53,12 +53,8 @@ pub fn upgrade(stream: &mut TcpStream) -> io::Result<bool> {
     if request.next() != Some("GET") {
         return Err(invalid());
     }
-    let path = request
-        .next()
-        .ok_or_else(invalid)?
-        .split('?')
-        .next()
-        .ok_or_else(invalid)?;
+    let target = request.next().ok_or_else(invalid)?;
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
     if request.next() != Some("HTTP/1.1") || request.next().is_some() {
         return Err(invalid());
     }
@@ -79,6 +75,16 @@ pub fn upgrade(stream: &mut TcpStream) -> io::Result<bool> {
         super::pwa::serve(stream, path, gzip)?;
         return Ok(false);
     }
+    if query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .any(|(name, value)| name == "v" && value != super::pwa::asset_hash())
+    {
+        stream.write_all(
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(false);
+    }
     if !headers
         .get("upgrade")
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
@@ -92,6 +98,7 @@ pub fn upgrade(stream: &mut TcpStream) -> io::Result<bool> {
     }
     let host = headers.get("host").ok_or_else(invalid)?;
     if let Some(origin) = headers.get("origin")
+        && Some(*origin) != allowed_origin
         && *origin != format!("http://{host}")
         && *origin != format!("https://{host}")
     {
@@ -219,6 +226,54 @@ mod tests {
         assert_eq!(
             read(&mut [0x82, 0x82, 1, 2, 3, 4, b'a' ^ 1, b'b' ^ 2].as_slice()).unwrap(),
             (BINARY, b"ab".to_vec())
+        );
+    }
+    fn handshake(origin: &str, allowed: Option<&str>, query: &str) -> (io::Result<bool>, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        write!(client, "GET /ws{query} HTTP/1.1\r\nHost: tunnel.test\r\nOrigin: {origin}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
+        let result = upgrade(&mut server, allowed);
+        drop(server);
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        (result, response)
+    }
+    #[test]
+    fn fixed_origin_is_opt_in_and_same_origin_is_preserved() {
+        let origin = "https://krill-mobile.pages.dev";
+        assert!(handshake(origin, None, "").0.is_err());
+        assert!(handshake("https://evil.test", Some(origin), "").0.is_err());
+        assert!(
+            handshake(&format!("{origin}.evil.test"), Some(origin), "")
+                .0
+                .is_err()
+        );
+        for own in ["http://tunnel.test", "https://tunnel.test"] {
+            assert!(handshake(own, None, "").0.unwrap());
+        }
+        let (result, response) = handshake(
+            origin,
+            Some(origin),
+            &format!("?v={}", super::super::pwa::asset_hash()),
+        );
+        assert!(result.unwrap());
+        assert!(response.starts_with("HTTP/1.1 101"));
+    }
+    #[test]
+    fn different_asset_version_returns_empty_409() {
+        for query in ["?v=old", "?other=1&v=", "?v=old&v=older"] {
+            let (result, response) = handshake("https://tunnel.test", None, query);
+            assert!(!result.unwrap());
+            assert_eq!(
+                response,
+                "HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+        assert!(
+            handshake("https://tunnel.test", None, "?other=1")
+                .0
+                .unwrap()
         );
     }
     proptest::proptest! {

@@ -19,7 +19,7 @@ fn start() -> (Arc<Registry>, Arc<Gateway>) {
     let r = Arc::new(Registry::new(None, None));
     r.start_mobile(hello()).unwrap();
     lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
-        super::super::tunnel::Tunnel::fixture;
+        Some(super::super::tunnel::Tunnel::fixture);
     let gateway = Arc::clone(r.mobile_gateway().unwrap());
     (r, gateway)
 }
@@ -32,7 +32,8 @@ fn offer(g: &Gateway) -> (u16, krill_proto::mobile::PairingTicket) {
     let MobileReply::PairingOffer { port, url, .. } = reply else {
         panic!("no offer");
     };
-    assert!(url.contains("#key="));
+    assert!(url.contains("#pair="));
+    assert!(url.contains("&key="));
     let t = lock(&g.shared.state)
         .devices
         .ticket(now_ms())
@@ -508,7 +509,7 @@ fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
     ));
     r.start_mobile(hello()).unwrap();
     lock(&r.mobile_gateway().unwrap().shared.state).tunnel_start =
-        super::super::tunnel::Tunnel::fixture;
+        Some(super::super::tunnel::Tunnel::fixture);
     let g = Arc::clone(r.mobile_gateway().unwrap());
     let (mut desktop, server) = UnixStream::pair().unwrap();
     desktop
@@ -753,4 +754,149 @@ fn idle_authenticated_socket_is_pinged_then_closed_without_pong() {
         }
     }
     until(|| lock(&g.shared.state).connections.is_empty());
+}
+
+#[test]
+fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
+    let (_registry, gateway) = start();
+    let (port, ticket) = offer(&gateway);
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.tunnel = Some(super::super::tunnel::Tunnel::fixed_fixture(port).unwrap());
+        state.publication.origin = "https://stage.test".into();
+    }
+    let state = lock(&gateway.shared.state);
+    let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
+        panic!("페어링 응답 없음");
+    };
+    assert_eq!(
+        url,
+        format!(
+            "https://stage.test/m/{}/#pair={}&key={}&t=fixture-mobile.trycloudflare.com&r={}",
+            super::super::pwa::asset_hash(),
+            hex(&ticket.token),
+            ws::base64(&ticket.secret, true),
+            state.publication.rid
+        )
+    );
+    drop(state);
+    assert_eq!(
+        gateway.deep_link(krill_proto::SessionId(7)).unwrap(),
+        format!(
+            "https://stage.test/m/{}/?session=7",
+            super::super::pwa::asset_hash()
+        )
+    );
+    let mut state = lock(&gateway.shared.state);
+    state.tunnel = Some(super::super::tunnel::Tunnel::fixture(port).unwrap());
+    for mode in [
+        ConnectMode::Tunnel,
+        ConnectMode::Lan,
+        ConnectMode::Tailscale,
+    ] {
+        state.mode = mode;
+        let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
+            panic!("페어링 응답 없음");
+        };
+        assert!(url.contains("/#pair="));
+        assert!(url.contains("&key="));
+        assert!(!url.contains("?pair="));
+        assert!(!url.contains("&r="));
+    }
+    state.mode = ConnectMode::Tunnel;
+    // 준비 확인 전 터널은 고정 출처를 쓰지 않고 찍힌 터널 URL로 강등한다.
+    state.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
+    let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
+        panic!("페어링 응답 없음");
+    };
+    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
+    state.tunnel = None;
+    assert!(pairing_offer(&state, now_ms()).is_err());
+}
+#[test]
+fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("mk-mobile-migrate-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    // 열거형의 실제 직렬화 표기를 사용해 구버전 파일을 만든다.
+    let legacy = serde_json::json!({"mode":ConnectMode::Tunnel,"custom":null});
+    super::super::devices::write_private(
+        &dir.join(INTENT_FILE),
+        &serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    let first = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(first.mode, ConnectMode::Tunnel);
+    assert_eq!(first.rid.len(), 32);
+    assert_eq!(first.key.len(), 64);
+    let gateway = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
+    gateway.request(MobileRequest::SetConnectMode {
+        mode: ConnectMode::Lan,
+        custom_address: None,
+    });
+    drop(gateway);
+    let second = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(second.mode, ConnectMode::Lan);
+    assert_eq!((first.rid, first.key), (second.rid, second.key));
+    assert_eq!(
+        std::fs::metadata(dir.join(INTENT_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn mint_waits_for_pending_download_without_holding_state_lock() {
+    fn downloading(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "cloudflared 내려받는 중",
+        ))
+    }
+    let (_registry, gateway) = start();
+    lock(&gateway.shared.state).tunnel_start = Some(downloading);
+    let worker_gateway = Arc::clone(&gateway);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        send.send(worker_gateway.request(MobileRequest::MintPairingTicket {
+            mode: ConnectMode::Tunnel,
+            custom_address: None,
+            rotate: true,
+        }))
+        .unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while lock(&gateway.shared.state)
+        .devices
+        .ticket(now_ms())
+        .is_none()
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        lock(&gateway.shared.state)
+            .devices
+            .ticket(now_ms())
+            .is_some()
+    );
+    assert!(receive.try_recv().is_err());
+    {
+        let mut state = lock(&gateway.shared.state);
+        assert!(state.tunnel.is_none());
+        assert_eq!(state.tunnel_failures, 0);
+        state.tunnel_start = Some(super::super::tunnel::Tunnel::fixture);
+        reconcile(&mut state, now_ms()).unwrap();
+    }
+    gateway.shared.changed.notify_all();
+    assert!(matches!(
+        receive.recv_timeout(Duration::from_secs(5)).unwrap(),
+        MobileReply::PairingOffer { .. }
+    ));
+    worker.join().unwrap();
 }
