@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 use krill_proto::control::Reply;
 use krill_proto::git::{ChangedFile, Changes, MAX_FILES, MAX_PATH_BYTES, Numstat};
 
+use crate::child::nonblocking;
+
 use super::GitQueue;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -267,12 +269,6 @@ fn interrupted(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
     if Instant::now() >= deadline {
         return Err("git query timed out".to_owned());
     }
-    Ok(())
-}
-
-fn nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
     Ok(())
 }
 
