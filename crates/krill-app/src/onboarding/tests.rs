@@ -284,6 +284,7 @@ fn wait_for_file(cx: &mut VisualTestContext, path: &Path, mut done: impl FnMut()
 fn open<'a>(cx: &'a mut TestAppContext, env: &Env) -> &'a mut VisualTestContext {
     // 마법사는 gpui-component 버튼을 쓴다(앱은 시작 때 초기화한다).
     cx.update(gpui_component::init);
+    cx.update(register_test_window_host);
     let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
     let env = env.clone();
     cx.update(|window, cx| offer(env, window, cx));
@@ -323,6 +324,7 @@ fn wait_survey(cx: &mut VisualTestContext) {
 /// 설정 점검 화면(재진입)을 열고 점검 목록을 기다린다.
 fn open_checks_screen<'a>(cx: &'a mut TestAppContext, env: &Env) -> &'a mut VisualTestContext {
     cx.update(gpui_component::init);
+    cx.update(register_test_window_host);
     let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
     let env = env.clone();
     cx.update(|_, cx| open_checks(&env, cx));
@@ -330,6 +332,11 @@ fn open_checks_screen<'a>(cx: &'a mut TestAppContext, env: &Env) -> &'a mut Visu
     wait_checks(cx);
     wait_survey(cx);
     cx
+}
+
+/// OWE-903 테스트 호스트 진입점. 실구현은 [`super::register_test_window_host`]다.
+fn register_test_host(cx: &mut gpui::App) {
+    register_test_window_host(cx);
 }
 
 // OWE-714: 첫 실행은 1장이다. 체크리스트 없이 동의 + 기본 에이전트 + [시작하기]로 끝난다.
@@ -377,16 +384,22 @@ fn wizard_first_run_is_one_page_and_start_completes(cx: &mut TestAppContext) {
     assert!(wizard_window(cx).is_none());
 }
 
-// OWE-714 (8): 창은 680×620 고정이고 크기 조절·최소화가 없다.
+// OWE-903: 온보딩은 별도 OS 창 대신 메인 창 안 중앙 모달(넓은 모달 규격)로 뜬다.
 #[gpui::test]
-fn wizard_window_is_fixed_size(cx: &mut TestAppContext) {
-    let options = cx.update(|cx| welcome::window_options(cx));
-    assert!(!options.is_resizable, "zoom/resize must be off");
-    assert!(!options.is_minimizable);
-    let Some(gpui::WindowBounds::Windowed(bounds)) = options.window_bounds else {
-        panic!("windowed bounds expected");
-    };
-    assert_eq!(bounds.size, gpui::size(gpui::px(680.), gpui::px(620.)));
+fn wizard_renders_as_in_window_modal_with_settings_modal_width(cx: &mut TestAppContext) {
+    let f = fake("wizard-modal");
+    let cx = open_checks_screen(cx, &f.env);
+    let w = wizard_window(cx).expect("wizard window");
+    let mut wcx = VisualTestContext::from_window(w.into(), &cx.cx);
+    wcx.simulate_resize(gpui::size(gpui::px(1200.), gpui::px(900.)));
+    wcx.run_until_parked();
+    let card = wcx.debug_bounds("onboarding-wizard").expect("modal card");
+    assert!(
+        (f32::from(card.size.width) - f32::from(crate::ui::SETTINGS_MODAL_WIDTH)).abs() < 1.,
+        "modal card must use SETTINGS_MODAL_WIDTH: {card:?}"
+    );
+    // 가짜 타이틀바는 그리지 않는다(메인 창의 것을 쓴다).
+    assert!(wcx.debug_bounds("onboarding-titlebar").is_none());
 }
 
 // OWE-861: 점검 창(온보딩 마법사)은 ⌘W로 닫힌다(Esc·⌥⌘W와 별개 경로).
@@ -1115,6 +1128,7 @@ fn fail_check(id: &str) -> Check {
 fn checks_window_is_single_instance(cx: &mut TestAppContext) {
     let f = fake("checks-single");
     cx.update(gpui_component::init);
+    cx.update(register_test_host);
     cx.update(|cx| open_checks(&f.env, cx));
     cx.run_until_parked();
     cx.update(|cx| open_checks(&f.env, cx));
@@ -1131,6 +1145,7 @@ fn checks_window_is_single_instance(cx: &mut TestAppContext) {
 fn rerun_restarts_wizard_from_consent(cx: &mut TestAppContext) {
     let f = fake("checks-rerun");
     cx.update(gpui_component::init);
+    cx.update(register_test_host);
     cx.update(|cx| open_checks(&f.env, cx));
     cx.run_until_parked();
     let step = cx.update(|cx| {
@@ -1443,6 +1458,7 @@ fn app_location_fail_is_required_blocker() {
 fn wizard_entries_share_single_window(cx: &mut TestAppContext) {
     let f = fake("entries-single");
     cx.update(gpui_component::init);
+    cx.update(register_test_host);
     cx.update(|cx| open_checks(&f.env, cx));
     cx.run_until_parked();
     cx.update(|cx| open_checks(&f.env, cx));

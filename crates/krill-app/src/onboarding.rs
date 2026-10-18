@@ -353,12 +353,79 @@ pub(super) fn clip(diff: &str, agent_id: &str) -> String {
     shown
 }
 
-/// 첫 실행 진입. 동의가 필요하면 첫 화면 1장(동의 + 기본 에이전트 + [시작하기])을 열고,
+/// 메인 창(`Shell`)이 온보딩 모달을 인앱으로 열 때 쓰는 명령(OWE-903).
+/// 별도 OS 창을 띄우지 않고 메인 창 안 `ui::modal_backdrop` 모달로 연다.
+#[derive(Clone, Debug)]
+pub enum HostCommand {
+    /// 온보딩 모달을 연다. 이미 열려 있으면 앞으로 가져온다(상태는 유지).
+    Open {
+        env: Env,
+        start: state::Step,
+        consent_only: bool,
+    },
+    /// 온보딩을 1단계부터 다시 실행한다. 열려 있으면 동의부터 다시 시작한다.
+    Rerun { env: Env },
+}
+
+type HostHandler = std::rc::Rc<dyn Fn(&HostCommand, &mut App) -> Option<bool>>;
+
+struct HostRegistry {
+    handlers: Vec<HostHandler>,
+}
+
+impl gpui::Global for HostRegistry {}
+
+/// 메인 창(`Shell`)을 온보딩 모달 호스트로 등록한다.
+/// 콜백은 호스트 엔티티가 이미 해제됐으면 `None`, 이 창이 처리했으면 `Some(true)`,
+/// 건너뛰면 `Some(false)`를 돌려준다.
+pub fn register_host(
+    cx: &mut App,
+    handler: impl Fn(&HostCommand, &mut App) -> Option<bool> + 'static,
+) {
+    let handler: HostHandler = std::rc::Rc::new(handler);
+    if cx.has_global::<HostRegistry>() {
+        cx.global_mut::<HostRegistry>().handlers.push(handler);
+    } else {
+        cx.set_global(HostRegistry {
+            handlers: vec![handler],
+        });
+    }
+}
+
+fn dispatch_host(cmd: &HostCommand, cx: &mut App) -> bool {
+    let Some(mut handlers) = cx.try_global::<HostRegistry>().map(|r| r.handlers.clone()) else {
+        return false;
+    };
+    let mut handled = false;
+    let mut i = handlers.len();
+    while i > 0 {
+        i -= 1;
+        match handlers[i](cmd, cx) {
+            Some(true) => {
+                handled = true;
+                break;
+            }
+            Some(false) => {}
+            None => {
+                handlers.remove(i);
+            }
+        }
+    }
+    if cx.has_global::<HostRegistry>() {
+        cx.global_mut::<HostRegistry>().handlers = handlers;
+    }
+    handled
+}
+
+/// 첫 실행 진입. 동의가 필요하면 첫 화면 1장(동의 + 기본 에이전트 + [시작하기]) 모달을 열고,
 /// 동의가 최신이면 창 없이 비번들 스테이징 바이너리만 최신 빌드로 갱신한다.
 ///
 /// 이미 완료한 사용자(`onboarding.toml` completed 또는 구 `done` 파일)에게 다시 동의가
 /// 필요하면 동의만 묻는다(`consent_only`, MK-127). 구 4단계 흐름 중간(점검·연결·완료)에서
 /// 멈춘 사용자는 동의가 이미 있으므로 완료로 넘긴다(OWE-714: 체크리스트는 설정 점검에서만).
+///
+/// 첫 실행 때는 메인 창이 먼저 떠 있고 그 안에 모달이 뜨므로(`main.rs`가 창을 먼저 만든다),
+/// 별도 OS 창은 띄우지 않는다(OWE-903).
 pub fn offer(env: Env, _window: &mut Window, cx: &mut App) {
     let stored = state::load(&env.state);
     if !consent::needs_consent(&env.state) {
@@ -372,10 +439,16 @@ pub fn offer(env: Env, _window: &mut Window, cx: &mut App) {
         }
         return;
     }
-    if find_wizard(cx).is_some() {
-        return;
+    if !dispatch_host(
+        &HostCommand::Open {
+            env,
+            start: state::Step::Consent,
+            consent_only: stored.completed,
+        },
+        cx,
+    ) {
+        tracing::warn!("onboarding modal host missing; ignoring offer");
     }
-    welcome::open(&env, state::Step::Consent, stored.completed, cx);
 }
 
 /// 메뉴·팔레트 액션을 등록한다. 앱 시작 때 한 번 부른다.
@@ -403,35 +476,92 @@ pub fn open_checks_current(cx: &mut App) {
     }
 }
 
-/// 점검 창(체크리스트 단독, 동의 생략)을 연다. 이미 열려 있으면 앞으로 가져온다.
+/// 점검 모달(체크리스트 단독, 동의 생략)을 연다. 이미 열려 있으면 앞으로 가져온다.
 pub fn open_checks(env: &Env, cx: &mut App) {
-    if let Some(handle) = find_wizard(cx) {
-        handle
-            .update(cx, |_, window, _| window.activate_window())
-            .ok();
-        return;
+    if !dispatch_host(
+        &HostCommand::Open {
+            env: env.clone(),
+            start: state::Step::Checklist,
+            consent_only: false,
+        },
+        cx,
+    ) {
+        tracing::warn!("onboarding modal host missing; ignoring open_checks");
     }
-    welcome::open(env, state::Step::Checklist, false, cx);
 }
 
-/// 온보딩을 1단계부터 다시 실행한다. 창이 열려 있으면 앞으로 가져와 동의부터 다시 시작한다.
+/// 온보딩을 1단계부터 다시 실행한다. 모달이 열려 있으면 앞으로 가져와 동의부터 다시 시작한다.
 pub fn rerun_onboarding(env: &Env, cx: &mut App) {
-    if let Some(handle) = find_wizard(cx) {
-        handle
-            .update(cx, |view, window, cx| {
-                view.restart_to_consent(cx);
-                window.activate_window();
-            })
-            .ok();
-        return;
+    if !dispatch_host(&HostCommand::Rerun { env: env.clone() }, cx) {
+        tracing::warn!("onboarding modal host missing; ignoring rerun_onboarding");
     }
-    welcome::open(env, state::Step::Consent, false, cx);
 }
 
-fn find_wizard(cx: &App) -> Option<gpui::WindowHandle<welcome::Wizard>> {
-    cx.windows()
-        .into_iter()
-        .find_map(|w| w.downcast::<welcome::Wizard>())
+/// 테스트용 창 호스트(OWE-903). 프로덕션 `Shell` 대신 마법사를 별도 창 루트로 열어
+/// 기존 창 단위 테스트 헬퍼를 그대로 쓴다. 닫기 이벤트를 받으면 창을 닫는다.
+#[cfg(test)]
+pub(crate) fn register_test_window_host(cx: &mut App) {
+    use gpui::AppContext as _;
+
+    struct TestHostSubs {
+        subs: Vec<gpui::Subscription>,
+    }
+
+    impl gpui::Global for TestHostSubs {}
+
+    if cx.has_global::<TestHostSubs>() {
+        return;
+    }
+    cx.set_global(TestHostSubs { subs: Vec::new() });
+    register_host(cx, |cmd, cx| {
+        if let Some(w) = cx
+            .windows()
+            .into_iter()
+            .find_map(|w| w.downcast::<welcome::Wizard>())
+        {
+            match cmd {
+                HostCommand::Open { .. } => {
+                    w.update(cx, |_, window, _| window.activate_window()).ok();
+                    return Some(true);
+                }
+                HostCommand::Rerun { .. } => {
+                    w.update(cx, |view, window, cx| {
+                        view.restart_to_consent(cx);
+                        window.activate_window();
+                    })
+                    .ok();
+                    return Some(true);
+                }
+            }
+        }
+        let (env, start, consent_only) = match cmd {
+            HostCommand::Open {
+                env,
+                start,
+                consent_only,
+            } => (env.clone(), *start, *consent_only),
+            HostCommand::Rerun { env } => (env.clone(), state::Step::Consent, false),
+        };
+        let opened = cx.open_window(gpui::WindowOptions::default(), |window, cx| {
+            let view = cx.new(|cx| welcome::Wizard::new(env, start, consent_only, cx));
+            let handle = window.window_handle();
+            let sub = cx.subscribe(&view, move |_, _: &welcome::Event, cx| {
+                handle
+                    .update(cx, |_, window, _| window.remove_window())
+                    .ok();
+            });
+            cx.global_mut::<TestHostSubs>().subs.push(sub);
+            view.update(cx, |w, cx| {
+                w.mount_consent(cx);
+                w.observe_activation(window, cx);
+                w.begin_collect(cx);
+            });
+            let focus = view.read(cx).focus_handle();
+            window.focus(&focus, cx);
+            view
+        });
+        Some(opened.is_ok())
+    });
 }
 
 /// 마지막 점검 스냅샷(설정 섹션·상태바가 읽는다). 마법사 재검사·빠른 점검이 갱신한다.
@@ -1003,7 +1133,7 @@ pub mod actions;
 pub mod banner;
 pub mod consent;
 pub mod state;
-mod welcome;
+pub mod welcome;
 
 #[cfg(test)]
 mod tests;
