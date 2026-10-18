@@ -1,3 +1,5 @@
+// Minikrill 변경(OWE-779, Apache-2.0 §4(b)): Polychrome(4B/px) 기본 아틀라스 크기를 512×512(1MiB)로 잡아
+// 작은 이미지/SVG 한 장에 4MiB(1024×1024) 텍스처가 잡히지 않게 한다.
 use anyhow::{Context as _, Result};
 use derive_more::{Deref, DerefMut};
 use etagere::BucketedAtlasAllocator;
@@ -126,16 +128,26 @@ impl MetalAtlasTextures {
         min_size: Size<DevicePixels>,
         kind: AtlasTextureKind,
     ) -> &mut MetalAtlasTexture {
-        const DEFAULT_ATLAS_SIZE: Size<DevicePixels> = Size {
+        const DEFAULT_MONOCHROME_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
+        };
+        // Minikrill 변경(OWE-779): BGRA 4B/px는 512×512가 Monochrome 1024×1024와 같은 1MiB다.
+        const DEFAULT_POLYCHROME_SIZE: Size<DevicePixels> = Size {
+            width: DevicePixels(512),
+            height: DevicePixels(512),
         };
         // Max texture size on all modern Apple GPUs. Anything bigger than that crashes in validateWithDevice.
         const MAX_ATLAS_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(16384),
             height: DevicePixels(16384),
         };
-        let size = min_size.min(&MAX_ATLAS_SIZE).max(&DEFAULT_ATLAS_SIZE);
+        let default_size = match kind {
+            AtlasTextureKind::Monochrome => DEFAULT_MONOCHROME_SIZE,
+            AtlasTextureKind::Polychrome => DEFAULT_POLYCHROME_SIZE,
+            AtlasTextureKind::Subpixel => unreachable!(),
+        };
+        let size = min_size.min(&MAX_ATLAS_SIZE).max(&default_size);
         let texture_descriptor = metal::TextureDescriptor::new();
         texture_descriptor.set_width(size.width.into());
         texture_descriptor.set_height(size.height.into());
