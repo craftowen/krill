@@ -14,12 +14,18 @@ use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 
 use super::theme::{
-    FONT_MONO, MODAL_BACKDROP, Palette, RADIUS_MD, RADIUS_SM, RADIUS_XS, TEXT_2XS, TEXT_SM, TEXT_XS,
+    FONT_MONO, MODAL_BACKDROP, Palette, RADIUS_MD, RADIUS_SM, RADIUS_XS, SWITCH_HEIGHT,
+    SWITCH_THUMB, SWITCH_WIDTH, TEXT_2XS, TEXT_SM, TEXT_XS,
 };
 
 /// 테두리 있는 카드(섹션·그룹 내용 묶음, Orca `Card` / `Inset hairline` 대응).
+///
+/// `w_full().min_w_0()`을 기본 포함해 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에
+/// 부모 폭 밖으로 넘치지 않게 한다(OWE-793).
 pub fn card(p: &Palette) -> Div {
     div()
+        .w_full()
+        .min_w_0()
         .p_3()
         .rounded(RADIUS_MD)
         .bg(p.card)
@@ -32,12 +38,38 @@ pub fn row(p: &Palette) -> Div {
     card(p).flex().items_center().justify_between().gap_3()
 }
 
+/// [`label`]의 선택 설명 인자 변환 트레이트.
+///
+/// `Option<&'static str>`(`None` 또는 `Some("...")`)과 동적 문자열(`String`, `SharedString`)을
+/// 모두 받아 정적 설정 행과 동적 목록 행(스킬 카드 등)이 같은 2열 라벨 프리미티브를 쓰게 한다(OWE-793).
+pub trait LabelDesc {
+    fn into_label_desc(self) -> Option<SharedString>;
+}
+
+impl LabelDesc for Option<&'static str> {
+    fn into_label_desc(self) -> Option<SharedString> {
+        self.map(SharedString::from)
+    }
+}
+
+impl LabelDesc for String {
+    fn into_label_desc(self) -> Option<SharedString> {
+        (!self.is_empty()).then(|| SharedString::from(self))
+    }
+}
+
+impl LabelDesc for SharedString {
+    fn into_label_desc(self) -> Option<SharedString> {
+        (!self.is_empty()).then_some(self)
+    }
+}
+
 /// 2열 행의 왼쪽 라벨 열(제목 + 선택 설명).
 ///
 /// 행(`justify_between`) 안의 텍스트 열은 flex 기준 폭이 내용 폭이 아니라 0에 가깝게 잡히고,
 /// `min_w_0`만 주면 자동 최소 폭마저 사라져 폭 0px로 무너진다. 따라서 라벨 열은 반드시
 /// `flex_1().min_w_0()`로 남는 폭을 차지하고, 오른쪽 컨트롤 묶음은 [`controls`]로 `flex_none` 처리한다.
-pub fn label(p: &Palette, title: impl Into<SharedString>, desc: Option<&'static str>) -> Div {
+pub fn label(p: &Palette, title: impl Into<SharedString>, desc: impl LabelDesc) -> Div {
     div()
         .flex_1()
         .min_w_0()
@@ -46,12 +78,14 @@ pub fn label(p: &Palette, title: impl Into<SharedString>, desc: Option<&'static 
         .gap_0p5()
         .child(
             div()
+                .min_w_0()
                 .text_size(TEXT_SM)
                 .font_weight(FontWeight::MEDIUM)
                 .child(title.into()),
         )
-        .children(desc.map(|desc| {
+        .children(desc.into_label_desc().map(|desc| {
             div()
+                .min_w_0()
                 .text_size(TEXT_XS)
                 .text_color(p.muted_foreground)
                 .child(desc)
@@ -90,9 +124,94 @@ pub fn section_title(p: &Palette, id: &'static str, title: &'static str) -> Stat
         .child(title)
 }
 
-/// 보조 동작 버튼(파일 열기·가져오기·복사 등, Orca `Button variant="outline" size="sm"` 대응).
+/// 대표 긍정 주 동작 버튼(전체 설치·모두 자동 설정·저장 등, Orca `Button variant="default" size="sm"` 대응, OWE-793).
+pub fn primary(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).small().primary().label(label)
+}
+
+/// 보조 동작 버튼(개별 설치·파일 열기·가져오기·복사 등, Orca `Button variant="outline" size="sm"` 대응).
 pub fn secondary(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
     Button::new(id).small().outline().label(label)
+}
+
+/// 가벼운 부가·취소·초기화 동작 버튼(Orca `Button variant="ghost" size="sm"` 대응, OWE-793).
+pub fn ghost(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Button {
+    Button::new(id).small().ghost().label(label)
+}
+
+/// 불리언(켜기/끄기) 토글 스위치(Orca `SettingsSwitch` / `Switch` 대응, OWE-793).
+///
+/// 2버튼(`켜기`/`끄기`) 나열 대신 단일 알약 트랙(36×20px)과 원형 썸(14px)으로
+/// 현재 활성 상태와 클릭 시 반전 동작을 일관되게 표현한다.
+pub fn switch(
+    p: &Palette,
+    id: impl Into<SharedString>,
+    checked: bool,
+    disabled: bool,
+    on_toggle: impl Fn(bool, &mut gpui::Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    let id: SharedString = id.into();
+    let selector = id.clone();
+    let thumb_id: SharedString = format!("{id}-thumb").into();
+    let thumb_selector = thumb_id.clone();
+    let track_bg = if checked { p.primary } else { p.muted };
+    let track_border = if checked { p.primary } else { p.border };
+    let thumb_bg = if checked {
+        p.primary_foreground
+    } else {
+        p.muted_foreground
+    };
+    div()
+        .id(ElementId::Name(id))
+        .debug_selector(move || selector.to_string())
+        .flex_none()
+        .w(SWITCH_WIDTH)
+        .h(SWITCH_HEIGHT)
+        .p(px(2.))
+        .rounded_full()
+        .border_1()
+        .border_color(track_border)
+        .bg(track_bg)
+        .flex()
+        .items_center()
+        .when(checked, Styled::justify_end)
+        .when(!checked, Styled::justify_start)
+        .when(disabled, |d| d.opacity(0.5).cursor_default())
+        .when(!disabled, |d| {
+            d.cursor_pointer()
+                .on_click(move |_, window, cx| on_toggle(!checked, window, cx))
+        })
+        .child(
+            div()
+                .id(ElementId::Name(thumb_id))
+                .debug_selector(move || thumb_selector.to_string())
+                .size(SWITCH_THUMB)
+                .rounded_full()
+                .bg(thumb_bg),
+        )
+}
+
+/// 다중 선택지(2~4개) 세그먼트 컨트롤 트랙(Orca `SegmentedControl` 대응, OWE-793).
+///
+/// 개별 버튼이 흩어져 보이지 않도록 테두리 있는 트랙 안에 선택지([`segment`])들을 묶는다.
+pub fn segmented_control(p: &Palette, items: impl IntoIterator<Item = impl IntoElement>) -> Div {
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_0p5()
+        .p(px(2.))
+        .rounded(RADIUS_SM)
+        .bg(p.background)
+        .border_1()
+        .border_color(p.border)
+        .children(items)
+}
+
+/// [`segmented_control`] 안에 들어가는 개별 선택지 버튼(활성 시 `primary`, 비활성 시 `ghost`, OWE-793).
+pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Button {
+    let btn = Button::new(id).small().label(label);
+    if active { btn.primary() } else { btn.ghost() }
 }
 
 /// 2단계 확인이 있는 파괴적 동작 버튼(Orca UX Rule 1 공간 사전 예약 적용).

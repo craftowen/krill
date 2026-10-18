@@ -985,26 +985,30 @@ impl SettingsView {
             };
 
         let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
-        let reuse_btn = Button::new("admin-schedule-mode-reuse")
-            .small()
-            .label(text::SCHEDULE_MODE_REUSE.get())
-            .debug_selector(|| "admin-schedule-mode-reuse".into())
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(m) = &mut this.schedule_modal {
-                    m.workspace_mode = WorkspaceMode::Reuse;
-                    cx.notify();
-                }
-            }));
-        let isolate_btn = Button::new("admin-schedule-mode-isolate")
-            .small()
-            .label(text::SCHEDULE_MODE_ISOLATE.get())
-            .debug_selector(|| "admin-schedule-mode-isolate".into())
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(m) = &mut this.schedule_modal {
-                    m.workspace_mode = WorkspaceMode::Isolate;
-                    cx.notify();
-                }
-            }));
+        let reuse_btn = layout::segment(
+            "admin-schedule-mode-reuse",
+            text::SCHEDULE_MODE_REUSE.get(),
+            reuse_active,
+        )
+        .debug_selector(|| "admin-schedule-mode-reuse".into())
+        .on_click(cx.listener(|this, _, _, cx| {
+            if let Some(m) = &mut this.schedule_modal {
+                m.workspace_mode = WorkspaceMode::Reuse;
+                cx.notify();
+            }
+        }));
+        let isolate_btn = layout::segment(
+            "admin-schedule-mode-isolate",
+            text::SCHEDULE_MODE_ISOLATE.get(),
+            !reuse_active,
+        )
+        .debug_selector(|| "admin-schedule-mode-isolate".into())
+        .on_click(cx.listener(|this, _, _, cx| {
+            if let Some(m) = &mut this.schedule_modal {
+                m.workspace_mode = WorkspaceMode::Isolate;
+                cx.notify();
+            }
+        }));
 
         let mode_row = div()
             .flex()
@@ -1015,22 +1019,7 @@ impl SettingsView {
                 None,
                 p,
             ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(if reuse_active {
-                        reuse_btn.primary()
-                    } else {
-                        reuse_btn.ghost()
-                    })
-                    .child(if reuse_active {
-                        isolate_btn.ghost()
-                    } else {
-                        isolate_btn.primary()
-                    }),
-            );
+            .child(layout::segmented_control(p, [reuse_btn, isolate_btn]));
 
         let mut dialog = div()
             .id("admin-schedule-modal")
@@ -1102,20 +1091,14 @@ impl SettingsView {
                 .gap_2()
                 .pt_2()
                 .child(
-                    Button::new("admin-schedule-modal-cancel")
-                        .small()
-                        .ghost()
-                        .label(text::SCHEDULE_CANCEL.get())
+                    layout::ghost("admin-schedule-modal-cancel", text::SCHEDULE_CANCEL.get())
                         .debug_selector(|| "admin-schedule-modal-cancel".into())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.close_schedule_modal(cx);
                         })),
                 )
                 .child(
-                    Button::new("admin-schedule-modal-save")
-                        .small()
-                        .primary()
-                        .label(text::SCHEDULE_SAVE.get())
+                    layout::primary("admin-schedule-modal-save", text::SCHEDULE_SAVE.get())
                         .debug_selector(|| "admin-schedule-modal-save".into())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.submit_schedule_modal(window, cx);

@@ -206,8 +206,7 @@ impl SettingsView {
             .flex_col()
             .gap_3()
             .child(text::TITLE.get());
-        let mut modes = layout::card(p).flex().flex_col().gap_2();
-        for (mode, id, label) in [
+        let modes = [
             (ConnectMode::Lan, "mobile-lan", text::LAN.get()),
             (
                 ConnectMode::Tailscale,
@@ -215,17 +214,16 @@ impl SettingsView {
                 text::TAILSCALE.get(),
             ),
             (ConnectMode::Tunnel, "mobile-tunnel", text::TUNNEL.get()),
-        ] {
+        ]
+        .into_iter()
+        .map(|(mode, id, label)| {
             let selected = self.mobile.mode == mode;
-            modes = modes.child(
-                Button::new(id)
-                    .label(label)
-                    .disabled(self.mobile.pending)
-                    .when(selected, gpui_component::button::ButtonVariants::primary)
-                    .on_click(cx.listener(move |this, _, _, cx| this.mobile_pair(mode, None, cx))),
-            );
-        }
-        root = root.child(modes);
+            layout::segment(id, label, selected)
+                .disabled(self.mobile.pending)
+                .debug_selector(move || id.into())
+                .on_click(cx.listener(move |this, _, _, cx| this.mobile_pair(mode, None, cx)))
+        });
+        root = root.child(layout::card(p).child(layout::segmented_control(p, modes)));
         if !self.mobile.interfaces.is_empty() && self.mobile.mode != ConnectMode::Tunnel {
             let mut interfaces = layout::card(p).flex().flex_wrap().gap_2();
             interfaces = interfaces.child(
