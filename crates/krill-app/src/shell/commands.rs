@@ -9,7 +9,7 @@ use krill_app::commands::{QuickCommand, text};
 use super::Shell;
 
 impl Shell {
-    fn inject_command(
+    pub(super) fn inject_command(
         &mut self,
         command: &QuickCommand,
         window: &mut Window,

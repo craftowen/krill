@@ -4771,3 +4771,144 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
 
     std::fs::remove_file(&tmp_file).ok();
 }
+
+/// OWE-865: ⇧⌘P 명령 팔레트는 액션부터 보여주고, ⌘1로 첫 행(빠른 액션)을 바로 실행한다.
+#[gpui::test]
+fn command_palette_digit_runs_settings_action(cx: &mut TestAppContext) {
+    use krill_proto::SessionId;
+    use krill_proto::control::{AgentState, AgentStatus};
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(5),
+            status: AgentStatus {
+                state: AgentState::Working,
+                agent: "claude".into(),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: Some("/repo/main".into()),
+            cwd: None,
+            account: None,
+        }],
+        trees: [("/repo".into(), vec!["/repo/main".into()])].into(),
+    };
+    let (view, cx) = open(cx, state_path("cmd-palette"));
+    // 볼트 실제 데몬을 타지 않게 빈 결과 목을 단다(테스트 머신의 실제 볼트에 좌우되지 않는다).
+    let call: krill_app::agent_history::Call = std::sync::Arc::new(move |r| {
+        use krill_proto::agent_history::{Action, Response, SearchSnapshot, Snapshot};
+        use krill_proto::control::{Reply, Request};
+        Ok(Reply::AgentHistory(match r {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: Vec::new(),
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
+                hits: Vec::new(),
+                truncated: false,
+                skipped: false,
+            }),
+            _ => unreachable!(),
+        }))
+    });
+    cx.update(|_, cx| {
+        let history = view.read(cx).history.clone();
+        history.update(cx, |h, _| h.set_call(call));
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |s, cx| {
+            s.connect_source(std::sync::Arc::new(Memory(snapshot)), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_none()));
+
+    cx.simulate_keystrokes("cmd-shift-p");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_some()));
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).jump.as_ref().unwrap().0.read(cx).mode()),
+        krill_app::jump::Mode::Commands
+    );
+
+    // "설정"으로 거르면 설정 열기 액션 1행만 남는다.
+    cx.simulate_input("설정");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).jump.as_ref().unwrap().0.read(cx).row_count()),
+        1
+    );
+
+    // ⌘1 즉시 실행: 팔레트가 닫히고 설정 페이지가 열린다(탭은 그대로).
+    let tabs_before = layout_of(&view, cx).tabs().len();
+    cx.simulate_keystrokes("cmd-1");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_none()));
+    assert!(cx.update(|_, cx| view.read(cx).settings.is_some()));
+    assert_eq!(layout_of(&view, cx).tabs().len(), tabs_before);
+}
+
+/// OWE-865: ⌘J 팔레트에서 세션 없는 워크트리를 Enter로 열면 새 탭에 새 세션을 만든다.
+#[gpui::test]
+fn jump_palette_opens_sessionless_worktree_in_new_tab(cx: &mut TestAppContext) {
+    use krill_proto::SessionId;
+    use krill_proto::control::{AgentState, AgentStatus};
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let session = |id, tree: &str| sidebar::Session {
+        id: SessionId(id),
+        status: AgentStatus {
+            state: AgentState::Working,
+            agent: "claude".into(),
+            ..AgentStatus::UNKNOWN
+        },
+        worktree: Some(tree.into()),
+        cwd: None,
+        account: None,
+    };
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![session(5, "/repo/main")],
+        trees: [(
+            "/repo".into(),
+            vec!["/repo/empty".into(), "/repo/main".into()],
+        )]
+        .into(),
+    };
+    let (view, cx) = open(cx, state_path("jump-worktree"));
+    cx.update(|_, cx| {
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |s, cx| {
+            s.connect_source(std::sync::Arc::new(Memory(snapshot)), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_some()));
+
+    cx.simulate_input("empty");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+
+    assert!(cx.update(|_, cx| view.read(cx).jump.is_none()));
+    let layout = layout_of(&view, cx);
+    assert_eq!(layout.tabs().len(), 2);
+    let pane = layout.active_tab().focused;
+    let cwd = layout
+        .launch(pane)
+        .map(|c| c.cwd.clone())
+        .unwrap_or_default();
+    assert_eq!(cwd, b"/repo/empty");
+}
