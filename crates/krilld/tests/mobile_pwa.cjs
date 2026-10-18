@@ -25,7 +25,52 @@ for(const size of [0,1,15,16,17,63,64,65,1024,512*1024]){
 }
 const vector=new C.Channel(new Uint8Array(32).fill(7),new Uint8Array(64).fill(9));assert.equal(C.hex(vector.seal(new TextEncoder().encode('prompt'))),'0000000000000000ca8c87d414301b7fc3a6a3f09a5fb977fb9422ea97cb');
 for(const name of ['index.html','app.js','app.css','manifest.json','icon.svg','crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
-const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js','app.js']){const at=html.indexOf('src="/'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
+const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
+// Fixed-origin bootstrap and transport, with real crypto and deterministic sockets.
+async function fixedOriginTests(){
+ const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,url:'https://saved.trycloudflare.com',hash};
+ const source=fs.readFileSync(path.join(assets,'client.js'),'utf8');
+ function fixture(href,credential=saved,found={url:'https://fresh.trycloudflare.com',hash}){
+  const location=new URL(href),values=new Map(credential?[['minikrill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0;
+  location.replace=href=>redirects.push(href);
+  class Socket extends EventTarget{
+   constructor(url){super();this.url=url;this.sent=[];sockets.push(this);}
+   send(bytes){this.sent.push(bytes);}
+   emit(type,data){const e=new Event(type);if(type==='message')e.data=data;if(type==='close')e.code=data;this.dispatchEvent(e);}
+   close(){if(this.closed)return;this.closed=true;this.emit('close',1006);}
+  }
+  const context={TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,URLSearchParams,location,history:{replaceState(a,b,url){location.href=new URL(url,location).href;}},navigator:{serviceWorker:{register:url=>{registrations.push(url);return Promise.resolve();}}},localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)},fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>found};},setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),crypto:{getRandomValues:bytes=>bytes.fill(1)},WebSocket:Socket,MkCrypto:C};
+  vm.createContext(context);vm.runInContext(source,context);const endpoint=context.KrillMobile.transport.bootstrap();
+  return {context,endpoint,location,values,requests,registrations,sockets,timers,redirects,stored:()=>JSON.parse(values.get('minikrill-mobile-v2'))};
+ }
+ const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
+ const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
+ let f=fixture(fixed+`?session=7&pair=query&key=query&t=evil&r=evil#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}`);
+ assert.equal(f.endpoint.credentials,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.endpoint.pair.secret,'secret');assert.equal(f.location.href,fixed+'?session=7#/pair-confirm');assert.deepEqual(f.registrations,['/sw.js']);assert.equal(f.endpoint.socketUrl(),`wss://paired.trycloudflare.com/ws?v=${hash}`);
+ for(const fragment of ['#t=evil.trycloudflare.com&r=forged','#pair=only&t=evil.trycloudflare.com&r=forged','#key=only&t=evil.trycloudflare.com&r=forged']){
+  f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
+ }
+ f=fixture(fixed+'?pair=query&key=query&t=evil.trycloudflare.com&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.equal(f.location.search,'');
+ f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,[]);
+ f=fixture(fixed+'#pair=ticket&key=secret&t=evil.test&r=bad');assert.throws(()=>f.endpoint.socketUrl(),/fresh QR/);
+ for(const found of [{url:'https://evil.test',hash},{url:'https://ok.trycloudflare.com.evil.test',hash},{url:'https://ok.trycloudflare.com',hash:'../evil'},{url:'https://ok.trycloudflare.com',hash:'ABCDEF0123456789'},{url:'https://ok.trycloudflare.com',hash:1234567890123456}]){
+  f=fixture(fixed,saved,found);assert.equal(await f.endpoint.locate(),false);assert.deepEqual(f.stored(),saved);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.deepEqual(f.redirects,[]);
+ }
+ // A pre-open failure (including an HTTP 409 handshake) locates, then uses normal backoff.
+ f=fixture(fixed);let t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
+ t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.requests.length,1);assert.equal(f.requests[0].options.cache,'no-store');assert.equal(f.stored().url,'https://fresh.trycloudflare.com');assert.equal(f.timers.size,1);
+ const retry=[...f.timers.values()][0];assert.equal(retry.ms,1000);retry.fn();await flush();assert.equal(f.sockets[1].url,`wss://fresh.trycloudflare.com/ws?v=${hash}`);t.close();
+ f=fixture(fixed+'?session=7#/host/local',saved,{url:'https://fresh.trycloudflare.com',hash:'fedcba9876543210'});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.deepEqual(f.redirects,['/m/fedcba9876543210/?session=7#/host/local']);assert.equal(f.timers.size,0);t.close();
+ f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('open');f.sockets[0].emit('close',1008);await flush();assert.equal(f.requests.length,0);assert.equal(f.timers.size,0);t.close();
+ // Authentication saves endpoint metadata, and terminal sockets share the main URL.
+ f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&t=paired.trycloudflare.com&r=${rid}`,null);
+ let authenticated;t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,pair:f.endpoint.pair,onAuthenticated:auth=>{authenticated=auth;f.context.localStorage.setItem('minikrill-mobile-v2',JSON.stringify(auth));}});
+ t.connect();await flush();const socket=f.sockets[0];socket.emit('open');socket.emit('message',JSON.stringify({version:2,challenge:'bc'.repeat(32)}));await flush();
+ const server=new C.Channel(new Uint8Array(32),C.concat(C.unhex('bc'.repeat(32)),new Uint8Array(32).fill(1)),false);
+ socket.emit('message',server.seal(new TextEncoder().encode(JSON.stringify({device_id:'new-device',credential:'cd'.repeat(32)}))));socket.emit('message',server.seal(frame(1,Buffer.concat([v(1),v(1),v(0)]))));await flush();
+ socket.emit('message',server.seal(frame(0x65,Buffer.concat([v(6),string(JSON.stringify({ok:true,data:{sessions:[]}}))]))));await flush();assert(t.ready);assert.equal(authenticated.rid,rid);assert.equal(authenticated.url,'https://paired.trycloudflare.com');assert.equal(authenticated.hash,hash);assert.equal(f.stored().credential,'cd'.repeat(32));const terminal=t.terminalConnect();assert.equal(terminal.socket.url,socket.url);assert.equal(terminal.credentials.rid,rid);t.close();
+ console.log('PASS fixed-origin fragment cleanup, saved destination protection, rid/url/hash persistence, shared socket URLs, strict rendezvous validation, hash redirect and pre-open retry');
+}
 // Cross-language fixed screen fixtures: wide Hangul, combining ZWJ, colors and scroll ops.
 const T=sandbox.MkTerminalCodec,model={};
 T.update(Buffer.from('3000000021ac02f0a204010400501801030203020161000000000003ed959c0103e2808d01090201020302ff0080e80503030201','hex').subarray(5),model);
@@ -56,7 +101,7 @@ async function connect(url,credential){
  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
  const challenge=JSON.parse(await next()),nonce=crypto.randomBytes(32),secret=credential?C.sha256(C.unhex(credential.credential)):C.unbase64(new URLSearchParams(u.hash.slice(1)).get('key'));
  const channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));
- socket.send(JSON.stringify({token:credential?null:u.searchParams.get('pair'),device_id:credential?credential.device_id:null,client_nonce:nonce.toString('hex')}));
+ socket.send(JSON.stringify({token:credential?null:new URLSearchParams(u.hash.slice(1)).get('pair'),device_id:credential?credential.device_id:null,client_nonce:nonce.toString('hex')}));
  socket.send(channel.seal(new TextEncoder().encode('{"label":"Non-secure HTTP test"}')));
  const authenticated=JSON.parse(new TextDecoder().decode(channel.open(await next()))),hello=Buffer.from(channel.open(await next())),r=reader(hello.subarray(5));r.u();r.u();const features=r.u();r.text();daemon=Number(r.u());
  socket.send(channel.seal(frame(2,Buffer.concat([v(1),v(1),v(features),v(0),string('pure-js-e2e')]))));
@@ -65,6 +110,7 @@ async function connect(url,credential){
 }
 (async()=>{
  try {
+  await fixedOriginTests();
   await require('./mobile_session.cjs').main();
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');
   fs.writeFileSync(path.join(profile,'statusline_cache.json'),JSON.stringify({five_hour:{utilization:23},seven_day:{utilization:47}}));

@@ -1082,7 +1082,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
         .as_str()
         .unwrap();
     assert!(url.starts_with("http://127.0.0.1:"));
-    assert!(url.contains("#key="));
+    assert!(url.contains("/#pair=") && url.contains("&key="));
     assert!(!url.split('#').next().unwrap().contains("key="));
     d.ok(&["mobile", "revoke", "--all", "--json"]);
     let script = d.dir.join("cloudflared-test");
@@ -1101,8 +1101,9 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
         .unwrap()
         .as_str()
         .unwrap();
-    assert!(url.starts_with("https://cli-mobile.trycloudflare.com/?pair="));
-    assert!(url.contains("#key="));
+    // 가짜 터널은 HTTP 준비 확인을 통과하지 못하므로 15초 뒤 터널 출처 URL로 강등된다.
+    assert!(url.starts_with("https://cli-mobile.trycloudflare.com/#pair="));
+    assert!(url.contains("&key="));
     let status = d.ok(&["mobile", "serve"]);
     assert!(status.contains("cli-mobile.trycloudflare.com"));
     d.ok(&["mobile", "revoke", "--all"]);
