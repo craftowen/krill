@@ -41,7 +41,7 @@ impl Component {
 }
 
 /// Explicit override isolates tests; production uses `LocalAppData` on Windows
-/// and the Console.app-visible directory on Unix.
+/// and the Console.app-visible directory on macOS (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
     directory_in(
         |key| std::env::var_os(key),
@@ -74,7 +74,12 @@ fn directory_in(
     {
         base.map(|path| path.join("Krill").join("Logs"))
     }
-    #[cfg(not(windows))]
+    // Linux 원격 호스트: `~/.local/state/krill/logs`(XDG state). macOS 경로를 만들지 않는다.
+    #[cfg(target_os = "linux")]
+    {
+        base.map(|h| h.join(".local/state/krill/logs"))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
     base.map(|h| {
         let logs = h.join("Library/Logs");
         let (new, old) = (logs.join("Krill"), logs.join("Minikrill"));
@@ -116,9 +121,14 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn directory_uses_home_default() {
+        let want = if cfg!(target_os = "linux") {
+            "/h/.local/state/krill/logs"
+        } else {
+            "/h/Library/Logs/Krill"
+        };
         assert_eq!(
             directory_in(|_| None, || Some(PathBuf::from("/h"))),
-            Some(PathBuf::from("/h/Library/Logs/Krill"))
+            Some(PathBuf::from(want))
         );
     }
 
@@ -139,6 +149,7 @@ mod tests {
     /// MK-170: 이관 전에는 옛 `Logs/Minikrill`, 옮겨진 뒤(옛 자리는 링크)에는 `Logs/Krill`.
     #[cfg(unix)]
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: ~/Library/Logs 이관")]
     fn directory_follows_bundle_migration() {
         let home = std::env::temp_dir().join(format!("mk170-log-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();

@@ -10,13 +10,14 @@ use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::sys::kq::{Event, EventFilter, EventFlags, ProcessEvents};
 use krill_proto::SessionId;
 use krill_proto::daemon::KRILLD_DUPLICATE;
 use krill_proto::holder::Error::UnknownKind;
 use krill_proto::holder::{
-    FromHolder, MAX_SESSIONS, STATUS_UNKNOWN, ToHolder, VERSION, WinSize, request_id,
+    FromHolder, MAX_SESSIONS, SESSION_LIMIT_ERRNO, STATUS_UNKNOWN, ToHolder, VERSION, WinSize,
+    request_id,
 };
-use rustix::event::kqueue::{Event, EventFilter, EventFlags, ProcessEvents};
 use rustix::io::{Errno, FdFlags, fcntl_setfd};
 use rustix::net::{AddressFamily, SocketFlags, SocketType, socketpair};
 use rustix::process::{Pid, Signal, WaitOptions};
@@ -81,7 +82,7 @@ struct Holder {
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let krilld_path = args.next().ok_or(Errno::INVAL)?;
     raise_nofile();
-    let kq = rustix::event::kqueue::kqueue()?;
+    let kq = sys::kq::kqueue()?;
     fcntl_setfd(&kq, FdFlags::CLOEXEC)?;
     let mut h = Holder {
         krilld_path,
@@ -247,7 +248,8 @@ impl Holder {
                     return Err(Errno::EXIST.into());
                 }
                 if self.sessions.len() >= MAX_SESSIONS {
-                    return Err(Errno::PROCLIM.into()); // SESSION_LIMIT_ERRNO
+                    // 와이어 값은 OS와 무관하게 macOS EPROCLIM(67)이다(Linux에서는 다른 errno 번호지만 krilld는 값만 비교한다).
+                    return Err(Errno::from_raw_os_error(SESSION_LIMIT_ERRNO).into());
                 }
                 let (pid, master) = spawn_session(&argv, &env, &cwd, size)?;
                 self.sessions.push(Session {

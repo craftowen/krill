@@ -24,13 +24,15 @@ postcard = { workspace = true }
 # 워크트리 설정 minikrill.toml(MK-042)과 setup 신뢰 해시.
 toml = { workspace = true }
 sha2 = { workspace = true }
-# 피어 코드서명 검증(MK-096). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
-security-framework = { workspace = true }
-core-foundation = { workspace = true }
 serde-saphyr = { workspace = true }
 notify = { workspace = true }
 ring = { workspace = true }
 zeroize = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# 피어 코드서명 검증(MK-096). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
+security-framework = { workspace = true }
+core-foundation = { workspace = true }
 
 [dev-dependencies]
 rustix-openpty = { workspace = true }

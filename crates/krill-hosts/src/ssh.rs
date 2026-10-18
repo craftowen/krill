@@ -25,6 +25,12 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// 파일명에 쓸 호스트명 상한(UDS 104바이트 제한 여유).
 const HOST_SLUG_MAX: usize = 24;
 const HOSTS_FILE: &str = "hosts.toml";
+/// 터널 ssh의 원격 명령. stdin(부모가 쥔 파이프)이 닫힐 때까지 기다린다.
+const TUNNEL_KEEPALIVE: &str = "cat >/dev/null";
+/// [`remote_query`] 둘째 줄 표식: 원격에 krill이 없다.
+const MISSING_MARK: &str = "__KRILL_MISSING__";
+/// [`remote_query`] 둘째 줄 표식: 원격 `krill ls`가 실패했다(뒤에 오류 첫 줄).
+const WAKE_FAILED_MARK: &str = "__KRILL_WAKE_FAILED__";
 
 static TUNNEL_SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -111,7 +117,10 @@ impl SshOptions {
     /// 안정성용 기본 옵션(`ServerAliveInterval=15`, `ServerAliveCountMax=3`, `ConnectTimeout`)과
     /// 포트(`-p`)·키 파일(`-i`)을 조립하는 공통 argv 빌더.
     pub fn common_args(&self, connect_timeout_secs: u16) -> Vec<String> {
+        // 처음 보는 호스트 키는 기록하고 믿는다(연결 테스트와 같은 수준). 바뀐 키는 ssh가 그대로 거부한다.
         let mut args = vec![
+            "-o".to_owned(),
+            "StrictHostKeyChecking=accept-new".to_owned(),
             "-o".to_owned(),
             "ServerAliveInterval=15".to_owned(),
             "-o".to_owned(),
@@ -142,10 +151,13 @@ impl SshOptions {
             "ExitOnForwardFailure=yes".to_owned(),
             "-o".to_owned(),
             "StreamLocalBindUnlink=yes".to_owned(),
-            "-N".to_owned(),
+            "-T".to_owned(),
             "-L".to_owned(),
             forward,
             self.destination.clone(),
+            // `-N` 대신 stdin을 읽는 원격 명령: 부모(앱·CLI)가 어떻게 죽든 stdin 파이프가 닫히면 ssh가 끝난다.
+            // `-N`이면 ssh가 부모 사망을 알 길이 없어 고아로 남았다(ppid 1 터널 누적 실측).
+            TUNNEL_KEEPALIVE.to_owned(),
         ]);
         args
     }
@@ -169,10 +181,8 @@ impl SshOptions {
         args.extend([
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
-            "-o".to_owned(),
-            "StrictHostKeyChecking=accept-new".to_owned(),
             self.destination.clone(),
-            "uname -sr && (command -v krill >/dev/null 2>&1 && echo 'krill: ready' || echo 'krill: not installed')".to_owned(),
+            "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
         args
     }
@@ -216,19 +226,37 @@ pub fn ssh_program() -> OsString {
     std::env::var_os("KRILL_SSH_BIN").unwrap_or_else(|| OsString::from("ssh"))
 }
 
-/// 원격 `$HOME`과 krilld 소켓이 있는 번들 디렉터리를 한 번에 묻는 명령(MK-170). 새 번들 → 옛 번들 순으로 찾는다
-/// (구버전 원격·이관 전 원격 호환). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
+/// 원격 상태 디렉터리 후보(`$HOME` 기준, 탐색 순서): macOS 새 번들 → macOS 옛 번들 → Linux.
+fn remote_state_dirs() -> [String; 3] {
+    [
+        format!("Library/Application Support/{}", daemon::BUNDLE_ID),
+        format!("Library/Application Support/{}", daemon::LEGACY_BUNDLE_ID),
+        format!("{}/{}", daemon::LINUX_STATE_PARENT, daemon::BUNDLE_ID),
+    ]
+}
+
+/// 원격 `$HOME`과 krilld 소켓이 있는 상태 디렉터리를 한 번에 묻는 명령(MK-170). 후보는 [`remote_state_dirs`] 순서로
+/// 찾는다(구버전 원격·이관 전 원격·Linux 호환). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
+///
+/// Linux 원격은 찾기 전에 항상 원격 `krill ls`(`~/.local/bin/krill` → `PATH`)를 한 번 돌린다. 데몬이 없으면 띄우고
+/// (재부팅한 VM), holder만 죽었으면 새 holder로 재결합한다(ARCHITECTURE §4.1). krill이 없거나 실행이 실패하면
+/// 둘째 줄에 표식을 남겨 원인을 알린다. macOS 원격은 깨우지 않는다 — ssh 세션 안에서 띄운 데몬은 GUI·키체인 밖이다.
 pub fn remote_query() -> String {
+    let dirs = remote_state_dirs().map(|d| format!("\"{d}\"")).join(" ");
+    let [.., linux] = remote_state_dirs();
     format!(
-        "/bin/sh -c 'printf \"%s\\n\" \"$HOME\"; for b in {} {}; do \
-         if [ -S \"$HOME/Library/Application Support/$b/run/krilld.sock\" ]; then printf %s \"$b\"; break; fi; done'",
-        daemon::BUNDLE_ID,
-        daemon::LEGACY_BUNDLE_ID
+        "/bin/sh -c 'printf \"%s\\n\" \"$HOME\"; \
+         f() {{ for d in {dirs}; do if [ -S \"$HOME/$d/run/krilld.sock\" ]; then printf %s \"$d\"; exit 0; fi; done; }}; \
+         if [ \"$(uname -s)\" != Linux ]; then f; exit 0; fi; \
+         k=\"$HOME/.local/bin/krill\"; [ -x \"$k\" ] || k=$(command -v krill); \
+         if [ -z \"$k\" ]; then f; printf %s {MISSING_MARK}; exit 0; fi; \
+         if ! e=$(\"$k\" ls </dev/null 2>&1 >/dev/null); then f; printf \"%s %s\" {WAKE_FAILED_MARK} \"$(printf %s \"$e\" | head -n 1)\"; exit 0; fi; \
+         f; printf %s \"{linux}\"'"
     )
 }
 
-/// [`remote_query`] 답(첫 줄 `$HOME`, 있으면 둘째 줄에 소켓을 찾은 번들 id)으로 원격 krilld 소켓 경로를 계산한다.
-/// 둘째 줄이 없으면(소켓 없음·`$HOME`만 답함) 새 번들 경로다.
+/// [`remote_query`] 답(첫 줄 `$HOME`, 있으면 둘째 줄에 상태 디렉터리)으로 원격 krilld 소켓 경로를 계산한다.
+/// 둘째 줄이 없거나 후보가 아니면 macOS 새 번들 경로다.
 pub fn remote_socket_for_home(remote_home: &str) -> io::Result<PathBuf> {
     let mut lines = remote_home.lines();
     let home = lines.next().unwrap_or_default().trim();
@@ -238,14 +266,25 @@ pub fn remote_socket_for_home(remote_home: &str) -> io::Result<PathBuf> {
             format!("invalid remote HOME path: {remote_home:?}"),
         ));
     }
-    let bundle = if lines.next().map(str::trim) == Some(daemon::LEGACY_BUNDLE_ID) {
-        daemon::LEGACY_BUNDLE_ID
-    } else {
-        daemon::BUNDLE_ID
-    };
-    Ok(PathBuf::from(home).join(format!(
-        "Library/Application Support/{bundle}/run/krilld.sock"
-    )))
+    let dirs = remote_state_dirs();
+    let found = lines.next().map(str::trim);
+    if found == Some(MISSING_MARK) {
+        return Err(io::Error::other(
+            "krill is not installed on the remote host (expected ~/.local/bin/krill; see install-linux.sh)",
+        ));
+    }
+    if let Some(detail) = found.and_then(|l| l.strip_prefix(WAKE_FAILED_MARK)) {
+        return Err(io::Error::other(format!(
+            "failed to start krill on the remote host: {}",
+            detail.trim()
+        )));
+    }
+    let [default, ..] = &dirs;
+    let dir = dirs
+        .iter()
+        .find(|d| Some(d.as_str()) == found)
+        .unwrap_or(default);
+    Ok(PathBuf::from(home).join(dir).join("run/krilld.sock"))
 }
 
 /// `ssh <opts> <host> <remote_query>`를 실행해 원격 맥의 `$HOME`과 소켓이 있는 번들 id를 조회한다.
@@ -480,9 +519,10 @@ impl Tunnel {
         }
         std::fs::remove_file(&local).ok();
         let host = &opts.destination;
+        // stdin 파이프의 쓰기 쪽은 `child`가 쥔다. 이 프로세스가 죽으면 닫혀 원격 `cat`과 ssh가 끝난다.
         let mut child = Command::new(ssh_bin)
             .args(opts.tunnel_args(&local, remote))
-            .stdin(Stdio::null())
+            .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()?;

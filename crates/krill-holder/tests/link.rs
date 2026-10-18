@@ -21,6 +21,13 @@ fn pair() -> (Link, Link) {
     (Link::new(a), Link::new(b))
 }
 
+#[cfg_attr(
+    target_os = "linux",
+    expect(
+        clippy::useless_conversion,
+        reason = "Linux st_dev는 이미 u64다(macOS는 i32)"
+    )
+)]
 fn ino(fd: impl AsFd) -> (u64, u64) {
     let st = fstat(fd).unwrap();
     (u64::try_from(st.st_dev).unwrap(), st.st_ino)
