@@ -280,6 +280,8 @@ impl Holder {
                 }
                 self.teardowns.push(Teardown::start(s.pid));
             }
+            // (v4) Unix는 krilld가 master fd에 직접 TIOCSWINSZ한다. Resize는 Windows ConPTY 전용.
+            ToHolder::Resize { .. } => return Err(Errno::NOSYS.into()),
             ToHolder::Release { id, .. } => {
                 let n = self.sessions.len();
                 self.sessions.retain(|s| s.id != id);
