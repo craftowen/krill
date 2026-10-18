@@ -1,11 +1,17 @@
 //! `krill update`: 헤드리스 `krill-app --update-cli`에 위임해 업데이트를 점검·적용한다(MK-156).
+//! Linux 원격 호스트에는 앱이 없다: `install-linux.sh`가 바이너리를 바꾼 뒤 이 명령이 돌고 있는 holder·krilld를
+//! 세션을 유지한 채 설치된 새 바이너리로 교체한다(exec 핸드오프, 같은 버전이면 아무것도 안 함).
 //!
 //! `crates/krill`은 `#![forbid(unsafe_code)]` 및 호출당 RSS < 10MB·hook 50ms 예산을 지키기 위해
 //! `krill-app`(`gpui`)이나 `ring`을 직접 의존성에 추가하지 않고 형제 실행 파일 `krill-app`을 호출한다.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+#[cfg(not(target_os = "linux"))]
+use std::path::Path;
+use std::path::PathBuf;
+#[cfg(not(target_os = "linux"))]
+use std::process::Command;
+use std::process::ExitCode;
 
 const USAGE: &str = "usage: krill update [--check] [--app <path>] [--state-dir <path>] [--json]";
 
@@ -44,7 +50,48 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         }
     }
 
-    let exe = resolve_krill_app_exe(app_bundle.as_deref());
+    #[cfg(target_os = "linux")]
+    {
+        let _ = app_bundle;
+        upgrade_daemon()
+    }
+    #[cfg(not(target_os = "linux"))]
+    delegate_to_app(raw, app_bundle.as_deref())
+}
+
+#[cfg(target_os = "linux")]
+fn upgrade_daemon() -> ExitCode {
+    use krill_proto::daemon;
+    let paths = match daemon::Paths::dev() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("krill update: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let hello = daemon::client_hello(krill_proto::ipc::ClientRole::Cli, "krill-update");
+    match daemon::upgrade(&paths, &hello) {
+        Ok(Some(server)) => println!("daemon upgraded to {}", server.build),
+        Ok(None) => println!("daemon is up to date ({})", krill_proto::BUILD),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            println!("daemon is not running; it will start with the installed binaries");
+        }
+        Err(e) => {
+            eprintln!("krill update: daemon upgrade failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+#[cfg(not(target_os = "linux"))]
+fn delegate_to_app(raw: &[OsString], app_bundle: Option<&Path>) -> ExitCode {
+    let exe = resolve_krill_app_exe(app_bundle);
     let status = match Command::new(&exe).arg("--update-cli").args(raw).status() {
         Ok(s) => s,
         Err(e) => {
@@ -64,6 +111,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 fn resolve_krill_app_exe(app_bundle: Option<&Path>) -> PathBuf {
     if let Some(bundle) = app_bundle {
         let candidate = bundle.join("Contents/MacOS/krill-app");
@@ -82,7 +130,9 @@ fn resolve_krill_app_exe(app_bundle: Option<&Path>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "linux"))]
     use std::fs;
+    #[cfg(not(target_os = "linux"))]
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -94,6 +144,7 @@ mod tests {
         assert_eq!(run(&[OsString::from("--state-dir")]), ExitCode::from(2));
     }
 
+    #[cfg(not(target_os = "linux"))]
     #[test]
     fn delegates_to_bundle_krill_app_with_update_cli_arg() {
         let dir =
