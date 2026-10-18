@@ -37,19 +37,22 @@ pub fn detect() -> io::Result<Vec<NetworkInterface>> {
         .collect())
 }
 
-/// 수동 선택은 별도로 보존한다. 자동 후보가 일시적으로 사라지면 저장된 주소로 돌아간다.
+/// 수동 주소가 지정되면 자동 인터페이스 후보보다 우선한다.
 pub fn select(
     interfaces: &[NetworkInterface],
     mode: ConnectMode,
     custom: Option<&str>,
 ) -> io::Result<SocketAddrV4> {
+    let custom = custom.map(parse).transpose()?;
     if mode == ConnectMode::Tunnel {
         return Ok(SocketAddrV4::new(
             Ipv4Addr::LOCALHOST,
-            custom.map(parse).transpose()?.map_or(0, |s| s.port()),
+            custom.map_or(0, |s| s.port()),
         ));
     }
-    let port = custom.map(parse).transpose()?.map_or(0, |s| s.port());
+    if let Some(address) = custom {
+        return Ok(address);
+    }
     let chosen = interfaces
         .iter()
         .filter(|i| !excluded(&i.name))
@@ -69,14 +72,12 @@ pub fn select(
             )
         });
     if let Some((_, ip)) = chosen {
-        return Ok(SocketAddrV4::new(ip, port));
+        return Ok(SocketAddrV4::new(ip, 0));
     }
-    custom.map(parse).transpose()?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AddrNotAvailable,
-            "no mobile network interface",
-        )
-    })
+    Err(io::Error::new(
+        io::ErrorKind::AddrNotAvailable,
+        "no mobile network interface",
+    ))
 }
 fn parse(value: &str) -> io::Result<SocketAddrV4> {
     let address: SocketAddrV4 = value
@@ -122,6 +123,12 @@ mod tests {
                 .to_string(),
             "100.127.255.254"
         );
+        assert_eq!(
+            select(&all, ConnectMode::Lan, Some("127.0.0.1:8765"))
+                .unwrap()
+                .to_string(),
+            "127.0.0.1:8765"
+        );
         all.pop();
         assert_eq!(
             select(&all, ConnectMode::Lan, None)
@@ -129,6 +136,12 @@ mod tests {
                 .ip()
                 .to_string(),
             "10.1.1.2"
+        );
+        assert_eq!(
+            select(&all, ConnectMode::Lan, Some("192.168.1.2:8765"))
+                .unwrap()
+                .to_string(),
+            "192.168.1.2:8765"
         );
         assert!(select(&all, ConnectMode::Tailscale, None).is_err());
         for name in [

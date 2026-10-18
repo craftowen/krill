@@ -207,3 +207,20 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
         Ok(())
     })()
 }
+
+#[test]
+fn session_screen_regressions() {
+    let result = std::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/mobile_session.cjs"
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

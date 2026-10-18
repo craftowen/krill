@@ -406,6 +406,10 @@ fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
             ws::BINARY,
             &channel.seal(b"{\"label\":\"attacker\"}").unwrap(),
         );
+        assert_eq!(
+            receive(&mut socket).unwrap(),
+            (8, 1008_u16.to_be_bytes().to_vec())
+        );
         assert!(receive(&mut socket).is_err());
     }
     let s = lock(&g.shared.state);
@@ -639,6 +643,76 @@ fn connect_mode_survives_daemon_restart() {
     std::fs::write(dir.join(INTENT_FILE), b"{").unwrap();
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
     assert_eq!(lock(&g.shared.state).mode, ConnectMode::Lan);
+    drop(g);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn manual_loopback_bind_survives_restart_with_multiple_interfaces() {
+    let dir = std::env::temp_dir().join(format!("mk-mobile-loopback-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let r = Arc::new(Registry::new(None, None));
+    let g = Gateway::start(Arc::downgrade(&r), Some(&dir), hello()).unwrap();
+    let MobileReply::PairingOffer { port, .. } = g.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Lan,
+        custom_address: Some("127.0.0.1:0".into()),
+        rotate: true,
+    }) else {
+        panic!("expected loopback offer");
+    };
+    let ticket = lock(&g.shared.state)
+        .devices
+        .ticket(now_ms())
+        .unwrap()
+        .clone();
+    let mut phone = Client::pair(port, &ticket);
+    phone.ipc();
+    let (device, credential) = (phone.device.clone(), phone.credential);
+    drop(phone);
+    drop(g);
+
+    // Status·SetConnectMode 호출 전 최초 reconcile에서도 수동 loopback만 바인딩해야 한다.
+    let g = Gateway::start(Arc::downgrade(&r), Some(&dir), hello()).unwrap();
+    until(|| !lock(&g.shared.state).listeners.is_empty());
+    let mut s = lock(&g.shared.state);
+    assert_eq!(s.mode, ConnectMode::Lan);
+    assert_eq!(s.custom.as_deref(), Some("127.0.0.1:0"));
+    assert_eq!(s.selected.unwrap().ip(), &Ipv4Addr::LOCALHOST);
+    assert_eq!(s.listeners.len(), 1);
+    assert_eq!(
+        s.listeners[0].local_addr().unwrap().ip(),
+        Ipv4Addr::LOCALHOST
+    );
+    s.interfaces = vec![
+        NetworkInterface {
+            name: "en0".into(),
+            address: "10.1.1.2".into(),
+            default_route: true,
+        },
+        NetworkInterface {
+            name: "en1".into(),
+            address: "192.168.1.2".into(),
+            default_route: false,
+        },
+        NetworkInterface {
+            name: "utun5".into(),
+            address: "100.64.0.2".into(),
+            default_route: false,
+        },
+    ];
+    close(&mut s);
+    s.selected = None;
+    reconcile(&mut s, now_ms()).unwrap();
+    assert_eq!(s.selected.unwrap().ip(), &Ipv4Addr::LOCALHOST);
+    assert_eq!(s.listeners.len(), 1);
+    assert_eq!(
+        s.listeners[0].local_addr().unwrap().ip(),
+        Ipv4Addr::LOCALHOST
+    );
+    let restarted_port = s.selected.unwrap().port();
+    drop(s);
+    let mut reconnected = Client::reconnect(restarted_port, &device, &credential);
+    reconnected.ipc();
+    drop(reconnected);
     drop(g);
     std::fs::remove_dir_all(dir).unwrap();
 }
