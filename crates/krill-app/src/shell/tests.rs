@@ -6694,3 +6694,30 @@ fn owe903_onboarding_checks_open_as_in_window_modal(cx: &mut TestAppContext) {
     assert_eq!(cx.windows().len(), 1);
     std::fs::remove_dir_all(&root).ok();
 }
+
+/// OWE-903 회귀: 첫 실행처럼 `Shell` 업데이트 안에서 `offer`를 불러도(`main.rs` 경로)
+/// 호스트가 `Shell`을 다시 읽다가 재진입 panic이 나지 않고 동의 모달이 뜬다.
+#[gpui::test]
+fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("owe903-offer"));
+    cx.run_until_parked();
+    let root = std::env::temp_dir().join(format!("mk-owe903-offer-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let env = krill_app::onboarding::Env {
+        shell: "/bin/sh".into(),
+        krill: root.join("krill"),
+        state: root.join("state"),
+        home: root.clone(),
+        state_overridden: true,
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |_, cx| {
+            krill_app::onboarding::offer(env.clone(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1, "no separate onboarding window");
+    assert!(cx.debug_bounds("onboarding-wizard").is_some());
+    std::fs::remove_dir_all(&root).ok();
+}

@@ -1419,10 +1419,13 @@ mod tests;
 /// 별도 OS 창을 띄우지 않고 메인 창(`Shell`) 안 `ui::modal_backdrop` 모달로 연다.
 /// 호스트가 등록돼 있으면 거기에 위임하고, 없으면(테스트·호스트 미기동) 경고만 남긴다.
 pub fn open_pairing(cx: &mut App) {
-    if dispatch_host(HostCommand::Open, cx) {
-        return;
-    }
-    tracing::warn!("pairing modal host missing; ignoring open_pairing");
+    // 현재 업데이트가 끝난 뒤 디스패치한다. 호출자가 `Shell` 업데이트 안이어도
+    // 핸들러가 `Shell`을 다시 읽다가 재진입 panic이 나지 않게 한다.
+    cx.defer(|cx| {
+        if !dispatch_host(HostCommand::Open, cx) {
+            tracing::warn!("pairing modal host missing; ignoring open_pairing");
+        }
+    });
 }
 
 /// 메인 창(`Shell`)이 짝짓기 모달을 인앱으로 열 때 쓰는 명령.

@@ -392,7 +392,18 @@ pub fn register_host(
     }
 }
 
-fn dispatch_host(cmd: &HostCommand, cx: &mut App) -> bool {
+/// 호스트 디스패치를 현재 업데이트가 끝난 뒤로 미룬다. 호출자가 `Shell` 업데이트 안
+/// (예: `main.rs`의 `window.update` 안 `offer`)에 있어도 핸들러가 `Shell`을 다시 읽다가
+/// 재진입 panic이 나지 않게 한다(OWE-903 첫 실행 크래시).
+fn dispatch_host(cmd: HostCommand, what: &'static str, cx: &mut App) {
+    cx.defer(move |cx| {
+        if !dispatch_now(&cmd, cx) {
+            tracing::warn!("onboarding modal host missing; ignoring {what}");
+        }
+    });
+}
+
+fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
     let Some(mut handlers) = cx.try_global::<HostRegistry>().map(|r| r.handlers.clone()) else {
         return false;
     };
@@ -439,16 +450,15 @@ pub fn offer(env: Env, _window: &mut Window, cx: &mut App) {
         }
         return;
     }
-    if !dispatch_host(
-        &HostCommand::Open {
+    dispatch_host(
+        HostCommand::Open {
             env,
             start: state::Step::Consent,
             consent_only: stored.completed,
         },
+        "offer",
         cx,
-    ) {
-        tracing::warn!("onboarding modal host missing; ignoring offer");
-    }
+    );
 }
 
 /// 메뉴·팔레트 액션을 등록한다. 앱 시작 때 한 번 부른다.
@@ -478,23 +488,24 @@ pub fn open_checks_current(cx: &mut App) {
 
 /// 점검 모달(체크리스트 단독, 동의 생략)을 연다. 이미 열려 있으면 앞으로 가져온다.
 pub fn open_checks(env: &Env, cx: &mut App) {
-    if !dispatch_host(
-        &HostCommand::Open {
+    dispatch_host(
+        HostCommand::Open {
             env: env.clone(),
             start: state::Step::Checklist,
             consent_only: false,
         },
+        "open_checks",
         cx,
-    ) {
-        tracing::warn!("onboarding modal host missing; ignoring open_checks");
-    }
+    );
 }
 
 /// 온보딩을 1단계부터 다시 실행한다. 모달이 열려 있으면 앞으로 가져와 동의부터 다시 시작한다.
 pub fn rerun_onboarding(env: &Env, cx: &mut App) {
-    if !dispatch_host(&HostCommand::Rerun { env: env.clone() }, cx) {
-        tracing::warn!("onboarding modal host missing; ignoring rerun_onboarding");
-    }
+    dispatch_host(
+        HostCommand::Rerun { env: env.clone() },
+        "rerun_onboarding",
+        cx,
+    );
 }
 
 /// 테스트용 창 호스트(OWE-903). 프로덕션 `Shell` 대신 마법사를 별도 창 루트로 열어
