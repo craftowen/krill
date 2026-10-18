@@ -50,7 +50,7 @@ struct Monitor {
     counts: Option<Counts>,
     connected: bool,
     _poll: Task<()>,
-    _commands: Task<()>,
+    _commands: Option<Task<()>>,
 }
 
 impl Global for Monitor {}
@@ -93,7 +93,7 @@ pub fn init(
     let item = StatusItem::new(text::OPEN.get(), text::QUIT.get(), cx);
     if let Some(item) = &item {
         item.set_title(text::DISCONNECTED.get());
-    } else if !cx.is_test() {
+    } else if cfg!(target_os = "macos") && !cx.is_test() {
         tracing::warn!("menu bar unavailable; keeping Dock access when windows close");
     }
     let poll = cx.spawn(async move |cx| {
@@ -105,21 +105,24 @@ pub fn init(
             bg.timer(Duration::from_millis(500)).await;
         }
     });
-    let commands = cx.spawn(async move |cx| {
-        loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(100))
-                .await;
-            cx.update(|cx| match StatusItem::take_command() {
-                Some(Command::Open) => open(None, cx),
-                // 셸의 종료 경로가 미저장 파일을 묻는다(OWE-663). 셸 없는 앱(테스트)은 바로 끝낸다.
-                Some(Command::Quit) => match cx.build_action("shell::Quit", None) {
-                    Ok(quit) => cx.dispatch_action(quit.as_ref()),
-                    Err(_) => cx.quit(),
-                },
-                None => {}
-            });
-        }
+    // 명령은 메뉴바 항목에서만 온다. 항목이 없으면(Windows) 100ms 깨우기를 돌리지 않는다(유휴 CPU, OWE-834).
+    let commands = item.is_some().then(|| {
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                cx.update(|cx| match StatusItem::take_command() {
+                    Some(Command::Open) => open(None, cx),
+                    // 셸의 종료 경로가 미저장 파일을 묻는다(OWE-663). 셸 없는 앱(테스트)은 바로 끝낸다.
+                    Some(Command::Quit) => match cx.build_action("shell::Quit", None) {
+                        Ok(quit) => cx.dispatch_action(quit.as_ref()),
+                        Err(_) => cx.quit(),
+                    },
+                    None => {}
+                });
+            }
+        })
     });
     cx.set_global(Monitor {
         item,

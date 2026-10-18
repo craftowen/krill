@@ -415,7 +415,9 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
                 ))
                 .child(action(
                     "file-reveal",
-                    text::REVEAL.get(),
+                    text::REVEAL
+                        .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                        .get(),
                     super::reveal_command,
                 )),
         )
@@ -436,7 +438,8 @@ pub(crate) fn size_label(len: u64) -> String {
 fn spawn_open(mut cmd: Command, cx: &App) {
     cx.background_spawn(async move {
         match cmd.status() {
-            Ok(status) if status.success() => {}
+            // explorer.exe는 열기에 성공해도 1로 끝난다.
+            Ok(status) if status.success() || cfg!(windows) => {}
             Ok(status) => tracing::warn!(?status, "open failed"),
             Err(error) => tracing::warn!(kind = ?error.kind(), "open failed to start"),
         }

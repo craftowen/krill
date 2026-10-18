@@ -225,23 +225,81 @@ impl Zoom {
     }
 }
 
-/// "기본 앱으로 열기" — Launch Services(`open`)가 확장자에 맞는 앱을 고른다.
-/// 실행 비트가 있는 파일은 `open`이 터미널에서 **실행**하므로 Finder에서 보기로 바꾼다(저장소 속 바이너리 한 번 클릭 실행 방지).
+/// "기본 앱으로 열기" — Launch Services(`open`)·Windows 탐색기가 확장자에 맞는 앱을 고른다.
+/// 실행 파일은 그 앱이 **실행**하므로 Finder에서 보기로 바꾼다(저장소 속 바이너리 한 번 클릭 실행 방지).
 pub fn open_default_command(path: &Path) -> Command {
-    let executable =
-        std::fs::metadata(path).is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m));
+    let executable = std::fs::metadata(path).is_ok_and(|m| m.is_file() && is_executable(path, &m));
     if executable {
         return reveal_command(path);
     }
+    #[cfg(windows)]
+    {
+        let mut cmd = explorer();
+        cmd.arg(path);
+        cmd
+    }
+    #[cfg(not(windows))]
     open_command(&[], path)
 }
 
-/// "Finder에서 보기" — `open -R`은 파일을 선택한 채 Finder 창을 연다.
+/// 기본 앱으로 열면 실행되는 파일인가. Windows는 실행 비트가 없어 셸이 실행하는 확장자로 본다.
+fn is_executable(path: &Path, meta: &std::fs::Metadata) -> bool {
+    const WINDOWS_RUNNABLE: &[&str] = &[
+        "exe",
+        "com",
+        "bat",
+        "cmd",
+        "ps1",
+        "vbs",
+        "vbe",
+        "js",
+        "jse",
+        "wsf",
+        "wsh",
+        "msi",
+        "msc",
+        "scr",
+        "hta",
+        "cpl",
+        "lnk",
+        "url",
+        "reg",
+        "jar",
+        "appref-ms",
+    ];
+    if cfg!(windows) {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| WINDOWS_RUNNABLE.iter().any(|r| e.eq_ignore_ascii_case(r)))
+    } else {
+        crate::platform::has_exec_bits(meta)
+    }
+}
+
+/// "Finder에서 보기" — `open -R`은 파일을 선택한 채 Finder 창을 연다. Windows는 `explorer.exe /select,"<경로>"`.
 pub fn reveal_command(path: &Path) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // explorer는 `/select,`와 경로를 한 인자로 받아 따옴표를 직접 해석한다. Windows 경로에는 `"`가 올 수 없다.
+        let mut cmd = explorer();
+        cmd.raw_arg(format!("/select,\"{}\"", path.display()));
+        cmd
+    }
+    #[cfg(not(windows))]
     open_command(&["-R"], path)
 }
 
-// ponytail: macOS `open`만 있다. Windows(`ShellExecuteW`)는 OWE-834 — 그 전까지 spawn이 실패한다.
+#[cfg(windows)]
+fn explorer() -> Command {
+    let mut cmd = Command::new("explorer.exe");
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd
+}
+
+#[cfg(not(windows))]
 fn open_command(flags: &[&str], path: &Path) -> Command {
     let mut cmd = Command::new("/usr/bin/open");
     cmd.args(flags).arg("--").arg(path);

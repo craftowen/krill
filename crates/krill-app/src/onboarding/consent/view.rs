@@ -25,7 +25,7 @@ const SECTIONS: [(Message, Message); 5] = [
 
 /// 첫 화면에 늘 보이는 요약 3줄.
 const SUMMARY: [Message; 3] = [
-    text::SUMMARY_LOCAL,
+    text::SUMMARY_LOCAL.mac_or(crate::i18n::catalog::other_os::SUMMARY_LOCAL),
     text::SUMMARY_HOOKS,
     text::SUMMARY_DAEMON,
 ];
