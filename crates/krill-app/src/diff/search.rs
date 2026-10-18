@@ -1539,7 +1539,7 @@ pub fn split_highlighted_preview(
 impl Panel {
     /// `Search` 탭으로 전환하고 검색어 입력창에 포커스를 준다.
     pub fn show_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = super::PanelTab::Search;
+        self.set_tab(super::PanelTab::Search, cx);
         let input = self.ensure_search_query_input(window, cx);
         let _ = self.ensure_search_include_input(window, cx);
         let _ = self.ensure_search_exclude_input(window, cx);
@@ -2031,7 +2031,7 @@ impl Panel {
     ) -> Vec<gpui::AnyElement> {
         #[cfg(test)]
         {
-            self.search.rendered_rows += range.len();
+            self.search.rendered_rows = range.len();
         }
         let p = ui::palette(cx);
         let selected_bg = p.accent;
