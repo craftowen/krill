@@ -12,7 +12,9 @@
 //! - 에이전트 상태([`crate::status`], MK-039): hook 연결(첫 프레임이 hook 이벤트)과 spool을 세션에 붙여 반영한다.
 //!   세션은 피어가 세션 후손이면 그 세션, 외부(전체 범위)·spool이면 이벤트의 `ppid` 계보로 정한다.
 
-use crate::os::{AsFd, OwnedFd};
+use crate::os::AsFd;
+#[cfg(all(test, unix))]
+use crate::os::OwnedFd;
 use krill_proto::os::net::UnixStream;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
@@ -37,7 +39,7 @@ use krill_proto::screen::{self, Attach, FEAT_SCREEN, Msg};
 
 use crate::appearance::Appearance;
 use crate::attach::{self, ATTACH_TIMEOUT, Tap};
-use crate::holder::{Holder, Kept};
+use crate::holder::{Holder, Kept, Master};
 use crate::scope::{self, Audit, Peer, Roots, Scope};
 use crate::session::{Session, lock};
 use crate::shell::{Launch, Shell};
@@ -219,9 +221,12 @@ impl Registry {
             }
             // 보관 세션의 PTY 크기를 그대로 쓰면 세션 안 `stty`로 키운 거대 winsize가
             // 재기동 때 Term에 들어가 수백 MB를 할당한다(K-01). 엔진·PTY 모두 자른다.
+            #[cfg(unix)]
             let size = crate::term::clamp_size(
                 crate::session::pty::size(&k.master).unwrap_or(FALLBACK_SIZE),
             );
+            #[cfg(windows)]
+            let size = FALLBACK_SIZE;
             st.next = st.next.max(k.id.0.saturating_add(1));
             let Ok(session) = reg.start(k.id, k.master, size) else {
                 // master는 holder가 계속 쥔다. 다음 krilld 기동 때 다시 온다.
@@ -1038,7 +1043,8 @@ impl Registry {
         }
     }
 
-    fn start(&self, id: SessionId, master: OwnedFd, size: WinSize) -> io::Result<Session> {
+    #[cfg(unix)]
+    fn start(&self, id: SessionId, master: Master, size: WinSize) -> io::Result<Session> {
         let rec = self
             .store
             .as_ref()
@@ -1053,6 +1059,13 @@ impl Registry {
                 }
             });
         Session::start(id, master, size, Arc::clone(&self.look), rec)
+    }
+
+    /// Windows `ReadFile` 리더 연결은 OWE-833-8에서 구현한다.
+    #[cfg(windows)]
+    #[expect(clippy::unused_self, reason = "Unix start와 같은 레지스트리 진입점")]
+    fn start(&self, _id: SessionId, _master: Master, _size: WinSize) -> io::Result<Session> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     fn create(&self, peer: &Peer, c: Create) -> Result<Reply, Failure> {

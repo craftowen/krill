@@ -32,8 +32,10 @@ use krill_proto::SessionId;
 use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder};
 use krill_proto::os::net::{UnixListener, UnixStream};
 
+#[cfg(unix)]
+use crate::holder;
+use crate::holder::Kept;
 use crate::holder::link::Link;
-use crate::holder::{self, Kept};
 use crate::ipc::{Listener, with_suffix};
 use crate::os::{AsFd, OwnedFd};
 use crate::registry::Registry;
@@ -42,6 +44,7 @@ use crate::sys::{self, ExitWatch};
 /// 인계 소켓 이름 = 소켓 경로 + 이 접미사. `.tmp`와 길이가 같아 [`Listener::bind`]의 경로 길이 검사 안에 든다.
 const SUFFIX: &str = ".hnd";
 /// 인계 중 상대를 기다리는 최대 시간(멈춘 상대가 고아 krilld를 붙잡지 못하게).
+#[cfg(unix)]
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// 리더가 멈추기를 기다리는 최대 시간. 리더는 읽은 묶음 하나(최대 64KiB)를 엔진에 넣고 멈춘다.
 const HALT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -111,6 +114,7 @@ fn watch_exits(reg: &Arc<Registry>) {
 }
 
 /// 리더를 멈추고 세션을 모두 넘긴 뒤 상대의 `Ready`를 기다린다.
+#[cfg(unix)]
 fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     halt_all(reg)?;
     s.set_read_timeout(Some(PEER_TIMEOUT))?;
@@ -136,6 +140,12 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
         Some((FromHolder::Ready, _)) => Ok(()),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
+}
+
+/// Windows 고아 재결합 전송로는 아직 연결하지 않는다(OWE-833-8).
+#[cfg(windows)]
+fn give(_reg: &Registry, _stream: UnixStream) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// PTY 리더를 모두 멈추고(읽은 묶음은 기록·세그먼트 봉인까지) 끝나기를 기다린다. 되돌릴 수 없다.
@@ -173,6 +183,7 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
 #[derive(Debug)]
 pub struct Handover {
     link: Link,
+    #[cfg(unix)]
     sessions: Vec<Kept>,
 }
 
@@ -181,6 +192,7 @@ impl Handover {
     ///
     /// # Errors
     /// 인계 소켓이 없거나 `Ready` 전에 끊기면 오류.
+    #[cfg(unix)]
     pub fn take(sock: &Path) -> io::Result<Self> {
         let s = UnixStream::connect(handoff_path(sock))?;
         s.set_read_timeout(Some(PEER_TIMEOUT))?;
@@ -190,11 +202,18 @@ impl Handover {
         Ok(Self { link, sessions })
     }
 
+    /// Windows에서는 Unix 소켓 기반 fd 재결합을 사용하지 않는다.
+    #[cfg(windows)]
+    pub fn take(_sock: &Path) -> io::Result<Self> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     /// 받은 세션을 holder가 돌려준 목록 `kept`에 더하고, holder에 맡길 세션(끝나지 않은 것)의 id·pid·master 사본을
     /// 돌려준다. holder가 이미 가진 id(맡긴 뒤 krilld#2가 죽어 다시 인계받은 경우)는 버린다.
     ///
     /// # Errors
     /// master fd 복제 실패.
+    #[cfg(unix)]
     pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {
         let mut adopt = Vec::new();
         for k in self.sessions.drain(..) {
@@ -207,6 +226,13 @@ impl Handover {
             kept.push(k);
         }
         Ok(adopt)
+    }
+
+    /// Windows 세션 재결합은 별도 핸들 전송 경로가 필요하다.
+    #[cfg(windows)]
+    #[expect(clippy::unused_self, reason = "Unix merge와 같은 인계 진입점")]
+    pub fn merge(&mut self, _kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// `Ready`를 돌려주고 krilld#1이 끝나기를 기다린 뒤 소켓을 게시한다.
