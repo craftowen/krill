@@ -679,6 +679,102 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn owe897_managed_remote_card_shows_probe_and_confirmed_remove(cx: &mut TestAppContext) {
+    use krill_hosts::managed::{RemoteArch, RemoteInfo, RemoteOs, RemotePlatform, RemoteVersion};
+
+    let d = dir("owe897-remote-card");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Ssh, cx);
+            v.ssh_hosts =
+                crate::ssh_hosts::add_host(Some(&d), "Studio", "owen@studio.local", None, None)
+                    .unwrap();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    let id = vcx.update(|_, cx| view.read(cx).ssh_hosts()[0].id.clone());
+    // `debug_bounds`는 `&'static str` 셀렉터를 받으므로 동적 id는 테스트용으로 leak한다.
+    let leak = |s: String| -> &'static str { Box::leak(s.into_boxed_str()) };
+    let card = leak(format!("admin-ssh-card-{id}"));
+    let remote = leak(format!("admin-ssh-remote-{id}"));
+    let probe = leak(format!("admin-ssh-probe-{id}"));
+    let install = leak(format!("admin-ssh-install-{id}"));
+    let remove = leak(format!("admin-ssh-remove-{id}"));
+
+    // 프로브 전: 설치 위치 힌트 + 확인 버튼만 보인다.
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds(card).is_some());
+    assert!(vcx.debug_bounds(remote).is_some());
+    assert!(vcx.debug_bounds(probe).is_some());
+    assert!(vcx.debug_bounds(install).is_none());
+
+    // 구버전 원격 주입: 새로고침·업데이트 버튼이 생긴다.
+    let ready = RemoteInfo {
+        platform: RemotePlatform {
+            os: RemoteOs::Macos,
+            arch: RemoteArch::Arm64,
+            kernel: "Darwin".into(),
+        },
+        home: "/Users/remote".into(),
+        version: RemoteVersion::Known("0.1.0".into()),
+        socket_bundle: None,
+    };
+    vcx.update(|window, cx| {
+        view.update(cx, |v, _cx| {
+            v.ssh_remote_infos.insert(
+                id.clone(),
+                RemoteCardState {
+                    probe: RemoteProbeState::Ready(ready),
+                    install: RemoteInstallState::Idle,
+                },
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds(probe).is_some());
+    assert!(vcx.debug_bounds(install).is_some());
+
+    // 프로브 실패 주입: 행은 그대로 렌더된다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, _cx| {
+            v.ssh_remote_infos.insert(
+                id.clone(),
+                RemoteCardState {
+                    probe: RemoteProbeState::Failed("ssh: connect timeout".into()),
+                    install: RemoteInstallState::Idle,
+                },
+            );
+        });
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds(remote).is_some());
+    assert!(vcx.debug_bounds(install).is_none());
+
+    // 삭제는 두 번 눌러야 실행된다(첫 클릭은 무장만).
+    let bounds = vcx.debug_bounds(remove).unwrap();
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).ssh_hosts().len(), 1);
+    });
+    let bounds = vcx.debug_bounds(remove).unwrap();
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).ssh_hosts().is_empty());
+        // 원격 상태 캐시도 함께 정리된다.
+        assert!(!view.read(cx).ssh_remote_infos.contains_key(&id));
+    });
+
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
 fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
     use krill_proto::orchestration::{OrchestrationStore, WorktreeStore, install_skill};
 
