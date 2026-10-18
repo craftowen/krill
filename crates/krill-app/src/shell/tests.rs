@@ -3752,6 +3752,27 @@ fn tab_rename_dialog_saves_and_clears(cx: &mut TestAppContext) {
     assert_eq!(layout_of(&view, cx).tab_title(0), None);
 }
 
+/// OWE-854: 사이드바 세션 행 '이름 변경'은 그 세션 탭을 열고 탭 이름 변경 대화상자를 띄운다.
+#[gpui::test]
+fn sidebar_rename_session_opens_tab_rename(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("sidebar-rename-session"));
+    cx.run_until_parked();
+    view.update(cx, |this, cx| {
+        this.sidebar.update(cx, |_, cx| {
+            cx.emit(sidebar::RenameSession(krill_proto::SessionId(77)));
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| {
+        let active = s.layout.active();
+        assert_eq!(
+            s.layout.session(s.layout.active_tab().focused),
+            Some(krill_proto::SessionId(77))
+        );
+        assert_eq!(s.tab_rename.as_ref().map(|r| r.index), Some(active));
+    });
+}
+
 /// OWE-870: 왼쪽 탭 닫기는 기준 탭 왼쪽의 비고정 탭만 닫고 닫은 세션을 기록한다(⌘⇧T 복원용).
 #[gpui::test]
 fn close_tabs_to_left_keeps_pinned_and_records(cx: &mut TestAppContext) {

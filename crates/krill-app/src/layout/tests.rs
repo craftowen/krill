@@ -536,6 +536,22 @@ fn new_tab_after_inserts_adjacent_and_activates() {
     assert!(l.is_valid());
 }
 
+/// 하-10: 새 탭(⌘T)은 맨 끝이 아니라 활성 탭 바로 오른쪽에 열린다.
+#[test]
+fn new_tab_opens_right_of_active_tab() {
+    let mut l = Layout::default();
+    let first = l.active_tab().focused;
+    l.new_tab();
+    let last = l.active_tab().focused;
+    l.activate(0);
+    l.new_tab();
+    assert_eq!(l.tabs().len(), 3);
+    assert_eq!(l.active(), 1);
+    assert_eq!(l.tabs()[0].focused, first);
+    assert_eq!(l.tabs()[2].focused, last);
+    assert!(l.is_valid());
+}
+
 #[test]
 fn v5_layout_migrates_to_v6_with_default_pin_and_color() {
     let path = temp_path("v5");

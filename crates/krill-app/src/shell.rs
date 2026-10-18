@@ -653,6 +653,26 @@ impl Shell {
                 this.continue_sidebar_session(&host, e.0, cx);
             },
         );
+        // OWE-854: 사이드바 세션 '이름 변경'은 그 세션 탭을 열고(없으면 새로) 탭 이름 변경(OWE-870)을 띄운다.
+        cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::RenameSession, cx| {
+            let host = sidebar
+                .update(cx, |s, _| s.take_action_host())
+                .unwrap_or(krill_app::hosts::HostId::Local);
+            this.open_session_on(host, e.0, cx);
+            let (Some(win), tab) = (this.window, this.layout.active()) else {
+                return;
+            };
+            let shell = cx.entity().downgrade();
+            cx.defer(move |cx| {
+                win.update(cx, |_, window, cx| {
+                    shell
+                        .update(cx, |s, cx| s.begin_tab_rename(tab, window, cx))
+                        .ok();
+                })
+                .ok();
+            });
+        })
+        .detach();
         // OWE-654·723: 사이드바 폴더 아이콘·빈 상태 '폴더 열기'는 Orca처럼 프로젝트 추가 모달을 연다.
         cx.subscribe(&sidebar, |this, _, _: &sidebar::OpenFolder, cx| {
             let Some(win) = this.window else {
