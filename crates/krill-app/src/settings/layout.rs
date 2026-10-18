@@ -4,5 +4,6 @@
 //! 설정 탭과 대화상자·온보딩·사이드바가 모두 동일한 카드·행·라벨·컨트롤·키캡·위험 버튼 프리미티브를 공유한다.
 
 pub(super) use crate::ui::primitives::{
-    card, controls, danger_confirm as danger, keycap, label, row, secondary, section_title,
+    card, controls, danger_confirm as danger, ghost, keycap, label, primary, row, secondary,
+    section_title, segment, segmented_control, switch,
 };

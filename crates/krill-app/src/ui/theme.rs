@@ -67,6 +67,18 @@ pub const SIDEBAR_EMPTY_PY: Pixels = px(24.);
 pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
 /// 창 가운데 모달 대화상자 기본 너비(Orca `DialogContent` `sm:max-w-lg` = 512px).
 pub const DIALOG_WIDTH: Pixels = px(512.);
+/// 설정 내 넓은 모달 대화상자 너비(공간 관리 정리 미리보기 등, 640px).
+pub const SETTINGS_MODAL_WIDTH: Pixels = px(640.);
+/// 설정 화면 왼쪽 탭 탐색 열 고정 너비(248px).
+pub const SETTINGS_NAV_WIDTH: Pixels = px(248.);
+/// 설정 화면 오른쪽 본문 열 최대 너비(1120px, 창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지, OWE-793).
+pub const SETTINGS_CONTENT_MAX_WIDTH: Pixels = px(1120.);
+/// 토글 스위치 트랙 너비(Orca `Switch` `w-9` = 36px, OWE-793).
+pub const SWITCH_WIDTH: Pixels = px(36.);
+/// 토글 스위치 트랙 높이(Orca `Switch` `h-5` = 20px, OWE-793).
+pub const SWITCH_HEIGHT: Pixels = px(20.);
+/// 토글 스위치 원형 썸 지름(Orca `Switch` 썸 `size-3.5` = 14px, OWE-793).
+pub const SWITCH_THUMB: Pixels = px(14.);
 /// 상단 Jump/커맨드 팔레트 기본 너비(520px).
 pub const COMMAND_PALETTE_WIDTH: Pixels = px(520.);
 
@@ -852,6 +864,12 @@ mod tests {
             "SPACE_3",
             "SPACE_4",
             "DIALOG_WIDTH",
+            "SETTINGS_MODAL_WIDTH",
+            "SETTINGS_NAV_WIDTH",
+            "SETTINGS_CONTENT_MAX_WIDTH",
+            "SWITCH_WIDTH",
+            "SWITCH_HEIGHT",
+            "SWITCH_THUMB",
             "COMMAND_PALETTE_WIDTH",
             "MODAL_BACKDROP",
             "AGENT_UNREAD",
@@ -859,6 +877,12 @@ mod tests {
             "ui::row",
             "ui::label",
             "ui::controls",
+            "ui::primary",
+            "ui::secondary",
+            "ui::ghost",
+            "ui::switch",
+            "ui::segmented_control",
+            "ui::segment",
             "ui::keycap",
             "ui::badge",
             "ui::error_banner",
