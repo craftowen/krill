@@ -23,7 +23,7 @@ use krill_proto::agent::{self, Agents};
 use krill_proto::doctor::{Check, Fix, FixKind, Level, Status};
 use rustix::fs::{Access, access};
 
-actions!(onboarding, [OpenChecks, CloseWizard]);
+actions!(onboarding, [OpenChecks]);
 
 /// 끝까지 간 뒤 상태 디렉터리에 만드는 표시 파일(구 방식, 마이그레이션 입력으로만 읽는다).
 pub const DONE_FILE: &str = "onboarding.done";
@@ -435,11 +435,9 @@ pub fn offer(env: Env, cx: &mut App) {
 
 /// 메뉴·팔레트 액션을 등록한다. 앱 시작 때 한 번 부른다.
 pub fn init_actions(cx: &mut App) {
-    // OWE-861: 점검 창에서도 ⌘W로 닫힌다(⌥⌘W는 전역 CloseWindow가 맡는다).
-    cx.bind_keys([KeyBinding::new("cmd-w", CloseWizard, Some("Wizard"))]);
     cx.on_action(|_: &OpenChecks, cx| open_checks_current(cx));
-    // 마법사(점검) 창의 macOS 표준 ⌘W 닫기(OWE-878). Esc는 마법사 `on_key_down`이 맡는다.
-    cx.bind_keys([gpui::KeyBinding::new(
+    // 마법사(점검) 창의 macOS 표준 ⌘W 닫기(OWE-861·878, ⌥⌘W는 전역 CloseWindow). Esc는 마법사 `on_key_down`이 맡는다.
+    cx.bind_keys([KeyBinding::new(
         "cmd-w",
         welcome::CloseWizard,
         Some(welcome::KEY_CONTEXT),

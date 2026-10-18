@@ -344,8 +344,8 @@ fn language_switch_rebuilds_native_menus_and_keeps_the_security_check(
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// OWE-859: `⌘N`은 셸 문맥에서 `shell::NewWorktree`가 이기고(OWE-864 전역 `NewWindow`와 공존),
-/// `NewWindow` 액션은 이미 열린 메인 `Shell` 창을 재사용해 레이아웃 저장 경로 유실을 막는다.
+/// OWE-859: `⌘N`은 `shell::NewWorktree` 하나에만, `⇧⌘N`은 `NewWindow` 하나에만 묶인다(메뉴 표기·단축키 탭과
+/// 실제 동작이 같다). `NewWindow` 액션은 이미 열린 메인 `Shell` 창을 재사용해 레이아웃 저장 경로 유실을 막는다.
 #[gpui::test]
 fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
     cx: &mut gpui::TestAppContext,
@@ -354,14 +354,15 @@ fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
     std::fs::remove_file(&path).ok();
     cx.update(|cx| {
         init(cx);
-        let typed = [gpui::Keystroke::parse("cmd-n").unwrap()];
-        let actions: Vec<_> = cx
-            .all_bindings_for_input(&typed)
-            .into_iter()
-            .map(|b| b.action().name())
-            .collect();
-        // OWE-864: 창 없는 곳에서는 전역 `NewWindow`가, 셸 문맥에서는 `NewWorktree`가 동작한다.
-        assert_eq!(actions, ["minikrill::NewWindow", "shell::NewWorktree"]);
+        let actions_for = |key: &str, cx: &App| -> Vec<&'static str> {
+            let typed = [gpui::Keystroke::parse(key).unwrap()];
+            cx.all_bindings_for_input(&typed)
+                .into_iter()
+                .map(|b| b.action().name())
+                .collect()
+        };
+        assert_eq!(actions_for("cmd-n", cx), ["shell::NewWorktree"]);
+        assert_eq!(actions_for("cmd-shift-n", cx), ["minikrill::NewWindow"]);
 
         let first = open_shell(cx, Some(path.clone())).unwrap();
         let second = new_window(cx).unwrap();
@@ -390,4 +391,35 @@ fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
     let restored = krill_app::layout::Layout::load(&path).unwrap();
     assert_eq!(restored.tabs().len(), 2);
     std::fs::remove_file(path).ok();
+}
+
+/// OWE-842: 어느 화면과도 겹치지 않는 저장 위치는 저장 크기로 주 화면 가운데에 연다. 화면 안이면 그대로 둔다.
+#[gpui::test]
+fn saved_window_bounds_off_every_display_open_centered(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let display = cx.primary_display().unwrap().bounds();
+        let inside = WindowBounds::Windowed(Bounds::new(
+            gpui::point(px(100.), px(80.)),
+            size(px(900.), px(600.)),
+        ));
+        assert_eq!(on_screen(inside, cx), inside);
+
+        let off = WindowBounds::Maximized(Bounds::new(
+            gpui::point(px(-90_000.), px(5_000.)),
+            size(px(900.), px(600.)),
+        ));
+        let WindowBounds::Maximized(b) = on_screen(off, cx) else {
+            panic!("window mode must be kept");
+        };
+        assert_eq!(b.size, size(px(900.), px(600.)));
+        assert!(display.intersects(&b));
+
+        // 저장 크기가 화면보다 크면 화면 크기로 줄인다.
+        let huge = WindowBounds::Windowed(Bounds::new(
+            gpui::point(px(-90_000.), px(0.)),
+            size(px(9_000.), px(9_000.)),
+        ));
+        let b = on_screen(huge, cx).get_bounds();
+        assert!(b.size.width <= display.size.width && b.size.height <= display.size.height);
+    });
 }

@@ -314,80 +314,90 @@ fn is_default(defaults: &[Pair], action: &str, key: &str) -> bool {
     norm(key).is_some_and(|key| defaults.iter().any(|(a, k)| *a == action && *k == key))
 }
 
-/// `action`의 `old` 키를 `key`로 바꾼다(`old`가 `None`이면 추가). 기본 키를 바꿀 때는 그 키를 `""`로 끈다.
-// ponytail: `""`는 그 키의 모든 기본 바인딩을 끈다(⌘W는 창 닫기와 대시보드 닫기를 함께). 액션별 끄기가 필요하면 keys.toml 형식을 넓힌다.
+/// `action`의 기본 키 `key`만 끈다(`[disabled]`, OWE-863). 같은 키를 쓰는 다른 액션은 그대로다.
+fn disable_default(keys: &mut Keys, action: &str, key: &str) {
+    let list = keys.disabled.entry(action.to_owned()).or_default();
+    if !list.iter().any(|k| same(k, key)) {
+        list.push(key.to_owned());
+    }
+}
+
+/// [`disable_default`]로 끈 `action`의 `key`를 되살린다.
+fn enable_default(keys: &mut Keys, action: &str, key: &str) {
+    if let Some(list) = keys.disabled.get_mut(action) {
+        list.retain(|k| !same(k, key));
+        if list.is_empty() {
+            keys.disabled.remove(action);
+        }
+    }
+}
+
+/// `action`의 `old` 키를 `key`로 바꾼다(`old`가 `None`이면 추가). 기본 키를 바꿀 때는 그 액션의 기본 키만 끈다.
 pub(super) fn set_key(
-    table: &mut toml::Table,
+    keys: &mut Keys,
     defaults: &[Pair],
     action: &str,
     old: Option<&str>,
     key: &str,
 ) {
-    table.retain(|k, _| !same(k, key));
+    keys.bindings.retain(|k, _| !same(k, key));
+    enable_default(keys, action, key);
     if let Some(old) = old.filter(|o| !same(o, key)) {
-        table.retain(|k, _| !same(k, old));
+        keys.bindings.retain(|k, _| !same(k, old));
         if is_default(defaults, action, old) {
-            table.insert(old.to_owned(), "".into());
+            disable_default(keys, action, old);
         }
     }
-    table.insert(key.to_owned(), action.into());
+    keys.bindings.insert(key.to_owned(), action.into());
 }
 
-/// `action`의 재정의(그 액션으로 가는 키, 그 액션의 기본 키를 끈 `""`)를 지워 기본 키로 되돌린다.
-pub(super) fn reset_action(table: &mut toml::Table, defaults: &[Pair], action: &str) {
-    table.retain(|k, v| match v.as_str() {
+/// `action`의 재정의(그 액션으로 가는 키, 그 액션의 끈 기본 키, 구 형식 `""`)를 지워 기본 키로 되돌린다.
+pub(super) fn reset_action(keys: &mut Keys, defaults: &[Pair], action: &str) {
+    keys.bindings.retain(|k, v| match v.as_str() {
         Some(v) if v == action => false,
         Some("") => !is_default(defaults, action, k),
         _ => true,
     });
+    keys.disabled.remove(action);
 }
 
-/// `action`의 바인딩 하나만 지운다(OWE-863). 기본 키면 `""`로 꺼서 같은 키의 다른 기본 바인딩도 함께
-/// 끈다([`set_key`]와 같은 키 단위 규칙).
-pub(super) fn remove_key(table: &mut toml::Table, defaults: &[Pair], action: &str, key: &str) {
-    table.retain(|k, _| !same(k, key));
+/// `action`의 바인딩 하나만 지운다(OWE-863). 기본 키면 그 액션의 기본 키만 끈다(같은 키의 다른 액션은 유지).
+pub(super) fn remove_key(keys: &mut Keys, defaults: &[Pair], action: &str, key: &str) {
+    keys.bindings.retain(|k, _| !same(k, key));
     if is_default(defaults, action, key) {
-        table.insert(key.to_owned(), "".into());
+        disable_default(keys, action, key);
     }
 }
 
 /// `action`의 현재 키를 모두 꺼 단축키를 비활성화한다(OWE-863). 초기화로 기본 키를 되돌릴 수 있다.
-pub(super) fn disable_action(
-    table: &mut toml::Table,
-    defaults: &[Pair],
-    action: &str,
-    current: &[String],
-) {
+pub(super) fn disable_action(keys: &mut Keys, defaults: &[Pair], action: &str, current: &[String]) {
     for key in current {
-        remove_key(table, defaults, action, key);
+        remove_key(keys, defaults, action, key);
     }
 }
 
-/// `original`의 `[bindings]` 항목을 `target`과 같게 고친 새 본문. 주석·빈 줄·남은 항목 순서는 그대로 둔다.
+/// `original`의 `[bindings]`·`[disabled]` 항목을 `target`과 같게 고친 새 본문. 주석·빈 줄·남은 항목 순서는 그대로 둔다.
 ///
 /// # Errors
 /// 직렬화에 실패하면 오류(파일은 건드리지 않는다).
-pub(super) fn rewrite(original: &str, target: &toml::Table) -> Result<String, String> {
-    let updated = Keys {
-        bindings: target.clone(),
-    };
-    krill_proto::config_document::edit_toml(original, &updated).map_err(|e| e.to_string())
+pub(super) fn rewrite(original: &str, target: &Keys) -> Result<String, String> {
+    krill_proto::config_document::edit_toml(original, target).map_err(|e| e.to_string())
 }
 
 /// `keys.toml`을 읽어 `f`로 고치고 바꿔 단다. 없으면 템플릿에서 시작하고, 틀린 파일은 덮어쓰지 않는다.
 ///
 /// # Errors
 /// 읽기·파싱·쓰기 실패.
-pub(super) fn edit_keys(dir: &Path, f: impl FnOnce(&mut toml::Table)) -> Result<(), String> {
+pub(super) fn edit_keys(dir: &Path, f: impl FnOnce(&mut Keys)) -> Result<(), String> {
     let path = dir.join(KEYS_FILE);
     let original = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => text::KEYS_TEMPLATE.get().to_owned(),
         Err(e) => return Err(e.to_string()),
     };
-    let mut table = Keys::parse(&original).map_err(|e| e.to_string())?.bindings;
-    f(&mut table);
-    let body = rewrite(&original, &table)?;
+    let mut keys = Keys::parse(&original).map_err(|e| e.to_string())?;
+    f(&mut keys);
+    let body = rewrite(&original, &keys)?;
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     // 1초 폴링이 반쯤 쓴 파일을 읽지 않게 고유 임시 파일에 쓰고 바꿔 단다(AS-08).
     super::write_settings(&path, &body).map_err(|e| e.to_string())
@@ -582,7 +592,7 @@ impl SettingsView {
         });
     }
 
-    fn write_keys(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut toml::Table, &[Pair])) {
+    fn write_keys(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Keys, &[Pair])) {
         let Some(c) = cx.try_global::<Config>() else {
             return;
         };
@@ -615,10 +625,13 @@ impl SettingsView {
 
     pub(super) fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
-        self.write_keys(cx, |t, _| t.clear());
+        self.write_keys(cx, |t, _| {
+            t.bindings.clear();
+            t.disabled.clear();
+        });
     }
 
-    /// 바인딩 하나만 지운다(OWE-863). 기본 키면 `""`로 꺼서 비활성화한다.
+    /// 바인딩 하나만 지운다(OWE-863). 기본 키면 그 액션의 기본 키만 끈다.
     pub(super) fn delete_key(&mut self, action: &'static str, key: &str, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
         self.write_keys(cx, |t, defaults| remove_key(t, defaults, action, key));

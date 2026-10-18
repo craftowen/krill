@@ -381,7 +381,6 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-up", PrevSession, ctx),
         KeyBinding::new("cmd-shift-down", NextSession, ctx),
         KeyBinding::new("cmd-n", NewWorktree, ctx),
-        KeyBinding::new("cmd-shift-n", NewWorktree, ctx),
         KeyBinding::new("cmd-1", ActivateTab1, ctx),
         KeyBinding::new("cmd-2", ActivateTab2, ctx),
         KeyBinding::new("cmd-3", ActivateTab3, ctx),

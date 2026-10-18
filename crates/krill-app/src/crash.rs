@@ -28,11 +28,28 @@ pub fn offer_report(
         &[text::BUNDLE.get(), text::DISMISS.get()],
         cx,
     );
+    let handle = window.window_handle();
     cx.spawn(async move |cx| {
         if answer.await == Ok(0) {
             match diag::write_bundle(&state) {
                 Ok(path) => cx.update(|cx| on_bundle(&path, cx)),
-                Err(e) => eprintln!("diagnostic bundle write failed: {e}"),
+                Err(e) => {
+                    // 번들을 못 만들면 알리고 확인 처리하지 않는다: 다음 실행에서 다시 물어 로그를 잃지 않는다.
+                    tracing::warn!(%e, "diagnostic bundle write failed");
+                    let detail = text::BUNDLE_FAILED_DETAIL.format(&[("error", &e.to_string())]);
+                    handle
+                        .update(cx, |_, window, cx| {
+                            drop(window.prompt(
+                                PromptLevel::Critical,
+                                text::BUNDLE_FAILED.get(),
+                                Some(&detail),
+                                &[text::DISMISS.get()],
+                                cx,
+                            ));
+                        })
+                        .ok();
+                    return;
+                }
             }
         }
         diag::acknowledge(&logs);
