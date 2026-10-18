@@ -783,7 +783,7 @@ catalog! {
         WRAPPED => ("순환", "Wrapped"),
     }
     settings {
-        KEYS_TEMPLATE => ("# 키 바인딩 재정의. 저장하면 바로 반영된다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 끈다.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n", "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables the default binding for that key.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n"),
+        KEYS_TEMPLATE => ("# 키 바인딩 재정의. 저장하면 바로 반영된다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 모두 끈다. 한 액션의 기본 키만 끄려면 [disabled]에 적는다.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n", "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables every default binding for that key. To disable one action's default key only, list it under [disabled].\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n"),
         TITLE => ("설정", "Settings"),
         THEME => ("테마", "Theme"),
         SYSTEM => ("시스템", "System"),
