@@ -165,10 +165,119 @@ fn fixtures_v3() {
     assert_eq!(hex(&b), "0e0000000800090000000700000000000000");
     assert_eq!(ToHolder::decode(one(&b)), Ok(m));
     let hello = FromHolder::Hello {
-        version: VERSION,
+        version: 3,
         holder_pid: 0x1234,
     };
     assert_eq!(hex(&hello.encode().unwrap()), "080000008100030034120000");
+}
+
+/// v4에서 추가한 메시지(OWE-831)의 고정 바이트.
+#[test]
+fn fixtures_v4() {
+    let m = ToHolder::Resize {
+        req: 10,
+        id: SessionId(7),
+        size: WinSize {
+            cols: 120,
+            rows: 40,
+        },
+    };
+    let b = m.encode().unwrap();
+    assert_eq!(hex(&b), "1200000009000a000000070000000000000078002800");
+    assert_eq!(ToHolder::decode(one(&b)), Ok(m.clone()));
+    // v3 holder에게는 모르는 kind다: fd 없이 오고 req를 읽어 ENOSYS로 답할 수 있다.
+    let f = one(&b);
+    assert_eq!((f.kind, f.fds), (0x09, 0));
+    assert_eq!(request_id(f.body), Some(10));
+    // 핸들 없는 kind는 Windows 프레임도 Unix와 바이트가 같다.
+    assert_eq!(m.encode_handles(&[]).unwrap(), b);
+    let hello = FromHolder::Hello {
+        version: VERSION,
+        holder_pid: 0x1234,
+    };
+    assert_eq!(hex(&hello.encode().unwrap()), "080000008100040034120000");
+}
+
+/// Windows 핸들 값 프레임: `[len][kind][n][n × u64][body]`. Unix 인코딩은 그대로다(위 v1~v3 표).
+#[test]
+fn windows_handles() {
+    let spawned = FromHolder::Spawned {
+        req: 1,
+        id: SessionId(7),
+        pid: 99,
+    };
+    let b = spawned.encode_handles(&[0x10, 0x14, 0x18]).unwrap();
+    assert_eq!(
+        hex(&b),
+        "2a0000008503".to_owned()
+            + "1000000000000000"
+            + "1400000000000000"
+            + "1800000000000000"
+            + "01000000070000000000000063000000"
+    );
+    assert_eq!(
+        FromHolder::decode_handles(one(&b)),
+        Ok((spawned.clone(), vec![0x10, 0x14, 0x18]))
+    );
+    // 선택 핸들(ref·proc)까지 5개.
+    let session = FromHolder::Session {
+        id: SessionId(8),
+        pid: 100,
+        status: None,
+    };
+    let h = [1, 2, 3, 4, 0xffff_ffff_ffff_fffe];
+    let b = session.encode_handles(&h).unwrap();
+    assert_eq!(
+        FromHolder::decode_handles(one(&b)),
+        Ok((session, h.to_vec()))
+    );
+    let adopt = ToHolder::Adopt {
+        req: 2,
+        id: SessionId(8),
+        pid: 100,
+    };
+    let b = adopt.encode_handles(&h[..3]).unwrap();
+    assert_eq!(
+        ToHolder::decode_handles(one(&b)),
+        Ok((adopt, h[..3].to_vec()))
+    );
+    for (m, n) in [
+        (ToHolder::HoldListener { req: 3 }.encode_handles(&[9]), 1),
+        (FromHolder::Listener.encode_handles(&[9]), 1),
+    ] {
+        assert_eq!(one(&m.unwrap()).fds, n);
+    }
+    // 핸들 수가 kind와 맞지 않으면 보내지도 받지도 않는다.
+    assert_eq!(
+        spawned.encode_handles(&[1, 2]),
+        Err(Error::FdCount { kind: 0x85, got: 2 }),
+        "sig가 빠진 세션"
+    );
+    assert_eq!(
+        FromHolder::Done { req: 1 }.encode_handles(&[1]),
+        Err(Error::FdCount { kind: 0x87, got: 1 })
+    );
+    assert_eq!(
+        FromHolder::Listener.encode_handles(&[]),
+        Err(Error::FdCount { kind: 0x83, got: 0 })
+    );
+    let mut b = FromHolder::Done { req: 1 }.encode().unwrap();
+    b[5] = 1;
+    assert_eq!(FromHolder::decode_handles(one(&b)), Err(Error::Truncated));
+}
+
+#[test]
+fn windows_unknown_kind_handles_can_be_closed() {
+    // 미래 kind 0x40이 핸들 2개를 싣고 오면 kind를 몰라도 값을 꺼내 닫고 req로 답한다.
+    let mut b = vec![0x16, 0, 0, 0, 0x40, 2];
+    b.extend(5u64.to_le_bytes());
+    b.extend(6u64.to_le_bytes());
+    b.extend(42u32.to_le_bytes());
+    let f = one(&b);
+    assert_eq!(ToHolder::decode_handles(f), Err(Error::UnknownKind(0x40)));
+    let (h, body) = f.handles().unwrap();
+    assert_eq!(h, vec![5, 6]);
+    assert_eq!(request_id(body), Some(42));
 }
 
 #[test]
@@ -269,6 +378,8 @@ fn random_bytes_never_panic() {
         if let Ok(Some((f, _))) = parse_frame(&b) {
             ToHolder::decode(f).ok();
             FromHolder::decode(f).ok();
+            ToHolder::decode_handles(f).ok();
+            FromHolder::decode_handles(f).ok();
         }
     }
 }
@@ -282,6 +393,8 @@ proptest::proptest! {
         if let Ok(Some((f, _))) = parse_frame(&bytes) {
             ToHolder::decode(f).ok();
             FromHolder::decode(f).ok();
+            ToHolder::decode_handles(f).ok();
+            FromHolder::decode_handles(f).ok();
         }
     }
 }
