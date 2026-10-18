@@ -601,11 +601,11 @@ fn login_dir(account: &AccountInfo) -> Option<&Path> {
 
 fn cleanup_failed_login(paths: &Paths, account: &AccountInfo, newly_added: bool) {
     if newly_added {
-        // RemoveAccount owns the atomic accounts.toml mutation and moves the complete,
+        // DeleteAccount owns the atomic accounts.toml mutation and moves the complete,
         // app-managed profile (including files written during login) to the user trash.
         request_ipc(
             paths,
-            &UsageRequest::RemoveAccount {
+            &UsageRequest::DeleteAccount {
                 provider: account.provider,
                 account_id: account.id.clone(),
             },
