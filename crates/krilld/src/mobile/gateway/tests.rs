@@ -482,6 +482,7 @@ fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {

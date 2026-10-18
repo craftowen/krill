@@ -22,7 +22,10 @@ fn to_holder() -> Vec<ToHolder> {
             req: 3,
             id: SessionId(7),
         },
-        ToHolder::HoldListener { req: 4 },
+        ToHolder::HoldListener {
+            req: 4,
+            info: Vec::new(),
+        },
         ToHolder::UpgradeKrilld {
             req: 5,
             path: b"/k".to_vec(),
@@ -39,6 +42,7 @@ fn from_holder() -> Vec<FromHolder> {
         FromHolder::Hello {
             version: 1,
             holder_pid: 0x1234,
+            inbox: false,
         },
         FromHolder::Session {
             id: SessionId(7),
@@ -50,7 +54,7 @@ fn from_holder() -> Vec<FromHolder> {
             pid: 100,
             status: Some(0x0100),
         },
-        FromHolder::Listener,
+        FromHolder::Listener { info: Vec::new() },
         FromHolder::Ready,
         FromHolder::Spawned {
             req: 1,
@@ -137,6 +141,7 @@ fn fixtures_v2() {
             FromHolder::Hello {
                 version: 2,
                 holder_pid: 0x1234,
+                inbox: false,
             },
             "080000008100020034120000",
         ),
@@ -167,6 +172,7 @@ fn fixtures_v3() {
     let hello = FromHolder::Hello {
         version: 3,
         holder_pid: 0x1234,
+        inbox: false,
     };
     assert_eq!(hex(&hello.encode().unwrap()), "080000008100030034120000");
 }
@@ -194,6 +200,7 @@ fn fixtures_v4() {
     let hello = FromHolder::Hello {
         version: VERSION,
         holder_pid: 0x1234,
+        inbox: false,
     };
     assert_eq!(hex(&hello.encode().unwrap()), "080000008100040034120000");
 }
@@ -242,8 +249,18 @@ fn windows_handles() {
         Ok((adopt, h[..3].to_vec()))
     );
     for (m, n) in [
-        (ToHolder::HoldListener { req: 3 }.encode_handles(&[9]), 1),
-        (FromHolder::Listener.encode_handles(&[9]), 1),
+        (
+            ToHolder::HoldListener {
+                req: 3,
+                info: Vec::new(),
+            }
+            .encode_handles(&[9]),
+            1,
+        ),
+        (
+            FromHolder::Listener { info: Vec::new() }.encode_handles(&[9]),
+            1,
+        ),
     ] {
         assert_eq!(one(&m.unwrap()).fds, n);
     }
@@ -258,12 +275,57 @@ fn windows_handles() {
         Err(Error::FdCount { kind: 0x87, got: 1 })
     );
     assert_eq!(
-        FromHolder::Listener.encode_handles(&[]),
+        FromHolder::Listener { info: Vec::new() }.encode_handles(&[]),
         Err(Error::FdCount { kind: 0x83, got: 0 })
     );
     let mut b = FromHolder::Done { req: 1 }.encode().unwrap();
     b[5] = 1;
     assert_eq!(FromHolder::decode_handles(one(&b)), Err(Error::Truncated));
+}
+
+/// OWE-832 끝 필드: `Hello.inbox`·`Listener.info`·`HoldListener.info`. 비어 있으면 v4 바이트와 같고,
+/// v3·v4 피어가 보낸 바이트는 거짓·빈 값으로 읽는다.
+#[test]
+fn tail_fields_owe832() {
+    let v4 = "080000008100040034120000";
+    let hello = |inbox| FromHolder::Hello {
+        version: VERSION,
+        holder_pid: 0x1234,
+        inbox,
+    };
+    assert_eq!(hex(&hello(false).encode().unwrap()), v4);
+    let b = hello(true).encode().unwrap();
+    assert_eq!(hex(&b), "09000000810004003412000001");
+    assert_eq!(FromHolder::decode(one(&b)), Ok(hello(true)));
+    let mut old = b.clone();
+    old.pop();
+    old[0] -= 1;
+    assert_eq!(
+        FromHolder::decode(one(&old)),
+        Ok(hello(false)),
+        "v3·v4 holder"
+    );
+    // Windows 소켓 정보는 핸들 0개로 싣는다. Unix(빈 info)는 fd 1개 그대로.
+    let info = vec![7u8; 4];
+    let lis = FromHolder::Listener { info: info.clone() };
+    let b = lis.encode_handles(&[]).unwrap();
+    assert_eq!(hex(&b), "0a00000083000400000007070707");
+    assert_eq!(
+        FromHolder::decode_handles(one(&b)),
+        Ok((lis.clone(), vec![]))
+    );
+    assert_eq!(
+        lis.encode_handles(&[9]),
+        Err(Error::FdCount { kind: 0x83, got: 1 })
+    );
+    let hold = ToHolder::HoldListener { req: 3, info };
+    let b = hold.encode_handles(&[]).unwrap();
+    assert_eq!(ToHolder::decode_handles(one(&b)), Ok((hold, vec![])));
+    let unix = ToHolder::HoldListener {
+        req: 4,
+        info: Vec::new(),
+    };
+    assert_eq!(hex(&unix.encode().unwrap()), "06000000040104000000");
 }
 
 #[test]
@@ -337,7 +399,7 @@ fn rejects_bad_frames() {
         Err(Error::BadLength(u32::from_le_bytes(big)))
     );
     // fd 수가 kind와 다르면 거절(fd 대기열이 어긋난 것).
-    let mut b = FromHolder::Listener.encode().unwrap();
+    let mut b = FromHolder::Listener { info: Vec::new() }.encode().unwrap();
     b[5] = 0;
     assert_eq!(
         FromHolder::decode(one(&b)),

@@ -476,7 +476,7 @@ impl Holder {
         let listener = self
             .listener
             .as_ref()
-            .map(|l| (FromHolder::Listener, Some(l.as_fd())));
+            .map(|l| (FromHolder::Listener { info: Vec::new() }, Some(l.as_fd())));
         let ok = std::iter::once((hello(), None))
             .chain(sessions)
             .chain(listener)
@@ -572,6 +572,7 @@ fn hello() -> FromHolder {
     FromHolder::Hello {
         version: VERSION,
         holder_pid: rustix::process::getpid().as_raw_pid().unsigned_abs(),
+        inbox: false,
     }
 }
 

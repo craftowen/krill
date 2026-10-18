@@ -81,6 +81,7 @@ fn timer_sends_terminate_only_for_safe_group_and_preserves_resume_marker() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: std::process::id(),
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
@@ -275,6 +276,7 @@ fn terminate_send_failure_leaves_no_sleep_marker() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: std::process::id(),
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
@@ -384,6 +386,7 @@ fn wake_after_account_switch_keeps_launch_profile() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: std::process::id(),
+            inbox: false,
         },
         FromHolder::Ready,
     ] {

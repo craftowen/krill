@@ -278,6 +278,7 @@ mod tests {
             FromHolder::Hello {
                 version: VERSION,
                 holder_pid: 1,
+                inbox: false,
             },
             FromHolder::Ready,
         ] {
