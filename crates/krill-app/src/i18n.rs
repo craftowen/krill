@@ -2209,6 +2209,7 @@ pub mod link_ui {
         REVOKE_CONFIRM_TITLE => ("'{name}' 기기의 연결을 끊을까요?", "Disconnect '{name}'?"),
         REVOKE_CONFIRM_DETAIL => ("연결을 끊으면 이 기기에서는 더 이상 이 Mac의 작업 화면을 볼 수 없습니다. 다시 연결하려면 새 초대 링크가 필요합니다.", "Once disconnected, this device can no longer view sessions on this Mac. A new invite link will be required to reconnect."),
         REVOKE_CONFIRM_YES => ("연결 끊기", "Disconnect"),
+        REVOKE_CONFIRM_AGAIN => ("다시 눌러 연결 끊기", "Click again to disconnect"),
         REVOKE_CONFIRM_CANCEL => ("취소", "Cancel"),
         CLIENT_TITLE => ("다른 Mac 추가", "Add another Mac"),
         CLIENT_DESC => ("다른 Mac에서 만든 초대 링크를 붙여넣어 연결하세요.", "Paste an invite link created on another Mac to connect."),

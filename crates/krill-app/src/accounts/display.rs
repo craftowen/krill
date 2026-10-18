@@ -153,10 +153,12 @@ pub fn render_status(
     info: &AccountDisplay,
     p: &crate::ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
-    use gpui::{div, prelude::*, px};
-    let color = match info.status {
-        AccountStatus::NeedsLogin | AccountStatus::Error | AccountStatus::RateLimited => p.warning,
-        _ => p.muted_foreground,
+    use gpui::{div, prelude::*};
+    let tone = match info.status {
+        AccountStatus::NeedsLogin | AccountStatus::Error | AccountStatus::RateLimited => {
+            crate::ui::BadgeTone::Warning
+        }
+        _ => crate::ui::BadgeTone::Muted,
     };
     let debug_id = id.clone();
     div()
@@ -168,15 +170,7 @@ pub fn render_status(
         .items_center()
         .gap_2()
         .text_size(crate::ui::TEXT_2XS)
-        .child(
-            div()
-                .px_1p5()
-                .py(px(1.))
-                .rounded(crate::ui::RADIUS_XS)
-                .bg(color.opacity(0.12))
-                .text_color(color)
-                .child(info.label),
-        )
+        .child(crate::ui::badge(p, tone, info.label))
         .child(
             div()
                 .text_color(
