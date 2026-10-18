@@ -490,6 +490,17 @@ fn floating_find_shortcut_opens_search(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let floating = cx.read(|cx| existing::<Floating>(cx).unwrap());
     let child = floating.update(cx, |f, _, _| f.shell.clone()).unwrap();
+    // OWE-868: 검색 바는 라이브 세션이 있을 때만 열린다. 플로팅 셸은 실제 환경에서
+    // 데몬 동기화로 라이브 세션이 붙으므로, 테스트에서도 같은 세션을 직접 붙여 준다.
+    let (ours_floating, _peer_floating) = UnixStream::pair().unwrap();
+    cx.update(|cx| {
+        child.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_session(pane, SessionId(61));
+            s.attach_test(pane, SessionId(61), ours_floating, cx);
+        });
+    });
+    cx.run_until_parked();
     assert!(
         child.read_with(cx, |s, _| s.search.is_none()),
         "search starts closed"
