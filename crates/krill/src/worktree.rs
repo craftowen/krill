@@ -20,7 +20,7 @@ use krill_proto::screen::Msg;
 
 use crate::remote::Target;
 
-const USAGE: &str = "usage: krill worktree new <name> [--host <user@host>] [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--host <user@host>] [--repo <path>] [--force]\n       krill worktree list [--repo <path>] [--json]\n       krill worktree show [<path>] [--json]\n       krill worktree current [--json]\n       krill worktree ps [--worktree <path>] [--json]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--json]";
+const USAGE: &str = "usage: krill worktree new <name> [--host <user@host>] [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--host <user@host>] [--repo <path>] [--force] [--trust-archive <hash>]\n       krill worktree list [--repo <path>] [--json]\n       krill worktree show [<path>] [--json]\n       krill worktree current [--json]\n       krill worktree ps [--worktree <path>] [--json]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--trust <hash>] [--json]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedNew {
@@ -709,11 +709,37 @@ fn run_symlink(args: &[OsString]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+pub(super) fn record_setup_trust(
+    state_dir: &std::path::Path,
+    raw_hash: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let hash = raw_hash.trim().to_ascii_lowercase();
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("hook trust requires a 64-digit SHA-256 hash".to_owned());
+    }
+    let trust_file = state_dir.join("setup-trust");
+    if let Ok(existing) = std::fs::read_to_string(&trust_file)
+        && existing.lines().any(|line| line.trim() == hash)
+    {
+        return Ok(());
+    }
+    std::fs::create_dir_all(state_dir).map_err(|e| format!("cannot create state dir: {e}"))?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&trust_file)
+        .and_then(|mut f| writeln!(f, "{hash}"))
+        .map_err(|e| format!("cannot record setup trust: {e}"))
+}
+
 fn run_hooks(args: &[OsString]) -> ExitCode {
     let mut it = args.iter();
     let mut repo = None;
     let mut setup: Option<String> = None;
     let mut archive: Option<String> = None;
+    let mut trust_hashes: Vec<String> = Vec::new();
     let mut json = false;
     while let Some(raw) = it.next() {
         let Ok(arg) = utf8(raw) else {
@@ -726,6 +752,12 @@ fn run_hooks(args: &[OsString]) -> ExitCode {
             setup = Some(val.to_owned());
         } else if let Some(val) = arg.strip_prefix("--archive=") {
             archive = Some(val.to_owned());
+        } else if let Some(val) = arg
+            .strip_prefix("--trust=")
+            .or_else(|| arg.strip_prefix("--trust-archive="))
+            .or_else(|| arg.strip_prefix("--trust-setup="))
+        {
+            trust_hashes.push(val.to_owned());
         } else {
             match arg {
                 "--repo" => {
@@ -749,6 +781,13 @@ fn run_hooks(args: &[OsString]) -> ExitCode {
                     };
                     archive = Some(v.to_owned());
                 }
+                "--trust" | "--trust-archive" | "--trust-setup" => {
+                    let Some(v) = it.next().and_then(|s| s.to_str()) else {
+                        eprintln!("missing {arg} value\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    trust_hashes.push(v.to_owned());
+                }
                 "--clear-setup" => setup = Some(String::new()),
                 "--clear-archive" => archive = Some(String::new()),
                 "--json" => json = true,
@@ -764,6 +803,12 @@ fn run_hooks(args: &[OsString]) -> ExitCode {
         eprintln!("worktree hooks: HOME is not set");
         return ExitCode::FAILURE;
     };
+    for hash in &trust_hashes {
+        if let Err(e) = record_setup_trust(&state, hash) {
+            eprintln!("worktree hooks: {e}");
+            return ExitCode::from(2);
+        }
+    }
     let root = match resolve_repo_arg(repo) {
         Ok(r) => r,
         Err(e) => {
@@ -856,5 +901,18 @@ mod tests {
             );
         }
         assert_eq!(run(&[]), ExitCode::from(2));
+    }
+
+    #[test]
+    fn record_setup_trust_deduplicates_and_validates_sha256() {
+        let dir = std::env::temp_dir().join(format!("mk-wt-trust-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(record_setup_trust(&dir, "not-a-hash").is_err());
+        let hash = "A".repeat(64);
+        record_setup_trust(&dir, &hash).unwrap();
+        record_setup_trust(&dir, &hash.to_ascii_lowercase()).unwrap();
+        let saved = std::fs::read_to_string(dir.join("setup-trust")).unwrap();
+        assert_eq!(saved, format!("{}\n", "a".repeat(64)));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
