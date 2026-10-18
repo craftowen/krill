@@ -125,6 +125,7 @@ fn open_floating(
             shell.sidebar_collapsed = true;
             shell.panel_collapsed = true;
             shell.sidebar.update(cx, |s, cx| s.set_visible(false, cx));
+            shell.diff.update(cx, |d, cx| d.set_visible(false, cx));
             shell.terminal_theme = theme;
             let pane = shell.layout.active_tab().focused;
             if let Some(t) = &target {
