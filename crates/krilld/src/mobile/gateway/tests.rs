@@ -729,7 +729,13 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
         assert!(!url.contains("&r="));
     }
     state.mode = ConnectMode::Tunnel;
+    // 준비 확인 전 터널은 고정 출처를 쓰지 않고 찍힌 터널 URL로 강등한다.
     state.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
+    let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now_ms()).unwrap() else {
+        panic!("페어링 응답 없음");
+    };
+    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
+    state.tunnel = None;
     assert!(pairing_offer(&state, now_ms()).is_err());
 }
 #[test]

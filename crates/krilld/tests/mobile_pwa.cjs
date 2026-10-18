@@ -56,7 +56,7 @@ async function connect(url,credential){
  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
  const challenge=JSON.parse(await next()),nonce=crypto.randomBytes(32),secret=credential?C.sha256(C.unhex(credential.credential)):C.unbase64(new URLSearchParams(u.hash.slice(1)).get('key'));
  const channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));
- socket.send(JSON.stringify({token:credential?null:u.searchParams.get('pair'),device_id:credential?credential.device_id:null,client_nonce:nonce.toString('hex')}));
+ socket.send(JSON.stringify({token:credential?null:new URLSearchParams(u.hash.slice(1)).get('pair'),device_id:credential?credential.device_id:null,client_nonce:nonce.toString('hex')}));
  socket.send(channel.seal(new TextEncoder().encode('{"label":"Non-secure HTTP test"}')));
  const authenticated=JSON.parse(new TextDecoder().decode(channel.open(await next()))),hello=Buffer.from(channel.open(await next())),r=reader(hello.subarray(5));r.u();r.u();const features=r.u();r.text();daemon=Number(r.u());
  socket.send(channel.seal(frame(2,Buffer.concat([v(1),v(1),v(features),v(0),string('pure-js-e2e')]))));
