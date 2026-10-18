@@ -627,8 +627,90 @@ pub enum Failure {
     UnknownAgent,
     /// 요청을 읽지 못했다(이 krilld가 모르는 variant 등).
     BadRequest,
-    /// 그 밖의 OS 오류(macOS errno). openpty·fork·exec 실패 등.
-    Os(i32),
+    /// 그 밖의 OS 오류. openpty·fork·exec 실패 등. 값은 이 프로세스 OS의 errno다. 와이어 표현([`wire_errno`])이
+    /// Linux 원격 호스트의 번호를 구분해, Mac 앱이 틀린 문구를 보이지 않게 한다.
+    Os(#[serde(with = "wire_errno")] i32),
+}
+
+/// [`Failure::Os`]의 와이어 표현. macOS는 자기 errno 그대로다. Linux는 두 OS 번호가 같은 1~34만 그대로 보내고,
+/// 그 밖은 `LINUX_TAG + errno`로 보낸다 — 번호가 겹쳐도(Linux ETIME 62 = macOS ELOOP 62) 같은 OS끼리는 늘 원래 값으로
+/// 돌아오고, 받는 macOS는 아는 것만 자기 번호로 옮긴다(모르는 값은 "Unknown error 100xx"로 남아 틀린 문구를 피한다).
+mod wire_errno {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    /// Linux errno 표식. 실제 errno는 이보다 훨씬 작다.
+    const LINUX_TAG: i32 = 10_000;
+    /// 1~34는 두 OS가 같다.
+    #[cfg(target_os = "linux")]
+    const SHARED_MAX: i32 = 34;
+    /// (Linux, macOS) 번호가 다른 errno 중 spawn·IO·소켓에서 나올 만한 것.
+    const PAIRS: &[(i32, i32)] = &[
+        (35, 11),  // EDEADLK
+        (36, 63),  // ENAMETOOLONG
+        (38, 78),  // ENOSYS
+        (39, 66),  // ENOTEMPTY
+        (40, 62),  // ELOOP
+        (95, 45),  // EOPNOTSUPP
+        (98, 48),  // EADDRINUSE
+        (104, 54), // ECONNRESET
+        (110, 60), // ETIMEDOUT
+        (111, 61), // ECONNREFUSED
+    ];
+    /// Linux EAGAIN(11)은 1~34 안이라 그대로 가지만 macOS EAGAIN은 35다.
+    #[cfg(target_os = "linux")]
+    const LINUX_EAGAIN: i32 = 11;
+    #[cfg(target_os = "linux")]
+    const MACOS_EAGAIN: i32 = 35;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        if (1..=SHARED_MAX).contains(&local) {
+            local
+        } else {
+            LINUX_TAG.saturating_add(local)
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        if wire > LINUX_TAG {
+            return wire.saturating_sub(LINUX_TAG);
+        }
+        // 1~34는 Linux 피어가 보낸 같은 번호다. 그보다 큰 값은 macOS 피어(원격 Mac 호스트)의 번호라 아는 것만 옮긴다.
+        if wire <= SHARED_MAX {
+            return wire;
+        }
+        if wire == MACOS_EAGAIN {
+            return LINUX_EAGAIN;
+        }
+        PAIRS
+            .iter()
+            .find(|p| p.1 == wire && p.1 > SHARED_MAX)
+            .map_or(wire, |p| p.0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        local
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        let Some(linux) = wire.checked_sub(LINUX_TAG).filter(|e| *e > 0) else {
+            // macOS 피어, 또는 Linux의 1~34(같은 번호). 단 Linux EAGAIN(11)은 macOS EDEADLK(11)과 겹쳐 구분할 수 없어 그대로 둔다.
+            return wire;
+        };
+        PAIRS.iter().find(|p| p.0 == linux).map_or(wire, |p| p.1)
+    }
+
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde with 계약이 &T를 요구한다"
+    )]
+    pub(super) fn serialize<S: Serializer>(errno: &i32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i32(to_wire(*errno))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+        i32::deserialize(d).map(from_wire)
+    }
 }
 
 impl Failure {

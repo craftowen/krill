@@ -15,11 +15,22 @@ use std::process::Stdio;
 use crate::sys::{self, User};
 
 /// launchd가 GUI 앱에 주는 PATH(실측, Terminal.app 셸이 받는 값). 나머지는 `/etc/zprofile`의 `path_helper`가 붙인다.
+#[cfg(not(target_os = "linux"))]
 const LAUNCHD_PATH: &[u8] = b"/usr/bin:/bin:/usr/sbin:/sbin";
+/// Linux(원격 호스트): Ubuntu `/etc/environment` 기본값. PAM 로그인 없이 `bash -l`만 돌리면 이 값이 안 붙는다.
+#[cfg(target_os = "linux")]
+const LAUNCHD_PATH: &[u8] = b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /// passwd를 못 읽고 `SHELL`도 없을 때의 셸(macOS 기본).
+#[cfg(not(target_os = "linux"))]
 const FALLBACK_SHELL: &[u8] = b"/bin/zsh";
+#[cfg(target_os = "linux")]
+const FALLBACK_SHELL: &[u8] = b"/bin/sh";
 /// `AppleLocale`을 읽지 못했을 때의 LANG. launchd GUI 부모 없이 띄운 개발 셸에서만 나온다.
+#[cfg(not(target_os = "linux"))]
 const FALLBACK_LANG: &[u8] = b"en_US.UTF-8";
+/// Linux는 `en_US` 로케일이 생성돼 있지 않은 이미지가 많다. `C.UTF-8`은 glibc에 늘 있다.
+#[cfg(target_os = "linux")]
+const FALLBACK_LANG: &[u8] = b"C.UTF-8";
 /// 시스템 로케일 조회의 하드 상한. `defaults read` 실측 4~8ms라 여유를 둔다.
 const LOCALE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 /// `defaults read` 출력(`ko_KR`·`ko_KR@...` 등)에서 LANG에 쓸 앞부분만 남길 때의 상한.

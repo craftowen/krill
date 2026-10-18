@@ -141,6 +141,7 @@ fn system_lang_falls_back_when_unreadable() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: AppleLocale(defaults)")]
 fn real_system_lang_matches_this_mac() {
     // 이 맥 실측: AppleLocale=ko_KR. 다른 맥에서는 그 맥의 값과 같아야 한다.
     let got = system_lang();
@@ -215,6 +216,10 @@ fn zsh_path(argv: &[Vec<u8>], env: &[(Vec<u8>, Vec<u8>)]) -> String {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS 전용: zsh ZDOTDIR·launchd GUI PATH 비교"
+)]
 fn polluted_parent_gives_same_path_as_gui_launch() {
     let dir = zdotdir("same");
     let zdot = dir.to_str().unwrap();

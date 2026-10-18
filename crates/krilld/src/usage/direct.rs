@@ -328,7 +328,7 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
 fn parse_antigravity_auth(raw: &[u8]) -> Option<AuthStatus> {
     let text = std::str::from_utf8(raw).ok()?.trim();
     let decoded = if let Some(encoded) = text.strip_prefix("go-keyring-base64:") {
-        pipe_command("/usr/bin/base64", &["-D"], encoded.as_bytes())?
+        pipe_command("/usr/bin/base64", &["--decode"], encoded.as_bytes())?
     } else if let Some(encoded) = text.strip_prefix("go-keyring-encoded:") {
         let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
         if !remainder.is_empty() {
