@@ -25,6 +25,12 @@ async function main(){
  let f=fixture();assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onStatus({phase:'disconnected'});for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
  f=fixture();f.mounts[0].options.onStatus({phase:'disconnected'});f.state.connection.phase='disconnected';f.view.update();f.advance(60000);assert.equal(f.mounts.length,1);f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,2);f.view.cleanup();
  console.log('PASS terminal-only reconnect backoff, generation/cleanup and main connection cancellation');
+ f=fixture();const actions=f.buttons.find(b=>b.textContent==='Terminal actions'),git=f.buttons.find(b=>b.textContent==='Git changes');assert(git.hidden);
+ const replace=(state,branch=null)=>{const session={id:7,state,branch};f.state.sessions.set(7,session);f.state.groups.set('g',{key:'g',label:'Latest workspace',sessions:[session]});};
+ replace('Waiting','main');actions.action();let entries=f.sheets.at(-1);assert(entries.some(e=>e.label==='Approve (Yes)'));assert(entries.some(e=>e.label==='Deny (No)'));f.view.update();assert.equal(git.hidden,false);
+ replace('Working');for(const entry of entries.filter(e=>['Approve (Yes)','Deny (No)'].includes(e.label)))await assert.rejects(entry.action(),/no longer waiting/);assert.equal(f.calls.length,0);actions.action();assert(!f.sheets.at(-1).some(e=>e.label==='Approve (Yes)'));f.view.update();assert(git.hidden);
+ replace('Blocked');actions.action();entries=f.sheets.at(-1);await entries.find(e=>e.label==='Approve (Yes)').action();await entries.find(e=>e.label==='Deny (No)').action();assert.deepEqual(f.calls.map(c=>c.value),['y','n']);f.state.sessions.delete(7);await assert.rejects(entries.find(e=>e.label==='Approve (Yes)').action(),/no longer waiting/);f.view.cleanup();
+ console.log('PASS latest session approval menus, stale action rejection and branch controls');
 }
 if(require.main===module)main().catch(e=>{console.error(e);process.exitCode=1;});
 module.exports={fixture,main};
