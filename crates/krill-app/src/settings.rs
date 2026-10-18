@@ -585,6 +585,193 @@ pub fn take_pending_terminal_command(cx: &mut App) -> Option<String> {
         .pop_front()
 }
 
+/// OWE-897: 관리형 설치 전체 수행(백그라운드 전용).
+/// 로컬 런타임 탐색 → 원격 프로브 → 전송 → 원격 설정 순이며,
+/// 어떤 단계도 사용자 파일·셸 설정을 건드리지 않는다.
+fn run_managed_install(
+    host: &crate::ssh_hosts::SshHost,
+) -> Result<krill_hosts::managed::InstallReport, krill_hosts::managed::InstallError> {
+    use krill_hosts::managed::{
+        InstallBlob, InstallError, InstallFailureKind, InstallPayload, InstallSpec,
+    };
+    let local = |kind: InstallFailureKind, step: &'static str, detail: String| InstallError {
+        kind,
+        step,
+        detail,
+    };
+    let runtime = crate::ssh_hosts::find_local_runtime().ok_or_else(|| {
+        local(
+            InstallFailureKind::Other,
+            "local",
+            "local runtime missing".to_owned(),
+        )
+    })?;
+    let opts = host.to_ssh_options();
+    let remote = krill_hosts::managed::query_remote_info(&opts).map_err(|e| {
+        local(
+            InstallFailureKind::Network,
+            "probe",
+            short_error(&e.to_string()),
+        )
+    })?;
+    let spec = InstallSpec::new(&remote.home, &runtime.version).map_err(|e| {
+        local(
+            InstallFailureKind::Protocol,
+            "spec",
+            short_error(&e.to_string()),
+        )
+    })?;
+    let read_blob = |path: &std::path::Path, name: &'static str| {
+        std::fs::read(path).map_err(|e| {
+            local(
+                InstallFailureKind::Other,
+                "read-local",
+                format!("cannot read local {name}: {e}"),
+            )
+        })
+    };
+    let krill = read_blob(&runtime.krill, "krill")?;
+    let krilld = read_blob(&runtime.krilld, "krilld")?;
+    let holder = read_blob(&runtime.holder, "krill-holder")?;
+    let blobs = [
+        InstallBlob {
+            name: "krill",
+            bytes: &krill,
+        },
+        InstallBlob {
+            name: "krilld",
+            bytes: &krilld,
+        },
+        InstallBlob {
+            name: "krill-holder",
+            bytes: &holder,
+        },
+    ];
+    let payload = InstallPayload {
+        blobs: &blobs,
+        plist_xml: &spec.render_plist(),
+    };
+    krill_hosts::managed::install_remote(
+        &opts,
+        &spec,
+        std::env::consts::ARCH,
+        payload.blobs,
+        payload.plist_xml,
+        &remote,
+    )
+}
+
+/// OWE-897: 설치 실패 원인을 설정 화면 안내문으로 바꾼다.
+fn install_failure_guide(e: &krill_hosts::managed::InstallError) -> String {
+    use krill_hosts::managed::InstallFailureKind as Kind;
+    let short = short_error(&e.detail);
+    match (e.kind, e.step) {
+        (_, "local") => text::SSH_REMOTE_RUNTIME_MISSING.get().to_owned(),
+        (Kind::Auth, _) => text::SSH_REMOTE_GUIDE_AUTH.format(&[("error", &short)]),
+        (Kind::Permission, _) => text::SSH_REMOTE_GUIDE_PERMISSION.format(&[("error", &short)]),
+        (Kind::Network, _) => text::SSH_REMOTE_GUIDE_NETWORK.format(&[("error", &short)]),
+        (Kind::DiskFull, _) => text::SSH_REMOTE_GUIDE_DISK.format(&[("error", &short)]),
+        (Kind::UnsupportedOs | Kind::UnsupportedArch, _) => {
+            text::SSH_REMOTE_GUIDE_UNSUPPORTED.format(&[("os", &e.detail)])
+        }
+        (Kind::ArchMismatch, _) => text::SSH_REMOTE_GUIDE_ARCH.format(&[("os", &e.detail)]),
+        (Kind::Bootstrap, _) => text::SSH_REMOTE_GUIDE_BOOTSTRAP.format(&[("error", &short)]),
+        (Kind::Protocol | Kind::Other, _) => {
+            text::SSH_REMOTE_GUIDE_OTHER.format(&[("error", &short)])
+        }
+    }
+}
+
+/// OWE-897: 호스트 카드의 원격 상태 행 텍스트와 오류 여부.
+fn remote_line_text(state: Option<&RemoteCardState>) -> (String, bool) {
+    use krill_hosts::managed::{RemoteVersion, VersionStatus};
+    let Some(state) = state else {
+        return (text::SSH_REMOTE_BIN.get().to_owned(), false);
+    };
+    // 설치 결과는 새 프로브가 없을 때만 행에 남긴다(배너가 다른 동작에 덮여도 카드에 유지).
+    if !matches!(state.probe, RemoteProbeState::Ready(_)) {
+        match &state.install {
+            RemoteInstallState::Running => {
+                return (text::SSH_REMOTE_INSTALLING.get().to_owned(), false);
+            }
+            RemoteInstallState::Done(version) => {
+                return (text::SSH_REMOTE_DONE.format(&[("version", version)]), false);
+            }
+            RemoteInstallState::Failed(msg) => {
+                return (
+                    text::SSH_REMOTE_PROBE_FAILED.format(&[("error", msg)]),
+                    true,
+                );
+            }
+            RemoteInstallState::Idle => {}
+        }
+    }
+    match &state.probe {
+        RemoteProbeState::Unknown => (text::SSH_REMOTE_BIN.get().to_owned(), false),
+        RemoteProbeState::Loading => (text::SSH_REMOTE_CHECKING.get().to_owned(), false),
+        RemoteProbeState::Failed(msg) => (
+            text::SSH_REMOTE_PROBE_FAILED.format(&[("error", msg)]),
+            true,
+        ),
+        RemoteProbeState::Ready(info) => {
+            let os = info.platform.describe();
+            if !info.platform.is_supported() {
+                return (text::SSH_REMOTE_UNSUPPORTED.format(&[("os", &os)]), false);
+            }
+            let short = |v: &str| v.split('+').next().unwrap_or(v).to_owned();
+            match &info.version {
+                RemoteVersion::Missing => (
+                    format!("{os} · {}", text::SSH_REMOTE_NOT_INSTALLED.get()),
+                    false,
+                ),
+                RemoteVersion::Unmanaged => (
+                    format!("{os} · {}", text::SSH_REMOTE_UNKNOWN_VERSION.get()),
+                    false,
+                ),
+                RemoteVersion::Known(v) => {
+                    let version_label = format!("krill {}", short(v));
+                    match info.version_status(krill_proto::BUILD) {
+                        VersionStatus::UpToDate => (
+                            text::SSH_REMOTE_LINE.format(&[
+                                ("os", &os),
+                                ("version", &version_label),
+                                ("state", text::SSH_REMOTE_UP_TO_DATE.get()),
+                            ]),
+                            false,
+                        ),
+                        VersionStatus::UpdateAvailable { local, .. } => {
+                            let state_label = text::SSH_REMOTE_UPDATE_AVAILABLE
+                                .format(&[("local", &short(&local))]);
+                            (
+                                text::SSH_REMOTE_LINE.format(&[
+                                    ("os", &os),
+                                    ("version", &version_label),
+                                    ("state", &state_label),
+                                ]),
+                                false,
+                            )
+                        }
+                        VersionStatus::NotInstalled | VersionStatus::Unknown => {
+                            (format!("{os} · {version_label}"), false)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// OWE-897: 상태 표시용 오류 축약(200자, 제어문자 제거).
+fn short_error(s: &str) -> String {
+    let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = clean.trim();
+    if trimmed.chars().count() > 200 {
+        format!("{}…", trimmed.chars().take(200).collect::<String>())
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 /// 관리자 YOLO 토글이 요청한 새 세션 권한을 꺼낸다.
 pub fn take_pending_permission(cx: &mut App) -> Option<krill_proto::agent::Permission> {
     if cx
@@ -2062,6 +2249,8 @@ pub struct SettingsView {
     opencode_login_prompt: bool,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     ssh_host_statuses: std::collections::BTreeMap<String, SshHostCardStatus>,
+    /// OWE-897: 호스트 카드별 원격 관리 상태(프로브·설치, 백그라운드에서만 갱신).
+    ssh_remote_infos: std::collections::BTreeMap<String, RemoteCardState>,
     ssh_status: Option<SharedString>,
     /// 연결 테스트 실행 중인 호스트 id. 결과(`apply_ssh_test_result`)가 오면 빠진다(OWE-884).
     ssh_test_pending: std::collections::BTreeSet<String>,
@@ -2166,6 +2355,33 @@ struct PendingLogin {
 const LOGIN_WAIT_TIMEOUT: Duration = Duration::from_secs(605);
 /// 로그인 결과 폴링 간격(OWE-881). 데몬 `ListAccounts`가 아니라 인메모리 결과만 본다.
 const LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+/// OWE-897: 원격 프로브 상태(백그라운드 `ssh` 한 번 조회 결과 캐시).
+#[derive(Debug, Clone, Default)]
+enum RemoteProbeState {
+    #[default]
+    Unknown,
+    Loading,
+    Ready(krill_hosts::managed::RemoteInfo),
+    Failed(String),
+}
+
+/// OWE-897: 원격 설치 진행 상태.
+#[derive(Debug, Clone, Default)]
+enum RemoteInstallState {
+    #[default]
+    Idle,
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+/// OWE-897: 호스트 카드별 원격 관리 상태.
+#[derive(Debug, Clone, Default)]
+struct RemoteCardState {
+    probe: RemoteProbeState,
+    install: RemoteInstallState,
+}
 
 /// SSH 호스트 추가·편집 입력 폼 상태(MK-132·OWE-800).
 struct SshForm {
@@ -2278,6 +2494,7 @@ impl SettingsView {
             opencode_login_prompt: false,
             ssh_hosts: Vec::new(),
             ssh_host_statuses: std::collections::BTreeMap::new(),
+            ssh_remote_infos: std::collections::BTreeMap::new(),
             ssh_status: None,
             ssh_test_pending: std::collections::BTreeSet::new(),
             ssh_form: None,
@@ -3097,6 +3314,7 @@ impl SettingsView {
         if let Ok(hosts) = crate::ssh_hosts::remove_host(dir.as_deref(), id) {
             self.ssh_hosts = hosts;
             self.ssh_host_statuses.remove(id);
+            self.ssh_remote_infos.remove(id);
             if let Some(form) = &mut self.ssh_form
                 && form.editing_id.as_deref() == Some(id)
             {
@@ -3573,6 +3791,106 @@ impl SettingsView {
             }
         });
         cx.notify();
+    }
+
+    /// OWE-897: 원격 OS·아키·버전·소켓을 백그라운드에서 조회한다.
+    /// 네트워크 IO는 UI 스레드에서 절대 하지 않는다(CONVENTIONS T7).
+    pub fn refresh_remote_info(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
+        self.ssh_remote_infos
+            .entry(host.id.clone())
+            .or_default()
+            .probe = RemoteProbeState::Loading;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let opts = host.to_ssh_options();
+            let res = cx
+                .background_executor()
+                .spawn(async move { krill_hosts::managed::query_remote_info(&opts) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_remote_probe(&host, res, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_remote_probe(
+        &mut self,
+        host: &crate::ssh_hosts::SshHost,
+        res: Result<krill_hosts::managed::RemoteInfo, std::io::Error>,
+        cx: &mut Context<Self>,
+    ) {
+        let state = self.ssh_remote_infos.entry(host.id.clone()).or_default();
+        match res {
+            Ok(info) => state.probe = RemoteProbeState::Ready(info),
+            Err(e) => {
+                let mut msg = e.to_string();
+                if msg.chars().count() > 200 {
+                    msg = format!("{}…", msg.chars().take(200).collect::<String>());
+                }
+                state.probe = RemoteProbeState::Failed(msg);
+            }
+        }
+        cx.notify();
+    }
+
+    /// OWE-897: 원격에 로컬 런타임을 설치·기동한다(전 과정 백그라운드).
+    pub fn install_remote(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
+        self.ssh_remote_infos
+            .entry(host.id.clone())
+            .or_default()
+            .install = RemoteInstallState::Running;
+        self.ssh_status = Some(text::SSH_REMOTE_INSTALLING.get().into());
+        cx.notify();
+        let bg_host = host.clone();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { run_managed_install(&bg_host) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.apply_install_result(&host, res, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn apply_install_result(
+        &mut self,
+        host: &crate::ssh_hosts::SshHost,
+        res: Result<krill_hosts::managed::InstallReport, krill_hosts::managed::InstallError>,
+        cx: &mut Context<Self>,
+    ) {
+        match res {
+            Ok(report) => {
+                self.ssh_remote_infos
+                    .entry(host.id.clone())
+                    .or_default()
+                    .install = RemoteInstallState::Done(report.version.clone());
+                self.ssh_status = Some(
+                    text::SSH_REMOTE_INSTALL_OK
+                        .format(&[("label", &host.label), ("version", &report.version)])
+                        .into(),
+                );
+                // 설치 직후 원격 버전을 다시 읽어 카드에 반영한다.
+                self.refresh_remote_info(host.clone(), cx);
+            }
+            Err(e) => {
+                let guide = install_failure_guide(&e);
+                self.ssh_remote_infos
+                    .entry(host.id.clone())
+                    .or_default()
+                    .install = RemoteInstallState::Failed(short_error(&e.to_string()));
+                self.ssh_status = Some(
+                    text::SSH_REMOTE_INSTALL_FAILED
+                        .format(&[("label", &host.label), ("guide", &guide)])
+                        .into(),
+                );
+                cx.notify();
+            }
+        }
     }
 
     pub fn run_doctor(&mut self, cx: &mut Context<Self>) {
@@ -7365,19 +7683,57 @@ impl SettingsView {
                         (p.destructive, text::SSH_STATUS_ERROR.get(), p.destructive)
                     }
                 };
-                let summary = host.format_summary();
                 let card_id = format!("admin-ssh-card-{}", host.id);
                 let dot_id = format!("admin-ssh-status-dot-{}", host.id);
+                let remote_id = format!("admin-ssh-remote-{}", host.id);
                 let conn_id = format!("admin-ssh-connect-{}", host.id);
                 let disc_id = format!("admin-ssh-disconnect-{}", host.id);
                 let test_id = format!("admin-ssh-test-{}", host.id);
+                let probe_id = format!("admin-ssh-probe-{}", host.id);
+                let install_id = format!("admin-ssh-install-{}", host.id);
                 let edit_id = format!("admin-ssh-edit-{}", host.id);
                 let rm_id = format!("admin-ssh-remove-{}", host.id);
                 let host_conn = host.clone();
                 let host_disc = host.clone();
                 let host_cl = host.clone();
+                let host_probe = host.clone();
+                let host_install = host.clone();
                 let host_edit = host.clone();
                 let rm_host_id = host.id.clone();
+                let card_state = self.ssh_remote_infos.get(&host.id);
+                let (remote_text, remote_is_error) = remote_line_text(card_state);
+                // OWE-897: 설치·업데이트 버튼은 프로브 완료 + 지원 플랫폼 + 구버전/미설치일 때만.
+                let install_label: Option<&'static str> =
+                    card_state.and_then(|st| match &st.probe {
+                        RemoteProbeState::Ready(info) if info.platform.is_supported() => {
+                            match info.version_status(krill_proto::BUILD) {
+                                krill_hosts::managed::VersionStatus::NotInstalled
+                                | krill_hosts::managed::VersionStatus::Unknown => {
+                                    Some(text::SSH_REMOTE_INSTALL.get())
+                                }
+                                krill_hosts::managed::VersionStatus::UpdateAvailable { .. } => {
+                                    Some(text::SSH_REMOTE_UPDATE.get())
+                                }
+                                krill_hosts::managed::VersionStatus::UpToDate => None,
+                            }
+                        }
+                        _ => None,
+                    });
+                let install_running =
+                    card_state.is_some_and(|st| matches!(st.install, RemoteInstallState::Running));
+                let probe_loading =
+                    card_state.is_some_and(|st| matches!(st.probe, RemoteProbeState::Loading));
+                let probe_label = match card_state {
+                    Some(st)
+                        if matches!(
+                            st.probe,
+                            RemoteProbeState::Ready(_) | RemoteProbeState::Failed(_)
+                        ) =>
+                    {
+                        text::SSH_REMOTE_REFRESH.get()
+                    }
+                    _ => text::SSH_REMOTE_PROBE.get(),
+                };
 
                 let connect_or_disconnect_btn = if status == SshHostCardStatus::Connected {
                     layout::secondary(
@@ -7400,6 +7756,88 @@ impl SettingsView {
                         this.connect_ssh_host(host_conn.clone(), cx);
                     }))
                 };
+
+                let probe_btn = if probe_loading {
+                    layout::ghost(
+                        gpui::ElementId::Name(probe_id.clone().into()),
+                        text::SSH_REMOTE_CHECKING.get(),
+                    )
+                    .small()
+                    .debug_selector(move || probe_id.clone())
+                } else {
+                    layout::secondary(gpui::ElementId::Name(probe_id.clone().into()), probe_label)
+                        .small()
+                        .debug_selector(move || probe_id.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.refresh_remote_info(host_probe.clone(), cx);
+                        }))
+                };
+
+                let mut controls = layout::controls()
+                    .child(connect_or_disconnect_btn)
+                    .child({
+                        let testing = self.is_ssh_test_pending(&host.id);
+                        let test_label = if testing {
+                            text::SSH_TESTING.get()
+                        } else {
+                            text::SSH_TEST.get()
+                        };
+                        layout::secondary(gpui::ElementId::Name(test_id.clone().into()), test_label)
+                            .small()
+                            .disabled(testing)
+                            .debug_selector(move || test_id.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.test_ssh_host(host_cl.clone(), cx);
+                            }))
+                    })
+                    .child(probe_btn);
+                if install_running {
+                    let running_id = install_id.clone();
+                    controls = controls.child(
+                        layout::ghost(
+                            gpui::ElementId::Name(install_id.clone().into()),
+                            text::SSH_REMOTE_INSTALLING.get(),
+                        )
+                        .small()
+                        .debug_selector(move || running_id.clone()),
+                    );
+                } else if let Some(label) = install_label {
+                    let install_id_cl = install_id.clone();
+                    controls = controls.child(
+                        layout::secondary(gpui::ElementId::Name(install_id.clone().into()), label)
+                            .small()
+                            .debug_selector(move || install_id_cl.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.install_remote(host_install.clone(), cx);
+                            })),
+                    );
+                }
+                controls = controls
+                    .child(
+                        layout::ghost(
+                            gpui::ElementId::Name(edit_id.clone().into()),
+                            text::SSH_EDIT.get(),
+                        )
+                        .small()
+                        .debug_selector(move || edit_id.clone())
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.start_edit_ssh_host(&host_edit, window, cx);
+                            },
+                        )),
+                    )
+                    // OWE-897: 삭제는 두 번 눌러 확인(파괴적 동작 규칙).
+                    .child(
+                        self.confirm_button(
+                            rm_id.clone(),
+                            text::SSH_REMOVE.get(),
+                            cx,
+                            move |this, cx| {
+                                this.remove_ssh_host(&rm_host_id, cx);
+                            },
+                        )
+                        .small(),
+                    );
 
                 root = root.child(
                     layout::row(p)
@@ -7471,56 +7909,26 @@ impl SettingsView {
                                                 .font_family(crate::ui::FONT_MONO)
                                                 .text_size(crate::ui::TEXT_XS)
                                                 .text_color(p.muted_foreground)
-                                                .child(summary),
+                                                .child(host.format_summary()),
+                                        )
+                                        .child(
+                                            div()
+                                                .id(gpui::ElementId::Name(remote_id.clone().into()))
+                                                .debug_selector(move || remote_id.clone())
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_family(crate::ui::FONT_MONO)
+                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_color(if remote_is_error {
+                                                    p.destructive
+                                                } else {
+                                                    p.muted_foreground
+                                                })
+                                                .child(remote_text),
                                         ),
                                 ),
                         )
-                        .child(
-                            layout::controls()
-                                .child(connect_or_disconnect_btn)
-                                .child({
-                                    let testing = self.is_ssh_test_pending(&host.id);
-                                    let test_label = if testing {
-                                        text::SSH_TESTING.get()
-                                    } else {
-                                        text::SSH_TEST.get()
-                                    };
-                                    layout::secondary(
-                                        gpui::ElementId::Name(test_id.clone().into()),
-                                        test_label,
-                                    )
-                                    .small()
-                                    .disabled(testing)
-                                    .debug_selector(move || test_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.test_ssh_host(host_cl.clone(), cx);
-                                        },
-                                    ))
-                                })
-                                .child(
-                                    layout::ghost(
-                                        gpui::ElementId::Name(edit_id.clone().into()),
-                                        text::SSH_EDIT.get(),
-                                    )
-                                    .small()
-                                    .debug_selector(move || edit_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, window, cx| {
-                                            this.start_edit_ssh_host(&host_edit, window, cx);
-                                        },
-                                    )),
-                                )
-                                .child(self.confirm_button(
-                                    rm_id.clone(),
-                                    text::SSH_REMOVE.get(),
-                                    cx,
-                                    move |this, cx| {
-                                        let id = rm_host_id.clone();
-                                        this.remove_ssh_host(&id, cx);
-                                    },
-                                )),
-                        ),
+                        .child(controls),
                 );
             }
         }

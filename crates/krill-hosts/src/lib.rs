@@ -19,6 +19,7 @@ use krill_proto::daemon::{self, Connection, Paths};
 use krill_proto::ipc::ClientHello;
 use serde::{Deserialize, Serialize};
 
+pub mod managed;
 pub mod manager;
 pub mod ssh;
 
