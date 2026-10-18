@@ -2330,7 +2330,11 @@ impl SettingsView {
                 }
                 // 시작 뒤 처리된 계정 요청의 성공·거부는 오래된 갱신보다 최신이다.
                 if this.accounts_snapshot == before.0 && this.account_error == before.1 {
-                    this.accounts_snapshot = loaded.0;
+                    let mut next = loaded.0;
+                    if !daemon {
+                        Self::merge_local_snapshot_tails(&this.accounts_snapshot, &mut next);
+                    }
+                    this.accounts_snapshot = next;
                     this.account_error = loaded.2.map(SharedString::from);
                 }
                 this.ssh_hosts = loaded.1;
@@ -2339,6 +2343,31 @@ impl SettingsView {
             .ok();
         })
         .detach();
+    }
+
+    fn merge_local_snapshot_tails(
+        prev: &krill_proto::usage::AccountsSnapshot,
+        next: &mut krill_proto::usage::AccountsSnapshot,
+    ) {
+        if prev.connections.supported {
+            next.connections.clone_from(&prev.connections);
+        }
+        if prev.advanced.supported {
+            next.advanced.clone_from(&prev.advanced);
+        }
+        if !prev.statuses.is_empty() && next.statuses.is_empty() {
+            next.statuses.clone_from(&prev.statuses);
+        }
+        for acc in &mut next.accounts {
+            if acc.usage.is_empty()
+                && let Some(prev_acc) = prev
+                    .accounts
+                    .iter()
+                    .find(|a| a.id == acc.id && !a.usage.is_empty())
+            {
+                acc.usage.clone_from(&prev_acc.usage);
+            }
+        }
     }
 
     /// Claude 계정 로그인을 `claude auth status`로 확인한다(OWE-705). 처음 보는 계정만, 백그라운드에서.
@@ -2561,9 +2590,32 @@ impl SettingsView {
         let dir = state_dir(cx);
         // 테스트용 임시 상태 디렉터리에서는 데몬 없이 로컬 파일로 동기 처리한다.
         if !is_daemon_state_dir(dir.as_deref()) {
+            match &req {
+                krill_proto::usage::UsageRequest::SetDirectUsage(on)
+                    if self.accounts_snapshot.connections.supported =>
+                {
+                    self.accounts_snapshot.connections.direct_usage = *on;
+                    self.account_error = None;
+                    cx.defer(notify_external_change);
+                    cx.notify();
+                    return;
+                }
+                krill_proto::usage::UsageRequest::SetAdvancedPolicy(policy)
+                    if self.accounts_snapshot.advanced.supported =>
+                {
+                    self.accounts_snapshot.advanced.policy.clone_from(policy);
+                    self.account_error = None;
+                    cx.defer(notify_external_change);
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
             let home = crate::accounts::default_home();
+            let prev = self.accounts_snapshot.clone();
             match crate::accounts::request_local(&home, dir.as_deref(), &req) {
-                Ok(snap) => {
+                Ok(mut snap) => {
+                    Self::merge_local_snapshot_tails(&prev, &mut snap);
                     self.accounts_snapshot = snap;
                     self.account_error = None;
                     cx.defer(notify_external_change);
@@ -3739,7 +3791,7 @@ impl SettingsView {
             )
     }
 
-    /// 계정 행의 5h·7d 미니 사용량 바(OWE-719). 리셋 시각은 묶음 툴팁([`format_account_usage`])에 있다.
+    /// 계정 행의 5h·7d 미니 사용량 바(OWE-719, OWE-797). 리셋 시각은 인라인 메타데이터와 묶음 툴팁([`format_account_usage`])에 함께 표시한다.
     fn render_usage_bar(
         key: &'static str,
         window_label: &'static str,
@@ -3748,10 +3800,12 @@ impl SettingsView {
         p: &crate::ui::Palette,
     ) -> gpui::Div {
         const BAR_W: f32 = 44.;
-        let display = crate::accounts::display::window(
-            win,
-            i64::try_from(crate::accounts::display::now()).unwrap_or(i64::MAX),
-        );
+        let now_secs = crate::accounts::display::now();
+        let display =
+            crate::accounts::display::window(win, i64::try_from(now_secs).unwrap_or(i64::MAX));
+        let reset = win
+            .and_then(|w| has_valid_reset(w.resets_at.as_deref()))
+            .and_then(|ts| relative_reset_suffix(Some(ts), now_secs));
         let pct = display.percent.unwrap_or(0);
         let fill_w = (f32::from(pct) / 100.0) * BAR_W;
         let mono = |d: gpui::Div| {
@@ -3773,10 +3827,10 @@ impl SettingsView {
                 div()
                     .w(px(BAR_W))
                     .h(px(4.))
-                    .rounded(px(2.))
+                    .rounded_full()
                     .bg(p.muted)
                     .overflow_hidden()
-                    .child(div().h_full().w(px(fill_w)).rounded(px(2.)).bg(usage_color(
+                    .child(div().h_full().w(px(fill_w)).rounded_full().bg(usage_color(
                         pct,
                         brand_color,
                         p,
@@ -3787,6 +3841,12 @@ impl SettingsView {
                     .text_color(usage_color(pct, p.foreground, p))
                     .child(display.text),
             )
+            .children(reset.map(|reset| {
+                mono(div().flex_none().whitespace_nowrap())
+                    .debug_selector(move || format!("admin-usage-reset-{key}"))
+                    .text_color(p.muted_foreground)
+                    .child(reset)
+            }))
     }
 
     fn render_account_rule(
@@ -4147,6 +4207,8 @@ impl SettingsView {
             ("updated", &usage.updated),
         ]);
         let status_id = format!("admin-account-status-{}", acc.id);
+        let status_tip_id = status_id.clone();
+        let dot_id = format!("admin-account-dot-{}", acc.id);
         let initial: String = primary
             .chars()
             .find(|c| c.is_alphanumeric())
@@ -4158,7 +4220,7 @@ impl SettingsView {
             .role(gpui::Role::Status)
             .aria_label(tip.clone())
             .tooltip(move |window, cx| {
-                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                crate::ui::tooltip_view(status_tip_id.clone(), tip.clone(), window, cx)
             })
             .relative()
             .flex_none()
@@ -4174,13 +4236,12 @@ impl SettingsView {
             .child(initial)
             .child(
                 div()
+                    .debug_selector(move || dot_id.clone())
                     .absolute()
-                    .right(px(-2.))
-                    .bottom(px(-2.))
-                    .size(px(10.))
+                    .right(px(-1.))
+                    .bottom(px(-1.))
+                    .size(crate::ui::STATE_DOT)
                     .rounded_full()
-                    .border_2()
-                    .border_color(p.background)
                     .bg(crate::accounts::display::connection_color(conn, p)),
             );
 
@@ -4190,6 +4251,10 @@ impl SettingsView {
             .filter(|(id, _)| *id == acc.id)
             .map(|(_, input)| input.clone());
         let in_use_id = format!("admin-account-in-use-{}", acc.id);
+        let needs_login_id = format!("admin-account-needs-login-{}", acc.id);
+        let rate_limited_id = format!("admin-account-rate-limited-{}", acc.id);
+        let is_rate_limited =
+            !needs_login && usage.status == krill_proto::usage::AccountStatus::RateLimited;
         let name_line = div()
             .flex()
             .items_center()
@@ -4208,9 +4273,31 @@ impl SettingsView {
             })
             .when(acc.active, |d| {
                 d.child(
-                    crate::ui::badge(p, crate::ui::BadgeTone::Neutral, text::ACCOUNT_IN_USE.get())
+                    crate::ui::badge(p, crate::ui::BadgeTone::Success, text::ACCOUNT_IN_USE.get())
                         .id(SharedString::from(in_use_id.clone()))
                         .debug_selector(move || in_use_id.clone()),
+                )
+            })
+            .when(needs_login, |d| {
+                d.child(
+                    crate::ui::badge(
+                        p,
+                        crate::ui::BadgeTone::Warning,
+                        text::ACCOUNT_LOGIN_REQUIRED.get(),
+                    )
+                    .id(SharedString::from(needs_login_id.clone()))
+                    .debug_selector(move || needs_login_id.clone()),
+                )
+            })
+            .when(is_rate_limited, |d| {
+                d.child(
+                    crate::ui::badge(
+                        p,
+                        crate::ui::BadgeTone::Warning,
+                        text::ACCOUNT_STATUS_LIMITED.get(),
+                    )
+                    .id(SharedString::from(rate_limited_id.clone()))
+                    .debug_selector(move || rate_limited_id.clone()),
                 )
             });
         let detail_line = div()
@@ -4241,12 +4328,13 @@ impl SettingsView {
             }));
 
         let usage_id = format!("admin-account-usage-{}", acc.id);
+        let usage_tip_id = usage_id.clone();
         let usage_tip = format_account_usage(&acc.usage);
         let usage_cluster = div()
             .id(SharedString::from(usage_id.clone()))
             .debug_selector(move || usage_id.clone())
             .tooltip(move |window, cx| {
-                gpui_component::tooltip::Tooltip::new(usage_tip.clone()).build(window, cx)
+                crate::ui::tooltip_view(usage_tip_id.clone(), usage_tip.clone(), window, cx)
             })
             .flex_none()
             .flex()
@@ -4267,13 +4355,18 @@ impl SettingsView {
                 p,
             ));
 
-        // 주 동작 하나: 로그인이 필요하면 "다시 로그인", 아니면 비활성 계정에만 "전환".
-        let mut actions = div().flex_none().flex().items_center().gap_1();
+        // 주 동작 하나: 로그인이 필요하면 "다시 로그인", 아니면 비활성 계정에만 "전환"(.ghost().small()).
+        let mut actions = div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if can_login && needs_login {
             let login_account = acc.clone();
             let login_id = format!("admin-login-account-{}", acc.id);
             actions = actions.child(
-                layout::secondary(
+                layout::ghost(
                     gpui::ElementId::Name(login_id.clone().into()),
                     text::ACCOUNT_LOGIN.get(),
                 )
@@ -4288,7 +4381,7 @@ impl SettingsView {
             let switch_id = format!("admin-switch-account-{}", acc.id);
             let acc_id = acc.id.clone();
             actions = actions.child(
-                layout::secondary(
+                layout::ghost(
                     gpui::ElementId::Name(switch_id.clone().into()),
                     text::ACCOUNT_SWITCH.get(),
                 )
@@ -4365,10 +4458,19 @@ impl SettingsView {
             );
         }
 
+        let can_click_switch = !(orca
+            || acc.active
+            || self.rename.is_some()
+            || self.removing.is_some()
+            || self.armed.is_some()
+            || can_login && needs_login);
+        let row_acc_id = acc.id.clone();
         let row_id = format!("admin-account-row-{}", acc.id);
         div()
             .id(SharedString::from(row_id.clone()))
             .debug_selector(move || row_id.clone())
+            .w_full()
+            .min_w_0()
             .flex()
             .items_center()
             .gap_3()
@@ -4378,11 +4480,26 @@ impl SettingsView {
             .border_1()
             .map(|d| {
                 if acc.active {
-                    d.border_color(p.foreground.opacity(0.2))
-                        .bg(p.accent.opacity(0.15))
+                    d.bg(p.accent).border_color(p.ring)
                 } else {
-                    d.border_color(p.border)
+                    d.bg(p.card).border_color(p.border)
                 }
+            })
+            .when(can_click_switch, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(p.accent))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if this.rename.is_none() && this.removing.is_none() && this.armed.is_none()
+                        {
+                            this.apply_account_request(
+                                UsageRequest::SwitchAccount {
+                                    provider,
+                                    account_id: row_acc_id.clone(),
+                                },
+                                cx,
+                            );
+                        }
+                    }))
             })
             .child(avatar)
             .child(
@@ -4468,12 +4585,12 @@ impl SettingsView {
                     .justify_end()
                     .gap_2()
                     .child(
-                        Button::new(gpui::ElementId::Name(cancel_id.clone().into()))
-                            .small()
-                            .ghost()
-                            .label(text::ACCOUNT_RENAME_CANCEL.get())
-                            .debug_selector(move || cancel_id.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
+                        layout::ghost(
+                            gpui::ElementId::Name(cancel_id.clone().into()),
+                            text::ACCOUNT_RENAME_CANCEL.get(),
+                        )
+                        .debug_selector(move || cancel_id.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| close(this, cx))),
                     )
                     .child(
                         Button::new(gpui::ElementId::Name(rm_id.clone().into()))
@@ -4498,8 +4615,8 @@ impl SettingsView {
     }
 
     fn render_accounts_tab(&self, cx: &mut Context<Self>) -> gpui::Div {
-        use gpui_component::{IconName, Sizable as _};
-        use krill_proto::usage::{ProviderKind, UsageRequest};
+        use gpui_component::IconName;
+        use krill_proto::usage::{ConnectionStatus, ProviderKind, UsageRequest};
         let p = crate::ui::palette(cx);
         let policy = self.accounts_snapshot.auto_switch.clone();
 
@@ -4519,10 +4636,9 @@ impl SettingsView {
                 )
             })
             .children(self.account_error.clone().map(|error| {
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.warning)
-                    .child(error)
+                crate::ui::error_banner(p, error)
+                    .id("admin-account-error")
+                    .debug_selector(|| "admin-account-error".into())
             }));
 
         let providers = [
@@ -4560,6 +4676,47 @@ impl SettingsView {
             // 시스템 기본값(호스트) 계정을 맨 위에 둔다(Orca accounts-pane 패리티).
             accounts.sort_by_key(|a| !a.host_default);
             let add_id = format!("admin-add-account-{}", provider.as_str());
+            let provider_installed = crate::accounts::installed::is_installed(cx, provider);
+            let active_conn = accounts.iter().find(|a| a.active).and_then(|acc| {
+                let usage = crate::accounts::display::account(
+                    acc,
+                    self.accounts_snapshot
+                        .statuses
+                        .iter()
+                        .find(|s| s.account_id == acc.id),
+                    crate::accounts::display::now(),
+                );
+                crate::accounts::display::connection(&self.accounts_snapshot, acc, &usage)
+            });
+            let (status_tone, status_label) = if provider_installed {
+                match active_conn {
+                    Some(ConnectionStatus::NeedsLogin) => (
+                        crate::ui::BadgeTone::Warning,
+                        text::ACCOUNT_LOGIN_REQUIRED.get(),
+                    ),
+                    Some(ConnectionStatus::CheckFailed) => (
+                        crate::ui::BadgeTone::Warning,
+                        text::CONNECTION_CHECK_FAILED.get(),
+                    ),
+                    Some(ConnectionStatus::Checking) => {
+                        (crate::ui::BadgeTone::Muted, text::CONNECTION_CHECKING.get())
+                    }
+                    Some(ConnectionStatus::NotInstalled) => (
+                        crate::ui::BadgeTone::Muted,
+                        text::CONNECTION_NOT_INSTALLED.get(),
+                    ),
+                    Some(ConnectionStatus::Connected) | None => (
+                        crate::ui::BadgeTone::Success,
+                        text::CONNECTION_CONNECTED.get(),
+                    ),
+                }
+            } else {
+                (
+                    crate::ui::BadgeTone::Muted,
+                    text::CONNECTION_NOT_INSTALLED.get(),
+                )
+            };
+            let provider_status_id = format!("admin-provider-status-{}", provider.as_str());
 
             let header = div()
                 .flex()
@@ -4576,6 +4733,11 @@ impl SettingsView {
                                 .text_size(crate::ui::TEXT_MD)
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .child(title),
+                        )
+                        .child(
+                            crate::ui::badge(p, status_tone, status_label)
+                                .id(SharedString::from(provider_status_id.clone()))
+                                .debug_selector(move || provider_status_id.clone()),
                         ),
                 )
                 .child(
@@ -4594,7 +4756,6 @@ impl SettingsView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.login_account(provider, None, cx);
             }));
-            let provider_installed = crate::accounts::installed::is_installed(cx, provider);
             let mut sub_controls = layout::controls();
             if !provider_installed
                 && let Some(install_cmd) = agent_install_command(provider.as_str())
@@ -4718,22 +4879,22 @@ impl SettingsView {
                 let adv_id = format!("admin-accounts-advanced-{}", provider.as_str());
                 section = section.child(
                     div().child(
-                        Button::new(gpui::ElementId::Name(adv_id.clone().into()))
-                            .small()
-                            .ghost()
-                            .icon(if open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .label(text::ACCOUNTS_ADVANCED.format(&[("n", &n.to_string())]))
-                            .debug_selector(move || adv_id.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                if !this.advanced_open.remove(&provider) {
-                                    this.advanced_open.insert(provider);
-                                }
-                                cx.notify();
-                            })),
+                        layout::ghost(
+                            gpui::ElementId::Name(adv_id.clone().into()),
+                            text::ACCOUNTS_ADVANCED.format(&[("n", &n.to_string())]),
+                        )
+                        .icon(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .debug_selector(move || adv_id.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.advanced_open.remove(&provider) {
+                                this.advanced_open.insert(provider);
+                            }
+                            cx.notify();
+                        })),
                     ),
                 );
                 if open {
@@ -4742,7 +4903,7 @@ impl SettingsView {
                 }
             }
 
-            if crate::accounts::installed::is_installed(cx, provider) {
+            if provider_installed {
                 root = root.child(section);
             } else {
                 not_installed.push(section);
@@ -4758,23 +4919,21 @@ impl SettingsView {
                     .gap_8()
                     .child(
                         div().child(
-                            Button::new("admin-accounts-not-installed")
-                                .small()
-                                .ghost()
-                                .icon(if open {
-                                    IconName::ChevronDown
-                                } else {
-                                    IconName::ChevronRight
-                                })
-                                .label(
-                                    text::PROVIDERS_NOT_INSTALLED
-                                        .format(&[("n", &not_installed.len().to_string())]),
-                                )
-                                .debug_selector(|| "admin-accounts-not-installed".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.not_installed_open = !this.not_installed_open;
-                                    cx.notify();
-                                })),
+                            layout::ghost(
+                                "admin-accounts-not-installed",
+                                text::PROVIDERS_NOT_INSTALLED
+                                    .format(&[("n", &not_installed.len().to_string())]),
+                            )
+                            .icon(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .debug_selector(|| "admin-accounts-not-installed".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.not_installed_open = !this.not_installed_open;
+                                cx.notify();
+                            })),
                         ),
                     )
                     .when(open, |d| d.children(not_installed)),
@@ -4837,20 +4996,36 @@ impl SettingsView {
                 });
             },
         );
-        let rl_btn = layout::segment(
+        let view = cx.entity();
+        let rl_switch = layout::switch(
+            p,
             "admin-rate-limit-toggle",
-            text::AUTO_SWITCH_RATE_LIMIT.get(),
             policy.switch_on_rate_limit,
-        )
-        .debug_selector(|| "admin-rate-limit-toggle".into())
-        .on_click({
-            let policy = policy.clone();
-            cx.listener(move |this, _, _, cx| {
-                let mut next = policy.clone();
-                next.switch_on_rate_limit = !next.switch_on_rate_limit;
-                this.apply_account_request(UsageRequest::SetAutoSwitch(next), cx);
-            })
-        });
+            false,
+            move |on, _, cx| {
+                view.update(cx, |this, cx| {
+                    let mut next = this.accounts_snapshot.auto_switch.clone();
+                    if next.switch_on_rate_limit != on {
+                        next.switch_on_rate_limit = on;
+                        this.apply_account_request(UsageRequest::SetAutoSwitch(next), cx);
+                    }
+                });
+            },
+        );
+        let rate_limit_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::AUTO_SWITCH_RATE_LIMIT.get()),
+            )
+            .child(layout::controls().child(rl_switch));
         let preset_btns = krill_proto::usage::AUTO_SWITCH_PRESETS
             .into_iter()
             .map(|pct| {
@@ -4914,21 +5089,107 @@ impl SettingsView {
             );
         }
 
-        root.child(
-            layout::card(p)
-                .flex()
-                .flex_col()
-                .gap_2p5()
+        let mut auto_switch_card = layout::card(p)
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(layout::label(p, text::AUTO_SWITCH_TITLE.get(), None))
+                    .child(layout::controls().child(toggle_btn)),
+            )
+            .child(threshold_row)
+            .child(rate_limit_row);
+
+        if self.accounts_snapshot.advanced.supported {
+            let adv = self.accounts_snapshot.advanced.policy.clone();
+            let view_predict = cx.entity();
+            let predict_switch = layout::switch(
+                p,
+                "admin-predict-exhaustion-toggle",
+                adv.predict_exhaustion,
+                false,
+                move |on, _, cx| {
+                    view_predict.update(cx, |this, cx| {
+                        let mut next = this.accounts_snapshot.advanced.policy.clone();
+                        if next.predict_exhaustion != on {
+                            next.predict_exhaustion = on;
+                            this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
+                        }
+                    });
+                },
+            );
+            let view_reset = cx.entity();
+            let reset_switch = layout::switch(
+                p,
+                "admin-prefer-soonest-reset-toggle",
+                adv.prefer_soonest_reset,
+                false,
+                move |on, _, cx| {
+                    view_reset.update(cx, |this, cx| {
+                        let mut next = this.accounts_snapshot.advanced.policy.clone();
+                        if next.prefer_soonest_reset != on {
+                            next.prefer_soonest_reset = on;
+                            this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
+                        }
+                    });
+                },
+            );
+            let cooldown_btns = [0_u64, 5, 15, 30].into_iter().map(|mins| {
+                let secs = mins * 60;
+                let id_str = format!("admin-cooldown-{mins}m");
+                let selected = adv.cooldown_secs / 60 == mins;
+                let adv_cl = adv.clone();
+                layout::segment(
+                    gpui::ElementId::Name(id_str.clone().into()),
+                    crate::i18n::catalog::shell::ACCOUNT_COOLDOWN_MINUTES
+                        .format(&[("minutes", &mins.to_string())]),
+                    selected,
+                )
+                .debug_selector(move || id_str.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let mut next = adv_cl.clone();
+                    next.cooldown_secs = secs;
+                    this.apply_account_request(UsageRequest::SetAdvancedPolicy(next), cx);
+                }))
+            });
+            auto_switch_card = auto_switch_card
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .child(layout::label(p, text::AUTO_SWITCH_TITLE.get(), None))
-                        .child(layout::controls().child(toggle_btn)),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(crate::i18n::catalog::shell::ACCOUNT_PREDICT.get()),
+                        )
+                        .child(layout::controls().child(predict_switch)),
                 )
-                .child(threshold_row)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get()),
+                        )
+                        .child(layout::controls().child(reset_switch)),
+                )
                 .child(
                     div()
                         .flex()
@@ -4936,39 +5197,53 @@ impl SettingsView {
                         .justify_between()
                         .gap_2()
                         .flex_wrap()
-                        .child(rl_btn)
                         .child(
-                            layout::controls()
-                                .child(
-                                    layout::secondary(
-                                        "admin-accounts-refresh",
-                                        text::ACCOUNTS_REFRESH.get(),
-                                    )
-                                    .icon(IconName::RefreshCw)
-                                    .debug_selector(|| "admin-accounts-refresh".into())
-                                    .on_click(cx.listener(
-                                        |this, _, _, cx| {
-                                            this.apply_account_request(
-                                                UsageRequest::ListAccounts,
-                                                cx,
-                                            );
-                                        },
-                                    )),
-                                )
-                                .child(
-                                    layout::secondary(
-                                        "admin-open-accounts-toml",
-                                        text::ACCOUNTS_OPEN_TOML.get(),
-                                    )
-                                    .icon(IconName::ExternalLink)
-                                    .debug_selector(|| "admin-open-accounts-toml".into())
-                                    .on_click(|_, _, cx| {
-                                        open_file("accounts.toml", "", cx);
-                                    }),
-                                ),
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(crate::i18n::catalog::shell::ACCOUNT_COOLDOWN.get()),
+                        )
+                        .child(
+                            layout::controls().child(layout::segmented_control(p, cooldown_btns)),
+                        ),
+                );
+        }
+
+        auto_switch_card = auto_switch_card.child(
+            div()
+                .flex()
+                .items_center()
+                .justify_end()
+                .gap_2()
+                .flex_wrap()
+                .child(
+                    layout::controls()
+                        .child(
+                            layout::secondary(
+                                "admin-accounts-refresh",
+                                text::ACCOUNTS_REFRESH.get(),
+                            )
+                            .icon(IconName::RefreshCw)
+                            .debug_selector(|| "admin-accounts-refresh".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.apply_account_request(UsageRequest::ListAccounts, cx);
+                            })),
+                        )
+                        .child(
+                            layout::secondary(
+                                "admin-open-accounts-toml",
+                                text::ACCOUNTS_OPEN_TOML.get(),
+                            )
+                            .icon(IconName::ExternalLink)
+                            .debug_selector(|| "admin-open-accounts-toml".into())
+                            .on_click(|_, _, cx| {
+                                open_file("accounts.toml", "", cx);
+                            }),
                         ),
                 ),
-        )
+        );
+
+        root.child(auto_switch_card)
     }
 
     fn render_agents_tab(
