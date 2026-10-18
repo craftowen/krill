@@ -264,11 +264,7 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
         s.selected = None;
     }
     let interfaces = net::detect()?;
-    let selected = if mode != ConnectMode::Tunnel && custom.is_some() {
-        net::select(&[], mode, custom.as_deref())?
-    } else {
-        net::select(&interfaces, mode, custom.as_deref())?
-    };
+    let selected = net::select(&interfaces, mode, custom.as_deref())?;
     if intent_changed || s.selected.is_some_and(|a| a.ip() != selected.ip()) {
         s.devices.clear_ticket();
         close(s);
