@@ -437,12 +437,15 @@ pub const fn tab_tag_color(color: crate::layout::TabColor) -> Hsla {
 pub fn apply(mode: ThemeMode, cx: &mut App) {
     Theme::change(mode, None, cx);
     let p = palette_for(mode);
-    let rem = px(16. * crate::settings::current(cx).zoom());
+    let s = crate::settings::current(cx);
+    let zoom = s.zoom();
+    let rem = px(16. * zoom);
+    let mono_pt = f32::from(s.editor_font_size());
     Theme::update(cx, |theme| {
         theme.font_family = FONT_UI.into();
         theme.mono_font_family = FONT_MONO.into();
         theme.font_size = TEXT_MD.to_pixels(rem);
-        theme.mono_font_size = TEXT_SM.to_pixels(rem);
+        theme.mono_font_size = px(mono_pt * zoom);
         theme.radius = RADIUS_SM;
         theme.radius_lg = RADIUS_LG;
 

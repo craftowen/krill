@@ -269,6 +269,29 @@ fn refresh_menus(cx: &mut App) {
                 CloseWindow,
             ),
         ]),
+        Menu::new(krill_app::i18n::catalog::general::VIEW.get()).items([
+            MenuItem::action(
+                krill_app::i18n::catalog::settings::SC_ZOOM_IN.get(),
+                krill_app::settings::ZoomIn,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::settings::SC_ZOOM_OUT.get(),
+                krill_app::settings::ZoomOut,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::settings::SC_ZOOM_RESET.get(),
+                krill_app::settings::ZoomReset,
+            ),
+            MenuItem::separator(),
+            MenuItem::action(
+                krill_app::i18n::catalog::settings::SC_SIDEBAR.get(),
+                shell::ToggleSidebar,
+            ),
+            MenuItem::action(
+                krill_app::i18n::catalog::settings::SC_PANEL.get(),
+                shell::TogglePanel,
+            ),
+        ]),
     ]);
 }
 

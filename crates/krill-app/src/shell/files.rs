@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use gpui::PromptLevel;
+use gpui::{Focusable as _, PromptLevel};
 use gpui_component::input::{Editor, EditorState, InputEvent};
 use gpui_component::{Icon, Selectable as _};
 use krill_app::editor::{self, Disk, Doc, Opened, Poll, Preview, SaveError, Unopenable};
@@ -288,7 +288,92 @@ impl Shell {
         .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
             this.toggle_quick_open(window, cx);
         }))
+        .on_action(
+            cx.listener(|this, _: &krill_app::settings::ZoomIn, window, cx| {
+                this.on_zoom_step(1, window, cx);
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &krill_app::settings::ZoomOut, window, cx| {
+                this.on_zoom_step(-1, window, cx);
+            }),
+        )
+        .on_action(
+            cx.listener(|this, _: &krill_app::settings::ZoomReset, window, cx| {
+                this.on_zoom_reset(window, cx);
+            }),
+        )
         .on_action(cx.listener(|_, _: &Quit, _, cx| quit_app(cx)))
+    }
+
+    pub(super) fn is_editor_focused(&self, window: &Window, cx: &App) -> bool {
+        if self.files.tabs.values().any(|tab| {
+            tab.focus_editor()
+                .is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(window))
+        }) {
+            return true;
+        }
+        self.layout
+            .focused()
+            .is_some_and(|pane| self.layout.file(pane).is_some())
+    }
+
+    pub(super) fn on_zoom_step(&mut self, dir: i8, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        if self.is_editor_focused(window, cx) {
+            if let Some(pane) = self.layout.focused()
+                && let Some(tab) = self.files.tabs.get(&pane)
+            {
+                match &tab.body {
+                    Body::Image(img)
+                    | Body::Text {
+                        shown: Some(Shown::Image(img)),
+                        ..
+                    } => {
+                        img.update(cx, |v, cx| {
+                            if dir >= 0 {
+                                v.zoom_in(cx);
+                            } else {
+                                v.zoom_out(cx);
+                            }
+                        });
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            krill_app::settings::step_editor_font_size(dir, cx);
+        } else if self.layout.focused().is_some() {
+            krill_app::settings::step_terminal_font_size(dir, cx);
+        }
+    }
+
+    pub(super) fn on_zoom_reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        if self.is_editor_focused(window, cx) {
+            if let Some(pane) = self.layout.focused()
+                && let Some(tab) = self.files.tabs.get(&pane)
+            {
+                match &tab.body {
+                    Body::Image(img)
+                    | Body::Text {
+                        shown: Some(Shown::Image(img)),
+                        ..
+                    } => {
+                        img.update(cx, ImageView::zoom_reset);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            krill_app::settings::reset_editor_font_size(cx);
+        } else if self.layout.focused().is_some() {
+            krill_app::settings::reset_terminal_font_size(cx);
+        }
     }
 
     /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
