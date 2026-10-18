@@ -144,14 +144,14 @@ impl Panel {
         self.tab
     }
 
-    /// 우측 패널 탭을 전환한다. `Files` 탭으로 처음 들어가면 루트 폴더를 지연 로드한다.
+    /// 우측 패널 탭을 전환한다. `Files` 탭으로 처음 들어가면 루트 폴더를 백그라운드에서 지연 로드한다.
     pub fn set_tab(&mut self, tab: PanelTab, cx: &mut Context<Self>) {
         if self.tab == tab && (tab != PanelTab::Files || self.explorer.loaded_root) {
             return;
         }
         self.tab = tab;
         if tab == PanelTab::Files {
-            self.explorer.ensure_loaded();
+            self.ensure_explorer_loaded_async(cx);
         }
         if tab == PanelTab::Search
             && !self.search.options.query.is_empty()

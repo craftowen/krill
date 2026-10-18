@@ -385,6 +385,15 @@ impl Shell {
         self.files.refocus = true;
     }
 
+    /// 파일을 미리보기 탭으로 연다(OWE-849): 같은 칸을 재사용하며 다음 단일 클릭이 교체한다.
+    pub(super) fn open_file_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.close_settings(None, cx);
+        self.change(true, cx, move |l| {
+            l.open_file_preview(path);
+        });
+        self.files.refocus = true;
+    }
+
     /// 파일을 가운데 영역 에디터 탭으로 열고 지정한 1-based `(line, column)`으로 커서를 이동한다(OWE-733).
     pub(super) fn open_file_at(
         &mut self,
@@ -536,7 +545,8 @@ impl Shell {
                     .truncate()
                     .text_size(krill_app::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
-                    .child(path.display().to_string()),
+                    // OWE-849: 절대 경로 대신 워크트리 상대 경로(또는 `~` 축약)를 보인다.
+                    .child(self.diff.read(cx).display_path(&path)),
             )
             .when(dirty, |d| {
                 d.child(
