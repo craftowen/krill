@@ -1,6 +1,6 @@
 //! OWE-576: 사이드바 위 "+ 새 세션" 드롭다운(터미널·에이전트·권한 Manual/YOLO·폴더 열기).
 
-use gpui::{App, Context, KeyBinding, actions, div, prelude::*};
+use gpui::{App, Context, actions, div, prelude::*};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::{IconName, Sizable as _};
@@ -16,10 +16,10 @@ actions!(shell, [NewAgent1, NewAgent2, NewAgent3, NewAgent4]);
 pub(super) fn bind_keys(cx: &mut App) {
     let ctx = Some(KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("alt-cmd-1", NewAgent1, ctx),
-        KeyBinding::new("alt-cmd-2", NewAgent2, ctx),
-        KeyBinding::new("alt-cmd-3", NewAgent3, ctx),
-        KeyBinding::new("alt-cmd-4", NewAgent4, ctx),
+        krill_app::keys::bind("alt-cmd-1", NewAgent1, ctx),
+        krill_app::keys::bind("alt-cmd-2", NewAgent2, ctx),
+        krill_app::keys::bind("alt-cmd-3", NewAgent3, ctx),
+        krill_app::keys::bind("alt-cmd-4", NewAgent4, ctx),
     ]);
 }
 

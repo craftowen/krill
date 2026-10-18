@@ -99,8 +99,8 @@ actions!(shell, [SaveFile, QuickOpen]);
 pub(super) fn bind_keys(cx: &mut App) {
     let ctx = Some(KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("cmd-s", SaveFile, ctx),
-        KeyBinding::new("cmd-p", QuickOpen, ctx),
+        krill_app::keys::bind("cmd-s", SaveFile, ctx),
+        krill_app::keys::bind("cmd-p", QuickOpen, ctx),
     ]);
 }
 
