@@ -373,7 +373,7 @@ catalog! {
         PASTE => ("붙여넣기", "Paste"),
         FORK_SESSION => ("에이전트 세션 포크", "Fork agent session"),
         CONTINUE_IN_NEW_SESSION => ("새 세션에 이어하기…", "Continue in new session…"),
-        FORKED_SESSION => ("에이전트 세션을 새 탭에 포크했습니다", "Forked agent session in a new tab"),
+        FORKED_SESSION => ("{agent} 세션을 새 탭에 포크했습니다", "Forked {agent} session in a new tab"),
         HANDOFF_SENT => ("핸드오프 → {agent} (클립보드에 맥락 복사됨)", "Handoff → {agent} (context copied to clipboard)"),
         DAEMON_UP => ("데몬 연결됨", "Daemon connected"),
         DAEMON_CONNECTING => ("데몬 재연결 중…", "Reconnecting to daemon…"),
