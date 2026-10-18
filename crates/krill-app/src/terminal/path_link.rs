@@ -21,6 +21,14 @@ pub struct PathLink {
     pub col: Option<u32>,
 }
 
+/// ⌘ 아래에서 찾은 평문 웹 URL(`http://`·`https://`). `column`부터 `cols`칸에 밑줄을 긋는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UrlLink {
+    pub column: u16,
+    pub cols: u16,
+    pub uri: String,
+}
+
 /// 경로를 끊는 글자. `:`는 `path:line`에 쓰여 끊지 않는다.
 fn breaks(c: char) -> bool {
     c.is_whitespace()
@@ -32,6 +40,186 @@ fn breaks(c: char) -> bool {
         )
 }
 
+/// 평문 URL 본문을 끊는 글자. 쿼리·경로 안 `,`·`;`·`:`·`()`·`[]`는 본문에 두고 문장 끝에서만 잘라낸다.
+fn url_breaks(c: char) -> bool {
+    c.is_whitespace()
+        || c.is_control()
+        || is_bidi_control(c)
+        || matches!(
+            c,
+            '"' | '\''
+                | '`'
+                | '<'
+                | '>'
+                | '{'
+                | '}'
+                | '|'
+                | '\\'
+                | '^'
+                | '（'
+                | '）'
+                | '「'
+                | '」'
+                | '『'
+                | '』'
+                | '【'
+                | '】'
+                | '〈'
+                | '〉'
+                | '《'
+                | '》'
+                | '〔'
+                | '〕'
+                | '［'
+                | '］'
+                | '｛'
+                | '｝'
+                | '、'
+                | '。'
+                | '・'
+                | '：'
+                | '；'
+                | '！'
+                | '？'
+                | '“'
+                | '”'
+                | '‘'
+                | '’'
+        )
+}
+
+fn trim_url_end(slice: &[(u16, char, u16)]) -> usize {
+    let mut end = slice.len();
+    while end > 0 {
+        let Some(&(_, c, _)) = slice.get(end - 1) else {
+            break;
+        };
+        let strip = match c {
+            '.' | ',' | ':' | ';' | '!' | '?' | '~' => true,
+            ')' => {
+                let head = slice.get(..end).unwrap_or_default();
+                let open = head.iter().filter(|&&(_, ch, _)| ch == '(').count();
+                let close = head.iter().filter(|&&(_, ch, _)| ch == ')').count();
+                close > open
+            }
+            ']' => {
+                let head = slice.get(..end).unwrap_or_default();
+                let open = head.iter().filter(|&&(_, ch, _)| ch == '[').count();
+                let close = head.iter().filter(|&&(_, ch, _)| ch == ']').count();
+                close > open
+            }
+            _ => false,
+        };
+        if strip {
+            end -= 1;
+        } else {
+            break;
+        }
+    }
+    end
+}
+
+/// (시작 칸, 글자, 폭). 2칸 글자의 둘째 칸(SPACER)은 앞 글자에 붙인다.
+fn row_chars(row: &[Cell]) -> Vec<(u16, char, u16)> {
+    let mut chars: Vec<(u16, char, u16)> = Vec::with_capacity(row.len());
+    for (col, cell) in (0u16..).zip(row) {
+        if cell.flags.contains(Flags::SPACER) {
+            if let Some(last) = chars.last_mut() {
+                last.2 = last.2.saturating_add(1);
+            }
+            continue;
+        }
+        let ch = if cell.flags.contains(Flags::HIDDEN) {
+            ' '
+        } else {
+            cell.ch
+        };
+        chars.push((col, ch, 1));
+    }
+    chars
+}
+
+/// `row`의 `column` 칸을 덮는 평문 `http://`·`https://` URL을 찾는다(OWE-867).
+pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
+    let chars = row_chars(row);
+    let len = chars.len();
+    let mut i = 0;
+    while i < len {
+        let start = i;
+        let rest = chars.get(start..)?;
+        let scheme_len = if rest
+            .get(..8)
+            .is_some_and(|s| s.iter().map(|t| t.1).eq("https://".chars()))
+        {
+            8
+        } else if rest
+            .get(..7)
+            .is_some_and(|s| s.iter().map(|t| t.1).eq("http://".chars()))
+        {
+            7
+        } else {
+            i += 1;
+            continue;
+        };
+        let boundary = start == 0
+            || chars
+                .get(start - 1)
+                .is_none_or(|&(_, c, _)| !c.is_ascii_alphanumeric() && c != '_');
+        if !boundary {
+            i = start + scheme_len;
+            continue;
+        }
+        let raw_end = rest
+            .iter()
+            .position(|&(_, c, _)| url_breaks(c))
+            .map_or(len, |off| start + off);
+        // 같은 공백 단위 토큰 안에 제어·양방향 위장 문자가 섞여 있으면 전체 후보를 버린다.
+        let token_poisoned = rest
+            .iter()
+            .take_while(|&&(_, c, _)| !c.is_whitespace())
+            .any(|&(_, c, _)| c.is_control() || is_bidi_control(c));
+        if token_poisoned {
+            i = raw_end.max(start + scheme_len);
+            continue;
+        }
+        i = start + scheme_len;
+        let Some(raw_slice) = chars.get(start..raw_end) else {
+            continue;
+        };
+        let trimmed_len = trim_url_end(raw_slice);
+        if trimmed_len <= scheme_len {
+            continue;
+        }
+        let Some(token) = raw_slice.get(..trimmed_len) else {
+            continue;
+        };
+        let Some(&(start_col, _, _)) = token.first() else {
+            continue;
+        };
+        let Some(&(last_col, _, last_w)) = token.last() else {
+            continue;
+        };
+        let end_col = last_col.saturating_add(last_w);
+        if !(start_col..end_col).contains(&column) {
+            continue;
+        }
+        let uri: String = token.iter().map(|t| t.1).collect();
+        let valid = gpui::http_client::Url::parse(&uri).is_ok_and(|u| {
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str()
+                    .is_some_and(|h| !h.is_empty() && !h.chars().all(|c| c == '.'))
+        });
+        if valid {
+            return Some(UrlLink {
+                column: start_col,
+                cols: end_col.saturating_sub(start_col),
+                uri,
+            });
+        }
+    }
+    None
+}
+
 /// 포인터 칸을 덮는 후보 글자열(디스크를 보지 않는다). 글자마다 시작 칸, 마지막 글자 다음 칸을 함께 둔다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
@@ -41,17 +229,7 @@ struct Candidate {
 }
 
 fn candidate_at(row: &[Cell], column: u16) -> Option<Candidate> {
-    // (시작 칸, 글자, 폭). 2칸 글자의 둘째 칸(SPACER)은 앞 글자에 붙인다.
-    let mut chars: Vec<(u16, char, u16)> = Vec::with_capacity(row.len());
-    for (col, cell) in (0u16..).zip(row) {
-        if cell.flags.contains(Flags::SPACER) {
-            if let Some(last) = chars.last_mut() {
-                last.2 = last.2.saturating_add(1);
-            }
-            continue;
-        }
-        chars.push((col, cell.ch, 1));
-    }
+    let chars = row_chars(row);
     let hit = chars
         .iter()
         .position(|&(c, _, w)| (c..c.saturating_add(w)).contains(&column))?;

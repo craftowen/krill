@@ -100,6 +100,53 @@ fn link_hit_testing_excludes_padding_and_unsafe_schemes(_cx: &mut TestAppContext
     // MK-076: 양방향(bidi) 재정의 문자가 섞인 스푸핑 URL도 거부한다.
     s.links[0][0].uri = "https://example.com/\u{202e}gpj.exe".into();
     assert_eq!(link_target(&s, &painted, point(px(25.), px(25.))), None);
+    assert_eq!(
+        osc_link_highlight(&s, &painted, point(px(25.), px(25.))),
+        None
+    );
+}
+
+#[test]
+fn plaintext_url_and_osc8_highlight_hit_testing() {
+    let painted: Painted = Rc::new(std::cell::Cell::new((
+        Bounds::new(point(px(0.), px(0.)), size(px(300.), px(36.))),
+        size(px(10.), px(18.)),
+    )));
+    let mut s = Screen::blank(30, 2);
+    s.rows[0] = "go https://example.com/a now"
+        .chars()
+        .map(|ch| Cell {
+            ch,
+            ..Cell::default()
+        })
+        .collect();
+    assert_eq!(
+        url_link_target(&s, &painted, point(px(55.), px(5.))),
+        Some((
+            Highlight {
+                line: 0,
+                column: 3,
+                cols: 21,
+            },
+            "https://example.com/a".to_owned(),
+        ))
+    );
+    assert_eq!(url_link_target(&s, &painted, point(px(15.), px(5.))), None);
+
+    // OSC 8 링크가 있는 칸은 OSC 8이 우선한다.
+    s.links[1].push(krill_proto::screen::Link {
+        column: 2,
+        cols: 4,
+        uri: "https://osc8.example/".into(),
+    });
+    assert_eq!(
+        osc_link_highlight(&s, &painted, point(px(35.), px(25.))),
+        Some(Highlight {
+            line: 1,
+            column: 2,
+            cols: 4,
+        })
+    );
 }
 
 #[test]

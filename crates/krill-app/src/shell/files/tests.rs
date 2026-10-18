@@ -463,6 +463,53 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
         state.read(cx).cursor_position()
     });
     assert_eq!(cursor, gpui_component::input::Position::new(2, 3));
+
+    // OWE-867: 터미널 탭으로 돌아가 일반 평문 URL을 ⌘+호버하면 밑줄이 생기고 ⌘+클릭하면 브라우저로 연다.
+    // 에디터를 여는 동안 숨은 터미널 칸의 연결은 끊기므로(EOF) 다시 붙인다.
+    cx.simulate_keystrokes("cmd-1");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        let (ours, _theirs) = std::os::unix::net::UnixStream::pair().unwrap();
+        s.attach_test(pane, krill_proto::SessionId(12), ours, cx);
+        let row = |t: &str| {
+            t.chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect()
+        };
+        let ops = vec![
+            Op::Reset { cols: 40, lines: 2 },
+            Op::Line {
+                line: 1,
+                cells: row("see (https://example.com/docs?x=1)."),
+            },
+        ];
+        let frame = &encode_update(Revision(1), Seq(1), ops).unwrap()[0];
+        let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, k, &body, cx));
+    });
+    cx.run_until_parked();
+    cx.simulate_mouse_move(at(10.), None, Modifiers::default());
+    assert_eq!(hover(cx), None, "⌘ 없이는 URL 밑줄이 없다");
+    cx.simulate_mouse_move(at(10.), None, cmd);
+    assert_eq!(
+        hover(cx),
+        Some(Highlight {
+            line: 1,
+            column: 5,
+            cols: 28,
+        }),
+        "평문 URL에 ⌘+호버하면 구두점을 뺀 범위에 밑줄이 생긴다"
+    );
+    cx.simulate_mouse_down(at(10.), MouseButton::Left, cmd);
+    cx.simulate_mouse_up(at(10.), MouseButton::Left, cmd);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/docs?x=1")
+    );
 }
 
 /// OWE-732(MK-178): `⌘⇧E` 파일 탐색기 토글 단축키와 `krill file open|diff` 요청 큐 통합 검증.

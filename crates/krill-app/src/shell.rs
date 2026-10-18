@@ -3195,21 +3195,32 @@ impl Shell {
                 cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
                     if e.modifiers.platform {
                         let mut file = None;
+                        let mut url = None;
                         if let Some(l) = this.live.get(&id) {
                             let screen = l.pane.shown();
                             if let Some(uri) = link_target(&screen, &l.painted, e.position) {
-                                cx.open_url(uri);
-                            } else {
-                                file = file_link_target(&screen, &l.painted, e.position);
+                                url = Some(uri.to_owned());
+                            } else if let Some(path) =
+                                file_link_target(&screen, &l.painted, e.position)
+                            {
+                                file = Some(path);
+                            } else if let Some((_, uri)) = krill_app::terminal::url_link_target(
+                                &screen, &l.painted, e.position,
+                            ) {
+                                url = Some(uri);
                             }
                         }
-                        // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
-                        match file {
-                            Some(path) if path.is_file() => this.open_file(path, cx),
-                            Some(path) => cx.reveal_path(&path),
-                            None => {
-                                if let Some((_, link)) = this.path_link_at(id, e.position, cx) {
-                                    this.open_path_link(link, cx);
+                        if let Some(uri) = url {
+                            cx.open_url(&uri);
+                        } else {
+                            // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
+                            match file {
+                                Some(path) if path.is_file() => this.open_file(path, cx),
+                                Some(path) => cx.reveal_path(&path),
+                                None => {
+                                    if let Some((_, link)) = this.path_link_at(id, e.position, cx) {
+                                        this.open_path_link(link, cx);
+                                    }
                                 }
                             }
                         }
