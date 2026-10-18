@@ -922,8 +922,7 @@ impl Wizard {
                     .gap_2()
                     .child(
                         div().debug_selector(|| "wizard-fix-all".into()).child(
-                            ui::secondary("wizard-fix-all", text::FIX_ALL.get())
-                                .primary()
+                            ui::primary("wizard-fix-all", text::FIX_ALL.get())
                                 .loading(fix_all_busy)
                                 .disabled(
                                     fix_all_busy || self.checks_loading || self.checks.is_none(),
@@ -967,17 +966,16 @@ impl Wizard {
             right = right
                 .child(
                     div().debug_selector(|| "consent-quit".into()).child(
-                        Button::new("consent-quit-btn")
-                            .outline()
-                            .label(crate::i18n::catalog::consent::QUIT.get())
-                            .on_click(|_, _, cx| Self::quit(cx)),
+                        ui::ghost(
+                            "consent-quit-btn",
+                            crate::i18n::catalog::consent::QUIT.get(),
+                        )
+                        .on_click(|_, _, cx| Self::quit(cx)),
                     ),
                 )
                 .child(
                     div().debug_selector(|| "consent-continue".into()).child(
-                        Button::new("consent-continue-btn")
-                            .primary()
-                            .label(text::START_NOW.get())
+                        ui::primary("consent-continue-btn", text::START_NOW.get())
                             .tooltip(text::START_HINT.get())
                             .disabled(!accepted)
                             .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
@@ -997,15 +995,16 @@ impl Wizard {
             .justify_between()
             .child(
                 div().debug_selector(|| "wizard-later".into()).child(
-                    Button::new("wizard-later")
-                        .ghost()
-                        .label(if first {
+                    ui::ghost(
+                        "wizard-later",
+                        if first {
                             text::LATER.get()
                         } else {
                             text::CLOSE.get()
-                        })
-                        .tooltip(text::LATER_HINT.get())
-                        .on_click(cx.listener(|s, _, window, cx| s.later(window, cx))),
+                        },
+                    )
+                    .tooltip(text::LATER_HINT.get())
+                    .on_click(cx.listener(|s, _, window, cx| s.later(window, cx))),
                 ),
             )
             .child(right)
@@ -1043,30 +1042,24 @@ impl Wizard {
                     .text_color(p.muted_foreground)
                     .child(text::AGENT_NONE.get())
                     .into_any_element(),
-                Some(found) => div()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1p5()
-                    .children(found.into_iter().map(|(id, name)| {
+                Some(found) => ui::segmented_control(
+                    p,
+                    found.into_iter().map(|(id, name)| {
                         let selected = self.agent.as_deref() == Some(id.as_str());
                         let selector = format!("wizard-agent-{id}");
-                        let button = Button::new(gpui::SharedString::from(selector.clone()))
-                            .small()
-                            .icon(ui::icons::agent_menu_icon(&id))
-                            .label(name)
+                        let debug = selector.clone();
+                        let agent = id.clone();
+                        ui::segment(gpui::SharedString::from(selector), name, selected)
+                            .icon(ui::icons::agent_menu_icon(&agent))
+                            .debug_selector(move || debug.clone())
                             .on_click(cx.listener(move |s, _, _, cx| {
-                                s.agent = Some(id.clone());
+                                s.agent = Some(agent.clone());
                                 cx.notify();
-                            }));
-                        div()
-                            .debug_selector(move || selector.clone())
-                            .child(if selected {
-                                button.primary()
-                            } else {
-                                button.outline()
-                            })
-                    }))
-                    .into_any_element(),
+                            }))
+                    }),
+                )
+                .flex_wrap()
+                .into_any_element(),
             };
             body = body.child(
                 ui::card(p)
@@ -1142,17 +1135,10 @@ impl Wizard {
                     .child(check_title(&check.id)),
             )
             .children((check.status == Status::Skip).then(|| {
-                div()
-                    .debug_selector({
-                        let id = id.clone();
-                        move || format!("wizard-skipped-{id}")
-                    })
-                    .px_1p5()
-                    .rounded(ui::RADIUS_XS)
-                    .bg(p.muted)
-                    .text_size(ui::TEXT_2XS)
-                    .text_color(p.muted_foreground)
-                    .child(ctext::STATUS_SKIPPED.get())
+                ui::badge(p, ui::BadgeTone::Muted, ctext::STATUS_SKIPPED.get()).debug_selector({
+                    let id = id.clone();
+                    move || format!("wizard-skipped-{id}")
+                })
             }));
         let line = div()
             .flex()
@@ -1269,26 +1255,30 @@ impl Wizard {
             .children(hook.map(|(agent, phase)| Self::render_hook_phase(agent, phase, cx)))
             .children(fix_error.and_then(|error| {
                 use super::actions::FixError;
-                let (selector, color, line) = match error {
-                    FixError::Cancelled => return None,
-                    FixError::Failed(message) => {
-                        ("wizard-fix-error", p.destructive, message.clone())
-                    }
-                    FixError::Conflict { guide, .. } => {
-                        ("wizard-fix-conflict", p.warning, guide.clone())
-                    }
-                };
-                Some(
-                    div()
-                        .debug_selector({
-                            let id = id.clone();
-                            move || format!("{selector}-{id}")
-                        })
-                        .pl_6()
-                        .text_size(ui::TEXT_XS)
-                        .text_color(color)
-                        .child(line),
-                )
+                match error {
+                    FixError::Cancelled => None,
+                    FixError::Failed(message) => Some(
+                        div()
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("wizard-fix-error-{id}")
+                            })
+                            .pl_6()
+                            .child(ui::error_banner(p, message.clone())),
+                    ),
+                    // 충돌 안내는 경고 톤 그대로 둔다(경고용 배너 프리미티브는 없다).
+                    FixError::Conflict { guide, .. } => Some(
+                        div()
+                            .debug_selector({
+                                let id = id.clone();
+                                move || format!("wizard-fix-conflict-{id}")
+                            })
+                            .pl_6()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.warning)
+                            .child(guide.clone()),
+                    ),
+                }
             }))
     }
 
@@ -1315,9 +1305,7 @@ impl Wizard {
             HookPhase::Failed(error) => div()
                 .debug_selector(move || format!("wizard-hook-error-{id}"))
                 .pl_6()
-                .text_size(ui::TEXT_XS)
-                .text_color(p.destructive)
-                .child(error.clone())
+                .child(ui::error_banner(p, error.clone()))
                 .into_any_element(),
             HookPhase::Review(diff) => div()
                 .pl_6()
@@ -1425,58 +1413,49 @@ impl Wizard {
                 .collect::<Vec<_>>()
                 .join(", ");
             body = body.child(
-                div()
-                    .debug_selector(|| "wizard-blocked".into())
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(p.destructive)
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.destructive)
-                    .child(Icon::new(IconName::CircleX).small())
-                    .child(
-                        text::BLOCKED_REQUIRED
-                            .format(&[("n", &blockers.len().to_string()), ("ids", &names)]),
-                    ),
+                ui::error_banner(
+                    p,
+                    text::BLOCKED_REQUIRED
+                        .format(&[("n", &blockers.len().to_string()), ("ids", &names)]),
+                )
+                .debug_selector(|| "wizard-blocked".into()),
             );
         }
         let mut index = 0;
-        for (level, header) in [
-            (Level::Required, text::GROUP_REQUIRED.get()),
-            (Level::Recommended, text::GROUP_RECOMMENDED.get()),
-            (Level::Optional, text::GROUP_OPTIONAL.get()),
+        for (level, id, header) in [
+            (
+                Level::Required,
+                "wizard-group-required",
+                text::GROUP_REQUIRED.get(),
+            ),
+            (
+                Level::Recommended,
+                "wizard-group-recommended",
+                text::GROUP_RECOMMENDED.get(),
+            ),
+            (
+                Level::Optional,
+                "wizard-group-optional",
+                text::GROUP_OPTIONAL.get(),
+            ),
         ] {
             let rows: Vec<_> = checks.iter().filter(|c| c.level == level).collect();
             let Some(last) = rows.len().checked_sub(1) else {
                 continue;
             };
-            let mut card = div()
-                .rounded(ui::RADIUS_MD)
-                .border_1()
-                .border_color(p.border)
-                .bg(p.card)
-                .flex()
-                .flex_col();
+            let mut card = ui::card(p).p_0().flex().flex_col();
             for (i, check) in rows.into_iter().enumerate() {
                 card = card.child(self.render_check_row(index, i == last, check, cx));
                 index += 1;
             }
             body = body.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_col()
                     .gap_1p5()
-                    .child(
-                        div()
-                            .text_size(ui::TEXT_XS)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(p.muted_foreground)
-                            .child(header),
-                    )
+                    .child(ui::section_title(p, id, header))
                     .child(card),
             );
         }
@@ -1532,7 +1511,7 @@ impl Render for Wizard {
                     .flex()
                     .items_center()
                     .justify_center()
-                    .bg(p.worktree_sidebar)
+                    .bg(p.sidebar)
                     .border_b_1()
                     .border_color(p.border)
                     .window_control_area(gpui::WindowControlArea::Drag)
