@@ -3134,3 +3134,120 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-845: 저장소 헤더 접기/펼치기가 하위 워크트리를 숨기고 재시작 후에도 유지된다.
+#[gpui::test]
+fn repo_header_fold_hides_children_and_persists(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe845", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(
+                PathBuf::from("/repo"),
+                vec![PathBuf::from("/repo"), PathBuf::from("/repo/a")],
+            );
+            s.rebuild(cx);
+            assert!(
+                s.rows
+                    .iter()
+                    .any(|r| matches!(r, Row::Worktree(w) if w == Path::new("/repo/a"))),
+                "펼친 저장소는 하위 워크트리를 보여야 한다"
+            );
+            s.fold(&PathBuf::from("/repo"), None, cx);
+            assert!(
+                s.rows.iter().all(|r| !matches!(r, Row::Worktree(_))),
+                "접은 저장소는 워크트리 행을 숨겨야 한다"
+            );
+            assert!(
+                s.rows
+                    .iter()
+                    .any(|r| matches!(r, Row::Repository(rp) if rp == Path::new("/repo"))),
+                "접어도 저장소 헤더 행은 남아야 한다"
+            );
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("repo-header-0").is_some());
+    let restored = Sidebar::new(Some(path.clone()));
+    assert!(
+        restored.collapsed.contains(Path::new("/repo")),
+        "저장소 접힘은 재시작 후에도 유지되어야 한다"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+/// OWE-845: 접힘·펼침·숨김·제거 UI 상태가 `sidebar.bin`에 영속화된다.
+#[gpui::test]
+fn ui_fold_state_round_trips_through_sidebar_bin(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe845u", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.collapsed.insert(PathBuf::from("/repo/a"));
+            s.collapsed_groups.insert(GroupKey::PrStatus(PrGroup::Open));
+            s.expanded_cards.insert(PathBuf::from("/repo/b"));
+            s.shown_external.insert(PathBuf::from("/repo"));
+            s.collapsed_hosts.insert(HostId::Local);
+            s.removed_projects.insert(PathBuf::from("/old"));
+            s.persist(cx);
+        });
+    });
+    vcx.run_until_parked();
+    let restored = Sidebar::new(Some(path.clone()));
+    assert!(restored.collapsed.contains(Path::new("/repo/a")));
+    assert!(
+        restored
+            .collapsed_groups
+            .contains(&GroupKey::PrStatus(PrGroup::Open))
+    );
+    assert!(restored.expanded_cards.contains(Path::new("/repo/b")));
+    assert!(restored.shown_external.contains(Path::new("/repo")));
+    assert!(restored.collapsed_hosts.contains(&HostId::Local));
+    assert!(restored.removed_projects.contains(Path::new("/old")));
+    fs::remove_dir_all(dir).ok();
+}
+
+/// OWE-845: 목록에서 제거한 저장소는 행에서 사라지고 재시작 후에도 숨겨진다.
+#[gpui::test]
+fn removed_project_hides_repo_and_survives_restart(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe845r", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(
+                PathBuf::from("/repo"),
+                vec![PathBuf::from("/repo"), PathBuf::from("/repo/a")],
+            );
+            s.rebuild(cx);
+            assert!(
+                s.rows
+                    .iter()
+                    .any(|r| matches!(r, Row::Repository(rp) if rp == Path::new("/repo")))
+            );
+            s.remove_project(PathBuf::from("/repo"), cx);
+            assert!(
+                s.rows.iter().all(|r| !matches!(r, Row::Repository(_))),
+                "제거한 저장소 헤더는 목록에서 사라져야 한다"
+            );
+        });
+    });
+    vcx.run_until_parked();
+    let restored = Sidebar::new(Some(path.clone()));
+    assert!(restored.removed_projects.contains(Path::new("/repo")));
+    fs::remove_dir_all(dir).ok();
+}

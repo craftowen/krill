@@ -167,6 +167,36 @@ struct Preference {
 
 type Preferences = BTreeMap<PathBuf, Preference>;
 
+/// 사이드바 접힘·제거 UI 상태(`sidebar.bin` 끝에 영속화, OWE-845).
+/// `collapsed`·`collapsed_groups`·`expanded_cards`가 없으면 앱 재시작 시 접힘이 풀린다.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct UiFoldState {
+    #[serde(default)]
+    collapsed_hosts: BTreeSet<HostId>,
+    #[serde(default)]
+    collapsed: BTreeSet<PathBuf>,
+    #[serde(default)]
+    collapsed_groups: BTreeSet<GroupKey>,
+    #[serde(default)]
+    expanded_cards: BTreeSet<PathBuf>,
+    #[serde(default)]
+    shown_external: BTreeSet<PathBuf>,
+    #[serde(default)]
+    removed_projects: BTreeSet<PathBuf>,
+}
+
+impl UiFoldState {
+    #[must_use]
+    fn is_empty(&self) -> bool {
+        self.collapsed_hosts.is_empty()
+            && self.collapsed.is_empty()
+            && self.collapsed_groups.is_empty()
+            && self.expanded_cards.is_empty()
+            && self.shown_external.is_empty()
+            && self.removed_projects.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
     HostHeader {
@@ -312,10 +342,17 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 /// 저장 파일을 읽는다. 손상·미지원 버전은 덮어쓰지 않도록 `.corrupt`로 보존한 뒤 오류를 돌려준다.
 #[cfg(test)]
 fn load(path: &Path) -> io::Result<Preferences> {
-    load_state(path).map(|(prefs, _, _)| prefs)
+    load_state(path).map(|(prefs, _, _, _)| prefs)
 }
 
-fn load_state(path: &Path) -> io::Result<(Preferences, WorkspaceOptions, lineage::LineageState)> {
+fn load_state(
+    path: &Path,
+) -> io::Result<(
+    Preferences,
+    WorkspaceOptions,
+    lineage::LineageState,
+    UiFoldState,
+)> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(MAX_FILE_BYTES + 1)
@@ -332,7 +369,12 @@ fn load_state(path: &Path) -> io::Result<(Preferences, WorkspaceOptions, lineage
 
 fn decode_state(
     bytes: &[u8],
-) -> io::Result<(Preferences, WorkspaceOptions, lineage::LineageState)> {
+) -> io::Result<(
+    Preferences,
+    WorkspaceOptions,
+    lineage::LineageState,
+    UiFoldState,
+)> {
     let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_owned());
     if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_FILE_BYTES) {
         return Err(invalid("sidebar file too large"));
@@ -350,16 +392,30 @@ fn decode_state(
             prefs,
             WorkspaceOptions::default(),
             lineage::LineageState::default(),
+            UiFoldState::default(),
         ));
     }
     let (opts, rest) =
         postcard::take_from_bytes::<WorkspaceOptions>(rest).map_err(|e| invalid(&e.to_string()))?;
-    let lin = if rest.is_empty() {
-        lineage::LineageState::default()
-    } else {
-        postcard::from_bytes::<lineage::LineageState>(rest).map_err(|e| invalid(&e.to_string()))?
-    };
-    Ok((prefs, opts, lin))
+    if rest.is_empty() {
+        return Ok((
+            prefs,
+            opts,
+            lineage::LineageState::default(),
+            UiFoldState::default(),
+        ));
+    }
+    let (lin, rest) = postcard::take_from_bytes::<lineage::LineageState>(rest)
+        .map_err(|e| invalid(&e.to_string()))?;
+    if rest.is_empty() {
+        return Ok((prefs, opts, lin, UiFoldState::default()));
+    }
+    let (ui, rest) =
+        postcard::take_from_bytes::<UiFoldState>(rest).map_err(|e| invalid(&e.to_string()))?;
+    if !rest.is_empty() {
+        return Err(invalid("trailing sidebar state"));
+    }
+    Ok((prefs, opts, lin, ui))
 }
 
 #[cfg(test)]
@@ -369,6 +425,7 @@ fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
         prefs,
         &WorkspaceOptions::default(),
         &lineage::LineageState::default(),
+        &UiFoldState::default(),
     )
 }
 
@@ -377,12 +434,14 @@ fn save_state(
     prefs: &Preferences,
     opts: &WorkspaceOptions,
     lin: &lineage::LineageState,
+    ui: &UiFoldState,
 ) -> io::Result<()> {
     let mut bytes = postcard::to_stdvec(prefs).map_err(io::Error::other)?;
-    if opts.is_customized() || !lin.is_empty() {
+    if opts.is_customized() || !lin.is_empty() || !ui.is_empty() {
         bytes.extend(postcard::to_stdvec(opts).map_err(io::Error::other)?);
-        if !lin.is_empty() {
-            bytes.extend(postcard::to_stdvec(lin).map_err(io::Error::other)?);
+        bytes.extend(postcard::to_stdvec(lin).map_err(io::Error::other)?);
+        if !ui.is_empty() {
+            bytes.extend(postcard::to_stdvec(ui).map_err(io::Error::other)?);
         }
     }
     if u64::try_from(bytes.len()).map_or(true, |n| n >= MAX_FILE_BYTES) {
@@ -461,6 +520,8 @@ pub struct Sidebar {
     collapsed: BTreeSet<PathBuf>,
     /// 카드 하단 요약 알약을 눌러 개별 세션 행을 펼친 워크트리 집합(Orca 기본값: 접힘).
     expanded_cards: BTreeSet<PathBuf>,
+    /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
+    removed_projects: BTreeSet<PathBuf>,
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
@@ -543,7 +604,7 @@ impl Sidebar {
     pub fn new(path: Option<PathBuf>) -> Self {
         let mut error = None;
         let mut writable = true;
-        let (prefs, options, lin) = match path.as_deref().map(load_state) {
+        let (prefs, options, lin, ui) = match path.as_deref().map(load_state) {
             Some(Ok(state)) => state,
             Some(Err(err)) if err.kind() != io::ErrorKind::NotFound => {
                 writable = path
@@ -554,12 +615,14 @@ impl Sidebar {
                     Preferences::default(),
                     WorkspaceOptions::default(),
                     lineage::LineageState::default(),
+                    UiFoldState::default(),
                 )
             }
             _ => (
                 Preferences::default(),
                 WorkspaceOptions::default(),
                 lineage::LineageState::default(),
+                UiFoldState::default(),
             ),
         };
         let comments = external::load_comments_from_sidebar_path(path.as_deref());
@@ -572,7 +635,6 @@ impl Sidebar {
             remote_task: None,
             remote_manager: None,
             remote_info: BTreeMap::new(),
-            collapsed_hosts: BTreeSet::new(),
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -581,7 +643,6 @@ impl Sidebar {
             rows: Vec::new(),
             prefs,
             options,
-            collapsed_groups: BTreeSet::new(),
             worktree_statuses: BTreeMap::new(),
             worktree_updated_at: BTreeMap::new(),
             issues: BTreeMap::new(),
@@ -593,9 +654,12 @@ impl Sidebar {
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
             sleeping_worktrees: lin.sleeping_worktrees,
-            shown_external: BTreeSet::new(),
-            collapsed: BTreeSet::new(),
-            expanded_cards: BTreeSet::new(),
+            shown_external: ui.shown_external,
+            collapsed: ui.collapsed,
+            collapsed_hosts: ui.collapsed_hosts,
+            collapsed_groups: ui.collapsed_groups,
+            expanded_cards: ui.expanded_cards,
+            removed_projects: ui.removed_projects,
             path: path.filter(|_| writable),
             error,
             poll_error: None,
@@ -793,7 +857,7 @@ impl Sidebar {
         self.collapsed_hosts.contains(host)
     }
 
-    /// 호스트 섹션 접기/펼치기.
+    /// 호스트 섹션 접기/펼치기(OWE-845: `UiFoldState`에 저장해 재시작 후에도 유지).
     pub fn fold_host(&mut self, host: &HostId, open: Option<bool>, cx: &mut Context<Self>) {
         let closed = self.collapsed_hosts.contains(host);
         if open.unwrap_or(closed) {
@@ -801,7 +865,7 @@ impl Sidebar {
         } else {
             self.collapsed_hosts.insert(host.clone());
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     /// 끊긴 원격 호스트의 '다시 연결' 버튼을 눌렀을 때 상태를 `Connecting`으로 바꾸고 재연결을 요청한다.
@@ -1178,6 +1242,7 @@ impl Sidebar {
     }
 
     /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
+    /// 펼침 집합은 `UiFoldState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub(super) fn toggle_card_sessions(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.expanded_cards.remove(path) {
             if let Some(c) = self.cursor
@@ -1191,12 +1256,11 @@ impl Sidebar {
                     .iter()
                     .position(|r| matches!(r, Row::Worktree(p) if p == path));
             }
-            cx.notify();
         } else {
             self.expanded_cards.insert(path.to_path_buf());
             self.collapsed.remove(path);
-            self.rebuild(cx);
         }
+        self.persist(cx);
     }
 
     /// Open in·새 에이전트의 폴더. git 세션은 워크트리 루트, 일반 세션은 작업 디렉터리.
@@ -1272,12 +1336,12 @@ impl Sidebar {
         external::comment_for(&self.comments, path)
     }
 
-    /// MK-093: 저장소의 `.claude/worktrees` 숨김 카드를 펼치거나 접는다.
+    /// MK-093: 저장소의 `.claude/worktrees` 숨김 카드를 펼치거나 접는다(OWE-845: 영속화).
     pub fn toggle_external(&mut self, repo: &Path, cx: &mut Context<Self>) {
         if !self.shown_external.remove(repo) {
             self.shown_external.insert(repo.to_path_buf());
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -1498,7 +1562,15 @@ impl Sidebar {
                 collapsed_lineage: self.collapsed_lineage.clone(),
                 sleeping_worktrees: self.sleeping_worktrees.clone(),
             };
-            if let Err(e) = save_state(path, &self.prefs, &self.options, &lin) {
+            let ui = UiFoldState {
+                collapsed_hosts: self.collapsed_hosts.clone(),
+                collapsed: self.collapsed.clone(),
+                collapsed_groups: self.collapsed_groups.clone(),
+                expanded_cards: self.expanded_cards.clone(),
+                shown_external: self.shown_external.clone(),
+                removed_projects: self.removed_projects.clone(),
+            };
+            if let Err(e) = save_state(path, &self.prefs, &self.options, &lin, &ui) {
                 self.error = Some(e.to_string());
             }
         }
@@ -1668,6 +1740,10 @@ impl Sidebar {
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, None, cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, None, cx),
+            Some(Row::Repository(path)) => {
+                self.cursor = Some(cursor);
+                self.fold(&path, None, cx);
+            }
             Some(Row::Session(session, _)) => {
                 self.action_host = Some(self.row_host(cursor).clone());
                 cx.emit(Selected(session.id));
@@ -1683,6 +1759,7 @@ impl Sidebar {
     }
 
     /// `open`: `None`이면 뒤집고, `Some(true)`면 펼치고, `Some(false)`면 접는다.
+    /// 저장소·폴더·워크트리의 접힘은 `UiFoldState`에 저장해 재시작 후에도 유지한다(OWE-845).
     fn fold(&mut self, path: &Path, open: Option<bool>, cx: &mut Context<Self>) {
         let closed = self.collapsed.contains(path);
         if open.unwrap_or(closed) {
@@ -1692,14 +1769,16 @@ impl Sidebar {
             self.collapsed.insert(path.to_path_buf());
             self.expanded_cards.remove(path);
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     fn fold_cursor(&mut self, open: bool, cx: &mut Context<Self>) {
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, Some(open), cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, Some(open), cx),
-            Some(Row::Worktree(path) | Row::Folder(path)) => self.fold(&path, Some(open), cx),
+            Some(Row::Worktree(path) | Row::Folder(path) | Row::Repository(path)) => {
+                self.fold(&path, Some(open), cx);
+            }
             _ => {}
         }
     }
@@ -1807,6 +1886,21 @@ impl Sidebar {
             }
             self.persist(cx);
         }
+    }
+
+    /// 저장소·폴더 프로젝트를 목록에서 제거한다(OWE-845).
+    /// `projects.toml`에 기록된 이관 프로젝트는 파일에서도 지우고,
+    /// 그 외에는 제거 집합에 넣어 행을 숨긴다(재시작 후에도 유지).
+    pub fn remove_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
+            external::remove_imported_project(&dir, &path);
+            self.sync_imported_projects_from_disk();
+        }
+        self.collapsed.remove(&path);
+        self.expanded_cards.remove(&path);
+        self.shown_external.remove(&path);
+        self.removed_projects.insert(path);
+        self.persist(cx);
     }
 
     /// 바꾼 이름 → 브랜치 → 첫 프롬프트 자동 제목 → 폴더 이름.
