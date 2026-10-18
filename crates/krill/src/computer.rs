@@ -403,6 +403,9 @@ fn resolve_target_app_name(common: &CommonWindowOpts) -> Result<String, CliError
         return Ok(app.clone());
     }
     if let Some(cached) = load_cached_snapshot().map_err(CliError::Runtime)? {
+        if cached.app.pid > 0 {
+            return Ok(format!("pid:{}", cached.app.pid));
+        }
         return Ok(cached.app.name);
     }
     if let Some(mock) = load_mock_env().map_err(CliError::Runtime)?
