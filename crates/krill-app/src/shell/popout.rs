@@ -506,13 +506,6 @@ fn provider_usage_menu(
 
     menu = menu.min_w(px(300.)).max_w(px(340.));
     let active_card = active.clone();
-    let active_status = active.as_ref().map(|acc| {
-        krill_app::accounts::display::account(
-            acc,
-            snap.statuses.iter().find(|s| s.account_id == acc.id),
-            krill_app::accounts::display::now(),
-        )
-    });
     menu = menu.item(
         PopupMenuItem::element(move |_, cx| {
             let p = ui::palette(cx);
@@ -586,13 +579,6 @@ fn provider_usage_menu(
                     brand_color,
                     p,
                 ))
-                .children(active_status.as_ref().map(|status| {
-                    krill_app::accounts::display::render_status(
-                        format!("status-provider-status-{}", provider.as_str()),
-                        status,
-                        p,
-                    )
-                }))
         })
         .disabled(true),
     );

@@ -51,7 +51,8 @@ fn provider_popup_exposes_account_status_and_updated_row(cx: &mut TestAppContext
     let pill = vcx.debug_bounds("status-provider-pill-claude").unwrap();
     vcx.simulate_click(pill.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("status-provider-status-claude").is_some());
+    // OWE-851d: 상태 배지는 계정 행에만 그린다(헤더 카드 중복 제거).
+    assert!(vcx.debug_bounds("status-provider-status-claude").is_none());
     assert!(
         vcx.debug_bounds("status-provider-account-claude-claude-status-test-status")
             .is_some()
