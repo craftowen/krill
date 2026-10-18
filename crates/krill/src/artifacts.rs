@@ -3,12 +3,12 @@
 //! Orca `orca artifacts` CLI를 본뜬다. HTTP 크레이트를 늘리지 않으려고 `curl`을 자식 프로세스로 부른다.
 //! 토큰이 `ps`에 보이지 않게 헤더는 0600 임시 파일(`-H @file`)로, 본문은 stdin으로 넘긴다.
 
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -557,6 +557,7 @@ fn percent_encode(s: &str) -> String {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt as _;

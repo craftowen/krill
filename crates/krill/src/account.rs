@@ -1,8 +1,8 @@
 //! `krill account`: 프로바이더 다계정 조회·등록·삭제·원클릭 전환·자동전환 설정(MK-107·MK-108).
 
+use krill_proto::os::ffi::OsStringExt as _;
 use std::ffi::OsString;
 use std::io::Write as _;
-use std::os::unix::ffi::OsStringExt as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -557,6 +557,7 @@ mod tests {
     use krill_proto::usage::{AccountInfo, Snapshot};
 
     #[test]
+    #[cfg(unix)]
     fn login_command_runs_fake_claude_in_selected_profile() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = std::env::temp_dir().join(format!("owe700-cli-{}", std::process::id()));

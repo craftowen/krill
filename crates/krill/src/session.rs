@@ -1,13 +1,17 @@
 //! MK-045: direct daemon commands. Text shown by these commands is kept here.
 
+#[cfg(unix)]
+mod terminal;
+#[cfg(windows)]
+#[path = "session/terminal_windows.rs"]
 mod terminal;
 mod wait;
 
+use krill_proto::os::ffi::OsStrExt as _;
+use krill_proto::os::net::UnixStream;
 use std::ffi::OsString;
 use std::fmt;
 use std::io::{self, Read, Write};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::net::UnixStream;
 use std::process::ExitCode;
 use std::time::Duration;
 

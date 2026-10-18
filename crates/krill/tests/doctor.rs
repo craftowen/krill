@@ -2,10 +2,14 @@
 //! 붙으며(재실행), 붙지 못하면 이유를 보이고 1로 끝난다. 실제 `krill-holder`·`krilld` 바이너리(`krill` 옆)를 쓴다.
 //! MK-067: 고장 3종(데몬 바이너리 누락·상태 디렉터리 쓰기 불가·git 없음)과 크래시 로그 경고, `--bundle` 리댁션.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
+#![cfg_attr(
+    unix,
+    expect(
+        clippy::unwrap_used,
+        reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"
+    )
 )]
+#![cfg(unix)]
 
 use std::ffi::OsStr;
 use std::fs;
