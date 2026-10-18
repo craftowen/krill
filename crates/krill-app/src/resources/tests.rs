@@ -84,6 +84,13 @@ fn restart_and_kill_only_after_confirmation(cx: &mut TestAppContext) {
     });
 
     panel.update_in(cx, |p, window, cx| p.confirm_kill(SessionId(2), window, cx));
+    let (title, _) = cx.pending_prompt().expect("kill dialog");
+    let fallback = format!("{} 2", text::SESSION.get());
+    assert_eq!(
+        title,
+        text::KILL_TITLE_NAMED.format(&[("name", &fallback)]),
+        "이름을 모르면 세션 번호로 묻는다"
+    );
     cx.simulate_prompt_answer(text::CANCEL.get());
     cx.run_until_parked();
     assert_eq!(log.lock().unwrap().len(), 1);
@@ -171,6 +178,12 @@ fn session_row_shows_name_and_click_emits_open(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(*opened.lock().unwrap(), [SessionId(2)]);
     panel.read_with(cx, |p, _| assert!(!p.open));
+
+    // OWE-851b: 종료 확인 제목도 번호 대신 세션 이름을 쓴다.
+    panel.update_in(cx, |p, window, cx| p.confirm_kill(SessionId(2), window, cx));
+    let (title, _) = cx.pending_prompt().expect("kill dialog");
+    assert_eq!(title, text::KILL_TITLE_NAMED.format(&[("name", "codex")]));
+    cx.simulate_prompt_answer(text::CANCEL.get());
 }
 
 /// OWE-652: 바깥 클릭은 팝오버를 닫고 폴링을 멈춘다.

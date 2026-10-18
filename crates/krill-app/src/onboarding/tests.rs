@@ -1155,7 +1155,7 @@ fn check_text_localizes_doctor_messages_and_keeps_values() {
     );
     assert_eq!(
         check_text("codex hook is not installed"),
-        "Codex hook이 설치돼 있지 않습니다"
+        "Codex 훅이 설치돼 있지 않습니다"
     );
     assert_eq!(check_text("2 agent(s) found"), "에이전트 2개 감지");
     assert_eq!(
