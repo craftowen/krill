@@ -1682,6 +1682,10 @@ impl Shell {
         if let Some(permission) = krill_app::settings::take_pending_permission(cx) {
             self.load_agents(Some(permission), cx);
         }
+        // 설정 창이 닫힌 뒤에도 보여야 할 안내(예: ssh-copy-id 비밀번호 입력)를 메인 창 배너로 잇는다(OWE-884).
+        if let Some(msg) = krill_app::settings::take_pending_notice(cx) {
+            self.notice = Some(msg);
+        }
         cx.notify();
     }
 
