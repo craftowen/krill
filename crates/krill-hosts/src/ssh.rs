@@ -6,8 +6,6 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::os::unix::fs::DirBuilderExt as _;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
@@ -15,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use krill_proto::daemon::{self, Connection};
 use krill_proto::ipc::ClientHello;
+use krill_proto::os::fs::DirBuilderExt as _;
+use krill_proto::os::net::{UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
 
 /// 포워더(ssh 또는 `KRILL_SSH_BIN`)가 local 소켓을 열 때까지 기다리는 상한.
