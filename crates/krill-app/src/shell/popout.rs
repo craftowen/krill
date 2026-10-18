@@ -448,7 +448,7 @@ fn provider_usage_menu(
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
-                                .child(ui::icons::provider_icon(provider, 14., brand_color))
+                                .child(ui::icons::provider_icon(provider, ui::ICON_MD, brand_color))
                                 .child(
                                     div()
                                         .text_size(ui::TEXT_XS)
@@ -1054,10 +1054,7 @@ impl Shell {
                 ui::button_with_tooltip(
                     Button::new(gpui::SharedString::from(selector.clone()))
                         .label(label)
-                        .icon(
-                            gpui_component::Icon::default()
-                                .data(ui::icons::provider_svg_bytes(provider)),
-                        )
+                        .icon(ui::icons::provider_menu_icon(provider))
                         .text_color(color)
                         .ghost()
                         .xsmall()
@@ -1329,8 +1326,9 @@ impl Shell {
                         menu = menu
                             .separator()
                             .item(
-                                PopupMenuItem::new(text::ORCH_HANDOFF_CODEX.get()).on_click(
-                                    move |_, _, cx| {
+                                PopupMenuItem::new(text::ORCH_HANDOFF_CODEX.get())
+                                    .icon(ui::icons::agent_menu_icon("codex"))
+                                    .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             body_codex.clone(),
                                         ));
@@ -1343,12 +1341,12 @@ impl Shell {
                                                 );
                                             })
                                             .ok();
-                                    },
-                                ),
+                                    }),
                             )
                             .item(
-                                PopupMenuItem::new(text::ORCH_HANDOFF_CLAUDE.get()).on_click(
-                                    move |_, _, cx| {
+                                PopupMenuItem::new(text::ORCH_HANDOFF_CLAUDE.get())
+                                    .icon(ui::icons::agent_menu_icon("claude"))
+                                    .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             body_claude.clone(),
                                         ));
@@ -1361,8 +1359,7 @@ impl Shell {
                                                 );
                                             })
                                             .ok();
-                                    },
-                                ),
+                                    }),
                             );
                     }
                     let open_weak = weak.clone();
@@ -1805,11 +1802,27 @@ impl Render for Dashboard {
                             .when(cards.is_empty(), |d| d.child(div().text_color(p.muted_foreground).child(text::EMPTY.get())))
                             .children(cards.into_iter().map(|item| {
                                 let session = item.id;
+                                let agent = sidebar
+                                    .session(session)
+                                    .map_or("", |s| s.status.agent.as_str());
                                 let screen = owner.as_ref().and_then(|o| o.read(cx).live.values().find(|l| l.pane.session() == Some(session))).map(|l| preview(&l.pane.shown()));
                                 div().id(("dashboard-session", session.0)).debug_selector(move || format!("dashboard-session-{}", session.0))
                                     .p(ui::SPACE_2).rounded(ui::RADIUS_XS).bg(p.card).cursor_pointer()
                                     .hover(|d| d.bg(p.accent)).flex().flex_col().gap_2()
-                                    .child(item.label.clone())
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .children((!agent.is_empty()).then(|| {
+                                                ui::icons::agent_brand_icon(
+                                                    agent,
+                                                    ui::ICON_MD,
+                                                    p.foreground,
+                                                )
+                                            }))
+                                            .child(item.label.clone()),
+                                    )
                                     .when_some(screen, |d, screen| d.child(div().text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::PREVIEW.get()))
                                         .child(div().font_family(ui::FONT_MONO).text_size(ui::TEXT_2XS).overflow_hidden().child(screen)))
                                     .child(div().text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::NO_PREVIEW.get()))

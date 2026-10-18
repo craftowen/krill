@@ -13,6 +13,7 @@ pub mod theme;
 pub const MENU_BAR_ICON: gpui_kit_assets::IconName = gpui_kit_assets::IconName::SquareTerminal;
 pub const MENU_BAR_ICON_SIZE: i32 = 18;
 
+pub use icons::{ICON_LG, ICON_MD, ICON_SM, ICON_XL, ICON_XS};
 pub use primitives::{
     BadgeTone, LabelDesc, badge, button_with_tooltip, card, controls, danger_confirm, error_banner,
     field_label, ghost, keycap, label, modal_backdrop, primary, row, secondary, section_title,

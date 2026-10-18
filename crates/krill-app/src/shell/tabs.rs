@@ -14,6 +14,7 @@ const CLOSE_GROUP: &str = "session-tab";
 struct TabDrag {
     pane: PaneId,
     title: SharedString,
+    agent: String,
 }
 
 impl Render for TabDrag {
@@ -29,6 +30,17 @@ impl Render for TabDrag {
             .border_color(p.border)
             .font_family(ui::FONT_UI)
             .text_size(ui::TEXT_SM)
+            .flex()
+            .items_center()
+            .gap(ui::SPACE_1)
+            .child(if self.agent.is_empty() {
+                Icon::new(agent_icon(&self.agent))
+                    .small()
+                    .into_any_element()
+            } else {
+                ui::icons::agent_brand_icon(&self.agent, ui::ICON_MD, p.foreground)
+                    .into_any_element()
+            })
             .child(self.title.clone())
     }
 }
@@ -226,8 +238,12 @@ impl Shell {
                                     .child(if agent.is_empty() {
                                         Icon::new(agent_icon(agent)).small().into_any_element()
                                     } else {
-                                        ui::icons::agent_brand_icon(agent, 13., p.foreground)
-                                            .into_any_element()
+                                        ui::icons::agent_brand_icon(
+                                            agent,
+                                            ui::ICON_SM,
+                                            p.foreground,
+                                        )
+                                        .into_any_element()
                                     })
                                     .children(self.yolo_badge(tab.focused, cx))
                                     .children(account_label.map(|l| {
@@ -297,6 +313,7 @@ impl Shell {
                         TabDrag {
                             pane,
                             title: label.into(),
+                            agent: agent.to_owned(),
                         },
                         |drag, _, _, cx| cx.new(|_| drag.clone()),
                     )
@@ -413,8 +430,7 @@ impl Shell {
                                 for profile in &profiles {
                                     let id = profile.id.clone();
                                     let weak = weak.clone();
-                                    let icon =
-                                        Icon::default().data(ui::icons::agent_svg_bytes(&id));
+                                    let icon = ui::icons::agent_menu_icon(&id);
                                     menu = menu.item(
                                         PopupMenuItem::new(profile.name.clone())
                                             .icon(icon)
@@ -1016,6 +1032,24 @@ impl Shell {
                 let label = labels.get(tab_idx)?.clone();
                 let selected = pos == cursor;
                 let is_file = self.layout.file(tab.focused).is_some();
+                let host = self.layout.host(tab.focused);
+                let session = self
+                    .layout
+                    .session(tab.focused)
+                    .and_then(|id| self.sidebar.read(cx).session_on(host, id));
+                let launch_agent = match self.layout.launch(tab.focused).map(|l| &l.program) {
+                    Some(Program::Agent { id }) => launch_agent_id(id),
+                    _ => "",
+                };
+                let agent = session
+                    .map_or(launch_agent, |s| {
+                        if s.status.agent.is_empty() {
+                            launch_agent
+                        } else {
+                            &s.status.agent
+                        }
+                    })
+                    .to_owned();
                 Some(
                     div()
                         .id(("recent-tab-item", tab_idx))
@@ -1047,14 +1081,16 @@ impl Shell {
                                 .rounded_full()
                                 .bg(ui::tab_tag_color(color))
                         }))
-                        .child(
-                            Icon::new(if is_file {
-                                IconName::FileText
-                            } else {
-                                IconName::SquareTerminal
-                            })
-                            .small(),
-                        )
+                        .child(if is_file {
+                            Icon::new(IconName::FileText).small().into_any_element()
+                        } else if !agent.is_empty() {
+                            ui::icons::agent_brand_icon(&agent, ui::ICON_MD, p.foreground)
+                                .into_any_element()
+                        } else {
+                            Icon::new(IconName::SquareTerminal)
+                                .small()
+                                .into_any_element()
+                        })
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.change(true, cx, |l| l.activate(tab_idx));

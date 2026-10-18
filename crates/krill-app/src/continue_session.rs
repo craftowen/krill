@@ -189,7 +189,7 @@ impl Render for Dialog {
                     .bg(if is_selected { p.accent } else { p.card })
                     .cursor_pointer()
                     .hover(|d| d.bg(p.accent))
-                    .child(ui::icons::agent_brand_icon(id, 13., p.foreground))
+                    .child(ui::icons::agent_brand_icon(id, ui::ICON_SM, p.foreground))
                     .child(
                         div()
                             .text_size(ui::TEXT_SM)

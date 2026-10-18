@@ -681,6 +681,27 @@ impl SettingsView {
                 };
 
                 let cmd_str = format_command_args(&sched.command);
+                let sched_agent = sched
+                    .command
+                    .first()
+                    .and_then(|bin| {
+                        std::path::Path::new(bin)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                    })
+                    .filter(|b| {
+                        matches!(
+                            *b,
+                            "claude"
+                                | "codex"
+                                | "agy"
+                                | "antigravity"
+                                | "gemini"
+                                | "cursor"
+                                | "cursor-agent"
+                                | "opencode"
+                        )
+                    });
                 let mut meta_line = format!("{} · {} · {}", sched.cron, cmd_str, sched.cwd);
                 if let Some(pre) = &sched.precheck {
                     meta_line.push_str(" · precheck: ");
@@ -712,6 +733,13 @@ impl SettingsView {
                                         .flex()
                                         .items_center()
                                         .gap_2()
+                                        .children(sched_agent.map(|ag| {
+                                            crate::ui::icons::agent_brand_icon(
+                                                ag,
+                                                crate::ui::ICON_MD,
+                                                p.foreground,
+                                            )
+                                        }))
                                         .child(
                                             div()
                                                 .text_size(crate::ui::TEXT_SM)

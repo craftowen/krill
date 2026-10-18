@@ -78,7 +78,7 @@ fn row_menu(
             );
             menu = menu.item(
                 PopupMenuItem::new(profile.name.clone())
-                    .icon(Icon::default().data(ui::icons::agent_svg_bytes(&id)))
+                    .icon(ui::icons::agent_menu_icon(&id))
                     .on_click(move |_, window, cx| {
                         this.update(cx, |s, cx| {
                             s.new_session_on(
@@ -674,7 +674,7 @@ impl Sidebar {
                     ))
                     .child(status::agent_icon(
                         &session.status.agent,
-                        12.,
+                        ui::ICON_XS,
                         p.muted_foreground,
                     ))
                     .child(
@@ -1491,7 +1491,7 @@ impl Sidebar {
                                         ))
                                         .child(status::agent_icon(
                                             &sess.status.agent,
-                                            13.,
+                                            ui::ICON_SM,
                                             p.muted_foreground,
                                         ))
                                         .child(
@@ -1545,7 +1545,7 @@ impl Sidebar {
                                                 ))
                                                 .child(status::agent_icon(
                                                     "",
-                                                    13.,
+                                                    ui::ICON_SM,
                                                     p.muted_foreground,
                                                 ))
                                                 .when(tree_session_count > 1, |d| {
