@@ -140,11 +140,12 @@ if(typeof document!=='undefined') (async()=>{
  let credentials;try{credentials=JSON.parse(localStorage.getItem('minikrill-mobile-v2')||'null');}catch{credentials=null;}
  let terminal;
  let socket,channel,queue=[],waiters=[],failed=null,selected=Number(parameters.get('session'))||null,snapshot=null,composing=false,closed=false;
+ let generation=0,connected=false,connecting=false,reconnectTimer,retryDelay=1000;
  const next=()=>{if(queue.length)return Promise.resolve(queue.shift());if(failed)return Promise.reject(failed);return new Promise((resolve,reject)=>waiters.push({resolve,reject}));};
  const send=bytes=>socket.send(channel.seal(bytes));
  const nextPlain=async()=>channel.open(await next());
  let sequence=Promise.resolve();
- async function rpc(request){const operation=sequence.then(async()=>{send(frame(0x45,C.concat(variable(7),string(JSON.stringify(request)))));const bytes=await nextPlain();if(bytes[4]!==0x65)throw Error('Unexpected daemon response');const r=reader(bytes.slice(5)),kind=Number(r.u());if(kind===4)throw Error(r.text());if(kind!==6)throw Error('Update the desktop for mobile workflows');const reply=JSON.parse(r.text());if(!reply.ok)throw Error(reply.error);return reply.data;});sequence=operation.catch(()=>{});return operation;}
+ async function rpc(request){const current=generation;const operation=sequence.then(async()=>{if(!connected||current!==generation)throw Error('Disconnected. The action was not resent.');send(frame(0x45,C.concat(variable(7),string(JSON.stringify(request)))));const bytes=await nextPlain();if(bytes[4]!==0x65)throw Error('Unexpected daemon response');const r=reader(bytes.slice(5)),kind=Number(r.u());if(kind===4)throw Error(r.text());if(kind!==6)throw Error('Update the desktop for mobile workflows');const reply=JSON.parse(r.text());if(!reply.ok)throw Error(reply.error);return reply.data;});sequence=operation.catch(()=>{});return operation;}
  async function act(action){clearError();try{await action();}catch(e){error(e);}}
  function select(id){if(terminal?.session&&terminal.session!==id){terminal.close();$('terminal-panel').hidden=true;}selected=id;$('selected-session').textContent=`Session #${id}`;for(const card of document.querySelectorAll('.session-card'))card.classList.toggle('selected',Number(card.dataset.session)===id);}
  function render(data){
@@ -190,19 +191,37 @@ if(typeof document!=='undefined') (async()=>{
  }
  for(const id of ['photo','camera'])$(id).addEventListener('change',e=>act(async()=>{await photo(e.target.files[0]);e.target.value='';}));
  $('pick-photo').addEventListener('click',()=>$('photo').click());$('take-photo').addEventListener('click',()=>$('camera').click());
- try {
+ function reconnect(){
+  clearTimeout(reconnectTimer);if(!credentials||document.hidden)return;
+  reconnectTimer=setTimeout(connect,retryDelay);retryDelay=Math.min(retryDelay*2,15000);
+ }
+ async function connect(){
+  if(connecting)return;connecting=true;connected=false;closed=false;
+  clearTimeout(reconnectTimer);clearTimeout(refreshTimer);await sequence;
+  const current=++generation;queue=[];waiters=[];failed=null;
+  try {
   if(!(ticket&&secretText)&&!credentials)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
   socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);socket.binaryType='arraybuffer';
-  socket.addEventListener('message',e=>{const waiter=waiters.shift();if(waiter)waiter.resolve(e.data);else queue.push(e.data);});
-  const terminate=()=>{closed=true;failed=Error('Disconnected. Reopen this page to reconnect.');$('connection').textContent='Disconnected';$('connection').className='connection';for(const w of waiters.splice(0))w.reject(failed);};socket.addEventListener('close',terminate);socket.addEventListener('error',terminate);
-  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
+  const active=socket;
+  socket.addEventListener('message',e=>{if(current!==generation)return;const waiter=waiters.shift();if(waiter)waiter.resolve(e.data);else queue.push(e.data);});
+  const terminate=()=>{if(current!==generation||closed)return;closed=true;connected=false;clearTimeout(refreshTimer);failed=Error('Disconnected. Pending actions were not resent.');$('connection').textContent='Disconnected';$('connection').className='connection';for(const w of waiters.splice(0))w.reject(failed);active.close();if(!connecting)reconnect();};socket.addEventListener('close',terminate);socket.addEventListener('error',terminate);
+  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});socket.addEventListener('close',()=>reject(failed),{once:true});});
   const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported desktop protocol');
-  const pairing=Boolean(ticket&&secretText),secret=pairing?C.unbase64(secretText):C.sha256(C.unhex(credentials.credential));
+  const pairing=Boolean(parameters.has('pair')&&ticket&&secretText),secret=pairing?C.unbase64(secretText):C.sha256(C.unhex(credentials.credential));
   channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));secret.fill(0);
   socket.send(JSON.stringify({token:pairing?ticket:null,device_id:pairing?null:credentials.device_id,client_nonce:C.hex(nonce)}));send(C.enc.encode(JSON.stringify({label:/iPhone|iPad/.test(navigator.userAgent)?'iPhone / iPad (Safari)':'Mobile browser'})));
   const authenticated=JSON.parse(decode.decode(await nextPlain()));if(authenticated.credential){credentials=authenticated;localStorage.setItem('minikrill-mobile-v2',JSON.stringify(credentials));}
   parameters.delete('pair');history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters.toString():''));
   const hello=reader((await nextPlain()).slice(5));hello.u();hello.u();const features=hello.u();send(frame(2,C.concat(variable(1),variable(1),variable(features),variable(0),string('minikrill-mobile-pwa'))));
-  terminal=new MkLiveTerminal(credentials,error);globalThis.liveTerminal=terminal;await refresh();if(parameters.has('session')&&selected)terminal.open(selected);scheduleRefresh();
- }catch(e){error(e);if(socket?.readyState===WebSocket.OPEN)socket.close();}
+  if(!terminal){terminal=new MkLiveTerminal(credentials,error);globalThis.liveTerminal=terminal;}
+  const initial=!snapshot;connected=true;await refresh();if(initial)clearError();retryDelay=1000;
+  if(parameters.has('session')&&selected&&!terminal.ready)terminal.open(selected);scheduleRefresh();
+  }catch(e){error(e);if(socket&&socket.readyState!==WebSocket.CLOSED)socket.close();}
+  finally{connecting=false;if(closed)reconnect();}
+ }
+ // iOS may suspend or discard a socket while the page is hidden. Resume with the saved
+ // credential and a fresh challenge; only snapshots are retried, never user actions.
+ const resume=()=>{if(!document.hidden&&closed){retryDelay=1000;connect();}};
+ document.addEventListener('visibilitychange',resume);globalThis.addEventListener('pageshow',resume);globalThis.addEventListener('online',resume);
+ connect();
 })();

@@ -29,6 +29,7 @@ def main():
     parser.add_argument("--screenshots", default="/tmp/m9-pwa-browser")
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[3]
+    target = Path(os.environ.get("CARGO_TARGET_DIR", root / "target"))
     screenshots = Path(args.screenshots).resolve()
     screenshots.mkdir(parents=True, exist_ok=True)
     session = f"m9-pwa-qa-{os.getpid()}"
@@ -37,7 +38,7 @@ def main():
         env = dict(os.environ, M9_BROWSER_ADDRESS=args.address, M9_BROWSER_METADATA=str(metadata))
         with (Path(scratch) / "fixture.log").open("w+") as log:
             fixture = subprocess.Popen(
-                ["node", str(Path(__file__).with_name("mobile_pwa.cjs")), str(root / "target/debug/krilld"), "--keep"],
+                ["node", str(Path(__file__).with_name("mobile_pwa.cjs")), str(target / "debug/krilld"), "--keep"],
                 env=env, stdout=log, stderr=log,
             )
             try:
@@ -58,18 +59,53 @@ def main():
 
                 def read_session():
                     return subprocess.check_output(
-                        [str(root / "target/debug/krill"), "read", str(config["session"])],
+                        [str(target / "debug/krill"), "read", str(config["session"])],
                         env=dict(os.environ, KRILL_STATE_DIR=config["dir"]), text=True,
                     )
 
-                browser("open", config["url"])
+                # Lose the connection after credentials arrive but before ServerHello.
+                # This used to leave a registered device with a permanently empty screen.
+                fault = Path(scratch) / "interrupt-once.js"
+                fault.write_text("""
+const NativeWebSocket=WebSocket;
+globalThis.recoverySockets=[];
+globalThis.WebSocket=class extends NativeWebSocket {
+ constructor(...args){super(...args);recoverySockets.push(this);let received=0;
+  this.addEventListener('message',e=>{
+   if((++received===3&&!sessionStorage.getItem('interrupted'))||this.dropReply){
+    this.dropReply=false;sessionStorage.setItem('interrupted','yes');
+    e.stopImmediatePropagation();this.close();
+   }
+  });
+ }
+ send(data){if(this.dropAfterSend){this.dropAfterSend=false;this.dropReply=true;}return super.send(data);}
+};
+""")
+                browser("--user-agent", "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1",
+                        "--init-script", str(fault), "open", config["url"])
                 browser("set", "viewport", "390", "844")
-                wait('document.getElementById("connection").textContent.includes("connected")')
+                wait('recoverySockets.length>=2 && document.querySelectorAll(".session-card").length===1 && document.getElementById("connection").textContent==="Encrypted · connected"')
+                assert evaluate('sessionStorage.getItem("interrupted")') == "yes"
+                assert len(json.loads((Path(config["dir"]) / "mobile-devices.json").read_text())) == 1
                 assert evaluate('({secure:isSecureContext, subtle:typeof crypto.subtle, uuid:typeof crypto.randomUUID, hash:location.hash, paired:!!localStorage.getItem("minikrill-mobile-v2")})') == {
                     "secure": False, "subtle": "undefined", "uuid": "undefined", "hash": "", "paired": True,
                 }
                 assert not evaluate("document.documentElement.scrollWidth>innerWidth")
                 browser("screenshot", str(screenshots / "sessions.png"))
+                # A lost prompt reply must never cause a mutation to be replayed on reconnect.
+                browser("fill", "#prompt", "mobile-reconnect-once")
+                evaluate('recoverySockets.at(-1).dropAfterSend=true;document.getElementById("composer").requestSubmit();true')
+                wait('recoverySockets.length>=3 && document.getElementById("connection").textContent==="Encrypted · connected"')
+                assert read_session().count("got:mobile-reconnect-once") == 1
+                assert evaluate('document.getElementById("prompt").value') == "mobile-reconnect-once"
+                assert "not resent" in evaluate('document.getElementById("notice").textContent')
+                browser("fill", "#prompt", "")
+                terminal_button = f'[data-session="{config["session"]}"] button.primary'
+                evaluate(f'document.querySelector({json.dumps(terminal_button)}).scrollIntoView({{block:"center"}});true')
+                browser("click", terminal_button)
+                wait('liveTerminal.ready && document.getElementById("terminal-grid").getAttribute("aria-label").includes("READY")')
+                browser("screenshot", str(screenshots / "terminal-after-reconnect.png"))
+                evaluate('liveTerminal.close();document.getElementById("terminal-panel").hidden=true;scrollTo(0,0);true')
                 browser("scroll", "down", "450")
                 browser("screenshot", str(screenshots / "sessions-detail.png"))
                 browser("scroll", "up", "450")
@@ -94,9 +130,10 @@ def main():
                 assert any(m["body"] == "모바일 응답" and m.get("reply_to") for m in store["messages"])
                 browser("find", "role", "button", "click", "--name", "Accounts", "--exact")
                 wait('Array.from(document.querySelectorAll(".account-card h2")).some(e=>e.textContent==="Mobile fixture")')
-                assert evaluate('Array.from(document.querySelector(".account-card:last-child").querySelectorAll("progress")).map(e=>e.value)') == [23, 47]
+                fixture_account = 'Array.from(document.querySelectorAll(".account-card")).find(e=>e.querySelector("h2").textContent==="Mobile fixture")'
+                assert evaluate(f'Array.from(({fixture_account}).querySelectorAll("progress")).map(e=>e.value)') == [23, 47]
                 browser("find", "role", "button", "click", "--name", "Switch to this account", "--exact")
-                wait('!!document.querySelector(".account-card:last-child .active-account")')
+                wait(f'!!({fixture_account}).querySelector(".active-account")')
                 browser("scroll", "down", "1200")
                 browser("screenshot", str(screenshots / "accounts.png"))
                 browser("find", "role", "button", "click", "--name", "Sessions", "--exact")
@@ -116,11 +153,11 @@ def main():
                 browser("find", "role", "button", "click", "--name", "→ Claude", "--exact")
                 wait('document.querySelectorAll(".session-card").length===2')
                 browser("reload")
-                wait('document.getElementById("connection").textContent.includes("connected")')
+                wait('document.getElementById("connection").textContent==="Encrypted · connected"')
                 assert evaluate('location.hash') == ""
                 assert not evaluate('document.getElementById("notice").textContent')
                 assert not browser("errors").strip()
-                print("Chromium LAN HTTP QA passed: non-secure E2EE, approval, IME, gate/question, accounts, photo, diff, mock handoff, reconnect")
+                print("Chromium LAN HTTP QA passed: interrupted pairing recovery, no prompt replay, live terminal, non-secure E2EE, approval, IME, gate/question, accounts, photo, diff, mock handoff, reconnect")
                 print(f"Screenshots: {screenshots}")
             finally:
                 subprocess.run(["agent-browser", "--session", session, "close"], capture_output=True, timeout=15)
