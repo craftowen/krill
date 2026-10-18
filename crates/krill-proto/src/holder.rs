@@ -64,8 +64,14 @@
 //!   - 세션 프레임(`Session`·`Spawned`·`Adopt`): `[in, out, sig, ref, proc]` 순서. 앞 3개(`n` ≥ 3)는 필수,
 //!     `ref`(conhost 참조)·`proc`(conhost 프로세스)는 선택이다. krilld가 `sig` 사본을 쥐어야 holder만 죽어도 세션이
 //!     살고, `ref`·`proc`가 있어야 새 holder가 `Adopt`로 HPCON을 다시 묶을 수 있다(스파이크 §1·§3).
-//!   - `Listener`·`HoldListener`: 소켓 1개(`n` = 1).
+//!   - `Listener`·`HoldListener`: 소켓 1개(`n` = 1). (OWE-832) Windows는 핸들 대신 아래 `info`를 싣는다(`n` = 0).
 //!   - 받는 쪽은 쓰지 않는 핸들과 거절한 프레임의 핸들을 닫는다([`Frame::handles`]로 kind와 무관하게 꺼낸다).
+//! - (OWE-832) body 끝 필드 두 개. 둘 다 Unix에서는 비어 있어 Unix 바이트가 v4와 같다.
+//!   - `Hello.inbox`: `[u8 1]`이면 Windows holder가 번들 `OpenConsole` 없이 kernel32 `ConPTY` 축소 모드다(질의 응답자
+//!     예외·충실도 저하, 세션이 있으면 `UpgradeHolder`를 `EBUSY`로 거절). 없으면 거짓으로 읽는다(v3·v4 피어).
+//!   - `HoldListener.info`·`Listener.info`: `WSADuplicateSocketW`가 받는 프로세스 앞으로 만든 `WSAPROTOCOL_INFOW`
+//!     바이트(`[u32 길이][바이트]`). 소켓은 `DuplicateHandle`로 넘기지 않는다. `info`가 있으면 핸들 수는 0,
+//!     없으면(Unix) fd·핸들 1개다.
 
 use std::fmt;
 
@@ -116,7 +122,8 @@ pub enum ToHolder {
     /// holder가 보관하던 master fd와 종료 상태를 버린다.
     Release { req: u32, id: SessionId },
     /// fd 1개(listen 소켓)를 맡긴다. krilld가 다시 뜨면 `Listener`로 돌려준다. 이전 것은 닫는다.
-    HoldListener { req: u32 },
+    /// (Windows) fd 대신 `info`(holder 앞 `WSAPROTOCOL_INFOW`). Unix는 비어 있다.
+    HoldListener { req: u32, info: Vec<u8> },
     /// 다음 krilld 기동부터 `path`를 실행한다. 이 요청 뒤 krilld가 끝나면 백오프 없이 바로 띄운다.
     UpgradeKrilld { req: u32, path: Vec<u8> },
     /// holder가 `path`로 exec 핸드오프한다(PID·자식·fd 유지).
@@ -139,6 +146,8 @@ pub enum FromHolder {
     Hello {
         version: u16,
         holder_pid: u32,
+        /// (Windows) kernel32 `ConPTY` 축소 모드. Unix는 늘 거짓이고 싣지 않는다.
+        inbox: bool,
     },
     /// 보관 중인 세션 하나(+master fd). `status`는 이미 끝났으면 `waitpid` 원시 상태 또는 [`STATUS_UNKNOWN`].
     Session {
@@ -146,8 +155,10 @@ pub enum FromHolder {
         pid: u32,
         status: Option<i32>,
     },
-    /// 맡겨 둔 listen 소켓(+fd).
-    Listener,
+    /// 맡겨 둔 listen 소켓(+fd). (Windows) fd 대신 `info`(krilld 앞 `WSAPROTOCOL_INFOW`).
+    Listener {
+        info: Vec<u8>,
+    },
     /// 복원 목록 끝.
     Ready,
     /// `Spawn` 성공(+master fd).
@@ -268,10 +279,11 @@ pub fn request_id(body: &[u8]) -> Option<u32> {
 impl ToHolder {
     /// 이 메시지에 붙는 fd 수.
     pub fn fds(&self) -> u8 {
-        u8::from(matches!(
-            self,
-            Self::HoldListener { .. } | Self::Adopt { .. }
-        ))
+        u8::from(match self {
+            Self::HoldListener { info, .. } => info.is_empty(),
+            Self::Adopt { .. } => true,
+            _ => false,
+        })
     }
 
     pub fn req(&self) -> u32 {
@@ -279,7 +291,7 @@ impl ToHolder {
             Self::Spawn { req, .. }
             | Self::Kill { req, .. }
             | Self::Release { req, .. }
-            | Self::HoldListener { req }
+            | Self::HoldListener { req, .. }
             | Self::UpgradeKrilld { req, .. }
             | Self::UpgradeHolder { req, .. }
             | Self::Adopt { req, .. }
@@ -292,7 +304,7 @@ impl ToHolder {
     fn min_handles(&self) -> u8 {
         match self {
             Self::Adopt { .. } => WIN_SESSION_HANDLES,
-            Self::HoldListener { .. } => 1,
+            Self::HoldListener { info, .. } => u8::from(info.is_empty()),
             _ => 0,
         }
     }
@@ -356,7 +368,10 @@ impl ToHolder {
                 w.u64(id.0);
                 kind::RELEASE
             }
-            Self::HoldListener { .. } => kind::HOLD_LISTENER,
+            Self::HoldListener { info, .. } => {
+                w.tail(info)?;
+                kind::HOLD_LISTENER
+            }
             Self::UpgradeKrilld { path, .. } => {
                 w.bytes(path)?;
                 kind::UPGRADE_KRILLD
@@ -427,7 +442,10 @@ impl ToHolder {
                 req,
                 id: SessionId(r.u64()?),
             },
-            kind::HOLD_LISTENER => Self::HoldListener { req },
+            kind::HOLD_LISTENER => Self::HoldListener {
+                req,
+                info: r.tail()?,
+            },
             kind::UPGRADE_KRILLD => Self::UpgradeKrilld {
                 req,
                 path: r.bytes()?,
@@ -461,17 +479,18 @@ impl ToHolder {
 impl FromHolder {
     /// 이 메시지에 붙는 fd 수.
     pub fn fds(&self) -> u8 {
-        u8::from(matches!(
-            self,
-            Self::Session { .. } | Self::Listener | Self::Spawned { .. }
-        ))
+        u8::from(match self {
+            Self::Session { .. } | Self::Spawned { .. } => true,
+            Self::Listener { info } => info.is_empty(),
+            _ => false,
+        })
     }
 
     /// (v4, Windows) 이 메시지에 필요한 최소 핸들 수(0이면 핸들을 싣지 않는다).
     fn min_handles(&self) -> u8 {
         match self {
             Self::Session { .. } | Self::Spawned { .. } => WIN_SESSION_HANDLES,
-            Self::Listener => 1,
+            Self::Listener { info } => u8::from(info.is_empty()),
             _ => 0,
         }
     }
@@ -505,9 +524,13 @@ impl FromHolder {
             Self::Hello {
                 version,
                 holder_pid,
+                inbox,
             } => {
                 w.u16(*version);
                 w.u32(*holder_pid);
+                if *inbox {
+                    w.u8(1);
+                }
                 kind::HELLO
             }
             Self::Session { id, pid, status } => {
@@ -522,7 +545,11 @@ impl FromHolder {
                 }
                 kind::SESSION
             }
-            Self::Listener => kind::LISTENER,
+            Self::Listener { info } => {
+                // 에러는 MAX_FRAME 검사(finish)가 다시 잡는다.
+                w.tail(info).ok();
+                kind::LISTENER
+            }
             Self::Ready => kind::READY,
             Self::Spawned { req, id, pid } => {
                 w.u32(*req);
@@ -559,6 +586,7 @@ impl FromHolder {
             kind::HELLO => Self::Hello {
                 version: r.u16()?,
                 holder_pid: r.u32()?,
+                inbox: r.0.first() == Some(&1),
             },
             kind::SESSION => Self::Session {
                 id: SessionId(r.u64()?),
@@ -569,7 +597,7 @@ impl FromHolder {
                     t => return Err(Error::BadTag(t)),
                 },
             },
-            kind::LISTENER => Self::Listener,
+            kind::LISTENER => Self::Listener { info: r.tail()? },
             kind::READY => Self::Ready,
             kind::SPAWNED => Self::Spawned {
                 req: r.u32()?,
@@ -647,6 +675,10 @@ impl Writer {
         self.0.extend_from_slice(v);
         Ok(())
     }
+    /// 끝 필드 바이트열: 비어 있으면 아무것도 쓰지 않는다(이전 버전과 바이트가 같다).
+    fn tail(&mut self, v: &[u8]) -> Result<(), Error> {
+        if v.is_empty() { Ok(()) } else { self.bytes(v) }
+    }
     fn finish(mut self, kind: u8, fds: u8) -> Result<Vec<u8>, Error> {
         let n = self.0.len().saturating_sub(4);
         if n > MAX_FRAME {
@@ -689,6 +721,14 @@ impl Reader<'_> {
         let (head, rest) = self.0.split_at_checked(n).ok_or(Error::Truncated)?;
         self.0 = rest;
         Ok(head.to_vec())
+    }
+    /// [`Writer::tail`]의 짝: 남은 바이트가 없으면 빈 값.
+    fn tail(&mut self) -> Result<Vec<u8>, Error> {
+        if self.0.is_empty() {
+            Ok(Vec::new())
+        } else {
+            self.bytes()
+        }
     }
 }
 
