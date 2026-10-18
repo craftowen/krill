@@ -218,6 +218,148 @@ fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
     assert_eq!(panes, 1);
     assert!(closed.contains(&SessionId(7)), "closed pane is reopenable");
 }
+
+/// OWE-872 테스트용: 칸에 세션을 붙이고 사이드바에 실행 중(`Working`) 스냅샷을 연결한다.
+fn attach_running(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    pane: PaneId,
+    sid: krill_proto::SessionId,
+) {
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let session = sidebar::Session {
+        id: sid,
+        status: krill_proto::control::AgentStatus {
+            state: krill_proto::control::AgentState::Working,
+            agent: "claude".into(),
+            ..krill_proto::control::AgentStatus::UNKNOWN
+        },
+        worktree: None,
+        cwd: None,
+        account: None,
+    };
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![session],
+        trees: std::collections::BTreeMap::default(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(pane, sid);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+}
+
+fn click(cx: &mut VisualTestContext, selector: &'static str) {
+    let at = cx.debug_bounds(selector).expect(selector).center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+}
+
+/// OWE-872: 실행 중인 탭을 닫으면 확인 대화상자가 뜨고, '닫기'를 눌러야 닫힌다.
+#[gpui::test]
+fn running_tab_close_asks_then_confirms(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("running-tab"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    attach_running(&view, cx, pane, krill_proto::SessionId(21));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    click(cx, "confirm-running-close");
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(cx.debug_bounds("running-close-dialog").is_none());
+}
+
+/// OWE-872: 실행 중인 탭 닫기 확인에서 취소하면 탭이 남는다.
+#[gpui::test]
+fn running_tab_close_cancel_keeps_tab(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("running-tab-cancel"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    attach_running(&view, cx, pane, krill_proto::SessionId(22));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    click(cx, "cancel-running-close");
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_none());
+}
+
+/// OWE-872: 실행 중이지 않은 탭은 묻지 않고 바로 닫힌다.
+#[gpui::test]
+fn idle_tab_close_needs_no_confirm(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("idle-tab"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(cx.debug_bounds("running-close-dialog").is_none());
+}
+
+/// OWE-872: 실행 중인 칸을 닫으면 확인 대화상자가 뜨고, 취소하면 칸이 남는다.
+#[gpui::test]
+fn running_pane_close_asks_then_cancels(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("running-pane"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    attach_running(&view, cx, pane, krill_proto::SessionId(23));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.maybe_close_pane(pane, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    click(cx, "cancel-running-close");
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+}
+
+/// OWE-872: '다시 묻지 않기'를 고르고 닫으면 설정이 꺼지고(`settings.toml` 영속) 다음부터 묻지 않는다.
+#[gpui::test]
+fn running_close_dont_ask_persists(cx: &mut TestAppContext) {
+    let path = state_path("running-dont-ask");
+    let (view, cx) = open(cx, path.clone());
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    attach_running(&view, cx, pane, krill_proto::SessionId(24));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            if let Some((_, dont_ask)) = s.pending_running_close.as_mut() {
+                *dont_ask = true;
+            }
+            s.confirm_running_close(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(!cx.update(|_, cx| krill_app::settings::confirm_running_close(cx)));
+    let body = std::fs::read_to_string(path.parent().unwrap().join("settings.toml"))
+        .expect("settings.toml persisted");
+    assert!(
+        body.contains("confirm_running_close = false"),
+        "unexpected settings.toml: {body}"
+    );
+}
+
 /// MK-025·MK-026: 데몬 기동 실패 이유와 끊김이 셸 배너로 보이고, 다시 붙으면 사라진다.
 #[gpui::test]
 fn daemon_link_shows_banner(cx: &mut TestAppContext) {

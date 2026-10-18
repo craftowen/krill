@@ -413,6 +413,11 @@ catalog! {
         PANE_ZOOM_TOGGLE => ("창 확대 전환", "Toggle pane zoom"),
         PANE_UNZOOM => ("확대 해제", "Unzoom pane"),
         ZOOMED_BADGE => ("확대됨", "Zoomed"),
+        RUNNING_CLOSE_TITLE => ("실행 중인 작업을 닫을까요?", "Close while running?"),
+        RUNNING_CLOSE_DETAIL => ("'{title}'에서 에이전트가 실행 중입니다. 닫으면 작업이 중단될 수 있습니다.", "An agent is still running in '{title}'. Closing may interrupt its work."),
+        RUNNING_CLOSE_CONFIRM => ("닫기", "Close"),
+        RUNNING_CLOSE_CANCEL => ("취소", "Cancel"),
+        DONT_ASK_AGAIN => ("다시 묻지 않기", "Don't ask again"),
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),
@@ -998,6 +1003,8 @@ catalog! {
         OPTION_AS_META_DESC => ("Option+키를 ESC+키로 보냅니다(셸·Emacs 단어 이동). 끄면 특수 문자를 입력합니다.", "Send Option+key as ESC+key (shell and Emacs word motions). Off types special characters."),
         COPY_ON_SELECT => ("선택 시 복사", "Copy on select"),
         COPY_ON_SELECT_DESC => ("마우스로 선택을 마치면 바로 클립보드에 복사합니다.", "Copy to the clipboard as soon as a mouse selection ends."),
+        CONFIRM_RUNNING_CLOSE => ("실행 중 닫기 확인", "Confirm closing while running"),
+        CONFIRM_RUNNING_CLOSE_DESC => ("에이전트가 실행 중인 탭·칸을 닫을 때 확인 대화상자를 띄웁니다.", "Ask for confirmation before closing a tab or pane whose agent is still running."),
         NOTIFICATIONS_DESC => ("에이전트 입력 대기·완료 알림과 Dock 배지를 보냅니다.", "Notify and badge the Dock when an agent waits for input or finishes."),
         ALERT_SOUND_DESC => ("알림을 보낼 때 소리를 함께 냅니다.", "Play a sound with notifications."),
         INACTIVE_ONLY_DESC => ("앱 창이 활성 상태가 아닐 때만 알림을 보냅니다.", "Only notify while the app window is not focused."),

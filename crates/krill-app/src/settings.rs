@@ -145,6 +145,10 @@ pub struct Settings {
     /// 첫 프롬프트 기반 브랜치·세션 이름 자동 변경 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub auto_rename_branch_from_work: bool,
+    /// 실행 중인 탭·칸을 닫기 전에 확인할지(기본 true, OWE-872).
+    /// '다시 묻지 않기'를 고르면 false로 저장된다.
+    #[serde(default = "default_true")]
+    pub confirm_running_close: bool,
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 false, 동의 후 활성화, OWE-737).
     pub workspace_trust_preset_enabled: bool,
 }
@@ -228,6 +232,7 @@ impl Default for Settings {
             prompt_cache_timer_enabled: true,
             prompt_cache_ttl_secs: DEFAULT_PROMPT_CACHE_TTL_SECS,
             auto_rename_branch_from_work: true,
+            confirm_running_close: true,
             workspace_trust_preset_enabled: false,
         }
     }
@@ -681,6 +686,19 @@ pub fn option_as_meta(cx: &App) -> bool {
 pub fn copy_on_select(cx: &App) -> bool {
     cx.try_global::<Config>()
         .is_some_and(|c| c.settings.copy_on_select)
+}
+
+/// 실행 중인 탭·칸을 닫기 전에 확인할지(OWE-872). `init` 전이면 기본값 true.
+pub fn confirm_running_close(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_none_or(|c| c.settings.confirm_running_close)
+}
+
+/// 실행 중 닫기 확인을 켜고 끄고 `settings.toml`에 저장한다(OWE-872 '다시 묻지 않기'·설정 스위치).
+pub fn set_confirm_running_close(enabled: bool, cx: &mut App) {
+    if cx.has_global::<Config>() && current(cx).confirm_running_close != enabled {
+        edit(cx, |s| s.confirm_running_close = enabled);
+    }
 }
 
 /// 알림 사운드 켜짐 여부. `init` 전이면 기본값 true.
@@ -3653,6 +3671,20 @@ impl SettingsView {
                         s.copy_on_select,
                         false,
                         |next, _, cx| edit(cx, |s| s.copy_on_select = next),
+                    ))),
+            )
+            .child(
+                row()
+                    .child(label(
+                        text::CONFIRM_RUNNING_CLOSE.get(),
+                        text::CONFIRM_RUNNING_CLOSE_DESC.get(),
+                    ))
+                    .child(layout::controls().child(layout::switch(
+                        p,
+                        "confirm-running-close-toggle",
+                        s.confirm_running_close,
+                        false,
+                        |next, _, cx| edit(cx, |s| s.confirm_running_close = next),
                     ))),
             )
     }

@@ -85,6 +85,11 @@ fn settings_parse_defaults_and_zoom() {
     assert!(def.notifications);
     assert!(def.webhooks.is_empty());
     assert_eq!(def.keep_awake, KeepAwake::Agent);
+    // OWE-872: 실행 중 닫기 확인은 기본 켜짐이며, 끈 값도 그대로 왕복한다.
+    assert!(def.confirm_running_close);
+    let off = Settings::parse("confirm_running_close = false").unwrap();
+    assert!(!off.confirm_running_close);
+    assert_eq!(Settings::parse(&off.to_toml()).unwrap(), off);
     let s = Settings::parse(
         "theme = \"dark\"\nzoom = 1.25\nnotifications = false\nkeep_awake = \"on\"",
     )
