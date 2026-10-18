@@ -30,8 +30,34 @@ gcloud compute firewall-rules create "$rule" --project "$project" --quiet \
   --allow tcp:22 --source-ranges "$myip/32" --target-tags krill-linux-build >/dev/null
 trap 'gcloud compute firewall-rules delete "$rule" --project "$project" --quiet >/dev/null 2>&1 || true; rm -f "$src"' EXIT
 
+# 한 아키텍처: VM 생성 → 빌드·스모크 → tar.gz 회수. `||` 문맥이라 set -e가 꺼지므로 단계마다 실패를 직접 돌려준다.
+run_build() {
+  local arch=$1 vm=$2 machine=$3 image=$4
+  local g=(--project "$project" --zone "$zone" --quiet)
+  gcloud compute instances create "$vm" "${g[@]}" --machine-type "$machine" \
+    --image-family "$image" --image-project ubuntu-os-cloud --boot-disk-size 40GB \
+    --labels purpose=krill-linux-build --tags krill-linux-build || return 1
+  local ready=0
+  for _ in $(seq 30); do
+    if gcloud compute ssh "$vm" "${g[@]}" --command true; then ready=1; break; fi
+    sleep 10
+  done
+  [[ $ready -eq 1 ]] || return 1
+  gcloud compute scp "${g[@]}" "$src" "$vm:krill-src.tar.gz" || return 1
+  gcloud compute ssh "$vm" "${g[@]}" --command "set -euo pipefail
+    sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config >/dev/null
+    curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $toolchain >/dev/null
+    mkdir -p src && tar -xzf krill-src.tar.gz -C src && cd src
+    PATH=\$HOME/.cargo/bin:\$PATH bash packaging/linux/build.sh $version dist
+    bash packaging/linux/smoke.sh dist/krill-$version-linux-$arch.tar.gz" || return 1
+  gcloud compute scp "${g[@]}" "$vm:src/dist/krill-$version-linux-$arch.tar.gz" \
+    "$vm:src/dist/krill-$version-linux-$arch.tar.gz.sha256" "$out/" || return 1
+}
+
+# VM 삭제는 트랩에 맡기지 않는다(비동기 함수 서브셸에서 EXIT 트랩이 돌지 않는 경우를 실측). 성공·실패 모두 지운다.
 build_one() {
-  local arch=$1 machine image vm log
+  local arch=$1 machine image vm log rc=0
   case "$arch" in
     x86_64) machine=e2-standard-4; image=ubuntu-2204-lts ;;
     aarch64) machine=t2a-standard-4; image=ubuntu-2204-lts-arm64 ;;
@@ -39,28 +65,9 @@ build_one() {
   esac
   vm="krill-build-${arch//_/-}-$(date +%s)"
   log="$out/build-linux-$arch.log"
-  local g=(--project "$project" --zone "$zone" --quiet)
-  # 백그라운드 서브셸이라 EXIT는 이 아키텍처 작업이 끝날 때(실패 포함) 한 번 돈다.
-  # shellcheck disable=SC2064
-  trap "gcloud compute instances delete $vm ${g[*]} >/dev/null 2>&1 || true" EXIT
-  {
-    gcloud compute instances create "$vm" "${g[@]}" --machine-type "$machine" \
-      --image-family "$image" --image-project ubuntu-os-cloud --boot-disk-size 40GB \
-      --labels purpose=krill-linux-build --tags krill-linux-build
-    for _ in $(seq 30); do
-      gcloud compute ssh "$vm" "${g[@]}" --command true && break
-      sleep 10
-    done
-    gcloud compute scp "${g[@]}" "$src" "$vm:krill-src.tar.gz"
-    gcloud compute ssh "$vm" "${g[@]}" --command "set -euo pipefail
-      sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-      sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq build-essential pkg-config >/dev/null
-      curl --proto =https --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain $toolchain >/dev/null
-      mkdir -p src && tar -xzf krill-src.tar.gz -C src && cd src
-      PATH=\$HOME/.cargo/bin:\$PATH bash packaging/linux/build.sh $version dist
-      bash packaging/linux/smoke.sh dist/krill-$version-linux-$arch.tar.gz"
-    gcloud compute scp "${g[@]}" "$vm:src/dist/krill-$version-linux-$arch.tar.gz" "$vm:src/dist/krill-$version-linux-$arch.tar.gz.sha256" "$out/"
-  } >"$log" 2>&1
+  run_build "$arch" "$vm" "$machine" "$image" >"$log" 2>&1 || rc=$?
+  gcloud compute instances delete "$vm" --project "$project" --zone "$zone" --quiet >>"$log" 2>&1 || true
+  return "$rc"
 }
 
 pids=()
