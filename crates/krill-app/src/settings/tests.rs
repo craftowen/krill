@@ -154,6 +154,116 @@ fn webhook_settings_roundtrip_survive_ui_edits_and_redact_parse_errors(cx: &mut 
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-883: 사람에게 보이는 한 줄·문구에 Rust 디버그 포맷(`{:?}`)과 내부 영문이 그대로 노출되지 않는다.
+#[test]
+fn owe883_user_facing_lines_hide_debug_and_english_internals() {
+    use krill_proto::orchestration::TaskStatus;
+
+    // 오케스트레이션 작업 행: 영문 상태·`deps={:?}` 대신 카탈로그 문구와 의존 목록.
+    let with_deps = orchestration_task_line(
+        "run-1",
+        "task-2",
+        "1단계 점검",
+        TaskStatus::Ready,
+        &["task-1".to_owned()],
+    );
+    assert!(with_deps.contains("준비"), "{with_deps}");
+    assert!(!with_deps.contains("ready"), "{with_deps}");
+    assert!(!with_deps.contains("deps="), "{with_deps}");
+    assert!(!with_deps.contains('"'), "{with_deps}");
+    assert!(with_deps.contains("task-1"), "{with_deps}");
+    let bare = orchestration_task_line("r", "t", "제목", TaskStatus::Dispatched, &[]);
+    assert!(bare.contains("실행 중"), "{bare}");
+    assert!(!bare.contains("dispatched"), "{bare}");
+    for (status, raw) in [
+        (TaskStatus::Pending, "pending"),
+        (TaskStatus::Ready, "ready"),
+        (TaskStatus::Dispatched, "dispatched"),
+        (TaskStatus::Completed, "completed"),
+        (TaskStatus::Failed, "failed"),
+        (TaskStatus::Blocked, "blocked"),
+    ] {
+        assert_ne!(orchestration_task_status_label(status), raw);
+    }
+
+    // 웹훅 행: 종류만 보이고 URL·비밀은 노출하지 않는다.
+    for (ep, kind) in [
+        (
+            crate::webhook::Endpoint::Ntfy {
+                url: "http://127.0.0.1:9/hook?token=SECRET".into(),
+            },
+            "Ntfy",
+        ),
+        (
+            crate::webhook::Endpoint::Telegram {
+                url: "https://api.telegram.org/botSECRET/send".into(),
+                chat_id: "PRIVATE".into(),
+            },
+            "Telegram",
+        ),
+        (
+            crate::webhook::Endpoint::Discord {
+                url: "https://discord.com/api/SECRET".into(),
+            },
+            "Discord",
+        ),
+    ] {
+        let label = webhook_kind_label(&ep);
+        assert_eq!(label, kind);
+        let row = text::WEBHOOK_LABEL.format(&[("n", "1"), ("kind", label)]);
+        assert!(!row.contains("SECRET"), "{row}");
+        assert!(!row.contains("PRIVATE"), "{row}");
+        assert!(!row.contains('{'), "{row}");
+    }
+
+    // 스케줄 실행 시각: epoch 분 대신 날짜·시각(UTC).
+    assert_eq!(schedules::format_run_minute(0), "1970-01-01 00:00 (UTC)");
+    assert_eq!(
+        schedules::format_run_minute(29_453_760),
+        "2026-01-01 00:00 (UTC)"
+    );
+    assert_eq!(
+        schedules::format_run_minute(29_871_930),
+        "2026-10-18 09:30 (UTC)"
+    );
+
+    // 자가 진단: 내부 키-값이 아니라 카탈로그 문구.
+    let report = run_doctor_check(None);
+    assert!(!report.contains("state="), "{report}");
+    assert!(!report.contains("bins="), "{report}");
+    assert!(!report.contains("crashes="), "{report}");
+    assert!(!report.contains("recording="), "{report}");
+    assert!(!report.contains("missing-bins"), "{report}");
+    assert!(report.contains(text::DOCTOR_MISSING.get()), "{report}");
+
+    // 업데이터 오류: 영문 Display 원문이 아니라 사용자용 문구.
+    for err in [
+        crate::updater::Error::BadSignature,
+        crate::updater::Error::InvalidRollout(101),
+        crate::updater::Error::Downgrade {
+            current: "1.0".into(),
+            offered: "0.9".into(),
+        },
+    ] {
+        let msg = err.user_message();
+        assert!(
+            !msg.contains("ed25519 signature verification failed"),
+            "{msg}"
+        );
+        assert!(!msg.contains("rollout_pct must be"), "{msg}");
+        assert!(!msg.contains("downgrade refused"), "{msg}");
+    }
+    let downgrade = crate::updater::Error::Downgrade {
+        current: "1.0".into(),
+        offered: "0.9".into(),
+    }
+    .user_message();
+    assert!(
+        downgrade.contains("1.0") && downgrade.contains("0.9"),
+        "{downgrade}"
+    );
+}
+
 #[gpui::test]
 fn key_override_and_unbind(cx: &mut TestAppContext) {
     cx.update(|cx| {
@@ -3717,6 +3827,165 @@ fn stale_account_refresh_preserves_newer_request_error(cx: &mut TestAppContext) 
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-881: 브라우저 로그인 대기 중에는 진행 표시·[취소]가 보이고, 스레드 결과에 따라 닫힌다.
+#[gpui::test]
+fn login_pending_waiting_cancel_and_outcome(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    use crate::accounts::{LoginFailReason, LoginOutcome};
+    use krill_proto::usage::{
+        AccountInfo, AccountStatus, AccountStatusInfo, ProviderKind, Snapshot,
+    };
+
+    let d = dir("owe881-login-pending");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    let set_pending = |vcx: &mut gpui::VisualTestContext| {
+        vcx.update(|_, cx| {
+            view.update(cx, |v, cx| {
+                v.tab = AdminTab::Accounts;
+                v.accounts_snapshot.accounts = vec![AccountInfo {
+                    id: "claude-work".into(),
+                    provider: ProviderKind::Claude,
+                    label: "Work".into(),
+                    email: None,
+                    profile_dir: d.join("work").display().to_string(),
+                    active: false,
+                    host_default: false,
+                    stale: false,
+                    usage: Snapshot::default(),
+                }];
+                v.accounts_snapshot.statuses = vec![AccountStatusInfo {
+                    account_id: "claude-work".into(),
+                    status: AccountStatus::NeedsLogin,
+                    updated_at: Some(crate::accounts::display::now()),
+                    detail: None,
+                }];
+                v.account_error = None;
+                v.login_pending = Some(PendingLogin {
+                    account_id: "claude-work".into(),
+                    cancel: Arc::new(AtomicBool::new(false)),
+                    cancelling: false,
+                    started: Instant::now(),
+                });
+                cx.notify();
+            });
+        });
+        vcx.run_until_parked();
+    };
+
+    // 대기 중: [로그인 취소]는 보이고 [다시 로그인]은 숨는다.
+    set_pending(vcx);
+    assert!(vcx.debug_bounds("admin-cancel-login-claude-work").is_some());
+    assert!(
+        vcx.debug_bounds("admin-login-account-claude-work")
+            .is_none()
+    );
+
+    // [로그인 취소] 클릭 → 취소 플래그가 켜지고 버튼이 비활성된다.
+    let bounds = vcx.debug_bounds("admin-cancel-login-claude-work").unwrap();
+    vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.login_pending.as_ref().is_some_and(|p| p.cancelling));
+        assert!(
+            v.login_pending
+                .as_ref()
+                .is_some_and(|p| p.cancel.load(Ordering::Relaxed))
+        );
+    });
+
+    // 스레드가 남긴 Cancelled → pending 해제, 오류는 남기지 않는다.
+    crate::accounts::record_login_outcome_for_test("claude-work", LoginOutcome::Cancelled);
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| assert!(v.poll_login_once(cx)));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.login_pending.is_none());
+        assert!(v.account_error.is_none());
+    });
+
+    // 실패 결과 → 계정 오류 안내가 남는다.
+    set_pending(vcx);
+    crate::accounts::record_login_outcome_for_test(
+        "claude-work",
+        LoginOutcome::Failed(LoginFailReason::Unsuccessful),
+    );
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| assert!(v.poll_login_once(cx)));
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.login_pending.is_none());
+        assert_eq!(
+            v.account_error.as_deref(),
+            Some(text::ACCOUNT_LOGIN_FAILED.get())
+        );
+    });
+
+    // 성공 결과 → pending 해제, 오류 없음.
+    set_pending(vcx);
+    crate::accounts::record_login_outcome_for_test("claude-work", LoginOutcome::Succeeded);
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| assert!(v.poll_login_once(cx)));
+        assert!(view.read(cx).login_pending.is_none());
+        assert!(view.read(cx).account_error.is_none());
+    });
+
+    // 타임아웃 결과 → 시간 초과 안내가 남는다.
+    set_pending(vcx);
+    crate::accounts::record_login_outcome_for_test(
+        "claude-work",
+        LoginOutcome::Failed(LoginFailReason::TimedOut),
+    );
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| assert!(v.poll_login_once(cx)));
+        assert_eq!(
+            view.read(cx).account_error.as_deref(),
+            Some(text::ACCOUNT_LOGIN_TIMED_OUT.get())
+        );
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-881: 결과 없이 제한 시간을 넘기면 시간 초과로 닫힌다.
+#[gpui::test]
+fn login_pending_without_outcome_times_out(cx: &mut TestAppContext) {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let d = dir("owe881-login-timeout");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.login_pending = Some(PendingLogin {
+                account_id: "codex-old".into(),
+                cancel: Arc::new(AtomicBool::new(false)),
+                cancelling: false,
+                started: std::time::Instant::now()
+                    .checked_sub(LOGIN_WAIT_TIMEOUT + std::time::Duration::from_secs(1))
+                    .unwrap(),
+            });
+            assert!(v.poll_login_once(cx));
+            assert!(v.login_pending.is_none());
+            assert_eq!(
+                v.account_error.as_deref(),
+                Some(text::ACCOUNT_LOGIN_TIMED_OUT.get())
+            );
+        });
+    });
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-708: 상태바와 계정 카드가 같은 경고(80)·위험(90) 기준을 쓴다.
 #[test]
 fn usage_tone_matches_shared_warn_and_critical_thresholds() {
@@ -5513,15 +5782,33 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         assert_eq!(take_pending_terminal_command(cx), None);
     });
 
-    // 6. OpenCode 계정의 "+ 로그인" 호출 시 터미널 로그인 명령어가 자동으로 큐에 들어간다.
+    // 6. OpenCode 계정의 "+ 계정 추가" 호출 시 명령을 바로 큐에 넣지 않고 안내 카드를 연다(OWE-881).
+    //    [터미널에서 실행]을 눌러야 큐에 들어가고, [닫기]는 큐 없이 안내만 닫는다.
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.login_account(krill_proto::usage::ProviderKind::OpenCode, None, cx);
         });
+        assert!(view.read(cx).opencode_login_prompt);
+        assert_eq!(take_pending_terminal_command(cx), None);
+    });
+    click(vcx, "admin-opencode-login-run");
+    vcx.update(|_, cx| {
+        assert!(!view.read(cx).opencode_login_prompt);
         assert_eq!(
             take_pending_terminal_command(cx).as_deref(),
             Some("opencode auth login")
         );
+        assert_eq!(take_pending_terminal_command(cx), None);
+    });
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.login_account(krill_proto::usage::ProviderKind::OpenCode, None, cx);
+        });
+        assert!(view.read(cx).opencode_login_prompt);
+    });
+    click(vcx, "admin-opencode-login-dismiss");
+    vcx.update(|_, cx| {
+        assert!(!view.read(cx).opencode_login_prompt);
         assert_eq!(take_pending_terminal_command(cx), None);
     });
 
