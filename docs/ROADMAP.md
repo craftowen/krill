@@ -1,6 +1,6 @@
 # Krill 로드맵 v1 (2026-10-14)
 
-트랙별 이슈 후보(T1 41개, T2 29개, T3 30개, T4 41개, 합 141개)를 중복 제거·병합해 102개로 만들었고, 교차 검증으로 선행 관계·완료 조건을 고치고 MK-103~106을 더해 106개가 되었으며, 이후 M7 Orca 패리티(MK-107~113), M8 오케스트레이션·포트·에디터(MK-114~121), M9 모바일 원격 제어(MK-122~126), M10 Orca 이관·워크벤치 확장(MK-172~187)을 추가했다. 출처 열의 `T2#7`은 `docs/planning/T2-final.md` §7의 7번 후보다. 우선순위 P0=긴급, P1=높음, P2=보통, P3=낮음. 목표일은 1인 + 에이전트 병렬 개발 기준 **추정**이다.
+트랙별 이슈 후보(T1 41개, T2 29개, T3 30개, T4 41개, 합 141개)를 중복 제거·병합해 102개로 만들었고, 교차 검증으로 선행 관계·완료 조건을 고치고 MK-103~106을 더해 106개가 되었으며, 이후 M7 Orca 패리티(MK-107~113), M8 오케스트레이션·포트·에디터(MK-114~121), M9 모바일 원격 제어(MK-122~126), M10 Orca 이관·워크벤치 확장(MK-172~187), M11 Windows 포팅(MK-188~222, 리니어 OWE-807~841과 1:1)을 추가했다. 출처 열의 `T2#7`은 `docs/planning/T2-final.md` §7의 7번 후보다. 우선순위 P0=긴급, P1=높음, P2=보통, P3=낮음. 목표일은 1인 + 에이전트 병렬 개발 기준 **추정**이다.
 
 ## 마일스톤
 
@@ -16,6 +16,7 @@
 | M8 오케스트레이션·핵심 고도화 | 멀티 에이전트 오케스트레이션(`krill orchestration`)·스킬 레지스트리(`krill skills`)·세션 핸드오프(`krill handoff`)·워크스페이스 체크포인트/레퍼런스·리스닝 포트 감지(`krill ports`)·에디터·GUI 통합 | 2026-10-19 | MK-114~121 전부 통과 및 실화면 검증 완료 |
 | M9 모바일 원격 제어 | `krilld` 모바일 기기 레지스트리·`ring` E2EE v2·지연 바인딩 게이트웨이(LAN/Tailscale/`cloudflared`)·1-스캔 QR 페어링(관리자 `Mobile` 8번째 탭 + `krill mobile`)·내장 모바일 PWA·라이브 터미널 뷰 | 2026-10-20 | MK-122~126 전부 통과, 데몬 ≤ 60MB, 실화면 검증 완료 |
 | M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer` | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
+| M11 Windows 포팅 | Windows(주 타깃 `x86_64-pc-windows-msvc`) 지원: 공통 컴파일 계층(Mac에서 Windows 타깃 `cargo check` 0) → GCP Windows VM 네이티브 ConPTY 실기 스파이크(S-W1~S-W5) → 합격 시 네이티브 본구현·배포. WSL2·앱만 원격은 보류(PRD 플랫폼 절) | 미정 | MK-205 Windows check 0, 스파이크 결과표로 본구현 여부 결정, 본구현 시 MK-217 Windows 생존 e2e 손실 0, macOS `scripts/check.sh` 0 유지 |
 
 ## 이슈 (우선순위 → 선행 순으로 진행)
 
@@ -179,3 +180,40 @@
 | MK-185 | PR CI Checks 실패 로그 조회 & "AI로 CI 실패 / PR 리뷰 코멘트 수정" 원클릭 큐 | M10 | P1 | PR CI 체크 상태·실패 로그·리뷰 코멘트 파싱 및 선택 항목 에이전트 프롬프트 일괄 전송 테스트 통과, `scripts/check.sh` 0 | MK-085, MK-090 | M10 | OWE-739 |
 | MK-186 | 스케줄 자동화 Precheck 셸 게이트 & 새 워크트리 격리 실행 · 실행 상세 로그 뷰어 | M10 | P1 | `precheck` 비-0 종료 시 에이전트 실행 생략(`skipped`), 새 워크트리 격리 실행, Workflows 탭 실행 로그 조회 및 `Run Now` 테스트 통과, `scripts/check.sh` 0 | MK-101 | M10 | OWE-740 |
 | MK-187 | macOS 네이티브 Computer Use (`krill computer` CLI + `computer-use` 내장 스킬) | M10 | P1 | `krill computer` 서브커맨드(앱/창 목록, AX 스냅샷, 클릭/키 입력 합성) 및 `computer-use` 내장 스킬 설치·조회 테스트 통과, `scripts/check.sh` 0 | MK-115 | M10 | OWE-741 |
+| MK-188 | Windows 포팅 기획·전략(상위) | M11 | P1 | 하위 MK-189~222 진행, Phase별 결정 기록 | — | boost-2026-10-18 | OWE-807 |
+| MK-189 | 문서: PRD·ROADMAP M11·MK 행 신설, ARCHITECTURE §4.1 Windows 열(미확정) 추가 | M11 | P1 | 문서 diff 리뷰, `scripts/check.sh` 0 | — | boost WIN-D1 | OWE-808 |
+| MK-190 | 하네스 문구: AGENTS 규칙 5·CONVENTIONS Windows 조항·holder 상한 해석 | M11 | P1 | 문서 diff, `scripts/check.sh` 0 | — | boost WIN-D2 | OWE-809 |
+| MK-191 | linux-host 미커밋 작업 정리·병합(선행) | M11 | P1 | main에 `sys/{macos,linux}.rs` 반영, `scripts/check.sh` 0 | — | boost WIN-D3 | OWE-810 |
+| MK-192 | 하네스: `scripts/check-windows.sh` + 격리 툴체인 부트스트랩 | M11 | P1 | 새 셸에서 `scripts/check-windows.sh -p krill-proto`가 기준선(lib 41건) 재현, Homebrew 툴체인 무변경 | — | boost W1-00 | OWE-811 |
+| MK-193 | 의존성 선등록: windows-sys·uds_windows, target 섹션 이동, deny.toml Windows 타깃 | M11 | P1 | `cargo metadata --locked` OK, `cargo deny --locked check` ok, `scripts/check.sh` 0 | — | boost W1-01 | OWE-812 |
+| MK-194 | krill-log Windows check 통과 | M11 | P1 | `WCHK(krill-log)` 0, macOS clippy·nextest | — | boost W1-02 | OWE-813 |
+| MK-195 | krill-proto: `krill_proto::os` 심 + 경로·preflight·which Windows 대응 | M11 | P1 | `WCHK(krill-proto)` 0, macOS clippy·nextest, Linux CI 녹색 | MK-193 | boost W1-03 | OWE-814 |
+| MK-196 | krill-term·krill-hosts Windows check 통과 | M11 | P1 | 두 크레이트 `WCHK` 0, macOS clippy·nextest | MK-195 | boost W1-04 | OWE-815 |
+| MK-197 | krill-holder Windows 스텁 계약(컴파일 전용) | M11 | P1 | `WCHK(krill-holder)` 0, macOS clippy·nextest·`tests/survive.rs` 녹색, holder 줄 수 상한 준수 | MK-195 | boost W1-05 | OWE-816 |
+| MK-198 | krill-link Windows check: tokio Unix·launchd cfg + 앱용 API 스텁 | M11 | P2 | `WCHK(krill-link)` 0, macOS clippy·nextest | MK-195 | boost W1-06 | OWE-817 |
+| MK-199 | krilld: nonblocking pipe + `kill_process_group` 중복 헬퍼 통합(macOS 리팩터) | M11 | P2 | 동작 동일, `cargo clippy -p krilld`·`cargo nextest run -p krilld` 녹색, `scripts/check.sh` 0 | — | boost W1-07a | OWE-818 |
+| MK-200 | krilld 플랫폼 계층: `sys/windows.rs` 스텁·할당기·crypto·Cargo.toml target 이동 | M11 | P1 | `WCHK(krilld, --lib)` 중 담당 파일 오류 0, macOS clippy·nextest | MK-191, MK-197 | boost W1-07b | OWE-819 |
+| MK-201 | krilld fd·PTY·IPC 경로 cfg | M11 | P1 | 담당 파일 오류 0, MK-200과 합친 뒤 `WCHK(krilld)` 0, macOS nextest 녹색 | MK-197, MK-199 | boost W1-07c | OWE-820 |
+| MK-202 | krill CLI Windows check | M11 | P2 | `WCHK(krill)` 0, macOS clippy·nextest | MK-196 | boost W1-08 | OWE-821 |
+| MK-203 | krill-app Windows check: platform cfg + `platform/windows.rs` no-op | M11 | P1 | 1차 `WCHK(krill-app, --lib --bins)` 0, 2차 `--all-targets`(MK-200·201 뒤), macOS clippy·nextest, 메모리 게이트 회귀 없음 | MK-196, MK-198 | boost W1-09 | OWE-822 |
+| MK-204 | `ci-windows.yml` + `.gitattributes`(eol=lf) | M11 | P2 | YAML 문법 검증, 처음엔 `workflow_dispatch`만, push 트리거는 MK-205 뒤 | — | boost W1-10 | OWE-823 |
+| MK-205 | Phase 1 통합 검증: 워크스페이스 Windows check 0 | M11 | P1 | `cargo check --workspace --all-targets --target x86_64-pc-windows-gnu` 0, Windows 타깃 clippy, `cargo deny --target x86_64-pc-windows-msvc check` ok, macOS `scripts/check.sh` 0 | MK-194, MK-196, MK-197, MK-198, MK-200, MK-201, MK-202, MK-203 | boost W1-11 | OWE-824 |
+| MK-206 | GCP Windows 테스트 VM: 켜기·끄기 스크립트 + Rust 빌드 환경 | M11 | P1 | `up.sh` → ssh로 `cargo --version`·`rustc -vV` 출력, `down.sh` 후 STATUS=TERMINATED | — | boost Phase 2 | OWE-825 |
+| MK-207 | [스파이크] S-W1 ConPTY 세션 생존·핸드오프·출력 충실도 | M11 | P0 | 실측 표 + ARCHITECTURE §4.1 Windows 열 초안, VM 정지 확인 | MK-206 | boost S-W1 | OWE-826 |
+| MK-208 | [스파이크] S-W2 AF_UNIX IPC·피어 인증 | M11 | P1 | 결과표(uds_windows·`SIO_AF_UNIX_GETPEERPID`·`WSADuplicateSocketW`, 안 되면 named pipe 비교), VM 정지 확인 | MK-206 | boost S-W2 | OWE-827 |
+| MK-209 | [스파이크] S-W3 gpui 앱 렌더·한글 IME·메모리 지표 | M11 | P1 | 결과표 + 캡처(한글 IME 10케이스, 메모리 지표 정의), 사람 확인 항목 표시 | MK-203, MK-206 | boost S-W3 | OWE-828 |
+| MK-210 | [스파이크] S-W4 데몬 수명(앱 종료·로그오프)과 기동 방식 | M11 | P2 | 기동 방식 결정안 | MK-206 | boost S-W4 | OWE-829 |
+| MK-211 | [스파이크] S-W5 에이전트 실행(PATHEXT·`.cmd`)·기본 셸 | M11 | P2 | 실행 성공표 | MK-206 | boost S-W5 | OWE-830 |
+| MK-212 | holder 프로토콜: 핸들 값 전달·Resize 메시지 | M11 | P2 | proto 테스트, 와이어 호환 유지 | MK-207 | boost W3-0 | OWE-831 |
+| MK-213 | holder Windows 구현: ConPTY·Job Object+IOCP·DuplicateHandle·업그레이드 정책 | M11 | P2 | Windows 생존 e2e | MK-212 | boost W3-1 | OWE-832 |
+| MK-214 | krilld Windows 구현: 리더 스레드·resize·DPAPI 키·셸·피어 검증·NOFOLLOW | M11 | P2 | Windows nextest 녹색 | MK-208, MK-212 | boost W3-2 | OWE-833 |
+| MK-215 | 앱 Windows 구현: platform 실구현·`secondary-` 단축키·폰트·열기 | M11 | P2 | 실기 QA | MK-209 | boost W3-3 | OWE-834 |
+| MK-216 | CLI Windows 구현: hook·doctor·statusline | M11 | P2 | Windows nextest | MK-205 | boost W3-4 | OWE-835 |
+| MK-217 | Windows 세션 생존 e2e: 앱 `taskkill /F` 1,000회·krilld kill·출력 해시 | M11 | P2 | 손실 0, 결과 첨부 | MK-213, MK-214 | boost W3-5 | OWE-836 |
+| MK-218 | 배포: 설치 형식·rename 방식 업데이터·롤백 | M11 | P3 | 설치 형식(zip·Inno·MSIX·winget) 결정, 실행 중 exe rename 교체·롤백 검증 | MK-217 | boost Phase 4 | OWE-837 |
+| MK-219 | Authenticode 서명(유료 인증서 — 사람 결정) | M11 | P3 | 사람 결정(MK-104와 같은 성격) | MK-218 | boost Phase 4 | OWE-838 |
+| MK-220 | release 워크플로 Windows 잡 + Windows 메모리 게이트 | M11 | P3 | release 워크플로 Windows 잡, 메모리 게이트 Windows판(지표는 MK-209에서 정의) | MK-218 | boost Phase 4 | OWE-839 |
+| MK-221 | 원격·부가: krill-link·모바일 게이트웨이·krill-hosts SSH 포워딩 Windows화 | M11 | P3 | tokio Unix 대체, Windows OpenSSH 로컬 Unix 소켓 `-L` 지원 확인(안 되면 루프백 TCP + 토큰) | MK-205 | boost Phase 5 | OWE-840 |
+| MK-222 | (보류) WSL2 백엔드 | M11 | P3 | 보류 — 네이티브 스파이크 실패 시 재검토 | — | boost 전략 B | OWE-841 |
+
+M11의 `WCHK(X)`는 [docs/boost-2026-10-18-windows-port.md](boost-2026-10-18-windows-port.md) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
