@@ -3586,8 +3586,6 @@ impl Shell {
 
         let divider_id = ElementId::Name(format!("split-{mine:?}").into());
         let drag = Drag::Split(mine.clone());
-        // OWE-871: 더블클릭 50:50 초기화용 경로는 드래그 리스너가 `mine`을 가져가기 전에 복사한다.
-        let reset = mine.clone();
         let horizontal = axis == Axis::Horizontal;
         div()
             .flex()
@@ -3615,7 +3613,7 @@ impl Shell {
                     .overflow_hidden()
                     .child(first),
             )
-            .child(divider(divider_id, drag, axis, Some(reset), cx))
+            .child(divider(divider_id, drag, axis, cx))
             .child(
                 div()
                     .flex_1()
@@ -4300,13 +4298,8 @@ fn traffic_light_pad(window: &Window) -> Pixels {
     }
 }
 
-fn divider(
-    id: ElementId,
-    drag: Drag,
-    axis: Axis,
-    reset: Option<Vec<Branch>>,
-    cx: &mut Context<Shell>,
-) -> impl IntoElement {
+/// 분할선. 더블클릭하면 분할은 50:50, 사이드바·우측 패널은 기본 너비로 되돌린다.
+fn divider(id: ElementId, drag: Drag, axis: Axis, cx: &mut Context<Shell>) -> impl IntoElement {
     let p = krill_app::ui::palette(cx);
     let line = div().bg(p.split_divider);
     div()
@@ -4328,16 +4321,19 @@ fn divider(
                 .cursor_row_resize()
                 .child(line.h(px(1.)).w_full()),
         })
-        .on_drag(drag, |_, _, _, cx| cx.new(|_| DragGhost))
-        .when_some(reset, |d, path| {
-            d.on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                if e.click_count() >= 2 {
-                    let path = path.clone();
-                    this.change(false, cx, move |l| l.set_ratio(&path, 0.5));
-                    this.save();
-                }
-            }))
-        })
+        .on_drag(drag.clone(), |_, _, _, cx| cx.new(|_| DragGhost))
+        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+            if e.click_count() < 2 {
+                return;
+            }
+            let reset = drag.clone();
+            this.change(false, cx, move |l| match reset {
+                Drag::Split(path) => l.set_ratio(&path, 0.5),
+                Drag::Sidebar => l.sidebar_width = Layout::default().sidebar_width,
+                Drag::Panel => l.panel_width = Layout::default().panel_width,
+            });
+            this.save();
+        }))
 }
 
 impl Render for Shell {
@@ -4833,7 +4829,6 @@ impl Render for Shell {
                             "divider-sidebar".into(),
                             Drag::Sidebar,
                             Axis::Horizontal,
-                            None,
                             cx,
                         ))
                     })
@@ -4902,7 +4897,6 @@ impl Render for Shell {
                             "divider-panel".into(),
                             Drag::Panel,
                             Axis::Horizontal,
-                            None,
                             cx,
                         ))
                         .child(
