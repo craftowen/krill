@@ -192,6 +192,18 @@ pub fn disable_launch_agent(state_dir: &Path) -> Result<PathBuf, Error> {
     Ok(plist_path)
 }
 
+/// `LaunchAgent` installation is only supported on macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn enable_launch_agent(_krill_link_exe: &Path, _state_dir: &Path) -> Result<PathBuf, Error> {
+    Err(crate::unsupported_platform())
+}
+
+/// `LaunchAgent` removal is only supported on macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn disable_launch_agent(_state_dir: &Path) -> Result<PathBuf, Error> {
+    Err(crate::unsupported_platform())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,16 +281,4 @@ mod tests {
         assert!(out.status.success(), "isolated plutil failed");
         fs::remove_dir_all(&dir).ok();
     }
-}
-
-/// LaunchAgent installation is only supported on macOS.
-#[cfg(not(target_os = "macos"))]
-pub fn enable_launch_agent(_krill_link_exe: &Path, _state_dir: &Path) -> Result<PathBuf, Error> {
-    Err(crate::unsupported_platform())
-}
-
-/// LaunchAgent removal is only supported on macOS.
-#[cfg(not(target_os = "macos"))]
-pub fn disable_launch_agent(_state_dir: &Path) -> Result<PathBuf, Error> {
-    Err(crate::unsupported_platform())
 }
