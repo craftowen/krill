@@ -49,6 +49,22 @@ impl ImageView {
         self.zoom
     }
 
+    pub fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        if self.dims.is_some() {
+            self.set_zoom(self.zoom.zoom_in(), cx);
+        }
+    }
+
+    pub fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        if self.dims.is_some() {
+            self.set_zoom(self.zoom.zoom_out(), cx);
+        }
+    }
+
+    pub fn zoom_reset(&mut self, cx: &mut Context<Self>) {
+        self.set_zoom(Zoom::Fit, cx);
+    }
+
     fn set_zoom(&mut self, zoom: Zoom, cx: &mut Context<Self>) {
         self.zoom = zoom;
         cx.notify();

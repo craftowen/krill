@@ -1,6 +1,6 @@
 use std::fs;
 
-use gpui::{Entity, Focusable as _, TestAppContext, VisualTestContext};
+use gpui::{Entity, TestAppContext, VisualTestContext};
 
 use super::*;
 use crate::shell::tests::{layout_of, open, state_path};

@@ -71,6 +71,8 @@ pub struct Settings {
     pub theme: ThemeChoice,
     pub language: Language,
     /// UI 배율(1.0 = 100%). 적용할 때 `ZOOM_MIN..=ZOOM_MAX`로 자른다.
+    /// 레거시 `zoom` 키는 첫 로드 시 `terminal_font_size`로 이관하고 `ui_zoom = 1.0`으로 초기화한다(OWE-843).
+    #[serde(rename = "ui_zoom")]
     pub zoom: f32,
     /// 에이전트 입력 대기·완료 알림과 Dock 배지 켜기/끄기(MK-044).
     pub notifications: bool,
@@ -86,6 +88,9 @@ pub struct Settings {
     /// 터미널 글꼴 크기(10..=24pt, 기본 13).
     #[serde(default = "default_terminal_font_size")]
     pub terminal_font_size: u8,
+    /// 코드 에디터 글꼴 크기(8..=32pt, 기본 12, OWE-843).
+    #[serde(default = "default_editor_font_size")]
+    pub editor_font_size: u8,
     /// 터미널 배경 불투명도(50..=100%, 기본 100).
     #[serde(default = "default_terminal_opacity_pct")]
     pub terminal_opacity_pct: u8,
@@ -150,8 +155,20 @@ pub struct Settings {
     pub workspace_trust_preset_enabled: bool,
 }
 
+pub const DEFAULT_TERMINAL_FONT_SIZE: u8 = 13;
+pub const TERMINAL_FONT_SIZE_MIN: u8 = 10;
+pub const TERMINAL_FONT_SIZE_MAX: u8 = 24;
+
+pub const DEFAULT_EDITOR_FONT_SIZE: u8 = 12;
+pub const EDITOR_FONT_SIZE_MIN: u8 = 8;
+pub const EDITOR_FONT_SIZE_MAX: u8 = 32;
+
 const fn default_terminal_font_size() -> u8 {
-    13
+    DEFAULT_TERMINAL_FONT_SIZE
+}
+
+const fn default_editor_font_size() -> u8 {
+    DEFAULT_EDITOR_FONT_SIZE
 }
 
 const fn default_terminal_opacity_pct() -> u8 {
@@ -208,7 +225,8 @@ impl Default for Settings {
             webhooks: Vec::new(),
             copy_context_lines: 100,
             quick_commands: Vec::new(),
-            terminal_font_size: 13,
+            terminal_font_size: DEFAULT_TERMINAL_FONT_SIZE,
+            editor_font_size: DEFAULT_EDITOR_FONT_SIZE,
             terminal_opacity_pct: 100,
             terminal_font_family: default_terminal_font_family(),
             terminal_cursor_shape: TerminalCursorShape::Block,
@@ -234,12 +252,51 @@ impl Default for Settings {
     }
 }
 
+fn has_legacy_zoom(s: &str) -> bool {
+    toml::from_str::<toml::Table>(s)
+        .is_ok_and(|t| !t.contains_key("ui_zoom") && t.contains_key("zoom"))
+}
+
 impl Settings {
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
         let mut parsed: Self = toml::from_str(s)?;
-        parsed.terminal_font_size = parsed.terminal_font_size.clamp(10, 24);
+        parsed.terminal_font_size = parsed
+            .terminal_font_size
+            .clamp(TERMINAL_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX);
+        parsed.editor_font_size = parsed
+            .editor_font_size
+            .clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         parsed.terminal_opacity_pct = parsed.terminal_opacity_pct.clamp(50, 100);
         parsed.prompt_cache_ttl_secs = parsed.prompt_cache_ttl_secs.clamp(60, 86_400);
+        let table: toml::Table = toml::from_str(s)?;
+        if !table.contains_key("ui_zoom")
+            && let Some(val) = table.get("zoom")
+        {
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "TOML 정수 배율은 소수 범위(0.5..=2.0)로 자르므로 정밀도 손실 무관"
+            )]
+            let raw = val
+                .as_float()
+                .or_else(|| val.as_integer().map(|n| n as f64))
+                .ok_or_else(|| <toml::de::Error as serde::de::Error>::custom("invalid zoom"))?;
+            #[expect(
+                clippy::cast_possible_truncation,
+                reason = "ZOOM_MIN..=ZOOM_MAX(0.5..=2.0)로 자르므로 f32 범위 내"
+            )]
+            let z = (raw as f32).clamp(ZOOM_MIN, ZOOM_MAX);
+            if z.is_finite() && (z - 1.0).abs() > f32::EPSILON {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    clippy::cast_sign_loss,
+                    reason = "10..=24 * 0.5..=2.0 반올림은 양수 u8 범위 내"
+                )]
+                let migrated = (f32::from(parsed.terminal_font_size) * z).round() as u8;
+                parsed.terminal_font_size =
+                    migrated.clamp(TERMINAL_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX);
+            }
+            parsed.zoom = 1.0;
+        }
         Ok(parsed)
     }
 
@@ -264,7 +321,42 @@ impl Settings {
 
     /// 자른 터미널 글꼴 크기(`10..=24`).
     pub fn terminal_font_size(&self) -> u8 {
-        self.terminal_font_size.clamp(10, 24)
+        self.terminal_font_size
+            .clamp(TERMINAL_FONT_SIZE_MIN, TERMINAL_FONT_SIZE_MAX)
+    }
+
+    /// 한 단계 키우거나(`+1`) 줄인(`-1`) 터미널 글꼴 크기(`10..=24`).
+    pub fn terminal_font_size_step(&self, dir: i8) -> u8 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "10..=24 범위로 clamp된 i16을 u8로 변환"
+        )]
+        let next = (i16::from(self.terminal_font_size()) + i16::from(dir)).clamp(
+            i16::from(TERMINAL_FONT_SIZE_MIN),
+            i16::from(TERMINAL_FONT_SIZE_MAX),
+        ) as u8;
+        next
+    }
+
+    /// 자른 코드 에디터 글꼴 크기(`8..=32`).
+    pub fn editor_font_size(&self) -> u8 {
+        self.editor_font_size
+            .clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX)
+    }
+
+    /// 한 단계 키우거나(`+1`) 줄인(`-1`) 코드 에디터 글꼴 크기(`8..=32`).
+    pub fn editor_font_size_step(&self, dir: i8) -> u8 {
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "8..=32 범위로 clamp된 i16을 u8로 변환"
+        )]
+        let next = (i16::from(self.editor_font_size()) + i16::from(dir)).clamp(
+            i16::from(EDITOR_FONT_SIZE_MIN),
+            i16::from(EDITOR_FONT_SIZE_MAX),
+        ) as u8;
+        next
     }
 
     /// 자른 터미널 배경 불투명도(`50..=100`).
@@ -384,6 +476,7 @@ fn own_bindings() -> Vec<KeyBinding> {
     vec![
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("cmd-=", ZoomIn, None),
+        KeyBinding::new("cmd-+", ZoomIn, None),
         KeyBinding::new("cmd--", ZoomOut, None),
         KeyBinding::new("cmd-0", ZoomReset, None),
         KeyBinding::new("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
@@ -497,12 +590,11 @@ pub fn take_pending_permission(cx: &mut App) -> Option<krill_proto::agent::Permi
 
 /// 설정을 읽어 적용하고, 1초마다 파일 변경을 보는 태스크를 띄운다. 앱 기본 키를 모두 묶은 뒤에
 /// 부른다(그때의 키맵이 재정의의 바탕이 된다). 첫 창 전에도 언어를 적용하고, 줌은 열린 창에 적용한다.
+/// `ZoomIn`/`ZoomOut`/`ZoomReset`은 전역 UI 배율이 아니라 `Shell`이 포커스된 터미널·에디터 글꼴 크기를
+/// 조절하도록 `Shell` 루트에 묶는다(OWE-843).
 pub fn init(cx: &mut App) {
     init_at(krill_proto::daemon::state_dir(), cx);
     cx.on_action(|_: &OpenSettings, cx| open_window(cx));
-    cx.on_action(|_: &ZoomIn, cx| edit(cx, |s| s.zoom = s.zoom_step(1)));
-    cx.on_action(|_: &ZoomOut, cx| edit(cx, |s| s.zoom = s.zoom_step(-1)));
-    cx.on_action(|_: &ZoomReset, cx| edit(cx, |s| s.zoom = 1.0));
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(POLL).await;
@@ -563,7 +655,14 @@ pub fn reload(cx: &mut App) {
         // 오류면 직전 설정을 유지하고 표식 동기화를 건너뛴다.
         match std::fs::read_to_string(dir.join(SETTINGS_FILE)) {
             Ok(s) => match Settings::parse(&s) {
-                Ok(s) => settings = s,
+                Ok(parsed) => {
+                    if has_legacy_zoom(&s)
+                        && save_settings(&dir.join(SETTINGS_FILE), &parsed, Some(&s)).is_ok()
+                    {
+                        stamp = file_stamps(dir);
+                    }
+                    settings = parsed;
+                }
                 // TOML 원문 진단에는 웹훅 토큰이 섞일 수 있어 원문을 표시하지 않는다.
                 Err(_) => {
                     errors.push(format!("{SETTINGS_FILE}: {}", text::INVALID_SETTINGS.get()));
@@ -637,6 +736,46 @@ pub fn terminal_font_pt(cx: &App) -> u8 {
         .map_or_else(default_terminal_font_size, |c| {
             c.settings.terminal_font_size()
         })
+}
+
+/// 코드 에디터 글꼴 크기(pt, `8..=32`). `init` 전이면 기본값 12(OWE-843).
+pub fn editor_font_pt(cx: &App) -> u8 {
+    cx.try_global::<Config>()
+        .map_or_else(default_editor_font_size, |c| c.settings.editor_font_size())
+}
+
+fn edit_or_in_memory(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+    if !cx.has_global::<Config>() {
+        cx.set_global(Config::default());
+    }
+    if cx.global::<Config>().dir.is_some() {
+        edit(cx, f);
+    } else {
+        f(&mut cx.global_mut::<Config>().settings);
+        cx.defer(apply);
+    }
+}
+
+/// 포커스된 터미널에서 `⌘=`/`⌘+`/`⌘-`로 터미널 글꼴 크기를 한 단계 조절하고 `settings.toml`에 저장한다(OWE-843).
+pub fn step_terminal_font_size(dir: i8, cx: &mut App) {
+    edit_or_in_memory(cx, |s| {
+        s.terminal_font_size = s.terminal_font_size_step(dir);
+    });
+}
+
+/// 포커스된 터미널에서 `⌘0`으로 터미널 글꼴 크기를 기본값(13pt)으로 되돌리고 저장한다(OWE-843).
+pub fn reset_terminal_font_size(cx: &mut App) {
+    edit_or_in_memory(cx, |s| s.terminal_font_size = DEFAULT_TERMINAL_FONT_SIZE);
+}
+
+/// 포커스된 코드 에디터 탭에서 `⌘=`/`⌘+`/`⌘-`로 에디터 글꼴 크기를 한 단계 조절하고 `settings.toml`에 저장한다(OWE-843).
+pub fn step_editor_font_size(dir: i8, cx: &mut App) {
+    edit_or_in_memory(cx, |s| s.editor_font_size = s.editor_font_size_step(dir));
+}
+
+/// 포커스된 코드 에디터 탭에서 `⌘0`으로 에디터 글꼴 크기를 기본값(12pt)으로 되돌리고 저장한다(OWE-843).
+pub fn reset_editor_font_size(cx: &mut App) {
+    edit_or_in_memory(cx, |s| s.editor_font_size = DEFAULT_EDITOR_FONT_SIZE);
 }
 
 /// 터미널 배경 불투명도(`50..=100`). 매 프레임 렌더에서 부르므로 전체 복제 없이 읽는다.
@@ -906,11 +1045,26 @@ fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::i
             if base != Some(body.as_str()) {
                 return Err(io::Error::other(text::SETTINGS_CONFLICT.get()));
             }
-            krill_proto::config_document::edit_toml_aliases(
-                &body,
-                settings,
-                &[("awake", "keep_awake")],
-            )?
+            if has_legacy_zoom(&body) && (settings.zoom() - 1.0).abs() < f32::EPSILON {
+                let mut temp = settings.clone();
+                temp.zoom = 0.0;
+                let step1 = krill_proto::config_document::edit_toml_aliases(
+                    &body,
+                    &temp,
+                    &[("awake", "keep_awake"), ("zoom", "ui_zoom")],
+                )?;
+                krill_proto::config_document::edit_toml_aliases(
+                    &step1,
+                    settings,
+                    &[("awake", "keep_awake"), ("zoom", "ui_zoom")],
+                )?
+            } else {
+                krill_proto::config_document::edit_toml_aliases(
+                    &body,
+                    settings,
+                    &[("awake", "keep_awake"), ("zoom", "ui_zoom")],
+                )?
+            }
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             if base.is_some() {
@@ -3587,6 +3741,7 @@ impl SettingsView {
         let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
         let font_size = s.terminal_font_size();
         let font_pt = format!("{font_size}pt");
+        let editor_font_pt = format!("{}pt", s.editor_font_size());
         let opacity_val = s.terminal_opacity_pct();
         let opacity_pct = format!("{opacity_val}%");
         let family = s.terminal_font_family.clone();
@@ -3677,6 +3832,52 @@ impl SettingsView {
                                         });
                                     }),
                             ),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(
+                        text::EDITOR_FONT_SIZE.get(),
+                        text::EDITOR_FONT_SIZE_DESC.get(),
+                    ))
+                    .child(
+                        Button::new("editor-font-dec")
+                            .label("−")
+                            .debug_selector(|| "editor-font-dec".into())
+                            .ghost()
+                            .on_click(|_, _, cx| {
+                                edit(cx, |s| {
+                                    s.editor_font_size = s.editor_font_size_step(-1);
+                                });
+                            }),
+                    )
+                    .child(
+                        div()
+                            .w_12()
+                            .font_family(crate::ui::FONT_UI)
+                            .text_size(crate::ui::TEXT_SM)
+                            .child(editor_font_pt),
+                    )
+                    .child(
+                        Button::new("editor-font-inc")
+                            .label("+")
+                            .debug_selector(|| "editor-font-inc".into())
+                            .ghost()
+                            .on_click(|_, _, cx| {
+                                edit(cx, |s| {
+                                    s.editor_font_size = s.editor_font_size_step(1);
+                                });
+                            }),
+                    )
+                    .child(
+                        Button::new("editor-font-reset")
+                            .label(text::RESET.get())
+                            .tooltip(text::EDITOR_FONT_RESET.get())
+                            .debug_selector(|| "editor-font-reset".into())
+                            .ghost()
+                            .on_click(|_, _, cx| {
+                                edit(cx, |s| s.editor_font_size = default_editor_font_size());
+                            }),
                     ),
             )
             .child(

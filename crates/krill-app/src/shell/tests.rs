@@ -4858,3 +4858,118 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
 
     std::fs::remove_file(&tmp_file).ok();
 }
+
+/// OWE-843: 터미널에 포커스가 있을 때 `⌘-`/`⌘=`/`⌘+`/`⌘0`은 터미널 글꼴 크기만 조절하고
+/// 창 전체 UI 배율(`window.rem_size()`)과 에디터 글꼴 크기는 바꾸지 않는다.
+#[gpui::test]
+fn owe843_terminal_zoom_shortcuts_adjust_only_terminal_font_and_preserve_ui_rem(
+    cx: &mut TestAppContext,
+) {
+    use gpui_component::ActiveTheme as _;
+    let path = state_path("owe-843-term-zoom");
+    let (_view, cx) = open(cx, path.clone());
+    cx.run_until_parked();
+
+    let cell_13 = cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
+        assert_eq!(cx.theme().font_size, px(13.));
+        assert_eq!(cx.theme().mono_font_size, px(12.));
+        krill_app::terminal::cell_size(window, cx)
+    });
+
+    // ⌘- : 터미널 글꼴만 13 -> 12pt로 감소, UI rem(16px)과 에디터 글꼴(12pt)은 그대로.
+    cx.simulate_keystrokes("cmd--");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 12);
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
+        assert_eq!(cx.theme().font_size, px(13.));
+        assert_eq!(cx.theme().mono_font_size, px(12.));
+        let cell_12 = krill_app::terminal::cell_size(window, cx);
+        assert!(cell_12.height < cell_13.height);
+    });
+
+    // ⌘= 및 ⌘+ : 터미널 글꼴만 12 -> 13 -> 14pt로 증가.
+    cx.simulate_keystrokes("cmd-= cmd-+");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 14);
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
+        let cell_14 = krill_app::terminal::cell_size(window, cx);
+        assert!(cell_14.height > cell_13.height);
+    });
+
+    // ⌘0 : 터미널 글꼴만 기본값(13pt)으로 복원.
+    cx.simulate_keystrokes("cmd-0");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
+    });
+
+    if let Some(dir) = path.parent() {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// OWE-843: 에디터 탭에 포커스가 있을 때 `⌘-`/`⌘=`/`⌘+`/`⌘0`은 에디터 글꼴 크기만 조절하고
+/// 창 전체 UI 배율(`window.rem_size()`)과 터미널 글꼴 크기는 바꾸지 않는다.
+#[gpui::test]
+fn owe843_editor_zoom_shortcuts_adjust_only_editor_font_and_preserve_terminal_and_ui_rem(
+    cx: &mut TestAppContext,
+) {
+    use gpui_component::ActiveTheme as _;
+    let path = state_path("owe-843-editor-zoom");
+    let (view, cx) = open(cx, path.clone());
+    let tmp_file = std::env::temp_dir().join(format!("krill-owe-843-{}.rs", std::process::id()));
+    std::fs::write(&tmp_file, "fn main() {\n    println!(\"hello\");\n}\n")
+        .expect("write temp file");
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.open_file(tmp_file.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // ⌘- : 에디터 글꼴만 12 -> 11pt로 감소, UI rem(16px)과 터미널 글꼴(13pt)은 그대로.
+    cx.simulate_keystrokes("cmd--");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 11);
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(cx.theme().font_size, px(13.));
+        assert_eq!(cx.theme().mono_font_size, px(11.));
+    });
+
+    // ⌘= 및 ⌘+ : 에디터 글꼴만 11 -> 12 -> 13pt로 증가.
+    cx.simulate_keystrokes("cmd-= cmd-+");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 13);
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(cx.theme().mono_font_size, px(13.));
+    });
+
+    // ⌘0 : 에디터 글꼴만 기본값(12pt)으로 복원.
+    cx.simulate_keystrokes("cmd-0");
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert_eq!(window.rem_size(), px(16.));
+        assert_eq!(krill_app::settings::editor_font_pt(cx), 12);
+        assert_eq!(krill_app::settings::terminal_font_pt(cx), 13);
+        assert_eq!(cx.theme().mono_font_size, px(12.));
+    });
+
+    std::fs::remove_file(&tmp_file).ok();
+    if let Some(dir) = path.parent() {
+        std::fs::remove_dir_all(dir).ok();
+    }
+}
