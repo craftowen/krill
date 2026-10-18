@@ -294,7 +294,10 @@ mod tests {
                 args: [
                     "SSH_CONNECTION=krill",
                     "agy",
-                    "--gemini_dir=/tmp/a/.gemini",
+                    &format!(
+                        "--gemini_dir={}",
+                        Path::new("/tmp/a").join(".gemini").to_string_lossy()
+                    ),
                     "login"
                 ]
                 .into_iter()

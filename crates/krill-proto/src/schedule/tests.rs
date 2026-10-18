@@ -1,5 +1,11 @@
 use super::*;
 
+const TEST_CWD: &str = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+
+fn parse_fixture(text: &str) -> io::Result<Schedules> {
+    Schedules::parse(&text.replace("/tmp", TEST_CWD))
+}
+
 #[test]
 fn cron_lists_ranges_steps_and_day_or_semantics() {
     let cron = Cron::parse("*/15 9-17/2 1,15 1-12 1-5").unwrap();
@@ -41,16 +47,16 @@ cwd = "/tmp"
 command = ["/bin/echo"]
 prompt = "한글 $(literal)"
 "#;
-    let value = Schedules::parse(text).unwrap();
-    let roundtrip = Schedules::parse(&toml::to_string(&value).unwrap()).unwrap();
+    let value = parse_fixture(text).unwrap();
+    let roundtrip = parse_fixture(&toml::to_string(&value).unwrap()).unwrap();
     assert_eq!(
         roundtrip.schedule.first().unwrap().prompt,
         "한글 $(literal)"
     );
-    assert!(Schedules::parse(&format!("{text}\n{text}")).is_err());
-    assert!(Schedules::parse(&text.replace("/tmp", "relative")).is_err());
-    assert!(Schedules::parse(&text.replace("test", "../escape")).is_err());
-    assert!(Schedules::parse(&text.replace("[\"/bin/echo\"]", "[]")).is_err());
+    assert!(parse_fixture(&format!("{text}\n{text}")).is_err());
+    assert!(parse_fixture(&text.replace("/tmp", "relative")).is_err());
+    assert!(parse_fixture(&text.replace("test", "../escape")).is_err());
+    assert!(parse_fixture(&text.replace("[\"/bin/echo\"]", "[]")).is_err());
 
     let extended = r#"[[schedule]]
 id = "isolated-check"
@@ -61,11 +67,11 @@ prompt = "check"
 precheck = "test -f ready"
 workspace_mode = "isolate"
 "#;
-    let parsed = Schedules::parse(extended).unwrap();
+    let parsed = parse_fixture(extended).unwrap();
     let entry = parsed.schedule.first().unwrap();
     assert_eq!(entry.precheck.as_deref(), Some("test -f ready"));
     assert_eq!(entry.workspace_mode, WorkspaceMode::Isolate);
-    assert!(Schedules::parse(&extended.replace("test -f ready", "   ")).is_err());
+    assert!(parse_fixture(&extended.replace("test -f ready", "   ")).is_err());
 
     let empty_prompt = r#"[[schedule]]
 id = "no-prompt"
@@ -74,7 +80,7 @@ cwd = "/tmp"
 command = ["/bin/echo", "two words"]
 prompt = ""
 "#;
-    let parsed_empty = Schedules::parse(empty_prompt).unwrap();
+    let parsed_empty = parse_fixture(empty_prompt).unwrap();
     assert_eq!(parsed_empty.schedule[0].prompt, "");
     let omitted_prompt = r#"[[schedule]]
 id = "omitted-prompt"
@@ -83,11 +89,11 @@ cwd = "/tmp"
 command = ["/bin/echo", "two words"]
 "#;
     assert_eq!(
-        Schedules::parse(omitted_prompt).unwrap().schedule[0].prompt,
+        parse_fixture(omitted_prompt).unwrap().schedule[0].prompt,
         ""
     );
     assert!(
-        Schedules::parse(&empty_prompt.replace("prompt = \"\"", "prompt = \"a\\u0000b\"")).is_err()
+        parse_fixture(&empty_prompt.replace("prompt = \"\"", "prompt = \"a\\u0000b\"")).is_err()
     );
 }
 
@@ -102,7 +108,7 @@ fn run_now_queue_and_coalesced_journal_roundtrip() {
             Schedule {
                 id: "gated".into(),
                 cron: "* * * * *".into(),
-                cwd: "/tmp".into(),
+                cwd: TEST_CWD.into(),
                 command: vec!["/bin/echo".into()],
                 prompt: "should-not-run".into(),
                 precheck: Some("echo 'no work' && exit 1".into()),
@@ -111,7 +117,7 @@ fn run_now_queue_and_coalesced_journal_roundtrip() {
             Schedule {
                 id: "isolated".into(),
                 cron: "* * * * *".into(),
-                cwd: "/tmp".into(),
+                cwd: TEST_CWD.into(),
                 command: vec!["/bin/echo".into()],
                 prompt: "isolated-ok".into(),
                 precheck: Some("exit 0".into()),
@@ -221,7 +227,7 @@ fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
             .map(|i| Schedule {
                 id: format!("job-{i}"),
                 cron: "* * * * *".into(),
-                cwd: "/tmp".into(),
+                cwd: TEST_CWD.into(),
                 command: vec!["/bin/echo".into()],
                 prompt: "ok".into(),
                 precheck: None,
@@ -271,6 +277,6 @@ proptest::proptest! {
     #[test]
     fn parsers_never_panic(text in ".{0,2048}", values in proptest::array::uniform5(0_u32..100)) {
         if let Ok(cron) = Cron::parse(&text) { let _ = cron.matches(values); }
-        drop(Schedules::parse(&text));
+        drop(parse_fixture(&text));
     }
 }
