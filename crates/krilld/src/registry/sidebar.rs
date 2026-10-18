@@ -18,14 +18,17 @@ pub(super) struct Cache {
 impl Cache {
     pub(super) fn snapshot(
         &mut self,
-        entries: &[(SessionId, u32, bool)],
+        entries: &[(SessionId, u32, Option<crate::session::Tap>)],
     ) -> Result<SidebarData, Failure> {
         // Scope-specific requests must never expose cached directories from another scope.
         let mut sessions = Vec::new();
         let mut repositories = BTreeMap::new();
         let mut bytes = 0;
-        for &(session, pid, live) in entries {
-            if live && let Ok(path) = crate::sys::current_directory(pid) {
+        for (session, pid, live) in entries {
+            let (session, pid) = (*session, *pid);
+            if let Some(tap) = live
+                && let Some(path) = tap.cwd(pid)
+            {
                 self.directories.insert(session, path);
             }
             let path = self.directories.get(&session);
@@ -161,7 +164,7 @@ mod tests {
         cache
             .directories
             .insert(SessionId(2), PathBuf::from("/does-not-exist/two"));
-        let snapshot = cache.snapshot(&[(SessionId(1), 0, false)]).unwrap();
+        let snapshot = cache.snapshot(&[(SessionId(1), 0, None)]).unwrap();
         assert_eq!(snapshot.sessions.len(), 1);
         assert_eq!(snapshot.sessions[0].session, SessionId(1));
         assert!(snapshot.repositories.is_empty());
@@ -170,7 +173,10 @@ mod tests {
     #[test]
     fn live_process_cwd_query() {
         assert_eq!(
-            crate::sys::current_directory(std::process::id()).unwrap(),
+            crate::sys::current_directory(std::process::id())
+                .unwrap()
+                .canonicalize()
+                .unwrap(),
             std::env::current_dir().unwrap().canonicalize().unwrap()
         );
     }
