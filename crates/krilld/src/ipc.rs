@@ -133,7 +133,7 @@ impl std::os::fd::AsFd for Listener {
 #[cfg(windows)]
 impl std::os::windows::io::AsSocket for Listener {
     fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
-        self.sock.as_socket()
+        sys::listener_socket(&self.sock)
     }
 }
 

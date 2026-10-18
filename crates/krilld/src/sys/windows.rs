@@ -481,6 +481,12 @@ pub(crate) fn clone_file(_src: &Path, _dst: &Path) -> io::Result<()> {
     unsupported()
 }
 
+/// `uds_windows` exposes `AsRawSocket` for listeners but not `AsSocket` (v1.2.1).
+pub(crate) fn listener_socket(listener: &krill_proto::os::net::UnixListener) -> BorrowedSocket<'_> {
+    // SAFETY: listener owns this socket for the entire returned borrow.
+    unsafe { BorrowedSocket::borrow_raw(listener.as_raw_socket()) }
+}
+
 /// Cancel only the synchronous IO of this daemon's pipe reader, never the PTY itself.
 pub(crate) fn cancel_pipe_read(thread: BorrowedHandle<'_>) {
     // SAFETY: borrowed live thread handle; cancellation does not close any handle.
