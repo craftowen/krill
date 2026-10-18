@@ -23,7 +23,7 @@ impl Devices {
     pub fn open(dir: Option<&Path>) -> io::Result<Self> {
         let path = dir.map(|d| d.join("mobile-devices.json"));
         let devices = if let Some(path) = &path {
-            match crate::os::no_follow(OpenOptions::new().read(true)).open(path) {
+            match crate::os::open_no_follow(OpenOptions::new().read(true), path) {
                 Ok(file) => {
                     let meta = file.metadata()?;
                     if !meta.is_file()

@@ -267,7 +267,7 @@ fn copy_with(
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Err(e),
         Err(_) => {}
     }
-    let mut source = crate::os::no_follow(OpenOptions::new().read(true)).open(src)?;
+    let mut source = crate::os::open_no_follow(OpenOptions::new().read(true), src)?;
     let mut target = OpenOptions::new()
         .write(true)
         .create_new(true)
