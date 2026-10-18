@@ -258,7 +258,10 @@ pub fn peer_pid(sock: BorrowedSocket<'_>) -> io::Result<u32> {
         return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
     }
     if returned != 4 || pid == 0 {
-        return Err(io::ErrorKind::InvalidData.into());
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("SIO_AF_UNIX_GETPEERPID returned {returned} bytes, pid {pid}"),
+        ));
     }
     Ok(pid)
 }
