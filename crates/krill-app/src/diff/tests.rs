@@ -1749,3 +1749,112 @@ fn right_panel_icon_only_tabs_switch_on_click_show_tooltips_and_fit_default_widt
         );
     }
 }
+
+/// OWE-844: 창이 비포커스(`set_active(false)`)되어도 패널이 열려 있으면(`visible == true`)
+/// `GitWatch`를 숨김으로 전환하지 않고 완화된 주기로 변경 사항을 계속 반영하며, 수동 새로고침은 즉시 실행된다.
+#[gpui::test]
+fn unfocused_panel_keeps_git_watch_and_manual_refresh_working(cx: &mut gpui::TestAppContext) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct DynamicWatchSource {
+        generation: AtomicU64,
+        hidden_seen: AtomicBool,
+        changes: Mutex<Changes>,
+    }
+    impl Source for DynamicWatchSource {
+        fn watch(&self, req: &GitWatchRequest) -> io::Result<GitWatchReply> {
+            if !req.visible {
+                self.hidden_seen.store(true, Ordering::SeqCst);
+                return Ok(GitWatchReply::Hidden);
+            }
+            let cur = self.generation.load(Ordering::SeqCst);
+            if req.since < cur || req.force {
+                Ok(GitWatchReply::Changed {
+                    generation: cur,
+                    changes: self.changes.lock().unwrap().clone(),
+                })
+            } else {
+                Ok(GitWatchReply::Unchanged { pending: false })
+            }
+        }
+    }
+
+    let source = Arc::new(DynamicWatchSource {
+        generation: AtomicU64::new(1),
+        hidden_seen: AtomicBool::new(false),
+        changes: Mutex::new(Changes {
+            files: vec![ChangedFile {
+                path: b"src/lib.rs".to_vec(),
+                old_path: None,
+                status: *b".M",
+                staged: None,
+                unstaged: None,
+            }],
+            limited: false,
+        }),
+    });
+
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(PathBuf::from("/repo"), cx);
+        p.connect_source(source.clone(), cx);
+        p
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).changes.files.len()), 1);
+
+    // 창이 비포커스되어도 `visible`은 유지되고 `visible: false` 요청을 보내지 않는다.
+    cx.update(|_, cx| view.update(cx, |p, cx| p.set_active(false, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).is_visible()));
+    assert!(!cx.update(|_, cx| view.read(cx).is_active()));
+    assert!(
+        !source.hidden_seen.load(Ordering::SeqCst),
+        "unfocused visible diff panel must not send GitWatch visible=false"
+    );
+
+    // 비포커스 상태에서 파일이 추가되면 백그라운드 감시 주기에 맞춰 자동 반영된다.
+    *source.changes.lock().unwrap() = Changes {
+        files: vec![
+            ChangedFile {
+                path: b"src/lib.rs".to_vec(),
+                old_path: None,
+                status: *b".M",
+                staged: None,
+                unstaged: None,
+            },
+            ChangedFile {
+                path: b"src/main.rs".to_vec(),
+                old_path: None,
+                status: *b"??",
+                staged: None,
+                unstaged: None,
+            },
+        ],
+        limited: false,
+    };
+    source.generation.store(2, Ordering::SeqCst);
+    for _ in 0..3 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).changes.files.len()),
+        2,
+        "unfocused visible diff panel must continue updating Git changes"
+    );
+
+    // 비포커스 상태에서 수동 새로고침(`refresh`) 호출 시 타이머를 기다리지 않고 즉시 반영된다.
+    *source.changes.lock().unwrap() = Changes {
+        files: Vec::new(),
+        limited: false,
+    };
+    source.generation.store(3, Ordering::SeqCst);
+    cx.update(|_, cx| view.update(cx, Panel::refresh));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).changes.files.len()),
+        0,
+        "manual diff refresh must execute immediately while window is unfocused"
+    );
+}

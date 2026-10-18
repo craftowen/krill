@@ -55,6 +55,7 @@ pub const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 mod edit;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const WATCH_POLL: Duration = Duration::from_millis(100);
+const WATCH_POLL_INACTIVE: Duration = Duration::from_millis(500);
 
 pub use crate::i18n::catalog::diff as text;
 
@@ -507,6 +508,10 @@ fn watch_action(
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "loaded, visible, active, and force_next are independent orthogonal panel flags"
+)]
 pub struct Panel {
     repo: PathBuf,
     tab: PanelTab,
@@ -522,6 +527,7 @@ pub struct Panel {
     repo_error: Option<String>,
     loaded: bool,
     visible: bool,
+    active: bool,
     watch_gen: u64,
     force_next: bool,
     patch_gen: u64,
@@ -551,6 +557,7 @@ impl std::fmt::Debug for Panel {
             .field("selected", &self.selected)
             .field("comparison", &self.comparison)
             .field("visible", &self.visible)
+            .field("active", &self.active)
             .finish_non_exhaustive()
     }
 }
@@ -595,6 +602,7 @@ impl Panel {
             repo_error: None,
             loaded: false,
             visible: true,
+            active: true,
             watch_gen: 0,
             force_next: false,
             patch_gen: 0,
@@ -711,7 +719,33 @@ impl Panel {
         self.visible
     }
 
-    /// 수동 새로고침: 가시 상태면 즉시 강제 조회를 트리거한다.
+    /// 창 활성 여부를 반영한다(OWE-844). 비포커스 상태에서도 패널이 열려 있으면(`visible`)
+    /// 완화된 주기로 `GitWatch`를 유지하고, 포커스를 되찾으면 즉시 빠른 감시 주기로 복귀한다.
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if active && self.visible {
+            self.start_watch(cx);
+        }
+        cx.notify();
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn watch_poll_interval(&self) -> Duration {
+        if self.active {
+            WATCH_POLL
+        } else {
+            WATCH_POLL_INACTIVE
+        }
+    }
+
+    /// 수동 새로고침: 가시·포커스 여부와 무관하게 즉시 강제 조회를 트리거한다(OWE-844).
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
         if self.tab == PanelTab::Checks {
             self.refresh_checks(cx);
@@ -726,27 +760,25 @@ impl Panel {
             self.source = Some(Arc::new(Socket::new(target)));
         }
         self.force_next = true;
-        if self.visible {
-            self.start_watch(cx);
-        }
+        self.start_watch(cx);
     }
 
     fn start_watch(&mut self, cx: &mut Context<Self>) {
-        if !self.visible || self.source.is_none() {
+        if (!self.visible && !self.force_next) || self.source.is_none() {
             return;
         }
         self.watch_task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
             loop {
                 let Ok(Some((source, req))) = this.update(cx, |this, _| {
-                    if !this.visible {
+                    if !this.visible && !this.force_next {
                         return None;
                     }
                     let source = this.source.clone()?;
                     let force = std::mem::replace(&mut this.force_next, false);
                     let req = GitWatchRequest {
                         repo: this.repo.as_os_str().as_bytes().to_vec(),
-                        visible: true,
+                        visible: this.visible || force,
                         since: this.watch_gen,
                         force,
                     };
@@ -755,14 +787,14 @@ impl Panel {
                     return;
                 };
                 let reply = bg.spawn(async move { source.watch(&req) }).await;
-                let keep_going = this.update(cx, |this, cx| {
+                let next_delay = this.update(cx, |this, cx| {
                     this.apply_watch(reply, cx);
-                    this.visible
+                    this.visible.then(|| this.watch_poll_interval())
                 });
-                if !matches!(keep_going, Ok(true)) {
+                let Ok(Some(delay)) = next_delay else {
                     return;
-                }
-                bg.timer(WATCH_POLL).await;
+                };
+                bg.timer(delay).await;
             }
         }));
     }

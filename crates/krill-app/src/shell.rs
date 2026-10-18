@@ -2601,7 +2601,7 @@ impl Shell {
 
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         self.panel_collapsed = !self.panel_collapsed;
-        let visible = !self.panel_collapsed && self.security.is_window_active();
+        let visible = !self.panel_collapsed;
         self.diff.update(cx, |d, cx| d.set_visible(visible, cx));
         cx.notify();
     }
@@ -2612,9 +2612,8 @@ impl Shell {
         }
         if self.panel_collapsed {
             self.panel_collapsed = false;
-            let visible = self.security.is_window_active();
             self.diff.update(cx, |d, cx| {
-                d.set_visible(visible, cx);
+                d.set_visible(true, cx);
                 d.show_files(window, cx);
             });
             cx.notify();
@@ -2636,9 +2635,8 @@ impl Shell {
         }
         if self.panel_collapsed {
             self.panel_collapsed = false;
-            let visible = self.security.is_window_active();
             self.diff.update(cx, |d, cx| {
-                d.set_visible(visible, cx);
+                d.set_visible(true, cx);
                 d.show_search(window, cx);
             });
             cx.notify();
