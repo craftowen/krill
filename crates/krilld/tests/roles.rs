@@ -553,6 +553,7 @@ fn creator_session_can_wait_read_and_send_to_created_child_while_unrelated_sessi
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
