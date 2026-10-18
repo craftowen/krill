@@ -1,6 +1,6 @@
 //! 기기 비밀키(`link/secret.key`) 생성·보관 및 마스킹(`Debug` 리댁션).
 //!
-//! - 상태 디렉터리 `<state_dir>/link/secret.key`에 0600 권한·원자적 쓰기로 보관한다.
+//! - 상태 디렉터리 `<state_dir>/link/secret.key`에 0600 권한(Windows는 `%LOCALAPPDATA%` ACL 상속)·원자적 쓰기로 보관한다.
 //! - 로그·오류·`Debug` 출력에 비밀키 원문이나 바이트를 절대 노출하지 않는다.
 
 use std::fmt;
@@ -80,7 +80,6 @@ impl DeviceIdentity {
         self.secret.public()
     }
 
-    #[cfg(unix)]
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.secret
     }

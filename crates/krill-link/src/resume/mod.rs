@@ -1,16 +1,11 @@
-//! Resumable link stream metadata and Unix transport.
+//! Resumable link stream metadata and local-socket transport.
 use serde::{Deserialize, Serialize};
 
-#[cfg(unix)]
+mod logical;
 pub(crate) mod registry;
-#[cfg(unix)]
 mod state;
-#[cfg(unix)]
-mod unix;
-#[cfg(unix)]
 pub(crate) mod wire;
-#[cfg(unix)]
-pub(crate) use unix::{Attachment, HANDSHAKE_TIMEOUT, Logical};
+pub(crate) use logical::{Attachment, HANDSHAKE_TIMEOUT, Logical};
 
 pub const MAX_STREAMS: usize = 32;
 pub const DEFAULT_STREAM_BUFFER_LIMIT: usize = 1024 * 1024;

@@ -4,15 +4,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
-#[cfg(unix)]
-mod unix;
-#[cfg(unix)]
-pub use unix::*;
-#[cfg(not(unix))]
-#[path = "connect/unsupported.rs"]
-mod unsupported;
-#[cfg(not(unix))]
-pub use unsupported::*;
+mod tunnel;
+pub use tunnel::*;
 
 /// 재연결 지수 백오프 초기 지연 (50ms).
 pub const BACKOFF_INITIAL: Duration = Duration::from_millis(50);

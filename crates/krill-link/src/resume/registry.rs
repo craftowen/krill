@@ -1,13 +1,13 @@
 //! Authenticated server registry. Unknown Resume never opens a new UDS.
 use super::{Attachment, HANDSHAKE_TIMEOUT, Logical, StreamId, StreamStatus, wire};
 use crate::Error;
+use crate::local::Stream;
 use iroh::EndpointId;
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::net::UnixStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -186,8 +186,7 @@ impl Registry {
         let logical = match found {
             Ok(Some(l)) => l,
             Ok(None) => {
-                let unix =
-                    tokio::time::timeout(HANDSHAKE_TIMEOUT, UnixStream::connect(socket)).await;
+                let unix = tokio::time::timeout(HANDSHAKE_TIMEOUT, Stream::connect(socket)).await;
                 let opened = match unix {
                     Ok(Ok(unix)) => Logical::spawn(
                         unix,

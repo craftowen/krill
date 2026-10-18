@@ -1,4 +1,5 @@
 use super::{MAX_STREAMS, StreamId, StreamPhase, StreamStatus, state, wire};
+use crate::local::Stream;
 use crate::{Error, store::now_unix_ms};
 use iroh::endpoint::{Connection, RecvStream, SendStream};
 use state::{Bytes, Ledger, add};
@@ -7,11 +8,7 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt as _;
-use tokio::net::{
-    UnixStream,
-    unix::{OwnedReadHalf, OwnedWriteHalf},
-};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _, ReadHalf, WriteHalf};
 use tokio::sync::{Notify, mpsc, oneshot, watch};
 use tokio::task::{JoinHandle, JoinSet};
 use wire::{CHUNK, HEADER_LEN, Header, Hello, Kind};
@@ -58,7 +55,7 @@ pub(crate) struct Logical {
 
 impl Logical {
     pub fn spawn(
-        unix: UnixStream,
+        unix: Stream,
         id: StreamId,
         grace: Duration,
         buffer_limit: usize,
@@ -150,12 +147,12 @@ impl Logical {
 
     async fn run(
         self: Arc<Self>,
-        unix: UnixStream,
+        unix: Stream,
         mut attachments: mpsc::Receiver<Attachment>,
         mut grace: Duration,
         buffer_limit: usize,
     ) {
-        let (read, write) = unix.into_split();
+        let (read, write) = tokio::io::split(unix);
         let (incoming_tx, incoming_rx) = mpsc::channel(1);
         let mut local_tasks = JoinSet::new();
         let me = Arc::clone(&self);
@@ -289,35 +286,30 @@ impl Logical {
         .ok();
     }
 
-    async fn read_local(&self, unix: OwnedReadHalf, limit: usize) -> Result<(), Error> {
+    async fn read_local(&self, mut unix: ReadHalf<Stream>, limit: usize) -> Result<(), Error> {
         let mut stop = self.stop.subscribe();
+        let mut scratch = [0; CHUNK];
         loop {
-            tokio::select! { _=stop.changed()=>return Ok(()), result=unix.readable()=>result.map_err(Error::Io)? }
-            let mut scratch = [0; CHUNK];
-            match unix.try_read(&mut scratch) {
-                Ok(0) => {
-                    self.with(|l| {
-                        l.tx_fin = true;
-                        Ok(())
-                    })?;
-                    self.changed.notify_waiters();
-                    return Ok(());
-                }
-                Ok(n) => {
-                    let mut bytes = Bytes::zeroed(n)?;
-                    bytes.as_mut().copy_from_slice(&scratch[..n]);
-                    self.with(|l| l.append(bytes, limit))?;
-                    self.changed.notify_waiters();
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(e) => return Err(Error::Io(e)),
+            // `read` is cancel safe: losing the race to `stop` consumes no bytes.
+            let n = tokio::select! { _=stop.changed()=>return Ok(()), n=unix.read(&mut scratch)=>n.map_err(Error::Io)? };
+            if n == 0 {
+                self.with(|l| {
+                    l.tx_fin = true;
+                    Ok(())
+                })?;
+                self.changed.notify_waiters();
+                return Ok(());
             }
+            let mut bytes = Bytes::zeroed(n)?;
+            bytes.as_mut().copy_from_slice(&scratch[..n]);
+            self.with(|l| l.append(bytes, limit))?;
+            self.changed.notify_waiters();
         }
     }
 
     async fn write_local(
         &self,
-        mut unix: OwnedWriteHalf,
+        mut unix: WriteHalf<Stream>,
         mut incoming: mpsc::Receiver<Incoming>,
     ) -> Result<(), Error> {
         let mut stop = self.stop.subscribe();
