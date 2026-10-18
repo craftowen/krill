@@ -1,3 +1,5 @@
+// Minikrill 변경(OWE-779, Apache-2.0 §4(b)): 정적 이미지 디코드 시 SmallVec::from_elem 복제를 피해
+// 큰 래스터 버퍼가 두 번 할당·캐시되지 않게 한다.
 mod app_menu;
 mod keyboard;
 mod keystroke;
@@ -3251,7 +3253,9 @@ pub(crate) fn decode_static_image_from_decoder(
         pixel.swap(0, 2);
     }
 
-    Ok(SmallVec::from_elem(Frame::new(data), 1))
+    // Minikrill 변경(OWE-779): SmallVec::from_elem(_, 1)은 Frame을 clone한 뒤 원본을 버려
+    // macOS libmalloc large cache에 디코드 버퍼 사본이 남는다.
+    Ok(SmallVec::from_const([Frame::new(data)]))
 }
 
 impl Hash for Image {
