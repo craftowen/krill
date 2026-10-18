@@ -406,6 +406,10 @@ fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
             ws::BINARY,
             &channel.seal(b"{\"label\":\"attacker\"}").unwrap(),
         );
+        assert_eq!(
+            receive(&mut socket).unwrap(),
+            (8, 1008_u16.to_be_bytes().to_vec())
+        );
         assert!(receive(&mut socket).is_err());
     }
     let s = lock(&g.shared.state);
