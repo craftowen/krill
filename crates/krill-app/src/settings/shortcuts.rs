@@ -49,6 +49,7 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::ToggleSidebar", text::SC_SIDEBAR),
     ("shell::FocusSidebar", text::SC_FOCUS_SIDEBAR),
     ("shell::TogglePanel", text::SC_PANEL),
+    ("shell::ToggleChanges", text::SC_CHANGES),
     ("shell::ToggleExplorer", text::SC_EXPLORER),
     ("shell::ToggleSearch", text::SC_WORKSPACE_SEARCH),
     ("shell::Jump", text::SC_JUMP),
