@@ -426,7 +426,7 @@ fn viewers_render(cx: &mut gpui::TestAppContext) {
                 .flex_col()
                 .child(self.image.clone())
                 .child(self.csv.clone())
-                .child(view::markdown("md", "# 제목\n\n- 항목"))
+                .child(view::markdown("md", "# 제목\n\n- 항목", cx))
                 .child(view::notebook("nb", &self.notebook, cx))
                 .child(view::placeholder(
                     Path::new("/tmp/a.pdf"),

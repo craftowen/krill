@@ -1394,7 +1394,7 @@ impl Panel {
             .items_center()
             .gap_1()
             .border_b_1()
-            .border_color(p.border)
+            .border_color(p.sidebar_border)
             .child(
                 div().flex_1().min_w_0().child(
                     Input::new(&filter_input)
@@ -1677,7 +1677,6 @@ impl Panel {
                             .child(
                                 Button::new("explorer-delete-cancel")
                                     .debug_selector(|| "explorer-delete-cancel".into())
-                                    .small()
                                     .ghost()
                                     .label(text::EXPLORER_CANCEL.get())
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1688,7 +1687,6 @@ impl Panel {
                     .child(
                         Button::new("explorer-delete-confirm")
                             .debug_selector(|| "explorer-delete-confirm".into())
-                            .small()
                             .danger()
                             .label(text::EXPLORER_DELETE.get())
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1710,8 +1708,8 @@ impl Panel {
             self.explorer.rendered_rows += range.len();
         }
         let p = ui::palette(cx);
-        let hover_bg = p.accent.opacity(0.6);
-        let fg = p.foreground;
+        let hover_bg = p.sidebar_accent;
+        let fg = p.sidebar_foreground;
         let muted = p.muted_foreground;
         let tree_focus = self
             .explorer
@@ -1750,7 +1748,7 @@ impl Panel {
                 };
                 let row = self.explorer.rows.get(data_ix)?.clone();
                 let is_selected = self.explorer.selected.as_ref() == Some(&row.path);
-                let selected_bg = p.accent;
+                let selected_bg = p.sidebar_accent;
                 let indent_px =
                     f32::from(u16::try_from(row.depth).unwrap_or(16).min(16)) * 14.0 + 8.0;
                 let row_path = row.path.clone();
@@ -1786,7 +1784,13 @@ impl Panel {
 
                 let selector = format!("explorer-row-{ix}");
                 let path_selector = format!("explorer-item-{}", row.relative_path);
-                let row_fg = if row.ignored { muted } else { fg };
+                let row_fg = if row.ignored {
+                    muted
+                } else if is_selected {
+                    p.sidebar_accent_foreground
+                } else {
+                    fg
+                };
                 let focus = tree_focus.clone();
                 let row_path_click = row_path.clone();
 
@@ -1802,8 +1806,11 @@ impl Panel {
                         .items_center()
                         .gap_1p5()
                         .cursor_pointer()
+                        .text_color(row_fg)
                         .when(is_selected, |d| d.bg(selected_bg))
-                        .when(!is_selected, |d| d.hover(move |s| s.bg(hover_bg)))
+                        .when(!is_selected, |d| {
+                            d.hover(move |s| s.bg(hover_bg).text_color(p.sidebar_accent_foreground))
+                        })
                         .child(chevron)
                         .child(icon)
                         .child(

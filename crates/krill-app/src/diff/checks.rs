@@ -14,6 +14,7 @@ use std::sync::Arc;
 use gpui::{AnyElement, Context, FontWeight, Stateful, Task, Window, div, prelude::*, px};
 use gpui_component::Disableable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::{Icon, IconName, Sizable as _};
 
 use super::{Panel, SendComments};
@@ -405,13 +406,18 @@ impl Panel {
         let is_failed = check.state == CheckState::Failed;
         let selected = is_failed && self.checks.selected_checks.contains(&idx);
         let expanded = self.checks.expanded_logs.contains(&idx);
+        let is_pending = check.state == CheckState::Pending;
         let (icon_name, status_color) = match check.state {
             CheckState::Passed => (IconName::CircleCheck, p.success),
             CheckState::Failed => (IconName::CircleX, p.destructive),
             CheckState::Pending => (IconName::Loader, p.warning),
             CheckState::Skipped => (IconName::Minus, p.muted_foreground),
         };
-        let checkbox_mark = if selected { "☑" } else { "☐" };
+        let card_fg = if selected {
+            p.sidebar_accent_foreground
+        } else {
+            p.card_foreground
+        };
         let details_url = check
             .details_url
             .as_deref()
@@ -449,7 +455,7 @@ impl Panel {
             .truncate()
             .text_size(crate::ui::TEXT_XS)
             .font_weight(FontWeight::MEDIUM)
-            .text_color(p.sidebar_foreground)
+            .text_color(card_fg)
             .child(check.name.clone());
         if let Some(url) = details_url {
             name_el = name_el
@@ -471,35 +477,42 @@ impl Panel {
                     div()
                         .id(("pr-check-select", idx))
                         .debug_selector(move || format!("pr-check-select-{idx}"))
-                        .cursor_pointer()
                         .px_1()
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(if selected {
-                            p.sidebar_foreground
-                        } else {
-                            p.muted_foreground
-                        })
-                        .child(checkbox_mark)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_check_selection(idx, cx);
-                        })),
+                        .child(
+                            Checkbox::new(("pr-check-select-box", idx))
+                                .checked(selected)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.toggle_check_selection(idx, cx);
+                                })),
+                        ),
                 )
             })
-            .child(Icon::new(icon_name).size(px(13.)).text_color(status_color))
-            .child(name_el)
-            .child(
-                div()
-                    .flex_none()
-                    .px_1()
-                    .rounded(crate::ui::RADIUS_XS)
-                    .bg(p.muted)
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_2XS)
+            .child(if is_pending {
+                crate::ui::status::status_glyph(
+                    krill_proto::control::AgentState::Working,
+                    false,
+                    crate::ui::status::Size::Md,
+                    cx,
+                )
+                .into_any_element()
+            } else {
+                Icon::new(icon_name)
+                    .size(px(13.))
                     .text_color(status_color)
-                    .child(check.state.label()),
-            )
+                    .into_any_element()
+            })
+            .child(name_el)
+            .child(crate::ui::badge(
+                p,
+                match check.state {
+                    CheckState::Passed => crate::ui::BadgeTone::Success,
+                    CheckState::Failed => crate::ui::BadgeTone::Destructive,
+                    CheckState::Pending => crate::ui::BadgeTone::Warning,
+                    CheckState::Skipped => crate::ui::BadgeTone::Muted,
+                },
+                check.state.label(),
+            ))
             .when(check.log_tail.is_some(), |d| {
                 let label = if expanded {
                     text::LOG_HIDE.get()
@@ -543,7 +556,7 @@ impl Panel {
                     .rounded(crate::ui::RADIUS_XS)
                     .bg(p.background)
                     .border_1()
-                    .border_color(p.sidebar_border)
+                    .border_color(p.border)
                     .flex()
                     .flex_col()
                     .gap_1()
@@ -575,7 +588,11 @@ impl Panel {
     ) -> Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
         let selected = self.checks.selected_comments.contains(&idx);
-        let checkbox_mark = if selected { "☑" } else { "☐" };
+        let card_fg = if selected {
+            p.sidebar_accent_foreground
+        } else {
+            p.card_foreground
+        };
         let has_path = !comment.path.trim().is_empty();
 
         let mut card = div()
@@ -609,7 +626,7 @@ impl Panel {
             .font_family(crate::ui::FONT_MONO)
             .text_size(crate::ui::TEXT_2XS)
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(p.sidebar_foreground)
+            .text_color(card_fg)
             .child(comment.location());
         if has_path {
             location_el = location_el
@@ -630,20 +647,15 @@ impl Panel {
                 div()
                     .id(("pr-comment-select", idx))
                     .debug_selector(move || format!("pr-comment-select-{idx}"))
-                    .cursor_pointer()
                     .px_1()
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(if selected {
-                        p.sidebar_foreground
-                    } else {
-                        p.muted_foreground
-                    })
-                    .child(checkbox_mark)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.toggle_comment_selection(idx, cx);
-                    })),
+                    .child(
+                        Checkbox::new(("pr-comment-select-box", idx))
+                            .checked(selected)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.toggle_comment_selection(idx, cx);
+                            })),
+                    ),
             )
             .child(location_el)
             .child(
@@ -654,36 +666,25 @@ impl Panel {
                     .child(format!("@{}", comment.author)),
             )
             .when(comment.is_bot, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .px_1()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .bg(p.muted)
-                        .font_family(crate::ui::FONT_MONO)
-                        .text_size(crate::ui::TEXT_2XS)
-                        .text_color(p.muted_foreground)
-                        .child(text::BOT_BADGE.get()),
-                )
+                d.child(crate::ui::badge(
+                    p,
+                    crate::ui::BadgeTone::Muted,
+                    text::BOT_BADGE.get(),
+                ))
             })
             .when(comment.is_outdated, |d| {
-                d.child(
-                    div()
-                        .flex_none()
-                        .px_1()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .bg(p.muted)
-                        .text_size(crate::ui::TEXT_2XS)
-                        .text_color(p.warning)
-                        .child(text::OUTDATED_BADGE.get()),
-                )
+                d.child(crate::ui::badge(
+                    p,
+                    crate::ui::BadgeTone::Warning,
+                    text::OUTDATED_BADGE.get(),
+                ))
             });
 
         card = card.child(header).child(
             div()
                 .pl_5()
                 .text_size(crate::ui::TEXT_XS)
-                .text_color(p.sidebar_foreground)
+                .text_color(card_fg)
                 .child(comment.body.clone()),
         );
 
@@ -710,18 +711,53 @@ impl Panel {
         let p = crate::ui::palette(cx);
 
         if self.checks.loading && self.checks.inspection.is_none() {
-            return Self::render_empty_state(
-                "pr-checks-loading",
-                IconName::Loader,
-                text::LOADING_CHECKS.get(),
-                "",
-                cx,
-            )
-            .into_any_element();
+            return div()
+                .id("pr-checks-loading")
+                .debug_selector(|| "pr-checks-loading".into())
+                .flex_1()
+                .min_h_0()
+                .px_4()
+                .py(crate::ui::SIDEBAR_EMPTY_PY)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .bg(p.sidebar)
+                .child(crate::ui::status::status_glyph(
+                    krill_proto::control::AgentState::Working,
+                    false,
+                    crate::ui::status::Size::Md,
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_SM)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(p.sidebar_foreground)
+                        .child(text::LOADING_CHECKS.get()),
+                )
+                .into_any_element();
         }
 
         if let Some(err) = &self.checks.error {
-            return Self::render_empty_state("pr-checks-error", IconName::CircleAlert, err, "", cx)
+            return div()
+                .flex_1()
+                .min_h_0()
+                .px_4()
+                .py(crate::ui::SIDEBAR_EMPTY_PY)
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .bg(p.sidebar)
+                .child(
+                    div()
+                        .debug_selector(|| "pr-checks-error".into())
+                        .w_full()
+                        .min_w_0()
+                        .child(crate::ui::error_banner(p, err.clone())),
+                )
                 .into_any_element();
         }
 
@@ -743,7 +779,7 @@ impl Panel {
                 .flex_1()
                 .min_h_0()
                 .px_4()
-                .py_6()
+                .py(crate::ui::SIDEBAR_EMPTY_PY)
                 .flex()
                 .flex_col()
                 .items_center()
@@ -934,16 +970,11 @@ impl Panel {
                                     .text_color(p.sidebar_foreground)
                                     .child(text::CHECKS_SECTION.get()),
                             )
-                            .child(
-                                div()
-                                    .px_1()
-                                    .rounded(crate::ui::RADIUS_XS)
-                                    .bg(p.muted)
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(pr.checks.len().to_string()),
-                            ),
+                            .child(crate::ui::badge(
+                                p,
+                                crate::ui::BadgeTone::Muted,
+                                pr.checks.len().to_string(),
+                            )),
                     )
                     .when(failed > 0, |d| {
                         d.child(
@@ -994,16 +1025,11 @@ impl Panel {
                                     .text_color(p.sidebar_foreground)
                                     .child(text::COMMENTS_SECTION.get()),
                             )
-                            .child(
-                                div()
-                                    .px_1()
-                                    .rounded(crate::ui::RADIUS_XS)
-                                    .bg(p.muted)
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(pr.review_comments.len().to_string()),
-                            ),
+                            .child(crate::ui::badge(
+                                p,
+                                crate::ui::BadgeTone::Muted,
+                                pr.review_comments.len().to_string(),
+                            )),
                     )
                     .when(!pr.review_comments.is_empty(), |d| {
                         d.child(
@@ -1079,6 +1105,7 @@ impl Panel {
             .child(
                 Button::new("pr-fix-with-ai")
                     .debug_selector(|| "pr-fix-with-ai".into())
+                    .small()
                     .primary()
                     .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
                     .label(fix_label)
