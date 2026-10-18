@@ -608,7 +608,9 @@ fn quick_helpers(env: &Env) -> Check {
     let missing: Vec<String> = ["krill-holder", "krilld"]
         .into_iter()
         .filter(|name| {
-            let path = env.krill.parent().unwrap_or(Path::new("")).join(name);
+            // 번들 설치본은 holder·krilld가 krill(Contents/MacOS) 옆이 아니라 Contents/Helpers에 있다.
+            let path =
+                krill_proto::daemon::exe_near(env.krill.parent().unwrap_or(Path::new("")), name);
             access(&path, Access::EXEC_OK).is_err()
         })
         .map(str::to_owned)
@@ -630,7 +632,7 @@ fn quick_helpers(env: &Env) -> Check {
             id: "bin.helpers".to_owned(),
             level: Level::Required,
             status: Status::Fail,
-            summary: "helpers are missing or not executable".to_owned(),
+            summary: ctext::D_HELPERS_MISSING.format(&[("what", &missing.join(", "))]),
             detail: format!("{} (reinstall Krill)", missing.join(", ")),
             fix: Fix {
                 kind: FixKind::Reinstall,
@@ -659,7 +661,8 @@ fn version_prefix(build: &str) -> &str {
 }
 
 fn quick_version(env: &Env) -> Check {
-    let krilld = env.krill.parent().unwrap_or(Path::new("")).join("krilld");
+    let krilld =
+        krill_proto::daemon::exe_near(env.krill.parent().unwrap_or(Path::new("")), "krilld");
     match (command_version(&env.krill), command_version(&krilld)) {
         (Some(a), Some(b)) if version_prefix(&a) == version_prefix(&b) => Check {
             id: "bin.version".to_owned(),
@@ -676,7 +679,7 @@ fn quick_version(env: &Env) -> Check {
             id: "bin.version".to_owned(),
             level: Level::Required,
             status: Status::Fail,
-            summary: "binary versions differ".to_owned(),
+            summary: ctext::D_VERSION_DIFF.get().to_owned(),
             detail: "reinstall Krill".to_owned(),
             fix: Fix {
                 kind: FixKind::Reinstall,
@@ -719,7 +722,7 @@ fn quick_state(env: &Env) -> Check {
             id: "state.writable".to_owned(),
             level: Level::Required,
             status: Status::Fail,
-            summary: "state directory is not writable".to_owned(),
+            summary: ctext::D_STATE_FAIL.get().to_owned(),
             detail: format!("{} (check owner: ls -ld)", env.state.display()),
             fix: Fix {
                 kind: FixKind::Command,
