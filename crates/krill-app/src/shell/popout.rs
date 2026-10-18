@@ -3,8 +3,8 @@
 //! 플로팅 창은 기존 Shell의 입력·IME·재접속을 재사용하고 레이아웃 파일은 쓰지 않는다.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, Subscription, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
+    App, Bounds, Context, Entity, KeyBinding, KeyDownEvent, Subscription, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
 };
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -74,6 +74,9 @@ impl Render for Floating {
     fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         window.set_window_title(text::FLOAT_LABEL.get());
         div()
+            // OWE-861: 플로팅 창에서도 Shell 키 문맥이 잡혀 터미널 단축키(⌘C·⌘V·⌘A·⌘F·⌘K·⌘W)가 동작한다.
+            // 실제 편집·닫기는 안쪽 Shell 핸들러(및 아래 ClosePane 갈무리)가 맡는다.
+            .key_context(super::KEY_CONTEXT)
             .size_full()
             .capture_action(|_: &super::ClosePane, window, cx| {
                 window.remove_window();
@@ -1792,6 +1795,12 @@ impl Render for Dashboard {
         let owner = self.owner.upgrade();
         div().key_context("Dashboard").track_focus(&self.focus)
             .on_action(|_: &CloseDashboard, window, _| window.remove_window())
+            // OWE-861: 대시보드 팝아웃도 Esc로 닫힌다(⌘W는 기존 CloseDashboard 바인딩).
+            .on_key_down(cx.listener(|_, e: &KeyDownEvent, window, _| {
+                if e.keystroke.key == "escape" {
+                    window.remove_window();
+                }
+            }))
             .size_full().flex().flex_col().bg(p.background).text_color(p.foreground)
             .font_family(ui::FONT_UI).text_size(ui::TEXT_SM)
             .child(div().h(ui::TITLEBAR_HEIGHT).pl(ui::TRAFFIC_LIGHT_PAD).flex().items_center().child(text::DASHBOARD.get()))
@@ -1806,13 +1815,15 @@ impl Render for Dashboard {
                             .children(cards.into_iter().map(|item| {
                                 let session = item.id;
                                 let screen = owner.as_ref().and_then(|o| o.read(cx).live.values().find(|l| l.pane.session() == Some(session))).map(|l| preview(&l.pane.shown()));
+                                // OWE-861: 미리보기가 있을 때는 '미리보기 없음'을 그리지 않는다.
+                                let has_screen = screen.is_some();
                                 div().id(("dashboard-session", session.0)).debug_selector(move || format!("dashboard-session-{}", session.0))
                                     .p(ui::SPACE_2).rounded(ui::RADIUS_XS).bg(p.card).cursor_pointer()
                                     .hover(|d| d.bg(p.accent)).flex().flex_col().gap_2()
                                     .child(item.label.clone())
-                                    .when_some(screen, |d, screen| d.child(div().text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::PREVIEW.get()))
+                                    .when_some(screen, |d, screen| d.child(div().debug_selector(move || format!("dashboard-preview-{}", session.0)).text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::PREVIEW.get()))
                                         .child(div().font_family(ui::FONT_MONO).text_size(ui::TEXT_2XS).overflow_hidden().child(screen)))
-                                    .child(div().text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::NO_PREVIEW.get()))
+                                    .when(!has_screen, |d| d.child(div().debug_selector(move || format!("dashboard-no-preview-{}", session.0)).text_size(ui::TEXT_2XS).text_color(p.muted_foreground).child(text::NO_PREVIEW.get())))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         if let Err(error) = open_floating(session, this.target.clone(), ui::terminal_theme(cx), cx) {
                                             tracing::warn!(%error, "floating terminal failed");
