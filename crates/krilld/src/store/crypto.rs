@@ -237,3 +237,33 @@ impl Stream {
             .map_err(crypto_error)
     }
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_file_is_dpapi_sealed_reused_and_required_when_data_exists() {
+        let root = std::env::temp_dir().join(format!("krilld-dpapi-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(
+            Key::load(&root, true).is_err(),
+            "데이터가 있는데 키가 없으면 새로 만들지 않는다"
+        );
+        let first = Key::load(&root, false).unwrap();
+        let sealed = std::fs::read(root.join(KEY_FILE)).unwrap();
+        assert!(sealed.len() > 32, "평문 32바이트가 아니라 DPAPI blob이다");
+        assert!(!sealed.windows(32).any(|w| w == first.0.as_ref()));
+        let second = Key::load(&root, true).unwrap();
+        assert_eq!(first.0.as_ref(), second.0.as_ref());
+        let mut bad = sealed;
+        if let Some(b) = bad.get_mut(40) {
+            *b ^= 1;
+        }
+        std::fs::write(root.join(KEY_FILE), bad).unwrap();
+        let err = Key::load(&root, true).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

@@ -111,3 +111,31 @@ pub(crate) fn allocated(meta: &Metadata) -> u64 {
     let bytes = meta.len();
     bytes
 }
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_no_follow_refuses_symlinks() {
+        let dir = std::env::temp_dir().join(format!("krilld-nofollow-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("real");
+        std::fs::write(&file, b"x").unwrap();
+        let link = dir.join("link");
+        if let Err(e) = std::os::windows::fs::symlink_file(&file, &link) {
+            // 심볼릭 링크 권한(관리자·개발자 모드)이 없는 환경.
+            eprintln!("skip: symlink_file {e}");
+            return;
+        }
+        assert!(open_no_follow(OpenOptions::new().read(true), &file).is_ok());
+        let err = open_no_follow(OpenOptions::new().read(true), &link).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(681));
+        let err =
+            open_no_follow(OpenOptions::new().create_new(true).write(true), &link).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&file).unwrap(), b"x");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
