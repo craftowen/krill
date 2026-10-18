@@ -257,10 +257,11 @@ pub fn peer_pid(sock: BorrowedSocket<'_>) -> io::Result<u32> {
         // SAFETY: 인자 없이 이 스레드의 마지막 Winsock 오류를 읽는다.
         return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
     }
-    if returned != 4 || pid == 0 {
+    // 반환 바이트 수는 믿지 않는다: pid를 채우고도 0을 돌려준 경우가 있다(VM 실측, 같은 테스트 안 두 번째 호출).
+    if pid == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!("SIO_AF_UNIX_GETPEERPID returned {returned} bytes, pid {pid}"),
+            "SIO_AF_UNIX_GETPEERPID returned no pid",
         ));
     }
     Ok(pid)
