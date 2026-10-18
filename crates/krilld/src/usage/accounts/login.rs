@@ -1,7 +1,7 @@
 //! CLI 상태 조회는 `SAVE_LOCK` 밖에서 한다. 캐시는 비밀값을 포함하지 않는다.
 
+use krill_proto::os::ffi::OsStrExt as _;
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
@@ -167,6 +167,7 @@ thread_local! {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

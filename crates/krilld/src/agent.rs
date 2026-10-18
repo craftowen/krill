@@ -13,9 +13,9 @@
 
 use krill_proto::agent::hooks::{self, Agent};
 use krill_proto::agent::{Permission, Profile};
+use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::usage::ProviderKind;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -567,9 +567,9 @@ pub(crate) fn write_trust_file_cas(
     bytes: &[u8],
     before_rename: Option<&dyn Fn(&Path)>,
 ) -> io::Result<bool> {
+    use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
     use std::sync::atomic::Ordering;
 
     if let Some(dir) = target.parent() {
@@ -579,7 +579,12 @@ pub(crate) fn write_trust_file_cas(
         tracing::warn!(path = %target.display(), "refusing to write symlink trust config");
         return Ok(false);
     }
-    let mode = std::fs::metadata(target).map_or(0o600, |m| m.permissions().mode() & 0o777);
+    #[cfg(unix)]
+    let mode = std::fs::metadata(target).map_or(0o600, |m| {
+        std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
+    });
+    #[cfg(windows)]
+    let mode = 0o600;
     let seq = TRUST_SEQ.fetch_add(1, Ordering::Relaxed);
     let tmp = target.with_extension(format!("tmp.{}.{}", std::process::id(), seq));
     let write_res = (|| -> io::Result<()> {
@@ -1316,7 +1321,7 @@ fn apply_account_env(
 
 /// 숨은 agy 플래그가 사라진 업데이트 뒤 잘못된 프로필로 조용히 실행하지 않도록 격리 HOME에서 확인한다.
 fn agy_gemini_dir_supported() -> bool {
-    use std::os::unix::ffi::OsStrExt as _;
+    use krill_proto::os::ffi::OsStrExt as _;
     let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
     let Some(exe) = krill_proto::agent::which("agy", path) else {
         return false;
@@ -1329,7 +1334,7 @@ fn agy_gemini_dir_supported() -> bool {
 }
 
 fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
-    use std::os::unix::fs::DirBuilderExt as _;
+    use krill_proto::os::fs::DirBuilderExt as _;
     if std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -1469,4 +1474,5 @@ fn wrap_account(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

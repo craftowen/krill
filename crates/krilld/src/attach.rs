@@ -20,12 +20,12 @@
 //! 쓴다. 거부되면 이 파일의 `Read::Disk`·`Source::Cold` 처리와 `Store::raw`만 걷어 낸다. 키프레임은 클라이언트
 //! 전송용(보이는 화면)이라 MK-006 포크(데몬 권위 키프레임: 파서 꼬리·모드)에 기대지 않는다.
 
+use crate::os::AsFd;
+use krill_proto::os::net::UnixStream;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Write};
 use std::net::Shutdown;
-use std::os::fd::AsFd;
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;

@@ -13,6 +13,7 @@ pub mod holder;
 pub mod ipc;
 pub mod mobile;
 pub mod monitor;
+mod os;
 pub mod registry;
 pub mod rejoin;
 mod resources;

@@ -1,4 +1,6 @@
+use std::fs::Permissions;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::thread;
 

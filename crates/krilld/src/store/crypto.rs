@@ -139,6 +139,7 @@ impl Key {
         }
     }
 
+    #[cfg_attr(windows, expect(dead_code, reason = "Windows 키 저장(DPAPI)은 WIN-42"))]
     pub(super) fn from_slice(bytes: &[u8]) -> io::Result<Self> {
         let bytes = bytes.try_into().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "invalid segment key length")

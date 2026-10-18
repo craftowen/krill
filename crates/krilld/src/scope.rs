@@ -10,12 +10,12 @@
 //! | 세션 X 루트 프로세스 또는 그 후손 | [`Scope::Session`]`(X)` — X와 X가 만든 하위 세션만 |
 //! | 피어 PID·부모 조회 실패, 체인이 [`MAX_DEPTH`]를 넘음 | [`Scope::Restricted`] — 어떤 세션도 못 다룸 |
 
+use crate::os::AsFd;
+use krill_proto::os::fs::OpenOptionsExt;
+use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::fd::AsFd;
-use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -418,4 +418,5 @@ impl Audit {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

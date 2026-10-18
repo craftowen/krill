@@ -21,7 +21,6 @@ mod input;
 
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -32,15 +31,21 @@ use krill_proto::SessionId;
 use krill_proto::holder::WinSize;
 use krill_proto::screen::{Cell, Revision, Screen, Seq};
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
-use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::io::{Errno, read, write};
 
 use crate::appearance::Appearance;
+use crate::os::{AsFd, BorrowedFd, OwnedFd};
 use crate::store::{Piece, Recorder, Store};
 use crate::term::{Engine, Feed};
 
 /// macOS PTY master의 read 한 번 최대 크기(perf-first 실측).
 const PTY_CHUNK: usize = 1_024;
+/// 슬레이브가 모두 닫힌 master의 read 오류.
+#[cfg(unix)]
+const PTY_EOF: Errno = Errno::IO;
+/// Windows는 master가 만들어지지 않는다([`pty`]). 읽기 끝은 연결 끊김으로 본다.
+#[cfg(windows)]
+const PTY_EOF: Errno = Errno::CONNRESET;
 /// 엔진에 한 번에 넣는 최대 바이트.
 const BATCH: usize = 64 * 1_024;
 /// 꽉 찬 read 뒤 다시 읽는 시간(perf-first 실측 범위 5~20µs의 가운데).
@@ -62,8 +67,86 @@ fn halt_pipe() -> io::Result<&'static (OwnedFd, OwnedFd)> {
     if let Some(p) = HALT.get() {
         return Ok(p);
     }
-    let (r, w) = io::pipe()?;
-    Ok(HALT.get_or_init(|| (r.into(), w.into())))
+    let pipe = pty::halt_pipe()?;
+    Ok(HALT.get_or_init(|| pipe))
+}
+
+/// PTY master 제어(termios). Windows는 컴파일 전용이라 master가 만들어지지 않고 모두 `Unsupported`다
+/// (`ConPTY`는 Phase 3, OWE-833).
+#[cfg(unix)]
+pub(crate) mod pty {
+    use std::io;
+    use std::os::fd::OwnedFd;
+
+    use krill_proto::holder::WinSize;
+    use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
+
+    pub(super) fn halt_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+        let (r, w) = io::pipe()?;
+        Ok((r.into(), w.into()))
+    }
+
+    pub(super) fn nonblocking(master: &OwnedFd) -> io::Result<()> {
+        fcntl_setfl(master, fcntl_getfl(master)? | OFlags::NONBLOCK)?;
+        Ok(())
+    }
+
+    pub(crate) fn size(master: &OwnedFd) -> io::Result<WinSize> {
+        let size = rustix::termios::tcgetwinsize(master)?;
+        Ok(WinSize {
+            cols: size.ws_col,
+            rows: size.ws_row,
+        })
+    }
+
+    pub(super) fn resize(master: &OwnedFd, size: WinSize) -> io::Result<()> {
+        rustix::termios::tcsetwinsize(
+            master,
+            rustix::termios::Winsize {
+                ws_col: size.cols,
+                ws_row: size.rows,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn foreground(master: &OwnedFd) -> Option<u32> {
+        rustix::termios::tcgetpgrp(master)
+            .ok()
+            .and_then(|p| u32::try_from(p.as_raw_nonzero().get()).ok())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) mod pty {
+    use std::io;
+
+    use krill_proto::holder::WinSize;
+
+    use crate::os::OwnedFd;
+
+    /// 익명 파이프는 소켓 poll에 넣을 수 없다. 리더가 없으니 깨울 것도 없다.
+    pub(super) fn halt_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn nonblocking(_master: &OwnedFd) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub(crate) fn size(_master: &OwnedFd) -> io::Result<WinSize> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn resize(_master: &OwnedFd, _size: WinSize) -> io::Result<()> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
+    pub(super) fn foreground(_master: &OwnedFd) -> Option<u32> {
+        None
+    }
 }
 
 /// 이 프로세스의 PTY 리더를 모두 멈춘다(krilld 간 인계). 리더는 읽은 묶음을 기록까지 마친 뒤 세그먼트를 봉인하고
@@ -230,7 +313,7 @@ impl Session {
         look: Arc<Appearance>,
         rec: Option<Recorder>,
     ) -> io::Result<Self> {
-        fcntl_setfl(&master, fcntl_getfl(&master)? | OFlags::NONBLOCK)?;
+        pty::nonblocking(&master)?;
         let halt = halt_pipe()?.0.as_fd();
         // krilld가 재기동했으면 seq는 디스크 마지막 세그먼트 끝에서 이어진다.
         let seq = rec.as_ref().map_or(0, Recorder::seq);
@@ -434,11 +517,7 @@ impl Tap {
 
     pub(crate) fn size(&self) -> io::Result<WinSize> {
         let _live = lock(&self.0.live);
-        let size = rustix::termios::tcgetwinsize(&self.0.master)?;
-        Ok(WinSize {
-            cols: size.ws_col,
-            rows: size.ws_row,
-        })
+        pty::size(&self.0.master)
     }
 
     pub fn id(&self) -> SessionId {
@@ -487,9 +566,7 @@ impl Tap {
 
     /// 전경 프로세스 그룹. PTY 소유권은 holder에 그대로 둔다.
     pub(crate) fn foreground(&self) -> Option<u32> {
-        rustix::termios::tcgetpgrp(&self.0.master)
-            .ok()
-            .and_then(|p| u32::try_from(p.as_raw_nonzero().get()).ok())
+        pty::foreground(&self.0.master)
     }
 
     /// CLI 화면과 원본 위치를 한 잠금 안에서 뜬다.
@@ -514,15 +591,7 @@ impl Tap {
     pub fn resize(&self, size: WinSize) -> io::Result<()> {
         let size = crate::term::clamp_size(size);
         let mut live = lock(&self.0.live);
-        rustix::termios::tcsetwinsize(
-            &self.0.master,
-            rustix::termios::Winsize {
-                ws_col: size.cols,
-                ws_row: size.rows,
-                ws_xpixel: 0,
-                ws_ypixel: 0,
-            },
-        )?;
+        pty::resize(&self.0.master, size)?;
         live.engine.resize(size);
         live.size = size;
         live.resized = Some(size);
@@ -869,8 +938,8 @@ fn read_batch(master: &OwnedFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
     let mut spin_until: Option<Instant> = None;
     while let Some(rest) = buf.get_mut(len..).filter(|r| !r.is_empty()) {
         match read(master, rest) {
-            Ok(0) | Err(Errno::IO) if len == 0 => return Ok(None),
-            Ok(0) | Err(Errno::IO) => break, // 남은 것부터 넣고 다음 바퀴에서 EOF
+            Ok(0) | Err(PTY_EOF) if len == 0 => return Ok(None),
+            Ok(0) | Err(PTY_EOF) => break, // 남은 것부터 넣고 다음 바퀴에서 EOF
             Ok(n) => {
                 len += n;
                 if n < PTY_CHUNK {
@@ -906,5 +975,6 @@ fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 #[path = "session/tests.rs"]
 mod tests;

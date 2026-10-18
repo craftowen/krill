@@ -1,6 +1,6 @@
 //! 연결 취소를 관찰하는 입력 직렬화와 프레임 경계를 넘는 bracketed paste 복구.
 
-use std::os::fd::{AsFd as _, OwnedFd};
+use crate::os::{AsFd as _, OwnedFd};
 use std::sync::TryLockError;
 
 use super::{

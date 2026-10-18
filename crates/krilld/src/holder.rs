@@ -12,17 +12,69 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::os::fd::{BorrowedFd, OwnedFd};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 
-use krill_holder::link::{Link, Packet};
+#[cfg(unix)]
+pub use krill_holder::link;
 use krill_proto::SessionId;
 use krill_proto::holder::{Error as WireError, FromHolder, ToHolder};
 
+use self::link::{Link, Packet};
+use crate::os::{BorrowedFd, OwnedFd};
 use crate::session::lock;
+
+/// Windows판 [`krill_holder::link`](OWE-820, 컴파일 전용). holder 링크가 없어 보내기·받기가 모두
+/// [`io::ErrorKind::Unsupported`]다. 그래서 [`Holder::connect`]가 늘 실패하고 세션도 만들어지지 않는다(Phase 3).
+#[cfg(windows)]
+pub mod link {
+    use std::io;
+
+    use krill_proto::holder::Frame;
+
+    use crate::os::{BorrowedFd, OwnedFd};
+
+    /// 받은 프레임 하나와 거기 붙은 핸들.
+    #[derive(Debug)]
+    pub struct Packet {
+        pub kind: u8,
+        pub body: Vec<u8>,
+        pub fds: Vec<OwnedFd>,
+    }
+
+    impl Packet {
+        /// [`krill_proto::holder`]의 `decode`에 넘길 형태.
+        pub fn frame(&self) -> Frame<'_> {
+            Frame {
+                kind: self.kind,
+                fds: u8::try_from(self.fds.len()).unwrap_or(u8::MAX),
+                body: &self.body,
+            }
+        }
+    }
+
+    /// holder 링크 자리. 소켓을 쥐고만 있다.
+    #[derive(Debug)]
+    pub struct Link(#[expect(dead_code, reason = "링크 구현은 Phase 3(OWE-833)")] OwnedFd);
+
+    impl Link {
+        pub fn new(sock: OwnedFd) -> Self {
+            Self(sock)
+        }
+
+        #[expect(clippy::unused_self, reason = "Unix 판과 같은 시그니처")]
+        pub fn send(&self, _frame: &[u8], _fds: &[BorrowedFd<'_>]) -> io::Result<()> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+
+        #[expect(clippy::unused_self, reason = "Unix 판과 같은 시그니처")]
+        pub fn recv(&mut self) -> io::Result<Option<Packet>> {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+}
 
 /// holder가 다시 넘겨준 세션(krilld 재기동).
 #[derive(Debug)]

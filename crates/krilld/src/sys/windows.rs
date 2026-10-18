@@ -76,12 +76,9 @@ pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr)>>
 
 /// 자식이 아닌 프로세스의 종료 감시. 아직 없어 [`ExitWatch::new`]가 실패한다.
 #[derive(Debug)]
-#[expect(
-    dead_code,
-    reason = "new가 늘 실패해 만들어지지 않는다(OWE-833에서 구현)"
-)]
 pub struct ExitWatch(());
 
+#[expect(clippy::unused_self, reason = "macOS·Linux 판과 같은 시그니처")]
 impl ExitWatch {
     pub fn new() -> io::Result<Self> {
         unsupported()

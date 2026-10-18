@@ -19,22 +19,23 @@
 //! `krill_proto::daemon::connect`가 기동 락 아래 새 `krill-holder --detach`를 띄운다. 서명 경로는 MK-106에서 전환한다.
 
 use std::collections::HashMap;
-use std::fs::{self, Permissions};
+use std::fs;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use krill_holder::link::Link;
 use krill_proto::SessionId;
 use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder};
+use krill_proto::os::net::{UnixListener, UnixStream};
 
+use crate::holder::link::Link;
 use crate::holder::{self, Kept};
 use crate::ipc::{Listener, with_suffix};
+use crate::os::{AsFd, OwnedFd};
 use crate::registry::Registry;
 use crate::sys::{self, ExitWatch};
 
@@ -62,9 +63,10 @@ pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
         _ => {}
     }
     let lis = UnixListener::bind(&path)?;
-    fs::set_permissions(&path, Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     reg.holder_lost();
-    let uid = rustix::process::geteuid().as_raw();
+    let uid = crate::os::euid();
     loop {
         let Ok((s, _)) = lis.accept() else { continue };
         if sys::peer_uid(s.as_fd()).ok() != Some(uid) {
@@ -113,7 +115,7 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     halt_all(reg)?;
     s.set_read_timeout(Some(PEER_TIMEOUT))?;
     s.set_write_timeout(Some(PEER_TIMEOUT))?;
-    let mut link = Link::new(OwnedFd::from(s));
+    let mut link = Link::new(crate::os::link_fd(s)?);
     let hello = FromHolder::Hello {
         version: krill_proto::holder::VERSION,
         holder_pid: std::process::id(),
@@ -182,7 +184,7 @@ impl Handover {
         let s = UnixStream::connect(handoff_path(sock))?;
         s.set_read_timeout(Some(PEER_TIMEOUT))?;
         s.set_write_timeout(Some(PEER_TIMEOUT))?;
-        let mut link = Link::new(OwnedFd::from(s));
+        let mut link = Link::new(crate::os::link_fd(s)?);
         let (_, sessions, _) = holder::receive(&mut link)?;
         Ok(Self { link, sessions })
     }

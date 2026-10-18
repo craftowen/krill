@@ -13,8 +13,8 @@
 //! 잠정 결정 의존: OWE-389(MK-024 세그먼트 저장소). 무손실 재생은 4의 세그먼트 봉인과 새 krilld의 이어 기록에
 //! 기댄다. 거부되면 이 모듈과 `registry.rs`의 `Request::Upgrade` 분기, `tests/upgrade.rs`의 처음부터 재생 검사를 고친다.
 
+use krill_proto::os::ffi::OsStrExt as _;
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 
 use krill_proto::control::{Failure, Upgrade, Upgraded, is_newer};
