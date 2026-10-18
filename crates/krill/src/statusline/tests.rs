@@ -1,14 +1,12 @@
 //! OWE-701: 실행 체인·기록·설치/제거 회귀 테스트. 전부 격리 임시 디렉터리만 쓴다.
 
-use std::os::unix::fs::PermissionsExt as _;
-
 use super::*;
 
 fn temp_root(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("owe701-{}-{}", std::process::id(), tag));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::canonicalize(&dir).unwrap()
+    crate::hook_install::canonicalize(&dir).unwrap()
 }
 
 fn payload(five: u8, seven: u8) -> Vec<u8> {
@@ -63,12 +61,16 @@ fn record_writes_cache_0600_with_cached_at_and_dedups_same_value() {
         first.get("cached_at").and_then(|c| c.as_str()),
         Some("1000")
     );
-    let mode = std::fs::metadata(statusline::cache_path(&dir))
-        .unwrap()
-        .permissions()
-        .mode()
-        & 0o777;
-    assert_eq!(mode, 0o600);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(statusline::cache_path(&dir))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 
     // 같은 값 5초 후: 파일 그대로(재기록 안 함).
     record(&dir, &body, 1_005);

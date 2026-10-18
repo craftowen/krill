@@ -27,7 +27,6 @@ const STDIN_MAX: u64 = 1024 * 1024;
 /// stdin EOF 대기. 넘으면 가진 만큼으로 진행한다(틱 pile-up 방지).
 const STDIN_WAIT: Duration = Duration::from_secs(5);
 /// 사용자 체인 명령 실행 제한. 넘으면 죽이고 빈 출력으로 둔다.
-#[cfg(unix)]
 const CHAIN_WAIT: Duration = Duration::from_secs(10);
 /// `claude --version` 프로브 제한.
 const PROBE_WAIT: Duration = Duration::from_secs(10);
@@ -100,14 +99,14 @@ fn read_stdin(wait: Duration, max: u64) -> Vec<u8> {
     receiver.recv_timeout(wait).unwrap_or_default()
 }
 
-/// 기록 대상 디렉터리. `CLAUDE_CONFIG_DIR`이 없으면 `~/.claude`로 둔다.
+/// 기록 대상 디렉터리. `CLAUDE_CONFIG_DIR`이 없으면 `~/.claude`(Windows `%USERPROFILE%\.claude`)로 둔다.
 fn config_dir() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from)
         && !dir.as_os_str().is_empty()
     {
         return Some(dir);
     }
-    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".claude"))
+    crate::hook_install::home_dir().map(|home| PathBuf::from(home).join(".claude"))
 }
 
 fn now_epoch() -> i64 {
@@ -168,11 +167,30 @@ fn resolve_chain(
     }
 }
 
-/// 사용자 명령을 `/bin/sh -c`로 실행하고 stdout을 그대로 돌려준다.
-/// 실패·타임아웃은 빈 출력이다(표시 우선).
+/// 체인 명령을 해석할 POSIX 셸. 설치한 statusLine 명령 자체가 POSIX 인용이라 Claude Code가 그 명령을
+/// 돌린 셸과 같은 종류여야 한다: Windows는 Git Bash(`CLAUDE_CODE_GIT_BASH_PATH`, 없으면 PATH의 `git` 옆
+/// `bin\bash.exe`, 그것도 없으면 PATH의 `sh`).
 #[cfg(unix)]
+fn chain_shell() -> PathBuf {
+    PathBuf::from("/bin/sh")
+}
+
+#[cfg(windows)]
+fn chain_shell() -> PathBuf {
+    std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let git = krill_proto::agent::which("git", &std::env::var_os("PATH")?)?;
+            Some(git.parent()?.parent()?.join("bin").join("bash.exe")).filter(|b| b.is_file())
+        })
+        .unwrap_or_else(|| PathBuf::from("sh"))
+}
+
+/// 사용자 명령을 [`chain_shell`]`-c`로 실행하고 stdout을 그대로 돌려준다.
+/// 실패·타임아웃은 빈 출력이다(표시 우선).
 fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
-    let mut child = match std::process::Command::new("/bin/sh")
+    let mut child = match std::process::Command::new(chain_shell())
         .arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::piped())
@@ -259,10 +277,10 @@ struct InstallPaths {
 }
 
 fn execute(action: &str, yes: bool, dry_run: bool, out: &mut impl Write) -> io::Result<()> {
-    let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME is unset"))?;
-    let home = std::fs::canonicalize(&home)?;
+    let home = crate::hook_install::home_dir().ok_or_else(|| io::Error::other("HOME is unset"))?;
+    let home = crate::hook_install::canonicalize(Path::new(&home))?;
     // 환경 루트는 심볼릭링크를 풀어 둔다(`/tmp` 등, `store::safe_path` 기준).
-    let resolve_dir = |path: PathBuf| std::fs::canonicalize(&path).unwrap_or(path);
+    let resolve_dir = |path: PathBuf| crate::hook_install::canonicalize(&path).unwrap_or(path);
     let config_dir = match std::env::var_os("CLAUDE_CONFIG_DIR") {
         Some(dir) if !dir.is_empty() => resolve_dir(PathBuf::from(dir)),
         _ => home.join(".claude"),
@@ -542,17 +560,4 @@ fn consent() -> io::Result<bool> {
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 mod tests;
-
-#[cfg(windows)]
-fn run_chain(_command: &OsStr, _input: &[u8]) -> Vec<u8> {
-    eprintln!(
-        "krill statusline: {}",
-        io::Error::new(
-            io::ErrorKind::Unsupported,
-            "shell command chains are not supported on Windows yet"
-        )
-    );
-    Vec::new()
-}
