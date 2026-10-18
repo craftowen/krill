@@ -268,9 +268,7 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let title = text::KILL_TITLE
-            .get()
-            .replace("{id}", &session.0.to_string());
+        let title = text::KILL_TITLE_NAMED.format(&[("name", &self.session_name(cx, session))]);
         let prompt = (
             title.as_str(),
             text::KILL_DETAIL.get(),
