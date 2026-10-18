@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::child::{kill_and_reap, nonblocking};
 use crate::session::lock;
 
 pub mod changes;
@@ -335,46 +336,10 @@ fn drain(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Res
     }
 }
 
-fn nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
-}
-
-fn kill_and_reap(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
-        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
-    }
-    child.kill().ok();
-    child.wait().ok();
-}
-
 /// K-15: 프로세스 그룹에 먼저 SIGTERM을 보내 git이 lockfile(`index.lock`)을 정리하고
 /// 스스로 죽을 기회를 준다. 유예 안에 안 죽으면 기존처럼 그룹 SIGKILL + 회수한다.
 fn terminate_gracefully(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
-        rustix::process::kill_process_group(pid, rustix::process::Signal::TERM).ok();
-    } else {
-        child.kill().ok();
-    }
-    let deadline = Instant::now() + TERMINATE_GRACE;
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                // git가 TERM 정리를 마쳐도 hook 자식은 TERM을 무시할 수 있다.
-                // 부모가 끝난 뒤 남은 같은 그룹까지 회수한다.
-                kill_and_reap(child);
-                return;
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-    kill_and_reap(child);
+    crate::child::terminate_gracefully(child, TERMINATE_GRACE);
 }
 
 /// 워크트리 변경과 조회가 공유하는 데몬 큐.
