@@ -31,6 +31,16 @@ pub struct SshHost {
 }
 
 impl SshHost {
+    /// [`krill_hosts::ssh::SshOptions`] 변환(관리형 프로브·설치용, OWE-897).
+    #[must_use]
+    pub fn to_ssh_options(&self) -> krill_hosts::ssh::SshOptions {
+        krill_hosts::ssh::SshOptions {
+            destination: self.destination.clone(),
+            port: self.port,
+            identity_file: self.identity_file.clone(),
+            remote_socket: self.remote_socket.clone(),
+        }
+    }
     /// 새 터미널 탭에서 `ssh` 대신 `ssh-copy-id`를 실행하도록 표시한 사본을 돌려준다.
     #[must_use]
     pub fn with_copy_id(mut self) -> Self {
@@ -852,6 +862,44 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+/// 원격에 전송할 로컬 런타임 바이너리(OWE-897 관리형 설치).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRuntime {
+    pub krill: PathBuf,
+    pub krilld: PathBuf,
+    pub holder: PathBuf,
+    /// `krill_proto::BUILD`(예: `0.1.5+dev.…`) — 원격 `VERSION`에 그대로 기록한다.
+    pub version: String,
+}
+
+/// 현재 실행 파일 기준으로 로컬 런타임 바이너리를 찾는다.
+/// 개발 빌드(`target/debug/*`, 테스트 바이너리는 `deps/*`라 부모도 본다)와
+/// 설치본(`Contents/MacOS` + `Contents/Helpers`)을 모두 지원한다.
+#[must_use]
+pub fn find_local_runtime() -> Option<LocalRuntime> {
+    let exe = std::env::current_exe().ok()?;
+    find_local_runtime_in(exe.parent().unwrap_or(Path::new(".")))
+}
+
+fn find_local_runtime_in(exe_dir: &Path) -> Option<LocalRuntime> {
+    let candidates_for = |name: &str| {
+        let mut out = vec![exe_dir.join(name), exe_dir.join("Helpers").join(name)];
+        if let Some(parent) = exe_dir.parent() {
+            // 개발 `deps`·번들 `MacOS`처럼 실행 파일이 하위 디렉터리에 있을 때.
+            out.push(parent.join(name));
+            out.push(parent.join("Helpers").join(name));
+        }
+        out
+    };
+    let pick = |name: &str| candidates_for(name).into_iter().find(|p| p.is_file());
+    Some(LocalRuntime {
+        krill: pick("krill")?,
+        krilld: pick("krilld")?,
+        holder: pick("krill-holder")?,
+        version: krill_proto::BUILD.to_owned(),
+    })
+}
+
 fn slugify(s: &str) -> String {
     let mut out = String::new();
     for ch in s.chars() {
@@ -872,6 +920,67 @@ fn slugify(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_runtime_resolution_covers_dev_and_bundle_layouts() {
+        let dir = std::env::temp_dir().join(format!("owe897-runtime-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let debug = dir.join("debug");
+        let helpers = dir.join("Contents").join("Helpers");
+        let macos = dir.join("Contents").join("MacOS");
+        std::fs::create_dir_all(&debug).unwrap();
+        std::fs::create_dir_all(&helpers).unwrap();
+        std::fs::create_dir_all(&macos).unwrap();
+
+        // 개발 레이아웃: 같은 디렉터리.
+        for name in ["krill", "krilld", "krill-holder"] {
+            std::fs::write(debug.join(name), b"x").unwrap();
+        }
+        let rt = find_local_runtime_in(&debug).unwrap();
+        assert_eq!(rt.krill, debug.join("krill"));
+        assert!(!rt.version.is_empty());
+
+        // `deps` 같은 하위 디렉터리에서는 부모를 본다.
+        let deps = debug.join("deps");
+        std::fs::create_dir_all(&deps).unwrap();
+        assert_eq!(
+            find_local_runtime_in(&deps).unwrap().krilld,
+            debug.join("krilld")
+        );
+
+        // 번들 레이아웃: MacOS/krill + Helpers/krilld·holder.
+        for name in ["krilld", "krill-holder"] {
+            std::fs::write(helpers.join(name), b"x").unwrap();
+        }
+        std::fs::write(macos.join("krill"), b"x").unwrap();
+        let rt = find_local_runtime_in(&macos).unwrap();
+        assert_eq!(rt.krill, macos.join("krill"));
+        assert_eq!(rt.krilld, helpers.join("krilld"));
+
+        // 하나라도 없으면 전체가 None(반쪽 설치 방지).
+        std::fs::remove_file(helpers.join("krilld")).unwrap();
+        assert!(find_local_runtime_in(&macos).is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn ssh_host_converts_to_managed_options() {
+        let host = SshHost {
+            id: "ssh-studio".into(),
+            label: "Studio".into(),
+            destination: "owen@studio.local".into(),
+            port: Some(2201),
+            identity_file: Some("~/.ssh/id_ed25519".into()),
+            remote_socket: None,
+            imported: false,
+            copy_id_first: false,
+        };
+        let opts = host.to_ssh_options();
+        assert_eq!(opts.destination, "owen@studio.local");
+        assert_eq!(opts.port, Some(2201));
+        opts.validate().unwrap();
+        assert!(opts.probe_args().contains(&host.destination));
+    }
 
     #[test]
     fn parses_ssh_config_and_skips_wildcards() {

@@ -174,6 +174,18 @@ impl SshOptions {
         args
     }
 
+    /// 관리형 원격 프로브(OS·아키·홈·버전·소켓 번들, OWE-897)용 ssh 인자 목록.
+    pub fn probe_args(&self) -> Vec<String> {
+        let mut args = self.common_args(5);
+        args.extend([
+            "-o".to_owned(),
+            "BatchMode=yes".to_owned(),
+            self.destination.clone(),
+            crate::managed::probe_command(),
+        ]);
+        args
+    }
+
     /// 연결 테스트용 ssh 인자 목록.
     #[cfg(test)]
     pub fn test_args(&self) -> Vec<String> {
