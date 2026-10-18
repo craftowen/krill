@@ -207,3 +207,18 @@ macOS 27.0.1 arm64, Homebrew rustc 1.98.1, Command Line Tools 환경에서:
 - Bash 구문 검사와 workflow YAML 파싱, 수동 트리거만 존재하는지 확인했다.
 
 `release` 프로필의 실제 전체 빌드와 GitHub Actions 원격 실행은 이 기록에 포함하지 않는다.
+
+## Linux 원격 호스트 바이너리
+
+Linux 머신은 GUI 없이 Mac 앱이 SSH로 붙는 원격 호스트다. `krill`·`krill-holder`·`krilld`만 묶는다.
+
+```sh
+# Linux 머신에서 직접: dist/krill-VERSION-linux-ARCH.tar.gz(+ .sha256)
+bash packaging/linux/build.sh VERSION
+bash packaging/linux/smoke.sh packaging/dist/krill-VERSION-linux-ARCH.tar.gz   # 임시 HOME 설치·세션·kill -9 생존
+# 맥에서: GCP 임시 VM(Ubuntu 22.04, x86_64·aarch64)으로 빌드·스모크 후 VM 삭제(유료)
+KRILL_GCP_PROJECT=<project> bash packaging/linux/build-gcp.sh VERSION
+```
+
+`publish-github.sh`는 `KRILL_GCP_PROJECT`가 있으면 위 GCP 빌드를 돌리고, Linux tar.gz와
+`install-linux.sh`를 릴리스 자산에 넣는다. 원격 머신 설치는 `install-linux.sh`(→ `~/.local/bin`).

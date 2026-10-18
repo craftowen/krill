@@ -125,6 +125,7 @@ fn holder_plist_snapshot() {
 
 /// 생성한 plist를 macOS가 읽을 수 있다.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: plutil(launchd plist)")]
 fn holder_plist_lints() {
     let d = dir("plist");
     std::fs::create_dir_all(&d).unwrap();

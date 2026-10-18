@@ -565,6 +565,7 @@ fn privacy_disabled_leaves_existing_recording_untouched() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: Time Machine(tmutil)")]
 fn privacy_time_machine_excludes_recreated_recordings() {
     let root = tmp("privacy-backup");
     let store = Store::open(&root, Limits::default()).unwrap();

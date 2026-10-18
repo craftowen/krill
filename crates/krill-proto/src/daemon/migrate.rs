@@ -67,7 +67,7 @@ fn items(home: &Path) -> [(PathBuf, PathBuf); 5] {
 }
 
 /// `HOME` 기준 상태 디렉터리. 이관 전이면 옛 경로, 아니면 새 경로.
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "linux")))]
 pub fn state_dir_in(home: &Path) -> PathBuf {
     let [(old, new), ..] = items(home);
     if pending(&old, &new) { old } else { new }
@@ -78,6 +78,15 @@ pub fn state_dir_in(home: &Path) -> PathBuf {
 pub fn state_dir_in(local_app_data: &Path) -> PathBuf {
     local_app_data.join("Krill")
 }
+
+/// Linux(원격 호스트): `~/.local/share/<번들 id>`. 개명 전 Linux 판이 없어 이관할 옛 경로도 없다.
+#[cfg(target_os = "linux")]
+pub fn state_dir_in(home: &Path) -> PathBuf {
+    home.join(LINUX_STATE_PARENT).join(BUNDLE_ID)
+}
+
+/// Linux 상태 디렉터리의 부모(`HOME` 기준). 원격 소켓 탐색(`krill-hosts`)도 쓴다.
+pub const LINUX_STATE_PARENT: &str = ".local/share";
 
 /// 새 경로가 없고 옛 경로가 실제(링크 아님) 파일·디렉터리다.
 fn pending(old: &Path, new: &Path) -> bool {
@@ -329,5 +338,6 @@ fn wait_lock(path: &Path) -> io::Result<Option<File>> {
     }
 }
 
+// 개명 이관은 macOS 번들 경로(`~/Library`·launchd)만 다룬다. Linux 상태 경로는 이관 대상이 없다.
 #[cfg(test)]
 mod tests;
