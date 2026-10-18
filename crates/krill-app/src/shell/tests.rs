@@ -4858,7 +4858,9 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert_eq!(Layout::load(&path).unwrap(), empty);
 
     // 빈 탭 상태에서 닫기·탭 순환 단축키를 눌러도 패닉이나 유령 탭이 생기지 않는다.
-    cx.simulate_keystrokes("cmd-w cmd-shift-w cmd-shift-] cmd-shift-[");
+    // ⌘W는 빈 작업 공간에서 창을 닫으므로(K11) 여기서는 누르지 않는다
+    // (`cmd_w_in_empty_workspace_closes_window`가 따로 본다).
+    cx.simulate_keystrokes("cmd-shift-w cmd-shift-] cmd-shift-[");
     cx.run_until_parked();
     assert!(layout_of(&view, cx).tabs().is_empty());
 
@@ -6723,4 +6725,20 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
         "no first-run modal"
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// K11: 탭이 없는 빈 작업 공간에서 ⌘W는 창을 닫는다(macOS 관례).
+#[gpui::test]
+fn cmd_w_in_empty_workspace_closes_window(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("empty-cmd-w"));
+    view.update(cx, |s, cx| s.change(false, cx, |l| l.close_tab(0)));
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert_eq!(cx.windows().len(), 1);
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(
+        cx.windows().is_empty(),
+        "empty workspace ⌘W closes the window"
+    );
 }
