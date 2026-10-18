@@ -207,6 +207,15 @@ fn fail_text(kind: &FailKind, agent: &str) -> String {
 }
 
 impl Shell {
+    /// 에이전트 id의 표시 이름(프로필 이름, 없으면 id 그대로). 알림 문구용.
+    pub(super) fn agent_display_name(&self, id: &str) -> String {
+        self.agents
+            .as_ref()
+            .and_then(|s| s.profiles.iter().find(|p| p.id == id))
+            .map_or(id, |p| p.name.as_str())
+            .to_owned()
+    }
+
     /// 칸의 에이전트 식별자(데몬 스냅샷 우선, 없으면 실행 설정 `Program::Agent`에서 추출).
     pub(super) fn pane_agent_id(&self, pane: PaneId, cx: &App) -> Option<String> {
         let host = self.layout.host(pane);
@@ -299,12 +308,7 @@ impl Shell {
                 forked_pane = Some(p);
             }
         });
-        let agent_name = self
-            .agents
-            .as_ref()
-            .and_then(|s| s.profiles.iter().find(|p| p.id == agent))
-            .map_or(agent.as_str(), |p| p.name.as_str())
-            .to_owned();
+        let agent_name = self.agent_display_name(&agent);
         self.notice =
             Some(krill_app::i18n::catalog::shell::FORKED_SESSION.format(&[("agent", &agent_name)]));
         cx.notify();
@@ -421,7 +425,8 @@ impl Shell {
                 target_pane = p;
             }
         });
-        self.notice = Some(text::HANDOFF_WAITING.format(&[("agent", &agent_id)]));
+        let name = self.agent_display_name(&agent_id);
+        self.notice = Some(text::HANDOFF_WAITING.format(&[("agent", &name)]));
         cx.notify();
         self.start_handoff_delivery(target_pane, agent_id, bytes, BOOT_TIMEOUT, cx);
         target_pane
@@ -455,7 +460,8 @@ impl Shell {
         let Some(pane) = self.layout.focused() else {
             return;
         };
-        self.notice = Some(text::HANDOFF_WAITING.format(&[("agent", agent_id)]));
+        let name = self.agent_display_name(agent_id);
+        self.notice = Some(text::HANDOFF_WAITING.format(&[("agent", &name)]));
         cx.notify();
         self.start_handoff_delivery(pane, agent_id.to_owned(), bytes, BOOT_TIMEOUT, cx);
     }
@@ -474,6 +480,7 @@ impl Shell {
         cx.spawn(async move |_, cx| {
             let outcome = deliver_handoff(&weak, target, pane, &brief, timeout, cx).await;
             weak.update(cx, |this, cx| {
+                let agent = this.agent_display_name(&agent);
                 match outcome {
                     Outcome::Delivered => {
                         this.notice = Some(text::HANDOFF_SPAWNED.format(&[("agent", &agent)]));
@@ -692,6 +699,32 @@ mod tests {
             assert_eq!(
                 shell.notice.as_deref(),
                 Some(krill_app::i18n::catalog::resources::OUTDATED.get())
+            );
+        });
+    }
+
+    /// 핸드오프 알림은 내부 id가 아니라 프로필 표시 이름을 쓴다(없으면 id).
+    #[gpui::test]
+    fn handoff_notice_uses_agent_display_name(cx: &mut gpui::TestAppContext) {
+        use crate::shell::tests::{open, state_path};
+        use krill_proto::agent::Permission;
+        use krill_proto::control::{AgentProfile, AgentSettings};
+
+        let (view, cx) = open(cx, state_path("ux-handoff-name"));
+        view.update(cx, |shell, cx| {
+            shell.agents = Some(AgentSettings {
+                permission: Permission::Manual,
+                profiles: vec![AgentProfile {
+                    id: "codex".into(),
+                    name: "Codex".into(),
+                }],
+            });
+            assert_eq!(shell.agent_display_name("codex"), "Codex");
+            assert_eq!(shell.agent_display_name("unknown"), "unknown");
+            shell.spawn_handoff_agent("codex", "brief".to_owned(), cx);
+            assert_eq!(
+                shell.notice,
+                Some(text::HANDOFF_WAITING.format(&[("agent", "Codex")]))
             );
         });
     }
