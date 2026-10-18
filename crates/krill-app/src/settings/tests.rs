@@ -2560,6 +2560,162 @@ fn owe799_shortcuts_categories_search_filter_and_reset_all(cx: &mut TestAppConte
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-863: 수식키 없는 일반 키는 단축키로 저장하지 않는다. 기능키는 맨몸도 된다.
+#[test]
+fn owe863_plain_keys_need_modifier() {
+    let bare = [
+        "a",
+        "1",
+        "space",
+        "enter",
+        "backspace",
+        "delete",
+        "tab",
+        "up",
+        "escape",
+    ];
+    for key in bare {
+        let k = Keystroke::parse(key).unwrap();
+        assert!(shortcuts::needs_modifier(&k), "{key}");
+    }
+    // ⇧만으로는 부족하다(여전히 터미널 입력과 겹친다).
+    assert!(shortcuts::needs_modifier(
+        &Keystroke::parse("shift-a").unwrap()
+    ));
+    assert!(shortcuts::needs_modifier(
+        &Keystroke::parse("shift-enter").unwrap()
+    ));
+    // ⌘/⌃/⌥ 중 하나라도 있으면 된다.
+    for key in [
+        "cmd-a",
+        "ctrl-a",
+        "alt-a",
+        "cmd-backspace",
+        "ctrl-space",
+        "alt-enter",
+    ] {
+        let k = Keystroke::parse(key).unwrap();
+        assert!(!shortcuts::needs_modifier(&k), "{key}");
+    }
+    // 기능키는 맨몸도 된다.
+    for key in ["f1", "f5", "f12", "cmd-f5", "shift-f1"] {
+        let k = Keystroke::parse(key).unwrap();
+        assert!(!shortcuts::needs_modifier(&k), "{key}");
+    }
+}
+
+/// OWE-863: 바인딩 하나만 지우거나 액션 전체를 끌 수 있고, 초기화로 되돌릴 수 있다.
+#[test]
+fn owe863_remove_and_disable_single_keys() {
+    let defaults = vec![
+        ("settings::ZoomIn", "cmd-=".to_owned()),
+        ("settings::ZoomOut", "cmd--".to_owned()),
+    ];
+    // 사용자 추가 키 하나만 지우면 그 항목만 사라진다.
+    let mut t = Keys::parse("[bindings]\n\"cmd-u\" = \"settings::ZoomIn\"\n")
+        .unwrap()
+        .bindings;
+    shortcuts::remove_key(&mut t, &defaults, "settings::ZoomIn", "cmd-u");
+    assert!(t.is_empty());
+    // 기본 키 하나를 지우면 `""`로 꺼진다.
+    let mut t = toml::Table::new();
+    shortcuts::remove_key(&mut t, &defaults, "settings::ZoomIn", "cmd-=");
+    assert_eq!(t["cmd-="].as_str(), Some(""));
+    // 없는 키를 지워도 다른 항목은 그대로다.
+    t.insert("cmd-u".to_owned(), "settings::ZoomIn".into());
+    shortcuts::remove_key(&mut t, &defaults, "settings::ZoomIn", "cmd-y");
+    assert_eq!(t["cmd-="].as_str(), Some(""));
+    assert_eq!(t["cmd-u"].as_str(), Some("settings::ZoomIn"));
+    // 전체 끄기: 기본 키는 `""`, 사용자 키는 삭제.
+    let mut t = Keys::parse("[bindings]\n\"cmd-u\" = \"settings::ZoomIn\"\n")
+        .unwrap()
+        .bindings;
+    shortcuts::disable_action(
+        &mut t,
+        &defaults,
+        "settings::ZoomIn",
+        &["cmd-=".to_owned(), "cmd-u".to_owned()],
+    );
+    assert_eq!(t["cmd-="].as_str(), Some(""));
+    assert!(!t.contains_key("cmd-u"));
+    // 초기화하면 둘 다 사라져 기본 키로 돌아간다.
+    shortcuts::reset_action(&mut t, &defaults, "settings::ZoomIn");
+    assert!(t.is_empty());
+}
+
+/// OWE-863 실화면 흐름: 맨몸 Backspace·일반 키는 저장되지 않고 오류만 남으며,
+/// ×로 개별 키를 지우고 사용 안 함으로 전체를 끌 수 있다.
+#[gpui::test]
+fn owe863_recorder_rejects_plain_keys_and_deletes(cx: &mut TestAppContext) {
+    let d = dir("owe863-recorder");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(3000.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let keys = || fs::read_to_string(d.join(KEYS_FILE)).unwrap_or_default();
+
+    // Backspace로 지우려 해도 바인딩되지 않고 오류만 남는다.
+    click(vcx, "sc-settings::ZoomIn-cmd-=");
+    vcx.simulate_keystrokes("backspace");
+    vcx.run_until_parked();
+    assert_eq!(keys(), "");
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).shortcuts.target.is_none());
+        assert!(view.read(cx).shortcuts.error.is_some());
+    });
+
+    // 맨몸 일반 키도 마찬가지다.
+    click(vcx, "sc-settings::ZoomIn-cmd-=");
+    vcx.simulate_keystrokes("a");
+    vcx.run_until_parked();
+    assert_eq!(keys(), "");
+    vcx.update(|_, cx| assert!(view.read(cx).shortcuts.error.is_some()));
+
+    // 기능키는 맨몸도 저장된다.
+    click(vcx, "sc-settings::ZoomIn-cmd-=");
+    vcx.simulate_keystrokes("f5");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert_eq!(bound(cx, "f5"), Some(ZoomIn.name()));
+        assert_eq!(bound(cx, "cmd-="), None);
+        assert!(view.read(cx).shortcuts.error.is_none());
+    });
+
+    // 키 추가 후 ×로 그 키만 지운다.
+    click(vcx, "sc-settings::ZoomIn-add");
+    vcx.simulate_keystrokes("cmd-u");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(bound(cx, "cmd-u"), Some(ZoomIn.name())));
+    click(vcx, "sc-del-settings::ZoomIn-cmd-u");
+    vcx.update(|_, cx| {
+        assert_eq!(bound(cx, "cmd-u"), None);
+        assert_eq!(bound(cx, "f5"), Some(ZoomIn.name()));
+    });
+
+    // 사용 안 함으로 전체를 끄면 초기화 버튼만 남고, 초기화로 되돌릴 수 있다.
+    click(vcx, "sc-disable-settings::ZoomIn");
+    vcx.update(|_, cx| {
+        assert_eq!(bound(cx, "f5"), None);
+        assert_eq!(bound(cx, "cmd-="), None);
+    });
+    assert!(vcx.debug_bounds("sc-reset-settings::ZoomIn").is_some());
+    click(vcx, "sc-reset-settings::ZoomIn");
+    vcx.update(|_, cx| {
+        assert_eq!(bound(cx, "cmd-="), Some(ZoomIn.name()));
+        assert_eq!(bound(cx, "f5"), None);
+    });
+    assert!(Keys::parse(&keys()).unwrap().bindings.is_empty());
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-658: 터미널 탭 설정의 기본값·직렬화 왕복과 옛 settings.toml 호환.
 #[gpui::test]
 fn owe658_terminal_settings_defaults_and_serialization(cx: &mut TestAppContext) {
