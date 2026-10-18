@@ -4519,6 +4519,41 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     assert_eq!(Input::decode(k, &b).unwrap().bytes, b"x");
 }
 
+/// OWE-855: 인앱 설정이 메인 창 제목을 "설정"으로 덮은 뒤 복귀·워크트리 전환 시에도
+/// 복원되지 않는다. 메인 창은 설정 열림 시 설정 제목, 닫힘 시 "Krill"로 복원한다.
+#[gpui::test]
+fn owe855_main_window_title_restored_after_settings(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("owe855-window-title"));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some(krill_app::i18n::catalog::shell::APP_TITLE.get())
+    );
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some(krill_app::i18n::catalog::settings::TITLE.get())
+    );
+    cx.update(|window, cx| view.update(cx, |s, cx| s.close_settings(Some(window), cx)));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some(krill_app::i18n::catalog::shell::APP_TITLE.get())
+    );
+    // 워크트리 전환相当: 다시 렌더해도 제목이 유지된다.
+    cx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.window_title().as_deref(),
+        Some(krill_app::i18n::catalog::shell::APP_TITLE.get())
+    );
+}
+
 /// OWE-860: ⌘,는 설정 토글이다. 열린 상태에서 누르면 닫히고, 탐색 단축키(⌘J·⌘B)는
 /// 설정을 먼저 닫고 동작한다. Shell 키 문맥이 설정 화면에서도 유지되기 때문이다.
 #[gpui::test]
