@@ -17,6 +17,7 @@ pub(super) fn search_tabs(query: &str) -> Vec<AdminTab> {
         .into_iter()
         .filter(|&tab| {
             both(tab_title(tab)).into_iter().any(hit)
+                || both(tab.subtitle_message()).into_iter().any(hit)
                 || INDEX
                     .iter()
                     .filter(|(t, ..)| *t == tab)
@@ -71,8 +72,10 @@ mod tests {
         ] {
             assert!(search_tabs(q).contains(&AdminTab::General), "{q}");
         }
-        // 탭 이름(다른 언어 포함)도 맞는다.
+        // 탭 이름·부제(한·영 모두)도 맞는다(OWE-795).
         assert!(search_tabs("shortcuts").contains(&AdminTab::Shortcuts));
+        assert_eq!(search_tabs("스마트폰"), [AdminTab::Mobile]);
+        assert_eq!(search_tabs("qr"), [AdminTab::Mobile]);
         assert!(search_tabs("zzz-no-such-setting").is_empty());
     }
 

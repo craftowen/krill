@@ -1235,6 +1235,24 @@ impl AdminTab {
         }
     }
 
+    pub fn subtitle_message(self) -> crate::i18n::Message {
+        match self {
+            Self::General => text::TAB_GENERAL_DESC,
+            Self::Terminal => text::TAB_TERMINAL_DESC,
+            Self::Accounts => text::TAB_ACCOUNTS_DESC,
+            Self::Agents => text::AGENTS_DESC,
+            Self::Ssh => text::TAB_SSH_DESC,
+            Self::Workflows => text::TAB_WORKFLOWS_DESC,
+            Self::Shortcuts => text::SHORTCUTS_DESC,
+            Self::Resources => text::TAB_RESOURCES_DESC,
+            Self::Mobile => text::TAB_MOBILE_DESC,
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        self.subtitle_message().get()
+    }
+
     /// 탭 아이콘. 앱 자산(`gpui_kit_assets`)의 전체 Lucide 집합에서 고른다.
     pub fn icon(self) -> gpui_kit_assets::IconName {
         use gpui_kit_assets::IconName;
@@ -7526,6 +7544,87 @@ impl SettingsView {
     }
 }
 
+impl SettingsView {
+    /// 사이드바 검색 입력을 비우고 전체 탭 목록과 현재 탭 본문을 복원한다(OWE-795).
+    pub fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((input, _)) = &self.search {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+        cx.notify();
+    }
+
+    /// 탭 페이지 헤더(아이콘·제목·배지·1줄 부제 + 우측 보조 동작 슬롯, OWE-795).
+    pub(crate) fn render_page_header(
+        tab: AdminTab,
+        action: Option<gpui::AnyElement>,
+        cx: &App,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::Sizable as _;
+        let p = crate::ui::palette(cx);
+        div()
+            .id("admin-page-header")
+            .debug_selector(|| "admin-page-header".into())
+            .w_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_3()
+            .pb_3()
+            .border_b_1()
+            .border_color(p.border)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(tab.icon_element().small())
+                            .child(
+                                div()
+                                    .id("admin-page-title")
+                                    .debug_selector(|| "admin-page-title".into())
+                                    .text_size(crate::ui::TEXT_LG)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(tab.label()),
+                            )
+                            .children(tab.badge().map(|badge_text| {
+                                crate::ui::badge(p, crate::ui::BadgeTone::Muted, badge_text)
+                                    .id("admin-page-badge")
+                                    .debug_selector(|| "admin-page-badge".into())
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("admin-page-subtitle")
+                            .debug_selector(|| "admin-page-subtitle".into())
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(tab.subtitle()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("admin-page-header-actions")
+                    .debug_selector(|| "admin-page-header-actions".into())
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(action),
+            )
+    }
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_component::{Icon, IconName, Sizable as _};
@@ -7538,7 +7637,9 @@ impl Render for SettingsView {
         let current_tab = self.tab;
 
         let search_input = self.search_input(window, cx);
-        let matches = search::search_tabs(&search_input.read(cx).value());
+        let search_value = search_input.read(cx).value().to_string();
+        let has_search_query = !search_value.is_empty();
+        let matches = search::search_tabs(&search_value);
         let groups: &[(&'static str, &[AdminTab])] = &[
             (
                 text::GROUP_AI.get(),
@@ -7594,10 +7695,8 @@ impl Render for SettingsView {
                     .capture_action(cx.listener(
                         |this, _: &gpui_component::input::Escape, window, cx| {
                             cx.stop_propagation();
-                            if let Some((input, _)) = &this.search
-                                && !input.read(cx).value().is_empty()
-                            {
-                                input.update(cx, |s, cx| s.set_value("", window, cx));
+                            if !this.search_query(cx).is_empty() {
+                                this.clear_search(window, cx);
                             } else if this.shortcuts.target.is_none() {
                                 close_settings_page_for(Some(cx.entity_id()), window, cx);
                             }
@@ -7619,16 +7718,33 @@ impl Render for SettingsView {
                         gpui_component::input::Input::new(&search_input)
                             .small()
                             .prefix(Icon::new(IconName::Search).xsmall())
-                            .suffix(
+                            .suffix(if has_search_query {
+                                crate::ui::button_with_tooltip(
+                                    Button::new("admin-search-clear")
+                                        .icon(IconName::Close)
+                                        .ghost()
+                                        .xsmall()
+                                        .debug_selector(|| "admin-search-clear".into())
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.clear_search(window, cx);
+                                        })),
+                                    "admin-search-clear",
+                                    text::SEARCH_CLEAR.get(),
+                                )
+                                .into_any_element()
+                            } else {
                                 div()
+                                    .id("admin-search-hint")
+                                    .debug_selector(|| "admin-search-hint".into())
                                     .px_1()
                                     .rounded(crate::ui::RADIUS_XS)
                                     .bg(p.muted)
                                     .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_2XS)
                                     .text_color(p.muted_foreground)
-                                    .child(text::SEARCH_HINT_CMD_F.get()),
-                            ),
+                                    .child(text::SEARCH_HINT_CMD_F.get())
+                                    .into_any_element()
+                            }),
                     ),
             );
         if matches.is_empty() {
@@ -7708,50 +7824,6 @@ impl Render for SettingsView {
             nav = nav.child(group_col);
         }
 
-        let host_bar = div()
-            .id("admin-host-scope-bar")
-            .debug_selector(|| "admin-host-scope-bar".into())
-            .w_full()
-            .px_6()
-            .py_2p5()
-            .border_b_1()
-            .border_color(p.border)
-            .bg(p.card)
-            .flex()
-            .items_center()
-            .gap_3()
-            .flex_wrap()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(p.muted_foreground)
-                    .child(text::HOST_SCOPE_LABEL.get()),
-            )
-            .child(
-                div()
-                    .px_2p5()
-                    .py_1()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
-                    .border_1()
-                    .border_color(p.border)
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .text_size(crate::ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(Icon::new(IconName::SquareTerminal).xsmall())
-                    .child(text::HOST_LOCAL_MAC.get())
-                    .child(Icon::new(IconName::ChevronDown).xsmall()),
-            )
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::HOST_SCOPE_DESC.get()),
-            );
-
         // 투명 제목 표시줄 위에 그리는 테마 색 제목 띠(신호등 버튼 자리 포함, 끌어서 창 이동).
         let titlebar = div()
             .id("admin-titlebar")
@@ -7771,42 +7843,100 @@ impl Render for SettingsView {
             .text_color(p.muted_foreground)
             .child(text::TITLE.get());
 
-        let body = match current_tab {
-            AdminTab::General => Self::render_general_tab(&s, cx),
-            AdminTab::Terminal => Self::render_terminal_tab(&s, cx),
-            AdminTab::Accounts => self.render_accounts_tab(cx),
-            AdminTab::Agents => self.render_agents_tab(&s, window, cx),
-            AdminTab::Ssh => self.render_ssh_tab(window, cx),
-            AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
-            AdminTab::Shortcuts => self.render_shortcuts_tab(cx),
-            AdminTab::Resources => self.render_resources_tab(&s, cx),
-            AdminTab::Mobile => self.render_mobile_tab(window, cx),
-        }
-        .w_full()
-        .min_w_0();
-
-        let page_header = div()
+        let content_column = if matches.is_empty() {
+            div()
+                .id("admin-content-column")
+                .debug_selector(|| "admin-content-column".into())
+                .max_w(crate::ui::SETTINGS_CONTENT_MAX_WIDTH)
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    layout::card(p)
+                        .id("admin-content-search-empty")
+                        .debug_selector(|| "admin-content-search-empty".into())
+                        .py_8()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Search)
+                                .small()
+                                .text_color(p.muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.foreground)
+                                .child(text::SEARCH_EMPTY_TITLE.get()),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .text_center()
+                                .child(
+                                    text::SEARCH_EMPTY_DESC
+                                        .format(&[("query", search_value.as_str())]),
+                                ),
+                        )
+                        .child(
+                            layout::secondary(
+                                "admin-content-search-clear",
+                                text::SEARCH_CLEAR.get(),
+                            )
+                            .debug_selector(|| "admin-content-search-clear".into())
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.clear_search(window, cx);
+                                },
+                            )),
+                        ),
+                )
+        } else {
+            let page_header = Self::render_page_header(current_tab, None, cx);
+            let body = match current_tab {
+                AdminTab::General => Self::render_general_tab(&s, cx),
+                AdminTab::Terminal => Self::render_terminal_tab(&s, cx),
+                AdminTab::Accounts => self.render_accounts_tab(cx),
+                AdminTab::Agents => self.render_agents_tab(&s, window, cx),
+                AdminTab::Ssh => self.render_ssh_tab(window, cx),
+                AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
+                AdminTab::Shortcuts => self.render_shortcuts_tab(cx),
+                AdminTab::Resources => self.render_resources_tab(&s, cx),
+                AdminTab::Mobile => self.render_mobile_tab(window, cx),
+            }
             .w_full()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .justify_between()
-            .pb_2()
-            .border_b_1()
-            .border_color(p.border)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(current_tab.icon_element().small())
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_LG)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(current_tab.label()),
-                    ),
-            );
+            .min_w_0();
+
+            div()
+                .id("admin-content-column")
+                .debug_selector(|| "admin-content-column".into())
+                // OWE-719·OWE-793·OWE-795: 왼쪽 정렬 + 창 폭에 맞춰 유동 확장하되 초대형 화면에서 과도한 행 길이만 제한.
+                .max_w(crate::ui::SETTINGS_CONTENT_MAX_WIDTH)
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(page_header)
+                .child(body)
+                .children(error.map(|e| {
+                    div()
+                        .p_2()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .bg(p.warning)
+                        .text_color(p.warning_foreground)
+                        .font_family(crate::ui::FONT_UI)
+                        .text_size(crate::ui::TEXT_XS)
+                        .child(crate::i18n::cached_notice(&e))
+                }))
+        };
 
         div()
             .id("admin-center")
@@ -7868,11 +7998,14 @@ impl Render for SettingsView {
                 }
                 if ev.keystroke.key == "escape"
                     && !ev.keystroke.modifiers.modified()
-                    && this.search_query(cx).is_empty()
                     && this.shortcuts.target.is_none()
                 {
                     cx.stop_propagation();
-                    close_settings_page_for(Some(cx.entity_id()), window, cx);
+                    if this.search_query(cx).is_empty() {
+                        close_settings_page_for(Some(cx.entity_id()), window, cx);
+                    } else {
+                        this.clear_search(window, cx);
+                    }
                 }
             }))
             .size_full()
@@ -7889,46 +8022,19 @@ impl Render for SettingsView {
             .child(titlebar)
             .child(
                 div().flex_1().min_h_0().w_full().flex().child(nav).child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h_full()
-                        .flex()
-                        .flex_col()
-                        .child(host_bar)
-                        .child(
-                            div()
-                                .id("admin-content")
-                                .flex_1()
-                                .min_w_0()
-                                .overflow_y_scroll()
-                                .px_8()
-                                .py_6()
-                                .child(
-                                    div()
-                                        .id("admin-content-column")
-                                        .debug_selector(|| "admin-content-column".into())
-                                        // OWE-719·OWE-793: 왼쪽 정렬 + 창 폭에 맞춰 유동 확장하되 초대형 화면에서 과도한 행 길이만 제한.
-                                        .max_w(crate::ui::SETTINGS_CONTENT_MAX_WIDTH)
-                                        .w_full()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_col()
-                                        .gap_4()
-                                        .child(page_header)
-                                        .child(body)
-                                        .children(error.map(|e| {
-                                            div()
-                                                .p_2()
-                                                .rounded(crate::ui::RADIUS_SM)
-                                                .bg(p.warning)
-                                                .text_color(p.warning_foreground)
-                                                .font_family(crate::ui::FONT_UI)
-                                                .text_size(crate::ui::TEXT_XS)
-                                                .child(crate::i18n::cached_notice(&e))
-                                        })),
-                                ),
-                        ),
+                    div().flex_1().min_w_0().h_full().flex().flex_col().child(
+                        div()
+                            // 탭별 스크롤 id: 탭 전환 시 스크롤 위치를 최상단으로 되돌린다(OWE-858).
+                            .id(("admin-content", current_tab as usize))
+                            .debug_selector(|| "admin-content".into())
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .overflow_y_scroll()
+                            .px_8()
+                            .py_6()
+                            .child(content_column),
+                    ),
                 ),
             )
     }
