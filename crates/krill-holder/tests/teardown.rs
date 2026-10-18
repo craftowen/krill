@@ -164,6 +164,7 @@ fn limit(link: &mut Link, dir: &Path) {
         },
         "257번째 세션"
     );
+    #[cfg(target_os = "macos")]
     assert_eq!(
         rustix::io::Errno::PROCLIM.raw_os_error(),
         SESSION_LIMIT_ERRNO

@@ -5,17 +5,29 @@
 )]
 
 use std::io;
-use std::os::fd::{BorrowedFd, FromRawFd, OwnedFd};
+#[cfg(target_os = "macos")]
+use std::os::fd::BorrowedFd;
+use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+#[cfg(target_os = "macos")]
 use std::time::Duration;
 
 use krill_proto::SessionId;
+#[cfg(target_os = "macos")]
 use rustix::event::kqueue::{Event, kevent};
 use rustix::io::{FdFlags, fcntl_setfd};
 use rustix::process::Pid;
 
 use crate::holder::Session;
+
+#[cfg(target_os = "macos")]
+pub use rustix::event::kqueue as kq;
+
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "linux")]
+pub use linux::{children, close_inherited, kq, start_time, wait};
 
 /// 자식이 새 세션을 만들고(setsid) stdin(PTY slave)을 제어 터미널로 잡게 한다(MK-004 결정 3).
 pub fn set_controlling_tty(cmd: &mut Command) {
@@ -31,6 +43,7 @@ pub fn set_controlling_tty(cmd: &mut Command) {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// kqueue에서 이벤트를 기다린다.
 pub fn wait(
     kq: BorrowedFd<'_>,
@@ -122,6 +135,7 @@ pub fn take_handoff() -> io::Result<Option<Handoff>> {
     }))
 }
 
+#[cfg(target_os = "macos")]
 /// 프로세스 시작 시각(µs). pid 재사용을 가려내는 정체성으로 쓴다. 없는 프로세스면 `None`.
 pub fn start_time(pid: Pid) -> Option<u64> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
@@ -148,6 +162,7 @@ pub fn start_time(pid: Pid) -> Option<u64> {
     )
 }
 
+#[cfg(target_os = "macos")]
 /// `pid`의 직계 자식들. 실패하면 빈 목록.
 /// ponytail: 자식 1024개에서 자른다. 그보다 많은 프로세스를 거느린 세션이 나오면 반환값이 버퍼를 채울 때 키워 다시 부른다.
 pub fn children(pid: Pid) -> Vec<Pid> {
@@ -161,6 +176,7 @@ pub fn children(pid: Pid) -> Vec<Pid> {
     buf.into_iter().filter_map(Pid::from_raw).collect()
 }
 
+#[cfg(target_os = "macos")]
 /// 띄운 쪽에게서 물려받은 fd 3 이상을 모두 닫는다(OWE-485). `--detach` 새 기동에서 `main` 첫머리에 한 번만 부른다.
 ///
 /// macOS std는 `pipe()` 뒤 CLOEXEC를 따로 걸고 `posix_spawn`에 `CLOEXEC_DEFAULT`를 주지 않는다. 그래서 다중

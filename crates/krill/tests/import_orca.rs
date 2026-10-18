@@ -168,6 +168,10 @@ fn spawn_fake_krilld(
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS 전용: Orca macOS 데이터 경로"
+)]
 fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     let root = std::env::temp_dir().join(format!("owe726-cli-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
