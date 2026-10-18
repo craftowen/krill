@@ -10,9 +10,15 @@ publish = false
 krill-log = { workspace = true }
 tracing = { workspace = true }
 krill-proto = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 rustix-openpty = { workspace = true }
 libc = { workspace = true }
+
+# ConPTY(Windows 홀더, M11). 기능 목록은 ConPTY 구현 작업이 확정한다.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [lints]
 workspace = true
