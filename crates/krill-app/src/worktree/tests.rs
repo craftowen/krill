@@ -46,6 +46,30 @@ impl Source for Fake {
 }
 
 #[test]
+fn owe853_branch_suggestions_prefers_parent_and_dedupes() {
+    let (default, candidates) = branch_suggestions(
+        Some("feat/parent"),
+        Some("main"),
+        &["main".into(), "feat/x".into()],
+    );
+    assert_eq!(default.as_deref(), Some("feat/parent"));
+    assert_eq!(candidates[0], "feat/parent");
+    assert_eq!(
+        candidates.iter().filter(|c| c.as_str() == "main").count(),
+        1
+    );
+    assert!(candidates.contains(&"origin/main".to_owned()));
+    assert!(candidates.contains(&"feat/x".to_owned()));
+
+    let (default, _) = branch_suggestions(None, Some("develop"), &[]);
+    assert_eq!(default.as_deref(), Some("develop"));
+
+    let (default, candidates) = branch_suggestions(None, None, &[]);
+    assert_eq!(default, None);
+    assert!(candidates.contains(&"HEAD".to_owned()));
+}
+
+#[test]
 fn script_controls_are_visible() {
     assert_eq!(
         visible("echo 1\n\techo\x1b[2J\r"),
@@ -289,4 +313,113 @@ fn dialog_renders_symlinks_setup_and_archive_preview(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("worktree-setup-preview").is_some());
     assert!(vcx.debug_bounds("worktree-archive-preview").is_some());
     std::fs::remove_dir_all(temp).ok();
+}
+
+#[gpui::test]
+fn owe853_base_default_and_searchable_dropdown(cx: &mut TestAppContext) {
+    let fake = Arc::new(Fake::default());
+    cx.update(gpui_component::init);
+    let (dialog, cx) =
+        cx.add_window_view(|window, cx| Dialog::new("/repo".into(), fake.clone(), window, cx));
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_branch_candidates(
+                vec![
+                    "main".to_owned(),
+                    "feat/parent".to_owned(),
+                    "origin/main".to_owned(),
+                ],
+                cx,
+            );
+            d.set_base_default(Some("feat/parent".to_owned()), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    // 현재 브랜치가 기본값으로 들어간다.
+    assert_eq!(
+        cx.update(|_, cx| dialog.read(cx).base_value(cx)),
+        "feat/parent"
+    );
+    // 입력済み면 덮지 않는다.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.base.update(cx, |input, cx| {
+                input.set_value("custom", window, cx);
+            });
+            d.set_base_default(Some("other".to_owned()), window, cx);
+        });
+    });
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).base_value(cx)), "custom");
+    // 검색어로 필터된다.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.base.update(cx, |input, cx| {
+                input.set_value("feat", window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("worktree-base-option-feat/parent")
+            .is_some()
+    );
+    assert!(cx.debug_bounds("worktree-base-option-main").is_none());
+}
+
+#[gpui::test]
+fn owe853_created_closes_dialog_and_opens_new_worktree(cx: &mut TestAppContext) {
+    use crate::sidebar::NewSession;
+    let fake = Arc::new(Fake::default());
+    let created = Worktree {
+        path: "/repo/wt-new".as_bytes().to_vec(),
+        branch: "wt-new".into(),
+        base: "main".into(),
+        copied: Vec::new(),
+        warnings: Vec::new(),
+        setup: None,
+    };
+    fake.replies
+        .lock()
+        .unwrap()
+        .push_back(Reply::WorktreeCreated(created.clone()));
+    cx.update(gpui_component::init);
+    let (sidebar, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let opened: Rc<Cell<Option<NewSession>>> = Rc::new(Cell::new(None));
+    let got = opened.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&sidebar, move |_, e: &NewSession, _| {
+            got.set(Some(e.clone()));
+        })
+        .detach();
+    });
+    let source: Arc<dyn Source> = fake.clone();
+    cx.update(|window, cx| {
+        sidebar.update(cx, |s, cx| {
+            s.connect_source(source, cx);
+            s.new_worktree("/repo".into(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
+    // 이름 입력 후 생성 제출 → Done 없이 바로 닫히고 NewSession이 열린다.
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.name.update(cx, |input, cx| {
+                input.set_value("wt-new", window, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| dialog.update(cx, |d, cx| d.submit(Setup::Ask, cx)));
+    cx.run_until_parked();
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| sidebar.read(cx).creating.is_none()),
+        "dialog must auto-close on Created"
+    );
+    let session = opened.take();
+    assert_eq!(
+        session.map(|s| s.cwd),
+        Some(std::path::PathBuf::from("/repo/wt-new"))
+    );
 }
