@@ -41,38 +41,48 @@ fn browser_login_accepts_only_https_provider_authorize_hosts() {
 }
 
 #[test]
-fn failed_new_login_removes_account_through_daemon_but_relogin_is_preserved() {
+fn failed_new_login_deletes_account_through_daemon_and_trashes_managed_profile() {
     use std::io::Write as _;
     use std::time::Duration;
 
     use krill_proto::ipc::{self, ClientHello, ServerHello};
     use krill_proto::screen::Msg as _;
-    use krill_proto::usage::{AccountInfo, AccountsSnapshot, Snapshot, UsageReply, UsageRequest};
+    use krill_proto::usage::{AccountInfo, UsageReply, UsageRequest};
 
     let root = std::env::temp_dir().join(format!("owe700-cleanup-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&state).unwrap();
     let paths = krill_proto::daemon::Paths {
         socket: root.join("daemon.sock"),
         holder: root.join("unused-holder"),
         krilld: root.join("unused-daemon"),
     };
-    let account = AccountInfo {
-        id: "claude-new".into(),
-        provider: ProviderKind::Claude,
-        label: "New profile".into(),
-        email: None,
-        profile_dir: root.join("profile").display().to_string(),
-        active: false,
-        host_default: false,
-        stale: false,
-        usage: Snapshot::default(),
-    };
-    std::fs::create_dir_all(&account.profile_dir).unwrap();
+    let added = super::request_local(
+        &home,
+        Some(&state),
+        &UsageRequest::AddAccount {
+            provider: ProviderKind::Claude,
+            label: "Claude Code Profile #1".into(),
+            email: None,
+            profile_dir: String::new(),
+        },
+    )
+    .unwrap();
+    let account: AccountInfo = added
+        .accounts
+        .into_iter()
+        .find(|a| a.id == "claude-claude-code-profile-1")
+        .unwrap();
     std::fs::write(
         Path::new(&account.profile_dir).join(".claude.json"),
         "partial",
     )
     .unwrap();
+    let server_home = home.clone();
+    let server_state = state.clone();
     let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
     let server = std::thread::spawn(move || {
         let hello = ServerHello {
@@ -95,20 +105,28 @@ fn failed_new_login_removes_account_through_daemon_but_relogin_is_preserved() {
         let client = ClientHello::decode(kind, &body).unwrap();
         let features = ipc::negotiate(&hello, &client).unwrap().features;
         let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        let req = UsageRequest::decode(kind, &body).unwrap();
         assert_eq!(
-            UsageRequest::decode(kind, &body).unwrap(),
-            UsageRequest::RemoveAccount {
+            req,
+            UsageRequest::DeleteAccount {
                 provider: ProviderKind::Claude,
-                account_id: "claude-new".into(),
+                account_id: "claude-claude-code-profile-1".into(),
             }
         );
-        let reply = UsageReply::Accounts(AccountsSnapshot::default()).for_features(features);
+        let snap = super::request_local(&server_home, Some(&server_state), &req).unwrap();
+        let reply = UsageReply::Accounts(snap).for_features(features);
         stream.write_all(&reply.encode().unwrap()).unwrap();
     });
     cleanup_failed_login(&paths, &account, true);
     server.join().unwrap();
+    assert!(!Path::new(&account.profile_dir).exists());
     assert!(
-        Path::new(&account.profile_dir)
+        super::orphans_local(&home, Some(&state)).is_empty(),
+        "failed new login must not leave an orphan profile"
+    );
+    assert!(
+        home.join(".Trash")
+            .join("krill-claude-claude-code-profile-1")
             .join(".claude.json")
             .is_file()
     );

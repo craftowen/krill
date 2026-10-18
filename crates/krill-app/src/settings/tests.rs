@@ -5081,5 +5081,47 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
         );
     }
 
+/// OWE-806: 자동 라벨이 조직명(`orgName`)으로 바뀐 뒤 `account_detail`이 라벨과 조직명을
+/// `Krill QA Org · Krill QA Org`처럼 두 번 반복하지 않는다. 사용자가 다른 라벨을 붙인 경우에만
+/// `라벨 · 조직명`으로 이어 붙인다.
+#[gpui::test]
+fn owe806_account_detail_does_not_repeat_org_name_when_auto_label_matches_org(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::usage::{AccountInfo, ProviderKind, Snapshot};
+
+    let d = dir("owe806-account-detail");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.identities.0.insert(
+                "claude-claude-code-profile-1".into(),
+                crate::accounts::Identity {
+                    email: "qa-login@example.com".into(),
+                    org_id: Some("org-qa-700".into()),
+                    org_name: Some("Krill QA Org".into()),
+                },
+            );
+            let mut acc = AccountInfo {
+                id: "claude-claude-code-profile-1".into(),
+                provider: ProviderKind::Claude,
+                label: "Krill QA Org".into(),
+                email: Some("qa-login@example.com".into()),
+                profile_dir: "/tmp/profiles/claude/claude-code-profile-1".into(),
+                active: false,
+                host_default: false,
+                stale: false,
+                usage: Snapshot::default(),
+            };
+            let (_, heading) = account_heading(&acc);
+            assert_eq!(v.account_detail(&acc, heading), "Krill QA Org");
+
+            acc.label = "Work".into();
+            let (_, heading) = account_heading(&acc);
+            assert_eq!(v.account_detail(&acc, heading), "Work · Krill QA Org");
+        });
+    });
     fs::remove_dir_all(d).ok();
 }

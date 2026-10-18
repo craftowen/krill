@@ -3841,7 +3841,8 @@ impl SettingsView {
             .identities
             .0
             .get(&acc.id)
-            .and_then(|i| i.org_name.as_deref());
+            .and_then(|i| i.org_name.as_deref())
+            .filter(|o| !o.is_empty() && *o != acc.label);
         let parts: Vec<&str> = [
             email
                 .filter(|e| *e != acc.label)
