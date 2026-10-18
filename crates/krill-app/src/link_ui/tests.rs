@@ -485,3 +485,131 @@ fn invite_link_accepts_new_and_legacy_schemes() {
         Some("minikrill://pair?t=00&k=11")
     );
 }
+
+/// OWE-878: '붙여넣기'는 초대 링크 입력칸만 채우고, 기기 이름을 확인할 때까지
+/// 연결을 시작하지 않는다. 제출은 [연결](또는 Enter)이 맡는다.
+#[gpui::test]
+fn paste_fills_link_without_auto_submit(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::new());
+    let (dialog, vcx) = cx.add_window_view(|window, cx| ClientDialog::new(backend, window, cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        cx.write_to_clipboard(ClipboardItem::new_string(
+            "krill://pair?invite=paste-no-submit".into(),
+        ));
+        dialog.update(cx, |d, cx| d.paste_from_clipboard(window, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let d = dialog.read(cx);
+        assert_eq!(d.link_value(cx), "krill://pair?invite=paste-no-submit");
+        assert_eq!(d.phase(), &ClientPhase::Idle);
+    });
+    // 사용자가 [연결]을 눌러야 짝짓기가 시작된다.
+    click(vcx, "link-client-connect-btn");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(matches!(dialog.read(cx).phase(), ClientPhase::Paired(_)));
+    });
+}
+
+/// OWE-878: 근처 Mac 자동 찾기가 지원되지 않아 목록이 비어 있으면 섹션 자체를
+/// 그리지 않는다(미구현 크롬 노출 금지). 탐색 결과가 있을 때만 행을 보여준다.
+#[gpui::test]
+fn nearby_section_hidden_until_discovery_returns_macs(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mock = Arc::new(MockLinkBackend::new());
+    let backend: Arc<dyn LinkBackend> = mock.clone();
+    let (dialog, vcx) = cx.add_window_view(|window, cx| ClientDialog::new(backend, window, cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("link-nearby-section").is_none());
+    assert!(vcx.debug_bounds("link-nearby-empty").is_none());
+    assert!(vcx.debug_bounds("link-nearby-refresh").is_none());
+
+    mock.set_nearby(vec![NearbyMac {
+        id: "near-1".to_owned(),
+        name: "집 맥미니".to_owned(),
+        invite_link: "krill://pair?nearby=home-mini".to_owned(),
+    }]);
+    vcx.update(|_, cx| {
+        dialog.update(cx, ClientDialog::refresh_nearby);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("link-nearby-section").is_some());
+    assert!(vcx.debug_bounds("link-nearby-item-0").is_some());
+}
+
+/// OWE-878: 클라이언트 카드의 [지우기]는 OS 창을 닫지 않고 입력칸·진행 상태만
+/// 초기화한다. 이 기기 이름은 유지한다.
+#[gpui::test]
+fn client_close_resets_form_instead_of_closing_window(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::new());
+    let (dialog, vcx) = cx.add_window_view(|window, cx| ClientDialog::new(backend, window, cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_link_value("https://not-minikrill.example", window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    click(vcx, "link-client-connect-btn");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(matches!(dialog.read(cx).phase(), ClientPhase::Failed(_)));
+    });
+
+    click(vcx, "link-client-close-btn");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let d = dialog.read(cx);
+        assert_eq!(d.phase(), &ClientPhase::Idle);
+        assert!(d.link_value(cx).is_empty());
+        assert!(
+            !d.device_name_value(cx).trim().is_empty(),
+            "device name is kept"
+        );
+    });
+}
+
+/// OWE-878: 짝짓기 창은 Esc로 닫힌다.
+#[gpui::test]
+fn pairing_window_closes_with_esc(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        super::bind_keys(cx);
+    });
+    let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::new());
+    let (_view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
+    vcx.simulate_resize(size(px(1100.), px(1800.)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    assert!(cx.windows().is_empty(), "Esc must close the pairing window");
+}
+
+/// OWE-878: 짝짓기 창은 ⌘W로 닫힌다.
+#[gpui::test]
+fn pairing_window_closes_with_cmd_w(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        super::bind_keys(cx);
+    });
+    let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::new());
+    let (_view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
+    vcx.simulate_resize(size(px(1100.), px(1800.)));
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-w");
+    vcx.run_until_parked();
+    assert!(
+        cx.windows().is_empty(),
+        "cmd-W must close the pairing window"
+    );
+}

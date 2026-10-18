@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
-    Render, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, div,
+    Render, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
     prelude::*, px, size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -43,6 +43,12 @@ const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const NOTIFICATION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 /// 창 크기(고정). Orca 온보딩 모달 비율에 맞춘 값이다.
 pub(super) const WINDOW_SIZE: (f32, f32) = (680., 620.);
+
+actions!(welcome, [CloseWizard]);
+
+/// 마법사 창의 키 컨텍스트. 별도 OS 창에서도 macOS 표준 ⌘W 닫기를 받는다(OWE-878).
+/// Esc는 기존 `on_key_down` 처리가 맡는다.
+pub(super) const KEY_CONTEXT: &str = "Wizard";
 
 /// 점검 행의 hook 설치 진행 상태. 없으면 대기다.
 #[derive(Debug, Clone)]
@@ -663,9 +669,7 @@ impl Wizard {
                     .background_executor()
                     .spawn(async move {
                         match super::actions::prepare_hook(agent, &env) {
-                            Ok(Some((diff, plan))) => {
-                                Outcome::Review(Box::new((diff, Some(plan))))
-                            }
+                            Ok(Some((diff, plan))) => Outcome::Review(Box::new((diff, Some(plan)))),
                             Ok(None) => Outcome::Done,
                             Err(e @ super::actions::FixError::Conflict { .. }) => Outcome::Error(e),
                             Err(e) => match agent {
@@ -1482,9 +1486,14 @@ impl Render for Wizard {
         };
         div()
             .id("onboarding-wizard")
+            .debug_selector(|| "onboarding-wizard".into())
+            .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .role(gpui::Role::Dialog)
             .aria_label(text::TITLE.get())
+            .on_action(cx.listener(|this, _: &CloseWizard, window, cx| {
+                this.later(window, cx);
+            }))
             .on_key_down(cx.listener(|s, e: &KeyDownEvent, window, cx| {
                 match e.keystroke.key.as_str() {
                     "escape" => {

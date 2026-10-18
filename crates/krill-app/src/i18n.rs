@@ -1927,6 +1927,8 @@ pub mod link_ui {
         REVOKE_CONFIRM_CANCEL => ("취소", "Cancel"),
         CLIENT_TITLE => ("다른 Mac 추가", "Add another Mac"),
         CLIENT_DESC => ("다른 Mac에서 만든 초대 링크를 붙여넣어 연결하세요.", "Paste an invite link created on another Mac to connect."),
+        PAIRING_TITLE => ("다른 Mac 연결", "Connect another Mac"),
+        CLIENT_CLEAR => ("지우기", "Clear"),
         LINK_LABEL => ("초대 링크", "Invite link"),
         LINK_PLACEHOLDER => ("krill://pair?... 링크를 붙여넣으세요", "Paste krill://pair?... link here"),
         PASTE_BUTTON => ("붙여넣기", "Paste"),

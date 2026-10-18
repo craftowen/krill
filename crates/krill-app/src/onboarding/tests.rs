@@ -423,6 +423,17 @@ fn wizard_later_on_first_page_asks_again(cx: &mut TestAppContext) {
     assert_eq!(wizard_step(cx), state::Step::Consent);
 }
 
+// OWE-878: 점검 창도 macOS 표준 ⌘W로 닫힌다(Esc와 동일하게 [나중에]/[닫기] 동작).
+#[gpui::test]
+fn wizard_cmd_w_closes_like_esc(cx: &mut TestAppContext) {
+    let f = fake("wizard-cmd-w");
+    let cx = open(cx, &f.env);
+    cx.update(|_, cx| super::init_actions(cx));
+    press(cx, "cmd-w");
+    assert!(wizard_window(cx).is_none(), "cmd-W must close the dialog");
+    assert!(consent::needs_consent(&f.env.state));
+}
+
 // 필수 실패가 있으면 [시작하기] 뒤 닫지 않고 점검 화면으로 막는다.
 #[gpui::test]
 fn wizard_required_fail_blocks_after_start(cx: &mut TestAppContext) {
