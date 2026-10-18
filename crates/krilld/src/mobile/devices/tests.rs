@@ -1,4 +1,5 @@
 use super::*;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 #[test]
 fn registry_atomic_permissions_reopen_and_revoke() {
     let dir = std::env::temp_dir().join(format!("mk-mobile-{}", hex(&random().unwrap())));

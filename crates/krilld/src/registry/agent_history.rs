@@ -114,10 +114,12 @@ impl Registry {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use krill_proto::agent_history::{Agent, Entry, SearchQuery};
     use krill_proto::control::{FEAT_CONTROL, Request};
+    use krill_proto::os::net::UnixStream;
     use krill_proto::screen::Msg as _;
     use krill_proto::{
         SessionId,
@@ -125,7 +127,6 @@ mod tests {
         roles::{self, Ack, Role},
     };
     use std::io::Write as _;
-    use std::os::unix::net::UnixStream;
 
     fn entry() -> Entry {
         Entry {
@@ -251,11 +252,11 @@ mod tests {
 
     #[test]
     fn resume_vault_agy_preserves_isolated_account_profile_and_records_launch_account() {
-        use std::os::fd::{AsFd as _, OwnedFd};
+        use crate::os::{AsFd as _, OwnedFd};
         use std::sync::Arc;
 
         use crate::holder::Holder;
-        use krill_holder::link::Link;
+        use crate::holder::link::Link;
         use krill_proto::holder::{FromHolder, ToHolder, VERSION};
 
         let dir = std::env::temp_dir().join(format!("owe753-reg-vault-{}", std::process::id()));

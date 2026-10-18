@@ -141,6 +141,7 @@ fn add_account_roots(
 
 /// 볼트 재개 시 해당 대화가 실제로 들어 있는 격리 프로필 디렉터리를 찾는다.
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn profile_dir_for_vault_target(
     accounts: &crate::usage::accounts::AccountsFile,
     target: &VaultTarget,

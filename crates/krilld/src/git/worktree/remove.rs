@@ -1,11 +1,10 @@
 //! 워크트리 삭제(MK-043). 잠금·dirty 검사 → remove → branch -d → prune.
 //! 브랜치 정리 실패는 작업 내용을 보존하고 경고한다. force로 잠금이나 미병합 브랜치를 무시하지 않는다.
 
+use krill_proto::os::ffi::{OsStrExt, OsStringExt};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use std::thread;
@@ -266,14 +265,14 @@ fn unlink_symlinks(wt_real: &Path, symlinks: &[String]) {
 fn run_archive_hook(q: &GitQueue, wt: &Path, script: &str) -> Result<(), String> {
     let envs = super::compat::environment_in(q, wt)?;
     let mut cmd = std::process::Command::new("/bin/sh");
-    cmd.arg("-c")
+    crate::child::own_group(&mut cmd)
+        .arg("-c")
         .arg(script)
         .current_dir(wt)
         .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
     for (k, v) in envs {
         cmd.env(OsStr::from_bytes(&k), OsStr::from_bytes(&v));
     }

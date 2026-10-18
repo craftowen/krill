@@ -1,9 +1,9 @@
 //! MK-081: opt-in 자동 종료. MK-052 의존은 재개 표식과 앱의 한 경계에 격리한다.
 //! Orca 문서의 조건을 독립 구현했다. 소스 코드는 차용하지 않았다.
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, OpenOptions};
 use std::io;
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -274,4 +274,5 @@ impl Registry {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

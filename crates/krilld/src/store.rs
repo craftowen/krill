@@ -25,9 +25,9 @@ mod segment;
 
 pub use recorder::Recorder;
 
+use krill_proto::os::fs::DirBuilderExt;
 use std::fs;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -833,8 +833,11 @@ fn replay_harvest(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod encryption_tests;
 #[cfg(test)]
+#[cfg(unix)]
 mod keyframe_tests;
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

@@ -137,6 +137,7 @@ impl Shell {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn launch_with(
         &self,
         user: Option<&User>,

@@ -157,7 +157,7 @@ fn wait(watch: &mut Watch, within: Duration, matches: impl Fn(&Changes) -> bool)
 #[test]
 fn hub_resolves_subdirectory_omits_unchanged_generation_and_reports_non_git() {
     use krill_proto::git::{GitWatchReply, GitWatchRequest};
-    use std::os::unix::ffi::OsStrExt;
+    use krill_proto::os::ffi::OsStrExt;
 
     let mut hub = Hub::default();
     let non_git = Dir::new("hub_non_git");
@@ -230,7 +230,7 @@ fn hub_resolves_subdirectory_omits_unchanged_generation_and_reports_non_git() {
 #[test]
 fn hub_keeps_watch_visible_until_all_subscribers_hide() {
     use krill_proto::git::{GitWatchReply, GitWatchRequest};
-    use std::os::unix::ffi::OsStrExt;
+    use krill_proto::os::ffi::OsStrExt;
 
     let mut hub = Hub::default();
     let dir = Dir::new("hub_refcount");

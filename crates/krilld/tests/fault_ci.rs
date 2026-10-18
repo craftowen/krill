@@ -17,6 +17,7 @@
 //! 5. [`release_gui_survival_e2e_2_and_3_three_rounds`] (`#[ignore]`):
 //!    실제 release `krill-app` GUI 프로세스로 생존 e2e ②(업데이트)·③(krilld kill -9 자동 복구) 3회 연속 검증.
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

@@ -260,8 +260,8 @@ impl Drop for McpLock {
 /// 신규 파일은 `hard_link`로 무덮어쓰기 게시, 기존 파일은 Claude 잠금 아래 rename한다.
 /// 잠금을 지키지 않는 외부 쓰기도 발견하면 거부한다. 원본/심볼릭 링크 대상에는 쓰지 않는다.
 fn publish_mcp(dst: &Path, bytes: &[u8], original: Option<&[u8]>) -> io::Result<()> {
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -276,7 +276,8 @@ fn publish_mcp(dst: &Path, bytes: &[u8], original: Option<&[u8]>) -> io::Result<
         .mode(0o600)
         .open(&tmp)?;
     let result = (|| {
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         drop(file);
@@ -318,7 +319,7 @@ fn link(src: &Path, dst: &Path, name: &'static str, report: &mut Report) -> io::
             return Ok(());
         }
     }
-    std::os::unix::fs::symlink(src, dst)?;
+    crate::os::symlink(src, dst)?;
     report.changed.push(name);
     Ok(())
 }
@@ -346,6 +347,7 @@ fn publish(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
