@@ -1,4 +1,4 @@
-//! `krill-link serve`: iroh QUIC 서버(`ALPN_LINK` + `ALPN_PAIR`), 허용 목록 강제, 즉시 revoke, 제어 소켓.
+//! `krill-link serve`: iroh QUIC 서버(`ALPN_LINK` + `ALPN_PAIR`), 허용 목록 강제, 즉시 revoke, 제어 소켓(`AF_UNIX`).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -15,12 +15,12 @@ use iroh::endpoint::{
 use iroh::{Endpoint, EndpointAddr, EndpointId};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Mutex, oneshot, watch};
 
 use super::ServeOptions;
 use crate::config::{LinkConfig, RelaySetting};
 use crate::identity::DeviceIdentity;
+use crate::local::{Listener, Stream};
 use crate::pair::{
     PairRateLimiter, PairWireRequest, PairWireResponse, encode_addr_ticket,
     generate_invite_for_addr, read_pair_frame, write_pair_frame,
@@ -87,7 +87,12 @@ impl EndpointHooks for ServerHooks {
     }
 }
 
+/// 프로세스 소프트 fd 한도를 올린다(CONVENTIONS §3). Windows는 fd 한도가 없어 아무것도 안 한다.
+#[cfg(windows)]
+pub fn raise_nofile_limit() {}
+
 /// 프로세스 소프트 fd 한도를 올린다(CONVENTIONS §3).
+#[cfg(unix)]
 pub fn raise_nofile_limit() {
     use rustix::process::{Resource, getrlimit, setrlimit};
     const TARGET_NOFILE: u64 = 10_240;
@@ -470,7 +475,7 @@ pub async fn start_server(opts: ServeOptions) -> Result<ServerHandle, Error> {
                     });
                 }
                 ctl_res = accept_ctl_optional(ctl_listener.as_ref()) => {
-                    if let Some((stream, _)) = ctl_res {
+                    if let Some(stream) = ctl_res {
                         let allowed_ctl = Arc::clone(&allowed_loop);
                         let peers_ctl = Arc::clone(&peers_loop);
                         let state_ctl = state_loop.clone();
@@ -572,12 +577,12 @@ fn ensure_loopback_addr(addr: &mut EndpointAddr) {
     }
 }
 
-fn bind_ctl_listener(ctl_path: &Path) -> Result<Option<UnixListener>, Error> {
+fn bind_ctl_listener(ctl_path: &Path) -> Result<Option<Listener>, Error> {
     if ctl_path.as_os_str().len() >= krill_proto::daemon::SUN_PATH_MAX {
         return Ok(None);
     }
     if let Some(parent) = ctl_path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        use std::os::unix::fs::DirBuilderExt as _;
+        use krill_proto::os::fs::DirBuilderExt as _;
         fs::DirBuilder::new()
             .recursive(true)
             .mode(0o700)
@@ -585,21 +590,19 @@ fn bind_ctl_listener(ctl_path: &Path) -> Result<Option<UnixListener>, Error> {
             .map_err(Error::Io)?;
     }
     fs::remove_file(ctl_path).ok();
-    let listener = UnixListener::bind(ctl_path).map_err(Error::Io)?;
+    let listener = Listener::bind(ctl_path).map_err(Error::Io)?;
     Ok(Some(listener))
 }
 
-async fn accept_ctl_optional(
-    listener: Option<&UnixListener>,
-) -> Option<(UnixStream, tokio::net::unix::SocketAddr)> {
+async fn accept_ctl_optional(listener: Option<&Listener>) -> Option<Stream> {
     match listener {
-        Some(l) => l.accept().await.ok(),
+        Some(l) => l.accept().await.ok().map(|(stream, _)| stream),
         None => std::future::pending().await,
     }
 }
 
 async fn handle_ctl_stream(
-    mut stream: UnixStream,
+    mut stream: Stream,
     state_dir: &Path,
     node_id: &str,
     allowed: &Arc<RwLock<BTreeSet<EndpointId>>>,
@@ -825,7 +828,7 @@ pub async fn revoke_device_command(state_dir: &Path, target: &str) -> Result<All
     let removed = remove_device(state_dir, target)?;
     let ctl_path = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
     if ctl_path.exists()
-        && let Ok(mut stream) = UnixStream::connect(&ctl_path).await
+        && let Ok(mut stream) = Stream::connect(&ctl_path).await
     {
         let req = ControlRequest::Revoke {
             target: removed.node_id.clone(),
@@ -845,5 +848,5 @@ pub async fn revoke_device_command(state_dir: &Path, target: &str) -> Result<All
 /// 실행 중인 `krill-link serve`가 살아 있는지 제어 소켓으로 확인한다.
 pub fn is_serve_running(state_dir: &Path) -> bool {
     let ctl_path = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
-    std::os::unix::net::UnixStream::connect(ctl_path).is_ok()
+    krill_proto::os::net::UnixStream::connect(ctl_path).is_ok()
 }

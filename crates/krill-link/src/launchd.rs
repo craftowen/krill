@@ -208,6 +208,18 @@ pub fn disable_launch_agent(_state_dir: &Path) -> Result<PathBuf, Error> {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_launch_agent_does_not_write_plists() {
+        let unsupported = |r: Result<PathBuf, Error>| matches!(r, Err(Error::Io(e)) if e.kind() == io::ErrorKind::Unsupported);
+        let state = Path::new("unused-state");
+        assert!(unsupported(enable_launch_agent(
+            Path::new("krill-link"),
+            state
+        )));
+        assert!(unsupported(disable_launch_agent(state)));
+    }
+
     #[test]
     fn link_plist_matches_snapshot() {
         let generated = link_plist(

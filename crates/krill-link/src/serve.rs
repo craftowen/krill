@@ -3,16 +3,9 @@ use crate::pair::PairRateLimiter;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-#[cfg(unix)]
-mod unix;
-#[cfg(unix)]
-pub(crate) use unix::build_iroh_endpoint;
-#[cfg(unix)]
-pub use unix::*;
-#[cfg(not(unix))]
-mod unsupported;
-#[cfg(not(unix))]
-pub use unsupported::*;
+mod server;
+pub(crate) use server::build_iroh_endpoint;
+pub use server::*;
 
 /// `krill-link serve` 실행 옵션.
 #[derive(Debug, Clone)]
