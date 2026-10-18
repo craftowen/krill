@@ -394,6 +394,9 @@ pub struct SettingsImportSummary {
     pub skipped_reason: Option<String>,
     pub settings_updated: bool,
     pub default_agent: Option<String>,
+    /// 가져오지 않은 터미널 글꼴과 사유(OWE-899). `None`이면 글꼴을 반영했거나 지정이 없었다.
+    #[serde(default)]
+    pub terminal_font_skipped: Option<String>,
     pub quick_commands_merged: usize,
     pub agents_updated: usize,
     pub schedules_merged: usize,
@@ -2441,6 +2444,65 @@ struct OrcaRunContext {
     cwd: Option<String>,
 }
 
+/// Orca `terminalFontFamily` 중 가져올 수 있는 알려진 고정폭 글꼴(OWE-899).
+/// CLI에는 글꼴 시스템이 없어 설치 확인이 안 되므로, 이 목록에 없는 이름은 반영하지 않고
+/// 건너뛴 사유를 남긴다. 앱 실행 중에는 실제 해석 결과로 Menlo 폴백한다.
+const IMPORTABLE_TERMINAL_FONTS: &[&str] = &[
+    "Menlo",
+    "Monaco",
+    "Courier New",
+    "Courier",
+    "Andale Mono",
+    "JetBrains Mono",
+    "Fira Code",
+    "Fira Mono",
+    "Hack",
+    "Source Code Pro",
+    "IBM Plex Mono",
+    "Cascadia Mono",
+    "Cascadia Code",
+    "Inconsolata",
+    "Roboto Mono",
+    "Ubuntu Mono",
+    "DejaVu Sans Mono",
+    "Liberation Mono",
+    "Consolas",
+    "Dank Mono",
+    "Operator Mono",
+    "Hasklig",
+    "Iosevka",
+    "Fantasque Sans Mono",
+    "Victor Mono",
+    "Space Mono",
+    "D2Coding",
+];
+
+/// 가져온 글꼴 이름을 `settings.toml`에 반영해도 되는지 본다(OWE-899).
+#[must_use]
+pub fn importable_terminal_font(name: &str) -> bool {
+    let trimmed = name.trim();
+    !trimmed.is_empty()
+        && IMPORTABLE_TERMINAL_FONTS
+            .iter()
+            .any(|known| known.eq_ignore_ascii_case(trimmed))
+}
+
+/// 가져오지 않은 터미널 글꼴의 사유(OWE-899). 결과 리포트·경고에 그대로 싣는다.
+#[must_use]
+pub fn terminal_font_skip_reason(family: &str) -> String {
+    let family = family.trim();
+    if family.eq_ignore_ascii_case("sf mono") {
+        format!(
+            "터미널 글꼴 '{family}' 가져오기 건너뜀: macOS 숨김 시스템 글꼴이라 \
+             Krill에서 고정폭으로 해석되지 않아 기존 글꼴을 유지합니다"
+        )
+    } else {
+        format!(
+            "터미널 글꼴 '{family}' 가져오기 건너뜀: 고정폭 확인이 안 돼 기존 글꼴을 유지합니다"
+        )
+    }
+}
+
 fn import_settings_domain(
     opts: &ImportOptions,
     domains: &BTreeMap<String, Json>,
@@ -2484,10 +2546,18 @@ fn import_settings_domain(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        settings_table.insert(
-            "terminal_font_family".to_owned(),
-            toml::Value::String(family.to_owned()),
-        );
+        // OWE-899: 고정폭 확인이 안 되는 이름(SF Mono 등)은 셀 계산을 깨뜨리므로
+        // 반영하지 않고 사유를 남긴다.
+        if importable_terminal_font(family) {
+            settings_table.insert(
+                "terminal_font_family".to_owned(),
+                toml::Value::String(family.to_owned()),
+            );
+        } else {
+            let reason = terminal_font_skip_reason(family);
+            summary.terminal_font_skipped = Some(reason.clone());
+            warnings.push(reason);
+        }
     }
 
     if let Some(cursor) = settings.get("terminalCursorStyle").and_then(Json::as_str) {
@@ -3185,6 +3255,80 @@ mod tests {
         fs::create_dir_all(&opts.state_dir).unwrap();
         fs::write(opts.state_dir.join(SETTINGS_FILE), "theme = \"dark\"\n").unwrap();
         (root, opts)
+    }
+
+    /// OWE-899: 알려진 고정폭만 대소문자·공백 무시하고 반영한다.
+    #[test]
+    fn importable_terminal_font_matches_known_monospace() {
+        assert!(importable_terminal_font("Menlo"));
+        assert!(importable_terminal_font("  jetbrains mono  "));
+        assert!(importable_terminal_font("D2Coding"));
+        assert!(!importable_terminal_font("SF Mono"));
+        assert!(!importable_terminal_font("Helvetica"));
+        assert!(!importable_terminal_font(""));
+        assert!(!importable_terminal_font("   "));
+    }
+
+    /// OWE-899: 고정폭 확인이 안 되는 글꼴(SF Mono 등)은 반영하지 않고 사유를 남긴다.
+    #[test]
+    fn unimportable_terminal_font_is_skipped_with_reason() {
+        for (label, family, applied) in [
+            ("font-sfmono", "SF Mono", false),
+            ("font-helvetica", "Helvetica", false),
+            ("font-jetbrains", "JetBrains Mono", true),
+        ] {
+            let root = std::env::temp_dir().join(format!("owe899-{label}-{}", std::process::id()));
+            fs::remove_dir_all(&root).ok();
+            let orca_dir = root.join("orca");
+            fs::create_dir_all(&orca_dir).unwrap();
+            fs::write(
+                orca_dir.join("orca-data.json"),
+                format!(r#"{{"settings":{{"terminalFontFamily":"{family}"}}}}"#),
+            )
+            .unwrap();
+            let opts = ImportOptions {
+                home: root.join("home"),
+                state_dir: root.join("state"),
+                orca_dir,
+                domains: vec![ImportDomain::Settings],
+                dry_run: false,
+            };
+            fs::create_dir_all(&opts.state_dir).unwrap();
+            fs::create_dir_all(&opts.home).unwrap();
+            fs::write(opts.state_dir.join(SETTINGS_FILE), "theme = \"dark\"\n").unwrap();
+
+            let report = run_import(&opts).unwrap();
+            let saved: toml::Table =
+                toml::from_str(&fs::read_to_string(opts.state_dir.join(SETTINGS_FILE)).unwrap())
+                    .unwrap();
+            if applied {
+                assert_eq!(
+                    saved
+                        .get("terminal_font_family")
+                        .and_then(toml::Value::as_str),
+                    Some(family),
+                    "{label}"
+                );
+                assert!(report.settings.terminal_font_skipped.is_none(), "{label}");
+            } else {
+                assert!(
+                    saved.get("terminal_font_family").is_none(),
+                    "{label}: {saved:?}"
+                );
+                let reason = report
+                    .settings
+                    .terminal_font_skipped
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("{label}: skip reason missing"));
+                assert!(reason.contains(family), "{label}: {reason}");
+                assert!(
+                    report.warnings.iter().any(|w| w == reason),
+                    "{label}: {:?}",
+                    report.warnings
+                );
+            }
+            fs::remove_dir_all(root).ok();
+        }
     }
 
     /// OWE-744: rename 직전 앱이 settings.toml을 저장하면 덮어쓰지 않고 새 원본으로 다시 병합한다.

@@ -88,7 +88,8 @@ pub struct Settings {
     /// 터미널 배경 불투명도(50..=100%, 기본 100).
     #[serde(default = "default_terminal_opacity_pct")]
     pub terminal_opacity_pct: u8,
-    /// 터미널 글꼴 패밀리(기본 Menlo, OWE-658). 없는 이름이면 gpui가 대체 글꼴을 쓴다.
+    /// 터미널 글꼴 패밀리(기본 Menlo, OWE-658). 고정폭으로 해석되지 않으면 Menlo로
+    /// 폴백한다(OWE-899: SF Mono처럼 비례 대체로 떨어지는 지정값이 셀을 어긋나게 했다).
     #[serde(default = "default_terminal_font_family")]
     pub terminal_font_family: String,
     /// 프로그램이 커서 모양을 지정하지 않았을 때의 기본 커서(기본 블록, OWE-658).
@@ -652,14 +653,29 @@ pub fn terminal_opacity_alpha(cx: &App) -> f32 {
     f32::from(terminal_opacity_pct(cx)) / 100.
 }
 
-/// 터미널 글꼴 패밀리(OWE-658). 비었거나 `init` 전이면 Menlo.
+/// 터미널 글꼴 패밀리(OWE-658, OWE-899). 비었거나 `init` 전이면 Menlo.
+/// 지정값이 고정폭으로 해석되지 않으면 Menlo로 폴백한다(SF Mono 등).
+/// 셀 폭과 그리기가 같은 이름을 쓰므로 셀이 어긋나지 않는다.
 pub fn terminal_font_family(cx: &App) -> SharedString {
-    cx.try_global::<Config>()
+    let raw = cx
+        .try_global::<Config>()
         .map(|c| c.settings.terminal_font_family.trim())
-        .filter(|f| !f.is_empty())
-        .map_or(SharedString::new_static(crate::ui::FONT_MONO), |f| {
-            SharedString::from(f.to_owned())
-        })
+        .filter(|f| !f.is_empty());
+    let Some(raw) = raw else {
+        return SharedString::new_static(crate::ui::FONT_MONO);
+    };
+    crate::terminal_font::effective_terminal_font(cx.text_system(), raw).family
+}
+
+/// 지정 글꼴이 고정폭으로 해석되지 않아 Menlo로 대신 그릴 때 (지정값, 실제값).
+/// 설정 화면 경고용(OWE-899). `init` 전이거나 대체가 없으면 None.
+pub fn terminal_font_fallback(cx: &App) -> Option<(String, SharedString)> {
+    let raw = cx
+        .try_global::<Config>()
+        .map(|c| c.settings.terminal_font_family.trim().to_owned())
+        .filter(|f| !f.is_empty())?;
+    let effective = crate::terminal_font::effective_terminal_font(cx.text_system(), &raw);
+    effective.replaced.then_some((raw, effective.family))
 }
 
 /// 프로그램이 지정하지 않았을 때 쓸 기본 커서(OWE-658). `init` 전이면 깜박이지 않는 블록.
@@ -3578,10 +3594,13 @@ impl SettingsView {
         let family = s.terminal_font_family.clone();
         let font_family = layout::secondary("terminal-font-family", family.clone())
             .debug_selector(|| "terminal-font-family".into())
-            .dropdown_menu(move |mut menu, _, cx| {
-                // 설치 글꼴 전체(숨김 시스템 글꼴 `.`으로 시작하는 이름 제외). 열 때만 읽는다.
-                let mut names = cx.text_system().all_font_names();
+            .dropdown_menu(move |mut menu, window, _| {
+                // 설치 글꼴 중 고정폭만(OWE-899, 숨김 시스템 글꼴 `.` 시작 제외). 열 때만 읽는다.
+                // 글꼴마다 해석·advance를 재므로 항목이 많으면 열리는 데 시간이 걸릴 수 있다.
+                let text: &gpui::TextSystem = window.text_system();
+                let mut names = text.all_font_names();
                 names.retain(|n| !n.starts_with('.'));
+                names = crate::terminal_font::usable_terminal_fonts(text, &names);
                 names.sort_unstable();
                 names.dedup();
                 menu = menu.scrollable(true).max_h(px(360.));
@@ -3615,6 +3634,18 @@ impl SettingsView {
                     ))
                     .child(layout::controls().child(font_family)),
             )
+            // 지정 글꼴이 고정폭으로 해석되지 않으면 Menlo로 대신 그리고 사유를 밝힌다(OWE-899).
+            .children(terminal_font_fallback(cx).map(|(requested, effective)| {
+                div()
+                    .id("terminal-font-fallback")
+                    .debug_selector(|| "terminal-font-fallback".into())
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.warning)
+                    .child(text::TERMINAL_FONT_FALLBACK.format(&[
+                        ("requested", requested.as_str()),
+                        ("effective", effective.as_ref()),
+                    ]))
+            }))
             .child(
                 row()
                     .child(label(text::FONT_SIZE.get(), text::FONT_SIZE_DESC.get()))
