@@ -371,6 +371,9 @@ pub struct ProjectsImportSummary {
     pub projects_updated: usize,
     pub worktrees_migrated: usize,
     pub lineage_migrated: usize,
+    /// 이관된 워크트리 코멘트 수(OWE-882). 구 JSON과 호환되도록 `default`다.
+    #[serde(default)]
+    pub comments_migrated: usize,
     #[serde(default)]
     pub items: Vec<ImportedProjectSummary>,
 }
@@ -2099,6 +2102,13 @@ fn import_projects_domain(
             };
             apply_worktree_meta(&clean_path, None, &meta, &mut store, &mut wt_store);
             summary.worktrees_migrated = summary.worktrees_migrated.saturating_add(1);
+            if meta
+                .comment
+                .as_deref()
+                .is_some_and(|c| !c.trim().is_empty())
+            {
+                summary.comments_migrated = summary.comments_migrated.saturating_add(1);
+            }
         }
     }
 
@@ -2121,6 +2131,13 @@ fn import_projects_domain(
                     &mut wt_store,
                 );
                 summary.worktrees_migrated = summary.worktrees_migrated.saturating_add(1);
+                if meta
+                    .comment
+                    .as_deref()
+                    .is_some_and(|c| !c.trim().is_empty())
+                {
+                    summary.comments_migrated = summary.comments_migrated.saturating_add(1);
+                }
             }
         }
     }
@@ -3531,6 +3548,7 @@ mod tests {
         assert_eq!(dry_report.ssh.environments_merged, 1);
         assert_eq!(dry_report.projects.projects_added, 2);
         assert_eq!(dry_report.projects.worktrees_migrated, 2);
+        assert_eq!(dry_report.projects.comments_migrated, 2);
         assert_eq!(dry_report.projects.lineage_migrated, 1);
         assert!(dry_report.settings.settings_updated);
         assert_eq!(dry_report.settings.quick_commands_merged, 1);
