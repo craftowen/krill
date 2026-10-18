@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Context, PromptLevel, Task, Window, div, prelude::*};
+use gpui_component::Sizable as _;
 use krill_proto::SessionId;
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -272,15 +273,31 @@ fn row(label: impl Into<String>, value: impl Into<String>, p: &crate::ui::Palett
 impl Render for Panel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = crate::ui::palette(cx);
-        let arrow = if self.open { "▾" } else { "▴" };
-        let summary = match &self.data {
-            Some(r) => format!("{} · {} {arrow}", text::TITLE.get(), mb(r.total())),
-            None => format!("{} {arrow}", text::TITLE.get()),
+        let tooltip_text = match &self.data {
+            Some(r) => {
+                let daemon = r.daemon.saturating_add(r.holder.unwrap_or(0));
+                format!(
+                    "{} · {}: {} · {}: {} · {}: {}",
+                    text::TITLE.get(),
+                    text::TOTAL.get(),
+                    mb(r.total()),
+                    text::APP.get(),
+                    r.client.map_or_else(|| "-".to_owned(), mb),
+                    text::DAEMON.get(),
+                    mb(daemon),
+                )
+            }
+            None => text::TITLE.get().to_owned(),
         };
+        let total_label = self.data.as_ref().map(|r| mb(r.total()));
         let header = div()
             .id("resources-toggle")
             .debug_selector(|| "resources-toggle".into())
-            .px_1p5()
+            .aria_label(tooltip_text.clone())
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
             .py_0p5()
             .rounded(crate::ui::RADIUS_XS)
             .cursor_pointer()
@@ -291,7 +308,15 @@ impl Render for Panel {
                 p.muted_foreground
             })
             .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-            .child(summary)
+            .child(
+                gpui_component::Icon::default()
+                    .data(crate::ui::icons::MEMORY_STICK_SVG)
+                    .with_size(gpui_component::Size::XSmall),
+            )
+            .children(total_label)
+            .tooltip(move |window, cx| {
+                crate::ui::tooltip_view("resources-toggle", tooltip_text.clone(), window, cx)
+            })
             .on_click(cx.listener(|this, _, _, cx| this.on_toggle_click(cx)));
         let popover = self.open.then(|| {
             let content = match &self.data {
