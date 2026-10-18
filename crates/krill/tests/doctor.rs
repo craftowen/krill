@@ -135,6 +135,14 @@ fn instance(out: &str) -> u32 {
 }
 
 fn ps(pid: u32, field: &str) -> String {
+    // Linux `ps -o comm`은 15자로 자른 이름이다. 실행 파일 경로는 `/proc/<pid>/exe`로 본다.
+    #[cfg(target_os = "linux")]
+    if field == "comm" {
+        return fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+    }
     let o = Command::new("/bin/ps")
         .args(["-o", &format!("{field}="), "-p", &pid.to_string()])
         .output()
@@ -194,7 +202,8 @@ fn first_run_launches_and_rerun_reuses() {
         ps(d.holder, "stat").contains('s'),
         "holder is not a session leader"
     );
-    assert_eq!(ps(d.holder, "tty"), "??");
+    // 제어 터미널 없음: macOS `ps`는 `??`, Linux procps는 `?`.
+    assert!(matches!(ps(d.holder, "tty").as_str(), "??" | "?"));
 
     let again = doctor(&dir);
     let out = stdout(&again);

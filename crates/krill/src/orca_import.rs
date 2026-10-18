@@ -3291,6 +3291,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "macos"),
+        ignore = "macOS 전용: Orca macOS 데이터 경로"
+    )]
     fn full_import_sqlite_and_json_fallback_is_idempotent_and_respects_dry_run_and_only() {
         let root = std::env::temp_dir().join(format!("owe726-proto-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();

@@ -37,6 +37,8 @@ impl Daemon {
         let dir = std::env::temp_dir().join(format!("mk045-{}-{tag}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
+        // 데몬은 그룹 쓰기 가능한 상태 디렉터리를 거부한다. Ubuntu 기본 umask(002)에서도 실제 설치(0700)와 같게 만든다.
+        fs::set_permissions(&dir, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
         if let Some(config) = config {
             fs::write(dir.join("history.toml"), config).unwrap();
         }
@@ -1107,7 +1109,10 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
 }
 
 #[test]
-#[cfg(target_os = "macos")]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS 전용: krill computer(접근성 API)"
+)]
 fn computer_cli_subcommands_and_skill_work_offline() {
     let dir = std::env::temp_dir().join(format!("mk187-computer-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();

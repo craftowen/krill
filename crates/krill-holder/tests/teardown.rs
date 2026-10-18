@@ -3,6 +3,7 @@
 //! 이 테스트 바이너리가 가짜 krilld를 겸한다(`MKT_ROLE=krilld`, holder가 이 바이너리를 다시 실행한다).
 //! 시나리오 결과는 `MKT_DIR`의 파일로 오케스트레이터에 넘긴다.
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,
@@ -163,6 +164,7 @@ fn limit(link: &mut Link, dir: &Path) {
         },
         "257번째 세션"
     );
+    #[cfg(target_os = "macos")]
     assert_eq!(
         rustix::io::Errno::PROCLIM.raw_os_error(),
         SESSION_LIMIT_ERRNO

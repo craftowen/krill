@@ -8,28 +8,55 @@
 //! - 환경은 krilld 것을 물려주지 않고 launchd 기본값만 남긴다. krilld가 개발 셸에서 떠도 그 셸의 PATH와
 //!   nvm·mise 활성화 흔적(`NVM_BIN`, `__MISE_*` 등)·`MK_*` 내부 값이 새지 않아, rc 파일이 같은 입력에서
 //!   같은 PATH를 만든다.
+//!
+//! Windows(OWE-819)는 셸 후보와 기본값만 있다: passwd가 없어 [`SHELL_CANDIDATES`]→`%COMSPEC%` 순으로 고르고,
+//! 로그인 셸 `PATH` 탐침은 하지 않는다.
+//! ponytail: 환경은 아직 Unix 규칙(KEEP 필터)이라 `SystemRoot`·`USERPROFILE` 등이 빠진다. `ConPTY` 셸을 띄우는 Phase 3(OWE-833)에서 Windows용 상속 목록을 만든다.
 
-use std::os::unix::ffi::OsStringExt;
 use std::process::Stdio;
+
+use krill_proto::os::ffi::OsStringExt;
 
 use crate::sys::{self, User};
 
 /// launchd가 GUI 앱에 주는 PATH(실측, Terminal.app 셸이 받는 값). 나머지는 `/etc/zprofile`의 `path_helper`가 붙인다.
+#[cfg(all(unix, not(target_os = "linux")))]
 const LAUNCHD_PATH: &[u8] = b"/usr/bin:/bin:/usr/sbin:/sbin";
+/// Linux(원격 호스트): Ubuntu `/etc/environment` 기본값. PAM 로그인 없이 `bash -l`만 돌리면 이 값이 안 붙는다.
+#[cfg(target_os = "linux")]
+const LAUNCHD_PATH: &[u8] = b"/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// Windows 기본 시스템 PATH(추정, 설치 기본값). Windows PowerShell 5.1 폴더를 포함한다.
+#[cfg(windows)]
+const LAUNCHD_PATH: &[u8] =
+    br"C:\Windows\system32;C:\Windows;C:\Windows\System32\WindowsPowerShell\v1.0\";
 /// passwd를 못 읽고 `SHELL`도 없을 때의 셸(macOS 기본).
+#[cfg(all(unix, not(target_os = "linux")))]
 const FALLBACK_SHELL: &[u8] = b"/bin/zsh";
+#[cfg(target_os = "linux")]
+const FALLBACK_SHELL: &[u8] = b"/bin/sh";
+/// Windows 기본 셸 후보(앞이 우선, `PATH`에서 찾는다). 모두 없으면 `%COMSPEC%`, 그것도 없으면 `cmd.exe`.
+#[cfg(windows)]
+const SHELL_CANDIDATES: &[&str] = &["pwsh.exe", "powershell.exe"];
 /// `AppleLocale`을 읽지 못했을 때의 LANG. launchd GUI 부모 없이 띄운 개발 셸에서만 나온다.
+#[cfg(not(target_os = "linux"))]
 const FALLBACK_LANG: &[u8] = b"en_US.UTF-8";
+/// Linux는 `en_US` 로케일이 생성돼 있지 않은 이미지가 많다. `C.UTF-8`은 glibc에 늘 있다.
+#[cfg(target_os = "linux")]
+const FALLBACK_LANG: &[u8] = b"C.UTF-8";
 /// 시스템 로케일 조회의 하드 상한. `defaults read` 실측 4~8ms라 여유를 둔다.
 const LOCALE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 /// `defaults read` 출력(`ko_KR`·`ko_KR@...` 등)에서 LANG에 쓸 앞부분만 남길 때의 상한.
 const LOCALE_MAX: usize = 32;
 
 /// 로그인 셸 `PATH` 조회의 하드 상한. rc 파일이 멈추거나 백그라운드 자식을 띄워도 데몬이 멈추지 않는다.
+#[cfg(unix)]
 const PATH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// 로그인 셸 stdout 수집 상한.
+#[cfg(unix)]
 const PATH_MAX: usize = 64 * 1024;
+#[cfg(unix)]
 const PATH_MARKER: &[u8] = b"__MK_PATH__=";
+#[cfg(unix)]
 const PATH_PROBE: &str = "/usr/bin/printf '\\n__MK_PATH__='; /usr/bin/printenv PATH";
 
 /// launchd 환경에서 그대로 물려줄 변수. HOME·USER·LOGNAME·SHELL은 passwd에서, PATH는 [`LAUNCHD_PATH`]로 새로 채운다.
@@ -148,8 +175,8 @@ impl Shell {
                 .map(<[u8]>::to_vec)
                 .or_else(|| from_env(key))
         };
-        let login_shell = pick(user.map(|u| u.shell.as_slice()), b"SHELL")
-            .unwrap_or_else(|| FALLBACK_SHELL.to_vec());
+        let login_shell =
+            pick(user.map(|u| u.shell.as_slice()), b"SHELL").unwrap_or_else(fallback_shell);
 
         let mut env: Vec<(Vec<u8>, Vec<u8>)> = inherited
             .iter()
@@ -183,6 +210,8 @@ impl Shell {
         ]);
 
         let argv = match self {
+            // pwsh·powershell·cmd에는 `-l`이 없다.
+            Self::Login if cfg!(windows) => vec![login_shell],
             Self::Login => vec![login_shell, b"-l".to_vec()],
             Self::Custom { program, args } => std::iter::once(program.clone())
                 .chain(args.iter().cloned())
@@ -190,6 +219,26 @@ impl Shell {
         };
         Launch { argv, env }
     }
+}
+
+#[cfg(unix)]
+fn fallback_shell() -> Vec<u8> {
+    FALLBACK_SHELL.to_vec()
+}
+
+#[cfg(windows)]
+fn fallback_shell() -> Vec<u8> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    SHELL_CANDIDATES
+        .iter()
+        .find_map(|c| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(c))
+                .find(|p| p.is_file())
+        })
+        .map(std::path::PathBuf::into_os_string)
+        .or_else(|| std::env::var_os("COMSPEC"))
+        .map_or_else(|| b"cmd.exe".to_vec(), OsStringExt::into_vec)
 }
 
 /// Terminal.app처럼 시스템 로케일(`AppleLocale`→`ko_KR`)에서 LANG(`ko_KR.UTF-8`)을 만든다.
@@ -324,6 +373,7 @@ fn set_path(launch: &mut Launch, path: &[u8]) {
 }
 
 /// 에이전트 `wrap`과 같은 방식(`<login_shell> -l -i -c`)으로 로그인 셸의 `PATH`를 읽는다.
+#[cfg(unix)]
 fn probe_path(login: &Launch) -> Option<Vec<u8>> {
     use std::ffi::OsStr;
     use std::io::Read as _;
@@ -403,6 +453,13 @@ fn probe_path(login: &Launch) -> Option<Vec<u8>> {
     extract_path(&out)
 }
 
+/// Windows는 로그인 셸 탐침이 없다. 호출자가 [`LAUNCHD_PATH`]를 쓴다.
+#[cfg(windows)]
+fn probe_path(_login: &Launch) -> Option<Vec<u8>> {
+    None
+}
+
+#[cfg(unix)]
 fn extract_path(out: &[u8]) -> Option<Vec<u8>> {
     out.split(|&b| b == b'\n')
         .rev()
@@ -414,10 +471,12 @@ fn extract_path(out: &[u8]) -> Option<Vec<u8>> {
         .map(<[u8]>::to_vec)
 }
 
+#[cfg(unix)]
 fn kill_probe(child: &mut std::process::Child) {
     child.kill().ok();
     child.wait().ok();
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

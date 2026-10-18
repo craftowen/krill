@@ -9,6 +9,7 @@
 //! `MKH_UPGRADES=10 cargo nextest run -p krill-holder --locked --no-capture exec_handoff`
 //! holder만 크래시한 뒤 재결합(OWE-478): `cargo nextest run -p krill-holder --locked holder_crash_adopt`
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -389,7 +390,10 @@ fn contract(link: &mut Link, dir: &Path, sessions: usize, listener: Option<Owned
     link.send(&[6, 0, 0, 0, 0x40, 0, 77, 0, 0, 0], &[]).unwrap();
     assert_eq!(
         reply(link, dir).0,
-        FromHolder::Failed { req: 77, errno: 78 }
+        FromHolder::Failed {
+            req: 77,
+            errno: rustix::io::Errno::NOSYS.raw_os_error()
+        }
     );
     let spawn = |req, id, argv: &[&str]| ToHolder::Spawn {
         req,

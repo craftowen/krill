@@ -1,25 +1,38 @@
-//! 키체인 마스터 키와 세그먼트별 인증 암호화. 잠정 MK-024 포맷에 대한 암호 의존은 이 모듈에 둔다.
+//! 마스터 키(macOS 키체인, Linux는 상태 디렉터리의 0600 파일, Windows는 아직 없음)와 세그먼트별 인증 암호화.
+//! 잠정 MK-024 포맷에 대한 암호 의존은 이 모듈에 둔다.
 
 use std::fmt;
 use std::io;
+#[cfg(target_os = "macos")]
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
 
 use ring::{
     aead, hkdf,
     rand::{SecureRandom as _, SystemRandom},
 };
+#[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::SecKeychain;
+#[cfg(target_os = "macos")]
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
+#[cfg(target_os = "macos")]
 const SERVICE: &str = "com.minikrill.segment-key.v2";
+#[cfg(target_os = "macos")]
 const NOT_FOUND: i32 = -25300;
+#[cfg(target_os = "macos")]
 const DUPLICATE: i32 = -25299;
 pub(super) const SALT_LEN: usize = 32;
 // Keychain의 UI 허용 상태는 프로세스 단위다. 이 모듈의 동시 조회를 직렬화한다.
+#[cfg(target_os = "macos")]
 static KEYCHAIN_GATE: Mutex<()> = Mutex::new(());
+/// Linux 키 파일 이름(상태 디렉터리 바로 아래).
+#[cfg(target_os = "linux")]
+const KEY_FILE: &str = "segment.key";
 
 pub(super) struct Key(Zeroizing<[u8; 32]>);
 
@@ -30,6 +43,7 @@ impl fmt::Debug for Key {
 }
 
 impl Key {
+    #[cfg(target_os = "macos")]
     pub(super) fn load(root: &Path, existing: bool) -> io::Result<Arc<Self>> {
         let _gate = crate::session::lock(&KEYCHAIN_GATE);
         let _ui = if SecKeychain::user_interaction_allowed().map_err(keychain_error)? {
@@ -41,7 +55,58 @@ impl Key {
         Self::load_from(root, existing, &keychain)
     }
 
+    /// 헤드리스 Linux VM에는 키체인이 없다. 키를 상태 디렉터리의 0600 파일에 둔다(디스크 권한만큼만 보호된다).
+    /// 임시 파일을 다 쓴 뒤 `link`로 자리에 놓아, 경쟁하는 생성자가 반쯤 쓴 키를 읽거나 기존 키를 덮어쓰지 않는다.
+    #[cfg(target_os = "linux")]
+    pub(super) fn load(root: &Path, existing: bool) -> io::Result<Arc<Self>> {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let path = root.join(KEY_FILE);
+        match std::fs::read(&path) {
+            Ok(bytes) => return Self::from_slice(&Zeroizing::new(bytes)).map(Arc::new),
+            Err(e) if e.kind() == io::ErrorKind::NotFound && !existing => {}
+            Err(e) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("segment key unavailable ({e})"),
+                ));
+            }
+        }
+        let mut bytes = Zeroizing::new([0; 32]);
+        SystemRandom::new()
+            .fill(bytes.as_mut())
+            .map_err(crypto_error)?;
+        let tmp = root.join(format!(".{KEY_FILE}.{}", std::process::id()));
+        std::fs::remove_file(&tmp).ok();
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(bytes.as_ref())?;
+        file.sync_all()?;
+        let placed = std::fs::hard_link(&tmp, &path);
+        std::fs::remove_file(&tmp).ok();
+        match placed {
+            Ok(()) => Ok(Arc::new(Self(bytes))),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                Self::from_slice(&Zeroizing::new(std::fs::read(&path)?)).map(Arc::new)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Windows 마스터 키(DPAPI)는 OWE-833에서 만든다. 그 전에는 평문 키 파일로 대신하지 않고 키 생성을 거부한다.
+    #[cfg(windows)]
+    pub(super) fn load(_root: &Path, _existing: bool) -> io::Result<Arc<Self>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "segment key unavailable (Windows DPAPI not implemented)",
+        ))
+    }
+
     /// 명시한 키체인만 검색한다. 테스트는 임시 키체인으로 같은 경로를 검증한다.
+    #[cfg(target_os = "macos")]
     pub(super) fn load_from(
         root: &Path,
         existing: bool,
@@ -90,6 +155,7 @@ impl Key {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn keychain_error(e: security_framework::base::Error) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,

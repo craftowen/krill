@@ -6,16 +6,20 @@
 //! plist `EnvironmentVariables`로 `KRILL_STATE_DIR`을 넘긴다. 격리 앱이 실제 사용자 항목을 덮어쓰거나 끄지 않고,
 //! launchd가 띄운 `serve`가 실제 상태 디렉터리(`link-ctl.sock`)에 붙지 않는다(OWE-669).
 
+use krill_proto::os::ffi::OsStrExt as _;
+#[cfg(target_os = "macos")]
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 use krill_proto::daemon::BUNDLE_ID;
 
 use crate::Error;
-use crate::store::{encode_hex, write_atomic_0600};
+use crate::store::encode_hex;
+#[cfg(target_os = "macos")]
+use crate::store::write_atomic_0600;
 
 /// `krill-link` `launchd` `LaunchAgent` 레이블 (CONVENTIONS A3 고유 식별자). 기본 상태 디렉터리 전용.
 pub const LINK_LABEL: &str = "dev.krill.app.link";
@@ -128,6 +132,7 @@ pub fn launch_agent_plist_path(label: &str) -> Result<PathBuf, Error> {
 }
 
 /// `state_dir`용 `LaunchAgent` plist를 설치하고 `launchctl bootstrap gui/<uid>`로 활성화한다.
+#[cfg(target_os = "macos")]
 pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<PathBuf, Error> {
     let isolated = match isolated_state_dir(state_dir) {
         None => None,
@@ -169,6 +174,7 @@ pub fn enable_launch_agent(krill_link_exe: &Path, state_dir: &Path) -> Result<Pa
 }
 
 /// `state_dir`용 `launchctl bootout gui/<uid>/<label>`로 중지하고 `LaunchAgent` plist 파일을 제거한다.
+#[cfg(target_os = "macos")]
 pub fn disable_launch_agent(state_dir: &Path) -> Result<PathBuf, Error> {
     let label = link_label(isolated_state_dir(state_dir));
     let plist_path = launch_agent_plist_path(&label)?;
@@ -236,6 +242,7 @@ mod tests {
         assert_eq!(LINK_LABEL, format!("{BUNDLE_ID}.link"));
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn link_plist_passes_macos_plutil_lint() {
         let dir = std::env::temp_dir().join(format!("mklink-plist-{}", std::process::id()));
@@ -262,4 +269,16 @@ mod tests {
         assert!(out.status.success(), "isolated plutil failed");
         fs::remove_dir_all(&dir).ok();
     }
+}
+
+/// LaunchAgent installation is only supported on macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn enable_launch_agent(_krill_link_exe: &Path, _state_dir: &Path) -> Result<PathBuf, Error> {
+    Err(crate::unsupported_platform())
+}
+
+/// LaunchAgent removal is only supported on macOS.
+#[cfg(not(target_os = "macos"))]
+pub fn disable_launch_agent(_state_dir: &Path) -> Result<PathBuf, Error> {
+    Err(crate::unsupported_platform())
 }

@@ -4,8 +4,10 @@
 //!
 //! 라이트/다크는 터미널 팔레트도 바꾸며 셸이 krilld에 전달한다(OWE-590). 줌은 rem 기반 UI 크기에 적용한다.
 
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -894,8 +896,8 @@ pub fn set_language(language: Language, cx: &mut App) {
 /// `base`는 [`edit`]이 읽은 디스크 원문이다. 저장 직전 다시 읽은 원문과 다르면
 /// 외부 편집이 낀 것이므로 덮어쓰지 않고 오류를 낸다(AS-07 lost-update 방지).
 fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::io::Result<()> {
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::io::{self, Write as _};
-    use std::os::unix::fs::OpenOptionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -965,6 +967,7 @@ fn write_settings(path: &Path, body: &str) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
+    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let result = (|| {
         use std::io::Write as _;
@@ -3306,7 +3309,10 @@ impl SettingsView {
                             .on_click(|_, _, cx| crate::onboarding::open_checks_current(cx)),
                     ),
             )
-            .children(Self::render_update_rows(s, cx))
+            // 자체 업데이터는 macOS 번들 전용이라 다른 OS에서는 숨긴다(규칙 10).
+            .when(cfg!(target_os = "macos"), |el| {
+                el.children(Self::render_update_rows(s, cx))
+            })
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
@@ -7119,26 +7125,29 @@ impl SettingsView {
                     ))
                     .child(layout::controls().child(clear)),
             )
-            .child(
-                row()
-                    .child(label(
-                        crate::security::text::SECURE_KEYBOARD_MENU.get(),
-                        text::SECURE_KB_DESC.get(),
-                    ))
-                    .child(
-                        layout::controls()
-                            .child(if s.secure_keyboard_entry {
-                                sec_on_btn.primary()
-                            } else {
-                                sec_on_btn.ghost()
-                            })
-                            .child(if s.secure_keyboard_entry {
-                                sec_off_btn.ghost()
-                            } else {
-                                sec_off_btn.primary()
-                            }),
-                    ),
-            )
+            // Secure Keyboard Entry는 macOS 전용이라 다른 OS에서는 숨긴다(규칙 10).
+            .when(cfg!(target_os = "macos"), |el| {
+                el.child(
+                    row()
+                        .child(label(
+                            crate::security::text::SECURE_KEYBOARD_MENU.get(),
+                            text::SECURE_KB_DESC.get(),
+                        ))
+                        .child(
+                            layout::controls()
+                                .child(if s.secure_keyboard_entry {
+                                    sec_on_btn.primary()
+                                } else {
+                                    sec_on_btn.ghost()
+                                })
+                                .child(if s.secure_keyboard_entry {
+                                    sec_off_btn.ghost()
+                                } else {
+                                    sec_off_btn.primary()
+                                }),
+                        ),
+                )
+            })
             .child(
                 row()
                     .child(label(text::DOCTOR_TITLE.get(), text::DOCTOR_DESC.get()))

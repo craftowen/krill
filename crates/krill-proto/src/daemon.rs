@@ -43,7 +43,7 @@ use crate::ipc::{self, ClientHello, ClientRole, Negotiated, ServerHello};
 use crate::screen::Msg as _;
 
 pub mod migrate;
-pub use migrate::state_dir_in;
+pub use migrate::{LINUX_STATE_PARENT, state_dir_in};
 
 /// 감시 연결에만 초기 holder 상태와 상실 통보를 보낸다. 기존 Hello DTO는 바꾸지 않는다.
 pub const FEAT_HOLDER_WATCH: u64 = 1 << 7;
@@ -507,10 +507,11 @@ pub fn preflight(path: &Path) -> io::Result<()> {
         }
     }
     // std::process::Command는 내부에서 posix_spawnp를 써서 ENOEXEC를 만나면 /bin/sh로 폴백한다.
-    // holder execve가 받는 Mach-O(단일·fat)·PE(Windows) 또는 #! 스크립트 매직인지 먼저 확인한다.
+    // holder execve가 받는 Mach-O(단일·fat)·ELF(Linux 원격 호스트)·PE(Windows) 또는 #! 스크립트 매직인지 먼저 확인한다.
     let mut magic = [0_u8; 4];
     let n = std::fs::File::open(path)?.read(&mut magic)?;
     let valid_magic = magic.starts_with(b"#!")
+        || (cfg!(target_os = "linux") && magic == *b"\x7fELF")
         || (cfg!(windows) && magic.starts_with(b"MZ"))
         || (n == 4
             && matches!(

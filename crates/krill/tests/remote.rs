@@ -241,8 +241,9 @@ fn remote_commands_use_forwarded_socket() {
             && argv.contains("-o ConnectTimeout=10")
             && argv.contains("-o ExitOnForwardFailure=yes")
             && argv.contains("-o StreamLocalBindUnlink=yes")
-            && argv.contains("-N")
+            && argv.contains("-T")
             && argv.contains("-L")
+            && argv.trim_end().ends_with("cat >/dev/null")
             && argv.contains(HOST),
         "unexpected ssh argv: {argv}"
     );
