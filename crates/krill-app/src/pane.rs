@@ -615,6 +615,7 @@ impl<W: Write> Pane<W> {
 
     /// `session`에 붙었다. 다른 세션이면 화면을 버리고, 보류 입력은 같은 세션(처음 붙는 칸이면 그 세션)에만 보낸다
     /// (MK-026). 버린 입력은 알림으로. `roles`면 잰 칸 크기를 보낸다([`Pane::fit`]).
+    /// 콜드 세션을 재개해 새 세션으로 이어 붙을 때는 콜드 화면·스크롤백을 새 세션 위쪽 히스토리로 보존한다(OWE-842).
     pub fn link(
         &mut self,
         session: SessionId,
@@ -623,11 +624,17 @@ impl<W: Write> Pane<W> {
         features: u64,
         now: Now,
     ) -> Vec<Notice> {
+        let was_cold = self.state == State::Cold;
         // 처음 붙는 칸(아직 세션 없음)에서 친 입력은 그 첫 세션에 간다.
         let same = if self.session.is_none_or(|s| s == session) {
             input::Incarnation::Same
         } else {
             input::Incarnation::Changed
+        };
+        let prior_from_cold = if same == input::Incarnation::Changed && was_cold {
+            Some(self.collect_cold_prior())
+        } else {
+            None
         };
         if same == input::Incarnation::Changed || self.instance != instance {
             self.view = View::default();
@@ -635,7 +642,11 @@ impl<W: Write> Pane<W> {
             self.state = State::Live;
         }
         if same == input::Incarnation::Changed {
-            self.history.reset();
+            if let Some(prior) = prior_from_cold {
+                self.history = History::with_prior(prior);
+            } else {
+                self.history.clear_all();
+            }
             self.search.clear();
         }
         self.search.supported = true;
@@ -920,6 +931,36 @@ impl<W: Write> Pane<W> {
     pub fn search_result(&self) -> Option<&krill_proto::search::SearchResult> {
         self.search.result.as_ref()
     }
+
+    fn collect_cold_prior(&mut self) -> Vec<Vec<Cell>> {
+        const MAX_PRIOR_ROWS: usize = 1_000;
+        let is_blank_row = |row: &[Cell]| row.iter().all(|c| c.ch == ' ' || c.ch == '\0');
+        let screen_rows = &self.view.screen.rows;
+        let non_blank_len = screen_rows
+            .iter()
+            .rposition(|r| !is_blank_row(r))
+            .map_or(0, |idx| idx + 1);
+        let mut prior = Vec::new();
+        for row in screen_rows[..non_blank_len].iter().rev() {
+            if prior.len() >= MAX_PRIOR_ROWS {
+                break;
+            }
+            prior.push(row.clone());
+        }
+        for row in self.history.rows.drain(..) {
+            if prior.len() >= MAX_PRIOR_ROWS {
+                break;
+            }
+            prior.push(row);
+        }
+        for row in self.history.prior.drain(..) {
+            if prior.len() >= MAX_PRIOR_ROWS {
+                break;
+            }
+            prior.push(row);
+        }
+        prior
+    }
 }
 
 /// 받는 단계: 핫 스크롤백 → 콜드 페이지(최신부터) → 끝.
@@ -939,6 +980,8 @@ pub struct History {
     offset: usize,
     /// 받은 행, 화면 바로 위부터 위로.
     rows: Vec<Vec<Cell>>,
+    /// 콜드 세션을 재개해 새 세션으로 이어 붙었을 때 보존한 이전 화면·스크롤백(최신 행부터, OWE-842).
+    prior: Vec<Vec<Cell>>,
     /// `rows` 중 앞쪽 핫 행 수.
     hot: usize,
     phase: Phase,
@@ -955,6 +998,7 @@ impl Default for History {
         Self {
             offset: 0,
             rows: Vec::new(),
+            prior: Vec::new(),
             hot: 0,
             phase: Phase::Hot { got: 0 },
             page: Vec::new(),
@@ -966,16 +1010,34 @@ impl Default for History {
 }
 
 impl History {
-    /// 바닥으로: 받은 행을 버린다. 늦게 오는 답은 요청 번호가 달라 버려진다.
+    /// 바닥으로: 받은 행을 버린다(재개된 콜드 히스토리 `prior`는 유지). 늦게 오는 답은 요청 번호가 달라 버려진다.
     fn reset(&mut self) {
         if self.fixed {
             self.offset = 0;
             return;
         }
+        let prior = std::mem::take(&mut self.prior);
+        *self = Self {
+            req: self.req,
+            prior,
+            ..Self::default()
+        };
+    }
+
+    /// 다른 라이브 세션으로 전환할 때 이전 히스토리를 모두 지운다.
+    fn clear_all(&mut self) {
         *self = Self {
             req: self.req,
             ..Self::default()
         };
+    }
+
+    /// 재개 전 콜드 화면·스크롤백(`prior`, 최신 행부터)을 품은 라이브 히스토리(OWE-842).
+    fn with_prior(prior: Vec<Vec<Cell>>) -> Self {
+        Self {
+            prior,
+            ..Self::default()
+        }
     }
 
     /// 다 받은 스크롤백(오래된 행부터).
@@ -990,16 +1052,20 @@ impl History {
         }
     }
 
+    fn total_len(&self) -> usize {
+        self.rows.len().saturating_add(self.prior.len())
+    }
+
     /// 지금 보이는 히스토리 행 수.
     fn visible(&self) -> usize {
-        self.offset.min(self.rows.len())
+        self.offset.min(self.total_len())
     }
 
     fn scroll(&mut self, lines: isize) {
         let next = self.offset.saturating_add_signed(lines);
         // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 두고, 행이 오면 그만큼 보인다.
         let cap = if self.phase == Phase::Done {
-            self.rows.len()
+            self.total_len()
         } else {
             self.visible().saturating_add(lines.unsigned_abs())
         };
@@ -1091,15 +1157,22 @@ impl History {
             return screen.clone();
         }
         // 보이는 줄 l은 화면 맨 위에서 l - off번째 줄이다. 음수면 히스토리(화면 바로 위가 0번)에서 off - l - 1번째.
-        let pick = |l: usize| match l.checked_sub(off) {
-            Some(v) => (
-                screen.rows.get(v).cloned().unwrap_or_default(),
-                screen.links.get(v).cloned().unwrap_or_default(),
-            ),
-            None => (
-                self.rows.get(off - l - 1).cloned().unwrap_or_default(),
-                Vec::new(),
-            ),
+        let pick = |l: usize| {
+            if let Some(v) = l.checked_sub(off) {
+                (
+                    screen.rows.get(v).cloned().unwrap_or_default(),
+                    screen.links.get(v).cloned().unwrap_or_default(),
+                )
+            } else {
+                let idx = off - l - 1;
+                let row = self
+                    .rows
+                    .get(idx)
+                    .or_else(|| self.prior.get(idx.saturating_sub(self.rows.len())))
+                    .cloned()
+                    .unwrap_or_default();
+                (row, Vec::new())
+            }
         };
         let mut s = screen.clone();
         (s.rows, s.links) = (0..screen.rows.len()).map(pick).unzip();

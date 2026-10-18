@@ -2887,3 +2887,74 @@ fn delete_worktree_failure_preserves_lineage_and_ssot_respects_cli_changes(
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-842: 사이드바 프로젝트·워크트리·그룹·원격 호스트 접힘/펼침, 다중 세션 카드 펼침, 선택된 워크트리가
+/// `sidebar.bin`에 저장·복원되며, `UiExpansionState` 꼬리가 없는 기존 v3 `sidebar.bin`도 그대로 읽힌다.
+#[gpui::test]
+fn owe_842_sidebar_persists_expansion_state_and_selected_worktree(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-owe-842-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+
+    let repo = PathBuf::from("/repo");
+    let wt_a = PathBuf::from("/repo/a");
+    let wt_b = PathBuf::from("/repo/b");
+    let group = options::GroupKey::PrStatus(options::PrGroup::Open);
+    let remote = crate::hosts::HostId::Remote("remote-dev".into());
+
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/repo/a")),
+                    session(2, AgentState::Done, Some("/repo/b")),
+                ],
+                trees: BTreeMap::from([(repo.clone(), vec![wt_a.clone(), wt_b.clone()])]),
+            };
+            s.rebuild(cx);
+            s.fold(&wt_a, Some(false), cx);
+            s.fold_group(group, Some(false), cx);
+            s.fold_host(&remote, Some(false), cx);
+            s.toggle_card_sessions(&wt_b, cx);
+            s.select_worktree(Some(wt_b.clone()), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let reloaded = Sidebar::new(Some(sidebar_bin.clone()));
+    assert!(reloaded.is_collapsed(&wt_a));
+    assert!(!reloaded.is_collapsed(&wt_b));
+    assert!(reloaded.is_group_collapsed(group));
+    assert!(reloaded.is_host_collapsed(&remote));
+    assert!(reloaded.is_card_expanded(&wt_b));
+    assert_eq!(
+        reloaded.selected_worktree().map(Path::to_path_buf),
+        Some(wt_b.clone())
+    );
+
+    // 새 창에서 다시 그려도(rebuild) 선택된 워크트리(`wt_b`)로 커서가 복원된다.
+    let (view2, cx) = cx.add_window_view(|_, _| reloaded);
+    cx.update(|_, cx| {
+        view2.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/repo/a")),
+                    session(2, AgentState::Done, Some("/repo/b")),
+                ],
+                trees: BTreeMap::from([(repo, vec![wt_a, wt_b.clone()])]),
+            };
+            s.rebuild(cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view2.read(cx);
+        let cur = s.cursor.expect("restored cursor");
+        assert_eq!(s.rows.get(cur), Some(&Row::Worktree(wt_b)));
+    });
+
+    fs::remove_dir_all(dir).ok();
+}

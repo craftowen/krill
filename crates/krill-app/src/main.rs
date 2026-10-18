@@ -138,9 +138,15 @@ fn new_window(cx: &mut App) -> Option<WindowHandle<shell::Shell>> {
 
 /// 창 구성과 외부 IO를 분리하여 gpui 테스트가 데몬을 띄우지 않게 한다.
 fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell::Shell>> {
-    let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
+    let window_bounds = path
+        .as_deref()
+        .and_then(krill_app::layout::Layout::peek_window_bounds)
+        .map_or_else(
+            || WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(760.)), cx)),
+            shell::gpui_window_bounds_from_saved,
+        );
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        window_bounds: Some(window_bounds),
         titlebar: Some(TitlebarOptions {
             title: Some(krill_app::i18n::catalog::security::APP_MENU.get().into()),
             appears_transparent: true,

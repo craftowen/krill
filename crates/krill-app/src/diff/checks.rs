@@ -23,7 +23,7 @@ use crate::pull_request::{
 };
 
 /// 오른쪽 사이드바 상단 탭.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PanelTab {
     #[default]
     Changes,
