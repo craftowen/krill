@@ -963,6 +963,7 @@ fn corrupt_and_unreadable_sidebar_prefs_preserve_original_and_prevent_overwrite(
 #[gpui::test]
 fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAppContext) {
     use crate::pull_request::Status;
+    use gpui::{Modifiers, MouseButton};
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
     let path = PathBuf::from("/repo/feature");
@@ -987,6 +988,12 @@ fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAp
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("pr-badge-1").is_none());
+    assert!(cx.debug_bounds("sidebar-pr-guidance").is_some());
+    let dismiss = cx.debug_bounds("sidebar-pr-guidance-dismiss").unwrap();
+    cx.simulate_mouse_down(dismiss.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(dismiss.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("sidebar-pr-guidance").is_none());
 }
 
 /// OWE-610(4): 사이드바는 제어 연결을 재사용해 500ms마다 새 UDS 2개를 열지 않으며,

@@ -36,22 +36,31 @@ fn all_branches_and_create_share_budget_and_branch_switch_drops_stale_badge() {
     let first = service.refresh(&branches, now);
     assert_eq!(fake.0.load(Ordering::SeqCst), 1);
     let path = first.keys().next().unwrap().clone();
-    assert_eq!(
-        service.create(&path, &branches[&path], now),
-        Err(PACED.get())
-    );
+    // OWE-850: user-initiated create/inspect is not blocked by background polling cooldown.
+    assert!(service.create(&path, &branches[&path], now).is_ok());
+    assert_eq!(fake.0.load(Ordering::SeqCst), 2);
     branches.insert(path.clone(), "switched".into());
     assert!(!service.refresh(&branches, now).contains_key(&path));
     for i in 1..20 {
         service.refresh(&branches, now + GAP * i);
     }
-    assert_eq!(fake.0.load(Ordering::SeqCst), 20);
-    assert_eq!(
-        service.create(&path, "switched", now + Duration::from_secs(299)),
-        Err(PACED.get())
-    );
-    assert!(service.create(&path, "switched", now + WINDOW).is_ok());
     assert_eq!(fake.0.load(Ordering::SeqCst), 21);
+    // Background refresh is still capped at 20 per WINDOW, while manual create/inspect still works.
+    assert_eq!(
+        service
+            .refresh(&branches, now + Duration::from_secs(299))
+            .len(),
+        19
+    );
+    assert_eq!(fake.0.load(Ordering::SeqCst), 21);
+    assert!(
+        service
+            .create(&path, "switched", now + Duration::from_secs(299))
+            .is_ok()
+    );
+    assert_eq!(fake.0.load(Ordering::SeqCst), 22);
+    assert_eq!(service.refresh(&branches, now + WINDOW).len(), 20);
+    assert_eq!(fake.0.load(Ordering::SeqCst), 23);
 }
 
 #[test]
@@ -568,9 +577,15 @@ fn pr_checks_tab_displays_failed_logs_and_sends_combined_fix_prompt_to_active_ag
         p.set_checks_branch("craftowen/m10-owe-739");
         p
     });
+    let opened_files: Arc<Mutex<Vec<crate::diff::OpenFileAt>>> = Arc::new(Mutex::new(Vec::new()));
+    let opened_clone = Arc::clone(&opened_files);
     cx.update(|_, cx| {
         cx.subscribe(&panel, move |_, event: &crate::diff::SendComments, _| {
             sent_clone.lock().unwrap().push(event.0.clone());
+        })
+        .detach();
+        cx.subscribe(&panel, move |_, event: &crate::diff::OpenFileAt, _| {
+            opened_clone.lock().unwrap().push(event.clone());
         })
         .detach();
     });
@@ -589,6 +604,35 @@ fn pr_checks_tab_displays_failed_logs_and_sends_combined_fix_prompt_to_active_ag
     assert!(cx.debug_bounds("pr-check-row-0").is_some());
     assert!(cx.debug_bounds("pr-check-log-tail-0").is_some());
     assert!(cx.debug_bounds("pr-comment-row-0").is_some());
+    // OWE-850: only failed checks expose the AI fix selection checkbox.
+    assert!(cx.debug_bounds("pr-check-select-0").is_some());
+    assert!(cx.debug_bounds("pr-check-select-1").is_none());
+
+    // OWE-850: clicking PR title/number or CI check opens external URL; clicking comment location opens file at line.
+    click("pr-checks-title-link", cx);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url(),
+        Some("https://github.com/acme/krill/pull/739".into())
+    );
+
+    click("pr-check-link-0", cx);
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url(),
+        Some("https://github.com/acme/krill/actions/runs/100/job/200".into())
+    );
+
+    click("pr-comment-location-0", cx);
+    cx.run_until_parked();
+    assert_eq!(
+        opened_files.lock().unwrap().as_slice(),
+        &[crate::diff::OpenFileAt {
+            path: PathBuf::from("/repo/crates/krill-app/src/pull_request/checks.rs"),
+            line: 142,
+            column: 1,
+        }]
+    );
 
     click("pr-check-select-0", cx);
     click("pr-comment-select-0", cx);
@@ -653,7 +697,7 @@ fn inspect_shares_budget_and_enforces_max_concurrent_slots() {
     let repo = PathBuf::from("/repo");
     let max_conc = u32::try_from(MAX_CONCURRENT).unwrap();
 
-    // 1. Hold MAX_CONCURRENT (4) concurrent `inspect_at` slots spaced by GAP in chronological order.
+    // 1. Hold MAX_CONCURRENT (4) concurrent `inspect_at` slots.
     let mut handles = Vec::new();
     for i in 0..max_conc {
         let svc = Arc::clone(&service);
@@ -663,7 +707,7 @@ fn inspect_shares_budget_and_enforces_max_concurrent_slots() {
         started_rx.recv().unwrap();
     }
 
-    // 2. While 4 slots are in-flight, a 5th `inspect_at` or `create` (even after GAP) is rejected with PACED.
+    // 2. While 4 slots are in-flight, a 5th `inspect_at` or `create` is rejected with PACED.
     assert_eq!(
         service.inspect_at(&repo, "main", now + GAP * max_conc),
         Err(PACED.get())
@@ -673,7 +717,7 @@ fn inspect_shares_budget_and_enforces_max_concurrent_slots() {
         Err(PACED.get())
     );
 
-    // 3. Release in-flight workers; slots are returned on Drop, and minimum GAP pacing still applies.
+    // 3. Release in-flight workers; slots are returned on Drop, and manual inspect/create work without 10s GAP cooldown.
     {
         let (lock, cvar) = &runner.gate;
         *lock.lock().unwrap() = true;
@@ -684,14 +728,53 @@ fn inspect_shares_budget_and_enforces_max_concurrent_slots() {
     }
     assert_eq!(runner.calls.load(Ordering::SeqCst), MAX_CONCURRENT);
 
-    // Calling within GAP of the last reserved timestamp (`now + GAP * 3`) is rejected by Budget.
     let last_at = now + GAP * (max_conc - 1);
-    assert_eq!(
-        service.inspect_at(&repo, "main", last_at + Duration::from_secs(9)),
-        Err(PACED.get())
+    assert!(
+        service
+            .inspect_at(&repo, "main", last_at + Duration::from_secs(1))
+            .is_ok()
     );
-    // After GAP, slot and budget are both available again.
-    assert!(service.create(&repo, "main", last_at + GAP).is_ok());
+    assert!(
+        service
+            .create(&repo, "main", last_at + Duration::from_secs(2))
+            .is_ok()
+    );
+}
+
+#[test]
+fn non_github_and_local_only_repositories_skip_pr_polling_without_failure() {
+    assert!(!has_github_remote_config(""));
+    assert!(!has_github_remote_config(
+        "remote.origin.url /tmp/local-bare-repo\nremote.upstream.url https://gitlab.com/acme/repo.git"
+    ));
+    assert!(has_github_remote_config(
+        "remote.origin.url git@github.com:acme/krill.git"
+    ));
+    assert!(has_github_remote_config(
+        "remote.origin.url https://ghe.corp.example.com/org/repo.git\nremote.origin.gh-resolved base"
+    ));
+
+    let root = std::env::temp_dir().join(format!("mk-owe850-local-repo-{}", std::process::id()));
+    drop(std::fs::remove_dir_all(&root));
+    std::fs::create_dir_all(&root).unwrap();
+    assert!(
+        Command::new("git")
+            .current_dir(&root)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!has_github_remote(&root));
+    assert_eq!(
+        Gh.run(&root, "main", Action::Refresh).unwrap(),
+        Status::NoPr
+    );
+    assert_eq!(
+        checks::inspect_with_gh(&root, "main").unwrap().status,
+        Status::NoPr
+    );
+    drop(std::fs::remove_dir_all(&root));
 }
 
 #[test]
