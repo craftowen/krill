@@ -4302,6 +4302,17 @@ fn divider(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window = Some(window.window_handle());
+        // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
+        // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
+        // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
+        // 플로팅 창 제목은 Floating::render가 소유하므로 건드리지 않는다.
+        if self.role == WindowRole::Main {
+            if self.settings.is_some() {
+                window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
+            } else {
+                window.set_window_title(text::APP_TITLE.get());
+            }
+        }
         if self.language != krill_app::i18n::language() {
             self.language = krill_app::i18n::language();
             if let Some((palette, _)) = &self.jump {
