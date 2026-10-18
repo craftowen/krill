@@ -1,3 +1,4 @@
+#![cfg(target_os = "macos")]
 //! MK-170: 번들 id 이관(`dev.minikrill.app` → `dev.krill.app`)을 실제 holder·krilld·`krill`로 임시 `HOME`에서
 //! 확인한다. 이 맥의 `~/Library`와 launchd는 건드리지 않는다(`HOME`을 바꾸고 launchctl을 끈다).
 //!

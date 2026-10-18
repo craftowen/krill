@@ -27,7 +27,7 @@ scripts/check-windows.sh [-p <크레이트>] [--clippy]   # Mac에서 Windows �
 ```
 Cargo.toml            # 워크스페이스, [workspace.lints], [workspace.dependencies] — 의존성 버전은 여기서만
 crates/krill-proto/   # 와이어 포맷(프레임·메시지·키프레임). 엔진·UI 무관. 모든 프로세스가 공유
-crates/krill-holder/  # PTY 부모·fd 보관·exec 핸드오프. 1,200줄 이하(결정 12-2, 플랫폼별로 셈 — CONVENTIONS §5), 거의 안 바뀜. unsafe FFI 집중 구역
+crates/krill-holder/  # PTY 부모·fd 보관·exec 핸드오프. macOS 빌드 1,250줄 이하 + Linux 전용 sys/linux.rs 300줄 이하(결정 12-2, 2026-10-18 개정, 플랫폼별로 셈 — CONVENTIONS §5), 거의 안 바뀜. unsafe FFI 집중 구역
 crates/krilld/        # 세션 데몬: alacritty_terminal·IPC·zstd 세그먼트·hook·상태·git 큐·모바일 게이트웨이
 crates/krill-term/    # 프레임워크 중립 그리드 렌더 모델 + IME 상태기계(gpui 실패 시 교체 대비)
 crates/krill-hosts/   # 원격 호스트 연결 계층(SSH 소켓 포워딩·피어 관리)

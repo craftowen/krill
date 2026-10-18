@@ -301,6 +301,10 @@ fn raw_stream_without_disk_reports_gap_beyond_ring() {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS 전용: 지연 기준(p95 300ms)은 macOS 실측값"
+)]
 fn screen_reconnect_p95_and_final_screens_match() {
     let dir = tmp("screen");
     let st = store(&dir, Limits::default());
@@ -680,6 +684,7 @@ fn client_footprint(n: usize) -> u64 {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: /usr/bin/footprint")]
 fn client_footprint_is_flat_in_output_length() {
     let small = client_footprint(1_000);
     let big = client_footprint(100_000);
