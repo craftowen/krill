@@ -112,7 +112,7 @@ impl Link {
         target: BorrowedHandle<'_>,
     ) -> io::Result<()> {
         let remote = sys::Remote::duplicate(target, handles)?;
-        let frame = message.encode_handles(remote.values()).map_err(invalid)?;
+        let frame = remote.encode(message)?;
         (&self.output).write_all(&frame)?;
         remote.commit();
         Ok(())
@@ -141,12 +141,7 @@ impl Link {
         let Some((f, total)) = parse_frame(&self.buf).map_err(invalid)? else {
             return Ok(None);
         };
-        let (values, body) = f.handles().map_err(invalid)?;
-        let packet = Packet {
-            kind: f.kind,
-            body: body.to_vec(),
-            fds: sys::received_handles(values)?,
-        };
+        let packet = sys::packet(f)?;
         self.buf.drain(..total);
         Ok(Some(packet))
     }

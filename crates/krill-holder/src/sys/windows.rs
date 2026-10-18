@@ -53,7 +53,7 @@ pub fn available(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
     })?;
     Ok(n)
 }
-pub fn received_handles(values: Vec<u64>) -> io::Result<Vec<OwnedHandle>> {
+fn received_handles(values: Vec<u64>) -> io::Result<Vec<OwnedHandle>> {
     let mut seen = std::collections::HashSet::new();
     if values
         .iter()
@@ -77,6 +77,16 @@ pub fn received_handles(values: Vec<u64>) -> io::Result<Vec<OwnedHandle>> {
         })?;
     }
     Ok(handles)
+}
+pub fn packet(frame: krill_proto::holder::Frame<'_>) -> io::Result<crate::link::Packet> {
+    let (values, body) = frame
+        .handles()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    Ok(crate::link::Packet {
+        kind: frame.kind,
+        body: body.to_vec(),
+        fds: received_handles(values)?,
+    })
 }
 pub fn inherited_link() -> io::Result<Link> {
     if TAKEN.swap(true, Ordering::AcqRel) {
@@ -135,8 +145,10 @@ impl<'a> Remote<'a> {
         }
         Ok(out)
     }
-    pub fn values(&self) -> &[u64] {
-        &self.values
+    pub fn encode(&self, message: &krill_proto::holder::FromHolder) -> io::Result<Vec<u8>> {
+        message
+            .encode_handles(&self.values)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
     pub fn commit(mut self) {
         self.committed = true;
@@ -896,7 +908,7 @@ mod tests {
         let (input, _output) = pipe()?;
         let remote = Remote::duplicate(target.as_handle(), &[input.as_handle()])?;
         let value = remote
-            .values()
+            .values
             .first()
             .copied()
             .ok_or(io::ErrorKind::InvalidData)?;
