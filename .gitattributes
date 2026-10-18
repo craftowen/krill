@@ -1,0 +1,22 @@
+* text=auto eol=lf
+
+# 이미지·압축 파일과 바이트 비교용 터미널 녹화는 원본 그대로 보존한다.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.gz binary
+*.zip binary
+*.zst binary
+*.xz binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.bin binary
+*.krs binary
+*.cert binary
+*.key binary
+*.rec -text
