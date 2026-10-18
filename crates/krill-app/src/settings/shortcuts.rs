@@ -81,7 +81,7 @@ pub(super) struct Recorder {
     pub(super) target: Option<Target>,
     /// 충돌 확인 대기: 대상, 새 키, 그 키를 이미 쓰는 액션들.
     conflict: Option<(Target, String, Vec<&'static str>)>,
-    error: Option<SharedString>,
+    pub(super) error: Option<SharedString>,
     intercept: Option<gpui::Subscription>,
 }
 
@@ -118,6 +118,23 @@ pub(super) fn norm(key: &str) -> Option<String> {
 
 fn same(a: &str, b: &str) -> bool {
     norm(a).is_some_and(|a| Some(a) == norm(b))
+}
+
+/// 기능키 이름인지(F1~F35, 대소문자 무시). 기능키는 수식키 없이도 단축키가 된다.
+fn is_function_key(key: &str) -> bool {
+    key.strip_prefix(['f', 'F'])
+        .is_some_and(|n| !n.is_empty() && n.len() <= 2 && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// 녹음한 키가 단축키로 쓰이려면 수식키(⇧ 제외, ⌘/⌃/⌥ 중 하나 이상)가 필요한지(OWE-863).
+/// 기능키(F1~F12 등)는 맨몸도 되지만, 문자·공백·Enter·Backspace·방향키 등은 맨몸이나 ⇧만으로는
+/// 터미널 입력과 겹치므로 저장하지 않는다(Orca 정규화와 같은 규칙).
+pub(super) fn needs_modifier(keystroke: &Keystroke) -> bool {
+    if is_function_key(&keystroke.key) {
+        return false;
+    }
+    let m = &keystroke.modifiers;
+    !(m.platform || m.control || m.alt)
 }
 
 /// `action`의 키들(키맵 순서, 중복 제거).
@@ -175,6 +192,27 @@ pub(super) fn reset_action(table: &mut toml::Table, defaults: &[Pair], action: &
         Some("") => !is_default(defaults, action, k),
         _ => true,
     });
+}
+
+/// `action`의 바인딩 하나만 지운다(OWE-863). 기본 키면 `""`로 꺼서 같은 키의 다른 기본 바인딩도 함께
+/// 끈다([`set_key`]와 같은 키 단위 규칙).
+pub(super) fn remove_key(table: &mut toml::Table, defaults: &[Pair], action: &str, key: &str) {
+    table.retain(|k, _| !same(k, key));
+    if is_default(defaults, action, key) {
+        table.insert(key.to_owned(), "".into());
+    }
+}
+
+/// `action`의 현재 키를 모두 꺼 단축키를 비활성화한다(OWE-863). 초기화로 기본 키를 되돌릴 수 있다.
+pub(super) fn disable_action(
+    table: &mut toml::Table,
+    defaults: &[Pair],
+    action: &str,
+    current: &[String],
+) {
+    for key in current {
+        remove_key(table, defaults, action, key);
+    }
 }
 
 /// `original`의 `[bindings]` 항목을 `target`과 같게 고친 새 본문. 주석·빈 줄·남은 항목 순서는 그대로 둔다.
@@ -297,6 +335,13 @@ impl SettingsView {
         if keystroke.key == "escape" && !keystroke.modifiers.modified() {
             return;
         }
+        // OWE-863: 수식키 없는 일반 키(Backspace로 지우려는 경우 포함)는 터미널 입력과 겹치므로
+        // 바인딩하지 않고 오류로 알린다. 지우기는 키 옆 ×, 끄기는 사용 안 함 버튼으로 한다.
+        if needs_modifier(keystroke) {
+            self.shortcuts.error = Some(text::SC_NEEDS_MODIFIER.get().into());
+            cx.notify();
+            return;
+        }
         let key = keystroke.unparse();
         let others = conflicts(&live_pairs(cx), &key, target.action);
         if others.is_empty() {
@@ -341,6 +386,25 @@ impl SettingsView {
     pub(super) fn reset_shortcut(&mut self, action: &'static str, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
         self.write_keys(cx, |t, defaults| reset_action(t, defaults, action));
+    }
+
+    /// 바인딩 하나만 지운다(OWE-863). 기본 키면 `""`로 꺼서 비활성화한다.
+    pub(super) fn delete_key(&mut self, action: &'static str, key: &str, cx: &mut Context<Self>) {
+        self.shortcuts.conflict = None;
+        self.write_keys(cx, |t, defaults| remove_key(t, defaults, action, key));
+    }
+
+    /// 액션의 현재 키를 모두 꺼 단축키를 비활성화한다(OWE-863). 초기화로 되돌릴 수 있다.
+    pub(super) fn disable_shortcut(
+        &mut self,
+        action: &'static str,
+        current: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        self.shortcuts.conflict = None;
+        self.write_keys(cx, |t, defaults| {
+            disable_action(t, defaults, action, current);
+        });
     }
 
     fn key_button(
@@ -394,9 +458,49 @@ impl SettingsView {
             }
             let mut caps = layout::controls();
             for key in &current {
-                caps = caps.child(self.key_button(action, Some(key.clone()), cx));
+                let del_id = format!("sc-del-{action}-{key}");
+                let del_selector = del_id.clone();
+                let key_owned = key.clone();
+                caps = caps.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .child(self.key_button(action, Some(key.clone()), cx))
+                        .child(
+                            layout::ghost(SharedString::from(del_id), "×")
+                                .debug_selector(move || del_selector.clone())
+                                .accessibility_label(text::SC_DELETE_KEY.get())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.delete_key(action, &key_owned, cx);
+                                })),
+                        ),
+                );
             }
             caps = caps.child(self.key_button(action, None, cx));
+            // OWE-863: 키를 모두 끈 행은 사용 안 함 힌트를, 키가 남은 행은 끄기 버튼을 보인다.
+            if current.is_empty() {
+                if !default.is_empty() {
+                    caps = caps.child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::SC_DISABLED_HINT.get()),
+                    );
+                }
+            } else {
+                let id = format!("sc-disable-{action}");
+                let selector = id.clone();
+                caps = caps.child(
+                    layout::ghost(SharedString::from(id), text::SC_DISABLE.get())
+                        .debug_selector(move || selector.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let live = live_pairs(cx);
+                            let current = keys_of(&live, action);
+                            this.disable_shortcut(action, &current, cx);
+                        })),
+                );
+            }
             let (mut a, mut b) = (current, default);
             a.sort();
             b.sort();
