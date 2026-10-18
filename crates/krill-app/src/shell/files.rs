@@ -225,6 +225,7 @@ impl FileTab {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     fn editor(&self) -> Option<&gpui::Entity<EditorState>> {
         match &self.body {
             Body::Text { state, .. } => Some(state),
@@ -1277,4 +1278,5 @@ fn prompt_unsaved(
 
 pub(crate) mod bench;
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

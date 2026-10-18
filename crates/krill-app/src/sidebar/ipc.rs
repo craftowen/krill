@@ -641,6 +641,7 @@ fn fetch_from(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

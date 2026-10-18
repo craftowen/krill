@@ -64,6 +64,7 @@ pub mod menu_bar {
     #[derive(Debug)]
     pub struct StatusItem(());
 
+    #[expect(clippy::unused_self, reason = "macOS StatusItem과 같은 시그니처")]
     impl StatusItem {
         pub fn new(_open_label: &str, _quit_label: &str, _cx: &App) -> Option<Self> {
             None

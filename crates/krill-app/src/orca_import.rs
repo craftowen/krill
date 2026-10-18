@@ -1312,6 +1312,7 @@ fn render_domain_row(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use krill_proto::os::net::UnixStream;
     use std::fs;

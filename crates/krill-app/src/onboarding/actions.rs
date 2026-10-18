@@ -668,4 +668,5 @@ mod notifications;
 pub use notifications::{dismiss_notification, show_notification};
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
