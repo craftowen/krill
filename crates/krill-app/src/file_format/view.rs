@@ -12,7 +12,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::text::TextView;
-use gpui_component::{Disableable as _, Selectable as _, Sizable as _};
+use gpui_component::{Disableable as _, IconName, Selectable as _, Sizable as _};
 
 use super::csv::Table;
 use super::ipynb::{CellKind, Notebook, Output};
@@ -128,20 +128,31 @@ impl Render for ImageView {
                     .on_click(cx.listener(|v, _, _, cx| v.set_zoom(Zoom::Scale(1.), cx))),
             )
             .child(
-                tool("image-zoom-out", "−")
+                Button::new("image-zoom-out")
+                    .debug_selector(|| "image-zoom-out".into())
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Minus)
                     .tooltip(text::ZOOM_OUT.get())
+                    .accessibility_label(text::ZOOM_OUT.get())
                     .disabled(fixed)
                     .on_click(cx.listener(|v, _, _, cx| v.set_zoom(v.zoom.zoom_out(), cx))),
             )
             .child(
-                tool("image-zoom-in", "+")
+                Button::new("image-zoom-in")
+                    .debug_selector(|| "image-zoom-in".into())
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::Plus)
                     .tooltip(text::ZOOM_IN.get())
+                    .accessibility_label(text::ZOOM_IN.get())
                     .disabled(fixed)
                     .on_click(cx.listener(|v, _, _, cx| v.set_zoom(v.zoom.zoom_in(), cx))),
             )
             .when_some(scale_label(self.zoom), |d, label| {
                 d.child(
                     div()
+                        .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_XS)
                         .text_color(pal.muted_foreground)
                         .child(label),
@@ -211,13 +222,16 @@ pub fn image_error(error: RasterError) -> String {
 }
 
 /// 마크다운 미리보기(gpui-component `TextView`). 편집↔미리보기 토글은 에디터 쪽(OWE-663/665)에서.
-pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>) -> AnyElement {
+pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>, cx: &App) -> AnyElement {
+    let pal = crate::ui::palette(cx);
     let id = id.into();
     div()
         .id(id.clone())
         .size_full()
         .overflow_y_scroll()
         .p(crate::ui::SPACE_4)
+        .bg(pal.editor_surface)
+        .text_color(pal.foreground)
         .child(TextView::markdown(id, source))
         .into_any_element()
 }
@@ -264,6 +278,7 @@ fn column_widths(table: &Table) -> Vec<f32> {
 fn csv_row(cells: &[String], widths: &[f32], border: gpui::Hsla) -> gpui::Div {
     div()
         .flex()
+        .items_center()
         .h(px(CSV_ROW_HEIGHT))
         .border_b_1()
         .border_color(border)
@@ -365,6 +380,7 @@ pub fn notebook(id: impl Into<ElementId>, nb: &Notebook, cx: &App) -> AnyElement
         };
         let prompt = (cell.kind == CellKind::Code).then(|| {
             div()
+                .font_family(crate::ui::FONT_MONO)
                 .text_size(crate::ui::TEXT_XS)
                 .text_color(pal.muted_foreground)
                 .child(match cell.execution_count {
@@ -419,12 +435,17 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let action = |id: &'static str, label: &'static str, make: fn(&Path) -> Command| {
+    let open_action = {
         let path = path.to_path_buf();
-        Button::new(id)
-            .small()
-            .label(label)
-            .on_click(move |_, _, cx| spawn_open(make(&path), cx))
+        crate::ui::primary("file-open-default", text::OPEN_DEFAULT.get())
+            .debug_selector(|| "file-open-default".into())
+            .on_click(move |_, _, cx| spawn_open(super::open_default_command(&path), cx))
+    };
+    let reveal_action = {
+        let path = path.to_path_buf();
+        crate::ui::secondary("file-reveal", text::REVEAL.get())
+            .debug_selector(|| "file-reveal".into())
+            .on_click(move |_, _, cx| spawn_open(super::reveal_command(&path), cx))
     };
     div()
         .size_full()
@@ -448,21 +469,7 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
                 .text_color(pal.muted_foreground)
                 .child(text::NO_PREVIEW.get()),
         )
-        .child(
-            div()
-                .flex()
-                .gap_2()
-                .child(action(
-                    "file-open-default",
-                    text::OPEN_DEFAULT.get(),
-                    super::open_default_command,
-                ))
-                .child(action(
-                    "file-reveal",
-                    text::REVEAL.get(),
-                    super::reveal_command,
-                )),
-        )
+        .child(div().flex().gap_2().child(open_action).child(reveal_action))
         .into_any_element()
 }
 

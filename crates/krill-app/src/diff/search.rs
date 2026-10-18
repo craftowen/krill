@@ -2069,7 +2069,7 @@ impl Panel {
             .flex_col()
             .gap_1()
             .border_b_1()
-            .border_color(p.border)
+            .border_color(p.sidebar_border)
             .child(
                 div()
                     .flex()
@@ -2132,7 +2132,7 @@ impl Panel {
                 .px_2p5()
                 .py_1()
                 .border_b_1()
-                .border_color(p.border)
+                .border_color(p.sidebar_border)
                 .text_size(ui::TEXT_2XS)
                 .text_color(if truncated {
                     p.warning
@@ -2242,10 +2242,10 @@ impl Panel {
         }
         let max_cols = self.search_row_max_cols(window);
         let p = ui::palette(cx);
-        let selected_bg = p.accent;
-        let hover_bg = p.accent.opacity(0.6);
+        let selected_bg = p.sidebar_accent;
+        let hover_bg = p.sidebar_accent;
         let highlight_bg = p.warning.opacity(0.3);
-        let fg = p.foreground;
+        let fg = p.sidebar_foreground;
         let muted = p.muted_foreground;
 
         range
@@ -2281,8 +2281,17 @@ impl Panel {
                                 .items_center()
                                 .gap_1p5()
                                 .cursor_pointer()
+                                .text_color(if is_selected {
+                                    p.sidebar_accent_foreground
+                                } else {
+                                    fg
+                                })
                                 .when(is_selected, |d| d.bg(selected_bg))
-                                .when(!is_selected, |d| d.hover(move |s| s.bg(hover_bg)))
+                                .when(!is_selected, |d| {
+                                    d.hover(move |s| {
+                                        s.bg(hover_bg).text_color(p.sidebar_accent_foreground)
+                                    })
+                                })
                                 .child(
                                     Icon::new(if collapsed {
                                         IconName::ChevronRight
@@ -2308,9 +2317,16 @@ impl Panel {
                                         .child(
                                             div()
                                                 .flex_none()
+                                                .min_w_0()
+                                                .truncate()
                                                 .text_size(ui::TEXT_XS)
                                                 .font_weight(FontWeight::MEDIUM)
-                                                .text_color(fg)
+                                                .font_family(ui::FONT_MONO)
+                                                .text_color(if is_selected {
+                                                    p.sidebar_accent_foreground
+                                                } else {
+                                                    fg
+                                                })
                                                 .child(file_name),
                                         )
                                         .when(!dir_path.is_empty(), |d| {
@@ -2386,8 +2402,17 @@ impl Panel {
                                 .gap_1p5()
                                 .cursor_pointer()
                                 .overflow_hidden()
+                                .text_color(if is_selected {
+                                    p.sidebar_accent_foreground
+                                } else {
+                                    fg
+                                })
                                 .when(is_selected, |d| d.bg(selected_bg))
-                                .when(!is_selected, |d| d.hover(move |s| s.bg(hover_bg)))
+                                .when(!is_selected, |d| {
+                                    d.hover(move |s| {
+                                        s.bg(hover_bg).text_color(p.sidebar_accent_foreground)
+                                    })
+                                })
                                 .child(
                                     div()
                                         .w(px(28.))
@@ -2411,7 +2436,11 @@ impl Panel {
                                         .overflow_hidden()
                                         .font_family(ui::FONT_MONO)
                                         .text_size(ui::TEXT_XS)
-                                        .text_color(fg)
+                                        .text_color(if is_selected {
+                                            p.sidebar_accent_foreground
+                                        } else {
+                                            fg
+                                        })
                                         .when(!before.is_empty(), |d| {
                                             d.child(div().flex_none().child(before))
                                         })

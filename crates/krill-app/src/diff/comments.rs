@@ -2,6 +2,7 @@
 
 use gpui::{AnyElement, Context, Entity, Subscription, Window, div, prelude::*};
 use gpui_component::Disableable as _;
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::diff::{DiffLineRange, DiffSide};
 use gpui_component::input::{Textarea, TextareaState};
@@ -254,7 +255,14 @@ impl Panel {
             }
             .location();
             view = view
-                .child(location)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(crate::ui::FONT_MONO)
+                        .child(location),
+                )
                 .child(Textarea::new(input).h(crate::ui::SPACE_4 * 4.))
                 .child(
                     div()
@@ -264,6 +272,7 @@ impl Panel {
                             Button::new("comment-save")
                                 .debug_selector(|| "comment-save".into())
                                 .label(text::ADD.get())
+                                .small()
                                 .primary()
                                 .disabled(input.read(cx).value().trim().is_empty())
                                 .on_click(cx.listener(|this, _, window, cx| {
@@ -290,11 +299,14 @@ impl Panel {
                     .flex()
                     .gap_1()
                     .items_center()
-                    .child(div().flex_1().min_w_0().truncate().child(format!(
-                        "{}: {}",
-                        c.location(),
-                        c.body
-                    )))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::ui::FONT_MONO)
+                            .child(format!("{}: {}", c.location(), c.body)),
+                    )
                     .child(
                         Button::new(("comment-remove", i))
                             .label(text::REMOVE.get())
@@ -323,6 +335,7 @@ impl Panel {
                     text::SEND.get(),
                     self.review.comments.len()
                 ))
+                .small()
                 .primary()
                 .disabled(self.review.comments.is_empty() || self.review.draft.is_some())
                 .on_click(cx.listener(|this, _, _, cx| {
