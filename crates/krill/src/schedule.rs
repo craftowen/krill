@@ -162,7 +162,7 @@ fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
             _ => return Err(usage_error(USAGE)),
         }
     }
-    if entry.cron.is_empty() || entry.prompt.is_empty() || entry.command.is_empty() {
+    if entry.cron.is_empty() || entry.command.is_empty() {
         return Err(usage_error(USAGE));
     }
     Ok(entry)

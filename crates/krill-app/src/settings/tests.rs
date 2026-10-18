@@ -4572,7 +4572,13 @@ fn owe760_schedule_modal_validates_fields_and_preserves_quoted_command_args(
             "bash -c 'unclosed",
             "check",
         ),
-        ("valid-id", "0 9 * * *", repo_str.as_str(), "claude -p", ""),
+        (
+            "valid-id",
+            "0 9 * * *",
+            repo_str.as_str(),
+            "claude -p",
+            "bad\0prompt",
+        ),
     ] {
         vcx.update(|window, cx| {
             view.update(cx, |v, cx| {
@@ -4844,4 +4850,130 @@ fn owe771_uninitialized_settings_and_default_panels_never_probe_daemon(cx: &mut 
     let res_err = (crate::resources::daemon_call_for(None))(&krill_proto::control::Request::List)
         .unwrap_err();
     assert_eq!(res_err.kind(), std::io::ErrorKind::NotConnected);
+}
+
+/// OWE-776: 스케줄 추가/편집 모달에서 `전달 프롬프트 (선택)`을 비워 두어도 정상 저장·편집 왕복되며,
+/// 필수 필드(ID·cwd·cron·command) 검증 실패 시 현재 언어에 맞는 다국어 오류 문구를 표시한다.
+#[gpui::test]
+fn owe776_schedule_modal_allows_empty_optional_prompt_and_localizes_validation_errors(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::schedule::{Schedules, WorkspaceMode};
+
+    let d = dir("owe776-optional-prompt");
+    let alpha = d.join("alpha");
+    fs::create_dir_all(&alpha).unwrap();
+    let alpha_str = fs::canonicalize(&alpha)
+        .unwrap_or_else(|_| alpha.clone())
+        .display()
+        .to_string();
+
+    init(cx, &d);
+    cx.update(|cx| crate::i18n::set_language(crate::i18n::Language::Ko, cx));
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(4000.)));
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+    });
+    vcx.run_until_parked();
+
+    let click_sel = |vcx: &mut gpui::VisualTestContext, sel: &'static str| {
+        let b = vcx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("missing selector {sel}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    click_sel(vcx, "admin-schedule-add");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_some());
+
+    // 1. 필수 필드(빈 ID 등) 오류 시 한글 다국어 검증 문구 표시 확인
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_schedule_modal_values(
+                "",
+                "0 0 1 1 *",
+                &alpha_str,
+                r#"/bin/echo "two words""#,
+                "",
+                "",
+                WorkspaceMode::Reuse,
+                window,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_some());
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).schedule_modal_error(),
+            Some(
+                crate::i18n::catalog::settings::SCHEDULE_ERR_ID
+                    .in_language(crate::i18n::Language::Ko)
+            )
+        );
+    });
+
+    // 2. QA 재현 시나리오: ID=qa-schedule, cron=0 0 1 1 *, cwd=.../alpha,
+    //    command=/bin/echo "two words", prompt=""(비움) → 저장 성공 및 모달 닫힘
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_schedule_modal_values(
+                "qa-schedule",
+                "0 0 1 1 *",
+                &alpha_str,
+                r#"/bin/echo "two words""#,
+                "",
+                "",
+                WorkspaceMode::Reuse,
+                window,
+                cx,
+            );
+        });
+    });
+    vcx.run_until_parked();
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(
+        vcx.debug_bounds("admin-schedule-modal").is_none(),
+        "schedule modal should close when optional prompt is left empty"
+    );
+    assert!(vcx.debug_bounds("admin-schedule-error").is_none());
+    assert!(vcx.debug_bounds("admin-schedule-row-qa-schedule").is_some());
+
+    let saved = Schedules::load(&d).unwrap();
+    assert_eq!(saved.schedule.len(), 1);
+    assert_eq!(saved.schedule[0].id, "qa-schedule");
+    assert_eq!(saved.schedule[0].cron, "0 0 1 1 *");
+    assert_eq!(saved.schedule[0].cwd, alpha_str);
+    assert_eq!(
+        saved.schedule[0].command,
+        vec!["/bin/echo".to_owned(), "two words".to_owned()]
+    );
+    assert_eq!(saved.schedule[0].prompt, "");
+
+    // 3. 편집 모달을 다시 열어도 빈 프롬프트와 공백 포함 인자가 그대로 유지되고 재저장된다.
+    click_sel(vcx, "admin-schedule-edit-qa-schedule");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_some());
+    vcx.update(|_, cx| {
+        let modal = view.read(cx).schedule_modal.as_ref().unwrap();
+        assert_eq!(modal.prompt.read(cx).value().as_str(), "");
+        assert_eq!(
+            modal.command.read(cx).value().as_str(),
+            "/bin/echo 'two words'"
+        );
+    });
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(vcx.debug_bounds("admin-schedule-modal").is_none());
+    let after_edit = Schedules::load(&d).unwrap();
+    assert_eq!(after_edit.schedule[0].prompt, "");
+    assert_eq!(
+        after_edit.schedule[0].command,
+        vec!["/bin/echo".to_owned(), "two words".to_owned()]
+    );
+
+    fs::remove_dir_all(d).ok();
 }

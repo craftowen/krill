@@ -59,8 +59,9 @@ pub struct Schedule {
     pub id: String,
     pub cron: String,
     pub cwd: String,
-    /// Executable and fixed arguments. The prompt is appended as one literal argument.
+    /// Executable and fixed arguments. The prompt is appended as one literal argument when non-empty.
     pub command: Vec<String>,
+    #[serde(default)]
     pub prompt: String,
     /// Optional shell gate command (`/bin/sh -c <precheck>` in `cwd`). Non-zero exit records `skipped`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -120,7 +121,6 @@ impl Schedules {
                     .command
                     .iter()
                     .any(|s| s.contains('\0') || s.len() > 8192)
-                || entry.prompt.is_empty()
                 || entry.prompt.contains('\0')
                 || entry.prompt.len() > 32 * 1024
                 || entry

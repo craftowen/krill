@@ -663,11 +663,7 @@ pub fn matches_app_selector(app: &AppSummary, selector: &str) -> bool {
 pub fn verify_not_self_targeted(app_name: &str, bundle_id: Option<&str>) -> Result<(), String> {
     let lower = app_name.to_ascii_lowercase();
     let bundle_lower = bundle_id.unwrap_or_default().to_ascii_lowercase();
-    if lower == "krill"
-        || lower == "krill-app"
-        || bundle_lower == "dev.krill.app"
-        || bundle_lower == "com.krill.app"
-    {
+    if lower == "krill" || bundle_lower == "dev.krill.app" || bundle_lower == "com.krill.app" {
         return Err(
             "self-targeting guard: krill computer refuses to drive the Krill host window itself"
                 .to_owned(),
