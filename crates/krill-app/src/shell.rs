@@ -230,6 +230,10 @@ actions!(
         ClosePane,
         FocusNextPane,
         FocusPrevPane,
+        FocusPaneLeft,
+        FocusPaneRight,
+        FocusPaneUp,
+        FocusPaneDown,
         ToggleZoomPane,
         ClearPane,
         SelectAll,
@@ -269,6 +273,13 @@ actions!(
 );
 
 const MAX_NAV_HISTORY: usize = 50;
+
+/// OWE-872: 실행 중인 탭·칸 닫기 확인 대기 대상.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PendingRunningClose {
+    Tab(usize),
+    Pane(PaneId),
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum NavEntry {
@@ -358,6 +369,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-alt-up", FocusPrevPane, ctx),
         KeyBinding::new("cmd-alt-left", NavigateBack, None),
         KeyBinding::new("cmd-alt-right", NavigateForward, None),
+        // OWE-871: ⌘⌥화살표는 히스토리·순환에 그대로 두고, 기하 방향 이동은 ⌘⌥⇧+화살표다.
+        KeyBinding::new("cmd-alt-shift-left", FocusPaneLeft, ctx),
+        KeyBinding::new("cmd-alt-shift-right", FocusPaneRight, ctx),
+        KeyBinding::new("cmd-alt-shift-up", FocusPaneUp, ctx),
+        KeyBinding::new("cmd-alt-shift-down", FocusPaneDown, ctx),
         KeyBinding::new("cmd-shift-enter", ToggleZoomPane, ctx),
         KeyBinding::new("cmd-k", ClearPane, ctx),
         KeyBinding::new("cmd-a", SelectAll, ctx),
@@ -524,6 +540,10 @@ pub struct Shell {
     pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
     /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
     pub(super) confirm_close_tab: Option<usize>,
+    /// OWE-872: 실행 중인 탭·칸 닫기 확인 대기(대상 + '다시 묻지 않기' 체크 상태).
+    pub(super) pending_running_close: Option<(PendingRunningClose, bool)>,
+    /// OWE-870: 탭 이름 변경 대화상자(인라인 편집 대신 모달 + `InputState`).
+    tab_rename: Option<tabs::TabRename>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
     pub(super) nav_history: NavHistory,
 }
@@ -848,6 +868,8 @@ impl Shell {
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
             confirm_close_tab: None,
+            pending_running_close: None,
+            tab_rename: None,
             nav_history: NavHistory::default(),
         };
         shell.record_workspace_nav(cx);
@@ -1961,6 +1983,39 @@ impl Shell {
         }
     }
 
+    /// 칸이 아직 레이아웃에 있으면 true(확인 대화상자를 기다리는 동안 닫혔을 수 있다).
+    fn has_pane(&self, pane: PaneId) -> bool {
+        self.layout.tabs().iter().any(|t| t.root.contains(pane))
+    }
+
+    /// OWE-872: 칸을 닫기 전에 실행 중인지 본다. 실행 중이면 확인 대화상자를 띄우고,
+    /// 아니면 바로 닫는다.
+    pub(super) fn maybe_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if self.has_pane(pane)
+            && self.pane_is_running(pane, cx)
+            && krill_app::settings::confirm_running_close(cx)
+        {
+            self.pending_running_close = Some((PendingRunningClose::Pane(pane), false));
+            cx.notify();
+            return;
+        }
+        self.do_close_pane(pane, cx);
+    }
+
+    /// OWE-872: 칸을 실제로 닫는다(줌 해제·닫은 기록 포함).
+    pub(super) fn do_close_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        if !self.has_pane(pane) {
+            cx.notify();
+            return;
+        }
+        self.zoomed_pane = None;
+        self.record_closed_pane(pane);
+        self.change(true, cx, |l| {
+            l.focus(pane);
+            l.close_pane();
+        });
+    }
+
     fn record_closed_tab(&mut self, tab_idx: usize) {
         if let Some(tab) = self.layout.tabs().get(tab_idx) {
             let mut l = self.layout.clone();
@@ -2604,6 +2659,22 @@ impl Shell {
                 "enter" => self.confirm_close_pinned_tab(cx),
                 _ => {}
             }
+            cx.stop_propagation();
+            return;
+        }
+        // OWE-872: 실행 중 닫기 확인 대화상자가 열려 있으면 Enter로 닫고 Esc로 취소한다.
+        if self.pending_running_close.is_some() {
+            match e.keystroke.key.as_str() {
+                "escape" => self.cancel_running_close(cx),
+                "enter" => self.confirm_running_close(cx),
+                _ => {}
+            }
+            cx.stop_propagation();
+            return;
+        }
+        // OWE-870: 이름 변경 대화상자가 열려 있으면 Esc로 닫는다(Enter 저장은 입력창 구독이 맡는다).
+        if self.tab_rename.is_some() && e.keystroke.key == "escape" {
+            self.cancel_tab_rename(cx);
             cx.stop_propagation();
             return;
         }
@@ -3505,6 +3576,8 @@ impl Shell {
 
         let divider_id = ElementId::Name(format!("split-{mine:?}").into());
         let drag = Drag::Split(mine.clone());
+        // OWE-871: 더블클릭 50:50 초기화용 경로는 드래그 리스너가 `mine`을 가져가기 전에 복사한다.
+        let reset = mine.clone();
         let horizontal = axis == Axis::Horizontal;
         div()
             .flex()
@@ -3532,7 +3605,7 @@ impl Shell {
                     .overflow_hidden()
                     .child(first),
             )
-            .child(divider(divider_id, drag, axis, cx))
+            .child(divider(divider_id, drag, axis, Some(reset), cx))
             .child(
                 div()
                     .flex_1()
@@ -3707,6 +3780,8 @@ impl Shell {
         let pane_title = self.pane_label(id, cx);
         let yolo_badge = self.yolo_badge(id, cx);
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
+        // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
+        let zoomed = self.zoomed_pane == Some(id);
         let pane_header = div()
             .debug_selector(move || format!("pane-header-{}", id.get()))
             .h(px(26.))
@@ -3763,7 +3838,38 @@ impl Shell {
                             .child(pane_title),
                     )
                     .children(yolo_badge)
-                    .children(host_badge),
+                    .children(host_badge)
+                    .when(zoomed, |d| {
+                        d.child(
+                            div()
+                                .id(("pane-zoom-badge", id.get()))
+                                .debug_selector(move || format!("pane-zoom-badge-{}", id.get()))
+                                .aria_label(text::ZOOMED_BADGE.get())
+                                .flex_none()
+                                .px_1()
+                                .rounded(krill_app::ui::RADIUS_XS)
+                                .bg(p.muted)
+                                .font_family(krill_app::ui::FONT_UI)
+                                .text_size(krill_app::ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::ZOOMED_BADGE.get()),
+                        )
+                        .child(
+                            krill_app::ui::ghost(
+                                ("pane-unzoom", id.get()),
+                                text::PANE_UNZOOM.get(),
+                            )
+                            .debug_selector(move || format!("pane-unzoom-{}", id.get()))
+                            .tooltip(text::PANE_UNZOOM.get())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    this.zoomed_pane = None;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -3779,6 +3885,8 @@ impl Shell {
                             .tooltip(text::SPLIT_RIGHT.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
+                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
+                                this.zoomed_pane = None;
                                 this.change(true, cx, |l| {
                                     l.focus(id);
                                     l.split(Axis::Horizontal);
@@ -3793,6 +3901,8 @@ impl Shell {
                             .tooltip(text::SPLIT_DOWN.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
+                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
+                                this.zoomed_pane = None;
                                 this.change(true, cx, |l| {
                                     l.focus(id);
                                     l.split(Axis::Vertical);
@@ -3802,16 +3912,16 @@ impl Shell {
                     .when(is_split, |d| {
                         d.child(
                             Button::new(("pane-close", id.get()))
+                                .debug_selector(move || format!("pane-close-{}", id.get()))
                                 .icon(IconName::Close)
                                 .ghost()
                                 .xsmall()
                                 .tooltip(text::CLOSE_PANE.get())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
-                                    this.change(true, cx, |l| {
-                                        l.focus(id);
-                                        l.close_pane();
-                                    });
+                                    // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
+                                    // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
+                                    this.maybe_close_pane(id, cx);
                                 })),
                         )
                     }),
@@ -3825,6 +3935,8 @@ impl Shell {
                     krill_app::settings::terminal_cursor(cx),
                 );
                 el.cursor_hidden = focused && self.cursor_blink.as_ref().is_some_and(|b| b.1);
+                // OWE-871: 비포커스 칸의 블록 커서는 빈 테두리로 그려 포커스 칸과 구별한다.
+                el.cursor_hollow = !focused;
                 el.painted = Some(Rc::clone(&l.painted));
                 el.selection = l.selection;
                 el.highlight = l.pane.highlight();
@@ -3896,6 +4008,9 @@ impl Shell {
                                                 .xsmall()
                                                 .on_click(cx.listener(move |this, _, _, cx| {
                                                     cx.stop_propagation();
+                                                    // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
+                                                    this.zoomed_pane = None;
+                                                    this.record_closed_pane(id);
                                                     this.change(true, cx, |layout| {
                                                         layout.focus(id);
                                                         layout.close_pane();
@@ -4104,10 +4219,18 @@ impl Shell {
         match menu {
             Some((has_selection, focus)) => pane
                 .context_menu(move |m, _, _| {
+                    // OWE-871: 복사·붙여넣기만 있던 메뉴에 선택·분할·줌·닫기·지우기를 연결한다.
                     let m = m
                         .action_context(focus.clone())
                         .menu_with_disabled(text::COPY.get(), Box::new(Copy), !has_selection)
-                        .menu(text::PASTE.get(), Box::new(Paste));
+                        .menu(text::PASTE.get(), Box::new(Paste))
+                        .separator()
+                        .menu(text::PANE_SELECT_ALL.get(), Box::new(SelectAll))
+                        .menu(text::PANE_CLEAR.get(), Box::new(ClearPane))
+                        .separator()
+                        .menu(text::SPLIT_RIGHT.get(), Box::new(SplitRight))
+                        .menu(text::SPLIT_DOWN.get(), Box::new(SplitDown))
+                        .menu(text::PANE_ZOOM_TOGGLE.get(), Box::new(ToggleZoomPane));
                     if peer_supports_fork {
                         m.separator()
                             .menu_with_disabled(
@@ -4120,8 +4243,11 @@ impl Shell {
                                 Box::new(ContinueInNewSession),
                                 !can_continue,
                             )
+                            .separator()
+                            .menu(text::CLOSE_PANE.get(), Box::new(ClosePane))
                     } else {
-                        m
+                        m.separator()
+                            .menu(text::CLOSE_PANE.get(), Box::new(ClosePane))
                     }
                 })
                 .into_any_element(),
@@ -4131,15 +4257,23 @@ impl Shell {
 }
 
 /// 분할선: 1pt 선 + 잡는 폭 5pt. 드래그 값은 `Drag`, 실제 크기 계산은 부모의 `on_drag_move`가 한다.
-fn divider(id: ElementId, drag: Drag, axis: Axis, cx: &App) -> impl IntoElement {
+/// OWE-871: 기본 선 색은 `p.split_divider`(STYLEGUIDE §3.1)이며, 분할 트리의 선(`reset` 있음)을
+/// 더블클릭하면 50:50(`ratio = 0.5`)으로 되돌린다.
+fn divider(
+    id: ElementId,
+    drag: Drag,
+    axis: Axis,
+    reset: Option<Vec<Branch>>,
+    cx: &mut Context<Shell>,
+) -> impl IntoElement {
     let p = krill_app::ui::palette(cx);
-    let line = div().bg(p.border);
+    let line = div().bg(p.split_divider);
     div()
         .id(id)
         .flex_none()
         .flex()
         .justify_center()
-        .hover(|d| d.bg(p.split_divider))
+        .hover(|d| d.bg(p.split_divider_strong))
         .map(|d| match axis {
             Axis::Horizontal => d
                 .w(DIVIDER_GRAB)
@@ -4154,6 +4288,15 @@ fn divider(id: ElementId, drag: Drag, axis: Axis, cx: &App) -> impl IntoElement 
                 .child(line.h(px(1.)).w_full()),
         })
         .on_drag(drag, |_, _, _, cx| cx.new(|_| DragGhost))
+        .when_some(reset, |d, path| {
+            d.on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                if e.click_count() >= 2 {
+                    let path = path.clone();
+                    this.change(false, cx, move |l| l.set_ratio(&path, 0.5));
+                    this.save();
+                }
+            }))
+        })
 }
 
 impl Render for Shell {
@@ -4345,17 +4488,16 @@ impl Render for Shell {
                     this.close_settings(Some(window), cx);
                     return;
                 }
-                this.zoomed_pane = None;
                 if this.layout.visible().len() == 1
                     && this.layout.is_tab_pinned(this.layout.active())
                 {
                     this.request_close_tab(this.layout.active(), cx);
                     return;
                 }
+                // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다(줌 해제·기록은 확정 뒤에).
                 if let Some(pane) = this.layout.focused() {
-                    this.record_closed_pane(pane);
+                    this.maybe_close_pane(pane, cx);
                 }
-                this.change(true, cx, Layout::close_pane);
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
                 if this.settings.is_some() {
@@ -4368,6 +4510,39 @@ impl Render for Shell {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(-1));
+            }))
+            // OWE-871: 2차원 분할에서 상하좌우 기하 방향으로 포커스를 옮긴다.
+            .on_action(cx.listener(|this, _: &FocusPaneLeft, _, cx| {
+                if this.settings.is_some() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app::layout::Direction::Left);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneRight, _, cx| {
+                if this.settings.is_some() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app::layout::Direction::Right);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneUp, _, cx| {
+                if this.settings.is_some() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app::layout::Direction::Up);
+                });
+            }))
+            .on_action(cx.listener(|this, _: &FocusPaneDown, _, cx| {
+                if this.settings.is_some() {
+                    return;
+                }
+                this.change(true, cx, |l| {
+                    l.focus_direction(krill_app::layout::Direction::Down);
+                });
             }))
             .on_action(cx.listener(|this, _: &ToggleZoomPane, _, cx| {
                 if this.settings.is_some() {
@@ -4600,6 +4775,7 @@ impl Render for Shell {
                             "divider-sidebar".into(),
                             Drag::Sidebar,
                             Axis::Horizontal,
+                            None,
                             cx,
                         ))
                     })
@@ -4668,6 +4844,7 @@ impl Render for Shell {
                             "divider-panel".into(),
                             Drag::Panel,
                             Axis::Horizontal,
+                            None,
                             cx,
                         ))
                         .child(
@@ -4695,6 +4872,8 @@ impl Render for Shell {
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
+            .children(self.render_running_close_dialog(window, cx))
+            .children(self.render_tab_rename_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
             .children(
                 (self.role == WindowRole::Main)

@@ -111,6 +111,255 @@ fn close_and_cycle_keys(cx: &mut TestAppContext) {
     assert_eq!(Layout::load(&path).unwrap(), l);
 }
 
+/// OWE-871: ⌘⌥⇧+화살표는 분할 배치대로 포커스를 옮긴다(⌘⌥화살표는 그대로 둔다).
+#[gpui::test]
+fn directional_focus_follows_geometry(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pane-direction"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let right = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses the new pane");
+    // ⌘⌥↓(순환)은 그대로 다음 칸으로 간다.
+    cx.simulate_keystrokes("cmd-alt-down");
+    let left = layout_of(&view, cx).focused().expect("cycle moves focus");
+    assert_ne!(left, right);
+    // 기하 이동: 왼쪽 끝에서는 그대로, 오른쪽으로는 간다.
+    cx.simulate_keystrokes("cmd-alt-shift-left");
+    assert_eq!(layout_of(&view, cx).focused(), Some(left));
+    cx.simulate_keystrokes("cmd-alt-shift-right");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    // 상하 분할이 없으면 위·아래는 그대로다.
+    cx.simulate_keystrokes("cmd-alt-shift-up");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    cx.simulate_keystrokes("cmd-alt-shift-down");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    // 아래로 가른 뒤에는 위·아래로 오간다.
+    cx.simulate_keystrokes("cmd-shift-d");
+    let below = layout_of(&view, cx)
+        .focused()
+        .expect("split down focuses the new pane");
+    assert_ne!(below, right);
+    cx.simulate_keystrokes("cmd-alt-shift-up");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+}
+
+/// OWE-871: 확대(줌) 상태면 패인 헤더에 배지와 해제 버튼이 보이고, 해제하면 2칸으로 돌아온다.
+#[gpui::test]
+fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pane-zoom-badge"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let id = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    cx.simulate_keystrokes("cmd-shift-enter");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), Some(id));
+    let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(badge).is_some(),
+        "zoomed pane shows a badge"
+    );
+    let unzoom: &'static str = Box::leak(format!("pane-unzoom-{}", id.get()).into_boxed_str());
+    let at = cx.debug_bounds(unzoom).expect("unzoom button").center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), None);
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+    assert!(cx.debug_bounds(badge).is_none());
+}
+
+/// OWE-871: 패인 헤더 ×는 ⌘W처럼 닫은 세션을 기록하고 확대 상태를 푼다.
+#[gpui::test]
+fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
+    use krill_proto::SessionId;
+    let (view, cx) = open(cx, state_path("pane-close-record"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let id = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    view.update(cx, |s, _| {
+        s.layout.set_session(id, SessionId(7));
+    });
+    cx.simulate_keystrokes("cmd-shift-enter");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), Some(id));
+    let header: &'static str = Box::leak(format!("pane-header-{}", id.get()).into_boxed_str());
+    assert!(cx.debug_bounds(header).is_some(), "zoomed header shows");
+    let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
+    assert!(cx.debug_bounds(badge).is_some(), "zoomed badge shows");
+    let (split_count, is_split) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        (s.layout.visible().len(), s.layout.visible().len() > 1)
+    });
+    assert!(is_split, "split panes present, got {split_count}");
+    let close: &'static str = Box::leak(format!("pane-close-{}", id.get()).into_boxed_str());
+    let at = cx
+        .debug_bounds(close)
+        .expect("header close button")
+        .center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    let (zoomed, panes, closed) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        (
+            s.zoomed_pane,
+            s.layout.visible().len(),
+            s.closed_sessions.clone(),
+        )
+    });
+    assert_eq!(zoomed, None);
+    assert_eq!(panes, 1);
+    assert!(closed.contains(&SessionId(7)), "closed pane is reopenable");
+}
+
+/// OWE-872 테스트용: 칸에 세션을 붙이고 사이드바에 실행 중(`Working`) 스냅샷을 연결한다.
+fn attach_running(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    pane: PaneId,
+    sid: krill_proto::SessionId,
+) {
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let session = sidebar::Session {
+        id: sid,
+        status: krill_proto::control::AgentStatus {
+            state: krill_proto::control::AgentState::Working,
+            agent: "claude".into(),
+            ..krill_proto::control::AgentStatus::UNKNOWN
+        },
+        worktree: None,
+        cwd: None,
+        account: None,
+    };
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![session],
+        trees: std::collections::BTreeMap::default(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout.set_session(pane, sid);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+}
+
+fn click(cx: &mut VisualTestContext, selector: &'static str) {
+    let at = cx.debug_bounds(selector).expect(selector).center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+}
+
+/// OWE-872: 실행 중인 탭을 닫으면 확인 대화상자가 뜨고, '닫기'를 눌러야 닫힌다.
+#[gpui::test]
+fn running_tab_close_asks_then_confirms(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("running-tab"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    attach_running(&view, cx, pane, krill_proto::SessionId(21));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    click(cx, "confirm-running-close");
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(cx.debug_bounds("running-close-dialog").is_none());
+}
+
+/// OWE-872: 실행 중인 탭 닫기 확인에서 취소하면 탭이 남는다.
+#[gpui::test]
+fn running_tab_close_cancel_keeps_tab(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("running-tab-cancel"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    attach_running(&view, cx, pane, krill_proto::SessionId(22));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    click(cx, "cancel-running-close");
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_none());
+}
+
+/// OWE-872: 실행 중이지 않은 탭은 묻지 않고 바로 닫힌다.
+#[gpui::test]
+fn idle_tab_close_needs_no_confirm(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("idle-tab"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(cx.debug_bounds("running-close-dialog").is_none());
+}
+
+/// OWE-872: 실행 중인 칸을 닫으면 확인 대화상자가 뜨고, 취소하면 칸이 남는다.
+#[gpui::test]
+fn running_pane_close_asks_then_cancels(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("running-pane"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    attach_running(&view, cx, pane, krill_proto::SessionId(23));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.maybe_close_pane(pane, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    click(cx, "cancel-running-close");
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+}
+
+/// OWE-872: '다시 묻지 않기'를 고르고 닫으면 설정이 꺼지고(`settings.toml` 영속) 다음부터 묻지 않는다.
+#[gpui::test]
+fn running_close_dont_ask_persists(cx: &mut TestAppContext) {
+    let path = state_path("running-dont-ask");
+    let (view, cx) = open(cx, path.clone());
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    attach_running(&view, cx, pane, krill_proto::SessionId(24));
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            if let Some((_, dont_ask)) = s.pending_running_close.as_mut() {
+                *dont_ask = true;
+            }
+            s.confirm_running_close(cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert!(!cx.update(|_, cx| krill_app::settings::confirm_running_close(cx)));
+    let body = std::fs::read_to_string(path.parent().unwrap().join("settings.toml"))
+        .expect("settings.toml persisted");
+    assert!(
+        body.contains("confirm_running_close = false"),
+        "unexpected settings.toml: {body}"
+    );
+}
+
 /// MK-025·MK-026: 데몬 기동 실패 이유와 끊김이 셸 배너로 보이고, 다시 붙으면 사라진다.
 #[gpui::test]
 fn daemon_link_shows_banner(cx: &mut TestAppContext) {
@@ -3431,6 +3680,97 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
             "{id}: tab must show its state dot"
         );
     }
+}
+
+/// OWE-870: 사용자 지정 탭 제목은 자동 제목을 덮어쓰고 `layout.bin`에 영속된다.
+/// 비우면 자동 제목으로 복귀한다.
+#[gpui::test]
+fn custom_tab_title_overrides_label_and_persists(cx: &mut TestAppContext) {
+    let path = state_path("tab-rename");
+    let (view, cx) = open(cx, path.clone());
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| l.set_tab_title(1, Some("  배포 탭  ")));
+    });
+    cx.run_until_parked();
+    let label = cx.update(|_, cx| view.read(cx).tab_display_label(1, cx));
+    assert_eq!(label, "배포 탭");
+    let saved = layout_of(&view, cx);
+    assert_eq!(saved.tab_title(1), Some("배포 탭"));
+    assert_eq!(Layout::load(&path).unwrap(), saved);
+    // 비우면 자동 제목으로 복귀한다.
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| l.set_tab_title(1, Some("   ")));
+    });
+    cx.run_until_parked();
+    let (label, auto) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        (
+            s.tab_display_label(1, cx),
+            s.pane_label(s.layout.tabs()[1].focused, cx),
+        )
+    });
+    assert_eq!(label, auto);
+}
+
+/// OWE-870: 이름 변경 대화상자에서 저장·초기화를 누르면 제목이 바뀌고 대화상자가 닫힌다.
+#[gpui::test]
+fn tab_rename_dialog_saves_and_clears(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-rename-dialog"));
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.begin_tab_rename(0, window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-rename-dialog").is_some());
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let rename = s.tab_rename.as_ref().expect("rename open");
+            rename.input.update(cx, |input, cx| {
+                input.set_value("  배포 탭  ", window, cx);
+            });
+        });
+    });
+    let save: &'static str = "save-tab-rename";
+    let at = cx.debug_bounds(save).expect("save button").center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tab_title(0), Some("배포 탭"));
+    assert!(cx.debug_bounds("tab-rename-dialog").is_none());
+    // 다시 열어 초기화를 누르면 자동 제목으로 복귀한다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.begin_tab_rename(0, window, cx));
+    });
+    cx.run_until_parked();
+    let clear: &'static str = "clear-tab-title";
+    let at = cx.debug_bounds(clear).expect("clear button").center();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tab_title(0), None);
+}
+
+/// OWE-870: 왼쪽 탭 닫기는 기준 탭 왼쪽의 비고정 탭만 닫고 닫은 세션을 기록한다(⌘⇧T 복원용).
+#[gpui::test]
+fn close_tabs_to_left_keeps_pinned_and_records(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-close-left"));
+    cx.simulate_keystrokes("cmd-t cmd-t cmd-t");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            l.toggle_pin_tab(1);
+            l.activate(2);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| s.close_tabs_to_left(2, cx));
+    cx.run_until_parked();
+    let l = layout_of(&view, cx);
+    assert_eq!(l.tabs().len(), 3);
+    assert!(l.is_tab_pinned(0));
+    assert_eq!(l.active(), 1);
 }
 
 /// OWE-653: 단일 칸은 패인 헤더 줄을 숨기고(분할하면 보인다), 저장 명령·맥락 복사는 별도 툴바 줄이 아니라

@@ -1,12 +1,22 @@
 //! OWE-577: 탭 크롬·닫기·재정렬·에이전트 런처. gpui 의존은 셸 경계 안에 둔다.
 
+use gpui::Entity;
 use gpui_component::Icon;
+use gpui_component::checkbox::Checkbox;
+use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_component::tab::{Tab, TabBar};
 use krill_app::ui;
 use krill_proto::control::AgentState;
 
 use super::*;
+
+/// OWE-870: 탭 이름 변경 대화상자 상태(대상 탭 + 입력창 + Enter 구독).
+pub(super) struct TabRename {
+    pub(super) index: usize,
+    pub(super) input: Entity<InputState>,
+    pub(super) _enter: Subscription,
+}
 
 const CLOSE_GROUP: &str = "session-tab";
 
@@ -131,6 +141,12 @@ impl Shell {
             .iter()
             .map(|t| self.pane_label(t.focused, cx))
             .collect();
+        // OWE-870: 사용자 지정 제목이 있으면 자동 제목 대신 쓴다(번호 매기기 전에 덮어쓴다).
+        for (i, label) in labels.iter_mut().enumerate() {
+            if let Some(custom) = self.layout.tab_title(i) {
+                custom.clone_into(label);
+            }
+        }
         number_duplicates(&mut labels);
         let tabs = self
             .layout
@@ -300,6 +316,16 @@ impl Shell {
                                         this.request_close_tab(i, cx);
                                     })),
                             ),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
+                            // OWE-870: 더블클릭으로 탭 이름 변경 대화상자를 연다(한 번 클릭은 탭바가 받는다).
+                            if e.click_count >= 2 {
+                                cx.stop_propagation();
+                                this.begin_tab_rename(i, window, cx);
+                            }
+                        }),
                     )
                     .on_mouse_down(
                         MouseButton::Middle,
@@ -524,8 +550,73 @@ impl Shell {
             cx.notify();
             return;
         }
+        self.maybe_close_tab(index, cx);
+    }
+
+    /// OWE-872: 탭 안의 칸에 실행 중인 에이전트(Working·Waiting·Blocked)가 있으면 true.
+    pub(super) fn pane_is_running(&self, pane: PaneId, cx: &App) -> bool {
+        let host = self.layout.host(pane);
+        self.layout
+            .session(pane)
+            .and_then(|id| self.sidebar.read(cx).session_on(host, id))
+            .is_some_and(|s| {
+                matches!(
+                    s.status.state,
+                    AgentState::Working | AgentState::Waiting | AgentState::Blocked
+                )
+            })
+    }
+
+    /// OWE-872: 탭 안의 칸 중 실행 중인 세션이 하나라도 있으면 true.
+    pub(super) fn tab_has_running(&self, index: usize, cx: &App) -> bool {
+        self.layout
+            .tab_panes(index)
+            .iter()
+            .any(|p| self.pane_is_running(*p, cx))
+    }
+
+    /// OWE-872: 탭을 닫기 전에 실행 중인지 본다. 실행 중이면 확인 대화상자를 띄우고,
+    /// 아니면 바로 닫는다. 일괄 닫기(다른·오른쪽·왼쪽 탭)는 닫은 기록이 남아 ⌘⇧T로 되돌릴 수 있어 묻지 않는다.
+    pub(super) fn maybe_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.layout.tabs().len()
+            && self.tab_has_running(index, cx)
+            && krill_app::settings::confirm_running_close(cx)
+        {
+            self.pending_running_close = Some((PendingRunningClose::Tab(index), false));
+            cx.notify();
+            return;
+        }
+        self.do_close_tab(index, cx);
+    }
+
+    /// OWE-872: 탭을 실제로 닫는다(닫은 세션 기록 포함).
+    pub(super) fn do_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.layout.tabs().len() {
+            return;
+        }
         self.record_closed_tab(index);
         self.change(true, cx, |l| l.close_tab(index));
+    }
+
+    /// OWE-872: 실행 중 닫기 확인 대화상자에서 '닫기'를 눌렀다.
+    /// '다시 묻지 않기'를 골랐으면 설정에 영속하고(`settings.toml` + 설정 스위치) 닫는다.
+    pub(super) fn confirm_running_close(&mut self, cx: &mut Context<Self>) {
+        let Some((pending, dont_ask)) = self.pending_running_close.take() else {
+            return;
+        };
+        if dont_ask {
+            krill_app::settings::set_confirm_running_close(false, cx);
+        }
+        match pending {
+            PendingRunningClose::Tab(index) => self.do_close_tab(index, cx),
+            PendingRunningClose::Pane(pane) => self.do_close_pane(pane, cx),
+        }
+    }
+
+    /// OWE-872: 실행 중 닫기 확인 대화상자를 취소한다.
+    pub(super) fn cancel_running_close(&mut self, cx: &mut Context<Self>) {
+        self.pending_running_close = None;
+        cx.notify();
     }
 
     /// OWE-734: 고정된 탭 닫기 확인 모달에서 '닫기'를 눌렀을 때 실제 탭을 닫는다.
@@ -534,8 +625,8 @@ impl Shell {
             return;
         };
         if index < self.layout.tabs().len() {
-            self.record_closed_tab(index);
-            self.change(true, cx, |l| l.close_tab(index));
+            // OWE-872: 고정 확인 뒤에도 실행 중이면 한 번 더 묻는다.
+            self.maybe_close_tab(index, cx);
         } else {
             cx.notify();
         }
@@ -545,6 +636,76 @@ impl Shell {
     pub(super) fn cancel_close_pinned_tab(&mut self, cx: &mut Context<Self>) {
         self.confirm_close_tab = None;
         cx.notify();
+    }
+
+    /// OWE-870: 탭 표시 이름. 사용자 지정 제목이 있으면 그걸, 없으면 자동 제목을 쓴다.
+    pub(super) fn tab_display_label(&self, index: usize, cx: &App) -> String {
+        if let Some(custom) = self.layout.tab_title(index) {
+            return custom.to_owned();
+        }
+        self.layout
+            .tabs()
+            .get(index)
+            .map_or(String::new(), |t| self.pane_label(t.focused, cx))
+    }
+
+    /// OWE-870: 탭 이름 변경 대화상자를 연다. 입력창에는 지금 표시 이름이 미리 채워진다.
+    pub(super) fn begin_tab_rename(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if index >= self.layout.tabs().len() {
+            return;
+        }
+        self.tab_context_menu = None;
+        let current = self.tab_display_label(index, cx);
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(current));
+        input.update(cx, |input, cx| input.focus(window, cx));
+        let enter = cx.subscribe_in(&input, window, |this, _, event: &InputEvent, _, cx| {
+            if matches!(event, InputEvent::PressEnter { .. }) {
+                this.finish_tab_rename(true, cx);
+            }
+        });
+        self.tab_rename = Some(TabRename {
+            index,
+            input,
+            _enter: enter,
+        });
+        cx.notify();
+    }
+
+    /// OWE-870: 이름 변경 대화상자를 닫는다. `save`면 입력값을 제목으로 저장(비우면 자동 제목으로 복귀).
+    pub(super) fn finish_tab_rename(&mut self, save: bool, cx: &mut Context<Self>) {
+        let Some(rename) = self.tab_rename.take() else {
+            return;
+        };
+        if save {
+            let title = rename.input.read(cx).value().trim().to_owned();
+            let index = rename.index;
+            self.change(true, cx, move |l| {
+                l.set_tab_title(index, (!title.is_empty()).then_some(title.as_str()));
+            });
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// OWE-870: 이름 변경 대화상자를 취소한다.
+    pub(super) fn cancel_tab_rename(&mut self, cx: &mut Context<Self>) {
+        self.finish_tab_rename(false, cx);
+    }
+
+    /// OWE-870: 이름 변경 대화상자에서 제목을 지우고 자동 제목으로 되돌린다.
+    pub(super) fn clear_tab_title(&mut self, cx: &mut Context<Self>) {
+        let Some(rename) = self.tab_rename.take() else {
+            return;
+        };
+        let index = rename.index;
+        self.change(true, cx, move |l| {
+            l.set_tab_title(index, None);
+        });
     }
 
     /// OWE-734: 탭 우클릭 컨텍스트 메뉴를 연다.
@@ -591,6 +752,22 @@ impl Shell {
         self.change(true, cx, |l| l.close_tabs_to_right(index));
     }
 
+    /// OWE-870: `index` 왼쪽의 고정되지 않은 탭을 일괄 닫는다.
+    pub(super) fn close_tabs_to_left(&mut self, index: usize, cx: &mut Context<Self>) {
+        let closing: Vec<usize> = self
+            .layout
+            .tabs()
+            .iter()
+            .enumerate()
+            .take(index)
+            .filter_map(|(i, tab)| (!tab.pinned).then_some(i))
+            .collect();
+        for i in closing {
+            self.record_closed_tab(i);
+        }
+        self.change(true, cx, |l| l.close_tabs_to_left(index));
+    }
+
     /// OWE-734: 고정되지 않은 에디터(파일) 탭을 일괄 닫는다.
     pub(super) fn close_all_editor_tabs(&mut self, cx: &mut Context<Self>) {
         self.change(true, cx, Layout::close_all_editor_tabs);
@@ -632,6 +809,7 @@ impl Shell {
             .enumerate()
             .any(|(i, t)| i != index && !t.pinned);
         let has_closable_right = self.layout.tabs().iter().skip(index + 1).any(|t| !t.pinned);
+        let has_closable_left = self.layout.tabs().iter().take(index).any(|t| !t.pinned);
         let has_closable_editors = self
             .layout
             .tabs()
@@ -649,10 +827,11 @@ impl Shell {
         let p = ui::palette(cx);
         let viewport = window.viewport_size();
         let menu_w = px(224.);
+        // OWE-870: 이름 변경 1행 + 왼쪽 닫기 1행이 늘었다.
         let menu_h = if peer_supports_fork {
-            px(300.)
+            px(364.)
         } else {
-            px(236.)
+            px(300.)
         } + if file_path.is_some() {
             // 복사 2항목 + Finder 보기 + 구분선(항목당 약 28pt).
             px(100.)
@@ -856,6 +1035,15 @@ impl Shell {
                         })),
                 )
                 .child(div().my_1().h(px(1.)).w_full().bg(p.border))
+                // OWE-870: 탭 이름 변경(더블클릭과 같은 대화상자).
+                .child(
+                    menu_item("tab-menu-rename", text::RENAME_TAB.get(), true, None).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.tab_context_menu = None;
+                            this.begin_tab_rename(index, window, cx);
+                        }),
+                    ),
+                )
                 .child(
                     menu_item(
                         "tab-menu-close",
@@ -895,6 +1083,21 @@ impl Shell {
                         d.on_click(cx.listener(move |this, _, _, cx| {
                             this.tab_context_menu = None;
                             this.close_tabs_to_right(index, cx);
+                        }))
+                    }),
+                )
+                // OWE-870: 왼쪽 탭 닫기(핀 고정 탭은 유지).
+                .child(
+                    menu_item(
+                        "tab-menu-close-left",
+                        text::CLOSE_TABS_TO_LEFT.get(),
+                        has_closable_left,
+                        None,
+                    )
+                    .when(has_closable_left, |d| {
+                        d.on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab_context_menu = None;
+                            this.close_tabs_to_left(index, cx);
                         }))
                     }),
                 )
@@ -1074,6 +1277,184 @@ impl Shell {
         Some(ui::modal_backdrop(window.viewport_size(), card))
     }
 
+    /// OWE-872: 실행 중인 탭·칸 닫기 확인 대화상자('다시 묻지 않기' 포함).
+    pub(super) fn render_running_close_dialog(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Deferred> {
+        let (pending, dont_ask) = self.pending_running_close.as_ref()?;
+        let pending = *pending;
+        let checked = *dont_ask;
+        // 대화상자를 기다리는 동안 대상이 사라졌으면 그리지 않는다.
+        let title = match pending {
+            PendingRunningClose::Tab(index) => {
+                if index >= self.layout.tabs().len() {
+                    return None;
+                }
+                self.tab_display_label(index, cx)
+            }
+            PendingRunningClose::Pane(pane) => {
+                if !self.layout.tabs().iter().any(|t| t.root.contains(pane)) {
+                    return None;
+                }
+                self.pane_label(pane, cx)
+            }
+        };
+        let detail = text::RUNNING_CLOSE_DETAIL.format(&[("title", title.as_str())]);
+        let p = ui::palette(cx);
+        let card = div()
+            .id("running-close-dialog")
+            .debug_selector(|| "running-close-dialog".into())
+            .occlude()
+            .w(px(360.))
+            .p_4()
+            .rounded(ui::RADIUS_LG)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .font_family(ui::FONT_UI)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_LG)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(text::RUNNING_CLOSE_TITLE.get()),
+                    )
+                    .child(
+                        div()
+                            .text_size(ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .child(detail),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .debug_selector(|| "dont-ask-again".into())
+                    .child(
+                        Checkbox::new("dont-ask-again")
+                            .label(text::DONT_ASK_AGAIN.get())
+                            .checked(checked)
+                            .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                                if let Some((_, dont_ask)) = this.pending_running_close.as_mut() {
+                                    *dont_ask = *checked;
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        ui::secondary("cancel-running-close", text::RUNNING_CLOSE_CANCEL.get())
+                            .debug_selector(|| "cancel-running-close".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_running_close(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("confirm-running-close")
+                            .debug_selector(|| "confirm-running-close".into())
+                            .small()
+                            .danger()
+                            .label(text::RUNNING_CLOSE_CONFIRM.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.confirm_running_close(cx);
+                            })),
+                    ),
+            );
+        Some(ui::modal_backdrop(window.viewport_size(), card))
+    }
+
+    /// OWE-870: 탭 이름 변경 대화상자. 비우면 자동 제목으로 복귀한다.
+    pub(super) fn render_tab_rename_dialog(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Deferred> {
+        let rename = self.tab_rename.as_ref()?;
+        let index = rename.index;
+        let input = rename.input.clone();
+        if index >= self.layout.tabs().len() {
+            return None;
+        }
+        let p = ui::palette(cx);
+        let card = div()
+            .id("tab-rename-dialog")
+            .debug_selector(|| "tab-rename-dialog".into())
+            .occlude()
+            .w(px(360.))
+            .p_4()
+            .rounded(ui::RADIUS_LG)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .font_family(ui::FONT_UI)
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .text_size(ui::TEXT_LG)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(p.foreground)
+                    .child(text::RENAME_TAB_TITLE.get()),
+            )
+            .child(
+                div()
+                    .id("tab-rename-input")
+                    .debug_selector(|| "tab-rename-input".into())
+                    .child(Input::new(&input).small()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        ui::secondary("cancel-tab-rename", text::RENAME_TAB_CANCEL.get())
+                            .debug_selector(|| "cancel-tab-rename".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cancel_tab_rename(cx);
+                            })),
+                    )
+                    .child(
+                        ui::ghost("clear-tab-title", text::RENAME_TAB_CLEAR.get())
+                            .debug_selector(|| "clear-tab-title".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_tab_title(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("save-tab-rename")
+                            .debug_selector(|| "save-tab-rename".into())
+                            .small()
+                            .primary()
+                            .label(text::RENAME_TAB_SAVE.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.finish_tab_rename(true, cx);
+                            })),
+                    ),
+            );
+        Some(ui::modal_backdrop(window.viewport_size(), card))
+    }
+
     // Design adapted from Orca (.ref/orca/src/renderer/src/components/tab-bar/RecentTabSwitcher.tsx),
     // MIT License — Copyright (c) 2026 Lovecast Inc.
     pub(super) fn render_recent_tab_switcher(
@@ -1089,6 +1470,12 @@ impl Shell {
             .iter()
             .map(|t| self.pane_label(t.focused, cx))
             .collect();
+        // OWE-870: 사용자 지정 제목이 있으면 자동 제목 대신 쓴다(번호 매기기 전에 덮어쓴다).
+        for (i, label) in labels.iter_mut().enumerate() {
+            if let Some(custom) = self.layout.tab_title(i) {
+                custom.clone_into(label);
+            }
+        }
         number_duplicates(&mut labels);
 
         let rows = self

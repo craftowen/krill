@@ -151,6 +151,10 @@ pub struct Settings {
     /// 첫 프롬프트 기반 브랜치·세션 이름 자동 변경 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub auto_rename_branch_from_work: bool,
+    /// 실행 중인 탭·칸을 닫기 전에 확인할지(기본 true, OWE-872).
+    /// '다시 묻지 않기'를 고르면 false로 저장된다.
+    #[serde(default = "default_true")]
+    pub confirm_running_close: bool,
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 false, 동의 후 활성화, OWE-737).
     pub workspace_trust_preset_enabled: bool,
 }
@@ -247,6 +251,7 @@ impl Default for Settings {
             prompt_cache_timer_enabled: true,
             prompt_cache_ttl_secs: DEFAULT_PROMPT_CACHE_TTL_SECS,
             auto_rename_branch_from_work: true,
+            confirm_running_close: true,
             workspace_trust_preset_enabled: false,
         }
     }
@@ -847,6 +852,19 @@ pub fn option_as_meta(cx: &App) -> bool {
 pub fn copy_on_select(cx: &App) -> bool {
     cx.try_global::<Config>()
         .is_some_and(|c| c.settings.copy_on_select)
+}
+
+/// 실행 중인 탭·칸을 닫기 전에 확인할지(OWE-872). `init` 전이면 기본값 true.
+pub fn confirm_running_close(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_none_or(|c| c.settings.confirm_running_close)
+}
+
+/// 실행 중 닫기 확인을 켜고 끄고 `settings.toml`에 저장한다(OWE-872 '다시 묻지 않기'·설정 스위치).
+pub fn set_confirm_running_close(enabled: bool, cx: &mut App) {
+    if cx.has_global::<Config>() && current(cx).confirm_running_close != enabled {
+        edit(cx, |s| s.confirm_running_close = enabled);
+    }
 }
 
 /// 알림 사운드 켜짐 여부. `init` 전이면 기본값 true.
@@ -4072,6 +4090,20 @@ impl SettingsView {
                         |next, _, cx| edit(cx, |s| s.copy_on_select = next),
                     ))),
             )
+            .child(
+                row()
+                    .child(label(
+                        text::CONFIRM_RUNNING_CLOSE.get(),
+                        text::CONFIRM_RUNNING_CLOSE_DESC.get(),
+                    ))
+                    .child(layout::controls().child(layout::switch(
+                        p,
+                        "confirm-running-close-toggle",
+                        s.confirm_running_close,
+                        false,
+                        |next, _, cx| edit(cx, |s| s.confirm_running_close = next),
+                    ))),
+            )
     }
 
     /// 계정 행의 5h·7d 미니 사용량 바(OWE-719, OWE-797). 리셋 시각은 인라인 메타데이터와 묶음 툴팁([`format_account_usage`])에 함께 표시한다.
@@ -5558,16 +5590,51 @@ impl SettingsView {
             let btn_id = format!("admin-default-agent-{agent_id}");
             let check_id = format!("admin-default-agent-check-{agent_id}");
             let selected = s.default_agent == agent_id;
-            layout::segment(
-                gpui::ElementId::Name(btn_id.clone().into()),
-                label,
-                selected,
-            )
-            .icon(crate::ui::icons::agent_menu_icon(agent_id))
-            .debug_selector(move || btn_id.clone())
-            .on_click(move |_, _, cx| {
-                edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
-            })
+            div()
+                .id(gpui::ElementId::Name(btn_id.clone().into()))
+                .debug_selector(move || btn_id.clone())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .rounded(crate::ui::RADIUS_SM)
+                .border_1()
+                .cursor_pointer()
+                .text_size(crate::ui::TEXT_SM)
+                .when(selected, |d| {
+                    d.border_color(p.muted_foreground.opacity(0.4))
+                        .bg(p.accent)
+                        .text_color(p.accent_foreground)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                })
+                .when(!selected, |d| {
+                    d.border_color(p.border)
+                        .bg(p.background.opacity(0.5))
+                        .text_color(p.muted_foreground)
+                        .hover(|st| {
+                            st.border_color(p.muted_foreground.opacity(0.35))
+                                .text_color(p.foreground)
+                        })
+                })
+                .on_click(move |_, _, cx| {
+                    edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
+                })
+                .child(crate::ui::icons::agent_menu_icon(agent_id))
+                .child(label)
+                .when(selected, |d| {
+                    d.child(
+                        div()
+                            .id(gpui::ElementId::Name(check_id.clone().into()))
+                            .debug_selector(move || check_id.clone())
+                            .flex()
+                            .items_center()
+                            .child(
+                                gpui_component::Icon::new(gpui_component::IconName::Check).xsmall(),
+                            ),
+                    )
+                })
         });
         let default_agent_row = layout::card(p)
             .id("admin-default-agent-card")
