@@ -6731,20 +6731,10 @@ impl SettingsView {
                 .iter()
                 .find(|a| a.provider == prov && a.active)
         });
+        let profiles = text::PROFILES_COUNT.format(&[("count", &profile_count.to_string())]);
         let dir_info = match active {
-            Some(a) => format!(
-                "{} ({}) · {} {}",
-                a.label,
-                a.profile_dir,
-                profile_count,
-                text::PROFILES_UNIT.get()
-            ),
-            None => format!(
-                "{} · {} {}",
-                display_name,
-                profile_count,
-                text::PROFILES_UNIT.get()
-            ),
+            Some(a) => format!("{} ({}) · {profiles}", a.label, a.profile_dir),
+            None => format!("{display_name} · {profiles}"),
         };
         let eff_prof = effective.profiles.get(agent_id);
         let cmd_name = eff_prof

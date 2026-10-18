@@ -1045,7 +1045,7 @@ catalog! {
         YOLO_DESC => ("에이전트 실행 시 권한 확인 프롬프트를 건너뛰는 플래그를 자동으로 전달합니다.", "Pass autonomous permission bypass flags when launching agents."),
         HIBERNATION_TITLE => ("유휴 세션 동면", "Idle hibernation"),
         HIBERNATION_DESC => ("오랫동안 사용하지 않는 백그라운드 세션을 자동으로 동면시켜 메모리를 절약합니다.", "Automatically hibernate inactive background sessions to save memory."),
-        PROFILES_UNIT => ("개 프로필", "profile(s)"),
+        PROFILES_COUNT => ("프로필 {count}개", "{count} profile(s)"),
         WEBHOOK_ADD_LOCAL => ("+ 로컬 웹훅 추가", "+ Add local webhook"),
         WEBHOOK_CLEAR => ("웹훅 비우기", "Clear webhooks"),
         WEBHOOK_LABEL => ("#{n} · {kind}", "#{n} · {kind}"),
