@@ -1138,8 +1138,8 @@ catalog! {
         SC_WORKTREE => ("새 워크트리", "New worktree"),
         SC_FLOAT_TERMINAL => ("떠 있는 터미널", "Floating terminal"),
         SC_DASHBOARD => ("대시보드 창", "Dashboard window"),
-        SC_NEW_WINDOW => ("새 윈도우", "New window"),
-        SC_CLOSE_WINDOW => ("윈도우 닫기", "Close window"),
+        SC_NEW_WINDOW => ("새 창", "New window"),
+        SC_CLOSE_WINDOW => ("창 닫기", "Close window"),
         SC_QUIT => ("종료", "Quit"),
         SC_SETTINGS => ("설정", "Settings"),
         SC_ZOOM_IN => ("글자 크게 (터미널·에디터)", "Zoom in (terminal & editor)"),
@@ -1402,7 +1402,7 @@ catalog! {
         ZOOM_OUT_ITEM => ("축소", "Zoom Out"),
         ZOOM_RESET_ITEM => ("실제 크기", "Actual Size"),
         FULLSCREEN_TOGGLE => ("전체 화면 전환", "Toggle Full Screen"),
-        WINDOW_MENU => ("윈도우", "Window"),
+        WINDOW_MENU => ("창", "Window"),
         MINIMIZE => ("최소화", "Minimize"),
         ZOOM_WINDOW => ("확대/축소", "Zoom"),
         BRING_ALL_FRONT => ("모두 앞으로 가져오기", "Bring All to Front"),
@@ -2114,6 +2114,34 @@ mod tests {
                 .in_language(super::Language::En)
                 .contains("{requested}")
         );
+    }
+
+    #[test]
+    fn window_terminology_unified_to_chang() {
+        use super::Language::Ko;
+        assert_eq!(catalog::settings::SC_NEW_WINDOW.in_language(Ko), "새 창");
+        assert_eq!(
+            catalog::settings::SC_NEW_WINDOW.in_language(Ko),
+            catalog::general::NEW_WINDOW.in_language(Ko)
+        );
+        assert_eq!(
+            catalog::settings::SC_CLOSE_WINDOW.in_language(Ko),
+            "창 닫기"
+        );
+        assert_eq!(
+            catalog::settings::SC_CLOSE_WINDOW.in_language(Ko),
+            catalog::general::CLOSE_WINDOW.in_language(Ko)
+        );
+        assert_eq!(catalog::general::WINDOW_MENU.in_language(Ko), "창");
+        assert_eq!(catalog::settings::SC_CLOSE_PANE.in_language(Ko), "칸 닫기");
+        for m in super::ALL.iter().chain(super::link_ui::ALL.iter()) {
+            assert!(
+                !m.in_language(Ko).contains("윈도우"),
+                "{} still contains '윈도우': {}",
+                m.id,
+                m.in_language(Ko)
+            );
+        }
     }
 }
 
