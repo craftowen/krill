@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::io::Read;
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -206,23 +205,43 @@ impl Agents {
     }
 }
 
-/// `program`을 `path`(PATH 형식)에서 찾는다. `/`가 들어 있으면 그 경로만 본다(셸 `command -v`와 같은 규칙).
+/// `program`을 `path`(PATH 형식)에서 찾는다. 경로 구분자(`/`, Windows는 `\`도)가 들어 있으면 그 경로만 본다
+/// (셸 `command -v`와 같은 규칙).
 pub fn which(program: &str, path: &OsStr) -> Option<PathBuf> {
-    let executable = |p: &Path| {
-        p.metadata()
-            .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-    };
     if program.is_empty() {
         return None;
     }
-    if program.contains('/') {
-        let p = PathBuf::from(program);
-        return executable(&p).then_some(p);
+    if program.contains(std::path::is_separator) {
+        return executable(PathBuf::from(program));
     }
     std::env::split_paths(path)
         .filter(|d| !d.as_os_str().is_empty())
-        .map(|d| d.join(program))
-        .find(|p| executable(p))
+        .find_map(|d| executable(d.join(program)))
+}
+
+/// 실행 비트가 있는 일반 파일이면 그 경로.
+#[cfg(unix)]
+fn executable(p: PathBuf) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt as _;
+    p.metadata()
+        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .then_some(p)
+}
+
+/// Windows에는 실행 비트가 없어 `PATHEXT`(없으면 `.COM;.EXE;.BAT;.CMD`) 확장자를 붙여 본다(`claude` → `claude.cmd`).
+/// 이미 확장자가 있으면 그 이름을 먼저 본다.
+#[cfg(windows)]
+fn executable(p: PathBuf) -> Option<PathBuf> {
+    if p.extension().is_some() && p.is_file() {
+        return Some(p);
+    }
+    let exts = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_owned());
+    exts.split(';').filter(|e| !e.is_empty()).find_map(|ext| {
+        let mut name = p.clone().into_os_string();
+        name.push(ext.to_ascii_lowercase());
+        let candidate = PathBuf::from(name);
+        candidate.is_file().then_some(candidate)
+    })
 }
 
 /// `<exe> --version` 출력의 첫 줄. 실패하거나 [`VERSION_TIMEOUT`] 안에 끝나지 않으면 `None`.

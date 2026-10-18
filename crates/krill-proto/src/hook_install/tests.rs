@@ -1,4 +1,5 @@
 use std::fs;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -60,6 +61,7 @@ impl Drop for Home {
 }
 
 #[test]
+#[cfg(unix)]
 fn shared_install_receipt_backup_and_rollback_preserve_original_bytes_and_mode() {
     let home = Home::new();
     let original = "{\n\t\"user\": \"한글\", \"hooks\": {}\n}\n";
@@ -150,6 +152,7 @@ fn shared_install_refuses_lock_contention_and_stale_config_or_receipt_snapshots(
 }
 
 #[test]
+#[cfg(unix)]
 fn invalid_json_utf8_size_and_symlinks_preserve_originals_without_a_receipt() {
     let home = Home::new();
     for original in [

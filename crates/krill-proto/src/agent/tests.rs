@@ -68,7 +68,9 @@ fn bad_user_file_is_error() {
 }
 
 #[test]
+#[cfg(unix)]
 fn which_follows_path_and_exec_bit() {
+    use std::os::unix::fs::PermissionsExt as _;
     let dir = std::env::temp_dir().join(format!("mk037-which-{}", std::process::id()));
     let (a, b) = (dir.join("a"), dir.join("b"));
     std::fs::create_dir_all(&a).unwrap();
@@ -87,7 +89,9 @@ fn which_follows_path_and_exec_bit() {
 }
 
 #[test]
+#[cfg(unix)]
 fn version_reads_first_line_and_times_out() {
+    use std::os::unix::fs::PermissionsExt as _;
     let dir = std::env::temp_dir().join(format!("mk037-ver-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let script = |name: &str, body: &str| {
@@ -168,4 +172,18 @@ env = { OLD = "1" }
     p.env.insert("K".into(), "v".into());
     let text = set_user_profile(None, "claude", &p).unwrap();
     assert_eq!(Agents::load(Some(&text)).unwrap().profiles["claude"], p);
+}
+
+/// Windows는 실행 비트 대신 `PATHEXT`로 `claude` → `claude.cmd`를 찾는다.
+#[test]
+#[cfg(windows)]
+fn which_appends_pathext_on_windows() {
+    let dir = std::env::temp_dir().join(format!("krill-which-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("claude.cmd"), "").unwrap();
+    let path = std::env::join_paths([&dir]).unwrap();
+    assert_eq!(which("claude", &path), Some(dir.join("claude.cmd")));
+    assert_eq!(which("claude.cmd", &path), Some(dir.join("claude.cmd")));
+    assert_eq!(which("missing", &path), None);
+    std::fs::remove_dir_all(&dir).ok();
 }

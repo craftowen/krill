@@ -398,10 +398,10 @@ pub fn record_session_auto_title(
     session: crate::SessionId,
     title: &str,
 ) -> std::io::Result<bool> {
+    use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
     use std::collections::BTreeMap;
     use std::fs::{DirBuilder, OpenOptions};
     use std::io::Write as _;
-    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
     let clean: String = title
         .trim()

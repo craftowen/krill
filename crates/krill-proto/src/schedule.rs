@@ -1,10 +1,10 @@
 //! MK-101 file configuration, shared by the CLI and daemon; no IPC extension.
 //! Cron uses five numeric UTC fields: minute, hour, day, month, weekday (Sunday 0/7).
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::HashSet;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Read, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};

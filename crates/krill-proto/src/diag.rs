@@ -7,10 +7,10 @@
 //! - 진단 번들은 크래시 로그를 모아 [`redact`]를 거친 텍스트 한 파일(`<상태 디렉터리>/diagnostics/`, 0600, 상한 4MiB)이다.
 //!   터미널 출력 본문은 넣지 않는다. 업로드는 하지 않는다(opt-in 업로드는 별도 이슈).
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::panic::PanicHookInfo;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
