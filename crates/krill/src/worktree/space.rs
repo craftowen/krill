@@ -3,11 +3,11 @@
 //! 파일시스템 순회·git·데몬 소켓 호출은 이 CLI 모듈에만 둔다. 직렬화 타입과 순수 함수는
 //! `krill_proto::worktree_space`, 앱은 `krill worktree space|cleanup --json`을 하위 프로세스로 호출한다.
 
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{Read as _, Write as _};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -346,7 +346,7 @@ pub fn discover_repositories(state_dir: Option<&Path>) -> Vec<PathBuf> {
     if (state_dir.is_none() || state_dir == daemon::state_dir().as_deref())
         && let Ok(paths) = Paths::dev()
         && paths.socket.exists()
-        && let Ok(mut stream) = std::os::unix::net::UnixStream::connect(&paths.socket)
+        && let Ok(mut stream) = krill_proto::os::net::UnixStream::connect(&paths.socket)
     {
         stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
@@ -656,7 +656,7 @@ fn remove_via_socket(
     socket: &Path,
     req: &RemoveWorktree,
 ) -> Result<Result<RemovedWorktree, String>, ()> {
-    let mut stream = std::os::unix::net::UnixStream::connect(socket).map_err(|_| ())?;
+    let mut stream = krill_proto::os::net::UnixStream::connect(socket).map_err(|_| ())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
         .map_err(|_| ())?;
@@ -1590,6 +1590,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn remove_worktree_git_unlinks_configured_symlinks_and_preserves_repo_targets() {
         use std::os::unix::fs::symlink;
 

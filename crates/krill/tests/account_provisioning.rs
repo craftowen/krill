@@ -1,9 +1,9 @@
 //! OWE-722: 실제 CLI와 가짜 IPC 데몬으로 프로비저닝 제어를 검증한다.
 #![expect(clippy::unwrap_used, reason = "통합 테스트 헬퍼")]
 
+use krill_proto::os::net::UnixListener;
 use std::fs;
 use std::io::Write as _;
-use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::Duration;

@@ -8,7 +8,8 @@
 //!
 //! 재현: `cargo nextest run -p krill --test remote` (자원 제한: `CARGO_BUILD_JOBS=2 KRILL_TEST_SLOTS=1 NEXTEST_TEST_THREADS=4`).
 
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs;
 use std::io::{Read as _, Write as _};

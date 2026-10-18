@@ -27,6 +27,7 @@ const STDIN_MAX: u64 = 1024 * 1024;
 /// stdin EOF 대기. 넘으면 가진 만큼으로 진행한다(틱 pile-up 방지).
 const STDIN_WAIT: Duration = Duration::from_secs(5);
 /// 사용자 체인 명령 실행 제한. 넘으면 죽이고 빈 출력으로 둔다.
+#[cfg(unix)]
 const CHAIN_WAIT: Duration = Duration::from_secs(10);
 /// `claude --version` 프로브 제한.
 const PROBE_WAIT: Duration = Duration::from_secs(10);
@@ -169,6 +170,7 @@ fn resolve_chain(
 
 /// 사용자 명령을 `/bin/sh -c`로 실행하고 stdout을 그대로 돌려준다.
 /// 실패·타임아웃은 빈 출력이다(표시 우선).
+#[cfg(unix)]
 fn run_chain(command: &OsStr, input: &[u8]) -> Vec<u8> {
     let mut child = match std::process::Command::new("/bin/sh")
         .arg("-c")
@@ -540,4 +542,17 @@ fn consent() -> io::Result<bool> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
+
+#[cfg(windows)]
+fn run_chain(_command: &OsStr, _input: &[u8]) -> Vec<u8> {
+    eprintln!(
+        "krill statusline: {}",
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "shell command chains are not supported on Windows yet"
+        )
+    );
+    Vec::new()
+}
