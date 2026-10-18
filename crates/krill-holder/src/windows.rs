@@ -293,6 +293,10 @@ impl Holder {
                 let (path, args) = argv.split_first().ok_or(io::ErrorKind::InvalidInput)?;
                 let env = env
                     .into_iter()
+                    .filter(|(key, _)| {
+                        !key.eq_ignore_ascii_case(b"KRILL_HOLDER_LINK")
+                            && !key.eq_ignore_ascii_case(b"KRILL_HOLDER_STATE")
+                    })
                     .map(|(k, v)| Ok((text(k)?, text(v)?)))
                     .collect::<io::Result<Vec<_>>>()?;
                 let cwd = text(cwd)?;
