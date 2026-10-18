@@ -317,6 +317,55 @@ fn live_action_payload_includes_resolved_pid_window_and_keycodes() {
 }
 
 #[test]
+fn permission_probe_script_tolerates_missing_preflight_symbol() {
+    use super::engine::PERMISSION_PROBE_JXA_SCRIPT;
+
+    // OWE-902: macOS 26.6 JXA 브리지에서 CGPreflightScreenCaptureAccess가
+    // 노출되지 않아 호출이 TypeError(-2700)로 실패하므로, 호출 전 typeof 검사가 필요하다.
+    assert!(PERMISSION_PROBE_JXA_SCRIPT.contains(r#"ObjC.import("CoreGraphics")"#));
+    assert!(PERMISSION_PROBE_JXA_SCRIPT.contains(r#"ObjC.import("ApplicationServices")"#));
+    assert!(
+        PERMISSION_PROBE_JXA_SCRIPT.contains("typeof $.CGPreflightScreenCaptureAccess"),
+        "probe must check CGPreflightScreenCaptureAccess availability before calling it"
+    );
+    assert!(
+        PERMISSION_PROBE_JXA_SCRIPT.contains("typeof $.AXIsProcessTrusted"),
+        "probe must check AXIsProcessTrusted availability before calling it"
+    );
+    // 심볼이 없을 때: 화면 기록 확인은 생략하고 진행(기본 true),
+    // 손쉬운 사용은 실패 닫힘(기본 false).
+    assert!(
+        PERMISSION_PROBE_JXA_SCRIPT.contains("let screenshots = true;"),
+        "probe must proceed without screenshot gating when the preflight symbol is missing"
+    );
+    assert!(
+        PERMISSION_PROBE_JXA_SCRIPT.contains("let accessibility = false;"),
+        "probe must fail closed when the accessibility symbol is missing"
+    );
+}
+
+#[test]
+fn permission_probe_output_parsing_handles_branches() {
+    use super::engine::parse_permission_probe_json;
+
+    assert_eq!(
+        parse_permission_probe_json(r#"{"accessibility":true,"screenshots":true}"#).unwrap(),
+        (true, true)
+    );
+    assert_eq!(
+        parse_permission_probe_json(r#"{"accessibility":true,"screenshots":false}"#).unwrap(),
+        (true, false)
+    );
+    assert_eq!(
+        parse_permission_probe_json(r#"{"accessibility":false,"screenshots":true}"#).unwrap(),
+        (false, true)
+    );
+    assert!(parse_permission_probe_json("not json").is_err());
+    // 키 누락 시 실패 닫힘 기본값.
+    assert_eq!(parse_permission_probe_json("{}").unwrap(), (false, false));
+}
+
+#[test]
 fn jxa_scripts_preserve_pid_whose_specifier_without_array_evaluation() {
     use super::engine::{LIVE_ACTION_JXA_SCRIPT, LIVE_WINDOW_AX_JXA_SCRIPT};
 
