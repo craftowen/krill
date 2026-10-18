@@ -112,14 +112,20 @@ catalog! {
         AUTO => ("네트워크 자동 선택", "Auto-select network"),
         EXPIRES => ("QR 만료까지", "QR expires in"),
         COPY => ("페어링 링크 복사", "Copy pairing link"),
+        COPIED => ("복사됨", "Copied"),
         NEW_QR => ("새 QR 발급", "New QR code"),
         REFRESH => ("기기 새로고침", "Refresh devices"),
         REVOKE_ALL => ("전체 기기 해제", "Revoke all devices"),
         REVOKE => ("연결 해제", "Revoke device"),
         CONNECTED => ("연결됨", "Connected"),
+        OFFLINE => ("오프라인", "Offline"),
         PAIRED => ("페어링", "Paired"),
         LAST_ACTIVE => ("마지막 활동", "Last active"),
-        MINUTES_AGO => ("분 전", "minutes ago")
+        MINUTES_AGO => ("분 전", "minutes ago"),
+        HOURS_AGO => ("시간 전", "hours ago"),
+        DAYS_AGO => ("일 전", "days ago"),
+        JUST_NOW => ("방금 전", "Just now"),
+        NEVER => ("없음", "Never")
     }
     status {
         PROVIDER_ACCOUNTS_HEADER ["status.provider.accounts_header"] => ("계정 전환", "Switch Account"),
