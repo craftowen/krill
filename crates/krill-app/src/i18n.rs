@@ -1593,6 +1593,7 @@ catalog! {
         BUSY => ("Git 작업 중…", "Running Git operation…"),
         INVALID => ("커밋 메시지를 입력하세요 (최대 16 KiB)", "Enter a commit message (up to 16 KiB)"),
         OUTDATED => ("데몬 업데이트 필요: Git 변경 작업을 지원하지 않습니다", "Daemon update required: Git edit operations are not supported"),
+        NO_REMOTE => ("원격 저장소가 설정되지 않았습니다", "No git remote configured"),
         FAILED => ("예상하지 못한 Git 응답", "Unexpected Git response"),
         DONE => ("Git 작업을 완료했습니다", "Git operation completed"),
         PUSH => ("푸시", "Push"),

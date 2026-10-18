@@ -9,6 +9,7 @@ struct Fake {
     discards: Mutex<Vec<Vec<u8>>>,
     fail: Mutex<bool>,
     no_sync_feature: Mutex<bool>,
+    no_remote: Mutex<bool>,
     sync: Mutex<(u64, u64)>,
     generated: Mutex<Option<Result<String, String>>>,
 }
@@ -33,6 +34,10 @@ impl EditSource for Fake {
 
     fn supports_sync(&self) -> bool {
         !*self.no_sync_feature.lock().unwrap()
+    }
+
+    fn has_remote(&self, _: &Path) -> bool {
+        !*self.no_remote.lock().unwrap()
     }
 
     fn branch_sync(&self, _: &Path) -> (u64, u64) {
@@ -755,4 +760,69 @@ fn line_patch_handles_no_newline_at_end_of_file_on_real_repo() {
     assert!(remaining.trim().is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[gpui::test]
+fn repo_without_remote_disables_sync_buttons_and_blocks_sync_edits(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let fake = Arc::new(Fake::default());
+    *fake.no_remote.lock().unwrap() = true;
+    let (panel, cx) = cx.add_window_view(|window, cx| {
+        let mut p = Panel::unconnected("/repo".into(), cx);
+        p.visible = false;
+        p.editing.source = fake.clone();
+        p.changes = Changes {
+            files: vec![ChangedFile {
+                path: b"src/lib.rs".into(),
+                old_path: None,
+                status: *b"M.",
+                staged: None,
+                unstaged: None,
+            }],
+            limited: false,
+        };
+        p.refresh_branch_sync(cx);
+        drop(p.render_editor(window, cx));
+        p
+    });
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| {
+        assert!(p.editing.sync_supported());
+        assert!(!p.editing.has_remote);
+    });
+
+    panel.update_in(cx, |p, window, cx| {
+        p.editing.input.as_ref().unwrap().update(cx, |input, cx| {
+            input.set_value("feat: local only", window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    click("git-pull", cx);
+    cx.run_until_parked();
+    click("git-push", cx);
+    cx.run_until_parked();
+    click("git-sync", cx);
+    cx.run_until_parked();
+    click("git-commit-push", cx);
+    cx.run_until_parked();
+    panel.update(cx, |p, cx| {
+        p.run_git_action(Edit::Pull, cx);
+        p.run_git_action(Edit::Push, cx);
+        p.run_git_action(Edit::Sync, cx);
+    });
+    cx.run_until_parked();
+    assert!(fake.edits.lock().unwrap().is_empty());
+    panel.read_with(cx, |p, _| {
+        assert_eq!(p.editing.note, text::NO_REMOTE.get());
+    });
+
+    click("git-commit", cx);
+    cx.run_until_parked();
+    assert_eq!(
+        *fake.edits.lock().unwrap(),
+        [Edit::Commit {
+            message: "feat: local only".into(),
+        }]
+    );
 }
