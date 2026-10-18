@@ -20,6 +20,8 @@ use serde::{Deserialize, Serialize};
 /// 포워더(ssh 또는 `KRILL_SSH_BIN`)가 local 소켓을 열 때까지 기다리는 상한.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 const READY_POLL: Duration = Duration::from_millis(20);
+/// 이보다 오래된 포워딩 소켓만 잔재로 본다. 다른 프로세스가 막 bind한(아직 listen 전) 소켓을 지우지 않게.
+const STALE_FORWARD_AGE: Duration = Duration::from_secs(60);
 /// 터널 소켓 Hello 읽기·쓰기 상한(`daemon::HELLO_TIMEOUT`과 같은 값).
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 /// 파일명에 쓸 호스트명 상한(UDS 104바이트 제한 여유).
@@ -516,6 +518,7 @@ impl Tunnel {
                 .recursive(true)
                 .mode(0o700)
                 .create(dir)?;
+            sweep_stale_forwards(dir, STALE_FORWARD_AGE);
         }
         std::fs::remove_file(&local).ok();
         let host = &opts.destination;
@@ -578,6 +581,32 @@ impl Drop for Tunnel {
         self.child.kill().ok();
         self.child.wait().ok();
         std::fs::remove_file(&self.socket).ok();
+    }
+}
+
+/// 소유 프로세스가 SIGKILL로 죽어 `Drop`이 못 지운 포워딩 소켓(`fwd-*`·`f-*`)을 지운다.
+/// 듣는 쪽이 없어 연결이 거부되는 것만 지우므로 살아 있는 다른 터널은 남는다.
+fn sweep_stale_forwards(dir: &Path, min_age: Duration) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("fwd-") || name.starts_with("f-")) || !name.ends_with(".sock") {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|age| age >= min_age));
+        let path = entry.path();
+        if old
+            && UnixStream::connect(&path)
+                .is_err_and(|e| e.kind() == io::ErrorKind::ConnectionRefused)
+        {
+            std::fs::remove_file(&path).ok();
+        }
     }
 }
 
