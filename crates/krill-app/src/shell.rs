@@ -426,6 +426,8 @@ pub struct Shell {
     /// Resource Manager(MK-071).
     resources: gpui::Entity<krill_app::resources::Panel>,
     _resources_open: Subscription,
+    /// OWE-851: 열려 있는 상태바 드롭다운 메뉴 수. 0이 아니면 호버 툴팁을 숨긴다.
+    status_menus_open: usize,
     history: gpui::Entity<krill_app::agent_history::Panel>,
     _history_open: Subscription,
     appearance: Option<Box<dyn std::io::Write>>,
@@ -718,6 +720,7 @@ impl Shell {
             _history_open: history_open,
             resources,
             _resources_open: resources_open,
+            status_menus_open: 0,
             security: krill_app::security::State::default(),
             zoomed_pane: None,
             files: files::Files::default(),

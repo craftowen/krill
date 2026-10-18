@@ -394,6 +394,21 @@ pub fn button_with_tooltip(
     button.tooltip(text.clone()).accessibility_label(text)
 }
 
+/// OWE-851: 메뉴가 열려 있는 동안(`on == false`)은 호버 툴팁을 달지 않고 접근성
+/// 라벨만 둔다. 열린 팝오버 하단 글자를 툴팁이 가리는 문제를 막는다.
+pub fn button_with_tooltip_when(
+    on: bool,
+    button: Button,
+    id: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+) -> Button {
+    if on {
+        button_with_tooltip(button, id, text)
+    } else {
+        button.accessibility_label(text.into())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
