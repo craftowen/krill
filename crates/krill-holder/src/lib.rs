@@ -11,7 +11,13 @@
 mod holder;
 #[cfg(unix)]
 pub mod link;
+#[cfg(windows)]
+#[path = "link/windows.rs"]
+pub mod link;
 #[cfg(unix)]
+mod sys;
+#[cfg(windows)]
+#[path = "sys/windows.rs"]
 mod sys;
 #[cfg(unix)]
 mod teardown;
