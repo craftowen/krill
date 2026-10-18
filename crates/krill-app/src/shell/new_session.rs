@@ -66,27 +66,16 @@ fn session_accounts(
 }
 
 impl Shell {
-    fn new_agent_with_account(&mut self, id: String, account: String, cx: &mut Context<Self>) {
-        use std::os::unix::ffi::OsStrExt as _;
+    pub(super) fn new_agent_with_account(
+        &mut self,
+        id: String,
+        account: String,
+        cx: &mut Context<Self>,
+    ) {
         if self.link != Link::Up || self.agents_busy {
             return;
         }
-        let cwd = self.folder().as_os_str().as_bytes().to_vec();
-        self.change(true, cx, |layout| {
-            layout.new_tab();
-            if let Some(pane) = layout.focused() {
-                layout.set_launch(
-                    pane,
-                    krill_proto::control::Create {
-                        program: krill_proto::control::Program::Agent { id },
-                        cwd,
-                        cols: krill_app::pane::SIZE.0,
-                        rows: krill_app::pane::SIZE.1,
-                        account: Some(account),
-                    },
-                );
-            }
-        });
+        self.new_agent_with_optional_account(id, Some(account), cx);
     }
 
     /// 프로필 목록의 `index`번째 에이전트를 새 탭에 띄운다. 연결 전·목록 밖이면 아무것도 하지 않는다.
@@ -189,31 +178,33 @@ impl Shell {
                             .action(Box::new(NewTab)),
                     );
                 for (i, profile) in settings.iter().flat_map(visible_profiles).enumerate() {
-                    let item = PopupMenuItem::new(profile.name.clone())
-                        .icon(
-                            gpui_component::Icon::default()
-                                .data(krill_app::ui::icons::agent_svg_bytes(&profile.id)),
-                        )
-                        .disabled(disabled);
-                    let item = if let Some(action) = shortcut(i) {
-                        item.action(action)
-                    } else {
-                        let this = this.clone();
-                        item.on_click(move |_, _, cx| {
-                            this.update(cx, |s, cx| s.new_agent_at(i, cx)).ok();
-                        })
-                    };
+                    let icon = gpui_component::Icon::default()
+                        .data(krill_app::ui::icons::agent_svg_bytes(&profile.id));
+                    let click_this = this.clone();
+                    let mut item = PopupMenuItem::new(profile.name.clone())
+                        .icon(icon.clone())
+                        .disabled(disabled)
+                        .on_click(move |_, _, cx| {
+                            click_this.update(cx, |s, cx| s.new_agent_at(i, cx)).ok();
+                        });
+                    if let Some(action) = shortcut(i) {
+                        item = item.action(action);
+                    }
                     let choices = session_accounts(&accounts, &profile.id);
-                    if choices.is_empty() {
+                    if disabled || choices.len() <= 1 {
                         menu = menu.item(item);
                     } else {
                         let this = this.clone();
                         let profile_id = profile.id.clone();
-                        menu =
-                            menu.submenu(profile.name.clone(), window, cx, move |mut sub, _, _| {
+                        menu = menu.submenu_with_icon(
+                            Some(icon),
+                            profile.name.clone(),
+                            window,
+                            cx,
+                            move |mut sub, _, _| {
                                 let default_this = this.clone();
                                 let default_id = profile_id.clone();
-                                sub = sub.item(
+                                let mut default_item =
                                     PopupMenuItem::new(text::ACCOUNT_DEFAULT.get())
                                         .disabled(disabled)
                                         .on_click(move |_, _, cx| {
@@ -222,8 +213,11 @@ impl Shell {
                                                     s.new_agent(default_id.clone(), cx);
                                                 })
                                                 .ok();
-                                        }),
-                                );
+                                        });
+                                if let Some(action) = shortcut(i) {
+                                    default_item = default_item.action(action);
+                                }
+                                sub = sub.item(default_item);
                                 for account in &choices {
                                     let this = this.clone();
                                     let id = profile_id.clone();
@@ -245,7 +239,8 @@ impl Shell {
                                     );
                                 }
                                 sub
-                            });
+                            },
+                        );
                     }
                 }
                 menu = menu.separator().label(text::EXECUTION_LOCATION.get());

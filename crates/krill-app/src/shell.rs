@@ -1739,17 +1739,43 @@ impl Shell {
 
     /// 새 탭에서 에이전트를 지금 보이는 폴더(MK-055)로 띄운다. 선택된 실행 위치가 원격이면 원격 기본 디렉터리에서 시작한다.
     fn new_agent(&mut self, id: String, cx: &mut Context<Self>) {
+        self.new_agent_with_optional_account(id, None, cx);
+    }
+
+    pub(super) fn new_agent_with_optional_account(
+        &mut self,
+        id: String,
+        account: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
         let host = self.launch_host.clone();
-        let same_host = self
-            .layout
-            .focused()
-            .is_some_and(|focused| *self.layout.host(focused) == host);
-        let cwd = if host.is_remote() && !same_host {
+        let cwd = if host.is_remote()
+            && self
+                .layout
+                .focused()
+                .is_none_or(|focused| *self.layout.host(focused) != host)
+        {
             PathBuf::new()
         } else {
             self.folder()
         };
-        self.new_folder_tab_on(host, &cwd, Program::Agent { id }, cx);
+        self.change(true, cx, |l| {
+            l.new_tab();
+            let pane = l.active_tab().focused;
+            if host.is_remote() {
+                l.set_host(pane, host);
+            }
+            l.set_launch(
+                pane,
+                Create {
+                    account,
+                    program: Program::Agent { id },
+                    cwd: cwd.as_os_str().as_bytes().to_vec(),
+                    cols: pane::SIZE.0,
+                    rows: pane::SIZE.1,
+                },
+            );
+        });
     }
 
     /// 첫 Attached 성공 때만 업데이트 health 신호를 보낸다.
