@@ -1,8 +1,8 @@
 //! `krill changes [--repo <path>]`: one-shot changed paths and staged/unstaged numstat via krilld.
 
+use krill_proto::os::ffi::OsStrExt as _;
 use std::ffi::{OsStr, OsString};
 use std::io::Write as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
 use std::process::ExitCode;
 

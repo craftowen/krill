@@ -4,10 +4,10 @@ mod cleanup;
 mod remove;
 mod space;
 
+use krill_proto::os::ffi::OsStrExt;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::io::{self, IsTerminal, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 

@@ -1,6 +1,7 @@
 //! MK-045: all MVP commands against real holder/krilld with no application process.
 
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs::{self, File};
 use std::io::Write as _;
@@ -1106,6 +1107,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
 }
 
 #[test]
+#[cfg(target_os = "macos")]
 fn computer_cli_subcommands_and_skill_work_offline() {
     let dir = std::env::temp_dir().join(format!("mk187-computer-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();

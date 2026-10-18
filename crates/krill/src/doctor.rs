@@ -12,9 +12,11 @@ mod checks;
 mod tests;
 
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -25,13 +27,16 @@ use krill_proto::doctor::{Check, Report, SCHEMA, Status};
 use krill_proto::history;
 use krill_proto::ipc::ClientRole;
 use krill_proto::telemetry::{self, Consent, Reason};
+#[cfg(unix)]
 use rustix::fs::{Access, access};
 
 use checks::{Agent as AgentFact, CliPath, Daemon, Facts, HOOK_IDS, Helpers, History, State};
 
 /// 로그인 셸이 PATH를 알려 주기까지 기다리는 최대 시간(앱 온보딩과 같은 5초).
+#[cfg(unix)]
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// rc 파일이 stdout에 무엇을 찍어도 PATH 줄을 골라내기 위한 표시.
+#[cfg(unix)]
 const PATH_MARK: &str = "__MK_PATH__=";
 /// 데몬을 띄우지 않는 ping의 Hello 상한.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -336,7 +341,7 @@ fn check_helpers(paths: Option<&Paths>) -> (bool, Vec<String>, String) {
     };
     let mut missing = Vec::new();
     for (name, bin) in [("krill-holder", &paths.holder), ("krilld", &paths.krilld)] {
-        if access(bin, Access::EXEC_OK).is_err() {
+        if !executable(bin) {
             missing.push(name.to_owned());
         }
     }
@@ -356,6 +361,7 @@ fn check_helpers(paths: Option<&Paths>) -> (bool, Vec<String>, String) {
 }
 
 /// 상태 디렉터리·`run/` 쓰기 가능, 소유자=현재 사용자. 없으면 데몬이 만든다.
+#[cfg(unix)]
 fn state_writable(state: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let me = rustix::process::geteuid().as_raw();
@@ -430,6 +436,7 @@ fn history_recording_off(state: &Path) -> bool {
 /// `shell -l -i -c`로 로그인·대화형 셸의 PATH를 얻는다. 실패하거나 [`SHELL_TIMEOUT`]을 넘기면 `None`.
 /// 앱 온보딩(`login_path`)과 같은 방식. 읽기는 별도 스레드+시간 제한이라 rc가 파이프를
 /// 쥐고 버텨도 호출자는 돌아온다.
+#[cfg(unix)]
 fn login_path() -> Option<OsString> {
     let shell = std::env::var_os("SHELL")
         .filter(|s| !s.is_empty())
@@ -497,11 +504,13 @@ fn builtin_install_hint() -> String {
         .unwrap_or_else(|| "curl -fsSL https://claude.ai/install.sh | bash".to_owned())
 }
 
+#[cfg(unix)]
 fn is_broken_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok() && std::fs::metadata(path).is_err()
 }
 
 /// PATH의 `krill`가 이 설치와 같은 파일인지(앱 온보딩 `Cli`와 같은 네 가지).
+#[cfg(unix)]
 fn cli_path(exe: &Path, path: &OsString, home: Option<&Path>) -> CliPath {
     for dir in std::env::split_paths(path) {
         let candidate = dir.join("krill");
@@ -579,6 +588,50 @@ pub fn bundle() -> ExitCode {
         Err(e) => {
             println!("bundle     FAIL: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    access(path, Access::EXEC_OK).is_ok()
+}
+
+#[cfg(windows)]
+fn executable(path: &Path) -> bool {
+    path.parent().is_some_and(|dir| {
+        path.to_str()
+            .and_then(|program| agent::which(program, dir.as_os_str()))
+            .is_some()
+    })
+}
+
+#[cfg(windows)]
+fn login_path() -> Option<OsString> {
+    std::env::var_os("PATH")
+}
+
+/// Unix 소유자/접근 권한 진단은 Windows ACL 검사 구현 전까지 성공으로 보고하지 않는다.
+#[cfg(windows)]
+fn state_writable(_state: &Path) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn cli_path(exe: &Path, path: &OsString, _home: Option<&Path>) -> CliPath {
+    if let Some(found) = agent::which("krill", path) {
+        let same = std::fs::canonicalize(&found)
+            .ok()
+            .zip(std::fs::canonicalize(exe).ok())
+            .is_some_and(|(found, mine)| found == mine);
+        if same {
+            CliPath::Installed
+        } else {
+            CliPath::Conflict { found }
+        }
+    } else {
+        CliPath::Manual {
+            hint: format!("add {} to PATH", exe.parent().unwrap_or(exe).display()),
         }
     }
 }
