@@ -2452,7 +2452,7 @@ fn owe660_keys_toml_record_and_reset_round_trip() {
         ("settings::ZoomIn", "cmd-=".to_owned()),
         ("settings::ZoomOut", "cmd--".to_owned()),
     ];
-    let mut t = Keys::parse(original).unwrap().bindings;
+    let mut t = Keys::parse(original).unwrap();
     shortcuts::set_key(
         &mut t,
         &defaults,
@@ -2464,10 +2464,11 @@ fn owe660_keys_toml_record_and_reset_round_trip() {
     assert!(
         body.starts_with("# 내 키맵\n[bindings]\n# 메모\n\"cmd-k\" = \"shell::Jump\" # 유지\n")
     );
-    let parsed = Keys::parse(&body).unwrap().bindings;
-    assert_eq!(parsed["cmd-y"].as_str(), Some("settings::ZoomIn"));
-    assert_eq!(parsed["cmd-="].as_str(), Some(""));
-    assert_eq!(parsed.len(), 3);
+    let parsed = Keys::parse(&body).unwrap();
+    assert_eq!(parsed.bindings["cmd-y"].as_str(), Some("settings::ZoomIn"));
+    // OWE-863: 기본 키는 그 액션만 끈다(`""`로 키 전체를 끄지 않는다).
+    assert_eq!(parsed.disabled["settings::ZoomIn"], ["cmd-="]);
+    assert_eq!(parsed.bindings.len(), 2);
 
     // 사용자 키를 다시 바꾸면 그 항목만 바뀐다(기본 키 끄기는 유지).
     let mut t = parsed;
@@ -2478,8 +2479,9 @@ fn owe660_keys_toml_record_and_reset_round_trip() {
         Some("cmd-y"),
         "alt-cmd-y",
     );
-    assert!(!t.contains_key("cmd-y"));
-    assert_eq!(t["alt-cmd-y"].as_str(), Some("settings::ZoomIn"));
+    assert!(!t.bindings.contains_key("cmd-y"));
+    assert_eq!(t.bindings["alt-cmd-y"].as_str(), Some("settings::ZoomIn"));
+    assert_eq!(t.disabled["settings::ZoomIn"], ["cmd-="]);
 
     shortcuts::reset_action(&mut t, &defaults, "settings::ZoomIn");
     let body = shortcuts::rewrite(&body, &t).unwrap();
@@ -2490,10 +2492,10 @@ fn owe660_keys_toml_record_and_reset_round_trip() {
 
     // 줄 단위로 못 고치는 형식(인라인 표)은 표 전체를 다시 쓴다.
     let inline = "bindings = { \"cmd-k\" = \"shell::Jump\" }\n";
-    let mut t = Keys::parse(inline).unwrap().bindings;
+    let mut t = Keys::parse(inline).unwrap();
     shortcuts::set_key(&mut t, &defaults, "settings::ZoomOut", None, "cmd-u");
     let parsed = Keys::parse(&shortcuts::rewrite(inline, &t).unwrap()).unwrap();
-    assert_eq!(parsed.bindings, t);
+    assert_eq!(parsed, t);
 
     assert_eq!(shortcuts::keycap_text("cmd-shift-w"), "⇧⌘W");
     assert_eq!(shortcuts::keycap_text("alt-cmd-left"), "⌥⌘←");
@@ -2549,9 +2551,9 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
         assert_eq!(bound(cx, "cmd-y"), Some(ZoomIn.name()));
         assert_eq!(bound(cx, "cmd-="), None);
     });
-    let saved = Keys::parse(&keys()).unwrap().bindings;
-    assert_eq!(saved["cmd-y"].as_str(), Some("settings::ZoomIn"));
-    assert_eq!(saved["cmd-="].as_str(), Some(""));
+    let saved = Keys::parse(&keys()).unwrap();
+    assert_eq!(saved.bindings["cmd-y"].as_str(), Some("settings::ZoomIn"));
+    assert_eq!(saved.disabled["settings::ZoomIn"], ["cmd-="]);
     assert!(keys().contains("# "), "템플릿 주석 유지");
 
     // Esc는 취소: 파일이 그대로다.
@@ -2817,6 +2819,24 @@ fn owe863_plain_keys_need_modifier() {
     }
 }
 
+/// OWE-863: `[disabled]`는 그 액션의 기본 키만 끄고, 같은 키를 쓰는 다른 액션의 기본 바인딩은 남긴다.
+#[gpui::test]
+fn owe863_disabled_table_is_per_action(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        let mut all = defaults();
+        all.push(KeyBinding::new("cmd-j", ZoomIn, None));
+        let keys = Keys::parse("[disabled]\n\"test::Probe\" = [\"cmd-j\"]\n").unwrap();
+        let b = bindings(all, &keys, cx).unwrap();
+        let typed = [Keystroke::parse("cmd-j").unwrap()];
+        let on: Vec<_> = b
+            .iter()
+            .filter(|b| b.match_keystrokes(&typed) == Some(false))
+            .map(|b| b.action().name())
+            .collect();
+        assert_eq!(on, [ZoomIn.name()]);
+    });
+}
+
 /// OWE-863: 바인딩 하나만 지우거나 액션 전체를 끌 수 있고, 초기화로 되돌릴 수 있다.
 #[test]
 fn owe863_remove_and_disable_single_keys() {
@@ -2825,35 +2845,34 @@ fn owe863_remove_and_disable_single_keys() {
         ("settings::ZoomOut", "cmd--".to_owned()),
     ];
     // 사용자 추가 키 하나만 지우면 그 항목만 사라진다.
-    let mut t = Keys::parse("[bindings]\n\"cmd-u\" = \"settings::ZoomIn\"\n")
-        .unwrap()
-        .bindings;
+    let mut t = Keys::parse("[bindings]\n\"cmd-u\" = \"settings::ZoomIn\"\n").unwrap();
     shortcuts::remove_key(&mut t, &defaults, "settings::ZoomIn", "cmd-u");
-    assert!(t.is_empty());
-    // 기본 키 하나를 지우면 `""`로 꺼진다.
-    let mut t = toml::Table::new();
+    assert_eq!(t, Keys::default());
+    // 기본 키 하나를 지우면 그 액션의 기본 키만 꺼진다(`""` 아님).
+    let mut t = Keys::default();
     shortcuts::remove_key(&mut t, &defaults, "settings::ZoomIn", "cmd-=");
-    assert_eq!(t["cmd-="].as_str(), Some(""));
+    assert_eq!(t.disabled["settings::ZoomIn"], ["cmd-="]);
+    assert!(t.bindings.is_empty());
     // 없는 키를 지워도 다른 항목은 그대로다.
-    t.insert("cmd-u".to_owned(), "settings::ZoomIn".into());
+    t.bindings
+        .insert("cmd-u".to_owned(), "settings::ZoomIn".into());
     shortcuts::remove_key(&mut t, &defaults, "settings::ZoomIn", "cmd-y");
-    assert_eq!(t["cmd-="].as_str(), Some(""));
-    assert_eq!(t["cmd-u"].as_str(), Some("settings::ZoomIn"));
-    // 전체 끄기: 기본 키는 `""`, 사용자 키는 삭제.
-    let mut t = Keys::parse("[bindings]\n\"cmd-u\" = \"settings::ZoomIn\"\n")
-        .unwrap()
-        .bindings;
+    assert_eq!(t.disabled["settings::ZoomIn"], ["cmd-="]);
+    assert_eq!(t.bindings["cmd-u"].as_str(), Some("settings::ZoomIn"));
+    // 전체 끄기: 기본 키는 `[disabled]`, 사용자 키는 삭제.
+    let mut t = Keys::parse("[bindings]\n\"cmd-u\" = \"settings::ZoomIn\"\n").unwrap();
     shortcuts::disable_action(
         &mut t,
         &defaults,
         "settings::ZoomIn",
         &["cmd-=".to_owned(), "cmd-u".to_owned()],
     );
-    assert_eq!(t["cmd-="].as_str(), Some(""));
-    assert!(!t.contains_key("cmd-u"));
-    // 초기화하면 둘 다 사라져 기본 키로 돌아간다.
+    assert_eq!(t.disabled["settings::ZoomIn"], ["cmd-="]);
+    assert!(!t.bindings.contains_key("cmd-u"));
+    // 초기화하면 둘 다 사라져 기본 키로 돌아간다. 구 형식 `""`도 함께 지운다.
+    t.bindings.insert("cmd-=".to_owned(), "".into());
     shortcuts::reset_action(&mut t, &defaults, "settings::ZoomIn");
-    assert!(t.is_empty());
+    assert_eq!(t, Keys::default());
 }
 
 /// OWE-863 실화면 흐름: 맨몸 Backspace·일반 키는 저장되지 않고 오류만 남으며,
@@ -2925,7 +2944,7 @@ fn owe863_recorder_rejects_plain_keys_and_deletes(cx: &mut TestAppContext) {
         assert_eq!(bound(cx, "cmd-="), Some(ZoomIn.name()));
         assert_eq!(bound(cx, "f5"), None);
     });
-    assert!(Keys::parse(&keys()).unwrap().bindings.is_empty());
+    assert_eq!(Keys::parse(&keys()).unwrap(), Keys::default());
     fs::remove_dir_all(d).ok();
 }
 
@@ -3784,7 +3803,8 @@ fn as08_concurrent_keys_edits_never_leave_torn_file() {
                 b.wait();
                 for n in 0..50 {
                     shortcuts::edit_keys(&dd, |t| {
-                        t.insert(format!("k-{i}"), toml::Value::String(format!("v-{n}")));
+                        t.bindings
+                            .insert(format!("k-{i}"), toml::Value::String(format!("v-{n}")));
                     })
                     .unwrap();
                 }
@@ -3837,8 +3857,8 @@ fn as12_keys_edit_preserves_future_fields_in_complex_toml() {
     let path = d.join(KEYS_FILE);
     let raw = "# future keys\nfuture = { mode = 'new' } # preserve\n[bindings]\n'cmd-j' = '''test::Probe'''\n";
     fs::write(&path, raw).unwrap();
-    shortcuts::edit_keys(&d, |bindings| {
-        bindings.insert("cmd-j".into(), "".into());
+    shortcuts::edit_keys(&d, |keys| {
+        keys.bindings.insert("cmd-j".into(), "".into());
     })
     .unwrap();
     let body = fs::read_to_string(&path).unwrap();

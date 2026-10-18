@@ -376,11 +376,14 @@ impl Settings {
     }
 }
 
-/// `keys.toml`: 키 → 액션 이름. 빈 이름은 기본 바인딩 끄기.
+/// `keys.toml`: 키 → 액션 이름. 빈 이름은 그 키의 기본 바인딩을 모두 끈다.
 #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Keys {
     pub bindings: toml::Table,
+    /// 액션 → 끈 기본 키들(OWE-863). 같은 키를 쓰는 다른 액션의 기본 바인딩은 그대로 둔다.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub disabled: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl Keys {
@@ -390,7 +393,8 @@ impl Keys {
 }
 
 /// 기본 바인딩(`defaults`) 위에 `keys`를 얹은 최종 바인딩. 재정의는 같은 액션의 기본 바인딩과 같은 문맥에
-/// 걸어(깊이가 같아야 나중 것이 이긴다) 기본 키를 대신한다. 빈 이름은 그 키의 기본 바인딩을 뺀다.
+/// 걸어(깊이가 같아야 나중 것이 이긴다) 기본 키를 대신한다. 빈 이름은 그 키의 기본 바인딩을 모두 빼고,
+/// `[disabled]`는 그 액션의 기본 바인딩만 뺀다.
 ///
 /// # Errors
 /// 키 문법이나 액션 이름이 틀리면 첫 오류를 돌려준다(이때는 아무것도 적용하지 않는다).
@@ -405,11 +409,7 @@ pub fn bindings(
         .map(|b| (b.action().name(), b.predicate()))
         .collect();
     let mut out = defaults;
-    let mut user = Vec::new();
-    for (key, action) in &keys.bindings {
-        let Some(name) = action.as_str() else {
-            return Err(text::KEY_VALUE.format(&[("file", KEYS_FILE), ("key", key)]));
-        };
+    let parse = |key: &str| {
         let typed = key
             .split_whitespace()
             .map(Keystroke::parse)
@@ -418,6 +418,20 @@ pub fn bindings(
         if typed.is_empty() {
             return Err(text::EMPTY_KEY.format(&[("file", KEYS_FILE)]));
         }
+        Ok(typed)
+    };
+    for (name, disabled) in &keys.disabled {
+        for key in disabled {
+            let typed = parse(key)?;
+            out.retain(|b| b.action().name() != name || b.match_keystrokes(&typed) != Some(false));
+        }
+    }
+    let mut user = Vec::new();
+    for (key, action) in &keys.bindings {
+        let Some(name) = action.as_str() else {
+            return Err(text::KEY_VALUE.format(&[("file", KEYS_FILE), ("key", key)]));
+        };
+        let typed = parse(key)?;
         if name.is_empty() {
             out.retain(|b| b.match_keystrokes(&typed) != Some(false));
             continue;

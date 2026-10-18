@@ -450,6 +450,8 @@ catalog! {
         TITLE => ("Krill이 지난번에 비정상 종료됐습니다", "Krill quit unexpectedly last time"),
         BUNDLE => ("진단 번들 만들기", "Create diagnostic bundle"),
         DISMISS => ("닫기", "Close"),
+        BUNDLE_FAILED => ("진단 번들을 만들지 못했습니다", "Could not create the diagnostic bundle"),
+        BUNDLE_FAILED_DETAIL => ("{error}\n크래시 로그는 남겨 두었고 다음 실행 때 다시 묻습니다.", "{error}\nThe crash logs were kept and you will be asked again next launch."),
         DETAIL => ("크래시 로그 {n}개가 남아 있습니다. 진단 번들은 API 키·토큰·PEM·사용자명을 가린 텍스트 파일이며 자동으로 보내지 않습니다.", "{n} crash logs remain. The diagnostic bundle is a text file with API keys, tokens, PEM data, and usernames redacted. It is never sent automatically."),
     }
     sidebar {
@@ -783,7 +785,7 @@ catalog! {
         WRAPPED => ("순환", "Wrapped"),
     }
     settings {
-        KEYS_TEMPLATE => ("# 키 바인딩 재정의. 저장하면 바로 반영된다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 끈다.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n", "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables the default binding for that key.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n"),
+        KEYS_TEMPLATE => ("# 키 바인딩 재정의. 저장하면 바로 반영된다.\n# 값은 액션 이름(예: shell::NewTab, shell::SplitRight, shell::Jump, settings::ZoomIn).\n# 빈 문자열은 그 키의 기본 바인딩을 모두 끈다. 한 액션의 기본 키만 끄려면 [disabled]에 적는다.\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n", "# Key binding overrides. Saving applies changes immediately.\n# Values are action names (e.g. shell::NewTab, shell::SplitRight, settings::ZoomIn).\n# An empty string disables every default binding for that key. To disable one action's default key only, list it under [disabled].\n[bindings]\n# \"cmd-shift-t\" = \"shell::NewTab\"\n# \"cmd-d\" = \"\"\n# [disabled]\n# \"shell::NewWorktree\" = [\"cmd-n\"]\n"),
         TITLE => ("설정", "Settings"),
         THEME => ("테마", "Theme"),
         SYSTEM => ("시스템", "System"),

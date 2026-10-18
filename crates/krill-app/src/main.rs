@@ -164,7 +164,7 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
         .and_then(krill_app::layout::Layout::peek_window_bounds)
         .map_or_else(
             || WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(760.)), cx)),
-            shell::gpui_window_bounds_from_saved,
+            |saved| on_screen(shell::gpui_window_bounds_from_saved(saved), cx),
         );
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
@@ -196,6 +196,21 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
     }
 }
 
+/// OWE-842: 저장된 위치가 지금 연결된 어느 화면과도 겹치지 않으면(모니터를 뗀 경우) 저장 크기로
+/// 주 화면 가운데에 연다(`Bounds::centered`가 화면 크기로 줄인다). 창 모드는 유지한다.
+fn on_screen(saved: WindowBounds, cx: &App) -> WindowBounds {
+    let b = saved.get_bounds();
+    if cx.displays().iter().any(|d| d.bounds().intersects(&b)) {
+        return saved;
+    }
+    let b = Bounds::centered(None, b.size, cx);
+    match saved {
+        WindowBounds::Windowed(_) => WindowBounds::Windowed(b),
+        WindowBounds::Maximized(_) => WindowBounds::Maximized(b),
+        WindowBounds::Fullscreen(_) => WindowBounds::Fullscreen(b),
+    }
+}
+
 #[expect(
     clippy::panic,
     reason = "MK-067: 크래시 로그·진단 대화상자 e2e용 강제 panic"
@@ -221,7 +236,8 @@ fn init(cx: &mut App) {
     })
     .detach();
     cx.bind_keys([
-        KeyBinding::new("cmd-n", NewWindow, None),
+        // OWE-859: ⌘N은 메인 창 안 새 워크트리(Orca와 같음), 새 창은 ⇧⌘N(메뉴 표기도 여기서 나온다).
+        KeyBinding::new("cmd-shift-n", NewWindow, None),
         KeyBinding::new("cmd-alt-w", CloseWindow, None),
         // OWE-864: macOS 표준 창·앱 동작. 터미널 문맥 바인딩과 겹치지 않는 전역 키만 쓴다.
         KeyBinding::new("cmd-h", HideApp, None),
