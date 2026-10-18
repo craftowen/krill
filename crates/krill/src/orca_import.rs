@@ -1854,6 +1854,65 @@ struct OrcaWorktreeLineage {
     fork_point_sha: Option<String>,
 }
 
+/// macOS 기본 심볼릭 링크(`/tmp`·`/var`·`/etc` → `/private/...`)를 어휘적으로 푼다.
+/// `fs::canonicalize`가 실패하는(존재하지 않는) 경로도 저장 키·비교가 일치하게 한다.
+fn lexical_private_alias(path: &Path) -> PathBuf {
+    for base in ["tmp", "var", "etc"] {
+        let prefix = Path::new("/").join(base);
+        if let Ok(rest) = path.strip_prefix(&prefix) {
+            return Path::new("/private").join(base).join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+/// Orca가 준 경로(심볼릭 링크 포함 가능)를 저장용 정규 경로로 바꾼다(OWE-803).
+/// 존재하면 `fs::canonicalize`로 풀고, 없으면 macOS 기본 별칭만 어휘적으로 맞춘다.
+/// `[[projects]] path`와 `[worktrees]`·`[lineage]` 키가 같은 표기를 쓰게 해
+/// 사이드바에서 동일 폴더가 2번 렌더링되지 않게 한다.
+fn normalize_import_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let aliased = lexical_private_alias(path);
+    if aliased != path {
+        if let Ok(canon) = fs::canonicalize(&aliased) {
+            return canon;
+        }
+        return aliased;
+    }
+    path.to_path_buf()
+}
+
+fn normalize_import_path_str(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    normalize_import_path(Path::new(trimmed))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// 저장된 경로와 이관 후보 경로가 심볼릭 링크 별칭(`/tmp` ↔ `/private/tmp` 등)만
+/// 다르고 같은 디렉터리면 참이다. 양쪽이 모두 존재하지 않을 때도 어휘 별칭으로 비교한다.
+fn same_import_path(a: &str, b: &str) -> bool {
+    let (ta, tb) = (a.trim(), b.trim());
+    ta == tb || normalize_import_path(Path::new(ta)) == normalize_import_path(Path::new(tb))
+}
+
+/// 계보 항목을 별칭 중복 없이 저장한다(OWE-803). 과거 이관에서 원본 경로(`/tmp/...`)로
+/// 저장된 키가 있으면 정규 키(`/private/tmp/...`)로 교체해 사이드바 중복을 없앤다.
+fn insert_lineage_entry(
+    lineage: &mut BTreeMap<String, StoredWorktreeLineage>,
+    key: String,
+    value: StoredWorktreeLineage,
+) {
+    let norm = normalize_import_path(Path::new(&key));
+    lineage.retain(|k, _| normalize_import_path(Path::new(k)) != norm);
+    lineage.insert(key, value);
+}
+
 fn import_projects_domain(
     opts: &ImportOptions,
     domains: &BTreeMap<String, Json>,
@@ -1879,7 +1938,7 @@ fn import_projects_domain(
         && let Ok(repos) = serde_json::from_value::<Vec<OrcaRepo>>(arr.clone())
     {
         for repo in repos {
-            let clean_path = repo.path.trim().to_owned();
+            let clean_path = normalize_import_path_str(&repo.path);
             if clean_path.is_empty() {
                 continue;
             }
@@ -1964,7 +2023,7 @@ fn import_projects_domain(
         && let Ok(setups) = serde_json::from_value::<Vec<OrcaProjectHostSetup>>(arr.clone())
     {
         for setup in setups {
-            let clean_path = setup.path.trim().to_owned();
+            let clean_path = normalize_import_path_str(&setup.path);
             if clean_path.is_empty() {
                 continue;
             }
@@ -2050,7 +2109,7 @@ fn import_projects_domain(
         && let Ok(folders) = serde_json::from_value::<Vec<OrcaFolderWorkspace>>(arr.clone())
     {
         for fw in folders {
-            let clean_path = fw.folder_path.trim().to_owned();
+            let clean_path = normalize_import_path_str(&fw.folder_path);
             if clean_path.is_empty() {
                 continue;
             }
@@ -2109,7 +2168,8 @@ fn import_projects_domain(
                 let Ok(meta) = serde_json::from_value::<OrcaWorktreeMeta>(val.clone()) else {
                     continue;
                 };
-                let (repo_id, wt_path) = split_worktree_key(raw_key);
+                let (repo_id, raw_wt_path) = split_worktree_key(raw_key);
+                let wt_path = normalize_import_path_str(&raw_wt_path);
                 if wt_path.is_empty() {
                     continue;
                 }
@@ -2133,33 +2193,39 @@ fn import_projects_domain(
                     continue;
                 };
                 let (key_repo_id, key_path) = split_worktree_key(raw_key);
-                let wt_path = lin
-                    .worktree_path
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map_or(key_path, str::to_owned);
+                let wt_path = normalize_import_path_str(
+                    &lin.worktree_path
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map_or(key_path, str::to_owned),
+                );
                 if wt_path.is_empty() {
                     continue;
                 }
                 if let Some(parent) = lin
                     .parent_worktree_path
                     .as_deref()
-                    .map(|p| split_worktree_key(p).1)
+                    .map(|p| normalize_import_path_str(&split_worktree_key(p).1))
                     .filter(|s| !s.is_empty())
                 {
                     lineage_parents.push((wt_path.clone(), parent));
                 }
-                store.lineage.insert(
+                let parent_worktree_path = lin
+                    .parent_worktree_path
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(normalize_import_path_str);
+                insert_lineage_entry(
+                    &mut store.lineage,
                     wt_path.clone(),
                     StoredWorktreeLineage {
                         repo_id: lin.repo_id.or(key_repo_id),
                         worktree_path: wt_path,
                         branch: lin.branch.filter(|s| !s.trim().is_empty()),
                         base_ref: lin.base_ref.filter(|s| !s.trim().is_empty()),
-                        parent_worktree_path: lin
-                            .parent_worktree_path
-                            .filter(|s| !s.trim().is_empty()),
+                        parent_worktree_path,
                         parent_branch: lin.parent_branch.filter(|s| !s.trim().is_empty()),
                         fork_point_sha: lin.fork_point_sha.filter(|s| !s.trim().is_empty()),
                         created_at: lin.created_at,
@@ -2169,6 +2235,9 @@ fn import_projects_domain(
             }
         }
     }
+
+    // OWE-803: 동일 디렉터리의 별칭 중복(원본 경로 잔재)을 저장 전에 하나로 합친다.
+    dedupe_projects_by_normalized_path(&mut store);
 
     if !opts.dry_run {
         store.save(&opts.state_dir, original.as_deref())?;
@@ -2196,9 +2265,16 @@ fn upsert_project(
     summary: &mut ProjectsImportSummary,
 ) {
     if let Some(existing) = store.projects.iter_mut().find(|p| {
-        (p.host_id == candidate.host_id && p.path == candidate.path) || p.id == candidate.id
+        (p.host_id == candidate.host_id
+            && (p.path == candidate.path || same_import_path(&p.path, &candidate.path)))
+            || p.id == candidate.id
     }) {
         let mut changed = false;
+        if existing.path != candidate.path && same_import_path(&existing.path, &candidate.path) {
+            // OWE-803: 과거 이관분이 원본 경로(`/tmp/...`)로 남아 있으면 정규 경로로 수렴시킨다.
+            existing.path.clone_from(&candidate.path);
+            changed = true;
+        }
         if existing.display_name != candidate.display_name && !candidate.display_name.is_empty() {
             existing.display_name.clone_from(&candidate.display_name);
             changed = true;
@@ -2279,6 +2355,18 @@ fn split_worktree_key(raw: &str) -> (Option<String>, String) {
     } else {
         (None, raw.trim().to_owned())
     }
+}
+
+/// 같은 디렉터리를 가리키는 프로젝트 중복(심볼릭 링크 별칭 차이)을 하나로 합친다(OWE-803).
+/// 첫 항목을 남기고 뒤 중복을 버린다. 계보·메타는 경로 기준으로도 해소되므로 참조는 유지된다.
+fn dedupe_projects_by_normalized_path(store: &mut ProjectsStore) {
+    let mut seen: BTreeSet<(Option<String>, PathBuf)> = BTreeSet::new();
+    store.projects.retain(|p| {
+        seen.insert((
+            p.host_id.clone(),
+            normalize_import_path(Path::new(p.path.trim())),
+        ))
+    });
 }
 
 /// 이관으로 모은 워크트리 메타(`src`)를 잠금 안에서 다시 읽은 저장본(`dst`)에 덮어쓴다.
@@ -2382,6 +2470,11 @@ fn apply_worktree_meta(
         wt_store.add_reference(&key, url).ok();
     }
 
+    // OWE-803: 과거 이관분이 원본 경로(`/tmp/...`) 키로 남아 있으면 정규 키로 교체한다.
+    let norm_key = normalize_import_path(Path::new(&key));
+    store
+        .worktrees
+        .retain(|k, _| normalize_import_path(Path::new(k)) != norm_key);
     store.worktrees.insert(
         key,
         StoredWorktreeMeta {
@@ -3904,5 +3997,118 @@ mod tests {
         assert_eq!(korean.prompt, "Korean schedule 1");
 
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// OWE-803: 심볼릭 링크(`/tmp` 등) 아래 경로를 이관하면 `[[projects]]`와
+    /// `[worktrees]`·`[lineage]` 키가 같은 정규 경로로 저장되고 재이관이 멱등하다.
+    #[test]
+    fn symlink_alias_paths_are_normalized_and_idempotent() {
+        let root = std::env::temp_dir().join(format!("owe803-alias-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        // 실제 디렉터리 + 심볼릭 링크 별칭을 만든다(OS 기본 `/tmp` 링크 가정 없이 재현).
+        let real = root.join("real");
+        let notes = real.join("notes");
+        fs::create_dir_all(&notes).unwrap();
+        let link = root.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link_str = link.display().to_string();
+        let notes_link_str = link.join("notes").display().to_string();
+        let canon_real = fs::canonicalize(&real).unwrap();
+        let canon_real_str = canon_real.display().to_string();
+        let canon_notes_str = fs::canonicalize(&notes).unwrap().display().to_string();
+
+        // 과거 이관분: `[[projects]]`에 원본(심볼릭 링크) 경로가 남아 있다.
+        let state_dir = root.join("state");
+        fs::create_dir_all(&state_dir).unwrap();
+        fs::write(
+            state_dir.join(PROJECTS_FILE),
+            format!(
+                "[[projects]]\nid = \"r1\"\npath = \"{link_str}\"\n\
+                 display_name = \"Link Repo\"\nkind = \"git\"\n"
+            ),
+        )
+        .unwrap();
+
+        let orca_dir = root.join("orca");
+        fs::create_dir_all(orca_dir.join("profiles").join("default")).unwrap();
+        let mut wt_meta = serde_json::Map::new();
+        wt_meta.insert(
+            format!("r1::{link_str}"),
+            serde_json::json!({"displayName": "Link Repo"}),
+        );
+        let mut wt_lin = serde_json::Map::new();
+        wt_lin.insert(
+            format!("r1::{notes_link_str}"),
+            serde_json::json!({
+                "repoId": "r1",
+                "worktreePath": notes_link_str,
+                "parentWorktreePath": link_str,
+            }),
+        );
+        let doc = serde_json::json!({
+            "repos": [{"id": "r1", "path": link_str, "displayName": "Link Repo", "kind": "git"}],
+            "folderWorkspaces": [{"id": "fw-1", "name": "Notes", "folderPath": notes_link_str}],
+            "worktreeMeta": wt_meta,
+            "worktreeLineageById": wt_lin,
+        });
+        fs::write(
+            orca_dir
+                .join("profiles")
+                .join("default")
+                .join("orca-data.json"),
+            doc.to_string(),
+        )
+        .unwrap();
+
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Projects],
+            dry_run: false,
+        };
+        fs::create_dir_all(&opts.home).unwrap();
+        let report = run_import(&opts).unwrap();
+
+        let store = ProjectsStore::load(&state_dir).unwrap();
+        // `[[projects]]`는 정규 경로로 수렴하고 중복 없이 2개(r1 + fw-1)만 있다.
+        assert_eq!(store.projects.len(), 2, "{:?}", store.projects);
+        assert!(
+            store.projects.iter().all(|p| !p.path.contains("/link")),
+            "{:?}",
+            store.projects
+        );
+        let r1 = store.projects.iter().find(|p| p.id == "r1").unwrap();
+        assert_eq!(r1.path, canon_real_str);
+        // `[worktrees]`·`[lineage]` 키도 같은 정규 경로를 쓴다.
+        assert!(store.worktrees.contains_key(&canon_real_str));
+        assert!(
+            store.worktrees.keys().all(|k| !k.contains("/link")),
+            "{:?}",
+            store.worktrees.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            store.lineage.keys().all(|k| !k.contains("/link")),
+            "{:?}",
+            store.lineage.keys().collect::<Vec<_>>()
+        );
+        assert!(store.lineage.contains_key(&canon_notes_str));
+        // fw-1만 신규, r1은 경로 수렴 업데이트.
+        assert_eq!(report.projects.projects_added, 1);
+        assert_eq!(report.projects.projects_updated, 1);
+
+        // `WorktreeStore` 부모 계보도 정규 경로로 기록된다.
+        let wt_store = WorktreeStore::load(&state_dir).unwrap();
+        assert_eq!(
+            wt_store.parents.get(&canon_notes_str).map(String::as_str),
+            Some(canon_real_str.as_str())
+        );
+
+        // 재이관은 완전히 멱등이다.
+        let second = run_import(&opts).unwrap();
+        assert_eq!(second.projects.projects_added, 0);
+        assert_eq!(second.projects.projects_updated, 0);
+
+        fs::remove_dir_all(root).ok();
     }
 }
