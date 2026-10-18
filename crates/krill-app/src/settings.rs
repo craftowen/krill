@@ -1889,12 +1889,18 @@ struct SshForm {
     error: Option<SharedString>,
 }
 
-/// 워크플로 탭의 저장소별 공유 심볼릭 링크·setup/archive 훅 입력 폼(MK-174).
+/// 워크플로 탭의 저장소별 공유 심볼릭 링크·setup/archive 훅·빠른 명령·완료 웹훅 입력 폼(MK-174·OWE-801).
 struct WorkflowRepoForm {
     repo_path: gpui::Entity<gpui_component::input::InputState>,
     symlink_path: gpui::Entity<gpui_component::input::InputState>,
     setup_script: gpui::Entity<gpui_component::input::InputState>,
     archive_script: gpui::Entity<gpui_component::input::InputState>,
+    qc_name: gpui::Entity<gpui_component::input::InputState>,
+    qc_text: gpui::Entity<gpui_component::input::InputState>,
+    qc_editing: Option<usize>,
+    webhook_url: gpui::Entity<gpui_component::input::InputState>,
+    webhook_error: Option<SharedString>,
+    pending_repo_path: Option<String>,
     loaded_repo: Option<String>,
     loaded_setup: String,
     loaded_archive: String,
@@ -5923,7 +5929,13 @@ impl SettingsView {
     }
 
     fn ensure_workflow_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.workflow_form.is_some() {
+        if let Some(form) = &mut self.workflow_form {
+            if let Some(pending) = form.pending_repo_path.take() {
+                let repo_inp = form.repo_path.clone();
+                if repo_inp.read(cx).value().as_str() != pending {
+                    repo_inp.update(cx, |inp, cx| inp.set_value(pending, window, cx));
+                }
+            }
             self.sync_workflow_repo_hooks(window, cx);
             return;
         }
@@ -5970,6 +5982,18 @@ impl SettingsView {
             }
             input
         });
+        let qc_name = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::QC_NAME_PLACEHOLDER.get())
+        });
+        let qc_text = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::QC_TEXT_PLACEHOLDER.get())
+        });
+        let webhook_url = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::WEBHOOK_URL_PLACEHOLDER.get())
+        });
         let repo_obs = cx.observe_in(&repo_path, window, |this, _, window, cx| {
             this.sync_workflow_repo_hooks(window, cx);
         });
@@ -5999,6 +6023,12 @@ impl SettingsView {
             symlink_path,
             setup_script,
             archive_script,
+            qc_name,
+            qc_text,
+            qc_editing: None,
+            webhook_url,
+            webhook_error: None,
+            pending_repo_path: None,
             loaded_repo,
             loaded_setup,
             loaded_archive,
@@ -6049,6 +6079,7 @@ impl SettingsView {
         };
 
         if let Some(form) = &mut self.workflow_form {
+            form.pending_repo_path = None;
             form.loaded_repo = next_repo;
             form.loaded_setup.clone_from(&target_setup);
             form.loaded_archive.clone_from(&target_archive);
@@ -6095,6 +6126,7 @@ impl SettingsView {
             .and_then(|k| store.archive_script_for(k))
             .unwrap_or_default();
         if let Some(form) = &mut self.workflow_form {
+            form.pending_repo_path = None;
             form.loaded_repo = next_repo;
             form.loaded_setup.clone_from(&repo_setup);
             form.loaded_archive.clone_from(&repo_archive);
@@ -6153,6 +6185,11 @@ impl SettingsView {
         match result {
             Ok(list) => {
                 if let Some(form) = &mut self.workflow_form {
+                    if Self::normalize_repo_key(&form.repo_path.read(cx).value()).as_deref()
+                        != Some(repo_key.as_str())
+                    {
+                        form.pending_repo_path = Some(repo_key);
+                    }
                     form.status = Some((text::HOOKS_SAVED.get().into(), false));
                 }
                 cx.defer(notify_external_change);
@@ -6252,6 +6289,108 @@ impl SettingsView {
         }
     }
 
+    pub fn submit_quick_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_workflow_form(window, cx);
+        let Some(form) = &self.workflow_form else {
+            return;
+        };
+        let name = form.qc_name.read(cx).value().trim().to_owned();
+        let cmd_text = form.qc_text.read(cx).value().trim().to_owned();
+        if name.is_empty() || cmd_text.is_empty() {
+            return;
+        }
+        let editing_idx = form.qc_editing;
+        let name_inp = form.qc_name.clone();
+        let text_inp = form.qc_text.clone();
+        edit(cx, |s| {
+            let entry = crate::commands::QuickCommand {
+                name,
+                text: cmd_text,
+            };
+            if let Some(idx) = editing_idx
+                && let Some(slot) = s.quick_commands.get_mut(idx)
+            {
+                *slot = entry;
+            } else {
+                s.quick_commands.push(entry);
+            }
+        });
+        if let Some(form) = &mut self.workflow_form {
+            form.qc_editing = None;
+        }
+        name_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        text_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        cx.notify();
+    }
+
+    pub fn edit_quick_command(&mut self, idx: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_workflow_form(window, cx);
+        let s = current(cx);
+        let Some(cmd) = s.quick_commands.get(idx).cloned() else {
+            return;
+        };
+        let Some(form) = &mut self.workflow_form else {
+            return;
+        };
+        form.qc_editing = Some(idx);
+        let name_inp = form.qc_name.clone();
+        let text_inp = form.qc_text.clone();
+        name_inp.update(cx, |inp, cx| inp.set_value(cmd.name, window, cx));
+        text_inp.update(cx, |inp, cx| inp.set_value(cmd.text, window, cx));
+        cx.notify();
+    }
+
+    pub fn cancel_quick_command_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.workflow_form else {
+            return;
+        };
+        form.qc_editing = None;
+        let name_inp = form.qc_name.clone();
+        let text_inp = form.qc_text.clone();
+        name_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        text_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        cx.notify();
+    }
+
+    pub fn add_webhook_url(
+        &mut self,
+        raw_url: &str,
+        cx: &mut Context<Self>,
+    ) -> Result<crate::webhook::Endpoint, String> {
+        if let Ok(ep) = crate::webhook::Endpoint::from_url_input(raw_url) {
+            let ep_clone = ep.clone();
+            edit(cx, |s| {
+                if !s.webhooks.contains(&ep_clone) {
+                    s.webhooks.push(ep_clone);
+                }
+            });
+            if let Some(form) = &mut self.workflow_form {
+                form.webhook_error = None;
+            }
+            cx.notify();
+            Ok(ep)
+        } else {
+            let msg = text::WEBHOOK_INVALID_URL.get().to_owned();
+            if let Some(form) = &mut self.workflow_form {
+                form.webhook_error = Some(msg.clone().into());
+            }
+            cx.notify();
+            Err(msg)
+        }
+    }
+
+    pub fn submit_webhook_url(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.ensure_workflow_form(window, cx);
+        let Some(form) = &self.workflow_form else {
+            return;
+        };
+        let raw = form.webhook_url.read(cx).value().to_string();
+        let url_inp = form.webhook_url.clone();
+        if self.add_webhook_url(&raw, cx).is_ok() {
+            url_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
+        }
+    }
+
     fn render_workflows_tab(
         &mut self,
         s: &Settings,
@@ -6259,6 +6398,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         use gpui_component::Sizable as _;
+        use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         self.ensure_workflow_form(window, cx);
         let p = crate::ui::palette(cx);
         let qc_count =
@@ -6292,7 +6432,10 @@ impl SettingsView {
         });
         let mut orch_card = layout::card(p).flex().flex_col().gap_2().child(
             div()
+                .w_full()
+                .min_w_0()
                 .flex()
+                .flex_wrap()
                 .items_center()
                 .justify_between()
                 .gap_3()
@@ -6339,53 +6482,154 @@ impl SettingsView {
                 text::CONTEXT_LINES.get(),
                 Some(text::CONTEXT_LINES_DESC.get()),
             ))
-            .child(layout::controls().child(layout::segmented_control(p, lines_btns)));
+            .child(
+                layout::controls().child(
+                    layout::segmented_control(p, lines_btns)
+                        .id("admin-context-lines-control")
+                        .debug_selector(|| "admin-context-lines-control".into()),
+                ),
+            );
 
         let mut qc_card = layout::card(p)
+            .id("admin-qc-card")
+            .debug_selector(|| "admin-qc-card".into())
             .flex()
             .flex_col()
-            .gap_2()
-            .child(layout::label(p, qc_count, None));
-        for (idx, cmd) in s.quick_commands.iter().enumerate() {
-            let rm_id = format!("admin-qc-remove-{idx}");
-            let summary = format!("{} → {}", cmd.name, cmd.text);
+            .gap_2p5()
+            .child(layout::label(p, qc_count, Some(text::QC_DESC.get())));
+        if let Some(form) = &self.workflow_form {
+            let qc_name_input = form.qc_name.clone();
+            let qc_text_input = form.qc_text.clone();
+            let is_editing = form.qc_editing.is_some();
+            let mut qc_controls = layout::controls();
+            if is_editing {
+                qc_controls = qc_controls.child(
+                    layout::ghost("admin-qc-cancel", text::QC_CANCEL.get())
+                        .debug_selector(|| "admin-qc-cancel".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_quick_command_edit(window, cx);
+                        })),
+                );
+            }
+            qc_controls = qc_controls.child(
+                layout::primary(
+                    "admin-qc-add",
+                    if is_editing {
+                        text::QC_SAVE.get()
+                    } else {
+                        text::QC_ADD.get()
+                    },
+                )
+                .debug_selector(|| "admin-qc-add".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.submit_quick_command(window, cx);
+                })),
+            );
             qc_card = qc_card.child(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
-                    .justify_between()
                     .gap_2()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_XS)
-                            .truncate()
-                            .child(summary),
+                            .id("admin-qc-name-input")
+                            .debug_selector(|| "admin-qc-name-input".into())
+                            .w(px(180.))
+                            .flex_none()
+                            .child(gpui_component::input::Input::new(&qc_name_input).small()),
                     )
                     .child(
-                        layout::controls().child(
-                            layout::secondary(
-                                gpui::ElementId::Name(rm_id.clone().into()),
-                                text::ACCOUNT_REMOVE.get(),
-                            )
-                            .debug_selector(move || rm_id.clone())
-                            .on_click(move |_, _, cx| {
-                                edit(cx, |s| {
-                                    if idx < s.quick_commands.len() {
-                                        s.quick_commands.remove(idx);
-                                    }
-                                });
-                            }),
-                        ),
-                    ),
+                        div()
+                            .id("admin-qc-text-input")
+                            .debug_selector(|| "admin-qc-text-input".into())
+                            .flex_1()
+                            .min_w_0()
+                            .child(gpui_component::input::Input::new(&qc_text_input).small()),
+                    )
+                    .child(qc_controls),
             );
+        }
+        if s.quick_commands.is_empty() {
+            qc_card = qc_card.child(
+                div()
+                    .id("admin-qc-empty")
+                    .debug_selector(|| "admin-qc-empty".into())
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::QC_EMPTY.get()),
+            );
+        } else {
+            for (idx, cmd) in s.quick_commands.iter().enumerate() {
+                let row_id = format!("admin-qc-row-{idx}");
+                let edit_id = format!("admin-qc-edit-{idx}");
+                let rm_id = format!("admin-qc-remove-{idx}");
+                let summary = format!("{} → {}", cmd.name, cmd.text);
+                qc_card = qc_card.child(
+                    div()
+                        .id(gpui::ElementId::Name(row_id.clone().into()))
+                        .debug_selector(move || row_id.clone())
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .p_2()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .bg(p.background)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .font_family(crate::ui::FONT_MONO)
+                                .text_size(crate::ui::TEXT_XS)
+                                .truncate()
+                                .child(summary),
+                        )
+                        .child(
+                            layout::controls()
+                                .child(
+                                    layout::ghost(
+                                        gpui::ElementId::Name(edit_id.clone().into()),
+                                        text::QC_EDIT.get(),
+                                    )
+                                    .debug_selector(move || edit_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.edit_quick_command(idx, window, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    layout::secondary(
+                                        gpui::ElementId::Name(rm_id.clone().into()),
+                                        text::ACCOUNT_REMOVE.get(),
+                                    )
+                                    .debug_selector(move || rm_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            if this
+                                                .workflow_form
+                                                .as_ref()
+                                                .is_some_and(|f| f.qc_editing == Some(idx))
+                                            {
+                                                this.cancel_quick_command_edit(window, cx);
+                                            }
+                                            edit(cx, |s| {
+                                                if idx < s.quick_commands.len() {
+                                                    s.quick_commands.remove(idx);
+                                                }
+                                            });
+                                        },
+                                    )),
+                                ),
+                        ),
+                );
+            }
         }
 
         let clear = self.confirm_button(
@@ -6394,75 +6638,137 @@ impl SettingsView {
             cx,
             |_, cx| edit(cx, |s| s.webhooks.clear()),
         );
-        let mut wh_card = layout::card(p).flex().flex_col().gap_2().child(
-            div()
-                .w_full()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_3()
-                .child(layout::label(p, wh_count, None))
-                .child(
-                    layout::controls()
-                        .child(
-                            layout::secondary(
-                                "admin-webhook-add-local",
-                                text::WEBHOOK_ADD_LOCAL.get(),
-                            )
-                            .debug_selector(|| "admin-webhook-add-local".into())
-                            .on_click(|_, _, cx| {
-                                edit(cx, |s| {
-                                    let n = s.webhooks.len().saturating_add(1);
-                                    s.webhooks.push(crate::webhook::Endpoint::Ntfy {
-                                        url: format!("http://127.0.0.1:8080/minikrill-hook-{n}"),
-                                    });
-                                });
-                            }),
-                        )
-                        .child(clear),
-                ),
-        );
-        for (idx, ep) in s.webhooks.iter().enumerate() {
-            let rm_id = format!("admin-webhook-remove-{idx}");
-            let label = format!("#{} · {:?}", idx + 1, ep);
+        let mut wh_card = layout::card(p)
+            .id("admin-webhooks-card")
+            .debug_selector(|| "admin-webhooks-card".into())
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(layout::label(p, wh_count, Some(text::WEBHOOK_DESC.get())))
+                    .child(layout::controls().child(clear)),
+            );
+        if let Some(form) = &self.workflow_form {
+            let webhook_url_input = form.webhook_url.clone();
+            let webhook_err = form.webhook_error.clone();
             wh_card = wh_card.child(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap_2()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
                     .child(
                         div()
+                            .id("admin-webhook-url-input")
+                            .debug_selector(|| "admin-webhook-url-input".into())
                             .flex_1()
                             .min_w_0()
-                            .truncate()
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_XS)
-                            .child(label),
+                            .child(gpui_component::input::Input::new(&webhook_url_input).small()),
                     )
                     .child(
                         layout::controls().child(
-                            layout::secondary(
-                                gpui::ElementId::Name(rm_id.clone().into()),
-                                text::ACCOUNT_REMOVE.get(),
-                            )
-                            .debug_selector(move || rm_id.clone())
-                            .on_click(move |_, _, cx| {
-                                edit(cx, |s| {
-                                    if idx < s.webhooks.len() {
-                                        s.webhooks.remove(idx);
-                                    }
-                                });
-                            }),
+                            layout::primary("admin-webhook-add", text::WEBHOOK_ADD.get())
+                                .debug_selector(|| "admin-webhook-add".into())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.submit_webhook_url(window, cx);
+                                })),
                         ),
                     ),
             );
+            if let Some(err) = webhook_err {
+                wh_card = wh_card.child(
+                    crate::ui::error_banner(p, err)
+                        .id("admin-webhook-error")
+                        .debug_selector(|| "admin-webhook-error".into()),
+                );
+            }
+        }
+        if s.webhooks.is_empty() {
+            wh_card = wh_card.child(
+                div()
+                    .id("admin-webhooks-empty")
+                    .debug_selector(|| "admin-webhooks-empty".into())
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::WEBHOOK_EMPTY.get()),
+            );
+        } else {
+            for (idx, ep) in s.webhooks.iter().enumerate() {
+                let row_id = format!("admin-webhook-row-{idx}");
+                let badge_id = format!("admin-webhook-badge-{idx}");
+                let url_id = format!("admin-webhook-url-{idx}");
+                let rm_id = format!("admin-webhook-remove-{idx}");
+                let provider_label = ep.provider_badge();
+                let url_text = ep.url().to_owned();
+                wh_card = wh_card.child(
+                    div()
+                        .id(gpui::ElementId::Name(row_id.clone().into()))
+                        .debug_selector(move || row_id.clone())
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .p_2()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .bg(p.background)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    crate::ui::badge(
+                                        p,
+                                        crate::ui::BadgeTone::Accent,
+                                        provider_label,
+                                    )
+                                    .id(SharedString::from(badge_id.clone()))
+                                    .debug_selector(move || badge_id.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(url_id.clone()))
+                                        .debug_selector(move || url_id.clone())
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .font_family(crate::ui::FONT_MONO)
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .child(url_text),
+                                ),
+                        )
+                        .child(
+                            layout::controls().child(
+                                layout::secondary(
+                                    gpui::ElementId::Name(rm_id.clone().into()),
+                                    text::ACCOUNT_REMOVE.get(),
+                                )
+                                .debug_selector(move || rm_id.clone())
+                                .on_click(move |_, _, cx| {
+                                    edit(cx, |s| {
+                                        if idx < s.webhooks.len() {
+                                            s.webhooks.remove(idx);
+                                        }
+                                    });
+                                }),
+                            ),
+                        ),
+                );
+            }
         }
         let files_row = layout::row(p)
             .child(layout::label(
@@ -6486,17 +6792,71 @@ impl SettingsView {
             .map(krill_proto::orchestration::WorktreeStore::load_cached)
             .unwrap_or_default();
 
+        let active_repo = self
+            .workflow_form
+            .as_ref()
+            .and_then(|f| Self::normalize_repo_key(&f.repo_path.read(cx).value()))
+            .or_else(|| {
+                self.workflow_form
+                    .as_ref()
+                    .and_then(|f| f.loaded_repo.clone())
+            });
+        let active_repo_display = active_repo
+            .as_deref()
+            .and_then(|r| Path::new(r).file_name().and_then(|n| n.to_str()))
+            .filter(|s| !s.is_empty())
+            .or(active_repo.as_deref())
+            .unwrap_or("—")
+            .to_owned();
+
+        let mut known_repos = std::collections::BTreeSet::new();
+        if let Some(cur) = &active_repo {
+            known_repos.insert(cur.clone());
+        }
+        known_repos.extend(wt_store.symlinks.keys().cloned());
+        known_repos.extend(wt_store.setup_scripts.keys().cloned());
+        known_repos.extend(wt_store.archive_scripts.keys().cloned());
+        known_repos.extend(wt_store.comments.keys().cloned());
+        known_repos.extend(wt_store.parents.values().cloned());
+        let known_repos_list: Vec<String> = known_repos.into_iter().collect();
+
+        let mut repo_context_card = layout::card(p)
+            .id("admin-workflow-repo-card")
+            .debug_selector(|| "admin-workflow-repo-card".into())
+            .flex()
+            .flex_col()
+            .gap_2p5();
+
         let mut symlinks_card = layout::card(p)
             .id("admin-worktree-symlinks-card")
             .debug_selector(|| "admin-worktree-symlinks-card".into())
             .flex()
             .flex_col()
             .gap_2p5()
-            .child(layout::label(
-                p,
-                text::SYMLINKS_TITLE.get(),
-                Some(text::SYMLINKS_DESC.get()),
-            ));
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(layout::label(
+                        p,
+                        text::SYMLINKS_TITLE.get(),
+                        Some(text::SYMLINKS_DESC.get()),
+                    ))
+                    .child(
+                        crate::ui::badge(
+                            p,
+                            crate::ui::BadgeTone::Neutral,
+                            active_repo_display.clone(),
+                        )
+                        .id("admin-symlinks-repo-badge")
+                        .debug_selector(|| "admin-symlinks-repo-badge".into()),
+                    ),
+            );
 
         let mut hooks_card = layout::card(p)
             .id("admin-repo-hooks-card")
@@ -6504,11 +6864,30 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_2p5()
-            .child(layout::label(
-                p,
-                text::HOOKS_TITLE.get(),
-                Some(text::HOOKS_DESC.get()),
-            ));
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(layout::label(
+                        p,
+                        text::HOOKS_TITLE.get(),
+                        Some(text::HOOKS_DESC.get()),
+                    ))
+                    .child(
+                        crate::ui::badge(
+                            p,
+                            crate::ui::BadgeTone::Neutral,
+                            active_repo_display.clone(),
+                        )
+                        .id("admin-hooks-repo-badge")
+                        .debug_selector(|| "admin-hooks-repo-badge".into()),
+                    ),
+            );
 
         if let Some(form) = &self.workflow_form {
             let repo_input = form.repo_path.clone();
@@ -6517,13 +6896,94 @@ impl SettingsView {
             let archive_input = form.archive_script.clone();
             let status = form.status.clone();
 
-            symlinks_card = symlinks_card
+            let weak = cx.weak_entity();
+            let dropdown_repos = known_repos_list.clone();
+            let repo_dropdown = layout::secondary(
+                "admin-workflow-repo-select",
+                format!(
+                    "{} ({})",
+                    text::WORKFLOW_REPO_SELECT.get(),
+                    active_repo_display
+                ),
+            )
+            .debug_selector(|| "admin-workflow-repo-select".into())
+            .dropdown_menu(move |mut menu, _, _| {
+                for repo_choice in &dropdown_repos {
+                    let weak = weak.clone();
+                    let repo_choice = repo_choice.clone();
+                    menu = menu.item(PopupMenuItem::new(repo_choice.clone()).on_click(
+                        move |_, window, cx| {
+                            weak.update(cx, |this, cx| {
+                                this.load_repo_hooks_for(&repo_choice, window, cx);
+                            })
+                            .ok();
+                        },
+                    ));
+                }
+                menu
+            });
+
+            repo_context_card = repo_context_card
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(layout::label(
+                            p,
+                            text::WORKFLOW_REPO_TITLE.get(),
+                            Some(text::WORKFLOW_REPO_DESC.get()),
+                        ))
+                        .child(layout::controls().child(repo_dropdown)),
+                )
                 .child(
                     div()
                         .id("admin-workflow-repo-input")
                         .debug_selector(|| "admin-workflow-repo-input".into())
+                        .w_full()
+                        .min_w_0()
                         .child(gpui_component::input::Input::new(&repo_input).small()),
-                )
+                );
+
+            if known_repos_list.len() > 1 {
+                let mut chips = div()
+                    .id("admin-workflow-repo-chips")
+                    .debug_selector(|| "admin-workflow-repo-chips".into())
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1p5();
+                for (idx, repo_key) in known_repos_list.iter().enumerate() {
+                    let chip_id = format!("admin-workflow-repo-chip-{idx}");
+                    let is_active = active_repo.as_deref() == Some(repo_key.as_str());
+                    let short = Path::new(repo_key)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(repo_key.as_str())
+                        .to_owned();
+                    let repo_cl = repo_key.clone();
+                    let btn = if is_active {
+                        layout::primary(gpui::ElementId::Name(chip_id.clone().into()), short)
+                    } else {
+                        layout::secondary(gpui::ElementId::Name(chip_id.clone().into()), short)
+                    };
+                    chips = chips.child(btn.debug_selector(move || chip_id.clone()).on_click(
+                        cx.listener(move |this, _, window, cx| {
+                            this.load_repo_hooks_for(&repo_cl, window, cx);
+                        }),
+                    ));
+                }
+                repo_context_card = repo_context_card.child(chips);
+            }
+
+            symlinks_card = symlinks_card
                 .child(
                     div()
                         .w_full()
@@ -6565,7 +7025,7 @@ impl SettingsView {
                         ),
                 )
                 .child({
-                    let mut row = div().flex().items_center().gap_1p5();
+                    let mut row = div().flex().flex_wrap().items_center().gap_1p5();
                     for (id, preset) in [
                         ("admin-symlink-preset-env", ".env"),
                         ("admin-symlink-preset-env-local", ".env.local"),
@@ -6585,12 +7045,22 @@ impl SettingsView {
                     row
                 });
 
-            let mut symlink_rows = Vec::new();
-            for (repo_key, paths) in &wt_store.symlinks {
-                for rel_path in paths {
-                    symlink_rows.push((repo_key.clone(), rel_path.clone()));
+            let symlink_rows: Vec<(String, String)> = if let Some(repo_key) = active_repo.as_deref()
+            {
+                wt_store
+                    .symlinks_for(repo_key)
+                    .into_iter()
+                    .map(|rel| (repo_key.to_owned(), rel))
+                    .collect()
+            } else {
+                let mut rows = Vec::new();
+                for (repo_key, paths) in &wt_store.symlinks {
+                    for rel_path in paths {
+                        rows.push((repo_key.clone(), rel_path.clone()));
+                    }
                 }
-            }
+                rows
+            };
             if symlink_rows.is_empty() {
                 symlinks_card = symlinks_card.child(
                     div()
@@ -6601,47 +7071,51 @@ impl SettingsView {
                         .child(text::SYMLINKS_EMPTY.get()),
                 );
             } else {
+                let mut chips_wrap = div()
+                    .id("admin-worktree-symlinks-chips")
+                    .debug_selector(|| "admin-worktree-symlinks-chips".into())
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_1p5();
                 for (idx, (repo_key, rel_path)) in symlink_rows.into_iter().enumerate() {
+                    let chip_id = format!("admin-symlink-chip-{idx}");
                     let rm_id = format!("admin-symlink-remove-{idx}");
-                    let line = format!("{repo_key} → {rel_path}");
                     let repo_cl = repo_key.clone();
                     let rel_cl = rel_path.clone();
-                    symlinks_card = symlinks_card.child(
+                    chips_wrap = chips_wrap.child(
                         div()
-                            .w_full()
-                            .min_w_0()
+                            .id(gpui::ElementId::Name(chip_id.clone().into()))
+                            .debug_selector(move || chip_id.clone())
                             .flex()
                             .items_center()
-                            .justify_between()
-                            .gap_2()
-                            .p_2()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
                             .rounded(crate::ui::RADIUS_SM)
+                            .border_1()
+                            .border_color(p.border)
                             .bg(p.background)
                             .child(
                                 div()
-                                    .flex_1()
-                                    .min_w_0()
                                     .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_XS)
-                                    .truncate()
-                                    .child(line),
+                                    .text_color(p.foreground)
+                                    .child(rel_path),
                             )
                             .child(
-                                layout::controls().child(
-                                    layout::secondary(
-                                        gpui::ElementId::Name(rm_id.clone().into()),
-                                        text::ACCOUNT_REMOVE.get(),
-                                    )
+                                layout::ghost(gpui::ElementId::Name(rm_id.clone().into()), "×")
+                                    .xsmall()
                                     .debug_selector(move || rm_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.remove_worktree_symlink_for(&repo_cl, &rel_cl, cx);
-                                        },
-                                    )),
-                                ),
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.remove_worktree_symlink_for(&repo_cl, &rel_cl, cx);
+                                    })),
                             ),
                     );
                 }
+                symlinks_card = symlinks_card.child(chips_wrap);
             }
 
             hooks_card = hooks_card
@@ -6650,12 +7124,11 @@ impl SettingsView {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .text_size(crate::ui::TEXT_XS)
-                        .child(
-                            div()
-                                .text_color(p.muted_foreground)
-                                .child(text::HOOKS_SETUP_LABEL.get()),
-                        )
+                        .child(crate::ui::field_label(
+                            text::HOOKS_SETUP_LABEL.get(),
+                            None,
+                            p,
+                        ))
                         .child(
                             div()
                                 .id("admin-repo-setup-input")
@@ -6668,12 +7141,11 @@ impl SettingsView {
                         .flex()
                         .flex_col()
                         .gap_1()
-                        .text_size(crate::ui::TEXT_XS)
-                        .child(
-                            div()
-                                .text_color(p.muted_foreground)
-                                .child(text::HOOKS_ARCHIVE_LABEL.get()),
-                        )
+                        .child(crate::ui::field_label(
+                            text::HOOKS_ARCHIVE_LABEL.get(),
+                            None,
+                            p,
+                        ))
                         .child(
                             div()
                                 .id("admin-repo-archive-input")
@@ -6750,6 +7222,7 @@ impl SettingsView {
                         .p_2()
                         .rounded(crate::ui::RADIUS_SM)
                         .bg(p.background)
+                        .hover(|d| d.bg(p.accent))
                         .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_XS)
                         .truncate()
@@ -6782,6 +7255,7 @@ impl SettingsView {
             .gap_3()
             .child(orch_card)
             .child(self.render_schedules_section(cx))
+            .child(repo_context_card)
             .child(symlinks_card)
             .child(hooks_card)
             .child(layout::section_title(

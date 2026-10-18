@@ -446,3 +446,39 @@ fn precheck_enforces_timeout_and_caps_pipe_output_bytes() {
     assert_eq!(out.len(), MAX_OUTPUT_BYTES);
     assert!(out.bytes().all(|b| b == b'A'));
 }
+
+#[test]
+fn paused_schedule_skips_automatic_cron_but_allows_manual_run_now() {
+    let dir = Temp::new("owe801-paused-schedule");
+    let toml_body = r#"[[schedule]]
+id = "paused-job"
+cron = "* * * * *"
+cwd = "/tmp"
+command = ["/bin/echo"]
+prompt = "hi"
+precheck = "printf 'manual-on-paused\n' && exit 5"
+enabled = false
+"#;
+    fs::write(dir.0.join(krill_proto::schedule::FILE), toml_body).unwrap();
+    let now = UNIX_EPOCH + Duration::from_mins(70);
+    let registry = Registry::new(None, Some(&dir.0));
+
+    // Automatic cron poll must skip disabled schedule.
+    registry.poll_schedules(now).unwrap();
+    assert!(
+        krill_proto::schedule::load_coalesced_runs(&dir.0)
+            .unwrap()
+            .is_empty(),
+        "disabled schedule must not trigger automatic cron run"
+    );
+
+    // Explicit Run Now still executes on demand even when paused.
+    krill_proto::schedule::request_run_now(&dir.0, "paused-job").unwrap();
+    registry.poll_schedules(now).unwrap();
+    let runs = krill_proto::schedule::load_coalesced_runs(&dir.0).unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].id, "paused-job");
+    assert_eq!(runs[0].phase, "skipped");
+    assert_eq!(runs[0].status, Some(5));
+    assert_eq!(runs[0].output.as_deref(), Some("manual-on-paused"));
+}

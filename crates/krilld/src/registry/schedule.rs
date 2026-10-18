@@ -320,7 +320,8 @@ impl Registry {
         }
         for entry in schedules.schedule {
             let forced = forced_ids.iter().any(|id| id == &entry.id);
-            let due = cron_due
+            let due = entry.enabled
+                && cron_due
                 && Cron::parse(&entry.cron)?.matches(calendar)
                 && !journal.claimed(&entry.id, minute);
             if !forced && !due {
