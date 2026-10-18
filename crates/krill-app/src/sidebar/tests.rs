@@ -4099,7 +4099,14 @@ fn session_row_actions_emit_session_events(cx: &mut TestAppContext) {
     let selected: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
     let closed: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
     let continued: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let renamed: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
     let (s_out, c_out, t_out) = (selected.clone(), closed.clone(), continued.clone());
+    let r_out = renamed.clone();
+    let _sub_rename = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &RenameSession, _| {
+            r_out.borrow_mut().push(event.0);
+        })
+    });
     let _sub_selected = cx.update(|_, cx| {
         cx.subscribe(&view, move |_, event: &Selected, _| {
             s_out.borrow_mut().push(event.0);
@@ -4127,9 +4134,11 @@ fn session_row_actions_emit_session_events(cx: &mut TestAppContext) {
             s.select_session(idx, SessionId(1), cx);
             s.request_close_session(idx, SessionId(1), cx);
             s.request_continue_session(idx, SessionId(1), cx);
+            s.request_rename_session(idx, SessionId(1), cx);
         });
     });
     cx.run_until_parked();
+    assert_eq!(renamed.borrow().as_slice(), &[SessionId(1)]);
     assert_eq!(selected.borrow().as_slice(), &[SessionId(1)]);
     assert_eq!(closed.borrow().as_slice(), &[SessionId(1)]);
     assert_eq!(continued.borrow().as_slice(), &[SessionId(1)]);
