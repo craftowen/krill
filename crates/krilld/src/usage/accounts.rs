@@ -19,8 +19,8 @@ use krill_proto::usage::{
 use serde::{Deserialize, Serialize};
 
 use super::{
-    CLAUDE_CACHE, ORCA_CACHE, ProfileUsage, Usage, Window, latest_rollout, mtime_secs,
-    parse_claude, parse_orca, read_codex,
+    AccountUsage, CLAUDE_CACHE, ORCA_CACHE, ProfileUsage, Usage, Window, latest_rollout,
+    mtime_secs, parse_claude, parse_orca, read_codex,
 };
 use crate::session::lock;
 
@@ -597,6 +597,59 @@ fn slugify(s: &str) -> String {
     }
 }
 
+/// Orca 감지 행의 안정 id(OWE-696). uuid 행은 `claude-orca-<uuid>`, 구버전 행만 순번 id.
+fn orca_detected_id(idx: usize, row: &AccountUsage) -> String {
+    if row.id.is_empty() {
+        format!("claude-orca-{idx}-{}", slugify(&row.label))
+    } else {
+        format!("claude-orca-{}", slugify(&row.id))
+    }
+}
+
+/// Orca 프로필 경로에서 계정 uuid를 뽑는다(OWE-896).
+/// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
+/// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
+fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
+    let mut parts = dir.split('/');
+    let leaf = parts.next_back()?;
+    let uuid = parts.next_back()?;
+    let parent = parts.next_back()?;
+    if !matches!(
+        parent,
+        "claude-profiles" | "claude-accounts" | "codex-accounts"
+    ) || !matches!(leaf, "home" | "auth")
+    {
+        return None;
+    }
+    is_uuid_shape(uuid).then_some(uuid)
+}
+
+/// uuid v4 텍스트 형태(8-4-4-4-12 hex)만 인정한다.
+fn is_uuid_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, c) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *c != b'-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// `"email (조직)"` 라벨에서 비교용 이메일만 뽑는다(OWE-896). `@`가 없으면 라벨 전체.
+fn primary_email(label: &str) -> &str {
+    match label.split_once(" (") {
+        Some((head, _)) if head.contains('@') => head.trim(),
+        _ => label.trim(),
+    }
+}
+
 /// K-04: 비ASCII 라벨은 `slugify`가 모두 `"account"`로 만들어 id·프로필 디렉터리가 충돌한다.
 /// 같은 라벨이면 기존 항목을 그대로 고쳐 멱등성을 지키고(기존 id·디렉터리 유지),
 /// 다른 라벨이 같은 id를 차지하면 `-2`, `-3` 접미사로 새 id·디렉터리를 만든다.
@@ -800,6 +853,9 @@ fn refresh_accounts_authenticated(
     }
 
     // 2. `~/.claude/orca-usage-cache.json`에 있는 추가 멀티계정 자동 감지.
+    // OWE-896: uuid 행 id → 감지 id 매핑. 3단계에서 등록 계정의 프로필 경로 속
+    // Orca uuid와 대조해 라벨·이메일 형식과 무관하게 같은 계정으로 병합한다.
+    let mut orca_uuids: BTreeMap<String, String> = BTreeMap::new();
     let orca_path = home.join(".claude").join(ORCA_CACHE);
     if let Ok(s) = std::fs::read_to_string(&orca_path) {
         let orca_stamp = mtime_secs(&orca_path);
@@ -830,11 +886,10 @@ fn refresh_accounts_authenticated(
             }
             // OWE-696: 캐시 행 uuid로 안정 id를 만든다(순번이 바뀌어도 같은 계정). uuid가 없는
             // 구버전 캐시만 순번 id. Orca 프로필 폴더는 Krill이 모르므로 경로를 비워 실행 불가로 둔다.
-            let id = if row.id.is_empty() {
-                format!("claude-orca-{idx}-{}", slugify(&row.label))
-            } else {
-                format!("claude-orca-{}", slugify(&row.id))
-            };
+            let id = orca_detected_id(idx, &row);
+            if !row.id.is_empty() {
+                orca_uuids.insert(id.clone(), row.id.clone());
+            }
             let profile_dir = String::new();
             meta.insert(
                 id.clone(),
@@ -887,12 +942,25 @@ fn refresh_accounts_authenticated(
                     && a.provider == provider
                     && a.profile_dir.is_empty()
                     && (a.label.eq_ignore_ascii_case(&stored.label)
+                        || orca_uuids.get(&a.id).is_some_and(|uuid| {
+                            orca_uuid_from_profile_dir(&stored.profile_dir)
+                                .is_some_and(|dir_uuid| dir_uuid == uuid)
+                        })
                         || stored.email.as_deref().is_some_and(|e| {
-                            a.email
-                                .as_deref()
-                                .is_some_and(|ae| ae.eq_ignore_ascii_case(e))
+                            let peer = a.email.as_deref().unwrap_or(a.label.as_str());
+                            (primary_email(peer).contains('@')
+                                && primary_email(peer).eq_ignore_ascii_case(primary_email(e)))
                                 || a.label.eq_ignore_ascii_case(e)
-                        })))
+                        })
+                        // OWE-896: 이메일이 없어도 `"email (조직)"` 라벨 속 이메일로 병합한다.
+                        // 행에는 조직 정보가 없어 이메일 일치를 같은 계정으로 본다.
+                        || {
+                            let stored_mail = stored.email.as_deref().unwrap_or(&stored.label);
+                            let peer = a.email.as_deref().unwrap_or(a.label.as_str());
+                            primary_email(peer).contains('@')
+                                && primary_email(peer)
+                                    .eq_ignore_ascii_case(primary_email(stored_mail))
+                        }))
         }) {
             if existing.id != stored.id {
                 if let Some(m) = meta.remove(&existing.id) {

@@ -114,9 +114,9 @@ use krill_proto::orchestration::{WorkspaceStatus, WorktreeStore, worktree_key};
 use krill_proto::schedule::{self, Cron, MAX_SCHEDULES, Schedule, Schedules};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
-    AccountInfo, AccountsSnapshot, FEAT_ACCOUNT_CONNECTION, FEAT_ACCOUNT_POLICY, FEAT_USAGE,
-    FEAT_USAGE_AGY, FEAT_USAGE_MANAGE, FEAT_USAGE_RATELIMIT, FEAT_USAGE_RULES, FEAT_USAGE_STATUS,
-    ProviderKind, UsageReply, UsageRequest,
+    AccountInfo, AccountsSnapshot, ConnectionStatus, FEAT_ACCOUNT_CONNECTION, FEAT_ACCOUNT_POLICY,
+    FEAT_USAGE, FEAT_USAGE_AGY, FEAT_USAGE_MANAGE, FEAT_USAGE_RATELIMIT, FEAT_USAGE_RULES,
+    FEAT_USAGE_STATUS, ProviderKind, UsageReply, UsageRequest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
@@ -320,6 +320,13 @@ pub struct AccountsImportSummary {
     pub codex_updated: usize,
     pub active_claude: Option<String>,
     pub active_codex: Option<String>,
+    /// Antigravity(agy): Orca 암호화 vault 감지 여부. 개별 이관은 불가(OWE-896·OWE-721) —
+    /// Krill은 호스트 agy 로그인을 공유해 사용한다.
+    #[serde(default)]
+    pub agy_detected: bool,
+    /// agy 미이관 사유(감지됐을 때만).
+    #[serde(default)]
+    pub agy_note: Option<String>,
     #[serde(default)]
     pub items: Vec<ImportedAccountSummary>,
 }
@@ -334,6 +341,10 @@ pub struct ImportedAccountSummary {
     pub profile_dir: String,
     pub active: bool,
     pub runnable: bool,
+    /// 실제 provider auth probe 결과(`connected`·`checking`·`needs_login`·`not_installed`·
+    /// `check_failed`; 데몬·프로브 없이 보고하면 `unknown`). 비밀값은 절대 담지 않는다.
+    #[serde(default)]
+    pub connection: String,
 }
 
 /// SSH 호스트(`ssh`) 도메인 계획·결과·스킵 사유.
@@ -650,10 +661,15 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
                 let active_mark = if item.active { " *" } else { "" };
                 writeln!(
                     out,
-                    "    - [{}] {}{active_mark}: {} ({})",
-                    item.provider, item.id, item.label, item.profile_dir
+                    "    - [{}] {}{active_mark}: {} ({}) [{}]",
+                    item.provider, item.id, item.label, item.profile_dir, item.connection
                 )
                 .ok();
+            }
+            if a.agy_detected
+                && let Some(note) = a.agy_note.as_deref()
+            {
+                writeln!(out, "  agy: {note}").ok();
             }
         }
     }
@@ -859,6 +875,7 @@ struct OrcaCodexAccount {
     email: Option<String>,
     workspace_label: Option<String>,
     workspace_account_id: Option<String>,
+    provider_account_id: Option<String>,
     managed_home_path: Option<String>,
 }
 
@@ -873,22 +890,50 @@ struct ClaudeDotJson {
 struct ClaudeOauthAccount {
     email_address: Option<String>,
     organization_name: Option<String>,
+    organization_uuid: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 struct PlannedOrcaAccount {
     provider: ProviderKind,
     planned_id: String,
+    /// Orca 측 계정 uuid(`claudeManagedAccounts[].id`·디렉터리명). OWE-896 중복 조인 키.
+    raw_id: String,
     label: String,
     email: Option<String>,
     org_or_workspace: Option<String>,
+    /// Claude 조직 uuid(`organizationUuid`). 이메일이 같아도 조직이 다르면 다른 계정.
+    org_uuid: Option<String>,
+    /// Codex `providerAccountId`(`auth.json`의 `tokens.account_id`와 대조).
+    codex_account_id: Option<String>,
     profile_dir: PathBuf,
     dir_str: String,
-    auth_fallback_dir: Option<PathBuf>,
     active: bool,
 }
 
 fn import_accounts_domain(
+    opts: &ImportOptions,
+    domains: &BTreeMap<String, Json>,
+    warnings: &mut Vec<String>,
+) -> AccountsImportSummary {
+    let mut summary = import_accounts_domain_inner(opts, domains, warnings);
+    // OWE-896 (c, 코디네이터 결정 A): agy 계정은 Orca 암호화 vault에만 있어 개별 이관 불가.
+    // vault 존재만 감지해 보고하고, 내용은 읽지 않는다(복호화·키체인 복사 금지).
+    // Krill은 Orca가 materialize한 호스트 agy 로그인을 공유해 사용한다.
+    if fs::symlink_metadata(opts.orca_dir.join("antigravity-accounts").join("vault"))
+        .is_ok_and(|m| m.is_file())
+    {
+        summary.agy_detected = true;
+        summary.agy_note = Some(
+            "Orca 암호화 vault 감지 — agy 개별 이관 불가(OWE-896·OWE-721). \
+             Krill은 호스트 agy 로그인을 공유해 사용한다"
+                .to_owned(),
+        );
+    }
+    summary
+}
+
+fn import_accounts_domain_inner(
     opts: &ImportOptions,
     domains: &BTreeMap<String, Json>,
     warnings: &mut Vec<String>,
@@ -1003,6 +1048,13 @@ fn import_accounts_domain(
                 {
                     acc.organization_name = oauth.organization_name;
                 }
+                if acc
+                    .organization_uuid
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+                {
+                    acc.organization_uuid = oauth.organization_uuid;
+                }
             }
         }
 
@@ -1026,17 +1078,18 @@ fn import_accounts_domain(
         let planned_id = format!("claude-{}", slugify(&label));
         let dir_str = profile_dir.display().to_string();
         let active = active_claude_raw.as_deref() == Some(raw_id.as_str());
-        let _ = acc.organization_uuid;
 
         planned.push(PlannedOrcaAccount {
             provider: ProviderKind::Claude,
             planned_id,
+            raw_id,
             label,
             email,
             org_or_workspace: org,
+            org_uuid: acc.organization_uuid,
+            codex_account_id: None,
             profile_dir,
             dir_str,
-            auth_fallback_dir: Some(auth_fallback_dir),
             active,
         });
     }
@@ -1063,17 +1116,24 @@ fn import_accounts_domain(
         let planned_id = format!("codex-{}", slugify(&label));
         let dir_str = profile_dir.display().to_string();
         let active = active_codex_raw.as_deref() == Some(raw_id.as_str());
-        let _ = acc.workspace_account_id;
 
         planned.push(PlannedOrcaAccount {
             provider: ProviderKind::Codex,
             planned_id,
+            raw_id,
             label,
             email,
             org_or_workspace: ws,
+            org_uuid: None,
+            codex_account_id: acc
+                .provider_account_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .or(acc.workspace_account_id),
             profile_dir,
             dir_str,
-            auth_fallback_dir: None,
             active,
         });
     }
@@ -1102,6 +1162,7 @@ fn import_accounts_domain(
                     profile_dir: cand.dir_str,
                     active: cand.active,
                     runnable: false,
+                    connection: "unknown".to_owned(),
                 });
             }
             warnings.push(format!("accounts skipped (데몬 필요): {e}"));
@@ -1134,6 +1195,7 @@ fn import_accounts_domain(
                     profile_dir: cand.dir_str,
                     active: cand.active,
                     runnable: true,
+                    connection: "unknown".to_owned(),
                 });
             }
             return summary;
@@ -1143,13 +1205,8 @@ fn import_accounts_domain(
                 if let Some(existing) = find_registered_account(&snap, &cand) {
                     let kept_id = existing.id.clone();
                     let was_active = existing.active;
-                    if !opts.dry_run
-                        && let Some(ref fallback) = cand.auth_fallback_dir
-                        && fallback.is_dir()
-                        && *fallback != cand.profile_dir
-                    {
-                        copy_missing_auth_files(fallback, &cand.profile_dir);
-                    }
+                    // OWE-896: Orca 원본(`claude-accounts/*`, `claude-profiles/*`)은 읽기만 한다.
+                    // 이메일 보강은 위에서 두 디렉터리를 모두 읽어 수행하므로 복사가 필요 없다.
                     if cand.active {
                         record_active_summary(&mut summary, cand.provider, &kept_id);
                         if !opts.dry_run && !was_active {
@@ -1178,6 +1235,7 @@ fn import_accounts_domain(
                         profile_dir: cand.dir_str,
                         active: cand.active,
                         runnable: opts.dry_run || cand.profile_dir.is_dir(),
+                        connection: "unknown".to_owned(),
                     });
                     continue;
                 }
@@ -1206,6 +1264,7 @@ fn import_accounts_domain(
                         profile_dir: cand.dir_str,
                         active: cand.active,
                         runnable: true,
+                        connection: "unknown".to_owned(),
                     });
                     continue;
                 }
@@ -1225,13 +1284,6 @@ fn import_accounts_domain(
                         warnings.push(format!("accounts skipped (데몬 필요): {e}"));
                         return summary;
                     }
-                }
-
-                if let Some(ref fallback) = cand.auth_fallback_dir
-                    && fallback.is_dir()
-                    && *fallback != cand.profile_dir
-                {
-                    copy_missing_auth_files(fallback, &cand.profile_dir);
                 }
 
                 let assigned_id = find_registered_account(&snap, &cand)
@@ -1274,6 +1326,7 @@ fn import_accounts_domain(
                     profile_dir: cand.dir_str,
                     active: cand.active,
                     runnable: cand.profile_dir.is_dir(),
+                    connection: "unknown".to_owned(),
                 });
             }
 
@@ -1291,10 +1344,54 @@ fn import_accounts_domain(
                     .find(|a| a.provider == ProviderKind::Codex && a.active && !a.host_default)
                     .map(|a| a.id.clone());
             }
+            // OWE-896 (e): 방금 등록한 계정의 실제 probe 결과가 확정될 때까지
+            // 최대 5초 대기한 뒤 항목별 연결 상태를 채운다(UI 15초 제한 안).
+            if !opts.dry_run {
+                settle_account_connections(&socket, &mut summary, &mut snap);
+            }
         }
     }
 
     summary
+}
+
+/// 등록된 항목의 실제 provider 연결 상태를 스냅샷에서 채운다.
+/// 백그라운드 probe가 `Checking`이면 최대 5초까지 `ListAccounts`로 다시 묻는다.
+/// 비밀값은 스냅샷에 없으며, 여기서도 상태 문자열만 옮긴다.
+fn settle_account_connections(
+    socket: &Path,
+    summary: &mut AccountsImportSummary,
+    snap: &mut AccountsSnapshot,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let pending = summary
+            .items
+            .iter()
+            .any(|item| snap.connection_for(&item.id) == ConnectionStatus::Checking);
+        if !pending || std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        match daemon_usage_request(socket, &UsageRequest::ListAccounts) {
+            Ok(next) => *snap = next,
+            Err(_) => break,
+        }
+    }
+    for item in &mut summary.items {
+        connection_name(snap.connection_for(&item.id)).clone_into(&mut item.connection);
+    }
+}
+
+/// `ConnectionStatus`의 와이어 문자열(`checking`·`connected`·`needs_login`·`not_installed`·`check_failed`).
+fn connection_name(status: ConnectionStatus) -> &'static str {
+    match status {
+        ConnectionStatus::Checking => "checking",
+        ConnectionStatus::Connected => "connected",
+        ConnectionStatus::NeedsLogin => "needs_login",
+        ConnectionStatus::NotInstalled => "not_installed",
+        ConnectionStatus::CheckFailed => "check_failed",
+    }
 }
 
 fn record_active_summary(
@@ -1310,7 +1407,8 @@ fn record_active_summary(
 }
 
 /// `snap.accounts`에서 이미 `accounts.toml`에 등록된(`!host_default && !profile_dir.is_empty()`)
-/// 대응 계정을 찾는다.
+/// 대응 계정을 찾는다. OWE-896: Orca uuid 조인(라벨·이메일 변경에도 같은 계정)과
+/// 이메일·조직 기준 병합(Orca `isSameClaudeLogin` 의미: 같은 이메일 + 조직 미상·동일)을 함께 본다.
 fn find_registered_account<'a>(
     snap: &'a AccountsSnapshot,
     cand: &PlannedOrcaAccount,
@@ -1322,20 +1420,120 @@ fn find_registered_account<'a>(
         if a.profile_dir == cand.dir_str || a.id == cand.planned_id {
             return true;
         }
+        // Orca uuid 조인: 이관 전후 라벨·이메일이 바뀌어도 같은 계정이다.
+        if !cand.raw_id.is_empty()
+            && orca_uuid_from_profile_dir(&a.profile_dir).is_some_and(|u| u == cand.raw_id)
+        {
+            return true;
+        }
+        // Codex 계정 id 조인(`providerAccountId` == 프로필 `auth.json`의 계정 id).
+        if cand.provider == ProviderKind::Codex
+            && let Some(ref wanted) = cand.codex_account_id
+            && read_codex_account_id(Path::new(&a.profile_dir)).is_some_and(|got| &got == wanted)
+        {
+            return true;
+        }
         if a.label.eq_ignore_ascii_case(&cand.label) {
             return true;
         }
-        if let Some(ce) = cand.email.as_deref()
-            && (a
-                .email
-                .as_deref()
-                .is_some_and(|ae| ae.eq_ignore_ascii_case(ce))
-                || a.label.eq_ignore_ascii_case(ce))
+        // 이메일·조직 기준: `"email (조직)"` 라벨에서도 이메일을 뽑아 비교한다.
+        let peer_mail = a.email.as_deref().unwrap_or(a.label.as_str());
+        let cand_mail = cand.email.as_deref().unwrap_or(cand.label.as_str());
+        if primary_email(peer_mail).contains('@')
+            && emails_equal(peer_mail, cand_mail)
+            && org_compatible(&a.profile_dir, cand.org_uuid.as_deref())
         {
             return true;
         }
         false
     })
+}
+
+/// Orca 프로필 경로에서 계정 uuid를 뽑는다.
+/// `claude-profiles/<uuid>/home`·`claude-accounts/<uuid>/auth`·`codex-accounts/<uuid>/home`.
+/// uuid 형태가 아니면 `None`(사용자 임의 경로와 오인 병합 방지).
+fn orca_uuid_from_profile_dir(dir: &str) -> Option<&str> {
+    let mut parts = dir.split('/');
+    let leaf = parts.next_back()?;
+    let uuid = parts.next_back()?;
+    let parent = parts.next_back()?;
+    if !matches!(
+        parent,
+        "claude-profiles" | "claude-accounts" | "codex-accounts"
+    ) || !matches!(leaf, "home" | "auth")
+    {
+        return None;
+    }
+    is_uuid_shape(uuid).then_some(uuid)
+}
+
+/// uuid v4 텍스트 형태(8-4-4-4-12 hex)만 인정한다.
+fn is_uuid_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+    for (i, c) in bytes.iter().enumerate() {
+        if matches!(i, 8 | 13 | 18 | 23) {
+            if *c != b'-' {
+                return false;
+            }
+        } else if !c.is_ascii_hexdigit() {
+            return false;
+        }
+    }
+    true
+}
+
+/// `"email (조직)"` 라벨에서 비교용 이메일만 뽑는다. `@`가 없으면 라벨 전체.
+fn primary_email(label: &str) -> &str {
+    match label.split_once(" (") {
+        Some((head, _)) if head.contains('@') => head.trim(),
+        _ => label.trim(),
+    }
+}
+
+fn emails_equal(left: &str, right: &str) -> bool {
+    primary_email(left).eq_ignore_ascii_case(primary_email(right))
+}
+
+/// 기존 프로필의 조직과 후보 조직이 충돌하지 않는지 확인한다.
+/// 둘 중 하나라도 미상이면 충돌 아님(Orca `isSameClaudeLogin`과 동일).
+fn org_compatible(profile_dir: &str, cand_org: Option<&str>) -> bool {
+    let Some(want) = cand_org.map(str::trim).filter(|s| !s.is_empty()) else {
+        return true;
+    };
+    read_claude_identity(Path::new(profile_dir))
+        .and_then(|(_, org)| org)
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_none_or(|got| got == want)
+}
+
+/// 등록된 프로필의 `.claude.json`에서 `(email, organizationUuid)`를 읽는다.
+/// 비교용 메타데이터만 읽고, 값은 로그·출력하지 않는다.
+fn read_claude_identity(profile_dir: &Path) -> Option<(Option<String>, Option<String>)> {
+    let raw = fs::read_to_string(profile_dir.join(".claude.json")).ok()?;
+    if raw.len() > 1024 * 1024 {
+        return None;
+    }
+    let parsed: ClaudeDotJson = serde_json::from_str(&raw).ok()?;
+    let oauth = parsed.oauth_account?;
+    Some((oauth.email_address, oauth.organization_uuid))
+}
+
+/// Codex 프로필 `auth.json`에서 `tokens.account_id`만 읽는다(토큰 값은 절대 담지 않는다).
+fn read_codex_account_id(profile_dir: &Path) -> Option<String> {
+    let raw = fs::read(profile_dir.join("auth.json")).ok()?;
+    if raw.len() > 64 * 1024 {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    value
+        .pointer("/tokens/account_id")?
+        .as_str()
+        .map(str::to_owned)
 }
 
 /// 실행 중인 `krilld` 소켓에 직접 핸드셰이크해 `UsageRequest`를 보낸다(데몬 자동 기동 없음).
@@ -1428,18 +1626,6 @@ fn resolve_codex_profile_dir(
         return codex_accounts_home;
     }
     explicit.unwrap_or(codex_accounts_home)
-}
-
-fn copy_missing_auth_files(src_dir: &Path, dst_dir: &Path) {
-    for name in [".claude.json", ".credentials.json", "settings.json"] {
-        let src = src_dir.join(name);
-        let dst = dst_dir.join(name);
-        if src.is_file() && !dst.exists() {
-            fs::copy(&src, &dst).ok();
-            #[cfg(unix)]
-            fs::set_permissions(&dst, fs::Permissions::from_mode(0o600)).ok();
-        }
-    }
 }
 
 fn format_account_label(email: Option<&str>, org_or_ws: Option<&str>, fallback: &str) -> String {
@@ -3256,6 +3442,210 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
             .collect();
         assert!(leftovers.is_empty(), "temp files must be cleaned up");
+        fs::remove_dir_all(root).ok();
+    }
+
+    /// OWE-896: uuid 조인·이메일·조직 기준·Codex 계정 id 매칭과 헬퍼 단위 동작.
+    #[test]
+    fn registered_lookup_matches_by_uuid_org_and_codex_account_id() {
+        let root = std::env::temp_dir().join(format!("owe896-match-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+
+        // uuid 조인용 프로필(라벨·이메일이 후보와 전부 다름).
+        let uuid = "96f8c826-8b89-4470-a327-f4918efb8177";
+        let profile = root.join("claude-profiles").join(uuid).join("home");
+        fs::create_dir_all(&profile).unwrap();
+        let dir_str = profile.display().to_string();
+        // 조직 충돌 판정용 프로필.
+        let org_profile = root.join("org-profile");
+        fs::create_dir_all(&org_profile).unwrap();
+        fs::write(
+            org_profile.join(".claude.json"),
+            r#"{"oauthAccount":{"emailAddress":"a@example.com","organizationUuid":"org-1"}}"#,
+        )
+        .unwrap();
+        // Codex 계정 id 판정용 프로필.
+        let codex_profile = root.join("codex-profile");
+        fs::create_dir_all(&codex_profile).unwrap();
+        fs::write(
+            codex_profile.join("auth.json"),
+            r#"{"tokens":{"account_id":"acct-9","access_token":"x"},"last_refresh":"t"}"#,
+        )
+        .unwrap();
+
+        let stored = |id: &str,
+                      provider: ProviderKind,
+                      label: &str,
+                      email: Option<&str>,
+                      profile_dir: &str| {
+            AccountInfo {
+                id: id.to_owned(),
+                provider,
+                label: label.to_owned(),
+                email: email.map(str::to_owned),
+                profile_dir: profile_dir.to_owned(),
+                active: false,
+                host_default: false,
+                stale: false,
+                usage: krill_proto::usage::Snapshot::default(),
+            }
+        };
+        let snap = AccountsSnapshot {
+            accounts: vec![
+                stored("old-id", ProviderKind::Claude, "옛라벨", None, &dir_str),
+                stored(
+                    "org-id",
+                    ProviderKind::Claude,
+                    "a@example.com (Org 1)",
+                    Some("a@example.com"),
+                    &org_profile.display().to_string(),
+                ),
+                stored(
+                    "codex-1",
+                    ProviderKind::Codex,
+                    "옛 Codex",
+                    None,
+                    &codex_profile.display().to_string(),
+                ),
+                stored(
+                    "other",
+                    ProviderKind::Claude,
+                    "z@example.com",
+                    None,
+                    "/tmp/other",
+                ),
+            ],
+            ..AccountsSnapshot::default()
+        };
+        let cand = |raw_id: &str,
+                    provider: ProviderKind,
+                    label: &str,
+                    email: Option<&str>,
+                    org_uuid: Option<&str>,
+                    codex_account_id: Option<&str>| {
+            PlannedOrcaAccount {
+                provider,
+                planned_id: format!("{raw_id}-planned"),
+                raw_id: raw_id.to_owned(),
+                label: label.to_owned(),
+                email: email.map(str::to_owned),
+                org_or_workspace: None,
+                org_uuid: org_uuid.map(str::to_owned),
+                codex_account_id: codex_account_id.map(str::to_owned),
+                profile_dir: PathBuf::from("/tmp/cand"),
+                dir_str: "/tmp/cand".to_owned(),
+                active: false,
+            }
+        };
+
+        // uuid 조인: 라벨·이메일·조직이 달라도 같은 계정.
+        let hit = find_registered_account(
+            &snap,
+            &cand(
+                uuid,
+                ProviderKind::Claude,
+                "new@example.com (New)",
+                Some("new@example.com"),
+                Some("org-9"),
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(hit.id, "old-id");
+        // 같은 이메일 + 조직 충돌 → 다른 계정.
+        assert!(
+            find_registered_account(
+                &snap,
+                &cand(
+                    "other-uuid",
+                    ProviderKind::Claude,
+                    "a@example.com (Org 2)",
+                    Some("a@example.com"),
+                    Some("org-2"),
+                    None,
+                ),
+            )
+            .is_none()
+        );
+        // 같은 이메일 + 후보 조직 미상 → 같은 계정.
+        let hit = find_registered_account(
+            &snap,
+            &cand(
+                "other-uuid",
+                ProviderKind::Claude,
+                "a@example.com",
+                Some("a@example.com"),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(hit.id, "org-id");
+        // `"email (조직)"` 라벨 속 이메일로도 병합.
+        let hit = find_registered_account(
+            &snap,
+            &cand(
+                "other-uuid",
+                ProviderKind::Claude,
+                "a@example.com",
+                Some("A@EXAMPLE.COM"),
+                None,
+                None,
+            ),
+        )
+        .unwrap();
+        assert_eq!(hit.id, "org-id");
+        // Codex 계정 id 조인.
+        let hit = find_registered_account(
+            &snap,
+            &cand(
+                "codex-uuid",
+                ProviderKind::Codex,
+                "새 Codex",
+                Some("other@example.com"),
+                None,
+                Some("acct-9"),
+            ),
+        )
+        .unwrap();
+        assert_eq!(hit.id, "codex-1");
+        // 무관한 후보는 매칭 없음.
+        assert!(
+            find_registered_account(
+                &snap,
+                &cand(
+                    "nope",
+                    ProviderKind::Claude,
+                    "nobody@example.com",
+                    Some("nobody@example.com"),
+                    None,
+                    None,
+                ),
+            )
+            .is_none()
+        );
+        // 헬퍼 단위 동작.
+        assert_eq!(
+            orca_uuid_from_profile_dir(
+                "/o/claude-profiles/96f8c826-8b89-4470-a327-f4918efb8177/home"
+            ),
+            Some("96f8c826-8b89-4470-a327-f4918efb8177")
+        );
+        assert_eq!(
+            orca_uuid_from_profile_dir(
+                "/o/claude-accounts/96f8c826-8b89-4470-a327-f4918efb8177/auth"
+            ),
+            Some("96f8c826-8b89-4470-a327-f4918efb8177")
+        );
+        assert_eq!(orca_uuid_from_profile_dir("/tmp/other"), None);
+        assert_eq!(
+            orca_uuid_from_profile_dir("/o/claude-profiles/not-a-uuid/home"),
+            None
+        );
+        assert_eq!(primary_email("a@example.com (Org A)"), "a@example.com");
+        assert_eq!(primary_email("표시명"), "표시명");
+        assert!(emails_equal("A@EXAMPLE.COM", "a@example.com (Org A)"));
+
         fs::remove_dir_all(root).ok();
     }
 

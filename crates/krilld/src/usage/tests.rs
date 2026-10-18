@@ -1466,6 +1466,91 @@ fn orca_detected_accounts_have_stable_uuid_ids_and_never_launch() {
     fs::remove_dir_all(&state).ok();
 }
 
+/// OWE-896: Orca 감지 행(`claude-orca-<uuid>`)은 등록 계정 프로필 경로 속 uuid와
+/// 라벨·이메일 형식 무관하게 병합된다(중복 표시 제거). uuid가 없는 레거시 행은
+/// `"email (조직)"` 라벨과 이메일 기준으로 병합된다.
+#[test]
+fn orca_detected_row_merges_with_imported_profile_by_uuid_and_email() {
+    use krill_proto::usage::ProviderKind;
+    let home = dir("owe896-home");
+    let state = dir("owe896-state");
+    let host = home.join(".claude");
+    fs::create_dir_all(&host).unwrap();
+
+    // uuid 행: 라벨이 표시명이라 기존 매칭(라벨·이메일 일치)으로는 병합 불가.
+    let uuid_a = "96f8c826-8b89-4470-a327-f4918efb8177";
+    let profile_a = state
+        .join("orca")
+        .join("claude-profiles")
+        .join(uuid_a)
+        .join("home");
+    fs::create_dir_all(&profile_a).unwrap();
+    fs::write(
+        profile_a.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"a@example.com","organizationUuid":"org-1","organizationName":"Org A"}}"#,
+    )
+    .unwrap();
+    // 레거시 행: uuid 없이 이메일 라벨. 이메일 없는 등록 항목과 병합되어야 한다.
+    let profile_b = state.join("custom-b");
+    fs::create_dir_all(&profile_b).unwrap();
+    fs::write(
+        host.join(ORCA_CACHE),
+        format!(
+            r#"{{"accounts":[{{"id":"{uuid_a}","label":"표시명","five_hour":{{"utilization":5}}}},{{"id":"","label":"b@example.com","five_hour":{{"utilization":7}}}}]}}"#,
+        ),
+    )
+    .unwrap();
+
+    accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "a@example.com (Org A)",
+        Some("a@example.com".to_owned()),
+        &profile_a.display().to_string(),
+    )
+    .unwrap();
+    accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Claude,
+        "b@example.com (Org B)",
+        None,
+        &profile_b.display().to_string(),
+    )
+    .unwrap();
+
+    let snap = accounts::refresh_accounts(&home, Some(&state));
+    // 감지 행은 등록 계정에 흡수되어 `claude-orca-*` id가 남지 않는다.
+    assert!(
+        !snap
+            .accounts
+            .iter()
+            .any(|a| a.id.starts_with("claude-orca-")),
+        "{:?}",
+        snap.accounts.iter().map(|a| &a.id).collect::<Vec<_>>()
+    );
+    let merged: Vec<_> = snap
+        .accounts
+        .iter()
+        .filter(|a| a.provider == ProviderKind::Claude && !a.host_default)
+        .collect();
+    assert_eq!(merged.len(), 2);
+    assert!(merged.iter().all(|a| !a.profile_dir.is_empty()));
+    // 행의 사용량이 등록 계정으로 이어진다.
+    let usage_of = |dir: &str| {
+        merged
+            .iter()
+            .find(|a| a.profile_dir == dir)
+            .and_then(|a| a.usage.five_hour.as_ref().map(|w| w.percent))
+    };
+    assert_eq!(usage_of(&profile_a.display().to_string()), Some(5));
+    assert_eq!(usage_of(&profile_b.display().to_string()), Some(7));
+
+    fs::remove_dir_all(&home).ok();
+    fs::remove_dir_all(&state).ok();
+}
+
 /// OWE-696: 등록 계정이라도 프로필 폴더가 사라지면 자동전환 후보·실행 env에서 빠지고,
 /// `active-accounts.env`는 실행과 같은 호스트 경로를 적는다.
 #[test]
