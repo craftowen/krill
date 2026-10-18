@@ -647,3 +647,132 @@ fn cmd_shift_f_toggles_search_and_match_click_moves_editor_cursor(cx: &mut TestA
     });
     assert_eq!(cursor, gpui_component::input::Position::new(2, 8));
 }
+
+/// OWE-874-1: 줄:열 지정 열기(`open_file_at`)는 미리보기 종류(마크다운)도 편집 모드로 열고 커서를 옮긴다.
+#[gpui::test]
+fn goto_opens_preview_kind_in_edit_mode_with_cursor(cx: &mut TestAppContext) {
+    let dir = TempDir::new("goto-preview");
+    let md = dir.0.join("doc.md");
+    fs::write(&md, "# t\nline2 here\nline3\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-goto-preview"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| s.open_file_at(md.clone(), 2, 3, cx));
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).file(pane), Some(md.as_path()));
+    let editing = cx.update(|_, cx| {
+        matches!(
+            view.read(cx).files.tabs[&pane].body,
+            Body::Text { shown: None, .. }
+        )
+    });
+    assert!(editing, "goto는 미리보기 종류도 편집 모드로 연다");
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(1, 2));
+}
+
+/// OWE-874-2: SVG '이미지' 미리보기는 디스크가 아니라 지금 에디터 버퍼로 그린다(미저장 수정 반영).
+#[gpui::test]
+fn svg_preview_reflects_unsaved_buffer(cx: &mut TestAppContext) {
+    let dir = TempDir::new("svg-buffer");
+    let svg = dir.0.join("icon.svg");
+    let saved = "<svg xmlns=\"http://www.w3.org/2000/svg\"></svg>\n";
+    fs::write(&svg, saved).unwrap();
+    let edited = "<svg xmlns=\"http://www.w3.org/2000/svg\"><g id=\"edited\"></g></svg>";
+    let (view, cx) = open(cx, state_path("files-svg-buffer"));
+    let pane = open_file(&view, &svg, cx);
+    let is_image = cx.update(|_, cx| {
+        matches!(
+            view.read(cx).files.tabs[&pane].body,
+            Body::Text {
+                shown: Some(Shown::Image(_)),
+                ..
+            }
+        )
+    });
+    assert!(is_image, "SVG는 이미지 미리보기로 열린다");
+
+    // 편집 모드로 바꿔 버퍼를 고친 뒤(저장 안 함) 미리보기로 돌아온다.
+    cx.update(|window, cx| view.update(cx, |s, cx| s.set_preview(pane, false, window, cx)));
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let state = s.files.tabs[&pane].editor().unwrap().clone();
+            state.update(cx, |e, cx| e.set_value(edited, window, cx));
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| view.update(cx, |s, cx| s.set_preview(pane, true, window, cx)));
+    cx.run_until_parked();
+
+    let bytes = cx.update(|_, cx| match &view.read(cx).files.tabs[&pane].body {
+        Body::Text {
+            shown: Some(Shown::Image(view)),
+            ..
+        } => view.read(cx).svg_bytes(),
+        _ => None,
+    });
+    assert_eq!(
+        bytes.as_deref().map(String::from_utf8_lossy),
+        Some(std::borrow::Cow::Borrowed(edited)),
+        "미리보기는 디스크가 아니라 버퍼를 그린다"
+    );
+    assert_eq!(
+        fs::read(&svg).unwrap(),
+        saved.as_bytes(),
+        "디스크는 그대로다"
+    );
+}
+
+/// OWE-874-3: 에디터 파일 탭이 포커스된 상태에서 ⌘F는 터미널 검색 바가 아니라 에디터 내장 검색을 연다.
+#[gpui::test]
+fn cmd_f_in_editor_opens_editor_search(cx: &mut TestAppContext) {
+    let dir = TempDir::new("editor-search");
+    let file = dir.0.join("main.rs");
+    fs::write(&file, "fn main() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-editor-search"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(
+        !cx.update(|_, cx| view.read(cx).search.is_some()),
+        "에디터 탭에서는 터미널 검색 바를 띄우지 않는다"
+    );
+    assert!(
+        cx.update(|_, cx| {
+            let state = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+            state.read(cx).search_session().open
+        }),
+        "에디터 내장 검색이 열린다"
+    );
+}
+
+/// OWE-874-4: 창보다 긴 줄도 잘리지 않고(자동 줄 바꿈) 끝까지 편집할 수 있다.
+#[gpui::test]
+fn long_line_wraps_and_cursor_reaches_end(cx: &mut TestAppContext) {
+    let dir = TempDir::new("long-line");
+    let file = dir.0.join("long.txt");
+    let long: String = "x".repeat(600);
+    fs::write(&file, format!("{long}\n")).unwrap();
+    let (view, cx) = open(cx, state_path("files-long-line"));
+    let pane = open_file(&view, &file, cx);
+    assert_eq!(editor_text(&view, pane, cx), format!("{long}\n"));
+    // 600번째 글자(0-based 599)로 커서를 옮긴다 — 잘려서 못 가는 일이 없다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let state = s.files.tabs[&pane].editor().unwrap().clone();
+            state.update(cx, |e, cx| {
+                e.set_cursor_position(gpui_component::input::Position::new(0, 599), window, cx);
+            });
+        });
+    });
+    let cursor = cx.update(|_, cx| {
+        let state = view.read(cx).files.tabs[&pane].editor().unwrap().clone();
+        state.read(cx).cursor_position()
+    });
+    assert_eq!(cursor, gpui_component::input::Position::new(0, 599));
+}
