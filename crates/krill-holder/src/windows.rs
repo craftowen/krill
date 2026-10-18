@@ -12,7 +12,7 @@ use krill_proto::{
 };
 use std::ffi::OsString;
 use std::io;
-use std::os::windows::io::{AsHandle, OwnedHandle};
+use std::os::windows::io::{AsHandle, AsSocket, OwnedHandle, OwnedSocket};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -39,6 +39,7 @@ struct Holder {
     streak: u32,
     restart: Instant,
     previous: Option<OsString>,
+    listener: Option<OwnedSocket>,
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
@@ -52,6 +53,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         streak: 0,
         restart: Instant::now(),
         previous: None,
+        listener: None,
     };
     loop {
         h.poll();
@@ -73,20 +75,36 @@ impl Holder {
     }
     fn start(&self) -> io::Result<Daemon> {
         let (process, link) = sys::child_link(&self.path, &self.args)?;
-        let target = sys::duplicate_target(process.pid)?;
-        link.send_message(&self.hello(), &[], target.as_handle())?;
-        for s in &self.sessions {
-            link.send_message(
-                &FromHolder::Session {
-                    id: s.id,
-                    pid: s.process.pid,
-                    status: s.status,
-                },
-                &s.console.pty.handles(),
-                target.as_handle(),
-            )?;
+        let target = match sys::duplicate_target(process.pid) {
+            Ok(target) => target,
+            Err(error) => {
+                sys::terminate(&process).ok();
+                return Err(error);
+            }
+        };
+        let bootstrap = || -> io::Result<()> {
+            link.send_message(&self.hello(), &[], target.as_handle())?;
+            for s in &self.sessions {
+                link.send_message(
+                    &FromHolder::Session {
+                        id: s.id,
+                        pid: s.process.pid,
+                        status: s.status,
+                    },
+                    &s.console.pty.handles(),
+                    target.as_handle(),
+                )?;
+            }
+            if let Some(socket) = &self.listener {
+                let info = sys::duplicate_socket(socket.as_socket(), process.pid)?;
+                link.send_message(&FromHolder::Listener { info }, &[], target.as_handle())?;
+            }
+            link.send_message(&FromHolder::Ready, &[], target.as_handle())
+        };
+        if let Err(error) = bootstrap() {
+            sys::terminate(&process).ok();
+            return Err(error);
         }
-        link.send_message(&FromHolder::Ready, &[], target.as_handle())?;
         Ok(Daemon {
             process,
             target,
@@ -323,9 +341,10 @@ impl Holder {
                     },
                 ));
             }
-            ToHolder::HoldListener { .. } | ToHolder::Adopt { .. } => {
-                return Err(io::Error::from_raw_os_error(38));
+            ToHolder::HoldListener { info, .. } => {
+                self.listener = Some(sys::restore_socket(&info)?);
             }
+            ToHolder::Adopt { .. } => return Err(io::Error::from_raw_os_error(38)),
         }
         Ok(Some(FromHolder::Done { req }))
     }

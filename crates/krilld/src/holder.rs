@@ -51,6 +51,8 @@ type Pending = Option<HashMap<u32, Sender<Answer>>>;
 #[derive(Debug)]
 pub struct Holder {
     version: u16,
+    #[cfg(windows)]
+    holder_pid: u32,
     /// 받는 쪽과 같은 소켓의 사본. 프레임 하나를 한 번에 보내도록 잠근다.
     out: Mutex<Link>,
     pending: Mutex<Pending>,
@@ -87,6 +89,7 @@ impl Holder {
         Ok((
             Self {
                 version,
+                holder_pid: link.peer_pid.ok_or(io::ErrorKind::InvalidData)?,
                 out: Mutex::new(out),
                 pending: Mutex::new(Some(HashMap::new())),
                 next: AtomicU32::new(1),
@@ -182,6 +185,15 @@ impl Holder {
     /// holder는 늘 소켓도 쥐고 있다.
     pub fn hold_listener(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
         let req = self.next.fetch_add(1, Ordering::Relaxed);
+        #[cfg(windows)]
+        return self.send(
+            &ToHolder::HoldListener {
+                req,
+                info: link::duplicate_socket(fd, self.holder_pid)?,
+            },
+            &[],
+        );
+        #[cfg(unix)]
         self.send(
             &ToHolder::HoldListener {
                 req,
@@ -263,12 +275,18 @@ impl Holder {
 pub(crate) fn receive(link: &mut Link) -> io::Result<(u16, Vec<Kept>, Option<OwnedFd>)> {
     let mut version = None;
     let mut kept = Vec::new();
-    #[cfg(unix)]
     let mut listener = None;
-    #[cfg(windows)]
-    let listener = None;
     loop {
         let p = link.recv()?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        #[cfg(windows)]
+        match FromHolder::decode(p.frame()) {
+            Ok(FromHolder::Hello { holder_pid, .. }) => link.peer_pid = Some(holder_pid),
+            Ok(FromHolder::Listener { info }) => {
+                listener = Some(link::restore_socket(&info)?);
+                continue;
+            }
+            _ => {}
+        }
         match decode(p)? {
             Some((FromHolder::Hello { version: v, .. }, _)) => version = Some(v),
             Some((FromHolder::Session { id, pid, status }, Some(master))) => {

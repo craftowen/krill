@@ -4,6 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::windows::io::{AsHandle, BorrowedHandle, BorrowedSocket, OwnedHandle};
 
 use crate::sys;
+pub use crate::sys::{duplicate_socket, restore_socket};
 use krill_proto::holder::{Frame, FromHolder, parse_frame};
 
 /// `ConPTY` 수명은 signal 사본으로 유지한다. 입출력 핸들만으로는 유지되지 않는다.
@@ -66,6 +67,7 @@ pub struct Link {
     pub(crate) input: File,
     pub(crate) output: File,
     buf: Vec<u8>,
+    pub peer_pid: Option<u32>,
 }
 impl Link {
     pub fn pair() -> io::Result<(Self, Self)> {
@@ -78,6 +80,7 @@ impl Link {
             input: input.into(),
             output: output.into(),
             buf: Vec::new(),
+            peer_pid: None,
         }
     }
     /// 시작할 때 한 번만 상속 핸들을 회수한다. 같은 프로세스에서 두 번 호출하지 않는다.
@@ -89,6 +92,7 @@ impl Link {
             input: self.input.try_clone()?,
             output: self.output.try_clone()?,
             buf: Vec::new(),
+            peer_pid: None,
         })
     }
     pub fn has_pending(&self) -> bool {
