@@ -3752,24 +3752,66 @@ fn tab_rename_dialog_saves_and_clears(cx: &mut TestAppContext) {
     assert_eq!(layout_of(&view, cx).tab_title(0), None);
 }
 
-/// OWE-854: 사이드바 세션 행 '이름 변경'은 그 세션 탭을 열고 탭 이름 변경 대화상자를 띄운다.
+/// OWE-854: 사이드바 세션 행 '이름 변경'은 그 세션 탭을 열고 탭 이름 변경 대화상자를 띄우며,
+/// 저장한 탭 사용자 제목이 사이드바 세션 행 라벨에 우선 반영되고 지우면 기존 라벨로 돌아간다.
 #[gpui::test]
 fn sidebar_rename_session_opens_tab_rename(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("sidebar-rename-session"));
     cx.run_until_parked();
+    let sess = sidebar::Session {
+        id: krill_proto::SessionId(77),
+        status: krill_proto::control::AgentStatus {
+            agent: "claude".into(),
+            ..krill_proto::control::AgentStatus::UNKNOWN
+        },
+        worktree: Some("/repo/wt".into()),
+        cwd: Some("/repo/wt".into()),
+        account: None,
+    };
     view.update(cx, |this, cx| {
-        this.sidebar.update(cx, |_, cx| {
+        this.sidebar.update(cx, |sb, cx| {
+            sb.set_title(krill_proto::SessionId(77), "터미널 기본 제목", cx);
+            assert_eq!(sb.session_label(&sess).0, "터미널 기본 제목");
             cx.emit(sidebar::RenameSession(krill_proto::SessionId(77)));
         });
     });
     cx.run_until_parked();
-    view.update(cx, |s, _| {
-        let active = s.layout.active();
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let active = s.layout.active();
+            assert_eq!(
+                s.layout.session(s.layout.active_tab().focused),
+                Some(krill_proto::SessionId(77))
+            );
+            assert_eq!(s.tab_rename.as_ref().map(|r| r.index), Some(active));
+            let rename = s.tab_rename.as_ref().expect("rename open");
+            rename.input.update(cx, |input, cx| {
+                input.set_value("  사용자 지정 세션  ", window, cx);
+            });
+            s.finish_tab_rename(true, cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, cx| {
         assert_eq!(
-            s.layout.session(s.layout.active_tab().focused),
-            Some(krill_proto::SessionId(77))
+            s.sidebar.read(cx).session_label(&sess).0,
+            "사용자 지정 세션"
         );
-        assert_eq!(s.tab_rename.as_ref().map(|r| r.index), Some(active));
+    });
+    // 제목을 비우면 기존 라벨로 복귀한다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let active = s.layout.active();
+            s.begin_tab_rename(active, window, cx);
+            s.clear_tab_title(cx);
+        });
+    });
+    cx.run_until_parked();
+    view.read_with(cx, |s, cx| {
+        assert_eq!(
+            s.sidebar.read(cx).session_label(&sess).0,
+            "터미널 기본 제목"
+        );
     });
 }
 
