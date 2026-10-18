@@ -217,6 +217,7 @@ remote_socket = "/Users/alice/custom/krilld.sock"
 
 /// MK-170 규칙 3: 원격 질의를 실제 `/bin/sh`로 돌려 소켓을 새 번들 → 옛 번들 순으로 찾는지 본다.
 /// 원격 맥은 이관 전(옛 holder가 옛 경로)이거나 구버전일 수 있다.
+#[cfg(unix)]
 #[test]
 fn remote_query_prefers_new_socket_then_legacy() {
     let home = PathBuf::from(format!("/tmp/mk170-remote-{}", std::process::id()));

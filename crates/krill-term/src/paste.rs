@@ -65,7 +65,7 @@ pub fn dropped<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::ffi::OsStrExt as _;
+    use krill_proto::os::ffi::OsStrExt as _;
     use std::process::Command;
 
     fn bracketed() -> Modes {
