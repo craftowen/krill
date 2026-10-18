@@ -17,7 +17,9 @@ use krill_proto::control::AgentState;
 use krill_proto::orchestration::WorkspaceStatus;
 use serde::{Deserialize, Serialize};
 
-use super::{Meta, Preferences, Row, Sidebar, Snapshot, basename, external, needs_you, text};
+use super::{
+    Meta, Preferences, Row, Session, Sidebar, Snapshot, basename, external, needs_you, text,
+};
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 
@@ -587,27 +589,29 @@ pub(super) fn is_worktree_visible(
 }
 
 /// 스마트 정렬 우선순위: 0(승인/주의) < 1(완료 미확인) < 2(작업 중) < 3(완료) < 4(유휴).
-fn smart_rank(path: &Path, snapshot: &Snapshot, ctx: &WorktreeContext<'_>) -> u8 {
+fn smart_rank(
+    path: &Path,
+    sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
+    ctx: &WorktreeContext<'_>,
+) -> u8 {
     let mut has_waiting_or_blocked = false;
     let mut has_unread_done = ctx.unread_worktrees.is_some_and(|u| u.contains(path));
     let mut has_working = false;
     let mut has_done = false;
-    for s in snapshot
-        .sessions
-        .iter()
-        .filter(|s| s.worktree.as_deref() == Some(path))
-    {
-        let is_unread = ctx.unread.is_some_and(|u| u.contains(&s.id));
-        match s.status.state {
-            AgentState::Waiting | AgentState::Blocked => has_waiting_or_blocked = true,
-            AgentState::Working => has_working = true,
-            AgentState::Done => {
-                has_done = true;
-                if is_unread {
-                    has_unread_done = true;
+    if let Some(list) = sessions_by_wt.get(path) {
+        for s in list {
+            let is_unread = ctx.unread.is_some_and(|u| u.contains(&s.id));
+            match s.status.state {
+                AgentState::Waiting | AgentState::Blocked => has_waiting_or_blocked = true,
+                AgentState::Working => has_working = true,
+                AgentState::Done => {
+                    has_done = true;
+                    if is_unread {
+                        has_unread_done = true;
+                    }
                 }
+                AgentState::Exited | AgentState::Unknown => {}
             }
-            AgentState::Exited | AgentState::Unknown => {}
         }
     }
     if has_waiting_or_blocked {
@@ -638,45 +642,38 @@ fn worktree_sort_name(path: &Path, prefs: &Preferences, meta: Option<&Meta>) -> 
 
 pub(super) fn sort_worktrees(
     trees: &mut [&PathBuf],
-    snapshot: &Snapshot,
+    sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
     prefs: &Preferences,
     sort_by: SortBy,
     ctx: &WorktreeContext<'_>,
 ) {
-    trees.sort_by(|a, b| {
-        let pin_a = !prefs.get(*a).is_some_and(|v| v.pinned);
-        let pin_b = !prefs.get(*b).is_some_and(|v| v.pinned);
-        let name_a = worktree_sort_name(a, prefs, ctx.meta);
-        let name_b = worktree_sort_name(b, prefs, ctx.meta);
-        let recent_a = Reverse(ctx.updated_at.and_then(|u| u.get(*a)).copied().unwrap_or(0));
-        let recent_b = Reverse(ctx.updated_at.and_then(|u| u.get(*b)).copied().unwrap_or(0));
-        match sort_by {
-            SortBy::Smart => (pin_a, smart_rank(a, snapshot, ctx), recent_a, &name_a, *a).cmp(&(
-                pin_b,
-                smart_rank(b, snapshot, ctx),
-                recent_b,
-                &name_b,
-                *b,
-            )),
-            SortBy::Recent => (pin_a, recent_a, &name_a, *a).cmp(&(pin_b, recent_b, &name_b, *b)),
-            SortBy::Name => (pin_a, &name_a, *a).cmp(&(pin_b, &name_b, *b)),
-        }
+    trees.sort_by_cached_key(|a| {
+        let pin = !prefs.get(*a).is_some_and(|v| v.pinned);
+        let name = worktree_sort_name(a, prefs, ctx.meta);
+        let recent = Reverse(ctx.updated_at.and_then(|u| u.get(*a)).copied().unwrap_or(0));
+        let rank = match sort_by {
+            SortBy::Smart => smart_rank(a, sessions_by_wt, ctx),
+            SortBy::Recent | SortBy::Name => 0,
+        };
+        let recent_key = match sort_by {
+            SortBy::Smart | SortBy::Recent => recent,
+            SortBy::Name => Reverse(0),
+        };
+        (pin, rank, recent_key, name, *a)
     });
 }
 
 fn push_worktree_and_sessions(
     out: &mut Vec<Row>,
     tree: &PathBuf,
-    snapshot: &Snapshot,
+    sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
     collapsed: &BTreeSet<PathBuf>,
 ) {
     out.push(Row::Worktree(tree.clone()));
-    if !collapsed.contains(tree) {
-        for s in snapshot
-            .sessions
-            .iter()
-            .filter(|s| s.worktree.as_ref() == Some(tree))
-        {
+    if !collapsed.contains(tree)
+        && let Some(list) = sessions_by_wt.get(tree.as_path())
+    {
+        for &s in list {
             out.push(Row::Session(s.clone(), true));
         }
     }
@@ -692,6 +689,12 @@ pub(super) fn rows_with_options<'a>(
     ctx: &WorktreeContext<'_>,
 ) -> Vec<Row> {
     let mut out = Vec::new();
+    let mut sessions_by_wt: BTreeMap<&Path, Vec<&'a Session>> = BTreeMap::new();
+    for s in &snapshot.sessions {
+        if let Some(wt) = s.worktree.as_deref() {
+            sessions_by_wt.entry(wt).or_default().push(s);
+        }
+    }
     let mut waiting = snapshot
         .sessions
         .iter()
@@ -726,7 +729,7 @@ pub(super) fn rows_with_options<'a>(
                 }
                 out.push(Row::Repository(repo.clone()));
                 if !collapsed.contains(repo) {
-                    sort_worktrees(&mut vis, snapshot, prefs, options.sort_by, ctx);
+                    sort_worktrees(&mut vis, &sessions_by_wt, prefs, options.sort_by, ctx);
                     let (normal, claude_ext) = external::partition_trees(repo, vis);
                     let normal = super::lineage::order_lineage_worktrees(
                         normal,
@@ -734,7 +737,7 @@ pub(super) fn rows_with_options<'a>(
                         ctx.collapsed_lineage,
                     );
                     for tree in normal {
-                        push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                        push_worktree_and_sessions(&mut out, tree, &sessions_by_wt, collapsed);
                     }
                     if !claude_ext.is_empty() {
                         let expanded = shown_external.contains(repo);
@@ -750,7 +753,12 @@ pub(super) fn rows_with_options<'a>(
                                 ctx.collapsed_lineage,
                             );
                             for tree in claude_ext {
-                                push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                                push_worktree_and_sessions(
+                                    &mut out,
+                                    tree,
+                                    &sessions_by_wt,
+                                    collapsed,
+                                );
                             }
                         }
                     }
@@ -780,7 +788,7 @@ pub(super) fn rows_with_options<'a>(
                 let Some(mut bucket) = buckets.remove(&idx).filter(|b| !b.is_empty()) else {
                     continue;
                 };
-                sort_worktrees(&mut bucket, snapshot, prefs, options.sort_by, ctx);
+                sort_worktrees(&mut bucket, &sessions_by_wt, prefs, options.sort_by, ctx);
                 let key = GroupKey::WorkspaceStatus(status);
                 out.push(Row::GroupHeader {
                     key,
@@ -793,7 +801,7 @@ pub(super) fn rows_with_options<'a>(
                         ctx.collapsed_lineage,
                     );
                     for tree in ordered {
-                        push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                        push_worktree_and_sessions(&mut out, tree, &sessions_by_wt, collapsed);
                     }
                 }
             }
@@ -817,7 +825,7 @@ pub(super) fn rows_with_options<'a>(
                 let Some(mut bucket) = buckets.remove(&pr_group).filter(|b| !b.is_empty()) else {
                     continue;
                 };
-                sort_worktrees(&mut bucket, snapshot, prefs, options.sort_by, ctx);
+                sort_worktrees(&mut bucket, &sessions_by_wt, prefs, options.sort_by, ctx);
                 let key = GroupKey::PrStatus(pr_group);
                 out.push(Row::GroupHeader {
                     key,
@@ -830,7 +838,7 @@ pub(super) fn rows_with_options<'a>(
                         ctx.collapsed_lineage,
                     );
                     for tree in ordered {
-                        push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                        push_worktree_and_sessions(&mut out, tree, &sessions_by_wt, collapsed);
                     }
                 }
             }
@@ -843,14 +851,14 @@ pub(super) fn rows_with_options<'a>(
                 }
                 all_trees.extend(visible_in_repo(repo, trees));
             }
-            sort_worktrees(&mut all_trees, snapshot, prefs, options.sort_by, ctx);
+            sort_worktrees(&mut all_trees, &sessions_by_wt, prefs, options.sort_by, ctx);
             let ordered = super::lineage::order_lineage_worktrees(
                 all_trees,
                 ctx.parents,
                 ctx.collapsed_lineage,
             );
             for tree in ordered {
-                push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                push_worktree_and_sessions(&mut out, tree, &sessions_by_wt, collapsed);
             }
         }
     }
@@ -1162,15 +1170,19 @@ impl Sidebar {
                 set.insert(port);
             }
         }
-        for s in self
-            .snapshot_for(host)
-            .sessions
-            .iter()
-            .filter(|s| s.worktree.as_deref() == Some(path))
-        {
-            if let Some(title) = self.titles.get(&s.id) {
-                for entry in krill_proto::orchestration::extract_local_urls(s.id.0, title, false) {
-                    set.insert(entry.port);
+        if !self.titles.is_empty() {
+            for s in self
+                .snapshot_for(host)
+                .sessions
+                .iter()
+                .filter(|s| s.worktree.as_deref() == Some(path))
+            {
+                if let Some(title) = self.titles.get(&s.id) {
+                    for entry in
+                        krill_proto::orchestration::extract_local_urls(s.id.0, title, false)
+                    {
+                        set.insert(entry.port);
+                    }
                 }
             }
         }
