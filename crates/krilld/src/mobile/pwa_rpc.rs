@@ -515,7 +515,6 @@ fn read_patch(cwd: &Path, path: &str) -> io::Result<String> {
     .into_owned())
 }
 fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io::Result<Vec<u8>> {
-    use std::os::fd::AsFd;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -523,8 +522,7 @@ fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io
         .spawn()?;
     let result = (|| {
         let mut pipe = child.stdout.take().ok_or_else(invalid)?;
-        let flags = rustix::fs::fcntl_getfl(pipe.as_fd())?;
-        rustix::fs::fcntl_setfl(pipe.as_fd(), flags | rustix::fs::OFlags::NONBLOCK)?;
+        crate::child::nonblocking(&pipe)?;
         let deadline = Instant::now() + timeout;
         let mut out = Vec::new();
         let mut buffer = [0; 8192];
