@@ -1,4 +1,4 @@
-//! MK-059 터미널 검색 바(⌘F): 검색어 입력, 이전(↑)·다음(Enter·↓) 순회, 일치 수 표시, Esc 닫기.
+//! MK-059 터미널 검색 바(⌘F): 검색어 입력, 이전(↑·⇧Enter)·다음(Enter·↓) 순회, 일치 수 표시, Esc 닫기.
 
 use std::time::Duration;
 
@@ -11,6 +11,9 @@ use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
 use krill_proto::search::{Direction, SearchResult};
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
+
+/// 검색 바 키 문맥(OWE-868). ⇧⌘G가 바 안에서만 이전 찾기로 동작하고, 바깥에서는 우측 패널 전환을 유지한다.
+pub const CONTEXT: &str = "TerminalSearch";
 
 use crate::i18n::catalog::search as text;
 
@@ -147,6 +150,7 @@ impl Render for Bar {
         );
         let bar = div()
             .id("search-bar")
+            .key_context(CONTEXT)
             .w(px(360.))
             .p_1()
             .flex()
@@ -166,9 +170,14 @@ impl Render for Bar {
                 cx.stop_propagation();
                 bar.step(Direction::Next, cx);
             }))
-            .capture_action(cx.listener(|bar, _: &Enter, _, cx| {
+            .capture_action(cx.listener(|bar, _: &Enter, window, cx| {
                 cx.stop_propagation();
-                bar.step(Direction::Next, cx);
+                // OWE-868: ⇧Enter는 이전 찾기(표준 단축키). Enter·↓는 다음, ↑는 이전이다.
+                if window.modifiers().shift {
+                    bar.step(Direction::Previous, cx);
+                } else {
+                    bar.step(Direction::Next, cx);
+                }
             }))
             .capture_action(cx.listener(|bar, _: &Escape, _, cx| {
                 cx.stop_propagation();
