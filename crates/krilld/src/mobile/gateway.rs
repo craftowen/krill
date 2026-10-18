@@ -249,14 +249,14 @@ impl Gateway {
                         if state.stopped || state.mode != mode {
                             return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
                         }
-                        if state
-                            .tunnel
-                            .as_ref()
-                            .is_some_and(|t| t.ready_url().is_some())
-                        {
+                        // 기한이 지나도 준비되지 않으면 찍힌 URL로 낸다(터널 출처). 몇 초 뒤 새로고침하면 열린다.
+                        let timed_out = Instant::now() >= deadline;
+                        if state.tunnel.as_ref().is_some_and(|t| {
+                            t.ready_url().is_some() || (timed_out && t.url().is_some())
+                        }) {
                             return pairing_offer(&state, now_ms());
                         }
-                        if Instant::now() >= deadline
+                        if timed_out
                             || (state.tunnel.is_none()
                                 && !state.resolver.downloading()
                                 && state
@@ -370,6 +370,7 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
             .ok_or_else(|| tunnel_unavailable(state))?;
         let url = tunnel
             .ready_url()
+            .or_else(|| tunnel.url())
             .ok_or_else(|| tunnel_unavailable(state))?;
         if tunnel.fixed() {
             fixed_base(state)
