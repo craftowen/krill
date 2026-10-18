@@ -3928,6 +3928,7 @@ dependencies = [
  "tikv-jemallocator",
  "toml 1.1.8+spec-1.1.0",
  "tracing",
+ "windows-sys 0.61.2",
  "zeroize",
  "zstd",
 ]

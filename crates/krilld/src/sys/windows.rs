@@ -1,38 +1,266 @@
-//! Windows 판(M11 Phase 1, OWE-819) — 컴파일 전용 스텁. linux.rs와 같은 함수를 닫힌 쪽으로 실패하게 둔다.
-//! - 조회(메모리·PID·cwd·passwd·인터페이스·cron 달력)는 [`io::ErrorKind::Unsupported`]. 호출자는 이미 실패를 견딘다.
+//! Windows 판(OWE-833): Toolhelp·psapi 프로세스 조회, `AF_UNIX` 피어 PID(`SIO_AF_UNIX_GETPEERPID`)와 토큰 SID 비교,
+//! DPAPI 키 봉인, 프로세스 핸들 폴링 종료 감시.
+//! - UID가 없다: [`peer_uid`]는 피어 프로세스 토큰의 사용자 SID가 우리 것과 같을 때만 [`SAME_USER`]를 준다.
 //! - 코드서명·감사 토큰은 없다: [`peer_token`]이 실패하고 [`verify_audit_token`]은 [`CodeSign::invalid`](Linux와 같다).
-//! - 실구현(Toolhelp·`GetProcessMemoryInfo`·피어 PID·SID 검사·`WaitForMultipleObjects`)은 Phase 3(OWE-833).
+//! - 다른 프로세스의 cwd는 읽지 않는다(PEB 읽기는 비공개 구조). 세션 cwd는 셸의 OSC 7·OSC 9;9 보고로 안다.
+//! - 부모가 이미 끝났거나(PID가 재사용돼) 부모보다 먼저 시작한 것으로 보이면 [`parent_pid`]는 0이다.
+//!   macOS·Linux의 고아가 launchd·init(1)에 입양되는 것과 같아, 범위 계산([`crate::scope`])이 같은 답을 낸다.
 
 use std::io;
-use std::os::windows::io::{BorrowedHandle, BorrowedSocket};
+use std::os::windows::io::{
+    AsRawHandle as _, AsRawSocket as _, BorrowedHandle, BorrowedSocket, FromRawHandle as _,
+    OwnedHandle,
+};
 use std::path::{Path, PathBuf};
+use std::ptr;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use windows_sys::Win32::Foundation::{
+    FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
+};
+use windows_sys::Win32::Networking::WinSock::{
+    SIO_AF_UNIX_GETPEERPID, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl,
+};
+use windows_sys::Win32::Security::Cryptography::{
+    CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+};
+use windows_sys::Win32::Security::{
+    EqualSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
+};
+use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS, OpenProcess,
+    OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
+use zeroize::Zeroizing;
 
 use super::{AUDIT_TOKEN_LEN, CodeSign, User};
+
+/// Windows에는 UID가 없어 "이 프로세스와 같은 사용자 SID"를 이 값 하나로 나타낸다([`crate::os::euid`]).
+pub(crate) const SAME_USER: u32 = 0;
+/// Toolhelp 스냅숏을 다시 쓰는 시간. [`crate::resources`]가 pid마다 [`parent_pid`]를 불러 스냅숏을 pid 수만큼
+/// 찍지 않게 한다. 캐시에 없는 pid는 새로 찍는다(방금 뜬 프로세스를 놓치지 않는다).
+const SNAPSHOT_TTL: Duration = Duration::from_millis(500);
+/// 종료 감시 폴링 간격.
+const EXIT_POLL: Duration = Duration::from_millis(100);
 
 fn unsupported<T>() -> io::Result<T> {
     Err(io::ErrorKind::Unsupported.into())
 }
 
-/// 자기 프로세스의 메모리·누적 디스크 쓰기. 측정이 없어 0으로 보고하지 않고 실패한다.
-pub(crate) fn resources() -> io::Result<(u64, u64)> {
-    unsupported()
+/// 실패하면 null을 돌려주는 핸들 생성 함수의 결과를 소유한다.
+fn owned(raw: HANDLE) -> io::Result<OwnedHandle> {
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: 방금 만든 유효한 핸들이고 소유권은 여기만 있다.
+    Ok(unsafe { OwnedHandle::from_raw_handle(raw) })
 }
 
-pub(crate) fn footprint(_pid: u32) -> io::Result<u64> {
-    unsupported()
+fn open_process(pid: u32, access: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: 인자만 읽는다. 실패하면 null.
+    owned(unsafe { OpenProcess(access, 0, pid) })
+}
+
+/// 사적 커밋 바이트(`PrivateUsage`). macOS `phys_footprint`처럼 공유 이미지 페이지를 빼고 페이지 파일로 나간
+/// 사적 페이지는 센다(작업 관리자 "커밋 크기"와 같은 값).
+fn private_bytes(process: HANDLE) -> io::Result<u64> {
+    let mut counters = PROCESS_MEMORY_COUNTERS_EX::default();
+    let cb = u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS_EX>()).unwrap_or(u32::MAX);
+    counters.cb = cb;
+    // SAFETY: counters는 cb 바이트짜리 쓰기 가능한 구조체다(`_EX`는 `PROCESS_MEMORY_COUNTERS`의 확장이라 같은 함수가 채운다).
+    if unsafe { GetProcessMemoryInfo(process, (&raw mut counters).cast(), cb) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(u64::try_from(counters.PrivateUsage).unwrap_or(u64::MAX))
+}
+
+/// 자기 프로세스의 사적 커밋 바이트와 누적 쓰기 바이트(`WriteTransferCount`, 실패하면 0).
+/// ponytail: Windows의 쓰기 수는 파일만이 아니라 파이프·소켓 쓰기도 센다(디스크 쓰기보다 크게 나온다). 디스크만
+/// 필요하면 ETW·`FileIoInfo`로.
+pub(crate) fn resources() -> io::Result<(u64, u64)> {
+    // SAFETY: 닫을 필요 없는 의사 핸들을 돌려줄 뿐이다.
+    let me = unsafe { GetCurrentProcess() };
+    let footprint = private_bytes(me)?;
+    let mut io_counters = IO_COUNTERS::default();
+    // SAFETY: me는 자기 프로세스 의사 핸들이고 io_counters는 쓰기 가능한 구조체다.
+    let writes = if unsafe { GetProcessIoCounters(me, &raw mut io_counters) } == 0 {
+        0
+    } else {
+        io_counters.WriteTransferCount
+    };
+    Ok((footprint, writes))
+}
+
+/// `pid`의 사적 커밋 바이트([`private_bytes`]).
+pub(crate) fn footprint(pid: u32) -> io::Result<u64> {
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    private_bytes(process.as_raw_handle())
+}
+
+/// Toolhelp 스냅숏의 한 항목.
+#[derive(Debug, Clone)]
+struct Process {
+    pid: u32,
+    parent: u32,
+    /// 실행 파일 이름(경로 없이, 예: `node.exe`).
+    exe: String,
+}
+
+/// 지금 있는 모든 프로세스.
+fn snapshot() -> io::Result<Vec<Process>> {
+    // SAFETY: 인자만 읽는다. 실패하면 INVALID_HANDLE_VALUE.
+    let snap = owned(unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) })?;
+    // SAFETY: PROCESSENTRY32W는 정수와 u16 배열뿐이라 0으로 채운 값이 유효하다.
+    let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+    entry.dwSize = u32::try_from(size_of::<PROCESSENTRY32W>()).unwrap_or(u32::MAX);
+    let mut out = Vec::new();
+    // SAFETY: snap은 유효한 스냅숏이고 entry는 dwSize를 채운 쓰기 가능한 구조체다.
+    let mut more = unsafe { Process32FirstW(snap.as_raw_handle(), &raw mut entry) } != 0;
+    while more {
+        let len = entry
+            .szExeFile
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(entry.szExeFile.len());
+        out.push(Process {
+            pid: entry.th32ProcessID,
+            parent: entry.th32ParentProcessID,
+            exe: String::from_utf16_lossy(entry.szExeFile.get(..len).unwrap_or_default()),
+        });
+        // SAFETY: 위와 같다.
+        more = unsafe { Process32NextW(snap.as_raw_handle(), &raw mut entry) } != 0;
+    }
+    Ok(out)
+}
+
+/// `pid` 항목. 캐시가 [`SNAPSHOT_TTL`]보다 오래됐거나 `pid`가 없으면 새로 찍는다. `pid`가 `None`이면 전체.
+fn processes(pid: Option<u32>) -> io::Result<Vec<Process>> {
+    static CACHE: Mutex<Option<(Instant, Vec<Process>)>> = Mutex::new(None);
+    let mut cache = CACHE
+        .lock()
+        .map_err(|_| io::Error::other("process cache poisoned"))?;
+    let fresh = cache.as_ref().is_some_and(|(at, list)| {
+        at.elapsed() < SNAPSHOT_TTL && pid.is_none_or(|p| list.iter().any(|e| e.pid == p))
+    });
+    if !fresh {
+        *cache = Some((Instant::now(), snapshot()?));
+    }
+    let list = cache
+        .as_ref()
+        .map(|(_, list)| list.as_slice())
+        .unwrap_or_default();
+    Ok(match pid {
+        Some(p) => list.iter().filter(|e| e.pid == p).cloned().collect(),
+        None => list.to_vec(),
+    })
+}
+
+fn process(pid: u32) -> io::Result<Process> {
+    processes(Some(pid))?
+        .pop()
+        .ok_or_else(|| io::ErrorKind::NotFound.into())
 }
 
 pub(crate) fn all_pids() -> io::Result<Vec<u32>> {
-    unsupported()
+    Ok(processes(None)?.into_iter().map(|e| e.pid).collect())
 }
 
-/// Windows에는 UID가 없다(SID 검사는 OWE-833). 실패하므로 피어 검사는 거부 쪽이다.
-pub fn peer_uid(_sock: BorrowedSocket<'_>) -> io::Result<u32> {
-    unsupported()
+/// 같은 사용자의 피어면 [`SAME_USER`]. SID가 다르면 `PermissionDenied`. PID를 묻고 곧바로 그 프로세스의 토큰을
+/// 읽는다(PID를 캐시하지 않는다, windows-spike-OWE-827.md "인증과 ACL 해석").
+/// ponytail: 피어가 connect 뒤 바로 끝나고 PID가 다른 사용자 프로세스로 재사용되면 그 사용자로 판정한다(그쪽은
+/// 거부라 닫힌 쪽). 반대로 같은 사용자로 잘못 볼 수는 없다 — 재사용된 프로세스가 같은 사용자일 때뿐이다.
+pub fn peer_uid(sock: BorrowedSocket<'_>) -> io::Result<u32> {
+    let pid = peer_pid(sock)?;
+    let peer = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    // SAFETY: 닫을 필요 없는 의사 핸들을 돌려줄 뿐이다.
+    let me = token_user(unsafe { GetCurrentProcess() })?;
+    let other = token_user(peer.as_raw_handle())?;
+    // SAFETY: 두 SID 모두 GetTokenInformation(TokenUser)가 채운 버퍼 안의 유효한 SID이고 버퍼는 아직 살아 있다.
+    if unsafe { EqualSid(sid(&me), sid(&other)) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("peer pid {pid} runs as another user"),
+        ));
+    }
+    Ok(SAME_USER)
 }
 
-pub fn peer_pid(_sock: BorrowedSocket<'_>) -> io::Result<u32> {
-    unsupported()
+/// `TokenUser` 정보 버퍼(앞이 [`TOKEN_USER`], SID 본문은 뒤에 이어진다). `u64`로 잡아 정렬을 맞춘다.
+fn token_user(process: HANDLE) -> io::Result<Vec<u64>> {
+    let mut raw = ptr::null_mut();
+    // SAFETY: process는 유효한 프로세스 핸들이고 raw는 쓰기 위치다.
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &raw mut raw) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let token = owned(raw)?;
+    let mut len = 0_u32;
+    // SAFETY: 크기만 묻는다(버퍼 null, 길이 0). 실패(ERROR_INSUFFICIENT_BUFFER)가 정상이다.
+    unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            ptr::null_mut(),
+            0,
+            &raw mut len,
+        )
+    };
+    if usize::try_from(len).unwrap_or(0) < size_of::<TOKEN_USER>() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut buf = vec![0_u64; usize::try_from(len).unwrap_or(0).div_ceil(8)];
+    // SAFETY: buf는 len 바이트 이상이고 8바이트 정렬이다.
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buf.as_mut_ptr().cast(),
+            len,
+            &raw mut len,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(buf)
+}
+
+fn sid(token_user: &[u64]) -> windows_sys::Win32::Security::PSID {
+    // SAFETY: [`token_user`]가 채운 버퍼라 앞이 정렬된 TOKEN_USER다.
+    unsafe { (*token_user.as_ptr().cast::<TOKEN_USER>()).User.Sid }
+}
+
+/// `AF_UNIX` 피어가 connect할 때의 PID(`SIO_AF_UNIX_GETPEERPID`, Windows 10 1803+).
+pub fn peer_pid(sock: BorrowedSocket<'_>) -> io::Result<u32> {
+    let mut pid = 0_u32;
+    let mut returned = 0_u32;
+    let socket = SOCKET::try_from(sock.as_raw_socket()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    // SAFETY: socket은 빌린 유효한 소켓이고 출력 버퍼는 4바이트 pid다. 입력·overlapped·완료 루틴은 없다.
+    let r = unsafe {
+        WSAIoctl(
+            socket,
+            SIO_AF_UNIX_GETPEERPID,
+            ptr::null(),
+            0,
+            (&raw mut pid).cast(),
+            4,
+            &raw mut returned,
+            ptr::null_mut(),
+            None,
+        )
+    };
+    if r == SOCKET_ERROR {
+        // SAFETY: 인자 없이 이 스레드의 마지막 Winsock 오류를 읽는다.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if returned != 4 || pid == 0 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(pid)
 }
 
 /// Windows에는 감사 토큰이 없다.
@@ -45,55 +273,196 @@ pub fn verify_audit_token(_token: &[u8]) -> CodeSign {
     CodeSign::invalid()
 }
 
-pub fn parent_pid(_pid: u32) -> io::Result<u32> {
+/// 부모 PID. 부모가 없거나 자식보다 늦게 시작했으면(PID 재사용) 0이다(모듈 설명).
+pub fn parent_pid(pid: u32) -> io::Result<u32> {
+    let parent = process(pid)?.parent;
+    if parent == 0 || parent == pid || process(parent).is_err() {
+        return Ok(0);
+    }
+    // 시작 시각을 못 읽으면(다른 사용자·보호 프로세스) 부모를 그대로 믿는다.
+    match (start_us(parent), start_us(pid)) {
+        (Ok(p), Ok(c)) if p > c => Ok(0),
+        _ => Ok(parent),
+    }
+}
+
+/// 자기 프로세스만 안다. 다른 프로세스의 cwd는 셸 보고(OSC 7·9;9)로 안다(모듈 설명).
+pub(crate) fn current_directory(pid: u32) -> io::Result<PathBuf> {
+    if pid == std::process::id() {
+        return std::env::current_dir();
+    }
     unsupported()
 }
 
-pub(crate) fn current_directory(_pid: u32) -> io::Result<PathBuf> {
-    unsupported()
+/// 실행 파일 이름에서 `.exe`를 뺀 것(`node.exe` → `node`). macOS·Linux의 짧은 실행 이름과 같은 꼴이다.
+pub(crate) fn process_name(pid: u32) -> io::Result<String> {
+    let exe = process(pid)?.exe;
+    let stem = exe
+        .len()
+        .checked_sub(4)
+        .filter(|&i| {
+            exe.get(i..)
+                .is_some_and(|ext| ext.eq_ignore_ascii_case(".exe"))
+        })
+        .and_then(|i| exe.get(..i));
+    Ok(stem.unwrap_or(&exe).to_owned())
 }
 
-pub(crate) fn process_name(_pid: u32) -> io::Result<String> {
-    unsupported()
+/// 프로세스 생성 시각(1601년 기준 µs). PID 재사용 구분용.
+pub fn start_us(pid: u32) -> io::Result<u64> {
+    let process = open_process(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+    let mut times = [FILETIME::default(); 4];
+    let [created, exited, kernel, user] = &mut times;
+    // SAFETY: process는 유효한 핸들이고 네 FILETIME은 쓰기 가능한 위치다.
+    if unsafe { GetProcessTimes(process.as_raw_handle(), created, exited, kernel, user) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let ticks = u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime);
+    Ok(ticks / 10)
 }
 
-pub fn start_us(_pid: u32) -> io::Result<u64> {
-    unsupported()
-}
-
-/// passwd가 없다. 셸은 호출자가 Windows 기본 셸 후보로 고른다(`shell.rs`).
+/// passwd가 없다: 탐색기가 주는 `USERNAME`·`USERPROFILE`. 셸은 비워 두고 `shell.rs`가 Windows 후보에서 고른다.
 pub fn user() -> io::Result<User> {
-    unsupported()
-}
-
-pub(crate) fn cron_calendar(_seconds: u64) -> io::Result<[u32; 5]> {
-    unsupported()
+    let var = |key| {
+        std::env::var_os(key)
+            .map(std::ffi::OsString::into_encoded_bytes)
+            .filter(|v| !v.is_empty())
+            .ok_or(io::ErrorKind::NotFound)
+    };
+    Ok(User {
+        name: var("USERNAME")?,
+        home: var("USERPROFILE")?,
+        shell: Vec::new(),
+    })
 }
 
 pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr)>> {
     unsupported()
 }
 
-/// 자식이 아닌 프로세스의 종료 감시. 아직 없어 [`ExitWatch::new`]가 실패한다.
+/// DPAPI로 봉인한다(현재 사용자 범위, UI 없음). 같은 사용자 로그온에서만 풀 수 있다.
+pub(crate) fn protect(data: &[u8]) -> io::Result<Vec<u8>> {
+    let input = blob(data)?;
+    let mut out = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: input은 살아 있는 data를 가리키고(읽기만 한다) out은 쓰기 위치다. 설명·엔트로피·프롬프트는 없다.
+    let ok = unsafe {
+        CryptProtectData(
+            &raw const input,
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &raw mut out,
+        )
+    };
+    take_blob(ok, out).map(|b| b.to_vec())
+}
+
+/// [`protect`]의 반대. 다른 사용자·다른 기기의 blob이나 변조된 blob은 실패한다.
+pub(crate) fn unprotect(data: &[u8]) -> io::Result<Zeroizing<Vec<u8>>> {
+    let input = blob(data)?;
+    let mut out = CRYPT_INTEGER_BLOB::default();
+    // SAFETY: protect와 같다. 설명 출력은 받지 않는다(null).
+    let ok = unsafe {
+        CryptUnprotectData(
+            &raw const input,
+            ptr::null_mut(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            CRYPTPROTECT_UI_FORBIDDEN,
+            &raw mut out,
+        )
+    };
+    take_blob(ok, out)
+}
+
+fn blob(data: &[u8]) -> io::Result<CRYPT_INTEGER_BLOB> {
+    Ok(CRYPT_INTEGER_BLOB {
+        cbData: u32::try_from(data.len()).map_err(|_| io::ErrorKind::InvalidInput)?,
+        pbData: data.as_ptr().cast_mut(),
+    })
+}
+
+/// DPAPI 출력 버퍼를 복사하고, 0으로 지운 뒤 푼다.
+fn take_blob(
+    ok: windows_sys::core::BOOL,
+    out: CRYPT_INTEGER_BLOB,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    if ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = usize::try_from(out.cbData).unwrap_or(0);
+    let bytes = if out.pbData.is_null() {
+        Zeroizing::new(Vec::new())
+    } else {
+        // SAFETY: 성공한 DPAPI 출력은 cbData 바이트짜리 LocalAlloc 버퍼다.
+        let bytes = Zeroizing::new(unsafe { std::slice::from_raw_parts(out.pbData, len) }.to_vec());
+        // SAFETY: 위 버퍼 전체에 쓴다(평문 키가 해제된 힙에 남지 않게).
+        unsafe { ptr::write_bytes(out.pbData, 0, len) };
+        bytes
+    };
+    // SAFETY: DPAPI가 LocalAlloc한 버퍼이고 한 번만 푼다(null이면 아무것도 안 한다).
+    unsafe { LocalFree(out.pbData.cast()) };
+    Ok(bytes)
+}
+
+/// 자식이 아닌 프로세스의 종료 감시. `SYNCHRONIZE` 핸들을 쥐고 [`EXIT_POLL`]마다 0ms 대기로 확인한다.
+/// 핸들을 쥐고 있어 그사이 PID가 재사용돼도 다른 프로세스를 보지 않는다.
+/// ponytail: 폴링 O(감시 수). 세션이 많아 비용이 보이면 `RegisterWaitForSingleObject`로.
 #[derive(Debug)]
-pub struct ExitWatch(());
+pub struct ExitWatch(Mutex<Vec<(u32, OwnedHandle)>>);
 
-#[expect(clippy::unused_self, reason = "macOS·Linux 판과 같은 시그니처")]
 impl ExitWatch {
+    #[expect(clippy::unnecessary_wraps, reason = "macOS·Linux 판과 같은 시그니처")]
     pub fn new() -> io::Result<Self> {
-        unsupported()
+        Ok(Self(Mutex::new(Vec::new())))
     }
 
-    pub fn add(&self, _pid: u32) -> io::Result<()> {
-        unsupported()
+    /// `pid`를 감시에 더한다. 이미 없는 pid면 `OpenProcess` 오류(`ERROR_INVALID_PARAMETER`).
+    pub fn add(&self, pid: u32) -> io::Result<()> {
+        let handle = open_process(pid, PROCESS_SYNCHRONIZE)?;
+        self.handles()?.push((pid, handle));
+        Ok(())
     }
 
+    /// 감시하던 프로세스 하나가 끝날 때까지 기다리고 그 pid를 돌려준다.
     pub fn next(&self) -> io::Result<u32> {
-        unsupported()
+        loop {
+            if let Some(pid) = self.take(1)?.pop() {
+                return Ok(pid);
+            }
+            std::thread::sleep(EXIT_POLL);
+        }
     }
 
+    /// 지금 끝나 있는 것을 꺼낸다. 기다리지 않는다.
     pub(crate) fn drain(&self) -> io::Result<Vec<u32>> {
-        unsupported()
+        self.take(usize::MAX)
+    }
+
+    /// 끝난 것을 `max`개까지 꺼내고 감시에서 뺀다(한 번만 알린다).
+    fn take(&self, max: usize) -> io::Result<Vec<u32>> {
+        let mut done = Vec::new();
+        self.handles()?.retain(|(pid, handle)| {
+            if done.len() >= max {
+                return true;
+            }
+            // SAFETY: SYNCHRONIZE로 연 유효한 프로세스 핸들이다. 기다리지 않는다(0ms).
+            let exited = unsafe { WaitForSingleObject(handle.as_raw_handle(), 0) } == WAIT_OBJECT_0;
+            if exited {
+                done.push(*pid);
+            }
+            !exited
+        });
+        Ok(done)
+    }
+
+    fn handles(&self) -> io::Result<std::sync::MutexGuard<'_, Vec<(u32, OwnedHandle)>>> {
+        self.0
+            .lock()
+            .map_err(|_| io::Error::other("exit watch poisoned"))
     }
 }
 
@@ -106,4 +475,80 @@ pub(crate) fn exclude_from_backup(_dir: BorrowedHandle<'_>) -> io::Result<()> {
 /// clone 없음: 호출자가 일반 복사로 넘어간다.
 pub(crate) fn clone_file(_src: &Path, _dst: &Path) -> io::Result<()> {
     unsupported()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn process_queries_describe_this_process() {
+        let me = std::process::id();
+        assert!(start_us(me).unwrap() > 0);
+        assert_eq!(start_us(me).unwrap(), start_us(me).unwrap());
+        assert_eq!(
+            current_directory(me).unwrap(),
+            std::env::current_dir().unwrap()
+        );
+        assert!(footprint(me).unwrap() > 0);
+        assert!(resources().unwrap().0 > 0);
+        assert!(all_pids().unwrap().contains(&me));
+        assert!(
+            !process_name(me)
+                .unwrap()
+                .to_ascii_lowercase()
+                .ends_with(".exe")
+        );
+        let parent = parent_pid(me).unwrap();
+        assert_ne!(parent, me);
+        assert!(parent == 0 || start_us(parent).unwrap() <= start_us(me).unwrap());
+    }
+
+    #[test]
+    fn child_tree_and_exit_watch() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "ping -n 2 127.0.0.1 >NUL"])
+            .spawn()
+            .unwrap();
+        assert_eq!(parent_pid(child.id()).unwrap(), std::process::id());
+        assert_eq!(
+            process_name(child.id()).unwrap().to_ascii_lowercase(),
+            "cmd"
+        );
+        let watch = ExitWatch::new().unwrap();
+        watch.add(child.id()).unwrap();
+        assert!(watch.drain().unwrap().is_empty());
+        assert_eq!(watch.next().unwrap(), child.id());
+        child.wait().unwrap();
+        assert!(watch.drain().unwrap().is_empty());
+    }
+
+    #[test]
+    fn dpapi_round_trip_and_tamper() {
+        let key = [7_u8; 32];
+        let sealed = protect(&key).unwrap();
+        assert_ne!(sealed.as_slice(), key.as_slice());
+        assert_eq!(unprotect(&sealed).unwrap().as_slice(), key.as_slice());
+        let mut bad = sealed.clone();
+        if let Some(last) = bad.last_mut() {
+            *last ^= 1;
+        }
+        assert!(unprotect(&bad).is_err());
+    }
+
+    #[test]
+    fn af_unix_peer_is_this_user() {
+        use std::os::windows::io::AsSocket as _;
+        let dir = std::env::temp_dir().join(format!("krilld-peer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s");
+        std::fs::remove_file(&path).ok();
+        let listener = krill_proto::os::net::UnixListener::bind(&path).unwrap();
+        let client = krill_proto::os::net::UnixStream::connect(&path).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        assert_eq!(peer_pid(server.as_socket()).unwrap(), std::process::id());
+        assert_eq!(peer_uid(server.as_socket()).unwrap(), SAME_USER);
+        drop((client, server, listener));
+        std::fs::remove_dir_all(dir).ok();
+    }
 }
