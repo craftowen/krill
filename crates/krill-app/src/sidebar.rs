@@ -2141,23 +2141,12 @@ impl Sidebar {
             .sessions
             .iter()
             .map(|s| {
-                let tree = s
-                    .worktree
-                    .as_deref()
-                    .map(|p| self.name(p))
-                    .unwrap_or_default();
-                let agent = s.status.agent.trim();
-                let label = if agent.is_empty() {
-                    // OWE-851: 빈 에이전트명은 워크트리·세션 이름으로 대신하고 빈 칸을 두지 않는다.
-                    format!("{} · {}", self.session_who(s), state_text(s.status.state))
-                } else if tree.trim().is_empty() {
-                    format!("{agent} {} · {}", s.id.0, state_text(s.status.state))
+                // STYLEGUIDE §7.4: 사이드바 세션 행과 같은 라벨 규칙(`session_label`)을 공유한다.
+                let (name, detail) = self.session_label(s);
+                let label = if detail.is_empty() {
+                    format!("{name} · {}", state_text(s.status.state))
                 } else {
-                    format!(
-                        "{agent} {} · {tree} · {}",
-                        s.id.0,
-                        state_text(s.status.state)
-                    )
+                    format!("{name} · {detail} · {}", state_text(s.status.state))
                 };
                 Item::new(s.id, label, needs_you(&s.status)).with_agent(s.status.agent.clone())
             })

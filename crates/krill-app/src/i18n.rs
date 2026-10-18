@@ -462,7 +462,7 @@ catalog! {
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),
         EXITED => ("종료됨", "Exited"),
-        CLOSE => ("×", "×"),
+        CLOSE => ("닫기", "Close"),
         SESSION_EXITED => ("세션 {id} · {state}", "Session {id} · {state}"),
         SESSION_PID => ("세션 {id} · pid {pid}", "Session {id} · pid {pid}"),
     }
@@ -521,7 +521,7 @@ catalog! {
         HOST_DISCONNECTED => ("끊김", "Disconnected"),
         HOST_RECONNECT => ("다시 연결", "Reconnect"),
         SESSION_ACCOUNT => ("계정 {label}", "Account {label}"),
-        COORD_BADGE => ("⚡ 지휘자", "⚡ coord"),
+        COORD_BADGE => ("지휘자", "coord"),
         SEARCH_SHORT => ("검색", "Search"),
         NAV_AGENT_DASHBOARD => ("에이전트 대시보드", "Agent Dashboard"),
         HIDING_DISCOVERED_ONE => ("감지된 워크트리 1개 숨김", "Hiding 1 discovered worktree"),
