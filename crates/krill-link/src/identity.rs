@@ -4,7 +4,10 @@
 //! - 로그·오류·`Debug` 출력에 비밀키 원문이나 바이트를 절대 노출하지 않는다.
 
 use std::fmt;
-use std::fs::{self, Permissions};
+use std::fs;
+#[cfg(unix)]
+use std::fs::Permissions;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 
@@ -59,6 +62,7 @@ impl DeviceIdentity {
     }
 
     fn load_existing(path: &Path) -> Result<Self, Error> {
+        #[cfg(unix)]
         if let Ok(meta) = fs::metadata(path) {
             let mode = meta.permissions().mode() & 0o777;
             if mode != 0o600 {
@@ -76,6 +80,7 @@ impl DeviceIdentity {
         self.secret.public()
     }
 
+    #[cfg(unix)]
     pub(crate) fn secret_key(&self) -> &SecretKey {
         &self.secret
     }
@@ -120,8 +125,11 @@ mod tests {
         let id1 = DeviceIdentity::load_or_create(&dir).unwrap();
         let path = DeviceIdentity::key_path(&dir);
         assert!(path.is_file());
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
 
         let id2 = DeviceIdentity::load_or_create(&dir).unwrap();
         assert_eq!(id1.node_id(), id2.node_id());

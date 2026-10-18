@@ -9,15 +9,22 @@ use std::time::{Duration, Instant};
 use iroh::EndpointAddr;
 use serde::{Deserialize, Serialize};
 
+use crate::Error;
+#[cfg(unix)]
 use crate::config::{LinkConfig, RelaySetting};
+#[cfg(unix)]
 use crate::identity::DeviceIdentity;
 use crate::qr::{QrMatrix, encode_qr, render_qr_unicode};
+#[cfg(unix)]
 use crate::serve::build_iroh_endpoint;
 use crate::store::{
-    DEFAULT_INVITE_TTL, InviteToken, RemoteHost, compact_endpoint_addr, create_invite, decode_hex,
-    encode_hex, now_unix_secs, sanitize_id_slug, upsert_host,
+    InviteToken, RemoteHost, compact_endpoint_addr, create_invite, decode_hex, encode_hex,
 };
-use crate::{ALPN_PAIR, Error};
+#[cfg(unix)]
+use crate::{
+    ALPN_PAIR,
+    store::{DEFAULT_INVITE_TTL, now_unix_secs, sanitize_id_slug, upsert_host},
+};
 
 /// 짝짓기 링크 스킴 접두어.
 pub const PAIR_URI_PREFIX: &str = "krill://pair?";
@@ -316,6 +323,7 @@ pub fn generate_invite_for_addr(
 }
 
 /// 기본 10분 만료로 초대 링크를 생성한다 (`serve`가 실행 중이면 그 주소를 쓰고, 아니면 임시 엔드포인트를 바인드해 주소를 얻는다).
+#[cfg(unix)]
 pub async fn create_invite_command(
     state_dir: &Path,
     ttl: Option<Duration>,
@@ -345,6 +353,7 @@ pub async fn create_invite_command(
 
 /// 클라이언트 `krill-link pair <링크> --name <기기 이름>`:
 /// ALPN `minikrill/pair/1`로 서버에 토큰·기기 이름을 보내 검증받고 `link/hosts.toml`에 호스트를 저장한다.
+#[cfg(unix)]
 pub async fn pair_with_server(
     state_dir: &Path,
     link_str: &str,
@@ -546,4 +555,31 @@ mod tests {
         // 윈도우(10초) 경과 후에는 다시 허용됨
         assert!(limiter.check_and_record_attempt(t0 + Duration::from_secs(15)));
     }
+}
+
+/// Invitation transport is unavailable until native local IPC is implemented.
+#[cfg(not(unix))]
+#[expect(
+    clippy::unused_async,
+    reason = "preserve the native transport async signature"
+)]
+pub async fn create_invite_command(
+    _state_dir: &Path,
+    _ttl: Option<Duration>,
+) -> Result<InviteOutput, Error> {
+    Err(crate::unsupported_platform())
+}
+
+/// Pairing transport is unavailable until native local IPC is implemented.
+#[cfg(not(unix))]
+#[expect(
+    clippy::unused_async,
+    reason = "preserve the native transport async signature"
+)]
+pub async fn pair_with_server(
+    _state_dir: &Path,
+    _link_str: &str,
+    _device_name: &str,
+) -> Result<RemoteHost, Error> {
+    Err(crate::unsupported_platform())
 }

@@ -8,8 +8,7 @@ use std::sync::{
 use super::wire::CHUNK;
 use crate::Error;
 
-/// Shared across every server and tunnel in this process, including in-flight frames.
-pub const PROCESS_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
+use super::PROCESS_BUFFER_LIMIT;
 static BUFFER_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug)]
