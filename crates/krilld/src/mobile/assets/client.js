@@ -23,19 +23,21 @@
   function poll(){clearTimeout(timer);if(!connected||stopped)return;timer=setTimeout(async()=>{try{await refresh();}catch(e){options.onError?.(e);}poll();},2500);}
   async function connect(){
    if(connecting||stopped||connected)return;connecting=true;clearTimeout(retryTimer);clearTimeout(timer);await serial;const current=++generation;queue=[];waiters=[];failed=null;status('connecting','Connecting…');
+   // 0 연결 전, 2 challenge 받음, 3 인증됨. 2에서 실패하면 회수·인증 실패라 재시도하지 않는다(게이트웨이 전역 실패 예산 보호).
+   let stage=0;
    try{
     if(!pair&&!credentials)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
     const active=socket=new WebSocket(options.url);active.binaryType='arraybuffer';
     active.addEventListener('message',e=>{if(current!==generation)return;const w=waiters.shift();if(w)w.resolve(e.data);else queue.push(e.data);});
     const end=()=>{if(current===generation)disconnect(Error('Disconnected. Pending actions were not resent.'));};active.addEventListener('close',end);active.addEventListener('error',end);
     await new Promise((resolve,reject)=>{active.addEventListener('open',resolve,{once:true});active.addEventListener('error',()=>reject(Error('Could not connect to desktop')),{once:true});active.addEventListener('close',()=>reject(failed||Error('Disconnected')),{once:true});});
-    const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported desktop protocol');
+    const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));stage=2;if(challenge.version!==2)throw Error('Unsupported desktop protocol');
     const pairing=!!pair,secret=pairing?C.unbase64(pair.secret):C.sha256(C.unhex(credentials.credential));channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));secret.fill(0);
     active.send(JSON.stringify({token:pairing?pair.ticket:null,device_id:pairing?null:credentials.device_id,client_nonce:C.hex(nonce)}));send(C.enc.encode(JSON.stringify({label:options.label||'Mobile browser'})));
-    const auth=JSON.parse(decode.decode(await plain()));if(auth.credential){credentials=auth;pair=null;options.onAuthenticated?.(auth);}
+    const auth=JSON.parse(decode.decode(await plain()));stage=3;if(auth.credential){credentials=auth;pair=null;options.onAuthenticated?.(auth);}
     const hello=reader((await plain()).slice(5));hello.u();hello.u();const features=hello.u();send(frame(2,C.concat(v(1),v(1),v(features),v(0),text('krill-mobile-pwa'))));
     connected=true;await refresh();retryDelay=1000;status('ready','Encrypted · connected');poll();
-   }catch(e){options.onError?.(e);disconnect(e);}finally{connecting=false;if(!connected)retry();}
+   }catch(e){options.onError?.(e);disconnect(e);}finally{connecting=false;if(!connected&&stage!==2)retry();}
   }
   return {connect,rpc,refresh,reconnect(){disconnect(Error('Reconnecting… Pending actions were not resent.'));retryDelay=1000;connect();},get ready(){return connected;},get credentials(){return credentials;},resume(){if(!connected){retryDelay=1000;connect();}else refresh().catch(options.onError);},terminalConnect(){if(!connected||!credentials)throw Error('Reconnect to desktop first');return {socket:new WebSocket(options.url),credentials};},close(){stopped=true;clearTimeout(timer);clearTimeout(retryTimer);disconnect(Error('Disconnected'));}};
  }};

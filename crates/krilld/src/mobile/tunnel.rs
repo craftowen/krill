@@ -1,13 +1,22 @@
 //! Cloudflare Quick Tunnel의 프로세스 수명. 키·pair token은 cloudflared 인자에 넣지 않는다.
+use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// URL이 찍힌 뒤에도 엣지 등록·DNS 전파 전에는 530/NXDOMAIN이 난다(실측 1.8~34초).
+/// 프로브가 200을 받아야 `ready`이고, 이 시간 안에 준비되지 않으면 감시자가 다시 띄운다.
+pub const READY_DEADLINE: Duration = Duration::from_secs(90);
+type Probe = fn(&str) -> bool;
 
 pub struct Tunnel {
     child: Option<Child>,
-    pub url: String,
+    url: Arc<OnceLock<String>>,
+    ready: Arc<AtomicBool>,
+    started: Instant,
 }
 impl std::fmt::Debug for Tunnel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -15,13 +24,14 @@ impl std::fmt::Debug for Tunnel {
     }
 }
 impl Tunnel {
+    /// 즉시 반환한다. URL 발행과 준비 확인은 백그라운드 스레드가 하므로 게이트웨이 락을 잡고 기다리지 않는다.
     pub fn start(port: u16) -> io::Result<Self> {
         let binary =
             std::env::var_os("KRILL_CLOUDFLARED_BIN").unwrap_or_else(|| "cloudflared".into());
-        Self::spawn(&binary, port, Duration::from_secs(15))
+        Self::spawn(&binary, port, probe)
     }
-    fn spawn(binary: &std::ffi::OsStr, port: u16, timeout: Duration) -> io::Result<Self> {
-        let child = Command::new(binary)
+    fn spawn(binary: &OsStr, port: u16, probe: Probe) -> io::Result<Self> {
+        let mut child = Command::new(binary)
             .args([
                 "tunnel",
                 "--no-autoupdate",
@@ -38,23 +48,22 @@ impl Tunnel {
                     "cloudflared unavailable; install with brew install cloudflared",
                 )
             })?;
-        let mut tunnel = Self {
+        let stderr = child.stderr.take();
+        let tunnel = Self {
             child: Some(child),
-            url: String::new(),
+            url: Arc::new(OnceLock::new()),
+            ready: Arc::new(AtomicBool::new(false)),
+            started: Instant::now(),
         };
-        let mut stderr = tunnel
-            .child
-            .as_mut()
-            .and_then(|c| c.stderr.take())
-            .ok_or_else(|| io::Error::other("cloudflared stderr unavailable"))?;
-        let (send, receive) = mpsc::sync_channel(1);
+        let mut stderr =
+            stderr.ok_or_else(|| io::Error::other("cloudflared stderr unavailable"))?;
+        let (url, ready) = (Arc::clone(&tunnel.url), Arc::clone(&tunnel.ready));
         thread::Builder::new()
             .name("mobile-tunnel-log".into())
             .stack_size(128 * 1024)
             .spawn(move || {
                 let mut buffer = [0; 2048];
                 let mut pending = String::new();
-                let mut published = false;
                 while let Ok(n) = stderr.read(&mut buffer) {
                     if n == 0 {
                         break;
@@ -62,9 +71,25 @@ impl Tunnel {
                     if let Some(bytes) = buffer.get(..n) {
                         pending.push_str(&String::from_utf8_lossy(bytes));
                     }
-                    if !published && let Some(url) = parse_url(&pending) {
-                        send.send(url).ok();
-                        published = true;
+                    if url.get().is_none()
+                        && let Some(found) = parse_url(&pending)
+                    {
+                        url.set(found.clone()).ok();
+                        let ready = Arc::clone(&ready);
+                        thread::Builder::new()
+                            .name("mobile-tunnel-probe".into())
+                            .stack_size(128 * 1024)
+                            .spawn(move || {
+                                let deadline = Instant::now() + READY_DEADLINE;
+                                while Instant::now() < deadline {
+                                    if probe(&found) {
+                                        ready.store(true, Ordering::Release);
+                                        return;
+                                    }
+                                    thread::sleep(Duration::from_millis(500));
+                                }
+                            })
+                            .ok();
                     }
                     if pending.len() > 4096 {
                         pending = pending
@@ -78,18 +103,23 @@ impl Tunnel {
                     }
                 }
             })?;
-        tunnel.url = receive.recv_timeout(timeout).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::TimedOut,
-                "cloudflared did not publish a Quick Tunnel URL",
-            )
-        })?;
         Ok(tunnel)
     }
-    pub fn running(&mut self) -> bool {
-        self.child
+    /// cloudflared가 찍은 URL. 준비 전일 수 있다.
+    pub fn url(&self) -> Option<&str> {
+        self.url.get().map(String::as_str)
+    }
+    /// 공개 경로로 실제 HTTP 200을 받은 URL.
+    pub fn ready_url(&self) -> Option<&str> {
+        self.url().filter(|_| self.ready.load(Ordering::Acquire))
+    }
+    /// 프로세스가 살아 있고 준비 기한을 넘기지 않았다. 아니면 감시자가 교체한다.
+    pub fn healthy(&mut self) -> bool {
+        let alive = self
+            .child
             .as_mut()
-            .is_none_or(|c| c.try_wait().is_ok_and(|s| s.is_none()))
+            .is_none_or(|c| c.try_wait().is_ok_and(|s| s.is_none()));
+        alive && (self.ready.load(Ordering::Acquire) || self.started.elapsed() < READY_DEADLINE)
     }
     #[cfg(test)]
     pub(super) fn fixture(port: u16) -> io::Result<Self> {
@@ -98,8 +128,24 @@ impl Tunnel {
         }
         Ok(Self {
             child: None,
-            url: "https://fixture-mobile.trycloudflare.com".into(),
+            url: Arc::new(OnceLock::from(
+                "https://fixture-mobile.trycloudflare.com".to_owned(),
+            )),
+            ready: Arc::new(AtomicBool::new(true)),
+            started: Instant::now(),
         })
+    }
+}
+#[cfg(test)]
+impl Tunnel {
+    /// URL은 찍혔지만 준비 기한을 넘긴 터널.
+    pub(super) fn stale(port: u16) -> io::Result<Self> {
+        let mut tunnel = Self::fixture(port)?;
+        tunnel.ready = Arc::new(AtomicBool::new(false));
+        tunnel.started = Instant::now()
+            .checked_sub(READY_DEADLINE + Duration::from_secs(1))
+            .ok_or(io::ErrorKind::InvalidInput)?;
+        Ok(tunnel)
     }
 }
 impl Drop for Tunnel {
@@ -108,6 +154,33 @@ impl Drop for Tunnel {
             child.kill().ok();
             child.wait().ok();
         }
+    }
+}
+/// 로컬 리졸버의 NXDOMAIN 음성 캐시(60초)를 피하려고 apex로 연결하고 SNI·Host만 터널 이름을 쓴다.
+/// curl이 없으면(일부 Linux) 확인을 건너뛰고 준비된 것으로 본다.
+fn probe(url: &str) -> bool {
+    let Some(host) = url.strip_prefix("https://") else {
+        return false;
+    };
+    match Command::new("curl")
+        .args([
+            "-sS",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{http_code}",
+            "--max-time",
+            "5",
+            "--connect-to",
+            &format!("{host}:443:trycloudflare.com:443"),
+            &format!("{url}/manifest.json"),
+        ])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(out) => out.stdout == b"200",
+        Err(e) => e.kind() == io::ErrorKind::NotFound,
     }
 }
 pub fn parse_url(text: &str) -> Option<String> {
@@ -158,8 +231,16 @@ mod tests {
         let script = dir.join("cloudflared");
         std::fs::write(&script,"#!/bin/sh\nprintf '%s\\n' \"$*\" >&2\nprintf 'https://test-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 30\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut tunnel = Tunnel::spawn(script.as_os_str(), 1234, Duration::from_secs(2)).unwrap();
-        assert!(tunnel.running());
+        let mut tunnel = Tunnel::spawn(script.as_os_str(), 1234, |_| true).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tunnel.ready_url().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            tunnel.ready_url(),
+            Some("https://test-mobile.trycloudflare.com")
+        );
+        assert!(tunnel.healthy());
         let pid = tunnel.child.as_ref().unwrap().id();
         drop(tunnel);
         let alive = Command::new("/bin/kill")
@@ -169,6 +250,24 @@ mod tests {
             .unwrap()
             .success();
         assert!(!alive);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn unready_url_is_published_but_not_ready() {
+        let dir = std::env::temp_dir().join(format!("mk-tunnel-nr-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("cloudflared");
+        std::fs::write(&script,"#!/bin/sh\nprintf 'https://slow-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut tunnel = Tunnel::spawn(script.as_os_str(), 1234, |_| false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while tunnel.url().is_none() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(tunnel.url(), Some("https://slow-mobile.trycloudflare.com"));
+        assert!(tunnel.ready_url().is_none());
+        assert!(tunnel.healthy());
+        drop(tunnel);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
