@@ -542,7 +542,7 @@ fn serve(
                     .set_read_timeout(Some(Duration::from_millis(50)))
                     .ok();
                 let mut drain = [0; 512];
-                let _ = io::Read::read(&mut socket, &mut drain);
+                io::Read::read(&mut socket, &mut drain).ok();
             }
             return Err(error);
         }
