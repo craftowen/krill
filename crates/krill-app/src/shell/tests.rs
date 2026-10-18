@@ -4771,3 +4771,141 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
 
     std::fs::remove_file(&tmp_file).ok();
 }
+
+/// OWE-879: '+' 새 세션 메뉴는 계정이 1개일 때 하위 메뉴 없이 에이전트 아이콘·단축키(⌥⌘1~4)를 유지하고,
+/// 2개 이상일 때만 아이콘이 달린 하위 메뉴를 열며, `new_agent_with_account`도 `launch_host` 원격 타깃과
+/// 원격 경로 규칙을 `new_agent`와 동일하게 적용한다.
+#[gpui::test]
+fn new_session_menu_keeps_shortcut_with_single_account_and_applies_launch_host_for_account_launch(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostId;
+    use krill_proto::control::{AgentProfile, AgentSettings};
+    use krill_proto::usage::{AccountInfo, AccountsSnapshot, ProviderKind, Snapshot};
+
+    let (view, cx) = open(cx, state_path("owe-879"));
+    cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+    let account = |id: &str, label: &str, active: bool, host_default: bool| AccountInfo {
+        id: id.into(),
+        provider: ProviderKind::Claude,
+        label: label.into(),
+        email: None,
+        profile_dir: format!("/tmp/{id}"),
+        active,
+        host_default,
+        stale: false,
+        usage: Snapshot::default(),
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.link = Link::Up;
+            s.agents = Some(AgentSettings {
+                permission: Permission::Manual,
+                profiles: vec![
+                    AgentProfile {
+                        id: "claude".into(),
+                        name: "Claude Code".into(),
+                    },
+                    AgentProfile {
+                        id: "codex".into(),
+                        name: "Codex".into(),
+                    },
+                ],
+            });
+            let mut snap = AccountsSnapshot::default();
+            snap.advanced.supported = true;
+            snap.accounts
+                .push(account("claude-default", "Host (.claude)", true, true));
+            s.accounts_snapshot = snap;
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    cx.run_until_parked();
+
+    // 1. 계정이 1개일 때 '+' 메뉴를 열면 하위 메뉴로 대체되지 않고 ⌥⌘1 단축키가 바로 표시된다.
+    // '+' 버튼은 검색 행 호버 때만 보이므로(hover-reveal) 먼저 행 위로 마우스를 올린다.
+    // 행 자체에는 debug_selector가 없어 트리거 좌표로 호버한다(트리거는 행 안에 있다).
+    // 참고: 팝업 컨테이너의 "popup-menu" id는 이 gpui 버전의 debug_bounds에 잡히지 않아
+    // 메뉴가 열렸음은 항목의 kbd 힌트("kbd:alt-cmd-1" 등)로 확인한다.
+    let hover_at = cx
+        .debug_bounds("new-session")
+        .expect("new-session trigger")
+        .center();
+    cx.simulate_mouse_move(hover_at, None, gpui::Modifiers::default());
+    cx.run_until_parked();
+    let trigger = cx.debug_bounds("new-session").expect("new-session trigger");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("kbd:alt-cmd-1").is_some(),
+        "single account must keep ⌥⌘1 shortcut on top-level agent item"
+    );
+    assert!(cx.debug_bounds("kbd:alt-cmd-2").is_some());
+    // 아래 화살표로 Claude Code 항목을 선택해도 불필요한 하위 메뉴가 열리지 않고 Enter로 바로 실행된다.
+    cx.simulate_keystrokes("down down enter");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+    let first_agent_pane = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(
+        layout_of(&view, cx)
+            .launch(first_agent_pane)
+            .map(|c| (&c.program, &c.account)),
+        Some((
+            &Program::Agent {
+                id: "claude".into()
+            },
+            &None
+        ))
+    );
+
+    // 2. 원격 실행 위치를 선택한 상태에서 `new_agent_with_account`를 호출하면 원격 호스트와 원격 경로 규칙이 적용된다.
+    let remote_host = HostId::Remote("studio-mac".into());
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_launch_host(remote_host.clone(), cx);
+            s.new_agent_with_account("claude".into(), "claude-work".into(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 3);
+    let remote_pane_1 = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(
+        layout_of(&view, cx).host(remote_pane_1),
+        &remote_host,
+        "new_agent_with_account must apply self.launch_host to the new pane"
+    );
+    let layout_1 = layout_of(&view, cx);
+    let launch_1 = layout_1.launch(remote_pane_1).expect("remote launch");
+    assert_eq!(
+        launch_1.program,
+        Program::Agent {
+            id: "claude".into()
+        }
+    );
+    assert_eq!(launch_1.account.as_deref(), Some("claude-work"));
+    assert!(
+        launch_1.cwd.is_empty(),
+        "switching from local pane to remote launch_host must use remote default cwd (empty)"
+    );
+
+    // 이미 같은 원격 호스트 패인에 포커스되어 있을 때는 그 원격 폴더 경로를 그대로 이어받는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut updated = s.launch_for(remote_pane_1);
+            updated.cwd = b"/home/owen/remote-work".to_vec();
+            s.layout.set_launch(remote_pane_1, updated);
+            s.new_agent_with_account("claude".into(), "claude-work".into(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 4);
+    let remote_pane_2 = layout_of(&view, cx).active_tab().focused;
+    assert_eq!(layout_of(&view, cx).host(remote_pane_2), &remote_host);
+    let layout_2 = layout_of(&view, cx);
+    let launch_2 = layout_2
+        .launch(remote_pane_2)
+        .expect("second remote launch");
+    assert_eq!(launch_2.account.as_deref(), Some("claude-work"));
+    assert_eq!(launch_2.cwd, b"/home/owen/remote-work".to_vec());
+}
