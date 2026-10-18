@@ -3460,7 +3460,7 @@ impl Shell {
         }
     }
 
-    fn render_sidebar_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_sidebar_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = krill_app::ui::palette(cx);
         let can_back = self.can_navigate_back(cx);
         let can_forward = self.can_navigate_forward(cx);
@@ -3469,7 +3469,7 @@ impl Shell {
             .h(krill_app::ui::TITLEBAR_HEIGHT)
             .w_full()
             .flex_none()
-            .pl(krill_app::ui::TRAFFIC_LIGHT_PAD)
+            .pl(traffic_light_pad(window))
             .pr_2()
             .flex()
             .items_center()
@@ -4289,6 +4289,15 @@ impl Shell {
 /// 분할선: 1pt 선 + 잡는 폭 5pt. 드래그 값은 `Drag`, 실제 크기 계산은 부모의 `on_drag_move`가 한다.
 /// OWE-871: 기본 선 색은 `p.split_divider`(STYLEGUIDE §3.1)이며, 분할 트리의 선(`reset` 있음)을
 /// 더블클릭하면 50:50(`ratio = 0.5`)으로 되돌린다.
+/// 타이틀바 첫 컨트롤의 왼쪽 여백. 전체화면에서는 신호등이 숨으므로 비우지 않는다(K11).
+fn traffic_light_pad(window: &Window) -> Pixels {
+    if window.is_fullscreen() {
+        krill_app::ui::SPACE_2
+    } else {
+        krill_app::ui::TRAFFIC_LIGHT_PAD
+    }
+}
+
 fn divider(
     id: ElementId,
     drag: Drag,
@@ -4812,7 +4821,7 @@ impl Render for Shell {
                                 .bg(sidebar_bg)
                                 .flex()
                                 .flex_col()
-                                .child(self.render_sidebar_header(cx))
+                                .child(self.render_sidebar_header(window, cx))
                                 .child(self.render_agents(cx))
                                 .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
                                 .child(self.detached.clone())
@@ -4834,7 +4843,7 @@ impl Render for Shell {
                             .flex()
                             .flex_col()
                             .bg(bg)
-                            .child(self.render_tab_bar(cx))
+                            .child(self.render_tab_bar(window, cx))
                             .children(self.link.banner().map(|msg| {
                                 div()
                                     .px_3()

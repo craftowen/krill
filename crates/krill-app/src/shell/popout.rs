@@ -1876,7 +1876,7 @@ impl Render for Dashboard {
             .child(
                 div()
                     .h(ui::TITLEBAR_HEIGHT)
-                    .pl(ui::TRAFFIC_LIGHT_PAD)
+                    .pl(super::traffic_light_pad(window))
                     .flex()
                     .items_center()
                     .child(text::DASHBOARD.get()),
