@@ -315,3 +315,28 @@ fn live_action_payload_includes_resolved_pid_window_and_keycodes() {
     assert_eq!(key_payload["usingMods"][0], "shift down");
     assert_eq!(key_payload["repeat"], 2);
 }
+
+#[test]
+fn jxa_scripts_preserve_pid_whose_specifier_without_array_evaluation() {
+    use super::engine::{LIVE_ACTION_JXA_SCRIPT, LIVE_WINDOW_AX_JXA_SCRIPT};
+
+    for script in [LIVE_WINDOW_AX_JXA_SCRIPT, LIVE_ACTION_JXA_SCRIPT] {
+        assert!(
+            script.contains("se.processes.whose({ unixId: targetPid }).first"),
+            "JXA script must use whose({{ unixId: targetPid }}).first to preserve PID filter specifier"
+        );
+        assert!(
+            !script.contains("whose({ unixId: targetPid })()")
+                && !script.contains("whose({ unixId: Number(req.pid) })()"),
+            "JXA script must not evaluate whose(...)() into an array that normalizes to byName"
+        );
+        assert!(
+            !script.contains("proc.windows()"),
+            "JXA script must pass proc.windows collection specifier without ()"
+        );
+        assert!(
+            !script.contains("parent.uiElements()"),
+            "JXA script must index parent.uiElements collection specifier without ()"
+        );
+    }
+}
