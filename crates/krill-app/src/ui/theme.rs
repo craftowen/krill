@@ -4,7 +4,7 @@
 //! `.ref/orca/src/shared/terminal-themes/defaults.ts`에서 가져와 순수 Rust/gpui 상수로 옮겼다.
 //! 출처·저작권: Copyright (c) 2026 Lovecast Inc. (MIT License, `.ref/orca/LICENSE`).
 
-use gpui::{App, Hsla, Pixels, Point, Rems, point, px, rems};
+use gpui::{App, Hsla, Pixels, Point, Rems, SharedString, TitlebarOptions, point, px, rems};
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode};
 use krill_proto::control::AgentState;
 use krill_proto::theme::{Rgb, Theme as TerminalTheme};
@@ -40,8 +40,22 @@ pub const SPACE_4: Pixels = px(16.);
 pub const TITLEBAR_HEIGHT: Pixels = px(36.);
 /// macOS 신호등(닫기·최소화·전체화면) 위치 inset.
 pub const TRAFFIC_LIGHT_INSET: Point<Pixels> = point(px(12.), px(10.));
-/// 신호등 오른쪽에 오는 타이틀바 첫 컨트롤의 왼쪽 여백(Orca `pl-20` 대응).
-pub const TRAFFIC_LIGHT_PAD: Pixels = px(78.);
+/// 신호등 오른쪽에 오는 타이틀바 첫 컨트롤의 왼쪽 여백(Orca `pl-20` 대응). 신호등이 없는 OS는 기본 간격만 둔다.
+pub const TRAFFIC_LIGHT_PAD: Pixels = if cfg!(target_os = "macos") {
+    px(78.)
+} else {
+    SPACE_2
+};
+
+/// 창 제목 표시줄(OWE-834). macOS는 투명 제목 표시줄 위에 신호등을 띄우고 앱이 상단 막대를 그린다. 그 밖의 OS는 OS 기본
+/// 제목 표시줄을 쓴다 — 최소화·최대화·닫기 버튼, 드래그, 더블클릭 최대화, 스냅 레이아웃을 OS가 맡는다.
+pub fn titlebar(title: impl Into<SharedString>) -> TitlebarOptions {
+    TitlebarOptions {
+        title: Some(title.into()),
+        appears_transparent: cfg!(target_os = "macos"),
+        traffic_light_position: cfg!(target_os = "macos").then_some(TRAFFIC_LIGHT_INSET),
+    }
+}
 /// 탭 바 높이(1단 통합 상단 바와 동일하게 36px).
 pub const TAB_BAR_HEIGHT: Pixels = px(36.);
 /// Orca 탭 너비(`tab-width-rules.ts`: 기본 180px·넓은 화면 220px·최소 72px).

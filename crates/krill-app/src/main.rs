@@ -141,11 +141,9 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
     let bounds = Bounds::centered(None, size(px(1200.), px(760.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        titlebar: Some(TitlebarOptions {
-            title: Some(krill_app::i18n::catalog::security::APP_MENU.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(krill_app::ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(krill_app::ui::titlebar(
+            krill_app::i18n::catalog::security::APP_MENU.get(),
+        )),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
