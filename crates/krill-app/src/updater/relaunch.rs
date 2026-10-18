@@ -563,6 +563,7 @@ pub fn offer_rollback(state_dir: PathBuf, window: &mut Window, cx: &mut App) {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

@@ -117,6 +117,7 @@ pub struct Survey {
 static READER_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) fn login_path_reader_count() -> usize {
     READER_THREADS.load(Ordering::Relaxed)
 }
@@ -1043,4 +1044,5 @@ pub mod state;
 mod welcome;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

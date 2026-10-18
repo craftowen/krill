@@ -21,6 +21,7 @@ use krill_proto::control::{
 };
 use krill_proto::daemon;
 #[cfg(test)]
+#[cfg(unix)]
 use krill_proto::daemon::Paths;
 use krill_proto::input::Now;
 use krill_proto::ipc::{self, ClientRole};
@@ -536,10 +537,13 @@ async fn deliver_handoff(
     }
 }
 
+// 실제 PTY(rustix-openpty) e2e라 Unix 전용.
 #[cfg(test)]
+#[cfg(unix)]
 mod e2e_tests;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

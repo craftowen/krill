@@ -720,6 +720,7 @@ pub fn render_hidden_row(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use krill_proto::orchestration::{OrchestrationStore, WorktreeStore};

@@ -41,4 +41,6 @@ proptest = { workspace = true }
 gpui-pre-platform = { workspace = true, features = ["test-support"] }
 gpui-pre = { workspace = true, features = ["test-support"] }
 krilld = { workspace = true }
+
+[target.'cfg(unix)'.dev-dependencies]
 rustix-openpty = { workspace = true }

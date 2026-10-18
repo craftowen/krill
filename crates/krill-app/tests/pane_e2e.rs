@@ -13,7 +13,7 @@
 //! 상태 디렉터리는 임시 디렉터리(`KRILL_STATE_DIR`, 자식 프로세스에만 줌).
 //!
 //! 재현: `cargo nextest run -p krill-app --test pane_e2e --no-capture` (측정값은 `MK490` 줄).
-
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::print_stdout,

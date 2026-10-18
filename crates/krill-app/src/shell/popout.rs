@@ -1717,4 +1717,5 @@ impl Render for Dashboard {
 pub(crate) mod bench;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

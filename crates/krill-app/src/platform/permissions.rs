@@ -667,4 +667,5 @@ unsafe extern "C" {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
