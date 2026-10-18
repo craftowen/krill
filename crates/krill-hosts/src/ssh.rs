@@ -172,7 +172,7 @@ impl SshOptions {
             "-o".to_owned(),
             "StrictHostKeyChecking=accept-new".to_owned(),
             self.destination.clone(),
-            "uname -sr && (command -v krill >/dev/null 2>&1 && echo 'krill: ready' || echo 'krill: not installed')".to_owned(),
+            "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
         args
     }
@@ -216,19 +216,33 @@ pub fn ssh_program() -> OsString {
     std::env::var_os("KRILL_SSH_BIN").unwrap_or_else(|| OsString::from("ssh"))
 }
 
-/// 원격 `$HOME`과 krilld 소켓이 있는 번들 디렉터리를 한 번에 묻는 명령(MK-170). 새 번들 → 옛 번들 순으로 찾는다
-/// (구버전 원격·이관 전 원격 호환). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
+/// 원격 상태 디렉터리 후보(`$HOME` 기준, 탐색 순서): macOS 새 번들 → macOS 옛 번들 → Linux.
+fn remote_state_dirs() -> [String; 3] {
+    [
+        format!("Library/Application Support/{}", daemon::BUNDLE_ID),
+        format!("Library/Application Support/{}", daemon::LEGACY_BUNDLE_ID),
+        format!("{}/{}", daemon::LINUX_STATE_PARENT, daemon::BUNDLE_ID),
+    ]
+}
+
+/// 원격 `$HOME`과 krilld 소켓이 있는 상태 디렉터리를 한 번에 묻는 명령(MK-170). 후보는 [`remote_state_dirs`] 순서로
+/// 찾는다(구버전 원격·이관 전 원격·Linux 호환). 소켓이 없으면 원격 `krill`(`~/.local/bin/krill` → `PATH`)로 데몬을 한 번
+/// 깨운 뒤 다시 찾는다 — 재부팅한 클라우드 VM처럼 아무도 데몬을 띄우지 않은 원격을 위해서다. 그래도 없으면 Linux만
+/// Linux 경로를 답한다. 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
 pub fn remote_query() -> String {
+    let dirs = remote_state_dirs().map(|d| format!("\"{d}\"")).join(" ");
+    let [.., linux] = remote_state_dirs();
     format!(
-        "/bin/sh -c 'printf \"%s\\n\" \"$HOME\"; for b in {} {}; do \
-         if [ -S \"$HOME/Library/Application Support/$b/run/krilld.sock\" ]; then printf %s \"$b\"; break; fi; done'",
-        daemon::BUNDLE_ID,
-        daemon::LEGACY_BUNDLE_ID
+        "/bin/sh -c 'printf \"%s\\n\" \"$HOME\"; \
+         f() {{ for d in {dirs}; do if [ -S \"$HOME/$d/run/krilld.sock\" ]; then printf %s \"$d\"; exit 0; fi; done; }}; f; \
+         k=\"$HOME/.local/bin/krill\"; [ -x \"$k\" ] || k=$(command -v krill); \
+         [ -n \"$k\" ] && \"$k\" ls </dev/null >/dev/null 2>&1; f; \
+         if [ \"$(uname -s)\" = Linux ]; then printf %s \"{linux}\"; fi'"
     )
 }
 
-/// [`remote_query`] 답(첫 줄 `$HOME`, 있으면 둘째 줄에 소켓을 찾은 번들 id)으로 원격 krilld 소켓 경로를 계산한다.
-/// 둘째 줄이 없으면(소켓 없음·`$HOME`만 답함) 새 번들 경로다.
+/// [`remote_query`] 답(첫 줄 `$HOME`, 있으면 둘째 줄에 상태 디렉터리)으로 원격 krilld 소켓 경로를 계산한다.
+/// 둘째 줄이 없거나 후보가 아니면 macOS 새 번들 경로다.
 pub fn remote_socket_for_home(remote_home: &str) -> io::Result<PathBuf> {
     let mut lines = remote_home.lines();
     let home = lines.next().unwrap_or_default().trim();
@@ -238,14 +252,14 @@ pub fn remote_socket_for_home(remote_home: &str) -> io::Result<PathBuf> {
             format!("invalid remote HOME path: {remote_home:?}"),
         ));
     }
-    let bundle = if lines.next().map(str::trim) == Some(daemon::LEGACY_BUNDLE_ID) {
-        daemon::LEGACY_BUNDLE_ID
-    } else {
-        daemon::BUNDLE_ID
-    };
-    Ok(PathBuf::from(home).join(format!(
-        "Library/Application Support/{bundle}/run/krilld.sock"
-    )))
+    let dirs = remote_state_dirs();
+    let found = lines.next().map(str::trim);
+    let [default, ..] = &dirs;
+    let dir = dirs
+        .iter()
+        .find(|d| Some(d.as_str()) == found)
+        .unwrap_or(default);
+    Ok(PathBuf::from(home).join(dir).join("run/krilld.sock"))
 }
 
 /// `ssh <opts> <host> <remote_query>`를 실행해 원격 맥의 `$HOME`과 소켓이 있는 번들 id를 조회한다.

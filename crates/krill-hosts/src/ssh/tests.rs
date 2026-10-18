@@ -160,10 +160,17 @@ fn remote_socket_for_home_computes_remote_user_path() {
         )
     );
     assert_eq!(
-        remote_socket_for_home("/Users/remoteuser\r\ndev.minikrill.app").unwrap(),
+        remote_socket_for_home(
+            "/Users/remoteuser\r\nLibrary/Application Support/dev.minikrill.app"
+        )
+        .unwrap(),
         PathBuf::from(
             "/Users/remoteuser/Library/Application Support/dev.minikrill.app/run/krilld.sock"
         )
+    );
+    assert_eq!(
+        remote_socket_for_home("/home/ubuntu\n.local/share/dev.krill.app").unwrap(),
+        PathBuf::from("/home/ubuntu/.local/share/dev.krill.app/run/krilld.sock")
     );
     // 모르는 둘째 줄은 새 경로로 본다.
     assert_eq!(
@@ -215,12 +222,13 @@ remote_socket = "/Users/alice/custom/krilld.sock"
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// MK-170 규칙 3: 원격 질의를 실제 `/bin/sh`로 돌려 소켓을 새 번들 → 옛 번들 순으로 찾는지 본다.
+/// MK-170 규칙 3: 원격 질의를 실제 `/bin/sh`로 돌려 소켓을 새 번들 → 옛 번들 → Linux 순으로 찾는지 본다.
 /// 원격 맥은 이관 전(옛 holder가 옛 경로)이거나 구버전일 수 있다.
 #[test]
 fn remote_query_prefers_new_socket_then_legacy() {
     let home = PathBuf::from(format!("/tmp/mk170-remote-{}", std::process::id()));
     std::fs::remove_dir_all(&home).ok();
+    let bin = home.join("bin");
     let sock = |bundle: &str| {
         home.join(format!(
             "Library/Application Support/{bundle}/run/krilld.sock"
@@ -230,12 +238,36 @@ fn remote_query_prefers_new_socket_then_legacy() {
         let out = Command::new("/bin/sh")
             .args(["-c", &remote_query()])
             .env("HOME", &home)
+            // 이 맥의 진짜 krill로 데몬을 깨우지 않는다(`/usr/local/bin`·Homebrew 경로 제외).
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
             .output()
             .unwrap();
         assert!(out.status.success());
         remote_socket_for_home(&String::from_utf8(out.stdout).unwrap()).unwrap()
     };
-    assert_eq!(resolve(), sock("dev.krill.app"), "no socket: new path");
+    // 소켓이 없으면 원격 krill(`~/.local/bin/krill`)을 한 번 불러 데몬을 깨운다.
+    let wake = home.join(".local/bin/krill");
+    std::fs::create_dir_all(wake.parent().unwrap()).unwrap();
+    std::fs::write(&wake, "#!/bin/sh\necho \"$1\" >> \"$HOME/woke\"\n").unwrap();
+    std::fs::set_permissions(&wake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        resolve(),
+        sock("dev.krill.app"),
+        "no socket on macOS: new path"
+    );
+    let linux = home.join(".local/share/dev.krill.app/run/krilld.sock");
+    #[cfg(target_os = "linux")]
+    assert_eq!(resolve(), linux, "no socket on Linux: Linux path");
+    assert_eq!(std::fs::read_to_string(home.join("woke")).unwrap(), "ls\n");
+    std::fs::create_dir_all(linux.parent().unwrap()).unwrap();
+    let _linux = UnixListener::bind(&linux).unwrap();
+    assert_eq!(resolve(), linux, "Linux remote");
+    assert_eq!(
+        std::fs::read_to_string(home.join("woke")).unwrap(),
+        "ls\n",
+        "소켓이 있으면 깨우지 않는다"
+    );
     std::fs::create_dir_all(sock("dev.minikrill.app").parent().unwrap()).unwrap();
     let _old = UnixListener::bind(sock("dev.minikrill.app")).unwrap();
     assert_eq!(resolve(), sock("dev.minikrill.app"), "legacy remote");
