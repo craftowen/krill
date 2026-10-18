@@ -6,7 +6,7 @@ Orca 기능을 참고해 순수 Rust로 만드는 초경량 AI 에이전트 병�
 
 ## 요구 사항
 
-- macOS (Apple Silicon·Intel), Command Line Tools
+- macOS (Apple Silicon. 릴리스 번들은 arm64만 배포하며, Intel Mac은 소스 빌드), Command Line Tools
 - Rust 1.98 이상 (MSRV는 루트 `Cargo.toml`, Homebrew rustc 권장, rustup 불필요)
 - Python 3.9 이상 (릴리스 조립 스크립트용)
 

@@ -372,3 +372,27 @@ fn tunnel_owner_child() {
     std::fs::write(dir.join("ready"), "").unwrap();
     std::thread::sleep(std::time::Duration::from_secs(60));
 }
+
+#[test]
+fn sweep_removes_only_dead_forward_sockets() {
+    let dir = std::env::temp_dir().join(format!("krill-sweep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let dead = dir.join("fwd-host-1-0.sock");
+    let live = dir.join("f-2-0.sock");
+    let daemon_sock = dir.join("krilld.sock");
+    drop(UnixListener::bind(&dead).unwrap());
+    let _live = UnixListener::bind(&live).unwrap();
+    drop(UnixListener::bind(&daemon_sock).unwrap());
+
+    sweep_stale_forwards(&dir, Duration::from_secs(3600));
+    assert!(dead.exists(), "fresh sockets are left alone");
+
+    sweep_stale_forwards(&dir, Duration::ZERO);
+    assert!(!dead.exists(), "refused forward socket is removed");
+    assert!(live.exists(), "listening forward socket stays");
+    assert!(
+        daemon_sock.exists(),
+        "non-forward sockets are never touched"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
