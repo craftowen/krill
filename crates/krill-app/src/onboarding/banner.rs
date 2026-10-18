@@ -70,6 +70,7 @@ fn fix(id: &str, cx: &mut App) {
                 dismiss_need(&id, cx);
             }
         }),
+        Err(super::actions::FixError::Cancelled) => {}
         Err(e) => cx.update(|cx| super::actions::report_failure(&id, e.to_string(), cx)),
     })
     .detach();

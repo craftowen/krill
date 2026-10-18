@@ -549,23 +549,45 @@ fn checks_screen_installs_hook_and_cli_in_app(cx: &mut TestAppContext) {
     click(cx, "wizard-fix-hook.cursor");
     for _ in 0..200 {
         cx.run_until_parked();
-        if cx.has_pending_prompt() {
+        if present(cx, "wizard-hook-confirm-cursor") {
             break;
         }
     }
     assert!(
-        cx.has_pending_prompt(),
+        !cx.has_pending_prompt(),
+        "checks screen must render inline diff preview instead of modal prompt"
+    );
+    assert!(
+        present(cx, "wizard-hook-diff-cursor"),
         "{:?}",
         wizard_read(cx, |w, _| w.fix_errors.clone())
     );
+    assert!(present(cx, "wizard-hook-title-cursor"));
+    assert!(present(cx, "wizard-hook-cancel-cursor"));
     assert!(
         !f.env.state.join("hooks/cursor.json").exists(),
         "review writes nothing"
     );
-    // 재검사는 동의 대기 중 조치 태스크를 취소하면 안 된다.
+    // 재검사는 검토 대기 중인 인라인 diff 상태를 깨뜨리면 안 된다.
     click(cx, "wizard-recheck");
-    assert!(cx.has_pending_prompt());
-    cx.simulate_prompt_answer(text::INSTALL.get());
+    wait_checks(cx);
+    assert!(present(cx, "wizard-hook-confirm-cursor"));
+
+    // 취소하면 아무 파일도 쓰지 않고 오류 배너도 남기지 않는다.
+    click(cx, "wizard-hook-cancel-cursor");
+    assert!(!present(cx, "wizard-hook-confirm-cursor"));
+    assert!(!present(cx, "wizard-fix-error-hook.cursor"));
+    assert!(!f.env.state.join("hooks/cursor.json").exists());
+
+    // 다시 눌러 설치 확정을 누르면 실제 훅과 영수증을 기록한다.
+    click(cx, "wizard-fix-hook.cursor");
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if present(cx, "wizard-hook-confirm-cursor") {
+            break;
+        }
+    }
+    click(cx, "wizard-hook-confirm-cursor");
     wait_for_file(cx, &f.env.state, || {
         f.env.state.join("hooks/cursor.json").exists()
     });
@@ -829,16 +851,16 @@ fn stage_runs_before_hook_records_stable_path_and_refreshes_after_done(cx: &mut 
     click(cx, "wizard-fix-hook.cursor");
     for _ in 0..200 {
         cx.run_until_parked();
-        if cx.has_pending_prompt() {
+        if present(cx, "wizard-hook-confirm-cursor") {
             break;
         }
     }
     assert!(
-        cx.has_pending_prompt(),
+        present(cx, "wizard-hook-confirm-cursor"),
         "{:?}",
         wizard_read(cx, |w, _| w.fix_errors.clone())
     );
-    cx.simulate_prompt_answer(text::INSTALL.get());
+    click(cx, "wizard-hook-confirm-cursor");
     wait_for_file(cx, &f.env.state, || {
         f.env.state.join("hooks/cursor.json").exists()
     });
@@ -1111,6 +1133,10 @@ fn check_title_maps_known_ids_and_passes_unknown_through() {
     assert_eq!(
         check_title("hook.codex"),
         ctext::TITLE_HOOK.format(&[("name", "Codex")])
+    );
+    assert_eq!(
+        check_title("hook.agy"),
+        ctext::TITLE_HOOK.format(&[("name", "Antigravity")])
     );
     assert_eq!(
         check_title("agent.opencode"),
@@ -1855,4 +1881,28 @@ fn wizard_fix_all_respects_isolated_state_without_polluting_fix_needs(cx: &mut T
     );
     assert!(!f.env.home.join(".local/bin/krill").exists());
     cx.update(|_, cx| assert!(cx.try_global::<actions::FixNeeds>().is_none()));
+}
+
+#[gpui::test]
+fn cancelled_fix_shows_no_error_and_failed_fix_shows_only_error_cause(cx: &mut TestAppContext) {
+    let f = fake("fix-error-copy");
+    let cx = open_checks_screen(cx, &f.env);
+    let w = wizard_window(cx).unwrap();
+    w.update(&mut cx.cx, |v, _, cx| {
+        v.fix_errors
+            .insert("bin.helpers".to_owned(), actions::FixError::Cancelled);
+        cx.notify();
+    })
+    .unwrap();
+    assert!(!present(cx, "wizard-fix-error-bin.helpers"));
+
+    w.update(&mut cx.cx, |v, _, cx| {
+        v.fix_errors.insert(
+            "bin.helpers".to_owned(),
+            actions::FixError::Failed("helper copy failed".to_owned()),
+        );
+        cx.notify();
+    })
+    .unwrap();
+    assert!(present(cx, "wizard-fix-error-bin.helpers"));
 }

@@ -19,8 +19,8 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
-use krill_proto::agent::hooks::Agent;
 use krill_proto::doctor::{Check, FixKind, Level, Status};
+use krill_proto::hook_install::{Plan, TargetAgent};
 
 use super::consent::view::ConsentView;
 use super::state::{OnboardingState, STATE_VERSION, Step, save};
@@ -64,7 +64,7 @@ enum Fix {
     AllowNotifications,
     ProbeFolders,
     /// 앱 안 hook 설치(dry-run diff 확인 → 설치).
-    Hook(Agent),
+    Hook(TargetAgent),
     /// 앱 안 CLI 링크 설치.
     Link,
 }
@@ -87,6 +87,8 @@ pub(super) struct Wizard {
     pub(super) busy: HashSet<String>,
     /// 에이전트 ID별 hook 설치 진행.
     pub(super) hooks: HashMap<&'static str, HookPhase>,
+    /// 에이전트 ID별 검토 대기 중인 hook 설치 계획.
+    hook_plans: HashMap<&'static str, Plan>,
     /// 점검 ID별 마지막 실행기 조치 실패(충돌 안내 포함).
     pub(super) fix_errors: HashMap<String, super::actions::FixError>,
     folder_check_requested: bool,
@@ -217,6 +219,7 @@ impl Wizard {
             copied: None,
             busy: HashSet::new(),
             hooks: HashMap::new(),
+            hook_plans: HashMap::new(),
             fix_errors: HashMap::new(),
             folder_check_requested: false,
             agent: None,
@@ -460,6 +463,7 @@ impl Wizard {
         }
         self.fix_errors.clear();
         self.hooks.clear();
+        self.hook_plans.clear();
         cx.notify();
         let home = self.env.home.clone();
         let state = self.env.state.clone();
@@ -556,8 +560,11 @@ impl Wizard {
                 let outcome = run.await;
                 this.update(cx, |w, cx| {
                     w.busy.remove(&key);
-                    if let Err(e) = outcome {
-                        w.fix_errors.insert(id, e);
+                    match outcome {
+                        Ok(()) | Err(super::actions::FixError::Cancelled) => {}
+                        Err(e) => {
+                            w.fix_errors.insert(id, e);
+                        }
                     }
                     cx.notify();
                 })
@@ -635,112 +642,191 @@ impl Wizard {
     }
 
     /// `[설치]`(hook): dry-run diff를 받아 행 아래에 보여 준다. 쓰기는 [설치 확정]에서만.
-    fn hook_install(&mut self, agent: Agent, cx: &mut Context<Self>) {
+    fn hook_install(&mut self, agent: TargetAgent, cx: &mut Context<Self>) {
+        let check_id = format!("hook.{}", agent.id());
+        self.fix_errors.remove(&check_id);
+        self.hook_plans.remove(agent.id());
         self.hooks.insert(agent.id(), HookPhase::Working);
         cx.notify();
+        let env = self.env.clone();
         let (staged, path) = self.hook_paths();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let dry = cx
-                .background_executor()
-                .spawn(async move { mk_hook(&staged, &path, agent, "--dry-run") })
-                .await;
-            this.update(cx, |w, cx| {
-                let phase = match dry {
-                    Ok(diff) => HookPhase::Review(clip(&diff, agent)),
-                    Err(e) => HookPhase::Failed(e),
-                };
-                w.hooks.insert(agent.id(), phase);
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn hook_confirm(&mut self, agent: Agent, cx: &mut Context<Self>) {
-        self.hooks.insert(agent.id(), HookPhase::Working);
-        cx.notify();
-        let (staged, path) = self.hook_paths();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let done = cx
-                .background_executor()
-                .spawn(async move { mk_hook(&staged, &path, agent, "--yes") })
-                .await;
-            this.update(cx, |w, cx| {
-                match done {
-                    Ok(_) => {
-                        w.hooks.remove(agent.id());
-                    }
-                    Err(e) => {
-                        w.hooks.insert(agent.id(), HookPhase::Failed(e));
-                    }
+        let task_key = format!("hook:{}", agent.id());
+        self.fix_tasks.insert(
+            task_key,
+            cx.spawn(async move |this, cx| {
+                enum Outcome {
+                    Review(Box<(String, Option<Plan>)>),
+                    Done,
+                    Error(super::actions::FixError),
                 }
-                cx.notify();
-            })
-            .ok();
-            // 영수증이 생겼으니 점검(hook.*)을 다시 읽는다. 위 업데이트와 합치면 빌림이 꼬인다.
-            this.update(cx, Self::recheck).ok();
-        }));
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match super::actions::prepare_hook(agent, &env) {
+                            Ok(Some((diff, plan))) => {
+                                Outcome::Review(Box::new((diff, Some(plan))))
+                            }
+                            Ok(None) => Outcome::Done,
+                            Err(e @ super::actions::FixError::Conflict { .. }) => Outcome::Error(e),
+                            Err(e) => match agent {
+                                TargetAgent::Other(a) => {
+                                    match mk_hook(&staged, &path, a, "--dry-run") {
+                                        Ok(diff) => Outcome::Review(Box::new((diff, None))),
+                                        Err(_) => Outcome::Error(e),
+                                    }
+                                }
+                                TargetAgent::Claude => Outcome::Error(e),
+                            },
+                        }
+                    })
+                    .await;
+                let done = matches!(outcome, Outcome::Done);
+                this.update(cx, |w, cx| {
+                    match outcome {
+                        Outcome::Review(boxed) => {
+                            let (diff, plan) = *boxed;
+                            if let Some(plan) = plan {
+                                w.hook_plans.insert(agent.id(), plan);
+                            }
+                            w.hooks
+                                .insert(agent.id(), HookPhase::Review(clip(&diff, agent.id())));
+                        }
+                        Outcome::Done | Outcome::Error(super::actions::FixError::Cancelled) => {
+                            w.hooks.remove(agent.id());
+                        }
+                        Outcome::Error(e @ super::actions::FixError::Conflict { .. }) => {
+                            w.hooks.remove(agent.id());
+                            w.fix_errors.insert(check_id, e);
+                        }
+                        Outcome::Error(super::actions::FixError::Failed(msg)) => {
+                            w.hooks.insert(agent.id(), HookPhase::Failed(msg));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+                if done {
+                    this.update(cx, Self::recheck).ok();
+                }
+            }),
+        );
     }
 
-    fn hook_cancel(&mut self, agent: Agent, cx: &mut Context<Self>) {
+    fn hook_confirm(&mut self, agent: TargetAgent, cx: &mut Context<Self>) {
+        let plan = self.hook_plans.remove(agent.id());
+        self.hooks.insert(agent.id(), HookPhase::Working);
+        cx.notify();
+        let (staged, path) = self.hook_paths();
+        let task_key = format!("hook:{}", agent.id());
+        self.fix_tasks.insert(
+            task_key,
+            cx.spawn(async move |this, cx| {
+                let done = cx
+                    .background_executor()
+                    .spawn(async move {
+                        match (plan, agent) {
+                            (Some(plan), _) => super::actions::apply_hook(plan),
+                            (None, TargetAgent::Other(a)) => mk_hook(&staged, &path, a, "--yes")
+                                .map(|_| ())
+                                .map_err(|e| text::HOOK_FAILED.format(&[("error", &e)])),
+                            (None, TargetAgent::Claude) => {
+                                Err(text::HOOK_FAILED.format(&[("error", "missing hook plan")]))
+                            }
+                        }
+                    })
+                    .await;
+                this.update(cx, |w, cx| {
+                    match done {
+                        Ok(()) => {
+                            w.hooks.remove(agent.id());
+                            w.fix_errors.remove(&format!("hook.{}", agent.id()));
+                        }
+                        Err(e) => {
+                            w.hooks.insert(agent.id(), HookPhase::Failed(e));
+                        }
+                    }
+                    cx.notify();
+                })
+                .ok();
+                // 영수증이 생겼으니 점검(hook.*)을 다시 읽는다. 위 업데이트와 합치면 빌림이 꼬인다.
+                this.update(cx, Self::recheck).ok();
+            }),
+        );
+    }
+
+    fn hook_cancel(&mut self, agent: TargetAgent, cx: &mut Context<Self>) {
         self.hooks.remove(agent.id());
+        self.hook_plans.remove(agent.id());
+        self.fix_errors.remove(&format!("hook.{}", agent.id()));
+        self.fix_tasks.remove(&format!("hook:{}", agent.id()));
         cx.notify();
     }
 
     /// `[설치]`(CLI 링크). 격리 상태면 실제 링크를 만들지 않는다.
     fn cli_install(&mut self, cx: &mut Context<Self>) {
-        let Some(link) = cli_link_target(self.survey.as_ref()) else {
+        if cli_link_target(self.survey.as_ref()).is_none() {
             return;
-        };
+        }
         if !self.busy.insert("cli".to_owned()) {
             return;
         }
+        self.fix_errors.remove("cli.path");
         cx.notify();
-        let (krill, home) = (self.env.krill.clone(), self.env.home.clone());
+        let env = self.env.clone();
         let isolated = self.env.is_isolated_state();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let ok = cx
-                .background_executor()
-                .spawn(async move {
-                    if isolated {
-                        return true;
+        self.fix_tasks.insert(
+            "cli".to_owned(),
+            cx.spawn(async move |this, cx| {
+                let outcome = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if isolated {
+                            return Ok(());
+                        }
+                        super::actions::install_managed_cli(&env)
+                    })
+                    .await;
+                let ok = outcome.is_ok();
+                this.update(cx, |w, cx| {
+                    w.busy.remove("cli");
+                    match outcome {
+                        Ok(()) => {
+                            if let Some(survey) = &mut w.survey {
+                                survey.cli = Cli::Installed;
+                            }
+                        }
+                        Err(e) => {
+                            w.fix_errors
+                                .insert("cli.path".to_owned(), super::actions::FixError::Failed(e));
+                        }
                     }
-                    install_cli_link(&krill, &home, &link)
-                        .inspect_err(|e| tracing::warn!(%e, "cli link install failed"))
-                        .is_ok()
+                    cx.notify();
                 })
-                .await;
-            this.update(cx, |w, cx| {
-                w.busy.remove("cli");
-                if ok && let Some(survey) = &mut w.survey {
-                    survey.cli = Cli::Installed;
+                .ok();
+                if ok {
+                    this.update(cx, Self::recheck).ok();
                 }
-                cx.notify();
-            })
-            .ok();
-            if ok {
-                this.update(cx, Self::recheck).ok();
-            }
-        }));
+            }),
+        );
     }
 
-    /// 행 조치와 버튼 문구. 실행기가 맡는 행이 먼저이고, 나머지는 앱 안 조치(hook·CLI 링크)를
-    /// 복사보다 먼저 고른다.
+    /// 행 조치와 버튼 문구. 앱 안 조치(hook 인라인 diff 검토·CLI 링크)를 먼저 고르고,
+    /// 나머지는 조치 실행기와 복사/설정 열기로 넘긴다.
     fn row_fix(&self, check: &Check) -> Option<(Fix, &'static str)> {
         use crate::platform::permissions as perm;
         if check.status == Status::Ok {
             return None;
         }
-        if let Some(label) = super::actions::fix_label(check) {
-            return Some((Fix::Runner, label));
-        }
-        if check.status == Status::Warn
-            && let Some(agent) = check.id.strip_prefix("hook.").and_then(Agent::parse)
+        if check.status != Status::Skip
+            && let Some(agent) = check.id.strip_prefix("hook.").and_then(TargetAgent::parse)
         {
             return Some((Fix::Hook(agent), text::INSTALL.get()));
         }
         if check.id == "cli.path" && cli_link_target(self.survey.as_ref()).is_some() {
             return Some((Fix::Link, text::INSTALL.get()));
+        }
+        if let Some(label) = super::actions::fix_label(check) {
+            return Some((Fix::Runner, label));
         }
         match (&check.fix.kind, check.id.as_str(), check.status) {
             (FixKind::Command | FixKind::Copy, _, _) if !check.fix.value.is_empty() => {
@@ -1170,38 +1256,40 @@ impl Wizard {
                     }))
             }))
             .children(hook.map(|(agent, phase)| Self::render_hook_phase(agent, phase, cx)))
-            .children(fix_error.map(|error| {
+            .children(fix_error.and_then(|error| {
                 use super::actions::FixError;
                 let (selector, color, line) = match error {
-                    FixError::Failed(message) => (
-                        "wizard-fix-error",
-                        p.destructive,
-                        text::HOOK_FAILED.format(&[("error", message.as_str())]),
-                    ),
+                    FixError::Cancelled => return None,
+                    FixError::Failed(message) => {
+                        ("wizard-fix-error", p.destructive, message.clone())
+                    }
                     FixError::Conflict { guide, .. } => {
                         ("wizard-fix-conflict", p.warning, guide.clone())
                     }
                 };
-                div()
-                    .debug_selector({
-                        let id = id.clone();
-                        move || format!("{selector}-{id}")
-                    })
-                    .pl_6()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(color)
-                    .child(line)
+                Some(
+                    div()
+                        .debug_selector({
+                            let id = id.clone();
+                            move || format!("{selector}-{id}")
+                        })
+                        .pl_6()
+                        .text_size(ui::TEXT_XS)
+                        .text_color(color)
+                        .child(line),
+                )
             }))
     }
 
     /// hook 행 아래: 진행·diff 확인·실패. 확인 버튼은 diff 위에 둬 긴 diff에도 행 가까이 보인다.
     fn render_hook_phase(
-        agent: Agent,
+        agent: TargetAgent,
         phase: &HookPhase,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let p = ui::palette(cx);
         let id = agent.id();
+        let name = super::agent_name(id);
         match phase {
             HookPhase::Working => div()
                 .pl_6()
@@ -1214,10 +1302,11 @@ impl Wizard {
                 .child(text::HOOK_INSTALLING.get())
                 .into_any_element(),
             HookPhase::Failed(error) => div()
+                .debug_selector(move || format!("wizard-hook-error-{id}"))
                 .pl_6()
                 .text_size(ui::TEXT_XS)
                 .text_color(p.destructive)
-                .child(text::HOOK_FAILED.format(&[("error", error.as_str())]))
+                .child(error.clone())
                 .into_any_element(),
             HookPhase::Review(diff) => div()
                 .pl_6()
@@ -1227,36 +1316,50 @@ impl Wizard {
                 .child(
                     div()
                         .flex()
-                        .justify_end()
-                        .gap_1p5()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
                         .child(
                             div()
-                                .debug_selector(move || format!("wizard-hook-cancel-{id}"))
-                                .child(
-                                    Button::new(gpui::SharedString::from(format!(
-                                        "wizard-hook-cancel-{id}"
-                                    )))
-                                    .small()
-                                    .ghost()
-                                    .label(text::CANCEL.get())
-                                    .on_click(
-                                        cx.listener(move |s, _, _, cx| s.hook_cancel(agent, cx)),
-                                    ),
-                                ),
+                                .debug_selector(move || format!("wizard-hook-title-{id}"))
+                                .text_size(ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::HOOK_TITLE.format(&[("name", name)])),
                         )
                         .child(
                             div()
-                                .debug_selector(move || format!("wizard-hook-confirm-{id}"))
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
                                 .child(
-                                    Button::new(gpui::SharedString::from(format!(
-                                        "wizard-hook-confirm-{id}"
-                                    )))
-                                    .small()
-                                    .primary()
-                                    .label(text::HOOK_CONFIRM.get())
-                                    .on_click(
-                                        cx.listener(move |s, _, _, cx| s.hook_confirm(agent, cx)),
-                                    ),
+                                    div()
+                                        .debug_selector(move || format!("wizard-hook-cancel-{id}"))
+                                        .child(
+                                            Button::new(gpui::SharedString::from(format!(
+                                                "wizard-hook-cancel-{id}"
+                                            )))
+                                            .small()
+                                            .ghost()
+                                            .label(text::CANCEL.get())
+                                            .on_click(cx.listener(move |s, _, _, cx| {
+                                                s.hook_cancel(agent, cx);
+                                            })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .debug_selector(move || format!("wizard-hook-confirm-{id}"))
+                                        .child(
+                                            Button::new(gpui::SharedString::from(format!(
+                                                "wizard-hook-confirm-{id}"
+                                            )))
+                                            .small()
+                                            .primary()
+                                            .label(text::HOOK_CONFIRM.get())
+                                            .on_click(cx.listener(move |s, _, _, cx| {
+                                                s.hook_confirm(agent, cx);
+                                            })),
+                                        ),
                                 ),
                         ),
                 )

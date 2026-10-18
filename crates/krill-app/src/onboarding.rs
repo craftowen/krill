@@ -333,7 +333,7 @@ pub(crate) fn install_codex_hook_with_login_path(
 }
 
 /// diff를 [`DIFF_LINES`]줄로 줄인다. 줄 단위라 한글이 잘리지 않는다.
-pub(super) fn clip(diff: &str, agent: Agent) -> String {
+pub(super) fn clip(diff: &str, agent_id: &str) -> String {
     let lines: Vec<&str> = diff.lines().collect();
     let mut shown = lines
         .iter()
@@ -347,7 +347,7 @@ pub(super) fn clip(diff: &str, agent: Agent) -> String {
             &text::DIFF_MORE
                 .get()
                 .replace("{n}", &more.to_string())
-                .replace("{id}", agent.id()),
+                .replace("{id}", agent_id),
         );
     }
     shown
@@ -792,13 +792,13 @@ fn match_template<'a, 't>(template: &'t str, text: &'a str) -> Option<Vec<(&'t s
     rest.is_empty().then_some(fields)
 }
 
-fn agent_name(id: &str) -> &str {
+pub(super) fn agent_name(id: &str) -> &str {
     match id {
         "codex" => "Codex",
         "opencode" => "OpenCode",
         "cursor" => "Cursor",
         "claude" => "Claude Code",
-        "agy" => "Agy",
+        "agy" | "antigravity" => "Antigravity",
         _ => id,
     }
 }
