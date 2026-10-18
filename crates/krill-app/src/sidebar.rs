@@ -76,6 +76,12 @@ actions!(
 const KEY_CONTEXT: &str = "Sidebar";
 /// 행 높이(`uniform_list`라 모든 행이 같다).
 const ROW_HEIGHT: f32 = 32.;
+/// 가상 리스트로 전환하는 행 수. 이 이상이면 `uniform_list`(고정 높이)라
+/// 워크트리 카드는 고정 높이 컴팩트 변형으로 렌더한다(OWE-900).
+const VIRTUALIZED_ROWS: usize = 100;
+/// 세션 없는 워크트리가 이 수를 넘으면 프로젝트를 접힌 상태로 시작한다(OWE-900).
+/// 코디네이터 결정: 기본값 `hide_sleeping = false` 유지, 대신 다량 유휴 프로젝트 자동 접힘.
+const AUTO_COLLAPSE_IDLE_WORKTREES: usize = 10;
 /// hover 액션을 드러내는 그룹 이름(가장 가까운 행에 걸린다).
 const ROW_GROUP: &str = "sidebar-row";
 const POLL_INTERVAL_ACTIVE: Duration = Duration::from_millis(500);
@@ -741,7 +747,9 @@ impl Sidebar {
             }
             this.parents = this.merged_parents();
         }
-        if this.sync_imported_projects_from_disk() {
+        // `sync` 안에서 자동 접힘이 먼저 반영되므로 행은 접힘 상태로 만든다.
+        let (trees_changed, auto_changed) = this.sync_imported_projects_from_disk();
+        if trees_changed {
             this.rows = if this.options.filters.contains_host(&HostId::Local) {
                 this.local_rows()
             } else {
@@ -755,10 +763,67 @@ impl Sidebar {
                 });
             }
         }
+        if auto_changed {
+            this.write_state();
+        }
         this
     }
 
-    fn sync_imported_projects_from_disk(&mut self) -> bool {
+    /// OWE-900: 세션 없는 워크트리가 많은 프로젝트는 접힌 상태로 시작한다.
+    ///
+    /// 반드시 `include_imported_projects` 직후·`apply_imported_project_prefs` 직전에
+    /// 불러야 한다. 이 시점에 `prefs`에 항목이 없는 저장소는 이번에 처음 본 것으로 보고,
+    /// 세션이 하나도 없고 유휴 워크트리가 [`AUTO_COLLAPSE_IDLE_WORKTREES`]개를 넘으면 접는다.
+    /// - 이관 프로젝트는 뒤따르는 prefs 동기화가 표시 이름·핀을 심어 다음부터 건너뛴다.
+    /// - 데몬 발견 프로젝트는 빈 prefs 항목을 표시로 남겨 재시작 후 재접힘을 막는다
+    ///   (사용자가 펼치면 그 상태가 유지된다). 핀·세션이 있으면 접지 않는다.
+    /// - 저장은 호출자가 맡는다(`new`는 `write_state`, 나머지는 `persist`).
+    fn auto_collapse_idle_heavy_repos(&mut self, state_dir: &Path) -> bool {
+        let imported = external::imported_repo_paths(state_dir);
+        let mut changed = false;
+        let repos: Vec<PathBuf> = self.snapshot.trees.keys().cloned().collect();
+        for repo in repos {
+            if self.collapsed.contains(&repo) || self.prefs.contains_key(&repo) {
+                continue;
+            }
+            let Some(trees) = self.snapshot.trees.get(&repo) else {
+                continue;
+            };
+            let has_session = trees.iter().any(|t| {
+                self.snapshot
+                    .sessions
+                    .iter()
+                    .any(|s| s.worktree.as_deref() == Some(t.as_path()))
+            });
+            if has_session {
+                continue;
+            }
+            if trees
+                .iter()
+                .any(|t| self.prefs.get(t).is_some_and(|p| p.pinned))
+            {
+                continue;
+            }
+            let idle = trees
+                .iter()
+                .filter(|t| t.as_path() != repo.as_path())
+                .count();
+            if idle <= AUTO_COLLAPSE_IDLE_WORKTREES {
+                continue;
+            }
+            self.collapsed.insert(repo.clone());
+            if !external::path_aliases(&repo)
+                .iter()
+                .any(|a| imported.contains(a))
+            {
+                self.prefs.entry(repo).or_default();
+            }
+            changed = true;
+        }
+        changed
+    }
+
+    fn sync_imported_projects_from_disk(&mut self) -> (bool, bool) {
         let Some(dir) = self
             .path
             .as_deref()
@@ -766,7 +831,7 @@ impl Sidebar {
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
         else {
-            return false;
+            return (false, false);
         };
         if let Ok(wt_store) = krill_proto::orchestration::WorktreeStore::load(&dir) {
             for (k, v) in &wt_store.statuses {
@@ -783,6 +848,7 @@ impl Sidebar {
         }
         let prev_trees = self.snapshot.trees.clone();
         external::include_imported_projects(&dir, &mut self.snapshot.trees, &mut self.meta);
+        let auto_changed = self.auto_collapse_idle_heavy_repos(&dir);
         external::apply_imported_project_prefs(
             &dir,
             &mut self.prefs,
@@ -790,7 +856,10 @@ impl Sidebar {
             &mut self.issues,
             &mut self.worktree_statuses,
         );
-        self.snapshot.trees != prev_trees || !self.snapshot.trees.is_empty()
+        (
+            self.snapshot.trees != prev_trees || !self.snapshot.trees.is_empty(),
+            auto_changed,
+        )
     }
 
     /// OWE-898: 라이브 워크트리 집합에 없는 파생 상태(상태·갱신시각·이슈·포트·호스트 라벨·자동/CLI 표시)를
@@ -827,9 +896,13 @@ impl Sidebar {
     pub fn reload_external(&mut self, cx: &mut Context<Self>) {
         lineage::invalidate_parents_cache();
         self.comments = external::load_comments_from_sidebar_path(self.path.as_deref());
-        self.sync_imported_projects_from_disk();
+        let (_, auto_changed) = self.sync_imported_projects_from_disk();
         self.prune_stale_worktree_state();
-        self.rebuild(cx);
+        if auto_changed {
+            self.persist(cx);
+        } else {
+            self.rebuild(cx);
+        }
     }
 
     #[cfg(test)]
@@ -1602,7 +1675,7 @@ impl Sidebar {
                     self.meta = meta;
                     self.comments = comments;
                     self.auto_titles = auto_titles;
-                    self.sync_imported_projects_from_disk();
+                    let (_, auto_changed) = self.sync_imported_projects_from_disk();
                     self.poll_error = None;
                     let live = &self.snapshot.sessions;
                     self.titles.retain(|id, _| live.iter().any(|s| s.id == *id));
@@ -1618,7 +1691,11 @@ impl Sidebar {
                     self.last_cache_tick_sec = self
                         .has_active_cache_timer(now_ns, cx)
                         .then_some(now_ns / 1_000_000_000);
-                    self.rebuild(cx);
+                    if auto_changed {
+                        self.persist(cx);
+                    } else {
+                        self.rebuild(cx);
+                    }
                 } else {
                     let now_ns = self.now_unix_ns();
                     let next_tick = self

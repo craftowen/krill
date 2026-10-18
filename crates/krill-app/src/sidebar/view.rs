@@ -19,7 +19,8 @@ use krill_proto::control::{AgentProfile, Program};
 use super::{
     Activate, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2, NewAgent3, NewAgent4,
     OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP, ROW_HEIGHT, Rename, Row,
-    SelectNext, SelectPrev, Sidebar, Target, TogglePin, basename, state_text, text,
+    SelectNext, SelectPrev, Sidebar, Target, TogglePin, VIRTUALIZED_ROWS, basename, state_text,
+    text,
 };
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
@@ -600,9 +601,24 @@ impl Sidebar {
                 let fold_btn = path.clone();
                 let fold_row = path.clone();
                 let closed = self.collapsed.contains(path);
+                // OWE-900: 헤더에 워크트리 수를 표시한다(자기 자신 제외).
+                // 접힌 다량 유휴 프로젝트도 규모를 알 수 있다.
+                let wt_count = self
+                    .snapshot_for(&row_host)
+                    .trees
+                    .get(path)
+                    .map_or(0, |list| {
+                        list.iter()
+                            .filter(|t| t.as_path() != path.as_path())
+                            .count()
+                    });
                 repo_heading(base)
                     .debug_selector(move || format!("repo-header-{index}"))
-                    .aria_label(format!("{} {}", text::REPOSITORY.get(), basename(path)))
+                    .aria_label(format!(
+                        "{} {} {wt_count}",
+                        text::REPOSITORY.get(),
+                        basename(path)
+                    ))
                     .aria_expanded(!closed)
                     .cursor_pointer()
                     .hover(|d| d.bg(p.sidebar_accent))
@@ -632,6 +648,20 @@ impl Sidebar {
                             .text_color(p.muted_foreground),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(basename(path)))
+                    .when(wt_count > 0, |d| {
+                        d.child(
+                            div()
+                                .debug_selector(move || format!("repo-count-{index}"))
+                                .flex_none()
+                                .px_1()
+                                .rounded(ui::RADIUS_XS)
+                                .bg(p.muted)
+                                .font_family(ui::FONT_MONO)
+                                .text_size(ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(wt_count.to_string()),
+                        )
+                    })
                     .when(row_host.is_local(), |d| {
                         d.child(
                             div()
@@ -1037,35 +1067,6 @@ impl Sidebar {
         }
         let hover_only = |d: gpui::Div| d.invisible().group_hover(ROW_GROUP, Styled::visible);
 
-        // 500행 가상화 벤치마크 모드: 고정 높이(ROW_HEIGHT) 1줄 행.
-        if self.rows.len() >= 100 {
-            return base
-                .debug_selector(move || format!("worktree-card-{index}"))
-                .aria_label(label)
-                .aria_expanded(!closed)
-                .h(px(ROW_HEIGHT))
-                .pl_1()
-                .pr_1p5()
-                .mx_1()
-                .rounded(ui::RADIUS_SM)
-                .flex()
-                .items_center()
-                .gap_1()
-                .text_size(ui::TEXT_SM)
-                .text_color(p.worktree_sidebar_foreground)
-                .cursor_pointer()
-                .child(div().flex_1().min_w_0().truncate().child(name))
-                .on_click(cx.listener(move |s, _, window, cx| {
-                    s.activate_worktree_card(
-                        index,
-                        row_host.clone(),
-                        card_path.clone(),
-                        Some(window),
-                        cx,
-                    );
-                }));
-        }
-
         let left_status = if unread {
             status::status_glyph(AgentState::Done, true, Size::Md, cx).into_any_element()
         } else if let Some(top) = summary.groups.first().filter(|g| {
@@ -1383,7 +1384,12 @@ impl Sidebar {
             p.sidebar_accent
         };
 
-        if self.options.card_layout == super::CardLayout::Compact {
+        // OWE-900: 가상화 구간(`rows >= VIRTUALIZED_ROWS`)에서는 `uniform_list` 고정 높이
+        // 제약으로 가변 높이 상세 카드를 그릴 수 없어, 평문 행 대신 고정 높이 컴팩트 카드를
+        // 렌더한다. 상태 점·브랜치·코멘트·배지·들여쓰기를 유지해 세션 없는 이관 워크트리도
+        // 일반 카드와 같이 보인다.
+        let compact_fallback = self.rows.len() >= VIRTUALIZED_ROWS;
+        if self.options.card_layout == super::CardLayout::Compact || compact_fallback {
             let compact_path = card_path.clone();
             let compact_fold = fold.clone();
             let compact_host = row_host.clone();
@@ -1959,7 +1965,7 @@ impl Sidebar {
 
     /// 가상 리스트(보이는 행만 만든다). 스크린 리더에는 이름 붙은 목록 하나로 보인다.
     pub(super) fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let content: AnyElement = if self.rows.len() >= 100 {
+        let content: AnyElement = if self.rows.len() >= VIRTUALIZED_ROWS {
             uniform_list(
                 "worktree-list",
                 self.rows.len(),

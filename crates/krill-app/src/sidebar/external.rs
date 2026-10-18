@@ -1,7 +1,7 @@
 //! MK-093: 워크트리 코멘트(`krill set --comment`) 조회와 외부 `.claude/worktrees` 감지·숨김 분류·표시.
 //! 선행 MK-046(`sidebar.rs`)에 대한 의존과 UI 표시 헬퍼는 이 모듈로 격리한다.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Write as _};
@@ -102,7 +102,7 @@ pub fn session_orch_badge(sidebar_path: Option<&Path>, session_id: u64) -> Optio
     None
 }
 
-fn path_aliases(worktree: &Path) -> Vec<String> {
+pub(super) fn path_aliases(worktree: &Path) -> Vec<String> {
     let mut out = vec![worktree.to_string_lossy().into_owned()];
     if let Ok(rest) = worktree.strip_prefix("/private") {
         out.push(Path::new("/").join(rest).to_string_lossy().into_owned());
@@ -560,6 +560,20 @@ struct ImportedWorktreeLineage {
     worktree_path: String,
     #[serde(default)]
     branch: Option<String>,
+}
+
+/// `<state_dir>/projects.toml`에 등록된 이관 프로젝트 경로 집합(OWE-900 자동 접힘 판정용).
+/// 보관·원격 프로젝트를 제외한 로컬 프로젝트의 다듬은 경로만 담는다.
+pub(super) fn imported_repo_paths(state_dir: &Path) -> BTreeSet<String> {
+    let Some(file) = load_imported_projects(state_dir) else {
+        return BTreeSet::new();
+    };
+    file.projects
+        .iter()
+        .filter(|p| !p.archived && p.host_id.is_none())
+        .map(|p| p.path.trim().to_owned())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn load_imported_projects(state_dir: &Path) -> Option<ImportedProjectsFile> {
