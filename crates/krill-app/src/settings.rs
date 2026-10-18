@@ -727,7 +727,8 @@ pub fn trigger_manual_update_check(cx: &mut App) {
                     next.status = status;
                 }
                 Err(err) => {
-                    next.status = CheckStatus::Error(err.to_string());
+                    // OWE-883: 영문 Display 대신 사용자용 문구를 보인다.
+                    next.status = CheckStatus::Error(err.user_message());
                 }
             }
             cx.set_global(next);
@@ -1656,16 +1657,17 @@ fn canonical_hook_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// `krill doctor` 핵심 항목(상태 디렉터리·데몬 바이너리·미보고 크래시·세그먼트 기록 상태)을 자가 진단한다.
+/// 내부 키-값이 아니라 카탈로그 문구로 보인다(OWE-883).
 pub fn run_doctor_check(state: Option<&Path>) -> String {
     let state_status = match state {
-        Some(d) if d.exists() => "ok",
-        Some(_) => "init",
-        None => "missing",
+        Some(d) if d.exists() => text::DOCTOR_OK.get(),
+        Some(_) => text::DOCTOR_NEEDS_INIT.get(),
+        None => text::DOCTOR_MISSING.get(),
     };
     let bins_status = match krill_proto::daemon::Paths::dev() {
-        Ok(p) if p.holder.exists() && p.krilld.exists() => "ok",
-        Ok(_) => "missing-bins",
-        Err(_) => "unavailable",
+        Ok(p) if p.holder.exists() && p.krilld.exists() => text::DOCTOR_OK.get(),
+        Ok(_) => text::DOCTOR_MISSING_BINS.get(),
+        Err(_) => text::DOCTOR_UNAVAILABLE.get(),
     };
     let crashes = state.map_or(0, |d| krill_proto::diag::pending(d).len());
     let rec_warns = state.map_or(0, |d| krill_proto::diag::record_warnings(d).len());
@@ -1674,13 +1676,19 @@ pub fn run_doctor_check(state: Option<&Path>) -> String {
             .exists()
     });
     let rec_status = if rec_flag || rec_warns > 0 {
-        format!("warn({rec_warns})")
+        text::DOCTOR_WARN.format(&[("n", &rec_warns.to_string())])
     } else {
-        "ok".to_owned()
+        text::DOCTOR_OK.get().to_owned()
     };
-    format!(
-        "krill doctor: state={state_status} · bins={bins_status} · crashes={crashes} · recording={rec_status}"
-    )
+    text::DOCTOR_REPORT.format(&[
+        ("state", state_status),
+        ("bins", bins_status),
+        (
+            "crashes",
+            &text::DOCTOR_CRASHES.format(&[("n", &crashes.to_string())]),
+        ),
+        ("recording", &rec_status),
+    ])
 }
 
 /// 디스크 기록(zstd 세그먼트) 즉시 삭제(MK-075). 데몬(`krilld`)에 `HistoryRequest::Clear`를
@@ -1932,6 +1940,60 @@ struct WorkflowRepoForm {
     loaded_archive: String,
     status: Option<(SharedString, bool)>,
     _subs: Vec<Subscription>,
+}
+
+/// 완료 웹훅 종류의 표시 이름(OWE-883). URL에는 비밀 토큰이 들어갈 수 있어
+/// 종류만 보이고 원문·`{:?}`는 노출하지 않는다.
+#[must_use]
+pub fn webhook_kind_label(ep: &crate::webhook::Endpoint) -> &'static str {
+    match ep {
+        crate::webhook::Endpoint::Ntfy { .. } => text::WEBHOOK_KIND_NTFY.get(),
+        crate::webhook::Endpoint::Telegram { .. } => text::WEBHOOK_KIND_TELEGRAM.get(),
+        crate::webhook::Endpoint::Discord { .. } => text::WEBHOOK_KIND_DISCORD.get(),
+    }
+}
+
+/// 오케스트레이션 작업 상태의 표시 이름(OWE-883). 내부 영문(`ready` 등)을 그대로 보이지 않는다.
+#[must_use]
+pub fn orchestration_task_status_label(
+    status: krill_proto::orchestration::TaskStatus,
+) -> &'static str {
+    use krill_proto::orchestration::TaskStatus as S;
+    match status {
+        S::Pending => text::ORCH_TASK_STATUS_PENDING.get(),
+        S::Ready => text::ORCH_TASK_STATUS_READY.get(),
+        S::Dispatched => text::ORCH_TASK_STATUS_DISPATCHED.get(),
+        S::Completed => text::ORCH_TASK_STATUS_COMPLETED.get(),
+        S::Failed => text::ORCH_TASK_STATUS_FAILED.get(),
+        S::Blocked => text::ORCH_TASK_STATUS_BLOCKED.get(),
+    }
+}
+
+/// 오케스트레이션 작업 한 줄(OWE-883). `{:?}` 의존성·영문 상태를 사람이 읽을 수 있게 푼다.
+/// 설정 탭과 상태바 메뉴가 같이 쓴다.
+#[must_use]
+pub fn orchestration_task_line(
+    run_id: &str,
+    id: &str,
+    title: &str,
+    status: krill_proto::orchestration::TaskStatus,
+    deps: &[String],
+) -> String {
+    let line = text::ORCH_TASK_LINE.format(&[
+        ("run", run_id),
+        ("id", id),
+        ("title", title),
+        ("status", orchestration_task_status_label(status)),
+    ]);
+    if deps.is_empty() {
+        line
+    } else {
+        format!(
+            "{} · {}",
+            line,
+            text::ORCH_TASK_DEPS.format(&[("deps", &deps.join(", "))])
+        )
+    }
 }
 
 impl std::fmt::Debug for SettingsView {
@@ -5643,7 +5705,7 @@ impl SettingsView {
             ),
             None => format!(
                 "{} · {} {}",
-                agent_id,
+                display_name,
                 profile_count,
                 text::PROFILES_UNIT.get()
             ),
@@ -5780,7 +5842,7 @@ impl SettingsView {
                                     }
                                     res
                                 }
-                                None => Err("no state dir".to_owned()),
+                                None => Err(text::NO_STATE_DIR.get().to_owned()),
                             };
                             if let Some(edit) = this.agent_edits.get_mut(agent_id) {
                                 edit.status = Some(match saved {
@@ -5826,7 +5888,7 @@ impl SettingsView {
                                         }
                                         res
                                     }
-                                    None => Err("no state dir".to_owned()),
+                                    None => Err(text::NO_STATE_DIR.get().to_owned()),
                                 };
                                 if let Some(edit) = this.agent_edits.get_mut(agent_id) {
                                     edit.status = match saved {
@@ -5956,9 +6018,10 @@ impl SettingsView {
                             .child(
                                 layout::secondary(
                                     gpui::ElementId::Name(hook_id.clone().into()),
-                                    hook_cmd,
+                                    text::HOOK_INSTALL.get(),
                                 )
                                 .debug_selector(move || hook_id.clone())
+                                .tooltip(text::HOOK_INSTALL_TIP.format(&[("cmd", &hook_cmd)]))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
@@ -5976,7 +6039,7 @@ impl SettingsView {
                                                 format!("{hook_copy} --yes"),
                                                 cx,
                                             );
-                                            format!("{hook_copy} (queued)")
+                                            text::HOOK_QUEUED.get().to_owned()
                                         } else {
                                             match install_agent_hook_at(&id_owned, &base, &state) {
                                                 Ok(path) => text::SKILLS_INSTALLED.format(&[(
@@ -5988,7 +6051,8 @@ impl SettingsView {
                                                         format!("{hook_copy} --yes"),
                                                         cx,
                                                     );
-                                                    format!("{id_owned} hook: {e}")
+                                                    text::HOOK_INSTALL_FAILED
+                                                        .format(&[("error", &e.to_string())])
                                                 }
                                             }
                                         };
@@ -7109,13 +7173,12 @@ impl SettingsView {
                 .child(layout::controls().child(reset)),
         );
         for task in orch.tasks.iter().take(6) {
-            let line = format!(
-                "[{}] {} · {} ({}) deps={:?}",
-                task.run_id,
-                task.id,
-                task.title,
-                task.status.as_str(),
-                task.deps
+            let line = orchestration_task_line(
+                &task.run_id,
+                &task.id,
+                &task.title,
+                task.status,
+                &task.deps,
             );
             orch_card = orch_card.child(
                 div()
@@ -7226,7 +7289,11 @@ impl SettingsView {
         );
         for (idx, ep) in s.webhooks.iter().enumerate() {
             let rm_id = format!("admin-webhook-remove-{idx}");
-            let label = format!("#{} · {:?}", idx + 1, ep);
+            // OWE-883: `{:?}`(내부 변형 이름·URL 원문) 대신 종류 표시 이름만 보인다.
+            // URL에는 비밀 토큰이 들어갈 수 있어 화면에 노출하지 않는다.
+            let kind = webhook_kind_label(ep);
+            let label =
+                text::WEBHOOK_LABEL.format(&[("n", &(idx + 1).to_string()), ("kind", kind)]);
             wh_card = wh_card.child(
                 div()
                     .w_full()
