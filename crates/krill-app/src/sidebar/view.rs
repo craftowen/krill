@@ -44,6 +44,13 @@ struct SessionMenuMeta {
     id: SessionId,
 }
 
+/// OWE-845: 저장소·폴더 헤더 메뉴 대상. `repo`면(로컬 저장소 헤더) '새 워크트리'도 붙인다.
+#[derive(Clone)]
+struct HeaderMenuMeta {
+    path: PathBuf,
+    repo: bool,
+}
+
 /// 행 컨텍스트 메뉴: 세션 행이면 세션 제어(열기·이어하기·종료)를 먼저 두고,
 /// 여기서 새 터미널·에이전트(N4), Open in(폴더가 있을 때), 워크트리면 핀·이름 변경·계보 작업(MK-176).
 #[expect(
@@ -57,7 +64,7 @@ fn row_menu(
     folder: Option<&PathBuf>,
     session: Option<&SessionMenuMeta>,
     tree: Option<&TreeMenuMeta>,
-    header: Option<&PathBuf>,
+    header: Option<&HeaderMenuMeta>,
     agents: &[AgentProfile],
     pr: Option<&crate::pull_request::Status>,
     window: &mut Window,
@@ -332,10 +339,23 @@ fn row_menu(
             }
         }
     }
-    // OWE-845: 저장소·폴더 헤더 우클릭 메뉴(목록에서 제거).
+    // OWE-845: 저장소·폴더 헤더 우클릭 메뉴(저장소면 새 워크트리, 목록에서 제거).
     if let Some(header) = header {
-        let (remove_this, remove_path) = (this.clone(), header.clone());
-        menu = menu.separator().item(
+        menu = menu.separator();
+        if header.repo {
+            let (wt_this, wt_repo) = (this.clone(), header.path.clone());
+            menu = menu.item(
+                PopupMenuItem::new(text::NEW_WORKTREE.get())
+                    .icon(IconName::Plus)
+                    .on_click(move |_, window, cx| {
+                        wt_this
+                            .update(cx, |s, cx| s.new_worktree(wt_repo.clone(), window, cx))
+                            .ok();
+                    }),
+            );
+        }
+        let (remove_this, remove_path) = (this.clone(), header.path.clone());
+        menu = menu.item(
             PopupMenuItem::new(text::REMOVE_PROJECT.get())
                 .icon(Icon::default().data(ui::icons::TRASH_SVG))
                 .on_click(move |_, _, cx| {
@@ -1930,9 +1950,15 @@ impl Sidebar {
                 None,
                 None,
             ),
-            Row::Repository(path) | Row::Folder(path) => {
-                (Some(path.clone()), None, None, Some(path.clone()))
-            }
+            Row::Repository(path) | Row::Folder(path) => (
+                Some(path.clone()),
+                None,
+                None,
+                Some(HeaderMenuMeta {
+                    path: path.clone(),
+                    repo: matches!(row, Row::Repository(_)) && host.is_local(),
+                }),
+            ),
             _ => return element.into_any_element(),
         };
         let this = cx.weak_entity();
