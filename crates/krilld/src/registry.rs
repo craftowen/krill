@@ -123,7 +123,7 @@ struct State {
 
 /// krilld 전체에 하나.
 pub struct Registry {
-    holder: Option<Holder>,
+    holder: Option<Arc<Holder>>,
     watch: crate::watch::Watch,
     store: Option<Arc<Store>>,
     look: Arc<Appearance>,
@@ -178,7 +178,7 @@ impl Registry {
                 None
             }
         });
-        let (holder, kept) = holder.map_or((None, Vec::new()), |(h, k)| (Some(h), k));
+        let (holder, kept) = holder.map_or((None, Vec::new()), |(h, k)| (Some(Arc::new(h)), k));
         let kept_count = kept.len();
         let reg = Self {
             app_opened: OnceLock::new(),
@@ -350,7 +350,7 @@ impl Registry {
     }
 
     pub fn holder(&self) -> Option<&Holder> {
-        self.holder.as_ref()
+        self.holder.as_deref()
     }
 
     /// 업그레이드 답을 보낸 뒤 `done`으로 main에 종료를 알린다(MK-062). 한 번만 설정된다.
@@ -1043,7 +1043,6 @@ impl Registry {
         }
     }
 
-    #[cfg(unix)]
     fn start(&self, id: SessionId, master: Master, size: WinSize) -> io::Result<Session> {
         let rec = self
             .store
@@ -1058,14 +1057,15 @@ impl Registry {
                     None
                 }
             });
-        Session::start(id, master, size, Arc::clone(&self.look), rec)
-    }
-
-    /// Windows `ReadFile` 리더 연결은 OWE-833-8에서 구현한다.
-    #[cfg(windows)]
-    #[expect(clippy::unused_self, reason = "Unix start와 같은 레지스트리 진입점")]
-    fn start(&self, _id: SessionId, _master: Master, _size: WinSize) -> io::Result<Session> {
-        Err(io::ErrorKind::Unsupported.into())
+        Session::start(
+            id,
+            master,
+            #[cfg(windows)]
+            self.holder.clone(),
+            size,
+            Arc::clone(&self.look),
+            rec,
+        )
     }
 
     fn create(&self, peer: &Peer, c: Create) -> Result<Reply, Failure> {

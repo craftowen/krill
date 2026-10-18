@@ -646,8 +646,19 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         Err(e) if is_absent(&e) => {}
         Err(e) => return Err(Error::Io(e)),
     }
-    let mut holder = Command::new(&paths.holder)
-        .arg(DETACH_ARG)
+    let mut command = Command::new(&paths.holder);
+    #[cfg(unix)]
+    command.arg(DETACH_ARG);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Short-lived bootstrap only. The holder FFI boundary creates the real
+        // holder with bInheritHandles=false and explicit Job breakaway.
+        command
+            .arg("--bootstrap")
+            .creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let mut holder = command
         .arg(&paths.krilld)
         .arg(&paths.socket)
         .stdin(Stdio::null())
@@ -673,7 +684,12 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
             Err(e) => return Err(Error::Io(e)),
         }
         if let Some(status) = holder.try_wait().map_err(Error::Io)? {
+            #[cfg(unix)]
             return Err(Error::HolderExited(status));
+            #[cfg(windows)]
+            if !status.success() {
+                return Err(Error::HolderExited(status));
+            }
         }
         if Instant::now() >= deadline {
             // 백오프로 krilld를 계속 다시 띄우는 holder를 남기지 않는다.
@@ -727,6 +743,10 @@ fn default_hello_timeout(role: ClientRole) -> Duration {
 
 /// 소켓 파일이 없거나(처음) 죽은 소켓만 남았다(krilld가 죽음).
 fn is_absent(e: &io::Error) -> bool {
+    // Windows AF_UNIX reports a missing socket as WSAENETDOWN (OWE-828).
+    if cfg!(windows) && e.raw_os_error() == Some(10050) {
+        return true;
+    }
     matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused

@@ -899,6 +899,66 @@ impl Console {
     }
 }
 
+/// Bootstrap is short-lived: its inherited std/SSH handles die before returning
+/// to the caller. Only this raw `CreateProcess` call creates the resident holder.
+pub fn bootstrap(args: &[OsString]) -> io::Result<()> {
+    use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+    use windows_sys::Win32::System::Threading::{
+        CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, STARTUPINFOW,
+    };
+    let app = std::env::current_exe()?;
+    let path = wide(app.as_os_str())?;
+    let mut command = quote(app.as_os_str());
+    for arg in args {
+        command.push(32);
+        command.extend(quote(arg));
+    }
+    if command.contains(&0) {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    command.push(0);
+    let mut in_job = 0;
+    // SAFETY: current process pseudo handle and valid output storage; null means any Job.
+    let current = unsafe { GetCurrentProcess() };
+    // SAFETY: current is our process pseudo handle and in_job is valid output storage.
+    cvt(unsafe { IsProcessInJob(current, null_mut(), &raw mut in_job) })?;
+    let flags = DETACHED_PROCESS
+        | CREATE_NEW_PROCESS_GROUP
+        | if in_job != 0 {
+            CREATE_BREAKAWAY_FROM_JOB
+        } else {
+            0
+        };
+    // SAFETY: these Win32 structures accept zero initialization with cb set below.
+    let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    startup.cb =
+        u32::try_from(size_of::<STARTUPINFOW>()).map_err(|_| io::ErrorKind::InvalidInput)?;
+    // SAFETY: PROCESS_INFORMATION is output-only storage.
+    let mut info: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: terminated UTF-16 buffers stay live; no inherited handles, no console,
+    // default environment/cwd. A restrictive Job rejects breakaway: never retry in it.
+    cvt(unsafe {
+        CreateProcessW(
+            path.as_ptr(),
+            command.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            flags,
+            null(),
+            null(),
+            &raw const startup,
+            &raw mut info,
+        )
+    })?;
+    // SAFETY: successful CreateProcessW returned two exclusive handles. Closing
+    // them does not terminate the independent holder process.
+    let _process = unsafe { owned(info.hProcess) }?;
+    // SAFETY: independent exclusive initial thread handle from CreateProcessW.
+    let _thread = unsafe { owned(info.hThread) }?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

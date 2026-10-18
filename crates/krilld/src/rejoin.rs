@@ -142,7 +142,7 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     }
 }
 
-/// Windows 고아 재결합 전송로는 아직 연결하지 않는다(OWE-833-8).
+/// Windows 고아 세션은 계속 서빙한다. 새 holder의 Adopt·Job 복원은 후속 작업이다.
 #[cfg(windows)]
 fn give(_reg: &Registry, _stream: UnixStream) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
@@ -173,7 +173,10 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
         .encode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     match with {
+        #[cfg(unix)]
         Some(s) => link.send(&frame, &[s.master()]),
+        #[cfg(windows)]
+        Some(_) => Err(io::ErrorKind::Unsupported.into()),
         None => link.send(&frame, &[]),
     }
 }
@@ -228,7 +231,7 @@ impl Handover {
         Ok(adopt)
     }
 
-    /// Windows 세션 재결합은 별도 핸들 전송 경로가 필요하다.
+    /// Windows 새 holder의 Adopt·ConPTY/Job 복원은 후속 작업이다.
     #[cfg(windows)]
     #[expect(clippy::unused_self, reason = "Unix merge와 같은 인계 진입점")]
     pub fn merge(&mut self, _kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {

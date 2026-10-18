@@ -99,13 +99,17 @@ impl Listener {
         })
     }
 
-    /// Windows에는 holder가 맡아 둘 소켓이 없다([`crate::holder`]).
+    /// Windows holder가 `WSADuplicateSocket`으로 돌려준 listener를 이어 쓴다.
     ///
     /// # Errors
-    /// 늘 `Unsupported`.
+    /// 소켓 단일 인스턴스 락을 얻지 못하면 `AddrInUse`.
     #[cfg(windows)]
-    pub fn adopt(_path: &Path, _sock: OwnedFd) -> io::Result<Self> {
-        Err(io::ErrorKind::Unsupported.into())
+    pub fn adopt(path: &Path, sock: OwnedFd) -> io::Result<Self> {
+        Ok(Self {
+            _lock: lock(path)?,
+            sock: sys::adopt_listener(sock),
+            uid: crate::os::euid(),
+        })
     }
 
     /// 다음 연결을 받는다. 피어 UID가 다르면 아무것도 보내지 않고 닫은 뒤 `PermissionDenied`를 돌려준다
@@ -127,6 +131,13 @@ impl Listener {
 impl std::os::fd::AsFd for Listener {
     fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.sock.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsSocket for Listener {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        sys::listener_socket(&self.sock)
     }
 }
 
@@ -165,3 +176,28 @@ pub fn handshake(s: &mut UnixStream, hello: &ServerHello) -> io::Result<(ClientH
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::io::AsSocket as _;
+
+    #[test]
+    fn adopted_listener_keeps_socket_and_reacquires_instance_lock() {
+        let dir = std::env::temp_dir().join(format!("kd-adopt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let path = dir.join("k.sock");
+        let original = Listener::bind(&path).unwrap();
+        let socket = original.as_socket().try_clone_to_owned().unwrap();
+        drop(original);
+        let adopted = Listener::adopt(&path, socket).unwrap();
+        assert_eq!(
+            Listener::bind(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let client = UnixStream::connect(&path).unwrap();
+        let server = adopted.accept().unwrap();
+        drop((client, server, adopted));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

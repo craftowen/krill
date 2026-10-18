@@ -160,7 +160,21 @@ fn missing_holder_is_reported() {
 #[test]
 fn holder_that_dies_is_reported() {
     let d = dir("dies");
-    let e = connect(&paths(&d, "/usr/bin/false", "/usr/bin/true"), &hello()).unwrap_err();
+    #[cfg(unix)]
+    let p = paths(&d, "/usr/bin/false", "/usr/bin/true");
+    #[cfg(windows)]
+    let p = {
+        let system = std::env::var_os("SystemRoot")
+            .map(PathBuf::from)
+            .unwrap()
+            .join("System32");
+        Paths {
+            socket: d.join("run/krilld.sock"),
+            holder: system.join("where.exe"),
+            krilld: system.join("cmd.exe"),
+        }
+    };
+    let e = connect(&p, &hello()).unwrap_err();
     assert!(matches!(e, Error::HolderExited(s) if !s.success()), "{e}");
     std::fs::remove_dir_all(&d).ok();
 }
@@ -522,4 +536,19 @@ fn paths_dev_excludes_installed_krill_app_in_tests_and_temp_home() {
         "test Paths::dev() must not fall back to /Applications/Krill.app: {:?}",
         dev.krilld
     );
+}
+
+#[test]
+fn absent_socket_errors_are_platform_specific() {
+    assert!(is_absent(&io::Error::from(io::ErrorKind::NotFound)));
+    assert!(is_absent(&io::Error::from(
+        io::ErrorKind::ConnectionRefused
+    )));
+    assert_eq!(
+        is_absent(&io::Error::from_raw_os_error(10050)),
+        cfg!(windows)
+    );
+    assert!(!is_absent(&io::Error::from(
+        io::ErrorKind::PermissionDenied
+    )));
 }
