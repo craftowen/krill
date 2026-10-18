@@ -516,7 +516,9 @@ fn search_requests_and_highlights_with_feat_search_check() {
         })
     );
 
-    // 스크롤백(Hot) 일치 응답: 보이는 화면 첫 줄에 일치 행 셀을 띄우고 하이라이트한다.
+    // 스크롤백(Hot) 일치 응답: 이웃 행을 가져오는 HISTORY 요청을 보내고, 답이 오면
+    // 일치 행이 뷰포트 안에 오도록 스크롤 오프셋을 옮겨 앞뒤 문맥과 함께 보여준다(OWE-868).
+    // 화면 3행: 위 1행·아래 1행 문맥, 깊이 3 = 4 - 0 - 1, skip = 3 - 1 = 2.
     let res2 = SearchResult {
         req: req2.req,
         snapshot: snap,
@@ -536,7 +538,28 @@ fn search_requests_and_highlights_with_feat_search_check() {
         approximate: false,
     };
     assert!(feed(&mut p, &res2.encode().unwrap()).redraw);
-    assert_eq!(p.shown().rows[0], row("hit in hot"));
+    let frames = sent(out(&mut p));
+    assert_eq!(frames.len(), 1);
+    let hist_req = HistoryRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    assert_eq!(hist_req.source, Source::Hot);
+    assert_eq!(hist_req.skip, 2);
+    assert_eq!(hist_req.count, 3);
+    // 아직 이웃 행이 오기 전에는 활성 하이라이트가 없다.
+    assert_eq!(p.highlight(), None);
+    let reply = HistoryRows {
+        req: hist_req.req,
+        total: 4,
+        pages: 0,
+        skip: 2,
+        rows: vec![row("hit in hot"), row("newer")],
+    }
+    .encode()
+    .unwrap();
+    assert!(feed(&mut p, &reply).redraw);
+    assert_eq!(
+        p.shown().rows,
+        vec![row("hit in hot"), row("newer"), row("alpha")]
+    );
     assert_eq!(
         p.highlight(),
         Some(Highlight {
@@ -545,11 +568,181 @@ fn search_requests_and_highlights_with_feat_search_check() {
             cols: 3,
         })
     );
+    // 화면 안의 모든 일치 범위를 모은다(현재 쿼리 "hit": 첫 행에만 있다).
+    assert_eq!(
+        p.highlights(),
+        &[Highlight {
+            line: 0,
+            column: 0,
+            cols: 3,
+        }]
+    );
 
-    // 검색 닫기(clear_search): 하이라이트·고정 행을 지우고 라이브 화면으로 돌아온다.
+    // 검색 닫기(clear_search): 하이라이트·일치 범위·고정 보기를 지우고 라이브 화면으로 돌아온다.
     p.clear_search();
     assert_eq!(p.highlight(), None);
+    assert!(p.highlights().is_empty());
     assert_eq!(p.shown().rows[0], row("alpha"));
+}
+
+#[test]
+fn search_cold_match_installs_fixed_view_with_context() {
+    use crate::terminal::Highlight;
+    use krill_proto::search::{
+        Direction, Hit, SearchRequest, SearchResult, Snapshot, Source as SearchSource,
+    };
+
+    let mut p = linked();
+    update(&mut p, 1, snapshot(["alpha", "beta hit", "gamma"]));
+    p.set_searchable(true);
+    assert!(p.search("hit", Direction::Next));
+    let frames = sent(out(&mut p));
+    let req = SearchRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    // 콜드 페이지 2의 5행 일치: 화면 3행이면 위 1·아래 1 문맥, skip = (10 - 5 - 1) - 1 = 3.
+    let snap = Snapshot {
+        revision: Revision(1),
+        seq: Seq(1),
+        oldest: Seq(0),
+        pages: 3,
+    };
+    let res = SearchResult {
+        req: req.req,
+        snapshot: snap,
+        total: 7,
+        hit: Some(Hit {
+            index: 0,
+            source: SearchSource::Cold { page: 2 },
+            row: 5,
+            total_rows: 10,
+            column: 1,
+            cols: 2,
+            cells: row("cold-hit"),
+        }),
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    };
+    assert!(feed(&mut p, &res.encode().unwrap()).redraw);
+    let frames = sent(out(&mut p));
+    assert_eq!(frames.len(), 1);
+    let hist_req = HistoryRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    assert_eq!(hist_req.source, Source::Cold { page: 2 });
+    assert_eq!(hist_req.skip, 3);
+    assert_eq!(hist_req.count, 3);
+    // 답 끝이 출처 끝에서 10 - 3 - 1 = 6행째라 일치(5행)는 끝에서 두 번째다.
+    let reply = HistoryRows {
+        req: hist_req.req,
+        total: 10,
+        pages: 3,
+        skip: 3,
+        rows: vec![row("cold-a"), row("cold-hit"), row("cold-b")],
+    }
+    .encode()
+    .unwrap();
+    assert!(feed(&mut p, &reply).redraw);
+    assert_eq!(
+        p.shown().rows,
+        vec![row("cold-a"), row("cold-hit"), row("cold-b")]
+    );
+    assert_eq!(
+        p.highlight(),
+        Some(Highlight {
+            line: 1,
+            column: 1,
+            cols: 2,
+        })
+    );
+    // 손 스크롤은 고정 보기를 걷고 라이브로 돌아간다.
+    assert!(p.scroll(1));
+    assert_eq!(p.highlight(), None);
+    assert_eq!(p.shown().rows[0], row("alpha"));
+}
+
+#[test]
+fn search_highlights_all_visible_matches() {
+    use crate::terminal::Highlight;
+    use krill_proto::search::{
+        Direction, Hit, SearchRequest, SearchResult, Snapshot, Source as SearchSource,
+    };
+
+    let mut p = linked();
+    update(&mut p, 1, snapshot(["hit hit", "no", "hit"]));
+    p.set_searchable(true);
+    assert!(p.search("hit", Direction::Next));
+    let frames = sent(out(&mut p));
+    let req = SearchRequest::decode(frames[0].0, &frames[0].1).unwrap();
+    let res = SearchResult {
+        req: req.req,
+        snapshot: Snapshot::default(),
+        total: 3,
+        hit: Some(Hit {
+            index: 1,
+            source: SearchSource::Screen,
+            row: 2,
+            total_rows: 3,
+            column: 0,
+            cols: 3,
+            cells: row("hit"),
+        }),
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    };
+    assert!(feed(&mut p, &res.encode().unwrap()).redraw);
+    // 활성 일치는 2행, 화면 안의 모든 일치는 0행 2곳 + 2행 1곳이다.
+    assert_eq!(
+        p.highlight(),
+        Some(Highlight {
+            line: 2,
+            column: 0,
+            cols: 3,
+        })
+    );
+    assert_eq!(
+        p.highlights(),
+        &[
+            Highlight {
+                line: 0,
+                column: 0,
+                cols: 3,
+            },
+            Highlight {
+                line: 0,
+                column: 4,
+                cols: 3,
+            },
+            Highlight {
+                line: 2,
+                column: 0,
+                cols: 3,
+            },
+        ]
+    );
+}
+
+#[test]
+fn find_matches_maps_cells_like_daemon() {
+    // 넓은 문자(다음 칸 SPACER)는 한 번에 2칸으로 잡고, 겹치지 않게 찾는다.
+    let wide = Cell {
+        ch: '한',
+        flags: Flags::WIDE,
+        ..Cell::default()
+    };
+    let spacer = Cell {
+        ch: ' ',
+        flags: Flags::SPACER,
+        ..Cell::default()
+    };
+    assert_eq!(
+        find_matches(&[wide.clone(), spacer.clone()], "한"),
+        vec![(0, 2)]
+    );
+    assert!(find_matches(&[wide, spacer], " ").is_empty());
+    assert_eq!(find_matches(&row("hit hit"), "hit"), vec![(0, 3), (4, 3)]);
+    assert_eq!(find_matches(&row("aaa"), "aa"), vec![(0, 2)]);
+    assert!(find_matches(&row("abc"), "").is_empty());
 }
 
 #[test]

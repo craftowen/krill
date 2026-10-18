@@ -1054,6 +1054,8 @@ catalog! {
         SC_CLEAR => ("화면 지우기", "Clear"),
         SC_SELECT_ALL => ("전체 선택", "Select all"),
         SC_FIND => ("찾기", "Find"),
+        SC_FIND_NEXT => ("다음 찾기", "Find next"),
+        SC_FIND_PREV => ("이전 찾기", "Find previous"),
         SC_COPY => ("복사", "Copy"),
         SC_PASTE => ("붙여넣기", "Paste"),
         SC_SIDEBAR => ("사이드바 전환", "Toggle sidebar"),

@@ -37,6 +37,10 @@ pub const FONT_SIZE: Pixels = px(14.);
 const CURSOR_ALPHA: f32 = 0.5;
 /// 선택 영역 불투명도(테마에 선택 색이 없어 전경색을 덮는다).
 const SELECTION_ALPHA: f32 = 0.3;
+/// 검색 일치(비활성) 불투명도. 선택보다 엷게, 활성보다 진하게는 아니다.
+const SEARCH_OTHER_ALPHA: f32 = 0.25;
+/// 검색 활성 일치 불투명도. 비활성·선택과 구분되게 가장 진하게.
+const SEARCH_ACTIVE_ALPHA: f32 = 0.55;
 /// 밑줄·취소선 두께.
 const DECORATION: Pixels = px(1.);
 /// 밑줄·막대 커서 두께.
@@ -338,8 +342,10 @@ pub struct TerminalElement {
     pub painted: Option<Painted>,
     /// 마우스 선택(MK-033). 배경 위·글자 아래에 반투명으로 칠한다.
     pub selection: Option<Selection>,
-    /// 검색 일치 하이라이트(MK-059).
+    /// 검색 활성 일치(MK-059). `highlights` 위에 진하게 덧칠한다.
     pub highlight: Option<Highlight>,
+    /// 검색 일치 범위 전부(OWE-868). 활성(`highlight`)과 겹치는 칸은 건너뛰고 엷게 칠한다.
+    pub highlights: Vec<Highlight>,
     /// ⌘ 아래 파일 경로 링크(OWE-663). 글자색 밑줄을 긋는다.
     pub link: Option<Highlight>,
     /// 터미널 배경 알파(`terminal_opacity_pct / 100`, 글자·장식은 그대로).
@@ -362,6 +368,7 @@ impl TerminalElement {
             painted: None,
             selection: None,
             highlight: None,
+            highlights: Vec::new(),
             link: None,
             opacity: 1.,
             cursor_hidden: false,
@@ -464,13 +471,24 @@ impl Element for TerminalElement {
                     }
                 }
             }
+            for h in &self.highlights {
+                if self.highlight.is_some_and(|active| active == *h) {
+                    continue;
+                }
+                if h.line < self.screen.lines && h.cols > 0 {
+                    let origin = point(col_x(h.column), line_y(h.line));
+                    let extent = size(cell.width * f32::from(h.cols), cell.height);
+                    let color = hsla(theme.ansi[3]).opacity(SEARCH_OTHER_ALPHA);
+                    window.paint_quad(fill(Bounds::new(origin, extent), color));
+                }
+            }
             if let Some(h) = self.highlight
                 && h.line < self.screen.lines
                 && h.cols > 0
             {
                 let origin = point(col_x(h.column), line_y(h.line));
                 let extent = size(cell.width * f32::from(h.cols), cell.height);
-                let color = hsla(theme.ansi[3]).opacity(SELECTION_ALPHA);
+                let color = hsla(theme.ansi[3]).opacity(SEARCH_ACTIVE_ALPHA);
                 window.paint_quad(fill(Bounds::new(origin, extent), color));
             }
         });
