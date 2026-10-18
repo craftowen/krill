@@ -261,11 +261,11 @@ pub fn agent_brand_icon(agent_id: &str, size_px: f32, _fg: Hsla) -> gpui::Div {
                 .flex()
                 .items_center()
                 .justify_center()
-                .rounded(px(3.))
+                .rounded(super::theme::RADIUS_XS)
                 .bg(brand.opacity(0.14))
                 .border_1()
                 .border_color(brand.opacity(0.45))
-                .text_size(px((size_px * 0.65).max(9.)))
+                .text_size(super::theme::TEXT_2XS)
                 .text_color(brand)
                 .child(letter)
         }
