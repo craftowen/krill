@@ -1169,11 +1169,7 @@ fn window_options(cx: &App) -> WindowOptions {
             size(px(1100.), px(740.)),
             cx,
         ))),
-        titlebar: Some(gpui::TitlebarOptions {
-            title: Some(text::TITLE.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(crate::ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(crate::ui::titlebar(text::TITLE.get())),
         ..Default::default()
     }
 }

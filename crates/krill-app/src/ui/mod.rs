@@ -26,5 +26,5 @@ pub use theme::{
     TAB_MAX_WIDTH, TERMINAL_DARK, TERMINAL_LIGHT, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XS,
     TITLEBAR_HEIGHT, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, agent_state_color, apply,
     git_status_color, hex, hexa, palette, palette_for, sync, tab_tag_color, terminal_surface,
-    terminal_surface_alpha, terminal_theme,
+    terminal_surface_alpha, terminal_theme, titlebar,
 };

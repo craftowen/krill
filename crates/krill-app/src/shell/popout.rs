@@ -52,11 +52,7 @@ fn options(title: &str, dimensions: gpui::Size<gpui::Pixels>, cx: &App) -> Windo
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None, dimensions, cx,
         ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(title.to_owned().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(ui::titlebar(title.to_owned())),
         ..Default::default()
     }
 }
