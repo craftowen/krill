@@ -9,10 +9,10 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use gpui::{AppContext as _, Context, Window};
-use krill_proto::control::{RemoveWorktree, Reply};
+use krill_proto::control::{Program, RemoveWorktree, Reply};
 use serde::{Deserialize, Serialize};
 
-use super::{Selected, Sidebar};
+use super::{NewSession, Selected, Sidebar};
 use crate::worktree;
 
 /// 시각적 들여쓰기 최대 깊이(너무 깊은 중첩에서 카드 폭이 무너지지 않게 제한).
@@ -541,20 +541,48 @@ impl Sidebar {
             return;
         };
         let parent_for_event = parent.clone();
-        let dialog =
-            cx.new(|cx| worktree::Dialog::new_with_parent(repo, parent, source, window, cx));
+        // OWE-853: 호출한 워크트리(부모 우선, 없으면 레포)의 현재 브랜치를 기본값으로 쓴다.
+        let parent_branch = parent
+            .as_ref()
+            .and_then(|p| self.meta.get(p).and_then(|t| t.branch.clone()));
+        let repo_branch = self.meta.get(&repo).and_then(|t| t.branch.clone());
+        // OWE-853: 로컬 git refs를 읽어 후보를 풍부하게 한다(새 IPC 없이, 실패 시 폴백만).
+        let git_refs = worktree::list_git_refs(&repo);
+        let (default_base, initial_candidates) = worktree::branch_suggestions(
+            parent_branch.as_deref(),
+            repo_branch.as_deref(),
+            &git_refs,
+        );
+        let dialog = cx.new(|cx| {
+            let mut dialog = worktree::Dialog::new_with_parent(repo, parent, source, window, cx);
+            dialog.set_branch_candidates(initial_candidates, cx);
+            if let Some(ref base) = default_base {
+                dialog.set_base_default(Some(base.clone()), window, cx);
+            }
+            dialog
+        });
         let events = cx.subscribe(
             &dialog,
             move |s, _, event: &worktree::Event, cx| match event {
                 worktree::Event::Created(w) => {
+                    // OWE-853: 생성 완료 즉시 모달을 닫고 새 워크트리로 전환한다.
+                    // Done 화면에 머물지 않는다. 계보·새로고침 뒤 setup 세션이 있으면
+                    // 그 세션으로, 없으면 새 워크트리 경로에 로그인 탭을 연다.
+                    let created_path = PathBuf::from(std::ffi::OsStr::from_bytes(&w.path));
                     if let Some(parent_path) = &parent_for_event {
-                        let created_path = PathBuf::from(std::ffi::OsStr::from_bytes(&w.path));
-                        s.set_worktree_parent(created_path, parent_path.clone(), cx);
+                        s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
                     }
+                    s.creating = None;
                     s.refresh(cx);
                     if let Some(id) = w.setup {
                         cx.emit(Selected(id));
+                    } else {
+                        cx.emit(NewSession {
+                            cwd: created_path,
+                            program: Program::Login,
+                        });
                     }
+                    cx.notify();
                 }
                 worktree::Event::Close => {
                     s.creating = None;

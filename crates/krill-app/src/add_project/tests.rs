@@ -49,6 +49,37 @@ fn enter_browses_and_escape_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn owe852_arrow_keys_move_selection_and_enter_activates(cx: &mut TestAppContext) {
+    let (dialog, events, cx) = open(cx);
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).selected()), 0);
+    cx.simulate_keystrokes("down");
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).selected()), 1);
+    cx.simulate_keystrokes("down");
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).selected()), 2);
+    cx.simulate_keystrokes("down");
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).selected()), 0);
+    cx.simulate_keystrokes("up");
+    assert_eq!(cx.update(|_, cx| dialog.read(cx).selected()), 2);
+    // 선택 2(만들기)에서 Enter는 Create를 내보낸다.
+    cx.simulate_keystrokes("enter");
+    assert_eq!(*events.lock().unwrap(), [Event::Create]);
+}
+
+#[gpui::test]
+fn owe852_escape_in_clone_returns_to_start(cx: &mut TestAppContext) {
+    let (dialog, events, cx) = open(cx);
+    cx.update(|window, cx| dialog.update(cx, |d, cx| d.show_clone(window, cx)));
+    cx.simulate_keystrokes("escape");
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "escape in clone step must not close"
+    );
+    cx.update(|_, cx| assert_eq!(dialog.read(cx).step, Step::Start));
+    cx.simulate_keystrokes("escape");
+    assert_eq!(*events.lock().unwrap(), [Event::Close]);
+}
+
+#[gpui::test]
 fn clone_step_requires_url_then_emits_it(cx: &mut TestAppContext) {
     let (dialog, events, cx) = open(cx);
     cx.update(|window, cx| dialog.update(cx, |d, cx| d.show_clone(window, cx)));
