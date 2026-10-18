@@ -2155,3 +2155,85 @@ fn comparison_tabs_filter_worktree_and_index_files_and_clear_mismatched_selectio
         Some("src/both.rs".to_owned())
     );
 }
+
+/// OWE-898: 우측 패널을 숨기면(`set_visible(false)`) 진행 중인 패치·Checks 조회가 취소돼
+/// 최대 4MiB 패치 버퍼와 검사 결과가 백그라운드에 머물지 않는다. 표시 중인 내용은 유지된다.
+#[gpui::test]
+fn hiding_panel_cancels_patch_and_checks_tasks(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| Panel::unconnected(PathBuf::from("/repo"), cx));
+    // 진행 중인 패치·Checks를 흉내낸다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.patch_gen = p.patch_gen.wrapping_add(1);
+            p.patch_task = Some(cx.spawn(async move |_, _| {
+                std::future::pending::<()>().await;
+            }));
+            p.checks.generation = p.checks.generation.wrapping_add(1);
+            p.checks.loading = true;
+            p.checks.task = Some(cx.spawn(async move |_, _| {
+                std::future::pending::<()>().await;
+            }));
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).patch_task.is_some()));
+    assert!(cx.update(|_, cx| view.read(cx).checks.task.is_some()));
+
+    cx.update(|_, cx| view.update(cx, |p, cx| p.set_visible(false, cx)));
+    cx.run_until_parked();
+    assert!(!cx.update(|_, cx| view.read(cx).is_visible()));
+    assert!(
+        cx.update(|_, cx| view.read(cx).patch_task.is_none()),
+        "hidden diff panel must cancel in-flight patch fetch"
+    );
+    assert!(
+        cx.update(|_, cx| view.read(cx).checks.task.is_none()),
+        "hidden diff panel must cancel in-flight checks fetch"
+    );
+    assert!(
+        !cx.update(|_, cx| view.read(cx).checks.loading),
+        "hidden diff panel must clear checks loading flag"
+    );
+}
+
+/// OWE-898: 비포커스 전환(`set_active`)은 살아 있는 감시 루프를 재시작하지 않는다.
+/// 재시작은 진행 중인 `watch` IPC와 새 루프의 조회가 겹쳐 피크를 2배로 만들기 때문이다.
+#[gpui::test]
+fn reactivating_panel_keeps_running_watch_task(cx: &mut gpui::TestAppContext) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    struct CountingSource {
+        watches: AtomicU64,
+    }
+    impl Source for CountingSource {
+        fn watch(&self, _req: &GitWatchRequest) -> io::Result<GitWatchReply> {
+            self.watches.fetch_add(1, Ordering::SeqCst);
+            Ok(GitWatchReply::Unchanged { pending: false })
+        }
+    }
+
+    cx.update(gpui_component::init);
+    let source = std::sync::Arc::new(CountingSource {
+        watches: AtomicU64::new(0),
+    });
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(PathBuf::from("/repo"), cx);
+        p.connect_source(source.clone(), cx);
+        p
+    });
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).watch_task.is_some()));
+
+    // 비포커스 후 다시 포커스해도 감시 태스크는 유지된다(재시작 없음).
+    cx.update(|_, cx| view.update(cx, |p, cx| p.set_active(false, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).watch_task.is_some()));
+    cx.update(|_, cx| view.update(cx, |p, cx| p.set_active(true, cx)));
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| view.read(cx).watch_task.is_some()),
+        "reactivation must keep the running watch loop instead of restarting it"
+    );
+    assert!(cx.update(|_, cx| view.read(cx).is_active()));
+}
