@@ -37,6 +37,23 @@ fn counts(sessions: usize, needs_you: usize) -> String {
     ])
 }
 
+/// OWE-851: 상태바 드롭다운 메뉴 열림·닫힘을 셸에 알려 메뉴가 열린 동안은
+/// 호버 툴팁을 숨긴다(팝오버 하단 글자 가림 방지).
+fn track_menu_open(weak: WeakEntity<Shell>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+    move |open, _, cx| {
+        let open = *open;
+        weak.update(cx, |shell, cx| {
+            if open {
+                shell.status_menus_open += 1;
+            } else {
+                shell.status_menus_open = shell.status_menus_open.saturating_sub(1);
+            }
+            cx.notify();
+        })
+        .ok();
+    }
+}
+
 actions!(popout, [FloatTerminal, DashboardPopout, CloseDashboard]);
 
 pub(super) fn bind_keys(cx: &mut App) {
@@ -1005,6 +1022,8 @@ impl Shell {
         };
         let items = self.sidebar.read(cx).jump_items();
         let needs_you = items.iter().filter(|i| i.needs_you).count();
+        // OWE-851: 메뉴가 열려 있는 동안은 상태바 호버 툴팁을 숨긴다.
+        let tooltips_on = self.status_menus_open == 0;
         let session = self.layout.focused().and_then(|p| self.layout.session(p));
         let snap = self.accounts_snapshot.clone();
         let status_providers = [
@@ -1065,7 +1084,8 @@ impl Shell {
                 |s| format!("{} · {} · {}", provider.display_name(), s.label, s.updated),
             );
             provider_pills = provider_pills.child(
-                ui::button_with_tooltip(
+                ui::button_with_tooltip_when(
+                    tooltips_on,
                     Button::new(gpui::SharedString::from(selector.clone()))
                         .label(label)
                         .icon(
@@ -1081,11 +1101,13 @@ impl Shell {
                 )
                 .dropdown_menu(move |menu, window, cx| {
                     provider_usage_menu(menu, &provider_snap, provider, weak.clone(), window, cx)
-                }),
+                })
+                .on_open_change(track_menu_open(cx.weak_entity())),
             );
         }
         let weak = cx.weak_entity();
-        let refresh_button = ui::button_with_tooltip(
+        let refresh_button = ui::button_with_tooltip_when(
+            tooltips_on,
             Button::new("status-usage-refresh")
                 .icon(gpui_component::IconName::RefreshCw)
                 .ghost()
@@ -1101,7 +1123,8 @@ impl Shell {
         let ssh_count_label = ssh_hosts.len().to_string();
         let ssh_full_label = text::SSH_MENU_BTN.format(&[("count", &ssh_count_label)]);
         let ssh_tooltip = format!("{} — {ssh_full_label}", text::SSH_MENU_TITLE.get());
-        let ssh_menu = ui::button_with_tooltip(
+        let ssh_menu = ui::button_with_tooltip_when(
+            tooltips_on,
             Button::new("status-ssh-switcher")
                 .icon(gpui_component::Icon::default().data(ui::icons::SERVER_SVG))
                 .label(ssh_count_label)
@@ -1139,7 +1162,8 @@ impl Shell {
                     },
                 ),
             )
-        });
+        })
+        .on_open_change(track_menu_open(cx.weak_entity()));
         let state_dir = self.state_dir(cx);
         let orch_store = state_dir
             .as_deref()
@@ -1157,7 +1181,7 @@ impl Shell {
                 .find(|l| l.pane.session() == Some(sid))
                 .map(|l| (sid.0, screen_plain_text(&l.pane.shown())))
         });
-        let orch_menu = ui::button_with_tooltip(
+        let orch_menu = ui::button_with_tooltip_when(tooltips_on,
             Button::new("status-orchestration-menu")
                 .icon(gpui_component::Icon::default().data(ui::icons::WORKFLOW_SVG))
                 .label(orch_compact_label)
@@ -1393,7 +1417,8 @@ impl Shell {
                         ),
                     )
                 }
-            });
+            })
+            .on_open_change(track_menu_open(cx.weak_entity()));
         let mut detected_ports = Vec::new();
         for live in self.live.values() {
             if let Some(sid) = live.pane.session() {
@@ -1434,7 +1459,8 @@ impl Shell {
         let ports_count_label = detected_ports.len().to_string();
         let ports_full_label = text::PORTS_MENU_BTN.format(&[("count", &ports_count_label)]);
         let ports_tooltip = format!("{} — {ports_full_label}", text::PORTS_MENU_TITLE.get());
-        let ports_menu = ui::button_with_tooltip(
+        let ports_menu = ui::button_with_tooltip_when(
+            tooltips_on,
             Button::new("status-ports-menu")
                 .icon(gpui_component::Icon::default().data(ui::icons::PLUG_SVG))
                 .label(ports_count_label)
@@ -1460,7 +1486,8 @@ impl Shell {
                 }
             }
             menu
-        });
+        })
+        .on_open_change(track_menu_open(cx.weak_entity()));
         div()
             .id("status-bar")
             .debug_selector(|| "status-bar".into())
@@ -1511,7 +1538,8 @@ impl Shell {
                             div()
                                 .debug_selector(|| "status-checks-warning".into())
                                 .child(
-                                    ui::button_with_tooltip(
+                                    ui::button_with_tooltip_when(
+                                        tooltips_on,
                                         Button::new("status-checks-warning")
                                             .icon(
                                                 gpui_component::Icon::default()
@@ -1540,7 +1568,8 @@ impl Shell {
                                     krill_app::i18n::catalog::updater_relaunch::STATUS_READY_BADGE
                                         .format(&[("version", &staged.to_version)]);
                                 let compact = format!("v{}", staged.to_version);
-                                ui::button_with_tooltip(
+                                ui::button_with_tooltip_when(
+                                    tooltips_on,
                                     Button::new("status-update-ready")
                                         .icon(
                                             gpui_component::Icon::default()
@@ -1645,7 +1674,8 @@ impl Shell {
                         let float_tip =
                             format!("{} — {}", text::FLOAT_BUTTON.get(), text::FLOAT_LABEL.get());
                         d.child(
-                            ui::button_with_tooltip(
+                            ui::button_with_tooltip_when(
+                                tooltips_on,
                                 Button::new("float-terminal")
                                     .icon(
                                         gpui_component::Icon::default()
@@ -1670,7 +1700,8 @@ impl Shell {
                             text::DASHBOARD.get(),
                             text::DASHBOARD_LABEL.get()
                         );
-                        ui::button_with_tooltip(
+                        ui::button_with_tooltip_when(
+                            tooltips_on,
                             Button::new("dashboard-popout")
                                 .icon(
                                     gpui_component::Icon::default()
