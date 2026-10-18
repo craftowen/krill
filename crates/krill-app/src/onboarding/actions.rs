@@ -653,7 +653,7 @@ pub(super) fn report_failure(id: &str, error: String, cx: &mut App) {
     publish(id, error, cx);
 }
 
-/// 동의 후 시작 준비. hook과 권한은 변경하지 않는다.
+/// 첫 실행 시작 준비(OWE-904: 동의 없이 `offer`가 부른다). hook과 권한은 변경하지 않는다.
 pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
     let background = cx.background_executor().clone();
     cx.spawn(async move |cx| {
