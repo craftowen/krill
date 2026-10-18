@@ -53,7 +53,7 @@ pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
 
 /// `create_new`로 임시 경로의 기존 링크를 거부하고 `hard_link`로 기존 설정을 덮어쓰지 않고 게시한다.
 fn copy_once(src: &Path, dst: &Path, name: &'static str, report: &mut Report) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -89,6 +89,7 @@ fn copy_once(src: &Path, dst: &Path, name: &'static str, report: &mut Report) ->
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use crate::usage::provision::provision_if_enabled;

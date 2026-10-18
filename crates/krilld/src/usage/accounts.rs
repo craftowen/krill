@@ -347,7 +347,7 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use krill_proto::os::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
     let write = (|| {
@@ -651,6 +651,7 @@ fn now_epoch() -> i64 {
 /// 같은 값으로 풀리고, `t`/공백 구분자·`±HHMM`·`,` 소수가 추가로 풀린다(실측 캐시 형식은 불변).
 /// 테스트에서 리셋 시각 픽스처를 풀 때 쓴다.
 #[cfg(test)]
+#[cfg(unix)]
 pub(crate) use krill_proto::time::parse_reset_epoch;
 
 /// Orca `error` 원문을 상태로 푼다(OWE-703). 로그인 계열 문구면 로그인 필요, 그 밖은 오류다.

@@ -6,16 +6,18 @@
 //! 소유자가 덮어쓸 죽은 소켓 하나만 있다. 종료할 때 unlink하지 않는다 — 떠나는 데몬이 후임의 소켓을 지우지 못하게.
 
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use krill_proto::ipc::{self, ClientHello, Negotiated, ServerHello};
+use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
+use krill_proto::os::net::{UnixListener, UnixStream};
 
+use crate::os::{AsFd, OwnedFd};
 use crate::sys;
 
 pub use krill_proto::daemon::SUN_PATH_MAX;
@@ -53,14 +55,14 @@ impl Listener {
                 "socket path must be shorter than 100 bytes",
             ));
         }
-        let uid = rustix::process::geteuid().as_raw();
+        let uid = crate::os::euid();
         let dir = path
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .ok_or(io::ErrorKind::InvalidInput)?;
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let m = fs::symlink_metadata(dir)?;
-        if !m.is_dir() || m.uid() != uid || m.mode() & 0o077 != 0 {
+        if !m.is_dir() || !crate::os::private_to_me(&m, 0o077) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "socket directory must be a 0700 directory owned by this user",
@@ -73,7 +75,8 @@ impl Listener {
             _ => {}
         }
         let sock = UnixListener::bind(&tmp)?;
-        fs::set_permissions(&tmp, Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
         fs::rename(&tmp, path)?;
         Ok(Self {
             sock,
@@ -87,12 +90,22 @@ impl Listener {
     ///
     /// # Errors
     /// 다른 krilld가 같은 `path`의 락을 쥐고 있으면 `AddrInUse`. 그 밖의 IO 오류.
+    #[cfg(unix)]
     pub fn adopt(path: &Path, sock: OwnedFd) -> io::Result<Self> {
         Ok(Self {
             _lock: lock(path)?,
             sock: UnixListener::from(sock),
-            uid: rustix::process::geteuid().as_raw(),
+            uid: crate::os::euid(),
         })
+    }
+
+    /// Windows에는 holder가 맡아 둘 소켓이 없다([`crate::holder`]).
+    ///
+    /// # Errors
+    /// 늘 `Unsupported`.
+    #[cfg(windows)]
+    pub fn adopt(_path: &Path, _sock: OwnedFd) -> io::Result<Self> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// 다음 연결을 받는다. 피어 UID가 다르면 아무것도 보내지 않고 닫은 뒤 `PermissionDenied`를 돌려준다
@@ -110,8 +123,9 @@ impl Listener {
     }
 }
 
-impl AsFd for Listener {
-    fn as_fd(&self) -> BorrowedFd<'_> {
+#[cfg(unix)]
+impl std::os::fd::AsFd for Listener {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.sock.as_fd()
     }
 }
@@ -149,4 +163,5 @@ pub fn handshake(s: &mut UnixStream, hello: &ServerHello) -> io::Result<(ClientH
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

@@ -1,4 +1,5 @@
 //! OWE-589: Exited가 exec 응답보다 먼저 와도 holder 리더가 Release 송신에 막히지 않는다.
+#![cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, mpsc};

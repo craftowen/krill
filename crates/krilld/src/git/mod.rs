@@ -6,12 +6,11 @@
 //! - 옵션·환경은 고정한다: `-c core.quotePath=false`, `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`,
 //!   stdin은 닫고, krilld를 띄운 쪽에서 물려받았을 수 있는 저장소 지정 변수(`GIT_DIR` 등)는 지운다.
 
+use krill_proto::os::ffi::OsStrExt as _;
 use std::collections::{HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -236,13 +235,13 @@ fn next(shared: &Shared) -> Option<Job> {
 
 fn command(program: &Path, repo: &Path, args: &[OsString]) -> Command {
     let mut cmd = Command::new(program);
-    cmd.args(FIXED_ARGS)
+    crate::child::own_group(&mut cmd)
+        .args(FIXED_ARGS)
         .args(args)
         .current_dir(repo)
         .env("PATH", OsStr::from_bytes(crate::shell::login_path()))
         .envs(FIXED_ENV)
-        .stdin(Stdio::null())
-        .process_group(0);
+        .stdin(Stdio::null());
     for var in CLEARED_ENV {
         cmd.env_remove(var);
     }
@@ -352,4 +351,5 @@ pub(crate) fn queue() -> Result<&'static Arc<GitQueue>, String> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

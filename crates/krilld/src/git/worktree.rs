@@ -18,13 +18,13 @@
 //! - setup 신뢰: 레포 경로와 스크립트 내용의 SHA-256을 신뢰 파일에 한 줄씩 남긴다. 같은 레포에서 같은 내용이면
 //!   묻지 않는다.
 
+use krill_proto::os::ffi::{OsStrExt, OsStringExt};
+use krill_proto::os::fs::OpenOptionsExt;
 use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Output;
 
@@ -650,7 +650,7 @@ fn link_symlinks(top: &Path, wt: &Path, entries: &[String]) -> (Vec<String>, Vec
             warnings.push(format!("symlink {e:?}: refused, destination has a symlink"));
             continue;
         }
-        match std::os::unix::fs::symlink(top_real.join(rel), &dst) {
+        match crate::os::symlink(&top_real.join(rel), &dst) {
             Ok(()) => linked.push(trimmed.to_owned()),
             Err(err) => warnings.push(format!("symlink {e:?}: {err}")),
         }
@@ -771,6 +771,7 @@ fn copy_tree(src: &Path, dst: &Path, name: &str, warnings: &mut Vec<String>) -> 
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
 
 /// Best-effort startup cleanup; preparation failures never prevent session recovery.

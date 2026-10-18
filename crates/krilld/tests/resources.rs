@@ -3,6 +3,7 @@
 //!
 //! `krill-holder`는 `krilld` 옆(같은 target 디렉터리)에 있어야 한다: `cargo nextest run --workspace`.
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,

@@ -201,6 +201,7 @@ pub(crate) fn valid(entry: &Entry) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn scan_in(claude: Option<&Path>, codex: Option<&Path>) -> Snapshot {
     let claude_roots: Vec<PathBuf> = claude.into_iter().map(Path::to_path_buf).collect();
     let codex_roots: Vec<PathBuf> = codex.into_iter().map(Path::to_path_buf).collect();
@@ -595,4 +596,5 @@ mod resume_profile_tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

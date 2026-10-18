@@ -1,12 +1,12 @@
 use super::*;
 use crate::holder::{Holder, Kept};
+use crate::os::OwnedFd;
 use crate::scope::{Peer, Scope};
 use krill_proto::agent::Permission;
 use krill_proto::control::{AgentLaunch, Create, Program, Reply};
 use krill_proto::holder::{FromHolder, VERSION};
+use krill_proto::os::net::UnixStream;
 use std::io::{Read as _, Write as _};
-use std::os::fd::OwnedFd;
-use std::os::unix::net::UnixStream;
 use std::process::{Command, Stdio};
 
 fn done(ns: u64) -> AgentStatus {
