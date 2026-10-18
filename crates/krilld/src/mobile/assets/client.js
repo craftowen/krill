@@ -5,7 +5,32 @@
  const text=s=>{const bytes=C.enc.encode(s);return C.concat(v(bytes.length),bytes);};
  const frame=(kind,body)=>{const h=new Uint8Array(5);new DataView(h.buffer).setUint32(0,body.length+1,true);h[4]=kind;return C.concat(h,body);};
  const reader=bytes=>{let at=0;return {u(){let n=0n,shift=0n;for(let i=0;i<10;i++){if(at>=bytes.length)throw Error('Truncated response');const b=bytes[at++];n|=BigInt(b&127)<<shift;if(!(b&128))return n;shift+=7n;}throw Error('Invalid response');},text(){const n=Number(this.u());if(n>bytes.length-at)throw Error('Truncated response');const s=decode.decode(bytes.slice(at,at+n));at+=n;return s;}};};
- M.transport={create(options){
+ // Pairing input is consumed once, before UI routing or networking.
+ function bootstrap(){
+  const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1)),ticket=fragment.get('pair'),secret=fragment.get('key'),pair=ticket&&secret?{ticket,secret}:null;
+  const sensitive=['pair','key','t','r'],consumed=sensitive.some(key=>fragment.has(key));for(const key of sensitive)parameters.delete(key);
+  history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?(pair?'#/pair-confirm':''):location.hash));
+  const STORE='minikrill-mobile-v2',match=/^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname),fixed=!!match,hash=match?.[1];
+  let credentials;try{credentials=pair?null:JSON.parse(localStorage.getItem(STORE)||'null');}catch{credentials=null;}
+  // A link without both pairing secrets cannot replace a saved destination.
+  const rid=pair?fragment.get('r'):credentials?.rid;
+  let url=pair?(fragment.get('t')?'https://'+fragment.get('t'):null):credentials?.url;
+  const validUrl=value=>typeof value==='string'&&/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(value);
+  if(fixed)navigator.serviceWorker?.register('/sw.js').catch(()=>{});
+  return {parameters,pair,credentials,fixed,
+   socketUrl(){if(!fixed)return `${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`;if(!validUrl(url))throw Error('Scan a fresh QR code from desktop Settings → Mobile.');return `wss://${url.slice(8)}/ws?v=${hash}`;},
+   authenticated(auth){credentials=auth.credential?auth:credentials;if(fixed)credentials={...credentials,rid,url,hash};return credentials;},
+   async locate(){
+    if(!fixed||!rid)return false;
+    try{const response=await fetch('/r/'+encodeURIComponent(rid),{cache:'no-store'});if(response.ok){const found=await response.json();if(validUrl(found.url)&&typeof found.hash==='string'&&/^[0-9a-f]{16}$/.test(found.hash)){
+     url=found.url;if(credentials){credentials={...credentials,rid,url,hash:found.hash};localStorage.setItem(STORE,JSON.stringify(credentials));}
+     if(found.hash!==hash){location.replace('/m/'+found.hash+'/'+location.search+location.hash);return true;}
+    }}}catch{}
+    return false;
+   }
+  };
+ }
+ M.transport={bootstrap,create(options){
   let credentials=options.credentials,pair=options.pair,socket,channel,generation=0,connected=false,connecting=false,stopped=false,failed,queue=[],waiters=[],serial=Promise.resolve(),refreshing,timer,retryTimer,retryDelay=1000,authFailures=0,retryNotBefore=0,authBlocked=false;
   const status=(phase,message)=>options.onStatus?.({phase,message,generation});
   const next=()=>queue.length?Promise.resolve(queue.shift()):failed?Promise.reject(failed):new Promise((resolve,reject)=>waiters.push({resolve,reject}));
@@ -27,18 +52,18 @@
    let stage=0;
    try{
     if(!pair&&!credentials)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
-    const active=socket=new WebSocket(options.url);active.binaryType='arraybuffer';
+    const active=socket=new WebSocket(options.endpoint?options.endpoint.socketUrl():options.url);active.binaryType='arraybuffer';
     active.addEventListener('message',e=>{if(current!==generation)return;const w=waiters.shift();if(w)w.resolve(e.data);else queue.push(e.data);});
     const end=e=>{if(current!==generation)return;const denied=e?.code===1008;if(denied){authBlocked=true;clearTimeout(retryTimer);}const error=Error(denied?'Desktop rejected authentication. Scan a fresh QR code.':'Disconnected. Pending actions were not resent.');error.transport=!denied;if(denied&&failed){failed=error;status('disconnected',error.message);return;}disconnect(error);};active.addEventListener('close',end);active.addEventListener('error',end);
-    await new Promise((resolve,reject)=>{active.addEventListener('open',resolve,{once:true});active.addEventListener('error',()=>reject(Error('Could not connect to desktop')),{once:true});active.addEventListener('close',()=>reject(failed||Error('Disconnected')),{once:true});});
+    await new Promise((resolve,reject)=>{active.addEventListener('open',()=>{stage=1;resolve();},{once:true});active.addEventListener('error',()=>reject(Error('Could not connect to desktop')),{once:true});active.addEventListener('close',()=>reject(failed||Error('Disconnected')),{once:true});});
     const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));stage=2;if(challenge.version!==2)throw Error('Unsupported desktop protocol');
     const pairing=!!pair,secret=pairing?C.unbase64(pair.secret):C.sha256(C.unhex(credentials.credential));channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));secret.fill(0);
     active.send(JSON.stringify({token:pairing?pair.ticket:null,device_id:pairing?null:credentials.device_id,client_nonce:C.hex(nonce)}));send(C.enc.encode(JSON.stringify({label:options.label||'Mobile browser'})));
-    const auth=JSON.parse(decode.decode(await plain()));stage=3;if(auth.credential){credentials=auth;pair=null;options.onAuthenticated?.(auth);}
+    const auth=JSON.parse(decode.decode(await plain()));stage=3;if(auth.credential||options.endpoint?.fixed){credentials=options.endpoint?options.endpoint.authenticated(auth):auth;pair=null;options.onAuthenticated?.(credentials);}
     const hello=reader((await plain()).slice(5));hello.u();hello.u();const features=hello.u();send(frame(2,C.concat(v(1),v(1),v(features),v(0),text('krill-mobile-pwa'))));
     connected=true;await refresh();retryDelay=1000;authFailures=0;retryNotBefore=0;status('ready','Encrypted · connected');poll();
-   }catch(e){if(stage===2){if((e?.transport||failed?.transport)&&!authBlocked){authFailures++;retryNotBefore=Date.now()+65000*authFailures;if(authFailures>2)authBlocked=true;}else authBlocked=true;}options.onError?.(e);disconnect(e);}finally{connecting=false;if(!connected)retry();}
+   }catch(e){if(stage===0&&!authBlocked&&await options.endpoint?.locate()){stopped=true;}if(stage===2){if((e?.transport||failed?.transport)&&!authBlocked){authFailures++;retryNotBefore=Date.now()+65000*authFailures;if(authFailures>2)authBlocked=true;}else authBlocked=true;}options.onError?.(e);disconnect(e);}finally{connecting=false;if(!connected)retry();}
   }
-  return {connect,rpc,refresh,reconnect(){disconnect(Error('Reconnecting… Pending actions were not resent.'));authBlocked=false;authFailures=0;retryNotBefore=0;retryDelay=1000;connect();},get ready(){return connected;},get credentials(){return credentials;},resume(){if(!connected){retryDelay=1000;connect();}else refresh().catch(options.onError);},terminalConnect(){if(!connected||!credentials)throw Error('Reconnect to desktop first');return {socket:new WebSocket(options.url),credentials};},close(){stopped=true;clearTimeout(timer);clearTimeout(retryTimer);disconnect(Error('Disconnected'));}};
+  return {connect,rpc,refresh,reconnect(){disconnect(Error('Reconnecting… Pending actions were not resent.'));authBlocked=false;authFailures=0;retryNotBefore=0;retryDelay=1000;connect();},get ready(){return connected;},get credentials(){return credentials;},resume(){if(!connected){retryDelay=1000;connect();}else refresh().catch(options.onError);},terminalConnect(){if(!connected||!credentials)throw Error('Reconnect to desktop first');return {socket:new WebSocket(options.endpoint?options.endpoint.socketUrl():options.url),credentials};},close(){stopped=true;clearTimeout(timer);clearTimeout(retryTimer);disconnect(Error('Disconnected'));}};
  }};
 })();

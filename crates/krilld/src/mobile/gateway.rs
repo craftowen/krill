@@ -9,6 +9,7 @@ use krill_proto::mobile::{ConnectMode, MobileReply, MobileRequest, NetworkInterf
 use krill_proto::os::net::UnixStream;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -29,6 +30,13 @@ const IDLE_PINGS: u8 = 3;
 const MINT_WAIT: Duration = Duration::from_secs(15);
 /// 사용자가 고른 연결 모드. 데몬을 재시작해도 Tunnel 기기가 다시 붙을 수 있게 남긴다.
 const INTENT_FILE: &str = "mobile-gateway.json";
+const MOBILE_ORIGIN: &str = "https://krill-mobile.pages.dev";
+fn mobile_origin() -> String {
+    std::env::var("KRILL_MOBILE_ORIGIN")
+        .unwrap_or_else(|_| MOBILE_ORIGIN.into())
+        .trim_end_matches('/')
+        .to_owned()
+}
 
 #[derive(Debug)]
 pub struct Gateway {
@@ -52,10 +60,12 @@ struct State {
     next: u64,
     stopped: bool,
     tunnel: Option<super::tunnel::Tunnel>,
-    tunnel_start: fn(u16) -> io::Result<super::tunnel::Tunnel>,
+    tunnel_start: Option<fn(u16) -> io::Result<super::tunnel::Tunnel>>,
+    resolver: super::cloudflared::Resolver,
+    publication: super::tunnel::Publication,
     tunnel_failures: u32,
     tunnel_retry_at: Option<Instant>,
-    tunnel_error: Option<io::ErrorKind>,
+    tunnel_error: Option<io::Error>,
     dir: Option<PathBuf>,
     ping: Duration,
 }
@@ -63,6 +73,41 @@ struct State {
 struct Intent {
     mode: ConnectMode,
     custom: Option<String>,
+    #[serde(default)]
+    rid: String,
+    #[serde(default)]
+    key: String,
+}
+impl Intent {
+    fn load(dir: Option<&Path>) -> io::Result<Self> {
+        let mut intent = dir
+            .and_then(|d| {
+                super::devices::read_private(&d.join(INTENT_FILE))
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
+            .unwrap_or_else(|| Self {
+                mode: ConnectMode::Lan,
+                custom: None,
+                rid: String::new(),
+                key: String::new(),
+            });
+        if decode_hex::<16>(&intent.rid).is_err() || decode_hex::<32>(&intent.key).is_err() {
+            intent.rid = hex(&random()?.into_iter().take(16).collect::<Vec<_>>());
+            intent.key = hex(&random()?);
+        }
+        if let Some(dir) = dir {
+            intent.save(dir)?;
+        }
+        Ok(intent)
+    }
+    fn save(&self, dir: &Path) -> io::Result<()> {
+        super::devices::write_private(
+            &dir.join(INTENT_FILE),
+            &serde_json::to_vec(self).map_err(io::Error::other)?,
+        )
+    }
 }
 #[derive(Debug)]
 struct Connection {
@@ -109,19 +154,17 @@ impl Gateway {
         dir: Option<&Path>,
         hello: ServerHello,
     ) -> io::Result<Arc<Self>> {
-        // 손상된 의도 파일은 모바일 전체를 끄지 않고 기본값(LAN)으로 시작한다.
-        let intent = dir
-            .and_then(|d| {
-                super::devices::read_private(&d.join(INTENT_FILE))
-                    .ok()
-                    .flatten()
-            })
-            .and_then(|bytes| serde_json::from_slice::<Intent>(&bytes).ok());
+        let intent = Intent::load(dir)?;
+        let publication = super::tunnel::Publication {
+            origin: mobile_origin(),
+            rid: intent.rid,
+            key: intent.key,
+        };
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 devices: Devices::open(dir)?,
-                mode: intent.as_ref().map_or(ConnectMode::Lan, |i| i.mode),
-                custom: intent.and_then(|i| i.custom),
+                mode: intent.mode,
+                custom: intent.custom,
                 interfaces: net::detect()?,
                 selected: None,
                 listeners: Vec::new(),
@@ -129,7 +172,9 @@ impl Gateway {
                 next: 0,
                 stopped: false,
                 tunnel: None,
-                tunnel_start: super::tunnel::Tunnel::start,
+                tunnel_start: None,
+                resolver: super::cloudflared::Resolver::default(),
+                publication,
                 tunnel_failures: 0,
                 tunnel_retry_at: None,
                 tunnel_error: None,
@@ -149,7 +194,7 @@ impl Gateway {
             })?;
         Ok(Arc::new(Self { shared, backend }))
     }
-    /// A notification link never contains a pairing ticket or credential.
+    /// 알림 링크에는 페어링 티켓·자격증명을 넣지 않는다.
     pub fn deep_link(&self, session: krill_proto::SessionId) -> Option<String> {
         let state = lock(&self.shared.state);
         if state.listeners.is_empty() || state.stopped {
@@ -157,7 +202,13 @@ impl Gateway {
         }
         let address = state.selected?;
         let base = if state.mode == ConnectMode::Tunnel {
-            state.tunnel.as_ref()?.ready_url()?.to_owned()
+            let tunnel = state.tunnel.as_ref()?;
+            let url = tunnel.ready_url()?;
+            if tunnel.fixed() {
+                fixed_base(&state)
+            } else {
+                url.to_owned()
+            }
         } else {
             format!("http://{address}")
         };
@@ -169,7 +220,7 @@ impl Gateway {
         }
         let reply = match self.handle(request) {
             Ok(reply) => reply,
-            Err(e) => MobileReply::Failed(e.kind().to_string()),
+            Err(e) => MobileReply::Failed(e.to_string()),
         };
         self.shared.changed.notify_all();
         reply
@@ -186,27 +237,40 @@ impl Gateway {
             } => {
                 configure(&mut state, mode, custom_address, now)?;
                 state.devices.mint(now, rotate)?;
-                // 사용자가 직접 요청했으므로 재기동 백오프를 건너뛴다.
                 state.tunnel_retry_at = None;
                 reconcile(&mut state, now)?;
-                if mode != ConnectMode::Tunnel {
-                    pairing_offer(&state, now)?
-                } else if state.tunnel.is_none() {
-                    return Err(state.tunnel_error.unwrap_or(io::ErrorKind::NotFound).into());
-                } else {
-                    // 준비 전 URL로 QR을 내면 폰이 530·NXDOMAIN을 캐시한다. 락 밖에서 준비를 기다린다.
+                if mode == ConnectMode::Tunnel {
+                    // 설치·터널 준비·고정 출처 판정을 모두 락 밖에서 기다린다.
                     drop(state);
                     self.shared.changed.notify_all();
                     let deadline = Instant::now() + MINT_WAIT;
-                    while Instant::now() < deadline
-                        && lock(&self.shared.state)
-                            .tunnel
-                            .as_ref()
-                            .is_some_and(|t| t.ready_url().is_none())
-                    {
+                    loop {
+                        let state = lock(&self.shared.state);
+                        if state.stopped || state.mode != mode {
+                            return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
+                        }
+                        // 기한이 지나도 준비되지 않으면 찍힌 URL로 낸다(터널 출처). 몇 초 뒤 새로고침하면 열린다.
+                        let timed_out = Instant::now() >= deadline;
+                        if state.tunnel.as_ref().is_some_and(|t| {
+                            t.ready_url().is_some() || (timed_out && t.url().is_some())
+                        }) {
+                            return pairing_offer(&state, now_ms());
+                        }
+                        if timed_out
+                            || (state.tunnel.is_none()
+                                && !state.resolver.downloading()
+                                && state
+                                    .tunnel_error
+                                    .as_ref()
+                                    .is_some_and(|e| e.kind() != io::ErrorKind::WouldBlock))
+                        {
+                            return Err(tunnel_unavailable(&state));
+                        }
+                        drop(state);
                         thread::sleep(Duration::from_millis(200));
                     }
-                    return pairing_offer(&lock(&self.shared.state), now_ms());
+                } else {
+                    pairing_offer(&state, now)?
                 }
             }
             MobileRequest::SetConnectMode {
@@ -277,11 +341,10 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
         let intent = Intent {
             mode,
             custom: custom.clone(),
+            rid: s.publication.rid.clone(),
+            key: s.publication.key.clone(),
         };
-        super::devices::write_private(
-            &dir.join(INTENT_FILE),
-            &serde_json::to_vec(&intent).map_err(io::Error::other)?,
-        )?;
+        intent.save(dir)?;
     }
     s.mode = mode;
     s.custom = custom;
@@ -297,28 +360,63 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let host = address.ip().to_string();
     let port = address.port();
     let base = if state.mode == ConnectMode::Tunnel {
-        // 기다려도 준비되지 않으면 찍힌 URL로 낸다. 몇 초 뒤 새로고침하면 열린다.
-        let tunnel = state.tunnel.as_ref().ok_or(io::ErrorKind::WouldBlock)?;
-        tunnel
+        let tunnel = state
+            .tunnel
+            .as_ref()
+            .ok_or_else(|| tunnel_unavailable(state))?;
+        let url = tunnel
             .ready_url()
             .or_else(|| tunnel.url())
-            .ok_or(io::ErrorKind::WouldBlock)?
-            .to_owned()
+            .ok_or_else(|| tunnel_unavailable(state))?;
+        if tunnel.fixed() {
+            fixed_base(state)
+        } else {
+            url.to_owned()
+        }
     } else {
         format!("http://{host}:{port}")
     };
+    let mut url = format!(
+        "{base}/#pair={}&key={}",
+        hex(&ticket.token),
+        ws::base64(&ticket.secret, true)
+    );
+    if let Some(tunnel) = state.tunnel.as_ref().filter(|t| t.fixed())
+        && state.mode == ConnectMode::Tunnel
+    {
+        let host = tunnel
+            .ready_url()
+            .and_then(|url| url.strip_prefix("https://"))
+            .ok_or_else(invalid)?;
+        write!(url, "&t={host}&r={}", state.publication.rid).map_err(io::Error::other)?;
+    }
     Ok(MobileReply::PairingOffer {
-        url: format!(
-            "{base}/?pair={}#key={}",
-            hex(&ticket.token),
-            ws::base64(&ticket.secret, true)
-        ),
+        url,
         host,
         port,
         expires_at_ms: ticket.expires_at_ms,
         mode: state.mode,
         interfaces: state.interfaces.clone(),
     })
+}
+
+fn fixed_base(state: &State) -> String {
+    format!(
+        "{}/m/{}",
+        state.publication.origin,
+        super::pwa::asset_hash()
+    )
+}
+fn tunnel_unavailable(state: &State) -> io::Error {
+    let message = if state.resolver.downloading() {
+        "cloudflared 내려받는 중 — 잠시 후 다시 시도".to_owned()
+    } else {
+        state.tunnel_error.as_ref().map_or_else(
+            || "모바일 터널 준비 중 — 잠시 후 다시 시도".into(),
+            ToString::to_string,
+        )
+    };
+    io::Error::new(io::ErrorKind::WouldBlock, message)
 }
 
 fn status(s: &State, now: u64) -> MobileReply {
@@ -373,7 +471,7 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     Ok(())
 }
 /// 리스너가 열려 있는 Tunnel 모드에서는 cloudflared가 항상 떠 있게 한다.
-/// 죽었거나 준비 기한을 넘기면 지수 백오프(2초~1분)로 다시 띄운다. 새 URL이 나오므로 폰은 다시 스캔한다.
+/// 죽었거나 준비 기한을 넘기면 지수 백오프(2초~1분)로 다시 띄운다. 고정 출처 기기는 랑데부에서 새 URL을 찾는다.
 fn supervise_tunnel(s: &mut State) {
     if s.mode != ConnectMode::Tunnel {
         s.tunnel = None;
@@ -396,7 +494,14 @@ fn supervise_tunnel(s: &mut State) {
     if s.tunnel_retry_at.is_some_and(|at| Instant::now() < at) {
         return;
     }
-    match (s.tunnel_start)(port) {
+    let result = if let Some(start) = s.tunnel_start {
+        start(port)
+    } else {
+        s.resolver.resolve(s.dir.as_deref()).and_then(|binary| {
+            super::tunnel::Tunnel::start(binary.as_os_str(), port, s.publication.clone())
+        })
+    };
+    match result {
         Ok(tunnel) => {
             s.tunnel = Some(tunnel);
             s.tunnel_retry_at = None;
@@ -404,8 +509,11 @@ fn supervise_tunnel(s: &mut State) {
         }
         Err(error) => {
             tracing::warn!(kind=?error.kind(), "mobile tunnel start failed");
-            s.tunnel_error = Some(error.kind());
-            backoff(s);
+            let pending = error.kind() == io::ErrorKind::WouldBlock;
+            s.tunnel_error = Some(error);
+            if !pending {
+                backoff(s);
+            }
         }
     }
 }
@@ -527,7 +635,11 @@ fn serve(
     socket.set_read_timeout(Some(TIMEOUT))?;
     socket.set_write_timeout(Some(TIMEOUT))?;
     socket.set_nodelay(true)?;
-    if !ws::upgrade(&mut socket)? {
+    let origin = {
+        let state = lock(&shared.state);
+        (state.mode == ConnectMode::Tunnel).then(|| state.publication.origin.clone())
+    };
+    if !ws::upgrade(&mut socket, origin.as_deref())? {
         return Ok(());
     }
     let channel = match authenticate(&mut socket, shared, id) {
