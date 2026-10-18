@@ -14,7 +14,12 @@ use krill_proto::theme::{Rgb, Theme as TerminalTheme};
 pub const FONT_UI: &str = ".SystemUIFont";
 
 /// 터미널 격자·코드·Diff hunk·경로·단축키 배지 전용 고정폭 글꼴.
+#[cfg(not(windows))]
 pub const FONT_MONO: &str = "Menlo";
+/// Windows는 모든 버전에 있는 Consolas(Cascadia Mono는 Windows 10에 없을 수 있고, 없는 이름이면 gpui가 비고정폭 시스템
+/// 글꼴로 떨어진다). 한글처럼 없는 글리프는 DirectWrite 시스템 폴백(맑은 고딕)이 채운다(OWE-828 실측).
+#[cfg(windows)]
+pub const FONT_MONO: &str = "Consolas";
 
 /// 글자 크기 단계(Orca `text-[10px]` ~ `text-sm` 대응, 창의 `rem_size`/줌을 따른다).
 pub const TEXT_2XS: Rems = rems(10. / 16.);
