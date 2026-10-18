@@ -201,7 +201,13 @@ impl Holder {
     /// holder는 늘 소켓도 쥐고 있다.
     pub fn hold_listener(&self, fd: BorrowedFd<'_>) -> io::Result<()> {
         let req = self.next.fetch_add(1, Ordering::Relaxed);
-        self.send(&ToHolder::HoldListener { req }, &[fd])
+        self.send(
+            &ToHolder::HoldListener {
+                req,
+                info: Vec::new(),
+            },
+            &[fd],
+        )
     }
 
     fn send(&self, m: &ToHolder, fds: &[BorrowedFd<'_>]) -> io::Result<()> {
@@ -289,7 +295,7 @@ pub(crate) fn receive(link: &mut Link) -> io::Result<(u16, Vec<Kept>, Option<Own
                     master,
                 });
             }
-            Some((FromHolder::Listener, fd)) => listener = fd,
+            Some((FromHolder::Listener { .. }, fd)) => listener = fd,
             Some((FromHolder::Ready, _)) => break,
             _ => {}
         }
