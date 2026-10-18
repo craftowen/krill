@@ -888,6 +888,16 @@ mod tests {
             "ui::error_banner",
             "ui::danger_confirm",
             "ui::modal_backdrop",
+            "ICON_XS",
+            "ICON_SM",
+            "ICON_MD",
+            "ICON_LG",
+            "ICON_XL",
+            "ui::icons::provider_icon",
+            "ui::icons::agent_brand_icon",
+            "ui::icons::provider_menu_icon",
+            "ui::icons::agent_menu_icon",
+            "프로바이더 아이콘",
         ] {
             assert!(
                 styleguide.contains(required),

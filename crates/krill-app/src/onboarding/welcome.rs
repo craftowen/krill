@@ -962,6 +962,7 @@ impl Wizard {
                         let selector = format!("wizard-agent-{id}");
                         let button = Button::new(gpui::SharedString::from(selector.clone()))
                             .small()
+                            .icon(ui::icons::agent_menu_icon(&id))
                             .label(name)
                             .on_click(cx.listener(move |s, _, _, cx| {
                                 s.agent = Some(id.clone());
@@ -1035,10 +1036,16 @@ impl Wizard {
             _ => false,
         };
         let id = check.id.clone();
+        let check_agent = id
+            .strip_prefix("agent.")
+            .or_else(|| id.strip_prefix("hook."));
         let title = div()
             .flex()
             .items_center()
             .gap_1p5()
+            .children(
+                check_agent.map(|ag| ui::icons::agent_brand_icon(ag, ui::ICON_SM, p.foreground)),
+            )
             .child(
                 div()
                     .font_weight(gpui::FontWeight::MEDIUM)

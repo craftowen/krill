@@ -188,10 +188,7 @@ impl Shell {
                     );
                 for (i, profile) in settings.iter().flat_map(visible_profiles).enumerate() {
                     let item = PopupMenuItem::new(profile.name.clone())
-                        .icon(
-                            gpui_component::Icon::default()
-                                .data(krill_app::ui::icons::agent_svg_bytes(&profile.id)),
-                        )
+                        .icon(krill_app::ui::icons::agent_menu_icon(&profile.id))
                         .disabled(disabled);
                     let item = if let Some(action) = shortcut(i) {
                         item.action(action)
@@ -207,8 +204,12 @@ impl Shell {
                     } else {
                         let this = this.clone();
                         let profile_id = profile.id.clone();
-                        menu =
-                            menu.submenu(profile.name.clone(), window, cx, move |mut sub, _, _| {
+                        menu = menu.submenu_with_icon(
+                            Some(krill_app::ui::icons::agent_menu_icon(&profile.id)),
+                            profile.name.clone(),
+                            window,
+                            cx,
+                            move |mut sub, _, _| {
                                 let default_this = this.clone();
                                 let default_id = profile_id.clone();
                                 sub = sub.item(
@@ -243,7 +244,8 @@ impl Shell {
                                     );
                                 }
                                 sub
-                            });
+                            },
+                        );
                     }
                 }
                 menu = menu.separator().label(text::EXECUTION_LOCATION.get());

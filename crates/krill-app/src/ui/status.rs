@@ -242,7 +242,7 @@ pub fn summary_element(summary: &Summary<'_>, cx: &App) -> gpui::Div {
                                 .justify_center()
                                 .rounded_full()
                                 .when(i > 0, |d| d.ml(px(-3.)).bg(p.worktree_sidebar))
-                                .child(agent_icon(a, 13., p.muted_foreground))
+                                .child(agent_icon(a, super::ICON_SM, p.muted_foreground))
                         })),
                 )
                 .when(g.more > 0, |d| d.child(more(g.more)))

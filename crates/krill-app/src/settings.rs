@@ -3976,6 +3976,11 @@ impl SettingsView {
             .items_center()
             .gap_2()
             .min_w_0()
+            .child(crate::ui::icons::provider_icon(
+                acc.provider,
+                crate::ui::ICON_XS,
+                p.foreground,
+            ))
             .map(|d| match renaming {
                 Some(input) => d.child(Self::render_rename_row(acc, &input, cx)),
                 None => d.child(
@@ -4351,7 +4356,11 @@ impl SettingsView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(crate::ui::icons::provider_icon(provider, 16., p.foreground))
+                        .child(crate::ui::icons::provider_icon(
+                            provider,
+                            crate::ui::ICON_LG,
+                            p.foreground,
+                        ))
                         .child(
                             div()
                                 .text_size(crate::ui::TEXT_MD)
@@ -4776,7 +4785,7 @@ impl SettingsView {
                 label,
                 selected,
             )
-            .icon(gpui_component::Icon::default().data(crate::ui::icons::agent_svg_bytes(agent_id)))
+            .icon(crate::ui::icons::agent_menu_icon(agent_id))
             .debug_selector(move || btn_id.clone())
             .on_click(move |_, _, cx| {
                 edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
@@ -5234,7 +5243,7 @@ impl SettingsView {
                                     .justify_center()
                                     .child(crate::ui::icons::agent_brand_icon(
                                         agent_id,
-                                        18.,
+                                        crate::ui::ICON_XL,
                                         p.foreground,
                                     )),
                             )

@@ -1764,7 +1764,7 @@ impl Sidebar {
                     s.id.0,
                     state_text(s.status.state)
                 );
-                Item::new(s.id, label, needs_you(&s.status))
+                Item::new(s.id, label, needs_you(&s.status)).with_agent(s.status.agent.clone())
             })
             .collect()
     }
