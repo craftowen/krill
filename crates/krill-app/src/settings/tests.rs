@@ -4019,11 +4019,27 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
 
     click(vcx, "admin-worktree-cleanup-open");
     assert!(vcx.debug_bounds("admin-cleanup-modal").is_some());
+    assert!(vcx.debug_bounds("admin-cleanup-exclude-dirty").is_some());
+    assert!(
+        vcx.debug_bounds("admin-cleanup-exclude-dirty-thumb")
+            .is_some()
+    );
+    assert!(vcx.debug_bounds("admin-cleanup-summary").is_some());
 
     // 기본 필터(MergedOrClosed, 경과 일수 전체, dirty 제외): dirty 1개를 제외한 3개 일치
     vcx.update(|_, cx| {
         let matched = view.read(cx).space.filtered_candidates();
         assert_eq!(matched.len(), 3);
+        assert_eq!(view.read(cx).space.selected.len(), 3);
+    });
+    // 후보 행 체크박스 토글 동작 확인
+    click(vcx, "admin-cleanup-select-wt-merged-old");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).space.selected.len(), 2);
+    });
+    click(vcx, "admin-cleanup-select-wt-merged-old");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).space.selected.len(), 3);
     });
 
     // 7일 이상 필터 클릭 -> wt-merged-old(20d), wt-closed-unmerged(16d) 2개 일치
@@ -5079,6 +5095,268 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
             b.right() <= column.right() + px(0.5),
             "agent control {sel} ({b:?}) overflowed column ({column:?})"
         );
+    }
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-802: 모바일 리모컨(Mobile) 탭의 연결 경로 라디오 카드·티켓 URL 복사 피드백·기기 해제·오류 배너와
+/// 시스템·보안(Resources) 탭의 스위치·진단 버튼·디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`)
+/// 우측 경계(좁은 창 포함)를 검증한다.
+#[gpui::test]
+fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::mobile::{
+        ConnectMode, MobileReply, MobileRequest, NetworkInterface, PairedMobileDevice,
+    };
+
+    let d = dir("owe802-mobile-resources");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = requests.clone();
+    let should_fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail_flag = should_fail.clone();
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile = mobile::Panel::new(std::sync::Arc::new(move |request| {
+                record.lock().unwrap().push(request.clone());
+                if fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("simulated mobile gateway error".into());
+                }
+                let devices = vec![
+                    PairedMobileDevice {
+                        device_id: "dev-iphone".into(),
+                        label: "Owen iPhone".into(),
+                        key_fingerprint: "fp-iphone".into(),
+                        shared_secret_hash: String::new(),
+                        created_at_ms: 1_700_000_000_000,
+                        last_seen_ms: 1_700_000_120_000,
+                        revoked_at_ms: None,
+                    },
+                    PairedMobileDevice {
+                        device_id: "dev-ipad".into(),
+                        label: "Owen iPad".into(),
+                        key_fingerprint: "fp-ipad".into(),
+                        shared_secret_hash: String::new(),
+                        created_at_ms: 1_700_000_000_000,
+                        last_seen_ms: 1_700_000_050_000,
+                        revoked_at_ms: None,
+                    },
+                ];
+                Ok(match request {
+                    MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
+                        url: format!("https://example.test/?pair=owe802&mode={mode:?}#key=secret"),
+                        host: "example.test".into(),
+                        port: 8443,
+                        expires_at_ms: krill_proto::mobile::client::now_ms() + 300_000,
+                        mode,
+                        interfaces: vec![NetworkInterface {
+                            name: "en0".into(),
+                            address: "192.168.1.25".into(),
+                            default_route: true,
+                        }],
+                    },
+                    MobileRequest::CurrentPairingOffer => MobileReply::PairingOffer {
+                        url: "https://example.test/?pair=owe802&mode=Lan#key=secret".into(),
+                        host: "example.test".into(),
+                        port: 8443,
+                        expires_at_ms: krill_proto::mobile::client::now_ms() + 300_000,
+                        mode: ConnectMode::Lan,
+                        interfaces: vec![NetworkInterface {
+                            name: "en0".into(),
+                            address: "192.168.1.25".into(),
+                            default_route: true,
+                        }],
+                    },
+                    MobileRequest::Status
+                    | MobileRequest::ListDevices
+                    | MobileRequest::RevokeDevice { .. } => MobileReply::Devices(devices),
+                    MobileRequest::ConnectedDevices => {
+                        MobileReply::ConnectedDevices(vec!["dev-iphone".into()])
+                    }
+                    _ => MobileReply::Devices(Vec::new()),
+                })
+            }));
+            v.set_tab(AdminTab::Mobile, cx);
+        });
+    });
+
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Lan, None, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let b = bounds(vcx, s);
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+
+    // 1) Mobile 탭: 연결 경로 라디오 카드·QR 카드·페어링된 기기 카드 렌더링 및 경계 검증
+    let column = bounds(vcx, "admin-content-column");
+    let mode_card = bounds(vcx, "mobile-mode-card");
+    assert!(
+        mode_card.right() <= column.right() + px(0.5),
+        "mobile-mode-card ({mode_card:?}) overflowed column ({column:?})"
+    );
+    for sel in ["mobile-lan", "mobile-tailscale", "mobile-tunnel"] {
+        let opt = bounds(vcx, sel);
+        assert!(
+            opt.right() <= mode_card.right() + px(0.5),
+            "radio row {sel} ({opt:?}) overflowed mobile-mode-card ({mode_card:?})"
+        );
+    }
+    for sel in [
+        "admin-mobile-pair-section",
+        "admin-mobile-devices-section",
+        "mobile-new-qr",
+        "mobile-refresh",
+        "mobile-qr-card",
+        "mobile-ticket-url",
+        "mobile-copy-link",
+        "mobile-if-0",
+        "mobile-device-row-0",
+        "mobile-device-row-1",
+        "mobile-revoke-0",
+        "mobile-revoke-1",
+        "mobile-revoke-all",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "mobile element {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    // 티켓 URL 복사 버튼 클릭 → 클립보드 복사 및 copied_url 상태 전환 확인
+    vcx.update(|_, cx| assert!(view.read(cx).mobile.copied_url.is_none()));
+    click(vcx, "mobile-copy-link");
+    vcx.update(|_, cx| {
+        let expected_url = view.read(cx).mobile.offer.as_ref().unwrap().0.clone();
+        assert_eq!(
+            view.read(cx).mobile.copied_url.as_deref(),
+            Some(expected_url.as_str())
+        );
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some(expected_url.as_str())
+        );
+    });
+
+    // 라디오 카드 모드 전환(Tailscale -> Tunnel) 시 copied_url 초기화 및 MintPairingTicket 호출 확인
+    click(vcx, "mobile-tailscale");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).mobile.mode, ConnectMode::Tailscale);
+        assert!(view.read(cx).mobile.copied_url.is_none());
+    });
+    click(vcx, "mobile-tunnel");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).mobile.mode, ConnectMode::Tunnel);
+    });
+
+    // 개별 기기 해제 및 전체 해제 버튼 동작 확인
+    click(vcx, "mobile-revoke-0");
+    click(vcx, "mobile-revoke-all");
+    {
+        let log = requests.lock().unwrap();
+        assert!(log.iter().any(|r| matches!(
+            r,
+            MobileRequest::RevokeDevice {
+                device_id: Some(id),
+                all: false,
+            } if id == "dev-iphone"
+        )));
+        assert!(log.iter().any(|r| matches!(
+            r,
+            MobileRequest::RevokeDevice {
+                device_id: None,
+                all: true,
+            }
+        )));
+    }
+
+    // 오류 발생 시 ui::error_banner(#mobile-error-banner) 표시 확인
+    should_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    click(vcx, "mobile-refresh");
+    assert!(vcx.debug_bounds("mobile-error-banner").is_some());
+
+    // 2) Resources 탭: 스위치·진단 버튼 및 좁은 창(720px / 820px)·넓은 창(1200px)에서
+    //    디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`) 우측 잘림 없음 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    for width in [720., 820., 1200.] {
+        vcx.simulate_resize(size(px(width), px(5000.)));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let column = bounds(vcx, "admin-content-column");
+        for sel in [
+            "admin-recording-paused",
+            "admin-recording-paused-thumb",
+            "admin-secure-kb-toggle",
+            "admin-secure-kb-toggle-thumb",
+            "admin-run-doctor",
+            "admin-history-clear",
+        ] {
+            let b = bounds(vcx, sel);
+            assert!(
+                b.right() <= column.right() + px(0.5),
+                "width={width}: resources control {sel} ({b:?}) overflowed column ({column:?})"
+            );
+        }
+
+        let space_card = bounds(vcx, "admin-space-section");
+        let header_row = bounds(vcx, "admin-space-header-row");
+        let scan_btn = bounds(vcx, "admin-space-scan");
+        let cleanup_btn = bounds(vcx, "admin-worktree-cleanup-open");
+
+        assert!(
+            space_card.right() <= column.right() + px(0.5),
+            "width={width}: admin-space-section ({space_card:?}) overflowed column ({column:?})"
+        );
+        assert!(
+            header_row.right() <= space_card.right() + px(0.5),
+            "width={width}: admin-space-header-row ({header_row:?}) overflowed card ({space_card:?})"
+        );
+        for (name, btn) in [
+            ("admin-space-scan", scan_btn),
+            ("admin-worktree-cleanup-open", cleanup_btn),
+        ] {
+            assert!(
+                btn.origin.x >= header_row.origin.x - px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed left of header_row ({header_row:?})"
+            );
+            assert!(
+                btn.right() <= header_row.right() + px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed right of header_row ({header_row:?})"
+            );
+            assert!(
+                btn.bottom() <= header_row.bottom() + px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed bottom of header_row ({header_row:?})"
+            );
+            assert!(
+                btn.right() <= space_card.right() + px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed right of space_card ({space_card:?})"
+            );
+        }
     }
 
     fs::remove_dir_all(d).ok();
