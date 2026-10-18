@@ -565,6 +565,8 @@ pub struct Sidebar {
     edit_subscription: Option<Subscription>,
     orca_import_subscription: Option<Subscription>,
     pub(crate) creating: Option<(Entity<worktree::Dialog>, Subscription)>,
+    /// OWE-854: 셸 탭에서 사용자가 직접 지정한 세션별 제목. 세션 행 라벨의 최우선 후보.
+    custom_titles: BTreeMap<SessionId, String>,
     /// 셸이 아는 세션별 터미널 제목(보이는 칸만). 세션 이름의 첫 후보.
     titles: BTreeMap<SessionId, String>,
     /// 첫 프롬프트 훅에서 자동 생성된 세션 제목(`session-titles.json`, OWE-737).
@@ -707,6 +709,7 @@ impl Sidebar {
             edit_subscription: None,
             orca_import_subscription: None,
             creating: None,
+            custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
             auto_titles,
             last_cache_tick_sec: None,
@@ -1501,6 +1504,18 @@ impl Sidebar {
     pub fn folder_on(&self, host: &HostId, session: SessionId) -> Option<&Path> {
         let session = self.session_on(host, session)?;
         session.worktree.as_deref().or(session.cwd.as_deref())
+    }
+
+    /// OWE-854: 셸 탭의 사용자 지정 제목을 세션별로 동기화한다. 바뀔 때만 다시 그린다.
+    pub fn set_custom_titles(
+        &mut self,
+        titles: BTreeMap<SessionId, String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.custom_titles != titles {
+            self.custom_titles = titles;
+            cx.notify();
+        }
     }
 
     /// 셸이 칸의 터미널 제목을 알린다. 바뀔 때만 다시 그린다.
@@ -2384,13 +2399,20 @@ impl Sidebar {
         self.meta_for(host).get(path)?.branch.as_deref()
     }
 
-    fn session_label(&self, session: &Session) -> (String, String) {
+    pub fn session_label(&self, session: &Session) -> (String, String) {
+        let custom_title = self
+            .custom_titles
+            .get(&session.id)
+            .map(String::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty());
         let explicit_title = self
             .titles
             .get(&session.id)
             .map(String::as_str)
             .filter(|t| !krill_proto::git::is_default_branch_or_worktree_name(t));
-        let title = explicit_title
+        let title = custom_title
+            .or(explicit_title)
             .or_else(|| self.auto_titles.get(&session.id).map(String::as_str))
             .or_else(|| self.titles.get(&session.id).map(String::as_str));
         session_label(session, title)

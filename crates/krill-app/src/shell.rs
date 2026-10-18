@@ -901,9 +901,30 @@ impl Shell {
             tab_rename: None,
             nav_history: NavHistory::default(),
         };
+        shell.sync_sidebar_custom_titles(cx);
         shell.record_workspace_nav(cx);
         Self::register_overlay_hosts(cx);
         shell
+    }
+
+    /// OWE-854: 탭의 사용자 지정 제목을 사이드바 세션 행 라벨에 동기화한다.
+    pub(super) fn sync_sidebar_custom_titles(&self, cx: &mut Context<Self>) {
+        let mut custom = std::collections::BTreeMap::new();
+        for (i, tab) in self.layout.tabs().iter().enumerate() {
+            let Some(title) = self.layout.tab_title(i) else {
+                continue;
+            };
+            if let Some(sid) = self.layout.session(tab.focused) {
+                custom.insert(sid, title.to_owned());
+            }
+            for pane in self.layout.tab_panes(i) {
+                if let Some(sid) = self.layout.session(pane) {
+                    custom.entry(sid).or_insert_with(|| title.to_owned());
+                }
+            }
+        }
+        self.sidebar
+            .update(cx, |s, cx| s.set_custom_titles(custom, cx));
     }
 
     /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
@@ -2379,6 +2400,7 @@ impl Shell {
                     self.layout.clear_session(pane);
                 }
                 self.layout.set_session(pane, session);
+                self.sync_sidebar_custom_titles(cx);
                 self.record_workspace_nav(cx);
                 self.save();
                 self.refresh_detached(cx);
@@ -2444,6 +2466,7 @@ impl Shell {
         if self.layout.session(pane) != Some(session) {
             self.layout.clear_session(pane);
             self.layout.set_session(pane, session);
+            self.sync_sidebar_custom_titles(cx);
             self.record_workspace_nav(cx);
             self.save();
             self.refresh_detached(cx);
@@ -3118,6 +3141,7 @@ impl Shell {
             .filter(|_| self.settings.is_none());
         krill_app::alert::focus(session, cx);
         self.sidebar.update(cx, |s, cx| s.set_focused(session, cx));
+        self.sync_sidebar_custom_titles(cx);
         if self.folder() != folder {
             let folder = self.folder();
             self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
