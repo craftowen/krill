@@ -494,10 +494,10 @@ pub fn open_url(url: &str) -> bool {
     let opened: Bool = unsafe { msg_send![workspace, openURL: &*ns_url] };
     opened.as_bool()
 }
+/// `URL`을 연다(Windows `ShellExecuteW`). 열기 요청을 전달하면 `true`다.
 #[cfg(not(target_os = "macos"))]
-// ponytail: Windows `ShellExecuteW` 열기는 OWE-834.
-pub fn open_url(_url: &str) -> bool {
-    false
+pub fn open_url(url: &str) -> bool {
+    super::shell_open(url.as_ref()).is_ok()
 }
 
 /// 번들 경로의 `com.apple.quarantine` 유무.

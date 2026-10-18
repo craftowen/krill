@@ -534,10 +534,14 @@ fn run_browser_login(
             && let Ok(raw) = std::fs::read_to_string(&link_file)
             && let Some(url) = authorize_url(account.provider, &raw)
         {
-            opened = std::process::Command::new("open")
-                .arg(url)
-                .status()
-                .is_ok_and(|status| status.success());
+            opened = if cfg!(target_os = "macos") {
+                std::process::Command::new("open")
+                    .arg(url)
+                    .status()
+                    .is_ok_and(|status| status.success())
+            } else {
+                crate::platform::permissions::open_url(url)
+            };
         }
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),

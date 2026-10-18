@@ -1579,11 +1579,15 @@ fn row_context_menu(
 
     let reveal_path = row.path.clone();
     menu = menu.item(
-        PopupMenuItem::new(text::EXPLORER_REVEAL_FINDER.get())
-            .icon(IconName::FolderOpen)
-            .on_click(move |_, _, cx| {
-                cx.reveal_path(&reveal_path);
-            }),
+        PopupMenuItem::new(
+            text::EXPLORER_REVEAL_FINDER
+                .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                .get(),
+        )
+        .icon(IconName::FolderOpen)
+        .on_click(move |_, _, cx| {
+            cx.reveal_path(&reveal_path);
+        }),
     );
 
     for target in [Target::VsCode, Target::Cursor, Target::Zed] {
@@ -1596,7 +1600,7 @@ fn row_context_menu(
             ))
             .icon(IconName::ExternalLink)
             .on_click(move |_, _, _| {
-                open_in_external(target, &p).ok();
+                target.open_path(&p).ok();
             }),
         );
     }
@@ -1630,30 +1634,4 @@ fn row_context_menu(
                         .ok();
                 }),
         )
-}
-
-fn open_in_external(target: Target, path: &Path) -> io::Result<()> {
-    // Launch Services 전용. Windows 열기는 OWE-834.
-    if !cfg!(target_os = "macos") {
-        return Err(io::ErrorKind::Unsupported.into());
-    }
-    let path = fs::canonicalize(path)?;
-    let bundle = match target {
-        Target::VsCode => "com.microsoft.VSCode",
-        Target::Cursor => "com.todesktop.230313mzl4w4u92",
-        Target::Zed => "dev.zed.Zed",
-        Target::Finder => "com.apple.finder",
-    };
-    let status = Command::new("/usr/bin/open")
-        .args(["-b", bundle, "--"])
-        .arg(&path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(io::Error::other("open failed"))
-    }
 }

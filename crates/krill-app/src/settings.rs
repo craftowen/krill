@@ -383,11 +383,11 @@ impl Global for Config {}
 
 fn own_bindings() -> Vec<KeyBinding> {
     vec![
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ZoomReset, None),
-        KeyBinding::new("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
+        crate::keys::bind("cmd-,", OpenSettings, None),
+        crate::keys::bind("cmd-=", ZoomIn, None),
+        crate::keys::bind("cmd--", ZoomOut, None),
+        crate::keys::bind("cmd-0", ZoomReset, None),
+        crate::keys::bind("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
     ]
 }
 
@@ -1169,11 +1169,7 @@ fn window_options(cx: &App) -> WindowOptions {
             size(px(1100.), px(740.)),
             cx,
         ))),
-        titlebar: Some(gpui::TitlebarOptions {
-            title: Some(text::TITLE.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(crate::ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(crate::ui::titlebar(text::TITLE.get())),
         ..Default::default()
     }
 }
@@ -3143,7 +3139,12 @@ impl SettingsView {
             )
             .child(
                 row()
-                    .child(label(text::THEME.get(), text::THEME_DESC.get()))
+                    .child(label(
+                        text::THEME.get(),
+                        text::THEME_DESC
+                            .mac_or(crate::i18n::catalog::other_os::THEME_DESC)
+                            .get(),
+                    ))
                     .child(theme_button(
                         "theme-system",
                         text::SYSTEM.get(),
@@ -3196,7 +3197,9 @@ impl SettingsView {
                 row()
                     .child(label(
                         text::NOTIFICATIONS.get(),
-                        text::NOTIFICATIONS_DESC.get(),
+                        text::NOTIFICATIONS_DESC
+                            .mac_or(crate::i18n::catalog::other_os::NOTIFICATIONS_DESC)
+                            .get(),
                     ))
                     .child(notif_button("notif-on", text::ON.get(), true))
                     .child(notif_button("notif-off", text::OFF.get(), false)),
@@ -3252,7 +3255,12 @@ impl SettingsView {
             )
             .child(
                 row()
-                    .child(label(text::KEEP_AWAKE.get(), text::KEEP_AWAKE_DESC.get()))
+                    .child(label(
+                        text::KEEP_AWAKE.get(),
+                        text::KEEP_AWAKE_DESC
+                            .mac_or(crate::i18n::catalog::other_os::KEEP_AWAKE_DESC)
+                            .get(),
+                    ))
                     .child(awake_button(
                         "awake-on",
                         text::AWAKE_ON.get(),
@@ -7429,7 +7437,11 @@ impl Render for SettingsView {
                     .text_size(crate::ui::TEXT_XS)
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(Icon::new(IconName::SquareTerminal).xsmall())
-                    .child(text::HOST_LOCAL_MAC.get())
+                    .child(
+                        text::HOST_LOCAL_MAC
+                            .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL_MAC)
+                            .get(),
+                    )
                     .child(Icon::new(IconName::ChevronDown).xsmall()),
             )
             .child(
