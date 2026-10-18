@@ -649,6 +649,7 @@ catalog! {
         RESTART_DETAIL => ("세션은 그대로 유지됩니다. 재시작하는 동안 화면이 잠깐 재연결됩니다.", "Sessions keep running. The screen briefly reconnects during restart."),
         RESTART_SENT => ("데몬 재시작을 요청했습니다", "Daemon restart requested"),
         KILL_TITLE => ("세션 {id}을(를) 종료할까요?", "End session {id}?"),
+        KILL_TITLE_NAMED => ("{name}을(를) 종료할까요?", "End {name}?"),
         KILL_DETAIL => ("세션의 프로세스(에이전트 포함)를 끝냅니다. 되돌릴 수 없습니다.", "End the session’s processes, including its agent. This cannot be undone."),
         KILL_CONFIRM => ("종료", "End session"),
         KILL_SENT => ("세션 종료를 요청했습니다", "Session termination requested"),
