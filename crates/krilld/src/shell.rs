@@ -566,3 +566,69 @@ fn kill_probe(child: &mut std::process::Child) {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(test)]
+#[cfg(windows)]
+mod windows_tests {
+    use super::*;
+
+    fn inherited(path: &std::path::Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut env: Vec<_> = std::env::vars_os()
+            .map(|(k, v)| (k.into_encoded_bytes(), v.into_encoded_bytes()))
+            .filter(|(k, _)| !k.eq_ignore_ascii_case(b"PATH"))
+            .collect();
+        let system = std::env::var_os("PATH").unwrap_or_default();
+        let mut joined = path.as_os_str().to_owned();
+        joined.push(";");
+        joined.push(system);
+        env.push((b"Path".to_vec(), joined.into_encoded_bytes()));
+        env
+    }
+
+    #[test]
+    fn login_shell_env_and_cmd_resolution() {
+        let dir = std::env::temp_dir().join(format!("krilld-shell 한글-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("fake-agent.cmd"), "@echo off\r\n").unwrap();
+        let env = inherited(&dir);
+
+        let login = Shell::Login.launch_with_lang(None, env.clone(), None);
+        let shell = String::from_utf8(login.argv[0].clone()).unwrap();
+        eprintln!("login shell: {shell}");
+        assert_eq!(login.argv.len(), 1);
+        assert!(
+            std::path::Path::new(&shell).is_absolute() || shell.eq_ignore_ascii_case("cmd.exe")
+        );
+        let get = |k: &[u8]| {
+            login
+                .env
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(k))
+        };
+        assert!(get(b"SystemRoot").is_some());
+        assert!(get(b"USERPROFILE").is_some());
+        let path = get(b"PATH").unwrap();
+        assert_eq!(path.0, b"PATH");
+        assert!(path.1.starts_with(dir.as_os_str().as_encoded_bytes()));
+
+        let custom = Shell::Custom {
+            program: b"fake-agent".to_vec(),
+            args: vec![b"has space".to_vec()],
+        }
+        .launch_with_lang(None, env.clone(), None);
+        assert_eq!(
+            custom.argv[0],
+            dir.join("fake-agent.cmd")
+                .into_os_string()
+                .into_encoded_bytes()
+        );
+        assert_eq!(custom.argv[1], b"has space");
+        let missing = Shell::Custom {
+            program: b"no-such-agent".to_vec(),
+            args: Vec::new(),
+        }
+        .launch_with_lang(None, env, None);
+        assert_eq!(missing.argv[0], b"no-such-agent");
+        std::fs::remove_dir_all(dir).ok();
+    }
+}

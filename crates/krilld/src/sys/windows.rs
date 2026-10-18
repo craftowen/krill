@@ -503,6 +503,13 @@ mod tests {
                 .to_ascii_lowercase()
                 .ends_with(".exe")
         );
+        eprintln!(
+            "footprint {} B, resources {:?}, processes {}, name {}",
+            footprint(me).unwrap(),
+            resources().unwrap(),
+            all_pids().unwrap().len(),
+            process_name(me).unwrap()
+        );
         let parent = parent_pid(me).unwrap();
         assert_ne!(parent, me);
         assert!(parent == 0 || start_us(parent).unwrap() <= start_us(me).unwrap());
