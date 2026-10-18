@@ -1,88 +1,117 @@
 //! 네트워크·CDN 없는 내장 PWA. gzip 파일은 소스 에셋의 결정적 사전 압축본이다.
+use ring::digest;
 use std::io::{self, Write};
+use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
 const ASSETS: [(&str, &str, &[u8], &[u8]); 13] = [
     (
-        "/",
+        "index.html",
         "text/html; charset=utf-8",
         include_bytes!("assets/index.html"),
         include_bytes!("assets/index.html.gz"),
     ),
     (
-        "/app.js",
+        "app.js",
         "text/javascript; charset=utf-8",
         APP,
         include_bytes!("assets/app.js.gz"),
     ),
     (
-        "/crypto.js",
+        "crypto.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/crypto.js"),
         include_bytes!("assets/crypto.js.gz"),
     ),
     (
-        "/client.js",
+        "client.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/client.js"),
         include_bytes!("assets/client.js.gz"),
     ),
     (
-        "/terminal.js",
+        "terminal.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/terminal.js"),
         include_bytes!("assets/terminal.js.gz"),
     ),
     (
-        "/screens/home.js",
+        "screens/home.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/screens/home.js"),
         include_bytes!("assets/screens/home.js.gz"),
     ),
     (
-        "/screens/workspaces.js",
+        "screens/workspaces.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/screens/workspaces.js"),
         include_bytes!("assets/screens/workspaces.js.gz"),
     ),
     (
-        "/screens/session.js",
+        "screens/session.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/screens/session.js"),
         include_bytes!("assets/screens/session.js.gz"),
     ),
     (
-        "/screens/details.js",
+        "screens/details.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/screens/details.js"),
         include_bytes!("assets/screens/details.js.gz"),
     ),
     (
-        "/screens/settings.js",
+        "screens/settings.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/screens/settings.js"),
         include_bytes!("assets/screens/settings.js.gz"),
     ),
     (
-        "/app.css",
+        "app.css",
         "text/css; charset=utf-8",
         include_bytes!("assets/app.css"),
         include_bytes!("assets/app.css.gz"),
     ),
     (
-        "/manifest.json",
+        "manifest.json",
         "application/manifest+json",
         include_bytes!("assets/manifest.json"),
         include_bytes!("assets/manifest.json.gz"),
     ),
     (
-        "/icon.svg",
+        "icon.svg",
         "image/svg+xml",
         include_bytes!("assets/icon.svg"),
         include_bytes!("assets/icon.svg.gz"),
     ),
 ];
+/// C1: 파일명·길이·원본 바이트로 식별하는 고정 출처 버전.
+pub fn asset_hash() -> &'static str {
+    static HASH: OnceLock<String> = OnceLock::new();
+    HASH.get_or_init(|| {
+        let mut files: Vec<_> = ASSETS
+            .iter()
+            .map(|(name, _, bytes, _)| (*name, *bytes))
+            .collect();
+        files.sort_unstable_by_key(|(name, _)| *name);
+        let mut context = digest::Context::new(&digest::SHA256);
+        for (name, bytes) in files {
+            context.update(format!("{name}\n{}\n", bytes.len()).as_bytes());
+            context.update(bytes);
+        }
+        super::devices::hex(context.finish().as_ref())
+            .chars()
+            .take(16)
+            .collect()
+    })
+}
+fn route(name: &str) -> String {
+    if name == "index.html" {
+        "/".into()
+    } else {
+        format!("/{name}")
+    }
+}
 pub(super) fn serve(writer: &mut impl Write, path: &str, gzip: bool) -> io::Result<()> {
-    let asset = ASSETS.iter().find(|(route, ..)| *route == path);
+    let asset = ASSETS.iter().find(|(name, ..)| route(name) == path);
     let (status, mime, body, encoding) = asset.map_or(
         (
             "404 Not Found",
@@ -122,14 +151,15 @@ mod tests {
                 .sum::<usize>()
                 <= 150 * 1024
         );
-        for (route, mime, plain, _) in ASSETS {
+        for (name, mime, plain, _) in ASSETS {
+            let route = route(name);
             let mut response = Vec::new();
-            serve(&mut response, route, false).unwrap();
+            serve(&mut response, &route, false).unwrap();
             assert!(response.starts_with(b"HTTP/1.1 200 OK"));
             assert!(String::from_utf8_lossy(&response).contains(mime));
             assert!(response.ends_with(plain));
             let mut response = Vec::new();
-            serve(&mut response, route, true).unwrap();
+            serve(&mut response, &route, true).unwrap();
             assert!(String::from_utf8_lossy(&response).contains("Content-Encoding: gzip"));
         }
         let js = String::from_utf8_lossy(APP);
@@ -137,5 +167,41 @@ mod tests {
         assert!(!js.contains("crypto.randomUUID"));
         assert!(include_str!("assets/client.js").contains("getRandomValues"));
         assert!(!js.contains("innerHTML"));
+    }
+}
+
+#[cfg(test)]
+mod hash_tests {
+    use super::*;
+    #[test]
+    fn disk_hash_and_source_file_inventory_match() {
+        let source = include_str!("pwa.rs");
+        let marker = ["include_bytes!", "(\"assets/"].concat();
+        let listed: std::collections::BTreeSet<_> = source
+            .split(&marker)
+            .skip(1)
+            .filter_map(|s| s.split('"').next())
+            .filter(|n| std::path::Path::new(n).extension() != Some(std::ffi::OsStr::new("gz")))
+            .collect();
+        let embedded: std::collections::BTreeSet<_> = ASSETS.iter().map(|a| a.0).collect();
+        assert_eq!(listed, embedded);
+        let mut context = digest::Context::new(&digest::SHA256);
+        for name in embedded {
+            let bytes = std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("src/mobile/assets")
+                    .join(name),
+            )
+            .unwrap();
+            context.update(format!("{name}\n{}\n", bytes.len()).as_bytes());
+            context.update(&bytes);
+        }
+        assert_eq!(
+            asset_hash(),
+            super::super::devices::hex(context.finish().as_ref())
+                .chars()
+                .take(16)
+                .collect::<String>()
+        );
     }
 }
