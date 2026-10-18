@@ -1108,7 +1108,7 @@ impl Panel {
                                     .child(text::SEARCH.get()),
                             )
                             .on_click(
-                                cx.listener(|this, _, _, cx| this.set_tab(PanelTab::Search, cx)),
+                                cx.listener(|this, _, window, cx| this.show_search(window, cx)),
                             ),
                     )
                     .child(

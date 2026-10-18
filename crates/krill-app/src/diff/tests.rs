@@ -1034,6 +1034,7 @@ fn workspace_search_engine_options_and_globs_work() {
 fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx: &mut gpui::TestAppContext,
 ) {
+    use gpui::Focusable as _;
     use std::cell::RefCell;
     use std::fmt::Write as _;
     use std::rc::Rc;
@@ -1064,7 +1065,7 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
         })
     });
 
-    // Click `diff-tab-search` to switch to Search tab.
+    // Click `diff-tab-search` to switch to Search tab and focus the query input.
     let search_tab = cx.debug_bounds("diff-tab-search").unwrap();
     cx.simulate_mouse_down(search_tab.center(), MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(search_tab.center(), MouseButton::Left, Modifiers::default());
@@ -1074,16 +1075,56 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
         cx.update(|_, cx| view.read(cx).active_tab()),
         PanelTab::Search
     );
+    assert!(
+        cx.update(|window, cx| {
+            view.read(cx)
+                .search
+                .query_input
+                .as_ref()
+                .unwrap()
+                .focus_handle(cx)
+                .is_focused(window)
+        }),
+        "clicking diff-tab-search must focus the search query input"
+    );
     assert!(cx.debug_bounds("search-pane").is_some());
     assert!(cx.debug_bounds("search-toolbar").is_some());
     assert!(cx.debug_bounds("search-filters").is_some());
     assert!(cx.debug_bounds("search-empty-idle").is_some());
 
-    // Run search for "needle_item".
-    cx.update(|_, cx| {
-        view.update(cx, |p, cx| p.set_search_query("needle_item", cx));
+    // OWE-777: Type "needle_ite", switch to Files tab via `show_files` (⇧⌘E),
+    // then click `diff-tab-search` with the mouse and immediately type "m".
+    cx.simulate_keystrokes("n e e d l e _ i t e");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search_options().query.clone()),
+        "needle_ite"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| p.show_files(window, cx));
     });
     cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).active_tab()),
+        PanelTab::Files
+    );
+
+    let search_tab = cx.debug_bounds("diff-tab-search").unwrap();
+    cx.simulate_mouse_down(search_tab.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(search_tab.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("m");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search_options().query.clone()),
+        "needle_item"
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).explorer.filter_query.clone()),
+        ""
+    );
 
     assert!(cx.debug_bounds("search-summary").is_some());
     assert_eq!(
