@@ -54,8 +54,7 @@ impl Reader {
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => Err(e),
                     };
-                    let failed = result.is_err();
-                    if tx.send(result).is_err() || failed {
+                    if tx.send(result).is_err() {
                         break;
                     }
                 }
@@ -153,5 +152,64 @@ pub(super) fn resize(shared: &Shared, size: WinSize) -> io::Result<()> {
         (FromHolder::Done { .. }, _) => Ok(()),
         (FromHolder::Failed { errno, .. }, _) => Err(io::Error::from_raw_os_error(errno)),
         _ => Err(io::ErrorKind::InvalidData.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn pipes() -> (Master, std::io::PipeReader, std::io::PipeWriter) {
+        let (input, to_shell) = io::pipe().unwrap();
+        let (from_shell, output) = io::pipe().unwrap();
+        let signal = to_shell.as_handle().try_clone_to_owned().unwrap();
+        let master = Master {
+            input: to_shell.into(),
+            output: from_shell.into(),
+            signal,
+            reference: None,
+            process: None,
+        };
+        (master, input, output)
+    }
+
+    #[test]
+    fn idle_reader_drop_cancels_and_joins_without_closing_holder_pipe() {
+        let (master, _input, mut output) = pipes();
+        // The holder retains its own output read handle throughout cancellation.
+        let reader = Reader::start(&master).unwrap();
+        drop(reader);
+        output.write_all(b"after cancellation").unwrap();
+        let reader = Reader::start(&master).unwrap();
+        let mut buf = [0; 64];
+        let n = reader
+            .read(&mut buf, Some(Duration::from_secs(2)))
+            .unwrap()
+            .unwrap();
+        assert_eq!(buf.get(..n), Some(b"after cancellation".as_slice()));
+    }
+
+    #[test]
+    fn da1_input_and_eof_use_the_common_engine() {
+        let (master, mut input, mut output) = pipes();
+        let session = crate::Session::start(
+            krill_proto::SessionId(1),
+            master,
+            None,
+            WinSize { cols: 80, rows: 25 },
+            Arc::new(crate::appearance::Appearance::load(
+                std::path::PathBuf::new(),
+            )),
+            None,
+        )
+        .unwrap();
+        output.write_all(b"\x1b[c").unwrap();
+        let mut reply = [0; 2];
+        input.read_exact(&mut reply).unwrap();
+        assert_eq!(reply, *b"\x1b[");
+        session.tap().write_input(b"user input", None).unwrap();
+        drop(output);
+        session.wait().unwrap();
     }
 }

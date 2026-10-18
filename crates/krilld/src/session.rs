@@ -81,8 +81,7 @@ fn halt_pipe() -> io::Result<&'static (OwnedFd, OwnedFd)> {
     Ok(HALT.get_or_init(|| pipe))
 }
 
-/// PTY master 제어(termios). Windows는 컴파일 전용이라 master가 만들어지지 않고 모두 `Unsupported`다
-/// (`ConPTY`는 Phase 3, OWE-833).
+/// Unix PTY master 제어(termios). Windows 파이프·holder Resize는 `windows` 모듈이 맡는다.
 #[cfg(unix)]
 pub(crate) mod pty {
     use std::io;
@@ -836,6 +835,9 @@ fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> 
     let mut seq = lock(&shared.live).seq;
     let mut errors = 0u32;
     loop {
+        // Unix has not read ahead. Windows must drain the bounded pipe queue
+        // through EOF after cancellation before sealing, or handover loses bytes.
+        #[cfg(unix)]
         if HALTED.load(Ordering::SeqCst) {
             if let Some(r) = &mut rec {
                 seal(shared, r);

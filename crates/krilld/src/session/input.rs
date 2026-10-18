@@ -111,6 +111,7 @@ fn write_all(
     while !bytes.is_empty() {
         alive(tap, None)?;
         let result = {
+            #[cfg(unix)]
             let _live = lock(&tap.0.live);
             #[cfg(unix)]
             let result = write(&tap.0.master, bytes).map_err(io::Error::from);
