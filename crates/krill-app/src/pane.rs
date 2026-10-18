@@ -31,8 +31,8 @@ use krill_proto::SessionId;
 use krill_proto::agent::Permission;
 pub use krill_proto::control::Program;
 use krill_proto::control::{
-    AgentLaunch, AgentSettings, Cold, Create, FEAT_AGENTS, FEAT_COLD, FEAT_CONTROL, FEAT_RESUME,
-    FEAT_SESSION_FORK, Reply, Request,
+    AgentLaunch, AgentSettings, Cold, Create, FEAT_AGENTS, FEAT_CLEAR_SCROLLBACK, FEAT_COLD,
+    FEAT_CONTROL, FEAT_RESUME, FEAT_SESSION_FORK, Reply, Request,
 };
 use krill_proto::daemon::{self, Paths};
 use krill_proto::input::{self, InputAck, Journal, Notice, Now};
@@ -107,6 +107,28 @@ pub fn load_cold(target: impl Into<HostTarget>, session: SessionId) -> Option<Co
     match Reply::decode(k, &b).ok()? {
         Reply::Cold(cold) => Some(cold),
         _ => None,
+    }
+}
+
+/// 세션 `session`의 데몬 쪽 핫·콜드 스크롤백을 제어 연결로 비운다(OWE-873b).
+/// 구버전 krilld가 [`FEAT_CLEAR_SCROLLBACK`]을 광고하지 않으면 요청을 보내지 않고 `Ok(false)`를 돌려준다.
+///
+/// # Errors
+/// krilld 연결·프레임 읽기/쓰기가 실패했거나 데몬이 요청을 거부했다.
+pub fn clear_scrollback(target: impl Into<HostTarget>, session: SessionId) -> io::Result<bool> {
+    let target = target.into();
+    let (mut s, features) = reconnect(&target, FEAT_CONTROL)?;
+    if features & FEAT_CLEAR_SCROLLBACK == 0 {
+        return Ok(false);
+    }
+    s.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    s.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    s.write_all(&Request::ClearScrollback { session }.encode()?)?;
+    let (k, b) = read(&mut s)?;
+    match Reply::decode(k, &b)? {
+        Reply::ScrollbackCleared => Ok(true),
+        Reply::Failed(f) => Err(io::Error::other(f.to_string())),
+        _ => Err(io::ErrorKind::InvalidData.into()),
     }
 }
 
@@ -810,12 +832,27 @@ impl<W: Write> Pane<W> {
         self.history.rows.len()
     }
 
-    /// 로컬 스크롤백을 버리고 바닥으로 돌아간다(⌘K, OWE-873). 데몬 쪽 핫·콜드 기록은 그대로라
-    /// 다시 위로 스크롤하면 데몬에서 다시 받는다 — 데몬 기록까지 지우려면 krilld IPC가 필요하다.
+    /// 스크롤백을 버리고 바닥으로 돌아간다(⌘K, OWE-873 / OWE-873b).
+    /// 데몬이 [`FEAT_CLEAR_SCROLLBACK`]을 협상했으면 [`Request::ClearScrollback`]을 함께 보내
+    /// 핫·콜드 스크롤백을 비우고, 구버전 데몬이면 로컬 히스토리만 비운다.
     pub fn clear_scrollback(&mut self) {
-        if self.history.offset != 0 || !self.history.rows.is_empty() {
-            self.history.reset();
+        self.search.hist_req = None;
+        self.search.hist_target = None;
+        let view_dropped = self.forget_search_view();
+        let had_local = self.history.offset != 0
+            || !self.history.rows.is_empty()
+            || !self.history.prior.is_empty();
+        self.history.clear_scrollback();
+        if had_local || view_dropped {
             self.refresh();
+        }
+        if self.state == State::Live
+            && self.out.is_some()
+            && self.features & FEAT_CLEAR_SCROLLBACK != 0
+            && let Some(session) = self.session
+            && self.send(&Request::ClearScrollback { session }).is_err()
+        {
+            self.unlink();
         }
     }
 
@@ -918,6 +955,9 @@ impl<W: Write> Pane<W> {
             }
             krill_proto::clipboard::CLIPBOARD => {
                 ev.clipboard = Some(krill_proto::clipboard::Clipboard::decode(k, body)?.text);
+            }
+            krill_proto::control::kind::REPLY => {
+                Reply::decode(k, body)?;
             }
             // REFUSED: 이 연결에서 받을 수 없는 요청을 보냈다(구 krilld). ROLE_ACK: [`Pane::fit`]의 응답(거절돼도 PTY
             // 크기가 그대로일 뿐). 둘 다 무시.
@@ -1212,6 +1252,21 @@ impl History {
         *self = Self {
             req: self.req,
             prior,
+            ..Self::default()
+        };
+    }
+
+    /// 스크롤백 지우기(⌘K, OWE-873b): 고정(콜드·닫힘) 행과 재개 `prior`까지 모두 비우고 바닥으로 돌아간다.
+    fn clear_scrollback(&mut self) {
+        let fixed = self.fixed;
+        *self = Self {
+            req: self.req,
+            phase: if fixed {
+                Phase::Done
+            } else {
+                Phase::Hot { got: 0 }
+            },
+            fixed,
             ..Self::default()
         };
     }

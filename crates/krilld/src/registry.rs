@@ -687,6 +687,11 @@ impl Registry {
                 {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::ClearScrollback { .. })
+                    if n.features & control::FEAT_CLEAR_SCROLLBACK == 0 =>
+                {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(req) if role == Role::Observer && !read_only(&req) => {
                     Reply::Failed(Failure::Denied)
                 }
@@ -826,6 +831,7 @@ impl Registry {
                     }
                 }),
             Request::Cold { session } => self.cold(peer, session),
+            Request::ClearScrollback { session } => self.clear_scrollback(peer, session),
             Request::Resume { session, create } => self.resume(peer, session, create),
             Request::Hibernation { session, create } => self.wake_hibernated(peer, session, create),
             Request::Create(c) => self.create(peer, c),
@@ -1012,6 +1018,29 @@ impl Registry {
             return None;
         }
         st.sessions.get(&id).map(|e| e.session.tap())
+    }
+
+    /// 세션 `id`의 핫·콜드 스크롤백을 비운다(OWE-873b). 세션·PTY·보이는 화면은 건드리지 않는다.
+    fn clear_scrollback(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
+        let tap = {
+            let st = lock(&self.state);
+            if !peer.authorize("clear-scrollback", id, &st.roots, &self.audit) {
+                return Err(Failure::Denied);
+            }
+            st.sessions.get(&id).map(|e| e.session.tap())
+        };
+        if let Some(tap) = tap {
+            tap.clear_scrollback();
+            return Ok(Reply::ScrollbackCleared);
+        }
+        if self
+            .store
+            .as_ref()
+            .is_some_and(|store| store.clear_cold_scrollback(id))
+        {
+            return Ok(Reply::ScrollbackCleared);
+        }
+        Err(Failure::NoSession)
     }
 
     /// 디스크 세그먼트에서 재구성한 마지막 화면과 스크롤백(MK-032 콜드 복원). 범위 밖이면 거부한다.

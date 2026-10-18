@@ -496,3 +496,154 @@ fn live_size_tracks_resize_for_panic_recovery() {
     drop(pty.user);
     session.wait().unwrap();
 }
+
+/// OWE-873b: 화면 스트림에서 `ClearScrollback`을 보내면 핫·콜드 스크롤백이 모두 비워져
+/// 지운 줄이 다시 돌아오지 않고, 그 뒤 새 출력은 정상으로 스크롤백에 쌓인다.
+#[test]
+fn clear_scrollback_drops_hot_and_cold_history_and_keeps_new_output() {
+    use crate::store::{Limits, Store};
+    use krill_proto::control::{FEAT_CLEAR_SCROLLBACK, Reply, Request};
+    use krill_proto::screen::{HistoryRequest, HistoryRows, Source, kind};
+
+    let root = std::env::temp_dir().join(format!(
+        "krill-session-clear-scrollback-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&root).ok();
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let size = WinSize { cols: 20, rows: 3 };
+    let rec = store.recorder(SessionId(1), size).unwrap();
+
+    let pty = rustix_openpty::openpty(
+        None,
+        Some(&rustix::termios::Winsize {
+            ws_col: size.cols,
+            ws_row: size.rows,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        }),
+    )
+    .unwrap();
+    let mut termios = rustix::termios::tcgetattr(&pty.user).unwrap();
+    termios.make_raw();
+    rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &termios).unwrap();
+
+    let session = Session::start(
+        SessionId(1),
+        pty.controller,
+        size,
+        Arc::new(Appearance::load(PathBuf::new())),
+        Some(rec),
+    )
+    .unwrap();
+    let tap = session.tap();
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let attached = tap.clone();
+    let worker = thread::spawn(move || {
+        crate::attach::run_as(
+            server,
+            Attach {
+                session: SessionId(1),
+                stream: Stream::Screen { known: None },
+            },
+            1,
+            FEAT_INPUT | FEAT_CLEAR_SCROLLBACK,
+            Some(attached),
+            Role::Interactive,
+        )
+    });
+    assert_eq!(
+        ipc::read_frame(&mut client).unwrap().unwrap().0,
+        kind::ATTACHED
+    );
+
+    rustix::io::write(&pty.user, b"old1\r\nold2\r\nold3\r\nold4\r\nold5").unwrap();
+    tap.wait(|p| p.end >= 28);
+    assert_eq!(tap.history(0, 10).0, 2);
+
+    client
+        .write_all(
+            &Request::ClearScrollback {
+                session: SessionId(1),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let cleared = loop {
+        let (k, b) = ipc::read_frame(&mut client).unwrap().unwrap();
+        if k == krill_proto::control::kind::REPLY {
+            break Reply::decode(k, &b).unwrap();
+        }
+    };
+    assert_eq!(cleared, Reply::ScrollbackCleared);
+
+    // 지운 뒤 히스토리 요청: 핫·콜드 모두 0이다.
+    client
+        .write_all(
+            &HistoryRequest {
+                req: 1,
+                source: Source::Hot,
+                skip: 0,
+                count: 10,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let rows = loop {
+        let (k, b) = ipc::read_frame(&mut client).unwrap().unwrap();
+        if k == kind::HISTORY_ROWS {
+            break HistoryRows::decode(k, &b).unwrap();
+        }
+    };
+    assert_eq!(rows.total, 0);
+    assert_eq!(rows.pages, 0);
+    assert!(rows.rows.is_empty());
+
+    // 지운 뒤 새 출력: 지운 시점 화면에 있던 줄이 위로 밀려나며 새 스크롤백이 쌓이고, old1·old2는 돌아오지 않는다.
+    rustix::io::write(&pty.user, b"\r\nnew1\r\nnew2").unwrap();
+    tap.wait(|p| p.end >= 40);
+
+    for (req, source) in [(2, Source::Hot), (3, Source::Cold { page: 0 })] {
+        client
+            .write_all(
+                &HistoryRequest {
+                    req,
+                    source,
+                    skip: 0,
+                    count: 10,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        let rows = loop {
+            let (k, b) = ipc::read_frame(&mut client).unwrap().unwrap();
+            if k == kind::HISTORY_ROWS {
+                let decoded = HistoryRows::decode(k, &b).unwrap();
+                if decoded.req == req {
+                    break decoded;
+                }
+            }
+        };
+        assert_eq!(rows.total, 2);
+        let texts: Vec<String> = rows
+            .rows
+            .iter()
+            .map(|r| r.iter().map(|c| c.ch).collect::<String>())
+            .collect();
+        assert_eq!(texts, vec!["old3", "old4"]);
+    }
+
+    client.shutdown(Shutdown::Both).unwrap();
+    drop(client);
+    worker.join().unwrap().ok();
+    drop(pty.user);
+    session.wait().unwrap();
+    std::fs::remove_dir_all(&root).ok();
+}

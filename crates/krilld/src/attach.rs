@@ -251,6 +251,23 @@ fn requests(
                 let req = HistoryRequest::decode(k, &body)?;
                 conn.send(&history(tap, &req).encode()?)?;
             }
+            (krill_proto::control::kind::REQUEST, Stream::Screen { .. })
+                if features & krill_proto::control::FEAT_CLEAR_SCROLLBACK != 0 =>
+            {
+                use krill_proto::control::{Failure, Reply, Request};
+                match Request::decode(k, &body)? {
+                    Request::ClearScrollback { session } if session == tap.id() => {
+                        let reply = if client.can_modify() {
+                            tap.clear_scrollback();
+                            Reply::ScrollbackCleared
+                        } else {
+                            Reply::Failed(Failure::Denied)
+                        };
+                        conn.send(&reply.encode()?)?;
+                    }
+                    _ => conn.send(&Refused::BadRequest.encode()?)?,
+                }
+            }
             _ => conn.send(&Refused::BadRequest.encode()?)?,
         }
     }
