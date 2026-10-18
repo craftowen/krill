@@ -481,6 +481,19 @@ pub(crate) fn clone_file(_src: &Path, _dst: &Path) -> io::Result<()> {
     unsupported()
 }
 
+/// Cancel only the synchronous IO of this daemon's pipe reader, never the PTY itself.
+pub(crate) fn cancel_pipe_read(thread: BorrowedHandle<'_>) {
+    // SAFETY: borrowed live thread handle; cancellation does not close any handle.
+    unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
+    }
+}
+
+pub(crate) fn thread_finished(thread: BorrowedHandle<'_>) -> bool {
+    // SAFETY: live borrowed thread handle, zero timeout cannot block.
+    unsafe { WaitForSingleObject(thread.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

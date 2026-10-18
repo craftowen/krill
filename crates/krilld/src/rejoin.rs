@@ -173,7 +173,10 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
         .encode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     match with {
+        #[cfg(unix)]
         Some(s) => link.send(&frame, &[s.master()]),
+        #[cfg(windows)]
+        Some(_) => Err(io::ErrorKind::Unsupported.into()),
         None => link.send(&frame, &[]),
     }
 }
