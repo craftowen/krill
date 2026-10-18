@@ -847,11 +847,10 @@ fn apply_mock_or_live_element_mutation(
 ) -> Result<LiveActionOutcome, CliError> {
     if let Some(mut mock) = load_mock_env().map_err(CliError::Runtime)? {
         mock.last_action = Some(action_record.to_owned());
-        let Some(app) = mock
-            .apps
-            .iter_mut()
-            .find(|a| matches_app_selector(&a.summary(), app_selector))
-        else {
+        let Some(app) = mock.apps.iter_mut().find(|a| {
+            resolved_app.is_some_and(|r| r.pid > 0 && a.pid == r.pid)
+                || matches_app_selector(&a.summary(), app_selector)
+        }) else {
             return Err(CliError::Runtime(format!(
                 "application not found: {app_selector}"
             )));
@@ -925,11 +924,10 @@ fn execute_paste_with_clipboard_preservation(
     if let Some(mut mock) = load_mock_env()? {
         let prev = mock.clipboard.clone();
         text.clone_into(&mut mock.clipboard);
-        if let Some(app) = mock
-            .apps
-            .iter_mut()
-            .find(|a| matches_app_selector(&a.summary(), app_selector))
-        {
+        if let Some(app) = mock.apps.iter_mut().find(|a| {
+            resolved_app.is_some_and(|r| r.pid > 0 && a.pid == r.pid)
+                || matches_app_selector(&a.summary(), app_selector)
+        }) {
             let win_opt = if let Some(target_win) = selected_window {
                 let idx = target_win.index.saturating_sub(1);
                 if let Some(pos) = app.windows.iter().position(|w| w.id == target_win.id) {

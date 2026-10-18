@@ -583,12 +583,7 @@ fn capture_live_window_screenshot(win: &WindowSummary) -> Result<ScreenshotMetad
     })
 }
 
-fn query_live_window_ax_tree(
-    app: &AppSummary,
-    win: Option<&WindowSummary>,
-    restore_window: bool,
-) -> Result<ElementNode, String> {
-    let script = r#"
+pub const LIVE_WINDOW_AX_JXA_SCRIPT: &str = r#"
 function run(argv) {
   const targetPid = Number(argv[0] || 0);
   const targetName = String(argv[1] || "");
@@ -601,8 +596,8 @@ function run(argv) {
   let proc = null;
   if (targetPid > 0) {
     try {
-      const byPid = se.processes.whose({ unixId: targetPid })();
-      if (byPid && byPid.length > 0) proc = byPid[0];
+      const byPid = se.processes.whose({ unixId: targetPid });
+      if (byPid && byPid.length > 0) proc = se.processes.whose({ unixId: targetPid }).first;
     } catch (_) {}
   }
   if (!proc) {
@@ -613,9 +608,11 @@ function run(argv) {
   }
 
   function selectTargetWindow(wins, winId, winIndex, winTitle) {
-    if (!wins || wins.length === 0) return null;
+    let winCount = 0;
+    try { winCount = Number(wins ? wins.length : 0); } catch (_) { return null; }
+    if (!winCount || winCount <= 0) return null;
     if (winId) {
-      for (let i = 0; i < wins.length; i++) {
+      for (let i = 0; i < winCount; i++) {
         const cand = wins[i];
         try {
           const axNum = cand.attributes.byName("AXWindowNumber").value();
@@ -626,13 +623,13 @@ function run(argv) {
         } catch (_) {}
       }
     }
-    if (winIndex >= 1 && winIndex <= wins.length) {
+    if (winIndex >= 1 && winIndex <= winCount) {
       const byIdx = wins[winIndex - 1];
       if (!winTitle) return byIdx;
       try {
         if (String(byIdx.name() || "") === winTitle) return byIdx;
       } catch (_) {}
-      for (let i = 0; i < wins.length; i++) {
+      for (let i = 0; i < winCount; i++) {
         const cand = wins[i];
         try {
           if (String(cand.name() || "") === winTitle) return cand;
@@ -641,7 +638,7 @@ function run(argv) {
       return byIdx;
     }
     if (winTitle) {
-      for (let i = 0; i < wins.length; i++) {
+      for (let i = 0; i < winCount; i++) {
         const cand = wins[i];
         try {
           if (String(cand.name() || "") === winTitle) return cand;
@@ -670,20 +667,20 @@ function run(argv) {
   let budget = 160;
   function readChildren(parent, depth) {
     if (depth >= 4 || budget <= 0) return [];
-    let elems = [];
-    try { elems = parent.uiElements(); } catch (_) { return []; }
-    const count = Math.min(elems.length, 40);
+    const elems = parent.uiElements;
+    let roles = [];
+    try { roles = elems.role(); } catch (_) { return []; }
+    const count = Math.min(Array.isArray(roles) ? roles.length : 0, 40);
     if (count === 0) return [];
-    let roles = [], subroles = [], titles = [], descs = [], vals = [], positions = [], sizes = [], enableds = [], focuseds = [];
-    try { roles = parent.uiElements.role(); } catch (_) {}
-    try { subroles = parent.uiElements.subrole(); } catch (_) {}
-    try { titles = parent.uiElements.title(); } catch (_) {}
-    try { descs = parent.uiElements.description(); } catch (_) {}
-    try { vals = parent.uiElements.value(); } catch (_) {}
-    try { positions = parent.uiElements.position(); } catch (_) {}
-    try { sizes = parent.uiElements.size(); } catch (_) {}
-    try { enableds = parent.uiElements.enabled(); } catch (_) {}
-    try { focuseds = parent.uiElements.focused(); } catch (_) {}
+    let subroles = [], titles = [], descs = [], vals = [], positions = [], sizes = [], enableds = [], focuseds = [];
+    try { subroles = elems.subrole(); } catch (_) {}
+    try { titles = elems.title(); } catch (_) {}
+    try { descs = elems.description(); } catch (_) {}
+    try { vals = elems.value(); } catch (_) {}
+    try { positions = elems.position(); } catch (_) {}
+    try { sizes = elems.size(); } catch (_) {}
+    try { enableds = elems.enabled(); } catch (_) {}
+    try { focuseds = elems.focused(); } catch (_) {}
     const out = [];
     for (let i = 0; i < count && budget > 0; i++) {
       budget -= 1;
@@ -726,7 +723,7 @@ function run(argv) {
   let winBounds = null;
   let children = [];
   try {
-    const wins = proc.windows();
+    const wins = proc.windows;
     const w = selectTargetWindow(wins, targetWinId, targetWinIndex, targetWinTitle);
     if (w) {
       if (restore) {
@@ -761,6 +758,12 @@ function run(argv) {
   });
 }
 "#;
+
+fn query_live_window_ax_tree(
+    app: &AppSummary,
+    win: Option<&WindowSummary>,
+    restore_window: bool,
+) -> Result<ElementNode, String> {
     let pid_str = app.pid.to_string();
     let effective_restore = restore_window
         && (std::env::var_os("KRILL_TEST_OFFLINE").is_none()
@@ -770,7 +773,7 @@ function run(argv) {
     let win_idx_str = win.map_or(0usize, |w| w.index).to_string();
     let win_title_str = win.map_or("", |w| w.title.as_str());
     let out = run_jxa(
-        script,
+        LIVE_WINDOW_AX_JXA_SCRIPT,
         &[
             &pid_str,
             &app.name,
@@ -1027,7 +1030,7 @@ pub fn build_live_action_payload(
     }
 }
 
-const LIVE_ACTION_JXA_SCRIPT: &str = r#"
+pub const LIVE_ACTION_JXA_SCRIPT: &str = r#"
 ObjC.import("AppKit");
 ObjC.import("CoreGraphics");
 ObjC.import("Foundation");
@@ -1036,6 +1039,17 @@ function run(argv) {
 const req = JSON.parse(String(argv[0] || "{}"));
 const se = Application("System Events");
 
+function getProcess() {
+  if (req.pid && Number(req.pid) > 0) {
+    try {
+      const targetPid = Number(req.pid);
+      const byPid = se.processes.whose({ unixId: targetPid });
+      if (byPid && byPid.length > 0) return se.processes.whose({ unixId: targetPid }).first;
+    } catch (_) {}
+  }
+  return se.processes.byName(String(req.appName || ""));
+}
+
 function activateTargetApp() {
   let activated = false;
   if (req.pid && Number(req.pid) > 0) {
@@ -1043,6 +1057,13 @@ function activateTargetApp() {
       const running = $.NSRunningApplication.runningApplicationWithProcessIdentifier(Number(req.pid));
       if (running && !running.isNil()) {
         activated = Boolean(running.activateWithOptions(3));
+        if (!activated) {
+          try {
+            getProcess().frontmost = true;
+            activated = true;
+          } catch (_) {}
+        }
+        return activated;
       }
     } catch (_) {}
   }
@@ -1063,23 +1084,15 @@ function activateTargetApp() {
   return activated;
 }
 
-function getProcess() {
-  if (req.pid && Number(req.pid) > 0) {
-    try {
-      const byPid = se.processes.whose({ unixId: Number(req.pid) })();
-      if (byPid && byPid.length > 0) return byPid[0];
-    } catch (_) {}
-  }
-  return se.processes.byName(String(req.appName || ""));
-}
-
 function selectTargetWindow(wins, winId, winIndex, winTitle) {
-  if (!wins || wins.length === 0) return null;
+  let winCount = 0;
+  try { winCount = Number(wins ? wins.length : 0); } catch (_) { return null; }
+  if (!winCount || winCount <= 0) return null;
   const idStr = winId ? String(winId) : "";
   const idxNum = Number(winIndex || 0);
   const titleStr = winTitle ? String(winTitle) : "";
   if (idStr) {
-    for (let i = 0; i < wins.length; i++) {
+    for (let i = 0; i < winCount; i++) {
       const cand = wins[i];
       try {
         const axNum = cand.attributes.byName("AXWindowNumber").value();
@@ -1090,13 +1103,13 @@ function selectTargetWindow(wins, winId, winIndex, winTitle) {
       } catch (_) {}
     }
   }
-  if (idxNum >= 1 && idxNum <= wins.length) {
+  if (idxNum >= 1 && idxNum <= winCount) {
     const byIdx = wins[idxNum - 1];
     if (!titleStr) return byIdx;
     try {
       if (String(byIdx.name() || "") === titleStr) return byIdx;
     } catch (_) {}
-    for (let i = 0; i < wins.length; i++) {
+    for (let i = 0; i < winCount; i++) {
       const cand = wins[i];
       try {
         if (String(cand.name() || "") === titleStr) return cand;
@@ -1105,7 +1118,7 @@ function selectTargetWindow(wins, winId, winIndex, winTitle) {
     return byIdx;
   }
   if (titleStr) {
-    for (let i = 0; i < wins.length; i++) {
+    for (let i = 0; i < winCount; i++) {
       const cand = wins[i];
       try {
         if (String(cand.name() || "") === titleStr) return cand;
@@ -1137,12 +1150,11 @@ function findInteractiveElementByRef(win, targetRef) {
   let nextRef = 1;
   function visitChildren(parent, depth) {
     if (depth >= 4 || budget <= 0) return null;
-    let elems = [];
-    try { elems = parent.uiElements(); } catch (_) { return null; }
-    const count = Math.min(elems.length, 40);
-    if (count === 0) return null;
+    const elems = parent.uiElements;
     let roles = [];
-    try { roles = parent.uiElements.role(); } catch (_) {}
+    try { roles = elems.role(); } catch (_) { return null; }
+    const count = Math.min(Array.isArray(roles) ? roles.length : 0, 40);
+    if (count === 0) return null;
     for (let i = 0; i < count && budget > 0; i++) {
       budget -= 1;
       const el = elems[i];
@@ -1197,7 +1209,7 @@ function focusTargetElementIfAny() {
   if (!req.targetRef) return true;
   try {
     const proc = getProcess();
-    const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+    const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
     const el = findInteractiveElementByRef(w, Number(req.targetRef));
     if (el) {
       try {
@@ -1223,7 +1235,7 @@ function executeRequest() {
     if (req.targetRef && isSimpleLeft) {
       try {
         const proc = getProcess();
-        const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+        const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
         const el = findInteractiveElementByRef(w, Number(req.targetRef));
         if (el) {
           try { el.focused = true; } catch (_) {}
@@ -1249,7 +1261,7 @@ function executeRequest() {
     const actionName = String(req.actionName || "AXShowMenu");
     try {
       const proc = getProcess();
-      const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+      const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
       const el = findInteractiveElementByRef(w, Number(req.targetRef));
       if (el) {
         try { el.focused = true; } catch (_) {}
@@ -1367,7 +1379,7 @@ function executeRequest() {
   if (kind === "setValue") {
     try {
       const proc = getProcess();
-      const w = selectTargetWindow(proc.windows(), req.winId, req.winIndex, req.winTitle);
+      const w = selectTargetWindow(proc.windows, req.winId, req.winIndex, req.winTitle);
       const el = findInteractiveElementByRef(w, Number(req.targetRef));
       if (!el) {
         return {
