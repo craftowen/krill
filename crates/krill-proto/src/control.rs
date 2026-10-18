@@ -669,7 +669,10 @@ mod wire_errno {
         wire
     }
 
-    #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde with 계약이 &T를 요구한다")]
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde with 계약이 &T를 요구한다"
+    )]
     pub(super) fn serialize<S: Serializer>(errno: &i32, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_i32(to_wire(*errno))
     }
