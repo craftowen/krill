@@ -1556,3 +1556,196 @@ fn workspace_search_default_width_panel_keeps_long_line_highlight_visible(
         "source.rs NEEDLE highlight ({src_highlight:?}) must stay inside 280pt match row ({src_match:?})"
     );
 }
+
+#[gpui::test]
+fn right_panel_icon_only_tabs_switch_on_click_show_tooltips_and_fit_default_width(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::i18n::Language;
+    use crate::pull_request::{
+        Action, CheckItem, CheckState, PrInspection, ReviewComment, Runner, Service, Status,
+    };
+
+    struct MockPrRunner;
+    impl Runner for MockPrRunner {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            Ok(Status::Open)
+        }
+
+        fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
+            Ok(PrInspection {
+                status: Status::Open,
+                number: Some(787),
+                title: "Icon-only right panel tabs".into(),
+                url: "https://github.com/acme/krill/pull/787".into(),
+                checks: vec![
+                    CheckItem {
+                        name: "cargo nextest".into(),
+                        state: CheckState::Failed,
+                        description: Some("1 test failed".into()),
+                        details_url: None,
+                        run_id: None,
+                        job_id: None,
+                        log_tail: None,
+                    },
+                    CheckItem {
+                        name: "cargo clippy".into(),
+                        state: CheckState::Passed,
+                        description: None,
+                        details_url: None,
+                        run_id: None,
+                        job_id: None,
+                        log_tail: None,
+                    },
+                ],
+                review_comments: vec![ReviewComment {
+                    id: "c1".into(),
+                    thread_id: Some("t1".into()),
+                    author: "owen".into(),
+                    is_bot: false,
+                    body: "Looks good".into(),
+                    path: "crates/krill-app/src/diff.rs".into(),
+                    line: Some(10),
+                    original_line: Some(10),
+                    diff_hunk: String::new(),
+                    created_at: "2026-10-18T00:00:00Z".into(),
+                    url: String::new(),
+                    is_resolved: false,
+                    is_outdated: false,
+                    replies: Vec::new(),
+                }],
+            })
+        }
+    }
+
+    struct NarrowHost(Entity<Panel>);
+    impl Render for NarrowHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(280.)).h(px(600.)).flex().flex_col().child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.0.clone()),
+            )
+        }
+    }
+
+    cx.update(gpui_component::init);
+    cx.update(|cx| crate::i18n::set_language(Language::Ko, cx));
+    assert_eq!(PanelTab::Changes.label(), "변경 사항");
+    assert_eq!(PanelTab::Files.label(), "파일");
+    assert_eq!(PanelTab::Search.label(), "검색");
+    assert_eq!(PanelTab::Checks.label(), "PR · CI");
+    assert_eq!(PanelTab::Changes.tooltip(), "변경 사항 (⇧⌘G)");
+    assert_eq!(PanelTab::Files.tooltip(), "파일 탐색기 (⇧⌘E)");
+    assert_eq!(PanelTab::Search.tooltip(), "워크스페이스 검색 (⇧⌘F)");
+    assert_eq!(PanelTab::Checks.tooltip(), "PR · CI");
+
+    cx.update(|cx| crate::i18n::set_language(Language::En, cx));
+    assert_eq!(PanelTab::Changes.label(), "Changes");
+    assert_eq!(PanelTab::Files.label(), "Files");
+    assert_eq!(PanelTab::Search.label(), "Search");
+    assert_eq!(PanelTab::Checks.label(), "PR · CI");
+    assert_eq!(PanelTab::Changes.tooltip(), "Changes (⇧⌘G)");
+    assert_eq!(PanelTab::Files.tooltip(), "File Explorer (⇧⌘E)");
+    assert_eq!(PanelTab::Search.tooltip(), "Search in Workspace (⇧⌘F)");
+    assert_eq!(PanelTab::Checks.tooltip(), "PR · CI");
+    cx.update(|cx| crate::i18n::set_language(Language::Ko, cx));
+
+    let repo = Repo::new();
+    std::fs::write(repo.0.join("changed.rs"), "pub fn demo() {}\n").unwrap();
+
+    let repo_path = repo.0.clone();
+    let pr_service = Arc::new(Service::new(Arc::new(MockPrRunner)));
+    let mut panel_handle: Option<Entity<Panel>> = None;
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        let p = cx.new(|cx| {
+            let mut panel = Panel::unconnected(repo_path, cx);
+            panel.set_pr_service(pr_service);
+            panel.set_checks_branch("craftowen/m10-owe-787");
+            panel
+        });
+        panel_handle = Some(p.clone());
+        NarrowHost(p)
+    });
+    let view = panel_handle.unwrap();
+    cx.run_until_parked();
+
+    // Default tab is Changes; only Changes active indicator bar is rendered.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).active_tab()),
+        PanelTab::Changes
+    );
+    assert!(cx.debug_bounds("diff-tab-changes-active").is_some());
+    assert!(cx.debug_bounds("diff-tab-files-active").is_none());
+    assert!(cx.debug_bounds("diff-tab-search-active").is_none());
+    assert!(cx.debug_bounds("diff-tab-checks-active").is_none());
+    assert!(cx.debug_bounds("diff-file-count").is_some());
+
+    // Icon-only tabs stay compact (< 40pt for icon-only tabs without badges) and all 4 tabs fit before refresh/collapse buttons in 280pt panel.
+    let files_bounds = cx.debug_bounds("diff-tab-files").unwrap();
+    let search_bounds = cx.debug_bounds("diff-tab-search").unwrap();
+    let checks_bounds = cx.debug_bounds("diff-tab-checks").unwrap();
+    let refresh_bounds = cx.debug_bounds("diff-refresh").unwrap();
+    assert!(
+        files_bounds.size.width <= px(36.) && search_bounds.size.width <= px(36.),
+        "icon-only tabs must not include inline text labels: files={files_bounds:?}, search={search_bounds:?}"
+    );
+    assert!(
+        checks_bounds.right() <= refresh_bounds.origin.x,
+        "all 4 icon tabs must fit left of refresh button inside 280pt panel: checks={checks_bounds:?}, refresh={refresh_bounds:?}"
+    );
+
+    let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+    };
+
+    // Click each tab and verify active_tab() + active bottom indicator bar transition.
+    for tab in [
+        PanelTab::Files,
+        PanelTab::Search,
+        PanelTab::Checks,
+        PanelTab::Changes,
+    ] {
+        click(tab.selector(), cx);
+        assert_eq!(cx.update(|_, cx| view.read(cx).active_tab()), tab);
+        for candidate in PanelTab::ALL {
+            assert_eq!(
+                cx.debug_bounds(candidate.active_selector()).is_some(),
+                candidate == tab,
+                "active indicator mismatch for {candidate:?} when active tab is {tab:?}"
+            );
+        }
+    }
+
+    // After Checks inspection completes, both status dot and actionable count badge are rendered on the Checks tab icon button and still fit inside 280pt.
+    assert!(cx.debug_bounds("diff-checks-dot").is_some());
+    assert!(cx.debug_bounds("diff-checks-count").is_some());
+    let checks_with_badge = cx.debug_bounds("diff-tab-checks").unwrap();
+    let refresh_after = cx.debug_bounds("diff-refresh").unwrap();
+    assert!(
+        checks_with_badge.right() <= refresh_after.origin.x,
+        "Checks tab with status dot and count badge must still fit left of refresh button in 280pt panel"
+    );
+
+    // Hovering each tab icon opens its specific tooltip popup.
+    for tab in PanelTab::ALL {
+        cx.simulate_mouse_move(gpui::point(px(275.), px(595.)), None, Modifiers::default());
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds(tab.selector()).unwrap();
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(tab.tooltip_selector()).is_some(),
+            "hovering {} must display tooltip '{}' ({})",
+            tab.selector(),
+            tab.tooltip(),
+            tab.tooltip_selector()
+        );
+    }
+}

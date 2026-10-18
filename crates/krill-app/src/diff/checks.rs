@@ -32,6 +32,70 @@ pub enum PanelTab {
     Checks,
 }
 
+impl PanelTab {
+    pub const ALL: [Self; 4] = [Self::Changes, Self::Files, Self::Search, Self::Checks];
+
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Changes => crate::i18n::catalog::diff::TITLE.get(),
+            Self::Files => crate::i18n::catalog::diff::FILES.get(),
+            Self::Search => crate::i18n::catalog::diff::SEARCH.get(),
+            Self::Checks => text::CHECKS_TAB.get(),
+        }
+    }
+
+    #[must_use]
+    pub fn tooltip(self) -> &'static str {
+        match self {
+            Self::Changes => crate::i18n::catalog::diff::CHANGES_TOOLTIP.get(),
+            Self::Files => crate::i18n::catalog::diff::FILES_TOOLTIP.get(),
+            Self::Search => crate::i18n::catalog::diff::SEARCH_TOOLTIP.get(),
+            Self::Checks => text::CHECKS_TAB.get(),
+        }
+    }
+
+    #[must_use]
+    pub const fn selector(self) -> &'static str {
+        match self {
+            Self::Changes => "diff-tab-changes",
+            Self::Files => "diff-tab-files",
+            Self::Search => "diff-tab-search",
+            Self::Checks => "diff-tab-checks",
+        }
+    }
+
+    #[must_use]
+    pub const fn active_selector(self) -> &'static str {
+        match self {
+            Self::Changes => "diff-tab-changes-active",
+            Self::Files => "diff-tab-files-active",
+            Self::Search => "diff-tab-search-active",
+            Self::Checks => "diff-tab-checks-active",
+        }
+    }
+
+    #[must_use]
+    pub const fn tooltip_selector(self) -> &'static str {
+        match self {
+            Self::Changes => "diff-tab-changes-tooltip",
+            Self::Files => "diff-tab-files-tooltip",
+            Self::Search => "diff-tab-search-tooltip",
+            Self::Checks => "diff-tab-checks-tooltip",
+        }
+    }
+
+    #[must_use]
+    pub const fn icon(self) -> IconName {
+        match self {
+            Self::Changes => IconName::FileText,
+            Self::Files => IconName::Folder,
+            Self::Search => IconName::Search,
+            Self::Checks => IconName::CircleCheck,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct State {
     pub branch_override: Option<String>,
@@ -278,6 +342,22 @@ impl Panel {
         }
         let actionable = pr.count(CheckState::Failed) + pr.review_comments.len();
         Some(actionable)
+    }
+
+    pub(super) fn checks_status_color(&self, p: &crate::ui::Palette) -> Option<gpui::Hsla> {
+        let pr = self.checks.inspection.as_ref()?;
+        if pr.status == Status::NoPr {
+            return None;
+        }
+        if pr.count(CheckState::Failed) > 0 || !pr.review_comments.is_empty() {
+            Some(p.destructive)
+        } else if pr.count(CheckState::Pending) > 0 {
+            Some(p.warning)
+        } else if pr.count(CheckState::Passed) > 0 {
+            Some(p.success)
+        } else {
+            None
+        }
     }
 
     fn render_check_row(

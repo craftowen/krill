@@ -951,6 +951,62 @@ impl Panel {
             .count()
     }
 
+    fn render_tab_button(
+        tab: PanelTab,
+        active: bool,
+        p: &crate::ui::Palette,
+    ) -> gpui::Stateful<gpui::Div> {
+        let selector = tab.selector();
+        let active_selector = tab.active_selector();
+        let tooltip_selector = tab.tooltip_selector();
+        let tip = tab.tooltip();
+        div()
+            .id(selector)
+            .debug_selector(move || selector.into())
+            .role(gpui::Role::Tab)
+            .aria_label(tip)
+            .relative()
+            .h(px(24.))
+            .min_w(px(26.))
+            .px_1p5()
+            .flex_shrink_0()
+            .rounded(crate::ui::RADIUS_XS)
+            .cursor_pointer()
+            .when(active, |d| d.bg(p.sidebar_accent))
+            .hover(|d| d.bg(p.sidebar_accent))
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .child(Icon::new(tab.icon()).size(px(14.)).text_color(if active {
+                p.sidebar_accent_foreground
+            } else {
+                p.muted_foreground
+            }))
+            .when(active, |d| {
+                d.child(
+                    div()
+                        .id(active_selector)
+                        .debug_selector(move || active_selector.into())
+                        .absolute()
+                        .bottom_0()
+                        .left_1()
+                        .right_1()
+                        .h(px(2.))
+                        .rounded_full()
+                        .bg(p.sidebar_foreground),
+                )
+            })
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::element(move |_, _| {
+                    div()
+                        .debug_selector(move || tooltip_selector.into())
+                        .child(tip)
+                })
+                .build(window, cx)
+            })
+    }
+
     fn render_top_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let p = crate::ui::palette(cx);
         let file_count = self.changes.files.len();
@@ -960,6 +1016,7 @@ impl Panel {
         let search_active = self.tab == PanelTab::Search;
         let checks_active = self.tab == PanelTab::Checks;
         let checks_badge = self.checks_badge_count();
+        let checks_dot = self.checks_status_color(p);
         div()
             .h(crate::ui::TAB_BAR_HEIGHT)
             .px_1p5()
@@ -978,41 +1035,7 @@ impl Panel {
                     .min_w_0()
                     .overflow_x_hidden()
                     .child(
-                        div()
-                            .id("diff-tab-changes")
-                            .debug_selector(|| "diff-tab-changes".into())
-                            .h(px(24.))
-                            .px_1p5()
-                            .flex_shrink_0()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .when(changes_active, |d| d.bg(p.sidebar_accent))
-                            .hover(|d| d.bg(p.sidebar_accent))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(Icon::new(IconName::FileText).size(px(12.)).text_color(
-                                if changes_active {
-                                    p.sidebar_accent_foreground
-                                } else {
-                                    p.muted_foreground
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .font_weight(if changes_active {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if changes_active {
-                                        p.sidebar_accent_foreground
-                                    } else {
-                                        p.muted_foreground
-                                    })
-                                    .child(text::TITLE.get()),
-                            )
+                        Self::render_tab_button(PanelTab::Changes, changes_active, p)
                             .when(show_badge, |d| {
                                 d.child(
                                     div()
@@ -1023,7 +1046,11 @@ impl Panel {
                                         .bg(p.muted)
                                         .font_family(crate::ui::FONT_MONO)
                                         .text_size(crate::ui::TEXT_2XS)
-                                        .text_color(p.muted_foreground)
+                                        .text_color(if changes_active {
+                                            p.sidebar_accent_foreground
+                                        } else {
+                                            p.muted_foreground
+                                        })
                                         .child(file_count.to_string()),
                                 )
                             })
@@ -1032,121 +1059,27 @@ impl Panel {
                             ),
                     )
                     .child(
-                        div()
-                            .id("diff-tab-files")
-                            .debug_selector(|| "diff-tab-files".into())
-                            .h(px(24.))
-                            .px_1p5()
-                            .flex_shrink_0()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .when(files_active, |d| d.bg(p.sidebar_accent))
-                            .hover(|d| d.bg(p.sidebar_accent))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(Icon::new(IconName::Folder).size(px(12.)).text_color(
-                                if files_active {
-                                    p.sidebar_accent_foreground
-                                } else {
-                                    p.muted_foreground
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .font_weight(if files_active {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if files_active {
-                                        p.sidebar_accent_foreground
-                                    } else {
-                                        p.muted_foreground
-                                    })
-                                    .child(text::FILES.get()),
-                            )
-                            .on_click(
-                                cx.listener(|this, _, _, cx| this.set_tab(PanelTab::Files, cx)),
-                            ),
+                        Self::render_tab_button(PanelTab::Files, files_active, p).on_click(
+                            cx.listener(|this, _, _, cx| this.set_tab(PanelTab::Files, cx)),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("diff-tab-search")
-                            .debug_selector(|| "diff-tab-search".into())
-                            .h(px(24.))
-                            .px_1p5()
-                            .flex_shrink_0()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .when(search_active, |d| d.bg(p.sidebar_accent))
-                            .hover(|d| d.bg(p.sidebar_accent))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(Icon::new(IconName::Search).size(px(12.)).text_color(
-                                if search_active {
-                                    p.sidebar_accent_foreground
-                                } else {
-                                    p.muted_foreground
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .font_weight(if search_active {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if search_active {
-                                        p.sidebar_accent_foreground
-                                    } else {
-                                        p.muted_foreground
-                                    })
-                                    .child(text::SEARCH.get()),
-                            )
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.show_search(window, cx)),
-                            ),
+                        Self::render_tab_button(PanelTab::Search, search_active, p).on_click(
+                            cx.listener(|this, _, window, cx| this.show_search(window, cx)),
+                        ),
                     )
                     .child(
-                        div()
-                            .id("diff-tab-checks")
-                            .debug_selector(|| "diff-tab-checks".into())
-                            .h(px(24.))
-                            .px_1p5()
-                            .flex_shrink_0()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .when(checks_active, |d| d.bg(p.sidebar_accent))
-                            .hover(|d| d.bg(p.sidebar_accent))
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(Icon::new(IconName::CircleCheck).size(px(12.)).text_color(
-                                if checks_active {
-                                    p.sidebar_accent_foreground
-                                } else {
-                                    p.muted_foreground
-                                },
-                            ))
-                            .child(
-                                div()
-                                    .text_size(crate::ui::TEXT_XS)
-                                    .font_weight(if checks_active {
-                                        FontWeight::SEMIBOLD
-                                    } else {
-                                        FontWeight::NORMAL
-                                    })
-                                    .text_color(if checks_active {
-                                        p.sidebar_accent_foreground
-                                    } else {
-                                        p.muted_foreground
-                                    })
-                                    .child(crate::i18n::catalog::pull_request::CHECKS_TAB.get()),
-                            )
+                        Self::render_tab_button(PanelTab::Checks, checks_active, p)
+                            .when_some(checks_dot, |d, dot_color| {
+                                d.child(
+                                    div()
+                                        .id("diff-checks-dot")
+                                        .debug_selector(|| "diff-checks-dot".into())
+                                        .size(crate::ui::STATE_DOT)
+                                        .rounded_full()
+                                        .bg(dot_color),
+                                )
+                            })
                             .when_some(checks_badge, |d, count| {
                                 d.child(
                                     div()
@@ -1159,6 +1092,8 @@ impl Panel {
                                         .text_size(crate::ui::TEXT_2XS)
                                         .text_color(if count > 0 {
                                             p.destructive
+                                        } else if checks_active {
+                                            p.sidebar_accent_foreground
                                         } else {
                                             p.muted_foreground
                                         })
