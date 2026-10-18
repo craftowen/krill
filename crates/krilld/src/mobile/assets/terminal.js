@@ -133,9 +133,9 @@ globalThis.MkTerminalCodec=(()=>{
   }
   setFontScale(scale,notify=true){if(this.disposed)return;this.fontScale=snap(Number(scale)||1);this.fontSize=Math.max(6,Math.round(13*this.fontScale));this.cellWidth=8*this.fontSize/13;this.cellHeight=18*this.fontSize/13;this.historyElement.style.fontSize=`${this.fontSize}px`;this.historyElement.style.lineHeight=`${this.cellHeight}px`;this.draw();if(notify)this.options.onPreferenceChange?.({textScale:this.fontScale});if(this.fit&&this.ready&&!this.fitPending)this.guard(()=>this.resize());}
   async open(){
-   const generation=this.generation;let result;try{result=await this.options.connect({sessionId:this.session});}catch(e){if(generation===this.generation)this.error(e);return;}
+   const generation=this.generation;let result;try{result=await this.options.connect({sessionId:this.session});}catch(e){if(generation===this.generation)this.disconnect('disconnected',e.message);return;}
    const {socket,credentials}=result||{};if(this.disposed||generation!==this.generation){socket?.close();return;}if(!socket||!credentials){this.error(Error('Invalid terminal connection factory'));return;}
-   this.socket=socket;socket.binaryType='arraybuffer';let phase=0,channel;
+   this.socket=socket;this.connectionTimer=setTimeout(()=>{if(generation===this.generation)this.disconnect('disconnected','Terminal connection timed out');},15000);socket.binaryType='arraybuffer';let phase=0,channel;
    this.listen(socket,'message',e=>{if(generation!==this.generation||this.disposed)return;try{
     if(phase===0){const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');channel=new C.Channel(C.sha256(C.unhex(credentials.credential)),C.concat(C.unhex(challenge.challenge),nonce));this.channel=channel;socket.send(JSON.stringify({device_id:credentials.device_id,token:null,client_nonce:C.hex(nonce)}));socket.send(channel.seal(C.enc.encode('{"label":"Live terminal"}')));phase=1;return;}
     const bytes=channel.open(e.data);if(phase===1){JSON.parse(new TextDecoder().decode(bytes));phase=2;return;}
@@ -143,7 +143,7 @@ globalThis.MkTerminalCodec=(()=>{
     if(bytes.length<5||new DataView(bytes.buffer,bytes.byteOffset).getUint32(0,true)!==bytes.length-4)throw Error('Invalid screen frame');const body=bytes.slice(5),r=T.reader(body);
     switch(bytes[4]){
      case 0x20:this.attached={seq:r.u(),revision:r.u()};break;
-     case 0x21:{try{const result=T.update(body,this.model);if(result.done){this.ready=true;this.draw();this.status('ready',`${this.model.cols} × ${this.model.lines}`);if(this.model.title!==this.title){this.title=this.model.title;this.options.onTitle?.(this.title||'');}}}catch(error){this.send(0x11);throw error;}break;}
+     case 0x21:{try{const result=T.update(body,this.model);if(result.done){clearTimeout(this.connectionTimer);this.ready=true;this.draw();this.status('ready',`${this.model.cols} × ${this.model.lines}`);if(this.model.title!==this.title){this.title=this.model.title;this.options.onTitle?.(this.title||'');}}}catch(error){this.send(0x11);throw error;}break;}
      case 0x26:this.receiveHistory(T.history(body));break;
      case 0x27:{const id=r.n(),result=r.n(2),pending=this.pendingInputs.get(id);this.pendingInputs.delete(id);if(result){const error=Error('Terminal input rejected');pending?.reject(error);this.error(error);}else pending?.resolve();break;}
      case 0x2c:{const result=r.n(3),pending=this.pendingRoles.shift();if(pending){clearTimeout(pending.timer);if(result)pending.reject(Error('Terminal resize rejected'));else pending.resolve();}else if(result)throw Error('Terminal role rejected');break;}
@@ -151,11 +151,11 @@ globalThis.MkTerminalCodec=(()=>{
      case 0x25:this.disconnect('error','Session unavailable');break;
     }
    }catch(error){this.error(error);if(phase<3)socket.close();}});
-   this.listen(socket,'close',()=>{if(generation===this.generation)this.disconnect();});this.listen(socket,'error',()=>{if(generation===this.generation)this.error(Error('Live terminal connection failed'));});
+   this.listen(socket,'close',e=>{if(generation===this.generation)this.disconnect(e.code===1008?'denied':'disconnected',e.code===1008?'Terminal authentication rejected':'Disconnected');});this.listen(socket,'error',()=>{if(generation===this.generation)this.disconnect('disconnected','Live terminal connection failed');});
   }
   send(kind,body){if(!this.socket||this.socket.readyState!==1||!this.channel)throw Error('Terminal disconnected');this.socket.send(this.channel.seal(T.frame(kind,body)));}
   input(text){if(this.disposed||!this.ready)return Promise.reject(Error('Wait for the live terminal to connect'));const bytes=C.enc.encode(text),id=++this.inputId;return new Promise((resolve,reject)=>{this.pendingInputs.set(id,{resolve,reject});try{this.send(0x13,C.concat(T.v(id),T.v(bytes.length),bytes));}catch(e){this.pendingInputs.delete(id);reject(e);}});}
-  role(body){return new Promise((resolve,reject)=>{const pending={resolve,reject,timer:setTimeout(()=>{this.socket?.close();this.disconnect('error','Terminal resize timed out');},5000)};this.pendingRoles.push(pending);try{this.send(0x17,body);}catch(e){this.pendingRoles.pop();clearTimeout(pending.timer);reject(e);}});}
+  role(body){return new Promise((resolve,reject)=>{const pending={resolve,reject,timer:setTimeout(()=>{this.socket?.close();this.disconnect('disconnected','Terminal resize timed out');},5000)};this.pendingRoles.push(pending);try{this.send(0x17,body);}catch(e){this.pendingRoles.pop();clearTimeout(pending.timer);reject(e);}});}
   async fitToPhone(){if(!this.ready)throw Error('Wait for the live terminal to connect');if(this.fitPending)return;const enabled=!this.fit,generation=this.generation;this.fitPending=true;this.fitButton.disabled=true;try{if(enabled)await this.resize();else await this.role(Uint8Array.from([0,2,0]));if(this.disposed||generation!==this.generation)return;this.fit=enabled;this.fitButton.setAttribute('aria-pressed',String(enabled));this.fitButton.replaceChildren(icon(enabled?'smartphone':'monitor'));this.status('ready',`${this.model.cols} × ${this.model.lines}`);}finally{this.fitPending=false;this.fitButton.disabled=false;}}
   async resize(){const cols=Math.max(10,Math.min(2048,Math.floor((this.port.clientWidth-2)/this.cellWidth))),rows=this.model.lines;if(this.resizePending)return this.resizePending;this.resizePending=this.role(C.concat(T.v(1),T.v(cols),T.v(rows)));try{await this.resizePending;}finally{this.resizePending=null;}}
   resetHistory(){this.historySource=null;this.historySkip=0;this.historyPending=null;this.historyRows=[];this.historyEnd=false;this.historyElement.textContent='';}
@@ -171,7 +171,7 @@ globalThis.MkTerminalCodec=(()=>{
    this.canvas.setAttribute('aria-label',m.rows.map(row=>row.filter(c=>!(c.flags&16)).map(c=>(c.flags&256)?' ':c.ch+c.zero).join('')).join('\n'));
   }
   disconnect(phase='disconnected',message='Disconnected'){
-   this.generation++;this.ready=false;this.fit=false;this.invalidateInput();const uncertain=this.pendingInputs.size,error=Error('Input delivery is uncertain; input will not be resent.');for(const pending of this.pendingInputs.values())pending.reject(error);this.pendingInputs.clear();for(const pending of this.pendingRoles.splice(0)){clearTimeout(pending.timer);pending.reject(Error('Terminal disconnected'));}this.channel=null;this.socket?.close();this.fitButton.setAttribute('aria-pressed','false');this.fitButton.replaceChildren(icon('monitor'));this.status(phase,uncertain?error.message:message,uncertain?error:undefined);
+   clearTimeout(this.connectionTimer);this.generation++;this.ready=false;this.fit=false;this.invalidateInput();const uncertain=this.pendingInputs.size,error=Error('Input delivery is uncertain; input will not be resent.');for(const pending of this.pendingInputs.values())pending.reject(error);this.pendingInputs.clear();for(const pending of this.pendingRoles.splice(0)){clearTimeout(pending.timer);pending.reject(Error('Terminal disconnected'));}this.channel=null;this.socket?.close();this.fitButton.setAttribute('aria-pressed','false');this.fitButton.replaceChildren(icon('monitor'));this.status(phase,uncertain?error.message:message,uncertain?error:undefined);
   }
   unmount(){if(this.disposed)return;drafts.set(this.session,this.command.value);this.disconnect();this.disposed=true;this.abort.abort();this.observer?.disconnect();clearTimeout(this.commitTimer);this.frame.remove();this.dock.remove();this.root.classList.remove('terminal-mount');this.root.style.removeProperty('--keyboard-inset');delete this.root.dataset.keyboardOpen;delete this.root.dataset.inputMode;}
  }
