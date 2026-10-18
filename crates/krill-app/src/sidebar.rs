@@ -97,10 +97,10 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("v", OpenInVsCode, ctx),
         KeyBinding::new("c", OpenInCursor, ctx),
         KeyBinding::new("z", OpenInZed, ctx),
-        KeyBinding::new("alt-cmd-1", NewAgent1, ctx),
-        KeyBinding::new("alt-cmd-2", NewAgent2, ctx),
-        KeyBinding::new("alt-cmd-3", NewAgent3, ctx),
-        KeyBinding::new("alt-cmd-4", NewAgent4, ctx),
+        crate::keys::bind("alt-cmd-1", NewAgent1, ctx),
+        crate::keys::bind("alt-cmd-2", NewAgent2, ctx),
+        crate::keys::bind("alt-cmd-3", NewAgent3, ctx),
+        crate::keys::bind("alt-cmd-4", NewAgent4, ctx),
     ]);
 }
 

@@ -3,8 +3,8 @@
 //! 플로팅 창은 기존 Shell의 입력·IME·재접속을 재사용하고 레이아웃 파일은 쓰지 않는다.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, Subscription, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
+    App, Bounds, Context, Entity, Subscription, WeakEntity, Window, WindowBounds, WindowHandle,
+    WindowOptions, actions, div, prelude::*, px,
 };
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -41,9 +41,9 @@ actions!(popout, [FloatTerminal, DashboardPopout, CloseDashboard]);
 
 pub(super) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("cmd-w", CloseDashboard, Some("Dashboard")),
-        KeyBinding::new("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
-        KeyBinding::new("alt-cmd-shift-a", DashboardPopout, Some(super::KEY_CONTEXT)),
+        krill_app::keys::bind("cmd-w", CloseDashboard, Some("Dashboard")),
+        krill_app::keys::bind("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
+        krill_app::keys::bind("alt-cmd-shift-a", DashboardPopout, Some(super::KEY_CONTEXT)),
     ]);
 }
 

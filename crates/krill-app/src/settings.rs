@@ -383,11 +383,11 @@ impl Global for Config {}
 
 fn own_bindings() -> Vec<KeyBinding> {
     vec![
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ZoomReset, None),
-        KeyBinding::new("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
+        crate::keys::bind("cmd-,", OpenSettings, None),
+        crate::keys::bind("cmd-=", ZoomIn, None),
+        crate::keys::bind("cmd--", ZoomOut, None),
+        crate::keys::bind("cmd-0", ZoomReset, None),
+        crate::keys::bind("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
     ]
 }
 

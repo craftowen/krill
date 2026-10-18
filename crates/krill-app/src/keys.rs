@@ -5,6 +5,53 @@
 
 pub mod tui;
 
+/// macOS 기본 바인딩(`cmd-…`)을 이 OS의 키로 바꾼 [`gpui::KeyBinding`](OWE-834). macOS는 그대로다.
+pub fn bind<A: gpui::Action>(mac: &str, action: A, context: Option<&str>) -> gpui::KeyBinding {
+    if cfg!(target_os = "macos") {
+        gpui::KeyBinding::new(mac, action, context)
+    } else {
+        gpui::KeyBinding::new(&windows_keys(mac), action, context)
+    }
+}
+
+/// `cmd-` 바인딩의 Windows·Linux판. Ctrl+글자와 Ctrl+`[` `]` `\` `/`는 셸이 쓰는 제어 문자(Ctrl+C SIGINT·Ctrl+D EOF·
+/// Ctrl+W·Ctrl+`[` = Esc)라 Windows Terminal처럼 Shift를 더한다(복사·붙여넣기 = Ctrl+Shift+C/V). 원래 Shift가 있던 키는
+/// 겹치지 않게 Alt도 더한다. 숫자·`,` `=` `-`·화살표처럼 셸이 쓰지 않는 키는 Ctrl로만 바꾼다. `cmd`가 없으면 그대로다.
+pub fn windows_keys(mac: &str) -> String {
+    let (mut cmd, mut alt, mut shift) = (false, false, false);
+    let mut key = mac;
+    loop {
+        if let Some(rest) = key.strip_prefix("cmd-") {
+            cmd = true;
+            key = rest;
+        } else if let Some(rest) = key.strip_prefix("alt-") {
+            alt = true;
+            key = rest;
+        } else if let Some(rest) = key.strip_prefix("shift-") {
+            shift = true;
+            key = rest;
+        } else {
+            break;
+        }
+    }
+    if !cmd || mac.starts_with("ctrl-") {
+        return mac.to_owned();
+    }
+    let control_char = key.len() == 1
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphabetic() || b"[]\\/".contains(&b));
+    if control_char && !alt {
+        alt = shift;
+        shift = true;
+    }
+    format!(
+        "ctrl-{}{}{key}",
+        if alt { "alt-" } else { "" },
+        if shift { "shift-" } else { "" }
+    )
+}
+
 /// 키 하나의 PTY 바이트. 글자 키(IME가 맡음)나 모르는 키는 `None`.
 // 기본 모드 전용 헬퍼. 실제 셸 입력은 `tui::key`가 협상된 모드에 따라 이 함수를 사용한다.
 pub fn encode(key: &str, ctrl: bool, shift: bool) -> Option<Vec<u8>> {
@@ -126,5 +173,34 @@ mod tests {
         assert_eq!(e("1"), None);
         assert_eq!(e("9"), None);
         assert_eq!(e("0"), None);
+    }
+
+    #[test]
+    fn windows_keys_keep_shell_control_chars_and_never_collide() {
+        for (mac, win) in [
+            ("cmd-c", "ctrl-shift-c"),
+            ("cmd-v", "ctrl-shift-v"),
+            ("cmd-d", "ctrl-shift-d"),
+            ("cmd-shift-d", "ctrl-alt-shift-d"),
+            ("cmd-alt-t", "ctrl-alt-t"),
+            ("alt-cmd-shift-a", "ctrl-alt-shift-a"),
+            ("cmd-[", "ctrl-shift-["),
+            ("cmd-shift-]", "ctrl-alt-shift-]"),
+            ("cmd-1", "ctrl-1"),
+            ("cmd--", "ctrl--"),
+            ("cmd-,", "ctrl-,"),
+            ("cmd-shift-0", "ctrl-shift-0"),
+            ("cmd-alt-left", "ctrl-alt-left"),
+            ("ctrl-tab", "ctrl-tab"),
+            ("f2", "f2"),
+        ] {
+            assert_eq!(super::windows_keys(mac), win, "{mac}");
+        }
+        // 같은 글자의 cmd- / cmd-shift- / cmd-alt- 가 Windows에서 서로 다른 키로 남는다.
+        let mapped: std::collections::BTreeSet<_> = ["cmd-t", "cmd-shift-t", "cmd-alt-t"]
+            .into_iter()
+            .map(super::windows_keys)
+            .collect();
+        assert_eq!(mapped.len(), 3);
     }
 }

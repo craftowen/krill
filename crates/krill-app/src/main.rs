@@ -6,8 +6,8 @@
 mod shell;
 
 use gpui::{
-    App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, QuitMode, TitlebarOptions,
-    WindowBounds, WindowHandle, WindowOptions, actions, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, QuitMode, WindowBounds, WindowHandle,
+    WindowOptions, actions, px, size,
 };
 use std::path::PathBuf;
 
@@ -192,8 +192,8 @@ fn init(cx: &mut App) {
     })
     .detach();
     cx.bind_keys([
-        KeyBinding::new("cmd-n", NewWindow, None),
-        KeyBinding::new("cmd-alt-w", CloseWindow, None),
+        krill_app::keys::bind("cmd-n", NewWindow, None),
+        krill_app::keys::bind("cmd-alt-w", CloseWindow, None),
     ]);
     cx.on_action(|_: &NewWindow, cx| {
         let _ = new_window(cx);
