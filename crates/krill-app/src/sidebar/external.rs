@@ -368,22 +368,54 @@ fn resolve_repo_for_worktree(
     repo_id: Option<&str>,
     wt_path: &Path,
 ) -> PathBuf {
+    let wt_norm = normalize_imported_path(wt_path);
     if let Some(id) = repo_id
         && let Some(proj) = projects
             .iter()
             .find(|p| !p.archived && p.host_id.is_none() && p.id == id)
     {
-        return PathBuf::from(proj.path.trim());
+        return normalize_imported_path(Path::new(proj.path.trim()));
     }
     if let Some(proj) = projects.iter().find(|p| {
         !p.archived
             && p.host_id.is_none()
             && !p.path.trim().is_empty()
-            && (wt_path == Path::new(p.path.trim()) || wt_path.starts_with(p.path.trim()))
+            && ({
+                let repo_norm = normalize_imported_path(Path::new(p.path.trim()));
+                wt_norm == repo_norm || wt_norm.starts_with(&repo_norm)
+            })
     }) {
-        return PathBuf::from(proj.path.trim());
+        return normalize_imported_path(Path::new(proj.path.trim()));
     }
-    wt_path.to_path_buf()
+    wt_norm
+}
+
+/// 이관 경로 정규화(OWE-803). 존재하면 `fs::canonicalize`로 풀고,
+/// 없으면 macOS 기본 별칭(`/tmp`·`/var`·`/etc` → `/private/...`)만 어휘적으로 맞춘다.
+/// 과거 이관분(`[[projects]]` 원본 경로 vs `[worktrees]` 정규 경로)이 섞인 파일도
+/// 사이드바에서 하나의 저장소로 합쳐지도록 읽는 쪽에서도 정규화한다.
+/// 별칭 후보가 아니면 시스템 콜 없이 그대로 둔다(스냅샷 폴링 부하 방지).
+fn normalize_imported_path(path: &Path) -> PathBuf {
+    if !["/tmp", "/var", "/etc", "/private"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+    {
+        return path.to_path_buf();
+    }
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    for base in ["tmp", "var", "etc"] {
+        let prefix = Path::new("/").join(base);
+        if let Ok(rest) = path.strip_prefix(&prefix) {
+            let aliased = Path::new("/private").join(base).join(rest);
+            if let Ok(canon) = fs::canonicalize(&aliased) {
+                return canon;
+            }
+            return aliased;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// `<state_dir>/projects.toml`(Orca 이관 프로젝트·워크트리·계보)을 사이드바 스냅샷 트리와 브랜치 메타에 병합한다.
@@ -399,7 +431,7 @@ pub fn include_imported_projects(
         if proj.archived || proj.host_id.is_some() || proj.path.trim().is_empty() {
             continue;
         }
-        let repo = PathBuf::from(proj.path.trim());
+        let repo = normalize_imported_path(Path::new(proj.path.trim()));
         let list = trees.entry(repo.clone()).or_default();
         if !list.contains(&repo) {
             list.push(repo);
@@ -409,7 +441,7 @@ pub fn include_imported_projects(
         if wt.archived || wt_key.trim().is_empty() {
             continue;
         }
-        let wt_path = PathBuf::from(wt_key.trim());
+        let wt_path = normalize_imported_path(Path::new(wt_key.trim()));
         let repo = resolve_repo_for_worktree(&file.projects, wt.repo_id.as_deref(), &wt_path);
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
@@ -425,7 +457,7 @@ pub fn include_imported_projects(
         if wt_str.is_empty() {
             continue;
         }
-        let wt_path = PathBuf::from(wt_str);
+        let wt_path = normalize_imported_path(Path::new(wt_str));
         let repo = resolve_repo_for_worktree(&file.projects, lin.repo_id.as_deref(), &wt_path);
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
@@ -461,7 +493,7 @@ pub(super) fn apply_imported_project_prefs(
         if proj.archived || proj.host_id.is_some() || proj.path.trim().is_empty() {
             continue;
         }
-        let repo = PathBuf::from(proj.path.trim());
+        let repo = normalize_imported_path(Path::new(proj.path.trim()));
         let dn = proj.display_name.trim();
         if (!dn.is_empty() || proj.pinned)
             && let std::collections::btree_map::Entry::Vacant(vacant) = prefs.entry(repo)
@@ -476,7 +508,7 @@ pub(super) fn apply_imported_project_prefs(
         if wt.archived || wt_key.trim().is_empty() {
             continue;
         }
-        let wt_path = PathBuf::from(wt_key.trim());
+        let wt_path = normalize_imported_path(Path::new(wt_key.trim()));
         let dn = wt
             .display_name
             .as_deref()
@@ -1046,4 +1078,43 @@ parent_worktree_path = "/Users/test/repo"
     );
 
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// OWE-803: 과거 이관분(`[[projects]]` 원본 경로 vs `[worktrees]` 정규 경로)이 섞여도
+/// 사이드바 트리는 하나의 저장소로 합쳐진다.
+#[test]
+fn owe803_symlink_alias_imports_merge_into_single_repo() {
+    let root = std::env::temp_dir().join(format!("owe803-sidebar-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let real = root.join("real");
+    fs::create_dir_all(&real).unwrap();
+    let link = root.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let canon = fs::canonicalize(&real).unwrap();
+    fs::write(
+        root.join(PROJECTS_FILE),
+        format!(
+            "[[projects]]\nid = \"r1\"\npath = \"{}\"\ndisplay_name = \"Link Repo\"\nkind = \"git\"\n\n\
+             [worktrees.\"{}\"]\nrepo_id = \"r1\"\ndisplay_name = \"Link Repo\"\n",
+            link.display(),
+            canon.display(),
+        ),
+    )
+    .unwrap();
+
+    let mut trees: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    let mut meta: super::Meta = BTreeMap::new();
+    include_imported_projects(&root, &mut trees, &mut meta);
+    assert_eq!(trees.len(), 1, "{trees:?}");
+    assert_eq!(trees.keys().next(), Some(&canon));
+    assert_eq!(trees.get(&canon), Some(&vec![canon.clone()]));
+
+    let mut prefs = super::Preferences::default();
+    let mut comments = BTreeMap::new();
+    let mut issues = BTreeMap::new();
+    let mut statuses = BTreeMap::new();
+    apply_imported_project_prefs(&root, &mut prefs, &mut comments, &mut issues, &mut statuses);
+    assert!(prefs.contains_key(&canon));
+
+    fs::remove_dir_all(root).unwrap();
 }
