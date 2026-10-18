@@ -1,6 +1,6 @@
 # Krill CI — macOS 전체 게이트 (OWE-382, MK-017).
 # clippy · nextest(PTY e2e 포함) · doctest를 전체 워크스페이스에 실행한다.
-# 비공개 저장소 macOS 분 절약을 위해 Rust·빌드 관련 경로가 바뀔 때만 실행하고,
+# macOS 분 절약을 위해 Rust·빌드 관련 경로가 바뀔 때만 실행하고,
 # 그 외(문서 등) PR에서는 건너뛴다. 필요하면 Actions에서 수동 실행한다.
 # Linux 고속 게이트(krill-proto·krill-term + deny)는 ci.yml이 모든 PR에서 실행한다.
 # 로컬 재현은 scripts/check.sh.

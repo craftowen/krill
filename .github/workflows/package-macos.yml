@@ -1,6 +1,6 @@
 name: Package macOS (ad-hoc)
 
-# 비공개 저장소 macOS 실행 비용을 피하기 위해 수동 실행만 허용한다.
+# macOS 실행 비용을 피하기 위해 수동 실행만 허용한다.
 on:
   workflow_dispatch:
     inputs:
