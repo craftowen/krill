@@ -5655,3 +5655,204 @@ fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut Tes
 
     fs::remove_dir_all(d).ok();
 }
+
+/// OWE-798: 일반·외관(General) 및 터미널(Terminal) 탭의 섹션 그룹화, 세그먼트 순서,
+/// `UIZoomControl` 스타일 고정폭 스테퍼 및 최솟값·최댓값 `.disabled(...)`,
+/// 마스터 알림(`notif-toggle`) 꺼짐 시 하위 알림 스위치·테스트 버튼 비활성화를 검증한다.
+#[gpui::test]
+fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notifications_disabled(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe798-general-terminal");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let b = bounds(vcx, s);
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // 1. General 탭 섹션 머리글 존재 및 위→아래 순서 검증
+    let column = bounds(vcx, "admin-content-column");
+    let sec_appearance = bounds(vcx, "general-section-appearance");
+    let sec_notif = bounds(vcx, "general-section-notifications");
+    let sec_power = bounds(vcx, "general-section-power");
+    let sec_files = bounds(vcx, "general-section-files");
+    assert!(sec_appearance.origin.y < sec_notif.origin.y);
+    assert!(sec_notif.origin.y < sec_power.origin.y);
+    assert!(sec_power.origin.y < sec_files.origin.y);
+
+    // 2. 세그먼트 선택지 좌→우 순서 검증 (한국어/English, 다크/라이트/시스템, 끄기/작업 중/항상)
+    assert!(bounds(vcx, "language-ko").origin.x < bounds(vcx, "language-en").origin.x);
+    assert!(bounds(vcx, "theme-dark").origin.x < bounds(vcx, "theme-light").origin.x);
+    assert!(bounds(vcx, "theme-light").origin.x < bounds(vcx, "theme-system").origin.x);
+    assert!(bounds(vcx, "awake-off").origin.x < bounds(vcx, "awake-agent").origin.x);
+    assert!(bounds(vcx, "awake-agent").origin.x < bounds(vcx, "awake-on").origin.x);
+
+    // 3. UI 줌 스테퍼 고정폭 및 경계값 비활성화·초기화 검증
+    let zoom_val_before = bounds(vcx, "zoom-value");
+    assert_eq!(zoom_val_before.size.width, px(48.));
+    click(vcx, "zoom-out"); // 100% -> 90% (3자리 -> 2자리)
+    vcx.update(|_, cx| assert!((current(cx).zoom() - 0.9).abs() < 1e-4));
+    assert_eq!(
+        bounds(vcx, "zoom-value").size.width,
+        zoom_val_before.size.width,
+        "zoom-value width must remain fixed across 100% -> 90%"
+    );
+    click(vcx, "zoom-reset");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - 1.0).abs() < 1e-4));
+
+    vcx.update(|window, cx| {
+        edit(cx, |s| s.zoom = ZOOM_MIN);
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    click(vcx, "zoom-out");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - ZOOM_MIN).abs() < 1e-4));
+
+    vcx.update(|window, cx| {
+        edit(cx, |s| s.zoom = ZOOM_MAX);
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    click(vcx, "zoom-in");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - ZOOM_MAX).abs() < 1e-4));
+    click(vcx, "zoom-reset");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - 1.0).abs() < 1e-4));
+
+    // 4. 마스터 알림(notif-toggle) OFF 시 하위 알림 행·컨트롤 비활성화 검증
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert!(s.notifications);
+        assert!(s.notify_on_input);
+        assert!(s.notify_on_done);
+        assert!(s.notify_on_bell);
+        assert!(s.notification_sound);
+        assert!(!s.notify_only_inactive);
+    });
+    click(vcx, "notif-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).notifications));
+
+    for sub_sel in [
+        "notify-input-toggle",
+        "notify-done-toggle",
+        "notify-bell-toggle",
+        "sound-toggle",
+        "notify-inactive-toggle",
+        "send-test-notification",
+    ] {
+        click(vcx, sub_sel);
+    }
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert!(
+            s.notify_on_input
+                && s.notify_on_done
+                && s.notify_on_bell
+                && s.notification_sound
+                && !s.notify_only_inactive,
+            "subordinate notification toggles must be disabled while master notifications is false"
+        );
+    });
+
+    // 다시 마스터 알림을 켜면 하위 스위치가 정상 동작한다.
+    click(vcx, "notif-toggle");
+    vcx.update(|_, cx| assert!(current(cx).notifications));
+    click(vcx, "notify-input-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).notify_on_input));
+    click(vcx, "notify-input-toggle");
+    vcx.update(|_, cx| assert!(current(cx).notify_on_input));
+
+    // 5. Terminal 탭 섹션 머리글·세그먼트 순서·스테퍼 고정폭 및 경계값 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let term_app = bounds(vcx, "terminal-section-appearance");
+    let term_cur = bounds(vcx, "terminal-section-cursor");
+    let term_kbd = bounds(vcx, "terminal-section-keyboard");
+    assert!(term_app.origin.y < term_cur.origin.y);
+    assert!(term_cur.origin.y < term_kbd.origin.y);
+
+    assert!(bounds(vcx, "cursor-block").origin.x < bounds(vcx, "cursor-bar").origin.x);
+    assert!(bounds(vcx, "cursor-bar").origin.x < bounds(vcx, "cursor-underline").origin.x);
+
+    let opacity_val_before = bounds(vcx, "opacity-value");
+    let opacity_inc_before = bounds(vcx, "opacity-inc");
+    // 기본 불투명도 100%(최댓값)에서 '+' 클릭은 무효, '-' 클릭 시 95%로 감소하되 버튼 위치 고정
+    click(vcx, "opacity-inc");
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 100));
+    click(vcx, "opacity-dec");
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 95));
+    assert_eq!(
+        bounds(vcx, "opacity-value").size.width,
+        opacity_val_before.size.width,
+        "opacity-value width must remain fixed across 100% -> 95%"
+    );
+    assert_eq!(
+        bounds(vcx, "opacity-inc").origin.x,
+        opacity_inc_before.origin.x,
+        "opacity-inc button must not shift horizontally across 100% -> 95%"
+    );
+    click(vcx, "opacity-reset");
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 100));
+
+    // 글꼴 크기 최솟값(10pt)·최댓값(24pt) 및 불투명도 최솟값(50%) 경계 검증
+    vcx.update(|window, cx| {
+        edit(cx, |s| {
+            s.terminal_font_size = 10;
+            s.terminal_opacity_pct = 50;
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    click(vcx, "font-dec");
+    click(vcx, "opacity-dec");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).terminal_font_size(), 10);
+        assert_eq!(current(cx).terminal_opacity_pct(), 50);
+    });
+    click(vcx, "font-reset");
+    click(vcx, "opacity-reset");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).terminal_font_size(), 13);
+        assert_eq!(current(cx).terminal_opacity_pct(), 100);
+    });
+
+    // 좁은 창(820px)에서 Terminal 탭의 모든 컨트롤이 본문 열 우측 경계를 넘지 않는다.
+    for sel in [
+        "terminal-font-family",
+        "font-dec",
+        "font-size-value",
+        "font-inc",
+        "font-reset",
+        "opacity-dec",
+        "opacity-value",
+        "opacity-inc",
+        "opacity-reset",
+        "cursor-block",
+        "cursor-bar",
+        "cursor-underline",
+        "cursor-blink-toggle",
+        "option-meta-toggle",
+        "copy-select-toggle",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "terminal control {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    fs::remove_dir_all(d).ok();
+}
