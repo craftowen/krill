@@ -279,6 +279,57 @@ impl Panel {
         let req = Request::Close { session };
         self.confirm(prompt, req, text::KILL_SENT.get(), window, cx);
     }
+
+    /// 상태바 토글 버튼(OWE-856: 버튼 역할·이름 노출).
+    fn render_toggle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let tooltip_text = match &self.data {
+            Some(r) => {
+                let daemon = r.daemon.saturating_add(r.holder.unwrap_or(0));
+                format!(
+                    "{} · {}: {} · {}: {} · {}: {}",
+                    text::TITLE.get(),
+                    text::TOTAL.get(),
+                    mb(r.total()),
+                    text::APP.get(),
+                    r.client.map_or_else(|| "-".to_owned(), mb),
+                    text::DAEMON.get(),
+                    mb(daemon),
+                )
+            }
+            None => text::TITLE.get().to_owned(),
+        };
+        let total_label = self.data.as_ref().map(|r| mb(r.total()));
+        div()
+            .id("resources-toggle")
+            .debug_selector(|| "resources-toggle".into())
+            .role(gpui::Role::Button)
+            .aria_label(tooltip_text.clone())
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .py_0p5()
+            .rounded(crate::ui::RADIUS_XS)
+            .cursor_pointer()
+            .text_size(crate::ui::TEXT_XS)
+            .text_color(if self.open {
+                p.foreground
+            } else {
+                p.muted_foreground
+            })
+            .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+            .child(
+                gpui_component::Icon::default()
+                    .data(crate::ui::icons::MEMORY_STICK_SVG)
+                    .with_size(gpui_component::Size::XSmall),
+            )
+            .children(total_label)
+            .tooltip(move |window, cx| {
+                crate::ui::tooltip_view("resources-toggle", tooltip_text.clone(), window, cx)
+            })
+            .on_click(cx.listener(|this, _, _, cx| this.on_toggle_click(cx)))
+    }
 }
 
 fn row(label: impl Into<String>, value: impl Into<String>, p: &crate::ui::Palette) -> gpui::Div {
@@ -307,51 +358,7 @@ fn row(label: impl Into<String>, value: impl Into<String>, p: &crate::ui::Palett
 impl Render for Panel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = crate::ui::palette(cx);
-        let tooltip_text = match &self.data {
-            Some(r) => {
-                let daemon = r.daemon.saturating_add(r.holder.unwrap_or(0));
-                format!(
-                    "{} · {}: {} · {}: {} · {}: {}",
-                    text::TITLE.get(),
-                    text::TOTAL.get(),
-                    mb(r.total()),
-                    text::APP.get(),
-                    r.client.map_or_else(|| "-".to_owned(), mb),
-                    text::DAEMON.get(),
-                    mb(daemon),
-                )
-            }
-            None => text::TITLE.get().to_owned(),
-        };
-        let total_label = self.data.as_ref().map(|r| mb(r.total()));
-        let header = div()
-            .id("resources-toggle")
-            .debug_selector(|| "resources-toggle".into())
-            .aria_label(tooltip_text.clone())
-            .flex()
-            .items_center()
-            .gap_1()
-            .px_1()
-            .py_0p5()
-            .rounded(crate::ui::RADIUS_XS)
-            .cursor_pointer()
-            .text_size(crate::ui::TEXT_XS)
-            .text_color(if self.open {
-                p.foreground
-            } else {
-                p.muted_foreground
-            })
-            .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-            .child(
-                gpui_component::Icon::default()
-                    .data(crate::ui::icons::MEMORY_STICK_SVG)
-                    .with_size(gpui_component::Size::XSmall),
-            )
-            .children(total_label)
-            .tooltip(move |window, cx| {
-                crate::ui::tooltip_view("resources-toggle", tooltip_text.clone(), window, cx)
-            })
-            .on_click(cx.listener(|this, _, _, cx| this.on_toggle_click(cx)));
+        let header = self.render_toggle(cx);
         let popover = self.open.then(|| {
             let content = match &self.data {
                 None => {

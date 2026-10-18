@@ -37,6 +37,79 @@ fn counts(sessions: usize, needs_you: usize) -> String {
     ])
 }
 
+/// OWE-856: 데몬 연결점(상태 역할·이름 노출).
+fn daemon_status_dot(tip: String, color: gpui::Hsla) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id("status-daemon")
+        .debug_selector(|| "status-daemon".into())
+        .role(gpui::Role::Status)
+        .aria_label(tip.clone())
+        .flex()
+        .items_center()
+        .justify_center()
+        .px_1()
+        .py_0p5()
+        .rounded(ui::RADIUS_XS)
+        .child(div().size(ui::STATE_DOT).rounded_full().bg(color))
+        .tooltip(move |window, cx| ui::tooltip_view("status-daemon", tip.clone(), window, cx))
+}
+
+/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출).
+fn usage_status(p: &ui::Palette, sessions: usize, needs_you: usize) -> gpui::Stateful<gpui::Div> {
+    let usage_tip = counts(sessions, needs_you);
+    let sessions_count = sessions.to_string();
+    let needs_you_count = needs_you.to_string();
+    let needs_you_color = if needs_you > 0 {
+        p.agent_question
+    } else {
+        p.muted_foreground
+    };
+    div()
+        .id("status-usage")
+        .debug_selector(|| "status-usage".into())
+        .role(gpui::Role::Status)
+        .aria_label(usage_tip.clone())
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_1()
+        .py_0p5()
+        .rounded(ui::RADIUS_XS)
+        .child(
+            div()
+                .id("status-sessions")
+                .debug_selector(|| "status-sessions".into())
+                .flex()
+                .items_center()
+                .gap_1()
+                .font_family(ui::FONT_MONO)
+                .child(
+                    gpui_component::Icon::default()
+                        .data(ui::icons::TERMINAL_SVG)
+                        .with_size(gpui_component::Size::XSmall),
+                )
+                .child(sessions_count),
+        )
+        .child(
+            div()
+                .id("status-needs-you")
+                .debug_selector(|| "status-needs-you".into())
+                .flex()
+                .items_center()
+                .gap_1()
+                .font_family(ui::FONT_MONO)
+                .text_color(needs_you_color)
+                .child(
+                    gpui_component::Icon::default()
+                        .data(ui::icons::BELL_SVG)
+                        .with_size(gpui_component::Size::XSmall)
+                        .text_color(needs_you_color),
+                )
+                .child(needs_you_count),
+        )
+        .tooltip(move |window, cx| ui::tooltip_view("status-usage", usage_tip.clone(), window, cx))
+}
+
 /// OWE-851: 상태바 드롭다운 메뉴 열림·닫힘을 셸에 알려 메뉴가 열린 동안은
 /// 호버 툴팁을 숨긴다(팝오버 하단 글자 가림 방지).
 fn track_menu_open(weak: WeakEntity<Shell>) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
@@ -1613,78 +1686,8 @@ impl Shell {
                                 ))
                             }),
                     )
-                    .child({
-                        let tip = daemon_tooltip;
-                        div()
-                            .id("status-daemon")
-                            .debug_selector(|| "status-daemon".into())
-                            .aria_label(tip.clone())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .px_1()
-                            .py_0p5()
-                            .rounded(ui::RADIUS_XS)
-                            .child(div().size(ui::STATE_DOT).rounded_full().bg(color))
-                            .tooltip(move |window, cx| {
-                                ui::tooltip_view("status-daemon", tip.clone(), window, cx)
-                            })
-                    })
-                    .child({
-                        let usage_tip = counts(items.len(), needs_you);
-                        let sessions_count = items.len().to_string();
-                        let needs_you_count = needs_you.to_string();
-                        let needs_you_color = if needs_you > 0 {
-                            p.agent_question
-                        } else {
-                            p.muted_foreground
-                        };
-                        div()
-                            .id("status-usage")
-                            .debug_selector(|| "status-usage".into())
-                            .aria_label(usage_tip.clone())
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_1()
-                            .py_0p5()
-                            .rounded(ui::RADIUS_XS)
-                            .child(
-                                div()
-                                    .id("status-sessions")
-                                    .debug_selector(|| "status-sessions".into())
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .font_family(ui::FONT_MONO)
-                                    .child(
-                                        gpui_component::Icon::default()
-                                            .data(ui::icons::TERMINAL_SVG)
-                                            .with_size(gpui_component::Size::XSmall),
-                                    )
-                                    .child(sessions_count),
-                            )
-                            .child(
-                                div()
-                                    .id("status-needs-you")
-                                    .debug_selector(|| "status-needs-you".into())
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .font_family(ui::FONT_MONO)
-                                    .text_color(needs_you_color)
-                                    .child(
-                                        gpui_component::Icon::default()
-                                            .data(ui::icons::BELL_SVG)
-                                            .with_size(gpui_component::Size::XSmall)
-                                            .text_color(needs_you_color),
-                                    )
-                                    .child(needs_you_count),
-                            )
-                            .tooltip(move |window, cx| {
-                                ui::tooltip_view("status-usage", usage_tip.clone(), window, cx)
-                            })
-                    })
+                    .child(daemon_status_dot(daemon_tooltip, color))
+                    .child(usage_status(p, items.len(), needs_you))
                     .child(orch_menu)
                     .child(ports_menu)
                     .child(ssh_menu)

@@ -412,6 +412,44 @@ impl Panel {
             .collect()
     }
 
+    /// 상태바 토글 버튼(OWE-856: 버튼 역할·이름 노출).
+    fn render_toggle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let tooltip_text = match (&self.vault, &self.data) {
+            (Some(v), _) => format!("{} ({})", text::TITLE.get(), v.hits.len()),
+            (None, Some(d)) => format!("{} ({})", text::TITLE.get(), d.entries.len()),
+            (None, None) => text::TITLE.get().to_owned(),
+        };
+        div()
+            .id("agent-history-toggle")
+            .debug_selector(|| "agent-history-toggle".into())
+            .role(gpui::Role::Button)
+            .aria_label(tooltip_text.clone())
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_1()
+            .py_0p5()
+            .text_size(crate::ui::TEXT_XS)
+            .text_color(if self.open {
+                p.foreground
+            } else {
+                p.muted_foreground
+            })
+            .rounded(crate::ui::RADIUS_XS)
+            .cursor_pointer()
+            .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
+            .child(
+                gpui_component::Icon::default()
+                    .data(crate::ui::icons::HISTORY_SVG)
+                    .with_size(gpui_component::Size::XSmall),
+            )
+            .tooltip(move |window, cx| {
+                crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
+            })
+            .on_click(cx.listener(|this, _, window, cx| this.on_toggle_click(window, cx)))
+    }
+
     /// OWE-652: 팝오버 밖 마우스 눌림에 닫는다. 같은 제스처의 헤더 클릭이
     /// 다시 열지 않게 시각을 남긴다(클릭은 마우스 뗌 뒤에 온다).
     fn on_outside_down(&mut self, cx: &mut Context<Self>) {
@@ -559,39 +597,7 @@ impl Render for Panel {
                 input.update(cx, |s, cx| s.focus(window, cx));
             }
         }
-
-        let tooltip_text = match (&self.vault, &self.data) {
-            (Some(v), _) => format!("{} ({})", text::TITLE.get(), v.hits.len()),
-            (None, Some(d)) => format!("{} ({})", text::TITLE.get(), d.entries.len()),
-            (None, None) => text::TITLE.get().to_owned(),
-        };
-        let header = div()
-            .id("agent-history-toggle")
-            .debug_selector(|| "agent-history-toggle".into())
-            .aria_label(tooltip_text.clone())
-            .flex()
-            .items_center()
-            .justify_center()
-            .px_1()
-            .py_0p5()
-            .text_size(crate::ui::TEXT_XS)
-            .text_color(if self.open {
-                p.foreground
-            } else {
-                p.muted_foreground
-            })
-            .rounded(crate::ui::RADIUS_XS)
-            .cursor_pointer()
-            .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-            .child(
-                gpui_component::Icon::default()
-                    .data(crate::ui::icons::HISTORY_SVG)
-                    .with_size(gpui_component::Size::XSmall),
-            )
-            .tooltip(move |window, cx| {
-                crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
-            })
-            .on_click(cx.listener(|this, _, window, cx| this.on_toggle_click(window, cx)));
+        let header = self.render_toggle(cx);
 
         let popover = self.open.then(|| {
             let search_bar = if let Some(input) = &self.input {

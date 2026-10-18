@@ -419,3 +419,25 @@ fn empty_message_is_agent_neutral() {
     assert_eq!(msg, "세션 기록이 없습니다");
     assert!(!msg.contains("Claude") && !msg.contains("Codex"));
 }
+
+/// OWE-856: 상태바 토글은 버튼 역할·이름을 노출한다.
+#[gpui::test]
+fn toggle_exposes_button_role_and_label(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let call: Call =
+        Arc::new(|_| Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "test")));
+    let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
+    let (role, label) = cx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            let el = p.render_toggle(cx);
+            let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+            gpui::Element::write_a11y_info(&el, &mut node);
+            (
+                gpui::Element::a11y_role(&el),
+                node.label().map(str::to_owned),
+            )
+        })
+    });
+    assert_eq!(role, Some(gpui::Role::Button));
+    assert_eq!(label.as_deref(), Some(text::TITLE.get()));
+}
