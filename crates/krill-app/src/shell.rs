@@ -207,6 +207,7 @@ actions!(
         ToggleSidebar,
         FocusSidebar,
         TogglePanel,
+        ToggleChanges,
         ToggleExplorer,
         ToggleSearch,
         Quit,
@@ -340,7 +341,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-f", ToggleSearch, ctx),
         KeyBinding::new("cmd-alt-b", TogglePanel, ctx),
         KeyBinding::new("cmd-l", TogglePanel, ctx),
-        KeyBinding::new("cmd-shift-g", TogglePanel, ctx),
+        KeyBinding::new("cmd-shift-g", ToggleChanges, ctx),
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-,", krill_app::settings::OpenSettings, None),
         KeyBinding::new("cmd-j", Jump, ctx),
@@ -2606,6 +2607,32 @@ impl Shell {
         cx.notify();
     }
 
+    fn toggle_changes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        if self.panel_collapsed {
+            self.panel_collapsed = false;
+            let visible = self.security.is_window_active();
+            self.diff.update(cx, |d, cx| {
+                d.set_visible(visible, cx);
+                d.show_changes(window, cx);
+            });
+            cx.notify();
+            return;
+        }
+        if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Changes {
+            self.panel_collapsed = true;
+            self.diff.update(cx, |d, cx| d.set_visible(false, cx));
+            window.focus(&self.focus, cx);
+        } else {
+            self.diff.update(cx, |d, cx| {
+                d.show_changes(window, cx);
+            });
+        }
+        cx.notify();
+    }
+
     fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_some() {
             return;
@@ -3660,6 +3687,9 @@ impl Render for Shell {
             .map(|d| Self::new_session_actions(d, cx))
             .map(|d| Self::file_actions(d, cx))
             .on_action(cx.listener(|this, _: &TogglePanel, _, cx| this.toggle_panel(cx)))
+            .on_action(cx.listener(|this, _: &ToggleChanges, window, cx| {
+                this.toggle_changes(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ToggleExplorer, window, cx| {
                 this.toggle_explorer(window, cx);
             }))

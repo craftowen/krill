@@ -794,7 +794,23 @@ impl Panel {
                         self.loaded = true;
                         self.repo_error = None;
                         self.changes = changes;
-                        self.select(idx, cx);
+                        if self
+                            .changes
+                            .files
+                            .get(idx)
+                            .is_some_and(|f| Self::matches_comparison(f, self.comparison))
+                        {
+                            self.select(idx, cx);
+                        } else {
+                            let had_selection = self.selected.take().is_some();
+                            self.patch_gen = self.patch_gen.wrapping_add(1);
+                            self.patch_task = None;
+                            self.message = text::EMPTY.get().into();
+                            if had_selection {
+                                self.state.update(cx, |s, cx| s.set_files([], cx));
+                            }
+                            cx.notify();
+                        }
                     }
                     WatchAction::Reset => {
                         self.loaded = true;
@@ -936,18 +952,31 @@ impl Panel {
         cx.notify();
     }
 
+    pub(crate) fn matches_comparison(file: &ChangedFile, comparison: Comparison) -> bool {
+        match comparison {
+            Comparison::Worktree => {
+                file.unstaged.is_some() || file.status == *b"??" || file.status[1] != b'.'
+            }
+            Comparison::Index => {
+                file.staged.is_some() || (file.status[0] != b'.' && file.status[0] != b'?')
+            }
+        }
+    }
+
+    pub(crate) fn visible_file_indices(&self, comparison: Comparison) -> Vec<usize> {
+        self.changes
+            .files
+            .iter()
+            .enumerate()
+            .filter_map(|(i, f)| Self::matches_comparison(f, comparison).then_some(i))
+            .collect()
+    }
+
     fn count_for(&self, comparison: Comparison) -> usize {
         self.changes
             .files
             .iter()
-            .filter(|f| match comparison {
-                Comparison::Worktree => {
-                    f.unstaged.is_some() || f.status == *b"??" || f.status[1] != b'.'
-                }
-                Comparison::Index => {
-                    f.staged.is_some() || (f.status[0] != b'.' && f.status[0] != b'?')
-                }
-            })
+            .filter(|f| Self::matches_comparison(f, comparison))
             .count()
     }
 
@@ -1208,7 +1237,18 @@ impl Panel {
                                 if this.comparison != comparison {
                                     this.comparison = comparison;
                                     if let Some(index) = this.selected {
-                                        this.select(index, cx);
+                                        if this.changes.files.get(index).is_some_and(|f| {
+                                            Self::matches_comparison(f, comparison)
+                                        }) {
+                                            this.select(index, cx);
+                                        } else {
+                                            this.selected = None;
+                                            this.patch_gen = this.patch_gen.wrapping_add(1);
+                                            this.patch_task = None;
+                                            this.message = text::EMPTY.get().into();
+                                            this.state.update(cx, |s, cx| s.set_files([], cx));
+                                            cx.notify();
+                                        }
                                     } else {
                                         cx.notify();
                                     }
@@ -1236,6 +1276,7 @@ impl Panel {
         let full = self.repo.join(OsStr::from_bytes(&file.path));
         let open = full.clone();
         let weak = cx.weak_entity();
+        let comparison = self.comparison;
 
         div()
             .id(("changed-file", i))
@@ -1329,8 +1370,24 @@ impl Panel {
                         .child(text::BINARY.get()),
                 }
             }))
-            .child(self.edit_button(i, Comparison::Index, cx))
-            .child(self.edit_button(i, Comparison::Worktree, cx))
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .ml_1()
+                    .when(comparison == Comparison::Worktree, |d| {
+                        d.child(self.discard_button(i, cx)).child(self.edit_button(
+                            i,
+                            Comparison::Worktree,
+                            cx,
+                        ))
+                    })
+                    .when(comparison == Comparison::Index, |d| {
+                        d.child(self.edit_button(i, Comparison::Index, cx))
+                    }),
+            )
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 if e.click_count() >= 2 {
                     cx.emit(OpenFile(open.clone()));
@@ -1340,14 +1397,60 @@ impl Panel {
             }))
             .context_menu(move |menu, _, _| {
                 let (weak, full) = (weak.clone(), full.clone());
-                menu.item(
+                let w_stage = weak.clone();
+                let w_discard = weak.clone();
+                let w_unstage = weak.clone();
+                let menu = menu.item(
                     gpui_component::menu::PopupMenuItem::new(text::OPEN_IN_EDITOR.get()).on_click(
                         move |_, _, cx| {
                             weak.update(cx, |_, cx| cx.emit(OpenFile(full.clone())))
                                 .ok();
                         },
                     ),
-                )
+                );
+                if comparison == Comparison::Worktree {
+                    menu.separator()
+                        .item(
+                            gpui_component::menu::PopupMenuItem::new(
+                                crate::i18n::catalog::diff_edit::STAGE.get(),
+                            )
+                            .icon(IconName::Plus)
+                            .on_click(move |_, _, cx| {
+                                w_stage
+                                    .update(cx, |this, cx| {
+                                        this.edit_file(i, Comparison::Worktree, cx);
+                                    })
+                                    .ok();
+                            }),
+                        )
+                        .item(
+                            gpui_component::menu::PopupMenuItem::new(
+                                crate::i18n::catalog::diff_edit::DISCARD.get(),
+                            )
+                            .icon(Icon::default().data(crate::ui::icons::ROTATE_CCW_SVG))
+                            .on_click(move |_, window, cx| {
+                                w_discard
+                                    .update(cx, |this, cx| {
+                                        this.confirm_discard_file(i, window, cx);
+                                    })
+                                    .ok();
+                            }),
+                        )
+                } else {
+                    menu.separator().item(
+                        gpui_component::menu::PopupMenuItem::new(
+                            crate::i18n::catalog::diff_edit::UNSTAGE.get(),
+                        )
+                        .icon(IconName::Minus)
+                        .on_click(move |_, _, cx| {
+                            w_unstage
+                                .update(cx, |this, cx| {
+                                    this.edit_file(i, Comparison::Index, cx);
+                                })
+                                .ok();
+                        }),
+                    )
+                }
             })
             .into_any_element()
     }
@@ -1513,21 +1616,25 @@ impl Render for Panel {
             .selected
             .and_then(|idx| self.changes.files.get(idx).cloned());
 
+        let visible_indices = Arc::new(self.visible_file_indices(self.comparison));
+        let has_visible_files = !visible_indices.is_empty();
+        let list_indices = Arc::clone(&visible_indices);
         let list = uniform_list(
             "changed-files",
-            self.changes.files.len(),
-            cx.processor(|this, range: std::ops::Range<usize>, _, cx| {
+            visible_indices.len(),
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
                 #[cfg(test)]
                 {
                     this.rendered_rows += range.len();
                 }
                 range
-                    .filter_map(|i| {
+                    .filter_map(|row_ix| {
+                        let file_idx = *list_indices.get(row_ix)?;
                         this.changes
                             .files
-                            .get(i)
+                            .get(file_idx)
                             .cloned()
-                            .map(|file| this.render_file_row(i, &file, cx))
+                            .map(|file| this.render_file_row(file_idx, &file, cx))
                     })
                     .collect()
             }),
@@ -1628,7 +1735,7 @@ impl Render for Panel {
             .text_color(p.sidebar_foreground)
             .child(top_bar)
             .child(comparison_bar)
-            .child(list)
+            .when(has_visible_files, |d| d.child(list))
             .child(editor)
             .when(self.changes.limited, |d| {
                 d.child(
