@@ -120,7 +120,11 @@ impl Shell {
             .to_owned()
     }
 
-    pub(super) fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_tab_bar(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = ui::palette(cx);
         let active = self.layout.active();
         let mut labels: Vec<_> = self
@@ -372,7 +376,7 @@ impl Shell {
             .when(self.sidebar_collapsed, |d| {
                 d.child(
                     div()
-                        .pl(ui::TRAFFIC_LIGHT_PAD)
+                        .pl(super::traffic_light_pad(window))
                         .pr_1p5()
                         .h_full()
                         .flex()
