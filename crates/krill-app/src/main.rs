@@ -181,6 +181,7 @@ fn init(cx: &mut App) {
     gpui_component::init(cx);
     krill_app::ui::apply(gpui_component::ThemeMode::Dark, cx);
     shell::bind_keys(cx);
+    krill_app::link_ui::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
     cx.set_quit_mode(QuitMode::Explicit);
     cx.on_app_quit(|cx| {

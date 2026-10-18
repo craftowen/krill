@@ -386,6 +386,12 @@ pub fn init_actions(cx: &mut App) {
             rerun_onboarding(&env, cx);
         }
     });
+    // 마법사(점검) 창의 macOS 표준 ⌘W 닫기(OWE-878). Esc는 마법사 `on_key_down`이 맡는다.
+    cx.bind_keys([gpui::KeyBinding::new(
+        "cmd-w",
+        welcome::CloseWizard,
+        Some(welcome::KEY_CONTEXT),
+    )]);
 }
 
 /// 현재 환경으로 점검 창을 연다. 메뉴·설정·상태바 진입점이 함께 쓴다.

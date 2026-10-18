@@ -17,8 +17,8 @@ pub mod real;
 use std::sync::Arc;
 
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, Render, SharedString, Subscription, Task,
-    Window, div, prelude::*, px,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, KeyBinding, KeyDownEvent,
+    Render, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -37,6 +37,16 @@ pub use qr::{
 
 use crate::i18n::link_ui as text;
 
+actions!(link_ui, [ClosePairing]);
+
+/// 짝짓기 창의 키 컨텍스트. 별도 OS 창에서도 macOS 표준 ⌘W 닫기를 받는다(OWE-878).
+pub const KEY_CONTEXT: &str = "Pairing";
+
+/// 짝짓기 창의 전역 키 바인딩. 앱 시작 때 한 번 등록한다.
+pub fn bind_keys(cx: &mut App) {
+    cx.bind_keys([KeyBinding::new("cmd-w", ClosePairing, Some(KEY_CONTEXT))]);
+}
+
 /// `ServerPanel`·`ClientDialog`가 외부로 알리는 이벤트.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkUiEvent {
@@ -46,8 +56,6 @@ pub enum LinkUiEvent {
     Paired(PairedDevice),
     /// 기기 연결 권한이 회수(연결 끊기)됨.
     Revoked(String),
-    /// 클라이언트 대화상자 닫기 요청.
-    Close,
 }
 
 /// "이 Mac에 다른 기기 접속 허용" 서버 패널.
@@ -905,7 +913,8 @@ impl ClientDialog {
         }
     }
 
-    /// 클립보드 텍스트를 초대 링크 입력칸에 바로 붙여넣는다.
+    /// 클립보드 텍스트를 초대 링크 입력칸에 채운다. 기기 이름을 확인·수정할 수 있게
+    /// 바로 연결하지 않고 사용자가 [연결](또는 Enter)으로 제출한다(OWE-878).
     pub fn paste_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
             let trimmed = text.trim().to_owned();
@@ -913,8 +922,16 @@ impl ClientDialog {
                 self.clipboard_suggestion = Some(valid);
             }
             self.set_link_value(trimmed, window, cx);
-            self.submit_pair(cx);
         }
+    }
+
+    /// 클라이언트 카드 입력 초기화. 통합 짝짓기 창 안에 있으므로 OS 창을 닫지 않고
+    /// 입력칸·진행 상태만 되돌린다(OWE-878). 이 기기 이름은 유지한다.
+    pub fn reset_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.task = None;
+        self.phase = ClientPhase::Idle;
+        self.set_link_value("", window, cx);
+        cx.notify();
     }
 
     /// 같은 Wi-Fi의 근처 Mac 목록(`nearby`)을 백그라운드 실행기에서 조회한다.
@@ -1037,11 +1054,16 @@ impl ClientDialog {
         }
     }
 
+    /// 같은 Wi-Fi 근처 Mac 목록. 실제 탐색이 지원되지 않아 목록이 비어 있으면
+    /// 섹션 자체를 그리지 않는다(미구현 크롬 노출 금지, STYLEGUIDE §7.1, OWE-878).
     fn render_nearby_section(
         &self,
         p: &crate::ui::Palette,
         cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        if self.nearby.is_empty() {
+            return None;
+        }
         let mut section = div()
             .id("link-nearby-section")
             .debug_selector(|| "link-nearby-section".into())
@@ -1073,60 +1095,44 @@ impl ClientDialog {
                     ),
             );
 
-        if self.nearby.is_empty() {
+        for (idx, mac) in self.nearby.iter().enumerate() {
+            let row_id = format!("link-nearby-item-{idx}");
+            let conn_id = format!("link-nearby-connect-{idx}");
             section = section.child(
                 div()
-                    .id("link-nearby-empty")
-                    .debug_selector(|| "link-nearby-empty".into())
+                    .id(SharedString::from(row_id.clone()))
+                    .debug_selector(move || row_id.clone())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
                     .p_2p5()
                     .rounded(crate::ui::RADIUS_SM)
                     .bg(p.background)
                     .border_1()
                     .border_color(p.border)
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::NEARBY_EMPTY.get()),
-            );
-        } else {
-            for (idx, mac) in self.nearby.iter().enumerate() {
-                let row_id = format!("link-nearby-item-{idx}");
-                let conn_id = format!("link-nearby-connect-{idx}");
-                section = section.child(
-                    div()
-                        .id(SharedString::from(row_id.clone()))
-                        .debug_selector(move || row_id.clone())
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
-                        .p_2p5()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.background)
-                        .border_1()
-                        .border_color(p.border)
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_SM)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(mac.name.clone()),
-                        )
-                        .child(
-                            div().flex().items_center().gap_1p5().child(
-                                Button::new(gpui::ElementId::Name(conn_id.clone().into()))
-                                    .small()
-                                    .primary()
-                                    .label(text::NEARBY_CONNECT.get())
-                                    .debug_selector(move || conn_id.clone())
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.connect_nearby(idx, window, cx);
-                                    })),
-                            ),
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_SM)
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .child(mac.name.clone()),
+                    )
+                    .child(
+                        div().flex().items_center().gap_1p5().child(
+                            Button::new(gpui::ElementId::Name(conn_id.clone().into()))
+                                .small()
+                                .primary()
+                                .label(text::NEARBY_CONNECT.get())
+                                .debug_selector(move || conn_id.clone())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.connect_nearby(idx, window, cx);
+                                })),
                         ),
-                );
-            }
+                    ),
+            );
         }
 
-        section
+        Some(section)
     }
 }
 
@@ -1290,12 +1296,14 @@ impl Render for ClientDialog {
                         Button::new("link-client-close-btn")
                             .small()
                             .ghost()
-                            .label(text::CLOSE_BUTTON.get())
+                            .label(text::CLIENT_CLEAR.get())
                             .debug_selector(|| "link-client-close-btn".into())
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(LinkUiEvent::Close))),
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.reset_form(window, cx);
+                            })),
                     ),
             )
-            .child(self.render_nearby_section(p, cx))
+            .children(self.render_nearby_section(p, cx))
     }
 }
 
@@ -1305,6 +1313,7 @@ impl Render for ClientDialog {
 pub struct PairingView {
     pub server: Entity<ServerPanel>,
     pub client: Entity<ClientDialog>,
+    focus: FocusHandle,
     _events: Vec<Subscription>,
 }
 
@@ -1317,19 +1326,18 @@ impl PairingView {
             cx.subscribe(&server, |_, _, _: &LinkUiEvent, cx| {
                 crate::settings::notify_external_change(cx);
             }),
-            cx.subscribe_in(
-                &client,
-                window,
-                |_, _, event: &LinkUiEvent, window, cx| match event {
-                    LinkUiEvent::Paired(_) => crate::settings::notify_external_change(cx),
-                    LinkUiEvent::Close => window.remove_window(),
-                    _ => {}
-                },
-            ),
+            cx.subscribe_in(&client, window, |_, _, event: &LinkUiEvent, _, cx| {
+                if let LinkUiEvent::Paired(_) = event {
+                    crate::settings::notify_external_change(cx);
+                }
+            }),
         ];
+        let focus = cx.focus_handle();
+        window.focus(&focus, cx);
         Self {
             server,
             client,
+            focus,
             _events: events,
         }
     }
@@ -1341,6 +1349,15 @@ impl Render for PairingView {
         div()
             .id("link-pairing-view")
             .debug_selector(|| "link-pairing-view".into())
+            .key_context(KEY_CONTEXT)
+            .track_focus(&self.focus)
+            .on_action(cx.listener(|_, _: &ClosePairing, window, _| window.remove_window()))
+            .on_key_down(cx.listener(|_, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key.as_str() == "escape" {
+                    window.remove_window();
+                    cx.stop_propagation();
+                }
+            }))
             .size_full()
             .overflow_y_scroll()
             .p_4()
@@ -1373,7 +1390,7 @@ pub fn open_pairing(cx: &mut App) {
             cx,
         ))),
         titlebar: Some(gpui::TitlebarOptions {
-            title: Some(text::CLIENT_TITLE.get().into()),
+            title: Some(text::PAIRING_TITLE.get().into()),
             ..Default::default()
         }),
         ..Default::default()
