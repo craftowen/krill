@@ -121,15 +121,21 @@ fn open_from_menu(
 }
 
 fn new_window(cx: &mut App) -> Option<WindowHandle<shell::Shell>> {
-    // 단일 창 레이아웃 파일의 쓰기 주인은 하나다. 추가 창은 새 레이아웃으로 시작하며
-    // 데몬 세션은 창을 닫아도 분리된 세션 목록에서 다시 열 수 있다.
-    let path = (!cx
+    // 단일 메인 창 정책: 이미 열린 Shell 창이 있으면 활성화하고, 모든 창이 닫혔을 때만
+    // 기본 레이아웃 저장 경로로 메인 창을 다시 열어 탭·분할 변경이 유실되지 않게 한다(OWE-859).
+    if let Some(window) = cx
         .windows()
-        .iter()
-        .any(|w| w.downcast::<shell::Shell>().is_some()))
-    .then(krill_app::layout::default_path)
-    .flatten();
-    let window = open_shell(cx, path)?;
+        .into_iter()
+        .find_map(|w| w.downcast::<shell::Shell>())
+    {
+        window
+            .update(cx, |_, window, _| window.activate_window())
+            .ok();
+        krill_app::menu_bar::sync_window_mode(cx);
+        cx.activate(true);
+        return Some(window);
+    }
+    let window = open_shell(cx, krill_app::layout::default_path())?;
     window
         .update(cx, |shell, _, cx| shell.connect_daemon(cx))
         .ok();
@@ -192,10 +198,7 @@ fn init(cx: &mut App) {
         })
     })
     .detach();
-    cx.bind_keys([
-        KeyBinding::new("cmd-n", NewWindow, None),
-        KeyBinding::new("cmd-alt-w", CloseWindow, None),
-    ]);
+    cx.bind_keys([KeyBinding::new("cmd-alt-w", CloseWindow, None)]);
     cx.on_action(|_: &NewWindow, cx| {
         let _ = new_window(cx);
     });
