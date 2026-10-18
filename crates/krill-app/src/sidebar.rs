@@ -504,6 +504,10 @@ pub struct CloseSession(pub SessionId);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContinueSession(pub SessionId);
 
+/// OWE-854: 사이드바 세션 행 메뉴의 '이름 변경'. 셸이 그 세션의 탭을 열고 탭 이름 변경(OWE-870)을 띄운다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenameSession(pub SessionId);
+
 /// 끊긴 원격 호스트 섹션에서 '다시 연결'을 눌렀을 때 내보내는 이벤트(MK-131).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectHost(pub HostId);
@@ -596,6 +600,7 @@ impl EventEmitter<Selected> for Sidebar {}
 impl EventEmitter<NewSession> for Sidebar {}
 impl EventEmitter<CloseSession> for Sidebar {}
 impl EventEmitter<ContinueSession> for Sidebar {}
+impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
 
@@ -1952,6 +1957,19 @@ impl Sidebar {
         self.cursor = Some(index);
         self.action_host = Some(self.row_host(index).clone());
         cx.emit(ContinueSession(id));
+        cx.notify();
+    }
+
+    /// OWE-854: 세션 행 메뉴의 '이름 변경'. 호스트를 남기고 셸에 탭 이름 변경을 맡긴다.
+    pub(crate) fn request_rename_session(
+        &mut self,
+        index: usize,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.cursor = Some(index);
+        self.action_host = Some(self.row_host(index).clone());
+        cx.emit(RenameSession(id));
         cx.notify();
     }
 

@@ -72,6 +72,16 @@ fn row_menu(
                     .ok();
             }),
         );
+        let (rename_this, rename_index, rename_id) = (this.clone(), sess.index, sess.id);
+        menu = menu.item(
+            PopupMenuItem::new(text::RENAME.get()).on_click(move |_, _, cx| {
+                rename_this
+                    .update(cx, |s, cx| {
+                        s.request_rename_session(rename_index, rename_id, cx);
+                    })
+                    .ok();
+            }),
+        );
         let (cont_this, cont_index, cont_id) = (this.clone(), sess.index, sess.id);
         menu = menu.item(PopupMenuItem::new(text::CONTINUE_SESSION.get()).on_click(
             move |_, _, cx| {
