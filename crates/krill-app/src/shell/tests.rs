@@ -4881,7 +4881,8 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
             s.layout.toggle_pin_tab(0);
             s.layout.set_tab_color(0, Some(TabColor::Green));
 
-            // 라이브 세션의 최신 cwd가 sidebar 스냅샷을 통해 layout.launches에 동기화되는지 확인(시나리오 B 대비)
+            // 라이브 세션의 최신 cwd는 재스폰용 별도 보관에 동기화되고(시나리오 B 대비),
+            // 폴더(launches·folder()·Open in 기준)는 그대로 유지되는지 확인
             s.sidebar.update(cx, |sb, cx| {
                 sb.fold(&wt_a, Some(false), cx);
                 sb.fold_group(group_key, Some(false), cx);
@@ -4891,10 +4892,14 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
             });
             let sb_snap = s.sidebar.read(cx);
             s.sync_live_cwds(sb_snap);
+            // 폴더는 설정된 cwd 그대로(워크트리 루트 유지), 최신 라이브 cwd는 재스폰 보관으로 분리.
             assert_eq!(
                 s.layout.launch(p0a).map(|l| l.cwd.as_slice()),
-                Some(&b"/repo/b"[..])
+                Some(&b"/repo/old-cwd"[..])
             );
+            assert_eq!(s.layout.respawn_cwd(p0a), Some(&b"/repo/b"[..]));
+            // 사이드바에 없는 세션(102)의 칸은 재스폰 보관에 손대지 않는다.
+            assert_eq!(s.layout.respawn_cwd(p0b), None);
 
             // 파일 에디터 탭 열기(1-based 커서 4행 5열 -> 0-based line=3, column=4)
             s.open_file_at(tmp_file.clone(), 4, 5, cx);
@@ -4978,13 +4983,16 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
         assert!((ratio - 0.35).abs() < 1e-5);
         assert_eq!(**first, PaneTree::Leaf(pane_0a));
         assert_eq!(**second, PaneTree::Leaf(pane_0b));
-        // (5-A) 터미널 세션 ID 및 최신 cwd 보존
+        // (5-A) 터미널 세션 ID 보존. 폴더(launches)는 설정된 cwd 그대로 유지되고,
+        // 셸 내부 cd 포함 최신 cwd는 재스폰용 별도 보관으로 복원된다.
         assert_eq!(s.layout.session(pane_0a), Some(SessionId(101)));
         assert_eq!(s.layout.session(pane_0b), Some(SessionId(102)));
         assert_eq!(
             s.layout.launch(pane_0a).map(|l| l.cwd.as_slice()),
-            Some(&b"/repo/b"[..])
+            Some(&b"/repo/old-cwd"[..])
         );
+        assert_eq!(s.layout.respawn_cwd(pane_0a), Some(&b"/repo/b"[..]));
+        assert_eq!(s.layout.respawn_cwd(pane_0b), None);
         // (6) 파일/에디터 탭 경로·커서 줄/열·미리보기/편집 모드 복원 (탭 활성화 전 디스크 상태)
         assert_eq!(s.layout.file(file_pane), Some(tmp_file.as_path()));
         assert_eq!(
