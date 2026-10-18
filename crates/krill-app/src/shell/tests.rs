@@ -6346,6 +6346,75 @@ fn close_sidebar_session_without_target_sets_notice(cx: &mut TestAppContext) {
     );
 }
 
+/// OWE-854: 사이드바 '세션 종료…' 확인 대화상자는 `KILL_TITLE_NAMED`로 세션 이름을 쓰고, 없으면 '세션 N'으로 폴백한다.
+#[gpui::test]
+fn confirm_close_sidebar_session_uses_session_name_or_fallback(cx: &mut TestAppContext) {
+    use krill_app::i18n::catalog::resources as rtext;
+    struct Fixed;
+    impl sidebar::Source for Fixed {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: krill_proto::SessionId(2),
+                    status: krill_proto::control::AgentStatus {
+                        agent: "codex".into(),
+                        ..krill_proto::control::AgentStatus::UNKNOWN
+                    },
+                    worktree: Some("/repo/wt".into()),
+                    cwd: Some("/repo/wt".into()),
+                    account: None,
+                }],
+                trees: [("/repo".into(), vec!["/repo/wt".into()])].into(),
+            })
+        }
+    }
+    let (view, cx) = open(cx, state_path("confirm-close-sidebar-session"));
+    view.update(cx, |s, cx| {
+        s.paths = Some(Paths {
+            socket: PathBuf::new(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(std::sync::Arc::new(Fixed), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.confirm_close_sidebar_session(
+                &krill_app::hosts::HostId::Local,
+                krill_proto::SessionId(2),
+                window,
+                cx,
+            );
+        });
+    });
+    let (title, _) = cx.pending_prompt().expect("named session kill prompt");
+    assert_eq!(title, rtext::KILL_TITLE_NAMED.format(&[("name", "codex")]));
+    cx.simulate_prompt_answer(rtext::CANCEL.get());
+
+    // 스냅샷에 없는 세션은 '세션 N'으로 폴백한다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.confirm_close_sidebar_session(
+                &krill_app::hosts::HostId::Local,
+                krill_proto::SessionId(99),
+                window,
+                cx,
+            );
+        });
+    });
+    let (fallback_title, _) = cx.pending_prompt().expect("fallback session kill prompt");
+    let fallback_name = format!("{} 99", rtext::SESSION.get());
+    assert_eq!(
+        fallback_title,
+        rtext::KILL_TITLE_NAMED.format(&[("name", &fallback_name)])
+    );
+    cx.simulate_prompt_answer(rtext::CANCEL.get());
+}
+
 /// OWE-854: 붙은 칸이 없는 세션의 '이어하기…'는 새 탭에 붙이고, 창이 없어 모달을 못 열면 알림을 남긴다.
 #[gpui::test]
 fn continue_sidebar_session_attaches_detached_session(cx: &mut TestAppContext) {

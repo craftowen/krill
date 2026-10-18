@@ -3299,9 +3299,14 @@ impl Shell {
             cx.notify();
             return;
         };
-        let title = rtext::KILL_TITLE
-            .get()
-            .replace("{id}", &session.0.to_string());
+        let name = {
+            let sidebar = self.sidebar.read(cx);
+            sidebar.session_on(host, session).map_or_else(
+                || format!("{} {}", rtext::SESSION.get(), session.0),
+                |s| sidebar.session_label(s).0,
+            )
+        };
+        let title = rtext::KILL_TITLE_NAMED.format(&[("name", &name)]);
         let detail = rtext::KILL_DETAIL.get().to_owned();
         let yes = rtext::KILL_CONFIRM.get().to_owned();
         let no = rtext::CANCEL.get().to_owned();
