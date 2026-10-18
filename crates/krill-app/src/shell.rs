@@ -2934,6 +2934,73 @@ impl Shell {
         )
     }
 
+    /// OWE-873: 스크롤 중(바닥 위)일 때 터미널 칸 우측에 스크롤 위치 막대와
+    /// '맨 아래로' 배지를 겹쳐 그린다. 바닥에 있으면 아무것도 그리지 않는다.
+    fn scroll_chrome(&self, id: PaneId, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(l) = self.live.get(&id) else {
+            return Vec::new();
+        };
+        if l.pane.session().is_none() {
+            return Vec::new();
+        }
+        let fetched = l.pane.scrollback_len();
+        let offset = l.pane.scroll_offset();
+        if offset == 0 || fetched == 0 {
+            return Vec::new();
+        }
+        let lines = usize::from(l.pane.screen().lines).max(1);
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "행 수는 수만 이하라 f32로도 순서·비율이 유지된다"
+        )]
+        let (lines, fetched, shown) = (lines as f32, fetched as f32, offset.min(fetched) as f32);
+        // 전체(화면 + 받아 둔 행)에서 화면이 차지하는 비율이 막대 길이, 받아 둔 행 중
+        // 아직 위쪽에 남은 비율이 막대 머리 위치다(받는 중인 위쪽 행은 어림값).
+        let thumb = (lines / (lines + fetched)).clamp(0.05, 1.);
+        let top = ((fetched - shown) / (lines + fetched)).clamp(0., 1. - thumb);
+        let p = krill_app::ui::palette(cx);
+        let bar = div()
+            .debug_selector(|| "scrollbar".into())
+            .absolute()
+            .top(px(4.))
+            .bottom(px(4.))
+            .right(px(2.))
+            .w(px(6.))
+            .flex()
+            .flex_col()
+            .child(div().w_full().h(gpui::relative(top)))
+            .child(
+                div()
+                    .debug_selector(|| "scrollbar-thumb".into())
+                    .w_full()
+                    .h(gpui::relative(thumb))
+                    .min_h(px(12.))
+                    .rounded_full()
+                    .bg(p.ring),
+            );
+        let bottom = div()
+            .id(("scroll-to-bottom", id.get()))
+            .debug_selector(|| "scroll-to-bottom".into())
+            .absolute()
+            .bottom(px(10.))
+            .right(px(14.))
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if let Some(l) = this.live.get_mut(&id) {
+                    l.clear_selection();
+                    l.pane.scroll(isize::MIN);
+                    cx.notify();
+                }
+            }))
+            .child(krill_app::ui::badge(
+                p,
+                krill_app::ui::BadgeTone::Neutral,
+                text::SCROLL_TO_BOTTOM.get(),
+            ));
+        vec![bar.into_any_element(), bottom.into_any_element()]
+    }
+
     fn render_pane(&self, id: PaneId, cx: &mut Context<Self>) -> AnyElement {
         if self.layout.file(id).is_some() {
             return self.render_file_pane(id, cx);
@@ -3185,7 +3252,8 @@ impl Shell {
                         .size_full()
                         .relative()
                         .child(body)
-                        .children(self.fit_probe(id, cx)),
+                        .children(self.fit_probe(id, cx))
+                        .children(self.scroll_chrome(id, cx)),
                 ),
             )
             .children(self.render_pane_security(id, cx))
@@ -3581,7 +3649,11 @@ impl Render for Shell {
                     return;
                 }
                 if let Some(l) = this.focused_live() {
-                    let _ = l.pane.scroll(isize::MIN);
+                    // OWE-873: 받아 둔 스크롤백·선택·검색 하이라이트를 먼저 버리고 바닥에 고정한 뒤
+                    // 셸에 화면 지우기를 요청한다. 데몬 쪽 핫·콜드 기록은 그대로다(krilld IPC 없음).
+                    l.clear_selection();
+                    l.pane.clear_search();
+                    l.pane.clear_scrollback();
                     let n = l.pane.input(b"\x0c", Now::get());
                     this.show(n.as_ref(), cx);
                     cx.notify();

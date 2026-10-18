@@ -300,6 +300,50 @@ fn osc52_write_becomes_clipboard_event() {
     assert_eq!(feed(&mut p, &f).clipboard.as_deref(), Some("복사"));
 }
 
+/// OWE-873: 스크롤 위치·받아 둔 행 수 보고와 로컬 스크롤백 비우기.
+#[test]
+fn scroll_report_and_clear_scrollback() {
+    let mut p = linked();
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 0));
+    update(&mut p, 1, snapshot(["s0", "s1", "s2"]));
+    let pages = vec![vec!["c0".to_owned(), "c1".to_owned()]];
+    assert!(!p.scroll(2));
+    answer(&mut p, 4, &pages);
+    assert_eq!(p.scroll_offset(), 2);
+    assert_eq!(p.scrollback_len(), 6);
+    // 바닥으로 돌아가면 보고가 0이 되고 받아 둔 행을 버린다.
+    assert!(p.scroll(-2));
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 0));
+
+    // 다시 올린 뒤 지우기: 바닥으로 고정하고 받아 둔 행을 버린다.
+    assert!(!p.scroll(1));
+    answer(&mut p, 4, &pages);
+    assert!(p.scroll_offset() > 0);
+    p.clear_scrollback();
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 0));
+    assert_eq!(texts(&p.shown()), ["s0", "s1", "s2"]);
+    // 이미 바닥이면 화면을 건드리지 않는다.
+    p.clear_scrollback();
+    assert_eq!(texts(&p.shown()), ["s0", "s1", "s2"]);
+}
+
+/// OWE-873: 콜드 화면에서도 스크롤 위치를 보고한다(읽기 전용 행은 둔다).
+#[test]
+fn cold_scroll_report_keeps_rows() {
+    let mut p: Pane<Vec<u8>> = Pane::default();
+    let cold = Cold {
+        screen: snapshot(["s0", "s1", "s2"]),
+        history: vec![row("h0"), row("h1")],
+    };
+    p.show_cold(SessionId(4), cold).unwrap();
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 2));
+    assert!(p.scroll(1));
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (1, 2));
+    // 콜드는 바닥으로만 돌아가고 행은 버리지 않는다.
+    p.clear_scrollback();
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 2));
+}
+
 /// 보낸 역할 요청들(다른 프레임은 건너뛴다).
 fn role_requests(bytes: &[u8]) -> Vec<roles::Request> {
     let mut r = bytes;
