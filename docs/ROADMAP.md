@@ -93,7 +93,7 @@
 | MK-070 | 설정(TOML) + 최소 설정 UI + 키 바인딩 파일 + 라이트/다크 + UI 줌 | M4 | P1 | 재시작 없이 반영, 키 바인딩 재정의 동작 | MK-030 | T1#24, T3#23 | OWE-435 |
 | MK-071 | Resource Manager 경량판(앱·데몬·세션별 메모리, 디스크, 데몬 재시작, 세션 kill) | M4 | P1 | 표시값이 footprint ±10%, 데몬 재시작은 확인 후 동작 | MK-045 | T1#21 | OWE-436 |
 | MK-072 | Homebrew 자체 tap + DMG 릴리스 워크플로 | M4 | P1 | `brew install --cask` 설치, `krill`이 PATH에, Gatekeeper 경고 없음, zap 후 잔여물 없음 | MK-061 | T4-31 | OWE-437 |
-| MK-073 | 첫 실행 온보딩(git·에이전트 감지, hook 동의, CLI 설치) | M4 | P1 | 새 macOS 계정에서 완료 후 Claude 상태 감지 동작 | MK-040, MK-048 | T4-33 | OWE-438 |
+| MK-073 | 첫 실행 온보딩(git·에이전트 감지, hook 설치 안내, CLI 설치 — 동의 화면 제거됨, 2026-10-18 OWE-904) | M4 | P1 | 새 macOS 계정에서 모달 없이 완료·자동 준비 후 Claude 상태 감지 동작 | MK-040, MK-048 | T4-33 | OWE-438 |
 | MK-074 | 라이선스 확정 + THIRD_PARTY_NOTICES + README 포지셔닝 + 공개 벤치(Orca 등 비교) | M4 | P1 | LICENSE·고지 파일 존재, README 첫 화면에 메모리·생존 수치와 측정 방법 | MK-064, MK-077 | T1#26, T1 S8 | OWE-439 |
 | MK-075 | 개인정보: 기록 끄기, Time Machine 제외, 기록 삭제 명령 | M4 | P2 | 옵션 켜면 디스크 기록 0바이트, 삭제 뒤 파일 없음 | MK-024 | T2#25 | OWE-440 |
 | MK-076 | 보안 강화: OSC 8 URL 미리보기, 제목 제어문자 필터, 여러 줄 붙여넣기 경고, Secure Keyboard Entry | M4 | P2 | 각 항목 테스트 또는 QA 통과 | MK-033 | T3#25 | OWE-441 |
@@ -147,11 +147,11 @@
 | MK-124 | 1-스캔 QR 페어링: 관리자 페이지 `Mobile` 전용 탭(8번째 탭) + `krill mobile` CLI + Cloudflare Quick Tunnel(`--tunnel`) | M9 | P0 | `Mobile` 8번째 설정 탭 UI 동작, QR 생성·만료·모드 전환 시 무효화/갱신, `krill mobile pair/devices/revoke/serve` CLI 및 `--tunnel` URL 파싱 단위·통합 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-109 | M9 | OWE-680 |
 | MK-125 | 내장 모바일 PWA 클라이언트 코어(`Needs You` 최상단·세션 카드·원탭 권한 승인·프롬프트/사진 첨부·오케스트레이션·계정 스위처·Git 변경) | M9 | P0 | 모바일 PWA 정적 에셋 내장 서빙(비보안 HTTP 컨텍스트 호환), 세션 목록·원탭 승인·프롬프트/이미지 첨부·오케스트레이션/계정 전환 E2E 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-124 | M9 | OWE-681 |
 | MK-126 | 모바일 라이브 터미널 그리드 뷰(화면 델타·핫/콜드 스크롤백·특수키 바·`Fit to Phone`) + 딥링크 웹훅 알림 및 실화면 QA | M9 | P1 | 라이브 그리드 델타·콜드 스크롤백·보조 키바·Fit to Phone·웹훅 딥링크 테스트 통과, 실화면 검증 완료, `scripts/check.sh` 0 | MK-125, MK-086 | M9 | OWE-682 |
-| MK-127 | 설치 후 온보딩 v2(상위): macOS 권한 점검·필수 요소 체크리스트(첫 실행 동의 화면 없음, OWE-904) | M4 | P1 | 새 계정 첫 실행에 모달 없이 완료·자동 준비, 필수 설치 안내는 조치 배너·빠른 점검(상태바)·점검 모달로, `scripts/check.sh` 0 | MK-073 | crates/krill-app/src/onboarding.rs | OWE-688 |
+| MK-127 | 설치 후 온보딩 v2(상위): macOS 권한 점검·필수 요소 체크리스트(동의 화면 제거됨, 2026-10-18 OWE-904) | M4 | P1 | 새 계정 첫 실행에 모달 없이 완료·자동 준비, 필수 설치 안내는 조치 배너·빠른 점검(상태바)·점검 모달로, `scripts/check.sh` 0 | MK-073 | crates/krill-app/src/onboarding.rs | OWE-688 |
 | MK-128 | 온보딩 점검 엔진(`krill doctor --json`, 공용 점검 ID·등급·수정 방법) | M4 | P1 | 판정 순수 함수 항목별 경계 테스트, 사람용 출력 회귀 없음, `scripts/check.sh` 0 | MK-067 | crates/krill/src/doctor.rs | OWE-689 |
-| MK-129 | 온보딩 동의 화면 + `consent.toml` 버전 재동의 | M4 | P1 | 파일 없음·구버전·손상·0600·원자 쓰기 테스트, 거절 시 앱만 종료·세션 생존 | MK-075 | crates/krilld/src/store/privacy.rs | OWE-690 |
+| MK-129 | 온보딩 동의 화면 + `consent.toml` 버전 재동의(동의 화면 제거됨, 2026-10-18 OWE-904) | M4 | P1 | 첫 실행 동의 화면·`consent.toml` 제거됨(2026-10-18 OWE-904). 첫 실행은 모달 없이 `onboarding.toml`에 완료를 기록하고 자동 준비만 수행 | MK-075 | crates/krill-app/src/onboarding.rs | OWE-690 |
 | MK-160 | 앱 전용 점검(설치 위치·알림 권한·폴더/전체 디스크 접근, TCC 귀속 측정 선행) | M4 | P1 | TCC 귀속 측정값, 판정 순수 함수 테스트, `scripts/check.sh` 0 | MK-044 | crates/krill-app/src/alert.rs | OWE-691 |
-| MK-161 | 단계형 온보딩 마법사 UI + `onboarding.toml` 상태기계 | M4 | P1 | 상태기계 테스트(동의 전·필수 fail·나중에·마이그레이션), 기존 온보딩 테스트 통과, `scripts/check.sh` 0 | MK-128, MK-129, MK-160 | crates/krill-app/src/onboarding/welcome.rs | OWE-692 |
+| MK-161 | 점검 모달 UI + `onboarding.toml` 상태기계(동의 화면 제거됨, 2026-10-18 OWE-904) | M4 | P1 | 상태기계 테스트(구 `consent` 단계 초기화·필수 fail·마이그레이션·원자 쓰기), 점검 모달·기존 온보딩 테스트 통과, `scripts/check.sh` 0 | MK-128, MK-160 | crates/krill-app/src/onboarding/welcome.rs | OWE-692 |
 | MK-162 | 설정 점검 재진입(설정·메뉴·명령 팔레트) + 필수 실패 상태바 경고 | M4 | P2 | 세 진입점 같은 창, 시작 경로 비블로킹, `scripts/check.sh` 0 | MK-161 | crates/krill-app/src/settings.rs | OWE-693 |
 | MK-163 | 온보딩 v2 새 계정 E2E·실화면 QA | M4 | P1 | 온보딩 시나리오 9종 결과, `scripts/check.sh` 0 | MK-128~MK-162 | — | OWE-694 |
 | MK-153 | GitHub Releases 배포 연동 무설정 자동 앱 업데이트 완성(상위) | M4 | P1 | `bash packaging/publish-github.sh` 배포 후 `/Applications/Krill.app` 무설정 자동 업데이트·재기동·`krilld` 업그레이드 완결 | MK-061, MK-062, MK-063 | M4 | OWE-715 |
@@ -164,7 +164,7 @@
 | MK-133 | `krill-link`: iroh P2P 터널 + 기기 짝짓기(초대 링크·QR·근처 기기)·기기 회수, 앱 연동 | M9 | P1 | 오프라인 통합 테스트(짝짓기·만료 토큰·미허용 거부·revoke·krilld 터널·재연결), krill-link ≤ 20MB(별도 예산, 켤 때만), `scripts/check.sh` 0 | MK-130, MK-131 | M9 | OWE-669 |
 | MK-134 | 끊김 복구: 입력 정확히 한 번·순서 보장, 연결 상태 칩, 세션 목록 캐시, 자동 재연결 | M9 | P1 | 네트워크 단절 중 입력이 재연결 후 1회·순서대로 도착, 상태 칩 전환 테스트, `scripts/check.sh` 0 | MK-131, MK-133 | — | OWE-670 |
 | MK-172 | Orca 데이터 스캐너 & 원클릭 전체 이관 엔진(`krill import orca` + 다계정·원격 SSH·등록 프로젝트·워크트리·설정 이관) | M10 | P0 | `profile-state.db`/`orca-data.json`·`claude-profiles`·`codex-accounts`·`sshTargets`·`repos`·`worktreeMeta` 멱등 이관 및 이관된 계정 즉시 기동 테스트 통과, `scripts/check.sh` 0 | MK-107, MK-112 | M10 | OWE-726 |
-| MK-173 | GUI Orca 마이그레이션 마법사 & Settings `Import from Orca` 카드(온보딩 v2 및 설정 연동) | M10 | P0 | 온보딩·Settings에서 Orca 데이터 감지·카테고리 선택·원클릭 이관 후 재시작 없이 사이드바·계정·SSH 즉시 반영, `scripts/check.sh` 0 | MK-172 | M10 | OWE-727 |
+| MK-173 | GUI Orca 마이그레이션 마법사 & Settings `Import from Orca` 카드(설정 연동; 첫 실행 온보딩 카드는 제거됨, 2026-10-18 OWE-904) | M10 | P0 | Settings에서 Orca 데이터 감지·카테고리 선택·원클릭 이관 후 재시작 없이 사이드바·계정·SSH 즉시 반영, `scripts/check.sh` 0 | MK-172 | M10 | OWE-727 |
 | MK-174 | 워크트리 공유 심볼릭 링크(`Worktree Symlinks`) & 저장소별 `setup`/`archive` 훅 고도화 | M10 | P1 | 새 워크트리 생성 시 등록된 공유 경로(`.env` 등) 자동 심볼릭 링크 생성 및 `setup`/`archive` 훅 동작 테스트 통과, `scripts/check.sh` 0 | MK-080 | M10 | OWE-728 |
 | MK-175 | 워크스페이스 디스크 용량 분석(`Space`) & 머지된 워크트리 일괄 클린업(`Cleanup`) | M10 | P1 | 워크트리별 용량 측정 및 PR 머지·경과일·clean 조건별 일괄 정리 CLI/GUI 테스트 통과, `scripts/check.sh` 0 | MK-043, MK-090 | M10 | OWE-729 |
 | MK-176 | 부모-자식 워크트리 계보 트리(`Worktree Lineage`) & 워크트리 탐색 히스토리(`Back`/`Forward` `⌘⌥←/→`) | M10 | P1 | 부모-자식 워크트리 계층 접기/펼치기 및 `⌘⌥←`/`⌘⌥→` 탐색 히스토리 이동 테스트 통과, `scripts/check.sh` 0 | MK-046 | M10 | OWE-730 |
