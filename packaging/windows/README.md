@@ -41,7 +41,15 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\bundle.ps1 -Version 0
 ```
 
 `packaging\dist\`(gitignore)에 `Krill\`과 zip을 만들고 zip의 SHA-256을 출력한다. 기존 산출물은 덮어쓰지 않는다.
-`latest.json`은 macOS와 같은 `packaging/macos/ed25519_manifest.py sign`으로 만든다(서명 형식이 플랫폼과 무관하다).
+Windows 매니페스트는 `latest-windows.json`이다. macOS와 같은 키·`packaging/macos/ed25519_manifest.py sign`으로 만든다(서명 형식이 플랫폼과 무관하다).
+macOS `latest.json`과 이름이 겹치지 않게 `-UpdateUrl`을 `…/releases/latest/download/latest-windows.json`으로 준다. 비우면 업데이터 기본값(macOS `latest.json`)을 본다.
+
+## 릴리스 워크플로 (OWE-839)
+
+`.github/workflows/release.yml`의 `build-windows` 잡이 위 빌드(`+crt-static`)·ConPTY nupkg 해시 확인·`bundle.ps1`을 돌려
+`Krill-<ver>-windows-x64.zip`·`.zip.sha256`·`latest-windows.json`을 만들고, `publish-windows` 잡이 macOS 잡이 끝난 뒤 같은 릴리스에 올린다.
+서명 비밀키는 저장소 시크릿 `KRILL_RELEASE_SIGNING_KEY`(macOS 업데이트 키와 같은 64hex 시드, `ed25519_manifest.py`가 읽는 환경 변수 이름)다.
+시크릿이 없으면 공개키 없는 zip(업데이터 꺼짐)만 올리고 매니페스트는 건너뛴다. Authenticode 서명 자리는 주석으로만 남겼다(OWE-838).
 
 ## 설치·업데이트·제거
 
