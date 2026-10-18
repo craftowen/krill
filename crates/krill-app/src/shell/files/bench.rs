@@ -21,15 +21,38 @@ fn footprint() -> Result<(u64, u64), String> {
         .args(["-f", "bytes", "-p", &std::process::id().to_string()])
         .output()
         .map_err(|e| e.to_string())?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    if !out.status.success() {
+        return Err(format!("footprint exited with {}", out.status));
+    }
+    parse_footprint(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_footprint(text: &str) -> Result<(u64, u64), String> {
     let field = |name: &str| {
         text.lines()
             .find_map(|l| l.trim_start().strip_prefix(name))
             .and_then(|rest| rest.split_whitespace().next())
-            .and_then(|n| n.parse::<u64>().ok())
+            .and_then(|n| n.replace(',', "").parse::<u64>().ok())
             .ok_or_else(|| format!("missing {name}"))
     };
     Ok((field("phys_footprint:")?, field("phys_footprint_peak:")?))
+}
+
+const fn within_budget(worst_bytes: u64) -> bool {
+    worst_bytes <= LIMIT
+}
+
+/// macOS `cx.quit()`(`[NSApp terminate:nil]`)은 `AppKit` 안에서 `exit(0)`을 직접 불러 `application().run`이
+/// 반환하지 않으므로, 실패 시에는 종료 코드 1을 직접 전달한다(OWE-779).
+fn finish(failed: bool, cx: &mut gpui::App) {
+    if failed {
+        #[expect(
+            clippy::exit,
+            reason = "macOS NSApplication terminate:가 exit(0)으로 끝내 run()이 반환하지 않으므로 벤치 실패 코드를 직접 전달한다"
+        )]
+        std::process::exit(1);
+    }
+    cx.quit();
 }
 
 pub(crate) fn run(dir: &std::path::Path) -> ExitCode {
@@ -55,7 +78,7 @@ pub(crate) fn run(dir: &std::path::Path) -> ExitCode {
         .run(move |cx| {
             crate::init(cx);
             let Some(main) = crate::open_shell(cx, None) else {
-                cx.quit();
+                finish(true, cx);
                 return;
             };
             cx.spawn(async move |cx| {
@@ -97,14 +120,18 @@ pub(crate) fn run(dir: &std::path::Path) -> ExitCode {
                     mark("switched").await?;
                     bg.timer(Duration::from_secs(15)).await;
                     mark("idle").await?;
-                    Ok::<_, Box<dyn std::error::Error>>(worst <= LIMIT)
+                    Ok::<_, Box<dyn std::error::Error>>(within_budget(worst))
                 }
                 .await;
-                match measured {
-                    Ok(pass) => result.store(!pass, Ordering::Relaxed),
-                    Err(error) => eprintln!("BENCH_ERROR {error}"),
-                }
-                cx.update(|cx| cx.quit());
+                let is_failed = match measured {
+                    Ok(pass) => !pass,
+                    Err(error) => {
+                        eprintln!("BENCH_ERROR {error}");
+                        true
+                    }
+                };
+                result.store(is_failed, Ordering::Relaxed);
+                cx.update(|cx| finish(is_failed, cx));
             })
             .detach();
         });
@@ -112,5 +139,27 @@ pub(crate) fn run(dir: &std::path::Path) -> ExitCode {
         ExitCode::FAILURE
     } else {
         ExitCode::SUCCESS
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn budget_rejects_peak_above_120_mib() {
+        assert!(within_budget(LIMIT));
+        assert!(within_budget(123_077_760));
+        assert!(!within_budget(LIMIT + 1));
+        assert!(!within_budget(126_895_232));
+    }
+
+    #[test]
+    fn parse_footprint_extracts_current_and_peak_bytes() {
+        let sample = "\
+            phys_footprint: 97256576 bytes\n\
+            phys_footprint_peak: 126895232 bytes\n";
+        assert_eq!(parse_footprint(sample), Ok((97_256_576, 126_895_232)));
+        assert!(parse_footprint("phys_footprint: 100 bytes\n").is_err());
     }
 }
