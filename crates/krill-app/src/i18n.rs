@@ -146,7 +146,25 @@ catalog! {
     }
     jump {
         PLACEHOLDER => ("세션 검색 (⌘J)", "Search sessions (⌘J)"),
+        PLACEHOLDER_COMMANDS => ("명령어 검색 (⇧⌘P)", "Search commands (⇧⌘P)"),
+        PLACEHOLDER_FILES => ("파일 열기 (⌘P)", "Open file (⌘P)"),
         EMPTY => ("일치하는 세션 없음", "No matching sessions"),
+        EMPTY_FILES => ("일치하는 파일 없음", "No matching files"),
+        HINT_MOVE => ("이동", "Move"),
+        HINT_OPEN => ("열기", "Open"),
+        HINT_CLOSE => ("닫기", "Close"),
+        SECTION_WORKTREES => ("워크트리", "Worktrees"),
+        SECTION_ACTIONS => ("액션", "Actions"),
+        SECTION_QUICK_COMMANDS => ("빠른 명령", "Quick commands"),
+        WORKTREE_NEW => ("새 세션", "New session"),
+        ACT_NEW_WORKTREE => ("새 워크트리 만들기", "New worktree"),
+        ACT_NEW_TAB => ("새 탭", "New tab"),
+        ACT_SPLIT_RIGHT => ("오른쪽에 분할", "Split right"),
+        ACT_SPLIT_DOWN => ("아래에 분할", "Split down"),
+        ACT_OPEN_SETTINGS => ("설정 열기", "Open settings"),
+        ACT_TOGGLE_SIDEBAR => ("사이드바 전환", "Toggle sidebar"),
+        ACT_TOGGLE_EXPLORER => ("파일 탐색기 전환", "Toggle file explorer"),
+        ACT_TOGGLE_SEARCH => ("파일 내용 검색 전환", "Toggle search in files"),
     }
     onboarding {
         TITLE => ("Krill 시작하기", "Get started with Krill"),
@@ -1078,6 +1096,7 @@ catalog! {
         SC_EXPLORER => ("파일 탐색기", "File explorer"),
         SC_WORKSPACE_SEARCH => ("파일 내용 검색", "Search in files"),
         SC_JUMP => ("빠른 이동", "Jump"),
+        SC_COMMAND_PALETTE => ("명령 팔레트", "Command palette"),
         SC_PREV_SESSION => ("이전 세션", "Previous session"),
         SC_NEXT_SESSION => ("다음 세션", "Next session"),
         SC_NAV_BACK => ("탐색 뒤로 이동", "Navigate back"),

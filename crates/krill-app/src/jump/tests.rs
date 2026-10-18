@@ -126,7 +126,8 @@ fn hangul_preedit_filters_and_keys_confirm(cx: &mut TestAppContext) {
     assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "한");
     assert_eq!(shown(&view, cx), [3, 1]);
 
-    cx.simulate_keystrokes("down down up down enter");
+    // OWE-862: ↑↓는 순환한다. 2행에서 down 3번은 0→1→0→1.
+    cx.simulate_keystrokes("down down down enter");
     assert_eq!(*events.borrow(), [Event::Confirm(SessionId(1))]);
     // 단일 행 입력이 위·아래를 먹지 않았다(커서·값 그대로).
     assert_eq!(cx.update(|_, cx| input.read(cx).value().to_string()), "한");
@@ -310,7 +311,162 @@ fn jump_palette_keyboard_navigates_vault_items_and_syncs_history_search(cx: &mut
     assert_eq!(cx.update(|_, cx| view.read(cx).matches().count()), 0);
     assert_eq!(cx.update(|_, cx| view.read(cx).vault_matches().count()), 2);
 
-    cx.simulate_keystrokes("down down up down enter");
+    // OWE-862: ↑↓는 순환한다. 2행에서 down 3번은 0→1→0→1.
+    cx.simulate_keystrokes("down down down enter");
     assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 1);
     assert_eq!(events.borrow().as_slice(), &[Event::ResumeVault(1)]);
+}
+
+fn worktree(id: &str, label: &str, session: Option<u64>) -> WorktreeEntry {
+    WorktreeEntry::new(
+        format!("/repo/{id}").into(),
+        label.into(),
+        Some("repo".into()),
+        session.map(SessionId),
+    )
+}
+
+#[test]
+fn worktree_and_action_search_rank_and_filter() {
+    let entries = vec![
+        worktree("main", "main", Some(1)),
+        worktree("feature-x", "feature-x", None),
+    ];
+    assert_eq!(worktree_search(&entries, ""), [0, 1]);
+    assert_eq!(worktree_search(&entries, "feat"), [1]);
+    assert_eq!(worktree_search(&entries, "main"), [0]);
+    // 경로는 검색되지만 한글 쿼리와 라틴 경로가 섞여도 깨지지 않는다.
+    assert_eq!(worktree_search(&entries, "repo").len(), 2);
+    assert!(worktree_search(&entries, "없는워크트리").is_empty());
+
+    let actions = vec![
+        ActionEntry::new(ActionKind::NewWorktree, "새 워크트리 만들기".into()),
+        ActionEntry::new(ActionKind::OpenSettings, "설정 열기".into()),
+    ];
+    assert_eq!(action_search(&actions, ""), [0, 1]);
+    assert_eq!(action_search(&actions, "설정"), [1]);
+    assert!(action_search(&actions, "없는액션").is_empty());
+}
+
+/// OWE-865: 섹션 순서(⌘J: 세션→워크트리→액션→빠른 명령, ⇧⌘P: 액션→빠른 명령→세션→워크트리)와
+/// ⌘1~9 행 즉시 선택(`jump_to_row`)이 이벤트로 이어진다.
+#[gpui::test]
+fn palette_sections_and_digit_jump_emit_events(cx: &mut TestAppContext) {
+    let (view, events, cx) = open(cx, vec![item(1, "claude 1 · main · 작업 중", false)]);
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.set_worktrees(
+                vec![
+                    worktree("main", "main", Some(1)),
+                    worktree("empty", "empty", None),
+                ],
+                cx,
+            );
+            p.set_actions(
+                vec![
+                    ActionEntry::new(ActionKind::NewWorktree, "새 워크트리 만들기".into()),
+                    ActionEntry::new(ActionKind::OpenSettings, "설정 열기".into()),
+                ],
+                cx,
+            );
+            p.set_quick_commands(
+                vec![crate::commands::QuickCommand {
+                    name: "상태".into(),
+                    text: "git status".into(),
+                }],
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    // Jump 모드: 세션 1 + 워크트리 2 + 액션 2 + 빠른 명령 1.
+    assert_eq!(cx.update(|_, cx| view.read(cx).row_count()), 6);
+
+    // 1행(세션 있는 워크트리) → 세션 열기.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| assert!(p.jump_to_row(1, cx)));
+    });
+    assert_eq!(events.borrow().as_slice(), &[Event::Confirm(SessionId(1))]);
+    events.borrow_mut().clear();
+
+    // 2행(세션 없는 워크트리) → 새 세션 만들기.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| assert!(p.jump_to_row(2, cx)));
+    });
+    assert_eq!(events.borrow().as_slice(), &[Event::OpenWorktree(1)]);
+    events.borrow_mut().clear();
+
+    // 3행(첫 액션) → 빠른 액션 실행.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| assert!(p.jump_to_row(3, cx)));
+    });
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[Event::Action(ActionKind::NewWorktree)]
+    );
+    events.borrow_mut().clear();
+
+    // 5행(빠른 명령) → 설정 인덱스 0 실행.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| assert!(p.jump_to_row(5, cx)));
+    });
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[Event::Action(ActionKind::QuickCommand(0))]
+    );
+    events.borrow_mut().clear();
+
+    // 범위를 벗어난 행은 무시한다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| assert!(!p.jump_to_row(6, cx)));
+    });
+    assert!(events.borrow().is_empty());
+
+    // Commands 모드: 액션이 맨 앞으로 온다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_mode(Mode::Commands, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).mode()), Mode::Commands);
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| assert!(p.jump_to_row(0, cx)));
+    });
+    assert_eq!(
+        events.borrow().as_slice(),
+        &[Event::Action(ActionKind::NewWorktree)]
+    );
+}
+
+/// OWE-862: ↑↓ 순환(끝에서 반대쪽으로) — 위·아래 모두 감싼다.
+#[gpui::test]
+fn palette_step_wraps_around(cx: &mut TestAppContext) {
+    let (view, events, cx) = open(cx, vec![item(1, "a", false), item(2, "b", false)]);
+    // 0에서 위로 가면 마지막 행, 마지막에서 아래로 가면 첫 행.
+    cx.simulate_keystrokes("up");
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 1);
+    cx.simulate_keystrokes("down");
+    assert_eq!(cx.update(|_, cx| view.read(cx).selected()), 0);
+    cx.simulate_keystrokes("enter");
+    assert_eq!(*events.borrow(), [Event::Confirm(SessionId(1))]);
+}
+
+/// OWE-862: ⌘P 파일 모드는 파일용 빈 문구·플레이스홀더를 쓰고 세션만 보여준다.
+#[gpui::test]
+fn files_mode_uses_file_empty_text(cx: &mut TestAppContext) {
+    let (view, _, cx) = open(cx, vec![item(1, "src/lib.rs", false)]);
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_mode(Mode::Files, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).mode()), Mode::Files);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).empty_text()),
+        "일치하는 파일 없음"
+    );
+    // 일치 없음 → 빈 행 0개, 힌트·빈 문구 선택자가 있다.
+    cx.simulate_input("없는파일zzz");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).row_count()), 0);
+    assert!(cx.debug_bounds("jump-empty").is_some());
+    assert!(cx.debug_bounds("jump-hint").is_some());
 }
