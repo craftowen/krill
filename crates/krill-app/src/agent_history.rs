@@ -673,6 +673,9 @@ impl Render for Panel {
                         div()
                             .id(id)
                             .debug_selector(move || id.into())
+                            .flex()
+                            .items_center()
+                            .gap_1()
                             .px_1p5()
                             .py_0p5()
                             .rounded(crate::ui::RADIUS_XS)
@@ -683,6 +686,13 @@ impl Render for Panel {
                             } else {
                                 p.secondary_foreground
                             })
+                            .children(agent.map(|ag| {
+                                crate::ui::icons::agent_brand_icon(
+                                    ag.profile(),
+                                    crate::ui::ICON_XS,
+                                    p.foreground,
+                                )
+                            }))
                             .child(label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.set_agent_filter(agent, cx);
@@ -727,12 +737,18 @@ impl Render for Panel {
                 } else {
                     format!("{} · {} ({})", hit.agent.profile(), hit.title, hit.id)
                 };
-                let mut detail = div()
-                    .flex_1()
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    .child(render_highlighted(&header_line, &self.query, p));
+                let mut detail = div().flex_1().flex().flex_col().overflow_hidden().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(crate::ui::icons::agent_brand_icon(
+                            hit.agent.profile(),
+                            crate::ui::ICON_SM,
+                            p.foreground,
+                        ))
+                        .child(render_highlighted(&header_line, &self.query, p)),
+                );
                 if !hit.snippet.is_empty() {
                     detail = detail.child(
                         div()

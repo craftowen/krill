@@ -178,8 +178,7 @@ impl Shell {
                             .action(Box::new(NewTab)),
                     );
                 for (i, profile) in settings.iter().flat_map(visible_profiles).enumerate() {
-                    let icon = gpui_component::Icon::default()
-                        .data(krill_app::ui::icons::agent_svg_bytes(&profile.id));
+                    let icon = krill_app::ui::icons::agent_menu_icon(&profile.id);
                     let click_this = this.clone();
                     let mut item = PopupMenuItem::new(profile.name.clone())
                         .icon(icon.clone())
@@ -197,7 +196,7 @@ impl Shell {
                         let this = this.clone();
                         let profile_id = profile.id.clone();
                         menu = menu.submenu_with_icon(
-                            Some(icon),
+                            Some(krill_app::ui::icons::agent_menu_icon(&profile.id)),
                             profile.name.clone(),
                             window,
                             cx,
