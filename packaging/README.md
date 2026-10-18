@@ -222,3 +222,11 @@ KRILL_GCP_PROJECT=<project> bash packaging/linux/build-gcp.sh VERSION
 
 `publish-github.sh`는 `KRILL_GCP_PROJECT`가 있으면 위 GCP 빌드를 돌리고, Linux tar.gz와
 `install-linux.sh`를 릴리스 자산에 넣는다. 원격 머신 설치는 `install-linux.sh`(→ `~/.local/bin`).
+
+원격 Linux 요구사항(2026-10-18 실측):
+- glibc 2.34 이상(Ubuntu 22.04+, Debian 12+, RHEL/Rocky 9+), 커널 5.9 이상. Rocky 8(glibc 2.28)에서는
+  `install-linux.sh`가 설치 전에 멈추고 원인을 알린다.
+- systemd-logind `KillUserProcesses=yes`이면 데몬을 깨운 ssh 로그인이 끝나는 순간 데몬이 죽어 연결할 수 없다
+  (Ubuntu 22.04 GCP VM에서 재현). `KillExcludeUsers=<사용자>`를 넣으면 해결된다(같은 VM에서 확인).
+  Ubuntu·Debian·RHEL 기본값은 `no`.
+- 이미 설치된 머신에 다시 설치하면 `krill update`가 실행 중인 데몬을 세션을 유지한 채 교체한다.
