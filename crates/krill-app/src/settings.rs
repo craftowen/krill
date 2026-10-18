@@ -3024,14 +3024,30 @@ impl SettingsView {
                     set_language(language, cx);
                 })
         };
-        let zoom_pct = format!("{:.0}%", s.zoom() * 100.);
+        let zoom_val = s.zoom();
+        let zoom_pct = format!("{:.0}%", zoom_val * 100.);
+        let zoom_at_min = zoom_val <= ZOOM_MIN + f32::EPSILON;
+        let zoom_at_max = zoom_val >= ZOOM_MAX - f32::EPSILON;
+        let zoom_at_default = (zoom_val - 1.0).abs() < f32::EPSILON;
+        let notif_disabled = !s.notifications;
         let row = || layout::row(p);
+        let sub_notif_row = |id: &'static str| {
+            layout::row(p)
+                .id(id)
+                .debug_selector(move || id.into())
+                .when(notif_disabled, |d| d.opacity(0.5))
+        };
         let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
         div()
             .flex()
             .flex_col()
             .gap_3()
             .children(crate::orca_import::render_banner("settings-general", cx))
+            .child(layout::section_title(
+                p,
+                "general-section-appearance",
+                text::SECTION_APPEARANCE.get(),
+            ))
             .child(
                 row()
                     .child(label(text::LANGUAGE.get(), text::LANGUAGE_DESC.get()))
@@ -3050,9 +3066,9 @@ impl SettingsView {
                         layout::controls().child(layout::segmented_control(
                             p,
                             [
-                                ("theme-system", text::SYSTEM.get(), ThemeChoice::System),
-                                ("theme-light", text::LIGHT.get(), ThemeChoice::Light),
                                 ("theme-dark", text::DARK.get(), ThemeChoice::Dark),
+                                ("theme-light", text::LIGHT.get(), ThemeChoice::Light),
+                                ("theme-system", text::SYSTEM.get(), ThemeChoice::System),
                             ]
                             .into_iter()
                             .map(|(id, l, choice)| theme_button(id, l, choice)),
@@ -3065,30 +3081,40 @@ impl SettingsView {
                     .child(
                         layout::controls()
                             .child(
-                                layout::ghost("zoom-out", "−")
+                                layout::secondary("zoom-out", "−")
+                                    .disabled(zoom_at_min)
                                     .debug_selector(|| "zoom-out".into())
                                     .on_click(|_, _, cx| edit(cx, |s| s.zoom = s.zoom_step(-1))),
                             )
                             .child(
                                 div()
-                                    .w_12()
+                                    .id("zoom-value")
+                                    .debug_selector(|| "zoom-value".into())
+                                    .w(px(48.))
                                     .text_center()
-                                    .font_family(crate::ui::FONT_UI)
+                                    .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_SM)
                                     .child(zoom_pct),
                             )
                             .child(
-                                layout::ghost("zoom-in", "+")
+                                layout::secondary("zoom-in", "+")
+                                    .disabled(zoom_at_max)
                                     .debug_selector(|| "zoom-in".into())
                                     .on_click(|_, _, cx| edit(cx, |s| s.zoom = s.zoom_step(1))),
                             )
                             .child(
                                 layout::ghost("zoom-reset", text::RESET.get())
+                                    .disabled(zoom_at_default)
                                     .debug_selector(|| "zoom-reset".into())
                                     .on_click(|_, _, cx| edit(cx, |s| s.zoom = 1.0)),
                             ),
                     ),
             )
+            .child(layout::section_title(
+                p,
+                "general-section-notifications",
+                text::SECTION_NOTIFICATIONS.get(),
+            ))
             .child(
                 row()
                     .child(label(
@@ -3104,7 +3130,7 @@ impl SettingsView {
                     ))),
             )
             .child(
-                row()
+                sub_notif_row("notify-input-row")
                     .child(label(
                         text::NOTIFY_INPUT.get(),
                         text::NOTIFY_INPUT_DESC.get(),
@@ -3113,56 +3139,45 @@ impl SettingsView {
                         p,
                         "notify-input-toggle",
                         s.notify_on_input,
-                        false,
+                        notif_disabled,
                         |next, _, cx| edit(cx, |s| s.notify_on_input = next),
                     ))),
             )
             .child(
-                row()
+                sub_notif_row("notify-done-row")
                     .child(label(text::NOTIFY_DONE.get(), text::NOTIFY_DONE_DESC.get()))
                     .child(layout::controls().child(layout::switch(
                         p,
                         "notify-done-toggle",
                         s.notify_on_done,
-                        false,
+                        notif_disabled,
                         |next, _, cx| edit(cx, |s| s.notify_on_done = next),
                     ))),
             )
             .child(
-                row()
+                sub_notif_row("notify-bell-row")
                     .child(label(text::NOTIFY_BELL.get(), text::NOTIFY_BELL_DESC.get()))
                     .child(layout::controls().child(layout::switch(
                         p,
                         "notify-bell-toggle",
                         s.notify_on_bell,
-                        false,
+                        notif_disabled,
                         |next, _, cx| edit(cx, |s| s.notify_on_bell = next),
                     ))),
             )
             .child(
-                row()
-                    .child(label(text::TEST_NOTIFY.get(), text::TEST_NOTIFY_DESC.get()))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary("send-test-notification", text::TEST_NOTIFY.get())
-                                .debug_selector(|| "send-test-notification".into())
-                                .on_click(|_, _, cx| crate::alert::send_test_notification(cx)),
-                        ),
-                    ),
-            )
-            .child(
-                row()
+                sub_notif_row("notify-sound-row")
                     .child(label(text::ALERT_SOUND.get(), text::ALERT_SOUND_DESC.get()))
                     .child(layout::controls().child(layout::switch(
                         p,
                         "sound-toggle",
                         s.notification_sound,
-                        false,
+                        notif_disabled,
                         |next, _, cx| edit(cx, |s| s.notification_sound = next),
                     ))),
             )
             .child(
-                row()
+                sub_notif_row("notify-inactive-row")
                     .child(label(
                         text::INACTIVE_ONLY.get(),
                         text::INACTIVE_ONLY_DESC.get(),
@@ -3171,10 +3186,27 @@ impl SettingsView {
                         p,
                         "notify-inactive-toggle",
                         s.notify_only_inactive,
-                        false,
+                        notif_disabled,
                         |next, _, cx| edit(cx, |s| s.notify_only_inactive = next),
                     ))),
             )
+            .child(
+                sub_notif_row("notify-test-row")
+                    .child(label(text::TEST_NOTIFY.get(), text::TEST_NOTIFY_DESC.get()))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary("send-test-notification", text::TEST_NOTIFY.get())
+                                .disabled(notif_disabled)
+                                .debug_selector(|| "send-test-notification".into())
+                                .on_click(|_, _, cx| crate::alert::send_test_notification(cx)),
+                        ),
+                    ),
+            )
+            .child(layout::section_title(
+                p,
+                "general-section-power",
+                text::SECTION_POWER.get(),
+            ))
             .child(
                 row()
                     .child(label(text::KEEP_AWAKE.get(), text::KEEP_AWAKE_DESC.get()))
@@ -3182,15 +3214,20 @@ impl SettingsView {
                         layout::controls().child(layout::segmented_control(
                             p,
                             [
-                                ("awake-on", text::AWAKE_ON.get(), KeepAwake::On),
-                                ("awake-agent", text::AWAKE_AGENT.get(), KeepAwake::Agent),
                                 ("awake-off", text::AWAKE_OFF.get(), KeepAwake::Off),
+                                ("awake-agent", text::AWAKE_AGENT.get(), KeepAwake::Agent),
+                                ("awake-on", text::AWAKE_ON.get(), KeepAwake::On),
                             ]
                             .into_iter()
                             .map(|(id, l, mode)| awake_button(id, l, mode)),
                         )),
                     ),
             )
+            .child(layout::section_title(
+                p,
+                "general-section-files",
+                text::SECTION_FILES_UPDATES.get(),
+            ))
             .child(
                 row()
                     .child(label(text::FILES_TITLE.get(), text::FILES_DESC.get()))
@@ -3316,14 +3353,16 @@ impl SettingsView {
                 ))),
         ]
     }
-    /// 터미널 탭(OWE-658): 글꼴·크기·투명도·기본 커서·Option 키·선택 복사.
+    /// 터미널 탭(OWE-658, OWE-798): 글꼴·크기·투명도·기본 커서·Option 키·선택 복사.
     fn render_terminal_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
         let p = crate::ui::palette(cx);
         let row = || layout::row(p);
         let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
-        let font_pt = format!("{}pt", s.terminal_font_size());
-        let opacity_pct = format!("{}%", s.terminal_opacity_pct());
+        let font_size = s.terminal_font_size();
+        let font_pt = format!("{font_size}pt");
+        let opacity_val = s.terminal_opacity_pct();
+        let opacity_pct = format!("{opacity_val}%");
         let family = s.terminal_font_family.clone();
         let font_family = layout::secondary("terminal-font-family", family.clone())
             .debug_selector(|| "terminal-font-family".into())
@@ -3351,6 +3390,11 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
+            .child(layout::section_title(
+                p,
+                "terminal-section-appearance",
+                text::SECTION_TERMINAL_APPEARANCE.get(),
+            ))
             .child(
                 row()
                     .child(label(
@@ -3365,7 +3409,8 @@ impl SettingsView {
                     .child(
                         layout::controls()
                             .child(
-                                layout::ghost("font-dec", "−")
+                                layout::secondary("font-dec", "−")
+                                    .disabled(font_size <= 10)
                                     .debug_selector(|| "font-dec".into())
                                     .on_click(|_, _, cx| {
                                         edit(cx, |s| {
@@ -3376,14 +3421,17 @@ impl SettingsView {
                             )
                             .child(
                                 div()
-                                    .w_12()
+                                    .id("font-size-value")
+                                    .debug_selector(|| "font-size-value".into())
+                                    .w(px(48.))
                                     .text_center()
-                                    .font_family(crate::ui::FONT_UI)
+                                    .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_SM)
                                     .child(font_pt),
                             )
                             .child(
-                                layout::ghost("font-inc", "+")
+                                layout::secondary("font-inc", "+")
+                                    .disabled(font_size >= 24)
                                     .debug_selector(|| "font-inc".into())
                                     .on_click(|_, _, cx| {
                                         edit(cx, |s| {
@@ -3394,6 +3442,7 @@ impl SettingsView {
                             )
                             .child(
                                 layout::ghost("font-reset", text::RESET.get())
+                                    .disabled(font_size == default_terminal_font_size())
                                     .tooltip(text::FONT_RESET.get())
                                     .debug_selector(|| "font-reset".into())
                                     .on_click(|_, _, cx| {
@@ -3410,7 +3459,8 @@ impl SettingsView {
                     .child(
                         layout::controls()
                             .child(
-                                layout::ghost("opacity-dec", "−")
+                                layout::secondary("opacity-dec", "−")
+                                    .disabled(opacity_val <= 50)
                                     .debug_selector(|| "opacity-dec".into())
                                     .on_click(|_, _, cx| {
                                         edit(cx, |s| {
@@ -3421,14 +3471,17 @@ impl SettingsView {
                             )
                             .child(
                                 div()
-                                    .w_12()
+                                    .id("opacity-value")
+                                    .debug_selector(|| "opacity-value".into())
+                                    .w(px(48.))
                                     .text_center()
-                                    .font_family(crate::ui::FONT_UI)
+                                    .font_family(crate::ui::FONT_MONO)
                                     .text_size(crate::ui::TEXT_SM)
                                     .child(opacity_pct),
                             )
                             .child(
-                                layout::ghost("opacity-inc", "+")
+                                layout::secondary("opacity-inc", "+")
+                                    .disabled(opacity_val >= 100)
                                     .debug_selector(|| "opacity-inc".into())
                                     .on_click(|_, _, cx| {
                                         edit(cx, |s| {
@@ -3439,6 +3492,7 @@ impl SettingsView {
                             )
                             .child(
                                 layout::ghost("opacity-reset", text::RESET.get())
+                                    .disabled(opacity_val == default_terminal_opacity_pct())
                                     .debug_selector(|| "opacity-reset".into())
                                     .on_click(|_, _, cx| {
                                         edit(cx, |s| s.terminal_opacity_pct = 100);
@@ -3446,6 +3500,11 @@ impl SettingsView {
                             ),
                     ),
             )
+            .child(layout::section_title(
+                p,
+                "terminal-section-cursor",
+                text::SECTION_TERMINAL_CURSOR.get(),
+            ))
             .child(
                 row()
                     .child(label(
@@ -3491,6 +3550,11 @@ impl SettingsView {
                         |next, _, cx| edit(cx, |s| s.terminal_cursor_blink = next),
                     ))),
             )
+            .child(layout::section_title(
+                p,
+                "terminal-section-keyboard",
+                text::SECTION_TERMINAL_KEYBOARD.get(),
+            ))
             .child(
                 row()
                     .child(label(
