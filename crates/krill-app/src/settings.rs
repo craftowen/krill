@@ -7445,8 +7445,11 @@ impl Render for SettingsView {
                 div().flex_1().min_h_0().w_full().flex().child(nav).child(
                     div().flex_1().min_w_0().h_full().flex().flex_col().child(
                         div()
-                            .id("admin-content")
+                            // 탭별 스크롤 id: 탭 전환 시 스크롤 위치를 최상단으로 되돌린다(OWE-858).
+                            .id(("admin-content", current_tab as usize))
+                            .debug_selector(|| "admin-content".into())
                             .flex_1()
+                            .min_h_0()
                             .min_w_0()
                             .overflow_y_scroll()
                             .px_8()
