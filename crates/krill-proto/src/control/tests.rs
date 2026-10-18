@@ -962,27 +962,36 @@ fn resume_and_hibernation_account_tails_decode_old_bytes() {
     }
 }
 
-/// `Failure::Os`는 와이어에 macOS errno 번호로 실린다. Linux 원격의 ENOSYS(38)가 Mac에서 ENOSYS(78)로 읽혀야 한다.
+/// `Failure::Os` 와이어: 같은 OS끼리는 늘 원래 errno로 돌아오고, Linux 번호는 표식으로 구분돼 macOS가 아는 것만 옮긴다.
 #[test]
 fn os_failure_errno_travels_in_macos_numbering() {
     use super::wire_errno::{from_wire, to_wire};
-    // 1~34는 두 OS가 같아 그대로다.
-    assert_eq!(to_wire(2), 2);
-    assert_eq!(from_wire(13), 13);
+    for errno in [1, 2, 11, 13, 34, 35, 38, 40, 62, 63, 78, 110, 4000] {
+        assert_eq!(
+            from_wire(to_wire(errno)),
+            errno,
+            "same-OS roundtrip {errno}"
+        );
+    }
     #[cfg(target_os = "linux")]
     {
-        assert_eq!(to_wire(38), 78);
-        assert_eq!(from_wire(78), 38);
-        assert_eq!(to_wire(11), 35);
-        assert_eq!(from_wire(35), 11);
+        assert_eq!(to_wire(2), 2);
+        assert_eq!(to_wire(38), 10_038);
+        assert_eq!(from_wire(78), 38, "원격 Mac의 ENOSYS");
     }
-    for errno in [1, 2, 11, 35, 38, 62, 63, 78, 110] {
-        assert_eq!(from_wire(to_wire(errno)), errno);
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(to_wire(78), 78);
+        assert_eq!(from_wire(10_038), 78, "Linux ENOSYS → macOS ENOSYS");
+        assert_eq!(
+            from_wire(10_062),
+            10_062,
+            "모르는 Linux 번호는 틀린 문구 대신 그대로"
+        );
+        assert_eq!(
+            roundtrip(&Reply::Failed(Failure::Os(78))),
+            "050000003103069c01",
+            "macOS 와이어 바이트 불변"
+        );
     }
-    // ENOSYS 바이트는 두 OS에서 같다(macOS 78 = Linux 38 → 와이어 78).
-    let enosys = if cfg!(target_os = "linux") { 38 } else { 78 };
-    assert_eq!(
-        roundtrip(&Reply::Failed(Failure::Os(enosys))),
-        "050000003103069c01"
-    );
 }
