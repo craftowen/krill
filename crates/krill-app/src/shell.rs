@@ -4336,6 +4336,25 @@ fn divider(id: ElementId, drag: Drag, axis: Axis, cx: &mut Context<Shell>) -> im
         }))
 }
 
+impl Shell {
+    /// OWE-855: 메인 창 제목. 포커스 칸 세션의 워크트리가 있으면 "Krill — <워크트리>".
+    fn main_window_title(&self, cx: &App) -> String {
+        let tree = self.layout.focused().and_then(|pane| {
+            let id = self.layout.session(pane)?;
+            let session = self
+                .sidebar
+                .read(cx)
+                .session_on(self.layout.host(pane), id)?;
+            let name = session.worktree.as_ref()?.file_name()?.to_string_lossy();
+            Some(krill_app::security::sanitize_title(&name))
+        });
+        match tree {
+            Some(name) if !name.is_empty() => format!("{} — {name}", text::APP_TITLE.get()),
+            _ => text::APP_TITLE.get().to_owned(),
+        }
+    }
+}
+
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window = Some(window.window_handle());
@@ -4349,7 +4368,7 @@ impl Render for Shell {
             if self.settings.is_some() {
                 window.set_window_title(krill_app::i18n::catalog::settings::TITLE.get());
             } else {
-                window.set_window_title(text::APP_TITLE.get());
+                window.set_window_title(&self.main_window_title(cx));
             }
         }
         if self.language != krill_app::i18n::language() {
