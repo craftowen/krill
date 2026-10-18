@@ -215,7 +215,7 @@ impl Rig {
     /// 명령줄에 이 상태 디렉터리가 들어간 프로세스(`name`이 비면 전부) 중 정리 대상에 없는 것.
     fn strays(&self, name: &str) -> Vec<u32> {
         let q = format!(
-            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' -and $_.Name -like '*{name}' }} | ForEach-Object {{ $_.ProcessId }}",
+            "Get-CimInstance Win32_Process | Where-Object {{ $_.CommandLine -like '*{}*' -and $_.Name -like '*{name}' }} | ForEach-Object {{ \"$($_.ProcessId) $($_.Name)\" }}",
             self.dir.display()
         );
         let o = Command::new("powershell.exe")
@@ -224,7 +224,11 @@ impl Rig {
             .unwrap();
         String::from_utf8_lossy(&o.stdout)
             .lines()
-            .filter_map(|l| l.trim().parse().ok())
+            .filter_map(|l| {
+                // 이 조회를 하는 powershell 자신도 명령줄에 상태 디렉터리가 들어 있다.
+                let (pid, name) = l.trim().split_once(' ')?;
+                (name != "powershell.exe").then(|| pid.parse().ok())?
+            })
             .filter(|p| !self.pids.contains(p) && *p != std::process::id())
             .collect()
     }
@@ -1055,7 +1059,7 @@ fn holder_taskkill_keeps_orphan_serving() {
             rows: 25,
         }),
     );
-    // 앱식 재접속: 고아 krilld를 보면 새 holder를 띄워 재결합을 시도한다(Windows Adopt 미구현 → 실패를 기록).
+    // 앱식 재접속: Windows는 Adopt 전까지 새 holder를 띄우지 않고 고아 krilld에 그대로 붙는다(daemon::ready_handshake).
     let t_re = Instant::now();
     let (mut child, rx) = spawn("launch", &rig.dir, &[]);
     let reconnect = rx.recv_timeout(WAIT * 2).unwrap().replace(' ', ":");

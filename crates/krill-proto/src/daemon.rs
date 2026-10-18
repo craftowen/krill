@@ -122,7 +122,8 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
         let consumed = reader.read;
         match frame {
             Ok(Some((kind, body))) if kind == HOLDER_STATUS => {
-                if HolderStatus::decode(kind, &body)? == HolderStatus::Orphan {
+                // Windows는 Adopt 전까지 고아 krilld를 계속 쓴다(ready_handshake 참고) — 상실 통보로 깨지 않는다.
+                if cfg!(unix) && HolderStatus::decode(kind, &body)? == HolderStatus::Orphan {
                     return Ok(());
                 }
             }
@@ -478,7 +479,7 @@ pub fn watch_hello(role: ClientRole, name: &str) -> ClientHello {
 /// krilld 종료·크래시 또는 holder 상실 통보까지 막고 기다린다(유휴 웨이크업 없음).
 pub fn wait_closed(stream: &mut UnixStream) {
     while let Ok(Some((kind, body))) = ipc::read_frame(stream) {
-        if HolderStatus::decode(kind, &body) == Ok(HolderStatus::Orphan) {
+        if cfg!(unix) && HolderStatus::decode(kind, &body) == Ok(HolderStatus::Orphan) {
             return;
         }
     }
@@ -720,7 +721,9 @@ fn ready_handshake(socket: &Path, hello: &ClientHello) -> io::Result<Option<Conn
     // 호출자가 기한을 명시한 handshake/dial 경로와 hook(수십 ms 예산)은 그대로 둔다.
     let first_hello = default_hello_timeout(hello.role);
     let c = handshake(socket, &watch, first_hello)?;
-    if c.holder_status == Some(HolderStatus::Orphan) {
+    // Windows holder는 아직 Adopt(새 holder 재결합)를 못 한다. 새 holder를 띄우면 재결합 없이 5초 Timeout 뒤
+    // holder+krilld가 남으므로(OWE-836 실측), 고아 krilld에 그대로 붙어 기존 세션을 계속 쓴다(새 세션은 NoHolder).
+    if cfg!(unix) && c.holder_status == Some(HolderStatus::Orphan) {
         return Ok(None);
     }
     if is_watch(hello.features) {
