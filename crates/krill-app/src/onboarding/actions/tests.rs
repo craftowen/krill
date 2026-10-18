@@ -253,13 +253,32 @@ fn hook_consent_cancellation_never_applies_and_acceptance_applies_once(
             atext::CANCEL.get()
         });
         cx.run_until_parked();
-        assert_eq!(result.borrow().as_ref().unwrap().is_ok(), accepted);
+        if accepted {
+            assert_eq!(*result.borrow(), Some(Ok(())));
+        } else {
+            assert_eq!(*result.borrow(), Some(Err(FixError::Cancelled)));
+        }
     }
     assert_eq!(
         executor.applied.load(std::sync::atomic::Ordering::SeqCst),
         1
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn hook_needed_banner_uses_display_name() {
+    for (id, name) in [
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("agy", "Antigravity"),
+        ("opencode", "OpenCode"),
+    ] {
+        let agent = TargetAgent::parse(id).unwrap_or_else(|| panic!("parse {id}"));
+        let (check_id, message) = hook_needed_content(agent);
+        assert_eq!(check_id, format!("hook.{id}"));
+        assert_eq!(message, atext::HOOK_NEEDED.format(&[("agent", name)]));
+    }
 }
 
 #[gpui::test]

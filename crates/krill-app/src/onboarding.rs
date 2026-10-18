@@ -333,7 +333,7 @@ pub(crate) fn install_codex_hook_with_login_path(
 }
 
 /// diff를 [`DIFF_LINES`]줄로 줄인다. 줄 단위라 한글이 잘리지 않는다.
-pub(super) fn clip(diff: &str, agent: Agent) -> String {
+pub(super) fn clip(diff: &str, agent_id: &str) -> String {
     let lines: Vec<&str> = diff.lines().collect();
     let mut shown = lines
         .iter()
@@ -347,7 +347,7 @@ pub(super) fn clip(diff: &str, agent: Agent) -> String {
             &text::DIFF_MORE
                 .get()
                 .replace("{n}", &more.to_string())
-                .replace("{id}", agent.id()),
+                .replace("{id}", agent_id),
         );
     }
     shown
@@ -388,6 +388,12 @@ pub fn init_actions(cx: &mut App) {
             rerun_onboarding(&env, cx);
         }
     });
+    // 마법사(점검) 창의 macOS 표준 ⌘W 닫기(OWE-878). Esc는 마법사 `on_key_down`이 맡는다.
+    cx.bind_keys([gpui::KeyBinding::new(
+        "cmd-w",
+        welcome::CloseWizard,
+        Some(welcome::KEY_CONTEXT),
+    )]);
 }
 
 /// 현재 환경으로 점검 창을 연다. 메뉴·설정·상태바 진입점이 함께 쓴다.
@@ -794,13 +800,13 @@ fn match_template<'a, 't>(template: &'t str, text: &'a str) -> Option<Vec<(&'t s
     rest.is_empty().then_some(fields)
 }
 
-fn agent_name(id: &str) -> &str {
+pub(super) fn agent_name(id: &str) -> &str {
     match id {
         "codex" => "Codex",
         "opencode" => "OpenCode",
         "cursor" => "Cursor",
         "claude" => "Claude Code",
-        "agy" => "Agy",
+        "agy" | "antigravity" => "Antigravity",
         _ => id,
     }
 }
