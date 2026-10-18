@@ -675,11 +675,17 @@ mod wire_errno {
         if wire > LINUX_TAG {
             return wire.saturating_sub(LINUX_TAG);
         }
-        // macOS 피어(원격 Mac 호스트)의 번호: 아는 것만 Linux 번호로.
+        // 1~34는 Linux 피어가 보낸 같은 번호다. 그보다 큰 값은 macOS 피어(원격 Mac 호스트)의 번호라 아는 것만 옮긴다.
+        if wire <= SHARED_MAX {
+            return wire;
+        }
         if wire == MACOS_EAGAIN {
             return LINUX_EAGAIN;
         }
-        PAIRS.iter().find(|p| p.1 == wire).map_or(wire, |p| p.0)
+        PAIRS
+            .iter()
+            .find(|p| p.1 == wire && p.1 > SHARED_MAX)
+            .map_or(wire, |p| p.0)
     }
     #[cfg(not(target_os = "linux"))]
     pub(super) fn to_wire(local: i32) -> i32 {
