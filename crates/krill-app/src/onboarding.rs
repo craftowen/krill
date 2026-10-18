@@ -1,16 +1,13 @@
-//! 첫 실행 온보딩 마법사(MK-073 뼈대, MK-161 4단계: 동의→점검→연결→완료).
+//! 첫 실행 온보딩(MK-073 뼈대, MK-127·OWE-904: 첫 실행 모달 없음).
 //!
-//! - 동의: [`consent`] 기록이 없거나 구버전이면 먼저 묻는다. 거절은 앱만 끝낸다.
-//! - 점검: staged `krill doctor --json --no-start` + `app.*`를 등급별 그룹으로 보여준다.
+//! - 첫 실행: 모달을 띄우지 않는다. [`offer`]가 완료를 남기고 비번들 스테이징·자동 준비만
+//!   백그라운드로 돌린다. 꼭 필요한 설치 안내는 조치 배너([`banner`])와 빠른 점검
+//!   ([`spawn_quick_check`]) → 상태바 경고 → 점검 모달로 한다.
+//! - 점검 모달: staged `krill doctor --json --no-start` + `app.*`를 등급별 그룹으로 보여준다.
 //!   행의 수정 버튼·모두 다시 검사·창 재포커스 재검사(1초 디바운스)는 [`welcome`]에 있다.
-//! - 연결: 감지된 에이전트별 hook 설치(diff 미리보기 30줄, [`DIFF_LINES`])와 `krill` CLI
-//!   링크를 창 안에서 한다. 기존 함수(`mk_hook`·`stage_binaries`·`install_cli_link`·
-//!   `pending_hooks`·`Cli` 판정)를 그대로 쓴다.
-//! - 완료: `onboarding.toml` 상태기계([`state`])에 완료를 남긴다. 구 `done` 파일은
-//!   마이그레이션 입력으로만 읽는다.
-//!
-//! 텔레메트리 단계는 없다(ARCHITECTURE §3: v1 없음). "나중에"를 고르면 저장된 단계부터
-//! 다음 실행에 다시 묻고, 끝까지 가면(건너뛰기 포함) 다시 묻지 않는다.
+//!   hook 설치(diff 미리보기 30줄, [`DIFF_LINES`])와 `krill` CLI 링크도 행 안에서 한다.
+//! - 완료: `onboarding.toml`([`state`])에 완료를 남긴다. 구 `done` 파일은 마이그레이션
+//!   입력으로만 읽는다.
 
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _};
@@ -20,13 +17,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use gpui::{App, KeyBinding, Window, actions};
+use gpui::{App, KeyBinding, actions};
 use krill_proto::agent::hooks::Agent;
 use krill_proto::agent::{self, Agents};
 use krill_proto::doctor::{Check, Fix, FixKind, Level, Status};
 use rustix::fs::{Access, access};
 
-actions!(onboarding, [OpenChecks, RerunOnboarding, CloseWizard]);
+actions!(onboarding, [OpenChecks, CloseWizard]);
 
 /// 끝까지 간 뒤 상태 디렉터리에 만드는 표시 파일(구 방식, 마이그레이션 입력으로만 읽는다).
 pub const DONE_FILE: &str = "onboarding.done";
@@ -353,18 +350,12 @@ pub(super) fn clip(diff: &str, agent_id: &str) -> String {
     shown
 }
 
-/// 메인 창(`Shell`)이 온보딩 모달을 인앱으로 열 때 쓰는 명령(OWE-903).
+/// 메인 창(`Shell`)이 점검 모달을 인앱으로 열 때 쓰는 명령(OWE-903).
 /// 별도 OS 창을 띄우지 않고 메인 창 안 `ui::modal_backdrop` 모달로 연다.
 #[derive(Clone, Debug)]
 pub enum HostCommand {
-    /// 온보딩 모달을 연다. 이미 열려 있으면 앞으로 가져온다(상태는 유지).
-    Open {
-        env: Env,
-        start: state::Step,
-        consent_only: bool,
-    },
-    /// 온보딩을 1단계부터 다시 실행한다. 열려 있으면 동의부터 다시 시작한다.
-    Rerun { env: Env },
+    /// 점검 모달을 연다. 이미 열려 있으면 앞으로 가져온다(상태는 유지).
+    Open { env: Env },
 }
 
 type HostHandler = std::rc::Rc<dyn Fn(&HostCommand, &mut App) -> Option<bool>>;
@@ -428,37 +419,18 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
     handled
 }
 
-/// 첫 실행 진입. 동의가 필요하면 첫 화면 1장(동의 + 기본 에이전트 + [시작하기]) 모달을 열고,
-/// 동의가 최신이면 창 없이 비번들 스테이징 바이너리만 최신 빌드로 갱신한다.
-///
-/// 이미 완료한 사용자(`onboarding.toml` completed 또는 구 `done` 파일)에게 다시 동의가
-/// 필요하면 동의만 묻는다(`consent_only`, MK-127). 구 4단계 흐름 중간(점검·연결·완료)에서
-/// 멈춘 사용자는 동의가 이미 있으므로 완료로 넘긴다(OWE-714: 체크리스트는 설정 점검에서만).
-///
-/// 첫 실행 때는 메인 창이 먼저 떠 있고 그 안에 모달이 뜨므로(`main.rs`가 창을 먼저 만든다),
-/// 별도 OS 창은 띄우지 않는다(OWE-903).
-pub fn offer(env: Env, _window: &mut Window, cx: &mut App) {
+/// 첫 실행 진입. 모달 없이 완료를 남기고, 격리 상태가 아니면 비번들 스테이징 바이너리
+/// 갱신·자동 준비를 백그라운드로 돌린다(OWE-904). 준비 중 필요한 조치는 조치 배너가 알린다.
+pub fn offer(env: Env, cx: &mut App) {
     let stored = state::load(&env.state);
-    if !consent::needs_consent(&env.state) {
-        if !stored.completed
-            && let Err(e) = state::save(&env.state, &stored.completed())
-        {
-            tracing::warn!(%e, "onboarding completion save failed");
-        }
-        if !env.is_isolated_state() {
-            actions::auto_prepare(env, cx).detach();
-        }
-        return;
+    if !stored.completed
+        && let Err(e) = state::save(&env.state, &stored.completed())
+    {
+        tracing::warn!(%e, "onboarding completion save failed");
     }
-    dispatch_host(
-        HostCommand::Open {
-            env,
-            start: state::Step::Consent,
-            consent_only: stored.completed,
-        },
-        "offer",
-        cx,
-    );
+    if !env.is_isolated_state() {
+        actions::auto_prepare(env, cx).detach();
+    }
 }
 
 /// 메뉴·팔레트 액션을 등록한다. 앱 시작 때 한 번 부른다.
@@ -466,11 +438,6 @@ pub fn init_actions(cx: &mut App) {
     // OWE-861: 점검 창에서도 ⌘W로 닫힌다(⌥⌘W는 전역 CloseWindow가 맡는다).
     cx.bind_keys([KeyBinding::new("cmd-w", CloseWizard, Some("Wizard"))]);
     cx.on_action(|_: &OpenChecks, cx| open_checks_current(cx));
-    cx.on_action(|_: &RerunOnboarding, cx| {
-        if let Some(env) = Env::current() {
-            rerun_onboarding(&env, cx);
-        }
-    });
     // 마법사(점검) 창의 macOS 표준 ⌘W 닫기(OWE-878). Esc는 마법사 `on_key_down`이 맡는다.
     cx.bind_keys([gpui::KeyBinding::new(
         "cmd-w",
@@ -486,26 +453,9 @@ pub fn open_checks_current(cx: &mut App) {
     }
 }
 
-/// 점검 모달(체크리스트 단독, 동의 생략)을 연다. 이미 열려 있으면 앞으로 가져온다.
+/// 점검 모달을 연다. 이미 열려 있으면 앞으로 가져온다.
 pub fn open_checks(env: &Env, cx: &mut App) {
-    dispatch_host(
-        HostCommand::Open {
-            env: env.clone(),
-            start: state::Step::Checklist,
-            consent_only: false,
-        },
-        "open_checks",
-        cx,
-    );
-}
-
-/// 온보딩을 1단계부터 다시 실행한다. 모달이 열려 있으면 앞으로 가져와 동의부터 다시 시작한다.
-pub fn rerun_onboarding(env: &Env, cx: &mut App) {
-    dispatch_host(
-        HostCommand::Rerun { env: env.clone() },
-        "rerun_onboarding",
-        cx,
-    );
+    dispatch_host(HostCommand::Open { env: env.clone() }, "open_checks", cx);
 }
 
 /// 테스트용 창 호스트(OWE-903). 프로덕션 `Shell` 대신 마법사를 별도 창 루트로 열어
@@ -530,31 +480,13 @@ pub(crate) fn register_test_window_host(cx: &mut App) {
             .into_iter()
             .find_map(|w| w.downcast::<welcome::Wizard>())
         {
-            match cmd {
-                HostCommand::Open { .. } => {
-                    w.update(cx, |_, window, _| window.activate_window()).ok();
-                    return Some(true);
-                }
-                HostCommand::Rerun { .. } => {
-                    w.update(cx, |view, window, cx| {
-                        view.restart_to_consent(cx);
-                        window.activate_window();
-                    })
-                    .ok();
-                    return Some(true);
-                }
-            }
+            w.update(cx, |_, window, _| window.activate_window()).ok();
+            return Some(true);
         }
-        let (env, start, consent_only) = match cmd {
-            HostCommand::Open {
-                env,
-                start,
-                consent_only,
-            } => (env.clone(), *start, *consent_only),
-            HostCommand::Rerun { env } => (env.clone(), state::Step::Consent, false),
-        };
+        let HostCommand::Open { env } = cmd;
+        let env = env.clone();
         let opened = cx.open_window(gpui::WindowOptions::default(), |window, cx| {
-            let view = cx.new(|cx| welcome::Wizard::new(env, start, consent_only, cx));
+            let view = cx.new(|cx| welcome::Wizard::new(env, cx));
             let handle = window.window_handle();
             let sub = cx.subscribe(&view, move |_, _: &welcome::Event, cx| {
                 handle
@@ -563,7 +495,6 @@ pub(crate) fn register_test_window_host(cx: &mut App) {
             });
             cx.global_mut::<TestHostSubs>().subs.push(sub);
             view.update(cx, |w, cx| {
-                w.mount_consent(cx);
                 w.observe_activation(window, cx);
                 w.begin_collect(cx);
             });
@@ -1142,7 +1073,6 @@ fn stage_executable(src: &Path, dst: &Path) -> io::Result<()> {
 
 pub mod actions;
 pub mod banner;
-pub mod consent;
 pub mod state;
 pub mod welcome;
 

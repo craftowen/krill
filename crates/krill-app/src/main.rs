@@ -84,7 +84,7 @@ fn main() -> std::process::ExitCode {
                     krill_app::updater::on_startup(state.clone(), window, cx);
                     krill_app::crash::offer_report(state, |p, cx| cx.reveal_path(p), window, cx);
                     if let Some(env) = krill_app::onboarding::Env::current() {
-                        krill_app::onboarding::offer(env.clone(), window, cx);
+                        krill_app::onboarding::offer(env.clone(), cx);
                         // 시작 시 빠른 점검(bin/state/위치만, 백그라운드). UI 스레드를 막지 않는다.
                         krill_app::onboarding::spawn_quick_check(&env, cx);
                         // OWE-706: 설치된 프로바이더만 계정 화면·상태바에 보인다.
@@ -298,10 +298,6 @@ fn refresh_menus(cx: &mut App) {
             MenuItem::action(
                 krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
                 krill_app::onboarding::OpenChecks,
-            ),
-            MenuItem::action(
-                krill_app::i18n::catalog::onboarding::MENU_RERUN.get(),
-                krill_app::onboarding::RerunOnboarding,
             ),
             MenuItem::action(
                 krill_app::security::text::SECURE_KEYBOARD_MENU.get(),

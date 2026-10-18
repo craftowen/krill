@@ -6695,8 +6695,8 @@ fn owe903_onboarding_checks_open_as_in_window_modal(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// OWE-903 회귀: 첫 실행처럼 `Shell` 업데이트 안에서 `offer`를 불러도(`main.rs` 경로)
-/// 호스트가 `Shell`을 다시 읽다가 재진입 panic이 나지 않고 동의 모달이 뜬다.
+/// OWE-903·OWE-904 회귀: 첫 실행처럼 `Shell` 업데이트 안에서 `offer`를 불러도(`main.rs` 경로)
+/// 재진입 panic이 나지 않고, 모달도 별도 창도 열지 않는다.
 #[gpui::test]
 fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("owe903-offer"));
@@ -6711,13 +6711,16 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
         home: root.clone(),
         state_overridden: true,
     };
-    cx.update(|window, cx| {
+    cx.update(|_, cx| {
         view.update(cx, |_, cx| {
-            krill_app::onboarding::offer(env.clone(), window, cx);
+            krill_app::onboarding::offer(env.clone(), cx);
         });
     });
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1, "no separate onboarding window");
-    assert!(cx.debug_bounds("onboarding-wizard").is_some());
+    assert!(
+        cx.debug_bounds("onboarding-wizard").is_none(),
+        "no first-run modal"
+    );
     std::fs::remove_dir_all(&root).ok();
 }

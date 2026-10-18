@@ -226,11 +226,6 @@ fn wizard_window(cx: &TestAppContext) -> Option<gpui::WindowHandle<welcome::Wiza
         .find_map(|w| w.downcast::<welcome::Wizard>())
 }
 
-fn wizard_step(cx: &mut VisualTestContext) -> state::Step {
-    let w = wizard_window(cx).expect("wizard window");
-    w.update(&mut cx.cx, |v, _, _| v.step).unwrap()
-}
-
 fn wizard_checks(cx: &mut VisualTestContext) -> Option<Vec<Check>> {
     let w = wizard_window(cx).expect("wizard window");
     w.update(&mut cx.cx, |v, _, _| v.checks.clone()).unwrap()
@@ -281,24 +276,16 @@ fn wait_for_file(cx: &mut VisualTestContext, path: &Path, mut done: impl FnMut()
     panic!("{} never ready", path.display());
 }
 
+/// 첫 실행 진입(`offer`)을 부른다. 모달이 뜨면 테스트 호스트가 창으로 연다.
 fn open<'a>(cx: &'a mut TestAppContext, env: &Env) -> &'a mut VisualTestContext {
     // 마법사는 gpui-component 버튼을 쓴다(앱은 시작 때 초기화한다).
     cx.update(gpui_component::init);
     cx.update(register_test_window_host);
     let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
     let env = env.clone();
-    cx.update(|window, cx| offer(env, window, cx));
+    cx.update(|_, cx| offer(env, cx));
     cx.run_until_parked();
     cx
-}
-
-/// 첫 화면에서 동의하고 [시작하기]까지 누른다(체크 전 Enter는 무시된다).
-fn start(cx: &mut VisualTestContext) {
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    press(cx, "enter");
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    click(cx, "consent-accept");
-    click(cx, "consent-continue");
 }
 
 /// 마법사 값 하나를 읽는다.
@@ -339,47 +326,19 @@ fn register_test_host(cx: &mut gpui::App) {
     register_test_window_host(cx);
 }
 
-// OWE-714: 첫 실행은 1장이다. 체크리스트 없이 동의 + 기본 에이전트 + [시작하기]로 끝난다.
+// OWE-904: 첫 실행은 모달 없이 완료를 남기고 hook·CLI를 묻지 않는다. 다시 불러도 같다.
 #[gpui::test]
-fn wizard_first_run_is_one_page_and_start_completes(cx: &mut TestAppContext) {
-    let f = fake("wizard-full");
+fn first_run_opens_no_modal_and_completes(cx: &mut TestAppContext) {
+    let f = fake("first-run");
     let cx = open(cx, &f.env);
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    assert!(present(cx, "wizard-header"));
-    assert!(present(cx, "wizard-footer"));
-    assert!(
-        !present(cx, "wizard-recheck"),
-        "no checklist on the first page"
-    );
-    assert!(
-        !present(cx, "wizard-body"),
-        "no checklist on the first page"
-    );
-
-    // 감지된 에이전트 중 설정 기본값(claude)을 자동으로 고르고, 바꿀 수 있다.
-    wait_survey(cx);
-    assert_eq!(
-        wizard_read(cx, |v, _| v.agent.clone()).as_deref(),
-        Some("claude")
-    );
-    assert!(present(cx, "wizard-agent-codex"));
-    click(cx, "wizard-agent-codex");
-    assert_eq!(
-        wizard_read(cx, |v, _| v.agent.clone()).as_deref(),
-        Some("codex")
-    );
-
-    start(cx);
-    assert!(wizard_window(cx).is_none(), "start closes the window");
+    assert!(wizard_window(cx).is_none(), "first run opens no modal");
     let stored = state::load(&f.env.state);
     assert!(stored.completed);
     assert_eq!(stored.step, state::Step::Done);
-    assert!(!consent::needs_consent(&f.env.state));
-    // 첫 화면은 hook·CLI를 묻지 않는다.
+    assert!(!f.env.state.join("consent.toml").exists());
     assert!(!f.root.join("krill.log").exists());
 
-    // 완료 뒤에는 창 없이 스테이징 갱신만 한다.
-    cx.update(|window, cx| offer(f.env.clone(), window, cx));
+    cx.update(|_, cx| offer(f.env.clone(), cx));
     cx.run_until_parked();
     assert!(wizard_window(cx).is_none());
 }
@@ -410,8 +369,7 @@ fn wizard_cmd_w_closes_window(cx: &mut TestAppContext) {
         gpui_component::init(cx);
         init_actions(cx);
     });
-    let cx = open(cx, &f.env);
-    cx.run_until_parked();
+    let cx = open_checks_screen(cx, &f.env);
     assert!(wizard_window(cx).is_some(), "wizard opens");
     press(cx, "cmd-w");
     assert!(
@@ -420,54 +378,9 @@ fn wizard_cmd_w_closes_window(cx: &mut TestAppContext) {
     );
 }
 
-// OWE-714 (9): 동의 체크박스는 처음에도, 다시 실행해도 해제 상태다.
+// 필수 실패는 점검 화면 위에 막힘 배너로 보이고, 실패 행은 펼친 채다.
 #[gpui::test]
-fn wizard_consent_checkbox_starts_unchecked_even_after_rerun(cx: &mut TestAppContext) {
-    let f = fake("consent-unchecked");
-    let cx = open(cx, &f.env);
-    assert!(!wizard_read(cx, welcome::Wizard::accepted));
-    click(cx, "consent-accept");
-    assert!(wizard_read(cx, welcome::Wizard::accepted));
-    cx.update(|_, cx| rerun_onboarding(&f.env, cx));
-    cx.run_until_parked();
-    assert!(
-        !wizard_read(cx, welcome::Wizard::accepted),
-        "rerun must reset consent"
-    );
-    // 체크 전 [시작하기]는 아무 일도 하지 않는다.
-    click(cx, "consent-continue");
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    assert!(consent::needs_consent(&f.env.state));
-}
-
-#[gpui::test]
-fn wizard_later_on_first_page_asks_again(cx: &mut TestAppContext) {
-    let f = fake("wizard-later");
-    let cx = open(cx, &f.env);
-    press(cx, "escape");
-    assert!(wizard_window(cx).is_none(), "Esc must close the dialog");
-    assert!(consent::needs_consent(&f.env.state));
-    assert!(!state::load(&f.env.state).completed);
-
-    cx.update(|window, cx| offer(f.env.clone(), window, cx));
-    cx.run_until_parked();
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-}
-
-// OWE-878: 점검 창도 macOS 표준 ⌘W로 닫힌다(Esc와 동일하게 [나중에]/[닫기] 동작).
-#[gpui::test]
-fn wizard_cmd_w_closes_like_esc(cx: &mut TestAppContext) {
-    let f = fake("wizard-cmd-w");
-    let cx = open(cx, &f.env);
-    cx.update(|_, cx| super::init_actions(cx));
-    press(cx, "cmd-w");
-    assert!(wizard_window(cx).is_none(), "cmd-W must close the dialog");
-    assert!(consent::needs_consent(&f.env.state));
-}
-
-// 필수 실패가 있으면 [시작하기] 뒤 닫지 않고 점검 화면으로 막는다.
-#[gpui::test]
-fn wizard_required_fail_blocks_after_start(cx: &mut TestAppContext) {
+fn checks_screen_shows_required_fail_expanded(cx: &mut TestAppContext) {
     let f = fake("wizard-blocked");
     write_doctor(
         &f.root,
@@ -481,14 +394,10 @@ fn wizard_required_fail_blocks_after_start(cx: &mut TestAppContext) {
             "",
         )],
     );
-    let cx = open(cx, &f.env);
-    wait_checks(cx);
-    start(cx);
-    assert_eq!(wizard_step(cx), state::Step::Checklist);
+    let cx = open_checks_screen(cx, &f.env);
     assert!(present(cx, "wizard-blocked"));
     // 실패 행은 원인·다음 행동을 펼친 채로 보여 준다(OWE-714 (6)).
     assert!(present(cx, "wizard-detail-bin.helpers"));
-    assert!(state::load(&f.env.state).completed);
     press(cx, "escape");
     assert!(wizard_window(cx).is_none());
 }
@@ -645,7 +554,7 @@ fn checks_screen_installs_hook_and_cli_in_app(cx: &mut TestAppContext) {
 fn wizard_missing_binary_shows_helpers_fail(cx: &mut TestAppContext) {
     let f = fake("wizard-missing-krill");
     fs::remove_file(&f.env.krill).unwrap();
-    let cx = open(cx, &f.env);
+    let cx = open_checks_screen(cx, &f.env);
     let checks = wait_checks(cx);
     let helpers = checks.iter().find(|c| c.id == "bin.helpers").unwrap();
     assert_eq!(helpers.status, Status::Fail);
@@ -654,8 +563,6 @@ fn wizard_missing_binary_shows_helpers_fail(cx: &mut TestAppContext) {
         "{}",
         helpers.detail
     );
-    start(cx);
-    assert_eq!(wizard_step(cx), state::Step::Checklist);
     assert!(present(cx, "wizard-blocked"));
 }
 
@@ -666,8 +573,6 @@ fn wizard_isolated_state_skips_cli_symlink(cx: &mut TestAppContext) {
     let link = f.env.home.join(".local/bin/krill");
 
     let cx = open(cx, &f.env);
-    wait_checks(cx);
-    start(cx);
     assert!(wizard_window(cx).is_none());
 
     assert!(fs::symlink_metadata(&link).is_err());
@@ -680,7 +585,6 @@ fn wizard_completed_state_only_refreshes_staging(cx: &mut TestAppContext) {
     let f = fake("wizard-refresh");
     script(&f.root.join("krill-holder"), "echo holder-v1\n");
     script(&f.root.join("krilld"), "echo krilld-v1\n");
-    consent::record_consent(&f.env.state, std::time::SystemTime::now()).unwrap();
     state::save(
         &f.env.state,
         &state::OnboardingState {
@@ -706,7 +610,7 @@ fn wizard_completed_state_only_refreshes_staging(cx: &mut TestAppContext) {
 
     // 새 빌드로 재실행하면 대화상자 없이 스테이징 바이너리만 갱신한다.
     script(&f.root.join("krilld"), "echo krilld-v2\n");
-    cx.update(|window, cx| offer(f.env.clone(), window, cx));
+    cx.update(|_, cx| offer(f.env.clone(), cx));
     let krilld = stable_dir.join("krilld");
     wait_for_file(cx, &krilld, || {
         fs::read_to_string(&krilld).is_ok_and(|b| b.contains("krilld-v2"))
@@ -715,25 +619,14 @@ fn wizard_completed_state_only_refreshes_staging(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn wizard_legacy_done_with_consent_skips_wizard(cx: &mut TestAppContext) {
+fn wizard_legacy_done_skips_wizard(cx: &mut TestAppContext) {
     let f = fake("wizard-migrated");
     fs::create_dir_all(&f.env.state).unwrap();
     fs::write(f.env.state.join(DONE_FILE), b"").unwrap();
-    consent::record_consent(&f.env.state, std::time::SystemTime::now()).unwrap();
 
     let cx = open(cx, &f.env);
     assert!(wizard_window(cx).is_none());
     assert!(state::load(&f.env.state).completed);
-}
-
-#[gpui::test]
-fn wizard_legacy_done_without_consent_asks_consent_once(cx: &mut TestAppContext) {
-    let f = fake("wizard-migrate-consent");
-    fs::create_dir_all(&f.env.state).unwrap();
-    fs::write(f.env.state.join(DONE_FILE), b"").unwrap();
-
-    let cx = open(cx, &f.env);
-    assert_eq!(wizard_step(cx), state::Step::Consent);
 }
 
 #[test]
@@ -842,8 +735,6 @@ fn isolated_state_dir_skips_cli_symlink_step(cx: &mut TestAppContext) {
     f.env.state_overridden = true;
     assert_eq!(f.env.state, default_state_dir(&f.env.home));
     let cx = open(cx, &f.env);
-    wait_checks(cx);
-    start(cx);
     assert!(wizard_window(cx).is_none());
     // 격리 상태에서는 CLI 링크·스테이징을 만들지 않는다.
     assert!(fs::symlink_metadata(f.env.home.join(".local/bin/krill")).is_err());
@@ -870,7 +761,6 @@ fn stage_runs_before_hook_records_stable_path_and_refreshes_after_done(cx: &mut 
         &f.root,
         &connect_checks(&f.env.home.join(".local/bin/krill").display().to_string()),
     );
-    consent::record_consent(&f.env.state, std::time::SystemTime::now()).unwrap();
 
     // hook 명령은 스테이징된 안정 경로를 기록해야 한다.
     write_doctor(
@@ -918,12 +808,12 @@ fn stage_runs_before_hook_records_stable_path_and_refreshes_after_done(cx: &mut 
         "{config}"
     );
 
-    // 동의가 있으면 새 빌드로 재실행해도 대화상자 없이 스테이징 바이너리만 갱신한다.
+    // 새 빌드로 재실행해도 대화상자 없이 스테이징 바이너리만 갱신한다.
     script(&f.env.krill, "echo mk-v2\n");
     script(&f.root.join("krill-holder"), "echo holder-v2\n");
     script(&f.root.join("krilld"), "echo krilld-v2\n");
 
-    cx.update(|window, cx| offer(f.env.clone(), window, cx));
+    cx.update(|_, cx| offer(f.env.clone(), cx));
     wait_for_file(cx, &stable_mk, || {
         fs::read_to_string(&stable_mk).is_ok_and(|b| b.contains("mk-v2"))
     });
@@ -939,170 +829,6 @@ fn stage_runs_before_hook_records_stable_path_and_refreshes_after_done(cx: &mut 
             .unwrap()
             .contains("krilld-v2")
     );
-}
-
-// OWE-690 동의 판정·기록·화면 테스트. 격리 임시 디렉터리만 쓰고 실제 상태를 건드리지 않는다.
-
-/// 동의 테스트용 격리 상태 디렉터리. 끝나면 권한을 되돌리고 지운다.
-struct ConsentDir {
-    path: PathBuf,
-}
-
-impl ConsentDir {
-    fn fresh(name: &str) -> Self {
-        let path = std::env::temp_dir().join(format!("mk-consent-{}-{name}", std::process::id()));
-        fs::remove_dir_all(&path).ok();
-        fs::create_dir_all(&path).unwrap();
-        Self { path }
-    }
-}
-
-impl Drop for ConsentDir {
-    fn drop(&mut self) {
-        fs::set_permissions(&self.path, fs::Permissions::from_mode(0o700)).ok();
-        fs::remove_dir_all(&self.path).ok();
-    }
-}
-
-#[test]
-fn consent_missing_file_needs_consent() {
-    let dir = ConsentDir::fresh("missing");
-    assert!(consent::needs_consent(&dir.path));
-}
-
-#[test]
-fn consent_current_record_needs_no_consent() {
-    let dir = ConsentDir::fresh("current");
-    consent::record_consent(&dir.path, std::time::SystemTime::now()).unwrap();
-    assert!(!consent::needs_consent(&dir.path));
-}
-
-#[test]
-fn consent_old_version_needs_reconsent() {
-    let dir = ConsentDir::fresh("old");
-    let old = consent::CONSENT_VERSION.saturating_sub(1);
-    assert!(old < consent::CONSENT_VERSION);
-    fs::write(
-        consent::consent_path(&dir.path),
-        format!(
-            "version = {old}\naccepted_at = \"2024-01-01T00:00:00Z\"\napp_version = \"0.1.0\"\n"
-        ),
-    )
-    .unwrap();
-    assert!(consent::needs_consent(&dir.path));
-    // 판정만 하고 파일은 손대지 않는다(덮어쓰기는 동의 때만).
-    let body = fs::read_to_string(consent::consent_path(&dir.path)).unwrap();
-    assert!(body.contains(&format!("version = {old}")));
-}
-
-#[test]
-fn consent_corrupt_file_needs_consent_and_stays_untouched() {
-    for (name, body) in [
-        ("garbage", "깨진 내용 [[["),
-        (
-            "wrong-type",
-            "version = \"1\"\naccepted_at = 3\napp_version = \"0.1.0\"\n",
-        ),
-        (
-            "bad-time",
-            "version = 1\naccepted_at = \"어제\"\napp_version = \"0.1.0\"\n",
-        ),
-    ] {
-        let dir = ConsentDir::fresh(name);
-        fs::write(consent::consent_path(&dir.path), body).unwrap();
-        assert!(consent::needs_consent(&dir.path), "{name}");
-        assert_eq!(
-            fs::read_to_string(consent::consent_path(&dir.path)).unwrap(),
-            body,
-            "{name}"
-        );
-    }
-}
-
-#[test]
-fn consent_record_is_0600_single_file_and_roundtrips() {
-    let dir = ConsentDir::fresh("record");
-    consent::record_consent(&dir.path, std::time::SystemTime::now()).unwrap();
-    let path = consent::consent_path(&dir.path);
-    assert_eq!(
-        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
-    let body = fs::read_to_string(&path).unwrap();
-    assert!(body.contains(&format!("version = {}", consent::CONSENT_VERSION)));
-    assert!(body.contains(env!("CARGO_PKG_VERSION")));
-    // 다시 기록해도 파일 하나로 교체된다(임시 파일 잔재 없음).
-    consent::record_consent(&dir.path, std::time::SystemTime::now()).unwrap();
-    let names: Vec<_> = fs::read_dir(&dir.path)
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(names, vec![std::ffi::OsString::from("consent.toml")]);
-    assert!(!consent::needs_consent(&dir.path));
-}
-
-#[test]
-fn consent_failed_write_preserves_existing() {
-    let dir = ConsentDir::fresh("failure");
-    consent::record_consent(&dir.path, std::time::SystemTime::now()).unwrap();
-    let before = fs::read_to_string(consent::consent_path(&dir.path)).unwrap();
-    fs::set_permissions(&dir.path, fs::Permissions::from_mode(0o500)).unwrap();
-    let result = consent::record_consent(&dir.path, std::time::SystemTime::now());
-    fs::set_permissions(&dir.path, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(result.is_err());
-    assert_eq!(
-        fs::read_to_string(consent::consent_path(&dir.path)).unwrap(),
-        before
-    );
-    let names: Vec<_> = fs::read_dir(&dir.path)
-        .unwrap()
-        .map(|e| e.unwrap().file_name())
-        .collect();
-    assert_eq!(names, vec![std::ffi::OsString::from("consent.toml")]);
-}
-
-#[gpui::test]
-fn consent_view_starts_unchecked_and_details_fold(cx: &mut TestAppContext) {
-    use consent::view::ConsentView;
-    let dir = ConsentDir::fresh("view-gate");
-    cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| ConsentView::new(dir.path.clone()));
-    cx.run_until_parked();
-    assert!(!view.read_with(cx, |v, _| v.accepted()));
-
-    // 요약 3줄만 보이고, [자세히 보기]를 누르면 실제 상태 디렉터리 경로가 든 전문이 펼쳐진다.
-    assert!(cx.debug_bounds("consent-detail-0").is_none());
-    let at = cx
-        .debug_bounds("consent-more")
-        .expect("more toggle")
-        .center();
-    cx.simulate_click(at, gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("consent-detail-4").is_some());
-
-    let at = cx
-        .debug_bounds("consent-accept")
-        .expect("accept checkbox")
-        .center();
-    cx.simulate_click(at, gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(view.read_with(cx, |v, _| v.accepted()));
-    // 화면 자체는 기록하지 않는다.
-    assert!(fs::metadata(consent::consent_path(&dir.path)).is_err());
-}
-
-#[gpui::test]
-fn consent_quit_writes_nothing(cx: &mut TestAppContext) {
-    let f = fake("consent-quit");
-    let cx = open(cx, &f.env);
-    click(cx, "consent-accept");
-    let w = wizard_window(cx).expect("wizard window");
-    let mut wcx = VisualTestContext::from_window(w.into(), &cx.cx);
-    let at = wcx.debug_bounds("consent-quit").expect("quit").center();
-    wcx.simulate_click(at, gpui::Modifiers::default());
-    wcx.run_until_parked();
-    assert!(consent::needs_consent(&f.env.state));
-    assert!(!state::load(&f.env.state).completed);
 }
 
 // MK-162 진입점·매핑·빠른 점검 테스트.
@@ -1139,35 +865,6 @@ fn checks_window_is_single_instance(cx: &mut TestAppContext) {
         .filter(|w| w.downcast::<welcome::Wizard>().is_some())
         .count();
     assert_eq!(count, 1);
-}
-
-#[gpui::test]
-fn rerun_restarts_wizard_from_consent(cx: &mut TestAppContext) {
-    let f = fake("checks-rerun");
-    cx.update(gpui_component::init);
-    cx.update(register_test_host);
-    cx.update(|cx| open_checks(&f.env, cx));
-    cx.run_until_parked();
-    let step = cx.update(|cx| {
-        cx.windows()
-            .into_iter()
-            .find_map(|w| w.downcast::<welcome::Wizard>())
-            .expect("wizard")
-            .update(cx, |v, _, _| v.step)
-            .unwrap()
-    });
-    assert_eq!(step, state::Step::Checklist);
-    cx.update(|cx| rerun_onboarding(&f.env, cx));
-    cx.run_until_parked();
-    let step = cx.update(|cx| {
-        cx.windows()
-            .into_iter()
-            .find_map(|w| w.downcast::<welcome::Wizard>())
-            .expect("wizard")
-            .update(cx, |v, _, _| v.step)
-            .unwrap()
-    });
-    assert_eq!(step, state::Step::Consent);
 }
 
 #[test]
@@ -1267,95 +964,16 @@ fn snapshot_roundtrip_via_global(cx: &mut TestAppContext) {
     cx.update(|cx| store_snapshot(cx, Vec::new()));
 }
 
-// OWE-694 시나리오 5: 완료한 기존 사용자는 동의만 묻고 기본 에이전트·점검을 묻지 않는다.
+// OWE-714: 구 4단계 흐름 중간(점검·연결·완료)에서 멈춘 사용자는 다시 묻지 않고 완료로
+// 넘긴다(체크리스트는 설정 점검에서만).
 #[gpui::test]
-fn wizard_completed_user_consent_only_skips_to_done(cx: &mut TestAppContext) {
-    let f = fake("consent-only");
-    state::save(
-        &f.env.state,
-        &state::OnboardingState {
-            completed: true,
-            step: state::Step::Done,
-            version: state::STATE_VERSION,
-        },
-    )
-    .unwrap();
-    assert!(consent::needs_consent(&f.env.state));
-
-    let cx = open(cx, &f.env);
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    assert!(
-        !present(cx, "wizard-agent"),
-        "existing users keep their default agent"
-    );
-    start(cx);
-    assert!(wizard_window(cx).is_none());
-    assert!(!consent::needs_consent(&f.env.state));
-    let stored = state::load(&f.env.state);
-    assert!(stored.completed);
-    assert_eq!(stored.step, state::Step::Done);
-
-    // 완료 + 동의 최신이면 마법사를 띄우지 않는다.
-    cx.update(|window, cx| offer(f.env.clone(), window, cx));
-    cx.run_until_parked();
-    assert!(wizard_window(cx).is_none());
-}
-
-// OWE-694 시나리오 5(구 파일): onboarding.done만 있는 기존 사용자도 동의만 1회다.
-#[gpui::test]
-fn wizard_legacy_done_consent_only_skips_to_done(cx: &mut TestAppContext) {
-    let f = fake("consent-only-legacy");
-    fs::create_dir_all(&f.env.state).unwrap();
-    fs::write(f.env.state.join(DONE_FILE), b"").unwrap();
-
-    let cx = open(cx, &f.env);
-    start(cx);
-    assert!(wizard_window(cx).is_none());
-    assert!(state::load(&f.env.state).completed);
-}
-
-// OWE-694 시나리오 6: CONSENT_VERSION 상승(구버전 기록)은 완료 사용자도 재동의다.
-#[gpui::test]
-fn wizard_consent_version_bump_asks_consent_again(cx: &mut TestAppContext) {
-    let f = fake("consent-bump");
-    state::save(
-        &f.env.state,
-        &state::OnboardingState {
-            completed: true,
-            step: state::Step::Done,
-            version: state::STATE_VERSION,
-        },
-    )
-    .unwrap();
-    consent::record_consent(&f.env.state, std::time::SystemTime::now()).unwrap();
-    let old = consent::CONSENT_VERSION.saturating_sub(1);
-    assert!(old < consent::CONSENT_VERSION);
-    fs::write(
-        consent::consent_path(&f.env.state),
-        format!(
-            "version = {old}\naccepted_at = \"2024-01-01T00:00:00Z\"\napp_version = \"0.1.0\"\n"
-        ),
-    )
-    .unwrap();
-    assert!(consent::needs_consent(&f.env.state));
-
-    let cx = open(cx, &f.env);
-    start(cx);
-    assert!(wizard_window(cx).is_none());
-    assert!(!consent::needs_consent(&f.env.state));
-}
-
-// OWE-714: 구 4단계 흐름 중간(점검·연결·완료)에서 멈춘 사용자는 동의가 있으므로 다시 묻지
-// 않고 완료로 넘긴다(체크리스트는 설정 점검에서만).
-#[gpui::test]
-fn wizard_legacy_mid_flow_with_consent_completes_silently(cx: &mut TestAppContext) {
+fn wizard_legacy_mid_flow_completes_silently(cx: &mut TestAppContext) {
     for step in [
         state::Step::Checklist,
         state::Step::Connect,
         state::Step::Done,
     ] {
         let f = fake(&format!("resume-{step:?}"));
-        consent::record_consent(&f.env.state, std::time::SystemTime::now()).unwrap();
         state::save(
             &f.env.state,
             &state::OnboardingState {
@@ -1426,8 +1044,8 @@ fn state_load_ignores_interrupted_tmp_debris() {
 }
 
 // OWE-694 시나리오 2: app.location이 /Volumes·AppTranslocation에서 fail이면 필수 차단이다.
-// UI 차단은 wizard_required_fail_blocks_next(필수 fail이면 다음 비활성)가 같은
-// required_blockers 경로로 보장하고, 여기서는 판정→차단 연결을 고정한다.
+// UI 표시는 checks_screen_shows_required_fail_expanded가 같은 required_blockers 경로로
+// 보장하고, 여기서는 판정→차단 연결을 고정한다.
 #[test]
 fn app_location_fail_is_required_blocker() {
     use crate::platform::permissions as perm;
@@ -1453,7 +1071,7 @@ fn app_location_fail_is_required_blocker() {
     assert!(required_failures(std::slice::from_ref(&ok)).is_empty());
 }
 
-// OWE-694 시나리오 7: 설정·메뉴·팔레트(같은 open_checks/rerun 경로)는 창을 하나만 쓴다.
+// OWE-694 시나리오 7: 설정·메뉴·팔레트(같은 open_checks 경로)는 창을 하나만 쓴다.
 #[gpui::test]
 fn wizard_entries_share_single_window(cx: &mut TestAppContext) {
     let f = fake("entries-single");
@@ -1470,64 +1088,6 @@ fn wizard_entries_share_single_window(cx: &mut TestAppContext) {
             .count()
     };
     assert_eq!(count(), 1);
-    // 명시적 재실행은 같은 창을 동의부터 다시 시작한다.
-    cx.update(|cx| rerun_onboarding(&f.env, cx));
-    cx.run_until_parked();
-    assert_eq!(count(), 1);
-    let step = cx.update(|cx| {
-        cx.windows()
-            .into_iter()
-            .find_map(|w| w.downcast::<welcome::Wizard>())
-            .expect("wizard")
-            .update(cx, |v, _, _| v.step)
-            .unwrap()
-    });
-    assert_eq!(step, state::Step::Consent);
-    // 재실행 뒤에도 점검 진입은 창을 복제하지 않는다.
-    cx.update(|cx| open_checks(&f.env, cx));
-    cx.run_until_parked();
-    assert_eq!(count(), 1);
-}
-
-// OWE-694 시나리오 7(시작 경로): offer는 이미 열린 마법사 창을 복제하지 않는다.
-#[gpui::test]
-fn wizard_offer_does_not_duplicate_open_wizard(cx: &mut TestAppContext) {
-    let f = fake("offer-single");
-    let cx = open(cx, &f.env);
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    cx.update(|window, cx| offer(f.env.clone(), window, cx));
-    cx.run_until_parked();
-    let count = cx
-        .cx
-        .windows()
-        .into_iter()
-        .filter(|w| w.downcast::<welcome::Wizard>().is_some())
-        .count();
-    assert_eq!(count, 1);
-}
-
-// OWE-694 시나리오 7(재실행): 동의-only 사용자의 명시적 재실행은 전체 흐름으로 돌아간다.
-#[gpui::test]
-fn wizard_rerun_after_consent_only_restores_full_flow(cx: &mut TestAppContext) {
-    let f = fake("rerun-full");
-    state::save(
-        &f.env.state,
-        &state::OnboardingState {
-            completed: true,
-            step: state::Step::Done,
-            version: state::STATE_VERSION,
-        },
-    )
-    .unwrap();
-    let cx = open(cx, &f.env);
-    assert!(!present(cx, "wizard-agent"));
-    // 같은 창에서 재실행하면 consent_only가 꺼져 기본 에이전트도 묻는다.
-    cx.update(|_, cx| rerun_onboarding(&f.env, cx));
-    cx.run_until_parked();
-    assert_eq!(wizard_step(cx), state::Step::Consent);
-    assert!(present(cx, "wizard-agent"));
-    start(cx);
-    assert!(wizard_window(cx).is_none());
 }
 
 // OWE-714 (6) 근본 원인: `krill doctor --json`은 fail 점검이 있으면 종료 코드 1이다.
@@ -1774,18 +1334,16 @@ fn doctor_calls(f: &Fake) -> u32 {
     fs::read_to_string(f.root.join("doctor-calls")).map_or(0, |s| s.trim().parse().unwrap())
 }
 
-// OWE-714 D1: [시작하기] 직후 점검이 데몬 소켓 준비 전에 돌아도, 잠깐 기다려 다시 점검한 뒤
-// 판정한다. 준비되면 막는 화면 없이 닫힌다.
+// OWE-714 D1: 점검이 데몬 소켓 준비 전에 돌아도, 잠깐 기다려 다시 점검한 뒤 판정한다.
 #[gpui::test]
 fn wizard_waits_for_late_daemon_instead_of_blocking(cx: &mut TestAppContext) {
     let f = fake("late-daemon");
     late_daemon(&f, 2);
-    let cx = open(cx, &f.env);
+    let cx = open_checks_screen(cx, &f.env);
     let checks = wait_checks(cx);
     let daemon = checks.iter().find(|c| c.id == "daemon.connect").unwrap();
     assert_eq!(daemon.status, Status::Ok, "{daemon:?}");
-    start(cx);
-    assert!(wizard_window(cx).is_none(), "late daemon must not block");
+    assert!(!present(cx, "wizard-blocked"), "late daemon must not block");
 }
 
 // OWE-714 D1: 기다린 뒤에도 데몬이 없으면 실패 그대로 돌려준다(막는 화면은 그때만).

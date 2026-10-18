@@ -1385,8 +1385,6 @@ mod tests {
         home: PathBuf,
         state_dir: PathBuf,
         orca_dir: PathBuf,
-        fake_krill_doctor: PathBuf,
-        fake_shell: PathBuf,
     }
 
     impl Drop for OrcaFixture {
@@ -1631,35 +1629,11 @@ mod tests {
             ],
         );
 
-        // Fast fake shell and doctor script for onboarding::Env
-        let bin_dir = root.join("bin");
-        fs::create_dir_all(&bin_dir).unwrap();
-        let fake_shell = root.join("shell.sh");
-        fs::write(
-            &fake_shell,
-            format!(
-                "#!/bin/sh\nPATH=\"{}\"\nexport PATH\nshift 2\neval \"$1\"\n",
-                bin_dir.display()
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&fake_shell, fs::Permissions::from_mode(0o755)).unwrap();
-
-        let fake_krill_doctor = bin_dir.join("krill-doctor-stub");
-        fs::write(
-            &fake_krill_doctor,
-            "#!/bin/sh\nprintf '{\"schema\":1,\"checks\":[{\"id\":\"daemon.connect\",\"level\":\"required\",\"status\":\"ok\",\"summary\":\"connected to krilld\",\"detail\":\"instance 1\",\"fix\":{\"kind\":\"none\",\"value\":\"\"}}]}'\n",
-        )
-        .unwrap();
-        fs::set_permissions(&fake_krill_doctor, fs::Permissions::from_mode(0o755)).unwrap();
-
         OrcaFixture {
             root,
             home,
             state_dir,
             orca_dir,
-            fake_krill_doctor,
-            fake_shell,
         }
     }
 
@@ -1675,13 +1649,11 @@ mod tests {
     }
 
     #[gpui::test]
-    fn onboarding_and_settings_detect_orca_dir_and_render_preview_counts(cx: &mut TestAppContext) {
+    fn settings_detect_orca_dir_and_render_preview_counts(cx: &mut TestAppContext) {
         let fx = setup_orca_fixture("detect");
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::settings::init_at(Some(fx.state_dir.clone()), cx);
-            // OWE-903: 온보딩은 메인 창 안 모달이라 테스트 창 호스트를 등록한다.
-            crate::onboarding::register_test_window_host(cx);
         });
 
         // 1. When no Orca dir exists, render_banner returns None
@@ -1699,18 +1671,18 @@ mod tests {
             assert!(render_banner("test", cx).is_none());
         });
 
-        // 2. Point to fixture HOME with `~/Library/Application Support/orca` and open Onboarding Wizard
-        let env = crate::onboarding::Env {
-            shell: fx.fake_shell.clone().into_os_string(),
-            krill: fx.fake_krill_doctor.clone(),
-            state: fx.state_dir.clone(),
-            home: fx.home.clone(),
-            state_overridden: true,
-        };
-        let (settings_view, _) = cx.add_window_view(|window, cx| {
-            crate::onboarding::offer(env, window, cx);
-            SettingsView::new(cx)
+        // 2. Point to fixture HOME with `~/Library/Application Support/orca` and open Settings
+        //    (온보딩에는 Orca 가져오기 카드가 없다, OWE-904).
+        cx.update(|cx| {
+            set_env_paths(
+                Some(fx.home.clone()),
+                None,
+                Some(fx.state_dir.clone()),
+                None,
+                cx,
+            );
         });
+        let (settings_view, _) = cx.add_window_view(|_, cx| SettingsView::new(cx));
 
         // Wait for background `krill import orca --dry-run --json` preview scan to complete
         wait_until(cx, |cx| {
@@ -1739,22 +1711,7 @@ mod tests {
             assert!(summary.contains("빠른 명령/스케줄 2"), "{summary}");
         });
 
-        // 3. Verify Onboarding Wizard window renders `onboarding-orca-import-card`
-        let wiz_win = cx
-            .windows()
-            .into_iter()
-            .find(|w| w.downcast::<SettingsView>().is_none())
-            .expect("onboarding wizard window");
-        let mut wiz_vcx = VisualTestContext::from_window(wiz_win, cx);
-        wiz_vcx.run_until_parked();
-        assert!(
-            wiz_vcx
-                .debug_bounds("onboarding-orca-import-card")
-                .is_some(),
-            "Onboarding wizard should render onboarding-orca-import-card"
-        );
-
-        // 4. Verify SettingsView General tab renders `settings-general-orca-import-card`
+        // 3. Verify SettingsView General tab renders `settings-general-orca-import-card`
         let settings_win: gpui::AnyWindowHandle = cx
             .windows()
             .into_iter()
@@ -1769,7 +1726,7 @@ mod tests {
             "Settings > General should render settings-general-orca-import-card"
         );
 
-        // 5. Switch SettingsView to Accounts tab and verify `settings-accounts-orca-import-card`
+        // 4. Switch SettingsView to Accounts tab and verify `settings-accounts-orca-import-card`
         settings_view.update(&mut settings_vcx, |view, cx| {
             view.set_tab(AdminTab::Accounts, cx);
         });
