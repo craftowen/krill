@@ -105,6 +105,15 @@ enum Got {
     Cold(krill_proto::SessionId, krill_proto::control::Cold),
 }
 
+/// 마우스 선택 단위(OWE-866): 더블클릭=단어, 트리플클릭=줄. 드래그 중에도 단위를 유지한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SelectKind {
+    #[default]
+    Char,
+    Word,
+    Line,
+}
+
 /// 보이는 칸 하나의 세션 연결과 입력 상태. 지우면 소켓을 닫아 IO 태스크도 끝난다.
 struct Live {
     pane: Pane<pane::Writer>,
@@ -126,6 +135,8 @@ struct Live {
     selection_text: Option<String>,
     /// 왼쪽 버튼으로 선택을 끄는 중.
     selecting: bool,
+    /// 끄는 중인 선택 단위(OWE-866).
+    selecting_kind: SelectKind,
     task: Task<()>,
 }
 
@@ -143,6 +154,7 @@ impl Live {
             selection: None,
             selection_text: None,
             selecting: false,
+            selecting_kind: SelectKind::Char,
             task,
         }
     }
@@ -157,6 +169,7 @@ impl Live {
     fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_text = None;
+        self.selecting_kind = SelectKind::Char;
     }
 
     /// 확정된 선택의 그 자리 글자를 기록한다(AS-17: 출력으로 내용이 바뀌면 지우기 위해).
@@ -1265,8 +1278,10 @@ impl Shell {
         let host = self.launch_host.clone();
         self.change(true, cx, |l| {
             l.new_tab();
-            if host.is_remote() {
-                l.set_host(l.active_tab().focused, host);
+            if host.is_remote()
+                && let Some(pane) = l.focused()
+            {
+                l.set_host(pane, host);
             }
         });
     }
@@ -1585,17 +1600,18 @@ impl Shell {
                 .unwrap_or_else(|| folder::default_folder().as_os_str().as_bytes().to_vec());
             self.change(true, cx, |l| {
                 l.new_tab();
-                let pane = l.active_tab().focused;
-                l.set_launch(
-                    pane,
-                    Create {
-                        account: None,
-                        program: Program::Login,
-                        cwd,
-                        cols: pane::SIZE.0,
-                        rows: pane::SIZE.1,
-                    },
-                );
+                if let Some(pane) = l.focused() {
+                    l.set_launch(
+                        pane,
+                        Create {
+                            account: None,
+                            program: Program::Login,
+                            cwd,
+                            cols: pane::SIZE.0,
+                            rows: pane::SIZE.1,
+                        },
+                    );
+                }
             });
         }
         let Some(l) = self.focused_live() else {
@@ -1701,8 +1717,11 @@ impl Shell {
     /// 새 탭에서 에이전트를 지금 보이는 폴더(MK-055)로 띄운다. 선택된 실행 위치가 원격이면 원격 기본 디렉터리에서 시작한다.
     fn new_agent(&mut self, id: String, cx: &mut Context<Self>) {
         let host = self.launch_host.clone();
-        let focused = self.layout.active_tab().focused;
-        let cwd = if host.is_remote() && *self.layout.host(focused) != host {
+        let same_host = self
+            .layout
+            .focused()
+            .is_some_and(|focused| *self.layout.host(focused) == host);
+        let cwd = if host.is_remote() && !same_host {
             PathBuf::new()
         } else {
             self.folder()
@@ -2347,40 +2366,102 @@ impl Shell {
             .is_some_and(|l| modifiers.shift || !l.pane.modes().mouse())
     }
 
-    /// 선택을 시작하거나(`start`) 끝점을 옮긴다. 그리드 밖이면 그대로.
-    fn select_at(
+    /// 왼쪽 버튼 누름(OWE-866): Shift+클릭은 기존 anchor를 유지한 채 head만 옮기고,
+    /// 더블클릭은 단어, 트리플클릭은 줄을 선택한다. 그리드 밖이면 그대로.
+    fn select_begin(
         &mut self,
         pane: PaneId,
         position: Point<Pixels>,
-        start: bool,
+        click_count: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(l) = self.live.get_mut(&pane) else {
             return;
         };
-        let Some((column, line)) = cell_at(&l.painted, &l.pane.shown(), position) else {
+        let screen = l.pane.shown();
+        let Some((column, line)) = cell_at(&l.painted, &screen, position) else {
             return;
         };
         let at = select::Point { line, column };
-        match (&mut l.selection, start) {
-            (Some(sel), false) if l.selecting => sel.head = at,
-            (_, true) => {
-                l.selection = Some(Selection::new(at));
-                l.selection_text = None;
-                l.selecting = true;
-            }
-            _ => return,
+        if shift && l.selection.is_some() {
+            let anchor = l.selection.map_or(at, |sel| sel.anchor);
+            l.selection = Some(Selection { anchor, head: at });
+            l.selection_text = None;
+            l.selecting = true;
+            l.selecting_kind = SelectKind::Char;
+            cx.notify();
+            return;
         }
+        let (selection, kind) = if click_count >= 3 {
+            (Selection::line_at(&screen, at), SelectKind::Line)
+        } else if click_count == 2 {
+            (Selection::word_at(&screen, at), SelectKind::Word)
+        } else {
+            (Selection::new(at), SelectKind::Char)
+        };
+        l.selection = Some(selection);
+        l.selection_text = None;
+        l.selecting = true;
+        l.selecting_kind = kind;
         cx.notify();
     }
 
-    /// 선택 끌기를 마친다. 움직이지 않은 클릭이면 선택을 지운다. 끌던 중이었으면 `true`.
+    /// 선택 끌기 중 끝점 이동: 누름 때 정한 단위(글자·단어·줄)를 유지한다(OWE-866).
+    fn select_move(&mut self, pane: PaneId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let screen = l.pane.shown();
+        let Some((column, line)) = cell_at(&l.painted, &screen, position) else {
+            return;
+        };
+        let at = select::Point { line, column };
+        let (Some(mut sel), selecting, kind) = (l.selection, l.selecting, l.selecting_kind) else {
+            return;
+        };
+        if !selecting {
+            return;
+        }
+        match kind {
+            SelectKind::Char => sel.head = at,
+            SelectKind::Word => {
+                let word = Selection::word_at(&screen, at);
+                sel.head = if at >= sel.anchor {
+                    word.head
+                } else {
+                    word.anchor
+                };
+            }
+            SelectKind::Line => {
+                let cols = screen.cols;
+                sel.head = if at.line >= sel.anchor.line {
+                    select::Point {
+                        line: at.line,
+                        column: cols.saturating_sub(1),
+                    }
+                } else {
+                    select::Point {
+                        line: at.line,
+                        column: 0,
+                    }
+                };
+            }
+        }
+        l.selection = Some(sel);
+        cx.notify();
+    }
+
+    /// 선택 끌기를 마친다. 움직이지 않은 클릭이면 선택을 지운다(OWE-866: 단어·줄
+    /// 선택은 한 칸짜리라도 유지한다). 끌던 중이었으면 `true`.
     fn select_end(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
         let Some(l) = self.live.get_mut(&pane).filter(|l| l.selecting) else {
             return false;
         };
         l.selecting = false;
-        if l.selection.is_some_and(|s| s.anchor == s.head) {
+        let keep_single = l.selecting_kind != SelectKind::Char;
+        l.selecting_kind = SelectKind::Char;
+        if l.selection.is_some_and(|s| s.anchor == s.head) && !keep_single {
             l.clear_selection();
         } else {
             l.snapshot_selection();
@@ -2563,12 +2644,14 @@ impl Shell {
                 l.focus(pane);
             } else {
                 l.new_tab();
-                let pane = l.active_tab().focused;
-                l.set_host(pane, host);
-                l.set_session(pane, session);
+                if let Some(pane) = l.focused() {
+                    l.set_host(pane, host);
+                    l.set_session(pane, session);
+                }
             }
-            if let Some(folder) = folder {
-                let pane = l.active_tab().focused;
+            if let Some(folder) = folder
+                && let Some(pane) = l.focused()
+            {
                 let mut launch = l.launch(pane).cloned().unwrap_or(Create {
                     account: None,
                     program: Program::Login,
@@ -3250,7 +3333,7 @@ impl Shell {
                     }
                     this.change(true, cx, |l| l.focus(id));
                     if this.selects(id, e.modifiers) {
-                        this.select_at(id, e.position, true, cx);
+                        this.select_begin(id, e.position, e.click_count, e.modifiers.shift, cx);
                     } else {
                         this.mouse_input(
                             id,
@@ -3325,7 +3408,7 @@ impl Shell {
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
                 {
-                    this.select_at(id, e.position, false, cx);
+                    this.select_move(id, e.position, cx);
                     return;
                 }
                 let b = match e.pressed_button {
@@ -3512,7 +3595,10 @@ impl Render for Shell {
                     .get(self.layout.active())
                     .map(|t| t.root.clone())
             };
-            root.map(|r| self.render_tree(&r, &mut Vec::new(), cx))
+            Some(match root {
+                Some(r) => self.render_tree(&r, &mut Vec::new(), cx),
+                None => Self::render_empty_workspace(cx),
+            })
         } else {
             None
         };
@@ -3577,18 +3663,10 @@ impl Render for Shell {
                 this.on_recent_tab(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
-                if this.settings.is_some() {
-                    return;
-                }
-                this.zoomed_pane = None;
-                this.change(true, cx, |l| l.split(Axis::Horizontal));
+                this.split_active(Axis::Horizontal, cx);
             }))
             .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
-                if this.settings.is_some() {
-                    return;
-                }
-                this.zoomed_pane = None;
-                this.change(true, cx, |l| l.split(Axis::Vertical));
+                this.split_active(Axis::Vertical, cx);
             }))
             .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
                 if this.settings.is_some() {
@@ -3907,6 +3985,90 @@ impl Render for Shell {
 }
 
 impl Shell {
+    pub(super) fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        self.zoomed_pane = None;
+        if self.layout.tabs().is_empty() {
+            self.new_tab_on_launch_host(cx);
+        } else {
+            self.change(true, cx, |l| l.split(axis));
+        }
+    }
+
+    fn render_empty_workspace(cx: &mut Context<Self>) -> AnyElement {
+        let p = krill_app::ui::palette(cx);
+        let action_row = |id: &'static str, label: &'static str, shortcut: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .cursor_pointer()
+                .px_3()
+                .py_1p5()
+                .rounded(krill_app::ui::RADIUS_SM)
+                .hover(|s| s.bg(p.accent))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .text_size(krill_app::ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(div().text_color(p.foreground).child(label))
+                .child(krill_app::ui::keycap(p, shortcut))
+        };
+        div()
+            .id("empty-workspace")
+            .debug_selector(|| "empty-workspace".into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(240.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        action_row(
+                            "empty-new-terminal",
+                            text::NEW_TERMINAL.get(),
+                            text::SHORTCUT_NEW_TAB.get(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.new_tab_on_launch_host(cx);
+                        })),
+                    )
+                    .child(
+                        action_row(
+                            "empty-new-agent",
+                            text::EMPTY_NEW_AGENT.get(),
+                            text::SHORTCUT_NEW_AGENT_TAB.get(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.link == Link::Up && this.agents.is_some() {
+                                this.new_default_agent(cx);
+                            } else {
+                                this.new_tab_on_launch_host(cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        action_row(
+                            "empty-open-file",
+                            text::EMPTY_OPEN_FILE.get(),
+                            text::SHORTCUT_QUICK_OPEN.get(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_quick_open(window, cx);
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     // Design adapted from Orca (.ref/orca/src/renderer/src/components/UpdateCard.tsx,
     // UpdateDownloadCardContent.tsx), MIT License — Copyright (c) 2026 Orca Contributors.
     fn render_update_card(cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {

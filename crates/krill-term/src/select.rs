@@ -28,6 +28,117 @@ impl Selection {
         }
     }
 
+    /// 단어 문자인지(OWE-866): 영숫자·밑줄. 공백·구두점은 구분자다.
+    pub fn is_word_char(ch: char) -> bool {
+        ch.is_alphanumeric() || ch == '_'
+    }
+
+    /// 화면 `at` 칸의 글자. 2칸 글자의 둘째 칸(`SPACER`)이면 앞 칸(`WIDE`)의 글자로 푼다.
+    /// 행이 짧아 칸이 없으면(잘린 끝 공백) `None`.
+    fn cell_char(screen: &Screen, line: u16, column: u16) -> Option<char> {
+        let row = screen.rows.get(usize::from(line))?;
+        let cell = row.get(usize::from(column))?;
+        if cell.flags.contains(Flags::SPACER) && column > 0 {
+            let prev = row.get(usize::from(column) - 1)?;
+            if prev.flags.contains(Flags::WIDE) {
+                return Some(prev.ch);
+            }
+        }
+        Some(cell.ch)
+    }
+
+    /// `at` 칸이 속한 단어 구간(OWE-866, 더블클릭). 구분자·공백을 누르면 그 한 칸만.
+    /// 항상 `anchor <= head` 순서로 돌려준다.
+    pub fn word_at(screen: &Screen, at: Point) -> Self {
+        if screen.cols == 0 {
+            return Self::new(at);
+        }
+        let cols = screen.cols;
+        // SPACER(오른쪽 절반)를 누르면 앞 칸(WIDE)부터 센다.
+        let mut col = at.column.min(cols - 1);
+        if let Some(row) = screen.rows.get(usize::from(at.line))
+            && let Some(cell) = row.get(usize::from(col))
+            && cell.flags.contains(Flags::SPACER)
+            && col > 0
+            && row
+                .get(usize::from(col) - 1)
+                .is_some_and(|p| p.flags.contains(Flags::WIDE))
+        {
+            col -= 1;
+        }
+        let at = Point {
+            line: at.line,
+            ..at
+        };
+        let at = Point { column: col, ..at };
+        let is_word = Self::cell_char(screen, at.line, at.column).is_some_and(Self::is_word_char);
+        if !is_word {
+            return Self::new(at);
+        }
+        let mut first = at.column;
+        while first > 0
+            && Self::cell_char(screen, at.line, first - 1).is_some_and(Self::is_word_char)
+        {
+            first -= 1;
+        }
+        let mut last = at.column;
+        while last + 1 < cols
+            && Self::cell_char(screen, at.line, last + 1).is_some_and(Self::is_word_char)
+        {
+            last += 1;
+        }
+        // 2칸 글자 경계에 걸치면 그 글자 전체를 포함한다(복사 `text()`도 같은 규칙).
+        if let Some(row) = screen.rows.get(usize::from(at.line)) {
+            if row
+                .get(usize::from(last))
+                .is_some_and(|c| c.flags.contains(Flags::WIDE))
+                && last + 1 < cols
+                && row
+                    .get(usize::from(last) + 1)
+                    .is_some_and(|c| c.flags.contains(Flags::SPACER))
+            {
+                last += 1;
+            }
+            if row
+                .get(usize::from(first))
+                .is_some_and(|c| c.flags.contains(Flags::SPACER))
+                && first > 0
+                && row
+                    .get(usize::from(first) - 1)
+                    .is_some_and(|c| c.flags.contains(Flags::WIDE))
+            {
+                first -= 1;
+            }
+        }
+        Self {
+            anchor: Point {
+                line: at.line,
+                column: first,
+            },
+            head: Point {
+                line: at.line,
+                column: last,
+            },
+        }
+    }
+
+    /// `at` 행 전체(OWE-866, 트리플클릭). 항상 `anchor <= head` 순서로 돌려준다.
+    pub fn line_at(screen: &Screen, at: Point) -> Self {
+        if screen.cols == 0 {
+            return Self::new(at);
+        }
+        Self {
+            anchor: Point {
+                line: at.line,
+                column: 0,
+            },
+            head: Point {
+                line: at.line,
+                column: screen.cols - 1,
+            },
+        }
+    }
+
     fn ordered(self) -> (Point, Point) {
         if self.anchor <= self.head {
             (self.anchor, self.head)
@@ -227,5 +338,91 @@ mod tests {
         assert_eq!(sel((0, 1), (0, 1)).text(&s), "한");
         // 왼쪽 절반에서 끝나도 그 글자를 포함한다.
         assert_eq!(sel((0, 0), (0, 1)).text(&s), "a한");
+    }
+
+    /// OWE-866: 더블클릭 단어 경계(공백·구두점 구분자).
+    #[test]
+    fn word_at_expands_to_word_boundaries() {
+        let s = screen(&["hello world,foo-bar"], 19);
+        let at = |column: u16| Point { line: 0, column };
+        assert_eq!(
+            Selection::word_at(&s, at(1)),
+            Selection {
+                anchor: at(0),
+                head: at(4),
+            }
+        );
+        assert_eq!(Selection::word_at(&s, at(1)).text(&s), "hello");
+        assert_eq!(Selection::word_at(&s, at(7)).text(&s), "world");
+        // 구두점은 구분자: ',' 위는 한 칸만.
+        assert_eq!(
+            Selection::word_at(&s, at(11)),
+            Selection {
+                anchor: at(11),
+                head: at(11),
+            }
+        );
+        assert_eq!(Selection::word_at(&s, at(13)).text(&s), "foo");
+        assert_eq!(Selection::word_at(&s, at(16)).text(&s), "bar");
+        // 공백 위는 한 칸만.
+        assert_eq!(
+            Selection::word_at(&s, at(5)),
+            Selection {
+                anchor: at(5),
+                head: at(5),
+            }
+        );
+    }
+
+    /// OWE-866: 트리플클릭 줄 전체.
+    #[test]
+    fn line_at_covers_full_row() {
+        let s = screen(&["hello world", "ab"], 12);
+        let at = Point { line: 1, column: 3 };
+        let line = Selection::line_at(&s, at);
+        assert_eq!(line.anchor, Point { line: 1, column: 0 });
+        assert_eq!(
+            line.head,
+            Point {
+                line: 1,
+                column: 11
+            }
+        );
+        assert_eq!(line.text(&s), "ab");
+    }
+
+    /// OWE-866: 2칸 글자 위 더블클릭은 그 글자를 포함한다.
+    #[test]
+    fn word_at_on_wide_char_keeps_glyph() {
+        let mut s = screen(&["a    "], 5);
+        s.rows[0] = vec![
+            Cell {
+                ch: 'a',
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                ..Cell::default()
+            },
+            Cell {
+                ch: '한',
+                flags: Flags::WIDE,
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                flags: Flags::SPACER,
+                ..Cell::default()
+            },
+            Cell {
+                ch: ' ',
+                ..Cell::default()
+            },
+        ];
+        // 왼쪽·오른쪽 절반 어디를 눌러도 '한'을 가리킨다.
+        for column in [2, 3] {
+            let word = Selection::word_at(&s, Point { line: 0, column });
+            assert_eq!(word.text(&s), "한", "column {column}");
+        }
     }
 }

@@ -683,3 +683,24 @@ fn ctrl_tab_mru_cycles_and_commits_recent_order() {
     assert!(l.commit_mru());
     assert_eq!(l.mru_order(), vec![0, 3, 1, 2]);
 }
+
+/// OWE-869: 탭이 0개인 상태에서 분할이나 파일 열기를 요청하면 패닉 없이 첫 탭을 만든다.
+#[test]
+fn empty_tabs_split_and_open_file_create_first_tab() {
+    let mut l = Layout::default();
+    l.close_tab(0);
+    assert!(l.tabs().is_empty());
+
+    l.split(Axis::Horizontal);
+    assert_eq!(l.tabs().len(), 1);
+    assert_eq!(l.visible().len(), 1);
+    assert!(l.is_valid());
+
+    l.close_tab(0);
+    assert!(l.tabs().is_empty());
+    let file_pane = l.open_file(PathBuf::from("/tmp/empty-open.rs"));
+    assert_eq!(l.tabs().len(), 1);
+    assert_eq!(l.focused(), Some(file_pane));
+    assert_eq!(l.file(file_pane), Some(Path::new("/tmp/empty-open.rs")));
+    assert!(l.is_valid());
+}

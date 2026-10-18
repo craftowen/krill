@@ -64,20 +64,21 @@ impl Shell {
     ) {
         self.change(true, cx, |l| {
             l.new_tab();
-            let pane = l.active_tab().focused;
-            if host.is_remote() {
-                l.set_host(pane, host);
+            if let Some(pane) = l.focused() {
+                if host.is_remote() {
+                    l.set_host(pane, host);
+                }
+                l.set_launch(
+                    pane,
+                    Create {
+                        account: None,
+                        program,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: pane::SIZE.0,
+                        rows: pane::SIZE.1,
+                    },
+                );
             }
-            l.set_launch(
-                pane,
-                Create {
-                    account: None,
-                    program,
-                    cwd: folder.as_os_str().as_bytes().to_vec(),
-                    cols: pane::SIZE.0,
-                    rows: pane::SIZE.1,
-                },
-            );
         });
     }
 

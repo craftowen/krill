@@ -74,16 +74,18 @@ impl Shell {
         let cwd = self.folder().as_os_str().as_bytes().to_vec();
         self.change(true, cx, |layout| {
             layout.new_tab();
-            layout.set_launch(
-                layout.active_tab().focused,
-                krill_proto::control::Create {
-                    program: krill_proto::control::Program::Agent { id },
-                    cwd,
-                    cols: krill_app::pane::SIZE.0,
-                    rows: krill_app::pane::SIZE.1,
-                    account: Some(account),
-                },
-            );
+            if let Some(pane) = layout.focused() {
+                layout.set_launch(
+                    pane,
+                    krill_proto::control::Create {
+                        program: krill_proto::control::Program::Agent { id },
+                        cwd,
+                        cols: krill_app::pane::SIZE.0,
+                        rows: krill_app::pane::SIZE.1,
+                        account: Some(account),
+                    },
+                );
+            }
         });
     }
 

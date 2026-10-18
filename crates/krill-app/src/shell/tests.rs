@@ -4267,8 +4267,8 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(cx.update(|_, cx| view.read(cx).live.is_empty()));
     assert_eq!(Layout::load(&path).unwrap(), empty);
 
-    // 빈 탭 상태에서 닫기·분할·탭 순환 단축키를 눌러도 패닉이나 유령 탭이 생기지 않는다.
-    cx.simulate_keystrokes("cmd-w cmd-shift-w cmd-d cmd-shift-] cmd-shift-[");
+    // 빈 탭 상태에서 닫기·탭 순환 단축키를 눌러도 패닉이나 유령 탭이 생기지 않는다.
+    cx.simulate_keystrokes("cmd-w cmd-shift-w cmd-shift-] cmd-shift-[");
     cx.run_until_parked();
     assert!(layout_of(&view, cx).tabs().is_empty());
 
