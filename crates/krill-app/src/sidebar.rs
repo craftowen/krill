@@ -78,6 +78,8 @@ const KEY_CONTEXT: &str = "Sidebar";
 const ROW_HEIGHT: f32 = 32.;
 /// hover 액션을 드러내는 그룹 이름(가장 가까운 행에 걸린다).
 const ROW_GROUP: &str = "sidebar-row";
+const POLL_INTERVAL_ACTIVE: Duration = Duration::from_millis(500);
+const POLL_INTERVAL_INACTIVE: Duration = Duration::from_millis(2000);
 
 /// 사이드바가 포커스를 가졌을 때의 키(↑↓ 이동, Enter 열기·새 터미널, ←→ 접기, p 핀, r/F2 이름 변경,
 /// o/v/c/z Open in, ⌥⌘1~4 새 에이전트, Esc 터미널로).
@@ -730,7 +732,20 @@ impl Sidebar {
 
     #[must_use]
     pub fn is_visible(&self) -> bool {
-        self.visible && self.active
+        self.visible
+    }
+
+    #[must_use]
+    pub fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn poll_interval(&self) -> Duration {
+        if self.active {
+            POLL_INTERVAL_ACTIVE
+        } else {
+            POLL_INTERVAL_INACTIVE
+        }
     }
 
     /// 사이드바 열 가시성을 바꾼다(N19). 접히면 폴링과 git 감시를 즉시 멈춘다.
@@ -741,11 +756,16 @@ impl Sidebar {
         }
     }
 
-    /// 창 활성 여부를 반영한다(N19). 비활성이면 폴링과 git 감시를 즉시 멈춘다.
+    /// 창 활성 여부를 반영한다(N19·OWE-844). 창이 비포커스 상태여도 사이드바가 표시 중(`visible`)이면
+    /// 완화된 주기로 백그라운드 폴링·알림을 유지하고, 포커스를 되찾으면 즉시 최신 스냅샷을 갱신한다.
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active != active {
             self.active = active;
-            self.sync_polling(cx);
+            if active && self.visible {
+                self.refresh(cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
@@ -911,15 +931,38 @@ impl Sidebar {
         }
     }
 
+    fn ensure_remote_sources(&mut self) {
+        if let Some(manager) = self.remote_manager.clone() {
+            for remote in &mut self.remote_hosts {
+                if remote.source.is_none() {
+                    remote.source = manager
+                        .target_for(&HostId::Remote(remote.id.clone()), None)
+                        .map(status_source);
+                }
+            }
+        }
+    }
+
     fn start_remote_polling(&mut self, cx: &mut Context<Self>) {
-        if !self.is_visible() || self.remote_hosts.is_empty() || self.remote_task.is_some() {
+        self.spawn_remote_polling(false, cx);
+    }
+
+    fn spawn_remote_polling(&mut self, force_once: bool, cx: &mut Context<Self>) {
+        if (!self.is_visible() && !force_once)
+            || self.remote_hosts.is_empty()
+            || self.remote_task.is_some()
+        {
             return;
+        }
+        if force_once {
+            self.ensure_remote_sources();
         }
         self.remote_task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
+            let mut forced = force_once;
             loop {
                 let Ok(Some(sources)) = this.read_with(cx, |s, _| {
-                    if !s.is_visible() || s.remote_hosts.is_empty() {
+                    if (!s.is_visible() && !forced) || s.remote_hosts.is_empty() {
                         return None;
                     }
                     let list: Vec<(String, Arc<dyn Source>)> = s
@@ -947,9 +990,9 @@ impl Sidebar {
                 for t in tasks {
                     results.push(t.await);
                 }
-                let keep_going = this.update(cx, |s, cx| {
-                    if !s.is_visible() || s.remote_hosts.is_empty() {
-                        return false;
+                let next_delay = this.update(cx, |s, cx| {
+                    if (!s.is_visible() && !forced) || s.remote_hosts.is_empty() {
+                        return None;
                     }
                     let mut changed = false;
                     for (id, res) in results {
@@ -983,12 +1026,13 @@ impl Sidebar {
                     if changed {
                         s.rebuild(cx);
                     }
-                    true
+                    s.is_visible().then(|| s.poll_interval())
                 });
-                if !matches!(keep_going, Ok(true)) {
+                forced = false;
+                let Ok(Some(delay)) = next_delay else {
                     return;
-                }
-                bg.timer(Duration::from_millis(500)).await;
+                };
+                bg.timer(delay).await;
             }
         }));
     }
@@ -1001,15 +1045,7 @@ impl Sidebar {
                 self.connect_source(source, cx);
             }
             if self.remote_task.is_none() && !self.remote_hosts.is_empty() {
-                if let Some(manager) = self.remote_manager.clone() {
-                    for remote in &mut self.remote_hosts {
-                        if remote.source.is_none() {
-                            remote.source = manager
-                                .target_for(&HostId::Remote(remote.id.clone()), None)
-                                .map(status_source);
-                        }
-                    }
-                }
+                self.ensure_remote_sources();
                 self.start_remote_polling(cx);
             }
         } else {
@@ -1022,8 +1058,14 @@ impl Sidebar {
                     })
                     .detach();
             }
+            let has_manager = self.remote_manager.is_some();
             for r in &mut self.remote_hosts {
-                if let Some(source) = r.source.take() {
+                let source = if has_manager {
+                    r.source.take()
+                } else {
+                    r.source.clone()
+                };
+                if let Some(source) = source {
                     cx.background_executor()
                         .spawn(async move {
                             source.set_visible(false);
@@ -1430,15 +1472,22 @@ impl Sidebar {
     pub fn connect_source(&mut self, source: Arc<dyn Source>, cx: &mut Context<Self>) {
         self.source = Some(source);
         crate::alert::listen(&cx.weak_entity(), cx);
-        if !self.is_visible() || self.task.is_some() {
+        self.spawn_local_polling(false, cx);
+    }
+
+    fn spawn_local_polling(&mut self, force_once: bool, cx: &mut Context<Self>) {
+        if (!self.is_visible() && !force_once) || self.task.is_some() || self.source.is_none() {
             return;
         }
         let sidebar_path = self.path.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
+            let mut forced = force_once;
             loop {
                 let Ok(Some(source)) = this.read_with(cx, |s, _| {
-                    s.is_visible().then(|| s.source.clone()).flatten()
+                    (s.is_visible() || forced)
+                        .then(|| s.source.clone())
+                        .flatten()
                 }) else {
                     return;
                 };
@@ -1470,18 +1519,19 @@ impl Sidebar {
                         (result, comments, auto_titles)
                     })
                     .await;
-                let keep_going = this.update(cx, |s, cx| {
-                    if !s.is_visible() {
-                        return false;
+                let next_delay = this.update(cx, |s, cx| {
+                    if !s.is_visible() && !forced {
+                        return None;
                     }
                     s.apply_with_auto_titles(result, comments, auto_titles, cx);
-                    true
+                    s.is_visible().then(|| s.poll_interval())
                 });
-                if !matches!(keep_going, Ok(true)) {
+                forced = false;
+                let Ok(Some(delay)) = next_delay else {
                     return;
-                }
+                };
                 // No frame requests or notifications on a stable snapshot.
-                bg.timer(Duration::from_millis(500)).await;
+                bg.timer(delay).await;
             }
         }));
     }
@@ -1509,13 +1559,11 @@ impl Sidebar {
         self.rows.len()
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
         self.task = None;
         self.remote_task = None;
-        if let Some(source) = self.source.clone() {
-            self.connect_source(source, cx);
-        }
-        self.start_remote_polling(cx);
+        self.spawn_local_polling(true, cx);
+        self.spawn_remote_polling(true, cx);
     }
 
     pub fn new_worktree(&mut self, repo: PathBuf, window: &mut Window, cx: &mut Context<Self>) {

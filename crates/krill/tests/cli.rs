@@ -1640,7 +1640,97 @@ esac
         String::from_utf8_lossy(&big_out.stderr)
     );
 
-    // Scenario 5 (OWE-775): real /usr/bin/osascript JXA execution for list-apps and list-windows --app pid:<N>
+    // Scenario 5 (OWE-775 / OWE-804): duplicate process names with --app pid:<N> and real /usr/bin/osascript JXA execution
+    let dup_osascript = dir.join("dup-osascript.sh");
+    let dup_log = dir.join("dup-jxa-actions.jsonl");
+    fs::write(
+        &dup_osascript,
+        format!(
+            r#"#!/bin/sh
+SCRIPT="$4"
+shift 4
+case "$SCRIPT" in
+  *"runningApplications"*)
+    printf '[{{"name":"krill-app","bundleId":null,"pid":69917,"isActive":false,"isHidden":false}},{{"name":"krill-app","bundleId":null,"pid":37140,"isActive":true,"isHidden":false}}]\n'
+    ;;
+  *"CGWindowListCopyWindowInfo"*)
+    if [ "$1" = "37140" ]; then
+      printf '[{{"id":"2747","index":1,"title":"Krill","appName":"krill-app","bundleId":null,"pid":37140,"bounds":{{"x":680.0,"y":310.0,"width":1200.0,"height":760.0}},"isFocused":true,"isMain":true,"isMinimized":false}}]\n'
+    else
+      printf '[{{"id":"1001","index":1,"title":"Krill","appName":"krill-app","bundleId":null,"pid":69917,"bounds":{{"x":0.0,"y":30.0,"width":2560.0,"height":1319.0}},"isFocused":true,"isMain":true,"isMinimized":false}}]\n'
+    fi
+    ;;
+  *"selectTargetWindow"*)
+    case "$SCRIPT" in
+      *"executeRequest"*)
+        printf '%s\n' "$1" >> "{dup_log}"
+        printf '{{"ok":true,"status":"verified","reason":null,"note":"performed AXPress"}}\n'
+        ;;
+      *)
+        if [ "$1" = "37140" ]; then
+          printf '{{"role":"AXWindow","title":"Krill","bounds":{{"x":680.0,"y":310.0,"width":1200.0,"height":760.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXButton","title":"IsolatedButton","value":null,"bounds":{{"x":700.0,"y":350.0,"width":80.0,"height":24.0}},"enabled":true,"focused":false,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n'
+        else
+          printf '{{"role":"AXWindow","title":"Krill","bounds":{{"x":0.0,"y":30.0,"width":2560.0,"height":1319.0}},"enabled":true,"focused":true,"selected":false,"actions":[],"children":[{{"role":"AXButton","title":"PrimaryButton","value":null,"bounds":{{"x":20.0,"y":60.0,"width":80.0,"height":24.0}},"enabled":true,"focused":false,"selected":false,"actions":["AXPress"],"children":[]}}]}}\n'
+        fi
+        ;;
+    esac
+    ;;
+esac
+"#,
+            dup_log = dup_log.display(),
+        ),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dup_osascript, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let ok_dup = |args: &[&str]| -> serde_json::Value {
+        let out = Command::new(&bin_path)
+            .args(args)
+            .env("KRILL_STATE_DIR", &dir)
+            .env("HOME", &dir)
+            .env("KRILL_TEST_OFFLINE", "1")
+            .env("KRILL_COMPUTER_OSASCRIPT_BIN", &dup_osascript)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    let dup_state = ok_dup(&["computer", "get-app-state", "--app", "pid:37140", "--json"]);
+    assert_eq!(dup_state["app"]["pid"], 37140);
+    assert_eq!(dup_state["window"]["id"], "2747");
+    assert_eq!(dup_state["window"]["bounds"]["width"], 1200.0);
+    assert_eq!(dup_state["window"]["bounds"]["height"], 760.0);
+    assert!(
+        dup_state["treeText"].as_str().unwrap().contains("1200x760"),
+        "expected isolated window bounds in treeText, got: {}",
+        dup_state["treeText"]
+    );
+    assert_eq!(dup_state["elements"][0]["label"], "IsolatedButton");
+
+    // Subsequent action without --app must preserve cached pid:37140 instead of falling back to first krill-app (pid:69917)
+    let dup_click = ok_dup(&["computer", "click", "--element", "1", "--json"]);
+    assert_eq!(dup_click["ok"], true);
+    assert_eq!(dup_click["appState"]["app"]["pid"], 37140);
+    assert_eq!(dup_click["appState"]["window"]["id"], "2747");
+    let dup_logged: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(&dup_log)
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(dup_logged["pid"], 37140);
+    assert_eq!(dup_logged["winId"], "2747");
+
     if cfg!(target_os = "macos") && Path::new("/usr/bin/osascript").exists() {
         let apps_out = Command::new(&bin_path)
             .args(["computer", "list-apps", "--json"])

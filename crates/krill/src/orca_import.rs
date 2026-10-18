@@ -2776,6 +2776,7 @@ fn import_automations(
             precheck: existing_entry.and_then(|s| s.precheck.clone()),
             workspace_mode: existing_entry
                 .map_or_else(schedule::WorkspaceMode::default, |s| s.workspace_mode),
+            enabled: existing_entry.is_none_or(|s| s.enabled),
         };
 
         if let Err(reason) = validate_schedule_candidate(&candidate, &mut seen_ids) {

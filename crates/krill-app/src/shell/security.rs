@@ -37,9 +37,7 @@ impl Shell {
         self.security.set_window_active(active);
         krill_app::alert::set_active(active, cx);
         self.sidebar.update(cx, |s, cx| s.set_active(active, cx));
-        let diff_visible = active && !self.panel_collapsed;
-        self.diff
-            .update(cx, |d, cx| d.set_visible(diff_visible, cx));
+        self.diff.update(cx, |d, cx| d.set_active(active, cx));
     }
 
     /// 클립보드 항목(텍스트·Finder 복사 파일 경로·스크린샷/복사 이미지)을 터미널 주입 바이트로 변환한다(MK-033·MK-111).

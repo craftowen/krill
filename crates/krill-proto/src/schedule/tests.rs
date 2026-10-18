@@ -107,6 +107,7 @@ fn run_now_queue_and_coalesced_journal_roundtrip() {
                 prompt: "should-not-run".into(),
                 precheck: Some("echo 'no work' && exit 1".into()),
                 workspace_mode: WorkspaceMode::Reuse,
+                enabled: true,
             },
             Schedule {
                 id: "isolated".into(),
@@ -116,6 +117,7 @@ fn run_now_queue_and_coalesced_journal_roundtrip() {
                 prompt: "isolated-ok".into(),
                 precheck: Some("exit 0".into()),
                 workspace_mode: WorkspaceMode::Isolate,
+                enabled: true,
             },
         ],
     };
@@ -226,6 +228,7 @@ fn concurrent_request_run_now_and_take_run_now_never_lose_triggers() {
                 prompt: "ok".into(),
                 precheck: None,
                 workspace_mode: WorkspaceMode::Reuse,
+                enabled: true,
             })
             .collect(),
     };

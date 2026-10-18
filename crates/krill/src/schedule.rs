@@ -121,6 +121,7 @@ fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
         prompt: String::new(),
         precheck: None,
         workspace_mode: WorkspaceMode::Reuse,
+        enabled: true,
     };
     let mut args = args.iter();
     while let Some(arg) = args.next() {

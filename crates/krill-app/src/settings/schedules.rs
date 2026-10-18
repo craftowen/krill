@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, prelude::*};
 use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use krill_proto::schedule::{
     FILE, Schedule, ScheduleRun, Schedules, WorkspaceMode, load_coalesced_runs, request_run_now,
@@ -26,6 +25,7 @@ pub(super) struct ScheduleModal {
     pub prompt: gpui::Entity<InputState>,
     pub precheck: gpui::Entity<InputState>,
     pub workspace_mode: WorkspaceMode,
+    pub enabled: bool,
     pub error: Option<SharedString>,
 }
 
@@ -261,6 +261,7 @@ impl SettingsView {
             .unwrap_or("")
             .to_owned();
         let workspace_mode = existing.map_or(WorkspaceMode::Reuse, |s| s.workspace_mode);
+        let enabled = existing.is_none_or(|s| s.enabled);
 
         let make_input = |placeholder: &'static str,
                           value: String,
@@ -314,6 +315,7 @@ impl SettingsView {
                 cx,
             ),
             workspace_mode,
+            enabled,
             error: None,
         });
         cx.notify();
@@ -389,6 +391,7 @@ impl SettingsView {
         let precheck_raw = modal.precheck.read(cx).value().trim().to_owned();
         let precheck = (!precheck_raw.is_empty()).then_some(precheck_raw);
         let workspace_mode = modal.workspace_mode;
+        let enabled = modal.enabled;
         let editing_id = modal.editing_id.clone();
 
         let fail = |modal: &mut ScheduleModal,
@@ -470,6 +473,7 @@ impl SettingsView {
             prompt,
             precheck,
             workspace_mode,
+            enabled,
         };
         let Some(dir) = state_dir(cx) else {
             fail(
@@ -500,6 +504,32 @@ impl SettingsView {
                 if let Some(m) = &mut self.schedule_modal {
                     fail(m, &mut self.schedule_error, err.to_string(), cx);
                 }
+            }
+        }
+    }
+
+    /// 지정한 스케줄의 활성/일시정지 상태(`enabled`)를 토글해 `schedules.toml`에 저장한다.
+    pub fn toggle_schedule_enabled(&mut self, id: &str, cx: &mut Context<Self>) {
+        let Some(dir) = state_dir(cx) else {
+            return;
+        };
+        let res: std::io::Result<()> = (|| {
+            let _guard = Schedules::exclusive_edit(&dir)?;
+            let mut schedules = Schedules::load(&dir)?;
+            if let Some(sched) = schedules.schedule.iter_mut().find(|s| s.id == id) {
+                sched.enabled = !sched.enabled;
+                schedules.save(&dir)?;
+            }
+            Ok(())
+        })();
+        match res {
+            Ok(()) => {
+                self.schedule_error = None;
+                cx.notify();
+            }
+            Err(err) => {
+                self.schedule_error = Some(err.to_string().into());
+                cx.notify();
             }
         }
     }
@@ -600,10 +630,7 @@ impl SettingsView {
             .and_then(|d| load_coalesced_runs(d).ok())
             .unwrap_or_default();
 
-        let add_btn = Button::new("admin-schedule-add")
-            .small()
-            .primary()
-            .label(text::SCHEDULE_ADD_BTN.get())
+        let add_btn = layout::primary("admin-schedule-add", text::SCHEDULE_ADD_BTN.get())
             .debug_selector(|| "admin-schedule-add".into())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_schedule_modal(None, window, cx);
@@ -624,7 +651,10 @@ impl SettingsView {
             .gap_3()
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .justify_between()
                     .gap_3()
@@ -660,12 +690,27 @@ impl SettingsView {
             let mut list = div().flex().flex_col().gap_2();
             for sched in &schedules {
                 let row_id = format!("admin-schedule-row-{}", sched.id);
+                let toggle_id = format!("admin-schedule-toggle-{}", sched.id);
+                let status_id = format!("admin-schedule-status-{}", sched.id);
                 let run_now_id = format!("admin-schedule-run-now-{}", sched.id);
                 let edit_id = format!("admin-schedule-edit-{}", sched.id);
                 let rm_id = format!("admin-schedule-remove-{}", sched.id);
                 let sched_for_edit = sched.clone();
+                let id_for_toggle = sched.id.clone();
                 let id_for_run = sched.id.clone();
                 let id_for_rm = sched.id.clone();
+
+                let status_badge = if sched.enabled {
+                    crate::ui::badge(
+                        p,
+                        crate::ui::BadgeTone::Success,
+                        text::SCHEDULE_ACTIVE.get(),
+                    )
+                } else {
+                    crate::ui::badge(p, crate::ui::BadgeTone::Muted, text::SCHEDULE_PAUSED.get())
+                }
+                .id(SharedString::from(status_id.clone()))
+                .debug_selector(move || status_id.clone());
 
                 let mode_badge = match sched.workspace_mode {
                     WorkspaceMode::Reuse => crate::ui::badge(
@@ -691,7 +736,10 @@ impl SettingsView {
                     div()
                         .id(SharedString::from(row_id.clone()))
                         .debug_selector(move || row_id.clone())
+                        .w_full()
+                        .min_w_0()
                         .flex()
+                        .flex_wrap()
                         .items_center()
                         .justify_between()
                         .gap_2()
@@ -710,6 +758,7 @@ impl SettingsView {
                                 .child(
                                     div()
                                         .flex()
+                                        .flex_wrap()
                                         .items_center()
                                         .gap_2()
                                         .child(
@@ -718,6 +767,7 @@ impl SettingsView {
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .child(sched.id.clone()),
                                         )
+                                        .child(status_badge)
                                         .child(mode_badge),
                                 )
                                 .child(
@@ -729,17 +779,35 @@ impl SettingsView {
                                         .child(meta_line),
                                 ),
                         )
-                        .child(
+                        .child({
+                            let view = cx.entity();
                             layout::controls()
+                                .flex_wrap()
                                 .child(
-                                    Button::new(gpui::ElementId::Name(run_now_id.clone().into()))
-                                        .small()
-                                        .primary()
-                                        .label(text::SCHEDULE_RUN_NOW.get())
-                                        .debug_selector(move || run_now_id.clone())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    layout::switch(
+                                        p,
+                                        toggle_id.clone(),
+                                        sched.enabled,
+                                        false,
+                                        move |_, _, cx| {
+                                            view.update(cx, |this, cx| {
+                                                this.toggle_schedule_enabled(&id_for_toggle, cx);
+                                            });
+                                        },
+                                    )
+                                    .debug_selector(move || toggle_id.clone()),
+                                )
+                                .child(
+                                    layout::primary(
+                                        gpui::ElementId::Name(run_now_id.clone().into()),
+                                        text::SCHEDULE_RUN_NOW.get(),
+                                    )
+                                    .debug_selector(move || run_now_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
                                             this.trigger_schedule_run_now(&id_for_run, cx);
-                                        })),
+                                        },
+                                    )),
                                 )
                                 .child(
                                     layout::secondary(
@@ -758,16 +826,18 @@ impl SettingsView {
                                     )),
                                 )
                                 .child(
-                                    Button::new(gpui::ElementId::Name(rm_id.clone().into()))
-                                        .small()
-                                        .ghost()
-                                        .label(text::SCHEDULE_REMOVE.get())
-                                        .debug_selector(move || rm_id.clone())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                    layout::ghost(
+                                        gpui::ElementId::Name(rm_id.clone().into()),
+                                        text::SCHEDULE_REMOVE.get(),
+                                    )
+                                    .debug_selector(move || rm_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
                                             this.remove_schedule(&id_for_rm, cx);
-                                        })),
-                                ),
-                        ),
+                                        },
+                                    )),
+                                )
+                        }),
                 );
             }
             card = card.child(list);
@@ -839,6 +909,7 @@ impl SettingsView {
                         .p_2()
                         .rounded(crate::ui::RADIUS_SM)
                         .bg(p.background)
+                        .hover(|d| d.bg(p.accent))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_schedule_run_log(&run_for_row, cx);
                         }))
@@ -917,14 +988,14 @@ impl SettingsView {
                                 .child(crate::ui::badge(p, tone, badge_label)),
                         )
                         .child(
-                            Button::new("admin-schedule-log-close")
-                                .small()
-                                .ghost()
-                                .label(text::SCHEDULE_CLOSE_LOG.get())
-                                .debug_selector(|| "admin-schedule-log-close".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.close_schedule_run_log(cx);
-                                })),
+                            layout::ghost(
+                                "admin-schedule-log-close",
+                                text::SCHEDULE_CLOSE_LOG.get(),
+                            )
+                            .debug_selector(|| "admin-schedule-log-close".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.close_schedule_run_log(cx);
+                            })),
                         ),
                 );
             if let Some(cwd) = &log.cwd {
@@ -985,26 +1056,30 @@ impl SettingsView {
             };
 
         let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
-        let reuse_btn = Button::new("admin-schedule-mode-reuse")
-            .small()
-            .label(text::SCHEDULE_MODE_REUSE.get())
-            .debug_selector(|| "admin-schedule-mode-reuse".into())
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(m) = &mut this.schedule_modal {
-                    m.workspace_mode = WorkspaceMode::Reuse;
-                    cx.notify();
-                }
-            }));
-        let isolate_btn = Button::new("admin-schedule-mode-isolate")
-            .small()
-            .label(text::SCHEDULE_MODE_ISOLATE.get())
-            .debug_selector(|| "admin-schedule-mode-isolate".into())
-            .on_click(cx.listener(|this, _, _, cx| {
-                if let Some(m) = &mut this.schedule_modal {
-                    m.workspace_mode = WorkspaceMode::Isolate;
-                    cx.notify();
-                }
-            }));
+        let reuse_btn = layout::segment(
+            "admin-schedule-mode-reuse",
+            text::SCHEDULE_MODE_REUSE.get(),
+            reuse_active,
+        )
+        .debug_selector(|| "admin-schedule-mode-reuse".into())
+        .on_click(cx.listener(|this, _, _, cx| {
+            if let Some(m) = &mut this.schedule_modal {
+                m.workspace_mode = WorkspaceMode::Reuse;
+                cx.notify();
+            }
+        }));
+        let isolate_btn = layout::segment(
+            "admin-schedule-mode-isolate",
+            text::SCHEDULE_MODE_ISOLATE.get(),
+            !reuse_active,
+        )
+        .debug_selector(|| "admin-schedule-mode-isolate".into())
+        .on_click(cx.listener(|this, _, _, cx| {
+            if let Some(m) = &mut this.schedule_modal {
+                m.workspace_mode = WorkspaceMode::Isolate;
+                cx.notify();
+            }
+        }));
 
         let mode_row = div()
             .flex()
@@ -1015,22 +1090,7 @@ impl SettingsView {
                 None,
                 p,
             ))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(if reuse_active {
-                        reuse_btn.primary()
-                    } else {
-                        reuse_btn.ghost()
-                    })
-                    .child(if reuse_active {
-                        isolate_btn.ghost()
-                    } else {
-                        isolate_btn.primary()
-                    }),
-            );
+            .child(layout::segmented_control(p, [reuse_btn, isolate_btn]));
 
         let mut dialog = div()
             .id("admin-schedule-modal")
@@ -1102,20 +1162,14 @@ impl SettingsView {
                 .gap_2()
                 .pt_2()
                 .child(
-                    Button::new("admin-schedule-modal-cancel")
-                        .small()
-                        .ghost()
-                        .label(text::SCHEDULE_CANCEL.get())
+                    layout::ghost("admin-schedule-modal-cancel", text::SCHEDULE_CANCEL.get())
                         .debug_selector(|| "admin-schedule-modal-cancel".into())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.close_schedule_modal(cx);
                         })),
                 )
                 .child(
-                    Button::new("admin-schedule-modal-save")
-                        .small()
-                        .primary()
-                        .label(text::SCHEDULE_SAVE.get())
+                    layout::primary("admin-schedule-modal-save", text::SCHEDULE_SAVE.get())
                         .debug_selector(|| "admin-schedule-modal-save".into())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.submit_schedule_modal(window, cx);

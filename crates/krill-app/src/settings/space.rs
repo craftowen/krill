@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 use gpui::{Context, FontWeight, SharedString, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::{Disableable as _, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::worktree_space::{
@@ -406,22 +407,33 @@ impl SettingsView {
             .on_click(cx.listener(|this, _, _, cx| {
                 this.scan_workspace_space(cx);
             }));
-        let cleanup_btn = Button::new("admin-worktree-cleanup-open")
-            .small()
-            .primary()
-            .label(text::CLEANUP_OPEN_BUTTON.get())
-            .debug_selector(|| "admin-worktree-cleanup-open".into())
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.open_cleanup_modal(cx);
-            }));
+        let cleanup_btn = layout::primary(
+            "admin-worktree-cleanup-open",
+            text::CLEANUP_OPEN_BUTTON.get(),
+        )
+        .debug_selector(|| "admin-worktree-cleanup-open".into())
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.open_cleanup_modal(cx);
+        }));
 
         let header_row = layout::row(p)
-            .child(layout::label(
-                p,
-                text::SPACE_CARD_TITLE.get(),
-                Some(text::SPACE_CARD_DESC.get()),
-            ))
-            .child(layout::controls().child(scan_btn).child(cleanup_btn));
+            .id("admin-space-header-row")
+            .debug_selector(|| "admin-space-header-row".into())
+            .flex_wrap()
+            .child(
+                layout::label(
+                    p,
+                    text::SPACE_CARD_TITLE.get(),
+                    Some(text::SPACE_CARD_DESC.get()),
+                )
+                .min_w(px(200.)),
+            )
+            .child(
+                layout::controls()
+                    .flex_wrap()
+                    .child(scan_btn)
+                    .child(cleanup_btn),
+            );
 
         let mut section = div()
             .id("admin-space-section")
@@ -437,12 +449,9 @@ impl SettingsView {
             .child(header_row);
         if let Some(err) = &self.space.error {
             section = section.child(
-                div()
+                crate::ui::error_banner(p, err.clone())
                     .id("admin-space-error")
-                    .debug_selector(|| "admin-space-error".into())
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.destructive)
-                    .child(err.clone()),
+                    .debug_selector(|| "admin-space-error".into()),
             );
         }
 
@@ -689,24 +698,31 @@ impl SettingsView {
                 text::CLEANUP_PR_ANY.get(),
             ),
         ];
-        let mut pr_row = div().flex().items_center().gap_1p5().flex_wrap().child(
-            div()
-                .text_size(crate::ui::TEXT_XS)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.muted_foreground)
-                .child(text::CLEANUP_FILTER_PR.get()),
+        let pr_seg = layout::segmented_control(
+            p,
+            pr_filters.iter().map(|&(mode, id_str, label)| {
+                let active = self.space.filter.pr_filter == mode;
+                layout::segment(id_str, label, active)
+                    .debug_selector(move || id_str.into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_cleanup_pr_filter(mode, cx);
+                    }))
+            }),
         );
-        for &(mode, id_str, label) in pr_filters {
-            let active = self.space.filter.pr_filter == mode;
-            let btn = Button::new(id_str)
-                .small()
-                .label(label)
-                .debug_selector(move || id_str.into())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_cleanup_pr_filter(mode, cx);
-                }));
-            pr_row = pr_row.child(if active { btn.primary() } else { btn.ghost() });
-        }
+        let pr_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.muted_foreground)
+                    .child(text::CLEANUP_FILTER_PR.get()),
+            )
+            .child(pr_seg);
 
         let idle_presets: &[(IdleDaysPreset, &'static str, &'static str)] = &[
             (
@@ -730,34 +746,46 @@ impl SettingsView {
                 text::CLEANUP_IDLE_30D.get(),
             ),
         ];
-        let mut idle_row = div().flex().items_center().gap_1p5().flex_wrap().child(
-            div()
-                .text_size(crate::ui::TEXT_XS)
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(p.muted_foreground)
-                .child(text::CLEANUP_FILTER_IDLE.get()),
+        let idle_seg = layout::segmented_control(
+            p,
+            idle_presets.iter().map(|&(preset, id_str, label)| {
+                let days = preset.days();
+                let active = self.space.filter.min_idle_days == days;
+                layout::segment(id_str, label, active)
+                    .debug_selector(move || id_str.into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_cleanup_idle_days(days, cx);
+                    }))
+            }),
         );
-        for &(preset, id_str, label) in idle_presets {
-            let days = preset.days();
-            let active = self.space.filter.min_idle_days == days;
-            let btn = Button::new(id_str)
-                .small()
-                .label(label)
-                .debug_selector(move || id_str.into())
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_cleanup_idle_days(days, cx);
-                }));
-            idle_row = idle_row.child(if active { btn.primary() } else { btn.ghost() });
-        }
+        let idle_row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .flex_wrap()
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(p.muted_foreground)
+                    .child(text::CLEANUP_FILTER_IDLE.get()),
+            )
+            .child(idle_seg);
 
         let exclude_dirty = self.space.filter.exclude_dirty;
-        let safety_btn = Button::new("admin-cleanup-exclude-dirty")
-            .small()
-            .label(text::CLEANUP_EXCLUDE_DIRTY.get())
-            .debug_selector(|| "admin-cleanup-exclude-dirty".into())
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.set_cleanup_exclude_dirty(!exclude_dirty, cx);
-            }));
+        let view = cx.entity();
+        let safety_switch = layout::switch(
+            p,
+            "admin-cleanup-exclude-dirty",
+            exclude_dirty,
+            self.space.cleaning,
+            move |next, _, cx| {
+                view.update(cx, |this, cx| {
+                    this.set_cleanup_exclude_dirty(next, cx);
+                });
+            },
+        );
         let safety_row = div()
             .flex()
             .items_center()
@@ -768,7 +796,7 @@ impl SettingsView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_1p5()
+                    .gap_2()
                     .child(
                         div()
                             .text_size(crate::ui::TEXT_XS)
@@ -776,14 +804,19 @@ impl SettingsView {
                             .text_color(p.muted_foreground)
                             .child(text::CLEANUP_FILTER_SAFETY.get()),
                     )
-                    .child(if exclude_dirty {
-                        safety_btn.primary()
-                    } else {
-                        safety_btn.ghost()
-                    }),
+                    .child(safety_switch)
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::CLEANUP_EXCLUDE_DIRTY.get()),
+                    ),
             )
             .child(
                 div()
+                    .id("admin-cleanup-summary")
+                    .debug_selector(|| "admin-cleanup-summary".into())
+                    .font_family(crate::ui::FONT_MONO)
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::CLEANUP_CANDIDATES_SUMMARY.format(&[
@@ -799,20 +832,21 @@ impl SettingsView {
             .max_h(px(280.))
             .overflow_y_scroll()
             .flex()
-            .flex_col()
-            .gap_1p5();
+            .flex_col();
 
         if matched.is_empty() {
             list = list.child(
-                layout::card(p)
+                div()
                     .id("admin-cleanup-empty")
                     .debug_selector(|| "admin-cleanup-empty".into())
+                    .w_full()
+                    .py_4()
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::CLEANUP_EMPTY.get()),
             );
         } else {
-            for cand in &matched {
+            for (idx, cand) in matched.iter().enumerate() {
                 let is_selected = self.space.selected.contains(&cand.path);
                 let row_id = format!("admin-cleanup-row-{}", cand.name);
                 let sel_id = format!("admin-cleanup-select-{}", cand.name);
@@ -854,18 +888,26 @@ impl SettingsView {
                     BadgeTone::Neutral,
                     text::CLEANUP_BADGE_IDLE.format(&[("days", &cand.idle_days.to_string())]),
                 );
-                let check_btn = Button::new(gpui::ElementId::Name(sel_id.clone().into()))
-                    .small()
-                    .label(if is_selected { "✓" } else { " " })
+                let check_id = gpui::ElementId::Name(sel_id.clone().into());
+                let check_box = div()
+                    .flex_none()
                     .debug_selector(move || sel_id.clone())
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.toggle_cleanup_candidate(&path_cl, cx);
-                    }));
+                    .child(
+                        Checkbox::new(check_id)
+                            .checked(is_selected)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_cleanup_candidate(&path_cl, cx);
+                            })),
+                    );
 
                 list = list.child(
-                    layout::card(p)
+                    div()
                         .id(SharedString::from(row_id.clone()))
                         .debug_selector(move || row_id.clone())
+                        .w_full()
+                        .min_w_0()
+                        .py_2()
+                        .when(idx > 0, |d| d.border_t_1().border_color(p.border))
                         .flex()
                         .items_center()
                         .justify_between()
@@ -876,11 +918,7 @@ impl SettingsView {
                                 .items_center()
                                 .gap_2()
                                 .min_w_0()
-                                .child(if is_selected {
-                                    check_btn.primary()
-                                } else {
-                                    check_btn.ghost()
-                                })
+                                .child(check_box)
                                 .child(
                                     div()
                                         .min_w_0()
@@ -944,7 +982,7 @@ impl SettingsView {
             .debug_selector(|| "admin-cleanup-modal".into())
             .occlude()
             .role(gpui::Role::Dialog)
-            .w(px(640.))
+            .w(crate::ui::SETTINGS_MODAL_WIDTH)
             .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
             .p_6()
             .rounded(crate::ui::RADIUS_LG)
@@ -978,7 +1016,12 @@ impl SettingsView {
                     ),
             )
             .child(
-                layout::card(p)
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .pb_3()
+                    .border_b_1()
+                    .border_color(p.border)
                     .flex()
                     .flex_col()
                     .gap_2p5()
@@ -1024,10 +1067,7 @@ impl SettingsView {
                             .items_center()
                             .gap_2()
                             .child(
-                                Button::new("admin-cleanup-cancel")
-                                    .small()
-                                    .ghost()
-                                    .label(text::CLEANUP_CLOSE.get())
+                                layout::ghost("admin-cleanup-cancel", text::CLEANUP_CLOSE.get())
                                     .debug_selector(|| "admin-cleanup-cancel".into())
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.close_cleanup_modal(cx);

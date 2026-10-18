@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
+use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
 use krill_proto::SessionId;
 use krill_proto::agent_history::{
@@ -529,16 +530,37 @@ impl Render for Panel {
             }
         }
 
+        let tooltip_text = match (&self.vault, &self.data) {
+            (Some(v), _) => format!("{} ({})", text::TITLE.get(), v.hits.len()),
+            (None, Some(d)) => format!("{} ({})", text::TITLE.get(), d.entries.len()),
+            (None, None) => text::TITLE.get().to_owned(),
+        };
         let header = div()
             .id("agent-history-toggle")
             .debug_selector(|| "agent-history-toggle".into())
-            .px_1p5()
+            .aria_label(tooltip_text.clone())
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_1()
             .py_0p5()
             .text_size(crate::ui::TEXT_XS)
+            .text_color(if self.open {
+                p.foreground
+            } else {
+                p.muted_foreground
+            })
             .rounded(crate::ui::RADIUS_XS)
             .cursor_pointer()
             .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-            .child(text::TITLE.get())
+            .child(
+                gpui_component::Icon::default()
+                    .data(crate::ui::icons::HISTORY_SVG)
+                    .with_size(gpui_component::Size::XSmall),
+            )
+            .tooltip(move |window, cx| {
+                crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
+            })
             .on_click(cx.listener(|this, _, _, cx| this.on_toggle_click(cx)));
 
         let popover = self.open.then(|| {

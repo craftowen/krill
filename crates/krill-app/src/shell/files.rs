@@ -734,12 +734,11 @@ impl Shell {
                     if self.panel_collapsed {
                         self.panel_collapsed = false;
                     }
-                    let visible = self.security.is_window_active();
                     let worktree = req.worktree;
                     let rel = req.relative_path;
                     let staged = req.staged;
                     self.diff.update(cx, |d, cx| {
-                        d.set_visible(visible, cx);
+                        d.set_visible(true, cx);
                         d.open_diff_file(worktree, &rel, staged, cx);
                     });
                 }
