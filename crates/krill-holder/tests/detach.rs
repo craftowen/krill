@@ -1,6 +1,8 @@
 //! OWE-485: `--detach`로 띄운 holder는 띄운 쪽에게서 새어 들어온 fd(3 이상)를 닫는다 — holder도, holder가
 //! 띄운 krilld도 쥐지 않는다.
 
+#![cfg(unix)]
+
 use std::io::Read;
 use std::process::Command;
 use std::sync::mpsc;
