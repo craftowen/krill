@@ -213,10 +213,14 @@ mod tests {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            connection(ProviderKind::Claude, &dir),
-            ConnectionStatus::Connected
-        );
+        // 마커가 띄운 백그라운드 재조회가 잠깐 Checking으로 보일 수 있다(check.sh flaky, 2026-10-19).
+        while connection(ProviderKind::Claude, &dir) != ConnectionStatus::Connected {
+            assert!(
+                Instant::now() < deadline,
+                "connection never became Connected"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
 
