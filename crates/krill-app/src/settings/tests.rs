@@ -2649,6 +2649,120 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-884: SSH 폼 Enter 제출·연결 테스트 진행 표시·삭제 2단계 확인·ssh-copy-id 메인 배너 전달을 검증한다.
+#[gpui::test]
+fn owe884_ssh_form_enter_test_pending_remove_confirm_and_copy_id_notice(cx: &mut TestAppContext) {
+    let d = dir("owe884-ssh-ux");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("admin-ssh-form").is_some());
+
+    // 1. 폼 입력 후 주소칸에서 Enter → 추가 버튼과 같은 경로로 호스트가 추가된다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.ensure_ssh_form(window, cx);
+            let form = v.ssh_form.as_ref().expect("ssh form");
+            form.label.update(cx, |s, cx| s.focus(window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.simulate_input("집 맥미니");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let form = v.ssh_form.as_ref().expect("ssh form");
+            form.address.update(cx, |s, cx| s.focus(window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.simulate_input("owen@10.0.0.5");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(view.read(cx).ssh_hosts().len(), 1);
+        assert_eq!(view.read(cx).ssh_hosts()[0].label, "집 맥미니");
+        assert_eq!(view.read(cx).ssh_hosts()[0].destination, "owen@10.0.0.5");
+    });
+    let host = vcx.update(|_, cx| view.read(cx).ssh_hosts()[0].clone());
+    let host_id = host.id.clone();
+
+    // 2. 연결 테스트 시작 → 진행 중 표시 → 결과 반영 후 해제.
+    // 빈 접속 주소는 `valid_host`에서 거부돼 실제 ssh를 띄우지 않고 즉시 실패한다.
+    let mut unreachable = host.clone();
+    unreachable.destination = String::new();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.test_ssh_host(unreachable.clone(), cx));
+        window.draw(cx).clear(cx);
+        assert!(
+            view.read(cx).is_ssh_test_pending(&host_id),
+            "test must be marked pending"
+        );
+        let status = view.read(cx).ssh_status.as_ref().unwrap().to_string();
+        assert!(
+            status.contains("연결 테스트 중") || status.contains("Testing connection"),
+            "unexpected status: {status}"
+        );
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.apply_ssh_test_result(host.clone(), Err("ssh: Connection refused".into()), cx);
+        });
+        window.draw(cx).clear(cx);
+        assert!(!view.read(cx).is_ssh_test_pending(&host_id));
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Error
+        );
+    });
+
+    // 3. 삭제는 2단계 확인: 첫 클릭은 무장만 하고, 두 번째 클릭에 삭제된다.
+    let rm_sel: &'static str = format!("admin-ssh-remove-{host_id}").leak();
+    assert!(vcx.debug_bounds(rm_sel).is_some());
+    click(vcx, rm_sel);
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).ssh_hosts().len(),
+            1,
+            "first click must only arm"
+        );
+        assert_eq!(view.read(cx).armed.as_deref(), Some(rm_sel));
+    });
+    click(vcx, rm_sel);
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).ssh_hosts().is_empty(), "second click deletes");
+        assert_eq!(view.read(cx).armed, None);
+    });
+
+    // 4. ssh-copy-id 실행 안내가 메인 셸 배너로 전달된다(설정 창이 닫혀도 보인다).
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.launch_ssh_copy_id(host.clone(), cx));
+        let notice = take_pending_notice(cx).expect("copy-id notice must be queued");
+        assert!(
+            notice.contains("ssh-copy-id"),
+            "unexpected notice: {notice}"
+        );
+        let status = view.read(cx).ssh_status.as_ref().unwrap().to_string();
+        assert!(
+            status.contains("ssh-copy-id"),
+            "unexpected status: {status}"
+        );
+    });
+
+    std::fs::remove_dir_all(d).ok();
+}
+
 /// AS-02: 일시 IO 오류를 `NotFound`로 취급해 설정을 기본값으로 리셋하면 안 된다.
 /// 직전 설정을 유지하고 오류를 표시하며 동면 표식 동기화를 건너뛴다.
 #[gpui::test]
