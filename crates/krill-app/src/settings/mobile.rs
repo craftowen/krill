@@ -280,7 +280,9 @@ impl SettingsView {
                 ConnectMode::Lan,
                 "mobile-lan",
                 text::LAN.get(),
-                text::LAN_DESC.get(),
+                text::LAN_DESC
+                    .mac_or(crate::i18n::catalog::other_os::LAN_DESC)
+                    .get(),
             ),
             (
                 ConnectMode::Tailscale,

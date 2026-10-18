@@ -17,8 +17,8 @@ pub mod real;
 use std::sync::Arc;
 
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, KeyBinding, KeyDownEvent,
-    Render, SharedString, Subscription, Task, Window, actions, div, prelude::*,
+    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, Render,
+    SharedString, Subscription, Task, Window, actions, div, prelude::*,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -44,7 +44,7 @@ pub const KEY_CONTEXT: &str = "Pairing";
 
 /// 짝짓기 모달의 전역 키 바인딩. 앱 시작 때 한 번 등록한다.
 pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([KeyBinding::new("cmd-w", ClosePairing, Some(KEY_CONTEXT))]);
+    cx.bind_keys([crate::keys::bind("cmd-w", ClosePairing, Some(KEY_CONTEXT))]);
 }
 
 /// `ServerPanel`·`ClientDialog`가 외부로 알리는 이벤트.

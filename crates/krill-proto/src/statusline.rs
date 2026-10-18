@@ -141,10 +141,9 @@ pub fn render_cache(
 /// 캐시 파일을 원자·0600으로 쓴다. 디렉터리가 없으면 만들지 않고 `Ok(false)`(기록 건너뜀).
 /// 같은 디렉터리의 숨김 임시 파일에 0600으로 쓰고 fsync 뒤 rename한다.
 pub fn write_cache_file(dir: &Path, text: &str) -> io::Result<bool> {
+    use crate::os::fs::OpenOptionsExt as _;
     use std::fs::OpenOptions;
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    use std::os::unix::fs::PermissionsExt as _;
     if !dir.is_dir() {
         return Ok(false);
     }
@@ -167,8 +166,13 @@ pub fn write_cache_file(dir: &Path, text: &str) -> io::Result<bool> {
         std::fs::remove_file(&temp).ok();
         written?;
     }
-    std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
-    std::fs::File::open(dir)?.sync_all()?;
+    // Windows는 권한 비트가 없고 디렉터리를 `File::open`으로 열 수 없다.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::File::open(dir)?.sync_all()?;
+    }
     Ok(true)
 }
 

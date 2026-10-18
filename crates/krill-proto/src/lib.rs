@@ -24,6 +24,7 @@ pub mod input;
 pub mod ipc;
 pub mod mobile;
 pub mod orchestration;
+pub mod os;
 pub mod resources;
 pub mod roles;
 pub mod schedule;

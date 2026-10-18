@@ -53,6 +53,7 @@ fn detect_login(login: Option<OsString>) -> Option<Vec<ProviderKind>> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
 

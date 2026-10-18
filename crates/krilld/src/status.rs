@@ -15,10 +15,10 @@
 //! `[u8 버전 = 1][postcard Vec<(SessionId, Record)>]`. 읽지 못하면(다른 버전·손상) 빈 저장소로 시작한다(상태가
 //! unknown이 될 뿐 세션에는 영향 없음). 필드는 끝에만 붙이고 버전을 올린다.
 
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -376,7 +376,8 @@ pub fn take_spool(
     if f.metadata()?.len() == 0 {
         return Ok(());
     }
-    f.lock()?;
+    let spool_lock = hook::spool_lock(path, &f)?;
+    spool_lock.lock()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     let mut events = hook::read_spool(&buf);

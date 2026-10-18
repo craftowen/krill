@@ -299,7 +299,10 @@ mod tests {
                 args: [
                     "SSH_CONNECTION=krill",
                     "agy",
-                    "--gemini_dir=/tmp/a/.gemini",
+                    &format!(
+                        "--gemini_dir={}",
+                        Path::new("/tmp/a").join(".gemini").to_string_lossy()
+                    ),
                     "login"
                 ]
                 .into_iter()
@@ -312,6 +315,7 @@ mod tests {
     /// 호스트 기본 계정은 env 없이 다룬다. Claude는 `CLAUDE_CONFIG_DIR`이 설정되기만 해도(값이 `~/.claude`여도)
     /// 키체인 항목 이름에 해시 접미사를 붙여 다른 로그인을 본다(claude 2.1.302 `D1`).
     #[test]
+    #[cfg(unix)] // 가짜 CLI가 /bin/sh 스크립트다.
     fn host_account_login_and_probe_drop_config_env() {
         use std::os::unix::fs::PermissionsExt as _;
         assert_eq!(
@@ -369,6 +373,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // 가짜 CLI가 /bin/sh 스크립트다.
     fn fake_cli_probes_isolated_profile_and_codex_stderr() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = std::env::temp_dir().join(format!("owe700-probe-{}", std::process::id()));
@@ -417,6 +422,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // 가짜 CLI가 /bin/sh 스크립트다.
     fn opencode_probe_uses_profile_xdg_paths() {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -465,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // 가짜 CLI가 /bin/sh 스크립트다.
     fn provider_probe_uses_requested_home_path_and_distinguishes_cli_failures() {
         use std::os::unix::fs::PermissionsExt as _;
         let root = std::env::temp_dir().join(format!("owe719-env-probe-{}", std::process::id()));
@@ -523,6 +530,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn cleanup_preserves_existing_data_and_symlinks() {
         let root = std::env::temp_dir().join(format!("owe700-cleanup-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();

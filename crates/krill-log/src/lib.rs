@@ -40,22 +40,48 @@ impl Component {
     }
 }
 
-/// Explicit override isolates tests; production uses the Console.app-visible directory.
+/// Explicit override isolates tests; production uses `LocalAppData` on Windows
+/// and the Console.app-visible directory on macOS (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
-    directory_in(|key| std::env::var_os(key))
+    directory_in(
+        |key| std::env::var_os(key),
+        || {
+            #[cfg(windows)]
+            {
+                std::env::home_dir()
+            }
+            #[cfg(not(windows))]
+            {
+                std::env::var_os("HOME").map(PathBuf::from)
+            }
+        },
+    )
 }
 
 /// [`directory`]의 본체. 환경변수를 직접 만지지 않아 병렬 테스트에 안전하다.
-fn directory_in(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+fn directory_in(
+    get: impl Fn(&str) -> Option<OsString>,
+    home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
     if let Some(dir) = get("KRILL_LOG_DIR") {
         return Some(PathBuf::from(dir));
     }
-    // Linux 원격 호스트: `~/.local/state/krill/logs`(XDG state). macOS 경로를 만들지 않는다.
-    if cfg!(target_os = "linux") {
-        return get("HOME").map(|h| PathBuf::from(h).join(".local/state/krill/logs"));
+    #[cfg(windows)]
+    let base = get("LOCALAPPDATA").map(PathBuf::from).or_else(home);
+    #[cfg(not(windows))]
+    let base = home();
+    #[cfg(windows)]
+    {
+        base.map(|path| path.join("Krill").join("Logs"))
     }
-    get("HOME").map(|h| {
-        let logs = PathBuf::from(h).join("Library/Logs");
+    // Linux 원격 호스트: `~/.local/state/krill/logs`(XDG state). macOS 경로를 만들지 않는다.
+    #[cfg(target_os = "linux")]
+    {
+        base.map(|h| h.join(".local/state/krill/logs"))
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    base.map(|h| {
+        let logs = h.join("Library/Logs");
         let (new, old) = (logs.join("Krill"), logs.join("Minikrill"));
         // MK-170: 이관 전(새 디렉터리 없음 + 옛 디렉터리가 실제 디렉터리)에는 옛 이름에 계속 쓴다.
         if new.symlink_metadata().is_err() && old.symlink_metadata().is_ok_and(|m| m.is_dir()) {
@@ -83,23 +109,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn directory_prefers_override_then_home_default() {
+    fn directory_prefers_override() {
         let override_dir = |k: &str| Some(OsString::from(format!("/{k}")));
         assert_eq!(
-            directory_in(override_dir),
+            directory_in(override_dir, || None),
             Some(PathBuf::from("/KRILL_LOG_DIR"))
         );
-        let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
+        assert_eq!(directory_in(|_| None, || None), None);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_uses_home_default() {
         let want = if cfg!(target_os = "linux") {
             "/h/.local/state/krill/logs"
         } else {
             "/h/Library/Logs/Krill"
         };
-        assert_eq!(directory_in(home), Some(PathBuf::from(want)));
-        assert_eq!(directory_in(|_| None), None);
+        assert_eq!(
+            directory_in(|_| None, || Some(PathBuf::from("/h"))),
+            Some(PathBuf::from(want))
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn directory_prefers_local_app_data_then_home() {
+        let local = |k: &str| (k == "LOCALAPPDATA").then(|| OsString::from(r"C:\local"));
+        assert_eq!(
+            directory_in(local, || Some(PathBuf::from(r"C:\home"))),
+            Some(PathBuf::from(r"C:\local\Krill\Logs"))
+        );
+        assert_eq!(
+            directory_in(|_| None, || Some(PathBuf::from(r"C:\home"))),
+            Some(PathBuf::from(r"C:\home\Krill\Logs"))
+        );
     }
 
     /// MK-170: 이관 전에는 옛 `Logs/Minikrill`, 옮겨진 뒤(옛 자리는 링크)에는 `Logs/Krill`.
+    #[cfg(unix)]
     #[test]
     #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: ~/Library/Logs 이관")]
     fn directory_follows_bundle_migration() {
@@ -107,11 +155,14 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
         let logs = home.join("Library/Logs");
         std::fs::create_dir_all(logs.join("Minikrill")).unwrap();
-        let get = |k: &str| (k == "HOME").then(|| home.clone().into_os_string());
-        assert_eq!(directory_in(get), Some(logs.join("Minikrill")));
+        let get_home = || Some(home.clone());
+        assert_eq!(
+            directory_in(|_| None, get_home),
+            Some(logs.join("Minikrill"))
+        );
         std::fs::rename(logs.join("Minikrill"), logs.join("Krill")).unwrap();
         std::os::unix::fs::symlink("Krill", logs.join("Minikrill")).unwrap();
-        assert_eq!(directory_in(get), Some(logs.join("Krill")));
+        assert_eq!(directory_in(|_| None, get_home), Some(logs.join("Krill")));
         std::fs::remove_dir_all(&home).unwrap();
     }
 }

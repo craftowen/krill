@@ -449,6 +449,7 @@ pub(crate) mod agy {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn reset_latch_for_tests() {
         MODEL_TURN_LATCH.store(false, Ordering::SeqCst);
         lock(&CACHE).clear();
@@ -630,11 +631,13 @@ pub(crate) mod agy {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn fetch_for_tests(exe: &Path, dir: &Path, host: bool) -> Option<Usage> {
         fetch(exe, dir, host)
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn probe_version_for_tests(exe: &Path) -> bool {
         version_supported(exe)
     }
@@ -839,7 +842,9 @@ pub(crate) mod agy {
         reader.join().ok()?
     }
 
+    // 가짜 agy 실행 파일(셸 스크립트·실행 권한)을 쓰므로 unix 전용이다.
     #[cfg(test)]
+    #[cfg(unix)]
     mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
@@ -1040,7 +1045,7 @@ pub(crate) mod agy {
 /// `PATH`에서 agy를 찾는다(테스트·오프라인에서는 호출하지 않는다).
 #[cfg(not(test))]
 fn agy_exe() -> Option<PathBuf> {
-    use std::os::unix::ffi::OsStrExt as _;
+    use krill_proto::os::ffi::OsStrExt as _;
     let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
     krill_proto::agent::which("agy", path)
 }
@@ -1109,10 +1114,14 @@ mod tests {
         );
         assert!(parse_antigravity_auth(b"invalid").is_none());
         assert!(parse_antigravity_auth(b"go-keyring-encoded:7").is_none());
-        let encoded = pipe_command("/usr/bin/base64", &[], raw).unwrap();
-        let mut wrapped = b"go-keyring-base64:".to_vec();
-        wrapped.extend_from_slice(&encoded);
-        assert!(parse_antigravity_auth(&wrapped).unwrap().logged_in);
+        // go-keyring base64 풀기는 /usr/bin/base64에 맡긴다(Unix 전용 경로).
+        #[cfg(unix)]
+        {
+            let encoded = pipe_command("/usr/bin/base64", &[], raw).unwrap();
+            let mut wrapped = b"go-keyring-base64:".to_vec();
+            wrapped.extend_from_slice(&encoded);
+            assert!(parse_antigravity_auth(&wrapped).unwrap().logged_in);
+        }
         assert_eq!(
             claude_service(Some(Path::new("/tmp/é"))),
             claude_service(Some(Path::new("/tmp/e\u{301}")))

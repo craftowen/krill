@@ -2,7 +2,7 @@
 //! OWE-723: 프로젝트 추가 모달의 복제·새 프로젝트는 새 탭의 셸에서 git을 돌린다(진행·인증·오류가 터미널에 보이고,
 //! 끝나면 그 폴더의 로그인 셸이 남아 사이드바가 실제 cwd로 프로젝트를 찾는다).
 
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
 use std::path::PathBuf;
 
 use gpui::{AppContext as _, Context, Window};

@@ -740,6 +740,7 @@ pub fn has_default_ssh_key(home: Option<&Path>) -> bool {
 
 /// `~/.ssh/id_ed25519` 키가 없으면 빈 패스프레이즈로 새로 생성한다.
 pub fn generate_default_ssh_key(home: Option<&Path>) -> io::Result<PathBuf> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     let key_path = default_ssh_key_path(home);
@@ -748,6 +749,7 @@ pub fn generate_default_ssh_key(home: Option<&Path>) -> io::Result<PathBuf> {
     }
     if let Some(ssh_dir) = key_path.parent() {
         std::fs::create_dir_all(ssh_dir)?;
+        #[cfg(unix)]
         std::fs::set_permissions(ssh_dir, std::fs::Permissions::from_mode(0o700)).ok();
     }
     let keygen_bin = std::env::var_os("KRILL_SSH_KEYGEN_BIN")

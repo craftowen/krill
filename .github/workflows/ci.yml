@@ -1,7 +1,7 @@
 # Krill CI — Linux 고속 게이트 (OWE-382, MK-017).
 # krill-proto·krill-term 단위 테스트 + clippy + cargo deny만. 모든 PR에서 항상 실행.
 # macOS 전체(clippy·nextest·PTY e2e)는 ci-macos.yml이 관련 경로 변경 시만 실행한다
-# (비공개 저장소 macOS 분 절약, 2026-10-15 오웬 결정).
+# (macOS 분 절약, 2026-10-15 오웬 결정).
 # 로컬 재현은 scripts/check.sh.
 name: ci
 

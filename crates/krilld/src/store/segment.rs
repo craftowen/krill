@@ -76,6 +76,7 @@ pub(crate) struct Header {
 
 impl Header {
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn encode(&self) -> [u8; HEADER_LEN] {
         self.encode_with_keyframe(KEYFRAME_NONE)
     }
@@ -97,6 +98,7 @@ impl Header {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn decode(b: &[u8]) -> Option<Self> {
         Self::decode_with_keyframe(b).map(|(h, _)| h)
     }
@@ -227,6 +229,7 @@ pub(super) fn read(path: &Path, key: Option<&Key>) -> io::Result<Option<Segment>
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(super) fn decode(bytes: &[u8], key: Option<&Key>) -> io::Result<Option<Segment>> {
     decode_mut(&mut bytes.to_vec(), key)
 }

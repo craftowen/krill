@@ -60,6 +60,16 @@ impl Message {
         self.in_language(language())
     }
 
+    /// "Mac"·"Finder"·"Dock"처럼 macOS 이름이 박힌 문구. macOS 밖에서는 `other`(카탈로그 `other_os`)를 쓴다(OWE-834).
+    #[must_use]
+    pub const fn mac_or(self, other: Self) -> Self {
+        if cfg!(target_os = "macos") {
+            self
+        } else {
+            other
+        }
+    }
+
     /// Named substitutions permit translators to reorder fields. Replacement values are
     /// inserted once, so braces in paths, errors, or terminal text stay literal.
     pub fn format(self, args: &[(&str, &str)]) -> String {
@@ -103,6 +113,15 @@ macro_rules! catalog {
 }
 
 catalog! {
+    other_os {
+        REVEAL => ("파일 탐색기에서 보기", "Show in File Explorer"),
+        SUMMARY_LOCAL => ("터미널 기록은 이 컴퓨터에만 저장되고, 텔레메트리는 없습니다.", "Terminal history stays on this computer. There is no telemetry."),
+        HOST_LOCAL => ("내 컴퓨터", "My computer"),
+        LAN_DESC => ("휴대폰이 이 컴퓨터와 같은 Wi-Fi에 연결되어 있어야 합니다. 별도 계정이 필요하지 않습니다.", "Phone must be on the same Wi-Fi network as this computer. No account needed."),
+        THEME_DESC => ("앱과 터미널의 라이트·다크 모양입니다. 시스템은 OS 설정을 따릅니다.", "Light or dark look for the app and terminals. System follows the OS setting."),
+        NOTIFICATIONS_DESC => ("에이전트 입력 대기·완료 알림을 보냅니다.", "Notify when an agent waits for input or finishes."),
+        KEEP_AWAKE_DESC => ("컴퓨터가 유휴 잠자기에 들어가지 않게 합니다.", "Prevent the computer from idle sleep."),
+    }
     mobile {
         TAB => ("모바일 원격 제어", "Mobile"),
         TITLE => ("모바일 원격 제어 · QR 페어링", "Mobile remote control · QR pairing"),

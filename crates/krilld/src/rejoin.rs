@@ -19,28 +19,32 @@
 //! `krill_proto::daemon::connect`가 기동 락 아래 새 `krill-holder --detach`를 띄운다. 서명 경로는 MK-106에서 전환한다.
 
 use std::collections::HashMap;
-use std::fs::{self, Permissions};
+use std::fs;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
-use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use krill_holder::link::Link;
 use krill_proto::SessionId;
 use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder};
+use krill_proto::os::net::{UnixListener, UnixStream};
 
-use crate::holder::{self, Kept};
+#[cfg(unix)]
+use crate::holder;
+use crate::holder::Kept;
+use crate::holder::link::Link;
 use crate::ipc::{Listener, with_suffix};
+use crate::os::{AsFd, OwnedFd};
 use crate::registry::Registry;
 use crate::sys::{self, ExitWatch};
 
 /// 인계 소켓 이름 = 소켓 경로 + 이 접미사. `.tmp`와 길이가 같아 [`Listener::bind`]의 경로 길이 검사 안에 든다.
 const SUFFIX: &str = ".hnd";
 /// 인계 중 상대를 기다리는 최대 시간(멈춘 상대가 고아 krilld를 붙잡지 못하게).
+#[cfg(unix)]
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// 리더가 멈추기를 기다리는 최대 시간. 리더는 읽은 묶음 하나(최대 64KiB)를 엔진에 넣고 멈춘다.
 const HALT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -62,9 +66,10 @@ pub fn orphan(reg: &Arc<Registry>, sock: &Path) -> io::Result<()> {
         _ => {}
     }
     let lis = UnixListener::bind(&path)?;
-    fs::set_permissions(&path, Permissions::from_mode(0o600))?;
+    #[cfg(unix)]
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
     reg.holder_lost();
-    let uid = rustix::process::geteuid().as_raw();
+    let uid = crate::os::euid();
     loop {
         let Ok((s, _)) = lis.accept() else { continue };
         if sys::peer_uid(s.as_fd()).ok() != Some(uid) {
@@ -109,14 +114,16 @@ fn watch_exits(reg: &Arc<Registry>) {
 }
 
 /// 리더를 멈추고 세션을 모두 넘긴 뒤 상대의 `Ready`를 기다린다.
+#[cfg(unix)]
 fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     halt_all(reg)?;
     s.set_read_timeout(Some(PEER_TIMEOUT))?;
     s.set_write_timeout(Some(PEER_TIMEOUT))?;
-    let mut link = Link::new(OwnedFd::from(s));
+    let mut link = Link::new(crate::os::link_fd(s)?);
     let hello = FromHolder::Hello {
         version: krill_proto::holder::VERSION,
         holder_pid: std::process::id(),
+        inbox: false,
     };
     send(&link, &hello, None)?;
     let mut sent = Ok(());
@@ -133,6 +140,12 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
         Some((FromHolder::Ready, _)) => Ok(()),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
+}
+
+/// Windows 고아 세션은 계속 서빙한다. 새 holder의 Adopt·Job 복원은 후속 작업이다.
+#[cfg(windows)]
+fn give(_reg: &Registry, _stream: UnixStream) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// PTY 리더를 모두 멈추고(읽은 묶음은 기록·세그먼트 봉인까지) 끝나기를 기다린다. 되돌릴 수 없다.
@@ -160,7 +173,10 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
         .encode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     match with {
+        #[cfg(unix)]
         Some(s) => link.send(&frame, &[s.master()]),
+        #[cfg(windows)]
+        Some(_) => Err(io::ErrorKind::Unsupported.into()),
         None => link.send(&frame, &[]),
     }
 }
@@ -170,6 +186,7 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
 #[derive(Debug)]
 pub struct Handover {
     link: Link,
+    #[cfg(unix)]
     sessions: Vec<Kept>,
 }
 
@@ -178,13 +195,20 @@ impl Handover {
     ///
     /// # Errors
     /// 인계 소켓이 없거나 `Ready` 전에 끊기면 오류.
+    #[cfg(unix)]
     pub fn take(sock: &Path) -> io::Result<Self> {
         let s = UnixStream::connect(handoff_path(sock))?;
         s.set_read_timeout(Some(PEER_TIMEOUT))?;
         s.set_write_timeout(Some(PEER_TIMEOUT))?;
-        let mut link = Link::new(OwnedFd::from(s));
+        let mut link = Link::new(crate::os::link_fd(s)?);
         let (_, sessions, _) = holder::receive(&mut link)?;
         Ok(Self { link, sessions })
+    }
+
+    /// Windows에서는 Unix 소켓 기반 fd 재결합을 사용하지 않는다.
+    #[cfg(windows)]
+    pub fn take(_sock: &Path) -> io::Result<Self> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// 받은 세션을 holder가 돌려준 목록 `kept`에 더하고, holder에 맡길 세션(끝나지 않은 것)의 id·pid·master 사본을
@@ -192,6 +216,7 @@ impl Handover {
     ///
     /// # Errors
     /// master fd 복제 실패.
+    #[cfg(unix)]
     pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {
         let mut adopt = Vec::new();
         for k in self.sessions.drain(..) {
@@ -204,6 +229,13 @@ impl Handover {
             kept.push(k);
         }
         Ok(adopt)
+    }
+
+    /// Windows 새 holder의 Adopt·ConPTY/Job 복원은 후속 작업이다.
+    #[cfg(windows)]
+    #[expect(clippy::unused_self, reason = "Unix merge와 같은 인계 진입점")]
+    pub fn merge(&mut self, _kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// `Ready`를 돌려주고 krilld#1이 끝나기를 기다린 뒤 소켓을 게시한다.

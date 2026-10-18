@@ -6,21 +6,26 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::os::unix::fs::DirBuilderExt as _;
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+#[cfg(unix)]
+use std::process::Child;
+use std::process::{Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::daemon::{self, Connection};
 use krill_proto::ipc::ClientHello;
+use krill_proto::os::fs::DirBuilderExt as _;
+use krill_proto::os::net::{UnixListener, UnixStream};
 use serde::{Deserialize, Serialize};
 
 /// 포워더(ssh 또는 `KRILL_SSH_BIN`)가 local 소켓을 열 때까지 기다리는 상한.
+#[cfg(unix)]
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(unix)]
 const READY_POLL: Duration = Duration::from_millis(20);
 /// 이보다 오래된 포워딩 소켓만 잔재로 본다. 다른 프로세스가 막 bind한(아직 listen 전) 소켓을 지우지 않게.
+#[cfg(unix)]
 const STALE_FORWARD_AGE: Duration = Duration::from_secs(60);
 /// 터널 소켓 Hello 읽기·쓰기 상한(`daemon::HELLO_TIMEOUT`과 같은 값).
 pub const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -311,6 +316,10 @@ fn query_remote_home_with_program(
     ssh_bin: &std::ffi::OsStr,
 ) -> io::Result<String> {
     opts.validate()?;
+    if cfg!(windows) {
+        // 파이프 stdout을 잡은 ssh.exe는 핸드셰이크에서 멈춘다(OWE-840 실측) — 막히기 전에 끊는다.
+        return Err(windows_unsupported());
+    }
     let out = Command::new(ssh_bin)
         .args(opts.remote_home_args())
         .stdin(Stdio::null())
@@ -333,6 +342,14 @@ fn query_remote_home_with_program(
         }));
     }
     String::from_utf8(out.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+}
+
+/// Windows SSH 원격 호스트 미지원 오류(`ssh/windows.rs` 참고).
+fn windows_unsupported() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        "ssh remote hosts are not supported on Windows yet",
+    )
 }
 
 /// 원격 krilld 소켓 경로 결정:
@@ -493,6 +510,9 @@ pub fn extract_host(args: &[OsString]) -> Result<(Option<String>, Vec<OsString>)
 }
 
 /// 살아 있는 SSH(또는 모의) 포워더. Drop 시 자식을 죽이고 소켓 파일을 치운다.
+///
+/// Windows는 아직 미지원이다(`windows.rs`). 공개 API는 같다.
+#[cfg(unix)]
 #[derive(Debug)]
 pub struct Tunnel {
     child: Child,
@@ -517,7 +537,10 @@ impl Tunnel {
         let prog = ssh_program();
         Self::start_at_with_program(opts, local, remote, &prog)
     }
+}
 
+#[cfg(unix)]
+impl Tunnel {
     pub fn start_at_with_program(
         opts: &SshOptions,
         local: PathBuf,
@@ -588,6 +611,7 @@ impl Tunnel {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Tunnel {
     fn drop(&mut self) {
         self.child.kill().ok();
@@ -598,6 +622,7 @@ impl Drop for Tunnel {
 
 /// 소유 프로세스가 SIGKILL로 죽어 `Drop`이 못 지운 포워딩 소켓(`fwd-*`·`f-*`)을 지운다.
 /// 듣는 쪽이 없어 연결이 거부되는 것만 지우므로 살아 있는 다른 터널은 남는다.
+#[cfg(unix)]
 fn sweep_stale_forwards(dir: &Path, min_age: Duration) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -742,6 +767,11 @@ fn proxy(down: UnixStream, up: UnixStream) {
     to.shutdown(std::net::Shutdown::Write).ok();
     one.join().ok();
 }
+
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::Tunnel;
 
 #[cfg(test)]
 mod tests;

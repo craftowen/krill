@@ -85,8 +85,12 @@ fn bundle_collects_redacted_logs_and_acknowledge_hides_them() {
     for leak in LEAKS {
         assert!(!text.contains(leak), "{leak} leaked:\n{text}");
     }
-    let mode = std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions());
-    assert_eq!(mode & 0o777, 0o600);
+    #[cfg(unix)]
+    {
+        let mode =
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o600);
+    }
     fs::remove_dir_all(&state).ok();
 }
 
@@ -153,7 +157,8 @@ fn panic_hook_writes_crash_log() {
     assert!(text.contains("process: test"), "{text}");
     assert!(text.contains("message: MK-067 hook test"), "{text}");
     assert!(
-        text.contains("location: crates/krill-proto/src/diag/tests.rs"),
+        text.replace('\\', "/")
+            .contains("location: crates/krill-proto/src/diag/tests.rs"),
         "{text}"
     );
     assert!(text.contains("backtrace:"), "{text}");

@@ -1,10 +1,10 @@
 //! 0600 원자 저장 기기 레지스트리와 5분 일회용 페어링 티켓. 호출자는 한 잠금으로 직렬화한다.
 use super::e2ee::{invalid, random};
 use krill_proto::mobile::{PairedMobileDevice, PairingTicket};
+use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
 use ring::{digest, hmac};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 pub const TICKET_TTL_MS: u64 = 300_000;
@@ -188,21 +188,13 @@ impl Devices {
 }
 /// 본인 소유·0600·심볼릭 링크 아님을 확인하고 읽는다. 없으면 `None`.
 pub(super) fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+    let file = match crate::os::open_no_follow(OpenOptions::new().read(true), path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
     let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.len() > MAX_FILE
-        || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o077 != 0
-    {
+    if !meta.is_file() || meta.len() > MAX_FILE || !crate::os::private_to_me(&meta, 0o077) {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     let mut bytes = Vec::new();
@@ -218,10 +210,7 @@ pub(super) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .mode(0o700)
         .create(dir)?;
     let meta = fs::symlink_metadata(dir)?;
-    if !meta.is_dir()
-        || meta.uid() != rustix::process::geteuid().as_raw()
-        || meta.mode() & 0o022 != 0
-    {
+    if !meta.is_dir() || !crate::os::private_to_me(&meta, 0o022) {
         return Err(io::ErrorKind::PermissionDenied.into());
     }
     let tmp = dir.join(format!(".mobile-{}.tmp", hex(&random()?)));
@@ -231,11 +220,15 @@ pub(super) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
             .create_new(true)
             .mode(0o600)
             .open(&tmp)?;
-        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
         file.write_all(bytes)?;
         file.sync_all()?;
         fs::rename(&tmp, path)?;
-        File::open(dir)?.sync_all()
+        // Windows는 디렉터리를 File::open으로 열지 못한다(os error 5, OWE-835 실측).
+        #[cfg(unix)]
+        fs::File::open(dir)?.sync_all()?;
+        Ok(())
     })();
     if result.is_err() {
         fs::remove_file(tmp).ok();
@@ -274,4 +267,5 @@ pub fn decode_hex<const N: usize>(value: &str) -> io::Result<[u8; N]> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

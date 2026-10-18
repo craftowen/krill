@@ -11,14 +11,19 @@
 //! 5. 별도 relauncher가 새 앱을 띄우고 기동 확인 신호(`ready`)를 기다린다(기본 30초). 새 앱이 비정상 종료되거나
 //!    제때 신호를 보내지 않으면 `<번들>.prev`로 자동 롤백한 뒤 복구된 앱을 띄우고 롤백 대화상자를 표시한다.
 //! 6. 데몬(`krill-holder`·`krilld`)은 업데이터가 죽이지 않으므로 업데이트·롤백 중에도 세션이 그대로 유지된다.
+//!
+//! Windows(OWE-837)는 같은 흐름에서 `.app` 번들 대신 설치 폴더(`%LOCALAPPDATA%\Programs\Krill`, `Krill.json` 표지)를 쓴다.
+//! 압축은 `tar.exe`로 풀고, 교체는 실행 중 exe를 덮어쓸 수 없어 파일 단위 이름 바꾸기([`rename`])로 한다.
+//! Authenticode 검증은 아직 없다(OWE-838). 무결성은 Ed25519 매니페스트와 SHA-256이 지킨다.
 
 pub mod ed25519;
 mod relaunch;
+mod rename;
 
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -55,6 +60,19 @@ pub const RELAUNCH_ARG: &str = "--relaunch-update";
 pub const UPDATE_CLI_ARG: &str = "--update-cli";
 
 pub(super) const UPDATE_DIR: &str = "update";
+/// 번들(설치 폴더) 안 앱 실행 파일 상대 경로.
+const APP_EXE: &str = if cfg!(windows) {
+    "krill-app.exe"
+} else {
+    "Contents/MacOS/krill-app"
+};
+/// 번들 정보 파일. Windows `Krill.json`은 `Info.plist`와 같은 키(`CFBundleShortVersionString`,
+/// `KrillUpdatePublicKey`, `KrillUpdateURL`)를 가진 JSON이다(`packaging/windows/bundle.ps1`이 쓴다).
+const BUNDLE_INFO: &str = if cfg!(windows) {
+    "Krill.json"
+} else {
+    "Contents/Info.plist"
+};
 const JOURNAL_FILE: &str = "journal.json";
 const MAX_MANIFEST_BYTES: usize = 1024 * 1024;
 const MAX_ARCHIVE_BYTES: usize = 256 * 1024 * 1024;
@@ -204,7 +222,7 @@ impl Config {
         Self::load_for_bundle(state_dir, None)
     }
 
-    /// `updater.toml`을 먼저 읽고, 비어 있는 필드는 `<app_bundle>/Contents/Info.plist`의
+    /// `updater.toml`을 먼저 읽고, 비어 있는 필드는 `<app_bundle>/Contents/Info.plist`(Windows는 `Krill.json`)의
     /// `KrillUpdatePublicKey`·`KrillUpdateURL`·`KrillUpdateDesignatedRequirement`에서 채운다(MK-155).
     pub fn load_for_bundle(state_dir: &Path, app_bundle: Option<&Path>) -> Result<Self, Error> {
         let path = state_dir.join(CONFIG_FILE);
@@ -283,9 +301,12 @@ impl Config {
 }
 
 fn read_bundle_info_plist_json(app_bundle: &Path) -> Option<serde_json::Value> {
-    let plist_path = app_bundle.join("Contents/Info.plist");
+    let plist_path = app_bundle.join(BUNDLE_INFO);
     if !plist_path.is_file() {
         return None;
+    }
+    if cfg!(windows) {
+        return serde_json::from_slice(&fs::read(plist_path).ok()?).ok();
     }
     let out = Command::new("/usr/bin/plutil")
         .args(["-convert", "json", "-o", "-"])
@@ -526,7 +547,7 @@ fn same_version(a: &str, b: &str) -> bool {
     is_newer(a, b) == Some(false) && is_newer(b, a) == Some(false)
 }
 
-/// 풀린 `.app` 번들의 코드 서명 검증 인터페이스(MK-063).
+/// 풀린 `.app` 번들(Windows는 설치 폴더)의 코드 서명 검증 인터페이스(MK-063).
 ///
 /// MK-104 인증서 준비 전에는 [`CodesignVerifier::adhoc`]으로 동작하고, 인증서 준비 후에는
 /// [`CodesignVerifier::with_requirement`]로 Developer ID designated requirement를 강제한다.
@@ -566,6 +587,9 @@ impl CodesignVerifier {
 /// 서명 검증 대상 실행 파일 목록(`Contents/Helpers` 또는 `Contents/MacOS`의 `krill-holder`·`krilld`,
 /// `Contents/MacOS`의 `krill`·`krill-app`)을 안쪽부터 순서대로 돌려준다.
 pub fn validate_bundle_layout(app_bundle: &Path) -> Result<Vec<PathBuf>, Error> {
+    if cfg!(windows) {
+        return validate_install_layout(app_bundle);
+    }
     let macos_dir = app_bundle.join("Contents/MacOS");
     let helpers_dir = app_bundle.join("Contents/Helpers");
     let plist = app_bundle.join("Contents/Info.plist");
@@ -596,8 +620,40 @@ pub fn validate_bundle_layout(app_bundle: &Path) -> Result<Vec<PathBuf>, Error> 
     Ok(binaries)
 }
 
+/// Windows 설치 폴더의 필수 구조(`Krill.json`, 실행 파일 4개)를 확인하고 실행 파일 목록을 돌려준다.
+/// `krill-link.exe`·`conpty.dll`·`x64\OpenConsole.exe`는 선택이다(없으면 holder는 kernel32 축소 모드).
+pub fn validate_install_layout(dir: &Path) -> Result<Vec<PathBuf>, Error> {
+    let mut binaries = Vec::new();
+    for name in [
+        "krill-holder.exe",
+        "krilld.exe",
+        "krill.exe",
+        "krill-app.exe",
+    ] {
+        let bin = dir.join(name);
+        if !bin.is_file() {
+            return Err(Error::BundleStructure(format!(
+                "missing {name} in {}",
+                dir.display()
+            )));
+        }
+        binaries.push(bin);
+    }
+    if !dir.join("Krill.json").is_file() {
+        return Err(Error::BundleStructure(format!(
+            "missing Krill.json in {}",
+            dir.display()
+        )));
+    }
+    Ok(binaries)
+}
+
 impl CodeVerifier for CodesignVerifier {
     fn verify(&self, app_bundle: &Path) -> Result<(), Error> {
+        // Windows: Authenticode 인증서가 없어(OWE-838) 구조만 확인한다. 위조 방지는 서명된 매니페스트의 SHA-256.
+        if cfg!(windows) {
+            return validate_install_layout(app_bundle).map(drop);
+        }
         // 안쪽 실행 파일부터 개별 검증한다(CONVENTIONS A3: --deep 서명에 기대지 않음).
         for bin in validate_bundle_layout(app_bundle)? {
             run_codesign(&["--verify", "--strict", "--verbose=2"], &bin)?;
@@ -644,7 +700,7 @@ fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
 pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
     validate_url(url)?;
     let max_str = max_bytes.to_string();
-    let out = Command::new("/usr/bin/curl")
+    let out = Command::new(system_tool("curl"))
         .args([
             "--fail",
             "--silent",
@@ -722,7 +778,7 @@ fn find_gh_binary() -> Option<PathBuf> {
     }
     if let Some(path_os) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path_os) {
-            let cand = dir.join("gh");
+            let cand = dir.join(format!("gh{}", std::env::consts::EXE_SUFFIX));
             if cand.is_file() {
                 return Some(cand);
             }
@@ -791,6 +847,12 @@ pub fn staging_path(app_bundle: &Path) -> PathBuf {
 #[must_use]
 pub fn prev_path(app_bundle: &Path) -> PathBuf {
     append_ext(app_bundle, "prev")
+}
+
+/// `<번들>.trash`: Windows에서 실행 중이라 지울 수 없는 파일을 옮겨 두는 곳([`rename`]).
+#[must_use]
+pub fn trash_path(app_bundle: &Path) -> PathBuf {
+    append_ext(app_bundle, "trash")
 }
 
 /// `<상태 디렉터리>/update/journal.json` 경로.
@@ -930,6 +992,7 @@ pub fn stage_update_for_bundle(
 /// `manifest_url`의 `latest.json`을 내려받아 `<app_bundle>.staging`까지 준비한다.
 /// 성공하면 `(상태 디렉터리, 매니페스트 버전)`을 돌려준다.
 #[cfg(test)]
+#[cfg(unix)]
 fn stage_update_manifest(
     manifest_url: &str,
     app_bundle: &Path,
@@ -941,12 +1004,32 @@ fn stage_update_manifest(
     )
 }
 
+/// 자체 업데이터가 동작하는 OS: macOS `.app` 번들과 Windows 설치 폴더. Linux는 패키지 관리자에 맡긴다.
+const SUPPORTED: bool = cfg!(any(target_os = "macos", windows));
+
+/// 번들을 찾지 못했을 때 쓰는 기본 설치 위치.
+fn default_app_bundle() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_default()
+            .join("Programs")
+            .join("Krill")
+    } else {
+        PathBuf::from("/Applications/Krill.app")
+    }
+}
+
 /// 현재 실행 중인 앱 번들의 업데이트를 점검·스테이징한다(Settings UI 및 CLI에서 사용).
+/// 자체 업데이터는 macOS `.app` 번들과 Windows 설치 폴더 전용이다. 다른 OS는 점검하지 않는다.
 pub fn check_and_stage_current_app(state_dir: &Path) -> Result<CheckStatus, Error> {
+    if !SUPPORTED {
+        return Err(io::Error::from(io::ErrorKind::Unsupported).into());
+    }
     let exe = std::env::current_exe()?;
     let bundle_env = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
-    let app_bundle = current_app_bundle_in(bundle_env.as_deref(), &exe)
-        .unwrap_or_else(|| PathBuf::from("/Applications/Krill.app"));
+    let app_bundle =
+        current_app_bundle_in(bundle_env.as_deref(), &exe).unwrap_or_else(default_app_bundle);
     check_and_stage_bundle(&app_bundle, state_dir)
 }
 
@@ -966,6 +1049,9 @@ pub fn check_and_stage_bundle(app_bundle: &Path, state_dir: &Path) -> Result<Che
 /// `KRILL_UPDATE_RELAUNCH_NOW=1`이면 즉시 별도 relauncher를 띄운다.
 /// 환경변수 읽기는 여기에만 있고 본체는 [`poll_update_with`]라 테스트에서 값을 직접 넣는다.
 pub fn poll_env_update(state_dir: &Path) -> Result<Option<StagedUpdate>, Error> {
+    if !SUPPORTED {
+        return Ok(None);
+    }
     let manifest_url = std::env::var("KRILL_UPDATE_MANIFEST_URL").ok();
     let bundle_path = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
     let relaunch_now = std::env::var("KRILL_UPDATE_RELAUNCH_NOW").ok().as_deref() == Some("1");
@@ -1070,7 +1156,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
     let exe = std::env::current_exe()?;
     let env_bundle = std::env::var("KRILL_UPDATE_BUNDLE_PATH").ok();
     let app_bundle = current_app_bundle_in(app_arg.as_deref().or(env_bundle.as_deref()), &exe)
-        .unwrap_or_else(|| PathBuf::from("/Applications/Krill.app"));
+        .unwrap_or_else(default_app_bundle);
     let state_dir = match state_arg {
         Some(dir) => dir,
         None => krill_proto::daemon::state_dir().ok_or_else(|| {
@@ -1143,7 +1229,10 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
     let archive = fetch_bytes(&manifest.url, MAX_ARCHIVE_BYTES)?;
     let _ = stage_verified_archive(&manifest, &pk, &archive, &app_bundle, &verifier)?;
 
-    if let Some(gui_pid) = find_running_gui_pid(&app_bundle) {
+    // Windows는 실행 중 GUI를 끄지 않는다. 이름 바꾸기 교체라 GUI는 구 이미지로 계속 돌고 다음 실행부터 새 버전이다.
+    if !cfg!(windows)
+        && let Some(gui_pid) = find_running_gui_pid(&app_bundle)
+    {
         Command::new("/bin/kill")
             .args(["-TERM", &gui_pid.to_string()])
             .status()
@@ -1170,9 +1259,17 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
             journal.stage = Stage::Healthy;
             journal.save(&state_dir).ok();
         }
+        // 교체 뒤 구 holder·krilld에 새 실행 파일로 업그레이드를 요청한다(기존 IPC). Windows inbox 축소 모드는
+        // 세션이 있으면 holder가 거절(EBUSY)해 구 holder가 다음 기동까지 남는다(OWE-832).
         let socket = state_dir.join("run/krilld.sock");
-        let holder = app_bundle.join("Contents/Helpers/krill-holder");
-        let krilld = app_bundle.join("Contents/Helpers/krilld");
+        let helpers = if cfg!(windows) {
+            app_bundle.clone()
+        } else {
+            app_bundle.join("Contents/Helpers")
+        };
+        let exe_name = |name: &str| format!("{name}{}", std::env::consts::EXE_SUFFIX);
+        let holder = helpers.join(exe_name("krill-holder"));
+        let krilld = helpers.join(exe_name("krilld"));
         if socket.exists() && holder.is_file() && krilld.is_file() {
             let paths = krill_proto::daemon::Paths {
                 socket,
@@ -1210,7 +1307,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
 }
 
 fn find_running_gui_pid(app_bundle: &Path) -> Option<u32> {
-    let target_exe = app_bundle.join("Contents/MacOS/krill-app");
+    let target_exe = app_bundle.join(APP_EXE);
     let target_canon = fs::canonicalize(&target_exe).unwrap_or(target_exe);
     let target_str = target_canon.to_string_lossy();
     let self_pid = std::process::id();
@@ -1244,23 +1341,45 @@ fn find_running_gui_pid(app_bundle: &Path) -> Option<u32> {
 }
 
 /// 번들 경로 결정을 테스트에서 직접 검증한다. `bundle_path`가 비어 있지 않으면 그대로 쓰고,
-/// 아니면 실행 파일 위치(`....app/Contents/MacOS/krill-app`)에서 번들을 찾는다.
+/// 아니면 실행 파일 위치(`....app/Contents/MacOS/krill-app`, Windows는 `Krill.json`이 있는 exe 폴더)에서 번들을 찾는다.
 pub fn current_app_bundle_in(bundle_path: Option<&str>, exe: &Path) -> Option<PathBuf> {
     if let Some(bundle) = bundle_path.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(bundle));
+    }
+    if cfg!(windows) {
+        let dir = exe.parent()?;
+        return dir.join(BUNDLE_INFO).is_file().then(|| dir.to_path_buf());
     }
     let bundle = exe.parent()?.parent()?.parent()?;
     (bundle.extension().is_some_and(|e| e == "app") || bundle.join("Contents/Info.plist").is_file())
         .then(|| bundle.to_path_buf())
 }
 
+/// OS 기본 도구의 절대 경로(PATH 가로채기 방지). Windows 10 1803+는 `System32`에 `curl.exe`·`tar.exe`가 있다.
+fn system_tool(name: &str) -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+            .join("System32")
+            .join(format!("{name}.exe"))
+    } else {
+        Path::new("/usr/bin").join(name)
+    }
+}
+
+/// zip을 푼다. macOS는 `ditto -x -k`(확장 속성·서명 보존), Windows는 `tar.exe -xf`(bsdtar, zip 지원).
 fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Result<(), Error> {
     fs::create_dir_all(unpack_tmp)?;
-    let out = Command::new("/usr/bin/ditto")
-        .args(["-x", "-k"])
-        .arg(zip_path)
-        .arg(unpack_tmp)
-        .output()?;
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new(system_tool("tar"));
+        c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
+        c
+    } else {
+        let mut c = Command::new(system_tool("ditto"));
+        c.args(["-x", "-k"]).arg(zip_path).arg(unpack_tmp);
+        c
+    };
+    let out = cmd.output()?;
     if !out.status.success() {
         return Err(Error::Unpack(
             String::from_utf8_lossy(&out.stderr).trim().to_owned(),
@@ -1273,13 +1392,13 @@ fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Resu
 }
 
 fn find_extracted_bundle(unpack_tmp: &Path) -> Result<PathBuf, Error> {
-    if unpack_tmp.join("Contents/Info.plist").is_file() {
+    if unpack_tmp.join(BUNDLE_INFO).is_file() {
         return Ok(unpack_tmp.to_path_buf());
     }
     for entry in fs::read_dir(unpack_tmp)? {
         let path = entry?.path();
-        if path.extension().is_some_and(|e| e == "app")
-            && path.join("Contents/Info.plist").is_file()
+        if (cfg!(windows) || path.extension().is_some_and(|e| e == "app"))
+            && path.join(BUNDLE_INFO).is_file()
         {
             return Ok(path);
         }
@@ -1332,4 +1451,5 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

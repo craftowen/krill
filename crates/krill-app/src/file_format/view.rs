@@ -443,9 +443,14 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
     };
     let reveal_action = {
         let path = path.to_path_buf();
-        crate::ui::secondary("file-reveal", text::REVEAL.get())
-            .debug_selector(|| "file-reveal".into())
-            .on_click(move |_, _, cx| spawn_open(super::reveal_command(&path), cx))
+        crate::ui::secondary(
+            "file-reveal",
+            text::REVEAL
+                .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                .get(),
+        )
+        .debug_selector(|| "file-reveal".into())
+        .on_click(move |_, _, cx| spawn_open(super::reveal_command(&path), cx))
     };
     div()
         .size_full()
@@ -487,7 +492,8 @@ pub(crate) fn size_label(len: u64) -> String {
 fn spawn_open(mut cmd: Command, cx: &App) {
     cx.background_spawn(async move {
         match cmd.status() {
-            Ok(status) if status.success() => {}
+            // explorer.exe는 열기에 성공해도 1로 끝난다.
+            Ok(status) if status.success() || cfg!(windows) => {}
             Ok(status) => tracing::warn!(?status, "open failed"),
             Err(error) => tracing::warn!(kind = ?error.kind(), "open failed to start"),
         }

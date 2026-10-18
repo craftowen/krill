@@ -122,6 +122,7 @@ impl Tunnel {
         alive && (self.ready.load(Ordering::Acquire) || self.started.elapsed() < READY_DEADLINE)
     }
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn fixture(port: u16) -> io::Result<Self> {
         if port == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -137,6 +138,7 @@ impl Tunnel {
     }
 }
 #[cfg(test)]
+#[cfg(unix)]
 impl Tunnel {
     /// URL은 찍혔지만 준비 기한을 넘긴 터널.
     pub(super) fn stale(port: u16) -> io::Result<Self> {
@@ -206,6 +208,7 @@ pub fn parse_url(text: &str) -> Option<String> {
     None
 }
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

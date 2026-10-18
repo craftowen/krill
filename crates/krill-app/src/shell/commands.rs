@@ -102,4 +102,5 @@ impl Shell {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

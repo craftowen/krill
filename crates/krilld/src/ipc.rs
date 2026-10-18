@@ -6,16 +6,18 @@
 //! 소유자가 덮어쓸 죽은 소켓 하나만 있다. 종료할 때 unlink하지 않는다 — 떠나는 데몬이 후임의 소켓을 지우지 못하게.
 
 use std::ffi::OsString;
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use krill_proto::ipc::{self, ClientHello, Negotiated, ServerHello};
+use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
+use krill_proto::os::net::{UnixListener, UnixStream};
 
+use crate::os::{AsFd, OwnedFd};
 use crate::sys;
 
 pub use krill_proto::daemon::SUN_PATH_MAX;
@@ -53,14 +55,14 @@ impl Listener {
                 "socket path must be shorter than 100 bytes",
             ));
         }
-        let uid = rustix::process::geteuid().as_raw();
+        let uid = crate::os::euid();
         let dir = path
             .parent()
             .filter(|d| !d.as_os_str().is_empty())
             .ok_or(io::ErrorKind::InvalidInput)?;
         DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let m = fs::symlink_metadata(dir)?;
-        if !m.is_dir() || m.uid() != uid || m.mode() & 0o077 != 0 {
+        if !m.is_dir() || !crate::os::private_to_me(&m, 0o077) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "socket directory must be a 0700 directory owned by this user",
@@ -73,7 +75,8 @@ impl Listener {
             _ => {}
         }
         let sock = UnixListener::bind(&tmp)?;
-        fs::set_permissions(&tmp, Permissions::from_mode(0o600))?;
+        #[cfg(unix)]
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
         fs::rename(&tmp, path)?;
         Ok(Self {
             sock,
@@ -87,11 +90,25 @@ impl Listener {
     ///
     /// # Errors
     /// 다른 krilld가 같은 `path`의 락을 쥐고 있으면 `AddrInUse`. 그 밖의 IO 오류.
+    #[cfg(unix)]
     pub fn adopt(path: &Path, sock: OwnedFd) -> io::Result<Self> {
         Ok(Self {
             _lock: lock(path)?,
             sock: UnixListener::from(sock),
-            uid: rustix::process::geteuid().as_raw(),
+            uid: crate::os::euid(),
+        })
+    }
+
+    /// Windows holder가 `WSADuplicateSocket`으로 돌려준 listener를 이어 쓴다.
+    ///
+    /// # Errors
+    /// 소켓 단일 인스턴스 락을 얻지 못하면 `AddrInUse`.
+    #[cfg(windows)]
+    pub fn adopt(path: &Path, sock: OwnedFd) -> io::Result<Self> {
+        Ok(Self {
+            _lock: lock(path)?,
+            sock: sys::adopt_listener(sock),
+            uid: crate::os::euid(),
         })
     }
 
@@ -110,9 +127,17 @@ impl Listener {
     }
 }
 
-impl AsFd for Listener {
-    fn as_fd(&self) -> BorrowedFd<'_> {
+#[cfg(unix)]
+impl std::os::fd::AsFd for Listener {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
         self.sock.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsSocket for Listener {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        sys::listener_socket(&self.sock)
     }
 }
 
@@ -149,4 +174,30 @@ pub fn handshake(s: &mut UnixStream, hello: &ServerHello) -> io::Result<(ClientH
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::io::AsSocket as _;
+
+    #[test]
+    fn adopted_listener_keeps_socket_and_reacquires_instance_lock() {
+        let dir = std::env::temp_dir().join(format!("kd-adopt-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let path = dir.join("k.sock");
+        let original = Listener::bind(&path).unwrap();
+        let socket = original.as_socket().try_clone_to_owned().unwrap();
+        drop(original);
+        let adopted = Listener::adopt(&path, socket).unwrap();
+        assert_eq!(
+            Listener::bind(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        let client = UnixStream::connect(&path).unwrap();
+        let server = adopted.accept().unwrap();
+        drop((client, server, adopted));
+        fs::remove_dir_all(dir).unwrap();
+    }
+}

@@ -280,6 +280,8 @@ impl Holder {
                 }
                 self.teardowns.push(Teardown::start(s.pid));
             }
+            // (v4) Unix는 krilld가 master fd에 직접 TIOCSWINSZ한다. Resize는 Windows ConPTY 전용.
+            ToHolder::Resize { .. } => return Err(Errno::NOSYS.into()),
             ToHolder::Release { id, .. } => {
                 let n = self.sessions.len();
                 self.sessions.retain(|s| s.id != id);
@@ -474,7 +476,7 @@ impl Holder {
         let listener = self
             .listener
             .as_ref()
-            .map(|l| (FromHolder::Listener, Some(l.as_fd())));
+            .map(|l| (FromHolder::Listener { info: Vec::new() }, Some(l.as_fd())));
         let ok = std::iter::once((hello(), None))
             .chain(sessions)
             .chain(listener)
@@ -570,6 +572,7 @@ fn hello() -> FromHolder {
     FromHolder::Hello {
         version: VERSION,
         holder_pid: rustix::process::getpid().as_raw_pid().unsigned_abs(),
+        inbox: false,
     }
 }
 
