@@ -761,7 +761,7 @@ query($owner: String!, $name: String!, $prNumber: Int!) {
 ";
 
 pub(super) fn inspect_with_gh(folder: &Path, branch: &str) -> io::Result<PrInspection> {
-    if branch.trim().is_empty() {
+    if branch.trim().is_empty() || !super::has_github_remote(folder) {
         return Ok(PrInspection::default());
     }
     let mut list_cmd = gh_base_command(folder);

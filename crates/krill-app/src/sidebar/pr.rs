@@ -45,13 +45,16 @@ impl Sidebar {
                     .update(cx, |s, cx| {
                         // Discard results if a branch changed while gh was running.
                         let current = s.pr_branches();
-                        let statuses = statuses
+                        let statuses: BTreeMap<PathBuf, Status> = statuses
                             .into_iter()
                             .filter(|(path, _)| {
                                 current.contains_key(path)
                                     && current.get(path) == branches.get(path)
                             })
                             .collect();
+                        if !statuses.values().any(|st| st.guidance().is_some()) {
+                            s.pr_guidance_dismissed = false;
+                        }
                         if s.prs != statuses {
                             s.prs = statuses;
                             cx.notify();

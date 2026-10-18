@@ -118,6 +118,60 @@ fn unsupported_daemon_shows_update_needed(cx: &mut TestAppContext) {
     panel.read_with(cx, |p, _| assert!(p.outdated && p.data.is_none()));
 }
 
+/// OWE-851: 행은 `세션 N` 대신 에이전트·워크트리 이름을 보이고, 클릭하면 Open을 낸 뒤 닫힌다.
+#[gpui::test]
+fn session_row_shows_name_and_click_emits_open(cx: &mut TestAppContext) {
+    use std::path::PathBuf;
+
+    use krill_proto::control::{AgentState, AgentStatus};
+    struct Memory(crate::sidebar::Snapshot);
+    impl crate::sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<crate::sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let sidebar = cx.update(|cx| cx.new(|_| crate::sidebar::Sidebar::new(None)));
+    sidebar.update(cx, |s, cx| {
+        s.connect_source(
+            Arc::new(Memory(crate::sidebar::Snapshot {
+                sessions: vec![crate::sidebar::Session {
+                    id: SessionId(2),
+                    status: AgentStatus {
+                        agent: "codex".into(),
+                        state: AgentState::Working,
+                        ..AgentStatus::UNKNOWN
+                    },
+                    worktree: Some(PathBuf::from("/repo/alpha")),
+                    cwd: None,
+                    account: None,
+                }],
+                ..Default::default()
+            })),
+            cx,
+        );
+    });
+    let (call, _) = fake();
+    let (panel, cx) = open(cx, call);
+    panel.update(cx, |p, _| p.set_sidebar(&sidebar));
+    let opened: Arc<Mutex<Vec<SessionId>>> = Arc::new(Mutex::new(Vec::new()));
+    let opened_clone = Arc::clone(&opened);
+    cx.update(|_, cx| {
+        cx.subscribe(&panel, move |_, event: &Open, _| {
+            opened_clone.lock().unwrap().push(event.0);
+        })
+        .detach();
+    });
+    panel.update(cx, Panel::toggle);
+    cx.run_until_parked();
+    let row = cx
+        .debug_bounds("resources-session-2")
+        .expect("named session row");
+    cx.simulate_click(row.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(*opened.lock().unwrap(), [SessionId(2)]);
+    panel.read_with(cx, |p, _| assert!(!p.open));
+}
+
 /// OWE-652: 바깥 클릭은 팝오버를 닫고 폴링을 멈춘다.
 #[gpui::test]
 fn outside_click_closes_popover_and_stops_poll(cx: &mut TestAppContext) {

@@ -14,9 +14,9 @@ pub const MENU_BAR_ICON: gpui_kit_assets::IconName = gpui_kit_assets::IconName::
 pub const MENU_BAR_ICON_SIZE: i32 = 18;
 
 pub use primitives::{
-    BadgeTone, LabelDesc, badge, button_with_tooltip, card, controls, danger_confirm, error_banner,
-    field_label, ghost, keycap, label, modal_backdrop, primary, row, secondary, section_title,
-    segment, segmented_control, switch, tooltip_view,
+    BadgeTone, LabelDesc, badge, button_with_tooltip, button_with_tooltip_when, card, controls,
+    danger_confirm, error_banner, field_label, ghost, keycap, label, modal_backdrop, primary, row,
+    secondary, section_title, segment, segmented_control, switch, tooltip_view,
 };
 pub use theme::{
     AGENT_HISTORY_MAX_HEIGHT, AGENT_HISTORY_WIDTH, AGENT_UNREAD, COMMAND_PALETTE_WIDTH, DARK,
