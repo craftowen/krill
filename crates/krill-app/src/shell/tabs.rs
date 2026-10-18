@@ -38,31 +38,19 @@ impl Render for TabDrag {
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
+            .shadow_lg()
             .font_family(ui::FONT_UI)
             .text_size(ui::TEXT_SM)
             .flex()
             .items_center()
             .gap(ui::SPACE_1)
-            .child(if self.agent.is_empty() {
-                Icon::new(agent_icon(&self.agent))
-                    .small()
-                    .into_any_element()
-            } else {
-                ui::icons::agent_brand_icon(&self.agent, ui::ICON_MD, p.foreground)
-                    .into_any_element()
-            })
+            // OWE-886: 탭과 같은 식별자(상태는 드래그 프리뷰에 두지 않고 브랜드 아이콘만, §6.5).
+            .child(ui::status::agent_icon(
+                &self.agent,
+                ui::ICON_MD,
+                p.foreground,
+            ))
             .child(self.title.clone())
-    }
-}
-
-fn agent_icon(agent: &str) -> IconName {
-    match agent {
-        "claude" => IconName::Asterisk,
-        "codex" => IconName::Cpu,
-        // OWE-605: 핀(Star/StarFill)과 겹치지 않는 기본 번들 아이콘. 초승달은 작은 탭에서도 별과 구분된다.
-        "agy" | "antigravity" => IconName::Moon,
-        "opencode" | "" => IconName::SquareTerminal,
-        _ => IconName::Bot,
     }
 }
 
@@ -257,16 +245,10 @@ impl Shell {
                                         )
                                         .debug_selector(move || format!("tab-state-{i}")),
                                     )
-                                    .child(if agent.is_empty() {
-                                        Icon::new(agent_icon(agent)).small().into_any_element()
-                                    } else {
-                                        ui::icons::agent_brand_icon(
-                                            agent,
-                                            ui::ICON_SM,
-                                            p.foreground,
-                                        )
-                                        .into_any_element()
-                                    })
+                                    .child(
+                                        // OWE-886: 빈 에이전트도 `status::agent_icon` 하나로 통일(§6.5).
+                                        ui::status::agent_icon(agent, ui::ICON_SM, p.foreground),
+                                    )
                                     .children(self.yolo_badge(tab.focused, cx))
                                     .children(account_label.map(|l| {
                                         let short = ui::status::account_initial(l);
@@ -289,8 +271,12 @@ impl Shell {
                                             .text_color(p.muted_foreground)
                                             .child(short)
                                             .tooltip(move |window, cx| {
-                                                gpui_component::tooltip::Tooltip::new(tip.clone())
-                                                    .build(window, cx)
+                                                ui::tooltip_view(
+                                                    format!("tab-account-badge-{i}"),
+                                                    tip.clone(),
+                                                    window,
+                                                    cx,
+                                                )
                                             })
                                     }))
                                     .children(self.host_badge(tab.focused, "tab-host-badge", cx))
@@ -303,19 +289,19 @@ impl Shell {
                             // Orca: 활성 탭의 닫기는 항상 보이고, 비활성은 호버 때만.
                             .when(selected, Styled::visible)
                             .group_hover(CLOSE_GROUP, Styled::visible)
-                            .child(
+                            .child(ui::button_with_tooltip(
                                 Button::new(("close-tab", i))
                                     .icon(IconName::Close)
                                     .ghost()
                                     .xsmall()
                                     .debug_selector(move || format!("close-tab-{i}"))
-                                    .accessibility_label(text::CLOSE_TAB.get())
-                                    .tooltip(text::CLOSE_TAB.get())
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         cx.stop_propagation();
                                         this.request_close_tab(i, cx);
                                     })),
-                            ),
+                                format!("close-tab-{i}"),
+                                text::CLOSE_TAB.get(),
+                            )),
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -395,17 +381,17 @@ impl Shell {
                         .gap_1()
                         .border_r_1()
                         .border_color(p.sidebar_border)
-                        .child(
+                        .child(ui::button_with_tooltip(
                             Button::new("toggle-sidebar")
                                 .icon(IconName::PanelLeft)
                                 .ghost()
                                 .xsmall()
                                 .toggled(false)
-                                .accessibility_label(text::TOGGLE_SIDEBAR.get())
-                                .tooltip(text::TOGGLE_SIDEBAR.get())
                                 .debug_selector(|| "toggle-sidebar".into())
                                 .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                        ),
+                            "toggle-sidebar",
+                            text::TOGGLE_SIDEBAR.get(),
+                        )),
                 )
             })
             .child(
@@ -436,106 +422,106 @@ impl Shell {
                     .gap_0p5()
                     .pr_2()
                     .child(self.render_commands(cx))
-                    .child(
+                    .child(ui::button_with_tooltip(
                         Button::new("new-tab")
                             .icon(IconName::Plus)
                             .ghost()
                             .xsmall()
-                            .accessibility_label(text::NEW_TAB.get())
-                            .tooltip(text::NEW_TAB.get())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.new_tab_on_launch_host(cx);
                             })),
-                    )
+                        "new-tab",
+                        text::NEW_TAB.get(),
+                    ))
                     .child(
-                        Button::new("tab-agent-menu")
-                            .icon(IconName::ChevronDown)
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label(
-                                krill_app::i18n::catalog::general::AGENT_CHOICE.get(),
-                            )
-                            .tooltip(krill_app::i18n::catalog::general::AGENT_CHOICE.get())
-                            .disabled(disabled)
-                            .dropdown_menu(move |mut menu, _, _| {
-                                menu = menu.label(text::AGENTS.get());
-                                for profile in &profiles {
-                                    let id = profile.id.clone();
-                                    let weak = weak.clone();
-                                    let icon = ui::icons::agent_menu_icon(&id);
-                                    menu = menu.item(
-                                        PopupMenuItem::new(profile.name.clone())
-                                            .icon(icon)
-                                            .on_click(move |_, _, cx| {
-                                                weak.update(cx, |this, cx| {
-                                                    this.new_agent(id.clone(), cx);
-                                                })
-                                                .ok();
-                                            }),
-                                    );
-                                }
-                                menu = menu.separator().label(text::EXECUTION_LOCATION.get());
-                                for (host_id, label) in &locations {
-                                    let weak = weak.clone();
-                                    let chosen = host_id.clone();
-                                    menu = menu.item(
-                                        PopupMenuItem::new(label.clone())
-                                            .checked(&launch_host == host_id)
-                                            .on_click(move |_, _, cx| {
-                                                weak.update(cx, |this, cx| {
-                                                    this.set_launch_host(chosen.clone(), cx);
-                                                })
-                                                .ok();
-                                            }),
-                                    );
-                                }
-                                menu
-                            }),
+                        ui::button_with_tooltip(
+                            Button::new("tab-agent-menu")
+                                .icon(IconName::ChevronDown)
+                                .ghost()
+                                .xsmall()
+                                .disabled(disabled),
+                            "tab-agent-menu",
+                            krill_app::i18n::catalog::general::AGENT_CHOICE.get(),
+                        )
+                        .dropdown_menu(move |mut menu, _, _| {
+                            menu = menu.label(text::AGENTS.get());
+                            for profile in &profiles {
+                                let id = profile.id.clone();
+                                let weak = weak.clone();
+                                let icon = ui::icons::agent_menu_icon(&id);
+                                menu = menu.item(
+                                    PopupMenuItem::new(profile.name.clone())
+                                        .icon(icon)
+                                        .on_click(move |_, _, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.new_agent(id.clone(), cx);
+                                            })
+                                            .ok();
+                                        }),
+                                );
+                            }
+                            menu = menu.separator().label(text::EXECUTION_LOCATION.get());
+                            for (host_id, label) in &locations {
+                                let weak = weak.clone();
+                                let chosen = host_id.clone();
+                                menu = menu.item(
+                                    PopupMenuItem::new(label.clone())
+                                        .checked(&launch_host == host_id)
+                                        .on_click(move |_, _, cx| {
+                                            weak.update(cx, |this, cx| {
+                                                this.set_launch_host(chosen.clone(), cx);
+                                            })
+                                            .ok();
+                                        }),
+                                );
+                            }
+                            menu
+                        }),
                     )
-                    .child(
+                    .child(ui::button_with_tooltip(
                         Button::new("split-right")
                             .icon(IconName::PanelRight)
                             .ghost()
                             .xsmall()
-                            .accessibility_label(text::SPLIT_RIGHT.get())
-                            .tooltip(text::SPLIT_RIGHT.get())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.split_active(Axis::Horizontal, cx);
                             })),
-                    )
-                    .child(
+                        "split-right",
+                        text::SPLIT_RIGHT.get(),
+                    ))
+                    .child(ui::button_with_tooltip(
                         Button::new("split-down")
                             .icon(IconName::PanelBottom)
                             .ghost()
                             .xsmall()
-                            .accessibility_label(text::SPLIT_DOWN.get())
-                            .tooltip(text::SPLIT_DOWN.get())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.split_active(Axis::Vertical, cx);
                             })),
-                    )
-                    .child(
+                        "split-down",
+                        text::SPLIT_DOWN.get(),
+                    ))
+                    .child(ui::button_with_tooltip(
                         Button::new("titlebar-jump")
                             .icon(IconName::Search)
                             .ghost()
                             .xsmall()
-                            .accessibility_label(text::JUMP_TOOLTIP.get())
-                            .tooltip(text::JUMP_TOOLTIP.get())
                             .on_click(
                                 cx.listener(|this, _, window, cx| this.toggle_jump(window, cx)),
                             ),
-                    )
-                    .child(
+                        "titlebar-jump",
+                        text::JUMP_TOOLTIP.get(),
+                    ))
+                    .child(ui::button_with_tooltip(
                         Button::new("toggle-panel")
                             .icon(IconName::PanelRight)
                             .ghost()
                             .xsmall()
                             .toggled(!self.panel_collapsed)
-                            .accessibility_label(text::TOGGLE_PANEL.get())
-                            .tooltip(text::TOGGLE_PANEL.get())
                             .debug_selector(|| "toggle-panel".into())
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_panel(cx))),
-                    ),
+                        "toggle-panel",
+                        text::TOGGLE_PANEL.get(),
+                    )),
             )
     }
 
@@ -1005,6 +991,7 @@ impl Shell {
                 .text_color(p.popover_foreground)
                 .border_1()
                 .border_color(p.border)
+                .shadow_lg()
                 .font_family(ui::FONT_UI)
                 .text_size(ui::TEXT_SM)
                 .flex()
@@ -1212,13 +1199,14 @@ impl Shell {
             .id("pinned-tab-close-dialog")
             .debug_selector(|| "pinned-tab-close-dialog".into())
             .occlude()
-            .w(px(360.))
+            .w(ui::DIALOG_WIDTH)
             .p_4()
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
+            .shadow_lg()
             .font_family(ui::FONT_UI)
             .flex()
             .flex_col()
@@ -1232,7 +1220,7 @@ impl Shell {
                         div()
                             .text_size(ui::TEXT_LG)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(p.foreground)
+                            .text_color(p.popover_foreground)
                             .child(text::PINNED_CLOSE_TITLE.get()),
                     )
                     .child(
@@ -1257,7 +1245,7 @@ impl Shell {
                     .justify_end()
                     .gap_2()
                     .child(
-                        ui::secondary("cancel-close-pinned-tab", text::PINNED_CLOSE_CANCEL.get())
+                        ui::ghost("cancel-close-pinned-tab", text::PINNED_CLOSE_CANCEL.get())
                             .debug_selector(|| "cancel-close-pinned-tab".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.cancel_close_pinned_tab(cx);
@@ -1522,7 +1510,7 @@ impl Shell {
                         .text_size(ui::TEXT_SM)
                         .when(selected, |d| d.bg(p.accent).text_color(p.accent_foreground))
                         .when(!selected, |d| {
-                            d.text_color(p.foreground).hover(|d| d.bg(p.muted))
+                            d.text_color(p.foreground).hover(|d| d.bg(p.accent))
                         })
                         .when(tab.pinned, |d| {
                             d.child(ui::icons::svg_box(
@@ -1540,13 +1528,9 @@ impl Shell {
                         }))
                         .child(if is_file {
                             Icon::new(IconName::FileText).small().into_any_element()
-                        } else if !agent.is_empty() {
-                            ui::icons::agent_brand_icon(&agent, ui::ICON_MD, p.foreground)
-                                .into_any_element()
                         } else {
-                            Icon::new(IconName::SquareTerminal)
-                                .small()
-                                .into_any_element()
+                            // OWE-886: 빈 에이전트도 `status::agent_icon` 하나로 통일(§6.5).
+                            ui::status::agent_icon(&agent, ui::ICON_MD, p.foreground)
                         })
                         .child(div().flex_1().min_w_0().truncate().child(label))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1560,12 +1544,13 @@ impl Shell {
             .id("recent-tab-switcher")
             .debug_selector(|| "recent-tab-switcher".into())
             .occlude()
-            .w(px(360.))
+            .w(ui::DIALOG_WIDTH)
             .rounded(ui::RADIUS_LG)
             .bg(p.popover)
             .text_color(p.popover_foreground)
             .border_1()
             .border_color(p.border)
+            .shadow_lg()
             .font_family(ui::FONT_UI)
             .overflow_hidden()
             .flex()
@@ -1605,25 +1590,24 @@ fn color_label(color: krill_app::layout::TabColor) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use gpui_component::IconNamed as _;
 
-    /// Agy 탭 아이콘이 핀 고정 아이콘(Star/StarFill)과 같으면 안 된다.
+    /// OWE-886: 탭·패인 헤더 에이전트 아이콘은 브랜드 SVG(`agent_svg_bytes`)로 통일하며,
+    /// 핀 고정 아이콘(`PIN_SVG`)과 겹치지 않아야 한다.
     #[test]
-    fn agy_icon_differs_from_pin() {
-        let agy = agent_icon("agy").path();
-        assert_ne!(agy, IconName::Star.path(), "agy가 핀 빈 별과 같음");
-        assert_ne!(agy, IconName::StarFill.path(), "agy가 핀 채운 별과 같음");
-        // 다섯 에이전트 아이콘은 서로 달라야 한다.
+    fn brand_icons_differ_from_pin() {
+        let pin = ui::icons::PIN_SVG;
         let icons = [
-            agent_icon("claude").path(),
-            agent_icon("codex").path(),
-            agent_icon("agy").path(),
-            agent_icon("opencode").path(),
-            agent_icon("unknown").path(),
+            ("claude", ui::icons::agent_svg_bytes("claude")),
+            ("codex", ui::icons::agent_svg_bytes("codex")),
+            ("agy", ui::icons::agent_svg_bytes("agy")),
+            ("cursor", ui::icons::agent_svg_bytes("cursor")),
         ];
-        for (i, a) in icons.iter().enumerate() {
-            for b in &icons[i + 1..] {
-                assert_ne!(a, b, "에이전트 아이콘 중복");
+        for (name, bytes) in icons {
+            assert_ne!(bytes, pin, "{name}가 핀 아이콘과 같음");
+        }
+        for (i, (a, ba)) in icons.iter().enumerate() {
+            for (b, bb) in &icons[i + 1..] {
+                assert_ne!(ba, bb, "{a}와 {b} 브랜드 아이콘 중복");
             }
         }
     }

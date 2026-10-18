@@ -1590,6 +1590,7 @@ impl Shell {
                                                 .data(ui::icons::CIRCLE_ARROW_UP_SVG),
                                         )
                                         .label(compact)
+                                        .font_family(ui::FONT_MONO)
                                         .text_color(p.success)
                                         .debug_selector(|| "status-update-ready".into())
                                         .ghost()
