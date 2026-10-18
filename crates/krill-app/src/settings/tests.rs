@@ -942,7 +942,7 @@ fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
 
     assert_eq!(
         crate::sidebar::external::checkpoint_badge_for(Some(&sidebar_file), &wt).as_deref(),
-        Some("● REVIEW #128 OWE-626 🔗2")
+        Some("REVIEW #128 OWE-626 links 2")
     );
     assert_eq!(
         crate::sidebar::external::checkpoint_badge_for(Some(&sidebar_file), &d.join("wt-empty")),
@@ -967,7 +967,7 @@ fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
 
     assert_eq!(
         crate::sidebar::external::session_orch_badge(Some(&sidebar_file), 42).as_deref(),
-        Some("⚡ worker-ui")
+        Some("worker-ui")
     );
     assert_eq!(
         crate::sidebar::external::session_orch_badge(Some(&sidebar_file), 7).as_deref(),

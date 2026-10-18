@@ -1402,7 +1402,7 @@ fn render_options_menu_panel(
                 .py_1()
                 .text_size(ui::TEXT_XS)
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_color(p.foreground)
+                .text_color(p.popover_foreground)
                 .child(text::WORKSPACE_OPTIONS.get()),
         )
         .when(has_show_section, |d| {
@@ -1533,7 +1533,7 @@ fn render_hosts_panel(
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .hover(move |s| s.bg(p.sidebar_accent))
+                .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                 .on_click(move |_, _, cx| {
                     clear_sidebar.update(cx, Sidebar::clear_host_filters).ok();
                     clear_menu.update(cx, |_, cx| cx.notify()).ok();
@@ -1547,7 +1547,7 @@ fn render_hosts_panel(
                         .child(
                             div()
                                 .text_size(ui::TEXT_XS)
-                                .text_color(p.foreground)
+                                .text_color(p.popover_foreground)
                                 .child(text::ALL_HOSTS.get()),
                         ),
                 )
@@ -1581,7 +1581,7 @@ fn render_hosts_panel(
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .hover(move |s| s.bg(p.sidebar_accent))
+                .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                 .on_click(move |_, _, cx| {
                     sb.update(cx, |s, cx| s.toggle_host_filter(&target_host, cx))
                         .ok();
@@ -1599,7 +1599,7 @@ fn render_hosts_panel(
                             div()
                                 .truncate()
                                 .text_size(ui::TEXT_XS)
-                                .text_color(p.foreground)
+                                .text_color(p.popover_foreground)
                                 .child(label),
                         ),
                 )
@@ -1651,7 +1651,7 @@ fn render_projects_panel(
                         .cursor_pointer()
                         .text_size(ui::TEXT_2XS)
                         .text_color(p.muted_foreground)
-                        .hover(move |s| s.bg(p.sidebar_accent).text_color(p.foreground))
+                        .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                         .on_click(move |_, _, cx| {
                             clear_sb.update(cx, Sidebar::clear_repo_filters).ok();
                             clear_mn.update(cx, |_, cx| cx.notify()).ok();
@@ -1684,7 +1684,7 @@ fn render_projects_panel(
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .hover(move |s| s.bg(p.sidebar_accent))
+                .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                 .on_click(move |_, _, cx| {
                     sb.update(cx, |s, cx| s.toggle_repo_filter(target.clone(), cx))
                         .ok();
@@ -1697,7 +1697,7 @@ fn render_projects_panel(
                         .flex_1()
                         .truncate()
                         .text_size(ui::TEXT_XS)
-                        .text_color(p.foreground)
+                        .text_color(p.popover_foreground)
                         .child(name),
                 ),
         );
@@ -1711,60 +1711,32 @@ fn render_group_by_section(
     current: GroupBy,
     p: &'static ui::Palette,
 ) -> gpui::Div {
-    let mut bar = div()
-        .id("sidebar-group-by-toggle")
-        .debug_selector(|| "sidebar-group-by-toggle".into())
-        .mx_1()
-        .h(px(26.))
-        .flex()
-        .items_center()
-        .rounded(ui::RADIUS_MD)
-        .border_1()
-        .border_color(p.border)
-        .bg(p.background.opacity(0.5))
-        .overflow_hidden();
-
-    for (idx, group) in GroupBy::SEGMENT_ORDER.into_iter().enumerate() {
-        let active = current == group;
-        let selector = group.selector();
-        let sb = sidebar_weak.clone();
-        let mn = menu_weak.clone();
-        bar = bar.child(
-            div()
-                .id(selector)
-                .debug_selector(move || selector.into())
-                .flex_1()
-                .h_full()
-                .px_1p5()
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .when(idx > 0, |d| d.border_l_1().border_color(p.border))
-                .when(active, |d| {
-                    d.bg(p.foreground.opacity(0.1))
-                        .text_color(p.foreground)
-                        .font_weight(FontWeight::SEMIBOLD)
-                })
-                .when(!active, |d| {
-                    d.text_color(p.muted_foreground)
-                        .hover(move |s| s.bg(p.sidebar_accent).text_color(p.foreground))
-                })
-                .text_size(ui::TEXT_XS)
-                .on_click(move |_, _, cx| {
-                    sb.update(cx, |s, cx| s.set_group_by(group, cx)).ok();
-                    mn.update(cx, |_, cx| cx.notify()).ok();
-                })
-                .child(div().truncate().child(group.short_label())),
-        );
-    }
-
     div()
         .flex()
         .flex_col()
         .gap_1()
         .child(section_label(text::GROUP_BY.get(), p))
-        .child(bar)
+        .child(
+            div()
+                .id("sidebar-group-by-toggle")
+                .debug_selector(|| "sidebar-group-by-toggle".into())
+                .mx_1()
+                .child(ui::segmented_control(
+                    p,
+                    GroupBy::SEGMENT_ORDER.into_iter().map(|group| {
+                        let active = current == group;
+                        let selector = group.selector();
+                        let sb = sidebar_weak.clone();
+                        let mn = menu_weak.clone();
+                        ui::segment(selector, group.short_label(), active)
+                            .debug_selector(move || selector.into())
+                            .on_click(move |_, _, cx| {
+                                sb.update(cx, |s, cx| s.set_group_by(group, cx)).ok();
+                                mn.update(cx, |_, cx| cx.notify()).ok();
+                            })
+                    }),
+                )),
+        )
 }
 
 fn render_sort_and_display_section(
@@ -1866,7 +1838,7 @@ fn render_sort_panel(
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .hover(move |s| s.bg(p.sidebar_accent))
+                .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                 .on_click(move |_, _, cx| {
                     sb.update(cx, |s, cx| s.set_sort_by(sort, cx)).ok();
                     mn.update(cx, |_, cx| cx.notify()).ok();
@@ -1875,7 +1847,7 @@ fn render_sort_panel(
                 .child(
                     div()
                         .text_size(ui::TEXT_XS)
-                        .text_color(p.foreground)
+                        .text_color(p.popover_foreground)
                         .child(sort.label()),
                 ),
         );
@@ -1906,7 +1878,7 @@ fn render_card_layout_panel(
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .hover(move |s| s.bg(p.sidebar_accent))
+                .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                 .on_click(move |_, _, cx| {
                     sb.update(cx, |s, cx| s.set_card_layout(layout, cx)).ok();
                     mn.update(cx, |_, cx| cx.notify()).ok();
@@ -1915,7 +1887,7 @@ fn render_card_layout_panel(
                 .child(
                     div()
                         .text_size(ui::TEXT_XS)
-                        .text_color(p.foreground)
+                        .text_color(p.popover_foreground)
                         .child(layout.label()),
                 ),
         );
@@ -1962,25 +1934,20 @@ fn render_card_properties_panel(
                 .items_center()
                 .justify_between()
                 .gap_2()
-                .hover(move |s| s.bg(p.sidebar_accent))
+                .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                 .on_click(move |_, _, cx| {
                     sb.update(cx, |s, cx| s.toggle_card_property(prop, cx)).ok();
                     mn.update(cx, |_, cx| cx.notify()).ok();
                 })
                 .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(check_slot(checked, p))
-                        .child(
-                            div()
-                                .text_size(ui::TEXT_XS)
-                                .text_color(p.foreground)
-                                .child(prop.label()),
-                        ),
+                    div().flex().items_center().gap_1p5().child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.popover_foreground)
+                            .child(prop.label()),
+                    ),
                 )
-                .child(switch_indicator(checked, p)),
+                .child(switch_face(checked, p)),
         );
     }
     panel
@@ -2075,7 +2042,7 @@ fn render_filter_section(
                     .gap_2()
                     .text_size(ui::TEXT_XS)
                     .text_color(p.muted_foreground)
-                    .hover(move |s| s.bg(p.sidebar_accent).text_color(p.foreground))
+                    .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
                     .on_click(move |_, _, cx| {
                         reset_sb.update(cx, Sidebar::reset_filters).ok();
                         reset_mn.update(cx, |_, cx| cx.notify()).ok();
@@ -2102,7 +2069,7 @@ fn render_filter_toggle_row(
     let text_color = if indented {
         p.muted_foreground
     } else {
-        p.foreground
+        p.popover_foreground
     };
     div()
         .id(id)
@@ -2116,7 +2083,7 @@ fn render_filter_toggle_row(
         .items_center()
         .justify_between()
         .gap_2()
-        .hover(move |s| s.bg(p.sidebar_accent))
+        .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
         .on_click(move |_, _, cx| on_toggle(cx))
         .child(
             div()
@@ -2136,7 +2103,7 @@ fn render_filter_toggle_row(
                         .child(label),
                 ),
         )
-        .child(switch_indicator(checked, p))
+        .child(switch_face(checked, p))
 }
 
 #[expect(
@@ -2173,8 +2140,8 @@ fn render_submenu_trigger(
         .items_center()
         .justify_between()
         .gap_2()
-        .when(is_open, |d| d.bg(p.sidebar_accent.opacity(0.6)))
-        .hover(move |s| s.bg(p.sidebar_accent))
+        .when(is_open, |d| d.bg(p.accent.opacity(0.6)))
+        .hover(move |s| s.bg(p.accent).text_color(p.accent_foreground))
         .on_click(move |_, _, cx| {
             state_handle.update(cx, |s, cx| {
                 *s = if *s == Some(target) {
@@ -2189,7 +2156,7 @@ fn render_submenu_trigger(
         .child(
             div()
                 .text_size(ui::TEXT_XS)
-                .text_color(p.foreground)
+                .text_color(p.popover_foreground)
                 .child(label),
         )
         .child(
@@ -2215,20 +2182,32 @@ fn render_submenu_trigger(
         )
 }
 
-fn switch_indicator(checked: bool, p: &'static ui::Palette) -> gpui::Div {
+/// OWE-888: `ui::switch` 정본 토큰(트랙 `SWITCH_WIDTH`×`SWITCH_HEIGHT`, 썸 `SWITCH_THUMB`,
+/// 켜짐 `primary`/꺼짐 `muted` + 테두리, 썸 `primary_foreground`/`muted_foreground`)을 그대로 쓰는
+/// 비상호작용 스위치 외형. 행 전체가 클릭 토글을 단일 소유하므로 여기서 중복
+/// 토글 핸들러를 달지 않는다(행 `on_click` 한 번만 토글된다).
+fn switch_face(checked: bool, p: &'static ui::Palette) -> gpui::Div {
+    let track_bg = if checked { p.primary } else { p.muted };
+    let track_border = if checked { p.primary } else { p.border };
+    let thumb_bg = if checked {
+        p.primary_foreground
+    } else {
+        p.muted_foreground
+    };
     div()
-        .w(px(24.))
-        .h(px(14.))
+        .w(ui::SWITCH_WIDTH)
+        .h(ui::SWITCH_HEIGHT)
         .flex_none()
         .rounded_full()
         .p(px(2.))
         .flex()
         .items_center()
-        .when(checked, |d| d.justify_end().bg(p.primary))
-        .when(!checked, |d| {
-            d.justify_start().bg(p.muted_foreground.opacity(0.3))
-        })
-        .child(div().size(px(10.)).rounded_full().bg(p.background))
+        .when(checked, Styled::justify_end)
+        .when(!checked, Styled::justify_start)
+        .border_1()
+        .border_color(track_border)
+        .bg(track_bg)
+        .child(div().size(ui::SWITCH_THUMB).rounded_full().bg(thumb_bg))
 }
 
 fn check_slot(checked: bool, p: &'static ui::Palette) -> gpui::Div {
