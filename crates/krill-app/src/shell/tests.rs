@@ -4973,3 +4973,233 @@ fn owe843_editor_zoom_shortcuts_adjust_only_editor_font_and_preserve_terminal_an
         std::fs::remove_dir_all(dir).ok();
     }
 }
+
+/// OWE-869: 탭이 0개인 상태에서 새 에이전트 탭·플로팅 터미널·분할·빈 화면 가이드 버튼을 실행해도 패닉 없이 동작한다.
+#[gpui::test]
+fn empty_tabs_actions_and_guide_never_panic(cx: &mut TestAppContext) {
+    let path = state_path("empty-tabs-actions");
+    let (view, cx) = open(cx, path);
+    cx.run_until_parked();
+
+    // 마지막 기본 탭 닫기 → 빈 화면 가이드 노출.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert!(cx.debug_bounds("empty-workspace").is_some());
+    assert!(cx.debug_bounds("empty-new-terminal").is_some());
+    assert!(cx.debug_bounds("empty-new-agent").is_some());
+    assert!(cx.debug_bounds("empty-open-file").is_some());
+
+    // 1. 탭 0개 상태에서 플로팅 터미널 호출 → 패닉 없이 무시.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.float_terminal(krill_proto::SessionId(999), cx);
+            assert!(s.layout.tabs().is_empty());
+        });
+    });
+
+    // 2. 탭 0개 상태에서 new_agent 직접 호출 → 패닉 없이 에이전트 탭 1개 생성.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_agent("claude".into(), cx);
+        });
+    });
+    cx.run_until_parked();
+    let after_agent = layout_of(&view, cx);
+    assert_eq!(after_agent.tabs().len(), 1);
+    let pane = after_agent.focused().expect("focused agent pane");
+    assert_eq!(
+        after_agent.launch(pane).map(|c| &c.program),
+        Some(&Program::Agent {
+            id: "claude".into()
+        })
+    );
+
+    // 3. 다시 닫고 ⌘D (SplitRight) → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+
+    // 4. 다시 닫고 ⌘⇧D (SplitDown) → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    cx.simulate_keystrokes("cmd-shift-d");
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+
+    // 5. 다시 닫고 빈 화면의 '새 터미널' 버튼 클릭 → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    let new_term_btn = cx
+        .debug_bounds("empty-new-terminal")
+        .expect("empty-new-terminal button");
+    cx.simulate_click(new_term_btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+
+    // 6. 다시 닫고 빈 화면의 '새 에이전트' 버튼 클릭 → 첫 탭 생성.
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    let new_agent_btn = cx
+        .debug_bounds("empty-new-agent")
+        .expect("empty-new-agent button");
+    cx.simulate_click(new_agent_btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+}
+
+/// OWE-866: 더블클릭 단어 선택·트리플클릭 줄 선택·Shift+클릭 확장이 동작하고,
+/// 단어·줄 선택은 한 칸짜리라도 클릭 해제에 지워지지 않는다.
+#[gpui::test]
+fn mouse_double_triple_shift_select(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Cell, Op, Revision, Seq, encode_update};
+    use krill_proto::term_modes::{Modes, TERM_MODES};
+
+    let (view, cx) = open(cx, state_path("mouse-word-line"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(3), ours, cx);
+            let modes = Modes {
+                kitty: 0,
+                flags: Modes::BRACKETED_PASTE,
+            };
+            let body = postcard::to_stdvec(&modes).unwrap();
+            assert!(s.on_frame(pane, TERM_MODES, &body, cx));
+            let row = |t: &str| {
+                t.chars()
+                    .map(|ch| Cell {
+                        ch,
+                        ..Cell::default()
+                    })
+                    .collect()
+            };
+            let ops = vec![
+                Op::Reset { cols: 20, lines: 2 },
+                Op::Line {
+                    line: 0,
+                    cells: row("hello world,foo"),
+                },
+                Op::Line {
+                    line: 1,
+                    cells: row("second line"),
+                },
+            ];
+            let (k, b) =
+                ipc::read_frame(&mut &encode_update(Revision(1), Seq(0), ops).unwrap()[0][..])
+                    .unwrap()
+                    .unwrap();
+            assert!(s.on_frame(pane, k, &b, cx));
+        });
+    });
+    cx.run_until_parked();
+    let text_of = |view: &Entity<Shell>, cx: &mut VisualTestContext| {
+        cx.update(|_, cx| view.read(cx).live[&pane].selection_text.clone())
+    };
+
+    // 더블클릭 → "world" 단어 선택.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(pane, pos(7., 0.), 2, false, cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("world"));
+
+    // 더블클릭 후 단어 단위 드래그 확장 → "world,foo".
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(pane, pos(7., 0.), 2, false, cx);
+            s.select_move(pane, pos(13., 0.), cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("world,foo"));
+
+    // 트리플클릭 → 0행 전체.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(pane, pos(3., 0.), 3, false, cx);
+            assert!(s.select_end(pane, cx));
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("hello world,foo"));
+
+    // Shift+클릭 → 기존 anchor 유지, head만 확장.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(pane, pos(0., 1.), 1, false, cx);
+            s.select_begin(pane, pos(5., 1.), 1, true, cx);
+            assert!(s.select_end(pane, cx));
+            let sel = s.live[&pane].selection.expect("shift selection");
+            assert_eq!(sel.anchor, select::Point { line: 1, column: 0 });
+            assert_eq!(sel.head, select::Point { line: 1, column: 5 });
+        });
+    });
+    assert_eq!(text_of(&view, cx).as_deref(), Some("second"));
+
+    // 구분자 더블클릭(한 칸)도 해제에 지워지지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(pane, pos(11., 0.), 2, false, cx);
+            assert!(s.select_end(pane, cx));
+            assert!(s.live[&pane].selection.is_some());
+        });
+    });
+
+    // 움직이지 않은 단일 클릭은 선택을 지운다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let (bounds, cell) = s.live[&pane].painted.get();
+            let pos = |col: f32, line: f32| {
+                point(
+                    bounds.origin.x + cell.width * (col + 0.5),
+                    bounds.origin.y + cell.height * (line + 0.5),
+                )
+            };
+            s.select_begin(pane, pos(1., 1.), 1, false, cx);
+            assert!(s.select_end(pane, cx));
+            assert!(s.live[&pane].selection.is_none());
+        });
+    });
+}
