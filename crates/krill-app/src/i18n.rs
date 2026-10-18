@@ -1546,6 +1546,8 @@ catalog! {
         FLOAT_LABEL => ("플로팅 터미널 (⌥⌘A)", "Floating terminal (⌥⌘A)"),
         DASHBOARD => ("세션 대시보드", "Session dashboard"),
         DASHBOARD_LABEL => ("대시보드 팝아웃 (⇧⌥⌘A)", "Dashboard popout (⇧⌥⌘A)"),
+        FLOAT_MENU => ("플로팅 터미널", "Floating terminal"),
+        STATUS_OPEN_SETTINGS => ("설정 열기", "Open settings"),
         DAEMON_UP => ("데몬 연결됨", "Daemon connected"),
         DAEMON_CONNECTING => ("데몬 재연결 중…", "Reconnecting to daemon…"),
         DAEMON_FAILED => ("데몬 오류", "Daemon error"),

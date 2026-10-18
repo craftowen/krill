@@ -4879,7 +4879,9 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert_eq!(Layout::load(&path).unwrap(), empty);
 
     // 빈 탭 상태에서 닫기·탭 순환 단축키를 눌러도 패닉이나 유령 탭이 생기지 않는다.
-    cx.simulate_keystrokes("cmd-w cmd-shift-w cmd-shift-] cmd-shift-[");
+    // ⌘W는 빈 작업 공간에서 창을 닫으므로(K11) 여기서는 누르지 않는다
+    // (`cmd_w_in_empty_workspace_closes_window`가 따로 본다).
+    cx.simulate_keystrokes("cmd-shift-w cmd-shift-] cmd-shift-[");
     cx.run_until_parked();
     assert!(layout_of(&view, cx).tabs().is_empty());
 
@@ -6744,4 +6746,108 @@ fn owe903_first_run_offer_inside_shell_update_does_not_panic(cx: &mut TestAppCon
         "no first-run modal"
     );
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// 하-3: 사이드바·우측 패널 분할선을 더블클릭하면 기본 너비로 돌아간다.
+#[gpui::test]
+fn column_divider_double_click_resets_width(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("divider-reset"));
+    let defaults = Layout::default();
+    let size = cx.update(|window, _| window.viewport_size());
+    let (w, y) = (f32::from(size.width), f32::from(size.height) * 0.75);
+    drag(cx, point(px(242.), px(y)), point(px(400.), px(y)));
+    drag(cx, point(px(w - 283.), px(y)), point(px(w - 400.), px(y)));
+    let l = layout_of(&view, cx);
+    assert!((l.sidebar_width - 400.).abs() < 0.5, "{}", l.sidebar_width);
+    assert!(
+        (l.panel_width - defaults.panel_width).abs() > 50.,
+        "{}",
+        l.panel_width
+    );
+
+    let double = |cx: &mut VisualTestContext, x: f32| {
+        let at = point(px(x), px(y));
+        for click_count in 1..=2 {
+            cx.simulate_event(gpui::MouseDownEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count,
+                first_mouse: false,
+            });
+            cx.simulate_event(gpui::MouseUpEvent {
+                button: MouseButton::Left,
+                position: at,
+                modifiers: Modifiers::default(),
+                click_count,
+            });
+        }
+        cx.run_until_parked();
+    };
+    let panel = layout_of(&view, cx).panel_width;
+    double(cx, w - panel - 3.);
+    double(cx, 402.);
+    let l = layout_of(&view, cx);
+    assert!(
+        (l.sidebar_width - defaults.sidebar_width).abs() < 0.5,
+        "{}",
+        l.sidebar_width
+    );
+    assert!(
+        (l.panel_width - defaults.panel_width).abs() < 0.5,
+        "{}",
+        l.panel_width
+    );
+}
+
+/// K11: 탭이 없는 빈 작업 공간에서 ⌘W는 창을 닫는다(macOS 관례).
+#[gpui::test]
+fn cmd_w_in_empty_workspace_closes_window(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("empty-cmd-w"));
+    view.update(cx, |s, cx| s.change(false, cx, |l| l.close_tab(0)));
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    assert_eq!(cx.windows().len(), 1);
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(
+        cx.windows().is_empty(),
+        "empty workspace ⌘W closes the window"
+    );
+}
+
+/// OWE-855: 포커스 칸 세션에 워크트리가 있으면 창 제목이 "Krill — <워크트리>"다.
+#[gpui::test]
+fn main_window_title_shows_worktree(cx: &mut TestAppContext) {
+    struct Fixed;
+    impl sidebar::Source for Fixed {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: krill_proto::SessionId(31),
+                    status: krill_proto::control::AgentStatus::UNKNOWN,
+                    worktree: Some("/repo/wt-title".into()),
+                    cwd: Some("/repo/wt-title".into()),
+                    account: None,
+                }],
+                trees: [("/repo".into(), vec!["/repo/wt-title".into()])].into(),
+            })
+        }
+    }
+    let (view, cx) = open(cx, state_path("owe855-worktree-title"));
+    let app = krill_app::i18n::catalog::shell::APP_TITLE.get();
+    cx.run_until_parked();
+    assert_eq!(cx.window_title().as_deref(), Some(app));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.focused().expect("focused pane");
+        s.change(true, cx, |l| {
+            l.set_session(pane, krill_proto::SessionId(31));
+        });
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(std::sync::Arc::new(Fixed), cx);
+        });
+    });
+    cx.run_until_parked();
+    let want = format!("{app} — wt-title");
+    assert_eq!(cx.window_title().as_deref(), Some(want.as_str()));
 }
