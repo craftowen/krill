@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use gpui::{AnyElement, Context, Window, div, prelude::*, px, uniform_list};
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::checkbox::Checkbox;
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::{Icon, IconName, Sizable as _};
@@ -241,14 +242,15 @@ fn row_menu(
             if !meta.is_primary || meta.descendant_count > 0 {
                 menu = menu.separator();
                 if !meta.is_primary {
-                    let (del_this, del_path) = (this.clone(), meta.path.clone());
+                    // OWE-847: 즉시 삭제하지 않고 확인 모달을 연다.
+                    let (confirm_this, confirm_path) = (this.clone(), meta.path.clone());
                     menu = menu.item(
                         PopupMenuItem::new(text::DELETE_WORKTREE.get())
                             .icon(IconName::Delete)
                             .on_click(move |_, _, cx| {
-                                del_this
+                                confirm_this
                                     .update(cx, |s, cx| {
-                                        s.delete_worktree(del_path.clone(), false, cx);
+                                        s.request_delete_worktree(confirm_path.clone(), false, cx);
                                     })
                                     .ok();
                             }),
@@ -262,7 +264,7 @@ fn row_menu(
                         move |_, _, cx| {
                             del_all_this
                                 .update(cx, |s, cx| {
-                                    s.delete_with_descendants(del_all_path.clone(), false, cx);
+                                    s.request_delete_worktree(del_all_path.clone(), true, cx);
                                 })
                                 .ok();
                         },
@@ -832,6 +834,40 @@ impl Sidebar {
         }
     }
 
+    /// 워크트리 카드 제목 자리(OWE-847): 이름 변경 중이면 인라인 입력창(Enter 저장·Esc 취소),
+    /// 아니면 기존 제목 텍스트를 돌려준다.
+    fn card_title_el(
+        &self,
+        path: &std::path::Path,
+        card_title: String,
+        title_size: gpui::Rems,
+        index: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        if let Some((_, input)) = self.editing.as_ref().filter(|(p, _)| p == path) {
+            let input = input.clone();
+            return div()
+                .debug_selector(move || format!("rename-inline-{index}"))
+                .flex_1()
+                .min_w_0()
+                .child(Input::new(&input).h(px(28.)))
+                .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
+                    if e.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        s.cancel_rename(Some(window), cx);
+                    }
+                }))
+                .into_any_element();
+        }
+        div()
+            .min_w_0()
+            .truncate()
+            .text_size(title_size)
+            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .child(card_title)
+            .into_any_element()
+    }
+
     fn render_worktree(
         &self,
         base: gpui::Stateful<gpui::Div>,
@@ -1290,14 +1326,7 @@ impl Sidebar {
                         .flex()
                         .items_center()
                         .gap_1p5()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(ui::TEXT_SM)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .child(card_title),
-                        )
+                        .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
                         .children(lineage_toggle_btn)
                         .when(props.branch, |d| {
                             d.child(
@@ -1433,14 +1462,7 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_MD)
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(card_title),
-                            )
+                            .child(self.card_title_el(path, card_title, ui::TEXT_MD, index, cx))
                             .when(is_default_tree, |d| {
                                 d.child(
                                     div()
@@ -1805,9 +1827,19 @@ impl Sidebar {
             .child(content)
     }
 
+    /// OWE-847: 이름 변경은 카드 제목 자리 인라인 편집이 기본이다.
+    /// 편집 중인 카드가 목록에 보이지 않을 때(필터·접힘 등)만 상단 대체 입력창을 띄운다.
     fn render_rename(&self, cx: &mut Context<Self>) -> Option<impl IntoElement + use<>> {
         let p = ui::palette(cx);
-        let (_, input) = self.editing.as_ref()?;
+        let (editing_path, input) = self.editing.as_ref()?;
+        if self
+            .rows
+            .iter()
+            .any(|row| matches!(row, Row::Worktree(w) if w == editing_path))
+        {
+            return None;
+        }
+        let input = input.clone();
         Some(
             div()
                 .p_2()
@@ -1816,14 +1848,14 @@ impl Sidebar {
                 .gap_1()
                 .border_b_1()
                 .border_color(p.sidebar_border)
-                .child(Input::new(input).h(px(30.)))
+                .child(Input::new(&input).h(px(30.)))
                 .child(
                     div()
                         .flex()
                         .gap_1()
                         .child(
                             Button::new("rename-save")
-                                .ghost()
+                                .primary()
                                 .label(text::SAVE.get())
                                 .on_click(cx.listener(|s, _, window, cx| {
                                     s.finish_rename(Some(window), cx);
@@ -1834,16 +1866,118 @@ impl Sidebar {
                                 .ghost()
                                 .label(text::CANCEL.get())
                                 .on_click(cx.listener(|s, _, window, cx| {
-                                    s.editing = None;
-                                    s.edit_subscription = None;
-                                    if let Some(focus) = &s.focus {
-                                        window.focus(focus, cx);
-                                    }
-                                    cx.notify();
+                                    s.cancel_rename(Some(window), cx);
                                 })),
                         ),
-                ),
+                )
+                .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
+                    if e.keystroke.key == "escape" {
+                        cx.stop_propagation();
+                        s.cancel_rename(Some(window), cx);
+                    }
+                })),
         )
+    }
+
+    /// OWE-847: 워크트리 삭제 확인 모달(Orca `DeleteWorktreeDialog`처럼 이름·자손 수·미커밋 경고를
+    /// 보여 주고, 미커밋 변경이 있으면 강제 삭제 토글을 제공한다).
+    fn render_delete_confirm(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let confirm = self.delete_confirm.clone()?;
+        let p = ui::palette(cx);
+        let name = self.name(&confirm.path);
+        let desc = if confirm.with_descendants {
+            text::DELETE_DESC_WITH_DESCENDANTS.format(&[
+                ("name", &name),
+                ("n", &confirm.descendant_count.to_string()),
+            ])
+        } else {
+            text::DELETE_DESC.format(&[("name", &name)])
+        };
+        let card = div()
+            .id("delete-worktree-dialog")
+            .debug_selector(|| "delete-worktree-dialog".into())
+            .occlude()
+            .role(gpui::Role::AlertDialog)
+            .w(ui::DIALOG_WIDTH)
+            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .p_6()
+            .rounded(ui::RADIUS_LG)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, _, cx| {
+                if e.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    s.cancel_delete(cx);
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|s, _, _, cx| s.cancel_delete(cx)))
+            .child(
+                div()
+                    .debug_selector(|| "delete-worktree-title".into())
+                    .text_size(ui::TEXT_LG)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(text::DELETE_TITLE.get()),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "delete-worktree-desc".into())
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(desc),
+            )
+            .when(confirm.dirty > 0, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "delete-worktree-dirty".into())
+                        .text_size(ui::TEXT_XS)
+                        .text_color(p.warning)
+                        .child(text::DELETE_DIRTY.format(&[("n", &confirm.dirty.to_string())])),
+                )
+                .child(
+                    div()
+                        .debug_selector(|| "delete-worktree-force".into())
+                        .child(
+                            Checkbox::new("delete-worktree-force")
+                                .label(text::DELETE_FORCE.get())
+                                .checked(confirm.force)
+                                .on_click(cx.listener(|s, _checked: &bool, _, cx| {
+                                    s.toggle_delete_force(cx);
+                                })),
+                        ),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .justify_end()
+                    .gap_2()
+                    .child(
+                        Button::new("delete-worktree-cancel")
+                            .ghost()
+                            .debug_selector(|| "delete-worktree-cancel".into())
+                            .label(text::CANCEL.get())
+                            .on_click(cx.listener(|s, _, _, cx| s.cancel_delete(cx))),
+                    )
+                    .child(
+                        Button::new("delete-worktree-confirm")
+                            .danger()
+                            .debug_selector(|| "delete-worktree-confirm".into())
+                            .label(text::DELETE_CONFIRM.get())
+                            .on_click(cx.listener(|s, _, _, cx| s.confirm_delete(cx))),
+                    ),
+            );
+        Some(ui::modal_backdrop(window.viewport_size(), card).into_any_element())
     }
 
     /// MK-174: Setup 스크립트 감지 인앱 프롬프트 카드(`SetupScriptPromptCard`).
@@ -1981,7 +2115,7 @@ impl Sidebar {
 }
 
 impl Render for Sidebar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.orca_import_subscription.is_none() {
             self.orca_import_subscription = Some(
                 cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
@@ -2001,12 +2135,14 @@ impl Render for Sidebar {
         let list = self.render_list(cx);
         let setup_prompt = self.render_setup_prompt_card(cx);
         let rename = self.render_rename(cx);
+        let delete_confirm = self.render_delete_confirm(window, cx);
         let default_repo = self.snapshot.trees.keys().next().cloned();
         div()
             .id("sidebar")
-            .when(self.editing.is_none() && self.creating.is_none(), |d| {
-                d.key_context(KEY_CONTEXT)
-            })
+            .when(
+                self.editing.is_none() && self.creating.is_none() && self.delete_confirm.is_none(),
+                |d| d.key_context(KEY_CONTEXT),
+            )
             .when_some(self.focus.as_ref(), InteractiveElement::track_focus)
             .on_action(cx.listener(|s, _: &SelectPrev, _, cx| s.step(-1, cx)))
             .on_action(cx.listener(|s, _: &SelectNext, _, cx| s.step(1, cx)))
@@ -2158,6 +2294,7 @@ impl Render for Sidebar {
             .children(setup_prompt)
             .children(rename)
             .children(self.creating.as_ref().map(|(dialog, _)| dialog.clone()))
+            .children(delete_confirm)
             .when(self.rows.is_empty(), |d| {
                 d.child(
                     div()
