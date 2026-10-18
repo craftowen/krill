@@ -4,10 +4,12 @@
 //! - fd: krilld가 fd로 다루는 것(holder 링크·클라이언트 소켓·PTY master) 중 Windows에서 지금 실제로 있는 것은
 //!   `AF_UNIX` 소켓뿐이라 소켓 타입을 쓴다. holder 링크([`crate::holder`])가 늘 실패해 PTY master는 만들어지지
 //!   않는다. `ConPTY` 핸들 모델은 Phase 3(OWE-833)에서 정한다.
-//! - 권한: 소유자·모드 검사와 `O_NOFOLLOW`는 없다(`krill_proto::os`처럼 `%LOCALAPPDATA%` ACL 상속에 맡김, 추정).
-//!   DACL 검사와 `FILE_FLAG_OPEN_REPARSE_POINT`는 Phase 3(OWE-833).
+//! - 권한: 소유자·모드 검사는 없다(`krill_proto::os`처럼 `%LOCALAPPDATA%` ACL 상속에 맡김, 추정). DACL 검사는 후속.
+//!   `O_NOFOLLOW` 대신 `FILE_FLAG_OPEN_REPARSE_POINT`로 열고 심볼릭 링크·정션이면 거부한다([`open_no_follow`]).
 
-use std::fs::{Metadata, OpenOptions};
+use std::fs::{File, Metadata, OpenOptions};
+use std::io;
+use std::path::Path;
 
 #[cfg(unix)]
 pub(crate) use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -77,11 +79,28 @@ pub(crate) fn private_to_me(_meta: &Metadata, _mask: u32) -> bool {
     true
 }
 
-/// 마지막 경로 성분이 심볼릭 링크면 열기를 실패시킨다(`O_NOFOLLOW`). Windows는 그대로 둔다(모듈 설명).
-pub(crate) fn no_follow(options: &mut OpenOptions) -> &mut OpenOptions {
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW);
-    options
+/// `path`를 연다. 마지막 경로 성분이 심볼릭 링크면 실패한다(`O_NOFOLLOW`, `ELOOP`).
+#[cfg(unix)]
+pub(crate) fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    std::os::unix::fs::OpenOptionsExt::custom_flags(options, libc::O_NOFOLLOW).open(path)
+}
+
+/// Windows: reparse point를 따라가지 않고 그 자체를 연 뒤, 이름 대리(심볼릭 링크·정션·마운트 지점)면 닫고
+/// `ERROR_STOPPED_ON_SYMLINK`로 실패한다. std `is_symlink`가 그 태그 판정이다. 클라우드 자리표시자 같은 다른 reparse
+/// point는 파일 자체라 그대로 쓴다(비수화 `OneDrive` 파일 읽기는 미확인).
+#[cfg(windows)]
+pub(crate) fn open_no_follow(options: &mut OpenOptions, path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    let file = options
+        .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_type().is_symlink() {
+        let code = windows_sys::Win32::Foundation::ERROR_STOPPED_ON_SYMLINK;
+        return Err(io::Error::from_raw_os_error(
+            i32::try_from(code).unwrap_or(i32::MAX),
+        ));
+    }
+    Ok(file)
 }
 
 /// 디스크에 실제로 잡힌 바이트(희소 파일은 길이보다 작다). Windows는 길이.
