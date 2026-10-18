@@ -111,6 +111,113 @@ fn close_and_cycle_keys(cx: &mut TestAppContext) {
     assert_eq!(Layout::load(&path).unwrap(), l);
 }
 
+/// OWE-871: ⌘⌥⇧+화살표는 분할 배치대로 포커스를 옮긴다(⌘⌥화살표는 그대로 둔다).
+#[gpui::test]
+fn directional_focus_follows_geometry(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pane-direction"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let right = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses the new pane");
+    // ⌘⌥↓(순환)은 그대로 다음 칸으로 간다.
+    cx.simulate_keystrokes("cmd-alt-down");
+    let left = layout_of(&view, cx).focused().expect("cycle moves focus");
+    assert_ne!(left, right);
+    // 기하 이동: 왼쪽 끝에서는 그대로, 오른쪽으로는 간다.
+    cx.simulate_keystrokes("cmd-alt-shift-left");
+    assert_eq!(layout_of(&view, cx).focused(), Some(left));
+    cx.simulate_keystrokes("cmd-alt-shift-right");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    // 상하 분할이 없으면 위·아래는 그대로다.
+    cx.simulate_keystrokes("cmd-alt-shift-up");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    cx.simulate_keystrokes("cmd-alt-shift-down");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+    // 아래로 가른 뒤에는 위·아래로 오간다.
+    cx.simulate_keystrokes("cmd-shift-d");
+    let below = layout_of(&view, cx)
+        .focused()
+        .expect("split down focuses the new pane");
+    assert_ne!(below, right);
+    cx.simulate_keystrokes("cmd-alt-shift-up");
+    assert_eq!(layout_of(&view, cx).focused(), Some(right));
+}
+
+/// OWE-871: 확대(줌) 상태면 패인 헤더에 배지와 해제 버튼이 보이고, 해제하면 2칸으로 돌아온다.
+#[gpui::test]
+fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("pane-zoom-badge"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let id = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    cx.simulate_keystrokes("cmd-shift-enter");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), Some(id));
+    let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
+    assert!(
+        cx.debug_bounds(badge).is_some(),
+        "zoomed pane shows a badge"
+    );
+    let unzoom: &'static str = Box::leak(format!("pane-unzoom-{}", id.get()).into_boxed_str());
+    let at = cx.debug_bounds(unzoom).expect("unzoom button").center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), None);
+    assert_eq!(layout_of(&view, cx).visible().len(), 2);
+    assert!(cx.debug_bounds(badge).is_none());
+}
+
+/// OWE-871: 패인 헤더 ×는 ⌘W처럼 닫은 세션을 기록하고 확대 상태를 푼다.
+#[gpui::test]
+fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
+    use krill_proto::SessionId;
+    let (view, cx) = open(cx, state_path("pane-close-record"));
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let id = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    view.update(cx, |s, _| {
+        s.layout.set_session(id, SessionId(7));
+    });
+    cx.simulate_keystrokes("cmd-shift-enter");
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).zoomed_pane), Some(id));
+    let header: &'static str = Box::leak(format!("pane-header-{}", id.get()).into_boxed_str());
+    assert!(cx.debug_bounds(header).is_some(), "zoomed header shows");
+    let badge: &'static str = Box::leak(format!("pane-zoom-badge-{}", id.get()).into_boxed_str());
+    assert!(cx.debug_bounds(badge).is_some(), "zoomed badge shows");
+    let (split_count, is_split) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        (s.layout.visible().len(), s.layout.visible().len() > 1)
+    });
+    assert!(is_split, "split panes present, got {split_count}");
+    let close: &'static str = Box::leak(format!("pane-close-{}", id.get()).into_boxed_str());
+    let at = cx
+        .debug_bounds(close)
+        .expect("header close button")
+        .center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    let (zoomed, panes, closed) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        (
+            s.zoomed_pane,
+            s.layout.visible().len(),
+            s.closed_sessions.clone(),
+        )
+    });
+    assert_eq!(zoomed, None);
+    assert_eq!(panes, 1);
+    assert!(closed.contains(&SessionId(7)), "closed pane is reopenable");
+}
 /// MK-025·MK-026: 데몬 기동 실패 이유와 끊김이 셸 배너로 보이고, 다시 붙으면 사라진다.
 #[gpui::test]
 fn daemon_link_shows_banner(cx: &mut TestAppContext) {

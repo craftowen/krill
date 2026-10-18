@@ -408,6 +408,11 @@ catalog! {
         PINNED_CLOSE_CONFIRM => ("탭 닫기", "Close Tab"),
         PINNED_CLOSE_CANCEL => ("취소", "Cancel"),
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
+        PANE_SELECT_ALL => ("전체 선택", "Select all"),
+        PANE_CLEAR => ("화면 지우기", "Clear screen"),
+        PANE_ZOOM_TOGGLE => ("창 확대 전환", "Toggle pane zoom"),
+        PANE_UNZOOM => ("확대 해제", "Unzoom pane"),
+        ZOOMED_BADGE => ("확대됨", "Zoomed"),
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),
@@ -1026,6 +1031,10 @@ catalog! {
         SC_NEXT_PANE => ("다음 창", "Next pane"),
         SC_PREV_PANE => ("이전 창", "Previous pane"),
         SC_ZOOM_PANE => ("창 확대 전환", "Toggle pane zoom"),
+        SC_PANE_LEFT => ("왼쪽 창으로", "Focus pane left"),
+        SC_PANE_RIGHT => ("오른쪽 창으로", "Focus pane right"),
+        SC_PANE_UP => ("위쪽 창으로", "Focus pane up"),
+        SC_PANE_DOWN => ("아래쪽 창으로", "Focus pane down"),
         SC_CLEAR => ("화면 지우기", "Clear"),
         SC_SELECT_ALL => ("전체 선택", "Select all"),
         SC_FIND => ("찾기", "Find"),
