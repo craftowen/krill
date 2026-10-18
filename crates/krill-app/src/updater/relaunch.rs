@@ -23,6 +23,26 @@ const WAIT_PID_TIMEOUT: Duration = Duration::from_secs(15);
 
 pub(super) use crate::i18n::catalog::updater_relaunch as text;
 
+/// 롤백 사유 영문을 사용자용 문구로 바꾼다(OWE-883). 모르는 사유는 그대로 둔다.
+#[must_use]
+pub fn localize_reason(reason: &str) -> String {
+    if reason == "interrupted during bundle replacement" {
+        return text::REASON_INTERRUPTED.get().to_owned();
+    }
+    if let Some(status) = reason.strip_prefix("new app exited before ready (") {
+        let status = status.strip_suffix(')').unwrap_or(status);
+        return text::REASON_EXITED_EARLY.format(&[("status", status)]);
+    }
+    if let Some(ms) = reason.strip_prefix("new app did not report ready within ") {
+        let ms = ms.strip_suffix("ms").unwrap_or(ms);
+        return text::REASON_NO_READY_SIGNAL.format(&[("ms", ms)]);
+    }
+    if reason == "old app did not exit; replacement aborted" {
+        return text::REASON_OLD_APP_LINGERING.get().to_owned();
+    }
+    reason.to_owned()
+}
+
 /// 교체·재실행 단계별 저널(ARCHITECTURE §7).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -527,7 +547,7 @@ pub fn offer_rollback(state_dir: PathBuf, window: &mut Window, cx: &mut App) {
             .get()
             .replace("{to}", &journal.to_version)
             .replace("{from}", &journal.from_version)
-            .replace("{reason}", &reason);
+            .replace("{reason}", &localize_reason(&reason));
         let answer = window.prompt(
             PromptLevel::Warning,
             text::ROLLBACK_DONE_TITLE.get(),

@@ -1213,12 +1213,13 @@ impl Shell {
                         menu = menu.item(PopupMenuItem::new(text::ORCH_EMPTY.get()).disabled(true));
                     }
                     for task in orch_store.tasks.iter().take(6) {
-                        let row = format!(
-                            "[{}] {} · {} ({})",
-                            task.run_id,
-                            task.id,
-                            task.title,
-                            task.status.as_str()
+                        // OWE-883: 내부 영문 상태·`{:?}` 대신 카탈로그 표시 이름과 의존 목록을 보인다.
+                        let row = krill_app::settings::orchestration_task_line(
+                            &task.run_id,
+                            &task.id,
+                            &task.title,
+                            task.status,
+                            &task.deps,
                         );
                         menu = menu.item(PopupMenuItem::new(row).disabled(true));
                     }

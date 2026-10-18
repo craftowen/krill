@@ -370,6 +370,32 @@ impl fmt::Display for Error {
     }
 }
 
+impl Error {
+    /// 설정·상태바에 보이는 사용자용 문구(OWE-883). 로그·CLI 출력은 [`fmt::Display`] 그대로 둔다.
+    #[must_use]
+    pub fn user_message(&self) -> String {
+        use crate::i18n::catalog::updater_relaunch as utext;
+        match self {
+            Self::Config(m) => utext::UPDATE_ERR_CONFIG.format(&[("detail", m)]),
+            Self::Json(m) => utext::UPDATE_ERR_MANIFEST.format(&[("detail", m)]),
+            Self::InsecureUrl(u) => utext::UPDATE_ERR_URL.format(&[("detail", u)]),
+            Self::InvalidVersion(v) => utext::UPDATE_ERR_VERSION.format(&[("detail", v)]),
+            Self::Downgrade { current, offered } => {
+                utext::UPDATE_ERR_DOWNGRADE.format(&[("current", current), ("offered", offered)])
+            }
+            Self::InvalidRollout(p) => utext::UPDATE_ERR_ROLLOUT.format(&[("pct", &p.to_string())]),
+            Self::BadSignature => utext::UPDATE_ERR_SIGNATURE.get().to_owned(),
+            Self::Sha256Mismatch { .. } => utext::UPDATE_ERR_SHA256.get().to_owned(),
+            Self::Codesign(m) => utext::UPDATE_ERR_CODESIGN.format(&[("detail", m)]),
+            Self::BundleStructure(m) => utext::UPDATE_ERR_BUNDLE.format(&[("detail", m)]),
+            Self::Http(m) => utext::UPDATE_ERR_NETWORK.format(&[("detail", m)]),
+            Self::Unpack(m) => utext::UPDATE_ERR_UNPACK.format(&[("detail", m)]),
+            Self::NoBackup(_) => utext::UPDATE_ERR_BACKUP.get().to_owned(),
+            Self::Io(e) => utext::UPDATE_ERR_IO.format(&[("detail", &e.to_string())]),
+        }
+    }
+}
+
 impl std::error::Error for Error {}
 
 impl From<io::Error> for Error {

@@ -438,7 +438,13 @@ pub fn claude_identity(exe: &Path, dir: Option<&Path>) -> Option<Identity> {
 }
 
 /// 로그인 CLI를 백그라운드에서 실행하고, 허용된 인증 링크가 준비되면 브라우저를 연다.
-pub fn start_login(paths: &Paths, account: &AccountInfo, newly_added: bool) -> Result<(), String> {
+/// 취소 손잡이(`Arc<AtomicBool>`)를 돌려준다. UI의 [취소]가 그것을 켜면
+/// 스레드가 자식 CLI를 죽이고 정리한 뒤 [`LoginOutcome::Cancelled`]를 기록한다(OWE-881).
+pub fn start_login(
+    paths: &Paths,
+    account: &AccountInfo,
+    newly_added: bool,
+) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
     let program = krill_proto::account_login::login_program(account.provider, login_dir(account))
         .ok_or_else(|| {
         crate::i18n::catalog::settings::ACCOUNT_LOGIN_UNSUPPORTED
@@ -449,13 +455,71 @@ pub fn start_login(paths: &Paths, account: &AccountInfo, newly_added: bool) -> R
         return Err("unsupported login command".to_owned());
     };
     let (paths, account) = (paths.clone(), account.clone());
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let cancel_for_thread = cancel.clone();
     std::thread::Builder::new()
         .name("account-login-browser".into())
         .spawn(move || {
-            run_browser_login(&paths, &account, newly_added, &program, &args);
+            run_browser_login(
+                &paths,
+                &account,
+                newly_added,
+                &program,
+                &args,
+                &cancel_for_thread,
+            );
         })
         .map_err(|e| e.to_string())?;
-    Ok(())
+    Ok(cancel)
+}
+
+/// 백그라운드 브라우저 로그인의 종료 사유(OWE-881). 설정 탭의 모니터가
+/// [`take_login_outcome`]으로 꺼내 진행 표시·실패 안내에 쓴다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Succeeded,
+    Failed(LoginFailReason),
+    Cancelled,
+}
+
+/// 로그인 실패 사유(OWE-881).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginFailReason {
+    /// 로그인 자식 프로세스를 띄우지 못했거나 임시 작업대를 만들지 못했다.
+    SpawnFailed,
+    /// 600초 안에 브라우저 인증이 끝나지 않았다.
+    TimedOut,
+    /// CLI가 비정상 종료했거나 로그인 상태를 확인하지 못했다.
+    Unsuccessful,
+}
+
+fn login_outcomes() -> &'static std::sync::Mutex<std::collections::HashMap<String, LoginOutcome>> {
+    static OUTCOMES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LoginOutcome>>,
+    > = std::sync::OnceLock::new();
+    OUTCOMES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn lock_login_outcomes()
+-> std::sync::MutexGuard<'static, std::collections::HashMap<String, LoginOutcome>> {
+    login_outcomes()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn record_login_outcome(account_id: &str, outcome: LoginOutcome) {
+    lock_login_outcomes().insert(account_id.to_owned(), outcome);
+}
+
+#[cfg(test)]
+pub(crate) fn record_login_outcome_for_test(account_id: &str, outcome: LoginOutcome) {
+    record_login_outcome(account_id, outcome);
+}
+
+/// 백그라운드 로그인 스레드가 남긴 종료 사유를 꺼낸다. 없으면 아직 진행 중이다(OWE-881).
+#[must_use]
+pub fn take_login_outcome(account_id: &str) -> Option<LoginOutcome> {
+    lock_login_outcomes().remove(account_id)
 }
 
 fn run_browser_login(
@@ -464,20 +528,27 @@ fn run_browser_login(
     newly_added: bool,
     program: &[u8],
     args: &[Vec<u8>],
+    cancel: &std::sync::atomic::AtomicBool,
 ) {
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::PermissionsExt as _;
+    use std::sync::atomic::Ordering;
+    // 실패 기록+정리를 한 번에 한다. 취소는 별도 경로(호출자가 구분해야 한다).
+    let fail = |reason: LoginFailReason| {
+        record_login_outcome(&account.id, LoginOutcome::Failed(reason));
+        cleanup_failed_login(paths, account, newly_added);
+    };
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |time| time.as_nanos());
     let temp = std::env::temp_dir().join(format!("krill-login-{}-{nonce}", std::process::id()));
     if std::fs::create_dir(&temp).is_err() {
-        cleanup_failed_login(paths, account, newly_added);
+        fail(LoginFailReason::SpawnFailed);
         return;
     }
     if std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o700)).is_err() {
         std::fs::remove_dir_all(&temp).ok();
-        cleanup_failed_login(paths, account, newly_added);
+        fail(LoginFailReason::SpawnFailed);
         return;
     }
     let browser = temp.join("browser");
@@ -492,12 +563,12 @@ fn run_browser_login(
     .is_err()
     {
         std::fs::remove_dir_all(&temp).ok();
-        cleanup_failed_login(paths, account, newly_added);
+        fail(LoginFailReason::SpawnFailed);
         return;
     }
     if std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).is_err() {
         std::fs::remove_dir_all(&temp).ok();
-        cleanup_failed_login(paths, account, newly_added);
+        fail(LoginFailReason::SpawnFailed);
         return;
     }
     let Ok(mut child) = std::process::Command::new(std::ffi::OsStr::from_bytes(program))
@@ -516,12 +587,21 @@ fn run_browser_login(
         .spawn()
     else {
         std::fs::remove_dir_all(&temp).ok();
-        cleanup_failed_login(paths, account, newly_added);
+        fail(LoginFailReason::SpawnFailed);
         return;
     };
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let mut opened = false;
+    let mut timed_out = false;
     let success = loop {
+        if cancel.load(Ordering::Relaxed) {
+            child.kill().ok();
+            child.wait().ok();
+            std::fs::remove_dir_all(&temp).ok();
+            record_login_outcome(&account.id, LoginOutcome::Cancelled);
+            cleanup_failed_login(paths, account, newly_added);
+            return;
+        }
         if !opened
             && let Ok(raw) = std::fs::read_to_string(&link_file)
             && let Some(url) = authorize_url(account.provider, &raw)
@@ -539,6 +619,8 @@ fn run_browser_login(
             _ => {
                 child.kill().ok();
                 child.wait().ok();
+                // 데드라인을 넘겼으면 타임아웃, 자식이 일찍 죽었으면 비정상 종료다.
+                timed_out = std::time::Instant::now() >= deadline;
                 break false;
             }
         }
@@ -570,8 +652,14 @@ fn run_browser_login(
             )
             .ok();
         }
+        record_login_outcome(&account.id, LoginOutcome::Succeeded);
     } else {
-        cleanup_failed_login(paths, account, newly_added);
+        let reason = if timed_out {
+            LoginFailReason::TimedOut
+        } else {
+            LoginFailReason::Unsuccessful
+        };
+        fail(reason);
     }
     std::fs::remove_dir_all(temp).ok();
 }

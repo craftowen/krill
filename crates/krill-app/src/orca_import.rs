@@ -74,7 +74,7 @@ impl ImportDomain {
             Self::Projects => text::CAT_PROJECTS_DESC.format(&[
                 ("projects", &r.projects_count().to_string()),
                 ("worktrees", &r.worktrees_count().to_string()),
-                ("comments", &r.projects.worktrees_migrated.to_string()),
+                ("comments", &r.projects.comments_migrated.to_string()),
             ]),
             Self::Settings => text::CAT_SETTINGS_DESC.format(&[
                 ("commands", &r.settings.quick_commands_merged.to_string()),
@@ -165,6 +165,20 @@ impl OrcaImportReport {
         self.settings
             .quick_commands_merged
             .saturating_add(self.settings.schedules_merged)
+    }
+
+    /// 스캔·이관된 실제 항목 합계(OWE-882). 0이면 가져올 것이 없어 배너를 숨긴다.
+    #[must_use]
+    pub fn total_importable(&self) -> usize {
+        self.claude_count()
+            .saturating_add(self.codex_count())
+            .saturating_add(self.ssh_count())
+            .saturating_add(self.ssh.environments_merged)
+            .saturating_add(self.projects_count())
+            .saturating_add(self.worktrees_count())
+            .saturating_add(self.commands_and_schedules_count())
+            .saturating_add(self.settings.agents_updated)
+            .saturating_add(usize::from(self.settings.settings_updated))
     }
 
     #[must_use]
@@ -329,6 +343,9 @@ pub struct ProjectsImportSummary {
     pub worktrees_migrated: usize,
     #[serde(default)]
     pub lineage_migrated: usize,
+    /// 이관된 워크트리 코멘트 수(OWE-882). 구 JSON과 호환되도록 `default`다.
+    #[serde(default)]
+    pub comments_migrated: usize,
     #[serde(default)]
     pub items: Vec<ImportedProjectSummary>,
 }
@@ -967,8 +984,14 @@ pub fn import_selected(cx: &mut App) {
 #[must_use]
 pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>> {
     let _orca_dir = detect_orca_dir(cx)?;
-    let p = ui::palette(cx);
     let st = state(cx).cloned().unwrap_or_default();
+    // OWE-882: 스캔이 끝났는데 가져올 항목이 하나도 없으면 빈 카드·[전체 가져오기]를 노출하지 않는다.
+    if let Some(report) = st.preview.as_ref().or(st.last_result.as_ref())
+        && report.total_importable() == 0
+    {
+        return None;
+    }
+    let p = ui::palette(cx);
     let daemon_ok = daemon_available(cx);
     let skipped_reason = st
         .last_result
@@ -1145,7 +1168,7 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
 
     let panel = div()
         .id("orca-import-modal")
-        .debug_selector(|| "orca-import-modal".to_owned())
+        .debug_selector(|| "orca-import-modal".into())
         .w(DIALOG_WIDTH)
         .max_w(px(560.))
         .p_5()
@@ -1158,6 +1181,13 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
         .flex_col()
         .gap_3()
         .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        // OWE-882: STYLEGUIDE §6.1·§7.5 — 배경 클릭도 취소와 같은 안전한 닫기로 취급한다.
+        // 가져오는 동안에는 실수로 닫히지 않게 막는다(취소 버튼과 동일 조건).
+        .on_mouse_down_out(|_, _, cx| {
+            if !state(cx).is_some_and(|st| st.importing) {
+                close_modal(cx);
+            }
+        })
         .child(
             div()
                 .flex()
@@ -1217,8 +1247,9 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
                 .child(
                     ui::controls()
                         .child(
-                            ui::secondary("orca-modal-cancel", text::CANCEL.get())
-                                .debug_selector(|| "orca-modal-cancel".to_owned())
+                            // OWE-882: 취소는 destructive가 아니라 STYLEGUIDE §6.1·§7.5의 ghost다.
+                            ui::ghost("orca-modal-cancel", text::CANCEL.get())
+                                .debug_selector(|| "orca-modal-cancel".into())
                                 .disabled(importing)
                                 .on_click(|_, _, cx| close_modal(cx)),
                         )
@@ -2172,5 +2203,44 @@ mod tests {
         assert!(!ssh_ko.contains("ssh-hosts.toml"));
         assert!(ssh_en.contains("hosts.toml"));
         assert!(!ssh_en.contains("ssh-hosts.toml"));
+
+        // OWE-882: 프로젝트 설명의 코멘트 수는 워크트리 수가 아니라 comments_migrated다.
+        let mut proj_report = OrcaImportReport::default();
+        proj_report.projects.projects_added = 2;
+        proj_report.projects.worktrees_migrated = 5;
+        proj_report.projects.comments_migrated = 3;
+        let proj_desc = ImportDomain::Projects.description(Some(&proj_report));
+        assert!(proj_desc.contains("코멘트 3"), "{proj_desc}");
+        assert!(!proj_desc.contains("코멘트 5"), "{proj_desc}");
+    }
+
+    #[gpui::test]
+    fn owe882_empty_report_hides_banner(cx: &mut TestAppContext) {
+        let fx = setup_orca_fixture("empty-banner");
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::settings::init_at(Some(fx.state_dir.clone()), cx);
+            ensure_state(cx);
+            set_env_paths(
+                Some(fx.home.clone()),
+                None,
+                Some(fx.state_dir.clone()),
+                None,
+                cx,
+            );
+            assert!(is_orca_detected(cx));
+            // 스캔 전(preview 없음): 스캔 중 카드 노출
+            assert!(render_banner("test", cx).is_some());
+            // 스캔 완료 0건: 빈 카드·[전체 가져오기] 대신 배너 숨김
+            assert_eq!(OrcaImportReport::default().total_importable(), 0);
+            cx.global_mut::<OrcaImportState>().preview = Some(OrcaImportReport::default());
+            assert!(render_banner("test", cx).is_none());
+            // 항목이 하나라도 있으면 노출
+            let mut with_items = OrcaImportReport::default();
+            with_items.ssh.hosts_added = 1;
+            assert_eq!(with_items.total_importable(), 1);
+            cx.global_mut::<OrcaImportState>().preview = Some(with_items);
+            assert!(render_banner("test", cx).is_some());
+        });
     }
 }

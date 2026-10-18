@@ -52,6 +52,38 @@ pub fn run_phase_badge_spec(phase: &str) -> (crate::ui::BadgeTone, &'static str)
     }
 }
 
+/// 유닉스 epoch 분을 `YYYY-MM-DD HH:MM` 날짜·시각으로 푼다(OWE-883, UTC).
+/// `chrono` 없이 윤년을 포함한 그레고리력 역산만 쓴다. 범위를 벗어나면 빈 문자열.
+#[must_use]
+pub fn format_run_minute(minute: u64) -> String {
+    let secs = minute.saturating_mul(60);
+    let days = secs / 86_400;
+    let secs_of_day = secs % 86_400;
+    // 1970-01-01 기준 일수를 연·월·일로 푼다(Howard Hinnant civil_from_days).
+    let Ok(z) = i64::try_from(days.saturating_add(719_468)) else {
+        return String::new();
+    };
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let mut y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    y += i64::from(m <= 2);
+    if !(1970..=9_999).contains(&y) {
+        return String::new();
+    }
+    let (hour, min) = (
+        (secs_of_day / 3_600) as u32,
+        (secs_of_day % 3_600 / 60) as u32,
+    );
+    let date = format!("{y:04}-{m:02}-{d:02}");
+    let time = format!("{hour:02}:{min:02}");
+    text::SCHEDULE_RUN_TIME.format(&[("date", &date), ("time", &time)])
+}
+
 fn capture_session_output(dir: &Path, session: krill_proto::SessionId) -> Option<String> {
     use krill_proto::control::{CaptureFormat, FEAT_CLI, FEAT_CONTROL, Reply, Request};
     use krill_proto::screen::Msg as _;
@@ -907,18 +939,19 @@ impl SettingsView {
                 let run_for_row = run.clone();
                 let run_for_btn = run.clone();
 
-                let mut summary = format!("{} · min {}", run.id, run.minute);
+                let mut summary = format!("{} · {}", run.id, format_run_minute(run.minute));
                 if let Some(sid) = run.session {
-                    summary.push_str(" · #");
-                    summary.push_str(&sid.to_string());
+                    summary.push_str(" · ");
+                    summary
+                        .push_str(&text::SCHEDULE_RUN_SESSION.format(&[("id", &sid.to_string())]));
                 }
                 if let Some(cwd) = &run.cwd {
                     summary.push_str(" · ");
                     summary.push_str(cwd);
                 }
                 if let Some(st) = run.status {
-                    summary.push_str(" · exit=");
-                    summary.push_str(&st.to_string());
+                    summary.push_str(" · ");
+                    summary.push_str(&text::SCHEDULE_RUN_EXIT.format(&[("code", &st.to_string())]));
                 }
                 if let Some(err) = &run.error {
                     summary.push_str(" · ");
@@ -983,8 +1016,10 @@ impl SettingsView {
         // 실행 상세 로그 뷰어
         if let Some(log) = &self.schedule_log {
             let (tone, badge_label) = run_phase_badge_spec(&log.phase);
-            let title = text::SCHEDULE_LOG_TITLE
-                .format(&[("id", &log.id), ("minute", &log.minute.to_string())]);
+            let title = text::SCHEDULE_LOG_TITLE.format(&[
+                ("id", &log.id),
+                ("datetime", &format_run_minute(log.minute)),
+            ]);
             let mut log_box = div()
                 .id("admin-schedule-log-viewer")
                 .debug_selector(|| "admin-schedule-log-viewer".into())

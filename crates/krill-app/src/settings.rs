@@ -927,7 +927,8 @@ pub fn trigger_manual_update_check(cx: &mut App) {
                     next.status = status;
                 }
                 Err(err) => {
-                    next.status = CheckStatus::Error(err.to_string());
+                    // OWE-883: 영문 Display 대신 사용자용 문구를 보인다.
+                    next.status = CheckStatus::Error(err.user_message());
                 }
             }
             cx.set_global(next);
@@ -1902,16 +1903,17 @@ fn canonical_hook_path(path: &Path) -> std::io::Result<PathBuf> {
 }
 
 /// `krill doctor` 핵심 항목(상태 디렉터리·데몬 바이너리·미보고 크래시·세그먼트 기록 상태)을 자가 진단한다.
+/// 내부 키-값이 아니라 카탈로그 문구로 보인다(OWE-883).
 pub fn run_doctor_check(state: Option<&Path>) -> String {
     let state_status = match state {
-        Some(d) if d.exists() => "ok",
-        Some(_) => "init",
-        None => "missing",
+        Some(d) if d.exists() => text::DOCTOR_OK.get(),
+        Some(_) => text::DOCTOR_NEEDS_INIT.get(),
+        None => text::DOCTOR_MISSING.get(),
     };
     let bins_status = match krill_proto::daemon::Paths::dev() {
-        Ok(p) if p.holder.exists() && p.krilld.exists() => "ok",
-        Ok(_) => "missing-bins",
-        Err(_) => "unavailable",
+        Ok(p) if p.holder.exists() && p.krilld.exists() => text::DOCTOR_OK.get(),
+        Ok(_) => text::DOCTOR_MISSING_BINS.get(),
+        Err(_) => text::DOCTOR_UNAVAILABLE.get(),
     };
     let crashes = state.map_or(0, |d| krill_proto::diag::pending(d).len());
     let rec_warns = state.map_or(0, |d| krill_proto::diag::record_warnings(d).len());
@@ -1920,13 +1922,19 @@ pub fn run_doctor_check(state: Option<&Path>) -> String {
             .exists()
     });
     let rec_status = if rec_flag || rec_warns > 0 {
-        format!("warn({rec_warns})")
+        text::DOCTOR_WARN.format(&[("n", &rec_warns.to_string())])
     } else {
-        "ok".to_owned()
+        text::DOCTOR_OK.get().to_owned()
     };
-    format!(
-        "krill doctor: state={state_status} · bins={bins_status} · crashes={crashes} · recording={rec_status}"
-    )
+    text::DOCTOR_REPORT.format(&[
+        ("state", state_status),
+        ("bins", bins_status),
+        (
+            "crashes",
+            &text::DOCTOR_CRASHES.format(&[("n", &crashes.to_string())]),
+        ),
+        ("recording", &rec_status),
+    ])
 }
 
 /// 디스크 기록(zstd 세그먼트) 즉시 삭제(MK-075). 데몬(`krilld`)에 `HistoryRequest::Clear`를
@@ -2047,6 +2055,11 @@ pub struct SettingsView {
     accounts_offline: bool,
     /// 규칙 변경 응답 전에는 다음 변경을 보내지 않는다.
     account_rule_pending: bool,
+    /// 브라우저 OAuth 로그인 진행 중(OWE-881). 있으면 해당 계정 행에 진행 표시·[취소].
+    login_pending: Option<PendingLogin>,
+    /// `OpenCode` 로그인은 터미널에서 진행한다(OWE-881). `true`면 안내 카드와
+    /// [터미널에서 실행] 버튼을 보이고, 버튼을 누르기 전에는 명령을 큐에 넣지 않는다.
+    opencode_login_prompt: bool,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     ssh_host_statuses: std::collections::BTreeMap<String, SshHostCardStatus>,
     ssh_status: Option<SharedString>,
@@ -2139,6 +2152,21 @@ pub enum SshHostCardStatus {
     Error,
 }
 
+/// 브라우저 OAuth 로그인 진행 상태(OWE-881). `account-login-browser` 스레드가
+/// 최대 600초 대기하는 동안 설정 탭은 이 계정 행에 진행 표시·[취소]를 보이고,
+/// 스레드가 남긴 [`crate::accounts::LoginOutcome`]으로 성공·실패를 닫는다.
+struct PendingLogin {
+    account_id: String,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    cancelling: bool,
+    started: std::time::Instant,
+}
+
+/// 브라우저 로그인 대기 상한(OWE-881). CLI 스레드의 600초 데드라인에 여유를 둔다.
+const LOGIN_WAIT_TIMEOUT: Duration = Duration::from_secs(605);
+/// 로그인 결과 폴링 간격(OWE-881). 데몬 `ListAccounts`가 아니라 인메모리 결과만 본다.
+const LOGIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
 /// SSH 호스트 추가·편집 입력 폼 상태(MK-132·OWE-800).
 struct SshForm {
     label: gpui::Entity<gpui_component::input::InputState>,
@@ -2170,6 +2198,60 @@ struct WorkflowRepoForm {
     _subs: Vec<Subscription>,
 }
 
+/// 완료 웹훅 종류의 표시 이름(OWE-883). URL에는 비밀 토큰이 들어갈 수 있어
+/// 종류만 보이고 원문·`{:?}`는 노출하지 않는다.
+#[must_use]
+pub fn webhook_kind_label(ep: &crate::webhook::Endpoint) -> &'static str {
+    match ep {
+        crate::webhook::Endpoint::Ntfy { .. } => text::WEBHOOK_KIND_NTFY.get(),
+        crate::webhook::Endpoint::Telegram { .. } => text::WEBHOOK_KIND_TELEGRAM.get(),
+        crate::webhook::Endpoint::Discord { .. } => text::WEBHOOK_KIND_DISCORD.get(),
+    }
+}
+
+/// 오케스트레이션 작업 상태의 표시 이름(OWE-883). 내부 영문(`ready` 등)을 그대로 보이지 않는다.
+#[must_use]
+pub fn orchestration_task_status_label(
+    status: krill_proto::orchestration::TaskStatus,
+) -> &'static str {
+    use krill_proto::orchestration::TaskStatus as S;
+    match status {
+        S::Pending => text::ORCH_TASK_STATUS_PENDING.get(),
+        S::Ready => text::ORCH_TASK_STATUS_READY.get(),
+        S::Dispatched => text::ORCH_TASK_STATUS_DISPATCHED.get(),
+        S::Completed => text::ORCH_TASK_STATUS_COMPLETED.get(),
+        S::Failed => text::ORCH_TASK_STATUS_FAILED.get(),
+        S::Blocked => text::ORCH_TASK_STATUS_BLOCKED.get(),
+    }
+}
+
+/// 오케스트레이션 작업 한 줄(OWE-883). `{:?}` 의존성·영문 상태를 사람이 읽을 수 있게 푼다.
+/// 설정 탭과 상태바 메뉴가 같이 쓴다.
+#[must_use]
+pub fn orchestration_task_line(
+    run_id: &str,
+    id: &str,
+    title: &str,
+    status: krill_proto::orchestration::TaskStatus,
+    deps: &[String],
+) -> String {
+    let line = text::ORCH_TASK_LINE.format(&[
+        ("run", run_id),
+        ("id", id),
+        ("title", title),
+        ("status", orchestration_task_status_label(status)),
+    ]);
+    if deps.is_empty() {
+        line
+    } else {
+        format!(
+            "{} · {}",
+            line,
+            text::ORCH_TASK_DEPS.format(&[("deps", &deps.join(", "))])
+        )
+    }
+}
+
 impl std::fmt::Debug for SettingsView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SettingsView")
@@ -2192,6 +2274,8 @@ impl SettingsView {
             account_error: None,
             accounts_offline: false,
             account_rule_pending: false,
+            login_pending: None,
+            opencode_login_prompt: false,
             ssh_hosts: Vec::new(),
             ssh_host_statuses: std::collections::BTreeMap::new(),
             ssh_status: None,
@@ -2732,6 +2816,8 @@ impl SettingsView {
     }
 
     /// 추가와 재로그인 모두 백그라운드 로그인 CLI를 실행한다. 앱 스레드에서는 IPC를 기다리지 않는다.
+    /// 브라우저 로그인이 끝나기 전에는 `login_pending`을 유지해 진행 표시·[취소]를 보이고,
+    /// 스레드가 남긴 [`crate::accounts::LoginOutcome`]으로 성공·실패·취소를 닫는다(OWE-881).
     fn login_account(
         &mut self,
         provider: krill_proto::usage::ProviderKind,
@@ -2739,7 +2825,7 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         use krill_proto::usage::UsageRequest;
-        if self.account_rule_pending {
+        if self.account_rule_pending || self.login_pending.is_some() {
             return;
         }
         if !matches!(
@@ -2748,8 +2834,13 @@ impl SettingsView {
                 | krill_proto::usage::ProviderKind::Codex
                 | krill_proto::usage::ProviderKind::Antigravity
         ) {
+            // OWE-881: OpenCode는 안내 카드에서 [터미널에서 실행]을 눌러야 명령이 간다.
+            // 예전처럼 호출 즉시 큐에 넣고 설정 화면을 닫지 않는다.
             if provider == krill_proto::usage::ProviderKind::OpenCode {
-                queue_terminal_command("opencode auth login", cx);
+                self.opencode_login_prompt = true;
+                self.account_error = None;
+                cx.notify();
+                return;
             }
             self.account_error = Some(text::ACCOUNT_LOGIN_UNSUPPORTED.get().into());
             cx.notify();
@@ -2804,21 +2895,116 @@ impl SettingsView {
                         let newly_added = !existing.iter().any(|a| a.id == added.id);
                         (added, newly_added)
                     };
-                    crate::accounts::start_login(&paths, &account, newly_added)
+                    let cancel = crate::accounts::start_login(&paths, &account, newly_added)?;
+                    Ok::<_, String>((account, cancel))
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.account_rule_pending = false;
+                // 갱신을 먼저 예약해야 뒤이은 오류가 갱신 완료에 지워지지 않는다.
+                this.refresh_accounts_async(cx);
                 match result {
-                    Ok(()) => {}
+                    Ok((account, cancel)) => {
+                        this.login_pending = Some(PendingLogin {
+                            account_id: account.id.clone(),
+                            cancel,
+                            cancelling: false,
+                            started: std::time::Instant::now(),
+                        });
+                        // 결과 폴링: 스레드가 남긴 LoginOutcome이 있거나 타임아웃이면 닫는다.
+                        cx.spawn(async move |this, cx| {
+                            loop {
+                                cx.background_executor().timer(LOGIN_POLL_INTERVAL).await;
+                                let settled = this
+                                    .update(cx, SettingsView::poll_login_once)
+                                    .unwrap_or(true);
+                                if settled {
+                                    break;
+                                }
+                            }
+                        })
+                        .detach();
+                    }
                     Err(e) => this.account_error = Some(e.into()),
                 }
-                this.refresh_accounts_async(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// 로그인 결과 폴링 한 걸음(OWE-881). 끝나면 `true`. 테스트에서 직접 부른다.
+    fn poll_login_once(&mut self, cx: &mut Context<Self>) -> bool {
+        let (account_id, timed_out) = match self.login_pending.as_ref() {
+            Some(pending) => (
+                pending.account_id.clone(),
+                pending.started.elapsed() >= LOGIN_WAIT_TIMEOUT,
+            ),
+            None => return true,
+        };
+        match crate::accounts::take_login_outcome(&account_id) {
+            None => {
+                if !timed_out {
+                    return false;
+                }
+                // 갱신을 먼저 예약해야 완료 시점이 오류보다 앞서 오류가 유지된다.
+                // 반대로 하면 갱신 완료가 시간 초과 안내를 지워 버린다.
+                self.login_pending = None;
+                self.refresh_accounts_async(cx);
+                self.account_error = Some(text::ACCOUNT_LOGIN_TIMED_OUT.get().into());
+                cx.notify();
+                true
+            }
+            Some(outcome) => {
+                self.login_pending = None;
+                self.refresh_accounts_async(cx);
+                match outcome {
+                    crate::accounts::LoginOutcome::Succeeded
+                    | crate::accounts::LoginOutcome::Cancelled => {}
+                    crate::accounts::LoginOutcome::Failed(reason) => {
+                        let msg = match reason {
+                            crate::accounts::LoginFailReason::TimedOut => {
+                                text::ACCOUNT_LOGIN_TIMED_OUT.get()
+                            }
+                            crate::accounts::LoginFailReason::SpawnFailed => {
+                                text::ACCOUNT_LOGIN_SPAWN_FAILED.get()
+                            }
+                            crate::accounts::LoginFailReason::Unsuccessful => {
+                                text::ACCOUNT_LOGIN_FAILED.get()
+                            }
+                        };
+                        self.account_error = Some(msg.into());
+                    }
+                }
+                cx.notify();
+                true
+            }
+        }
+    }
+
+    /// 진행 중 브라우저 로그인을 취소한다(OWE-881). 스레드가 자식 CLI를 죽이고
+    /// 정리한 뒤 남긴 `Cancelled`를 모니터가 보고 `login_pending`을 치운다.
+    fn cancel_login(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.login_pending.as_mut() else {
+            return;
+        };
+        if pending.cancelling {
+            return;
+        }
+        pending.cancelling = true;
+        pending
+            .cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        cx.notify();
+    }
+
+    /// `OpenCode` 안내 카드의 [터미널에서 실행](OWE-881). 사용자가 직접 누른 뒤라
+    /// 설정 화면이 닫히고 활성 터미널에서 로그인 명령이 실행돼도 된다.
+    fn run_opencode_login(&mut self, cx: &mut Context<Self>) {
+        self.opencode_login_prompt = false;
+        queue_terminal_command("opencode auth login", cx);
+        cx.notify();
     }
 
     pub fn apply_account_request(
@@ -4548,8 +4734,19 @@ impl SettingsView {
         let needs_login = conn == Some(ConnectionStatus::NeedsLogin);
         let can_login = !orca && matches!(provider, ProviderKind::Claude | ProviderKind::Codex);
         let manageable = !acc.host_default && !orca;
+        // OWE-881: 이 계정이 브라우저 로그인 대기 중이면 진행 문구와 [취소]만 보인다.
+        let logging_in = self
+            .login_pending
+            .as_ref()
+            .is_some_and(|p| p.account_id == acc.id);
+        let cancelling = self
+            .login_pending
+            .as_ref()
+            .is_some_and(|p| p.account_id == acc.id && p.cancelling);
         let (primary, heading) = account_heading(acc);
-        let detail = if needs_login && can_login {
+        let detail = if logging_in {
+            text::ACCOUNT_LOGIN_WAITING.get().to_owned()
+        } else if needs_login && can_login {
             text::ACCOUNT_SIGN_IN_TO_USE.get().to_owned()
         } else {
             self.account_detail(acc, heading)
@@ -4728,13 +4925,33 @@ impl SettingsView {
             ));
 
         // 주 동작 하나: 로그인이 필요하면 "다시 로그인", 아니면 비활성 계정에만 "전환"(.ghost().small()).
+        // 로그인 대기 중이면 진행 표시 대신 [로그인 취소]만 둔다(OWE-881).
         let mut actions = div()
             .flex_none()
             .flex()
             .items_center()
             .gap_1()
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        if can_login && needs_login {
+        if logging_in {
+            let cancel_id = format!("admin-cancel-login-{}", acc.id);
+            let cancel_label = if cancelling {
+                text::ACCOUNT_LOGIN_CANCELLING.get()
+            } else {
+                text::ACCOUNT_LOGIN_CANCEL.get()
+            };
+            actions = actions.child(
+                layout::secondary(
+                    gpui::ElementId::Name(cancel_id.clone().into()),
+                    cancel_label,
+                )
+                .icon(IconName::Close)
+                .disabled(cancelling)
+                .debug_selector(move || cancel_id.clone())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.cancel_login(cx);
+                })),
+            );
+        } else if can_login && needs_login {
             let login_account = acc.clone();
             let login_id = format!("admin-login-account-{}", acc.id);
             actions = actions.child(
@@ -4743,7 +4960,11 @@ impl SettingsView {
                     text::ACCOUNT_LOGIN.get(),
                 )
                 .icon(IconName::RefreshCw)
-                .disabled(self.account_rule_pending || self.accounts_offline)
+                .disabled(
+                    self.account_rule_pending
+                        || self.login_pending.is_some()
+                        || self.accounts_offline,
+                )
                 .debug_selector(move || login_id.clone())
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.login_account(provider, Some(login_account.clone()), cx);
@@ -4773,7 +4994,8 @@ impl SettingsView {
             let menu_id = format!("admin-account-menu-{}", acc.id);
             let view = cx.entity().downgrade();
             let menu_acc = acc.clone();
-            let busy = self.account_rule_pending || self.accounts_offline;
+            let busy =
+                self.account_rule_pending || self.login_pending.is_some() || self.accounts_offline;
             actions = actions.child(
                 Button::new(gpui::ElementId::Name(menu_id.clone().into()))
                     .small()
@@ -5128,6 +5350,8 @@ impl SettingsView {
                 text::ACCOUNTS_ADD.get(),
             )
             .icon(IconName::Plus)
+            // OWE-881: 브라우저 로그인 진행 중에는 중복 시작을 막는다.
+            .disabled(self.login_pending.is_some())
             .debug_selector(move || add_id.clone())
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.login_account(provider, None, cx);
@@ -5203,6 +5427,66 @@ impl SettingsView {
                 );
 
             let mut list = div().flex().flex_col().gap_2();
+            // OWE-881: OpenCode 로그인은 터미널에서 진행한다. [+ 계정 추가]를 눌러도
+            // 명령을 바로 큐에 넣지 않고, 이 안내 카드의 [터미널에서 실행]을 눌러야 간다.
+            if provider == ProviderKind::OpenCode && self.opencode_login_prompt {
+                let run_id = "admin-opencode-login-run".to_owned();
+                let dismiss_id = "admin-opencode-login-dismiss".to_owned();
+                list = list.child(
+                    div()
+                        .id("admin-opencode-login-guide")
+                        .debug_selector(|| "admin-opencode-login-guide".into())
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .px_3()
+                        .py_3()
+                        .rounded(crate::ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(p.border)
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(text::ACCOUNT_LOGIN_UNSUPPORTED.get()),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::OPENCODE_LOGIN_GUIDE.get()),
+                        )
+                        .child(
+                            layout::controls()
+                                .child(
+                                    layout::secondary(
+                                        gpui::ElementId::Name(run_id.clone().into()),
+                                        text::OPENCODE_LOGIN_RUN.get(),
+                                    )
+                                    .icon(IconName::SquareTerminal)
+                                    .debug_selector(move || run_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.run_opencode_login(cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    layout::ghost(
+                                        gpui::ElementId::Name(dismiss_id.clone().into()),
+                                        text::OPENCODE_LOGIN_DISMISS.get(),
+                                    )
+                                    .debug_selector(move || dismiss_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            this.opencode_login_prompt = false;
+                                            cx.notify();
+                                        },
+                                    )),
+                                ),
+                        ),
+                );
+            }
             for acc in &accounts {
                 list = list.child(self.render_account_row(acc, cx));
             }
@@ -6146,7 +6430,7 @@ impl SettingsView {
             ),
             None => format!(
                 "{} · {} {}",
-                agent_id,
+                display_name,
                 profile_count,
                 text::PROFILES_UNIT.get()
             ),
@@ -6283,7 +6567,7 @@ impl SettingsView {
                                     }
                                     res
                                 }
-                                None => Err("no state dir".to_owned()),
+                                None => Err(text::NO_STATE_DIR.get().to_owned()),
                             };
                             if let Some(edit) = this.agent_edits.get_mut(agent_id) {
                                 edit.status = Some(match saved {
@@ -6329,7 +6613,7 @@ impl SettingsView {
                                         }
                                         res
                                     }
-                                    None => Err("no state dir".to_owned()),
+                                    None => Err(text::NO_STATE_DIR.get().to_owned()),
                                 };
                                 if let Some(edit) = this.agent_edits.get_mut(agent_id) {
                                     edit.status = match saved {
@@ -6459,9 +6743,10 @@ impl SettingsView {
                             .child(
                                 layout::secondary(
                                     gpui::ElementId::Name(hook_id.clone().into()),
-                                    hook_cmd,
+                                    text::HOOK_INSTALL.get(),
                                 )
                                 .debug_selector(move || hook_id.clone())
+                                .tooltip(text::HOOK_INSTALL_TIP.format(&[("cmd", &hook_cmd)]))
                                 .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
@@ -6479,7 +6764,7 @@ impl SettingsView {
                                                 format!("{hook_copy} --yes"),
                                                 cx,
                                             );
-                                            format!("{hook_copy} (queued)")
+                                            text::HOOK_QUEUED.get().to_owned()
                                         } else {
                                             match install_agent_hook_at(&id_owned, &base, &state) {
                                                 Ok(path) => text::SKILLS_INSTALLED.format(&[(
@@ -6491,7 +6776,8 @@ impl SettingsView {
                                                         format!("{hook_copy} --yes"),
                                                         cx,
                                                     );
-                                                    format!("{id_owned} hook: {e}")
+                                                    text::HOOK_INSTALL_FAILED
+                                                        .format(&[("error", &e.to_string())])
                                                 }
                                             }
                                         };
@@ -7764,13 +8050,12 @@ impl SettingsView {
                 .child(layout::controls().child(reset)),
         );
         for task in orch.tasks.iter().take(6) {
-            let line = format!(
-                "[{}] {} · {} ({}) deps={:?}",
-                task.run_id,
-                task.id,
-                task.title,
-                task.status.as_str(),
-                task.deps
+            let line = orchestration_task_line(
+                &task.run_id,
+                &task.id,
+                &task.title,
+                task.status,
+                &task.deps,
             );
             orch_card = orch_card.child(
                 div()
@@ -7967,7 +8252,27 @@ impl SettingsView {
                     .justify_between()
                     .gap_3()
                     .child(layout::label(p, wh_count, Some(text::WEBHOOK_DESC.get())))
-                    .child(layout::controls().child(clear)),
+                    .child(
+                        layout::controls()
+                            .child(
+                                layout::secondary(
+                                    "admin-webhook-add-local",
+                                    text::WEBHOOK_ADD_LOCAL.get(),
+                                )
+                                .debug_selector(|| "admin-webhook-add-local".into())
+                                .on_click(|_, _, cx| {
+                                    edit(cx, |s| {
+                                        let n = s.webhooks.len().saturating_add(1);
+                                        s.webhooks.push(crate::webhook::Endpoint::Ntfy {
+                                            url: format!(
+                                                "http://127.0.0.1:8080/minikrill-hook-{n}"
+                                            ),
+                                        });
+                                    });
+                                }),
+                            )
+                            .child(clear),
+                    ),
             );
         if let Some(form) = &self.workflow_form {
             let webhook_url_input = form.webhook_url.clone();
@@ -8021,7 +8326,11 @@ impl SettingsView {
                 let url_id = format!("admin-webhook-url-{idx}");
                 let rm_id = format!("admin-webhook-remove-{idx}");
                 let provider_label = ep.provider_badge();
-                let url_text = ep.url().to_owned();
+                // OWE-883: URL 원문(비밀 토큰 포함 가능) 대신 종류 표시 이름만 보인다.
+                let kind_label = text::WEBHOOK_LABEL.format(&[
+                    ("n", &(idx + 1).to_string()),
+                    ("kind", webhook_kind_label(ep)),
+                ]);
                 wh_card = wh_card.child(
                     div()
                         .id(gpui::ElementId::Name(row_id.clone().into()))
@@ -8061,7 +8370,7 @@ impl SettingsView {
                                         .truncate()
                                         .font_family(crate::ui::FONT_MONO)
                                         .text_size(crate::ui::TEXT_XS)
-                                        .child(url_text),
+                                        .child(kind_label),
                                 ),
                         )
                         .child(
