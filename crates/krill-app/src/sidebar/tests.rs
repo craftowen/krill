@@ -1047,7 +1047,7 @@ fn jump_items_fall_back_to_worktree_and_session_names() {
     assert_eq!(items.len(), 3);
     assert_eq!(
         items[0].label,
-        format!("codex 1 · alpha · {}", state_text(AgentState::Working))
+        format!("codex · alpha · {}", state_text(AgentState::Working))
     );
     assert_eq!(
         items[1].label,
@@ -3499,11 +3499,11 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
 
     assert_eq!(
         external::checkpoint_badge_for(Some(&sidebar_bin), &wt_feature).as_deref(),
-        Some("● REVIEW #128 OWE-626 🔗2")
+        Some("REVIEW #128 OWE-626 links 2")
     );
     assert_eq!(
         external::checkpoint_badge_for_card(Some(&sidebar_bin), &wt_feature, true).as_deref(),
-        Some("● REVIEW #128 🔗2"),
+        Some("REVIEW #128 links 2"),
         "card checkpoint badge must omit issue key when issue_badge is separately shown"
     );
 

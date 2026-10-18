@@ -209,6 +209,7 @@ pub fn summary_element(summary: &Summary<'_>, cx: &App) -> gpui::Div {
     let more = |n: usize| {
         div()
             .flex_none()
+            .font_family(FONT_MONO)
             .text_size(TEXT_2XS)
             .text_color(p.muted_foreground.opacity(0.7))
             .child(format!("+{n}"))

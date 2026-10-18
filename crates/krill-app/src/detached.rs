@@ -6,6 +6,8 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 use gpui::{Context, EventEmitter, Task, Window, div, prelude::*};
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Icon, IconName, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::control::{FEAT_CONTROL, Info, Reply, Request};
 use krill_proto::daemon;
@@ -160,7 +162,15 @@ impl Render for Panel {
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
-                                .child(if expanded { "▾" } else { "▸" })
+                                .child(
+                                    Icon::new(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .with_size(gpui::px(12.))
+                                    .text_color(p.muted_foreground.opacity(0.65)),
+                                )
                                 .child(text::TITLE.get()),
                         )
                         .child(
@@ -206,11 +216,15 @@ impl Render for Panel {
                                     .rounded(crate::ui::RADIUS_XS)
                                     .text_size(crate::ui::TEXT_XS)
                                     .text_color(p.sidebar_foreground)
-                                    .hover(|d| d.bg(p.sidebar_accent))
+                                    .hover(|d| {
+                                        d.bg(p.sidebar_accent)
+                                            .text_color(p.sidebar_accent_foreground)
+                                    })
                                     .child(
                                         div()
                                             .id(("detached-open", id.0))
                                             .flex_1()
+                                            .min_w_0()
                                             .truncate()
                                             .cursor_pointer()
                                             .child(label)
@@ -219,18 +233,21 @@ impl Render for Panel {
                                             ),
                                     )
                                     .child(
-                                        div()
-                                            .id(("detached-close", id.0))
-                                            .px_1()
-                                            .cursor_pointer()
-                                            .text_color(p.muted_foreground)
-                                            .hover(|d| d.text_color(p.destructive))
-                                            .child(text::CLOSE.get())
-                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                        crate::ui::button_with_tooltip(
+                                            Button::new(("detached-close", id.0))
+                                                .ghost()
+                                                .xsmall()
+                                                .icon(IconName::Close),
+                                            format!("detached-close-{id}", id = id.0),
+                                            text::CLOSE.get(),
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, _, cx| {
                                                 if let Some(target) = this.target.clone() {
                                                     this.close(target, id, cx);
                                                 }
-                                            })),
+                                            }),
+                                        ),
                                     )
                             })),
                     )
