@@ -8,7 +8,7 @@ use gpui::{
 };
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
 use krill_app::{sidebar, ui};
 use krill_proto::{
     SessionId,
@@ -1561,6 +1561,9 @@ impl Shell {
             menu
         })
         .on_open_change(track_menu_open(cx.weak_entity()));
+        let weak = cx.weak_entity();
+        let focus = self.focus.clone();
+        let has_session = session.is_some();
         div()
             .id("status-bar")
             .debug_selector(|| "status-bar".into())
@@ -1725,6 +1728,36 @@ impl Shell {
                     .child(self.history.clone())
                     .child(self.resources.clone()),
             )
+            // 하-4: 상태바 우클릭 메뉴. 상태바에 이미 있는 동작과 설정 열기만 담는다.
+            .context_menu(move |m, _, _| {
+                let weak = weak.clone();
+                m.action_context(focus.clone())
+                    .item(
+                        PopupMenuItem::element(|_, _| {
+                            div()
+                                .debug_selector(|| "status-bar-menu-refresh".into())
+                                .child(provider_text::PROVIDER_REFRESH_USAGE.get())
+                        })
+                        .on_click(move |_, _, cx| {
+                            weak.update(cx, |shell, cx| {
+                                shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+                            })
+                            .ok();
+                        }),
+                    )
+                    .separator()
+                    .menu_with_disabled(
+                        text::FLOAT_MENU.get(),
+                        Box::new(FloatTerminal),
+                        !has_session,
+                    )
+                    .menu(text::DASHBOARD.get(), Box::new(DashboardPopout))
+                    .separator()
+                    .menu(
+                        text::STATUS_OPEN_SETTINGS.get(),
+                        Box::new(krill_app::settings::OpenSettings),
+                    )
+            })
     }
 }
 
