@@ -131,8 +131,16 @@ struct State {
     cache: BTreeMap<PathBuf, Entry>,
 }
 impl State {
-    fn reserve(&mut self, now: Instant) -> bool {
+    fn reserve_refresh(&mut self, now: Instant) -> bool {
         if self.in_flight >= MAX_CONCURRENT || !self.budget.reserve(now) {
+            return false;
+        }
+        self.in_flight += 1;
+        true
+    }
+
+    fn reserve_interactive(&mut self) -> bool {
+        if self.in_flight >= MAX_CONCURRENT {
             return false;
         }
         self.in_flight += 1;
@@ -167,9 +175,9 @@ impl Service {
         }
     }
 
-    fn reserve_slot(&self, now: Instant) -> Result<SlotGuard<'_>, &'static str> {
+    fn reserve_slot(&self, _now: Instant) -> Result<SlotGuard<'_>, &'static str> {
         let mut state = self.state.lock().map_err(|_| FAILED.get())?;
-        if !state.reserve(now) {
+        if !state.reserve_interactive() {
             return Err(PACED.get());
         }
         drop(state);
@@ -203,7 +211,7 @@ impl Service {
                 .min_by_key(|(path, _)| state.cache.get(*path).map(|entry| entry.at))
                 .map(|(path, branch)| (path.clone(), branch.clone()));
             candidate
-                .filter(|_| state.reserve(now))
+                .filter(|_| state.reserve_refresh(now))
                 .map(|(path, branch)| {
                     state
                         .cache
@@ -312,6 +320,47 @@ fn status_error(error: &io::Error) -> Status {
     }
 }
 
+pub fn has_github_remote(folder: &Path) -> bool {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(folder)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["config", "--get-regexp", r"^remote\..*\.(url|gh-resolved)$"]);
+    let Ok(out) = execute(&mut cmd, TIMEOUT) else {
+        return false;
+    };
+    has_github_remote_config(&String::from_utf8_lossy(&out))
+}
+
+pub(crate) fn has_github_remote_config(config_output: &str) -> bool {
+    let custom_host = std::env::var("GH_HOST")
+        .ok()
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty());
+    config_output.lines().any(|line| {
+        let line = line.trim();
+        if line.is_empty() {
+            return false;
+        }
+        let Some((key, value)) = line.split_once(char::is_whitespace) else {
+            return false;
+        };
+        let value = value.trim().to_ascii_lowercase();
+        if key.ends_with(".gh-resolved") {
+            return !value.is_empty() && value != "false";
+        }
+        value.contains("github")
+            || custom_host
+                .as_deref()
+                .is_some_and(|host| value.contains(host))
+    })
+}
+
 pub fn shared() -> Arc<Service> {
     static SERVICE: OnceLock<Arc<Service>> = OnceLock::new();
     SERVICE
@@ -322,6 +371,9 @@ pub fn shared() -> Arc<Service> {
 struct Gh;
 impl Runner for Gh {
     fn run(&self, folder: &Path, branch: &str, action: Action) -> io::Result<Status> {
+        if action == Action::Refresh && !has_github_remote(folder) {
+            return Ok(Status::NoPr);
+        }
         let bytes = execute(&mut command(folder, branch, action), TIMEOUT)?;
         if action == Action::Create {
             Ok(Status::NoPr)

@@ -2056,16 +2056,49 @@ impl Render for Sidebar {
                     .child(crate::i18n::cached_notice(&e))
             }))
             .children(
-                self.prs
-                    .values()
-                    .find_map(crate::pull_request::Status::guidance)
+                (!self.pr_guidance_dismissed)
+                    .then(|| {
+                        self.prs
+                            .values()
+                            .find_map(crate::pull_request::Status::guidance)
+                    })
+                    .flatten()
                     .map(|hint| {
                         div()
+                            .id("sidebar-pr-guidance")
+                            .debug_selector(|| "sidebar-pr-guidance".into())
                             .px_3()
                             .py_1()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_1p5()
+                            .cursor_pointer()
                             .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
-                            .child(hint)
+                            .on_click(cx.listener(|s, _, _, cx| {
+                                s.pr_guidance_dismissed = true;
+                                cx.notify();
+                            }))
+                            .child(div().flex_1().min_w_0().child(hint))
+                            .child(
+                                div()
+                                    .id("sidebar-pr-guidance-dismiss")
+                                    .debug_selector(|| "sidebar-pr-guidance-dismiss".into())
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded(ui::RADIUS_XS)
+                                    .text_color(p.muted_foreground)
+                                    .hover(|s| {
+                                        s.bg(p.sidebar_accent).text_color(p.sidebar_foreground)
+                                    })
+                                    .child("×")
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.pr_guidance_dismissed = true;
+                                        cx.notify();
+                                    })),
+                            )
                     }),
             )
             .children(self.notice.clone().map(|e| {
