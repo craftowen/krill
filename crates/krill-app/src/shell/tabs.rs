@@ -857,7 +857,7 @@ impl Shell {
 
         let p = ui::palette(cx);
         let viewport = window.viewport_size();
-        let menu_w = px(224.);
+        let menu_w = px(232.);
         // OWE-870: 이름 변경 1행 + 왼쪽 닫기 1행이 늘었다.
         let menu_h = if peer_supports_fork {
             px(364.)
@@ -1196,9 +1196,9 @@ impl Shell {
                         .child(
                             div()
                                 .flex()
-                                .flex_wrap()
                                 .items_center()
-                                .gap_1p5()
+                                .justify_between()
+                                .gap_1()
                                 .children(swatches),
                         ),
                 );
