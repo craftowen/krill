@@ -1304,7 +1304,10 @@ impl Sidebar {
             if self.options.filters.contains_host(&HostId::Local) {
                 rows.push(Row::HostHeader {
                     host: HostId::Local,
-                    label: text::HOST_LOCAL.get().to_owned(),
+                    label: text::HOST_LOCAL
+                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                        .get()
+                        .to_owned(),
                     status: self.local_status,
                     sessions: self.snapshot.sessions.len(),
                 });

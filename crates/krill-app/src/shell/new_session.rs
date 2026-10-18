@@ -127,7 +127,10 @@ impl Shell {
     pub(crate) fn execution_locations(&self, cx: &App) -> Vec<(krill_app::hosts::HostId, String)> {
         let mut out = vec![(
             krill_app::hosts::HostId::Local,
-            text::HOST_LOCAL.get().to_owned(),
+            text::HOST_LOCAL
+                .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
+                .get()
+                .to_owned(),
         )];
         for host in self.sidebar.read(cx).remote_hosts() {
             if host.status == krill_app::hosts::HostStatus::Connected {

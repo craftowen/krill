@@ -3321,7 +3321,13 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
             assert_eq!(
                 s.execution_locations(cx),
                 vec![
-                    (HostId::Local, text::HOST_LOCAL.get().to_owned()),
+                    (
+                        HostId::Local,
+                        text::HOST_LOCAL
+                            .mac_or(krill_app::i18n::catalog::other_os::HOST_LOCAL)
+                            .get()
+                            .to_owned()
+                    ),
                     (studio_id.clone(), "Mac Studio".to_owned()),
                 ]
             );

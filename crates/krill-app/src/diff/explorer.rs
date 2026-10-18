@@ -1579,11 +1579,15 @@ fn row_context_menu(
 
     let reveal_path = row.path.clone();
     menu = menu.item(
-        PopupMenuItem::new(text::EXPLORER_REVEAL_FINDER.get())
-            .icon(IconName::FolderOpen)
-            .on_click(move |_, _, cx| {
-                cx.reveal_path(&reveal_path);
-            }),
+        PopupMenuItem::new(
+            text::EXPLORER_REVEAL_FINDER
+                .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                .get(),
+        )
+        .icon(IconName::FolderOpen)
+        .on_click(move |_, _, cx| {
+            cx.reveal_path(&reveal_path);
+        }),
     );
 
     for target in [Target::VsCode, Target::Cursor, Target::Zed] {
