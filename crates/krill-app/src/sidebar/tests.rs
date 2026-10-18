@@ -3134,3 +3134,114 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-854: 세션 행 메뉴 액션(열기·이어하기·종료)은 세션 이벤트를 내보내고 호스트를 남긴다.
+#[gpui::test]
+fn session_row_actions_emit_session_events(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut s1 = session(1, AgentState::Working, Some("/repo/a"));
+            s1.status.agent = "claude".into();
+            s.snapshot = Snapshot {
+                sessions: vec![s1],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
+            };
+            s.toggle_card_sessions(Path::new("/repo/a"), cx);
+            s.rebuild(cx);
+        });
+    });
+    cx.run_until_parked();
+    let selected: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let closed: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let continued: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let (s_out, c_out, t_out) = (selected.clone(), closed.clone(), continued.clone());
+    let _sub_selected = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &Selected, _| {
+            s_out.borrow_mut().push(event.0);
+        })
+    });
+    let _sub_close = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &CloseSession, _| {
+            c_out.borrow_mut().push(event.0);
+        })
+    });
+    let _sub_continue = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &ContinueSession, _| {
+            t_out.borrow_mut().push(event.0);
+        })
+    });
+    let idx = cx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Session(s, _) if s.id == SessionId(1)))
+            .expect("nested session row renders when card is expanded")
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_session(idx, SessionId(1), cx);
+            s.request_close_session(idx, SessionId(1), cx);
+            s.request_continue_session(idx, SessionId(1), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(selected.borrow().as_slice(), &[SessionId(1)]);
+    assert_eq!(closed.borrow().as_slice(), &[SessionId(1)]);
+    assert_eq!(continued.borrow().as_slice(), &[SessionId(1)]);
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.cursor, Some(idx));
+        assert_eq!(s.action_host, Some(HostId::Local));
+    });
+}
+
+/// OWE-854: 1개 세션 카드의 세션 줄 클릭은 펼치기 토글이 아니라 해당 세션 선택이다.
+#[gpui::test]
+fn single_session_card_line_selects_session(cx: &mut TestAppContext) {
+    use gpui::Modifiers;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut s1 = session(1, AgentState::Working, Some("/repo/a"));
+            s1.status.agent = "claude".into();
+            s.snapshot = Snapshot {
+                sessions: vec![s1],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
+            };
+            s.rebuild(cx);
+        });
+    });
+    cx.run_until_parked();
+    let emitted: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let emitted_out = emitted.clone();
+    let _sub = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &Selected, _| {
+            emitted_out.borrow_mut().push(event.0);
+        })
+    });
+    let card_idx = cx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Worktree(p) if p == Path::new("/repo/a")))
+            .expect("worktree card row")
+    });
+    let sel: &'static str = Box::leak(format!("card-session-{card_idx}").into_boxed_str());
+    let line = cx
+        .debug_bounds(sel)
+        .expect("single-session line renders in detailed card");
+    cx.simulate_click(line.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(emitted.borrow().as_slice(), &[SessionId(1)]);
+    assert!(
+        !cx.update(|_, cx| view.read(cx).expanded_cards.contains(Path::new("/repo/a"))),
+        "single-session line click must select, not expand"
+    );
+}
