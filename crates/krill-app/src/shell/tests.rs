@@ -6111,3 +6111,160 @@ fn jump_and_quick_open_are_mutually_exclusive(cx: &mut TestAppContext) {
     assert!(cx.update(|_, cx| view.read(cx).quick_open_palette().is_none()));
     fs::remove_dir_all(&dir).ok();
 }
+
+/// OWE-873: 스크롤 중이면 스크롤바·맨 아래로 배지가 보이고, 배지를 누르면 바닥으로 돌아간다.
+#[gpui::test]
+fn scrolled_terminal_shows_scrollbar_and_bottom_badge(cx: &mut TestAppContext) {
+    use krill_proto::control::Cold;
+    use krill_proto::screen::{Cell, Op};
+    use std::os::unix::net::UnixStream;
+
+    fn row(text: &str) -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    }
+
+    let (view, cx) = open(cx, state_path("scroll-chrome"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(3), ours, cx);
+            s.live
+                .get_mut(&pane)
+                .unwrap()
+                .pane
+                .show_cold(
+                    krill_proto::SessionId(3),
+                    Cold {
+                        screen: vec![Op::Reset { cols: 10, lines: 3 }],
+                        history: vec![row("h0"), row("h1")],
+                    },
+                )
+                .unwrap();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("scrollbar").is_none());
+    assert!(cx.debug_bounds("scroll-to-bottom").is_none());
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert!(s.live.get_mut(&pane).unwrap().pane.scroll(1));
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let badge = cx
+        .debug_bounds("scroll-to-bottom")
+        .expect("badge while scrolled");
+    assert!(cx.debug_bounds("scrollbar-thumb").is_some());
+
+    // 배지를 누르면 바닥으로 돌아가고 배지·막대가 사라진다.
+    cx.simulate_click(badge.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("scroll-to-bottom").is_none());
+    assert!(cx.debug_bounds("scrollbar").is_none());
+    let offset = cx.update(|_, cx| view.read(cx).live.get(&pane).unwrap().pane.scroll_offset());
+    assert_eq!(offset, 0);
+}
+
+/// OWE-874-5: 파일 탭 우클릭 메뉴에 절대·상대 경로 복사, Finder 보기가 있고 세션 탭에는 없다.
+#[gpui::test]
+fn file_tab_context_menu_copies_paths(cx: &mut TestAppContext) {
+    use krill_proto::control::Create;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let dir = std::env::temp_dir().join(format!("mk-file-tab-menu-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hi\n").unwrap();
+
+    let (view, cx) = open(cx, state_path("file-tab-menu"));
+    view.update(cx, |s, cx| s.open_file(file.clone(), cx));
+    cx.run_until_parked();
+    // 작업 폴더를 파일이 있는 폴더로 두면 상대 경로는 파일 이름이 된다.
+    view.update(cx, |s, _| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_launch(
+            pane,
+            Create {
+                account: None,
+                program: Program::Login,
+                cwd: dir.as_os_str().as_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            },
+        );
+    });
+    let l = layout_of(&view, cx);
+    assert_eq!(l.tabs().len(), 2);
+    let idx = l
+        .tabs()
+        .iter()
+        .position(|t| l.file(t.focused).is_some())
+        .expect("file tab");
+    assert_eq!(idx, 1, "새 파일은 두 번째 탭에 열린다");
+
+    // 파일 탭을 우클릭하면 경로 메뉴가 보인다.
+    let tab = cx
+        .debug_bounds("session-tab-1")
+        .expect("file tab bounds")
+        .center();
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_some());
+    assert!(cx.debug_bounds("tab-menu-copy-path").is_some());
+    assert!(cx.debug_bounds("tab-menu-copy-relative-path").is_some());
+    assert!(cx.debug_bounds("tab-menu-reveal-finder").is_some());
+
+    // 절대 경로 복사를 누르면 클립보드에 절대 경로가 들어간다.
+    let copy = cx
+        .debug_bounds("tab-menu-copy-path")
+        .expect("copy path")
+        .center();
+    cx.simulate_click(copy, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+    let clip = cx.read_from_clipboard().and_then(|c| c.text());
+    assert_eq!(clip.as_deref(), Some(file.display().to_string().as_str()));
+
+    // 상대 경로 복사를 누르면 작업 폴더 기준 상대 경로가 들어간다.
+    cx.simulate_mouse_down(tab, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    let copy_rel = cx
+        .debug_bounds("tab-menu-copy-relative-path")
+        .expect("copy relative path")
+        .center();
+    cx.simulate_click(copy_rel, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+    let clip = cx.read_from_clipboard().and_then(|c| c.text());
+    assert_eq!(clip.as_deref(), Some("note.txt"));
+
+    // 세션 탭(0) 메뉴에는 경로 항목이 없다.
+    let tab0 = cx
+        .debug_bounds("session-tab-0")
+        .expect("session tab")
+        .center();
+    cx.simulate_mouse_down(tab0, MouseButton::Right, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_some());
+    assert!(cx.debug_bounds("tab-menu-copy-path").is_none());
+    assert!(cx.debug_bounds("tab-menu-copy-relative-path").is_none());
+    assert!(cx.debug_bounds("tab-menu-reveal-finder").is_none());
+    let backdrop = cx
+        .debug_bounds("tab-context-menu-backdrop")
+        .expect("backdrop")
+        .center();
+    cx.simulate_mouse_down(backdrop, MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-context-menu").is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
