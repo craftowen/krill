@@ -23,6 +23,12 @@ mkdir -p "$out"
 out=$(cd "$out" && pwd -P)
 src=$(mktemp "${TMPDIR:-/tmp}/krill-src.XXXXXX")
 git archive --format=tar.gz -o "$src" HEAD
+# 빌드 VM(태그 krill-linux-build)에 이 맥의 현재 공인 IP에서만 SSH를 여는 임시 방화벽 규칙. 끝나면 지운다.
+myip=$(curl -fsS --max-time 10 https://api.ipify.org)
+rule="krill-linux-build-ssh-$(date +%s)"
+gcloud compute firewall-rules create "$rule" --project "$project" --quiet \
+  --allow tcp:22 --source-ranges "$myip/32" --target-tags krill-linux-build >/dev/null
+trap 'gcloud compute firewall-rules delete "$rule" --project "$project" --quiet >/dev/null 2>&1 || true; rm -f "$src"' EXIT
 
 build_one() {
   local arch=$1 machine image vm log
@@ -40,7 +46,7 @@ build_one() {
   {
     gcloud compute instances create "$vm" "${g[@]}" --machine-type "$machine" \
       --image-family "$image" --image-project ubuntu-os-cloud --boot-disk-size 40GB \
-      --labels purpose=krill-linux-build
+      --labels purpose=krill-linux-build --tags krill-linux-build
     for _ in $(seq 30); do
       gcloud compute ssh "$vm" "${g[@]}" --command true && break
       sleep 10
@@ -63,7 +69,6 @@ for arch in $arches; do
 done
 status=0
 for pid in "${pids[@]}"; do wait "$pid" || status=1; done
-rm -f "$src"
 leftover=$(gcloud compute instances list --project "$project" --filter 'labels.purpose=krill-linux-build' --format 'value(name)')
 [[ -z "$leftover" ]] || { echo "warning: build VMs still exist: $leftover" >&2; status=1; }
 for arch in $arches; do
