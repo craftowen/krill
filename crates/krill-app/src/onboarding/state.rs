@@ -1,23 +1,21 @@
-//! 온보딩 상태기계(MK-161): `onboarding.toml` + 순수 단계 전이.
+//! 온보딩 완료 기록(MK-161): `onboarding.toml`.
 //!
 //! 구 표시 파일(`onboarding.done`)은 마이그레이션 입력으로만 읽는다. `done`이
-//! 있고 `toml`이 없으면 완료로 간주한다(체크리스트 강제 없음, 동의는 MK-129
-//! 규칙대로 별도 판정). `toml` 쓰기는 임시 파일+rename 원자 교체다.
+//! 있고 `toml`이 없으면 완료로 간주한다. `toml` 쓰기는 임시 파일+rename 원자 교체다.
+//! 단계(`step`)는 구 4단계 마법사 파일과 호환하려고 남긴 값이다. 첫 실행 동의 단계는
+//! 없어졌으므로(OWE-904) 구 `step = "consent"` 파일은 처음 상태로 읽는다.
 
 use std::io;
 use std::path::{Path, PathBuf};
-
-use super::consent::atomic_write_0600;
 
 /// 상태 파일 이름(상태 디렉터리 바로 아래).
 pub const STATE_FILE: &str = "onboarding.toml";
 /// 상태 문서 버전. 올리면 모르는 버전은 처음부터 다시 시작한다.
 pub const STATE_VERSION: u32 = 1;
 
-/// 마법사 단계. `toml`에는 `step = "consent"` 형태로 저장된다.
+/// 저장된 단계. `toml`에는 `step = "done"` 형태로 저장된다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
-    Consent,
     Checklist,
     Connect,
     Done,
@@ -26,7 +24,6 @@ pub enum Step {
 impl Step {
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Consent => "consent",
             Self::Checklist => "checklist",
             Self::Connect => "connect",
             Self::Done => "done",
@@ -35,36 +32,11 @@ impl Step {
 
     fn from_str(text: &str) -> Option<Self> {
         match text {
-            "consent" => Some(Self::Consent),
             "checklist" => Some(Self::Checklist),
             "connect" => Some(Self::Connect),
             "done" => Some(Self::Done),
             _ => None,
         }
-    }
-}
-
-/// 앞으로 나아가는 사건. `[나중에]`는 단계를 바꾸지 않고 닫는다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Advance {
-    /// 동의를 기록함.
-    Consented,
-    /// 필수 실패 없이 점검을 통과함.
-    ChecksPassed,
-    /// 연결 단계를 끝냄(건너뛰기 포함).
-    ConnectFinished,
-    /// 나중에 하기.
-    Later,
-}
-
-/// 순수 단계 전이. 해당 단계의 사건이 아니면 제자리에 둔다.
-#[must_use]
-pub const fn next(step: Step, advance: Advance) -> Step {
-    match (step, advance) {
-        (Step::Consent, Advance::Consented) => Step::Checklist,
-        (Step::Checklist, Advance::ChecksPassed) => Step::Connect,
-        (Step::Connect, Advance::ConnectFinished) | (Step::Done, _) => Step::Done,
-        (step, _) => step,
     }
 }
 
@@ -80,7 +52,7 @@ impl OnboardingState {
     fn fresh() -> Self {
         Self {
             completed: false,
-            step: Step::Consent,
+            step: Step::Checklist,
             version: STATE_VERSION,
         }
     }
@@ -153,44 +125,44 @@ pub fn save(state_dir: &Path, state: &OnboardingState) -> io::Result<()> {
     atomic_write_0600(&state_path(state_dir), &body)
 }
 
+/// `settings.rs`의 `write_settings`와 같은 원자 교체다. 그 헬퍼는 settings 전용이라
+/// 여기서 필요한 최소 형태(0600·고유 임시 파일·fsync·rename·실패 시 임시 파일 정리)만 둔다.
+fn atomic_write_0600(path: &Path, body: &str) -> io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension(format!(
+        "tmp-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    let result = (|| {
+        use std::io::Write as _;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        std::fs::remove_file(&tmp).ok();
+    }
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn consent_advances_only_on_consent() {
-        assert_eq!(next(Step::Consent, Advance::Consented), Step::Checklist);
-        assert_eq!(next(Step::Consent, Advance::Later), Step::Consent);
-        assert_eq!(next(Step::Consent, Advance::ChecksPassed), Step::Consent);
-    }
-
-    #[test]
-    fn checklist_advances_only_on_pass() {
-        assert_eq!(next(Step::Checklist, Advance::ChecksPassed), Step::Connect);
-        assert_eq!(next(Step::Checklist, Advance::Later), Step::Checklist);
-        assert_eq!(next(Step::Checklist, Advance::Consented), Step::Checklist);
-    }
-
-    #[test]
-    fn later_never_changes_step() {
-        for step in [Step::Consent, Step::Checklist, Step::Connect, Step::Done] {
-            assert_eq!(next(step, Advance::Later), step);
-        }
-    }
-
-    #[test]
-    fn connect_finishes_to_done_and_done_is_terminal() {
-        assert_eq!(next(Step::Connect, Advance::ConnectFinished), Step::Done);
-        assert_eq!(next(Step::Connect, Advance::Later), Step::Connect);
-        for advance in [
-            Advance::Consented,
-            Advance::ChecksPassed,
-            Advance::ConnectFinished,
-            Advance::Later,
-        ] {
-            assert_eq!(next(Step::Done, advance), Step::Done);
-        }
-    }
 
     fn dir(name: &str) -> PathBuf {
         let path = std::env::temp_dir().join(format!("mk131-state-{}-{name}", std::process::id()));
@@ -200,11 +172,11 @@ mod tests {
     }
 
     #[test]
-    fn fresh_dir_starts_at_consent_incomplete() {
+    fn fresh_dir_starts_incomplete() {
         let root = dir("fresh");
         let state = load(&root);
         assert!(!state.completed);
-        assert_eq!(state.step, Step::Consent);
+        assert_eq!(state.step, Step::Checklist);
         std::fs::remove_dir_all(&root).ok();
     }
 
@@ -227,6 +199,10 @@ mod tests {
                 "completed = false\nstep = \"warp\"\nversion = 1\n",
             ),
             (
+                "removed-consent-step",
+                "completed = false\nstep = \"consent\"\nversion = 1\n",
+            ),
+            (
                 "future-version",
                 "completed = true\nstep = \"done\"\nversion = 999\n",
             ),
@@ -235,7 +211,7 @@ mod tests {
             std::fs::write(state_path(&root), body).unwrap();
             let state = load(&root);
             assert!(!state.completed, "{name}");
-            assert_eq!(state.step, Step::Consent, "{name}");
+            assert_eq!(state.step, Step::Checklist, "{name}");
             std::fs::remove_dir_all(&root).ok();
         }
     }
