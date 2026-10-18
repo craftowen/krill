@@ -2328,21 +2328,18 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
 
-    // Tailscale 피어가 없으면 발견된 기기 카드가 조용히 숨겨진다.
+    // Tailscale 피어가 없으면 발견된 기기 카드가 조용히 숨겨지고, 2열 그리드 4개 입력이 모두 보인다.
     assert!(vcx.debug_bounds("admin-ssh-discovered").is_none());
     assert!(vcx.debug_bounds("admin-ssh-form").is_some());
-    assert!(vcx.debug_bounds("admin-ssh-input-port").is_none());
+    assert!(vcx.debug_bounds("admin-ssh-input-label").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-input-address").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-input-port").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-input-key").is_some());
 
     // 빈 주소로 추가 클릭 시 한국어 검증 오류가 표시된다.
     click(vcx, "admin-ssh-add-submit");
     vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("admin-ssh-form-error").is_some());
-
-    // 고급 옵션 펼치기 → 포트·키 입력 노출.
-    click(vcx, "admin-ssh-advanced-toggle");
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(vcx.debug_bounds("admin-ssh-input-port").is_some());
-    assert!(vcx.debug_bounds("admin-ssh-input-key").is_some());
 
     // 잘못된 포트/주소 검증 실패 후 정상 호스트 추가.
     vcx.update(|_, cx| {
@@ -2446,6 +2443,199 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
         let cmd = crate::ssh_hosts::build_connect_command(&pending);
         assert!(cmd.starts_with("ssh-copy-id"), "unexpected cmd: {cmd}");
     });
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-800: 설정 원격 호스트(SSH) 탭 — 2열 추가/편집 폼, 호스트 카드 상태 점(Connected/Disconnected/Error),
+/// 연결/연결 해제 버튼 전환, 호스트 인플레이스 편집(hosts.toml 갱신)을 검증한다.
+#[gpui::test]
+fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe800-ssh-card-edit");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        window.draw(cx).clear(cx);
+    });
+
+    // 1. 2열 그리드 배치 검증: [표시 이름 | 호스트], [포트 | SSH 키 경로]
+    let b_label = vcx.debug_bounds("admin-ssh-input-label").unwrap();
+    let b_addr = vcx.debug_bounds("admin-ssh-input-address").unwrap();
+    let b_port = vcx.debug_bounds("admin-ssh-input-port").unwrap();
+    let b_key = vcx.debug_bounds("admin-ssh-input-key").unwrap();
+    assert!(
+        (b_label.origin.y - b_addr.origin.y).abs() < px(2.),
+        "label and address should be on row 1"
+    );
+    assert!(
+        b_label.origin.x < b_addr.origin.x,
+        "label should be left of address"
+    );
+    assert!(
+        (b_port.origin.y - b_key.origin.y).abs() < px(2.),
+        "port and key should be on row 2"
+    );
+    assert!(
+        b_port.origin.x < b_key.origin.x,
+        "port should be left of key"
+    );
+    assert!(
+        b_port.origin.y > b_label.origin.y,
+        "row 2 should be below row 1"
+    );
+
+    // 2. 호스트 추가 후 호스트 카드·상태 점·액션 버튼 검증
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.submit_ssh_host(
+                "Prod Box",
+                "deploy@10.0.0.8",
+                "2222",
+                "~/.ssh/id_ed25519",
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    vcx.run_until_parked();
+    let host_id = vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let h = &view.read(cx).ssh_hosts()[0];
+        assert_eq!(h.id, "ssh-prod-box");
+        assert_eq!(
+            h.format_summary(),
+            "deploy@10.0.0.8:2222 • ~/.ssh/id_ed25519"
+        );
+        assert_eq!(
+            view.read(cx).ssh_host_status(&h.id),
+            SshHostCardStatus::Disconnected
+        );
+        h.id.clone()
+    });
+
+    assert!(vcx.debug_bounds("admin-ssh-card-ssh-prod-box").is_some());
+    assert!(
+        vcx.debug_bounds("admin-ssh-status-dot-ssh-prod-box")
+            .is_some()
+    );
+    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_some());
+    assert!(
+        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+            .is_none()
+    );
+    assert!(vcx.debug_bounds("admin-ssh-test-ssh-prod-box").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-edit-ssh-prod-box").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-remove-ssh-prod-box").is_some());
+
+    // 3. 연결 클릭 → Connected 상태 + 연결 해제 버튼 전환 → 연결 해제 클릭 → Disconnected 복귀
+    click(vcx, "admin-ssh-connect-ssh-prod-box");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Connected
+        );
+    });
+    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_none());
+    assert!(
+        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+            .is_some()
+    );
+
+    click(vcx, "admin-ssh-disconnect-ssh-prod-box");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Disconnected
+        );
+        assert!(take_pending_ssh_connect(cx).is_none());
+    });
+    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_some());
+    assert!(
+        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+            .is_none()
+    );
+
+    // 4. 연결 테스트 결과에 따른 Error / Connected 상태 전환
+    let host_snap = vcx.update(|_, cx| view.read(cx).ssh_hosts()[0].clone());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.apply_ssh_test_result(host_snap.clone(), Err("timeout".into()), cx);
+        });
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Error
+        );
+        view.update(cx, |v, cx| {
+            v.apply_ssh_test_result(host_snap.clone(), Ok("krill-ssh-ok".into()), cx);
+        });
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Connected
+        );
+    });
+
+    // 5. 편집 버튼 클릭 → 폼이 편집 모드로 전환되고 제출 시 hosts.toml 인플레이스 수정
+    click(vcx, "admin-ssh-edit-ssh-prod-box");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(view.read(cx).editing_ssh_host_id(), Some(host_id.as_str()));
+    });
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_some());
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.submit_ssh_host("Prod Renamed", "root@10.0.0.99", "2200", "", cx)
+                .unwrap();
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(view.read(cx).editing_ssh_host_id().is_none());
+        let hosts = view.read(cx).ssh_hosts();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, host_id);
+        assert_eq!(hosts[0].label, "Prod Renamed");
+        assert_eq!(hosts[0].destination, "root@10.0.0.99");
+        assert_eq!(hosts[0].port, Some(2200));
+        assert_eq!(hosts[0].identity_file, None);
+    });
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_none());
+
+    // 디스크(hosts.toml)에도 인플레이스 반영되었는지 검증
+    let disk_hosts = crate::ssh_hosts::load_hosts(Some(&d));
+    assert_eq!(disk_hosts.len(), 1);
+    assert_eq!(disk_hosts[0].id, host_id);
+    assert_eq!(disk_hosts[0].label, "Prod Renamed");
+    assert_eq!(disk_hosts[0].destination, "root@10.0.0.99");
+    assert_eq!(disk_hosts[0].port, Some(2200));
+
+    // 편집 취소 동작 검증
+    click(vcx, "admin-ssh-edit-ssh-prod-box");
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_some());
+    click(vcx, "admin-ssh-edit-cancel");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(view.read(cx).editing_ssh_host_id().is_none());
+    });
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_none());
 
     fs::remove_dir_all(d).ok();
 }
