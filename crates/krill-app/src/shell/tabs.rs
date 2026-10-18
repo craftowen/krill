@@ -778,7 +778,9 @@ impl Shell {
                         "tab-menu-close",
                         text::CLOSE_TAB_MENU.get(),
                         true,
-                        Some("⌘W"),
+                        // OWE-864: 탭 전체를 닫는 `shell::CloseTab`(⇧⌘W)을 호출하므로
+                        // 칸 닫기(⌘W)가 아닌 ⇧⌘W로 표기한다.
+                        Some("⇧⌘W"),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.tab_context_menu = None;

@@ -37,6 +37,93 @@ fn app_menu_is_available_without_windows(cx: &mut gpui::TestAppContext) {
     });
 }
 
+/// OWE-864: 편집·보기·윈도우·도움말 메뉴와 ⌘M·⌃⌘F·⌘H·⇧⌘W 동작이 실제로 등록되어 있다.
+#[gpui::test]
+fn owe864_native_menus_cover_edit_view_window_help(cx: &mut gpui::TestAppContext) {
+    use krill_app::i18n::catalog::general as gtext;
+    cx.update(|cx| {
+        init(cx);
+        let menus = cx.get_menus().expect("menus must exist");
+        for name in [
+            gtext::EDIT.get(),
+            gtext::VIEW.get(),
+            gtext::WINDOW_MENU.get(),
+            gtext::HELP.get(),
+        ] {
+            assert!(
+                menus.iter().any(|m| m.name.as_ref() == name),
+                "missing menu {name}"
+            );
+        }
+        let labels: Vec<_> = menus
+            .iter()
+            .flat_map(|menu| &menu.items)
+            .filter_map(|item| {
+                if let gpui::OwnedMenuItem::Action { name, .. } = item {
+                    Some(name.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for expected in [
+            gtext::HIDE_APP.get(),
+            gtext::HIDE_OTHERS.get(),
+            gtext::SHOW_ALL.get(),
+            gtext::CLOSE_TAB.get(),
+            gtext::CLOSE_PANE.get(),
+            gtext::UNDO.get(),
+            gtext::REDO.get(),
+            gtext::CUT.get(),
+            gtext::COPY_ITEM.get(),
+            gtext::PASTE_ITEM.get(),
+            gtext::SELECT_ALL_ITEM.get(),
+            gtext::SIDEBAR_TOGGLE.get(),
+            gtext::PANEL_TOGGLE.get(),
+            gtext::ZOOM_IN_ITEM.get(),
+            gtext::ZOOM_OUT_ITEM.get(),
+            gtext::ZOOM_RESET_ITEM.get(),
+            gtext::FULLSCREEN_TOGGLE.get(),
+            gtext::MINIMIZE.get(),
+            gtext::ZOOM_WINDOW.get(),
+            gtext::BRING_ALL_FRONT.get(),
+            gtext::SHORTCUTS_HELP.get(),
+        ] {
+            assert!(labels.contains(&expected), "missing {expected}");
+        }
+        // 창이 없어도 액션은 전역에 등록되어 있고, 창 동작은 조용히 무시된다.
+        for action in [
+            &HideApp as &dyn gpui::Action,
+            &HideOthers,
+            &ShowAll,
+            &MinimizeWindow,
+            &ZoomWindow,
+            &ToggleFullscreen,
+            &BringAllToFront,
+            &ShowShortcuts,
+        ] {
+            assert!(cx.is_action_available(action));
+        }
+        let bound = |action: &dyn gpui::Action| {
+            cx.key_bindings()
+                .borrow()
+                .bindings_for_action(action)
+                .flat_map(|b| {
+                    b.keystrokes()
+                        .iter()
+                        .map(|k| k.inner().unparse())
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert!(bound(&HideApp).contains(&"cmd-h".to_owned()));
+        // `unparse`는 fn-ctrl-alt-cmd-shift- 순이라 `cmd-alt-h`는 `alt-cmd-h`가 된다.
+        assert!(bound(&HideOthers).contains(&"alt-cmd-h".to_owned()));
+        assert!(bound(&MinimizeWindow).contains(&"cmd-m".to_owned()));
+        assert!(bound(&ToggleFullscreen).contains(&"ctrl-cmd-f".to_owned()));
+    });
+}
+
 #[gpui::test]
 fn closing_last_window_then_reopening_restores_layout(cx: &mut gpui::TestAppContext) {
     let path = std::env::temp_dir().join(format!("owe-583-reopen-{}.bin", std::process::id()));
