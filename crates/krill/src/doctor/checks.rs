@@ -220,24 +220,33 @@ fn bin_version(facts: &Facts) -> Check {
 
 fn state_writable(facts: &Facts) -> Check {
     if facts.state.ok {
+        #[cfg(unix)]
+        let detail = format!("{}", facts.state.dir.display());
+        #[cfg(windows)]
+        let detail = format!(
+            "{} (write probe; owner check skipped: Unix only)",
+            facts.state.dir.display()
+        );
         check(
             "state.writable",
             Level::Required,
             Status::Ok,
             "state directory is writable",
-            &format!("{}", facts.state.dir.display()),
+            &detail,
             fix(FixKind::None, ""),
         )
     } else {
         #[cfg(windows)]
         let (summary, detail, remedy) = (
-            "state directory permission check is not supported",
-            std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "Windows ACL validation is not implemented yet",
-            )
-            .to_string(),
-            fix(FixKind::None, ""),
+            "state directory is not writable",
+            format!(
+                "{} is not writable (check ACL: icacls)",
+                facts.state.dir.display()
+            ),
+            fix(
+                FixKind::Command,
+                &format!("icacls \"{}\"", facts.state.dir.display()),
+            ),
         );
         #[cfg(unix)]
         let (summary, detail, remedy) = (
