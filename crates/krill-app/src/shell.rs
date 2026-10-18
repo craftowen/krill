@@ -59,7 +59,7 @@ use krill_app::terminal::{
 };
 use krill_app::{keys, platform};
 use krill_proto::agent::Permission;
-use krill_proto::control::{AgentLaunch, AgentSettings};
+use krill_proto::control::{AgentLaunch, AgentSettings, AgentState};
 use krill_proto::daemon::{self, Paths};
 use krill_proto::input::{Notice, Now};
 use krill_proto::ipc::{self, ClientRole};
@@ -3476,16 +3476,16 @@ impl Shell {
                     .text_color(p.sidebar_foreground)
                     .child(text::APP_TITLE.get()),
             )
-            .child(
+            .child(krill_app::ui::button_with_tooltip(
                 Button::new("toggle-sidebar")
                     .icon(IconName::PanelLeft)
                     .ghost()
                     .xsmall()
-                    .accessibility_label(text::TOGGLE_SIDEBAR.get())
-                    .tooltip(text::TOGGLE_SIDEBAR.get())
                     .debug_selector(|| "toggle-sidebar".into())
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-            )
+                "toggle-sidebar",
+                text::TOGGLE_SIDEBAR.get(),
+            ))
             .child(
                 div()
                     .id("sidebar-titlebar-drag")
@@ -3502,7 +3502,7 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_0p5()
-                    .child(
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new("sidebar-history-prev")
                             .icon(
                                 gpui_component::Icon::default()
@@ -3512,15 +3512,13 @@ impl Shell {
                             .xsmall()
                             .disabled(!can_back)
                             .debug_selector(|| "sidebar-history-prev".into())
-                            .accessibility_label(
-                                krill_app::i18n::catalog::settings::SC_NAV_BACK.get(),
-                            )
-                            .tooltip(krill_app::i18n::catalog::settings::SC_NAV_BACK.get())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.navigate_back(Some(window), cx);
                             })),
-                    )
-                    .child(
+                        "sidebar-history-prev",
+                        krill_app::i18n::catalog::settings::SC_NAV_BACK.get(),
+                    ))
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new("sidebar-history-next")
                             .icon(
                                 gpui_component::Icon::default()
@@ -3530,25 +3528,23 @@ impl Shell {
                             .xsmall()
                             .disabled(!can_forward)
                             .debug_selector(|| "sidebar-history-next".into())
-                            .accessibility_label(
-                                krill_app::i18n::catalog::settings::SC_NAV_FORWARD.get(),
-                            )
-                            .tooltip(krill_app::i18n::catalog::settings::SC_NAV_FORWARD.get())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.navigate_forward(Some(window), cx);
                             })),
-                    ),
+                        "sidebar-history-next",
+                        krill_app::i18n::catalog::settings::SC_NAV_FORWARD.get(),
+                    )),
             )
-            .child(
+            .child(krill_app::ui::button_with_tooltip(
                 Button::new("sidebar-add-mac")
                     .icon(IconName::Plus)
                     .ghost()
                     .xsmall()
-                    .accessibility_label(krill_app::i18n::link_ui::ADD_MAC.get())
-                    .tooltip(krill_app::i18n::link_ui::ADD_MAC.get())
                     .debug_selector(|| "sidebar-add-mac".into())
                     .on_click(|_, _, cx| krill_app::link_ui::open_pairing(cx)),
-            )
+                "sidebar-add-mac",
+                krill_app::i18n::link_ui::ADD_MAC.get(),
+            ))
     }
 
     fn render_tree(
@@ -3780,6 +3776,29 @@ impl Shell {
         let pane_title = self.pane_label(id, cx);
         let yolo_badge = self.yolo_badge(id, cx);
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
+        // OWE-886: 탭 바와 같은 식별자(상태 글리프 + 에이전트 브랜드 아이콘, STYLEGUIDE §6.4·§7.4).
+        let host = self.layout.host(id);
+        let session = self
+            .layout
+            .session(id)
+            .and_then(|sid| self.sidebar.read(cx).session_on(host, sid));
+        let launch_agent = match self.layout.launch(id).map(|l| &l.program) {
+            Some(Program::Agent { id }) => tabs::launch_agent_id(id),
+            _ => "",
+        };
+        let agent = session.map_or(launch_agent, |s| {
+            if s.status.agent.is_empty() {
+                launch_agent
+            } else {
+                &s.status.agent
+            }
+        });
+        let state = session.map_or(AgentState::Unknown, |s| s.status.state);
+        let pane_fg = if focused {
+            p.sidebar_foreground
+        } else {
+            p.muted_foreground
+        };
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.zoomed_pane == Some(id);
         let pane_header = div()
@@ -3802,24 +3821,19 @@ impl Shell {
                     .items_center()
                     .gap_1p5()
                     .child(
-                        div()
-                            .size(krill_app::ui::STATE_DOT)
-                            .rounded_full()
-                            .bg(if focused {
-                                p.sidebar_primary
-                            } else {
-                                p.muted_foreground
-                            }),
+                        krill_app::ui::status::status_glyph(
+                            state,
+                            false,
+                            krill_app::ui::status::Size::Md,
+                            cx,
+                        )
+                        .debug_selector(move || format!("pane-state-{}", id.get())),
                     )
-                    .child(
-                        gpui_component::Icon::new(IconName::SquareTerminal)
-                            .size(px(12.))
-                            .text_color(if focused {
-                                p.foreground
-                            } else {
-                                p.muted_foreground
-                            }),
-                    )
+                    .child(krill_app::ui::status::agent_icon(
+                        agent,
+                        krill_app::ui::ICON_SM,
+                        pane_fg,
+                    ))
                     .child(
                         div()
                             .min_w_0()
@@ -3831,7 +3845,7 @@ impl Shell {
                                 gpui::FontWeight::NORMAL
                             })
                             .text_color(if focused {
-                                p.foreground
+                                p.sidebar_foreground
                             } else {
                                 p.muted_foreground
                             })
@@ -3854,13 +3868,12 @@ impl Shell {
                                 .text_color(p.muted_foreground)
                                 .child(text::ZOOMED_BADGE.get()),
                         )
-                        .child(
+                        .child(krill_app::ui::button_with_tooltip(
                             krill_app::ui::ghost(
                                 ("pane-unzoom", id.get()),
                                 text::PANE_UNZOOM.get(),
                             )
                             .debug_selector(move || format!("pane-unzoom-{}", id.get()))
-                            .tooltip(text::PANE_UNZOOM.get())
                             .on_click(cx.listener(
                                 move |this, _, _, cx| {
                                     cx.stop_propagation();
@@ -3868,7 +3881,9 @@ impl Shell {
                                     cx.notify();
                                 },
                             )),
-                        )
+                            format!("pane-unzoom-{}", id.get()),
+                            text::PANE_UNZOOM.get(),
+                        ))
                     }),
             )
             .child(
@@ -3877,12 +3892,11 @@ impl Shell {
                     .flex_none()
                     .items_center()
                     .gap_0p5()
-                    .child(
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new(("pane-split-right", id.get()))
                             .icon(IconName::PanelRight)
                             .ghost()
                             .xsmall()
-                            .tooltip(text::SPLIT_RIGHT.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
@@ -3892,13 +3906,14 @@ impl Shell {
                                     l.split(Axis::Horizontal);
                                 });
                             })),
-                    )
-                    .child(
+                        format!("pane-split-right-{}", id.get()),
+                        text::SPLIT_RIGHT.get(),
+                    ))
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new(("pane-split-down", id.get()))
                             .icon(IconName::PanelBottom)
                             .ghost()
                             .xsmall()
-                            .tooltip(text::SPLIT_DOWN.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
@@ -3908,22 +3923,25 @@ impl Shell {
                                     l.split(Axis::Vertical);
                                 });
                             })),
-                    )
+                        format!("pane-split-down-{}", id.get()),
+                        text::SPLIT_DOWN.get(),
+                    ))
                     .when(is_split, |d| {
-                        d.child(
+                        d.child(krill_app::ui::button_with_tooltip(
                             Button::new(("pane-close", id.get()))
                                 .debug_selector(move || format!("pane-close-{}", id.get()))
                                 .icon(IconName::Close)
                                 .ghost()
                                 .xsmall()
-                                .tooltip(text::CLOSE_PANE.get())
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     cx.stop_propagation();
                                     // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
                                     // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
                                     this.maybe_close_pane(id, cx);
                                 })),
-                        )
+                            format!("pane-close-{}", id.get()),
+                            text::CLOSE_PANE.get(),
+                        ))
                     }),
             );
         let body = match self.live.get(&id) {
@@ -5011,6 +5029,7 @@ impl Shell {
                 .border_1()
                 .border_color(p.border)
                 .bg(p.popover)
+                .shadow_lg()
                 .flex()
                 .flex_col()
                 .gap_2p5()
@@ -5034,14 +5053,13 @@ impl Shell {
                             div()
                                 .text_size(krill_app::ui::TEXT_SM)
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(p.foreground)
+                                .text_color(p.popover_foreground)
                                 .child(title),
                         )
-                        .child(
+                        .child(krill_app::ui::button_with_tooltip(
                             Button::new("update-card-minimize")
-                                .label("−")
+                                .icon(gpui_component::IconName::Minus)
                                 .debug_selector(|| "update-card-minimize".into())
-                                .tooltip(utext::CARD_MINIMIZE_TOOLTIP.get())
                                 .ghost()
                                 .xsmall()
                                 .on_click(cx.listener(|_, _, _, cx| {
@@ -5052,7 +5070,9 @@ impl Shell {
                                     cx.refresh_windows();
                                     cx.notify();
                                 })),
-                        ),
+                            "update-card-minimize",
+                            utext::CARD_MINIMIZE_TOOLTIP.get(),
+                        )),
                 )
                 .child(
                     div()
@@ -5062,7 +5082,7 @@ impl Shell {
                         .child(
                             div()
                                 .text_size(krill_app::ui::TEXT_XS)
-                                .text_color(p.foreground)
+                                .text_color(p.popover_foreground)
                                 .child(body),
                         )
                         .child(
