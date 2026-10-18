@@ -327,7 +327,7 @@ fn scroll_report_and_clear_scrollback() {
     assert_eq!(texts(&p.shown()), ["s0", "s1", "s2"]);
 }
 
-/// OWE-873: 콜드 화면에서도 스크롤 위치를 보고한다(읽기 전용 행은 둔다).
+/// OWE-873 / OWE-873b: 콜드 화면에서도 스크롤 위치를 보고하고, ⌘K 시 받아 둔 고정 행까지 비운다.
 #[test]
 fn cold_scroll_report_keeps_rows() {
     let mut p: Pane<Vec<u8>> = Pane::default();
@@ -339,9 +339,73 @@ fn cold_scroll_report_keeps_rows() {
     assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 2));
     assert!(p.scroll(1));
     assert_eq!((p.scroll_offset(), p.scrollback_len()), (1, 2));
-    // 콜드는 바닥으로만 돌아가고 행은 버리지 않는다.
+    // ⌘K는 콜드 고정 행도 비우고 바닥으로 돌아간다.
     p.clear_scrollback();
-    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 2));
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 0));
+}
+
+/// OWE-873b: `FEAT_CLEAR_SCROLLBACK`을 협상한 데몬에는 `Request::ClearScrollback`을 보내고,
+/// 구버전 데몬에는 요청을 보내지 않고 로컬 히스토리(재개 `prior` 포함)만 비운다.
+#[test]
+fn clear_scrollback_sends_request_when_negotiated_and_falls_back_on_old_daemon() {
+    // 1. 구버전 데몬(FEAT_CLEAR_SCROLLBACK 없음): 로컬 reset만 하고 제어 프레임을 보내지 않는다.
+    let mut old_pane = Pane::<Vec<u8>>::default();
+    old_pane
+        .show_cold(
+            SessionId(1),
+            Cold {
+                screen: snapshot(["cold-1", "", ""]),
+                history: vec![row("cold-0")],
+            },
+        )
+        .unwrap();
+    old_pane.link(SessionId(2), 1, Vec::new(), input::FEAT_INPUT, Now::get());
+    update(&mut old_pane, 1, snapshot(["s0", "s1", "s2"]));
+    assert!(old_pane.scroll(1));
+    assert_eq!(old_pane.shown().rows[0], row("cold-1"));
+    out(&mut old_pane).clear();
+    old_pane.clear_scrollback();
+    assert_eq!(
+        (old_pane.scroll_offset(), old_pane.scrollback_len()),
+        (0, 0)
+    );
+    assert!(sent(out(&mut old_pane)).is_empty());
+
+    // 2. 신버전 데몬(FEAT_CLEAR_SCROLLBACK 협상): Request::ClearScrollback을 보내고 ScrollbackCleared 답을 처리한다.
+    let mut p = Pane::<Vec<u8>>::default();
+    p.link(
+        SessionId(7),
+        1,
+        Vec::new(),
+        input::FEAT_INPUT | FEAT_CLEAR_SCROLLBACK,
+        Now::get(),
+    );
+    update(&mut p, 1, snapshot(["s0", "s1", "s2"]));
+    assert!(!p.scroll(2));
+    answer(&mut p, 2, &[vec!["c0".to_owned(), "c1".to_owned()]]);
+    assert_eq!(p.scroll_offset(), 2);
+    assert_eq!(p.scrollback_len(), 4);
+
+    p.clear_scrollback();
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 0));
+    let frames = sent(out(&mut p));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(
+        Request::decode(frames[0].0, &frames[0].1).unwrap(),
+        Request::ClearScrollback {
+            session: SessionId(7)
+        }
+    );
+    assert_eq!(
+        feed(&mut p, &Reply::ScrollbackCleared.encode().unwrap()),
+        Events::default()
+    );
+
+    // 지운 뒤 다시 위로 스크롤하면 데몬에 새로 묻고, 데몬이 빈 응답을 주면 지운 줄이 되살아나지 않는다.
+    assert!(!p.scroll(2));
+    answer(&mut p, 0, &[]);
+    assert_eq!((p.scroll_offset(), p.scrollback_len()), (0, 0));
+    assert_eq!(texts(&p.shown()), ["s0", "s1", "s2"]);
 }
 
 /// 보낸 역할 요청들(다른 프레임은 건너뛴다).

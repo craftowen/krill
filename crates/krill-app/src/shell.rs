@@ -4685,15 +4685,28 @@ impl Render for Shell {
                 if this.settings.is_some() {
                     return;
                 }
+                let unlinked_session = this.layout.focused().and_then(|pane| {
+                    let l = this.live.get(&pane)?;
+                    (!l.pane.is_linked())
+                        .then(|| this.target_for_pane(pane).zip(l.pane.session()))
+                        .flatten()
+                });
                 if let Some(l) = this.focused_live() {
-                    // OWE-873: 받아 둔 스크롤백·선택·검색 하이라이트를 먼저 버리고 바닥에 고정한 뒤
-                    // 셸에 화면 지우기를 요청한다. 데몬 쪽 핫·콜드 기록은 그대로다(krilld IPC 없음).
+                    // OWE-873 / OWE-873b: 받아 둔 스크롤백·선택·검색 하이라이트를 먼저 버리고 바닥에 고정하며,
+                    // 데몬이 FEAT_CLEAR_SCROLLBACK을 협상했으면 핫·콜드 스크롤백도 비운 뒤 셸에 화면 지우기를 요청한다.
                     l.clear_selection();
                     l.pane.clear_search();
                     l.pane.clear_scrollback();
                     let n = l.pane.input(b"\x0c", Now::get());
                     this.show(n.as_ref(), cx);
                     cx.notify();
+                }
+                if let Some((target, session)) = unlinked_session {
+                    cx.background_executor()
+                        .spawn(async move {
+                            pane::clear_scrollback(target, session).ok();
+                        })
+                        .detach();
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
