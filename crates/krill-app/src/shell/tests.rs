@@ -1298,11 +1298,9 @@ fn cmd_f_search_bar_requests_and_highlights(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
 
-    // ⌘F로 검색 바를 열고 "match"를 치면 마지막 입력 150ms 뒤 SearchRequest 하나가 나간다.
     cx.simulate_keystrokes("cmd-f");
     cx.run_until_parked();
     assert!(cx.update(|_, cx| view.read(cx).search.is_some()));
-
     cx.simulate_input("match");
     cx.run_until_parked();
     theirs.set_nonblocking(true).unwrap();
@@ -1395,6 +1393,159 @@ fn cmd_f_search_bar_requests_and_highlights(cx: &mut TestAppContext) {
         cx.update(|_, cx| view.read(cx).live[&pane].pane.highlight()),
         None
     );
+}
+
+/// OWE-868: ⌘G/⇧⌘G로 다음/이전 일치를 찾고, 화면 안의 모든 일치 범위를 모으며,
+/// 에디터 파일 탭에서는 ⌘F로 터미널 검색 바를 열지 않는다.
+#[gpui::test]
+fn cmd_g_steps_and_cmd_f_ignores_editor_tab(cx: &mut TestAppContext) {
+    use krill_app::terminal::Highlight;
+    use krill_proto::screen::{Cell, Msg as _, Op, Revision, Seq, encode_update};
+    use krill_proto::search::{
+        Cursor, Direction, Hit, SearchRequest, SearchResult, Snapshot, Source as SearchSource,
+    };
+
+    let (view, cx) = open(cx, state_path("search-step"));
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let row = |t: &str| {
+        t.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(7), ours, cx);
+            let ops = vec![
+                Op::Reset { cols: 20, lines: 2 },
+                Op::Line {
+                    line: 0,
+                    cells: row("first line"),
+                },
+                Op::Line {
+                    line: 1,
+                    cells: row("second match"),
+                },
+            ];
+            let f = &encode_update(Revision(1), Seq(1), ops).unwrap()[0];
+            let (k, b) = ipc::read_frame(&mut &f[..]).unwrap().unwrap();
+            assert!(s.on_frame(pane, k, &b, cx));
+        });
+    });
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).search.is_some()));
+    cx.simulate_input("match");
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(150));
+    cx.run_until_parked();
+    let mut requests = Vec::new();
+    while let Ok(Some((k, b))) = ipc::read_frame(&mut theirs) {
+        requests.push(SearchRequest::decode(k, &b).unwrap());
+    }
+    assert_eq!(requests.len(), 1);
+    let snap = Snapshot {
+        revision: Revision(1),
+        seq: Seq(1),
+        oldest: Seq(0),
+        pages: 0,
+    };
+    let res = SearchResult {
+        req: requests[0].req,
+        snapshot: snap,
+        total: 3,
+        hit: Some(Hit {
+            index: 1,
+            source: SearchSource::Screen,
+            row: 1,
+            total_rows: 2,
+            column: 7,
+            cols: 5,
+            cells: row("second match"),
+        }),
+        wrapped: false,
+        stale: false,
+        incomplete: false,
+        approximate: false,
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let f = res.encode().unwrap();
+            let (k, b) = ipc::read_frame(&mut &f[..]).unwrap().unwrap();
+            assert!(s.on_frame(pane, k, &b, cx));
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).live[&pane].pane.highlight()),
+        Some(Highlight {
+            line: 1,
+            column: 7,
+            cols: 5,
+        })
+    );
+    // 화면 안의 모든 일치 범위도 모은다.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).live[&pane].pane.highlights().to_vec()),
+        vec![Highlight {
+            line: 1,
+            column: 7,
+            cols: 5,
+        }]
+    );
+
+    // ⌘G(다음)는 Cursor를 실어 Next 요청을 보낸다.
+    cx.simulate_keystrokes("cmd-g");
+    cx.run_until_parked();
+    let (k, b) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+    let next = SearchRequest::decode(k, &b).unwrap();
+    assert_eq!(next.direction, Direction::Next);
+    assert_eq!(
+        next.after,
+        Some(Cursor {
+            snapshot: snap,
+            index: 1,
+        })
+    );
+
+    // ⇧⌘G(이전)는 바 안에서 이전 찾기로 동작한다(바깥의 우측 패널 전환이 아니다).
+    cx.simulate_keystrokes("cmd-shift-g");
+    cx.run_until_parked();
+    let (k, b) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+    let prev = SearchRequest::decode(k, &b).unwrap();
+    assert_eq!(prev.direction, Direction::Previous);
+    assert_eq!(
+        prev.after,
+        Some(Cursor {
+            snapshot: snap,
+            index: 1,
+        })
+    );
+
+    // Esc로 바를 닫고 에디터 파일 탭으로 가면 ⌘F가 바를 열지 않는다.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).search.is_none()));
+    let tmp = std::env::temp_dir().join(format!("krill-owe-868-{}.rs", std::process::id()));
+    std::fs::write(&tmp, "fn main() {}\n").expect("write temp file");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.open_file(tmp.clone(), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-f");
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).search.is_none()));
+    std::fs::remove_file(&tmp).ok();
 }
 
 #[gpui::test]

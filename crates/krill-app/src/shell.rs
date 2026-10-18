@@ -212,6 +212,8 @@ actions!(
         Quit,
         Jump,
         Find,
+        FindNext,
+        FindPrev,
         Copy,
         Paste,
         ForkSession,
@@ -345,6 +347,9 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-,", krill_app::settings::OpenSettings, None),
         KeyBinding::new("cmd-j", Jump, ctx),
         KeyBinding::new("cmd-f", Find, ctx),
+        KeyBinding::new("cmd-g", FindNext, ctx),
+        // OWE-868: ⇧⌘G는 검색 바가 열려 있을 때만 이전 찾기다. 바깥에서는 기존 TogglePanel(우측 패널)을 유지한다.
+        KeyBinding::new("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
         KeyBinding::new("cmd-c", Copy, ctx),
         KeyBinding::new("cmd-v", Paste, ctx),
     ]);
@@ -1044,6 +1049,20 @@ impl Shell {
         cx.notify();
     }
 
+    /// Cmd+G/⇧Cmd+G: 열린 터미널 검색 바의 검색어로 다음/이전 일치를 찾는다(OWE-868). 바가 닫혀 있으면 무시한다.
+    fn step_search(&mut self, direction: krill_proto::search::Direction, cx: &mut Context<Self>) {
+        let query = self
+            .search
+            .as_ref()
+            .map(|(bar, _)| bar.read(cx).query().to_owned());
+        if let Some(query) = query
+            && !query.is_empty()
+            && let Some(l) = self.focused_live()
+        {
+            l.pane.search(&query, direction);
+        }
+    }
+
     /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(settings) = self.settings.clone() {
@@ -1056,6 +1075,10 @@ impl Shell {
             }
             window.focus(&self.focus, cx);
             cx.notify();
+            return;
+        }
+        // OWE-868: 에디터 파일 탭·빈 탭에서는 터미널 검색 바를 열지 않는다(열어도 동작하지 않는다).
+        if self.focused_live().is_none() {
             return;
         }
         if let Some(pane) = self.layout.focused() {
@@ -3066,6 +3089,7 @@ impl Shell {
                 el.painted = Some(Rc::clone(&l.painted));
                 el.selection = l.selection;
                 el.highlight = l.pane.highlight();
+                el.highlights = l.pane.highlights().to_vec();
                 el.link = self.path_hover(id);
                 el.preedit = focused.then(|| l.ime.overlay()).flatten().map(|o| Preedit {
                     origin: o.origin,
@@ -3685,6 +3709,12 @@ impl Render for Shell {
             )
             .on_action(cx.listener(|this, _: &Jump, window, cx| this.toggle_jump(window, cx)))
             .on_action(cx.listener(|this, _: &Find, window, cx| this.toggle_search(window, cx)))
+            .on_action(cx.listener(|this, _: &FindNext, _, cx| {
+                this.step_search(krill_proto::search::Direction::Next, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindPrev, _, cx| {
+                this.step_search(krill_proto::search::Direction::Previous, cx);
+            }))
             .on_action(cx.listener(|this, _: &Copy, _, cx| this.copy(cx)))
             .on_action(cx.listener(|this, _: &Paste, window, cx| this.paste(window, cx)))
             .on_action(cx.listener(|this, _: &ForkSession, _, cx| {

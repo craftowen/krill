@@ -39,7 +39,7 @@ use krill_proto::input::{self, InputAck, Journal, Notice, Now};
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::roles::{self, FEAT_ROLES};
 use krill_proto::screen::{
-    ApplyError, Attach, Cell, FEAT_SCREEN, HistoryRequest, HistoryRows, Known, MAX_COLS,
+    ApplyError, Attach, Cell, FEAT_SCREEN, Flags, HistoryRequest, HistoryRows, Known, MAX_COLS,
     MAX_HISTORY_ROWS, MAX_LINES, Msg, Refused, Screen, Source, Stream, Update, View, kind,
 };
 
@@ -457,9 +457,65 @@ struct SearchState {
     query: String,
     cursor: Option<krill_proto::search::Cursor>,
     result: Option<krill_proto::search::SearchResult>,
-    /// 화면 밖(Hot/Cold) 일치 행을 보여줄 때의 셀. 스크롤·입력·검색 닫기 때 지운다.
-    pinned_row: Option<Vec<Cell>>,
+    /// 스크롤백(Hot/Cold) 일치의 이웃 행 요청 번호. 늦은 답·스크롤·입력·연결 끊김 때 버린다.
+    hist_req: Option<u32>,
+    /// 이웃 행이 오면 고정 보기로 둘 일치 자리(출처 안 행 번호·하이라이트 범위).
+    hist_target: Option<SearchTarget>,
+    /// 스크롤백 일치를 고정 보기로 두어 히스토리를 가렸는지. 스크롤·입력·검색 닫기·화면 일치 때 걷는다.
+    scrolled: bool,
+    /// 현재 활성 일치 1개(데몬이 준 범위).
     highlight: Option<crate::terminal::Highlight>,
+    /// 보이는 화면의 일치 범위 전부(활성 포함 가능, 엷게 칠한다).
+    highlights: Vec<crate::terminal::Highlight>,
+}
+
+/// 이웃 행(`HISTORY_ROWS`)이 오면 고정 보기로 둘 자리.
+#[derive(Debug, Clone, Copy)]
+struct SearchTarget {
+    row: u32,
+    column: u16,
+    cols: u16,
+}
+
+/// 화면에 그릴 검색 일치 상한(OWE-868). 한 글자 검색어·거대 화면에서도 프레임당 quad를 묶는다.
+const MAX_SEARCH_MARKS: usize = 1_000;
+
+/// 한 행에서 리터럴 검색어와 겹치지 않게 일치하는 칸 범위들을 돌려준다.
+/// 데몬(`krilld::search`)의 `text_spans`와 같은 셀→글자 대응(SPACER 건너뜀, 넓은 문자 2칸)이다.
+fn find_matches(row: &[Cell], query: &str) -> Vec<(u16, u16)> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut text = String::new();
+    let mut spans: Vec<(usize, usize, u16, u16)> = Vec::new();
+    for (column, cell) in row.iter().enumerate() {
+        if cell.flags.contains(Flags::SPACER) {
+            continue;
+        }
+        let Ok(column) = u16::try_from(column) else {
+            break;
+        };
+        let start = text.len();
+        text.push(cell.ch);
+        text.extend(&cell.zerowidth);
+        let end_column = column.saturating_add(if cell.flags.contains(Flags::WIDE) {
+            2
+        } else {
+            1
+        });
+        spans.push((start, text.len(), column, end_column));
+    }
+    let mut out = Vec::new();
+    for (byte, matched) in text.match_indices(query) {
+        let end = byte.saturating_add(matched.len());
+        let mut overlaps = spans.iter().filter(|span| span.1 > byte && span.0 < end);
+        let Some(first) = overlaps.next() else {
+            continue;
+        };
+        let last = overlaps.next_back().unwrap_or(first);
+        out.push((first.2, last.3.saturating_sub(first.2)));
+    }
+    out
 }
 
 impl SearchState {
@@ -468,8 +524,11 @@ impl SearchState {
         self.query.clear();
         self.cursor = None;
         self.result = None;
-        self.pinned_row = None;
+        self.hist_req = None;
+        self.hist_target = None;
+        self.scrolled = false;
         self.highlight = None;
+        self.highlights.clear();
     }
 }
 
@@ -635,12 +694,15 @@ impl<W: Write> Pane<W> {
             self.state = State::Live;
         }
         if same == input::Incarnation::Changed {
+            self.forget_search_view();
             self.history.reset();
             self.search.clear();
         }
         self.search.supported = true;
         self.search.pending = None;
         self.search.cursor = None;
+        self.search.hist_req = None;
+        self.search.hist_target = None;
         self.session = Some(session);
         self.instance = instance;
         self.out = Some(out);
@@ -679,6 +741,8 @@ impl<W: Write> Pane<W> {
         self.history.pending = None;
         self.search.pending = None;
         self.search.cursor = None;
+        self.search.hist_req = None;
+        self.search.hist_target = None;
         self.journal.unlink()
     }
 
@@ -687,11 +751,11 @@ impl<W: Write> Pane<W> {
         if self.state != State::Live {
             return None;
         }
-        let had_pin = self.search.pinned_row.take().is_some();
-        if had_pin {
-            self.search.highlight = None;
-        }
-        if self.history.offset != 0 || had_pin {
+        let had_mark = self.search.highlight.take().is_some();
+        self.search.hist_req = None;
+        self.search.hist_target = None;
+        let view_dropped = self.forget_search_view();
+        if self.history.offset != 0 || had_mark || view_dropped {
             self.history.reset();
             self.refresh();
         }
@@ -711,14 +775,14 @@ impl<W: Write> Pane<W> {
 
     /// 화면을 `lines`행 위로(음수면 아래로) 넘긴다. 필요하면 히스토리를 요청한다. 화면이 바뀌면 `true`.
     pub fn scroll(&mut self, lines: isize) -> bool {
-        let had_pin = self.search.pinned_row.take().is_some();
-        if had_pin {
-            self.search.highlight = None;
-        }
+        let had_mark = self.search.highlight.take().is_some();
+        let had_fetch =
+            self.search.hist_req.take().is_some() || self.search.hist_target.take().is_some();
+        let view_dropped = self.forget_search_view();
         let before = self.history.visible();
         self.history.scroll(lines);
         self.fetch();
-        let changed = self.history.visible() != before || had_pin;
+        let changed = self.history.visible() != before || had_mark || had_fetch || view_dropped;
         if changed {
             self.refresh();
         }
@@ -754,46 +818,56 @@ impl<W: Write> Pane<W> {
             kind::HISTORY_ROWS => {
                 let before = self.history.visible();
                 let rows = HistoryRows::decode(k, body)?;
-                if self.context_rows(&rows) {
-                    ev.clipboard = self.advance_context()?;
-                } else {
-                    self.history.rows(rows);
-                }
-                self.fetch();
-                ev.redraw = self.history.visible() != before;
-                if ev.redraw {
+                if self.search_hist_rows(&rows) {
+                    ev.redraw = true;
                     self.refresh();
+                } else {
+                    if self.context_rows(&rows) {
+                        ev.clipboard = self.advance_context()?;
+                    } else {
+                        self.history.rows(rows);
+                    }
+                    self.fetch();
+                    ev.redraw = self.history.visible() != before;
+                    if ev.redraw {
+                        self.refresh();
+                    }
                 }
             }
             krill_proto::search::kind::SEARCH_RESULT => {
                 let r = krill_proto::search::SearchResult::decode(k, body)?;
                 if self.search.pending == Some(r.req) {
                     self.search.pending = None;
+                    self.search.hist_req = None;
+                    self.search.hist_target = None;
+                    // 스크롤백 일치는 이웃 행이 올 때 다시 두기 전에는 활성 표시를 비운다.
+                    self.search.highlight = None;
                     if let Some(hit) = &r.hit {
                         self.search.cursor = Some(krill_proto::search::Cursor {
                             snapshot: r.snapshot,
                             index: hit.index,
                         });
-                        if hit.source == krill_proto::search::Source::Screen {
-                            self.history.reset();
-                            self.search.pinned_row = None;
-                            self.search.highlight = Some(crate::terminal::Highlight {
-                                line: u16::try_from(hit.row).unwrap_or(0),
-                                column: hit.column,
-                                cols: hit.cols,
-                            });
-                        } else {
-                            self.search.pinned_row = Some(hit.cells.clone());
-                            self.search.highlight = Some(crate::terminal::Highlight {
-                                line: 0,
-                                column: hit.column,
-                                cols: hit.cols,
-                            });
+                        match hit.source {
+                            krill_proto::search::Source::Hot => {
+                                self.request_search_neighborhood(Source::Hot, hit);
+                            }
+                            krill_proto::search::Source::Cold { page } => {
+                                self.request_search_neighborhood(Source::Cold { page }, hit);
+                            }
+                            krill_proto::search::Source::Screen => {
+                                self.forget_search_view();
+                                self.history.reset();
+                                self.search.highlight = Some(crate::terminal::Highlight {
+                                    line: u16::try_from(hit.row).unwrap_or(u16::MAX),
+                                    column: hit.column,
+                                    cols: hit.cols,
+                                });
+                            }
                         }
                     } else {
                         self.search.cursor = None;
-                        self.search.pinned_row = None;
                         self.search.highlight = None;
+                        self.forget_search_view();
                     }
                     self.search.result = Some(r);
                     ev.redraw = true;
@@ -846,19 +920,109 @@ impl<W: Write> Pane<W> {
     }
 
     fn refresh(&mut self) {
-        let mut s = self.history.compose(&self.view.screen);
-        if let Some(row) = &self.search.pinned_row {
-            if let Some(first) = s.rows.first_mut() {
-                first.clone_from(row);
-            } else {
-                s.rows.push(row.clone());
-            }
-            if let Some(links) = s.links.first_mut() {
-                links.clear();
-            }
-            s.cursor.visible = false;
-        }
+        let s = self.history.compose(&self.view.screen);
         self.shown = Rc::new(s);
+        self.refresh_search_marks();
+    }
+
+    /// 보이는 화면의 검색 일치 범위를 전부 다시 찾는다(OWE-868). 활성 일치는 그대로 둔다.
+    fn refresh_search_marks(&mut self) {
+        self.search.highlights.clear();
+        if self.search.query.is_empty() || self.search.result.is_none() {
+            return;
+        }
+        for (line, row) in self.shown.rows.iter().enumerate() {
+            if self.search.highlights.len() >= MAX_SEARCH_MARKS {
+                break;
+            }
+            let Ok(line) = u16::try_from(line) else {
+                break;
+            };
+            for (column, cols) in find_matches(row, &self.search.query) {
+                if self.search.highlights.len() >= MAX_SEARCH_MARKS {
+                    break;
+                }
+                self.search
+                    .highlights
+                    .push(crate::terminal::Highlight { line, column, cols });
+            }
+        }
+    }
+
+    /// 스크롤백 일치의 이웃 행을 달라고 데몬에 요청한다(OWE-868). 일치 행이 뷰포트 안에 오도록
+    /// `HISTORY` 한 번으로 화면 높이만큼 가져오고, 답이 오면 고정 보기로 둔다. 쓰기가 실패하면 연결을 끊는다.
+    fn request_search_neighborhood(&mut self, source: Source, hit: &krill_proto::search::Hit) {
+        let lines = usize::from(self.view.screen.lines.max(1));
+        let above = lines / 2;
+        let below = lines.saturating_sub(above).saturating_sub(1);
+        let depth = u64::from(hit.total_rows)
+            .saturating_sub(u64::from(hit.row))
+            .saturating_sub(1);
+        let skip = u32::try_from(depth.saturating_sub(below as u64)).unwrap_or(u32::MAX);
+        let count =
+            u16::try_from(lines.min(usize::from(MAX_HISTORY_ROWS))).unwrap_or(MAX_HISTORY_ROWS);
+        self.history.req = self.history.req.wrapping_add(1);
+        let req = self.history.req;
+        let request = HistoryRequest {
+            req,
+            source,
+            skip,
+            count,
+        };
+        self.search.hist_req = Some(req);
+        self.search.hist_target = Some(SearchTarget {
+            row: hit.row,
+            column: hit.column,
+            cols: hit.cols,
+        });
+        if self.send(&request).is_err() {
+            self.unlink();
+        }
+    }
+
+    /// 스크롤백 이웃 행 답을 고정 보기로 둔다. 우리 요청이 아니면 `false`(호출자가 다른 용도로 쓴다).
+    fn search_hist_rows(&mut self, rows: &HistoryRows) -> bool {
+        if self.search.hist_req != Some(rows.req) {
+            return false;
+        }
+        self.search.hist_req = None;
+        let Some(target) = self.search.hist_target.take() else {
+            return false;
+        };
+        self.search.highlight = None;
+        if rows.rows.is_empty() {
+            return true;
+        }
+        // 답 끝(아래에서 `skip`행 위)이 출처 끝에서 몇 번째인지를 세어 일치 행의 깊이를 잰다.
+        let newest = rows.total.saturating_sub(rows.skip).saturating_sub(1);
+        let depth = usize::try_from(newest.saturating_sub(target.row))
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let lines = usize::from(self.view.screen.lines.max(1));
+        let offset = rows.rows.len().min(depth.saturating_add(lines / 2));
+        self.history = History::fixed(rows.rows.clone());
+        self.history.offset = offset;
+        self.search.scrolled = true;
+        if depth >= 1 && depth <= offset {
+            self.search.highlight = Some(crate::terminal::Highlight {
+                line: u16::try_from(offset - depth).unwrap_or(u16::MAX),
+                column: target.column,
+                cols: target.cols,
+            });
+        }
+        true
+    }
+
+    /// 검색이 둔 스크롤백 고정 보기를 걷고 라이브 히스토리로 되돌린다. 걷었으면 `true`.
+    fn forget_search_view(&mut self) -> bool {
+        if !self.search.scrolled {
+            return false;
+        }
+        self.search.scrolled = false;
+        let req = self.history.req;
+        self.history = History::default();
+        self.history.req = req;
+        true
     }
 
     /// `FEAT_SEARCH` 협상 여부. `false`면 [`Pane::search`]가 요청을 보내지 않는다.
@@ -891,6 +1055,8 @@ impl<W: Write> Pane<W> {
         self.search.req = self.search.req.wrapping_add(1);
         let req = self.search.req;
         self.search.pending = Some(req);
+        self.search.hist_req = None;
+        self.search.hist_target = None;
         let msg = krill_proto::search::SearchRequest {
             req,
             query: self.search.query.clone(),
@@ -904,17 +1070,24 @@ impl<W: Write> Pane<W> {
         true
     }
 
-    /// 검색 하이라이트·고정 행을 지운다.
+    /// 검색 하이라이트·일치 범위·스크롤백 고정 보기를 지운다. 손으로 스크롤한 위치는 유지한다.
     pub fn clear_search(&mut self) {
-        let had_pin = self.search.pinned_row.is_some();
+        let had_mark = self.search.highlight.is_some() || !self.search.highlights.is_empty();
+        let had_fetch = self.search.hist_req.is_some() || self.search.hist_target.is_some();
+        let view_dropped = self.forget_search_view();
         self.search.clear();
-        if had_pin {
+        if had_mark || had_fetch || view_dropped {
             self.refresh();
         }
     }
 
     pub fn highlight(&self) -> Option<crate::terminal::Highlight> {
         self.search.highlight
+    }
+
+    /// 보이는 화면의 검색 일치 범위 전부(OWE-868).
+    pub fn highlights(&self) -> &[crate::terminal::Highlight] {
+        &self.search.highlights
     }
 
     pub fn search_result(&self) -> Option<&krill_proto::search::SearchResult> {
