@@ -389,6 +389,24 @@ fn wizard_window_is_fixed_size(cx: &mut TestAppContext) {
     assert_eq!(bounds.size, gpui::size(gpui::px(680.), gpui::px(620.)));
 }
 
+// OWE-861: 점검 창(온보딩 마법사)은 ⌘W로 닫힌다(Esc·⌥⌘W와 별개 경로).
+#[gpui::test]
+fn wizard_cmd_w_closes_window(cx: &mut TestAppContext) {
+    let f = fake("wizard-cmd-w");
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        init_actions(cx);
+    });
+    let cx = open(cx, &f.env);
+    cx.run_until_parked();
+    assert!(wizard_window(cx).is_some(), "wizard opens");
+    press(cx, "cmd-w");
+    assert!(
+        wizard_window(cx).is_none(),
+        "cmd-w closes the checks window"
+    );
+}
+
 // OWE-714 (9): 동의 체크박스는 처음에도, 다시 실행해도 해제 상태다.
 #[gpui::test]
 fn wizard_consent_checkbox_starts_unchecked_even_after_rerun(cx: &mut TestAppContext) {
