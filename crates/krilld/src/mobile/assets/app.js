@@ -77,7 +77,7 @@ globalThis.MkTerminalCodec=(()=>{
  return {v,text,frame,reader,update,history,keys};
 })();
 globalThis.MkLiveTerminal=class {
- constructor(credentials,onError){this.credentials=credentials;this.onError=onError;this.generation=0;this.model={cols:80,lines:24,rows:[],cursor:{visible:false}};this.fit=false;this.ready=false;this.inputId=0;this.historyId=0;this.pendingInputs=new Set();this.pendingRoles=[];this.port=document.getElementById('terminal-scroll');this.canvas=document.getElementById('terminal-grid');this.ctx=this.canvas.getContext('2d');this.historyElement=document.getElementById('terminal-history');this.resetHistory();
+ constructor(credentials,onError,socketUrl){this.credentials=credentials;this.socketUrl=socketUrl;this.onError=onError;this.generation=0;this.model={cols:80,lines:24,rows:[],cursor:{visible:false}};this.fit=false;this.ready=false;this.inputId=0;this.historyId=0;this.pendingInputs=new Set();this.pendingRoles=[];this.port=document.getElementById('terminal-scroll');this.canvas=document.getElementById('terminal-grid');this.ctx=this.canvas.getContext('2d');this.historyElement=document.getElementById('terminal-history');this.resetHistory();
   document.getElementById('fit-phone').addEventListener('change',e=>{this.setFit(e.target.checked).catch(onError);});
   document.getElementById('load-history').addEventListener('click',()=>this.loadHistory());
   this.port.addEventListener('scroll',()=>{if(this.port.scrollTop<30)this.loadHistory();},{passive:true});
@@ -89,7 +89,7 @@ globalThis.MkLiveTerminal=class {
  resetHistory(){this.historySource=null;this.historySkip=0;this.historyPages=null;this.historyPending=null;this.historyRows=[];this.historyEnd=false;if(this.historyElement)this.historyElement.textContent='';const button=document.getElementById('load-history');if(button)button.disabled=false;}
  send(kind,body){if(!this.socket||this.socket.readyState!==WebSocket.OPEN||!this.channel)throw Error('Terminal disconnected');this.socket.send(this.channel.seal(MkTerminalCodec.frame(kind,body)));}
  async open(session){this.close();const generation=this.generation;this.session=session;this.resetHistory();document.getElementById('terminal-panel').hidden=false;document.getElementById('terminal-title').textContent=`Live terminal · #${session}`;
-  const T=MkTerminalCodec,C=MkCrypto,socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);this.socket=socket;socket.binaryType='arraybuffer';let phase=0,channel;
+  const T=MkTerminalCodec,C=MkCrypto,socket=new WebSocket(this.socketUrl);this.socket=socket;socket.binaryType='arraybuffer';let phase=0,channel;
   socket.addEventListener('message',e=>{if(generation!==this.generation)return;try{
    if(phase===0){const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');channel=new C.Channel(C.sha256(C.unhex(this.credentials.credential)),C.concat(C.unhex(challenge.challenge),nonce));this.channel=channel;socket.send(JSON.stringify({device_id:this.credentials.device_id,token:null,client_nonce:C.hex(nonce)}));socket.send(channel.seal(C.enc.encode('{"label":"Live terminal"}')));phase=1;return;}
    const bytes=channel.open(e.data);if(phase===1){JSON.parse(new TextDecoder().decode(bytes));phase=2;return;}if(phase===2){const r=T.reader(bytes.slice(5));r.u();r.u();const offered=r.u(),features=offered&((1n<<56n)|1n|4n|4096n);this.send(2,C.concat(T.v(1),T.v(1),T.v(features),T.v(0),T.text('minikrill-mobile-grid')));this.send(0x17,Uint8Array.from([0,2,0]));this.send(0x10,C.concat(T.v(session),Uint8Array.from([0,0])));phase=3;return;}
@@ -134,10 +134,14 @@ if(typeof document!=='undefined') (async()=>{
  const frame=(kind,body)=>{const h=new Uint8Array(5);new DataView(h.buffer).setUint32(0,body.length+1,true);h[4]=kind;return C.concat(h,body);};
  const reader=bytes=>{let at=0;return {u(){let n=0n,shift=0n;for(let i=0;i<10;i++){if(at>=bytes.length)throw Error('Truncated response');const b=bytes[at++];n|=BigInt(b&127)<<shift;if(!(b&128))return n;shift+=7n;}throw Error('Invalid response');},text(){const n=Number(this.u());if(n>bytes.length-at)throw Error('Truncated response');const text=decode.decode(bytes.slice(at,at+n));at+=n;return text;}};};
  const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1));
- const ticket=parameters.get('pair'),secretText=fragment.get('key');
- // Capture the key once, then remove it from the address bar before any connection or asset action.
+ const ticket=fragment.get('pair'),secretText=fragment.get('key');
+ // Capture the pairing secrets once, then remove them from the address bar before any connection or asset action.
  history.replaceState({},'',location.pathname+location.search);
- let credentials;try{credentials=JSON.parse(localStorage.getItem('minikrill-mobile-v2')||'null');}catch{credentials=null;}
+ const STORE='minikrill-mobile-v2';
+ let credentials;try{credentials=JSON.parse(localStorage.getItem(STORE)||'null');}catch{credentials=null;}
+ // 고정 출처 모드(/m/<hash>/): 코드는 Pages, 데이터는 Quick Tunnel WS, 터널 주소는 QR 또는 랑데부(/r/<rid>)에서 얻는다.
+ const fixed=location.pathname.startsWith('/m/'),hash=fixed?location.pathname.split('/')[2]:null;
+ if(fixed)navigator.serviceWorker?.register('/sw.js').catch(()=>{});
  let terminal;
  let socket,channel,queue=[],waiters=[],failed=null,selected=Number(parameters.get('session'))||null,snapshot=null,composing=false,closed=false;
  const next=()=>{if(queue.length)return Promise.resolve(queue.shift());if(failed)return Promise.reject(failed);return new Promise((resolve,reject)=>waiters.push({resolve,reject}));};
@@ -193,26 +197,36 @@ if(typeof document!=='undefined') (async()=>{
  // stage 0: 연결 전, 1: 열림, 2: challenge 받음, 3: 인증됨. 2에서 끊기면 회수·인증 실패라 재시도하지 않는다
  // (재시도하면 게이트웨이 전역 실패 예산을 태워 다른 기기까지 잠근다).
  const pairing=Boolean(ticket&&secretText);let stage=0;
+ // 위조 링크가 저장된 자격증명을 다른 터널로 보내지 못하게, t·r은 페어링 링크에서만 받는다.
+ const rid=pairing?fragment.get('r'):credentials?.rid,tunnel=fixed?(pairing?fragment.get('t'):credentials?.url?.replace(/^https:\/\//,'')):location.host;
+ const socketUrl=fixed?`wss://${tunnel}/ws?v=${hash}`:`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`;
+ const go=path=>{const p=new URLSearchParams(),s=terminal?.session||(parameters.has('session')?selected:null);if(s)p.set('session',s);location.replace(path+(p.size?'?'+p:''));};
  function reconnect(){
   const tries=Number(sessionStorage.getItem('mk-retry')||0);sessionStorage.setItem('mk-retry',String(tries+1));
-  const go=()=>{const p=new URLSearchParams(),s=terminal?.session||(parameters.has('session')?selected:null);if(s)p.set('session',s);location.replace(location.pathname+(p.size?'?'+p:''));};
   const ready=()=>document.visibilityState==='visible'&&navigator.onLine;
-  const once=()=>{if(!ready())return;document.removeEventListener('visibilitychange',once);removeEventListener('online',once);go();};
-  setTimeout(()=>{if(ready())go();else{document.addEventListener('visibilitychange',once);addEventListener('online',once);}},Math.min(8000,500*2**tries));
+  const once=()=>{if(!ready())return;document.removeEventListener('visibilitychange',once);removeEventListener('online',once);go(location.pathname);};
+  setTimeout(()=>{if(ready())go(location.pathname);else{document.addEventListener('visibilitychange',once);addEventListener('online',once);}},Math.min(8000,500*2**tries));
+ }
+ // 캐시한 터널이 열리지 않으면(종료·교체·409 버전 불일치) 랑데부에서 현재 터널과 PWA 해시를 찾는다.
+ async function locate(){
+  try{const r=await fetch('/r/'+rid,{cache:'no-store'});if(r.ok){const found=await r.json();if(/^https:\/\/[a-z0-9-]+\.trycloudflare\.com$/.test(found.url)&&/^[0-9a-f]{16}$/.test(found.hash)){credentials={...credentials,url:found.url,hash:found.hash};localStorage.setItem(STORE,JSON.stringify(credentials));if(found.hash!==hash)return go('/m/'+found.hash+'/');}}}catch{}
+  reconnect();
  }
  try {
   if(!pairing&&!credentials)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
-  socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);socket.binaryType='arraybuffer';
+  if(fixed&&!tunnel)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
+  socket=new WebSocket(socketUrl);socket.binaryType='arraybuffer';
   socket.addEventListener('message',e=>{const waiter=waiters.shift();if(waiter)waiter.resolve(e.data);else queue.push(e.data);});
-  const terminate=()=>{if(closed)return;closed=true;const retry=stage===3||(credentials&&!pairing&&stage<2);failed=Error(retry?'Reconnecting…':'Disconnected. Reopen this page to reconnect.');$('connection').textContent=retry?'Reconnecting…':'Disconnected';if(retry)reconnect();$('connection').className='connection';for(const w of waiters.splice(0))w.reject(failed);};socket.addEventListener('close',terminate);socket.addEventListener('error',terminate);
+  const terminate=()=>{if(closed)return;closed=true;const retry=stage===3||(credentials&&!pairing&&stage<2);failed=Error(retry?'Reconnecting…':'Disconnected. Reopen this page to reconnect.');$('connection').textContent=retry?'Reconnecting…':'Disconnected';if(retry)(fixed&&rid&&stage===0?locate:reconnect)();$('connection').className='connection';for(const w of waiters.splice(0))w.reject(failed);};socket.addEventListener('close',terminate);socket.addEventListener('error',terminate);
   await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});stage=1;
   const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));stage=2;if(challenge.version!==2)throw Error('Unsupported desktop protocol');
   const secret=pairing?C.unbase64(secretText):C.sha256(C.unhex(credentials.credential));
   channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));secret.fill(0);
   socket.send(JSON.stringify({token:pairing?ticket:null,device_id:pairing?null:credentials.device_id,client_nonce:C.hex(nonce)}));send(C.enc.encode(JSON.stringify({label:/iPhone|iPad/.test(navigator.userAgent)?'iPhone / iPad (Safari)':'Mobile browser'})));
-  const authenticated=JSON.parse(decode.decode(await nextPlain()));stage=3;sessionStorage.removeItem('mk-retry');if(authenticated.credential){credentials=authenticated;localStorage.setItem('minikrill-mobile-v2',JSON.stringify(credentials));}
-  parameters.delete('pair');history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters.toString():''));
+  const authenticated=JSON.parse(decode.decode(await nextPlain()));stage=3;sessionStorage.removeItem('mk-retry');if(authenticated.credential)credentials=authenticated;
+  if(fixed)credentials={...credentials,rid,url:`https://${tunnel}`,hash};
+  if(authenticated.credential||fixed)localStorage.setItem(STORE,JSON.stringify(credentials));
   const hello=reader((await nextPlain()).slice(5));hello.u();hello.u();const features=hello.u();send(frame(2,C.concat(variable(1),variable(1),variable(features),variable(0),string('minikrill-mobile-pwa'))));
-  terminal=new MkLiveTerminal(credentials,error);globalThis.liveTerminal=terminal;await refresh();if(parameters.has('session')&&selected)terminal.open(selected);scheduleRefresh();
+  terminal=new MkLiveTerminal(credentials,error,socketUrl);globalThis.liveTerminal=terminal;await refresh();if(parameters.has('session')&&selected)terminal.open(selected);scheduleRefresh();
  }catch(e){error(e);if(socket?.readyState===WebSocket.OPEN)socket.close();}
 })();
