@@ -477,6 +477,8 @@ impl SettingsView {
                         .debug_selector(|| "mobile-copy-link".into())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                            // OWE-880 복사 피드백(`copied`)과 URL별 복사 상태(`copied_url`)를 함께 갱신한다.
+                            this.mobile.copied = true;
                             this.mobile.copied_url = Some(link.clone());
                             cx.notify();
                         })),
@@ -510,29 +512,6 @@ impl SettingsView {
             "admin-mobile-devices-section",
             text::DEVICES_TITLE.get(),
         ));
-        // 페어링된 기기가 없을 때는 해제 버튼을 숨긴다. 있을 때는 2단계 확인(위험 색)으로
-        // 1클릭 실수를 막는다(OWE-880).
-        let active_devices = self
-            .mobile
-            .devices
-            .iter()
-            .any(|d| d.revoked_at_ms.is_none());
-        if active_devices {
-            root = root.child(self.confirm_button(
-                "mobile-revoke-all",
-                text::REVOKE_ALL.get(),
-                cx,
-                |this, cx| {
-                    this.mobile_action(
-                        MobileRequest::RevokeDevice {
-                            device_id: None,
-                            all: true,
-                        },
-                        cx,
-                    );
-                },
-            ));
-        }
         let now = krill_proto::mobile::client::now_ms();
         let active_devices: Vec<&PairedMobileDevice> = self
             .mobile
@@ -629,26 +608,28 @@ impl SettingsView {
                 );
             }
         }
-        root = root.child(
-            layout::row(p)
-                .id("mobile-revoke-all-row")
-                .debug_selector(|| "mobile-revoke-all-row".into())
-                .flex_wrap()
-                .child(
-                    layout::label(p, text::REVOKE_ALL.get(), Some(text::REVOKE_ALL_DESC.get()))
-                        .min_w(px(200.)),
-                )
-                .child(
-                    layout::controls().child(
-                        layout::danger(
-                            "mobile-revoke-all",
-                            text::REVOKE_ALL.get(),
-                            text::REVOKE_ALL.get(),
-                            false,
-                        )
-                        .disabled(self.mobile.pending)
-                        .debug_selector(|| "mobile-revoke-all".into())
-                        .on_click(cx.listener(|this, _, _, cx| {
+        // 페어링된 기기가 없을 때는 전체 해제 행을 숨긴다. 있을 때는 2단계 확인(위험 색)으로
+        // 1클릭 실수를 막는다(OWE-880).
+        let has_active_devices = self
+            .mobile
+            .devices
+            .iter()
+            .any(|d| d.revoked_at_ms.is_none());
+        if has_active_devices {
+            root = root.child(
+                layout::row(p)
+                    .id("mobile-revoke-all-row")
+                    .debug_selector(|| "mobile-revoke-all-row".into())
+                    .flex_wrap()
+                    .child(
+                        layout::label(p, text::REVOKE_ALL.get(), Some(text::REVOKE_ALL_DESC.get()))
+                            .min_w(px(200.)),
+                    )
+                    .child(layout::controls().child(self.confirm_button(
+                        "mobile-revoke-all",
+                        text::REVOKE_ALL.get(),
+                        cx,
+                        |this, cx| {
                             this.mobile_action(
                                 MobileRequest::RevokeDevice {
                                     device_id: None,
@@ -656,10 +637,10 @@ impl SettingsView {
                                 },
                                 cx,
                             );
-                        })),
-                    ),
-                ),
-        );
+                        },
+                    ))),
+            );
+        }
         if let Some(error) = &self.mobile.error {
             root = root.child(
                 crate::ui::error_banner(p, error.clone())
