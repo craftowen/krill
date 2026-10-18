@@ -6,7 +6,7 @@
 use gpui::{Div, Stateful, div, prelude::*, px};
 use sha2::{Digest as _, Sha256};
 
-use crate::ui::hex;
+use crate::ui::theme::{QR_DARK, QR_LIGHT};
 
 /// 기본 QR 격자 한 변 크기(Version 2 규격 25×25).
 pub const DEFAULT_QR_SIZE: usize = 25;
@@ -201,7 +201,7 @@ pub fn render_qr_matrix(matrix: &[Vec<bool>], module_px: f32) -> Stateful<Div> {
     div()
         .id("link-invite-qr")
         .debug_selector(|| "link-invite-qr".into())
-        .bg(hex(0x00ff_ffff))
+        .bg(QR_LIGHT)
         .child(
             gpui::canvas(
                 |_, _, _| (),
@@ -216,7 +216,7 @@ pub fn render_qr_matrix(matrix: &[Vec<bool>], module_px: f32) -> Stateful<Div> {
                                     );
                                 window.paint_quad(gpui::fill(
                                     gpui::Bounds::new(origin, gpui::size(px(cell), px(cell))),
-                                    hex(0x0000_0000),
+                                    QR_DARK,
                                 ));
                             }
                         }
