@@ -608,6 +608,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // /bin/sh
     fn subprocess_output_and_time_are_bounded() {
         let mut good = Command::new("/bin/sh");
         good.args(["-c", "printf hello"]);
