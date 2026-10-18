@@ -4,6 +4,7 @@ use super::crypto::{Key, SALT_LEN, Stream};
 use super::segment::{HEADER_LEN, Header};
 use super::tests::{SEGMENT_V1, noise};
 use super::*;
+#[cfg(target_os = "macos")]
 use security_framework::os::macos::keychain::{CreateOptions, SecKeychain};
 use std::process::Command;
 
@@ -240,6 +241,37 @@ proptest::proptest! {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn key_file_is_private_reused_and_required_when_data_exists() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = root("keyfile");
+    assert!(
+        Key::load(&root, true).is_err(),
+        "데이터가 있는데 키가 없으면 새로 만들지 않는다"
+    );
+    let first = Key::load(&root, false).unwrap();
+    let mode = fs::metadata(root.join("segment.key"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    let second = Key::load(&root, true).unwrap();
+    let store = encrypted(&root, first);
+    let mut rec = store.recorder(ID, SIZE).unwrap();
+    rec.append(b"secret from key file\r\n");
+    rec.seal();
+    let bytes = fs::read(path(&store)).unwrap();
+    assert!(
+        segment::decode(&bytes, Some(&second))
+            .unwrap()
+            .unwrap()
+            .sealed
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn keychain_roundtrip_in_isolated_child() {
     let root = root("keychain");
@@ -259,6 +291,7 @@ fn keychain_roundtrip_in_isolated_child() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 #[ignore = "keychain_roundtrip_in_isolated_child가 HOME 오버레이로 실행한다"]
 fn keychain_child() {
