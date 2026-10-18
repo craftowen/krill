@@ -1662,6 +1662,14 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        vcx.debug_bounds("admin-agent-save-codex").is_none(),
+        "에이전트 행은 기본적으로 접혀 있어야 한다"
+    );
+    let toggle = vcx.debug_bounds("admin-agent-toggle-codex").unwrap();
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
     let set_env = |vcx: &mut gpui::VisualTestContext, value: &'static str| {
         vcx.update(|window, cx| {
             let env = view.read(cx).agent_edits["codex"].env.clone();
@@ -1688,7 +1696,8 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
     let text = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
     let a = krill_proto::agent::Agents::load(Some(&text)).unwrap();
     assert_eq!(a.profiles["codex"].env["GOOD"], "1");
-    assert!(vcx.debug_bounds("admin-agent-open-toml-codex").is_some());
+    assert!(vcx.debug_bounds("admin-agents-open-toml").is_some());
+    assert!(vcx.debug_bounds("admin-agent-open-toml-codex").is_none());
     fs::remove_dir_all(&d).ok();
 }
 
@@ -5123,5 +5132,199 @@ fn owe806_account_detail_does_not_repeat_org_name_when_auto_label_matches_org(
             assert_eq!(v.account_detail(&acc, heading), "Work · Krill QA Org");
         });
     });
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-796: 에이전트 탭의 알약형 기본 에이전트 선택기(체크 아이콘), Yolo/수동 세그먼트,
+/// 조건부 프롬프트 캐시 TTL 하위 행, 단일 `agents.toml 열기` 헤더와 접이식 에이전트 카탈로그 행을 검증한다.
+#[gpui::test]
+fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut TestAppContext) {
+    let d = dir("owe796-agents-tab");
+    init(cx, &d);
+
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+
+    // 1) 기본 에이전트 알약형 선택기: 초기 claude 선택 시 claude에만 체크 아이콘이 표시되고,
+    //    codex 클릭 시 codex로 체크 아이콘과 설정이 이동한다.
+    assert!(vcx.debug_bounds("admin-default-agent-card").is_some());
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-claude")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-codex")
+            .is_none()
+    );
+    let codex_pill = bounds(vcx, "admin-default-agent-codex");
+    vcx.simulate_click(codex_pill.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert_eq!(current(cx).default_agent, "codex");
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-claude")
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-codex")
+            .is_some()
+    );
+
+    // 2) 권한 모드(Yolo / 수동) 세그먼트 전환 검증
+    let manual_seg = bounds(vcx, "admin-yolo-manual");
+    vcx.simulate_click(manual_seg.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(!current(cx).yolo_mode);
+        assert_eq!(
+            cx.global::<Config>().pending_permission,
+            Some(krill_proto::agent::Permission::Manual)
+        );
+    });
+    let yolo_seg = bounds(vcx, "admin-yolo-yolo");
+    vcx.simulate_click(yolo_seg.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(current(cx).yolo_mode);
+        assert_eq!(
+            cx.global::<Config>().pending_permission,
+            Some(krill_proto::agent::Permission::Yolo)
+        );
+    });
+
+    // 3) 프롬프트 캐시 TTL: 타이머가 켜진 동안에만 하위 행으로 보이고, 끄면 숨겨진다.
+    assert!(vcx.debug_bounds("prompt-cache-ttl-row").is_some());
+    let cache_toggle = bounds(vcx, "prompt-cache-timer-toggle");
+    vcx.simulate_click(cache_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(!current(cx).prompt_cache_timer_enabled);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.debug_bounds("prompt-cache-ttl-row").is_none(),
+        "타이머가 꺼지면 캐시 TTL 하위 행은 숨겨져야 한다"
+    );
+    let cache_toggle = bounds(vcx, "prompt-cache-timer-toggle");
+    vcx.simulate_click(cache_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(current(cx).prompt_cache_timer_enabled);
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("prompt-cache-ttl-row").is_some());
+
+    // 4) 에이전트 카탈로그 카드: 헤더 우측에 `agents.toml 열기`가 한 번만 배치되고,
+    //    5개 에이전트 행은 기본적으로 모두 접혀 있으며 요약·배지가 표시된다.
+    let catalog_card = bounds(vcx, "admin-agents-catalog-card");
+    let open_toml = bounds(vcx, "admin-agents-open-toml");
+    assert!(open_toml.right() <= catalog_card.right() + px(0.5));
+    for (open_sel, badge_sel, summary_sel, editor_sel) in [
+        (
+            "admin-agent-open-toml-claude",
+            "admin-agent-installed-badge-claude",
+            "admin-agent-summary-claude",
+            "admin-agent-editor-claude",
+        ),
+        (
+            "admin-agent-open-toml-codex",
+            "admin-agent-installed-badge-codex",
+            "admin-agent-summary-codex",
+            "admin-agent-editor-codex",
+        ),
+        (
+            "admin-agent-open-toml-agy",
+            "admin-agent-installed-badge-agy",
+            "admin-agent-summary-agy",
+            "admin-agent-editor-agy",
+        ),
+        (
+            "admin-agent-open-toml-cursor",
+            "admin-agent-installed-badge-cursor",
+            "admin-agent-summary-cursor",
+            "admin-agent-editor-cursor",
+        ),
+        (
+            "admin-agent-open-toml-opencode",
+            "admin-agent-installed-badge-opencode",
+            "admin-agent-summary-opencode",
+            "admin-agent-editor-opencode",
+        ),
+    ] {
+        assert!(
+            vcx.debug_bounds(open_sel).is_none(),
+            "행마다 중복된 agents.toml 열기 버튼이 있으면 안 된다"
+        );
+        assert!(vcx.debug_bounds(badge_sel).is_some());
+        assert!(vcx.debug_bounds(summary_sel).is_some());
+        assert!(
+            vcx.debug_bounds(editor_sel).is_none(),
+            "{editor_sel} 편집기는 기본 접힘 상태여야 한다"
+        );
+    }
+
+    // codex 행만 펼치기 → 저장 → 초기화 → 다시 접기
+    let codex_toggle = bounds(vcx, "admin-agent-toggle-codex");
+    vcx.simulate_click(codex_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-agent-editor-codex").is_some());
+    assert!(vcx.debug_bounds("admin-agent-editor-claude").is_none());
+
+    vcx.update(|window, cx| {
+        let edit = &view.read(cx).agent_edits["codex"];
+        let args = edit.args.clone();
+        let env = edit.env.clone();
+        args.update(cx, |s, cx| s.set_value("--model o3", window, cx));
+        env.update(cx, |s, cx| s.set_value("FOO=bar", window, cx));
+        window.draw(cx).clear(cx);
+    });
+    let save_btn = bounds(vcx, "admin-agent-save-codex");
+    vcx.simulate_click(save_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let saved_toml = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
+    let loaded = krill_proto::agent::Agents::load(Some(&saved_toml)).unwrap();
+    assert_eq!(
+        loaded.profiles["codex"].env.get("FOO").map(String::as_str),
+        Some("bar")
+    );
+
+    let reset_btn = bounds(vcx, "admin-agent-reset-codex");
+    vcx.simulate_click(reset_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let edit = &view.read(cx).agent_edits["codex"];
+        assert!(edit.env.read(cx).value().is_empty());
+        window.draw(cx).clear(cx);
+    });
+
+    // 좁은 창(820px)에서도 펼쳐진 에이전트 카드·기본 에이전트 카드·스킬 카드가 컬럼 경계를 넘지 않는다.
+    let column = bounds(vcx, "admin-content-column");
+    for sel in [
+        "admin-default-agent-card",
+        "admin-agents-catalog-card",
+        "admin-agent-editor-codex",
+        "admin-skills-card",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "{sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
     fs::remove_dir_all(d).ok();
 }
