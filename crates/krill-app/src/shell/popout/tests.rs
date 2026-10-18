@@ -1007,3 +1007,18 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
         "clicking resources-toggle opens resources popover"
     );
 }
+
+/// OWE-857: SSH·오케스트레이션 메뉴 하단 버튼은 각 설정 목적에 맞는 라벨을 쓴다.
+#[test]
+fn settings_shortcut_labels_match_their_admin_tabs() {
+    assert_eq!(text::OPEN_SSH_SETTINGS.get(), "SSH 호스트 설정…");
+    assert_eq!(text::OPEN_WORKFLOWS_SETTINGS.get(), "워크플로 설정…");
+    assert_ne!(
+        text::OPEN_SSH_SETTINGS.get(),
+        text::OPEN_ADMIN_ACCOUNTS.get()
+    );
+    assert_ne!(
+        text::OPEN_WORKFLOWS_SETTINGS.get(),
+        text::OPEN_ADMIN_ACCOUNTS.get()
+    );
+}
