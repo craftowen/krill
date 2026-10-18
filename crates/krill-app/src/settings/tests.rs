@@ -6415,3 +6415,275 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
 
     fs::remove_dir_all(d).ok();
 }
+
+/// OWE-801: Workflows 탭의 컨텍스트 줄 수 `SegmentedControl`, 저장소 선택 컨텍스트 통합,
+/// 심볼릭 링크 등폭 칩 추가/제거, 빠른 명령 추가/수정/삭제, 완료 웹훅 배지+URL 표시 및 추가/삭제,
+/// 예약 작업 활성/일시정지 `Switch` 및 820px 좁은 창 경계 준수를 검증한다.
+#[gpui::test]
+fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_schedule_switch(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::schedule::Schedules;
+
+    let d = dir("owe801-workflows");
+    let repo_a_dir = d.join("repo-alpha");
+    let repo_b_dir = d.join("repo-beta");
+    fs::create_dir_all(&repo_a_dir).unwrap();
+    fs::create_dir_all(&repo_b_dir).unwrap();
+    let repo_a = fs::canonicalize(&repo_a_dir)
+        .unwrap_or_else(|_| repo_a_dir.clone())
+        .display()
+        .to_string();
+    let repo_b = fs::canonicalize(&repo_b_dir)
+        .unwrap_or_else(|_| repo_b_dir.clone())
+        .display()
+        .to_string();
+
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(6000.)));
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let click_sel = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing selector {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+
+    // 1) 컨텍스트 줄 수 SegmentedControl (50/100/250/500)
+    assert!(vcx.debug_bounds("admin-context-lines-control").is_some());
+    click_sel(vcx, "admin-context-lines-100");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 100));
+    click_sel(vcx, "admin-context-lines-250");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 250));
+    click_sel(vcx, "admin-context-lines-500");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 500));
+    click_sel(vcx, "admin-context-lines-50");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 50));
+
+    // 2) 저장소 선택 컨텍스트 통합 및 심볼릭 링크 등폭 칩 추가/제거
+    assert!(vcx.debug_bounds("admin-workflow-repo-card").is_some());
+    assert!(vcx.debug_bounds("admin-workflow-repo-input").is_some());
+    assert!(
+        vcx.debug_bounds("admin-worktree-symlinks-repo-input")
+            .is_none(),
+        "duplicate repo input in symlinks card must be removed"
+    );
+    assert!(
+        vcx.debug_bounds("admin-hooks-repo-input").is_none(),
+        "duplicate repo input in hooks card must be removed"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.add_worktree_symlink_for(&repo_a, ".env", cx).unwrap();
+            v.add_worktree_symlink_for(&repo_a, "node_modules", cx)
+                .unwrap();
+            v.save_repo_hooks_for(&repo_a, Some("pnpm install"), Some("./cleanup-a.sh"), cx)
+                .unwrap();
+            v.save_repo_hooks_for(&repo_b, Some("cargo check"), Some("./cleanup-b.sh"), cx)
+                .unwrap();
+            v.load_repo_hooks_for(&repo_a, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(vcx.debug_bounds("admin-workflow-repo-select").is_some());
+    assert!(vcx.debug_bounds("admin-workflow-repo-chips").is_some());
+    assert!(vcx.debug_bounds("admin-symlinks-repo-badge").is_some());
+    assert!(vcx.debug_bounds("admin-hooks-repo-badge").is_some());
+    assert!(vcx.debug_bounds("admin-worktree-symlinks-chips").is_some());
+    assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
+    assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
+
+    // repo-b 칩을 클릭하면 훅 입력창이 repo-b로 동기화되고 심볼릭 링크 카드는 repo-b 기준(빈 상태)으로 바뀐다.
+    click_sel(vcx, "admin-workflow-repo-chip-1");
+    vcx.update(|_, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.setup_script.read(cx).value().as_str(), "cargo check");
+        assert_eq!(
+            form.archive_script.read(cx).value().as_str(),
+            "./cleanup-b.sh"
+        );
+    });
+    assert!(vcx.debug_bounds("admin-worktree-symlinks-empty").is_some());
+
+    // 다시 repo-a 칩을 클릭하면 심볼릭 링크 칩 2개가 나타나고 × 버튼으로 제거할 수 있다.
+    click_sel(vcx, "admin-workflow-repo-chip-0");
+    assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
+    assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
+    click_sel(vcx, "admin-symlink-remove-0");
+    let store = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
+    assert_eq!(store.symlinks_for(&repo_a), vec!["node_modules".to_owned()]);
+
+    // 3) 빠른 명령(Quick Commands) 추가·수정·삭제
+    assert!(vcx.debug_bounds("admin-qc-card").is_some());
+    assert!(vcx.debug_bounds("admin-qc-empty").is_some());
+    vcx.update(|window, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        let name_inp = form.qc_name.clone();
+        let text_inp = form.qc_text.clone();
+        name_inp.update(cx, |inp, cx| inp.set_value("상태 확인", window, cx));
+        text_inp.update(cx, |inp, cx| inp.set_value("git status -sb", window, cx));
+    });
+    click_sel(vcx, "admin-qc-add");
+    assert!(vcx.debug_bounds("admin-qc-row-0").is_some());
+    assert!(vcx.debug_bounds("admin-qc-edit-0").is_some());
+    assert!(vcx.debug_bounds("admin-qc-remove-0").is_some());
+    vcx.update(|_, cx| {
+        let cmds = &current(cx).quick_commands;
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name, "상태 확인");
+        assert_eq!(cmds[0].text, "git status -sb");
+    });
+
+    click_sel(vcx, "admin-qc-edit-0");
+    assert!(vcx.debug_bounds("admin-qc-cancel").is_some());
+    vcx.update(|window, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.qc_editing, Some(0));
+        assert_eq!(form.qc_name.read(cx).value().as_str(), "상태 확인");
+        let text_inp = form.qc_text.clone();
+        text_inp.update(cx, |inp, cx| inp.set_value("git status", window, cx));
+    });
+    click_sel(vcx, "admin-qc-add");
+    assert!(vcx.debug_bounds("admin-qc-cancel").is_none());
+    vcx.update(|_, cx| {
+        let cmds = &current(cx).quick_commands;
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].text, "git status");
+    });
+
+    click_sel(vcx, "admin-qc-remove-0");
+    assert!(vcx.debug_bounds("admin-qc-empty").is_some());
+    vcx.update(|_, cx| assert!(current(cx).quick_commands.is_empty()));
+
+    // 4) 완료 웹훅 배지+URL 표시 및 추가·검증·삭제 ({:?} [redacted] 노출 금지)
+    assert!(vcx.debug_bounds("admin-webhooks-card").is_some());
+    assert!(vcx.debug_bounds("admin-webhooks-empty").is_some());
+    vcx.update(|window, cx| {
+        let url_inp = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .webhook_url
+            .clone();
+        url_inp.update(cx, |inp, cx| inp.set_value("invalid-url", window, cx));
+    });
+    click_sel(vcx, "admin-webhook-add");
+    assert!(vcx.debug_bounds("admin-webhook-error").is_some());
+
+    let discord_url = "https://discord.com/api/webhooks/12345/token-abc";
+    vcx.update(|window, cx| {
+        let url_inp = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .webhook_url
+            .clone();
+        url_inp.update(cx, |inp, cx| inp.set_value(discord_url, window, cx));
+    });
+    click_sel(vcx, "admin-webhook-add");
+    assert!(vcx.debug_bounds("admin-webhook-error").is_none());
+    assert!(vcx.debug_bounds("admin-webhook-row-0").is_some());
+    assert!(vcx.debug_bounds("admin-webhook-badge-0").is_some());
+    assert!(vcx.debug_bounds("admin-webhook-url-0").is_some());
+    vcx.update(|_, cx| {
+        let hooks = &current(cx).webhooks;
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].provider_badge(), "Discord");
+        assert_eq!(hooks[0].url(), discord_url);
+        assert!(!hooks[0].url().contains("[redacted]"));
+    });
+
+    // 5) 예약 작업 활성/일시정지 Switch 및 좁은 창(820px) 경계 검증
+    click_sel(vcx, "admin-schedule-add");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_schedule_modal_values(
+                "nightly-check",
+                "0 3 * * *",
+                &repo_a,
+                "/bin/echo ok",
+                "",
+                "",
+                krill_proto::schedule::WorkspaceMode::Reuse,
+                window,
+                cx,
+            );
+        });
+    });
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(
+        vcx.debug_bounds("admin-schedule-row-nightly-check")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-schedule-status-nightly-check")
+            .is_some()
+    );
+    let sw_bounds = vcx
+        .debug_bounds("admin-schedule-toggle-nightly-check")
+        .expect("schedule switch");
+    assert_eq!(sw_bounds.size.width, crate::ui::SWITCH_WIDTH);
+    assert_eq!(sw_bounds.size.height, crate::ui::SWITCH_HEIGHT);
+
+    click_sel(vcx, "admin-schedule-toggle-nightly-check");
+    assert!(!Schedules::load(&d).unwrap().schedule[0].enabled);
+    click_sel(vcx, "admin-schedule-toggle-nightly-check");
+    assert!(Schedules::load(&d).unwrap().schedule[0].enabled);
+
+    // 좁은 창(820px)에서도 카드 및 예약 작업 행 우측 버튼이 부모 우측 경계를 넘어가지 않는다.
+    vcx.simulate_resize(size(px(820.), px(6000.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let col_b = vcx.debug_bounds("admin-content-column").unwrap();
+    for card_sel in [
+        "admin-workflow-repo-card",
+        "admin-worktree-symlinks-card",
+        "admin-repo-hooks-card",
+        "admin-schedules-card",
+        "admin-qc-card",
+        "admin-webhooks-card",
+    ] {
+        let cb = vcx.debug_bounds(card_sel).unwrap();
+        assert!(
+            cb.right() <= col_b.right() + px(0.5),
+            "workflow card {card_sel} ({cb:?}) overflowed column ({col_b:?})"
+        );
+    }
+    let sched_row_b = vcx
+        .debug_bounds("admin-schedule-row-nightly-check")
+        .unwrap();
+    for ctrl_sel in [
+        "admin-schedule-toggle-nightly-check",
+        "admin-schedule-run-now-nightly-check",
+        "admin-schedule-edit-nightly-check",
+        "admin-schedule-remove-nightly-check",
+    ] {
+        let b = vcx.debug_bounds(ctrl_sel).unwrap();
+        assert!(
+            b.right() <= sched_row_b.right() + px(0.5),
+            "schedule control {ctrl_sel} ({b:?}) overflowed row ({sched_row_b:?})"
+        );
+    }
+
+    click_sel(vcx, "admin-webhook-remove-0");
+    assert!(vcx.debug_bounds("admin-webhooks-empty").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
