@@ -133,6 +133,8 @@ fn permission_capabilities_and_self_target_guard_behave_as_expected() {
     assert_eq!(caps[1].status, "denied");
 
     assert!(verify_not_self_targeted("Krill", Some("dev.krill.app")).is_err());
+    assert!(verify_not_self_targeted("krill-app", Some("dev.krill.app")).is_err());
+    assert!(verify_not_self_targeted("krill-app", None).is_ok());
     assert!(verify_not_self_targeted("Calculator", Some("com.apple.calculator")).is_ok());
 
     let summary = AppSummary {
