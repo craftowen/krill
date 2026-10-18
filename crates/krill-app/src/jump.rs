@@ -99,22 +99,144 @@ fn score(query: &[char], text: &[char]) -> Option<u32> {
     Some(total)
 }
 
-/// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 입력 대기 세션 먼저, 그다음 원래 순서. 공백은 무시한다.
-pub fn search(items: &[Item], query: &str) -> Vec<usize> {
+/// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 `boost`가 참인 항목 먼저, 그다음 원래 순서. 공백은 무시한다.
+fn rank(all: &[&[char]], boost: &[bool], query: &str) -> Vec<usize> {
     let query: Vec<char> = query
         .chars()
         .filter(|c| !c.is_whitespace())
         .flat_map(char::to_lowercase)
         .collect();
-    let mut hits: Vec<_> = items
+    let mut hits: Vec<_> = all
         .iter()
         .enumerate()
-        .filter_map(|(i, item)| {
-            score(&query, &item.chars).map(|s| (Reverse(s), !item.needs_you, i))
+        .filter_map(|(i, text)| {
+            score(&query, text).map(|s| (Reverse(s), !boost.get(i).copied().unwrap_or(false), i))
         })
         .collect();
     hits.sort_unstable();
     hits.into_iter().map(|(_, _, i)| i).collect()
+}
+
+/// 일치하는 항목의 인덱스. 점수 높은 순, 같으면 입력 대기 세션 먼저, 그다음 원래 순서. 공백은 무시한다.
+pub fn search(items: &[Item], query: &str) -> Vec<usize> {
+    let all: Vec<&[char]> = items.iter().map(|item| item.chars.as_slice()).collect();
+    let boost: Vec<bool> = items.iter().map(|item| item.needs_you).collect();
+    rank(&all, &boost, query)
+}
+
+fn lower_chars(text: &str) -> Vec<char> {
+    text.chars().flat_map(char::to_lowercase).collect()
+}
+
+/// Jump 팔레트의 워크트리 한 줄(OWE-865): 세션이 열린 워크트리(열기)와
+/// 아직 세션이 없는 워크트리·폴더(새 세션 만들기)를 함께 검색한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: std::path::PathBuf,
+    pub label: String,
+    pub detail: Option<String>,
+    pub session: Option<SessionId>,
+    chars: Vec<char>,
+}
+
+impl WorktreeEntry {
+    pub fn new(
+        path: std::path::PathBuf,
+        label: String,
+        detail: Option<String>,
+        session: Option<SessionId>,
+    ) -> Self {
+        let chars = lower_chars(&format!("{label} {}", path.display()));
+        Self {
+            path,
+            label,
+            detail,
+            session,
+            chars,
+        }
+    }
+}
+
+/// 워크트리 목록에서 `query`와 일치하는 인덱스(점수 높은 순, 원래 순서는 유지).
+pub fn worktree_search(entries: &[WorktreeEntry], query: &str) -> Vec<usize> {
+    let all: Vec<&[char]> = entries.iter().map(|entry| entry.chars.as_slice()).collect();
+    rank(&all, &vec![false; entries.len()], query)
+}
+
+/// 팔레트에서 바로 실행하는 빠른 액션(OWE-865). `QuickCommand`는 설정의
+/// `quick_commands` 목록 인덱스를 가리킨다(팔레트가 닫히면 무효).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionKind {
+    NewWorktree,
+    NewTab,
+    SplitRight,
+    SplitDown,
+    OpenSettings,
+    ToggleSidebar,
+    ToggleExplorer,
+    ToggleSearch,
+    QuickCommand(usize),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionEntry {
+    pub kind: ActionKind,
+    pub label: String,
+    chars: Vec<char>,
+}
+
+impl ActionEntry {
+    pub fn new(kind: ActionKind, label: String) -> Self {
+        let chars = lower_chars(&label);
+        Self { kind, label, chars }
+    }
+}
+
+/// 빠른 액션 목록에서 `query`와 일치하는 인덱스(점수 높은 순, 원래 순서는 유지).
+pub fn action_search(actions: &[ActionEntry], query: &str) -> Vec<usize> {
+    let all: Vec<&[char]> = actions
+        .iter()
+        .map(|action| action.chars.as_slice())
+        .collect();
+    rank(&all, &vec![false; actions.len()], query)
+}
+
+/// 팔레트 진입점별 섹션 순서(OWE-865): ⌘J는 세션부터, ⇧⌘P는 액션부터 보여준다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    #[default]
+    Jump,
+    Commands,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Section {
+    Sessions,
+    Worktrees,
+    Actions,
+    QuickCommands,
+    Vault,
+}
+
+impl Mode {
+    fn sections(self) -> [Section; 5] {
+        match self {
+            Mode::Jump => [
+                Section::Sessions,
+                Section::Worktrees,
+                Section::Actions,
+                Section::QuickCommands,
+                Section::Vault,
+            ],
+            Mode::Commands => [
+                Section::Actions,
+                Section::QuickCommands,
+                Section::Sessions,
+                Section::Worktrees,
+                Section::Vault,
+            ],
+        }
+    }
 }
 
 fn normalize_path(path: &str) -> String {
@@ -201,14 +323,28 @@ fn filter_vault(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     Confirm(SessionId),
+    /// 세션 없는 `worktrees` 목록 인덱스: 새 세션을 만든다.
+    /// (세션이 있는 항목은 [`Event::Confirm`]으로 나간다.)
+    OpenWorktree(usize),
+    /// 빠른 액션 실행(빠른 명령은 설정 목록 인덱스).
+    Action(ActionKind),
     ResumeVault(usize),
     Dismiss,
 }
 
 pub struct Palette {
     language: crate::i18n::Language,
+    mode: Mode,
+    /// 입력칸에 지금 들어 있는 플레이스홀더의 모드(언어·모드 변경 때 다시 맞춘다).
+    placeholder_mode: Mode,
     items: Vec<Item>,
     matches: Vec<usize>,
+    worktrees: Vec<WorktreeEntry>,
+    worktree_matches: Vec<usize>,
+    actions: Vec<ActionEntry>,
+    action_matches: Vec<usize>,
+    quick_commands: Vec<crate::commands::QuickCommand>,
+    quick_matches: Vec<usize>,
     vault_hits: Vec<VaultHit>,
     vault_matches: Vec<usize>,
     scope: VaultScope,
@@ -246,6 +382,7 @@ impl Palette {
             if *value != p.query {
                 p.query = value.to_string();
                 p.matches = search(&p.items, &p.query);
+                p.recompute_entry_matches();
                 p.recompute_vault_matches();
                 p.selected = 0;
                 p.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
@@ -263,7 +400,15 @@ impl Palette {
         });
         Self {
             language: crate::i18n::language(),
+            mode: Mode::Jump,
+            placeholder_mode: Mode::Jump,
             matches: search(&items, ""),
+            worktrees: Vec::new(),
+            worktree_matches: Vec::new(),
+            actions: Vec::new(),
+            action_matches: Vec::new(),
+            quick_commands: Vec::new(),
+            quick_matches: Vec::new(),
             items,
             vault_hits: Vec::new(),
             vault_matches: Vec::new(),
@@ -419,7 +564,11 @@ impl Palette {
             self.workspace_path.as_deref(),
             &self.project_paths,
         );
-        let total = self.matches.len() + self.vault_matches.len();
+        self.clamp_selected();
+    }
+
+    fn clamp_selected(&mut self) {
+        let total = self.row_count();
         if total == 0 {
             self.selected = 0;
         } else if self.selected >= total {
@@ -427,8 +576,28 @@ impl Palette {
         }
     }
 
+    /// 검색어가 바뀌면 워크트리·액션·빠른 명령 일치 목록도 다시 고른다.
+    fn recompute_entry_matches(&mut self) {
+        self.worktree_matches = worktree_search(&self.worktrees, &self.query);
+        self.action_matches = action_search(&self.actions, &self.query);
+        let all: Vec<Vec<char>> = self
+            .quick_commands
+            .iter()
+            .map(|c| lower_chars(&format!("{} {}", c.name, c.text)))
+            .collect();
+        let refs: Vec<&[char]> = all.iter().map(Vec::as_slice).collect();
+        self.quick_matches = rank(&refs, &vec![false; all.len()], &self.query);
+        self.clamp_selected();
+    }
+
     pub fn set_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
-        let selected = self.matches().nth(self.selected).map(|item| item.id);
+        // 절대 행 번호에서 세션 위치만 살린다(Commands 모드에서는 세션이 뒤에 있다).
+        let selected = self
+            .row_at(self.selected)
+            .filter(|(section, _)| *section == Section::Sessions)
+            .and_then(|(_, pos)| self.matches.get(pos))
+            .and_then(|&i| self.items.get(i))
+            .map(|item| item.id);
         self.items = items;
         self.matches = search(&self.items, &self.query);
         let selected_index = self
@@ -443,15 +612,124 @@ impl Palette {
         &self.input
     }
 
+    #[must_use]
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn set_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
+        if self.mode != mode {
+            self.mode = mode;
+            self.selected = 0;
+            self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
+            cx.notify();
+        }
+    }
+
+    pub fn set_worktrees(&mut self, worktrees: Vec<WorktreeEntry>, cx: &mut Context<Self>) {
+        self.worktrees = worktrees;
+        self.recompute_entry_matches();
+        cx.notify();
+    }
+
+    pub fn set_actions(&mut self, actions: Vec<ActionEntry>, cx: &mut Context<Self>) {
+        self.actions = actions;
+        self.recompute_entry_matches();
+        cx.notify();
+    }
+
+    pub fn set_quick_commands(
+        &mut self,
+        quick_commands: Vec<crate::commands::QuickCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        self.quick_commands = quick_commands;
+        self.recompute_entry_matches();
+        cx.notify();
+    }
+
+    /// 지금 필터에 일치하는 워크트리 항목.
+    pub fn worktree_matches(&self) -> impl Iterator<Item = &WorktreeEntry> {
+        self.worktree_matches
+            .iter()
+            .filter_map(|&i| self.worktrees.get(i))
+    }
+
+    #[must_use]
+    pub fn worktree_entry(&self, index: usize) -> Option<&WorktreeEntry> {
+        self.worktrees.get(index)
+    }
+
+    /// 지금 필터에 일치하는 빠른 액션.
+    pub fn action_matches(&self) -> impl Iterator<Item = &ActionEntry> {
+        self.action_matches
+            .iter()
+            .filter_map(|&i| self.actions.get(i))
+    }
+
+    /// 지금 필터에 일치하는 빠른 명령.
+    pub fn quick_matches(&self) -> impl Iterator<Item = &crate::commands::QuickCommand> {
+        self.quick_matches
+            .iter()
+            .filter_map(|&i| self.quick_commands.get(i))
+    }
+
+    fn section_len(&self, section: Section) -> usize {
+        match section {
+            Section::Sessions => self.matches.len(),
+            Section::Worktrees => self.worktree_matches.len(),
+            Section::Actions => self.action_matches.len(),
+            Section::QuickCommands => self.quick_matches.len(),
+            Section::Vault => self.vault_matches.len(),
+        }
+    }
+
+    /// 볼트까지 합친 전체 행 수(↑↓ 이동·Enter·⌘1~9 즉시 선택 범위).
+    #[must_use]
+    pub fn row_count(&self) -> usize {
+        self.mode
+            .sections()
+            .iter()
+            .map(|s| self.section_len(*s))
+            .sum()
+    }
+
+    /// 절대 행 번호를 (섹션, 섹션 안 위치)로 푼다.
+    fn row_at(&self, mut row: usize) -> Option<(Section, usize)> {
+        for section in self.mode.sections() {
+            let len = self.section_len(section);
+            if row < len {
+                return Some((section, row));
+            }
+            row -= len;
+        }
+        None
+    }
+
+    /// 섹션 시작 행(렌더·클릭에서 절대 행 번호를 구할 때).
+    fn section_base(&self, section: Section) -> usize {
+        let mut base = 0;
+        for s in self.mode.sections() {
+            if s == section {
+                return base;
+            }
+            base += self.section_len(s);
+        }
+        base
+    }
+
     fn step(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let total = self.matches.len() + self.vault_matches.len();
+        let total = self.row_count();
         if total == 0 {
             self.selected = 0;
             return;
         }
         let last = total.saturating_sub(1);
         self.selected = self.selected.saturating_add_signed(delta).min(last);
-        if self.selected < self.matches.len() {
+        if self
+            .row_at(self.selected)
+            .is_some_and(|(s, _)| s != Section::Vault)
+        {
             self.scroll
                 .scroll_to_item(self.selected, gpui::ScrollStrategy::Center);
         }
@@ -459,14 +737,57 @@ impl Palette {
     }
 
     fn confirm(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = self.matches().nth(self.selected) {
-            cx.emit(Event::Confirm(item.id));
-        } else if let Some(&vault_idx) = self
-            .vault_matches
-            .get(self.selected.saturating_sub(self.matches.len()))
-        {
-            cx.emit(Event::ResumeVault(vault_idx));
+        match self.row_at(self.selected) {
+            Some((Section::Sessions, pos)) => {
+                if let Some(item) = self.matches.get(pos).and_then(|&i| self.items.get(i)) {
+                    cx.emit(Event::Confirm(item.id));
+                }
+            }
+            Some((Section::Worktrees, pos)) => {
+                if let Some(&index) = self.worktree_matches.get(pos)
+                    && let Some(entry) = self.worktrees.get(index)
+                {
+                    // 세션이 이미 있으면 세션 행과 똑같이 열기만 한다.
+                    if let Some(id) = entry.session {
+                        cx.emit(Event::Confirm(id));
+                    } else {
+                        cx.emit(Event::OpenWorktree(index));
+                    }
+                }
+            }
+            Some((Section::Actions, pos)) => {
+                if let Some(kind) = self
+                    .action_matches
+                    .get(pos)
+                    .and_then(|&i| self.actions.get(i))
+                    .map(|a| a.kind)
+                {
+                    cx.emit(Event::Action(kind));
+                }
+            }
+            Some((Section::QuickCommands, pos)) => {
+                if let Some(&index) = self.quick_matches.get(pos) {
+                    cx.emit(Event::Action(ActionKind::QuickCommand(index)));
+                }
+            }
+            Some((Section::Vault, pos)) => {
+                if let Some(&vault_idx) = self.vault_matches.get(pos) {
+                    cx.emit(Event::ResumeVault(vault_idx));
+                }
+            }
+            None => {}
         }
+    }
+
+    /// OWE-865: ⌘1~9 행 즉시 선택(Orca digitShortcut). 존재하는 행이면
+    /// 선택 후 바로 실행하고 true를 돌려준다.
+    pub fn jump_to_row(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        if self.row_at(row).is_none() {
+            return false;
+        }
+        self.selected = row;
+        self.confirm(cx);
+        true
     }
 }
 
@@ -492,10 +813,15 @@ fn render_vault_highlight(text_str: &str, query: &str, p: &crate::ui::Palette) -
 
 impl Render for Palette {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if self.language != crate::i18n::language() {
+        if self.language != crate::i18n::language() || self.placeholder_mode != self.mode {
             self.language = crate::i18n::language();
+            self.placeholder_mode = self.mode;
+            let holder = match self.mode {
+                Mode::Jump => text::PLACEHOLDER.get(),
+                Mode::Commands => text::PLACEHOLDER_COMMANDS.get(),
+            };
             self.input.update(cx, |input, cx| {
-                input.set_placeholder(text::PLACEHOLDER.get(), window, cx);
+                input.set_placeholder(holder, window, cx);
             });
         }
         let pal = crate::ui::palette(cx);
@@ -508,6 +834,8 @@ impl Render for Palette {
             pal.muted_foreground,
         );
         let rows = self.matches.len();
+        // Commands 모드에서는 세션 섹션이 뒤에 오므로 하이라이트·클릭에 절대 행 번호를 쓴다.
+        let session_base = self.section_base(Section::Sessions);
         #[expect(
             clippy::cast_precision_loss,
             reason = "VISIBLE_ROWS 이하라 정확히 표현된다"
@@ -533,7 +861,7 @@ impl Render for Palette {
                                 .cursor_pointer()
                                 .text_size(crate::ui::TEXT_SM)
                                 .text_color(fg)
-                                .when(i == p.selected, |d| d.bg(accent))
+                                .when(session_base + i == p.selected, |d| d.bg(accent))
                                 .child(
                                     div()
                                         .text_size(crate::ui::TEXT_2XS)
@@ -543,7 +871,7 @@ impl Render for Palette {
                                 )
                                 .child(div().flex_1().truncate().child(item.label.clone()))
                                 .on_click(cx.listener(move |p, _, _, cx| {
-                                    p.selected = i;
+                                    p.selected = session_base + i;
                                     p.confirm(cx);
                                 })),
                         )
@@ -553,6 +881,157 @@ impl Render for Palette {
         )
         .track_scroll(&self.scroll)
         .h(px(height));
+
+        // OWE-865: 세션 밖 워크트리·빠른 액션·빠른 명령 섹션. 세션 목록과 같은
+        // 28px 행에 선택 강조·클릭 실행을 맞추고, 길어지면 볼트처럼 안에서 스크롤한다.
+        let header = |label: &str| {
+            div()
+                .px_2()
+                .pt_1()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(muted)
+                .child(label.to_owned())
+        };
+        let worktree_base = self.section_base(Section::Worktrees);
+        let worktree_rows: Vec<gpui::Stateful<gpui::Div>> = self
+            .worktree_matches
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &index)| {
+                let entry = self.worktrees.get(index)?;
+                let row_index = worktree_base + pos;
+                let is_selected = self.selected == row_index;
+                let mut row = div()
+                    .id(("jump-worktree", index))
+                    .debug_selector(move || format!("jump-worktree-{index}"))
+                    .h(px(ROW_HEIGHT))
+                    .px_2()
+                    .rounded(crate::ui::RADIUS_XS)
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .overflow_hidden()
+                    .cursor_pointer()
+                    .text_size(crate::ui::TEXT_SM)
+                    .text_color(fg)
+                    .when(is_selected, |d| d.bg(accent))
+                    .child(div().flex_1().truncate().child(entry.label.clone()));
+                if entry.session.is_none() {
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::ui::TEXT_2XS)
+                            .text_color(muted)
+                            .child(text::WORKTREE_NEW.get()),
+                    );
+                }
+                Some(row.on_click(cx.listener(move |p, _, _, cx| {
+                    p.selected = row_index;
+                    p.confirm(cx);
+                })))
+            })
+            .collect();
+        let worktree_section = (!self.worktree_matches.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(header(text::SECTION_WORKTREES.get()))
+                .child(
+                    div()
+                        .id("jump-worktree-list")
+                        .flex()
+                        .flex_col()
+                        .max_h(px(ROW_HEIGHT * 6.))
+                        .overflow_y_scroll()
+                        .children(worktree_rows),
+                )
+        });
+        let action_base = self.section_base(Section::Actions);
+        let action_rows: Vec<gpui::Stateful<gpui::Div>> = self
+            .action_matches
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &index)| {
+                let action = self.actions.get(index)?;
+                let row_index = action_base + pos;
+                let is_selected = self.selected == row_index;
+                Some(
+                    div()
+                        .id(("jump-action", index))
+                        .debug_selector(move || format!("jump-action-{index}"))
+                        .h(px(ROW_HEIGHT))
+                        .px_2()
+                        .rounded(crate::ui::RADIUS_XS)
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .text_size(crate::ui::TEXT_SM)
+                        .text_color(fg)
+                        .when(is_selected, |d| d.bg(accent))
+                        .child(div().flex_1().truncate().child(action.label.clone()))
+                        .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selected = row_index;
+                            p.confirm(cx);
+                        })),
+                )
+            })
+            .collect();
+        let action_section = (!self.action_matches.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(header(text::SECTION_ACTIONS.get()))
+                .children(action_rows)
+        });
+        let quick_base = self.section_base(Section::QuickCommands);
+        let quick_rows: Vec<gpui::Stateful<gpui::Div>> = self
+            .quick_matches
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &index)| {
+                let command = self.quick_commands.get(index)?;
+                let row_index = quick_base + pos;
+                let is_selected = self.selected == row_index;
+                Some(
+                    div()
+                        .id(("jump-quick-command", index))
+                        .debug_selector(move || format!("jump-quick-command-{index}"))
+                        .h(px(ROW_HEIGHT))
+                        .px_2()
+                        .rounded(crate::ui::RADIUS_XS)
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .text_size(crate::ui::TEXT_SM)
+                        .text_color(fg)
+                        .when(is_selected, |d| d.bg(accent))
+                        .child(div().flex_1().truncate().child(command.name.clone()))
+                        .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selected = row_index;
+                            p.confirm(cx);
+                        })),
+                )
+            })
+            .collect();
+        let quick_section = (!self.quick_matches.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(header(text::SECTION_QUICK_COMMANDS.get()))
+                .child(
+                    div()
+                        .id("jump-quick-command-list")
+                        .flex()
+                        .flex_col()
+                        .max_h(px(ROW_HEIGHT * 6.))
+                        .overflow_y_scroll()
+                        .children(quick_rows),
+                )
+        });
 
         let show_vault = !self.vault_hits.is_empty()
             || self.scope != VaultScope::All
@@ -646,9 +1125,11 @@ impl Render for Palette {
                 .max_h(px(ROW_HEIGHT * 6.))
                 .overflow_y_scroll()
                 .text_size(crate::ui::TEXT_XS);
+            // 볼트 행의 절대 번호(워크트리·액션·빠른 명령이 앞에 올 수 있다).
+            let vault_base = self.section_base(Section::Vault);
             for (vault_pos, &hit_idx) in self.vault_matches.iter().enumerate() {
                 if let Some(hit) = self.vault_hits.get(hit_idx) {
-                    let row_index = rows + vault_pos;
+                    let row_index = vault_base + vault_pos;
                     let is_selected = self.selected == row_index;
                     let title = if hit.title.is_empty() {
                         format!("{} · {}", hit.agent.profile(), hit.id)
@@ -713,7 +1194,7 @@ impl Render for Palette {
         });
 
         // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc 처리를 대신한다.
-        let palette = div()
+        let mut palette = div()
             .w(crate::ui::COMMAND_PALETTE_WIDTH)
             .p_2()
             .flex()
@@ -742,18 +1223,35 @@ impl Render for Palette {
                 cx.emit(Event::Dismiss);
             }))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Dismiss)))
-            .child(Input::new(&self.input))
-            .when(rows == 0 && self.vault_matches.is_empty(), |d| {
-                d.child(
-                    div()
-                        .p_2()
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(muted)
-                        .child(text::EMPTY.get()),
-                )
-            })
-            .child(list)
-            .children(vault_section);
+            .child(Input::new(&self.input));
+        if self.row_count() == 0 {
+            palette = palette.child(
+                div()
+                    .p_2()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(muted)
+                    .child(text::EMPTY.get()),
+            );
+        }
+        // OWE-865: ⇧⌘P 명령 팔레트에서는 액션부터, ⌘J에서는 세션부터 보여준다.
+        match self.mode {
+            Mode::Commands => {
+                palette = palette
+                    .children(action_section)
+                    .children(quick_section)
+                    .child(list)
+                    .children(worktree_section)
+                    .children(vault_section);
+            }
+            Mode::Jump => {
+                palette = palette
+                    .child(list)
+                    .children(worktree_section)
+                    .children(action_section)
+                    .children(quick_section)
+                    .children(vault_section);
+            }
+        }
         deferred(
             div()
                 .absolute()
