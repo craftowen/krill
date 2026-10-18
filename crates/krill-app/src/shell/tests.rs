@@ -6643,3 +6643,54 @@ fn file_tab_context_menu_copies_paths(cx: &mut TestAppContext) {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// OWE-903: 짝짓기는 별도 OS 창 대신 메인 창 안 모달로 뜨고, Esc로 닫힌다(창은 유지).
+#[gpui::test]
+fn owe903_pairing_opens_as_in_window_modal(cx: &mut TestAppContext) {
+    let (_view, cx) = open(cx, state_path("owe903-pairing"));
+    cx.run_until_parked();
+    cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1, "no separate pairing window");
+    assert!(cx.debug_bounds("link-pairing-modal").is_some());
+    assert!(cx.debug_bounds("link-pairing-view").is_some());
+    assert!(cx.debug_bounds("link-server-panel").is_some());
+    // 두 번 열어도 모달은 하나다.
+    cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1);
+    assert!(cx.debug_bounds("link-pairing-modal").is_some());
+    // Esc = 모달만 닫고 메인 창은 남는다.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("link-pairing-modal").is_none());
+    assert_eq!(cx.windows().len(), 1);
+}
+
+/// OWE-903: 온보딩 점검은 별도 OS 창 대신 메인 창 안 모달로 뜨고, Esc로 닫힌다.
+#[gpui::test]
+fn owe903_onboarding_checks_open_as_in_window_modal(cx: &mut TestAppContext) {
+    let (_view, cx) = open(cx, state_path("owe903-onboarding"));
+    cx.run_until_parked();
+    let root = std::env::temp_dir().join(format!("mk-owe903-onboarding-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let env = krill_app::onboarding::Env {
+        shell: "/bin/sh".into(),
+        krill: root.join("krill"),
+        state: root.join("state"),
+        home: root.clone(),
+        state_overridden: true,
+    };
+    cx.update(|_, cx| krill_app::onboarding::open_checks(&env, cx));
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1, "no separate onboarding window");
+    assert!(cx.debug_bounds("onboarding-wizard").is_some());
+    assert!(cx.debug_bounds("wizard-header").is_some());
+    // Esc = 모달만 닫고 메인 창은 남는다.
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("onboarding-wizard").is_none());
+    assert_eq!(cx.windows().len(), 1);
+    std::fs::remove_dir_all(&root).ok();
+}

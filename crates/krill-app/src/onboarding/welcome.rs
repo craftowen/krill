@@ -1,4 +1,4 @@
-//! 온보딩 창(MK-161, OWE-714): 첫 실행 1장 + 설정 점검 화면을 한 창이 맡는다.
+//! 온보딩 모달(MK-161, OWE-714, OWE-903): 첫 실행 1장 + 설정 점검 화면을 한 모달이 맡는다.
 //!
 //! - 첫 실행(동의 단계)은 1장이다. 짧은 동의(요약 3줄 + 자세히 보기), 감지된 기본 에이전트,
 //!   [시작하기]. 체크리스트는 보여 주지 않는다. 시작하면 동의를 기록하고 완료로 저장한 뒤
@@ -6,16 +6,19 @@
 //! - 점검 화면(설정 > 일반 > 설정 점검 재진입, 필수 실패)은 staged `krill doctor --json
 //!   --no-start` + `app.*`를 등급별 카드로 보여 준다. 행 오른쪽에 조치 버튼과 펼침 chevron,
 //!   고정 헤더(제목·요약·모두 다시 검사)와 고정 푸터(닫기). 창 재포커스 재검사(1초 디바운스).
-//! - Enter = 주 버튼, Esc = 나중에/닫기. 창은 680×620 고정(크기 조절·최소화 없음).
+//! - Enter = 주 버튼, Esc = 나중에/닫기. 별도 OS 창 대신 메인 창 안 `ui::modal_backdrop`
+//!   중앙 모달(`SETTINGS_MODAL_WIDTH`)로 뜨며, 닫기는 [`Event::Close`]로 호스트(`Shell`)에
+//!   알린다(OWE-903).
+//!
+//! 호스트가 없는 테스트에서는 [`Event::Close`]를 구독한 테스트 호스트가 창을 닫는다.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext as _, Bounds, ClipboardItem, Context, Entity, FocusHandle, KeyDownEvent,
-    Render, Subscription, Task, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div,
-    prelude::*, px, size,
+    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent,
+    Render, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
@@ -41,14 +44,19 @@ const FOLDER_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// 알림 재조회 상한.
 const NOTIFICATION_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
-/// 창 크기(고정). Orca 온보딩 모달 비율에 맞춘 값이다.
-pub(super) const WINDOW_SIZE: (f32, f32) = (680., 620.);
 
 actions!(welcome, [CloseWizard]);
 
-/// 마법사 창의 키 컨텍스트. 별도 OS 창에서도 macOS 표준 ⌘W 닫기를 받는다(OWE-878).
+/// 마법사 모달의 키 컨텍스트. 메인 창 안 모달에서도 macOS 표준 ⌘W 닫기를 받는다(OWE-878).
 /// Esc는 기존 `on_key_down` 처리가 맡는다.
 pub(super) const KEY_CONTEXT: &str = "Wizard";
+
+/// 마법사 모달이 외부(호스트 `Shell`)로 알리는 이벤트. 모달은 OS 창을 직접 닫지 않는다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Event {
+    /// 모달을 닫는다([나중에]/[닫기]·Esc·⌘W·바깥 클릭·[시작하기] 완료).
+    Close,
+}
 
 /// 점검 행의 hook 설치 진행 상태. 없으면 대기다.
 #[derive(Debug, Clone)]
@@ -75,7 +83,7 @@ enum Fix {
     Link,
 }
 
-pub(super) struct Wizard {
+pub struct Wizard {
     pub(super) env: Env,
     pub(super) step: Step,
     /// 기존 완료 사용자의 재동의(MK-127). 기본 에이전트를 묻지 않고 동의만 기록한다.
@@ -118,58 +126,7 @@ impl std::fmt::Debug for Wizard {
     }
 }
 
-/// 온보딩 창을 연다. 수집은 백그라운드에서 바로 시작한다.
-pub(super) fn open(env: &Env, start: Step, consent_only: bool, cx: &mut App) {
-    let options = window_options(cx);
-    let opened = cx.open_window(options, |window, cx| {
-        let view = cx.new(|cx| Wizard::new(env.clone(), start, consent_only, cx));
-        view.update(cx, |w, cx| {
-            w.mount_consent(cx);
-            let sub = cx.observe_window_activation(window, |w, window, cx| {
-                if window.is_window_active() {
-                    w.activated(cx);
-                }
-            });
-            w.activation = Some(sub);
-        });
-        let focus = view.read(cx).focus.clone();
-        window.focus(&focus, cx);
-        view
-    });
-    match opened {
-        Ok(handle) => {
-            handle
-                .update(cx, |w, _window, cx| {
-                    w.begin_collect(cx);
-                })
-                .ok();
-        }
-        Err(_) => {
-            tracing::warn!("onboarding wizard window creation failed");
-        }
-    }
-}
-
-/// 고정 크기 창(OWE-714 (8): 첫 실행에 화면 전체 크기로 뜨던 결함). 크기 조절을 끄면
-/// macOS 확대(초록) 버튼도 꺼진다.
-pub(super) fn window_options(cx: &App) -> WindowOptions {
-    let (w, h) = WINDOW_SIZE;
-    WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-            None,
-            size(px(w), px(h)),
-            cx,
-        ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(text::TITLE.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(ui::TRAFFIC_LIGHT_INSET),
-        }),
-        is_resizable: false,
-        is_minimizable: false,
-        ..Default::default()
-    }
-}
+impl EventEmitter<Event> for Wizard {}
 
 /// 필수 실패 행.
 fn required_blockers(checks: &[Check]) -> Vec<&Check> {
@@ -203,7 +160,7 @@ fn pick_default_agent(detected: &[(String, String)], current: &str) -> Option<St
 }
 
 impl Wizard {
-    fn new(env: Env, step: Step, consent_only: bool, cx: &mut Context<Self>) -> Self {
+    pub fn new(env: Env, step: Step, consent_only: bool, cx: &mut Context<Self>) -> Self {
         crate::orca_import::set_env_paths(
             Some(env.home.clone()),
             None,
@@ -238,8 +195,23 @@ impl Wizard {
         }
     }
 
+    /// 창 활성화 관찰(재포커스 재검사)을 연결한다. 호스트가 모달 생성 직후 부른다.
+    pub fn observe_activation(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let sub = cx.observe_window_activation(window, |w, window, cx| {
+            if window.is_window_active() {
+                w.activated(cx);
+            }
+        });
+        self.activation = Some(sub);
+    }
+
+    /// 모달의 포커스 핸들. 호스트가 모달을 열 때 포커스를 옮긴다.
+    pub fn focus_handle(&self) -> FocusHandle {
+        self.focus.clone()
+    }
+
     /// 동의 단계면 동의 뷰를 얹는다. 체크 상태가 바뀌면 푸터 [시작하기]를 다시 그린다.
-    fn mount_consent(&mut self, cx: &mut Context<Self>) {
+    pub fn mount_consent(&mut self, cx: &mut Context<Self>) {
         if self.step != Step::Consent || self.consent.is_some() {
             return;
         }
@@ -251,7 +223,8 @@ impl Wizard {
 
     /// [시작하기]: 동의를 기록하고 완료로 저장한다. 기록이 실패해도 닫고 다음 실행에 다시 묻는다.
     /// 백그라운드 점검에 필수 실패가 있으면 닫지 않고 점검 화면으로 넘어간다.
-    fn on_consented(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// 닫기는 OS 창을 직접 닫지 않고 [`Event::Close`]로 호스트에 알린다(OWE-903).
+    fn on_consented(&mut self, cx: &mut Context<Self>) {
         if let Err(e) =
             super::consent::record_consent(&self.env.state, std::time::SystemTime::now())
         {
@@ -281,7 +254,6 @@ impl Wizard {
             // 필수 실패는 자동 준비와 재검사 뒤에도 남을 때만 막는다.
             let prepare = super::actions::auto_prepare(self.env.clone(), cx);
             let env = self.env.clone();
-            let handle = window.window_handle();
             self.busy.insert("auto-prepare".to_owned());
             self.task = Some(cx.spawn(async move |this, cx| {
                 prepare.await.ok();
@@ -298,9 +270,7 @@ impl Wizard {
                     {
                         w.step = Step::Checklist;
                     } else {
-                        handle
-                            .update(cx, |_, window, _| window.remove_window())
-                            .ok();
+                        Self::close(cx);
                     }
                     cx.notify();
                 })
@@ -313,13 +283,13 @@ impl Wizard {
             if !self.env.is_isolated_state() {
                 super::actions::auto_prepare(self.env.clone(), cx).detach();
             }
-            window.remove_window();
+            Self::close(cx);
         }
     }
 
-    /// 온보딩 다시 실행: 첫 화면부터 다시 시작한다(열려 있는 창을 재사용).
+    /// 온보딩 다시 실행: 첫 화면부터 다시 시작한다(열려 있는 모달을 재사용).
     /// 명시적 재실행은 전체 흐름이므로 `consent_only`를 끈다.
-    pub(super) fn restart_to_consent(&mut self, cx: &mut Context<Self>) {
+    pub fn restart_to_consent(&mut self, cx: &mut Context<Self>) {
         self.step = Step::Consent;
         self.consent_only = false;
         self.consent = None;
@@ -339,8 +309,8 @@ impl Wizard {
         }
     }
 
-    /// 창이 처음 열릴 때 수집 시작.
-    fn begin_collect(&mut self, cx: &mut Context<Self>) {
+    /// 모달이 처음 열릴 때 수집 시작.
+    pub fn begin_collect(&mut self, cx: &mut Context<Self>) {
         if self.checks_loading {
             return;
         }
@@ -415,8 +385,9 @@ impl Wizard {
         }));
     }
 
-    /// 창 재포커스(시스템 설정에서 돌아옴) → 디바운스 후 재검사.
-    fn activated(&mut self, cx: &mut Context<Self>) {
+    /// 모달 재포커스(시스템 설정에서 돌아옴) → 디바운스 후 재검사.
+    /// 호스트가 창 활성화를 관찰해 부른다.
+    pub fn activated(&mut self, cx: &mut Context<Self>) {
         super::actions::recheck_needed(cx).detach();
         if self.step != Step::Consent
             && !self.checks_loading
@@ -427,11 +398,17 @@ impl Wizard {
     }
 
     /// `[나중에]`/`[닫기]`(Esc). 첫 화면이면 다음 실행에 다시 묻도록 단계를 남긴다.
-    fn later(&mut self, window: &mut Window, _cx: &mut Context<Self>) {
+    /// 모달 자체는 닫지 않고 [`Event::Close`]로 호스트에 알린다(OWE-903).
+    fn later(&mut self, cx: &mut Context<Self>) {
         if self.step == Step::Consent {
             self.persist_step();
         }
-        window.remove_window();
+        Self::close(cx);
+    }
+
+    /// 모달 닫기를 호스트에 알린다.
+    fn close(cx: &mut Context<Self>) {
+        cx.emit(Event::Close);
     }
 
     /// 동의 체크박스가 체크됐나. 체크 전에는 [시작하기]·Enter가 아무 일도 하지 않는다.
@@ -440,11 +417,11 @@ impl Wizard {
     }
 
     /// 주 버튼(Enter). 첫 화면은 [시작하기](체크 전이면 무시), 점검 화면은 닫기.
-    fn primary(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn primary(&mut self, cx: &mut Context<Self>) {
         match self.step {
-            Step::Consent if self.accepted(cx) => self.on_consented(window, cx),
+            Step::Consent if self.accepted(cx) => self.on_consented(cx),
             Step::Consent => {}
-            _ => self.later(window, cx),
+            _ => self.later(cx),
         }
     }
 
@@ -978,7 +955,7 @@ impl Wizard {
                         ui::primary("consent-continue-btn", text::START_NOW.get())
                             .tooltip(text::START_HINT.get())
                             .disabled(!accepted)
-                            .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
+                            .on_click(cx.listener(|s, _, _, cx| s.primary(cx))),
                     ),
                 );
         }
@@ -1004,7 +981,7 @@ impl Wizard {
                         },
                     )
                     .tooltip(text::LATER_HINT.get())
-                    .on_click(cx.listener(|s, _, window, cx| s.later(window, cx))),
+                    .on_click(cx.listener(|s, _, _, cx| s.later(cx))),
                 ),
             )
             .child(right)
@@ -1018,8 +995,11 @@ impl Wizard {
             None => div().child(text::CHECKING.get()).into_any_element(),
         };
         let mut body = div()
+            .id("wizard-first-body")
+            .debug_selector(|| "wizard-first-body".into())
             .flex_1()
             .min_h_0()
+            .overflow_y_scroll()
             .px_6()
             .pb_4()
             .flex()
@@ -1470,59 +1450,52 @@ impl Render for Wizard {
             Step::Consent => self.render_first(cx),
             Step::Checklist | Step::Connect | Step::Done => self.render_checks(cx),
         };
-        div()
+        // OWE-903: 별도 OS 창 대신 메인 창 안 중앙 모달. 가짜 타이틀바는 그리지 않는다.
+        // 본문이 스크롤되도록 카드 높이를 고정한다(기존 고정 창 680×620 계승).
+        let card = div()
             .id("onboarding-wizard")
             .debug_selector(|| "onboarding-wizard".into())
             .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .role(gpui::Role::Dialog)
             .aria_label(text::TITLE.get())
-            .on_action(cx.listener(|this, _: &CloseWizard, window, cx| {
-                this.later(window, cx);
+            .occlude()
+            .w(ui::SETTINGS_MODAL_WIDTH)
+            .max_w(window.viewport_size().width - ui::SPACE_4 * 2.)
+            .h(window.viewport_size().height - ui::SPACE_4 * 2.)
+            .max_h(px(620.))
+            .rounded(ui::RADIUS_LG)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .flex()
+            .flex_col()
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .on_action(cx.listener(|this, _: &CloseWizard, _, cx| {
+                this.later(cx);
             }))
-            .on_key_down(cx.listener(|s, e: &KeyDownEvent, window, cx| {
+            .on_key_down(cx.listener(|s, e: &KeyDownEvent, _, cx| {
                 match e.keystroke.key.as_str() {
                     "escape" => {
                         if crate::orca_import::state(cx).is_some_and(|st| st.modal_open) {
                             crate::orca_import::close_modal(cx);
                         } else {
-                            s.later(window, cx);
+                            s.later(cx);
                         }
                     }
-                    "enter" => s.primary(window, cx),
+                    "enter" => s.primary(cx),
                     _ => return,
                 }
                 cx.stop_propagation();
             }))
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(p.background)
-            .text_color(p.foreground)
-            .font_family(ui::FONT_UI)
-            .text_size(ui::TEXT_SM)
-            .child(
-                div()
-                    .id("onboarding-titlebar")
-                    .debug_selector(|| "onboarding-titlebar".into())
-                    .h(ui::TITLEBAR_HEIGHT)
-                    .w_full()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(p.sidebar)
-                    .border_b_1()
-                    .border_color(p.border)
-                    .window_control_area(gpui::WindowControlArea::Drag)
-                    .text_size(ui::TEXT_XS)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(p.muted_foreground)
-                    .child(text::TITLE.get()),
-            )
+            .on_mouse_down_out(cx.listener(|s, _, _, cx| s.later(cx)))
             .child(self.render_header(cx))
             .child(body)
             .child(self.render_footer(cx))
-            .children(crate::orca_import::render_modal(window, cx))
+            .children(crate::orca_import::render_modal(window, cx));
+        ui::modal_backdrop(window.viewport_size(), card)
     }
 }

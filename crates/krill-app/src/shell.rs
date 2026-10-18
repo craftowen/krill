@@ -23,6 +23,7 @@ mod fit;
 mod folder;
 mod handoff;
 mod new_session;
+mod overlays;
 mod persist;
 pub(crate) mod popout;
 mod release;
@@ -493,6 +494,12 @@ pub struct Shell {
         gpui::Entity<krill_app::continue_session::Dialog>,
         Subscription,
     )>,
+    /// OWE-903 온보딩 모달(메인 창 안 `ui::modal_backdrop`).
+    onboarding: Option<overlays::OnboardingModal>,
+    /// OWE-903 짝짓기 모달(메인 창 안 `ui::modal_backdrop`).
+    pairing: Option<overlays::PairingModal>,
+    /// OWE-903 렌더에서 지연 생성할 모달 요청.
+    pending: overlays::PendingOverlays,
     /// 열린 터미널 검색 바(MK-059)와 그 이벤트 구독.
     search: Option<(gpui::Entity<krill_app::search::Bar>, Subscription)>,
     /// Resource Manager(MK-071).
@@ -842,6 +849,9 @@ impl Shell {
             jump: None,
             add_project: None,
             continue_session: None,
+            onboarding: None,
+            pairing: None,
+            pending: overlays::PendingOverlays::default(),
             search: None,
             history,
             _history_open: history_open,
@@ -873,6 +883,7 @@ impl Shell {
             nav_history: NavHistory::default(),
         };
         shell.record_workspace_nav(cx);
+        Self::register_overlay_hosts(cx);
         shell
     }
 
@@ -4320,6 +4331,8 @@ fn divider(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.window = Some(window.window_handle());
+        // OWE-903: 라이브러리에서 들어온 온보딩·짝짓기 모달 요청을 엔티티로 만든다.
+        self.open_pending_overlays(window, cx);
         // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
         // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
         // macOS 창 목록·Mission Control·접근성 트리를 복원한다.
@@ -4898,6 +4911,9 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(dialog, _)| dialog.clone()),
             )
+            // OWE-903: 온보딩·짝짓기는 메인 창 안 모달로 그린다(별도 OS 창 없음).
+            .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
+            .children(self.pairing.as_ref().map(|modal| modal.view.clone()))
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))

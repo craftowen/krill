@@ -1680,6 +1680,8 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::settings::init_at(Some(fx.state_dir.clone()), cx);
+            // OWE-903: 온보딩은 메인 창 안 모달이라 테스트 창 호스트를 등록한다.
+            crate::onboarding::register_test_window_host(cx);
         });
 
         // 1. When no Orca dir exists, render_banner returns None
