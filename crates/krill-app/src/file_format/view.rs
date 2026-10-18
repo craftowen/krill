@@ -415,7 +415,9 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
                 ))
                 .child(action(
                     "file-reveal",
-                    text::REVEAL.get(),
+                    text::REVEAL
+                        .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                        .get(),
                     super::reveal_command,
                 )),
         )

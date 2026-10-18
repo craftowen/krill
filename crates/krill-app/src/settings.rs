@@ -3139,7 +3139,12 @@ impl SettingsView {
             )
             .child(
                 row()
-                    .child(label(text::THEME.get(), text::THEME_DESC.get()))
+                    .child(label(
+                        text::THEME.get(),
+                        text::THEME_DESC
+                            .mac_or(crate::i18n::catalog::other_os::THEME_DESC)
+                            .get(),
+                    ))
                     .child(theme_button(
                         "theme-system",
                         text::SYSTEM.get(),
@@ -3192,7 +3197,9 @@ impl SettingsView {
                 row()
                     .child(label(
                         text::NOTIFICATIONS.get(),
-                        text::NOTIFICATIONS_DESC.get(),
+                        text::NOTIFICATIONS_DESC
+                            .mac_or(crate::i18n::catalog::other_os::NOTIFICATIONS_DESC)
+                            .get(),
                     ))
                     .child(notif_button("notif-on", text::ON.get(), true))
                     .child(notif_button("notif-off", text::OFF.get(), false)),
@@ -3248,7 +3255,12 @@ impl SettingsView {
             )
             .child(
                 row()
-                    .child(label(text::KEEP_AWAKE.get(), text::KEEP_AWAKE_DESC.get()))
+                    .child(label(
+                        text::KEEP_AWAKE.get(),
+                        text::KEEP_AWAKE_DESC
+                            .mac_or(crate::i18n::catalog::other_os::KEEP_AWAKE_DESC)
+                            .get(),
+                    ))
                     .child(awake_button(
                         "awake-on",
                         text::AWAKE_ON.get(),
@@ -7425,7 +7437,11 @@ impl Render for SettingsView {
                     .text_size(crate::ui::TEXT_XS)
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(Icon::new(IconName::SquareTerminal).xsmall())
-                    .child(text::HOST_LOCAL_MAC.get())
+                    .child(
+                        text::HOST_LOCAL_MAC
+                            .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL_MAC)
+                            .get(),
+                    )
                     .child(Icon::new(IconName::ChevronDown).xsmall()),
             )
             .child(

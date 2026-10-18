@@ -1081,9 +1081,12 @@ impl Sidebar {
                     .find(|r| r.id == *id)
                     .map_or_else(|| id.clone(), |r| r.label.clone()),
             ),
-            HostId::Local => {
-                (!self.remote_hosts.is_empty()).then(|| text::HOST_LOCAL.get().to_owned())
-            }
+            HostId::Local => (!self.remote_hosts.is_empty()).then(|| {
+                text::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned()
+            }),
         }
     }
 
@@ -1095,13 +1098,19 @@ impl Sidebar {
         let hosts: Vec<(HostId, String)> = if self.remote_hosts.is_empty() {
             Vec::new()
         } else {
-            std::iter::once((HostId::Local, text::HOST_LOCAL.get().to_owned()))
-                .chain(
-                    self.remote_hosts
-                        .iter()
-                        .map(|r| (HostId::Remote(r.id.clone()), r.label.clone())),
-                )
-                .collect()
+            std::iter::once((
+                HostId::Local,
+                text::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned(),
+            ))
+            .chain(
+                self.remote_hosts
+                    .iter()
+                    .map(|r| (HostId::Remote(r.id.clone()), r.label.clone())),
+            )
+            .collect()
         };
         let this = cx.weak_entity();
         let btn = Button::new("sidebar-options")
