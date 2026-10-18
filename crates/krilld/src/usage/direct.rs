@@ -493,6 +493,11 @@ pub(crate) mod agy {
             profiles.push((dir, false));
         }
         for (dir, host) in profiles {
+            // 로그인 안 된 agy에 `-p /usage`를 보내면 매번 대화형 OAuth를 시작한다(설 실기, v0.1.9:
+            // 격리 HOME에서 2~3분마다 OAuth 시도 46회). 로그인된 프로필만 조회한다.
+            if !should_probe(&dir, host) {
+                continue;
+            }
             let key = (home.to_path_buf(), dir);
             if lock(&CACHE)
                 .get(&key)
@@ -503,6 +508,10 @@ pub(crate) mod agy {
             }
             spawn(&key, host, state.map(Path::to_path_buf));
         }
+    }
+
+    fn should_probe(dir: &Path, host: bool) -> bool {
+        super::antigravity_auth(dir, host).is_some_and(|a| a.logged_in)
     }
 
     fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
@@ -942,6 +951,31 @@ pub(crate) mod agy {
                 &usage_script("agy 1.1.10", USAGE_ENVELOPE),
             );
             assert!(fetch_for_tests(&old, &profile, false).is_none());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        /// 로그인 안 된 agy는 `/usage`가 대화형 로그인을 띄우므로 조회 대상이 아니다(설 실기).
+        #[test]
+        fn probe_only_logged_in_profiles() {
+            let root = std::env::temp_dir().join(format!("agy-probe-gate-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            let host_dir = root.join("home/.gemini/antigravity-cli");
+            std::fs::create_dir_all(&host_dir).unwrap();
+            assert!(
+                !should_probe(&host_dir, true),
+                "host without token or keychain"
+            );
+            let profile = root.join("profile");
+            std::fs::create_dir_all(profile.join(".gemini/antigravity-cli")).unwrap();
+            assert!(!should_probe(&profile, false), "profile without token");
+            std::fs::write(
+                profile.join(".gemini/antigravity-cli/antigravity-oauth-token"),
+                "x",
+            )
+            .unwrap();
+            assert!(should_probe(&profile, false));
+            std::fs::write(host_dir.join("antigravity-oauth-token"), "x").unwrap();
+            assert!(should_probe(&host_dir, true));
             std::fs::remove_dir_all(root).unwrap();
         }
 
