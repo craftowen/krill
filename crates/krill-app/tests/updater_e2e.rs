@@ -1,7 +1,7 @@
 //! MK-063 e2e: 로컬 HTTP 서버 + 실제 `krill-holder`·`krilld` 데몬 세션 + `krill-app --relaunch-update` 프로세스로
 //! 위조 패키지 거부, 정상 업데이트(0.1.0 → 0.2.0) 중 세션·출력 무손실 유지, 재실행 실패(0.2.0 → 0.3.0) 시
 //! 자동 롤백과 세션 유지를 검증한다.
-
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

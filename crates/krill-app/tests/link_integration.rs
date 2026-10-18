@@ -1,4 +1,5 @@
 //! 실제 앱 백엔드 → 짝짓기 → 공유 connect → 사이드바 소스·세션 생성·회수.
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::panic,

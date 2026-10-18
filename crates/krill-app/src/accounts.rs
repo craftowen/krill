@@ -8,6 +8,7 @@ pub mod display;
 pub mod installed;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod login_tests;
 
 use std::collections::BTreeMap;
@@ -1224,6 +1225,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod as_regression_tests {
     use super::*;
 

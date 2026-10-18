@@ -904,6 +904,7 @@ pub fn stage_update_for_bundle(
 /// `manifest_url`의 `latest.json`을 내려받아 `<app_bundle>.staging`까지 준비한다.
 /// 성공하면 `(상태 디렉터리, 매니페스트 버전)`을 돌려준다.
 #[cfg(test)]
+#[cfg(unix)]
 fn stage_update_manifest(
     manifest_url: &str,
     app_bundle: &Path,
@@ -1313,4 +1314,5 @@ pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

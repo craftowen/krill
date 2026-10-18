@@ -294,6 +294,7 @@ pub fn session_label(session: &Session, title: Option<&str>) -> (String, String)
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn rows(snapshot: &Snapshot, prefs: &Preferences, collapsed: &BTreeSet<PathBuf>) -> Vec<Row> {
     options::rows_with_options(
         snapshot,
@@ -311,6 +312,7 @@ const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
 /// 저장 파일을 읽는다. 손상·미지원 버전은 덮어쓰지 않도록 `.corrupt`로 보존한 뒤 오류를 돌려준다.
 #[cfg(test)]
+#[cfg(unix)]
 fn load(path: &Path) -> io::Result<Preferences> {
     load_state(path).map(|(prefs, _, _)| prefs)
 }
@@ -363,6 +365,7 @@ fn decode_state(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
     save_state(
         path,
@@ -707,21 +710,25 @@ impl Sidebar {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn trees(&self) -> &BTreeMap<PathBuf, Vec<PathBuf>> {
         &self.snapshot.trees
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn comments(&self) -> &BTreeMap<PathBuf, String> {
         &self.comments
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn issues(&self) -> &BTreeMap<PathBuf, String> {
         &self.issues
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(crate) fn worktree_statuses(
         &self,
     ) -> &BTreeMap<PathBuf, krill_proto::orchestration::WorkspaceStatus> {
@@ -1337,6 +1344,7 @@ impl Sidebar {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     fn apply(
         &mut self,
         result: io::Result<(Snapshot, Meta)>,
@@ -1868,6 +1876,7 @@ impl Sidebar {
 
     /// OWE-662: 로컬 호스트 워크트리 세션의 상태 묶음과 미확인 세션이 있는지.
     #[cfg(test)]
+    #[cfg(unix)]
     fn tree_summary(&self, tree: &Path) -> (crate::ui::status::Summary<'_>, bool) {
         self.tree_summary_on(&HostId::Local, tree)
     }
@@ -1899,8 +1908,10 @@ impl Sidebar {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 use krill_proto::daemon::Paths;
 
 #[cfg(test)]
+#[cfg(unix)]
 #[path = "sidebar/tests.rs"]
 mod tests;

@@ -3967,6 +3967,7 @@ impl Shell {
     }
 
     /// IO 태스크 없이 칸을 `sock`(krilld 쪽 대신)에 붙인다.
+    #[cfg(unix)]
     fn attach_test(
         &mut self,
         pane: PaneId,
@@ -4144,4 +4145,5 @@ fn is_permanent_error(err: &std::io::Error) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
