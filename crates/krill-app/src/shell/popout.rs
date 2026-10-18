@@ -3,8 +3,8 @@
 //! 플로팅 창은 기존 Shell의 입력·IME·재접속을 재사용하고 레이아웃 파일은 쓰지 않는다.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, Subscription, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
+    App, Bounds, Context, Entity, KeyBinding, Subscription, TitlebarOptions, WeakEntity, Window,
+    WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
 };
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -1939,6 +1939,13 @@ impl Render for Dashboard {
                                             .when_some(screen, |d, screen| {
                                                 d.child(
                                                     div()
+                                                        // OWE-861: 미리보기 유무 회귀 검사 대상.
+                                                        .debug_selector(move || {
+                                                            format!(
+                                                                "dashboard-preview-{}",
+                                                                session.0
+                                                            )
+                                                        })
                                                         .text_size(ui::TEXT_2XS)
                                                         .text_color(p.muted_foreground)
                                                         .child(text::PREVIEW.get()),
@@ -1954,6 +1961,13 @@ impl Render for Dashboard {
                                             .when(!has_preview, |d| {
                                                 d.child(
                                                     div()
+                                                        // OWE-861: 미리보기 유무 회귀 검사 대상.
+                                                        .debug_selector(move || {
+                                                            format!(
+                                                                "dashboard-no-preview-{}",
+                                                                session.0
+                                                            )
+                                                        })
                                                         .text_size(ui::TEXT_2XS)
                                                         .text_color(p.muted_foreground)
                                                         .child(text::NO_PREVIEW.get()),
