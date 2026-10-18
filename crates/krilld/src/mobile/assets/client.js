@@ -37,6 +37,6 @@
     connected=true;await refresh();retryDelay=1000;status('ready','Encrypted · connected');poll();
    }catch(e){options.onError?.(e);disconnect(e);}finally{connecting=false;if(!connected)retry();}
   }
-  return {connect,rpc,refresh,get ready(){return connected;},get credentials(){return credentials;},resume(){if(!connected){retryDelay=1000;connect();}else refresh().catch(options.onError);},terminalConnect(){if(!connected||!credentials)throw Error('Reconnect to desktop first');return {socket:new WebSocket(options.url),credentials};},close(){stopped=true;clearTimeout(timer);clearTimeout(retryTimer);disconnect(Error('Disconnected'));}};
+  return {connect,rpc,refresh,reconnect(){disconnect(Error('Reconnecting… Pending actions were not resent.'));retryDelay=1000;connect();},get ready(){return connected;},get credentials(){return credentials;},resume(){if(!connected){retryDelay=1000;connect();}else refresh().catch(options.onError);},terminalConnect(){if(!connected||!credentials)throw Error('Reconnect to desktop first');return {socket:new WebSocket(options.url),credentials};},close(){stopped=true;clearTimeout(timer);clearTimeout(retryTimer);disconnect(Error('Disconnected'));}};
  }};
 })();
