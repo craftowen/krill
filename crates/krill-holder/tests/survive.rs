@@ -389,7 +389,10 @@ fn contract(link: &mut Link, dir: &Path, sessions: usize, listener: Option<Owned
     link.send(&[6, 0, 0, 0, 0x40, 0, 77, 0, 0, 0], &[]).unwrap();
     assert_eq!(
         reply(link, dir).0,
-        FromHolder::Failed { req: 77, errno: 78 }
+        FromHolder::Failed {
+            req: 77,
+            errno: rustix::io::Errno::NOSYS.raw_os_error()
+        }
     );
     let spawn = |req, id, argv: &[&str]| ToHolder::Spawn {
         req,

@@ -1035,6 +1035,7 @@ fn fault_injection_output_flood_isolation_and_disk_cap() {
 /// 워밍업(에포크 2 + 숨김 세션 강등) 이후 에포크 24까지의 데몬 `phys_footprint` 증가량이 차단선(≤ 20MiB) 안이고,
 /// 데몬 합계(≤ 60MiB) 및 전체 합계(≤ 200MiB) 예산 안임을 검사한다.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: /usr/bin/footprint")]
 fn fault_injection_accelerated_24h_memory_soak() {
     let mut rig = Rig::new("soak24");
     let paths = rig.install_bins("bin");

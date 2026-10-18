@@ -235,6 +235,10 @@ fn install(dir: &Path) -> (PathBuf, PathBuf) {
 }
 
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS 전용: Mach-O 손상 holder 주입"
+)]
 fn upgrade_keeps_sessions_lossless_and_one_generation() {
     let target = Path::new(KRILLD).parent().unwrap();
     assert!(
