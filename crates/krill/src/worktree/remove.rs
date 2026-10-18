@@ -1,8 +1,8 @@
 //! `krill worktree rm`: 삭제·브랜치 정리 결과를 데몬에서 받는다.
 
+use krill_proto::os::ffi::OsStrExt;
 use std::ffi::OsString;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
 

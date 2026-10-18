@@ -1,6 +1,7 @@
 //! MK-045: all MVP commands against real holder/krilld with no application process.
 
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs::{self, File};
 use std::io::Write as _;

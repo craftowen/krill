@@ -1,9 +1,13 @@
 //! MK-042: 실제 CLI → krilld → `GitQueue` → git, 승인 후 holder setup 세션을 검증한다.
 
-#![expect(
-    clippy::unwrap_used,
-    reason = "통합 테스트 fixture 실패는 테스트 실패다"
+#![cfg_attr(
+    unix,
+    expect(
+        clippy::unwrap_used,
+        reason = "통합 테스트 fixture 실패는 테스트 실패다"
+    )
 )]
+#![cfg(unix)]
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;

@@ -3572,7 +3572,7 @@ mod tests {
         let run_dir = state_dir.join("run");
         fs::create_dir_all(&run_dir).unwrap();
         let sock_path = run_dir.join("krilld.sock");
-        let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
+        let listener = krill_proto::os::net::UnixListener::bind(&sock_path).unwrap();
         let stop_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = std::sync::Arc::clone(&stop_flag);
         let server_thread = std::thread::spawn(move || {
@@ -3768,7 +3768,7 @@ mod tests {
         assert_eq!(second.settings.schedules_merged, 0);
 
         stop_flag.store(true, Ordering::Relaxed);
-        std::os::unix::net::UnixStream::connect(&sock_path).ok();
+        krill_proto::os::net::UnixStream::connect(&sock_path).ok();
         server_thread.join().ok();
         fs::remove_dir_all(&root).ok();
     }
