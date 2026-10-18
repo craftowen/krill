@@ -15,7 +15,7 @@ use gpui_component::{IconName, Sizable as _};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::catalog::star_nag as text;
-use crate::onboarding::consent::atomic_write_0600;
+use crate::onboarding::state::atomic_write_0600;
 
 /// 상태 파일 이름(상태 디렉터리 바로 아래).
 pub const FILE: &str = "star-nag.toml";
