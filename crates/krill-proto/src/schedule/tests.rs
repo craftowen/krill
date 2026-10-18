@@ -66,6 +66,29 @@ workspace_mode = "isolate"
     assert_eq!(entry.precheck.as_deref(), Some("test -f ready"));
     assert_eq!(entry.workspace_mode, WorkspaceMode::Isolate);
     assert!(Schedules::parse(&extended.replace("test -f ready", "   ")).is_err());
+
+    let empty_prompt = r#"[[schedule]]
+id = "no-prompt"
+cron = "0 0 1 1 *"
+cwd = "/tmp"
+command = ["/bin/echo", "two words"]
+prompt = ""
+"#;
+    let parsed_empty = Schedules::parse(empty_prompt).unwrap();
+    assert_eq!(parsed_empty.schedule[0].prompt, "");
+    let omitted_prompt = r#"[[schedule]]
+id = "omitted-prompt"
+cron = "0 0 1 1 *"
+cwd = "/tmp"
+command = ["/bin/echo", "two words"]
+"#;
+    assert_eq!(
+        Schedules::parse(omitted_prompt).unwrap().schedule[0].prompt,
+        ""
+    );
+    assert!(
+        Schedules::parse(&empty_prompt.replace("prompt = \"\"", "prompt = \"a\\u0000b\"")).is_err()
+    );
 }
 
 #[test]
