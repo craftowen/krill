@@ -464,6 +464,25 @@ pub async fn pair_with_server(
     upsert_host(state_dir, host)
 }
 
+/// Invitation transport is unavailable until native local IPC is implemented.
+#[cfg(not(unix))]
+pub async fn create_invite_command(
+    _state_dir: &Path,
+    _ttl: Option<Duration>,
+) -> Result<InviteOutput, Error> {
+    Err(crate::unsupported_platform())
+}
+
+/// Pairing transport is unavailable until native local IPC is implemented.
+#[cfg(not(unix))]
+pub async fn pair_with_server(
+    _state_dir: &Path,
+    _link_str: &str,
+    _device_name: &str,
+) -> Result<RemoteHost, Error> {
+    Err(crate::unsupported_platform())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -555,31 +574,4 @@ mod tests {
         // 윈도우(10초) 경과 후에는 다시 허용됨
         assert!(limiter.check_and_record_attempt(t0 + Duration::from_secs(15)));
     }
-}
-
-/// Invitation transport is unavailable until native local IPC is implemented.
-#[cfg(not(unix))]
-#[expect(
-    clippy::unused_async,
-    reason = "preserve the native transport async signature"
-)]
-pub async fn create_invite_command(
-    _state_dir: &Path,
-    _ttl: Option<Duration>,
-) -> Result<InviteOutput, Error> {
-    Err(crate::unsupported_platform())
-}
-
-/// Pairing transport is unavailable until native local IPC is implemented.
-#[cfg(not(unix))]
-#[expect(
-    clippy::unused_async,
-    reason = "preserve the native transport async signature"
-)]
-pub async fn pair_with_server(
-    _state_dir: &Path,
-    _link_str: &str,
-    _device_name: &str,
-) -> Result<RemoteHost, Error> {
-    Err(crate::unsupported_platform())
 }
