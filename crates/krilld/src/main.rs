@@ -10,26 +10,49 @@
 //!
 //! holder 재결합([`krilld::rejoin`]): holder 링크가 끊기면 고아로 계속 서빙하다가 다음 krilld에 세션을 넘기고 끝난다.
 //! holder 아래에서 떴는데 소켓 락을 못 잡으면 고아 krilld에게서 세션을 넘겨받는다.
+//!
+//! Windows(OWE-819): holder 링크(`OwnedFd`·`SCM_RIGHTS`)가 없어 기동을 거부한다. `ConPTY` holder와 새 링크는 Phase 3.
 
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(unix)]
 use std::path::PathBuf;
 use std::process::ExitCode;
+#[cfg(unix)]
 use std::sync::{Arc, mpsc};
+#[cfg(unix)]
 use std::thread;
 
+#[cfg(unix)]
 use krill_proto::daemon;
+#[cfg(unix)]
 use krill_proto::ipc::{FEATURES, PROTO_MAX, PROTO_MIN, ServerHello};
+#[cfg(unix)]
 use krilld::holder::Holder;
+#[cfg(unix)]
 use krilld::ipc::Listener;
+#[cfg(unix)]
 use krilld::registry::Registry;
+#[cfg(unix)]
 use krilld::rejoin::{self, Handover};
+#[cfg(unix)]
 use rustix::fs::{FileType, fstat};
 
 // 해제한 핫 스크롤백·sync 버퍼를 footprint로 돌려주는 할당기(OWE-477, docs/spikes/OWE-477.md).
+#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+#[cfg(windows)]
+fn main() -> ExitCode {
+    krill_log::init(krill_log::Component::Daemon).ok();
+    tracing::error!(kind = ?std::io::ErrorKind::Unsupported, "daemon unavailable on Windows");
+    ExitCode::FAILURE
+}
+
+#[cfg(unix)]
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
         return ExitCode::from(2);
@@ -234,6 +257,7 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+#[cfg(unix)]
 /// 환경 변수 `KRILL_TEST_BALLAST_MB`(메비바이트 단위)만큼을 0이 아닌 값으로 채워 쥔다(dirty 페이지라 footprint에 잡힌다). 없거나 잘못된 값이면 빈 Vec.
 fn ballast() -> Vec<u8> {
     std::env::var("KRILL_TEST_BALLAST_MB")
