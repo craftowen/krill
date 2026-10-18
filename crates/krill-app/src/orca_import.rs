@@ -254,6 +254,10 @@ pub struct AccountsImportSummary {
     #[serde(default)]
     pub active_codex: Option<String>,
     #[serde(default)]
+    pub agy_detected: bool,
+    #[serde(default)]
+    pub agy_note: Option<String>,
+    #[serde(default)]
     pub items: Vec<ImportedAccountSummary>,
 }
 
@@ -275,6 +279,8 @@ pub struct ImportedAccountSummary {
     pub active: bool,
     #[serde(default)]
     pub runnable: bool,
+    #[serde(default)]
+    pub connection: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
