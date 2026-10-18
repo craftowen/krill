@@ -571,6 +571,44 @@ fn agy_hidden_flag_guard_uses_only_temporary_home_and_profile() {
     assert!(!root.exists());
 }
 
+/// OWE-901: 가드 결과는 (실행 경로, mtime, 버전) 키로 캐시돼 같은 바이너리는 다시 실행하지 않는다.
+#[test]
+fn agy_guard_result_is_cached_per_binary_and_version() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("owe901-agy-guard-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    super::clear_agy_guard_cache_for_tests();
+    let before = super::agy_guard_cache_len_for_tests();
+    let exe = root.join("agy");
+    let counter = root.join("calls");
+    std::fs::write(
+        &exe,
+        format!(
+            "#!/bin/sh\necho x >> '{}'\nif [ \"$1\" = '--version' ]; then echo 'agy 1.2.0'; exit 0; fi\ntest -d \"$HOME\" && test \"$SSH_CONNECTION\" = krill && case \"$1\" in --gemini_dir=*) test \"$2 $3\" = 'mcp list' ;; *) exit 1 ;; esac\n",
+            counter.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // 1회차: `--version` + `mcp list` 2회 실행.
+    assert!(super::agy_gemini_dir_supported_cached(&exe));
+    assert_eq!(super::agy_guard_cache_len_for_tests(), before + 1);
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        2
+    );
+    // 2회차: 캐시 적중이라 추가 실행 없음.
+    assert!(super::agy_gemini_dir_supported_cached(&exe));
+    assert_eq!(
+        std::fs::read_to_string(&counter).unwrap().lines().count(),
+        2
+    );
+    super::clear_agy_guard_cache_for_tests();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// OWE-698: 실행 뒤 계정을 바꿔도 재개는 실행 당시 계정 프로필로 이어 간다.
 /// 기록 계정 폴더가 없어지면 대화가 든 프로필, 호스트 기본 기록이면 env를 덮어쓰지 않는다.
 #[test]

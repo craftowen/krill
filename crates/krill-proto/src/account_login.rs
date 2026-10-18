@@ -77,17 +77,22 @@ pub fn parse_claude_status(json: &str) -> Option<AuthStatus> {
     })
 }
 
+/// agy 프로필 로그인 판정(OWE-901). 토큰 파일 존재·크기만 보고 내용은 읽지 않는다.
+/// `krilld::usage::direct::antigravity_auth`와 같은 판정이라 여기로 모았다.
+#[must_use]
+pub fn agy_token_logged_in(dir: &Path) -> bool {
+    let token = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
+    std::fs::symlink_metadata(&token)
+        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
+}
+
 /// 비밀값을 출력하지 않는 CLI 상태 조회. stdout·stderr를 함께 읽되 결과에는 신원만 남긴다.
 /// Codex는 상태를 stderr에 쓰며 로그아웃이면 비영(非零) 종료한다. `dir`이 `None`이면 호스트 기본 계정([`login_program`]).
 pub fn probe(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<AuthStatus> {
     if provider == ProviderKind::Antigravity {
         let dir = dir?;
-        let token = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        let metadata = std::fs::symlink_metadata(token).ok()?;
         return Some(AuthStatus {
-            logged_in: metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() > 0,
+            logged_in: agy_token_logged_in(dir),
             identity: None,
         });
     }
@@ -448,8 +453,14 @@ mod tests {
                 .unwrap()
                 .logged_in
         );
+        // 토큰 파일이 없으면 모름이 아니라 로그인 필요다(OWE-901: 프로필 판정 통일).
         std::fs::remove_file(&token).unwrap();
-        assert!(probe(Path::new("/unused"), ProviderKind::Antigravity, Some(&root)).is_none());
+        assert!(
+            !probe(Path::new("/unused"), ProviderKind::Antigravity, Some(&root))
+                .unwrap()
+                .logged_in
+        );
+        assert!(!agy_token_logged_in(&root));
         std::fs::remove_dir_all(root).unwrap();
     }
 

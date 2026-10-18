@@ -1611,10 +1611,11 @@ impl Registry {
             }
         }
         // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다(다음 실행부터 적용).
+        // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
         // 평가는 공개 API만 써서 기존 정책을 그대로 따른다. 실행 중 세션의 env는 바꾸지 않는다.
         // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
         // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
-        if status::stop_failure_rate_limited(&e.payload)
+        if (status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload))
             && let Ok(Some(stored)) = self.agents.stored(id)
             && let Some(launch) = stored.account
             && let Some(provider) = krill_proto::usage::ProviderKind::from_env_var(&launch.env_key)
