@@ -11,14 +11,24 @@ use std::collections::HashMap;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-const MAX_CONNECTIONS: usize = 4;
+/// 미인증 연결 상한. 인증된 연결은 기기당 WS 2개(메인+터미널)라 별도 상한을 둔다.
+const MAX_PENDING: usize = 4;
+const MAX_CONNECTIONS: usize = 12;
 const STACK: usize = 128 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// Cloudflare는 양방향 무전송 WS를 끊는다(Quick Tunnel 실측 약 125초). 이 주기로 ping하고,
+/// 응답 없는 주기가 `IDLE_PINGS`번 이어지면(LTE 전환 등으로 죽은 연결) 닫는다.
+const PING: Duration = Duration::from_secs(30);
+const IDLE_PINGS: u8 = 3;
+/// 페어링 요청이 터널 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기 타임아웃(20초)보다 짧다.
+const MINT_WAIT: Duration = Duration::from_secs(15);
+/// 사용자가 고른 연결 모드. 데몬을 재시작해도 Tunnel 기기가 다시 붙을 수 있게 남긴다.
+const INTENT_FILE: &str = "mobile-gateway.json";
 
 #[derive(Debug)]
 pub struct Gateway {
@@ -43,6 +53,16 @@ struct State {
     stopped: bool,
     tunnel: Option<super::tunnel::Tunnel>,
     tunnel_start: fn(u16) -> io::Result<super::tunnel::Tunnel>,
+    tunnel_failures: u32,
+    tunnel_retry_at: Option<Instant>,
+    tunnel_error: Option<io::ErrorKind>,
+    dir: Option<PathBuf>,
+    ping: Duration,
+}
+#[derive(Deserialize, Serialize)]
+struct Intent {
+    mode: ConnectMode,
+    custom: Option<String>,
 }
 #[derive(Debug)]
 struct Connection {
@@ -89,11 +109,19 @@ impl Gateway {
         dir: Option<&Path>,
         hello: ServerHello,
     ) -> io::Result<Arc<Self>> {
+        // 손상된 의도 파일은 모바일 전체를 끄지 않고 기본값(LAN)으로 시작한다.
+        let intent = dir
+            .and_then(|d| {
+                super::devices::read_private(&d.join(INTENT_FILE))
+                    .ok()
+                    .flatten()
+            })
+            .and_then(|bytes| serde_json::from_slice::<Intent>(&bytes).ok());
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 devices: Devices::open(dir)?,
-                mode: ConnectMode::Lan,
-                custom: None,
+                mode: intent.as_ref().map_or(ConnectMode::Lan, |i| i.mode),
+                custom: intent.and_then(|i| i.custom),
                 interfaces: net::detect()?,
                 selected: None,
                 listeners: Vec::new(),
@@ -102,6 +130,11 @@ impl Gateway {
                 stopped: false,
                 tunnel: None,
                 tunnel_start: super::tunnel::Tunnel::start,
+                tunnel_failures: 0,
+                tunnel_retry_at: None,
+                tunnel_error: None,
+                dir: dir.map(Path::to_path_buf),
+                ping: PING,
             }),
             changed: Condvar::new(),
         });
@@ -124,8 +157,7 @@ impl Gateway {
         }
         let address = state.selected?;
         let base = if state.mode == ConnectMode::Tunnel {
-            let tunnel = state.tunnel.as_ref()?;
-            tunnel.url.clone()
+            state.tunnel.as_ref()?.ready_url()?.to_owned()
         } else {
             format!("http://{address}")
         };
@@ -154,13 +186,28 @@ impl Gateway {
             } => {
                 configure(&mut state, mode, custom_address, now)?;
                 state.devices.mint(now, rotate)?;
+                // 사용자가 직접 요청했으므로 재기동 백오프를 건너뛴다.
+                state.tunnel_retry_at = None;
                 reconcile(&mut state, now)?;
-                let address = state.selected.ok_or_else(invalid)?;
-                if mode == ConnectMode::Tunnel && state.tunnel.as_mut().is_none_or(|t| !t.running())
-                {
-                    state.tunnel = Some((state.tunnel_start)(address.port())?);
+                if mode != ConnectMode::Tunnel {
+                    pairing_offer(&state, now)?
+                } else if state.tunnel.is_none() {
+                    return Err(state.tunnel_error.unwrap_or(io::ErrorKind::NotFound).into());
+                } else {
+                    // 준비 전 URL로 QR을 내면 폰이 530·NXDOMAIN을 캐시한다. 락 밖에서 준비를 기다린다.
+                    drop(state);
+                    self.shared.changed.notify_all();
+                    let deadline = Instant::now() + MINT_WAIT;
+                    while Instant::now() < deadline
+                        && lock(&self.shared.state)
+                            .tunnel
+                            .as_ref()
+                            .is_some_and(|t| t.ready_url().is_none())
+                    {
+                        thread::sleep(Duration::from_millis(200));
+                    }
+                    return pairing_offer(&lock(&self.shared.state), now_ms());
                 }
-                pairing_offer(&state, now)?
             }
             MobileRequest::SetConnectMode {
                 mode,
@@ -230,6 +277,16 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
             s.devices.mint(now, true)?;
         }
     }
+    if intent_changed && let Some(dir) = &s.dir {
+        let intent = Intent {
+            mode,
+            custom: custom.clone(),
+        };
+        super::devices::write_private(
+            &dir.join(INTENT_FILE),
+            &serde_json::to_vec(&intent).map_err(io::Error::other)?,
+        )?;
+    }
     s.mode = mode;
     s.custom = custom;
     s.interfaces = interfaces;
@@ -243,13 +300,20 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let address = state.selected.ok_or_else(invalid)?;
     let host = address.ip().to_string();
     let port = address.port();
+    let base = if state.mode == ConnectMode::Tunnel {
+        // 기다려도 준비되지 않으면 찍힌 URL로 낸다. 몇 초 뒤 새로고침하면 열린다.
+        let tunnel = state.tunnel.as_ref().ok_or(io::ErrorKind::WouldBlock)?;
+        tunnel
+            .ready_url()
+            .or_else(|| tunnel.url())
+            .ok_or(io::ErrorKind::WouldBlock)?
+            .to_owned()
+    } else {
+        format!("http://{host}:{port}")
+    };
     Ok(MobileReply::PairingOffer {
         url: format!(
-            "{}/?pair={}#key={}",
-            state
-                .tunnel
-                .as_ref()
-                .map_or_else(|| format!("http://{host}:{port}"), |t| t.url.clone()),
+            "{base}/?pair={}#key={}",
             hex(&ticket.token),
             ws::base64(&ticket.secret, true)
         ),
@@ -270,13 +334,15 @@ fn status(s: &State, now: u64) -> MobileReply {
             .filter_map(|l| l.local_addr().ok().map(|a| a.to_string()))
             .collect(),
         mode: s.mode,
-        tunnel_url: s.tunnel.as_ref().map(|t| t.url.clone()),
+        tunnel_url: s.tunnel.as_ref().and_then(|t| t.url()).map(str::to_owned),
         active_offer: s.devices.ticket(now).is_some(),
         devices: s.devices.list(),
     }
 }
 fn close(s: &mut State) {
     s.tunnel = None;
+    s.tunnel_failures = 0;
+    s.tunnel_retry_at = None;
     s.listeners.clear();
     for c in s.connections.values() {
         c.socket.shutdown(Shutdown::Both).ok();
@@ -289,6 +355,7 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
         return Ok(());
     }
     if !s.listeners.is_empty() {
+        supervise_tunnel(s);
         return Ok(());
     }
     let selected = match s.selected {
@@ -306,7 +373,50 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     }
     s.selected = Some(SocketAddrV4::new(*selected.ip(), port));
     s.listeners = listeners;
+    supervise_tunnel(s);
     Ok(())
+}
+/// 리스너가 열려 있는 Tunnel 모드에서는 cloudflared가 항상 떠 있게 한다.
+/// 죽었거나 준비 기한을 넘기면 지수 백오프(2초~1분)로 다시 띄운다. 새 URL이 나오므로 폰은 다시 스캔한다.
+fn supervise_tunnel(s: &mut State) {
+    if s.mode != ConnectMode::Tunnel {
+        s.tunnel = None;
+        return;
+    }
+    let Some(port) = s.selected.map(|a| a.port()) else {
+        return;
+    };
+    if let Some(tunnel) = s.tunnel.as_mut() {
+        if tunnel.ready_url().is_some() {
+            s.tunnel_failures = 0;
+        }
+        if tunnel.healthy() {
+            return;
+        }
+        tracing::warn!("mobile tunnel exited or never became reachable; restarting");
+        s.tunnel = None;
+        backoff(s);
+    }
+    if s.tunnel_retry_at.is_some_and(|at| Instant::now() < at) {
+        return;
+    }
+    match (s.tunnel_start)(port) {
+        Ok(tunnel) => {
+            s.tunnel = Some(tunnel);
+            s.tunnel_retry_at = None;
+            s.tunnel_error = None;
+        }
+        Err(error) => {
+            tracing::warn!(kind=?error.kind(), "mobile tunnel start failed");
+            s.tunnel_error = Some(error.kind());
+            backoff(s);
+        }
+    }
+}
+fn backoff(s: &mut State) {
+    s.tunnel_failures = s.tunnel_failures.saturating_add(1);
+    let delay = Duration::from_secs(1 << s.tunnel_failures.min(6)).min(Duration::from_secs(60));
+    s.tunnel_retry_at = Some(Instant::now() + delay);
 }
 pub fn now_ms() -> u64 {
     SystemTime::now()
@@ -326,7 +436,12 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
                 connection.socket.shutdown(Shutdown::Both).ok();
             }
         }
-        let incoming = if state.connections.len() < MAX_CONNECTIONS {
+        let pending = state
+            .connections
+            .values()
+            .filter(|c| c.device.is_none())
+            .count();
+        let incoming = if pending < MAX_PENDING && state.connections.len() < MAX_CONNECTIONS {
             state
                 .listeners
                 .iter()
@@ -419,7 +534,7 @@ fn serve(
     if !ws::upgrade(&mut socket)? {
         return Ok(());
     }
-    // 주소와 무관한 실패 예산. 미인증 연결도 최대 4개·5초로 제한한다.
+    // 주소와 무관한 실패 예산. 미인증 연결은 최대 4개·5초로 제한한다.
     lock(&shared.state).devices.attempt(now_ms())?;
     let challenge = random()?;
     ws::write(
@@ -481,7 +596,8 @@ fn serve(
     ws::write(&mut socket, ws::BINARY, &payload)?;
     shared.changed.notify_all();
     let registry = registry.upgrade().ok_or_else(invalid)?;
-    socket.set_read_timeout(None)?;
+    let ping = lock(&shared.state).ping;
+    socket.set_read_timeout(Some(ping))?;
     bridge(socket, channel, registry, hello.clone())
 }
 
@@ -523,7 +639,27 @@ fn bridge(
         });
     let result = if worker.is_ok() {
         (|| -> io::Result<()> {
+            let mut idle = 0u8;
             loop {
+                // 프레임 경계에서만 유휴를 판정한다. 프레임 중간 타임아웃은 손상이므로 치명으로 둔다.
+                match socket.peek(&mut [0]) {
+                    Ok(0) => return Ok(()),
+                    Ok(_) => idle = 0,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        idle = idle.saturating_add(1);
+                        if idle >= IDLE_PINGS {
+                            return Err(io::ErrorKind::TimedOut.into());
+                        }
+                        ws::write(&mut *lock(&output), 9, &[])?;
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                }
                 let (opcode, body) = ws::read(&mut socket)?;
                 match opcode {
                     ws::BINARY => {

@@ -22,39 +22,19 @@ pub struct Devices {
 impl Devices {
     pub fn open(dir: Option<&Path>) -> io::Result<Self> {
         let path = dir.map(|d| d.join("mobile-devices.json"));
-        let devices = if let Some(path) = &path {
-            match OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(path)
-            {
-                Ok(file) => {
-                    let meta = file.metadata()?;
-                    if !meta.is_file()
-                        || meta.len() > MAX_FILE
-                        || meta.uid() != rustix::process::geteuid().as_raw()
-                        || meta.mode() & 0o077 != 0
-                    {
-                        return Err(io::ErrorKind::PermissionDenied.into());
-                    }
-                    let mut bytes = Vec::new();
-                    file.take(MAX_FILE.saturating_add(1))
-                        .read_to_end(&mut bytes)?;
-                    let devices: Vec<PairedMobileDevice> =
-                        serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-                    if devices.len() > MAX_DEVICES {
-                        return Err(invalid());
-                    }
-                    for device in &devices {
-                        decode_hex::<32>(&device.shared_secret_hash)?;
-                    }
-                    devices
+        let devices = match path.as_deref().map(read_private).transpose()?.flatten() {
+            Some(bytes) => {
+                let devices: Vec<PairedMobileDevice> =
+                    serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+                if devices.len() > MAX_DEVICES {
+                    return Err(invalid());
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-                Err(e) => return Err(e),
+                for device in &devices {
+                    decode_hex::<32>(&device.shared_secret_hash)?;
+                }
+                devices
             }
-        } else {
-            Vec::new()
+            None => Vec::new(),
         };
         Ok(Self {
             path,
@@ -200,36 +180,67 @@ impl Devices {
         let Some(path) = &self.path else {
             return Ok(());
         };
-        let dir = path.parent().ok_or_else(invalid)?;
-        fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)?;
-        let meta = fs::symlink_metadata(dir)?;
-        if !meta.is_dir()
-            || meta.uid() != rustix::process::geteuid().as_raw()
-            || meta.mode() & 0o022 != 0
-        {
-            return Err(io::ErrorKind::PermissionDenied.into());
-        }
-        let tmp = dir.join(format!(".mobile-devices-{}.tmp", hex(&random()?)));
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-            file.write_all(&serde_json::to_vec(devices).map_err(io::Error::other)?)?;
-            file.sync_all()?;
-            fs::rename(&tmp, path)?;
-            File::open(dir)?.sync_all()
-        })();
-        if result.is_err() {
-            fs::remove_file(tmp).ok();
-        }
-        result
+        write_private(
+            path,
+            &serde_json::to_vec(devices).map_err(io::Error::other)?,
+        )
     }
+}
+/// 본인 소유·0600·심볼릭 링크 아님을 확인하고 읽는다. 없으면 `None`.
+pub(super) fn read_private(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file()
+        || meta.len() > MAX_FILE
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o077 != 0
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE.saturating_add(1))
+        .read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
+}
+/// 0600 임시 파일 → fsync → rename → 디렉터리 fsync.
+pub(super) fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().ok_or_else(invalid)?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)?;
+    let meta = fs::symlink_metadata(dir)?;
+    if !meta.is_dir()
+        || meta.uid() != rustix::process::geteuid().as_raw()
+        || meta.mode() & 0o022 != 0
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let tmp = dir.join(format!(".mobile-{}.tmp", hex(&random()?)));
+    let result = (|| {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)?;
+        File::open(dir)?.sync_all()
+    })();
+    if result.is_err() {
+        fs::remove_file(tmp).ok();
+    }
+    result
 }
 fn equal(a: &[u8], b: &[u8]) -> bool {
     let key = hmac::Key::new(hmac::HMAC_SHA256, a);

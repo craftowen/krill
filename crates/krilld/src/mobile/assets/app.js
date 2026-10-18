@@ -190,17 +190,27 @@ if(typeof document!=='undefined') (async()=>{
  }
  for(const id of ['photo','camera'])$(id).addEventListener('change',e=>act(async()=>{await photo(e.target.files[0]);e.target.value='';}));
  $('pick-photo').addEventListener('click',()=>$('photo').click());$('take-photo').addEventListener('click',()=>$('camera').click());
+ // stage 0: 연결 전, 1: 열림, 2: challenge 받음, 3: 인증됨. 2에서 끊기면 회수·인증 실패라 재시도하지 않는다
+ // (재시도하면 게이트웨이 전역 실패 예산을 태워 다른 기기까지 잠근다).
+ const pairing=Boolean(ticket&&secretText);let stage=0;
+ function reconnect(){
+  const tries=Number(sessionStorage.getItem('mk-retry')||0);sessionStorage.setItem('mk-retry',String(tries+1));
+  const go=()=>{const p=new URLSearchParams(),s=terminal?.session||(parameters.has('session')?selected:null);if(s)p.set('session',s);location.replace(location.pathname+(p.size?'?'+p:''));};
+  const ready=()=>document.visibilityState==='visible'&&navigator.onLine;
+  const once=()=>{if(!ready())return;document.removeEventListener('visibilitychange',once);removeEventListener('online',once);go();};
+  setTimeout(()=>{if(ready())go();else{document.addEventListener('visibilitychange',once);addEventListener('online',once);}},Math.min(8000,500*2**tries));
+ }
  try {
-  if(!(ticket&&secretText)&&!credentials)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
+  if(!pairing&&!credentials)throw Error('Scan a fresh QR code from desktop Settings → Mobile.');
   socket=new WebSocket(`${location.protocol==='https:'?'wss:':'ws:'}//${location.host}/ws`);socket.binaryType='arraybuffer';
   socket.addEventListener('message',e=>{const waiter=waiters.shift();if(waiter)waiter.resolve(e.data);else queue.push(e.data);});
-  const terminate=()=>{closed=true;failed=Error('Disconnected. Reopen this page to reconnect.');$('connection').textContent='Disconnected';$('connection').className='connection';for(const w of waiters.splice(0))w.reject(failed);};socket.addEventListener('close',terminate);socket.addEventListener('error',terminate);
-  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});
-  const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported desktop protocol');
-  const pairing=Boolean(ticket&&secretText),secret=pairing?C.unbase64(secretText):C.sha256(C.unhex(credentials.credential));
+  const terminate=()=>{if(closed)return;closed=true;const retry=stage===3||(credentials&&!pairing&&stage<2);failed=Error(retry?'Reconnecting…':'Disconnected. Reopen this page to reconnect.');$('connection').textContent=retry?'Reconnecting…':'Disconnected';if(retry)reconnect();$('connection').className='connection';for(const w of waiters.splice(0))w.reject(failed);};socket.addEventListener('close',terminate);socket.addEventListener('error',terminate);
+  await new Promise((resolve,reject)=>{socket.addEventListener('open',resolve,{once:true});socket.addEventListener('error',reject,{once:true});});stage=1;
+  const challenge=JSON.parse(await next()),nonce=crypto.getRandomValues(new Uint8Array(32));stage=2;if(challenge.version!==2)throw Error('Unsupported desktop protocol');
+  const secret=pairing?C.unbase64(secretText):C.sha256(C.unhex(credentials.credential));
   channel=new C.Channel(secret,C.concat(C.unhex(challenge.challenge),nonce));secret.fill(0);
   socket.send(JSON.stringify({token:pairing?ticket:null,device_id:pairing?null:credentials.device_id,client_nonce:C.hex(nonce)}));send(C.enc.encode(JSON.stringify({label:/iPhone|iPad/.test(navigator.userAgent)?'iPhone / iPad (Safari)':'Mobile browser'})));
-  const authenticated=JSON.parse(decode.decode(await nextPlain()));if(authenticated.credential){credentials=authenticated;localStorage.setItem('minikrill-mobile-v2',JSON.stringify(credentials));}
+  const authenticated=JSON.parse(decode.decode(await nextPlain()));stage=3;sessionStorage.removeItem('mk-retry');if(authenticated.credential){credentials=authenticated;localStorage.setItem('minikrill-mobile-v2',JSON.stringify(credentials));}
   parameters.delete('pair');history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters.toString():''));
   const hello=reader((await nextPlain()).slice(5));hello.u();hello.u();const features=hello.u();send(frame(2,C.concat(variable(1),variable(1),variable(features),variable(0),string('minikrill-mobile-pwa'))));
   terminal=new MkLiveTerminal(credentials,error);globalThis.liveTerminal=terminal;await refresh();if(parameters.has('session')&&selected)terminal.open(selected);scheduleRefresh();
