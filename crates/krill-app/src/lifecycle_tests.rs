@@ -246,3 +246,50 @@ fn language_switch_rebuilds_native_menus_and_keeps_the_security_check(
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// OWE-859: `⌘N`은 `shell::NewWorktree`에만 바인딩되어 `NewWindow`와 충돌하지 않고,
+/// `NewWindow` 액션은 이미 열린 메인 `Shell` 창을 재사용해 레이아웃 저장 경로 유실을 막는다.
+#[gpui::test]
+fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
+    cx: &mut gpui::TestAppContext,
+) {
+    let path = std::env::temp_dir().join(format!("owe-859-layout-{}.bin", std::process::id()));
+    std::fs::remove_file(&path).ok();
+    cx.update(|cx| {
+        init(cx);
+        let typed = [gpui::Keystroke::parse("cmd-n").unwrap()];
+        let actions: Vec<_> = cx
+            .all_bindings_for_input(&typed)
+            .into_iter()
+            .map(|b| b.action().name())
+            .collect();
+        assert_eq!(actions, ["shell::NewWorktree"]);
+
+        let first = open_shell(cx, Some(path.clone())).unwrap();
+        let second = new_window(cx).unwrap();
+        assert_eq!(
+            first, second,
+            "NewWindow reuses existing persisted Shell window"
+        );
+        assert_eq!(cx.windows().len(), 1);
+        second
+            .update(cx, |_, window, cx| {
+                window.dispatch_action(Box::new(shell::NewTab), cx);
+            })
+            .unwrap();
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let shell_window = cx
+            .windows()
+            .into_iter()
+            .find_map(|w| w.downcast::<shell::Shell>())
+            .unwrap();
+        shell_window
+            .update(cx, |shell, _, _| shell.flush_layout())
+            .unwrap();
+    });
+    let restored = krill_app::layout::Layout::load(&path).unwrap();
+    assert_eq!(restored.tabs().len(), 2);
+    std::fs::remove_file(path).ok();
+}
