@@ -61,7 +61,8 @@ trap cleanup EXIT
 if [[ "${MODE}" == "release" ]]; then
     ARCH="$(uname -m)"
     case "${ARCH}" in
-        arm64|x86_64) ;;
+        arm64) ;;
+        x86_64) echo "release bundles are arm64 only; on Intel Macs install from source: --from-source --tag main" >&2; exit 2 ;;
         *) echo "unsupported architecture: ${ARCH}" >&2; exit 2 ;;
     esac
 
