@@ -85,8 +85,12 @@ fn bundle_collects_redacted_logs_and_acknowledge_hides_them() {
     for leak in LEAKS {
         assert!(!text.contains(leak), "{leak} leaked:\n{text}");
     }
-    let mode = std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions());
-    assert_eq!(mode & 0o777, 0o600);
+    #[cfg(unix)]
+    {
+        let mode =
+            std::os::unix::fs::PermissionsExt::mode(&fs::metadata(&path).unwrap().permissions());
+        assert_eq!(mode & 0o777, 0o600);
+    }
     fs::remove_dir_all(&state).ok();
 }
 

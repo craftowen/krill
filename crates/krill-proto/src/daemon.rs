@@ -27,12 +27,12 @@
 //!   살아 있으면 연결은 backlog에서 krilld를 기다렸다 붙는다. 고아 상태도 초기 감시 프레임으로 확인해 holder를
 //!   다시 띄운다. 앱 없이 실행한 `krill`도 같은 경로로 복구한다.
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use crate::os::net::UnixStream;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -215,7 +215,11 @@ pub const LEGACY_HOLDER_LABEL: &str = "dev.minikrill.app.holder";
 /// holder에게 "launchd 밖에서 떴으니 스스로 setsid하라"고 알리는 첫 인자. launchd 경로에서는 주지 않는다.
 pub const DETACH_ARG: &str = "--detach";
 /// macOS `sockaddr_un.sun_path` 크기(NUL 포함). 소켓 경로는 자르지 않고 오류로 본다(CONVENTIONS A6).
+#[cfg(not(windows))]
 pub const SUN_PATH_MAX: usize = 104;
+/// Windows `afunix.h` `UNIX_PATH_MAX`(NUL 포함).
+#[cfg(windows)]
+pub const SUN_PATH_MAX: usize = 108;
 /// launchd 잡 소프트 fd 한도(launchd 기본 256, C2 실측). holder가 스스로 올리는 값과 같다.
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
@@ -239,13 +243,17 @@ pub fn state_dir_override() -> Option<OsString> {
     std::env::var_os("KRILL_STATE_DIR")
 }
 
-/// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`.
+/// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`
+/// (Windows는 `%LOCALAPPDATA%\Krill`).
 /// 이관 전(새 디렉터리 없음 + 옛 디렉터리가 실제 디렉터리)에는 옛 번들 id 경로다([`migrate::run`]).
 pub fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = state_dir_override() {
         return Some(PathBuf::from(dir));
     }
+    #[cfg(not(windows))]
     let home = std::env::var_os("HOME")?;
+    #[cfg(windows)]
+    let home = std::env::var_os("LOCALAPPDATA")?;
     Some(state_dir_in(Path::new(&home)))
 }
 
@@ -355,6 +363,7 @@ pub fn exe_near(bin: &Path, name: &str) -> PathBuf {
 }
 
 fn find_exe(bin: &Path, apps: &[PathBuf], name: &str) -> PathBuf {
+    let name = &format!("{name}{}", std::env::consts::EXE_SUFFIX);
     let direct = bin.join(name);
     if direct.is_file() {
         return direct;
@@ -486,19 +495,23 @@ pub fn wait_closed(stream: &mut UnixStream) {
 /// 절대 경로의 일반 파일이 아니면 `ENOENT`, 실행 실패는 OS 오류(`EACCES`·`ENOEXEC` 등), 시그널 종료는 `EPERM`.
 pub fn preflight(path: &Path) -> io::Result<()> {
     use std::io::Read as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
     if !path.is_absolute() || !path.is_file() {
         return Err(io::Error::from_raw_os_error(2)); // ENOENT
     }
-    if std::fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
-        return Err(io::Error::from_raw_os_error(13)); // EACCES
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
+            return Err(io::Error::from_raw_os_error(13)); // EACCES
+        }
     }
     // std::process::Command는 내부에서 posix_spawnp를 써서 ENOEXEC를 만나면 /bin/sh로 폴백한다.
-    // holder execve가 받는 Mach-O(단일·fat) 또는 #! 스크립트 매직인지 먼저 확인한다.
+    // holder execve가 받는 Mach-O(단일·fat)·PE(Windows) 또는 #! 스크립트 매직인지 먼저 확인한다.
     let mut magic = [0_u8; 4];
     let n = std::fs::File::open(path)?.read(&mut magic)?;
     let valid_magic = magic.starts_with(b"#!")
+        || (cfg!(windows) && magic.starts_with(b"MZ"))
         || (n == 4
             && matches!(
                 u32::from_ne_bytes(magic),

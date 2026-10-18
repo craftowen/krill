@@ -140,9 +140,12 @@ mod tests {
         ));
         assert!(!is_managed(&h, &root.join("claude").join("missing")));
         // 심볼릭 링크로 바깥 폴더를 가리키면 옮기지 않는다.
-        let link = root.join("claude").join("link");
-        std::os::unix::fs::symlink(h.join(".claude"), &link).unwrap();
-        assert!(!is_managed(&h, &link));
+        #[cfg(unix)]
+        {
+            let link = root.join("claude").join("link");
+            std::os::unix::fs::symlink(h.join(".claude"), &link).unwrap();
+            assert!(!is_managed(&h, &link));
+        }
         std::fs::remove_dir_all(h).unwrap();
     }
 
@@ -216,6 +219,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn worktree_trash_only_moves_paths_inside_root() {
         let h = home("worktree");
         let root = h.join("repo");

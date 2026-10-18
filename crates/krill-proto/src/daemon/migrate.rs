@@ -20,14 +20,17 @@
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions, TryLockError};
 use std::io;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt as _;
-use std::os::unix::net::UnixStream;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use super::{BUNDLE_ID, LEGACY_BUNDLE_ID, LEGACY_HOLDER_LABEL, is_absent, launch_lock};
+use crate::os::net::UnixStream;
 
 /// 1단계(옛 자리 옆 링크) 이름 꼬리.
 const LINK_SUFFIX: &str = ".krill-migrate";
@@ -64,9 +67,16 @@ fn items(home: &Path) -> [(PathBuf, PathBuf); 5] {
 }
 
 /// `HOME` 기준 상태 디렉터리. 이관 전이면 옛 경로, 아니면 새 경로.
+#[cfg(not(windows))]
 pub fn state_dir_in(home: &Path) -> PathBuf {
     let [(old, new), ..] = items(home);
     if pending(&old, &new) { old } else { new }
+}
+
+/// Windows: `local_app_data`(`%LOCALAPPDATA%`) 아래 `Krill`. 개명 전 Windows 판이 없어 이관할 옛 경로도 없다.
+#[cfg(windows)]
+pub fn state_dir_in(local_app_data: &Path) -> PathBuf {
+    local_app_data.join("Krill")
 }
 
 /// 새 경로가 없고 옛 경로가 실제(링크 아님) 파일·디렉터리다.
@@ -87,7 +97,7 @@ fn link_of(old: &Path) -> PathBuf {
 /// [`run`] 결과.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// 상태 디렉터리 재정의(`KRILL_STATE_DIR`)나 `HOME` 없음으로 건너뜀.
+    /// Windows, 상태 디렉터리 재정의(`KRILL_STATE_DIR`)나 `HOME` 없음으로 건너뜀.
     Skipped,
     /// 옛 holder·krilld가 살아 있거나 다른 기동자가 띄우는 중이라 옛 경로를 그대로 쓴다.
     Legacy,
@@ -118,7 +128,8 @@ pub enum Step {
 /// # Errors
 /// 잠금·rename·symlink·LaunchAgent plist 쓰기 실패.
 pub fn run() -> io::Result<Outcome> {
-    if super::state_dir_override().is_some() {
+    // 개명 이관은 macOS 번들 경로(`~/Library`·launchd)만 다룬다.
+    if cfg!(windows) || super::state_dir_override().is_some() {
         return Ok(Outcome::Skipped);
     }
     let Some(home) = std::env::var_os("HOME") else {
@@ -212,7 +223,7 @@ fn move_item(
     if pending(old, new) {
         remove_link(&link)?; // 1단계 뒤에 끊긴 흔적
         let target = new.file_name().ok_or(io::ErrorKind::InvalidInput)?;
-        std::os::unix::fs::symlink(target, &link)?;
+        symlink(target, &link)?;
         step(Step::Linked)?;
         fs::rename(old, new)?;
         step(Step::Moved)?;
@@ -267,8 +278,21 @@ fn migrate_link_agent(home: &Path, legacy: &Path, launchctl: Launchctl) -> io::R
 }
 
 /// `gui/<uid>`. uid는 `HOME`의 소유자다(krill-proto는 libc를 쓰지 않는다).
+#[cfg(target_os = "macos")]
 fn domain(home: &Path) -> Option<String> {
     fs::metadata(home).ok().map(|m| format!("gui/{}", m.uid()))
+}
+
+/// launchd는 macOS에만 있다.
+#[cfg(not(target_os = "macos"))]
+fn domain(_home: &Path) -> Option<String> {
+    None
+}
+
+/// [`run`]이 Windows에서 이관을 건너뛰므로 부르지 않는다.
+#[cfg(windows)]
+fn symlink(_target: impl AsRef<Path>, _link: impl AsRef<Path>) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 /// 등록돼 있지 않으면 launchctl이 실패하고 끝난다. 결과는 보지 않는다.
