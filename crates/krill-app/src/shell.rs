@@ -101,8 +101,40 @@ enum Next {
 
 /// 칸 IO 태스크가 백그라운드에서 정한 것.
 enum Got {
-    Live(krill_proto::SessionId, std::io::Result<pane::Linked>),
+    Live {
+        session: krill_proto::SessionId,
+        linked: std::io::Result<pane::Linked>,
+        prior_cold: Option<(krill_proto::SessionId, krill_proto::control::Cold)>,
+    },
     Cold(krill_proto::SessionId, krill_proto::control::Cold),
+}
+
+pub(crate) fn saved_window_bounds_from_gpui(wb: gpui::WindowBounds) -> layout::SavedWindowBounds {
+    let (mode, bounds) = match wb {
+        gpui::WindowBounds::Windowed(b) => (layout::SavedWindowMode::Windowed, b),
+        gpui::WindowBounds::Maximized(b) => (layout::SavedWindowMode::Maximized, b),
+        gpui::WindowBounds::Fullscreen(b) => (layout::SavedWindowMode::Fullscreen, b),
+    };
+    layout::SavedWindowBounds {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+        mode,
+    }
+}
+
+#[must_use]
+pub fn gpui_window_bounds_from_saved(saved: layout::SavedWindowBounds) -> gpui::WindowBounds {
+    let b = gpui::Bounds::new(
+        gpui::point(gpui::px(saved.x), gpui::px(saved.y)),
+        gpui::size(gpui::px(saved.width), gpui::px(saved.height)),
+    );
+    match saved.mode {
+        layout::SavedWindowMode::Windowed => gpui::WindowBounds::Windowed(b),
+        layout::SavedWindowMode::Maximized => gpui::WindowBounds::Maximized(b),
+        layout::SavedWindowMode::Fullscreen => gpui::WindowBounds::Fullscreen(b),
+    }
 }
 
 /// 보이는 칸 하나의 세션 연결과 입력 상태. 지우면 소켓을 닫아 IO 태스크도 끝난다.
@@ -406,6 +438,7 @@ pub struct Shell {
     notice: Option<String>,
     window: Option<AnyWindowHandle>,
     activation: Option<Subscription>,
+    bounds_observer: Option<Subscription>,
     diff: gpui::Entity<krill_app::diff::Panel>,
     _diff_collapse: Subscription,
     _diff_send: Subscription,
@@ -511,9 +544,21 @@ impl Shell {
             }
             _ => Layout::default(),
         };
+        let sidebar_collapsed = layout.sidebar_collapsed;
+        let panel_collapsed = layout.panel_collapsed;
+        let panel_tab = layout.panel_tab;
         let sidebar_path = path.as_deref().map(|p| p.with_file_name("sidebar.bin"));
-        let sidebar = cx.new(|_| sidebar::Sidebar::new(sidebar_path));
-        let sidebar_tabs = cx.observe(&sidebar, |_, _, cx| cx.notify());
+        let sidebar = cx.new(|cx| {
+            let mut s = sidebar::Sidebar::new(sidebar_path);
+            if sidebar_collapsed {
+                s.set_visible(false, cx);
+            }
+            s
+        });
+        let sidebar_tabs = cx.observe(&sidebar, |this, sidebar, cx| {
+            this.sync_live_cwds(sidebar.read(cx));
+            cx.notify();
+        });
         let selection = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::Selected, cx| {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
@@ -588,7 +633,21 @@ impl Shell {
             .detach();
         cx.observe_global::<krill_app::accounts::installed::Installed>(|_, cx| cx.notify())
             .detach();
-        let diff = cx.new(|cx| krill_app::diff::Panel::unconnected(folder, cx));
+        let diff = cx.new(|cx| {
+            let mut panel = krill_app::diff::Panel::unconnected(folder, cx);
+            panel.set_tab(panel_tab, cx);
+            if panel_collapsed {
+                panel.set_visible(false, cx);
+            }
+            panel
+        });
+        cx.observe(&diff, |this, diff, cx| {
+            let tab = diff.read(cx).active_tab();
+            if this.layout.set_panel_tab(tab) {
+                this.save();
+            }
+        })
+        .detach();
         let diff_send = Self::subscribe_diff(&diff, cx);
         cx.subscribe(&diff, |this, _, e: &krill_app::diff::OpenFile, cx| {
             this.open_file(e.0.clone(), cx);
@@ -673,8 +732,8 @@ impl Shell {
             _sidebar_reconnect: sidebar_reconnect,
             _sidebar_tabs: sidebar_tabs,
             layout,
-            sidebar_collapsed: false,
-            panel_collapsed: false,
+            sidebar_collapsed,
+            panel_collapsed,
             path: path.filter(|_| writable),
             saver: persist::Saver::default(),
             fits: fit::Pending::default(),
@@ -693,6 +752,7 @@ impl Shell {
             notice,
             window: None,
             activation: None,
+            bounds_observer: None,
             diff,
             _diff_collapse: diff_collapse,
             _diff_send: diff_send,
@@ -729,6 +789,43 @@ impl Shell {
         };
         shell.record_workspace_nav(cx);
         shell
+    }
+
+    /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 `layout.launches`에 동기화한다(OWE-842 시나리오 B).
+    pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) {
+        let mut changed = false;
+        let panes: Vec<PaneId> = (0..self.layout.tabs().len())
+            .flat_map(|i| self.layout.tab_panes(i))
+            .collect();
+        for pane in panes {
+            let Some(sid) = self.layout.session(pane) else {
+                continue;
+            };
+            let host = self.layout.host(pane);
+            let Some(live_cwd) = sidebar
+                .session_on(host, sid)
+                .and_then(|s| s.cwd.as_deref())
+                .filter(|p| !p.as_os_str().is_empty())
+            else {
+                continue;
+            };
+            let cwd_bytes = live_cwd.as_os_str().as_bytes();
+            let mut launch = self.layout.launch(pane).cloned().unwrap_or(Create {
+                account: None,
+                program: Program::Login,
+                cwd: cwd_bytes.to_vec(),
+                cols: pane::SIZE.0,
+                rows: pane::SIZE.1,
+            });
+            if launch.cwd != cwd_bytes || self.layout.launch(pane).is_none() {
+                launch.cwd = cwd_bytes.to_vec();
+                self.layout.set_launch(pane, launch);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
     }
 
     /// 칸이 사이드바의 로컬 git 워크트리에 속할 때만 그 워크트리 루트 경로를 돌려준다.
@@ -1764,27 +1861,51 @@ impl Shell {
                 let old = resume.filter(|r| want.is_none() || want == Some(*r));
                 let got = bg
                     .spawn(async move {
-                        let session = match old {
-                            Some(old) => pane::resume_session_in(&p, Some(old), &launch)?,
+                        let (session, prior_cold) = match old {
+                            Some(old) => (
+                                pane::resume_session_in(&p, Some(old), &launch)?,
+                                pane::load_cold(&p, old).map(|c| (old, c)),
+                            ),
                             None => match pane::ensure_session_in(&p, want, &launch)? {
-                                pane::Found::Live(session, _) => session,
-                                pane::Found::Cold(session, cold) => {
-                                    return Ok(Got::Cold(session, cold));
+                                pane::Found::Live(session, _) => (session, None),
+                                // OWE-842(시나리오 B): 재부팅 등으로 이전 세션이 콜드가 되었으면
+                                // 같은 cwd·셸 설정으로 새 세션을 즉시 자동 재스폰하고,
+                                // 이전 세션의 콜드 화면·스크롤백을 새 세션 위쪽 히스토리로 보존한다.
+                                // 재개에 실패하면(예: holder 없음) 기존 콜드 읽기 전용 화면으로 폴백한다.
+                                pane::Found::Cold(cold_session, cold) => {
+                                    match pane::resume_session_in(&p, Some(cold_session), &launch) {
+                                        Ok(new_session) => {
+                                            (new_session, Some((cold_session, cold)))
+                                        }
+                                        Err(_) => return Ok(Got::Cold(cold_session, cold)),
+                                    }
                                 }
                             },
                         };
                         let known = known.filter(|_| want == Some(session));
                         match pane::attach(&p, session, known) {
-                            Ok(linked) => Ok(Got::Live(session, Ok(linked))),
+                            Ok(linked) => Ok(Got::Live {
+                                session,
+                                linked: Ok(linked),
+                                prior_cold,
+                            }),
                             // AS-27: attach 직전 세션이 끝나도(`Refused`→`NotFound`) 디스크 마지막
                             // 화면을 보여준다. 백그라운드에서 읽어 UI 스레드를 막지 않는다.
                             Err(e) if is_permanent_error(&e) => {
                                 Ok(match pane::load_cold(&p, session) {
                                     Some(cold) => Got::Cold(session, cold),
-                                    None => Got::Live(session, Err(e)),
+                                    None => Got::Live {
+                                        session,
+                                        linked: Err(e),
+                                        prior_cold,
+                                    },
                                 })
                             }
-                            Err(e) => Ok(Got::Live(session, Err(e))),
+                            Err(e) => Ok(Got::Live {
+                                session,
+                                linked: Err(e),
+                                prior_cold,
+                            }),
                         }
                     })
                     .await;
@@ -1842,10 +1963,20 @@ impl Shell {
     fn settled(&mut self, pane: PaneId, got: std::io::Result<Got>, cx: &mut Context<Self>) -> Next {
         let got = match got {
             Ok(Got::Cold(session, cold)) => return self.cold(pane, session, cold, cx),
-            Ok(Got::Live(session, linked)) => Ok((session, linked)),
+            Ok(Got::Live {
+                session,
+                linked,
+                prior_cold,
+            }) => Ok((session, linked, prior_cold)),
             Err(e) => Err(e),
         };
-        let got = got.and_then(|(session, linked)| {
+        let got = got.and_then(|(session, linked, prior_cold)| {
+            if let Some((cold_session, cold)) = prior_cold
+                && let Some(l) = self.live.get_mut(&pane)
+                && !l.pane.is_cold()
+            {
+                l.pane.show_cold(cold_session, cold).ok();
+            }
             if self.layout.session(pane) != Some(session) {
                 if self.layout.host(pane).is_local() {
                     self.layout.clear_session(pane);
@@ -2594,6 +2725,8 @@ impl Shell {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.sidebar_collapsed = !self.sidebar_collapsed;
+        self.layout.sidebar_collapsed = self.sidebar_collapsed;
+        self.save();
         let visible = !self.sidebar_collapsed;
         self.sidebar.update(cx, |s, cx| s.set_visible(visible, cx));
         cx.notify();
@@ -2601,6 +2734,8 @@ impl Shell {
 
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
         self.panel_collapsed = !self.panel_collapsed;
+        self.layout.panel_collapsed = self.panel_collapsed;
+        self.save();
         let visible = !self.panel_collapsed && self.security.is_window_active();
         self.diff.update(cx, |d, cx| d.set_visible(visible, cx));
         cx.notify();
@@ -2612,20 +2747,28 @@ impl Shell {
         }
         if self.panel_collapsed {
             self.panel_collapsed = false;
+            self.layout.panel_collapsed = false;
             let visible = self.security.is_window_active();
             self.diff.update(cx, |d, cx| {
                 d.set_visible(visible, cx);
                 d.show_files(window, cx);
             });
+            let _ = self.layout.set_panel_tab(krill_app::diff::PanelTab::Files);
+            self.save();
             cx.notify();
             return;
         }
         if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Files {
             self.panel_collapsed = true;
+            self.layout.panel_collapsed = true;
+            self.save();
             self.diff.update(cx, |d, cx| d.set_visible(false, cx));
             window.focus(&self.focus, cx);
         } else {
             self.diff.update(cx, |d, cx| d.show_files(window, cx));
+            if self.layout.set_panel_tab(krill_app::diff::PanelTab::Files) {
+                self.save();
+            }
         }
         cx.notify();
     }
@@ -2636,21 +2779,29 @@ impl Shell {
         }
         if self.panel_collapsed {
             self.panel_collapsed = false;
+            self.layout.panel_collapsed = false;
             let visible = self.security.is_window_active();
             self.diff.update(cx, |d, cx| {
                 d.set_visible(visible, cx);
                 d.show_search(window, cx);
             });
+            let _ = self.layout.set_panel_tab(krill_app::diff::PanelTab::Search);
+            self.save();
             cx.notify();
             return;
         }
         if self.diff.read(cx).active_tab() == krill_app::diff::PanelTab::Search {
             self.panel_collapsed = true;
+            self.layout.panel_collapsed = true;
+            self.save();
             self.diff.update(cx, |d, cx| d.set_visible(false, cx));
             self.files.refocus = true;
             window.focus(&self.focus, cx);
         } else {
             self.diff.update(cx, |d, cx| d.show_search(window, cx));
+            if self.layout.set_panel_tab(krill_app::diff::PanelTab::Search) {
+                self.save();
+            }
         }
         cx.notify();
     }
@@ -3441,6 +3592,16 @@ impl Render for Shell {
                 }
                 if !active && let Some(pane) = this.layout.focused() {
                     this.commit_ime(pane, Some(window), cx);
+                }
+            }));
+        }
+        if self.bounds_observer.is_none() && self.role == WindowRole::Main {
+            self.bounds_observer = Some(cx.observe_window_bounds(window, |this, window, _| {
+                if this.role == WindowRole::Main {
+                    let saved = saved_window_bounds_from_gpui(window.window_bounds());
+                    if this.layout.set_window_bounds(saved) {
+                        this.save();
+                    }
                 }
             }));
         }

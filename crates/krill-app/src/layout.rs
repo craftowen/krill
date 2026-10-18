@@ -221,6 +221,57 @@ impl PartialEq for MruState {
     }
 }
 
+/// 창 위치·크기·전체화면 상태(OWE-842).
+pub const MIN_WINDOW_WIDTH: f32 = 360.0;
+pub const MIN_WINDOW_HEIGHT: f32 = 240.0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavedWindowMode {
+    #[default]
+    Windowed,
+    Maximized,
+    Fullscreen,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct SavedWindowBounds {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub mode: SavedWindowMode,
+}
+
+impl SavedWindowBounds {
+    #[must_use]
+    pub fn is_valid(self) -> bool {
+        self.x.is_finite()
+            && self.y.is_finite()
+            && self.width.is_finite()
+            && self.height.is_finite()
+            && self.width >= MIN_WINDOW_WIDTH
+            && self.height >= MIN_WINDOW_HEIGHT
+    }
+}
+
+/// 파일(에디터) 칸의 커서 위치와 미리보기/편집 모드 상태(OWE-842).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedFileState {
+    pub line: u32,
+    pub column: u32,
+    pub preview: bool,
+}
+
+/// OWE-842: v6 본문(`hosts` 뒤)에 붙는 확장 상태(창 크기·위치·전체화면, 좌·우 사이드바 열림/탭, 파일 커서/미리보기).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+struct LayoutTail {
+    window_bounds: Option<SavedWindowBounds>,
+    sidebar_collapsed: bool,
+    panel_collapsed: bool,
+    panel_tab: crate::diff::PanelTab,
+    file_states: BTreeMap<PaneId, SavedFileState>,
+}
+
 /// 창 하나의 레이아웃. 불변식: 탭이 있으면 `active < tabs.len()`(없으면 `active == 0`), 각 탭의 `focused`는 그 탭의 잎.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
@@ -237,6 +288,16 @@ pub struct Layout {
     hosts: BTreeMap<PaneId, HostId>,
     /// 파일 칸(MK-119): 세션 대신 이 파일을 에디터로 보인다. 세션을 붙이지 않는다.
     files: BTreeMap<PaneId, PathBuf>,
+    #[serde(skip)]
+    window_bounds: Option<SavedWindowBounds>,
+    #[serde(skip)]
+    pub sidebar_collapsed: bool,
+    #[serde(skip)]
+    pub panel_collapsed: bool,
+    #[serde(skip)]
+    pub panel_tab: crate::diff::PanelTab,
+    #[serde(skip)]
+    file_states: BTreeMap<PaneId, SavedFileState>,
     #[serde(skip)]
     mru: MruState,
 }
@@ -309,6 +370,11 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             launches,
             hosts: BTreeMap::new(),
             files: old.files,
+            window_bounds: None,
+            sidebar_collapsed: false,
+            panel_collapsed: false,
+            panel_tab: crate::diff::PanelTab::default(),
+            file_states: BTreeMap::new(),
             mru: MruState::default(),
         };
         layout.record_mru(layout.active);
@@ -328,6 +394,11 @@ impl Default for Layout {
             launches: BTreeMap::new(),
             hosts: BTreeMap::new(),
             files: BTreeMap::new(),
+            window_bounds: None,
+            sidebar_collapsed: false,
+            panel_collapsed: false,
+            panel_tab: crate::diff::PanelTab::default(),
+            file_states: BTreeMap::new(),
             mru: MruState {
                 order: vec![0],
                 cursor: None,
@@ -468,6 +539,56 @@ impl Layout {
         self.files.iter().map(|(p, f)| (*p, f.as_path()))
     }
 
+    /// 파일 칸의 에디터 상태(커서 위치·미리보기 모드, OWE-842).
+    #[must_use]
+    pub fn file_state(&self, pane: PaneId) -> Option<SavedFileState> {
+        self.file_states.get(&pane).copied()
+    }
+
+    /// 파일 칸의 에디터 상태를 갱신한다. 값이 바뀌었을 때만 `true`를 돌려준다.
+    pub fn set_file_state(&mut self, pane: PaneId, state: SavedFileState) -> bool {
+        if !self.files.contains_key(&pane) {
+            return false;
+        }
+        if state == SavedFileState::default() {
+            return self.file_states.remove(&pane).is_some();
+        }
+        if self.file_states.get(&pane) == Some(&state) {
+            return false;
+        }
+        self.file_states.insert(pane, state);
+        true
+    }
+
+    /// 마지막으로 저장된 창 위치·크기·전체화면 상태(OWE-842).
+    #[must_use]
+    pub fn window_bounds(&self) -> Option<SavedWindowBounds> {
+        self.window_bounds
+    }
+
+    /// 창 위치·크기·전체화면 상태를 갱신한다. 유효하고 값이 바뀌었을 때만 `true`.
+    pub fn set_window_bounds(&mut self, bounds: SavedWindowBounds) -> bool {
+        if !bounds.is_valid() || self.window_bounds == Some(bounds) {
+            return false;
+        }
+        self.window_bounds = Some(bounds);
+        true
+    }
+
+    #[must_use]
+    pub fn panel_tab(&self) -> crate::diff::PanelTab {
+        self.panel_tab
+    }
+
+    /// 우측 패널의 활성 탭을 갱신한다. 값이 바뀌었을 때만 `true`.
+    pub fn set_panel_tab(&mut self, tab: crate::diff::PanelTab) -> bool {
+        if self.panel_tab == tab {
+            return false;
+        }
+        self.panel_tab = tab;
+        true
+    }
+
     /// 파일을 연다: 이미 어느 탭의 칸에 열려 있으면 그 탭·칸으로, 아니면 새 탭(폴더는 지금 칸을 물려받는다).
     pub fn open_file(&mut self, path: PathBuf) -> PaneId {
         if let Some((tab, pane)) = self.tabs.iter().enumerate().find_map(|(i, t)| {
@@ -519,6 +640,7 @@ impl Layout {
         self.launches.retain(|p, _| live.contains(p));
         self.hosts.retain(|p, _| live.contains(p));
         self.files.retain(|p, _| live.contains(p));
+        self.file_states.retain(|p, _| self.files.contains_key(p));
     }
 
     fn alloc_pane(&mut self) -> PaneId {
@@ -861,6 +983,24 @@ impl Layout {
         }
     }
 
+    fn tail(&self) -> LayoutTail {
+        LayoutTail {
+            window_bounds: self.window_bounds,
+            sidebar_collapsed: self.sidebar_collapsed,
+            panel_collapsed: self.panel_collapsed,
+            panel_tab: self.panel_tab,
+            file_states: self.file_states.clone(),
+        }
+    }
+
+    fn apply_tail(&mut self, tail: LayoutTail) {
+        self.window_bounds = tail.window_bounds;
+        self.sidebar_collapsed = tail.sidebar_collapsed;
+        self.panel_collapsed = tail.panel_collapsed;
+        self.panel_tab = tail.panel_tab;
+        self.file_states = tail.file_states;
+    }
+
     fn is_valid(&self) -> bool {
         let widths_ok = [self.sidebar_width, self.panel_width]
             .iter()
@@ -889,9 +1029,27 @@ impl Layout {
             && sessions_ok
             && self.launches.keys().all(|p| seen.contains(p))
             && self
+                .hosts
+                .iter()
+                .all(|(p, h)| seen.contains(p) && !h.is_local())
+            && self.window_bounds.is_none_or(SavedWindowBounds::is_valid)
+            && self
                 .files
                 .keys()
                 .all(|p| seen.contains(p) && !self.sessions.contains_key(p))
+            && self.file_states.keys().all(|p| self.files.contains_key(p))
+    }
+
+    /// 손상 백업(`.corrupt`)을 만들지 않고 저장 파일에서 창 위치·크기만 미리 읽는다.
+    #[must_use]
+    pub fn peek_window_bounds(path: &Path) -> Option<SavedWindowBounds> {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .ok()?
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Self::decode(&bytes).ok()?.window_bounds
     }
 
     /// 저장 파일을 읽는다. 손상·미지원 버전은 덮어쓰지 않도록 `.corrupt`로 보존한 뒤 오류를 돌려준다.
@@ -934,11 +1092,25 @@ impl Layout {
             body
         };
         let mut layout = match version {
-            FORMAT_VERSION => postcard::from_bytes::<Self>(body),
+            FORMAT_VERSION => {
+                let (mut l, rest) =
+                    postcard::take_from_bytes::<Self>(body).map_err(|e| invalid(&e.to_string()))?;
+                if !rest.is_empty() {
+                    let (hosts, rest) = postcard::take_from_bytes::<BTreeMap<PaneId, HostId>>(rest)
+                        .map_err(|e| invalid(&e.to_string()))?;
+                    l.hosts = hosts;
+                    if !rest.is_empty() {
+                        let tail = postcard::from_bytes::<LayoutTail>(rest)
+                            .map_err(|e| invalid(&e.to_string()))?;
+                        l.apply_tail(tail);
+                    }
+                }
+                Ok(l)
+            }
             5 => postcard::from_bytes::<LegacyLayout<Create>>(body).map(Self::from),
             _ => postcard::from_bytes::<LegacyLayout<LegacyCreate>>(body).map(Self::from),
         }
-        .map_err(|e| invalid(&e.to_string()))?;
+        .map_err(|e: postcard::Error| invalid(&e.to_string()))?;
         if !layout.is_valid() {
             return Err(invalid("layout violates invariants"));
         }
@@ -948,7 +1120,14 @@ impl Layout {
 
     /// 임시 파일(0600)에 쓰고 fsync한 뒤 rename한다. 중간에 죽어도 이전 파일이나 새 파일 중 하나가 남는다.
     pub fn save(&self, path: &Path) -> io::Result<()> {
-        let body = postcard::to_stdvec(self).map_err(io::Error::other)?;
+        let mut body = postcard::to_stdvec(self).map_err(io::Error::other)?;
+        let tail = self.tail();
+        if !self.hosts.is_empty() || tail != LayoutTail::default() {
+            body.extend(postcard::to_stdvec(&self.hosts).map_err(io::Error::other)?);
+            if tail != LayoutTail::default() {
+                body.extend(postcard::to_stdvec(&tail).map_err(io::Error::other)?);
+            }
+        }
         if u64::try_from(body.len()).map_or(true, |n| n >= MAX_FILE_BYTES) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

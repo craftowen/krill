@@ -522,7 +522,15 @@ fn attach_failure_after_create_keeps_session(cx: &mut TestAppContext) {
         view.update(cx, |t, cx| {
             t.live.insert(pane, Live::new(Task::ready(())));
             let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "attach timed out");
-            t.settled(pane, Ok(Got::Live(s, Err(err))), cx)
+            t.settled(
+                pane,
+                Ok(Got::Live {
+                    session: s,
+                    linked: Err(err),
+                    prior_cold: None,
+                }),
+                cx,
+            )
         })
     });
     assert!(matches!(next, Next::Retry));
@@ -1760,7 +1768,15 @@ fn update_ready_waits_for_successful_link(cx: &mut TestAppContext) {
                 search: false,
             };
             assert!(matches!(
-                s.settled(pane, Ok(Got::Live(session, Ok(linked))), cx),
+                s.settled(
+                    pane,
+                    Ok(Got::Live {
+                        session,
+                        linked: Ok(linked),
+                        prior_cold: None,
+                    }),
+                    cx,
+                ),
                 Next::Read(_)
             ));
             assert!(ready.exists());
@@ -4767,6 +4783,324 @@ fn navigation_history_reaches_non_git_subdir_file_and_remote_tabs_with_sidebar_t
     cx.update(|_, cx| {
         assert!(view.read(cx).can_navigate_back(cx));
         assert!(!view.read(cx).can_navigate_forward(cx));
+    });
+
+    std::fs::remove_file(&tmp_file).ok();
+}
+
+/// OWE-842: 앱 재시작(시나리오 A) 및 PC 재부팅/콜드 세션 자동 재개(시나리오 B) 시 8대 워크스페이스 상태가
+/// 빠짐없이 저장·복원되는지 검증한다.
+#[gpui::test]
+fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext) {
+    use std::os::unix::net::UnixStream;
+    use std::sync::Arc;
+
+    use krill_app::diff::PanelTab;
+    use krill_app::hosts::HostId;
+    use krill_app::layout::{SavedFileState, SavedWindowBounds, SavedWindowMode, TabColor};
+    use krill_app::sidebar::options::{GroupKey, PrGroup};
+    use krill_proto::SessionId;
+    use krill_proto::control::{AgentState, AgentStatus, Cold};
+    use krill_proto::screen::{Cell, Op, Revision, Seq, encode_update};
+
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+
+    // 1. 창 크기·위치·전체화면/최대화 모드 변환 및 디스크 사전 조회(peek_window_bounds) 검증
+    let bounds_full = SavedWindowBounds {
+        x: 140.0,
+        y: 90.0,
+        width: 1520.0,
+        height: 940.0,
+        mode: SavedWindowMode::Fullscreen,
+    };
+    let gpui_bounds = gpui_window_bounds_from_saved(bounds_full);
+    assert_eq!(saved_window_bounds_from_gpui(gpui_bounds), bounds_full);
+
+    let path = state_path("owe-842-e2e");
+    let tmp_file = std::env::temp_dir().join(format!("krill-owe-842-{}.md", std::process::id()));
+    std::fs::write(&tmp_file, "# line 1\nline 2\nline 3\nline 4\n").expect("write temp md");
+
+    let (view, cx) = open(cx, path.clone());
+    let wt_a = PathBuf::from("/repo/a");
+    let wt_b = PathBuf::from("/repo/b");
+    let remote_host = HostId::Remote("remote-dev".into());
+    let group_key = GroupKey::PrStatus(PrGroup::Open);
+
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![sidebar::Session {
+            id: SessionId(101),
+            status: AgentStatus {
+                state: AgentState::Working,
+                agent: "claude".into(),
+                ..AgentStatus::UNKNOWN
+            },
+            worktree: Some(wt_b.clone()),
+            cwd: Some(wt_b.clone()),
+            account: None,
+        }],
+        trees: [(PathBuf::from("/repo"), vec![wt_a.clone(), wt_b.clone()])].into(),
+    };
+    cx.update(|_, cx| {
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |sb, cx| {
+            sb.connect_source(Arc::new(Memory(snapshot)), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    // 2~8. 복합 상태 구성:
+    // - 탭 0: 좌우 분할 2칸(비율 0.35), 첫 칸 SessionId(101), 둘째 칸 SessionId(102), 탭 핀 고정 + Green 색상
+    // - 탭 1: 파일 에디터 탭(3행 4열 커서, 편집 모드 preview=false)
+    // - 탭 2: 원격 호스트 탭(remote-dev)
+    // - 사이드바: 접힘(collapsed=true), 너비 275px, 워크트리 `/repo/b` 선택, `/repo/a` 접힘, PR 그룹/호스트 접힘
+    // - 우측 패널: 열림(panel_collapsed=false), `PanelTab::Search` 활성, 너비 340px
+    let (pane_0a, pane_0b, file_pane) = cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert!(s.layout.set_window_bounds(bounds_full));
+            let p0a = s.layout.focused().expect("initial pane");
+            s.layout.set_session(p0a, SessionId(101));
+            s.layout.set_launch(
+                p0a,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: b"/repo/old-cwd".to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            s.layout.split(Axis::Horizontal);
+            let p0b = s.layout.focused().expect("split pane");
+            s.layout.set_session(p0b, SessionId(102));
+            s.layout.set_ratio(&[], 0.35);
+            s.layout.toggle_pin_tab(0);
+            s.layout.set_tab_color(0, Some(TabColor::Green));
+
+            // 라이브 세션의 최신 cwd가 sidebar 스냅샷을 통해 layout.launches에 동기화되는지 확인(시나리오 B 대비)
+            s.sidebar.update(cx, |sb, cx| {
+                sb.fold(&wt_a, Some(false), cx);
+                sb.fold_group(group_key, Some(false), cx);
+                sb.fold_host(&remote_host, Some(false), cx);
+                sb.toggle_card_sessions(&wt_b, cx);
+                sb.select_worktree(Some(wt_b.clone()), cx);
+            });
+            let sb_snap = s.sidebar.read(cx);
+            s.sync_live_cwds(sb_snap);
+            assert_eq!(
+                s.layout.launch(p0a).map(|l| l.cwd.as_slice()),
+                Some(&b"/repo/b"[..])
+            );
+
+            // 파일 에디터 탭 열기(1-based 커서 4행 5열 -> 0-based line=3, column=4)
+            s.open_file_at(tmp_file.clone(), 4, 5, cx);
+            let fp = s.layout.focused().expect("file pane");
+            (p0a, p0b, fp)
+        })
+    });
+    cx.run_until_parked();
+    // apply_goto가 다음 프레임에 커서를 옮기도록 한 번 더 갱신한 뒤 편집 모드(preview=false)로 전환
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.set_preview(file_pane, false, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let remote_pane = cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            // 원격 호스트 탭 열기
+            s.new_folder_tab_on(
+                remote_host.clone(),
+                std::path::Path::new("/home/dev/app"),
+                Program::Login,
+                cx,
+            );
+            let rp = s.layout.focused().expect("remote pane");
+
+            // 탭 0의 둘째 칸(p0b)을 활성 포커스로 두고 사이드바/우측 패널 상태 설정
+            s.layout.activate(0);
+            s.layout.focus(pane_0b);
+            s.layout.sidebar_width = 275.0;
+            s.layout.panel_width = 340.0;
+            s.toggle_sidebar(cx); // sidebar_collapsed = true
+            s.toggle_workspace_search(window, cx); // panel_collapsed = false, panel_tab = Search
+            s.save();
+            rp
+        })
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| view.read(cx).saver.flush());
+
+    assert_eq!(Layout::peek_window_bounds(&path), Some(bounds_full));
+
+    // === 시나리오 A: 앱을 닫았다가 다시 켰을 때(새 Shell 생성) 8대 항목 복원 검증 ===
+    let (restored, cx) = cx.add_window_view(|_, cx| Shell::new(Some(path.clone()), cx));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = restored.read(cx);
+        // (1) 창 크기·위치·모드
+        assert_eq!(s.layout.window_bounds(), Some(bounds_full));
+        // (2) 사이드바 접힘·너비·선택된 워크트리·접힌 워크트리/그룹/호스트
+        assert!(s.layout.sidebar_collapsed);
+        assert!(!s.sidebar.read(cx).is_visible());
+        assert!((s.layout.sidebar_width - 275.0).abs() < f32::EPSILON);
+        let sb = s.sidebar.read(cx);
+        assert!(sb.is_collapsed(&wt_a));
+        assert!(sb.is_group_collapsed(group_key));
+        assert!(sb.is_host_collapsed(&remote_host));
+        assert!(sb.is_card_expanded(&wt_b));
+        assert_eq!(
+            sb.selected_worktree().map(std::path::Path::to_path_buf),
+            Some(wt_b.clone())
+        );
+        // (3) 탭 순서·핀·색상·활성 탭
+        assert_eq!(s.layout.tabs().len(), 3);
+        assert_eq!(s.layout.active(), 0);
+        assert!(s.layout.is_tab_pinned(0));
+        assert_eq!(s.layout.tab_color(0), Some(TabColor::Green));
+        // (4) 분할 구조·비율·포커스된 분할 칸
+        assert_eq!(s.layout.focused(), Some(pane_0b));
+        let PaneTree::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } = &s.layout.tabs()[0].root
+        else {
+            panic!("tab 0 root must be split");
+        };
+        assert_eq!(*axis, Axis::Horizontal);
+        assert!((ratio - 0.35).abs() < 1e-5);
+        assert_eq!(**first, PaneTree::Leaf(pane_0a));
+        assert_eq!(**second, PaneTree::Leaf(pane_0b));
+        // (5-A) 터미널 세션 ID 및 최신 cwd 보존
+        assert_eq!(s.layout.session(pane_0a), Some(SessionId(101)));
+        assert_eq!(s.layout.session(pane_0b), Some(SessionId(102)));
+        assert_eq!(
+            s.layout.launch(pane_0a).map(|l| l.cwd.as_slice()),
+            Some(&b"/repo/b"[..])
+        );
+        // (6) 파일/에디터 탭 경로·커서 줄/열·미리보기/편집 모드 복원 (탭 활성화 전 디스크 상태)
+        assert_eq!(s.layout.file(file_pane), Some(tmp_file.as_path()));
+        assert_eq!(
+            s.layout.file_state(file_pane),
+            Some(SavedFileState {
+                line: 3,
+                column: 4,
+                preview: false,
+            })
+        );
+        // (7) 우측 패널 열림/접힘·활성 탭·너비
+        assert!(!s.layout.panel_collapsed);
+        assert!(s.diff.read(cx).is_visible());
+        assert_eq!(s.diff.read(cx).active_tab(), PanelTab::Search);
+        assert!((s.layout.panel_width - 340.0).abs() < f32::EPSILON);
+        // (8) 원격 호스트 배정
+        assert_eq!(s.layout.host(remote_pane), &remote_host);
+    });
+
+    // 파일 탭(탭 1)을 활성화해 실제로 에디터 뷰가 로드될 때도 편집 모드(preview=false)와 커서(3, 4)가 유지되는지 검증
+    cx.update(|_, cx| {
+        restored.update(cx, |s, cx| {
+            s.change(true, cx, |l| l.activate(1));
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = restored.read(cx);
+        assert_eq!(s.is_file_preview(file_pane), Some(false));
+        assert_eq!(
+            s.layout.file_state(file_pane),
+            Some(SavedFileState {
+                line: 3,
+                column: 4,
+                preview: false,
+            })
+        );
+    });
+
+    // === 시나리오 B: PC 재부팅 후 죽은 세션(SessionId(101))이 새 세션(SessionId(201))으로 자동 재개되고
+    // 이전 세션의 콜드 스크롤백 + 화면이 새 세션 위쪽 히스토리로 보존되는지 검증 ===
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let reader = ours.try_clone().unwrap();
+    let writer = pane::Writer::spawn(ours).unwrap();
+    let row = |text: &str| -> Vec<Cell> {
+        text.chars()
+            .map(|ch| Cell {
+                ch,
+                ..Cell::default()
+            })
+            .collect()
+    };
+    let cold_ops = vec![
+        Op::Reset { cols: 10, lines: 2 },
+        Op::Line {
+            line: 0,
+            cells: row("reboot-scr"),
+        },
+    ];
+    let cold = Cold {
+        screen: cold_ops,
+        history: vec![row("reboot-hist")],
+    };
+    cx.update(|_, cx| {
+        restored.update(cx, |s, cx| {
+            s.change(true, cx, |l| l.activate(0));
+            s.live
+                .entry(pane_0a)
+                .or_insert_with(|| Live::new(Task::ready(())));
+            let next = s.settled(
+                pane_0a,
+                Ok(Got::Live {
+                    session: SessionId(201),
+                    linked: Ok(pane::Linked {
+                        reader,
+                        writer,
+                        instance: 2,
+                        launch: None,
+                        features: krill_proto::input::FEAT_INPUT,
+                        search: false,
+                    }),
+                    prior_cold: Some((SessionId(101), cold)),
+                }),
+                cx,
+            );
+            assert!(matches!(next, Next::Read(_)));
+            assert_eq!(s.layout.session(pane_0a), Some(SessionId(201)));
+
+            // 새 세션의 첫 라이브 화면 프레임 도착
+            let frames = encode_update(
+                Revision(1),
+                Seq(1),
+                vec![
+                    Op::Reset { cols: 10, lines: 2 },
+                    Op::Line {
+                        line: 0,
+                        cells: row("fresh-sh$"),
+                    },
+                ],
+            )
+            .unwrap();
+            for frame in frames {
+                let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+                assert!(s.on_frame(pane_0a, k, &body, cx));
+            }
+            let live_pane = &mut s.live.get_mut(&pane_0a).expect("live pane").pane;
+            assert!(!live_pane.is_cold());
+            assert_eq!(live_pane.shown().rows[0], row("fresh-sh$"));
+
+            // 위로 2행 스크롤하면 재부팅 전 세션의 콜드 스크롤백("reboot-hist")과 콜드 화면("reboot-scr")이 보존되어 보인다.
+            assert!(live_pane.scroll(2));
+            assert_eq!(
+                live_pane.shown().rows,
+                vec![row("reboot-hist"), row("reboot-scr")]
+            );
+        });
     });
 
     std::fs::remove_file(&tmp_file).ok();

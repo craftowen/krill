@@ -586,6 +586,14 @@ impl Shell {
             .into_any_element()
     }
 
+    #[cfg(test)]
+    pub(super) fn is_file_preview(&self, id: PaneId) -> Option<bool> {
+        let Body::Text { preview, shown, .. } = &self.files.tabs.get(&id)?.body else {
+            return None;
+        };
+        Some(preview.is_some() && shown.is_some())
+    }
+
     /// 파일 칸 머리의 편집/미리보기 토글(마크다운·CSV·ipynb·SVG만).
     fn preview_toggle(&self, id: PaneId, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let Some(Body::Text {
@@ -658,7 +666,48 @@ impl Shell {
             None
         };
         self.files.refocus = true;
+        self.sync_file_states(cx);
         cx.notify();
+    }
+
+    /// 열린 텍스트 탭들의 커서 위치·미리보기 여부를 `layout.file_states`에 동기화하고 바뀌었으면 저장한다(OWE-842).
+    pub(super) fn sync_file_states(&mut self, cx: &App) {
+        let mut changed = false;
+        let entries: Vec<_> = self
+            .files
+            .tabs
+            .iter()
+            .filter_map(|(&pane, tab)| {
+                let Body::Text {
+                    state,
+                    preview,
+                    shown,
+                    ..
+                } = &tab.body
+                else {
+                    return None;
+                };
+                let pos = state.read(cx).cursor_position();
+                let is_preview = preview.is_some() && shown.is_some();
+                Some((
+                    pane,
+                    layout::SavedFileState {
+                        line: pos.line,
+                        column: pos.character,
+                        preview: is_preview,
+                    },
+                ))
+            })
+            .collect();
+        for (pane, st) in entries {
+            if self.layout.file_state(pane) != Some(st) {
+                self.layout.set_file_state(pane, st);
+                changed = true;
+            }
+        }
+        if changed {
+            self.save();
+        }
     }
 
     /// 탭 바의 파일 탭 앞 아이콘(파일 + 미저장 점). 세션 칸이면 `None`.
@@ -733,6 +782,8 @@ impl Shell {
                     self.close_settings(Some(window), cx);
                     if self.panel_collapsed {
                         self.panel_collapsed = false;
+                        self.layout.panel_collapsed = false;
+                        self.save();
                     }
                     let visible = self.security.is_window_active();
                     let worktree = req.worktree;
@@ -759,7 +810,8 @@ impl Shell {
             if let Some(path) = self.layout.file(pane)
                 && !self.files.tabs.contains_key(&pane)
             {
-                let mut tab = Self::load_file_tab(pane, path.to_owned(), window, cx);
+                let saved = self.layout.file_state(pane);
+                let mut tab = Self::load_file_tab(pane, path.to_owned(), saved, window, cx);
                 if self
                     .files
                     .goto
@@ -772,6 +824,7 @@ impl Shell {
                 self.files.tabs.insert(pane, tab);
             }
         }
+        self.sync_file_states(cx);
         if !self.files.watching
             && (self.layout.files().next().is_some() || self.file_requests_dir(cx).is_some())
         {
@@ -852,11 +905,13 @@ impl Shell {
                 gpui_component::input::Position::new(line.saturating_sub(1), col.saturating_sub(1));
             state.update(cx, |s, cx| s.set_cursor_position(at, window, cx));
         }
+        self.sync_file_states(cx);
     }
 
     fn load_file_tab(
         pane: PaneId,
         path: PathBuf,
+        saved: Option<layout::SavedFileState>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> FileTab {
@@ -864,7 +919,10 @@ impl Shell {
             Ok((Opened::Text(kind, text), stamp)) => {
                 let language = editor::language(kind, &path);
                 let preview = editor::preview(kind);
-                let shown = preview.map(|preview| build_preview(preview, &text, &path, cx));
+                let show_preview = saved.is_none_or(|s| s.preview);
+                let shown = preview
+                    .filter(|_| show_preview)
+                    .map(|preview| build_preview(preview, &text, &path, cx));
                 let state = cx.new(|cx| {
                     EditorState::new(window, cx)
                         .language(language)
@@ -873,10 +931,17 @@ impl Shell {
                 });
                 // 에디터가 받은 그대로를 기준으로 삼는다(정규화가 있어도 열자마자 dirty가 되지 않게).
                 let baseline = state.read(cx).text().to_string();
+                if let Some(s) = saved
+                    && (s.line != 0 || s.column != 0)
+                {
+                    let at = gpui_component::input::Position::new(s.line, s.column);
+                    state.update(cx, |ed, cx| ed.set_cursor_position(at, window, cx));
+                }
                 let edits = cx.subscribe(&state, move |this, _, e: &InputEvent, cx| {
                     if matches!(e, InputEvent::Change) {
                         this.file_edited(pane, cx);
                     }
+                    this.sync_file_states(cx);
                 });
                 return FileTab {
                     doc: Some(Doc::new(path, baseline, stamp)),
@@ -960,6 +1025,7 @@ impl Shell {
 
     /// 디스크 내용으로 다시 읽는다(깨끗한 탭의 자동 재로드, 또는 dirty 탭에서 사용자가 고름). 커서 줄은 유지한다.
     fn reload_file(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let saved = self.layout.file_state(pane);
         let Some(tab) = self.files.tabs.get_mut(&pane) else {
             return;
         };
@@ -971,7 +1037,7 @@ impl Shell {
             if tab.shows_image() {
                 self.files.released.push(path.clone());
             }
-            let fresh = Self::load_file_tab(pane, path, window, cx);
+            let fresh = Self::load_file_tab(pane, path, saved, window, cx);
             self.files.tabs.insert(pane, fresh);
             cx.notify();
             return;
