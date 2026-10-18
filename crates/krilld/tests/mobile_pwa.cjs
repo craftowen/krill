@@ -65,6 +65,7 @@ async function connect(url,credential){
 }
 (async()=>{
  try {
+  await require('./mobile_session.cjs').main();
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');
   fs.writeFileSync(path.join(profile,'statusline_cache.json'),JSON.stringify({five_hour:{utilization:23},seven_day:{utilization:47}}));
   fs.writeFileSync(path.join(dir,'accounts.toml'),`[active]\nclaude = "claude-host"\n[[accounts]]\nid = "mobile-test-account"\nprovider = "claude"\nlabel = "Mobile fixture"\nprofile_dir = ${JSON.stringify(profile)}\n`);
@@ -102,7 +103,10 @@ async function connect(url,credential){
   await phone.rpc({action:'question_reply',id:question.id,body:'Proceed from mobile'});assert(JSON.parse(fs.readFileSync(path.join(dir,'orchestration.json'))).messages.some(m=>m.reply_to===question.id&&m.body==='Proceed from mobile'));
   const diff=await phone.rpc({action:'git',session,path:'example.txt'});assert(diff.patch.includes('+after'));await assert.rejects(phone.rpc({action:'git',session,path:'../../secrets'}));
   const handoff=await phone.rpc({action:'handoff',session,agent:'codex'});assert(handoff.to_session);await until(()=>cli(['read',String(handoff.to_session)]).includes('MK HANDOFF'));
-  const saved={device_id:phone.authenticated.device_id,credential:phone.authenticated.credential};phone.socket.close();await new Promise(r=>setTimeout(r,80));other=await connect(url,saved);const resumed=await other.rpc({action:'snapshot'});assert(resumed.sessions.some(s=>s.id===session));
+  const saved={device_id:phone.authenticated.device_id,credential:phone.authenticated.credential};phone.socket.close();await new Promise(r=>setTimeout(r,80));
+  const rejectedCode=await new Promise((resolve,reject)=>{const u=new URL(url),ws=new WebSocket(`ws://${u.host}/ws`);ws.binaryType='arraybuffer';ws.addEventListener('error',reject,{once:true});ws.addEventListener('message',e=>{const ch=JSON.parse(e.data),nonce=crypto.randomBytes(32),chan=new C.Channel(new Uint8Array(32),C.concat(C.unhex(ch.challenge),nonce));ws.send(JSON.stringify({token:null,device_id:saved.device_id,client_nonce:nonce.toString('hex')}));ws.send(chan.seal(new TextEncoder().encode('{"label":"Bad credential"}')));},{once:true});ws.addEventListener('close',e=>resolve(e.code),{once:true});});
+  assert.equal(rejectedCode,1008);
+  other=await connect(url,saved);const resumed=await other.rpc({action:'snapshot'});assert(resumed.sessions.some(s=>s.id===session));
   // Daemon-owned notifications reach all providers with no desktop process running.
   const posts=[];webhookServer=require('node:http').createServer((req,res)=>{let body='';req.on('data',b=>body+=b);req.on('end',()=>{posts.push({path:req.url,body});res.writeHead(204);res.end();});});await new Promise(r=>webhookServer.listen(0,'127.0.0.1',r));
   const webhookBase=`http://127.0.0.1:${webhookServer.address().port}`;
