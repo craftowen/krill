@@ -137,7 +137,12 @@ catalog! {
     jump {
         PLACEHOLDER => ("세션 검색 (⌘J)", "Search sessions (⌘J)"),
         PLACEHOLDER_COMMANDS => ("명령어 검색 (⇧⌘P)", "Search commands (⇧⌘P)"),
+        PLACEHOLDER_FILES => ("파일 열기 (⌘P)", "Open file (⌘P)"),
         EMPTY => ("일치하는 세션 없음", "No matching sessions"),
+        EMPTY_FILES => ("일치하는 파일 없음", "No matching files"),
+        HINT_MOVE => ("이동", "Move"),
+        HINT_OPEN => ("열기", "Open"),
+        HINT_CLOSE => ("닫기", "Close"),
         SECTION_WORKTREES => ("워크트리", "Worktrees"),
         SECTION_ACTIONS => ("액션", "Actions"),
         SECTION_QUICK_COMMANDS => ("빠른 명령", "Quick commands"),

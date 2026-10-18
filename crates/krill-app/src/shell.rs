@@ -1001,12 +1001,14 @@ impl Shell {
     }
 
     /// Cmd+J: Jump 팔레트를 열거나(사이드바 스냅샷으로) 닫는다. 열 때 칸의 조합 중 글자는 확정한다(포커스 이탈).
+    /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫는다.
     fn toggle_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.jump.take().is_some() {
             window.focus(&self.focus, cx);
             cx.notify();
             return;
         }
+        self.files.close_quick_open();
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
