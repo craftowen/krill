@@ -2381,12 +2381,13 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-799: 50개 단축키 액션이 6개 기능 영역 카테고리에 빠짐없이 분류되고, 로컬 검색·수정 여부가 정확히 판별된다.
+/// OWE-799: 단축키 액션이 6개 기능 영역 카테고리에 빠짐없이 분류되고, 로컬 검색·수정 여부가 정확히 판별된다.
+/// (OWE-868에서 `shell::FindNext`·`shell::FindPrev`가 추가되어 50개에서 52개가 되었다.)
 #[test]
 fn owe799_category_mapping_and_search_matching() {
     use shortcuts::{ACTIONS, Category, action_category, is_modified, matches_query};
 
-    assert_eq!(ACTIONS.len(), 50);
+    assert_eq!(ACTIONS.len(), 52);
     for &cat in Category::ALL {
         let count = ACTIONS
             .iter()
@@ -2407,7 +2408,8 @@ fn owe799_category_mapping_and_search_matching() {
     assert!(!is_modified(&def, &def));
 
     // 명령 이름(한·영)·액션 ID·카테고리·키 문자열·키캡 기호 모두 매칭된다.
-    assert!(matches_query("settings::ZoomIn", &cur, &def, "확대"));
+    // (SC_ZOOM_IN 한글 라벨이 OWE-843에서 "확대" → "글자 크게 (터미널·에디터)"로 바뀌었다.)
+    assert!(matches_query("settings::ZoomIn", &cur, &def, "크게"));
     assert!(matches_query("settings::ZoomIn", &cur, &def, "zoom in"));
     assert!(matches_query("settings::ZoomIn", &cur, &def, "cmd-y"));
     assert!(matches_query("settings::ZoomIn", &cur, &def, "⌘Y"));
