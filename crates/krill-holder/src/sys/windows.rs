@@ -12,18 +12,24 @@ use windows_sys::Win32::System::Threading::GetCurrentProcess;
 
 pub const LINK_ENV: &str = "KRILL_HOLDER_LINK";
 static TAKEN: AtomicBool = AtomicBool::new(false);
-fn owned(h: HANDLE) -> io::Result<OwnedHandle> {
+/// # Safety
+/// `h` must be a newly created or duplicated handle with exclusive ownership.
+unsafe fn owned(h: HANDLE) -> io::Result<OwnedHandle> {
     if h.is_null() || h == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
-    // SAFETY: 呼出元は新規作成・複製された有効ハンドルの所有権を渡す。
+    // SAFETY: caller transfers exclusive ownership of a newly created/duplicated handle.
     Ok(unsafe { OwnedHandle::from_raw_handle(h) })
 }
 pub fn pipe() -> io::Result<(OwnedHandle, OwnedHandle)> {
     let (mut r, mut w) = (std::ptr::null_mut(), std::ptr::null_mut());
-    // SAFETY: 出力は有効な HANDLE ポインター、既定で非継承。
+    // SAFETY: valid output pointers; handles are noninheritable by default.
     cvt(unsafe { CreatePipe(&raw mut r, &raw mut w, std::ptr::null(), 0) })?;
-    Ok((owned(r)?, owned(w)?))
+    // SAFETY: CreatePipe returned exclusive ownership of both ends.
+    let reader = unsafe { owned(r) }?;
+    // SAFETY: the independently owned write end returned by CreatePipe.
+    let writer = unsafe { owned(w) }?;
+    Ok((reader, writer))
 }
 fn cvt(ok: i32) -> io::Result<()> {
     if ok == 0 {
@@ -34,7 +40,7 @@ fn cvt(ok: i32) -> io::Result<()> {
 }
 pub fn available(pipe: BorrowedHandle<'_>) -> io::Result<u32> {
     let mut n = 0;
-    // SAFETY: 借用したパイプと有効な出力ポインター、データは読み取らない。
+    // SAFETY: live borrowed pipe and writable output; data is not consumed.
     cvt(unsafe {
         PeekNamedPipe(
             pipe.as_raw_handle(),
@@ -55,18 +61,22 @@ pub fn received_handles(values: Vec<u64>) -> io::Result<Vec<OwnedHandle>> {
     {
         return Err(io::ErrorKind::InvalidData.into());
     }
-    // 値は認証された親/子がこのプロセスに DuplicateHandle したもののみ。
-    values
+    // Values originate only from our authenticated parent/child via DuplicateHandle.
+    let handles = values
         .into_iter()
         .map(|v| {
-            let h = owned(usize::try_from(v).map_err(|_| io::ErrorKind::InvalidData)? as HANDLE)?;
-            // SAFETY: owned handle; removes inheritance before any descendant can be launched.
-            cvt(unsafe {
-                windows_sys::Win32::Foundation::SetHandleInformation(h.as_raw_handle(), 1, 0)
-            })?;
-            Ok(h)
+            let h = usize::try_from(v).map_err(|_| io::ErrorKind::InvalidData)? as HANDLE;
+            // SAFETY: authenticated sender transferred this process-local duplicate exactly once.
+            unsafe { owned(h) }
         })
-        .collect()
+        .collect::<io::Result<Vec<_>>>()?;
+    for h in &handles {
+        // SAFETY: owned live handle; stop inheritance before creating descendants.
+        cvt(unsafe {
+            windows_sys::Win32::Foundation::SetHandleInformation(h.as_raw_handle(), 1, 0)
+        })?;
+    }
+    Ok(handles)
 }
 pub fn inherited_link() -> io::Result<Link> {
     if TAKEN.swap(true, Ordering::AcqRel) {
@@ -89,7 +99,7 @@ pub fn inherited_link() -> io::Result<Link> {
         it.next().ok_or(io::ErrorKind::InvalidData)?,
     ))
 }
-/// 送信失敗では受信先の複製を回収する。target は holder 自身が作った子だけ。
+/// Failed sends reclaim remote copies; target is always our own child daemon.
 pub struct Remote<'a> {
     target: BorrowedHandle<'a>,
     values: Vec<u64>,
@@ -105,11 +115,11 @@ impl<'a> Remote<'a> {
             values: Vec::new(),
             committed: false,
         };
-        // SAFETY: 疑似ハンドルは現在のプロセスを表す。閉じない。
+        // SAFETY: pseudo handle represents the current process and is never closed.
         let current = unsafe { GetCurrentProcess() };
         for h in handles {
             let mut remote = std::ptr::null_mut();
-            // SAFETY: 両プロセスとローカルの借用ハンドルが呼出中有効。
+            // SAFETY: both processes and the borrowed local handle stay live during the call.
             cvt(unsafe {
                 DuplicateHandle(
                     current,
@@ -138,7 +148,7 @@ impl Drop for Remote<'_> {
             return;
         }
         for v in &self.values {
-            // SAFETY: 未送信の複製だけを元プロセス内で閉じる。ローカル複製は作らない。
+            // SAFETY: only uncommitted remote copies are closed; no local copy is created.
             unsafe {
                 DuplicateHandle(
                     self.target.as_raw_handle(),
@@ -173,7 +183,8 @@ use windows_sys::Win32::System::Threading::{
     DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
     InitializeProcThreadAttributeList, OpenProcess, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_DUP_HANDLE, PROCESS_INFORMATION, ResumeThread,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    STARTF_USESTDHANDLES, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
 type Create = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
@@ -293,7 +304,10 @@ impl Console {
         let fields = unsafe { *(h as *const [HANDLE; 3]) };
         let copies = fields
             .into_iter()
-            .map(|v| duplicate_raw(v, false))
+            .map(|v| {
+                // SAFETY: the ABI fields belong to the live HPCON created above.
+                unsafe { duplicate_raw(v, false) }
+            })
             .collect::<io::Result<Vec<_>>>();
         let mut fields = match copies {
             Ok(v) => v.into_iter(),
@@ -337,16 +351,9 @@ impl Console {
         }
     }
 }
-impl Drop for Console {
-    fn drop(&mut self) {
-        if self.handle.is_some() {
-            self.stop_host().ok();
-            self.close();
-        }
-    }
-}
-
-fn duplicate_raw(h: HANDLE, inherit: bool) -> io::Result<OwnedHandle> {
+/// # Safety
+/// `h` must remain a valid borrowed handle throughout duplication.
+unsafe fn duplicate_raw(h: HANDLE, inherit: bool) -> io::Result<OwnedHandle> {
     let mut out = null_mut();
     // SAFETY: pseudo handle, no ownership is acquired.
     let current = unsafe { GetCurrentProcess() };
@@ -362,10 +369,12 @@ fn duplicate_raw(h: HANDLE, inherit: bool) -> io::Result<OwnedHandle> {
             DUPLICATE_SAME_ACCESS,
         )
     })?;
-    owned(out)
+    // SAFETY: DuplicateHandle returned a new exclusively owned local handle.
+    unsafe { owned(out) }
 }
 pub fn inheritable(h: BorrowedHandle<'_>) -> io::Result<OwnedHandle> {
-    duplicate_raw(h.as_raw_handle(), true)
+    // SAFETY: BorrowedHandle guarantees validity for this call.
+    unsafe { duplicate_raw(h.as_raw_handle(), true) }
 }
 pub fn wide(s: &OsStr) -> io::Result<Vec<u16>> {
     let mut v: Vec<_> = s.encode_wide().collect();
@@ -510,6 +519,9 @@ pub fn spawn(
     si.StartupInfo.cb =
         u32::try_from(size_of::<STARTUPINFOEXW>()).map_err(|_| io::ErrorKind::InvalidInput)?;
     si.lpAttributeList = list;
+    if console.is_some() {
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    }
     // SAFETY: PROCESS_INFORMATION is an output-only C struct.
     let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     let flags = CREATE_SUSPENDED
@@ -540,10 +552,12 @@ pub fn spawn(
         )
     })?;
     let process = Process {
-        handle: owned(pi.hProcess)?,
+        // SAFETY: CreateProcessW returned a new exclusively owned process handle.
+        handle: unsafe { owned(pi.hProcess) }?,
         pid: pi.dwProcessId,
     };
-    let thread = owned(pi.hThread)?;
+    // SAFETY: CreateProcessW returned a new exclusively owned initial thread handle.
+    let thread = unsafe { owned(pi.hThread) }?;
     let start = || {
         if let Some(job) = job {
             job.assign(&process)?;
@@ -589,7 +603,9 @@ pub fn child_link(path: &OsStr, args: &[OsString]) -> io::Result<(Process, Link)
 }
 pub fn duplicate_target(pid: u32) -> io::Result<OwnedHandle> {
     // SAFETY: caller supplies only the pid from its own newly created child Process.
-    owned(unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) })
+    let raw = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
+    // SAFETY: OpenProcess returns a new owned handle or an error sentinel.
+    unsafe { owned(raw) }
 }
 #[derive(Debug)]
 pub struct Job {
@@ -599,10 +615,13 @@ pub struct Job {
 impl Job {
     pub fn new() -> io::Result<Self> {
         // SAFETY: unnamed, noninheritable job; no KILL_ON_JOB_CLOSE or breakaway flags.
-        let handle = owned(unsafe { CreateJobObjectW(null(), null()) })?;
+        let raw = unsafe { CreateJobObjectW(null(), null()) };
+        // SAFETY: CreateJobObjectW returned exclusive ownership or an error sentinel.
+        let handle = unsafe { owned(raw) }?;
         // SAFETY: INVALID_HANDLE_VALUE creates a new IOCP.
-        let port =
-            owned(unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 1) })?;
+        let raw = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, null_mut(), 0, 1) };
+        // SAFETY: a new exclusively owned IOCP handle or an error sentinel.
+        let port = unsafe { owned(raw) }?;
         let info = JOBOBJECT_ASSOCIATE_COMPLETION_PORT {
             CompletionKey: null_mut(),
             CompletionPort: port.as_raw_handle(),
@@ -660,4 +679,101 @@ impl Job {
 pub fn terminate(process: &Process) -> io::Result<()> {
     // SAFETY: newly created suspended child, used only to unwind failed creation.
     cvt(unsafe { TerminateProcess(process.handle.as_raw_handle(), 1) })
+}
+
+use std::os::windows::io::{AsRawSocket, BorrowedSocket, FromRawSocket, OwnedSocket};
+use windows_sys::Win32::Networking::WinSock::{
+    FROM_PROTOCOL_INFO, INVALID_SOCKET, WSA_FLAG_NO_HANDLE_INHERIT, WSADATA, WSADuplicateSocketW,
+    WSAGetLastError, WSAPROTOCOL_INFOW, WSASocketW, WSAStartup,
+};
+fn winsock() -> io::Result<()> {
+    static STATUS: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let status = *STATUS.get_or_init(|| {
+        // SAFETY: WSADATA is a C output structure accepting a zero initial state.
+        let mut data: WSADATA = unsafe { std::mem::zeroed() };
+        // SAFETY: request Winsock 2.2, process-lifetime initialization.
+        unsafe { WSAStartup(0x202, &raw mut data) }
+    });
+    if status == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(status))
+    }
+}
+pub fn duplicate_socket(socket: BorrowedSocket<'_>, pid: u32) -> io::Result<Vec<u8>> {
+    winsock()?;
+    // SAFETY: output-only C structure.
+    let mut info: WSAPROTOCOL_INFOW = unsafe { std::mem::zeroed() };
+    // SAFETY: borrowed socket, target is the authenticated child/holder PID.
+    if unsafe {
+        WSADuplicateSocketW(
+            usize::try_from(socket.as_raw_socket()).map_err(|_| io::ErrorKind::InvalidInput)?,
+            pid,
+            &raw mut info,
+        )
+    } != 0
+    {
+        return Err(wsa_error());
+    }
+    // SAFETY: fixed-size, fully initialized protocol info copied as opaque bytes.
+    Ok(
+        unsafe { std::slice::from_raw_parts((&raw const info).cast::<u8>(), size_of_val(&info)) }
+            .to_vec(),
+    )
+}
+pub fn restore_socket(bytes: &[u8]) -> io::Result<OwnedSocket> {
+    winsock()?;
+    if bytes.len() != size_of::<WSAPROTOCOL_INFOW>() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    // SAFETY: exact size verified; unaligned copy into the protocol-info struct, no references inside.
+    let info = unsafe { bytes.as_ptr().cast::<WSAPROTOCOL_INFOW>().read_unaligned() };
+    // SAFETY: info was produced for this PID by WSADuplicateSocketW.
+    let socket = unsafe {
+        WSASocketW(
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            FROM_PROTOCOL_INFO,
+            &raw const info,
+            0,
+            WSA_FLAG_NO_HANDLE_INHERIT,
+        )
+    };
+    if socket == INVALID_SOCKET {
+        return Err(wsa_error());
+    }
+    // SAFETY: newly created socket, exclusive ownership transfers into OwnedSocket.
+    Ok(unsafe { OwnedSocket::from_raw_socket(socket as _) })
+}
+fn wsa_error() -> io::Error {
+    // SAFETY: retrieves this thread's Winsock error code.
+    io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn failed_send_reclaims_remote_copy() -> io::Result<()> {
+        let target = duplicate_target(std::process::id())?;
+        let (input, _output) = pipe()?;
+        let remote = Remote::duplicate(target.as_handle(), &[input.as_handle()])?;
+        let value = remote
+            .values()
+            .first()
+            .copied()
+            .ok_or(io::ErrorKind::InvalidData)?;
+        let handle = usize::try_from(value).map_err(|_| io::ErrorKind::InvalidData)? as HANDLE;
+        let mut flags = 0;
+        // SAFETY: DuplicateHandle just created this local-process copy.
+        let valid =
+            unsafe { windows_sys::Win32::Foundation::GetHandleInformation(handle, &raw mut flags) };
+        assert_ne!(valid, 0);
+        drop(remote);
+        // SAFETY: GetHandleInformation accepts stale handles and reports ERROR_INVALID_HANDLE.
+        let valid =
+            unsafe { windows_sys::Win32::Foundation::GetHandleInformation(handle, &raw mut flags) };
+        assert_eq!(valid, 0);
+        Ok(())
+    }
 }
