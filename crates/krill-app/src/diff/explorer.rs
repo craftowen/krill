@@ -1633,6 +1633,10 @@ fn row_context_menu(
 }
 
 fn open_in_external(target: Target, path: &Path) -> io::Result<()> {
+    // Launch Services 전용. Windows 열기는 OWE-834.
+    if !cfg!(target_os = "macos") {
+        return Err(io::ErrorKind::Unsupported.into());
+    }
     let path = fs::canonicalize(path)?;
     let bundle = match target {
         Target::VsCode => "com.microsoft.VSCode",

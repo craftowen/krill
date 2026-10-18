@@ -71,11 +71,12 @@ fn take_pending_file_requests(state_dir: &Path) -> Vec<CliFileRequest> {
     else {
         return Vec::new();
     };
-    if rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive).is_err() {
+    // std `File::lock`은 Unix에서 `flock(LOCK_EX)`라 CLI 쪽 잠금과 같고 Windows에서도 돈다.
+    if lock.lock().is_err() {
         return Vec::new();
     }
     let Ok(file) = std::fs::File::open(&file_path) else {
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock).ok();
+        lock.unlock().ok();
         return Vec::new();
     };
     let mut buf = Vec::new();
@@ -84,7 +85,7 @@ fn take_pending_file_requests(state_dir: &Path) -> Vec<CliFileRequest> {
         .read_to_end(&mut buf)
         .is_ok();
     std::fs::remove_file(&file_path).ok();
-    rustix::fs::flock(&lock, rustix::fs::FlockOperation::Unlock).ok();
+    lock.unlock().ok();
     if !read_ok || u64::try_from(buf.len()).unwrap_or(u64::MAX) > MAX_REQUEST_FILE_BYTES {
         return Vec::new();
     }
@@ -314,7 +315,7 @@ impl Shell {
 
     /// 세션의 현재 폴더(krilld가 알린 값), 모르면 칸을 연 폴더. 터미널 상대 경로 링크의 기준이다.
     fn pane_cwd(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
-        use std::os::unix::ffi::OsStringExt as _;
+        use krill_proto::os::ffi::OsStringExt as _;
         let live = self
             .layout
             .session(pane)

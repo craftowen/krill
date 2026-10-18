@@ -67,7 +67,7 @@ fn session_accounts(
 
 impl Shell {
     fn new_agent_with_account(&mut self, id: String, account: String, cx: &mut Context<Self>) {
-        use std::os::unix::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::OsStrExt as _;
         if self.link != Link::Up || self.agents_busy {
             return;
         }
