@@ -6794,3 +6794,39 @@ fn cmd_w_in_empty_workspace_closes_window(cx: &mut TestAppContext) {
         "empty workspace ⌘W closes the window"
     );
 }
+
+/// OWE-855: 포커스 칸 세션에 워크트리가 있으면 창 제목이 "Krill — <워크트리>"다.
+#[gpui::test]
+fn main_window_title_shows_worktree(cx: &mut TestAppContext) {
+    struct Fixed;
+    impl sidebar::Source for Fixed {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: krill_proto::SessionId(31),
+                    status: krill_proto::control::AgentStatus::UNKNOWN,
+                    worktree: Some("/repo/wt-title".into()),
+                    cwd: Some("/repo/wt-title".into()),
+                    account: None,
+                }],
+                trees: [("/repo".into(), vec!["/repo/wt-title".into()])].into(),
+            })
+        }
+    }
+    let (view, cx) = open(cx, state_path("owe855-worktree-title"));
+    let app = krill_app::i18n::catalog::shell::APP_TITLE.get();
+    cx.run_until_parked();
+    assert_eq!(cx.window_title().as_deref(), Some(app));
+    view.update(cx, |s, cx| {
+        let pane = s.layout.focused().expect("focused pane");
+        s.change(true, cx, |l| {
+            l.set_session(pane, krill_proto::SessionId(31));
+        });
+        s.sidebar.update(cx, |sb, cx| {
+            sb.connect_source(std::sync::Arc::new(Fixed), cx);
+        });
+    });
+    cx.run_until_parked();
+    let want = format!("{app} — wt-title");
+    assert_eq!(cx.window_title().as_deref(), Some(want.as_str()));
+}
