@@ -3667,7 +3667,7 @@ fn multi_host_local_and_remote_krilld_survive_remote_kill_and_auto_reconnect() {
         argv.contains("-p\n2222\n-i\n/tmp/key with spaces\n"),
         "{argv}"
     );
-    assert!(argv.contains("-N\n-L\n"), "{argv}");
+    assert!(argv.contains("-T\n-L\n"), "{argv}");
     assert!(argv.contains("ServerAliveInterval=15\n"), "{argv}");
     assert!(
         !argv.contains("$HOME"),
