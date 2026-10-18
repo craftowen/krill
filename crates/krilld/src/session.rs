@@ -564,6 +564,16 @@ impl Tap {
         ))
     }
 
+    /// 세션 셸의 현재 디렉터리: 프로세스 `pid`의 cwd, 읽지 못하면(Windows) 셸이 OSC 7·9;9로 알린 값.
+    pub(crate) fn cwd(&self, pid: u32) -> Option<std::path::PathBuf> {
+        crate::sys::current_directory(pid).ok().or_else(|| {
+            lock(&self.0.live)
+                .engine
+                .cwd()
+                .map(std::path::Path::to_path_buf)
+        })
+    }
+
     /// 전경 프로세스 그룹. PTY 소유권은 holder에 그대로 둔다.
     pub(crate) fn foreground(&self) -> Option<u32> {
         pty::foreground(&self.0.master)

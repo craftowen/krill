@@ -20,8 +20,12 @@
 //! 창 제목(OSC 0·2, 제목 스택 포함)과 벨은 alacritty 이벤트로 받아 엔진이 들고, [`Engine::screen`]이 화면과 함께 뜬다.
 //! 벨은 [`Feed::Live`]만 센다(재생한 바이트의 벨은 이미 울렸다). OSC 4로 바꾼 팔레트 0~255는 칸 색을 RGB로 풀어
 //! 보낸다(앱은 테마로 색을 풀기 때문). OSC 10·11·12(기본 전경·배경·커서)는 아직 앱에 전하지 않는다.
+//!
+//! 셸이 알리는 현재 디렉터리(OSC 7 `file://host/path`, Windows Terminal식 OSC 9;9 `"C:\path"`)도 alacritty가
+//! 버리므로 같은 곁 파서가 본다([`Engine::cwd`]). 프로세스 cwd를 읽지 못하는 Windows의 세션 cwd가 이것이다.
 
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
@@ -75,16 +79,18 @@ impl EventListener for Events {
     }
 }
 
-/// 모드 2031 상태. alacritty는 이 모드를 모르니 원본 바이트에서 따로 본다.
+/// alacritty가 버리는 것을 원본 바이트에서 따로 본다: 모드 2031 상태와 셸의 cwd 보고.
 #[derive(Default)]
-struct SchemeMode {
+struct RawScan {
     on: bool,
     /// alacritty가 아직 답하지 않은 `CSI ?2031$p`마다 질의 시점의 상태. DEC 2026 sync 안의 질의는 alacritty가
     /// 구간이 끝날 때 답하므로 큐로 둔다.
     asked: VecDeque<bool>,
+    /// 마지막으로 보고된 절대 경로 cwd.
+    cwd: Option<PathBuf>,
 }
 
-impl Perform for SchemeMode {
+impl Perform for RawScan {
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
         if ignore {
             return;
@@ -105,6 +111,49 @@ impl Perform for SchemeMode {
             self.on = false; // RIS
         }
     }
+
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        let cwd = match params {
+            [b"7", rest @ ..] => file_url_path(&rest.join(&b';')),
+            [b"9", b"9", rest @ ..] => {
+                let raw = rest.join(&b';');
+                let path = raw
+                    .strip_prefix(b"\"")
+                    .and_then(|p| p.strip_suffix(b"\""))
+                    .unwrap_or(&raw);
+                std::str::from_utf8(path).ok().map(PathBuf::from)
+            }
+            _ => None,
+        };
+        // 원격 셸(ssh)이 보낸 경로처럼 이 OS에서 절대 경로가 아니면 버린다.
+        // ponytail: 호스트 이름은 대조하지 않는다. 원격 경로가 우연히 로컬 절대 경로 꼴이면(macOS·Linux 간) 받아들인다.
+        if let Some(cwd) = cwd.filter(|p| p.is_absolute()) {
+            self.cwd = Some(cwd);
+        }
+    }
+}
+
+/// `file://host/path`의 경로(퍼센트 디코딩). Windows는 `/C:/x`를 `C:/x`로 둔다.
+fn file_url_path(url: &[u8]) -> Option<PathBuf> {
+    let rest = url.strip_prefix(b"file://")?;
+    let path = rest.get(rest.iter().position(|&b| b == b'/')?..)?;
+    let mut out = Vec::with_capacity(path.len());
+    let mut bytes = path.iter();
+    while let Some(&b) = bytes.next() {
+        if b == b'%' {
+            let hex = [*bytes.next()?, *bytes.next()?];
+            out.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+        } else {
+            out.push(b);
+        }
+    }
+    let path = String::from_utf8(out).ok()?;
+    #[cfg(windows)]
+    let path = match path.as_bytes() {
+        [b'/', drive, b':', ..] if drive.is_ascii_alphabetic() => path.get(1..)?.to_owned(),
+        _ => path,
+    };
+    Some(PathBuf::from(path))
 }
 
 /// 엔진이 실제로 쓰는 최소 열 수. 1열은 alacritty 0.26 `shrink_columns`가 끝나지 않는다:
@@ -147,7 +196,7 @@ pub(crate) struct Engine {
     parser: Processor<StdSyncHandler>,
     events: Receiver<Event>,
     scan: Parser,
-    scheme: SchemeMode,
+    scheme: RawScan,
     cli_boundary: crate::cli::Boundary,
     /// 창 제목(OSC 0·2). [`MAX_TITLE`]에서 자른다.
     title: String,
@@ -171,7 +220,7 @@ impl Engine {
             parser: Processor::new(),
             events,
             scan: Parser::new(),
-            scheme: SchemeMode::default(),
+            scheme: RawScan::default(),
             cli_boundary: crate::cli::Boundary::default(),
             title: String::new(),
             bells: 0,
@@ -331,6 +380,11 @@ impl Engine {
 
     pub(crate) fn title(&self) -> &str {
         &self.title
+    }
+
+    /// 셸이 마지막으로 알린 현재 디렉터리(OSC 7·OSC 9;9). 엔진을 새로 만들면 다음 보고까지 없다.
+    pub(crate) fn cwd(&self) -> Option<&Path> {
+        self.scheme.cwd.as_deref()
     }
 
     /// OSC 52 쓰기 수와 마지막 값.
