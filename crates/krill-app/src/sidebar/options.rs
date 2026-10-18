@@ -491,6 +491,7 @@ pub(super) struct WorktreeContext<'a> {
     pub parents: Option<&'a BTreeMap<PathBuf, PathBuf>>,
     pub collapsed_lineage: Option<&'a BTreeSet<PathBuf>>,
     pub sleeping_worktrees: Option<&'a BTreeSet<PathBuf>>,
+    pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
 }
 
 pub(super) fn is_default_branch_worktree(
@@ -711,10 +712,12 @@ pub(super) fn rows_with_options<'a>(
             .collect()
     };
 
+    let is_removed = |path: &Path| ctx.removed_projects.is_some_and(|r| r.contains(path));
+
     match options.group_by {
         GroupBy::Repo => {
             for (repo, trees) in &snapshot.trees {
-                if !options.filters.contains_repo(repo) {
+                if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
                 let mut vis = visible_in_repo(repo, trees);
@@ -722,31 +725,33 @@ pub(super) fn rows_with_options<'a>(
                     continue;
                 }
                 out.push(Row::Repository(repo.clone()));
-                sort_worktrees(&mut vis, snapshot, prefs, options.sort_by, ctx);
-                let (normal, claude_ext) = external::partition_trees(repo, vis);
-                let normal = super::lineage::order_lineage_worktrees(
-                    normal,
-                    ctx.parents,
-                    ctx.collapsed_lineage,
-                );
-                for tree in normal {
-                    push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
-                }
-                if !claude_ext.is_empty() {
-                    let expanded = shown_external.contains(repo);
-                    out.push(Row::HiddenWorktrees(
-                        repo.clone(),
-                        claude_ext.len(),
-                        expanded,
-                    ));
-                    if expanded {
-                        let claude_ext = super::lineage::order_lineage_worktrees(
-                            claude_ext,
-                            ctx.parents,
-                            ctx.collapsed_lineage,
-                        );
-                        for tree in claude_ext {
-                            push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                if !collapsed.contains(repo) {
+                    sort_worktrees(&mut vis, snapshot, prefs, options.sort_by, ctx);
+                    let (normal, claude_ext) = external::partition_trees(repo, vis);
+                    let normal = super::lineage::order_lineage_worktrees(
+                        normal,
+                        ctx.parents,
+                        ctx.collapsed_lineage,
+                    );
+                    for tree in normal {
+                        push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                    }
+                    if !claude_ext.is_empty() {
+                        let expanded = shown_external.contains(repo);
+                        out.push(Row::HiddenWorktrees(
+                            repo.clone(),
+                            claude_ext.len(),
+                            expanded,
+                        ));
+                        if expanded {
+                            let claude_ext = super::lineage::order_lineage_worktrees(
+                                claude_ext,
+                                ctx.parents,
+                                ctx.collapsed_lineage,
+                            );
+                            for tree in claude_ext {
+                                push_worktree_and_sessions(&mut out, tree, snapshot, collapsed);
+                            }
                         }
                     }
                 }
@@ -755,7 +760,7 @@ pub(super) fn rows_with_options<'a>(
         GroupBy::WorkspaceStatus => {
             let mut buckets: BTreeMap<usize, Vec<&PathBuf>> = BTreeMap::new();
             for (repo, trees) in &snapshot.trees {
-                if !options.filters.contains_repo(repo) {
+                if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
                 for tree in visible_in_repo(repo, trees) {
@@ -796,7 +801,7 @@ pub(super) fn rows_with_options<'a>(
         GroupBy::PrStatus => {
             let mut buckets: BTreeMap<PrGroup, Vec<&PathBuf>> = BTreeMap::new();
             for (repo, trees) in &snapshot.trees {
-                if !options.filters.contains_repo(repo) {
+                if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
                 for tree in visible_in_repo(repo, trees) {
@@ -833,7 +838,7 @@ pub(super) fn rows_with_options<'a>(
         GroupBy::None => {
             let mut all_trees: Vec<&PathBuf> = Vec::new();
             for (repo, trees) in &snapshot.trees {
-                if !options.filters.contains_repo(repo) {
+                if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
                 all_trees.extend(visible_in_repo(repo, trees));
@@ -852,7 +857,9 @@ pub(super) fn rows_with_options<'a>(
 
     let mut folders: BTreeMap<&PathBuf, Vec<Row>> = BTreeMap::new();
     for s in snapshot.sessions.iter().filter(|s| s.worktree.is_none()) {
-        if let Some(cwd) = &s.cwd {
+        if let Some(cwd) = &s.cwd
+            && !is_removed(cwd)
+        {
             folders
                 .entry(cwd)
                 .or_default()
@@ -924,6 +931,7 @@ impl Sidebar {
             parents: Some(&parents),
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
+            removed_projects: Some(&self.removed_projects),
         };
         rows_with_options(
             &self.snapshot,
@@ -949,6 +957,7 @@ impl Sidebar {
             parents: Some(&parents),
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
+            removed_projects: Some(&self.removed_projects),
             ..WorktreeContext::default()
         };
         rows_with_options(

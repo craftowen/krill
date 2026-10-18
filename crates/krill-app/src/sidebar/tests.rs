@@ -3528,3 +3528,287 @@ fn owe_842_sidebar_persists_expansion_state_and_selected_worktree(cx: &mut TestA
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-845: 저장소 헤더 접기/펼치기가 하위 워크트리를 숨기고 재시작 후에도 유지된다.
+#[gpui::test]
+fn repo_header_fold_hides_children_and_persists(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe845", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(
+                PathBuf::from("/repo"),
+                vec![PathBuf::from("/repo"), PathBuf::from("/repo/a")],
+            );
+            s.rebuild(cx);
+            assert!(
+                s.rows
+                    .iter()
+                    .any(|r| matches!(r, Row::Worktree(w) if w == Path::new("/repo/a"))),
+                "펼친 저장소는 하위 워크트리를 보여야 한다"
+            );
+            s.fold(&PathBuf::from("/repo"), None, cx);
+            assert!(
+                s.rows.iter().all(|r| !matches!(r, Row::Worktree(_))),
+                "접은 저장소는 워크트리 행을 숨겨야 한다"
+            );
+            assert!(
+                s.rows
+                    .iter()
+                    .any(|r| matches!(r, Row::Repository(rp) if rp == Path::new("/repo"))),
+                "접어도 저장소 헤더 행은 남아야 한다"
+            );
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("repo-header-0").is_some());
+    let restored = Sidebar::new(Some(path.clone()));
+    assert!(
+        restored.collapsed.contains(Path::new("/repo")),
+        "저장소 접힘은 재시작 후에도 유지되어야 한다"
+    );
+    fs::remove_dir_all(dir).ok();
+}
+
+/// OWE-845: 접힘·펼침·숨김·제거 UI 상태가 `sidebar.bin`에 영속화된다.
+#[gpui::test]
+fn ui_fold_state_round_trips_through_sidebar_bin(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe845u", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.collapsed.insert(PathBuf::from("/repo/a"));
+            s.collapsed_groups.insert(GroupKey::PrStatus(PrGroup::Open));
+            s.expanded_cards.insert(PathBuf::from("/repo/b"));
+            s.shown_external.insert(PathBuf::from("/repo"));
+            s.collapsed_hosts.insert(HostId::Local);
+            s.removed_projects.insert(PathBuf::from("/old"));
+            s.persist(cx);
+        });
+    });
+    vcx.run_until_parked();
+    let restored = Sidebar::new(Some(path.clone()));
+    assert!(restored.collapsed.contains(Path::new("/repo/a")));
+    assert!(
+        restored
+            .collapsed_groups
+            .contains(&GroupKey::PrStatus(PrGroup::Open))
+    );
+    assert!(restored.expanded_cards.contains(Path::new("/repo/b")));
+    assert!(restored.shown_external.contains(Path::new("/repo")));
+    assert!(restored.collapsed_hosts.contains(&HostId::Local));
+    assert!(restored.removed_projects.contains(Path::new("/old")));
+    fs::remove_dir_all(dir).ok();
+}
+
+/// OWE-845: 목록에서 제거한 저장소는 행에서 사라지고 재시작 후에도 숨겨진다.
+#[gpui::test]
+fn removed_project_hides_repo_and_survives_restart(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("mk-sidebar-{}-owe845r", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(
+                PathBuf::from("/repo"),
+                vec![PathBuf::from("/repo"), PathBuf::from("/repo/a")],
+            );
+            s.rebuild(cx);
+            assert!(
+                s.rows
+                    .iter()
+                    .any(|r| matches!(r, Row::Repository(rp) if rp == Path::new("/repo")))
+            );
+            s.remove_project(PathBuf::from("/repo"), cx);
+            assert!(
+                s.rows.iter().all(|r| !matches!(r, Row::Repository(_))),
+                "제거한 저장소 헤더는 목록에서 사라져야 한다"
+            );
+        });
+    });
+    vcx.run_until_parked();
+    let restored = Sidebar::new(Some(path.clone()));
+    assert!(restored.removed_projects.contains(Path::new("/repo")));
+    fs::remove_dir_all(dir).ok();
+}
+
+/// OWE-847: 이름 변경은 카드 제목 자리에서 인라인으로 편집하고 Enter 저장·Esc 취소한다.
+#[gpui::test]
+fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(
+                PathBuf::from("/repo"),
+                vec![PathBuf::from("/repo"), PathBuf::from("/repo/a")],
+            );
+            s.rebuild(cx);
+            s.rename(PathBuf::from("/repo/a"), window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.debug_bounds("rename-inline-1").is_some(),
+        "이름 변경 입력창은 워크트리 카드 제목 자리(행 1)에 있어야 한다"
+    );
+    // Esc: 저장하지 않고 닫는다.
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            assert!(s.editing.is_none(), "Esc는 편집을 취소해야 한다");
+            assert!(
+                !s.prefs.contains_key(Path::new("/repo/a")),
+                "취소 시 이름이 저장되면 안 된다"
+            );
+        });
+    });
+    assert!(vcx.debug_bounds("rename-inline-1").is_none());
+    // Enter: 저장한다.
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.rename(PathBuf::from("/repo/a"), window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-a");
+    vcx.simulate_input("새 이름");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            assert!(s.editing.is_none(), "Enter는 편집을 마쳐야 한다");
+            assert_eq!(
+                s.prefs[Path::new("/repo/a")].name,
+                "새 이름",
+                "Enter는 입력한 이름을 저장해야 한다"
+            );
+        });
+    });
+}
+
+/// OWE-847: 워크트리 삭제는 확인 모달을 거쳐 확정해야 실행되고 강제 플래그가 전달된다.
+#[gpui::test]
+fn delete_confirm_modal_requires_explicit_confirm_with_force(cx: &mut TestAppContext) {
+    struct RecordingSource {
+        removed: std::sync::Mutex<Vec<(PathBuf, bool)>>,
+        snapshot: Snapshot,
+    }
+    impl Source for RecordingSource {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(self.snapshot.clone())
+        }
+        fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
+            BTreeMap::from([(
+                PathBuf::from("/repo/a"),
+                Tree {
+                    branch: Some("feat".into()),
+                    dirty: Some(2),
+                },
+            )])
+        }
+        fn remove_worktree(&self, req: krill_proto::control::RemoveWorktree) -> io::Result<Reply> {
+            use std::os::unix::ffi::OsStrExt as _;
+            let path = PathBuf::from(std::ffi::OsStr::from_bytes(&req.path));
+            self.removed
+                .lock()
+                .expect("test lock")
+                .push((path.clone(), req.force));
+            Ok(Reply::WorktreeRemoved(
+                krill_proto::control::RemovedWorktree {
+                    branch: Some("feat".into()),
+                    branch_deleted: true,
+                    warnings: Vec::new(),
+                },
+            ))
+        }
+    }
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let events = Arc::new(RecordingSource {
+        removed: std::sync::Mutex::new(Vec::new()),
+        snapshot: Snapshot {
+            sessions: Vec::new(),
+            trees: BTreeMap::from([(
+                PathBuf::from("/repo"),
+                vec![PathBuf::from("/repo"), PathBuf::from("/repo/a")],
+            )]),
+        },
+    });
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.meta.insert(
+                PathBuf::from("/repo/a"),
+                Tree {
+                    branch: Some("feat".into()),
+                    dirty: Some(2),
+                },
+            );
+            s.connect_source(events.clone(), cx);
+        });
+    });
+    vcx.run_until_parked();
+    // 확인 모달을 열기만 해서는 삭제되지 않는다.
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.request_delete_worktree(PathBuf::from("/repo/a"), false, cx);
+            assert!(s.delete_confirm.is_some());
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        events.removed.lock().expect("test lock").is_empty(),
+        "모달 확정 전에는 삭제 IPC를 보내면 안 된다"
+    );
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("delete-worktree-dialog").is_some());
+    assert!(vcx.debug_bounds("delete-worktree-force").is_some());
+    // 강제 토글 후 확정하면 force=true로 삭제된다.
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.toggle_delete_force(cx);
+            s.confirm_delete(cx);
+            assert!(s.delete_confirm.is_none());
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        events.removed.lock().expect("test lock").as_slice(),
+        [(PathBuf::from("/repo/a"), true)],
+        "확정 시 강제 플래그와 함께 삭제해야 한다"
+    );
+    // 취소는 모달만 닫는다.
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.request_delete_worktree(PathBuf::from("/repo/a"), false, cx);
+            s.cancel_delete(cx);
+            assert!(s.delete_confirm.is_none());
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        events.removed.lock().expect("test lock").len(),
+        1,
+        "취소 시 추가 삭제가 없어야 한다"
+    );
+}
