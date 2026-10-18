@@ -2,8 +2,7 @@
 
 use super::{Store, lock, mkdir};
 use std::{
-    fs::{self, File},
-    io,
+    fs, io,
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -54,7 +53,17 @@ pub(super) fn initial_pause(root: &Path) -> io::Result<bool> {
 
 pub(super) fn prepare(sessions: &Path) -> io::Result<()> {
     mkdir(sessions)?;
-    let file = File::open(sessions)?;
+    #[cfg(unix)]
+    let file = fs::File::open(sessions)?;
+    // Windows 디렉터리 핸들은 백업 의미 플래그 없이는 열리지 않는다(os error 5 → 기록 전체가 꺼졌다, OWE-836).
+    #[cfg(windows)]
+    let file = {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS)
+            .open(sessions)?
+    };
     #[cfg(unix)]
     let dir = std::os::fd::AsFd::as_fd(&file);
     #[cfg(windows)]
