@@ -481,6 +481,35 @@ pub(crate) fn clone_file(_src: &Path, _dst: &Path) -> io::Result<()> {
     unsupported()
 }
 
+/// Adopt one exclusively owned `Winsock` listener restored by the holder.
+pub(crate) fn adopt_listener(
+    socket: std::os::windows::io::OwnedSocket,
+) -> krill_proto::os::net::UnixListener {
+    use std::os::windows::io::{FromRawSocket as _, IntoRawSocket as _};
+    let raw = socket.into_raw_socket();
+    // SAFETY: ownership came from a restored listening socket and is transferred exactly once.
+    unsafe { krill_proto::os::net::UnixListener::from_raw_socket(raw) }
+}
+
+/// `uds_windows` exposes `AsRawSocket` for listeners but not `AsSocket` (v1.2.1).
+pub(crate) fn listener_socket(listener: &krill_proto::os::net::UnixListener) -> BorrowedSocket<'_> {
+    // SAFETY: listener owns this socket for the entire returned borrow.
+    unsafe { BorrowedSocket::borrow_raw(listener.as_raw_socket()) }
+}
+
+/// Cancel only the synchronous IO of this daemon's pipe reader, never the PTY itself.
+pub(crate) fn cancel_pipe_read(thread: BorrowedHandle<'_>) {
+    // SAFETY: borrowed live thread handle; cancellation does not close any handle.
+    unsafe {
+        windows_sys::Win32::System::IO::CancelSynchronousIo(thread.as_raw_handle());
+    }
+}
+
+pub(crate) fn thread_finished(thread: BorrowedHandle<'_>) -> bool {
+    // SAFETY: live borrowed thread handle, zero timeout cannot block.
+    unsafe { WaitForSingleObject(thread.as_raw_handle(), 0) == WAIT_OBJECT_0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

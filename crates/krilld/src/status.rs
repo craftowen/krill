@@ -355,7 +355,8 @@ pub fn take_spool(
     if f.metadata()?.len() == 0 {
         return Ok(());
     }
-    f.lock()?;
+    let spool_lock = hook::spool_lock(path, &f)?;
+    spool_lock.lock()?;
     let mut buf = Vec::new();
     f.read_to_end(&mut buf)?;
     let mut events = hook::read_spool(&buf);

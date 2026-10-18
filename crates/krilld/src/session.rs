@@ -18,38 +18,46 @@
 //!   디스크에 기록하지 않는 세션은 강등하지 않는다.
 
 mod input;
+#[cfg(windows)]
+mod windows;
 
 use std::collections::VecDeque;
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
+#[cfg(unix)]
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
 use krill_proto::holder::WinSize;
 use krill_proto::screen::{Cell, Revision, Screen, Seq};
+#[cfg(unix)]
 use rustix::event::{PollFd, PollFlags, Timespec, poll};
+#[cfg(unix)]
 use rustix::io::{Errno, read, write};
 
 use crate::appearance::Appearance;
-use crate::os::{AsFd, BorrowedFd, OwnedFd};
+use crate::holder::Master;
+use crate::os::BorrowedFd;
+#[cfg(unix)]
+use crate::os::{AsFd, OwnedFd};
 use crate::store::{Piece, Recorder, Store};
 use crate::term::{Engine, Feed};
 
 /// macOS PTY master의 read 한 번 최대 크기(perf-first 실측).
+#[cfg(unix)]
 const PTY_CHUNK: usize = 1_024;
 /// 슬레이브가 모두 닫힌 master의 read 오류.
 #[cfg(unix)]
 const PTY_EOF: Errno = Errno::IO;
-/// Windows는 master가 만들어지지 않는다([`pty`]). 읽기 끝은 연결 끊김으로 본다.
-#[cfg(windows)]
-const PTY_EOF: Errno = Errno::CONNRESET;
 /// 엔진에 한 번에 넣는 최대 바이트.
 const BATCH: usize = 64 * 1_024;
 /// 꽉 찬 read 뒤 다시 읽는 시간(perf-first 실측 범위 5~20µs의 가운데).
 // ponytail: 고정 상수. tokio AsyncFd 위 효과는 미측정(perf-first 미확인) — 런타임을 바꾸면 다시 잰다.
+#[cfg(unix)]
 const SPIN: Duration = Duration::from_micros(10);
 /// 세션마다 메모리에 두는 최근 원본(원본 스트림 구독자의 큐). 넘게 밀린 구독자는 디스크에서 읽는다.
 // ponytail: 고정 256KiB 비압축(세션 10개 2.5MB). 메모리가 빠듯하면 zstd 링(ARCHITECTURE §3) 또는 크기 축소.
@@ -61,8 +69,10 @@ pub const PARK_GRACE: Duration = Duration::from_secs(10);
 static HALTED: AtomicBool = AtomicBool::new(false);
 /// 리더가 master와 함께 poll하는 파이프(읽는 쪽, 쓰는 쪽). [`halt`]가 한 바이트를 쓰고 아무도 읽지 않아 모든 리더의
 /// poll이 깨어 있는 채로 남는다. 프로세스에 하나.
+#[cfg(unix)]
 static HALT: OnceLock<(OwnedFd, OwnedFd)> = OnceLock::new();
 
+#[cfg(unix)]
 fn halt_pipe() -> io::Result<&'static (OwnedFd, OwnedFd)> {
     if let Some(p) = HALT.get() {
         return Ok(p);
@@ -71,8 +81,7 @@ fn halt_pipe() -> io::Result<&'static (OwnedFd, OwnedFd)> {
     Ok(HALT.get_or_init(|| pipe))
 }
 
-/// PTY master 제어(termios). Windows는 컴파일 전용이라 master가 만들어지지 않고 모두 `Unsupported`다
-/// (`ConPTY`는 Phase 3, OWE-833).
+/// Unix PTY master 제어(termios). Windows 파이프·holder Resize는 `windows` 모듈이 맡는다.
 #[cfg(unix)]
 pub(crate) mod pty {
     use std::io;
@@ -119,42 +128,24 @@ pub(crate) mod pty {
     }
 }
 
-#[cfg(windows)]
-pub(crate) mod pty {
-    use std::io;
-
-    use krill_proto::holder::WinSize;
-
-    use crate::os::OwnedFd;
-
-    /// 익명 파이프는 소켓 poll에 넣을 수 없다. 리더가 없으니 깨울 것도 없다.
-    pub(super) fn halt_pipe() -> io::Result<(OwnedFd, OwnedFd)> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
-    pub(super) fn nonblocking(_master: &OwnedFd) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
-    pub(crate) fn size(_master: &OwnedFd) -> io::Result<WinSize> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
-    pub(super) fn resize(_master: &OwnedFd, _size: WinSize) -> io::Result<()> {
-        Err(io::ErrorKind::Unsupported.into())
-    }
-
-    pub(super) fn foreground(_master: &OwnedFd) -> Option<u32> {
-        None
-    }
-}
-
 /// 이 프로세스의 PTY 리더를 모두 멈춘다(krilld 간 인계). 리더는 읽은 묶음을 기록까지 마친 뒤 세그먼트를 봉인하고
 /// 끝난다. 되돌릴 수 없다. 끝났는지는 [`Session::is_closed`]로 본다.
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Unix halt can fail creating/writing its wake pipe"
+    )
+)]
 pub(crate) fn halt() -> io::Result<()> {
-    let (_, w) = halt_pipe()?;
     HALTED.store(true, Ordering::SeqCst);
-    write(w, &[0])?;
+    #[cfg(unix)]
+    {
+        let (_, w) = halt_pipe()?;
+        write(w, &[0])?;
+    }
+    #[cfg(windows)]
+    windows::halt();
     Ok(())
 }
 
@@ -216,7 +207,9 @@ struct Shared {
     /// PTY 쓰기(질의 응답·알림)는 모두 `live` 잠금 안에서 해서 서로 섞이지 않는다.
     live: Mutex<Live>,
     gaps: Mutex<Vec<Gap>>,
-    master: OwnedFd,
+    master: Master,
+    #[cfg(windows)]
+    holder: Option<Arc<crate::holder::Holder>>,
     look: Arc<Appearance>,
     out: Mutex<Out>,
     changed: Condvar,
@@ -308,13 +301,18 @@ impl Session {
     /// master fd를 non-blocking으로 바꾸고 리더 스레드를 띄운다. `rec`이 `None`이면 디스크에 기록하지 않는다.
     pub fn start(
         id: SessionId,
-        master: OwnedFd,
+        master: Master,
+        #[cfg(windows)] holder: Option<Arc<crate::holder::Holder>>,
         size: WinSize,
         look: Arc<Appearance>,
         rec: Option<Recorder>,
     ) -> io::Result<Self> {
+        #[cfg(unix)]
         pty::nonblocking(&master)?;
+        #[cfg(unix)]
         let halt = halt_pipe()?.0.as_fd();
+        #[cfg(windows)]
+        let pipe = windows::Reader::start(&master)?;
         // krilld가 재기동했으면 seq는 디스크 마지막 세그먼트 끝에서 이어진다.
         let seq = rec.as_ref().map_or(0, Recorder::seq);
         let shared = Arc::new(Shared {
@@ -337,6 +335,8 @@ impl Session {
             }),
             gaps: Mutex::new(Vec::new()),
             master,
+            #[cfg(windows)]
+            holder,
             look,
             out: Mutex::new(Out {
                 ring: VecDeque::new(),
@@ -358,7 +358,11 @@ impl Session {
                     if let Some(r) = &rec {
                         rebuild(&shared, r, size);
                     }
-                    let r = read_loop(&shared, halt, rec);
+                    #[cfg(unix)]
+                    let source = halt;
+                    #[cfg(windows)]
+                    let source = pipe;
+                    let r = read_loop(&shared, source, rec);
                     if !HALTED.load(Ordering::SeqCst)
                         && panic::catch_unwind(AssertUnwindSafe(|| {
                             shared.publish(&[], 0, true);
@@ -399,6 +403,7 @@ impl Session {
     }
 
     /// master fd(krilld 간 인계에서 다음 krilld에 넘긴다).
+    #[cfg(unix)]
     pub(crate) fn master(&self) -> BorrowedFd<'_> {
         self.shared.master.as_fd()
     }
@@ -515,9 +520,19 @@ impl Tap {
         &self.0.clients
     }
 
+    #[cfg_attr(
+        windows,
+        expect(clippy::unnecessary_wraps, reason = "Unix size queries the kernel")
+    )]
     pub(crate) fn size(&self) -> io::Result<WinSize> {
+        #[cfg(unix)]
         let _live = lock(&self.0.live);
-        pty::size(&self.0.master)
+        #[cfg(windows)]
+        let live = lock(&self.0.live);
+        #[cfg(unix)]
+        return pty::size(&self.0.master);
+        #[cfg(windows)]
+        Ok(live.size)
     }
 
     pub fn id(&self) -> SessionId {
@@ -575,8 +590,18 @@ impl Tap {
     }
 
     /// 전경 프로세스 그룹. PTY 소유권은 holder에 그대로 둔다.
+    #[cfg_attr(
+        windows,
+        expect(
+            clippy::unused_self,
+            reason = "Windows has no PTY foreground process group"
+        )
+    )]
     pub(crate) fn foreground(&self) -> Option<u32> {
-        pty::foreground(&self.0.master)
+        #[cfg(unix)]
+        return pty::foreground(&self.0.master);
+        #[cfg(windows)]
+        None
     }
 
     /// CLI 화면과 원본 위치를 한 잠금 안에서 뜬다.
@@ -601,7 +626,10 @@ impl Tap {
     pub fn resize(&self, size: WinSize) -> io::Result<()> {
         let size = crate::term::clamp_size(size);
         let mut live = lock(&self.0.live);
+        #[cfg(unix)]
         pty::resize(&self.0.master, size)?;
+        #[cfg(windows)]
+        windows::resize(&self.0, size)?;
         live.engine.resize(size);
         live.size = size;
         live.resized = Some(size);
@@ -789,13 +817,27 @@ fn rebuild(shared: &Shared, rec: &Recorder, size: WinSize) {
     shared.publish(&[], rev, false);
 }
 
-fn read_loop(shared: &Shared, halt: BorrowedFd<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
-    let master = &shared.master;
+#[cfg(unix)]
+type Source<'a> = BorrowedFd<'a>;
+#[cfg(windows)]
+type Source<'a> = windows::Reader;
+
+#[cfg_attr(
+    windows,
+    expect(
+        clippy::needless_pass_by_value,
+        reason = "Own Reader so every loop exit cancels and joins the pipe worker"
+    )
+)]
+fn read_loop(shared: &Shared, source: Source<'_>, mut rec: Option<Recorder>) -> io::Result<()> {
     let look = &*shared.look;
     let mut buf = vec![0u8; BATCH];
     let mut seq = lock(&shared.live).seq;
     let mut errors = 0u32;
     loop {
+        // Unix has not read ahead. Windows must drain the bounded pipe queue
+        // through EOF after cancellation before sealing, or handover loses bytes.
+        #[cfg(unix)]
         if HALTED.load(Ordering::SeqCst) {
             if let Some(r) = &mut rec {
                 seal(shared, r);
@@ -803,38 +845,18 @@ fn read_loop(shared: &Shared, halt: BorrowedFd<'_>, mut rec: Option<Recorder>) -
             return Ok(());
         }
         let deadline = lock(&shared.live).engine.sync_deadline();
-        let timeout = match deadline {
-            Some(at) => {
-                let left = at.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    let (_, rev, _) = guarded(shared, 0, |e| e.end_sync(Feed::Live, look));
-                    shared.publish(&[], rev, false);
-                    continue;
-                }
-                // 변환에 실패하는 시각은 사실상 없지만, 실패해도 리더를 끝내지 않고 타임아웃 없이 기다린다.
-                Timespec::try_from(left).ok()
-            }
-            None => None,
-        };
-        let mut fds = [
-            PollFd::new(master, PollFlags::IN),
-            PollFd::new(&halt, PollFlags::IN),
-        ];
-        match poll(&mut fds, timeout.as_ref()) {
-            // 마감 도달·halt는 다음 바퀴 맨 위에서 반영
-            Ok(0) | Err(Errno::INTR) => continue,
-            Ok(_) if HALTED.load(Ordering::SeqCst) => continue,
-            Ok(_) => {}
-            // poll 오류로 리더를 끝내면 PTY를 읽는 쪽이 없어 세션 출력이 영구 정지한다.
-            // 백오프 후 다시 기다린다(K-05).
-            Err(e) => {
-                errors = errors.saturating_add(1);
-                tracing::warn!(error = ?e, consecutive = errors, "pty poll failed; retrying");
-                thread::sleep(backoff(errors));
-                continue;
-            }
+        if deadline.is_some_and(|at| at <= Instant::now()) {
+            let (_, rev, _) = guarded(shared, 0, |e| e.end_sync(Feed::Live, look));
+            shared.publish(&[], rev, false);
+            continue;
         }
-        let Some(n) = (match read_batch(master, &mut buf) {
+        let timeout = deadline.map(|at| at.saturating_duration_since(Instant::now()));
+        #[cfg(unix)]
+        let ready = read_ready(&shared.master, source, &mut buf, timeout);
+        #[cfg(windows)]
+        let ready = source.read(&mut buf, timeout);
+        let Some(n) = (match ready {
+            Ok(Some(0)) => continue,
             Ok(n) => n,
             Err(e) => {
                 errors = errors.saturating_add(1);
@@ -942,7 +964,28 @@ fn seal(shared: &Shared, rec: &mut Recorder) {
     }
 }
 
+#[cfg(unix)]
+fn read_ready(
+    master: &OwnedFd,
+    halt: BorrowedFd<'_>,
+    buf: &mut [u8],
+    timeout: Option<Duration>,
+) -> io::Result<Option<usize>> {
+    let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());
+    let mut fds = [
+        PollFd::new(master, PollFlags::IN),
+        PollFd::new(&halt, PollFlags::IN),
+    ];
+    match poll(&mut fds, timeout.as_ref()) {
+        Ok(0) | Err(Errno::INTR) => Ok(Some(0)),
+        Ok(_) if HALTED.load(Ordering::SeqCst) => Ok(Some(0)),
+        Ok(_) => read_batch(master, buf),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// 읽을 수 있게 된 master에서 한 묶음을 읽는다. `None`이면 EOF(슬레이브가 모두 닫힘).
+#[cfg(unix)]
 fn read_batch(master: &OwnedFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
     let mut len = 0;
     let mut spin_until: Option<Instant> = None;
@@ -972,6 +1015,7 @@ fn read_batch(master: &OwnedFd, buf: &mut [u8]) -> io::Result<Option<usize>> {
 }
 
 /// 질의 응답을 PTY 입력으로 쓴다. 리더를 멈추지 않으려고 기다리지 않는다.
+#[cfg(unix)]
 fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
     while !bytes.is_empty() {
         match write(master, bytes) {
@@ -980,6 +1024,17 @@ fn write_reply(master: &OwnedFd, mut bytes: &[u8]) {
             // ponytail: 입력 큐가 가득하면(에이전트가 stdin을 안 읽음, EAGAIN) 남은 응답을 버린다. 응답은 질의당 수십
             // 바이트라 드물다. UI 입력 쓰기(MK-026)가 생기면 같은 세션 쓰기 큐로 보내 순서를 지키며 기다린다.
             Ok(_) | Err(_) => return,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn write_reply(master: &Master, bytes: &[u8]) {
+    use std::io::Write as _;
+    if !bytes.is_empty() {
+        // A borrowed handle becomes a File only through an owned duplicate.
+        if let Ok(handle) = master.input.try_clone() {
+            std::fs::File::from(handle).write_all(bytes).ok();
         }
     }
 }

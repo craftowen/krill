@@ -11,31 +11,23 @@
 //! holder 재결합([`krilld::rejoin`]): holder 링크가 끊기면 고아로 계속 서빙하다가 다음 krilld에 세션을 넘기고 끝난다.
 //! holder 아래에서 떴는데 소켓 락을 못 잡으면 고아 krilld에게서 세션을 넘겨받는다.
 //!
-//! Windows(OWE-819): holder 링크(`OwnedFd`·`SCM_RIGHTS`)가 없어 기동을 거부한다. `ConPTY` holder와 새 링크는 Phase 3.
+//! Windows는 holder가 상속한 익명 파이프를 `Holder::connect_inherited`로 회수한다.
 
-#[cfg(unix)]
 use std::io;
 #[cfg(unix)]
 use std::os::fd::AsFd;
-#[cfg(unix)]
+#[cfg(windows)]
+use std::os::windows::io::AsSocket;
 use std::path::PathBuf;
 use std::process::ExitCode;
-#[cfg(unix)]
 use std::sync::{Arc, mpsc};
-#[cfg(unix)]
 use std::thread;
 
-#[cfg(unix)]
 use krill_proto::daemon;
-#[cfg(unix)]
 use krill_proto::ipc::{FEATURES, PROTO_MAX, PROTO_MIN, ServerHello};
-#[cfg(unix)]
 use krilld::holder::Holder;
-#[cfg(unix)]
 use krilld::ipc::Listener;
-#[cfg(unix)]
 use krilld::registry::Registry;
-#[cfg(unix)]
 use krilld::rejoin::{self, Handover};
 #[cfg(unix)]
 use rustix::fs::{FileType, fstat};
@@ -45,14 +37,6 @@ use rustix::fs::{FileType, fstat};
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(windows)]
-fn main() -> ExitCode {
-    krill_log::init(krill_log::Component::Daemon).ok();
-    tracing::error!(kind = ?std::io::ErrorKind::Unsupported, "daemon unavailable on Windows");
-    ExitCode::FAILURE
-}
-
-#[cfg(unix)]
 fn main() -> ExitCode {
     let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
         return ExitCode::from(2);
@@ -65,13 +49,19 @@ fn main() -> ExitCode {
     krilld::alloc::return_freed_pages().ok();
     // MK-066: 메모리 게이트가 의도적 회귀를 잡는지 확인하는 주입(`scripts/memory-gate.sh --inject`). 평소에는 빈 Vec.
     let _ballast = std::hint::black_box(ballast());
+    #[cfg(unix)]
     let stdin = io::stdin();
+    #[cfg(unix)]
     let linked = fstat(stdin.as_fd())
         .is_ok_and(|st| FileType::from_raw_mode(st.st_mode) == FileType::Socket);
+    #[cfg(windows)]
+    let linked = std::env::var_os("KRILL_HOLDER_LINK").is_some();
     let (holder, held) = if linked {
-        let Ok((holder, link, kept, held)) =
-            stdin.as_fd().try_clone_to_owned().and_then(Holder::connect)
-        else {
+        #[cfg(unix)]
+        let connection = stdin.as_fd().try_clone_to_owned().and_then(Holder::connect);
+        #[cfg(windows)]
+        let connection = Holder::connect_inherited();
+        let Ok((holder, link, kept, held)) = connection else {
             return ExitCode::FAILURE; // holder가 링크를 끊고 다시 띄운다
         };
         (Some((holder, link, kept)), held)
@@ -178,7 +168,11 @@ fn main() -> ExitCode {
     // ponytail: 첫 게시와 `HoldListener` 사이에 죽으면 그 holder는 소켓 없이 남아 연결이 거부되고 holder가 하나 더
     // 뜰 수 있다. 세션을 만들기 전이라 갈라질 세션은 없다. 막아야 하면 holder 자체 flock을 더한다.
     if fresh && let Some(h) = registry.holder() {
-        h.hold_listener(lis.as_fd()).ok();
+        #[cfg(unix)]
+        let fd = lis.as_fd();
+        #[cfg(windows)]
+        let fd = lis.as_socket();
+        h.hold_listener(fd).ok();
     }
     krilld::monitor::start(Arc::clone(&registry), done.clone()).ok();
     if linked {
@@ -257,7 +251,6 @@ fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-#[cfg(unix)]
 /// 환경 변수 `KRILL_TEST_BALLAST_MB`(메비바이트 단위)만큼을 0이 아닌 값으로 채워 쥔다(dirty 페이지라 footprint에 잡힌다). 없거나 잘못된 값이면 빈 Vec.
 fn ballast() -> Vec<u8> {
     std::env::var("KRILL_TEST_BALLAST_MB")
