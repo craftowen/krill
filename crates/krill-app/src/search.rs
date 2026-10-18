@@ -8,6 +8,7 @@ use gpui::{
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
+use gpui_component::{IconName, Sizable as _};
 use krill_proto::search::{Direction, SearchResult};
 
 const DEBOUNCE: Duration = Duration::from_millis(150);
@@ -190,41 +191,53 @@ impl Render for Bar {
                     div()
                         .debug_selector(|| "search-status".into())
                         .px_1()
-                        .font_family(crate::ui::FONT_UI)
+                        .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_XS)
                         .text_color(muted)
                         .child(self.status.clone()),
                 )
             })
             .child(
-                Button::new("search-prev")
-                    .label("↑")
-                    .ghost()
-                    .accessibility_label(text::PREV.get())
-                    .tooltip(text::PREV.get())
-                    .on_click(cx.listener(|bar, _, _, cx| {
-                        bar.step(Direction::Previous, cx);
-                    })),
+                crate::ui::button_with_tooltip(
+                    Button::new("search-prev")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronUp),
+                    "search-prev",
+                    text::PREV.get(),
+                )
+                .accessibility_label(text::PREV.get())
+                .on_click(cx.listener(|bar, _, _, cx| {
+                    bar.step(Direction::Previous, cx);
+                })),
             )
             .child(
-                Button::new("search-next")
-                    .label("↓")
-                    .ghost()
-                    .accessibility_label(text::NEXT.get())
-                    .tooltip(text::NEXT.get())
-                    .on_click(cx.listener(|bar, _, _, cx| {
-                        bar.step(Direction::Next, cx);
-                    })),
+                crate::ui::button_with_tooltip(
+                    Button::new("search-next")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::ChevronDown),
+                    "search-next",
+                    text::NEXT.get(),
+                )
+                .accessibility_label(text::NEXT.get())
+                .on_click(cx.listener(|bar, _, _, cx| {
+                    bar.step(Direction::Next, cx);
+                })),
             )
             .child(
-                Button::new("search-close")
-                    .label("×")
-                    .ghost()
-                    .accessibility_label(text::CLOSE.get())
-                    .tooltip(text::CLOSE.get())
-                    .on_click(cx.listener(|bar, _, _, cx| {
-                        bar.dismiss(cx);
-                    })),
+                crate::ui::button_with_tooltip(
+                    Button::new("search-close")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close),
+                    "search-close",
+                    text::CLOSE.get(),
+                )
+                .accessibility_label(text::CLOSE.get())
+                .on_click(cx.listener(|bar, _, _, cx| {
+                    bar.dismiss(cx);
+                })),
             );
         deferred(
             div()

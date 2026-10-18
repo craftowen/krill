@@ -6,6 +6,7 @@
 use gpui::{
     Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, SharedString, Window, div, prelude::*,
 };
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use krill_proto::SessionId;
@@ -290,6 +291,7 @@ impl Render for Dialog {
                     .child(
                         Button::new("continue-session-close")
                             .ghost()
+                            .small()
                             .icon(gpui_component::IconName::Close)
                             .accessibility_label(text::CLOSE.get())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
