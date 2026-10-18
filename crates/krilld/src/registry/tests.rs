@@ -590,6 +590,10 @@ fn preparation_requires_feature_and_rejects_observer() {
 /// MK-096: `serve()`는 핸드셰이크 전에 서명 정책을 강제한다. 테스트 바이너리 자신(ad-hoc 서명)의 식별자와
 /// 같으면 이어지고, 다르면 `ServerHello`도 보내지 않고 닫는다. 정책 파일이 없으면 기존처럼 이어진다.
 #[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "macOS 전용: 코드서명(LOCAL_PEERTOKEN)"
+)]
 fn serve_enforces_peer_signing_policy() {
     let dir = std::env::temp_dir().join(format!("mksign-serve-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
