@@ -114,9 +114,9 @@ pub(super) struct Files {
     close_guard: bool,
     /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·저장·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
     released: Vec<PathBuf>,
-    /// 터미널 경로 링크(OWE-663 4번): 디스크 확인 캐시, ⌘ 아래 링크(칸, 행, 링크), 열고 나서 옮길 (파일, 줄, 열).
+    /// 터미널 링크(OWE-663 4번, OWE-867): 디스크 확인 캐시, ⌘ 아래 링크(칸, 밑줄 범위), 열고 나서 옮길 (파일, 줄, 열).
     links: path_link::Cache,
-    pub(super) hover: Option<(PaneId, u16, PathLink)>,
+    pub(super) hover: Option<(PaneId, Highlight)>,
     goto: Option<(PathBuf, u32, u32)>,
 }
 
@@ -345,7 +345,7 @@ impl Shell {
         Some((line, link))
     }
 
-    /// ⌘를 누른 채 움직이면 경로 밑줄을 갱신한다. 바뀔 때만 다시 그린다.
+    /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
     pub(super) fn update_path_hover(
         &mut self,
         pane: PaneId,
@@ -354,8 +354,25 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let next = if cmd {
-            self.path_link_at(pane, position, cx)
-                .map(|(line, link)| (pane, line, link))
+            let osc_or_url = self.live.get(&pane).and_then(|l| {
+                let screen = l.pane.shown();
+                krill_app::terminal::osc_link_highlight(&screen, &l.painted, position).or_else(
+                    || {
+                        krill_app::terminal::url_link_target(&screen, &l.painted, position)
+                            .map(|(h, _)| h)
+                    },
+                )
+            });
+            osc_or_url
+                .or_else(|| {
+                    self.path_link_at(pane, position, cx)
+                        .map(|(line, link)| Highlight {
+                            line,
+                            column: link.column,
+                            cols: link.cols,
+                        })
+                })
+                .map(|h| (pane, h))
         } else {
             None
         };
@@ -391,14 +408,9 @@ impl Shell {
         }
     }
 
-    /// 칸에 그릴 경로 밑줄.
+    /// 칸에 그릴 링크 밑줄.
     pub(super) fn path_hover(&self, pane: PaneId) -> Option<Highlight> {
-        let (_, line, link) = self.files.hover.as_ref().filter(|h| h.0 == pane)?;
-        Some(Highlight {
-            line: *line,
-            column: link.column,
-            cols: link.cols,
-        })
+        self.files.hover.filter(|h| h.0 == pane).map(|h| h.1)
     }
 
     /// 경로 링크를 가운데 에디터로 연다. 줄이 있으면 탭이 한 번 그려진 뒤(스크롤에 레이아웃이 필요) 그 줄로 옮긴다.

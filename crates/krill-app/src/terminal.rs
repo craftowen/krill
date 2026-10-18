@@ -230,6 +230,56 @@ pub fn file_link_target(
     Some(path)
 }
 
+/// ⌘+호버 시 유효한 OSC 8 링크 칸 범위를 밑줄·포인터 커서 대상으로 돌려준다(OWE-867).
+pub fn osc_link_highlight(
+    screen: &Screen,
+    painted: &Painted,
+    position: gpui::Point<Pixels>,
+) -> Option<Highlight> {
+    if link_target(screen, painted, position).is_none()
+        && file_link_target(screen, painted, position).is_none()
+    {
+        return None;
+    }
+    let (column, line) = cell_at(painted, screen, position)?;
+    let uri = screen.link_at(line, column)?;
+    let mut start = column;
+    while start > 0 && screen.link_at(line, start - 1) == Some(uri) {
+        start -= 1;
+    }
+    let mut end = column.saturating_add(1);
+    while end < screen.cols && screen.link_at(line, end) == Some(uri) {
+        end = end.saturating_add(1);
+    }
+    Some(Highlight {
+        line,
+        column: start,
+        cols: end.saturating_sub(start),
+    })
+}
+
+/// ⌘+호버·⌘+클릭 대상인 평문 `http://`·`https://` URL과 밑줄 범위를 돌려준다(OWE-867).
+pub fn url_link_target(
+    screen: &Screen,
+    painted: &Painted,
+    position: gpui::Point<Pixels>,
+) -> Option<(Highlight, String)> {
+    let (column, line) = cell_at(painted, screen, position)?;
+    if screen.link_at(line, column).is_some() {
+        return None;
+    }
+    let row = screen.rows.get(usize::from(line))?;
+    let u = path_link::url_at(row, column)?;
+    Some((
+        Highlight {
+            line,
+            column: u.column,
+            cols: u.cols,
+        },
+        u.uri,
+    ))
+}
+
 /// IME 조합 중 글자(커서 칸 `origin`부터 `columns`칸).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Preedit {
