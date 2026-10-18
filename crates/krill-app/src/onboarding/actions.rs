@@ -21,6 +21,8 @@ pub type FixOutcome = Result<(), String>;
 /// 경우다(OWE-714 D2). 오류가 아니라 안내라서 점검 화면이 주의 톤으로 다음 행동을 보여 준다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FixError {
+    /// 사용자가 동의·안내 대화상자에서 취소함. 설정을 바꾸지 않았고 오류도 아니다.
+    Cancelled,
     Failed(String),
     /// `guide`는 화면 언어 안내, `detail`은 충돌 원문(펼쳐서 본다).
     Conflict {
@@ -38,6 +40,7 @@ impl From<String> for FixError {
 impl std::fmt::Display for FixError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Cancelled => f.write_str(atext::CANCELLED.get()),
             Self::Failed(message) => f.write_str(message),
             Self::Conflict { guide, .. } => f.write_str(guide),
         }
@@ -134,7 +137,7 @@ fn run_with<E: Executor>(id: &str, env: &Env, executor: E, cx: &mut App) -> Task
                 })
                 .map_err(|_| atext::NO_WINDOW.get().to_owned())?;
             if answer.await != Ok(0) {
-                return Err(atext::CANCELLED.get().to_owned().into());
+                return Err(FixError::Cancelled);
             }
             return background
                 .spawn(async move {
@@ -155,8 +158,10 @@ fn run_with<E: Executor>(id: &str, env: &Env, executor: E, cx: &mut App) -> Task
             return Ok(());
         };
         let window = window.ok_or_else(|| atext::NO_WINDOW.get().to_owned())?;
-        let title = text::HOOK_TITLE.format(&[("name", agent.id())]);
-        let detail = text::HOOK_DETAIL.format(&[("id", agent.id()), ("diff", &diff)]);
+        let name = super::agent_name(agent.id());
+        let clipped = super::clip(&diff, agent.id());
+        let title = text::HOOK_TITLE.format(&[("name", name)]);
+        let detail = text::HOOK_DETAIL.format(&[("id", agent.id()), ("diff", &clipped)]);
         let answer = window
             .update(cx, |_, window, cx| {
                 window.prompt(
@@ -169,7 +174,7 @@ fn run_with<E: Executor>(id: &str, env: &Env, executor: E, cx: &mut App) -> Task
             })
             .map_err(|_| atext::NO_WINDOW.get().to_owned())?;
         if answer.await != Ok(0) {
-            return Err(atext::CANCELLED.get().to_owned().into());
+            return Err(FixError::Cancelled);
         }
         background
             .spawn(async move { executor.apply(review) })
@@ -190,18 +195,10 @@ impl Executor for SystemExecutor {
             }
             FixAction::Cli => install_managed_cli(env)?,
             FixAction::Hook(agent) => {
-                let executable = stage_helpers(env)?;
-                let state = canonical_path(&env.state)?;
-                let path = hook_config_path(agent, env)?;
-                if let Some(plan) =
-                    Plan::prepare(Action::Install, agent, &path, &state, &executable)
-                        .map_err(|e| hook_prepare_error(agent, &e))?
-                {
-                    let mut diff = Vec::new();
-                    plan.write_diff(&mut diff).map_err(|e| e.to_string())?;
+                if let Some((diff, plan)) = prepare_hook(agent, env)? {
                     return Ok(Prepared::Review {
                         agent,
-                        diff: String::from_utf8_lossy(&diff).into_owned(),
+                        diff,
                         review: plan,
                     });
                 }
@@ -214,11 +211,32 @@ impl Executor for SystemExecutor {
     }
 
     fn apply(&self, review: Plan) -> FixOutcome {
-        review
-            .apply()
-            .map(|_| ())
-            .map_err(|e| atext::HOOK_ERROR.format(&[("error", &e.to_string())]))
+        apply_hook(review)
     }
+}
+
+pub(super) fn prepare_hook(
+    agent: TargetAgent,
+    env: &Env,
+) -> Result<Option<(String, Plan)>, FixError> {
+    let executable = stage_helpers(env)?;
+    let state = canonical_path(&env.state)?;
+    let path = hook_config_path(agent, env)?;
+    if let Some(plan) = Plan::prepare(Action::Install, agent, &path, &state, &executable)
+        .map_err(|e| hook_prepare_error(agent, &e))?
+    {
+        let mut diff = Vec::new();
+        plan.write_diff(&mut diff).map_err(|e| e.to_string())?;
+        return Ok(Some((String::from_utf8_lossy(&diff).into_owned(), plan)));
+    }
+    Ok(None)
+}
+
+pub(super) fn apply_hook(review: Plan) -> FixOutcome {
+    review
+        .apply()
+        .map(|_| ())
+        .map_err(|e| atext::HOOK_ERROR.format(&[("error", &e.to_string())]))
 }
 
 /// 설치 계획 실패를 행 조치 실패로. 기존 설정과의 충돌(`AlreadyExists`)은 아무것도 바꾸지 않았으니
@@ -252,7 +270,7 @@ fn stage_helpers(env: &Env) -> Result<PathBuf, String> {
     super::stage_binaries(&env.krill, &env.home)
 }
 
-fn install_managed_cli(env: &Env) -> FixOutcome {
+pub(super) fn install_managed_cli(env: &Env) -> FixOutcome {
     let path = super::login_path(&env.shell)
         .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
     install_managed_cli_at(env, &path)
@@ -509,6 +527,14 @@ pub fn note_access_denied(path: &Path, error: &io::Error, cx: &mut App) {
     publish(id, atext::ACCESS_DENIED.get().to_owned(), cx);
 }
 
+/// hook 미설치 배너의 점검 ID·문구. 표시 이름 규칙은 `agent_name` 단일 출처다(OWE-877).
+pub(super) fn hook_needed_content(agent: TargetAgent) -> (String, String) {
+    (
+        format!("hook.{}", agent.id()),
+        atext::HOOK_NEEDED.format(&[("agent", super::agent_name(agent.id()))]),
+    )
+}
+
 /// 새 에이전트 세션에 hook 설치를 안내한다. 설정 변경은 동의 뒤에만 한다.
 pub fn note_agent_session(agent: &str, cx: &mut App) {
     let Some(agent) = TargetAgent::parse(agent) else {
@@ -530,11 +556,8 @@ pub fn note_agent_session(agent: &str, cx: &mut App) {
     cx.spawn(async move |cx| {
         if !check.await {
             cx.update(|cx| {
-                publish(
-                    &format!("hook.{}", agent.id()),
-                    atext::HOOK_NEEDED.format(&[("agent", agent.id())]),
-                    cx,
-                );
+                let (id, message) = hook_needed_content(agent);
+                publish(&id, message, cx);
             });
         }
     })
