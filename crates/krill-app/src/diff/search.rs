@@ -53,8 +53,20 @@ const MAX_GIT_IGNORE_STDOUT_BYTES: usize = 2 * 1024 * 1024;
 /// 결과 줄 미리보기 최대 문자 수.
 const MAX_PREVIEW_CHARS: usize = 300;
 
-/// 긴 줄에서 매치 시작 위치 앞쪽에 유지할 문맥 문자 수.
-const PREVIEW_CONTEXT_BEFORE: usize = 40;
+/// 긴 줄에서 매치 시작 위치 앞쪽에 유지할 문맥 문자 수(패널 확대 시 노출 가능한 앞 문맥 상한).
+const PREVIEW_CONTEXT_BEFORE: usize = 120;
+
+/// 스크롤 뷰포트 폭 측정 전 기본 검색 패널 행 폭(우측 사이드바 기본 폭 `280pt`).
+const DEFAULT_SEARCH_ROW_WIDTH_PX: f32 = 280.0;
+
+/// 매치 행의 좌우 여백·줄 번호 열·간격·하이라이트 패딩 합계(여유 마진 포함, px).
+const MATCH_ROW_CHROME_PX: f32 = 76.0;
+
+/// 매우 좁은 패널에서도 보장할 최소 미리보기 열 수.
+const MIN_MATCH_PREVIEW_COLS: usize = 12;
+
+/// 앞 문맥 생략 시 뒤 문맥(`after`) 노출을 위해 예약할 최대 열 수.
+const AFTER_CONTEXT_RESERVE_COLS: usize = 6;
 
 /// 단일 시작 위치에서 허용하는 정규식 백트래킹 최대 스텝 수.
 const MAX_REGEX_STEPS_PER_MATCH: usize = 4_096;
@@ -1536,6 +1548,154 @@ pub fn split_highlighted_preview(
     (trimmed_before, matched, after)
 }
 
+fn char_display_cols(ch: char) -> usize {
+    if ch.is_ascii() { 1 } else { 2 }
+}
+
+fn str_display_cols(s: &str) -> usize {
+    s.chars().map(char_display_cols).sum()
+}
+
+fn elide_start_to_cols(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if max_cols == 1 {
+        return "…".to_owned();
+    }
+    let tail_budget = max_cols.saturating_sub(1);
+    let mut used = 0usize;
+    let mut tail_chars: Vec<char> = Vec::new();
+    for ch in s.chars().rev() {
+        let w = char_display_cols(ch);
+        if used.saturating_add(w) > tail_budget {
+            break;
+        }
+        used = used.saturating_add(w);
+        tail_chars.push(ch);
+    }
+    tail_chars.reverse();
+    let mut out = String::with_capacity(tail_chars.len().saturating_add('…'.len_utf8()));
+    out.push('…');
+    for ch in tail_chars {
+        out.push(ch);
+    }
+    out
+}
+
+fn truncate_end_to_cols(s: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    if str_display_cols(s) <= max_cols {
+        return s.to_owned();
+    }
+    if max_cols == 1 {
+        return "…".to_owned();
+    }
+    let head_budget = max_cols.saturating_sub(1);
+    let mut used = 0usize;
+    let mut out = String::new();
+    for ch in s.chars() {
+        let w = char_display_cols(ch);
+        if used.saturating_add(w) > head_budget {
+            break;
+        }
+        used = used.saturating_add(w);
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// 현재 행 폭(`row_width_px`)과 고정폭 글꼴 문자 폭(`cell_width_px`)으로 매치 미리보기에
+/// 사용할 수 있는 최대 고정폭 열 수를 계산한다.
+#[must_use]
+pub fn max_cols_for_row_width(row_width_px: f32, cell_width_px: f32) -> usize {
+    let effective_cell = if cell_width_px.is_finite() && cell_width_px > 1.0 {
+        cell_width_px
+    } else {
+        7.0
+    };
+    let text_px = (row_width_px - MATCH_ROW_CHROME_PX).max(0.0);
+    let raw_cols = (text_px / effective_cell).floor();
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "0 이상 유한 부동소수점을 usize로 변환"
+    )]
+    let cols = if raw_cols.is_finite() && raw_cols >= 0.0 {
+        raw_cols as usize
+    } else {
+        MIN_MATCH_PREVIEW_COLS
+    };
+    cols.max(MIN_MATCH_PREVIEW_COLS)
+}
+
+/// 현재 행에서 사용 가능한 고정폭 열(`max_cols`) 예산에 맞춰 `(앞 문맥, 일치 구간, 뒤 문맥)`을
+/// 조정한다. 앞 문맥이 예산을 넘거나 원본 줄에서 앞부분이 이미 잘린 경우(`window_start > 0`)
+/// 앞부분을 `…`로 생략해 일치 강조(`matched`)가 항상 패널 폭 안에 노출되도록 보장한다.
+#[must_use]
+pub fn fit_highlighted_preview_for_cols(
+    line_content: &str,
+    column: u32,
+    match_length: u32,
+    max_cols: usize,
+) -> (String, String, String) {
+    let budget = max_cols.max(MIN_MATCH_PREVIEW_COLS);
+    let (before, matched, after) = split_highlighted_preview(line_content, column, match_length);
+    let col0 = usize::try_from(column.saturating_sub(1)).unwrap_or(0);
+    let len_chars = usize::try_from(match_length).unwrap_or(0);
+    let pre_windowed = line_content.chars().count() <= MAX_PREVIEW_CHARS
+        && preview_window_start(col0, len_chars) > 0;
+
+    let before_cols = str_display_cols(&before);
+    let matched_cols = str_display_cols(&matched);
+    let after_cols = str_display_cols(&after);
+
+    if !pre_windowed
+        && before_cols
+            .saturating_add(matched_cols)
+            .saturating_add(after_cols.min(AFTER_CONTEXT_RESERVE_COLS))
+            <= budget
+    {
+        return (before, matched, after);
+    }
+
+    if matched_cols >= budget {
+        if !before.is_empty() && budget > 6 {
+            let fitted_matched = truncate_end_to_cols(&matched, budget.saturating_sub(1));
+            return ("…".to_owned(), fitted_matched, String::new());
+        }
+        let fitted_matched = truncate_end_to_cols(&matched, budget);
+        return (String::new(), fitted_matched, String::new());
+    }
+
+    if before.is_empty() {
+        return (before, matched, after);
+    }
+
+    let remaining = budget.saturating_sub(matched_cols);
+    let right_reserve = after_cols
+        .clamp(2, AFTER_CONTEXT_RESERVE_COLS)
+        .min(remaining / 2);
+    let before_budget = remaining.saturating_sub(right_reserve);
+
+    let fitted_before = if before_cols > before_budget {
+        elide_start_to_cols(&before, before_budget)
+    } else if pre_windowed {
+        if before_cols.saturating_add(1) <= before_budget {
+            format!("…{before}")
+        } else {
+            elide_start_to_cols(&before, before_budget)
+        }
+    } else {
+        before
+    };
+
+    (fitted_before, matched, after)
+}
+
 impl Panel {
     /// `Search` 탭으로 전환하고 검색어 입력창에 포커스를 준다.
     pub fn show_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2023,16 +2183,39 @@ impl Panel {
             )
     }
 
+    fn search_row_max_cols(&self, window: &Window) -> usize {
+        let list_width_px = self
+            .search
+            .scroll
+            .0
+            .borrow()
+            .last_item_size
+            .map(|sz| f32::from(sz.item.width))
+            .filter(|&w| w.is_finite() && w > 0.0)
+            .unwrap_or(DEFAULT_SEARCH_ROW_WIDTH_PX);
+        let font_size = ui::TEXT_XS.to_pixels(window.rem_size());
+        let font_id = window
+            .text_system()
+            .resolve_font(&gpui::font(ui::FONT_MONO));
+        let cell_width_px = window
+            .text_system()
+            .advance(font_id, font_size, 'm')
+            .map_or(f32::from(font_size) * 0.62, |s| f32::from(s.width))
+            .max(4.0);
+        max_cols_for_row_width(list_width_px, cell_width_px)
+    }
+
     fn render_search_rows(
         &mut self,
         range: std::ops::Range<usize>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         #[cfg(test)]
         {
             self.search.rendered_rows = range.len();
         }
+        let max_cols = self.search_row_max_cols(window);
         let p = ui::palette(cx);
         let selected_bg = p.accent;
         let hover_bg = p.accent.opacity(0.6);
@@ -2149,10 +2332,15 @@ impl Panel {
                     } => {
                         let match_selector =
                             format!("search-match-{relative_path}-{}-{}", hit.line, hit.column);
-                        let (before, matched, after) = split_highlighted_preview(
+                        let highlight_selector = format!(
+                            "search-highlight-{relative_path}-{}-{}",
+                            hit.line, hit.column
+                        );
+                        let (before, matched, after) = fit_highlighted_preview_for_cols(
                             &hit.line_content,
                             hit.column,
                             hit.match_length,
+                            max_cols,
                         );
                         let open_path = path.clone();
                         let line = hit.line;
@@ -2205,6 +2393,12 @@ impl Panel {
                                         .when(!matched.is_empty(), |d| {
                                             d.child(
                                                 div()
+                                                    .id(ElementId::Name(SharedString::from(
+                                                        highlight_selector.clone(),
+                                                    )))
+                                                    .debug_selector(move || {
+                                                        highlight_selector.clone()
+                                                    })
                                                     .flex_none()
                                                     .px_0p5()
                                                     .rounded(ui::RADIUS_XS)

@@ -46,8 +46,8 @@ pub use explorer::{DirEntry, EditKind, Explorer, TreeRow};
 pub mod search;
 pub use search::{
     DEFAULT_MAX_RESULTS, SearchFileResult, SearchMatch, SearchOptions, SearchResult, SearchRow,
-    WorkspaceSearch, glob_matches_path, parse_glob_patterns, search_worktree,
-    search_worktree_fallback, split_highlighted_preview,
+    WorkspaceSearch, fit_highlighted_preview_for_cols, glob_matches_path, max_cols_for_row_width,
+    parse_glob_patterns, search_worktree, search_worktree_fallback, split_highlighted_preview,
 };
 
 /// Retained patch bound, independent of the number of visible rows.
