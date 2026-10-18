@@ -4,7 +4,7 @@ use super::e2ee::{invalid, random};
 use crate::registry::Registry;
 use krill_proto::{
     SessionId,
-    control::{self, CaptureFormat, Reply, Request},
+    control::{self, CaptureFormat, Create, Program, Reply, Request},
     input::{Input, InputAck, InputId, InputResult},
     ipc::{self, ClientRole, ServerHello},
     orchestration::{GateStatus, MessageType, OrchestrationStore},
@@ -17,7 +17,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::{
-    ffi::OsStringExt,
+    ffi::{OsStrExt, OsStringExt},
     fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     net::UnixStream,
 };
@@ -31,6 +31,7 @@ pub(super) struct Backend {
     registry: Weak<Registry>,
     dir: Option<PathBuf>,
     hello: ServerHello,
+    host: Value,
 }
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -41,6 +42,12 @@ impl std::fmt::Debug for Backend {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum Action {
     Snapshot,
+    CreateTerminal {
+        cwd_session: u64,
+    },
+    CloseTerminal {
+        session: u64,
+    },
     Prompt {
         session: u64,
         text: String,
@@ -83,6 +90,7 @@ impl Backend {
             registry,
             dir: dir.map(Path::to_path_buf),
             hello,
+            host: host_metadata(),
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -105,6 +113,29 @@ impl Backend {
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
             Action::Snapshot => self.snapshot(),
+            Action::CreateTerminal { cwd_session } => {
+                let cwd = self.cwd(cwd_session)?;
+                match self.control(&Request::Create(Create {
+                    program: Program::Login,
+                    cwd: cwd.into_os_string().into_vec(),
+                    cols: 80,
+                    rows: 24,
+                    account: None,
+                }))? {
+                    Reply::Created { session, .. } => Ok(json!({"session":session.0})),
+                    Reply::Failed(error) => Err(io::Error::other(error.to_string())),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::CloseTerminal { session } => {
+                match self.control(&Request::Close {
+                    session: SessionId(session),
+                })? {
+                    Reply::Closed => Ok(json!({"closed":true})),
+                    Reply::Failed(error) => Err(io::Error::other(error.to_string())),
+                    _ => Err(invalid()),
+                }
+            }
             Action::Prompt { session, text } => {
                 if text.len() >= krill_proto::input::MAX_INPUT {
                     return Err(invalid());
@@ -300,21 +331,26 @@ impl Backend {
             _ => Vec::new(),
         };
         let sidebar = match self.control(&Request::Sidebar)? {
-            Reply::Sidebar(s) => s.sessions,
-            _ => Vec::new(),
+            Reply::Sidebar(s) => s,
+            _ => control::SidebarData {
+                sessions: Vec::new(),
+                repositories: Vec::new(),
+            },
         };
+        let truncated = sessions.len() > 64;
         let mut cards = Vec::new();
         for info in sessions.into_iter().take(64) {
             let state = states
                 .iter()
                 .find(|s| s.session == info.session)
                 .map_or(control::AgentStatus::UNKNOWN, |s| s.status.clone());
-            let cwd = sidebar
+            let cwd_bytes = sidebar
+                .sessions
                 .iter()
                 .find(|s| s.session == info.session)
-                .map_or_else(String::new, |s| {
-                    String::from_utf8_lossy(&s.cwd).into_owned()
-                });
+                .map_or(&[][..], |s| s.cwd.as_slice());
+            let cwd = String::from_utf8_lossy(cwd_bytes);
+            let group = session_group(info.session, cwd_bytes, &sidebar.repositories);
             let text = match self.control(&Request::Capture {
                 session: info.session,
                 format: CaptureFormat::Plain,
@@ -331,9 +367,18 @@ impl Backend {
                 .collect();
             lines.reverse();
             let git = self.git(info.session.0, None).unwrap_or(Value::Null);
-            cards.push(json!({"id":info.session.0,"state":state.state,"agent":state.agent,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted")}));
+            cards.push(json!({"id":info.session.0,"state":state.state,"agent":state.agent,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+                "repo_key":group.repo_key,"worktree_key":group.worktree_key,
+                "group_label":group.label,"group_path":group.path,
+                "state_source":state.source,"state_confidence":state.confidence,
+                "state_since_unix_ns":state.since_unix_ns.to_string()}));
         }
-        Ok(json!({"sessions":cards,"orchestration":self.orchestration()?}))
+        Ok(
+            json!({"sessions":cards,"orchestration":self.orchestration()?,
+            "repositories":repositories_json(&sidebar.repositories),"truncated":truncated,
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true},
+            "host":self.host}),
+        )
     }
     fn orchestration(&self) -> io::Result<Value> {
         let store = self
@@ -394,6 +439,80 @@ impl Backend {
             json!({"branch":String::from_utf8_lossy(&branch.stdout).trim(),"added":added,"deleted":deleted,"files":files,"patch":patch}),
         )
     }
+}
+/// 표시용 lossy UTF-8과 분리해 OS 경로 바이트를 그대로 식별한다.
+#[derive(Debug)]
+struct SessionGroup {
+    repo_key: Option<String>,
+    worktree_key: String,
+    label: Option<String>,
+    path: Option<String>,
+}
+fn session_group(
+    session: SessionId,
+    cwd: &[u8],
+    repositories: &[control::RepositoryTrees],
+) -> SessionGroup {
+    if cwd.is_empty() {
+        return SessionGroup {
+            repo_key: None,
+            worktree_key: format!("unknown:{}", session.0),
+            label: None,
+            path: None,
+        };
+    }
+    let cwd_path = Path::new(std::ffi::OsStr::from_bytes(cwd));
+    let matched = repositories
+        .iter()
+        .flat_map(|repo| {
+            repo.worktrees
+                .iter()
+                .filter(|tree| !tree.is_empty())
+                .map(move |tree| (repo, tree))
+        })
+        .filter_map(|(repo, tree)| {
+            let path = Path::new(std::ffi::OsStr::from_bytes(tree));
+            cwd_path
+                .starts_with(path)
+                .then(|| (repo, tree, path.components().count()))
+        })
+        .max_by_key(|(_, _, depth)| *depth);
+    let (repo_key, bytes) = matched.map_or((None, cwd), |(repo, tree, _)| {
+        (Some(hex(&repo.repo)), tree.as_slice())
+    });
+    SessionGroup {
+        repo_key,
+        worktree_key: hex(bytes),
+        label: Some(path_label(bytes)),
+        path: Some(String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+fn path_label(bytes: &[u8]) -> String {
+    let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+fn repositories_json(repositories: &[control::RepositoryTrees]) -> Vec<Value> {
+    repositories.iter().map(|repo| json!({
+        "key":hex(&repo.repo),"label":path_label(&repo.repo),"path":String::from_utf8_lossy(&repo.repo),
+        "worktree_keys":repo.worktrees.iter().map(|tree| hex(tree)).collect::<Vec<_>>()
+    })).collect()
+}
+fn host_metadata() -> Value {
+    let mut command = Command::new("/bin/hostname");
+    let display_name = bounded_command(&mut command, Duration::from_secs(1), 1024)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty());
+    let platform = match std::env::consts::OS {
+        "macos" => Some("macos"),
+        "linux" => Some("linux"),
+        _ => None,
+    };
+    json!({"display_name":display_name,"platform":platform})
 }
 struct Wire {
     socket: UnixStream,
@@ -568,6 +687,75 @@ fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn snapshot_groups_use_deepest_path_components_and_keep_empty_repositories() {
+        let repositories = vec![
+            control::RepositoryTrees {
+                repo: b"/repo".to_vec(),
+                worktrees: vec![b"/repo/a".to_vec(), b"/repo/a/nested".to_vec()],
+            },
+            control::RepositoryTrees {
+                repo: b"/empty".to_vec(),
+                worktrees: vec![],
+            },
+        ];
+        let group = session_group(SessionId(1), b"/repo/a/nested/src", &repositories);
+        assert_eq!(group.repo_key, Some(hex(b"/repo")));
+        assert_eq!(group.worktree_key, hex(b"/repo/a/nested"));
+        assert_eq!(group.label.as_deref(), Some("nested"));
+        assert_eq!(group.path.as_deref(), Some("/repo/a/nested"));
+        let group = session_group(SessionId(2), b"/repo/abc", &repositories);
+        assert_eq!(group.repo_key, None);
+        assert_eq!(group.worktree_key, hex(b"/repo/abc"));
+        let outside = session_group(SessionId(3), b"/outside/sub", &repositories);
+        assert_eq!(outside.repo_key, None);
+        assert_eq!(outside.path.as_deref(), Some("/outside/sub"));
+        assert_eq!(
+            repositories_json(&repositories)[1]["worktree_keys"],
+            json!([])
+        );
+    }
+
+    #[test]
+    fn snapshot_group_keys_preserve_non_utf8_bytes_and_unknown_sessions() {
+        let first = session_group(SessionId(1), b"/tmp/\xff", &[]);
+        let second = session_group(SessionId(2), b"/tmp/\xfe", &[]);
+        assert_eq!(first.path, second.path);
+        assert_ne!(first.worktree_key, second.worktree_key);
+        let first = session_group(SessionId(1), &[], &[]);
+        let second = session_group(SessionId(2), &[], &[]);
+        assert_ne!(first.worktree_key, second.worktree_key);
+        assert!(first.repo_key.is_none());
+        assert!(first.path.is_none());
+        assert!(first.label.is_none());
+    }
+
+    #[test]
+    fn host_metadata_reports_only_actual_hostname_and_platform() {
+        let host = host_metadata();
+        let expected = Command::new("/bin/hostname").output().unwrap();
+        assert_eq!(
+            host["display_name"],
+            String::from_utf8(expected.stdout).unwrap().trim()
+        );
+        assert_eq!(host["platform"], std::env::consts::OS);
+    }
+
+    #[test]
+    fn terminal_actions_reject_phone_supplied_paths_and_programs() {
+        for request in [
+            r#"{"action":"create_terminal","cwd_session":1,"cwd":"/tmp"}"#,
+            r#"{"action":"create_terminal","cwd_session":1,"program":"/bin/sh"}"#,
+            r#"{"action":"create_terminal"}"#,
+            r#"{"action":"close_terminal","session":1,"extra":true}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Action>(request).is_err(),
+                "{request}"
+            );
+        }
+    }
 
     #[test]
     fn photo_decoder_bounds_and_malformed_data() {

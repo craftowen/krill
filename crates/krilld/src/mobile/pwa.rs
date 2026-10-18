@@ -1,7 +1,7 @@
 //! 네트워크·CDN 없는 내장 PWA. gzip 파일은 소스 에셋의 결정적 사전 압축본이다.
 use std::io::{self, Write};
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 5] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 13] = [
     (
         "/",
         "text/html; charset=utf-8",
@@ -13,6 +13,54 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 5] = [
         "text/javascript; charset=utf-8",
         APP,
         include_bytes!("assets/app.js.gz"),
+    ),
+    (
+        "/crypto.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/crypto.js"),
+        include_bytes!("assets/crypto.js.gz"),
+    ),
+    (
+        "/client.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/client.js"),
+        include_bytes!("assets/client.js.gz"),
+    ),
+    (
+        "/terminal.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/terminal.js"),
+        include_bytes!("assets/terminal.js.gz"),
+    ),
+    (
+        "/screens/home.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/screens/home.js"),
+        include_bytes!("assets/screens/home.js.gz"),
+    ),
+    (
+        "/screens/workspaces.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/screens/workspaces.js"),
+        include_bytes!("assets/screens/workspaces.js.gz"),
+    ),
+    (
+        "/screens/session.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/screens/session.js"),
+        include_bytes!("assets/screens/session.js.gz"),
+    ),
+    (
+        "/screens/details.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/screens/details.js"),
+        include_bytes!("assets/screens/details.js.gz"),
+    ),
+    (
+        "/screens/settings.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/screens/settings.js"),
+        include_bytes!("assets/screens/settings.js.gz"),
     ),
     (
         "/app.css",
@@ -87,7 +135,7 @@ mod tests {
         let js = String::from_utf8_lossy(APP);
         assert!(!js.contains("crypto.subtle"));
         assert!(!js.contains("crypto.randomUUID"));
-        assert!(js.contains("getRandomValues"));
+        assert!(include_str!("assets/client.js").contains("getRandomValues"));
         assert!(!js.contains("innerHTML"));
     }
 }
