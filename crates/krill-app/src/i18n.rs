@@ -1134,6 +1134,15 @@ catalog! {
         SCHEDULE_CLOSE_LOG => ("로그 닫기", "Close Log"),
         SCHEDULE_LOG_TITLE => ("실행 로그: {id} (분 {minute})", "Run Log: {id} (min {minute})"),
         SCHEDULE_LOG_EMPTY => ("(캡처된 터미널 출력이 없습니다)", "(No terminal output captured)"),
+        SCHEDULE_ERR_ID => ("스케줄 ID는 1~64자의 영문, 숫자, _, -만 사용할 수 있습니다.", "Schedule ID must be 1..=64 ASCII letters, digits, _ or -."),
+        SCHEDULE_ERR_CWD => ("작업 폴더(cwd)는 비어 있지 않은 절대 경로여야 합니다.", "Working directory (cwd) must be a non-empty absolute path."),
+        SCHEDULE_ERR_CRON => ("올바른 UTC 5필드 Cron 표현식을 입력해 주세요 (예: 0 9 * * 1-5).", "Invalid 5-field UTC cron expression (e.g. 0 9 * * 1-5)."),
+        SCHEDULE_ERR_COMMAND_EMPTY => ("실행 명령을 입력해 주세요.", "Schedule command must not be empty."),
+        SCHEDULE_ERR_COMMAND_INVALID => ("유효하지 않은 실행 명령 형식입니다.", "Invalid schedule command."),
+        SCHEDULE_ERR_COMMAND_ESCAPE => ("실행 명령의 이스케이프(\\)가 끝나지 않았습니다.", "Unterminated escape in schedule command."),
+        SCHEDULE_ERR_COMMAND_QUOTE => ("실행 명령의 따옴표가 닫히지 않았습니다.", "Unclosed quote in schedule command."),
+        SCHEDULE_ERR_PROMPT => ("전달 프롬프트는 널 문자 없이 32 KiB 이하여야 합니다.", "Schedule prompt must not contain NUL bytes and must be at most 32 KiB."),
+        SCHEDULE_ERR_PRECHECK => ("Precheck 명령은 널 문자 없이 8 KiB 이하여야 합니다.", "Precheck command must not contain NUL bytes and must be at most 8 KiB."),
     }
     diff_comments {
         HINT => ("줄 번호를 선택한 뒤 + 버튼으로 주석을 추가하세요", "Select line numbers, then press + to add a comment"),

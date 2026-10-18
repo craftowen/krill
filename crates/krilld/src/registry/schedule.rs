@@ -375,7 +375,7 @@ impl Registry {
                 continue;
             };
             let args = command
-                .chain(std::iter::once(entry.prompt))
+                .chain((!entry.prompt.is_empty()).then_some(entry.prompt))
                 .map(String::into_bytes)
                 .collect();
             let create = Create {
