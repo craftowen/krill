@@ -1802,6 +1802,7 @@ pub struct SettingsView {
     /// 규칙 변경 응답 전에는 다음 변경을 보내지 않는다.
     account_rule_pending: bool,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
+    ssh_host_statuses: std::collections::BTreeMap<String, SshHostCardStatus>,
     ssh_status: Option<SharedString>,
     ssh_form: Option<SshForm>,
     tailscale_peers: Vec<crate::ssh_hosts::TailscalePeer>,
@@ -1879,13 +1880,22 @@ struct AgentEdit {
     status: Option<(SharedString, bool)>,
 }
 
-/// SSH 호스트 추가 입력 폼 상태(MK-132).
+/// SSH 호스트 카드의 최근 연결 상태(OWE-800).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SshHostCardStatus {
+    Connected,
+    #[default]
+    Disconnected,
+    Error,
+}
+
+/// SSH 호스트 추가·편집 입력 폼 상태(MK-132·OWE-800).
 struct SshForm {
     label: gpui::Entity<gpui_component::input::InputState>,
     address: gpui::Entity<gpui_component::input::InputState>,
     port: gpui::Entity<gpui_component::input::InputState>,
     identity_file: gpui::Entity<gpui_component::input::InputState>,
-    advanced_open: bool,
+    editing_id: Option<String>,
     error: Option<SharedString>,
 }
 
@@ -1925,6 +1935,7 @@ impl SettingsView {
             accounts_offline: false,
             account_rule_pending: false,
             ssh_hosts: Vec::new(),
+            ssh_host_statuses: std::collections::BTreeMap::new(),
             ssh_status: None,
             ssh_form: None,
             tailscale_peers: Vec::new(),
@@ -2583,6 +2594,13 @@ impl SettingsView {
         let dir = state_dir(cx);
         if let Ok(hosts) = crate::ssh_hosts::remove_host(dir.as_deref(), id) {
             self.ssh_hosts = hosts;
+            self.ssh_host_statuses.remove(id);
+            if let Some(form) = &mut self.ssh_form
+                && form.editing_id.as_deref() == Some(id)
+            {
+                form.editing_id = None;
+                form.error = None;
+            }
             if self
                 .ssh_auth_failed_host
                 .as_ref()
@@ -2600,6 +2618,58 @@ impl SettingsView {
             cx.defer(notify_external_change);
             cx.notify();
         }
+    }
+
+    pub fn ssh_host_status(&self, id: &str) -> SshHostCardStatus {
+        self.ssh_host_statuses.get(id).copied().unwrap_or_default()
+    }
+
+    pub fn editing_ssh_host_id(&self) -> Option<&str> {
+        self.ssh_form.as_ref().and_then(|f| f.editing_id.as_deref())
+    }
+
+    pub fn start_edit_ssh_host(
+        &mut self,
+        host: &crate::ssh_hosts::SshHost,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ensure_ssh_form(window, cx);
+        let Some(form) = &mut self.ssh_form else {
+            return;
+        };
+        form.editing_id = Some(host.id.clone());
+        form.error = None;
+        let label_input = form.label.clone();
+        let addr_input = form.address.clone();
+        let port_input = form.port.clone();
+        let key_input = form.identity_file.clone();
+        let label = host.label.clone();
+        let addr = host.destination.clone();
+        let port = host.port.map(|p| p.to_string()).unwrap_or_default();
+        let key = host.identity_file.clone().unwrap_or_default();
+        label_input.update(cx, |s, cx| s.set_value(label, window, cx));
+        addr_input.update(cx, |s, cx| s.set_value(addr, window, cx));
+        port_input.update(cx, |s, cx| s.set_value(port, window, cx));
+        key_input.update(cx, |s, cx| s.set_value(key, window, cx));
+        cx.notify();
+    }
+
+    pub fn cancel_edit_ssh_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(form) = &mut self.ssh_form else {
+            return;
+        };
+        form.editing_id = None;
+        form.error = None;
+        let label_input = form.label.clone();
+        let addr_input = form.address.clone();
+        let port_input = form.port.clone();
+        let key_input = form.identity_file.clone();
+        label_input.update(cx, |s, cx| s.set_value("", window, cx));
+        addr_input.update(cx, |s, cx| s.set_value("", window, cx));
+        port_input.update(cx, |s, cx| s.set_value("", window, cx));
+        key_input.update(cx, |s, cx| s.set_value("", window, cx));
+        cx.notify();
     }
 
     fn ensure_ssh_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2627,7 +2697,7 @@ impl SettingsView {
             address,
             port,
             identity_file,
-            advanced_open: false,
+            editing_id: None,
             error: None,
         });
     }
@@ -2666,19 +2736,38 @@ impl SettingsView {
             }
         };
         let dir = state_dir(cx);
-        match crate::ssh_hosts::add_host(
-            dir.as_deref(),
-            &valid.label,
-            &valid.destination,
-            valid.port,
-            valid.identity_file,
-        ) {
+        let editing_id = self.ssh_form.as_ref().and_then(|f| f.editing_id.clone());
+        let save_res = if let Some(id) = &editing_id {
+            crate::ssh_hosts::update_host(
+                dir.as_deref(),
+                id,
+                &valid.label,
+                &valid.destination,
+                valid.port,
+                valid.identity_file,
+            )
+        } else {
+            crate::ssh_hosts::add_host(
+                dir.as_deref(),
+                &valid.label,
+                &valid.destination,
+                valid.port,
+                valid.identity_file,
+            )
+        };
+        match save_res {
             Ok(hosts) => {
                 self.ssh_hosts = hosts;
                 if let Some(form) = &mut self.ssh_form {
+                    form.editing_id = None;
                     form.error = None;
                 }
-                self.ssh_status = Some(text::SSH_ADDED.format(&[("label", &valid.label)]).into());
+                let status_tmpl = if editing_id.is_some() {
+                    text::SSH_UPDATED
+                } else {
+                    text::SSH_ADDED
+                };
+                self.ssh_status = Some(status_tmpl.format(&[("label", &valid.label)]).into());
                 cx.defer(notify_external_change);
                 cx.notify();
                 Ok(())
@@ -2753,18 +2842,56 @@ impl SettingsView {
         peer: &crate::ssh_hosts::TailscalePeer,
         cx: &mut Context<Self>,
     ) {
+        let prev_editing = self
+            .ssh_form
+            .as_mut()
+            .and_then(|form| form.editing_id.take());
         self.submit_ssh_host(&peer.hostname, &peer.address, "", "", cx)
             .ok();
+        if let Some(id) = prev_editing
+            && let Some(form) = &mut self.ssh_form
+        {
+            form.editing_id = Some(id);
+        }
     }
 
     pub fn connect_ssh_host(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
         let cmd = crate::ssh_hosts::build_connect_command(&host)
             .trim()
             .to_owned();
+        self.ssh_host_statuses
+            .insert(host.id.clone(), SshHostCardStatus::Connected);
         self.ssh_status = Some(format!("{}: {cmd}", host.label).into());
         cx.defer(move |cx| {
             if cx.has_global::<Config>() {
                 cx.global_mut::<Config>().pending_ssh_connect = Some(host);
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn disconnect_ssh_host(
+        &mut self,
+        host: &crate::ssh_hosts::SshHost,
+        cx: &mut Context<Self>,
+    ) {
+        let host_id = host.id.clone();
+        self.ssh_host_statuses
+            .insert(host_id.clone(), SshHostCardStatus::Disconnected);
+        self.ssh_status = Some(
+            text::SSH_DISCONNECTED_MSG
+                .format(&[("label", &host.label)])
+                .into(),
+        );
+        cx.defer(move |cx| {
+            if cx.has_global::<Config>()
+                && cx
+                    .global::<Config>()
+                    .pending_ssh_connect
+                    .as_ref()
+                    .is_some_and(|h| h.id == host_id)
+            {
+                cx.global_mut::<Config>().pending_ssh_connect = None;
             }
         });
         cx.notify();
@@ -2779,30 +2906,36 @@ impl SettingsView {
     ) {
         match res {
             Ok(ok) => {
+                self.ssh_host_statuses
+                    .insert(host.id.clone(), SshHostCardStatus::Connected);
                 self.ssh_auth_failed_host = None;
                 self.ssh_keygen_confirm_host = None;
                 self.ssh_status = Some(format!("{}: {ok}", host.label).into());
             }
-            Err(err) => match crate::ssh_hosts::classify_ssh_error(&err) {
-                crate::ssh_hosts::SshTestFailureKind::AuthFailed => {
-                    let msg = text::SSH_AUTH_FAILED_GUIDE
-                        .format(&[("label", &host.label), ("error", &err)]);
-                    self.ssh_auth_failed_host = Some(host);
-                    self.ssh_keygen_confirm_host = None;
-                    self.ssh_status = Some(msg.into());
+            Err(err) => {
+                self.ssh_host_statuses
+                    .insert(host.id.clone(), SshHostCardStatus::Error);
+                match crate::ssh_hosts::classify_ssh_error(&err) {
+                    crate::ssh_hosts::SshTestFailureKind::AuthFailed => {
+                        let msg = text::SSH_AUTH_FAILED_GUIDE
+                            .format(&[("label", &host.label), ("error", &err)]);
+                        self.ssh_auth_failed_host = Some(host);
+                        self.ssh_keygen_confirm_host = None;
+                        self.ssh_status = Some(msg.into());
+                    }
+                    crate::ssh_hosts::SshTestFailureKind::ConnectionRefused => {
+                        let msg = text::SSH_CONN_REFUSED_GUIDE.format(&[("label", &host.label)]);
+                        self.ssh_auth_failed_host = None;
+                        self.ssh_keygen_confirm_host = None;
+                        self.ssh_status = Some(msg.into());
+                    }
+                    crate::ssh_hosts::SshTestFailureKind::Other => {
+                        self.ssh_auth_failed_host = None;
+                        self.ssh_keygen_confirm_host = None;
+                        self.ssh_status = Some(format!("{}: {err}", host.label).into());
+                    }
                 }
-                crate::ssh_hosts::SshTestFailureKind::ConnectionRefused => {
-                    let msg = text::SSH_CONN_REFUSED_GUIDE.format(&[("label", &host.label)]);
-                    self.ssh_auth_failed_host = None;
-                    self.ssh_keygen_confirm_host = None;
-                    self.ssh_status = Some(msg.into());
-                }
-                crate::ssh_hosts::SshTestFailureKind::Other => {
-                    self.ssh_auth_failed_host = None;
-                    self.ssh_keygen_confirm_host = None;
-                    self.ssh_status = Some(format!("{}: {err}", host.label).into());
-                }
-            },
+            }
         }
         cx.notify();
     }
@@ -5457,7 +5590,7 @@ impl SettingsView {
 
     #[expect(
         clippy::too_many_lines,
-        reason = "SSH 탭은 Tailscale 발견 기기·호스트 추가 폼(고급 옵션)·첫 연결 키 등록 도우미·호스트 목록을 한 화면에 그린다"
+        reason = "SSH 탭은 Tailscale 발견 기기·호스트 추가/편집 2열 폼·첫 연결 키 등록 도우미·호스트 목록 카드를 한 화면에 그린다"
     )]
     fn render_ssh_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::Sizable as _;
@@ -5582,18 +5715,23 @@ impl SettingsView {
             root = root.child(peer_card);
         }
 
-        // 2. 새 SSH 호스트 추가 입력 폼: 이름(선택) + 주소 + 고급(포트, 키 파일)
+        // 2. SSH 호스트 추가·편집 2열 그리드 폼(OWE-800): [표시 이름 | 호스트], [포트 | SSH 키 경로]
         if let Some(form) = &self.ssh_form {
             let label_input = form.label.clone();
             let addr_input = form.address.clone();
             let port_input = form.port.clone();
             let key_input = form.identity_file.clone();
-            let advanced_open = form.advanced_open;
+            let is_editing = form.editing_id.is_some();
             let form_error = form.error.clone();
-            let adv_label = if advanced_open {
-                text::SSH_ADVANCED_HIDE.get()
+            let form_title = if is_editing {
+                text::SSH_EDIT_TITLE.get()
             } else {
-                text::SSH_ADVANCED_SHOW.get()
+                text::SSH_ADD_TITLE.get()
+            };
+            let submit_label = if is_editing {
+                text::SSH_EDIT_SUBMIT.get()
+            } else {
+                text::SSH_ADD_SUBMIT.get()
             };
 
             let mut form_card = layout::card(p)
@@ -5606,54 +5744,69 @@ impl SettingsView {
                     div()
                         .text_size(crate::ui::TEXT_SM)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .child(text::SSH_ADD_TITLE.get()),
+                        .child(form_title),
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .flex()
-                        .flex_col()
-                        .gap_1()
-                        .text_size(crate::ui::TEXT_XS)
+                        .gap_2p5()
                         .child(
                             div()
-                                .text_color(p.muted_foreground)
-                                .child(text::SSH_NAME_LABEL.get()),
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .text_size(crate::ui::TEXT_XS)
+                                .child(
+                                    div()
+                                        .text_color(p.muted_foreground)
+                                        .child(text::SSH_NAME_LABEL.get()),
+                                )
+                                .child(
+                                    div()
+                                        .id("admin-ssh-input-label")
+                                        .debug_selector(|| "admin-ssh-input-label".into())
+                                        .child(
+                                            gpui_component::input::Input::new(&label_input).small(),
+                                        ),
+                                ),
                         )
                         .child(
                             div()
-                                .id("admin-ssh-input-label")
-                                .debug_selector(|| "admin-ssh-input-label".into())
-                                .child(gpui_component::input::Input::new(&label_input).small()),
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .text_size(crate::ui::TEXT_XS)
+                                .child(
+                                    div()
+                                        .text_color(p.muted_foreground)
+                                        .child(text::SSH_ADDRESS_LABEL.get()),
+                                )
+                                .child(
+                                    div()
+                                        .id("admin-ssh-input-address")
+                                        .debug_selector(|| "admin-ssh-input-address".into())
+                                        .child(
+                                            gpui_component::input::Input::new(&addr_input).small(),
+                                        ),
+                                ),
                         ),
                 )
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .flex()
-                        .flex_col()
-                        .gap_1()
-                        .text_size(crate::ui::TEXT_XS)
+                        .gap_2p5()
                         .child(
                             div()
-                                .text_color(p.muted_foreground)
-                                .child(text::SSH_ADDRESS_LABEL.get()),
-                        )
-                        .child(
-                            div()
-                                .id("admin-ssh-input-address")
-                                .debug_selector(|| "admin-ssh-input-address".into())
-                                .child(gpui_component::input::Input::new(&addr_input).small()),
-                        ),
-                );
-
-            if advanced_open {
-                form_card = form_card.child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(
-                            div()
-                                .w(px(140.))
-                                .flex_none()
+                                .flex_1()
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap_1()
@@ -5695,7 +5848,6 @@ impl SettingsView {
                                 ),
                         ),
                 );
-            }
 
             if let Some(err_msg) = form_error {
                 form_card = form_card.child(
@@ -5708,33 +5860,35 @@ impl SettingsView {
                 );
             }
 
+            let mut form_controls = layout::controls();
+            if is_editing {
+                form_controls = form_controls.child(
+                    layout::ghost("admin-ssh-edit-cancel", text::SSH_EDIT_CANCEL.get())
+                        .small()
+                        .debug_selector(|| "admin-ssh-edit-cancel".into())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.cancel_edit_ssh_host(window, cx);
+                        })),
+                );
+            }
+            form_controls = form_controls.child(
+                layout::primary("admin-ssh-add-submit", submit_label)
+                    .small()
+                    .debug_selector(|| "admin-ssh-add-submit".into())
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.submit_ssh_host_form(window, cx);
+                    })),
+            );
+
             form_card = form_card.child(
                 div()
                     .w_full()
                     .min_w_0()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .justify_end()
                     .gap_2()
-                    .child(
-                        layout::ghost("admin-ssh-advanced-toggle", adv_label)
-                            .debug_selector(|| "admin-ssh-advanced-toggle".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                if let Some(form) = &mut this.ssh_form {
-                                    form.advanced_open = !form.advanced_open;
-                                    cx.notify();
-                                }
-                            })),
-                    )
-                    .child(
-                        layout::controls().child(
-                            layout::primary("admin-ssh-add-submit", text::SSH_ADD_SUBMIT.get())
-                                .debug_selector(|| "admin-ssh-add-submit".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_ssh_host_form(window, cx);
-                                })),
-                        ),
-                    ),
+                    .child(form_controls),
             );
             root = root.child(form_card);
         }
@@ -5828,7 +5982,7 @@ impl SettingsView {
             root = root.child(status_box);
         }
 
-        // 4. 등록된 호스트 목록
+        // 4. 등록된 호스트 목록(OWE-800 SshTargetCard 구조)
         if self.ssh_hosts.is_empty() {
             root = root.child(
                 layout::card(p)
@@ -5838,64 +5992,139 @@ impl SettingsView {
             );
         } else {
             for host in &self.ssh_hosts {
-                let title = match host.port {
-                    Some(port) => format!("{} ({} :{port})", host.label, host.destination),
-                    None => format!("{} ({})", host.label, host.destination),
+                let status = self.ssh_host_status(&host.id);
+                let (dot_color, status_label, status_text_color) = match status {
+                    SshHostCardStatus::Connected => {
+                        (p.success, text::SSH_STATUS_CONNECTED.get(), p.success)
+                    }
+                    SshHostCardStatus::Disconnected => (
+                        p.muted_foreground.opacity(0.4),
+                        text::SSH_STATUS_DISCONNECTED.get(),
+                        p.muted_foreground,
+                    ),
+                    SshHostCardStatus::Error => {
+                        (p.destructive, text::SSH_STATUS_ERROR.get(), p.destructive)
+                    }
                 };
-                let cmd_preview = crate::ssh_hosts::build_mk_host_command(host, "ls")
-                    .trim()
-                    .to_owned();
+                let summary = host.format_summary();
+                let card_id = format!("admin-ssh-card-{}", host.id);
+                let dot_id = format!("admin-ssh-status-dot-{}", host.id);
                 let conn_id = format!("admin-ssh-connect-{}", host.id);
+                let disc_id = format!("admin-ssh-disconnect-{}", host.id);
                 let test_id = format!("admin-ssh-test-{}", host.id);
+                let edit_id = format!("admin-ssh-edit-{}", host.id);
                 let rm_id = format!("admin-ssh-remove-{}", host.id);
                 let host_conn = host.clone();
+                let host_disc = host.clone();
                 let host_cl = host.clone();
+                let host_edit = host.clone();
                 let rm_host_id = host.id.clone();
+
+                let connect_or_disconnect_btn = if status == SshHostCardStatus::Connected {
+                    layout::secondary(
+                        gpui::ElementId::Name(disc_id.clone().into()),
+                        text::SSH_DISCONNECT.get(),
+                    )
+                    .small()
+                    .debug_selector(move || disc_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.disconnect_ssh_host(&host_disc, cx);
+                    }))
+                } else {
+                    layout::secondary(
+                        gpui::ElementId::Name(conn_id.clone().into()),
+                        text::SSH_CONNECT.get(),
+                    )
+                    .small()
+                    .debug_selector(move || conn_id.clone())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.connect_ssh_host(host_conn.clone(), cx);
+                    }))
+                };
+
                 root = root.child(
                     layout::row(p)
+                        .id(gpui::ElementId::Name(card_id.clone().into()))
+                        .debug_selector(move || card_id.clone())
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
                                 .flex()
-                                .flex_col()
-                                .gap_1()
+                                .items_center()
+                                .gap_3()
+                                .child(crate::ui::icons::svg_box(
+                                    crate::ui::icons::SERVER_SVG,
+                                    16.,
+                                    p.muted_foreground,
+                                ))
                                 .child(
                                     div()
+                                        .flex_1()
                                         .min_w_0()
-                                        .truncate()
-                                        .text_size(crate::ui::TEXT_SM)
-                                        .child(title),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .truncate()
-                                        .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(cmd_preview),
+                                        .flex()
+                                        .flex_col()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(
+                                                    div()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(crate::ui::TEXT_SM)
+                                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                                        .child(host.label.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .child(
+                                                            div()
+                                                                .id(gpui::ElementId::Name(
+                                                                    dot_id.clone().into(),
+                                                                ))
+                                                                .debug_selector(move || {
+                                                                    dot_id.clone()
+                                                                })
+                                                                .size(crate::ui::STATE_DOT)
+                                                                .rounded_full()
+                                                                .bg(dot_color),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_size(crate::ui::TEXT_XS)
+                                                                .text_color(status_text_color)
+                                                                .child(status_label),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_family(crate::ui::FONT_MONO)
+                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_color(p.muted_foreground)
+                                                .child(summary),
+                                        ),
                                 ),
                         )
                         .child(
                             layout::controls()
-                                .child(
-                                    layout::primary(
-                                        gpui::ElementId::Name(conn_id.clone().into()),
-                                        text::SSH_CONNECT.get(),
-                                    )
-                                    .debug_selector(move || conn_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.connect_ssh_host(host_conn.clone(), cx);
-                                        },
-                                    )),
-                                )
+                                .child(connect_or_disconnect_btn)
                                 .child(
                                     layout::secondary(
                                         gpui::ElementId::Name(test_id.clone().into()),
                                         text::SSH_TEST.get(),
                                     )
+                                    .small()
                                     .debug_selector(move || test_id.clone())
                                     .on_click(cx.listener(
                                         move |_, _, _, cx| {
@@ -5905,9 +6134,23 @@ impl SettingsView {
                                 )
                                 .child(
                                     layout::ghost(
+                                        gpui::ElementId::Name(edit_id.clone().into()),
+                                        text::SSH_EDIT.get(),
+                                    )
+                                    .small()
+                                    .debug_selector(move || edit_id.clone())
+                                    .on_click(cx.listener(
+                                        move |this, _, window, cx| {
+                                            this.start_edit_ssh_host(&host_edit, window, cx);
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    layout::ghost(
                                         gpui::ElementId::Name(rm_id.clone().into()),
                                         text::SSH_REMOVE.get(),
                                     )
+                                    .small()
                                     .debug_selector(move || rm_id.clone())
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
