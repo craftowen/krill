@@ -22,7 +22,16 @@ Claude Code 1st-party 백그라운드 세션과는 경쟁하지 않고 공존한
 
 ## 타깃
 
-AI 코딩 에이전트를 동시에 여러 개(5~20개) 돌리는 macOS(Apple Silicon) 개발자.
+AI 코딩 에이전트를 동시에 여러 개(5~20개) 돌리는 macOS(Apple Silicon) 개발자. Windows 개발자는 M11 스파이크 결과에 따라 넓힐 후보다(아래 플랫폼 절).
+
+## 플랫폼 (T1-D8·B12·비타깃 개정, 2026-10-18 오웬 결정)
+
+T1-final의 D8(macOS Apple Silicon 우선, 크로스플랫폼 동시 지원 안 함), B12(Windows 셸·WSL Won't), 비타깃(Windows 사용자, v1)을 다음과 같이 고친다.
+
+- **macOS Apple Silicon이 계속 1차 플랫폼이다.** Windows 작업은 macOS의 동작·메모리 예산·출시 일정을 막지 않는다(macOS `scripts/check.sh` 0 유지).
+- **Windows(주 타깃 `x86_64-pc-windows-msvc`, ARM64는 후속)는 M11에서 단계로 진행한다.** ① 공통 컴파일 계층: Mac에서 Windows 타깃 `cargo check` 0(MK-205) ② 네이티브 ConPTY 실기 스파이크 S-W1~S-W5(MK-207~MK-211, GCP Windows VM은 테스트할 때만 켠다) ③ 스파이크 결과로 네이티브 본구현(MK-212~) 진행 여부를 정한다.
+- **보류**: WSL2 백엔드(MK-222), 앱만 Windows에서 돌리고 데몬은 원격에 두는 방식. 네이티브 스파이크가 실패하면 다시 본다.
+- Windows의 장애별 보장 범위(ARCHITECTURE §4.1)·메모리 예산·기본 셸은 스파이크 전까지 미확정이다.
 
 ## v1 범위 (T1-D1)
 
@@ -57,6 +66,8 @@ AI 코딩 에이전트를 동시에 여러 개(5~20개) 돌리는 macOS(Apple Si
 | krilld panic 전략 | `unwind` 유지 + 세션 단위 `catch_unwind` 격리 | 확정 (CONVENTIONS P4) |
 | GitHub 원격·CI | `craftowen/krill` + GitHub Actions(Linux 고속 게이트 + macOS 전체 게이트) | 확정 (MK-017) |
 | 텔레메트리 | 기본 꺼짐(opt-in, `DO_NOT_TRACK` 존중) | 확정 (MK-089) |
+| Windows 지원 범위 | 공통 컴파일 계층 + 네이티브 ConPTY 실기 스파이크 먼저, WSL2·앱만 원격은 보류 | 확정 (2026-10-18, M11) |
+| Windows 코드 서명(Authenticode, 유료 인증서) | 사람이 결정 | 보류 (MK-219) |
 
 ## 문서 지도
 
