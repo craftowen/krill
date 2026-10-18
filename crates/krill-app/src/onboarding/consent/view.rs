@@ -7,9 +7,8 @@
 use std::path::{Path, PathBuf};
 
 use gpui::{Context, Render, Window, div, prelude::*};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::IconName;
 use gpui_component::checkbox::Checkbox;
-use gpui_component::{IconName, Sizable as _};
 
 use crate::i18n::{Message, catalog::consent as text};
 use crate::ui;
@@ -68,7 +67,7 @@ impl Render for ConsentView {
                 .gap_2()
                 .child(
                     div()
-                        .mt(gpui::px(6.))
+                        .mt_1p5()
                         .size_1()
                         .flex_none()
                         .rounded_full()
@@ -99,23 +98,23 @@ impl Render for ConsentView {
                     .flex_none()
                     .debug_selector(|| "consent-more".into())
                     .child(
-                        Button::new("consent-more")
-                            .ghost()
-                            .small()
-                            .icon(if more {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .label(if more {
+                        ui::ghost(
+                            "consent-more",
+                            if more {
                                 text::LESS.get()
                             } else {
                                 text::MORE.get()
-                            })
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.more = !s.more;
-                                cx.notify();
-                            })),
+                            },
+                        )
+                        .icon(if more {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            s.more = !s.more;
+                            cx.notify();
+                        })),
                     ),
             )
             .child(
@@ -141,6 +140,9 @@ impl Render for ConsentView {
                                 )
                                 .child(
                                     div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .font_family(ui::FONT_MONO)
                                         .text_size(ui::TEXT_XS)
                                         .text_color(p.muted_foreground)
                                         .child(detail(*body, &self.state)),
