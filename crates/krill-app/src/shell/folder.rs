@@ -62,6 +62,7 @@ impl Shell {
         program: Program,
         cx: &mut Context<Self>,
     ) {
+        let is_remote = host.is_remote();
         self.change(true, cx, |l| {
             l.new_tab();
             let pane = l.active_tab().focused;
@@ -79,6 +80,11 @@ impl Shell {
                 },
             );
         });
+        // OWE-852: 로컬 폴더를 열면 projects.toml에 영속 등록해 탭을 닫아도 사이드바에 남긴다.
+        // 원격 호스트 경로는 로컬 projects.toml에 넣지 않는다. 실패해도 탭 열기는 막지 않는다.
+        if !is_remote && let Some(dir) = self.state_dir(cx) {
+            krill_app::sidebar::external::register_project(&dir, folder).ok();
+        }
     }
 
     pub(super) fn choose_folder(cx: &mut Context<Self>) {
@@ -166,8 +172,18 @@ impl Shell {
                     r#"git clone -- "$1" "$2" && cd -- "$2"; exec "${SHELL:-/bin/zsh}" -l"#,
                     &[url.as_bytes(), dir.as_bytes()],
                 );
-                this.update(cx, |this, cx| this.new_folder_tab(&parent, program, cx))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    this.new_folder_tab(&parent, program, cx);
+                    // OWE-852: 복제될 실제 저장소 루트(parent/dir)를 영속 등록한다.
+                    if let Some(dir_state) = this.state_dir(cx) {
+                        krill_app::sidebar::external::register_project(
+                            &dir_state,
+                            &parent.join(&dir),
+                        )
+                        .ok();
+                    }
+                })
+                .ok();
             }
         })
         .detach();
@@ -183,8 +199,14 @@ impl Shell {
                     r#"mkdir -- "$1" && cd -- "$1" && git init; exec "${SHELL:-/bin/zsh}" -l"#,
                     &[path.as_os_str().as_bytes()],
                 );
-                this.update(cx, |this, cx| this.new_folder_tab(parent, program, cx))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    this.new_folder_tab(parent, program, cx);
+                    // OWE-852: 새로 만들 프로젝트 루트 자체를 영속 등록한다.
+                    if let Some(dir_state) = this.state_dir(cx) {
+                        krill_app::sidebar::external::register_project(&dir_state, &path).ok();
+                    }
+                })
+                .ok();
             }
         })
         .detach();
