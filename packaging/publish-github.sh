@@ -193,6 +193,14 @@ python3 packaging/macos/ed25519_manifest.py sign \
 
 cp packaging/install.sh "$OUT_DIR/install.sh"
 chmod 755 "$OUT_DIR/install.sh"
+cp packaging/install-linux.sh "$OUT_DIR/install-linux.sh"
+chmod 755 "$OUT_DIR/install-linux.sh"
+# Linux 원격 호스트 바이너리: KRILL_GCP_PROJECT가 있으면 GCP 임시 VM에서 빌드·스모크 테스트 후 VM을 지운다.
+if [[ -n "${KRILL_GCP_PROJECT:-}" ]]; then
+  bash packaging/linux/build-gcp.sh "$VERSION" "$OUT_DIR"
+fi
+LINUX_ASSETS=("$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz "$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz.sha256)
+[[ "${#LINUX_ASSETS[@]}" -gt 0 ]] || echo "warning: no Linux tarballs (set KRILL_GCP_PROJECT to build them)" >&2
 
 ASSETS=(
   "$OUT_DIR/Krill-${VERSION}.dmg"
@@ -202,6 +210,8 @@ ASSETS=(
   "$OUT_DIR/homebrew-krill/SHA256SUMS"
   "$OUT_DIR/latest.json"
   "$OUT_DIR/install.sh"
+  "$OUT_DIR/install-linux.sh"
+  "${LINUX_ASSETS[@]}"
 )
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
