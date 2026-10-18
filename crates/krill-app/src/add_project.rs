@@ -37,6 +37,8 @@ pub struct Dialog {
     error: Option<&'static str>,
     focus: FocusHandle,
     _enter: Subscription,
+    /// OWE-852: 시작 단계 3개 카드의 키보드 선택 위치(0=찾아보기, 1=복제, 2=만들기).
+    selected: usize,
 }
 
 impl EventEmitter<Event> for Dialog {}
@@ -72,6 +74,7 @@ impl Dialog {
             error: None,
             focus,
             _enter: enter,
+            selected: 0,
         }
     }
 
@@ -79,6 +82,26 @@ impl Dialog {
         self.step = Step::Clone;
         self.url.update(cx, |input, cx| input.focus(window, cx));
         cx.notify();
+    }
+
+    fn show_start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.step = Step::Start;
+        self.error = None;
+        self.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn selected(&self) -> usize {
+        self.selected
+    }
+
+    fn activate_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.selected {
+            0 => cx.emit(Event::Browse),
+            1 => self.show_clone(window, cx),
+            _ => cx.emit(Event::Create),
+        }
     }
 
     fn submit_clone(&mut self, cx: &mut Context<Self>) {
@@ -91,15 +114,36 @@ impl Dialog {
         cx.emit(Event::Clone(url));
     }
 
-    fn on_key(&mut self, e: &KeyDownEvent, cx: &mut Context<Self>) {
+    fn on_key(&mut self, e: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         match e.keystroke.key.as_str() {
             "escape" => {
                 cx.stop_propagation();
-                cx.emit(Event::Close);
+                if self.step == Step::Clone {
+                    // OWE-852: 복제 단계 Esc는 모달을 닫지 않고 시작 단계로 복귀한다.
+                    self.show_start(window, cx);
+                } else {
+                    cx.emit(Event::Close);
+                }
+            }
+            "up" if self.step == Step::Start => {
+                cx.stop_propagation();
+                self.selected = match self.selected {
+                    0 => 2,
+                    n => n - 1,
+                };
+                cx.notify();
+            }
+            "down" if self.step == Step::Start => {
+                cx.stop_propagation();
+                self.selected = match self.selected {
+                    0 | 1 => self.selected + 1,
+                    _ => 0,
+                };
+                cx.notify();
             }
             "enter" if self.step == Step::Start => {
                 cx.stop_propagation();
-                cx.emit(Event::Browse);
+                self.activate_selected(window, cx);
             }
             _ => {}
         }
@@ -107,6 +151,7 @@ impl Dialog {
 }
 
 /// 아이콘 + 제목 + 설명 한 줄(Orca `AddRepoPrimaryStartAction`/`AddRepoSecondaryStartAction`).
+/// OWE-852: 스크린 리더가 버튼으로 읽도록 `Role::Button`을 단다.
 fn action(
     p: &ui::Palette,
     id: &'static str,
@@ -117,6 +162,8 @@ fn action(
     div()
         .id(id)
         .debug_selector(move || id.into())
+        .role(gpui::Role::Button)
+        .aria_label(title)
         .flex()
         .items_center()
         .gap_3()
@@ -137,6 +184,25 @@ fn action(
         .child(ui::label(p, title, Some(desc)))
 }
 
+/// OWE-852: 키보드 선택 위치를 카드 테두리·배경으로 드러낸다(선택 카드만 링+강조).
+fn selected_card(
+    base: gpui::Stateful<gpui::Div>,
+    p: &ui::Palette,
+    is_selected: bool,
+) -> gpui::Stateful<gpui::Div> {
+    if is_selected {
+        base.rounded(ui::RADIUS_MD)
+            .border_1()
+            .border_color(p.ring)
+            .bg(p.accent)
+    } else {
+        base.rounded(ui::RADIUS_MD)
+            .border_1()
+            .border_color(p.input)
+            .bg(p.background)
+    }
+}
+
 impl Render for Dialog {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
@@ -146,9 +212,9 @@ impl Render for Dialog {
         };
         let body = div().flex().flex_col().gap_3();
         let body = match self.step {
-            Step::Start => body
-                .child(
-                    // Orca: 주 동작은 선택된 카드처럼 보이고 Enter 칩을 단다.
+            Step::Start => {
+                let selected = self.selected;
+                body.child(selected_card(
                     action(
                         p,
                         "add-project-browse",
@@ -156,13 +222,11 @@ impl Render for Dialog {
                         text::BROWSE.get(),
                         text::BROWSE_DESC.get(),
                     )
-                    .rounded(ui::RADIUS_MD)
-                    .border_1()
-                    .border_color(p.ring)
-                    .bg(p.accent)
                     .child(ui::keycap(p, "↵"))
                     .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Browse))),
-                )
+                    p,
+                    selected == 0,
+                ))
                 .child(
                     div()
                         .text_size(ui::TEXT_XS)
@@ -172,12 +236,10 @@ impl Render for Dialog {
                 )
                 .child(
                     div()
-                        .rounded(ui::RADIUS_MD)
-                        .border_1()
-                        .border_color(p.input)
-                        .bg(p.background)
-                        .overflow_hidden()
-                        .child(
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(selected_card(
                             action(
                                 p,
                                 "add-project-clone",
@@ -186,8 +248,10 @@ impl Render for Dialog {
                                 text::CLONE_DESC.get(),
                             )
                             .on_click(cx.listener(|d, _, window, cx| d.show_clone(window, cx))),
-                        )
-                        .child(
+                            p,
+                            selected == 1,
+                        ))
+                        .child(selected_card(
                             action(
                                 p,
                                 "add-project-create",
@@ -195,11 +259,12 @@ impl Render for Dialog {
                                 text::CREATE.get(),
                                 text::CREATE_DESC.get(),
                             )
-                            .border_t_1()
-                            .border_color(p.border)
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Create))),
-                        ),
-                ),
+                            p,
+                            selected == 2,
+                        )),
+                )
+            }
             Step::Clone => body
                 .child(
                     div()
@@ -250,7 +315,9 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
-            .capture_key_down(cx.listener(|d, e: &KeyDownEvent, _, cx| d.on_key(e, cx)))
+            .capture_key_down(cx.listener(|d, e: &KeyDownEvent, window, cx| {
+                d.on_key(e, window, cx);
+            }))
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
             .child(
                 div()

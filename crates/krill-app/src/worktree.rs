@@ -6,12 +6,15 @@
 use ring::rand::{SecureRandom as _, SystemRandom};
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, EventEmitter, Focusable as _, Subscription, Task, Window, div,
+    prelude::*, px,
+};
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -51,6 +54,10 @@ pub struct Dialog {
     preparation: Option<Preparation>,
     preparation_task: Option<Task<()>>,
     preparation_ready: bool,
+    /// OWE-853: 기준 ref 후보(호출 워크트리 브랜치·데몬 폴백·git refs). 입력값으로 필터해 드롭다운에 보인다.
+    candidates: Vec<String>,
+    /// OWE-853: 드롭다운 키보드 하이라이트(필터 목록 내 인덱스). `None`이면 Enter가 생성 제출이다.
+    highlight: Option<usize>,
 }
 
 struct Preparation {
@@ -108,6 +115,117 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// OWE-853: 호출 워크트리·레포 브랜치를 앞에 둔 기준 ref 후보.
+/// 데몬 폴백 순서(`origin/HEAD` → `origin/main` → … → `HEAD`)와 로컬 git refs를 뒤에 붙인다.
+pub fn branch_suggestions(
+    parent_branch: Option<&str>,
+    repo_branch: Option<&str>,
+    git_refs: &[String],
+) -> (Option<String>, Vec<String>) {
+    let default = parent_branch
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            repo_branch
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        });
+    let mut out: Vec<String> = Vec::new();
+    let push = |out: &mut Vec<String>, s: &str| {
+        let trimmed = s.trim();
+        if !trimmed.is_empty()
+            && trimmed.len() <= 256
+            && !trimmed.chars().any(char::is_control)
+            && !out.iter().any(|e| e == trimmed)
+        {
+            out.push(trimmed.to_owned());
+        }
+    };
+    if let Some(ref d) = default {
+        push(&mut out, d);
+    }
+    if let Some(repo) = repo_branch {
+        push(&mut out, repo);
+    }
+    for fallback in [
+        "origin/HEAD",
+        "origin/main",
+        "origin/master",
+        "main",
+        "master",
+        "HEAD",
+    ] {
+        push(&mut out, fallback);
+    }
+    for git_ref in git_refs {
+        push(&mut out, git_ref);
+        if out.len() >= 100 {
+            break;
+        }
+    }
+    (default, out)
+}
+
+/// OWE-853: 로컬 `git for-each-ref`로 브랜치·태그를 읽는다(새 IPC 없이).
+/// 실패·타임아웃 시 빈 목록으로 조용히 넘어간다. 호출자는 백그라운드에서 부른다.
+pub fn list_git_refs(repo: &Path) -> Vec<String> {
+    use std::time::{Duration, Instant};
+    let child = std::process::Command::new("git")
+        .current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args([
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+            "refs/tags",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .ok();
+    let Some(mut child) = child else {
+        return Vec::new();
+    };
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                child.kill().ok();
+                child.wait().ok();
+                return Vec::new();
+            }
+        }
+    }
+    let output = child.wait_with_output().map_or(Vec::new(), |o| o.stdout);
+    let text = String::from_utf8_lossy(&output);
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.len() > 256
+            || trimmed.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            continue;
+        }
+        if !out.iter().any(|e: &String| e == trimmed) {
+            out.push(trimmed.to_owned());
+        }
+        if out.len() >= 50 {
+            break;
+        }
+    }
+    out
+}
+
 impl Dialog {
     pub fn new(
         repo: PathBuf,
@@ -159,6 +277,8 @@ impl Dialog {
             preparation: None,
             preparation_task: None,
             preparation_ready: false,
+            candidates: Vec::new(),
+            highlight: None,
         };
         dialog.prepare(cx);
         dialog
@@ -167,6 +287,139 @@ impl Dialog {
     #[must_use]
     pub fn parent(&self) -> Option<&std::path::Path> {
         self.parent.as_deref()
+    }
+
+    /// OWE-853: 기준 ref 후보를 교체한다(중복·빈값 제거, 최대 100개). 입력 필터는 렌더 시 계산한다.
+    pub fn set_branch_candidates(&mut self, candidates: Vec<String>, cx: &mut Context<Self>) {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut cleaned = Vec::new();
+        for raw in candidates {
+            let trimmed = raw.trim().to_owned();
+            if trimmed.is_empty()
+                || trimmed.len() > 256
+                || trimmed.chars().any(char::is_control)
+                || !seen.insert(trimmed.clone())
+            {
+                continue;
+            }
+            cleaned.push(trimmed);
+            if cleaned.len() >= 100 {
+                break;
+            }
+        }
+        self.candidates = cleaned;
+        self.highlight = None;
+        cx.notify();
+    }
+
+    /// OWE-853: 호출한 워크트리의 현재 브랜치를 기준 ref 기본값으로 넣는다(입력済み면 덮지 않는다).
+    pub fn set_base_default(
+        &mut self,
+        base: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(default) = base.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()) else {
+            return;
+        };
+        let current = self.base.read(cx).value().trim().to_owned();
+        if current.is_empty() {
+            self.base.update(cx, |input, cx| {
+                input.set_value(&default, window, cx);
+            });
+            self.highlight = None;
+            cx.notify();
+        }
+    }
+
+    /// OWE-853: 현재 입력값으로 필터한 후보(최대 8개). 빈 입력이면 상위 후보를 그대로 보인다.
+    fn filtered_bases(&self, cx: &App) -> Vec<String> {
+        let query = self.base.read(cx).value().trim().to_lowercase();
+        let mut out = Vec::new();
+        for candidate in &self.candidates {
+            if query.is_empty() || candidate.to_lowercase().contains(query.as_str()) {
+                out.push(candidate.clone());
+                if out.len() >= 8 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    fn base_is_focused(&self, window: &Window, cx: &App) -> bool {
+        self.base.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// OWE-853: 드롭다운 키보드 처리. 하이라이트를 소비하면 `true`(전파 중단).
+    fn on_key(
+        &mut self,
+        e: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !matches!(self.phase, Phase::Edit(_)) {
+            return false;
+        }
+        match e.keystroke.key.as_str() {
+            "escape" => {
+                if self.highlight.is_some() {
+                    self.highlight = None;
+                    cx.notify();
+                    return true;
+                }
+                false
+            }
+            "down" if self.base_is_focused(window, cx) => {
+                let filtered = self.filtered_bases(cx);
+                if filtered.is_empty() {
+                    return false;
+                }
+                let next = self
+                    .highlight
+                    .map_or(0, |i| if i + 1 >= filtered.len() { 0 } else { i + 1 });
+                self.highlight = Some(next);
+                cx.notify();
+                true
+            }
+            "up" if self.base_is_focused(window, cx) => {
+                let filtered = self.filtered_bases(cx);
+                if filtered.is_empty() {
+                    return false;
+                }
+                let next = self
+                    .highlight
+                    .map_or(filtered.len().saturating_sub(1), |i| {
+                        if i == 0 { filtered.len() - 1 } else { i - 1 }
+                    });
+                self.highlight = Some(next);
+                cx.notify();
+                true
+            }
+            "enter" if self.base_is_focused(window, cx) => {
+                if let Some(index) = self.highlight {
+                    let filtered = self.filtered_bases(cx);
+                    if let Some(picked) = filtered.get(index).cloned() {
+                        self.base.update(cx, |input, cx| {
+                            input.set_value(&picked, window, cx);
+                        });
+                        self.highlight = None;
+                        self.prepare(cx);
+                        cx.notify();
+                        return true;
+                    }
+                    self.highlight = None;
+                    cx.notify();
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn base_value(&self, cx: &App) -> String {
+        self.base.read(cx).value().to_string()
     }
 
     fn cancel_preparation(&mut self, cx: &mut Context<Self>) {
@@ -329,6 +582,12 @@ impl Render for Dialog {
         let repo_hooks =
             krill_proto::orchestration::inspect_repo_hooks(&self.repo, state_dir.as_deref());
         let body = div().flex().flex_col().gap_4();
+        let filtered = match &self.phase {
+            Phase::Edit(_) => self.filtered_bases(cx),
+            _ => Vec::new(),
+        };
+        let highlight = self.highlight;
+        let base_candidates = filtered.clone();
         let body = match &self.phase {
             Phase::Edit(error) => body
                 .child(
@@ -350,6 +609,56 @@ impl Render for Dialog {
                             p,
                         ))
                         .child(Input::new(&self.base).h(px(32.)))
+                        .when(!base_candidates.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .id("worktree-base-options")
+                                    .flex()
+                                    .flex_col()
+                                    .gap_0p5()
+                                    .mt_1()
+                                    .rounded(crate::ui::RADIUS_SM)
+                                    .border_1()
+                                    .border_color(p.border)
+                                    .bg(p.background)
+                                    .p_1()
+                                    .children(base_candidates.iter().enumerate().map(
+                                        |(index, candidate)| {
+                                            let label = candidate.clone();
+                                            let picked = candidate.clone();
+                                            let is_active = highlight == Some(index);
+                                            div()
+                                                .id(("worktree-base-option", index))
+                                                .debug_selector(move || {
+                                                    format!("worktree-base-option-{label}")
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .px_2()
+                                                .py_1()
+                                                .rounded(crate::ui::RADIUS_XS)
+                                                .font_family(crate::ui::FONT_MONO)
+                                                .text_size(crate::ui::TEXT_XS)
+                                                .text_color(if is_active {
+                                                    p.accent_foreground
+                                                } else {
+                                                    p.muted_foreground
+                                                })
+                                                .when(is_active, |row| row.bg(p.accent))
+                                                .cursor_pointer()
+                                                .child(picked.clone())
+                                                .on_click(cx.listener(move |d, _, window, cx| {
+                                                    d.base.update(cx, |input, cx| {
+                                                        input.set_value(&picked, window, cx);
+                                                    });
+                                                    d.highlight = None;
+                                                    d.prepare(cx);
+                                                    cx.notify();
+                                                }))
+                                        },
+                                    )),
+                            )
+                        })
                         .when(self.preparation.is_some(), |d| {
                             d.child(
                                 div()
@@ -524,7 +833,11 @@ impl Render for Dialog {
             .flex()
             .flex_col()
             .gap_4()
-            .capture_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|d, e: &gpui::KeyDownEvent, window, cx| {
+                if d.on_key(e, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
                 if e.keystroke.key == "escape" {
                     cx.stop_propagation();
                     cx.emit(Event::Close);
