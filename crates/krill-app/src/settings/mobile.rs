@@ -27,6 +27,8 @@ pub struct Panel {
     pub connected: BTreeSet<String>,
     pub pending: bool,
     pub error: Option<String>,
+    /// 페어링 링크 복사 피드백(버튼 라벨 '복사됨'). 새 오퍼가 오면 풀린다(OWE-880).
+    pub copied: bool,
     pub call: Call,
     timer: Option<Task<()>>,
     generation: u64,
@@ -62,6 +64,7 @@ impl Panel {
             connected: BTreeSet::new(),
             pending: false,
             error: None,
+            copied: false,
             call,
             timer: None,
             generation: 0,
@@ -79,7 +82,10 @@ impl Panel {
                     self.copied_url = None;
                 }
                 match Qr::encode(&url) {
-                    Ok(q) => self.offer = Some((url, expires_at_ms, q)),
+                    Ok(q) => {
+                        self.offer = Some((url, expires_at_ms, q));
+                        self.copied = false;
+                    }
                     Err(e) => self.error = Some(e.into()),
                 }
                 self.interfaces = interfaces;
@@ -106,6 +112,7 @@ impl SettingsView {
         ) {
             self.mobile.offer = None;
             self.mobile.copied_url = None;
+            self.mobile.copied = false;
         }
         self.mobile.generation = self.mobile.generation.wrapping_add(1);
         self.mobile.pending = true;
@@ -121,6 +128,50 @@ impl SettingsView {
                 match got {
                     Ok(reply) => this.mobile.accept(reply),
                     Err(e) => this.mobile.error = Some(e),
+                }
+                this.mobile_poll(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+    /// 탭 진입 시 기기 목록·활성 오퍼를 자동 조회한다(Orca 마운트 조회 대응, OWE-880).
+    /// 진행 중인 요청이 있으면 그 결과가 오면 폴링이 시작되므로 중복 호출하지 않는다.
+    pub(super) fn mobile_enter(&mut self, cx: &mut Context<Self>) {
+        if self.mobile.pending {
+            return;
+        }
+        self.mobile.generation = self.mobile.generation.wrapping_add(1);
+        self.mobile.pending = true;
+        self.mobile.error = None;
+        let call = Arc::clone(&self.mobile.call);
+        cx.spawn(async move |this, cx| {
+            let got = cx
+                .background_executor()
+                .spawn(async move {
+                    let status = call(MobileRequest::Status);
+                    // 활성 오퍼가 있을 때만 복원한다. 티켓이 없으면 데몬이
+                    // Err를 돌려주므로 무조건 조회하면 오류가 뜬다.
+                    let offer = match &status {
+                        Ok(MobileReply::GatewayStatus {
+                            active_offer: true, ..
+                        }) => Some(call(MobileRequest::CurrentPairingOffer)),
+                        _ => None,
+                    };
+                    (status, offer)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.mobile.pending = false;
+                match got.0 {
+                    Ok(reply) => this.mobile.accept(reply),
+                    Err(e) => this.mobile.error = Some(e),
+                }
+                // 오퍼 복원 실패(만료 등)는 조용히 무시한다.
+                if let Some(Ok(reply)) = got.1 {
+                    this.mobile.accept(reply);
                 }
                 this.mobile_poll(cx);
                 cx.notify();
@@ -459,6 +510,29 @@ impl SettingsView {
             "admin-mobile-devices-section",
             text::DEVICES_TITLE.get(),
         ));
+        // 페어링된 기기가 없을 때는 해제 버튼을 숨긴다. 있을 때는 2단계 확인(위험 색)으로
+        // 1클릭 실수를 막는다(OWE-880).
+        let active_devices = self
+            .mobile
+            .devices
+            .iter()
+            .any(|d| d.revoked_at_ms.is_none());
+        if active_devices {
+            root = root.child(self.confirm_button(
+                "mobile-revoke-all",
+                text::REVOKE_ALL.get(),
+                cx,
+                |this, cx| {
+                    this.mobile_action(
+                        MobileRequest::RevokeDevice {
+                            device_id: None,
+                            all: true,
+                        },
+                        cx,
+                    );
+                },
+            ));
+        }
         let now = krill_proto::mobile::client::now_ms();
         let active_devices: Vec<&PairedMobileDevice> = self
             .mobile
@@ -491,16 +565,12 @@ impl SettingsView {
                     if connected {
                         text::CONNECTED.get()
                     } else {
-                        text::PAIRED.get()
+                        // OWE-880: 오프라인 표기는 `OFFLINE`을 쓴다(`PAIRED` 중복 금지).
+                        text::OFFLINE.get()
                     },
                 );
-                let meta = format!(
-                    "{}: {} · {}: {}",
-                    text::PAIRED.get(),
-                    ago(now, device.created_at_ms),
-                    text::LAST_ACTIVE.get(),
-                    ago(now, device.last_seen_ms)
-                );
+                // OWE-880: 상태 줄은 `device_line` 서식(경과 스케일·`NEVER` 처리)을 쓴다.
+                let meta = device_line(device, connected, now);
                 root = root.child(
                     layout::row(p)
                         .id(SharedString::from(row_id.clone()))
@@ -600,10 +670,103 @@ impl SettingsView {
         div().child(root)
     }
 }
-fn ago(now: u64, then: u64) -> String {
+/// 기기 행 상태 줄. 오프라인 표기는 `OFFLINE`을 쓰고(`PAIRED` 중복 금지),
+/// 접속 기록이 없으면 `NEVER`, 경과는 분/시간/일 단위로 표기한다(OWE-880).
+fn device_line(device: &PairedMobileDevice, connected: bool, now: u64) -> String {
     format!(
-        "{} {}",
-        now.saturating_sub(then) / 60_000,
-        text::MINUTES_AGO.get()
+        "{} {} · {}: {} · {}: {}",
+        if connected { "●" } else { "○" },
+        if connected {
+            text::CONNECTED.get()
+        } else {
+            text::OFFLINE.get()
+        },
+        text::PAIRED.get(),
+        ago(now, device.created_at_ms),
+        text::LAST_ACTIVE.get(),
+        if device.last_seen_ms == 0 {
+            text::NEVER.get().to_owned()
+        } else {
+            ago(now, device.last_seen_ms)
+        }
     )
+}
+
+fn ago(now: u64, then: u64) -> String {
+    let elapsed = now.saturating_sub(then);
+    if elapsed < 60_000 {
+        return text::JUST_NOW.get().to_owned();
+    }
+    let mins = elapsed / 60_000;
+    if mins < 60 {
+        return format!("{} {}", mins, text::MINUTES_AGO.get());
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{} {}", hours, text::HOURS_AGO.get());
+    }
+    format!("{} {}", hours / 24, text::DAYS_AGO.get())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn device(created_at_ms: u64, last_seen_ms: u64) -> PairedMobileDevice {
+        PairedMobileDevice {
+            device_id: "dev-1".into(),
+            label: "아이폰".into(),
+            key_fingerprint: String::new(),
+            shared_secret_hash: String::new(),
+            created_at_ms,
+            last_seen_ms,
+            revoked_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn ago_scales_from_just_now_to_days() {
+        let now = 10_000_000_000;
+        assert_eq!(ago(now, now), text::JUST_NOW.get());
+        assert_eq!(ago(now, now + 5_000), text::JUST_NOW.get());
+        assert!(
+            ago(now, now - 90_000).starts_with("1 "),
+            "got {}",
+            ago(now, now - 90_000)
+        );
+        assert!(
+            ago(now, now - 3 * 3_600_000).starts_with("3 "),
+            "got {}",
+            ago(now, now - 3 * 3_600_000)
+        );
+        assert!(
+            ago(now, now - 2 * 86_400_000).starts_with("2 "),
+            "got {}",
+            ago(now, now - 2 * 86_400_000)
+        );
+    }
+
+    #[test]
+    fn device_line_avoids_paired_duplication_and_handles_never_seen() {
+        let now = 10_000_000_000;
+        // 오프라인·접속 기록 없음: 상태는 OFFLINE 1회, 마지막 활동은 NEVER.
+        let line = device_line(&device(now - 90_000, 0), false, now);
+        assert!(line.starts_with("○ "), "got {line}");
+        assert!(line.contains(text::OFFLINE.get()), "got {line}");
+        assert!(line.contains(text::NEVER.get()), "got {line}");
+        assert_eq!(
+            line.matches(text::PAIRED.get()).count(),
+            1,
+            "PAIRED must appear exactly once (paired-at label): {line}"
+        );
+        // 온라인 기기: CONNECTED 1회 + 경과 시간 표기.
+        let line = device_line(
+            &device(now - 2 * 86_400_000, now - 3 * 3_600_000),
+            true,
+            now,
+        );
+        assert!(line.starts_with("● "), "got {line}");
+        assert!(line.contains(text::CONNECTED.get()), "got {line}");
+        assert!(!line.contains(text::OFFLINE.get()), "got {line}");
+    }
 }

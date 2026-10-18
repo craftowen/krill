@@ -127,9 +127,14 @@ catalog! {
         REVOKE_ALL_DESC => ("등록된 모든 모바일 기기의 접근 권한과 활성 연결을 즉시 해제합니다.", "Immediately revoke access and disconnect all paired mobile devices."),
         REVOKE => ("연결 해제", "Revoke device"),
         CONNECTED => ("연결됨", "Connected"),
+        OFFLINE => ("오프라인", "Offline"),
         PAIRED => ("페어링", "Paired"),
         LAST_ACTIVE => ("마지막 활동", "Last active"),
-        MINUTES_AGO => ("분 전", "minutes ago")
+        MINUTES_AGO => ("분 전", "minutes ago"),
+        HOURS_AGO => ("시간 전", "hours ago"),
+        DAYS_AGO => ("일 전", "days ago"),
+        JUST_NOW => ("방금 전", "Just now"),
+        NEVER => ("없음", "Never")
     }
     status {
         PROVIDER_ACCOUNTS_HEADER ["status.provider.accounts_header"] => ("계정 전환", "Switch Account"),
@@ -942,6 +947,7 @@ catalog! {
         SSH_OPEN_TOML => ("hosts.toml 열기", "Open hosts.toml"),
         SSH_EMPTY => ("등록된 SSH 호스트가 없습니다. 위 입력 폼에서 추가하거나 ~/.ssh/config에서 가져오세요.", "No SSH hosts registered. Add one using the form above or import from ~/.ssh/config."),
         SSH_TEST => ("연결 테스트", "Test"),
+        SSH_TESTING => ("연결 테스트 중…", "Testing connection…"),
         SSH_CONNECT => ("연결", "Connect"),
         SSH_DISCONNECT => ("연결 해제", "Disconnect"),
         SSH_EDIT => ("편집", "Edit"),

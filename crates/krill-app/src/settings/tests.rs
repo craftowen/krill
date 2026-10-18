@@ -3156,6 +3156,120 @@ fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-884: SSH 폼 Enter 제출·연결 테스트 진행 표시·삭제 2단계 확인·ssh-copy-id 메인 배너 전달을 검증한다.
+#[gpui::test]
+fn owe884_ssh_form_enter_test_pending_remove_confirm_and_copy_id_notice(cx: &mut TestAppContext) {
+    let d = dir("owe884-ssh-ux");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("admin-ssh-form").is_some());
+
+    // 1. 폼 입력 후 주소칸에서 Enter → 추가 버튼과 같은 경로로 호스트가 추가된다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.ensure_ssh_form(window, cx);
+            let form = v.ssh_form.as_ref().expect("ssh form");
+            form.label.update(cx, |s, cx| s.focus(window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.simulate_input("집 맥미니");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let form = v.ssh_form.as_ref().expect("ssh form");
+            form.address.update(cx, |s, cx| s.focus(window, cx));
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.simulate_input("owen@10.0.0.5");
+    vcx.simulate_keystrokes("enter");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(view.read(cx).ssh_hosts().len(), 1);
+        assert_eq!(view.read(cx).ssh_hosts()[0].label, "집 맥미니");
+        assert_eq!(view.read(cx).ssh_hosts()[0].destination, "owen@10.0.0.5");
+    });
+    let host = vcx.update(|_, cx| view.read(cx).ssh_hosts()[0].clone());
+    let host_id = host.id.clone();
+
+    // 2. 연결 테스트 시작 → 진행 중 표시 → 결과 반영 후 해제.
+    // 빈 접속 주소는 `valid_host`에서 거부돼 실제 ssh를 띄우지 않고 즉시 실패한다.
+    let mut unreachable = host.clone();
+    unreachable.destination = String::new();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.test_ssh_host(unreachable.clone(), cx));
+        window.draw(cx).clear(cx);
+        assert!(
+            view.read(cx).is_ssh_test_pending(&host_id),
+            "test must be marked pending"
+        );
+        let status = view.read(cx).ssh_status.as_ref().unwrap().to_string();
+        assert!(
+            status.contains("연결 테스트 중") || status.contains("Testing connection"),
+            "unexpected status: {status}"
+        );
+    });
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.apply_ssh_test_result(host.clone(), Err("ssh: Connection refused".into()), cx);
+        });
+        window.draw(cx).clear(cx);
+        assert!(!view.read(cx).is_ssh_test_pending(&host_id));
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Error
+        );
+    });
+
+    // 3. 삭제는 2단계 확인: 첫 클릭은 무장만 하고, 두 번째 클릭에 삭제된다.
+    let rm_sel: &'static str = format!("admin-ssh-remove-{host_id}").leak();
+    assert!(vcx.debug_bounds(rm_sel).is_some());
+    click(vcx, rm_sel);
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).ssh_hosts().len(),
+            1,
+            "first click must only arm"
+        );
+        assert_eq!(view.read(cx).armed.as_deref(), Some(rm_sel));
+    });
+    click(vcx, rm_sel);
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).ssh_hosts().is_empty(), "second click deletes");
+        assert_eq!(view.read(cx).armed, None);
+    });
+
+    // 4. ssh-copy-id 실행 안내가 메인 셸 배너로 전달된다(설정 창이 닫혀도 보인다).
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.launch_ssh_copy_id(host.clone(), cx));
+        let notice = take_pending_notice(cx).expect("copy-id notice must be queued");
+        assert!(
+            notice.contains("ssh-copy-id"),
+            "unexpected notice: {notice}"
+        );
+        let status = view.read(cx).ssh_status.as_ref().unwrap().to_string();
+        assert!(
+            status.contains("ssh-copy-id"),
+            "unexpected status: {status}"
+        );
+    });
+
+    std::fs::remove_dir_all(d).ok();
+}
+
 /// AS-02: 일시 IO 오류를 `NotFound`로 취급해 설정을 기본값으로 리셋하면 안 된다.
 /// 직전 설정을 유지하고 오류를 표시하며 동면 표식 동기화를 건너뛴다.
 #[gpui::test]
@@ -4254,6 +4368,22 @@ fn mobile_eighth_tab_qr_and_mode_invalidation(cx: &mut TestAppContext) {
             }));
             assert_eq!(AdminTab::ALL.get(7), Some(&AdminTab::Mobile));
             v.set_tab(AdminTab::Mobile, cx);
+            // OWE-880: 탭 진입 시 상태 자동 조회가 시작된다.
+            assert!(v.mobile.pending, "entering the tab auto-fetches status");
+        });
+    });
+    vcx.run_until_parked();
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MobileRequest::Status)),
+        "tab entry must request Status"
+    );
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            assert!(!v.mobile.pending);
             v.mobile_pair(ConnectMode::Lan, None, cx);
             assert!(v.mobile.offer.is_none());
         });
@@ -4280,6 +4410,146 @@ fn mobile_eighth_tab_qr_and_mode_invalidation(cx: &mut TestAppContext) {
             ..
         }
     )));
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-880: 모바일 탭 진입 자동 조회·전체 해제 2단계 확인·복사 피드백을 검증한다.
+#[gpui::test]
+fn owe880_mobile_enter_revoke_confirm_and_copy_feedback(cx: &mut TestAppContext) {
+    use krill_proto::mobile::{ConnectMode, MobileReply, MobileRequest, PairedMobileDevice};
+    let d = dir("owe880-mobile-ux");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = requests.clone();
+    let now = krill_proto::mobile::client::now_ms();
+    let phone = PairedMobileDevice {
+        device_id: "dev-phone".into(),
+        label: "아이폰".into(),
+        key_fingerprint: String::new(),
+        shared_secret_hash: String::new(),
+        created_at_ms: now.saturating_sub(3 * 3_600_000),
+        last_seen_ms: 0,
+        revoked_at_ms: None,
+    };
+    let sent_status = || {
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MobileRequest::Status))
+    };
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile = mobile::Panel::new(std::sync::Arc::new(move |request| {
+                record.lock().unwrap().push(request.clone());
+                Ok(match request {
+                    MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
+                        url: "https://example.test/?pair=fixture#key=fixture".into(),
+                        host: "example.test".into(),
+                        port: 1234,
+                        expires_at_ms: krill_proto::mobile::client::now_ms() + 300_000,
+                        mode,
+                        interfaces: Vec::new(),
+                    },
+                    MobileRequest::ConnectedDevices => {
+                        MobileReply::ConnectedDevices(vec!["dev-phone".into()])
+                    }
+                    MobileRequest::CurrentPairingOffer => MobileReply::Failed("no ticket".into()),
+                    _ => MobileReply::GatewayStatus {
+                        listening: true,
+                        bind_addrs: Vec::new(),
+                        mode: ConnectMode::Lan,
+                        tunnel_url: None,
+                        active_offer: false,
+                        devices: vec![phone.clone()],
+                    },
+                })
+            }));
+            v.set_tab(AdminTab::Mobile, cx);
+            // 1. 탭 진입만으로 상태 자동 조회가 시작된다.
+            assert!(v.mobile.pending, "entering the tab auto-fetches status");
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(!view.read(cx).mobile.pending);
+        assert_eq!(view.read(cx).mobile.devices.len(), 1);
+        assert!(
+            view.read(cx).mobile.offer.is_none(),
+            "no active offer to restore"
+        );
+    });
+    assert!(sent_status(), "tab entry must request Status");
+
+    // 기기가 있으면 전체 해제가 보인다.
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("mobile-revoke-all").is_some());
+
+    // 2. 전체 해제는 2단계 확인: 첫 클릭은 무장만 하고 Revoke를 보내지 않는다.
+    click(vcx, "mobile-revoke-all");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).armed.as_deref(), Some("mobile-revoke-all"));
+    });
+    assert!(
+        !requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MobileRequest::RevokeDevice { all: true, .. })),
+        "first click must only arm"
+    );
+    // 두 번째 클릭에 전체 해제가 실행된다.
+    click(vcx, "mobile-revoke-all");
+    assert!(
+        requests
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| matches!(r, MobileRequest::RevokeDevice { all: true, .. })),
+        "second click must revoke all"
+    );
+
+    // 3. 기기가 없으면 전체 해제는 숨는다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, _| v.mobile.devices.clear());
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("mobile-revoke-all").is_none());
+
+    // 4. 페어링 링크 복사 → '복사됨' 피드백(플래그+클립보드).
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Lan, None, cx));
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(view.read(cx).mobile.offer.is_some());
+        window.draw(cx).clear(cx);
+    });
+    assert!(!vcx.update(|_, cx| view.read(cx).mobile.copied));
+    click(vcx, "mobile-copy-link");
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).mobile.copied, "copy must set feedback flag");
+        let clip = cx
+            .read_from_clipboard()
+            .and_then(|c| c.text())
+            .expect("clipboard text");
+        assert!(
+            clip.contains("pair=fixture"),
+            "unexpected clipboard: {clip}"
+        );
+    });
+
     fs::remove_dir_all(d).ok();
 }
 
