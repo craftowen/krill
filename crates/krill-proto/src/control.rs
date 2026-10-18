@@ -627,8 +627,56 @@ pub enum Failure {
     UnknownAgent,
     /// 요청을 읽지 못했다(이 krilld가 모르는 variant 등).
     BadRequest,
-    /// 그 밖의 OS 오류(macOS errno). openpty·fork·exec 실패 등.
-    Os(i32),
+    /// 그 밖의 OS 오류. openpty·fork·exec 실패 등. 값은 이 프로세스 OS의 errno이고, 와이어에는 macOS 번호로 실린다
+    /// ([`wire_errno`]) — Linux 원격 호스트의 오류를 Mac 앱이 맞는 문구로 보이게.
+    Os(#[serde(with = "wire_errno")] i32),
+}
+
+/// [`Failure::Os`]의 와이어 표현: macOS errno 번호. Linux는 번호가 다른 것만 옮긴다(1~34는 두 OS가 같다).
+mod wire_errno {
+    use serde::{Deserialize as _, Deserializer, Serializer};
+
+    /// (Linux, macOS) 번호가 다른 errno 중 spawn·IO·소켓에서 나올 만한 것.
+    #[cfg(target_os = "linux")]
+    const PAIRS: &[(i32, i32)] = &[
+        (11, 35),  // EAGAIN
+        (35, 11),  // EDEADLK
+        (36, 63),  // ENAMETOOLONG
+        (38, 78),  // ENOSYS
+        (39, 66),  // ENOTEMPTY
+        (40, 62),  // ELOOP
+        (95, 45),  // EOPNOTSUPP
+        (98, 48),  // EADDRINUSE
+        (104, 54), // ECONNRESET
+        (110, 60), // ETIMEDOUT
+        (111, 61), // ECONNREFUSED
+    ];
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        PAIRS.iter().find(|p| p.0 == local).map_or(local, |p| p.1)
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        PAIRS.iter().find(|p| p.1 == wire).map_or(wire, |p| p.0)
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn to_wire(local: i32) -> i32 {
+        local
+    }
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn from_wire(wire: i32) -> i32 {
+        wire
+    }
+
+    #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde with 계약이 &T를 요구한다")]
+    pub(super) fn serialize<S: Serializer>(errno: &i32, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_i32(to_wire(*errno))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<i32, D::Error> {
+        i32::deserialize(d).map(from_wire)
+    }
 }
 
 impl Failure {
