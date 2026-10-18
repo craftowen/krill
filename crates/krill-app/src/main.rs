@@ -81,6 +81,7 @@ fn main() -> std::process::ExitCode {
             window
                 .update(cx, |shell, window, cx| {
                     shell.arm_update_ready(state.clone());
+                    krill_app::star_nag::init(state.clone(), cx);
                     krill_app::updater::on_startup(state.clone(), window, cx);
                     krill_app::crash::offer_report(state, |p, cx| cx.reveal_path(p), window, cx);
                     if let Some(env) = krill_app::onboarding::Env::current() {

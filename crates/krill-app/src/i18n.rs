@@ -1425,6 +1425,15 @@ catalog! {
         CARD_LATER_BTN => ("나중에", "Later"),
         STATUS_READY_BADGE => ("↑ 업데이트 준비됨 v{version}", "↑ Update ready v{version}"),
     }
+    star_nag {
+        TITLE => ("Krill이 도움이 되고 있나요?", "Enjoying Krill?"),
+        BODY => ("GitHub 별 하나가 개발을 이어 가는 데 큰 힘이 됩니다.", "A GitHub star helps keep Krill going."),
+        STAR => ("GitHub에 별 주기", "Star on GitHub"),
+        STARRING => ("별 주는 중…", "Starring…"),
+        LATER => ("나중에", "Later"),
+        NEVER => ("다시 보지 않기", "Don't show again"),
+        THANKS => ("별 고맙습니다!", "Thanks for the star!"),
+    }
     general {
         JUMP_SHORTCUT => ("⌘J", "⌘J"),
         HASH => ("SHA-256 {hash}", "SHA-256 {hash}"),

@@ -63,6 +63,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let is_remote = host.is_remote();
+        if matches!(program, Program::Agent { .. }) {
+            krill_app::star_nag::record_agent_start(cx);
+        }
         self.change(true, cx, |l| {
             l.new_tab();
             if let Some(pane) = l.focused() {

@@ -2147,6 +2147,7 @@ impl Shell {
         } else {
             self.folder()
         };
+        krill_app::star_nag::record_agent_start(cx);
         self.change(true, cx, |l| {
             l.new_tab();
             let pane = l.active_tab().focused;
@@ -4920,9 +4921,14 @@ impl Render for Shell {
             .children(self.render_running_close_dialog(window, cx))
             .children(self.render_tab_rename_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
+            // 우하단 카드는 하나만: 업데이트 카드가 있으면 별 요청 카드(OWE-905)는 숨긴다.
             .children(
                 (self.role == WindowRole::Main)
-                    .then(|| Self::render_update_card(cx))
+                    .then(|| {
+                        Self::render_update_card(cx)
+                            .map(IntoElement::into_any_element)
+                            .or_else(|| krill_app::star_nag::card(cx))
+                    })
                     .flatten(),
             )
     }
