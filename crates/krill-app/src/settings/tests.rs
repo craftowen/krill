@@ -149,6 +149,116 @@ fn webhook_settings_roundtrip_survive_ui_edits_and_redact_parse_errors(cx: &mut 
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-883: 사람에게 보이는 한 줄·문구에 Rust 디버그 포맷(`{:?}`)과 내부 영문이 그대로 노출되지 않는다.
+#[test]
+fn owe883_user_facing_lines_hide_debug_and_english_internals() {
+    use krill_proto::orchestration::TaskStatus;
+
+    // 오케스트레이션 작업 행: 영문 상태·`deps={:?}` 대신 카탈로그 문구와 의존 목록.
+    let with_deps = orchestration_task_line(
+        "run-1",
+        "task-2",
+        "1단계 점검",
+        TaskStatus::Ready,
+        &["task-1".to_owned()],
+    );
+    assert!(with_deps.contains("준비"), "{with_deps}");
+    assert!(!with_deps.contains("ready"), "{with_deps}");
+    assert!(!with_deps.contains("deps="), "{with_deps}");
+    assert!(!with_deps.contains('"'), "{with_deps}");
+    assert!(with_deps.contains("task-1"), "{with_deps}");
+    let bare = orchestration_task_line("r", "t", "제목", TaskStatus::Dispatched, &[]);
+    assert!(bare.contains("실행 중"), "{bare}");
+    assert!(!bare.contains("dispatched"), "{bare}");
+    for (status, raw) in [
+        (TaskStatus::Pending, "pending"),
+        (TaskStatus::Ready, "ready"),
+        (TaskStatus::Dispatched, "dispatched"),
+        (TaskStatus::Completed, "completed"),
+        (TaskStatus::Failed, "failed"),
+        (TaskStatus::Blocked, "blocked"),
+    ] {
+        assert_ne!(orchestration_task_status_label(status), raw);
+    }
+
+    // 웹훅 행: 종류만 보이고 URL·비밀은 노출하지 않는다.
+    for (ep, kind) in [
+        (
+            crate::webhook::Endpoint::Ntfy {
+                url: "http://127.0.0.1:9/hook?token=SECRET".into(),
+            },
+            "Ntfy",
+        ),
+        (
+            crate::webhook::Endpoint::Telegram {
+                url: "https://api.telegram.org/botSECRET/send".into(),
+                chat_id: "PRIVATE".into(),
+            },
+            "Telegram",
+        ),
+        (
+            crate::webhook::Endpoint::Discord {
+                url: "https://discord.com/api/SECRET".into(),
+            },
+            "Discord",
+        ),
+    ] {
+        let label = webhook_kind_label(&ep);
+        assert_eq!(label, kind);
+        let row = text::WEBHOOK_LABEL.format(&[("n", "1"), ("kind", label)]);
+        assert!(!row.contains("SECRET"), "{row}");
+        assert!(!row.contains("PRIVATE"), "{row}");
+        assert!(!row.contains('{'), "{row}");
+    }
+
+    // 스케줄 실행 시각: epoch 분 대신 날짜·시각(UTC).
+    assert_eq!(schedules::format_run_minute(0), "1970-01-01 00:00 (UTC)");
+    assert_eq!(
+        schedules::format_run_minute(29_453_760),
+        "2026-01-01 00:00 (UTC)"
+    );
+    assert_eq!(
+        schedules::format_run_minute(29_871_930),
+        "2026-10-18 09:30 (UTC)"
+    );
+
+    // 자가 진단: 내부 키-값이 아니라 카탈로그 문구.
+    let report = run_doctor_check(None);
+    assert!(!report.contains("state="), "{report}");
+    assert!(!report.contains("bins="), "{report}");
+    assert!(!report.contains("crashes="), "{report}");
+    assert!(!report.contains("recording="), "{report}");
+    assert!(!report.contains("missing-bins"), "{report}");
+    assert!(report.contains(text::DOCTOR_MISSING.get()), "{report}");
+
+    // 업데이터 오류: 영문 Display 원문이 아니라 사용자용 문구.
+    for err in [
+        crate::updater::Error::BadSignature,
+        crate::updater::Error::InvalidRollout(101),
+        crate::updater::Error::Downgrade {
+            current: "1.0".into(),
+            offered: "0.9".into(),
+        },
+    ] {
+        let msg = err.user_message();
+        assert!(
+            !msg.contains("ed25519 signature verification failed"),
+            "{msg}"
+        );
+        assert!(!msg.contains("rollout_pct must be"), "{msg}");
+        assert!(!msg.contains("downgrade refused"), "{msg}");
+    }
+    let downgrade = crate::updater::Error::Downgrade {
+        current: "1.0".into(),
+        offered: "0.9".into(),
+    }
+    .user_message();
+    assert!(
+        downgrade.contains("1.0") && downgrade.contains("0.9"),
+        "{downgrade}"
+    );
+}
+
 #[gpui::test]
 fn key_override_and_unbind(cx: &mut TestAppContext) {
     cx.update(|cx| {

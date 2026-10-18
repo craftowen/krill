@@ -1402,3 +1402,23 @@ fn update_cli_check_and_headless_apply_updates_bundle_and_marks_healthy() {
     fetch_bytes(&format!("{base_url}/stop"), 64).ok();
     server.join().ok();
 }
+
+/// OWE-883: 롤백 사유 영문을 사용자용 문구로 바꾼다. 모르는 사유는 그대로 둔다.
+#[test]
+fn owe883_localize_reason_maps_known_english_reasons() {
+    assert_eq!(
+        relaunch::localize_reason("interrupted during bundle replacement"),
+        "교체 중 중단됨"
+    );
+    assert_eq!(
+        relaunch::localize_reason("old app did not exit; replacement aborted"),
+        "이전 앱이 종료되지 않아 교체 중단됨"
+    );
+    let exited = relaunch::localize_reason("new app exited before ready (exit status: 1)");
+    assert!(exited.contains("exit status: 1"), "{exited}");
+    assert!(!exited.contains("new app exited before ready"), "{exited}");
+    let timeout = relaunch::localize_reason("new app did not report ready within 30000ms");
+    assert!(timeout.contains("30000"), "{timeout}");
+    assert!(!timeout.contains("did not report ready"), "{timeout}");
+    assert_eq!(relaunch::localize_reason("mystery"), "mystery");
+}
