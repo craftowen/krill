@@ -8,9 +8,9 @@
 //! - **세션 보존**: `krilld`·`krill-holder`·`krill-proto` 와이어 프로토콜을 수정하지 않으며,
 //!   원격 연결 실패가 로컬 PTY나 세션을 절대 건드리지 않는다.
 //! - **비밀 보호**: 기기 비밀키(`link/secret.key`)와 초대 토큰(`link/invites.toml`에는 SHA-256 해시만 저장)은
-//!   0600 원자적 쓰기로 보관하며, `Debug`·로그·오류 메시지에 절대 원문을 남기지 않는다.
+//!   0600 원자적 쓰기(Windows는 `%LOCALAPPDATA%` ACL 상속)로 보관하며, `Debug`·로그·오류 메시지에 절대 원문을 남기지 않는다.
 //! - **Resumable stream v2**: random stream IDs, byte offsets, bounded replay and
-//!   destination-write ACKs preserve both Unix connections across QUIC outages.
+//!   destination-write ACKs preserve both local-socket connections across QUIC outages.
 
 use std::fmt;
 use std::io;
@@ -20,6 +20,8 @@ pub mod config;
 pub mod connect;
 pub mod identity;
 pub mod launchd;
+#[doc(hidden)]
+pub mod local;
 pub mod messages;
 pub mod pair;
 pub mod qr;
@@ -133,15 +135,11 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Platform operations fail explicitly until a native transport is implemented.
-#[cfg(any(test, not(target_os = "macos")))]
+/// launchd 자동 시작처럼 macOS 전용 기능은 다른 플랫폼에서 명시적으로 실패한다.
+#[cfg(not(target_os = "macos"))]
 pub(crate) fn unsupported_platform() -> Error {
     Error::Io(io::Error::new(
         io::ErrorKind::Unsupported,
         "krill-link is not supported on this platform",
     ))
 }
-
-#[cfg(test)]
-#[cfg(unix)]
-mod unsupported_tests;

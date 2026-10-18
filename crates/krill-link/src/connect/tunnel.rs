@@ -6,7 +6,6 @@
 //!   조회할 수 있도록 함수와 상태 파일(`<state_dir>/run/hosts/<id>.status.json`)을 제공한다.
 
 use std::fs::{self, DirBuilder};
-use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -17,19 +16,20 @@ use super::{
 };
 use iroh::endpoint::Connection;
 use krill_proto::daemon::SUN_PATH_MAX;
-use tokio::net::UnixListener;
+use krill_proto::os::fs::DirBuilderExt as _;
 use tokio::sync::{Notify, oneshot, watch};
 
 use crate::config::{LinkConfig, RelaySetting};
 use crate::identity::DeviceIdentity;
+use crate::local::Listener;
 use crate::serve::{build_iroh_endpoint, is_serve_running, raise_nofile_limit};
 use crate::store::{
     find_host, load_devices, load_hosts, now_unix_ms, validate_host_id, write_atomic_0600,
 };
 use crate::{ALPN_LINK, Error};
 
-/// 원격 호스트의 로컬 Unix 도메인 소켓 경로(`<state_dir>/run/hosts/<host_id>.sock`)를 계산하고
-/// macOS `SUN_PATH_MAX`(104바이트) 제한을 검증한다(CONVENTIONS A6).
+/// 원격 호스트의 로컬 `AF_UNIX` 소켓 경로(`<state_dir>/run/hosts/<host_id>.sock`)를 계산하고
+/// 플랫폼 `SUN_PATH_MAX`(macOS 104·Windows 108바이트) 제한을 검증한다(CONVENTIONS A6).
 pub fn host_socket_path(state_dir: &Path, host_id: &str) -> Result<PathBuf, Error> {
     validate_host_id(host_id)?;
     let path = state_dir
@@ -60,7 +60,7 @@ pub fn host_status(state_dir: &Path, host_id: &str) -> Result<HostTunnelStatus, 
     if let Ok(text) = fs::read_to_string(&status_file)
         && let Ok(mut parsed) = serde_json::from_str::<HostTunnelStatus>(&text)
     {
-        let alive = parsed.pid.is_some_and(is_pid_alive) && sock_path.exists();
+        let alive = is_tunnel_alive(&parsed) && sock_path.exists();
         if alive {
             return Ok(parsed);
         }
@@ -127,14 +127,25 @@ pub fn status_report(state_dir: &Path) -> Result<LinkStatusReport, Error> {
     })
 }
 
-fn is_pid_alive(pid: u32) -> bool {
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
-    let Some(p) = rustix::process::Pid::from_raw(raw) else {
-        return false;
-    };
-    rustix::process::test_kill_process(p).is_ok()
+#[cfg(unix)]
+fn is_tunnel_alive(status: &HostTunnelStatus) -> bool {
+    status.pid.is_some_and(|pid| {
+        let Ok(raw) = i32::try_from(pid) else {
+            return false;
+        };
+        let Some(p) = rustix::process::Pid::from_raw(raw) else {
+            return false;
+        };
+        rustix::process::test_kill_process(p).is_ok()
+    })
+}
+
+/// Windows: PID 조회는 unsafe FFI라 쓰지 않고, 살아 있는 터널이 400ms마다 다시 쓰는 상태 파일의 신선도로 판단한다.
+#[cfg(windows)]
+fn is_tunnel_alive(status: &HostTunnelStatus) -> bool {
+    // ponytail: 갱신 주기의 5배. 상태 파일 쓰기가 막히면 살아 있어도 끊김으로 보인다.
+    const STALE_MS: u64 = 2_000;
+    status.pid.is_some() && now_unix_ms().saturating_sub(status.updated_at_ms) <= STALE_MS
 }
 
 fn persist_status(status_path: &Path, status: &HostTunnelStatus) {
@@ -213,7 +224,7 @@ pub async fn start_tunnel(opts: ConnectOptions) -> Result<TunnelHandle, Error> {
             .map_err(Error::Io)?;
     }
     fs::remove_file(&socket_path).ok();
-    let listener = UnixListener::bind(&socket_path).map_err(Error::Io)?;
+    let listener = Listener::bind(&socket_path).map_err(Error::Io)?;
     let identity = DeviceIdentity::load_or_create(&state_dir)?;
     let endpoint =
         build_iroh_endpoint(&state_dir, &identity, &cfg, false, Some(&remote_addr)).await?;
