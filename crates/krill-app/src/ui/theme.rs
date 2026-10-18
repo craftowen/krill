@@ -59,12 +59,32 @@ pub const MODAL_BACKDROP: Hsla = hexa(0x0000_0000, 0.55);
 /// QR 코드 밝은 칸·어두운 칸. 테마와 무관하게 고정해야 카메라가 읽는다(M9 모바일 페어링).
 pub const QR_LIGHT: Hsla = hex(0x00ff_ffff);
 pub const QR_DARK: Hsla = hex(0x0000_0000);
+/// 완전 투명(유휴 행 테두리·겹침 마스크 등). 생 `gpui::transparent_black()` 대신 사용한다.
+pub const TRANSPARENT: Hsla = hexa(0x0000_0000, 0.0);
+
+/// 완전 투명을 돌려준다. `gpui::transparent_black()` 직접 호출 대신 사용한다.
+#[must_use]
+pub const fn transparent() -> Hsla {
+    TRANSPARENT
+}
 /// 사이드바 헤더 높이(Orca `h-8`).
 pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(32.);
 /// 사이드바 빈 상태 상하 여백(Orca `py-6`).
 pub const SIDEBAR_EMPTY_PY: Pixels = px(24.);
 /// 하단 상태 바 높이(Orca `h-6` = 24px).
 pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
+/// 사이드바 세션 행 높이(32px, `sidebar::ROW_HEIGHT` 정본).
+pub const SIDEBAR_ROW_HEIGHT: Pixels = px(32.);
+/// 우측 패널 파일·검색 행 높이(26px, `diff::explorer::ROW_HEIGHT` 정본).
+pub const PANEL_ROW_HEIGHT: Pixels = px(26.);
+/// 우측 패널 탭 높이(24px, `diff::search::ROW_HEIGHT` 정본).
+pub const PANEL_TAB_HEIGHT: Pixels = px(24.);
+/// 분할 창 헤더 높이(26px).
+pub const PANE_HEADER_HEIGHT: Pixels = px(26.);
+/// 워크트리 상태 요약 겹친 에이전트 아이콘 타일 크기(15px, `ui::status::summary_element` 전용).
+pub const STATUS_GROUP_ICON: Pixels = px(15.);
+/// 상태 요약 타일 겹침 음수 마진(-3px, 두 번째 이후 타일).
+pub const STATUS_GROUP_OVERLAP: Pixels = px(-3.);
 /// 창 가운데 모달 대화상자 기본 너비(Orca `DialogContent` `sm:max-w-lg` = 512px).
 pub const DIALOG_WIDTH: Pixels = px(512.);
 /// 설정 내 넓은 모달 대화상자 너비(공간 관리 정리 미리보기 등, 640px).
@@ -555,6 +575,7 @@ mod tests {
     }
 
     /// Orca 정합 토큰 회귀 방지: 탭 최대폭 220px·비활성 투명도 0.7·상태 점 6px·사이드바 헤더 32px·빈 상태 여백 24px.
+    /// OWE-885: 사이드바·패널 행 높이와 상태 요약 치수·완전 투명 토큰도 고정한다.
     #[test]
     fn orca_parity_tokens() {
         assert_eq!(TAB_MAX_WIDTH, px(220.));
@@ -563,6 +584,14 @@ mod tests {
         assert_eq!(SIDEBAR_HEADER_HEIGHT, px(32.));
         assert_eq!(SIDEBAR_EMPTY_PY, px(24.));
         assert_eq!(TITLEBAR_HEIGHT, TAB_BAR_HEIGHT);
+        assert_eq!(SIDEBAR_ROW_HEIGHT, px(32.));
+        assert_eq!(PANEL_ROW_HEIGHT, px(26.));
+        assert_eq!(PANEL_TAB_HEIGHT, px(24.));
+        assert_eq!(PANE_HEADER_HEIGHT, px(26.));
+        assert_eq!(STATUS_GROUP_ICON, px(15.));
+        assert_eq!(STATUS_GROUP_OVERLAP, px(-3.));
+        assert!((TRANSPARENT.a - 0.0).abs() < f32::EPSILON);
+        assert_eq!(transparent(), TRANSPARENT);
     }
 
     /// OWE-655: 터미널 배경 불투명도는 50..=100으로 자르고 그 외 색은 그대로 둔다.
@@ -718,10 +747,25 @@ mod tests {
             "gpui::hsla(",
             "gpui::black(",
             "gpui::white(",
+            "gpui::transparent_black(",
+            "gpui::red(",
+            "gpui::green(",
+            "gpui::blue(",
+            "gpui::yellow(",
             "ui::hex(",
             "ui::hexa(",
             "theme::hex(",
             "theme::hexa(",
+            // 비수식 `hex(0x...)` 호출(`use crate::ui::hex;` 임포트 우회, OWE-885).
+            // `worktree::hex(hash)` 같은 비색상 헬퍼와 구분되도록 `0x` 리터럴에만 반응한다.
+            "hex(0x",
+            "hexa(0x",
+            // STYLEGUIDE §5.4: `.shadow_lg()` 외 그림자 단계 금지(OWE-885).
+            ".shadow_xs(",
+            ".shadow_sm(",
+            ".shadow_md(",
+            ".shadow_xl(",
+            ".shadow_2xl(",
             ".text_size(px(",
             ".text_size(gpui::px(",
             ".text_size(rems(",
@@ -752,8 +796,10 @@ mod tests {
     }
 
     /// 디자인 시스템 게이트(Orca `lint:design-system` 대응): `src/ui/`와 터미널 격자(`terminal.rs`) 밖에서
-    /// 생 색상(`gpui::rgb`/`rgba`/`hsla`/`black`/`white`, 비수식 `rgb(` 등, `ui::hex`/`hexa`)이나
-    /// 임의 글자 크기(`.text_size(px(..))`, `.text_size(rems(..))`)를 직접 쓰면 실패한다(`docs/STYLEGUIDE.md` §2·§4·§9).
+    /// 생 색상(`gpui::rgb`/`rgba`/`hsla`/`black`/`white`/`transparent_black`/`red`/`green`/`blue`/`yellow`,
+    /// 비수식 `rgb(` 등, `ui::hex`/`hexa`, 임포트 우회 `hex(0x...)`)이나
+    /// 비허용 그림자 단계(`.shadow_xs/sm/md/xl/2xl`, `.shadow_lg()`만 허용)나
+    /// 임의 글자 크기(`.text_size(px(..))`, `.text_size(rems(..))`)를 직접 쓰면 실패한다(`docs/STYLEGUIDE.md` §2·§4·§5.4·§9).
     #[test]
     fn no_raw_colors_or_arbitrary_font_sizes_outside_ui_module() {
         let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -805,6 +851,18 @@ mod tests {
             "div().bg(black())",
             "div().bg(white())",
             "div().bg(ui::hex(0x112233))",
+            "div().bg(hex(0x112233))",
+            "div().bg(hexa(0x112233, 0.5))",
+            "div().border_color(gpui::transparent_black())",
+            "div().text_color(gpui::red())",
+            "div().text_color(gpui::green())",
+            "div().text_color(gpui::blue())",
+            "div().text_color(gpui::yellow())",
+            "div().shadow_xs()",
+            "div().shadow_sm()",
+            "div().shadow_md()",
+            "div().shadow_xl()",
+            "div().shadow_2xl()",
             "div().text_size(px(13.))",
             "div().text_size(rems(0.75))",
         ] {
@@ -876,6 +934,14 @@ mod tests {
             "COMMAND_PALETTE_WIDTH",
             "MODAL_BACKDROP",
             "AGENT_UNREAD",
+            "TRANSPARENT",
+            "ui::transparent",
+            "SIDEBAR_ROW_HEIGHT",
+            "PANEL_ROW_HEIGHT",
+            "PANEL_TAB_HEIGHT",
+            "PANE_HEADER_HEIGHT",
+            "STATUS_GROUP_ICON",
+            "STATUS_GROUP_OVERLAP",
             "ui::card",
             "ui::row",
             "ui::label",

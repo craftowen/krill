@@ -18,7 +18,7 @@ use krill_proto::control::AgentState;
 
 use super::{
     FONT_MONO, RADIUS_XS, STATE_DOT, TEXT_2XS, agent_state_color, icons, palette,
-    theme::AGENT_UNREAD,
+    theme::{AGENT_UNREAD, STATUS_GROUP_ICON, STATUS_GROUP_OVERLAP},
 };
 
 /// 3/4 링(위쪽이 빈 회전 스피너). 선 굵기는 6px 링에서 Orca `border-2`에 가깝게 잡았다.
@@ -235,13 +235,13 @@ pub fn summary_element(summary: &Summary<'_>, cx: &App) -> gpui::Div {
                         .items_center()
                         .children(g.icons.iter().enumerate().map(|(i, a)| {
                             div()
-                                .size(px(15.))
+                                .size(STATUS_GROUP_ICON)
                                 .flex_none()
                                 .flex()
                                 .items_center()
                                 .justify_center()
                                 .rounded_full()
-                                .when(i > 0, |d| d.ml(px(-3.)).bg(p.worktree_sidebar))
+                                .when(i > 0, |d| d.ml(STATUS_GROUP_OVERLAP).bg(p.worktree_sidebar))
                                 .child(agent_icon(a, super::ICON_SM, p.muted_foreground))
                         })),
                 )
