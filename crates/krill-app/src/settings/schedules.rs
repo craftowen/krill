@@ -148,17 +148,18 @@ pub fn format_command_args(args: &[String]) -> String {
 pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err("schedule command must not be empty".to_owned());
+        return Err(text::SCHEDULE_ERR_COMMAND_EMPTY.get().to_owned());
     }
     if trimmed.starts_with('[')
         && trimmed.ends_with(']')
         && let Ok(arr) = serde_json::from_str::<Vec<String>>(trimmed)
     {
         if arr.is_empty()
+            || arr.len() > 128
             || arr.first().is_none_or(|s| s.trim().is_empty())
-            || arr.iter().any(|s| s.contains('\0'))
+            || arr.iter().any(|s| s.contains('\0') || s.len() > 8192)
         {
-            return Err("invalid schedule command".to_owned());
+            return Err(text::SCHEDULE_ERR_COMMAND_INVALID.get().to_owned());
         }
         return Ok(arr);
     }
@@ -182,7 +183,7 @@ pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
                     quote = None;
                 } else if ch == '\\' {
                     let Some(next) = chars.next() else {
-                        return Err("unterminated escape in schedule command".to_owned());
+                        return Err(text::SCHEDULE_ERR_COMMAND_ESCAPE.get().to_owned());
                     };
                     match next {
                         '\\' | '"' => cur.push(next),
@@ -212,7 +213,7 @@ pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
                     quote = Some(Quote::Double);
                 } else if ch == '\\' {
                     let Some(next) = chars.next() else {
-                        return Err("unterminated escape in schedule command".to_owned());
+                        return Err(text::SCHEDULE_ERR_COMMAND_ESCAPE.get().to_owned());
                     };
                     in_token = true;
                     cur.push(next);
@@ -224,16 +225,16 @@ pub fn parse_command_args(raw: &str) -> Result<Vec<String>, String> {
         }
     }
     if quote.is_some() {
-        return Err("unclosed quote in schedule command".to_owned());
+        return Err(text::SCHEDULE_ERR_COMMAND_QUOTE.get().to_owned());
     }
     if in_token {
         args.push(cur);
     }
-    if args.is_empty()
-        || args.first().is_none_or(|s| s.trim().is_empty())
-        || args.iter().any(|s| s.contains('\0'))
-    {
-        return Err("schedule command must not be empty".to_owned());
+    if args.is_empty() || args.first().is_none_or(|s| s.trim().is_empty()) {
+        return Err(text::SCHEDULE_ERR_COMMAND_EMPTY.get().to_owned());
+    }
+    if args.len() > 128 || args.iter().any(|s| s.contains('\0') || s.len() > 8192) {
+        return Err(text::SCHEDULE_ERR_COMMAND_INVALID.get().to_owned());
     }
     Ok(args)
 }
@@ -409,7 +410,7 @@ impl SettingsView {
             fail(
                 modal,
                 &mut self.schedule_error,
-                "schedule ID must be 1..=64 ASCII letters, digits, _ or -".to_owned(),
+                text::SCHEDULE_ERR_ID.get().to_owned(),
                 cx,
             );
             return;
@@ -418,13 +419,18 @@ impl SettingsView {
             fail(
                 modal,
                 &mut self.schedule_error,
-                "schedule cwd must be a non-empty absolute path".to_owned(),
+                text::SCHEDULE_ERR_CWD.get().to_owned(),
                 cx,
             );
             return;
         }
-        if let Err(err) = krill_proto::schedule::Cron::parse(&cron) {
-            fail(modal, &mut self.schedule_error, err.to_string(), cx);
+        if krill_proto::schedule::Cron::parse(&cron).is_err() {
+            fail(
+                modal,
+                &mut self.schedule_error,
+                text::SCHEDULE_ERR_CRON.get().to_owned(),
+                cx,
+            );
             return;
         }
         let command = match parse_command_args(&cmd_raw) {
@@ -434,11 +440,23 @@ impl SettingsView {
                 return;
             }
         };
-        if prompt.is_empty() || prompt.contains('\0') {
+        if prompt.contains('\0') || prompt.len() > 32 * 1024 {
             fail(
                 modal,
                 &mut self.schedule_error,
-                "schedule prompt must not be empty".to_owned(),
+                text::SCHEDULE_ERR_PROMPT.get().to_owned(),
+                cx,
+            );
+            return;
+        }
+        if precheck
+            .as_ref()
+            .is_some_and(|s| s.contains('\0') || s.len() > 8192)
+        {
+            fail(
+                modal,
+                &mut self.schedule_error,
+                text::SCHEDULE_ERR_PRECHECK.get().to_owned(),
                 cx,
             );
             return;
