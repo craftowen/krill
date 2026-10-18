@@ -262,7 +262,8 @@ pub struct SavedFileState {
     pub preview: bool,
 }
 
-/// OWE-842: v6 본문(`hosts` 뒤)에 붙는 확장 상태(창 크기·위치·전체화면, 좌·우 사이드바 열림/탭, 파일 커서/미리보기).
+/// OWE-842: v6 본문(`hosts` 뒤)에 붙는 확장 상태(창 크기·위치·전체화면, 좌·우 사이드바 열림/탭,
+/// 파일 커서·미리보기, 시나리오 B 재스폰용 최신 cwd).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct LayoutTail {
     window_bounds: Option<SavedWindowBounds>,
@@ -270,6 +271,31 @@ struct LayoutTail {
     panel_collapsed: bool,
     panel_tab: crate::diff::PanelTab,
     file_states: BTreeMap<PaneId, SavedFileState>,
+    /// 셸 내부 `cd` 포함 최신 라이브 cwd(칸별). `launches`의 폴더(워크트리 루트·Open in 기준)와 분리 보관한다.
+    respawn_cwds: BTreeMap<PaneId, Vec<u8>>,
+}
+
+/// `respawn_cwds`가 붙기 전 OWE-842 중간 형식의 5-필드 꼬리. 새 꼬리 디코딩에 실패할 때만 구 꼬리로 읽는다.
+#[derive(Deserialize)]
+struct LegacyTail {
+    window_bounds: Option<SavedWindowBounds>,
+    sidebar_collapsed: bool,
+    panel_collapsed: bool,
+    panel_tab: crate::diff::PanelTab,
+    file_states: BTreeMap<PaneId, SavedFileState>,
+}
+
+impl From<LegacyTail> for LayoutTail {
+    fn from(old: LegacyTail) -> Self {
+        Self {
+            window_bounds: old.window_bounds,
+            sidebar_collapsed: old.sidebar_collapsed,
+            panel_collapsed: old.panel_collapsed,
+            panel_tab: old.panel_tab,
+            file_states: old.file_states,
+            respawn_cwds: BTreeMap::new(),
+        }
+    }
 }
 
 /// 창 하나의 레이아웃. 불변식: 탭이 있으면 `active < tabs.len()`(없으면 `active == 0`), 각 탭의 `focused`는 그 탭의 잎.
@@ -298,6 +324,9 @@ pub struct Layout {
     pub panel_tab: crate::diff::PanelTab,
     #[serde(skip)]
     file_states: BTreeMap<PaneId, SavedFileState>,
+    /// 시나리오 B 재스폰용 최신 라이브 cwd(칸별, 디스크에는 꼬리로 영속). `launches`와 분리.
+    #[serde(skip)]
+    respawn_cwds: BTreeMap<PaneId, Vec<u8>>,
     #[serde(skip)]
     mru: MruState,
 }
@@ -375,6 +404,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             panel_collapsed: false,
             panel_tab: crate::diff::PanelTab::default(),
             file_states: BTreeMap::new(),
+            respawn_cwds: BTreeMap::new(),
             mru: MruState::default(),
         };
         layout.record_mru(layout.active);
@@ -399,6 +429,7 @@ impl Default for Layout {
             panel_collapsed: false,
             panel_tab: crate::diff::PanelTab::default(),
             file_states: BTreeMap::new(),
+            respawn_cwds: BTreeMap::new(),
             mru: MruState {
                 order: vec![0],
                 cursor: None,
@@ -534,6 +565,25 @@ impl Layout {
         self.files.get(&pane).map(PathBuf::as_path)
     }
 
+    /// 시나리오 B 재스폰용 최신 라이브 cwd(셸 내부 `cd` 반영). 없으면 `launches`의 폴더를 쓴다.
+    /// `launches`의 cwd(워크트리 루트 유지)와 분리 보관하므로 `folder()`·Open in에 영향을 주지 않는다.
+    #[must_use]
+    pub fn respawn_cwd(&self, pane: PaneId) -> Option<&[u8]> {
+        self.respawn_cwds.get(&pane).map(Vec::as_slice)
+    }
+
+    /// 재스폰용 최신 cwd를 갱신한다. 값이 바뀌었을 때만 `true`를 돌려준다.
+    pub fn set_respawn_cwd(&mut self, pane: PaneId, cwd: Vec<u8>) -> bool {
+        if cwd.is_empty() || !self.panes().contains(&pane) {
+            return false;
+        }
+        if self.respawn_cwds.get(&pane) == Some(&cwd) {
+            return false;
+        }
+        self.respawn_cwds.insert(pane, cwd);
+        true
+    }
+
     /// 파일 칸들(모든 탭).
     pub fn files(&self) -> impl Iterator<Item = (PaneId, &Path)> {
         self.files.iter().map(|(p, f)| (*p, f.as_path()))
@@ -641,6 +691,7 @@ impl Layout {
         self.hosts.retain(|p, _| live.contains(p));
         self.files.retain(|p, _| live.contains(p));
         self.file_states.retain(|p, _| self.files.contains_key(p));
+        self.respawn_cwds.retain(|p, _| live.contains(p));
     }
 
     fn alloc_pane(&mut self) -> PaneId {
@@ -990,6 +1041,7 @@ impl Layout {
             panel_collapsed: self.panel_collapsed,
             panel_tab: self.panel_tab,
             file_states: self.file_states.clone(),
+            respawn_cwds: self.respawn_cwds.clone(),
         }
     }
 
@@ -999,6 +1051,7 @@ impl Layout {
         self.panel_collapsed = tail.panel_collapsed;
         self.panel_tab = tail.panel_tab;
         self.file_states = tail.file_states;
+        self.respawn_cwds = tail.respawn_cwds;
     }
 
     fn is_valid(&self) -> bool {
@@ -1033,11 +1086,8 @@ impl Layout {
                 .iter()
                 .all(|(p, h)| seen.contains(p) && !h.is_local())
             && self.window_bounds.is_none_or(SavedWindowBounds::is_valid)
-            && self
-                .files
-                .keys()
-                .all(|p| seen.contains(p) && !self.sessions.contains_key(p))
             && self.file_states.keys().all(|p| self.files.contains_key(p))
+            && self.respawn_cwds.keys().all(|p| seen.contains(p))
     }
 
     /// 손상 백업(`.corrupt`)을 만들지 않고 저장 파일에서 창 위치·크기만 미리 읽는다.
@@ -1100,7 +1150,11 @@ impl Layout {
                         .map_err(|e| invalid(&e.to_string()))?;
                     l.hosts = hosts;
                     if !rest.is_empty() {
+                        // 6-필드 꼬리(OWE-842 `respawn_cwds` 포함)가 아니면 중간 커밋의 5-필드 꼬리로 읽는다.
                         let tail = postcard::from_bytes::<LayoutTail>(rest)
+                            .or_else(|_| {
+                                postcard::from_bytes::<LegacyTail>(rest).map(LayoutTail::from)
+                            })
                             .map_err(|e| invalid(&e.to_string()))?;
                         l.apply_tail(tail);
                     }

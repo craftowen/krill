@@ -791,7 +791,9 @@ impl Shell {
         shell
     }
 
-    /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 `layout.launches`에 동기화한다(OWE-842 시나리오 B).
+    /// 사이드바가 데몬에서 읽은 라이브 세션들의 최신 `cwd`를 재스폰용으로 따로 보관한다(OWE-842 시나리오 B).
+    /// `layout.launches`의 폴더(워크트리 루트·`folder()`·Open in·새 에이전트 기준)는 건드리지 않는다.
+    /// 재부팅 뒤에도 살아남도록 꼬리(`LayoutTail.respawn_cwds`)로 영속한다.
     pub(super) fn sync_live_cwds(&mut self, sidebar: &sidebar::Sidebar) {
         let mut changed = false;
         let panes: Vec<PaneId> = (0..self.layout.tabs().len())
@@ -810,17 +812,8 @@ impl Shell {
                 continue;
             };
             let cwd_bytes = live_cwd.as_os_str().as_bytes();
-            let mut launch = self.layout.launch(pane).cloned().unwrap_or(Create {
-                account: None,
-                program: Program::Login,
-                cwd: cwd_bytes.to_vec(),
-                cols: pane::SIZE.0,
-                rows: pane::SIZE.1,
-            });
-            if launch.cwd != cwd_bytes || self.layout.launch(pane).is_none() {
-                launch.cwd = cwd_bytes.to_vec();
-                self.layout.set_launch(pane, launch);
-                changed = true;
+            if self.layout.respawn_cwd(pane) != Some(cwd_bytes) {
+                changed |= self.layout.set_respawn_cwd(pane, cwd_bytes.to_vec());
             }
         }
         if changed {
@@ -1852,6 +1845,13 @@ impl Shell {
                     let mut launch = t.launch_for(pane);
                     if let Some((cols, rows)) = l.pane.grid() {
                         (launch.cols, launch.rows) = (cols, rows); // 새 세션도 칸 크기로(OWE-534)
+                    }
+                    // OWE-842: 죽은 세션 자리 재스폰은 셸 내부 `cd` 포함 최신 cwd로.
+                    // 폴더(`launches`)는 워크트리 루트를 유지하므로 세션 없는 새 칸에는 덮지 않는다.
+                    if want.is_some()
+                        && let Some(respawn) = t.layout.respawn_cwd(pane)
+                    {
+                        launch.cwd = respawn.to_vec();
                     }
                     Some((want, want.and_then(|w| l.pane.known(w)), launch))
                 }) else {
