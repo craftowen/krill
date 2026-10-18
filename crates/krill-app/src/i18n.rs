@@ -1672,9 +1672,9 @@ catalog! {
         FOLDER_DOWNLOADS => ("다운로드", "Downloads"),
     }
     orca_import {
-        TITLE => ("Orca 설정·계정·프로젝트 가져오기 (Import from Orca)", "Import settings, accounts & projects from Orca"),
+        TITLE => ("Orca 설정·계정·프로젝트 가져오기", "Import settings, accounts & projects from Orca"),
         SUBTITLE => ("이 Mac에서 Orca 데이터를 감지했습니다. 원하는 항목만 골라 재시작 없이 바로 가져옵니다.", "Detected existing Orca data on this Mac. Choose categories to import immediately without restarting."),
-        MODAL_TITLE => ("Orca에서 가져오기 (Import from Orca)", "Import from Orca"),
+        MODAL_TITLE => ("Orca에서 가져오기", "Import from Orca"),
         MODAL_SUBTITLE => ("가져올 카테고리를 선택하세요. 원본 Orca 파일은 변경하거나 삭제하지 않습니다.", "Choose categories to import. Your original Orca files are never modified or deleted."),
         SUMMARY => ("Claude 계정 {claude}개 · Codex 계정 {codex}개 · 원격 호스트 {ssh}개 · 프로젝트/폴더 {projects}개 · 워크트리 메타 {worktrees}개 · 빠른 명령/스케줄 {commands}개", "Claude accounts {claude} · Codex accounts {codex} · Remote hosts {ssh} · Projects/folders {projects} · Worktree metadata {worktrees} · Quick commands/schedules {commands}"),
         SCANNING => ("Orca 데이터 스캔 중…", "Scanning Orca data…"),
