@@ -510,12 +510,13 @@ fn watch_action(
 
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "loaded, visible, active, and force_next are independent orthogonal panel flags"
+    reason = "loaded, visible, active, force_next, and single-click preview are independent orthogonal panel flags (OWE-849)"
 )]
 pub struct Panel {
     repo: PathBuf,
     tab: PanelTab,
     explorer: Explorer,
+    open_file_preview: bool,
     search: WorkspaceSearch,
     pending_diff_path: Option<Vec<u8>>,
     changes: Changes,
@@ -591,6 +592,7 @@ impl Panel {
             repo,
             tab: PanelTab::default(),
             explorer,
+            open_file_preview: false,
             search,
             pending_diff_path: None,
             changes: Changes::default(),
@@ -620,6 +622,17 @@ impl Panel {
         }
     }
 
+    /// 직전 `OpenFile` 이벤트가 단일 클릭 미리보기(preview) 열기인지 반환한다.
+    #[must_use]
+    pub fn last_open_file_preview(&self) -> bool {
+        self.open_file_preview
+    }
+
+    /// 직전 `OpenFile` 이벤트의 미리보기(preview) 플래그를 꺼내고 `false`로 초기화한다.
+    pub fn take_open_file_preview(&mut self) -> bool {
+        std::mem::replace(&mut self.open_file_preview, false)
+    }
+
     pub fn connect(&mut self, target: impl Into<HostTarget>, cx: &mut Context<Self>) {
         let target = target.into();
         self.editing.connect(target.clone());
@@ -642,8 +655,10 @@ impl Panel {
         }
         self.review = comments::Review::default();
         self.editing.reset_repo();
-        self.explorer
-            .set_repo(repo.clone(), self.tab == PanelTab::Files);
+        self.explorer.set_repo(repo.clone(), false);
+        if self.tab == PanelTab::Files {
+            self.ensure_explorer_loaded_async(cx);
+        }
         self.search
             .set_repo(repo.clone(), self.tab == PanelTab::Search);
         if self.tab == PanelTab::Search && !self.search.options.query.trim().is_empty() {
@@ -875,6 +890,27 @@ impl Panel {
         let idx = self.selected?;
         let file = self.changes.files.get(idx)?;
         Some(String::from_utf8_lossy(&file.path).into_owned())
+    }
+
+    /// 파일 칸 헤더에 보여줄 경로(OWE-849): 워크트리 상대 경로를 우선하고,
+    /// 홈 아래면 `~`로 축약하며, 그 외에만 절대 경로를 그대로 보인다.
+    #[must_use]
+    pub fn display_path(&self, path: &Path) -> String {
+        if let Ok(rel) = path.strip_prefix(&self.repo) {
+            let text = rel.to_string_lossy().replace('\\', "/");
+            if !text.is_empty() {
+                return text;
+            }
+        }
+        let home = crate::accounts::default_home();
+        if let Ok(rel) = path.strip_prefix(&home) {
+            let text = rel.to_string_lossy().replace('\\', "/");
+            if !text.is_empty() {
+                return format!("~/{text}");
+            }
+            return String::from("~");
+        }
+        path.display().to_string()
     }
 
     /// 지정된 워크트리 내 상대 경로 파일의 Diff 뷰를 우측 패널(`Changes` 탭)에 연다(`krill file diff`).
@@ -1153,8 +1189,7 @@ impl Panel {
                                 .accessibility_label(text::REFRESH.get())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     if this.tab == PanelTab::Files {
-                                        this.explorer.refresh();
-                                        cx.notify();
+                                        this.refresh_explorer_async(cx);
                                     } else if this.tab == PanelTab::Search {
                                         this.spawn_async_search(cx);
                                     } else {
@@ -1365,6 +1400,7 @@ impl Panel {
             .child(self.edit_button(i, Comparison::Worktree, cx))
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 if e.click_count() >= 2 {
+                    this.open_file_preview = false;
                     cx.emit(OpenFile(open.clone()));
                 } else {
                     this.select(i, cx);
@@ -1375,8 +1411,11 @@ impl Panel {
                 menu.item(
                     gpui_component::menu::PopupMenuItem::new(text::OPEN_IN_EDITOR.get()).on_click(
                         move |_, _, cx| {
-                            weak.update(cx, |_, cx| cx.emit(OpenFile(full.clone())))
-                                .ok();
+                            weak.update(cx, |this, cx| {
+                                this.open_file_preview = false;
+                                cx.emit(OpenFile(full.clone()));
+                            })
+                            .ok();
                         },
                     ),
                 )
