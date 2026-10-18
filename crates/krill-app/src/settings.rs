@@ -1845,6 +1845,8 @@ pub struct SettingsView {
     ),
     /// 에이전트 카드의 추가 인자·환경변수 편집(OWE-657). 에이전트 탭을 처음 그릴 때 만든다.
     agent_edits: std::collections::BTreeMap<&'static str, AgentEdit>,
+    /// 에이전트 탭에서 인자·환경변수 편집기를 펼친 에이전트 id 집합(OWE-796). 기본 접힘.
+    agent_expanded: std::collections::BTreeSet<&'static str>,
     /// 사이드바 설정 검색 입력(OWE-656). 창이 필요해 처음 그릴 때 만든다.
     search: Option<(
         gpui::Entity<gpui_component::input::InputState>,
@@ -1951,6 +1953,7 @@ impl SettingsView {
             workspace_trust_confirm_pending: false,
             identities: Default::default(),
             agent_edits: std::collections::BTreeMap::new(),
+            agent_expanded: std::collections::BTreeSet::new(),
             search: None,
             shortcuts: shortcuts::Recorder::default(),
             workflow_form: None,
@@ -4758,8 +4761,8 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        use gpui_component::Sizable as _;
         let p = crate::ui::palette(cx);
-        let row = || layout::row(p);
         let default_agent_btns = [
             ("claude", "Claude Code"),
             ("codex", "Codex"),
@@ -4770,51 +4773,118 @@ impl SettingsView {
         .into_iter()
         .map(|(agent_id, label)| {
             let btn_id = format!("admin-default-agent-{agent_id}");
+            let check_id = format!("admin-default-agent-check-{agent_id}");
             let selected = s.default_agent == agent_id;
-            layout::segment(
-                gpui::ElementId::Name(btn_id.clone().into()),
-                label,
-                selected,
-            )
-            .icon(gpui_component::Icon::default().data(crate::ui::icons::agent_svg_bytes(agent_id)))
-            .debug_selector(move || btn_id.clone())
-            .on_click(move |_, _, cx| {
-                edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
-            })
+            div()
+                .id(gpui::ElementId::Name(btn_id.clone().into()))
+                .debug_selector(move || btn_id.clone())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1p5()
+                .rounded(crate::ui::RADIUS_SM)
+                .border_1()
+                .cursor_pointer()
+                .text_size(crate::ui::TEXT_SM)
+                .when(selected, |d| {
+                    d.border_color(p.muted_foreground.opacity(0.4))
+                        .bg(p.accent)
+                        .text_color(p.accent_foreground)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                })
+                .when(!selected, |d| {
+                    d.border_color(p.border)
+                        .bg(p.background.opacity(0.5))
+                        .text_color(p.muted_foreground)
+                        .hover(|st| {
+                            st.border_color(p.muted_foreground.opacity(0.35))
+                                .text_color(p.foreground)
+                        })
+                })
+                .on_click(move |_, _, cx| {
+                    edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
+                })
+                .child(crate::ui::icons::agent_brand_icon(
+                    agent_id,
+                    14.,
+                    if selected {
+                        p.accent_foreground
+                    } else {
+                        p.muted_foreground
+                    },
+                ))
+                .child(label)
+                .when(selected, |d| {
+                    d.child(
+                        div()
+                            .id(gpui::ElementId::Name(check_id.clone().into()))
+                            .debug_selector(move || check_id.clone())
+                            .flex()
+                            .items_center()
+                            .child(
+                                gpui_component::Icon::new(gpui_component::IconName::Check).xsmall(),
+                            ),
+                    )
+                })
         });
-        let default_agent_row = row()
+        let default_agent_row = layout::card(p)
+            .id("admin-default-agent-card")
+            .debug_selector(|| "admin-default-agent-card".into())
+            .flex()
+            .flex_col()
+            .gap_2p5()
             .child(layout::label(
                 p,
                 text::DEFAULT_AGENT_TITLE.get(),
                 Some(text::DEFAULT_AGENT_DESC.get()),
             ))
-            .child(layout::controls().child(layout::segmented_control(p, default_agent_btns)));
+            .child(
+                layout::controls()
+                    .w_full()
+                    .min_w_0()
+                    .flex_wrap()
+                    .gap_2()
+                    .children(default_agent_btns),
+            );
 
-        // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다.
-        let yolo_row = row()
+        // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
+        let yolo_seg = layout::segment("admin-yolo-yolo", text::YOLO_MODE_YOLO.get(), s.yolo_mode)
+            .debug_selector(|| "admin-yolo-yolo".into())
+            .on_click(|_, _, cx| {
+                cx.global_mut::<Config>().pending_permission =
+                    Some(krill_proto::agent::Permission::Yolo);
+                edit(cx, |s| s.yolo_mode = true);
+            });
+        let manual_seg = layout::segment(
+            "admin-yolo-manual",
+            text::YOLO_MODE_MANUAL.get(),
+            !s.yolo_mode,
+        )
+        .debug_selector(|| "admin-yolo-manual".into())
+        .on_click(|_, _, cx| {
+            cx.global_mut::<Config>().pending_permission =
+                Some(krill_proto::agent::Permission::Manual);
+            edit(cx, |s| s.yolo_mode = false);
+        });
+        let yolo_row = layout::row(p)
             .child(layout::label(
                 p,
                 text::YOLO_TITLE.get(),
                 Some(text::YOLO_DESC.get()),
             ))
-            .child(layout::controls().child(layout::switch(
-                p,
-                "admin-yolo-toggle",
-                s.yolo_mode,
-                false,
-                |next, _, cx| {
-                    cx.global_mut::<Config>().pending_permission = Some(if next {
-                        krill_proto::agent::Permission::Yolo
-                    } else {
-                        krill_proto::agent::Permission::Manual
-                    });
-                    edit(cx, |s| s.yolo_mode = next);
-                },
-            )));
+            .child(
+                layout::controls().child(
+                    layout::segmented_control(p, [yolo_seg, manual_seg])
+                        .id("admin-yolo-toggle")
+                        .debug_selector(|| "admin-yolo-toggle".into()),
+                ),
+            );
 
         // 유휴 동면은 `settings.toml` + 상태 디렉터리의 `hibernation.enabled` 표식으로 데몬에
         // 전달한다(OWE-655). 표식 동기화는 `edit`·`reload`가 맡는다.
-        let hib_row = row()
+        let hib_row = layout::row(p)
             .child(layout::label(
                 p,
                 text::HIBERNATION_TITLE.get(),
@@ -4828,7 +4898,7 @@ impl SettingsView {
                 |next, _, cx| edit(cx, |s| s.hibernation_enabled = next),
             )));
 
-        let auto_setup_row = row()
+        let auto_setup_row = layout::row(p)
             .child(layout::label(
                 p,
                 text::AUTO_SETUP_ALL_TITLE.get(),
@@ -4904,15 +4974,7 @@ impl SettingsView {
         }
         let effective = krill_proto::agent::Agents::load(user_agents.as_deref())
             .unwrap_or_else(|_| builtin_agents.clone());
-        for agent_id in ["claude", "codex", "agy", "cursor", "opencode"] {
-            root = root.child(self.render_agent_profile_card(
-                agent_id,
-                &builtin_agents,
-                &effective,
-                window,
-                cx,
-            ));
-        }
+        root = root.child(self.render_agent_catalog_card(&builtin_agents, &effective, window, cx));
         root.child(self.render_skills_card(cx))
             .children(self.render_agent_extra_rows(s, cx))
     }
@@ -4920,8 +4982,7 @@ impl SettingsView {
     #[inline(never)]
     fn render_agent_extra_rows(&mut self, s: &Settings, cx: &mut Context<Self>) -> Vec<gpui::Div> {
         let p = crate::ui::palette(cx);
-        let row = || layout::row(p);
-        let auto_rename_row = row()
+        let auto_rename_row = layout::row(p)
             .child(layout::label(
                 p,
                 text::AUTO_RENAME_BRANCH.get(),
@@ -4935,20 +4996,6 @@ impl SettingsView {
                 |next, _, cx| edit(cx, |s| s.auto_rename_branch_from_work = next),
             )));
 
-        let cache_timer_row = row()
-            .child(layout::label(
-                p,
-                text::PROMPT_CACHE_TIMER.get(),
-                Some(text::PROMPT_CACHE_TIMER_DESC.get()),
-            ))
-            .child(layout::controls().child(layout::switch(
-                p,
-                "prompt-cache-timer-toggle",
-                s.prompt_cache_timer_enabled,
-                false,
-                |next, _, cx| edit(cx, |s| s.prompt_cache_timer_enabled = next),
-            )));
-
         let is_1h = s.prompt_cache_ttl_secs >= 3_600;
         let ttl_5m = layout::segment("prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
             .debug_selector(|| "prompt-cache-ttl-5m".into())
@@ -4956,17 +5003,62 @@ impl SettingsView {
         let ttl_1h = layout::segment("prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
             .debug_selector(|| "prompt-cache-ttl-1h".into())
             .on_click(|_, _, cx| edit(cx, |s| s.prompt_cache_ttl_secs = 3_600));
-        let cache_ttl_row = row()
-            .child(layout::label(
-                p,
-                text::PROMPT_CACHE_TTL.get(),
-                Some(text::PROMPT_CACHE_TTL_DESC.get()),
-            ))
-            .child(layout::controls().child(layout::segmented_control(p, [ttl_5m, ttl_1h])));
+        let cache_timer_card = layout::card(p)
+            .debug_selector(|| "prompt-cache-timer-card".into())
+            .flex()
+            .flex_col()
+            .gap_2p5()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(layout::label(
+                        p,
+                        text::PROMPT_CACHE_TIMER.get(),
+                        Some(text::PROMPT_CACHE_TIMER_DESC.get()),
+                    ))
+                    .child(layout::controls().child(layout::switch(
+                        p,
+                        "prompt-cache-timer-toggle",
+                        s.prompt_cache_timer_enabled,
+                        false,
+                        |next, _, cx| edit(cx, |s| s.prompt_cache_timer_enabled = next),
+                    ))),
+            )
+            .when(s.prompt_cache_timer_enabled, |d| {
+                d.child(
+                    div()
+                        .id("prompt-cache-ttl-row")
+                        .debug_selector(|| "prompt-cache-ttl-row".into())
+                        .w_full()
+                        .min_w_0()
+                        .pl_6()
+                        .pt_2()
+                        .border_t_1()
+                        .border_color(p.border)
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .child(layout::label(
+                            p,
+                            text::PROMPT_CACHE_TTL.get(),
+                            Some(text::PROMPT_CACHE_TTL_DESC.get()),
+                        ))
+                        .child(
+                            layout::controls()
+                                .child(layout::segmented_control(p, [ttl_5m, ttl_1h])),
+                        ),
+                )
+            });
 
         let view = cx.entity();
         let mut workspace_trust_section = div().w_full().min_w_0().flex().flex_col().gap_2().child(
-            row()
+            layout::row(p)
                 .child(layout::label(
                     p,
                     text::WORKSPACE_TRUST_PRESET.get(),
@@ -5051,24 +5143,82 @@ impl SettingsView {
                     ),
             );
         }
-        vec![
-            auto_rename_row,
-            cache_timer_row,
-            cache_ttl_row,
-            workspace_trust_section,
-        ]
+        vec![auto_rename_row, cache_timer_card, workspace_trust_section]
     }
 
     #[inline(never)]
-    fn render_agent_profile_card(
+    fn render_agent_catalog_card(
         &mut self,
+        builtin_agents: &krill_proto::agent::Agents,
+        effective: &krill_proto::agent::Agents,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let p = crate::ui::palette(cx);
+        let mut card = layout::card(p)
+            .id("admin-agents-catalog-card")
+            .debug_selector(|| "admin-agents-catalog-card".into())
+            .flex()
+            .flex_col()
+            .gap_0()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .pb_2p5()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(layout::label(
+                        p,
+                        text::AGENTS_PROFILES_TITLE.get(),
+                        Some(text::AGENTS_PROFILES_DESC.get()),
+                    ))
+                    .child(
+                        layout::controls().child(
+                            layout::secondary(
+                                "admin-agents-open-toml",
+                                text::AGENTS_OPEN_TOML.get(),
+                            )
+                            .icon(gpui_component::IconName::ExternalLink)
+                            .debug_selector(|| "admin-agents-open-toml".into())
+                            .on_click(|_, _, cx| {
+                                open_file(krill_proto::agent::FILE_NAME, "", cx);
+                            }),
+                        ),
+                    ),
+            );
+        for (idx, agent_id) in ["claude", "codex", "agy", "cursor", "opencode"]
+            .into_iter()
+            .enumerate()
+        {
+            card = card.child(self.render_agent_catalog_row(
+                idx,
+                agent_id,
+                builtin_agents,
+                effective,
+                window,
+                cx,
+            ));
+        }
+        card
+    }
+
+    #[inline(never)]
+    fn render_agent_catalog_row(
+        &mut self,
+        idx: usize,
         agent_id: &'static str,
         builtin_agents: &krill_proto::agent::Agents,
         effective: &krill_proto::agent::Agents,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui::Stateful<gpui::Div> {
         use gpui_component::Sizable as _;
+        use krill_proto::doctor::Status as DoctorStatus;
         use krill_proto::usage::ProviderKind;
         let p = crate::ui::palette(cx);
         let display_name = builtin_agents
@@ -5077,6 +5227,42 @@ impl SettingsView {
             .map_or(agent_id, |prof| prof.name.as_str())
             .to_owned();
         let provider = ProviderKind::parse(agent_id);
+        let checks = crate::onboarding::snapshot(cx).checks;
+        let agent_check_id = format!("agent.{agent_id}");
+        let hook_check_id = format!("hook.{agent_id}");
+        let doctor_version = checks
+            .iter()
+            .find(|c| c.id == agent_check_id && c.status == DoctorStatus::Ok)
+            .map(|c| c.detail.trim().to_owned())
+            .filter(|d| !d.is_empty() && d != "version unknown");
+        let doctor_not_installed = checks
+            .iter()
+            .any(|c| c.id == hook_check_id && c.status == DoctorStatus::Skip);
+        let is_installed = if doctor_version.is_some()
+            || checks
+                .iter()
+                .any(|c| c.id == agent_check_id && c.status == DoctorStatus::Ok)
+        {
+            true
+        } else if doctor_not_installed {
+            false
+        } else {
+            provider.is_none_or(|prov| crate::accounts::installed::is_installed(cx, prov))
+        };
+        let (badge_tone, badge_text) = if is_installed {
+            let text = match &doctor_version {
+                Some(ver) => format!("{} · {ver}", crate::i18n::catalog::onboarding::READY.get()),
+                None => crate::i18n::catalog::onboarding::READY.get().to_owned(),
+            };
+            (crate::ui::BadgeTone::Success, text)
+        } else {
+            (
+                crate::ui::BadgeTone::Muted,
+                text::CONNECTION_NOT_INSTALLED.get().to_owned(),
+            )
+        };
+        let badge_id = format!("admin-agent-installed-badge-{agent_id}");
+
         let profile_count = provider.map_or(1usize, |prov| {
             self.accounts_snapshot
                 .accounts
@@ -5106,12 +5292,48 @@ impl SettingsView {
                 text::PROFILES_UNIT.get()
             ),
         };
+        let eff_prof = effective.profiles.get(agent_id);
+        let cmd_name = eff_prof
+            .and_then(krill_proto::agent::Profile::program)
+            .unwrap_or(agent_id);
+        let eff_args = eff_prof
+            .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
+            .unwrap_or_default();
+        let eff_env = eff_prof
+            .map(|p| {
+                p.env
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .unwrap_or_default();
+        let mut launch_summary = cmd_name.to_owned();
+        if !eff_args.is_empty() {
+            launch_summary.push(' ');
+            launch_summary.push_str(&eff_args);
+        }
+        if !eff_env.is_empty() {
+            launch_summary.push(' ');
+            launch_summary.push_str(&eff_env);
+        }
+        let summary_text = format!("{launch_summary} · {dir_info}");
+        let summary_id = format!("admin-agent-summary-{agent_id}");
+
         let hook_cmd = format!("krill hook install {agent_id}");
         let hook_id = format!("admin-agent-hook-{agent_id}");
         let hook_copy = hook_cmd.clone();
         let id_owned = agent_id.to_owned();
         let install_cmd = agent_install_command(agent_id);
         let install_id = format!("admin-agent-install-{agent_id}");
+        let builtin_prof = builtin_agents.profiles.get(agent_id);
+        let default_args = builtin_prof
+            .map(|p| p.launch.get(1..).unwrap_or_default().join(" "))
+            .unwrap_or_default();
+        let default_env = builtin_prof
+            .map(|p| krill_proto::agent::format_env_lines(&p.env))
+            .unwrap_or_default();
+
         let edit_state = self.agent_edits.entry(agent_id).or_insert_with(|| {
             let prof = effective.profiles.get(agent_id);
             let args = prof
@@ -5134,11 +5356,19 @@ impl SettingsView {
         });
         let (args_input, env_input) = (edit_state.args.clone(), edit_state.env.clone());
         let status = edit_state.status.clone();
+        let is_open = self.agent_expanded.contains(agent_id);
+        let toggle_id = format!("admin-agent-toggle-{agent_id}");
+        let header_id = format!("admin-agent-header-{agent_id}");
+        let editor_id = format!("admin-agent-editor-{agent_id}");
         let save_id = format!("admin-agent-save-{agent_id}");
-        let open_id = format!("admin-agent-open-toml-{agent_id}");
+        let reset_id = format!("admin-agent-reset-{agent_id}");
+
         let edit_section = div()
+            .id(gpui::ElementId::Name(editor_id.clone().into()))
+            .debug_selector(move || editor_id.clone())
             .w_full()
             .min_w_0()
+            .pl_9()
             .flex()
             .flex_col()
             .gap_1p5()
@@ -5182,32 +5412,90 @@ impl SettingsView {
                             let args = edit.args.read(cx).value();
                             let env = edit.env.read(cx).value();
                             let saved = match state_dir(cx) {
-                                Some(dir) => save_agent_profile(&dir, agent_id, &args, &env),
+                                Some(dir) => {
+                                    let res = save_agent_profile(&dir, agent_id, &args, &env);
+                                    if res.is_ok() {
+                                        let path = dir.join(krill_proto::agent::FILE_NAME);
+                                        let stamp = std::fs::metadata(&path)
+                                            .and_then(|m| m.modified())
+                                            .ok();
+                                        this.agents_file_cache.0 =
+                                            Some((stamp, std::fs::read_to_string(&path).ok()));
+                                    }
+                                    res
+                                }
                                 None => Err("no state dir".to_owned()),
                             };
-                            edit.status = Some(match saved {
-                                Ok(()) => (text::AGENT_SAVED.get().into(), false),
-                                Err(e) => (e.into(), true),
-                            });
+                            if let Some(edit) = this.agent_edits.get_mut(agent_id) {
+                                edit.status = Some(match saved {
+                                    Ok(()) => (text::AGENT_SAVED.get().into(), false),
+                                    Err(e) => (e.into(), true),
+                                });
+                            }
                             cx.notify();
                         })),
                     )
                     .child(
-                        layout::secondary(
-                            gpui::ElementId::Name(open_id.clone().into()),
-                            text::AGENTS_OPEN_TOML.get(),
+                        layout::ghost(
+                            gpui::ElementId::Name(reset_id.clone().into()),
+                            text::AGENT_RESET.get(),
                         )
-                        .debug_selector(move || open_id.clone())
-                        .on_click(|_, _, cx| {
-                            open_file(krill_proto::agent::FILE_NAME, "", cx);
-                        }),
+                        .debug_selector(move || reset_id.clone())
+                        .on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                let Some(edit) = this.agent_edits.get(agent_id) else {
+                                    return;
+                                };
+                                let args_entity = edit.args.clone();
+                                let env_entity = edit.env.clone();
+                                let def_args = default_args.clone();
+                                let def_env = default_env.clone();
+                                args_entity.update(cx, |s, cx| {
+                                    s.set_value(def_args.clone(), window, cx);
+                                });
+                                env_entity.update(cx, |s, cx| {
+                                    s.set_value(def_env.clone(), window, cx);
+                                });
+                                let saved = match state_dir(cx) {
+                                    Some(dir) => {
+                                        let res =
+                                            save_agent_profile(&dir, agent_id, &def_args, &def_env);
+                                        if res.is_ok() {
+                                            let path = dir.join(krill_proto::agent::FILE_NAME);
+                                            let stamp = std::fs::metadata(&path)
+                                                .and_then(|m| m.modified())
+                                                .ok();
+                                            this.agents_file_cache.0 =
+                                                Some((stamp, std::fs::read_to_string(&path).ok()));
+                                        }
+                                        res
+                                    }
+                                    None => Err("no state dir".to_owned()),
+                                };
+                                if let Some(edit) = this.agent_edits.get_mut(agent_id) {
+                                    edit.status = match saved {
+                                        Ok(()) => None,
+                                        Err(e) => Some((e.into(), true)),
+                                    };
+                                }
+                                cx.notify();
+                            },
+                        )),
                     ),
             );
-        layout::card(p)
-            .debug_selector(move || format!("admin-agent-card-{agent_id}"))
+
+        let card_id = format!("admin-agent-card-{agent_id}");
+        div()
+            .id(gpui::ElementId::Name(card_id.clone().into()))
+            .debug_selector(move || card_id.clone())
+            .w_full()
+            .min_w_0()
+            .py_2p5()
             .flex()
             .flex_col()
-            .gap_3()
+            .gap_2p5()
+            .when(idx > 0, |d| d.border_t_1().border_color(p.border))
+            .when(!is_installed, |d| d.opacity(0.75))
             .child(
                 div()
                     .w_full()
@@ -5215,18 +5503,27 @@ impl SettingsView {
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_3()
+                    .gap_2()
                     .child(
                         div()
+                            .id(gpui::ElementId::Name(header_id.clone().into()))
+                            .debug_selector(move || header_id.clone())
                             .flex_1()
                             .min_w_0()
                             .flex()
                             .items_center()
-                            .gap_3()
+                            .gap_2p5()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if !this.agent_expanded.remove(agent_id) {
+                                    this.agent_expanded.insert(agent_id);
+                                }
+                                cx.notify();
+                            }))
                             .child(
                                 div()
                                     .flex_none()
-                                    .size(px(32.))
+                                    .size(px(28.))
                                     .rounded(crate::ui::RADIUS_SM)
                                     .bg(p.muted)
                                     .flex()
@@ -5234,7 +5531,7 @@ impl SettingsView {
                                     .justify_center()
                                     .child(crate::ui::icons::agent_brand_icon(
                                         agent_id,
-                                        18.,
+                                        16.,
                                         p.foreground,
                                     )),
                             )
@@ -5248,19 +5545,35 @@ impl SettingsView {
                                     .child(
                                         div()
                                             .min_w_0()
-                                            .truncate()
-                                            .text_size(crate::ui::TEXT_SM)
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .child(display_name),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .min_w_0()
+                                                    .truncate()
+                                                    .text_size(crate::ui::TEXT_SM)
+                                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                    .child(display_name),
+                                            )
+                                            .child(
+                                                crate::ui::badge(p, badge_tone, badge_text)
+                                                    .id(gpui::ElementId::Name(
+                                                        badge_id.clone().into(),
+                                                    ))
+                                                    .debug_selector(move || badge_id.clone()),
+                                            ),
                                     )
                                     .child(
                                         div()
+                                            .id(gpui::ElementId::Name(summary_id.clone().into()))
+                                            .debug_selector(move || summary_id.clone())
                                             .min_w_0()
                                             .truncate()
                                             .font_family(crate::ui::FONT_MONO)
                                             .text_size(crate::ui::TEXT_2XS)
                                             .text_color(p.muted_foreground)
-                                            .child(dir_info),
+                                            .child(summary_text),
                                     ),
                             ),
                     )
@@ -5327,10 +5640,32 @@ impl SettingsView {
                                         cx.notify();
                                     },
                                 )),
+                            )
+                            .child(
+                                Button::new(gpui::ElementId::Name(toggle_id.clone().into()))
+                                    .small()
+                                    .ghost()
+                                    .icon(if is_open {
+                                        gpui_component::IconName::ChevronDown
+                                    } else {
+                                        gpui_component::IconName::ChevronRight
+                                    })
+                                    .accessibility_label(if is_open {
+                                        text::AGENT_COLLAPSE.get()
+                                    } else {
+                                        text::AGENT_EXPAND.get()
+                                    })
+                                    .debug_selector(move || toggle_id.clone())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if !this.agent_expanded.remove(agent_id) {
+                                            this.agent_expanded.insert(agent_id);
+                                        }
+                                        cx.notify();
+                                    })),
                             ),
                     ),
             )
-            .child(edit_section)
+            .when(is_open, |d| d.child(edit_section))
     }
 
     #[inline(never)]
