@@ -17,7 +17,6 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 
-#[cfg(unix)]
 pub use krill_holder::link;
 use krill_proto::SessionId;
 use krill_proto::holder::{Error as WireError, FromHolder, ToHolder};
@@ -26,55 +25,11 @@ use self::link::{Link, Packet};
 use crate::os::{BorrowedFd, OwnedFd};
 use crate::session::lock;
 
-/// Windows판 [`krill_holder::link`](OWE-820, 컴파일 전용). holder 링크가 없어 보내기·받기가 모두
-/// [`io::ErrorKind::Unsupported`]다. 그래서 [`Holder::connect`]가 늘 실패하고 세션도 만들어지지 않는다(Phase 3).
+/// 세션 전송 핸들: Unix master fd 또는 Windows `ConPTY` 핸들 묶음.
+#[cfg(unix)]
+pub type Master = OwnedFd;
 #[cfg(windows)]
-pub mod link {
-    use std::io;
-
-    use krill_proto::holder::Frame;
-
-    use crate::os::{BorrowedFd, OwnedFd};
-
-    /// 받은 프레임 하나와 거기 붙은 핸들.
-    #[derive(Debug)]
-    pub struct Packet {
-        pub kind: u8,
-        pub body: Vec<u8>,
-        pub fds: Vec<OwnedFd>,
-    }
-
-    impl Packet {
-        /// [`krill_proto::holder`]의 `decode`에 넘길 형태.
-        pub fn frame(&self) -> Frame<'_> {
-            Frame {
-                kind: self.kind,
-                fds: u8::try_from(self.fds.len()).unwrap_or(u8::MAX),
-                body: &self.body,
-            }
-        }
-    }
-
-    /// holder 링크 자리. 소켓을 쥐고만 있다.
-    #[derive(Debug)]
-    pub struct Link(#[expect(dead_code, reason = "링크 구현은 Phase 3(OWE-833)")] OwnedFd);
-
-    impl Link {
-        pub fn new(sock: OwnedFd) -> Self {
-            Self(sock)
-        }
-
-        #[expect(clippy::unused_self, reason = "Unix 판과 같은 시그니처")]
-        pub fn send(&self, _frame: &[u8], _fds: &[BorrowedFd<'_>]) -> io::Result<()> {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-
-        #[expect(clippy::unused_self, reason = "Unix 판과 같은 시그니처")]
-        pub fn recv(&mut self) -> io::Result<Option<Packet>> {
-            Err(io::ErrorKind::Unsupported.into())
-        }
-    }
-}
+pub type Master = link::Pty;
 
 /// holder가 다시 넘겨준 세션(krilld 재기동).
 #[derive(Debug)]
@@ -83,11 +38,11 @@ pub struct Kept {
     pub pid: u32,
     /// 이미 끝났으면 `waitpid` 원시 상태.
     pub status: Option<i32>,
-    pub master: OwnedFd,
+    pub master: Master,
 }
 
 /// 답(`Spawned`면 master fd가 붙는다).
-pub type Answer = (FromHolder, Option<OwnedFd>);
+pub type Answer = (FromHolder, Option<Master>);
 
 /// 답을 기다리는 요청들. `None`이면 링크가 끊겼다.
 type Pending = Option<HashMap<u32, Sender<Answer>>>;
@@ -109,6 +64,7 @@ impl Holder {
     /// `Ready` 전에 링크가 끊기거나 `Hello`가 없으면 오류.
     ///
     /// 마지막 값은 holder가 맡아 둔 listen 소켓(앞선 krilld가 [`Holder::hold_listener`]로 맡긴 것)이다.
+    #[cfg(unix)]
     pub fn connect(sock: OwnedFd) -> io::Result<(Self, Link, Vec<Kept>, Option<OwnedFd>)> {
         let out = Link::new(sock.try_clone()?);
         let mut link = Link::new(sock);
@@ -120,6 +76,31 @@ impl Holder {
             next: AtomicU32::new(1),
         };
         Ok((holder, link, kept, listener))
+    }
+
+    /// Windows: holder가 명시적으로 상속한 익명 파이프 두 개로 연결한다.
+    #[cfg(windows)]
+    pub fn connect_inherited() -> io::Result<(Self, Link, Vec<Kept>, Option<OwnedFd>)> {
+        let mut link = Link::inherited()?;
+        let out = link.try_clone()?;
+        let (version, kept, listener) = receive(&mut link)?;
+        Ok((
+            Self {
+                version,
+                out: Mutex::new(out),
+                pending: Mutex::new(Some(HashMap::new())),
+                next: AtomicU32::new(1),
+            },
+            link,
+            kept,
+            listener,
+        ))
+    }
+
+    /// Windows에서는 소켓이 아닌 상속 파이프로만 연결한다.
+    #[cfg(windows)]
+    pub fn connect(_sock: OwnedFd) -> io::Result<(Self, Link, Vec<Kept>, Option<OwnedFd>)> {
+        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// holder의 프로토콜 버전(`Hello.version`). v3 미만이면 `Terminate`가 없다.
@@ -282,7 +263,10 @@ impl Holder {
 pub(crate) fn receive(link: &mut Link) -> io::Result<(u16, Vec<Kept>, Option<OwnedFd>)> {
     let mut version = None;
     let mut kept = Vec::new();
+    #[cfg(unix)]
     let mut listener = None;
+    #[cfg(windows)]
+    let listener = None;
     loop {
         let p = link.recv()?.ok_or(io::ErrorKind::UnexpectedEof)?;
         match decode(p)? {
@@ -295,7 +279,10 @@ pub(crate) fn receive(link: &mut Link) -> io::Result<(u16, Vec<Kept>, Option<Own
                     master,
                 });
             }
+            #[cfg(unix)]
             Some((FromHolder::Listener { .. }, fd)) => listener = fd,
+            #[cfg(windows)]
+            Some((FromHolder::Listener { .. }, _)) => {}
             Some((FromHolder::Ready, _)) => break,
             _ => {}
         }
@@ -306,7 +293,17 @@ pub(crate) fn receive(link: &mut Link) -> io::Result<(u16, Vec<Kept>, Option<Own
 /// 모르는 kind(새 holder)는 붙은 fd를 닫고 `None`. 그 밖의 디코드 실패는 오류.
 pub(crate) fn decode(mut p: Packet) -> io::Result<Option<Answer>> {
     match FromHolder::decode(p.frame()) {
-        Ok(m) => Ok(Some((m, p.fds.pop()))),
+        Ok(m) => {
+            #[cfg(unix)]
+            let master = p.fds.pop();
+            #[cfg(windows)]
+            let master = if p.fds.is_empty() {
+                None
+            } else {
+                Some(Master::from_handles(std::mem::take(&mut p.fds))?)
+            };
+            Ok(Some((m, master)))
+        }
         Err(WireError::UnknownKind(_)) => Ok(None),
         Err(e) => Err(io::Error::new(io::ErrorKind::InvalidData, e)),
     }
