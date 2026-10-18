@@ -153,3 +153,50 @@ fn cache_skips_disk_for_same_candidate() {
     );
     assert!(cache.link_at_with_home(&r, 3, Some(&dir.0), None).is_none());
 }
+
+#[test]
+fn url_at_parses_plaintext_http_https_and_trims_punctuation() {
+    let r = row("visit (https://example.com:8080/a/b?x=1&y=2#frag).");
+    assert_eq!(url_at(&r, 6), None, "여는 괄호 위는 링크가 아니다");
+    let expected = UrlLink {
+        column: 7,
+        cols: 41,
+        uri: "https://example.com:8080/a/b?x=1&y=2#frag".into(),
+    };
+    assert_eq!(url_at(&r, 7), Some(expected.clone()));
+    assert_eq!(url_at(&r, 25), Some(expected.clone()));
+    assert_eq!(url_at(&r, 47), Some(expected));
+    assert_eq!(url_at(&r, 48), None, "닫는 괄호·마침표 위는 링크가 아니다");
+
+    // 짝이 맞는 괄호(위키백과 등)는 유지하고 바깥 닫는 괄호만 잘라낸다.
+    let wiki = row("(https://en.wikipedia.org/wiki/Rust_(programming_language))");
+    assert_eq!(
+        url_at(&wiki, 10),
+        Some(UrlLink {
+            column: 1,
+            cols: 57,
+            uri: "https://en.wikipedia.org/wiki/Rust_(programming_language)".into(),
+        })
+    );
+
+    // http:// 및 한글 2칸 경로/주변 문자.
+    let kr = row("링크: http://localhost:3000/문서!");
+    assert_eq!(
+        url_at(&kr, 10),
+        Some(UrlLink {
+            column: 6,
+            cols: 26,
+            uri: "http://localhost:3000/문서".into(),
+        })
+    );
+
+    // 안전하지 않은 스킴·중간 접두사·양방향 제어 문자 위장은 거부한다.
+    assert_eq!(url_at(&row("javascript:alert(1)"), 2), None);
+    assert_eq!(url_at(&row("file:///etc/hosts"), 2), None);
+    assert_eq!(url_at(&row("foohttps://example.com"), 10), None);
+    assert_eq!(url_at(&row("https://..."), 8), None);
+    assert_eq!(
+        url_at(&row("https://example.com/\u{202e}gpj.exe"), 10),
+        None
+    );
+}
