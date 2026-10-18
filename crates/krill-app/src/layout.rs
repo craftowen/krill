@@ -23,7 +23,8 @@ const FILE_NAME: &str = "layout.bin";
 /// 4: 파일 칸(MK-119 에디터 탭), v2·v3은 파일 칸 없이 읽는다.
 /// 5: 실행 정보의 계정(OWE-712 `Create.account`), v2~v4는 [`LegacyLayout`]으로 읽는다.
 /// 6: 탭 핀 고정·9색 태그(OWE-734 `Tab.pinned`, `Tab.color`), v2~v5는 [`LegacyLayout`]으로 읽는다.
-const FORMAT_VERSION: u8 = 6;
+/// 7: 탭 사용자 지정 제목(OWE-870 `Tab.custom_title`), v6은 [`LegacyLayoutV6`]으로 읽는다.
+const FORMAT_VERSION: u8 = 7;
 /// 손상·악성 파일의 깊은 중첩이 역직렬화 재귀로 스택을 넘지 않게 하는 상한.
 /// 탭 10개 × 분할 4개는 수백 바이트다.
 const MAX_FILE_BYTES: u64 = 16 * 1024;
@@ -195,6 +196,9 @@ pub struct Tab {
     pub focused: PaneId,
     pub pinned: bool,
     pub color: Option<TabColor>,
+    /// 탭 더블클릭·우클릭 메뉴로 정한 사용자 지정 제목(OWE-870). `None`이면 자동 제목을 쓴다.
+    #[serde(default)]
+    pub custom_title: Option<String>,
 }
 
 impl Tab {
@@ -204,6 +208,7 @@ impl Tab {
             focused: pane,
             pinned: false,
             color: None,
+            custom_title: None,
         }
     }
 }
@@ -248,6 +253,15 @@ struct LegacyTab {
     focused: PaneId,
 }
 
+/// v6 디스크 `Tab`(`pinned`·`color`는 있고 OWE-870 `custom_title`은 없음).
+#[derive(Deserialize)]
+struct LegacyTabV6 {
+    root: PaneTree,
+    focused: PaneId,
+    pinned: bool,
+    color: Option<TabColor>,
+}
+
 /// v4까지의 디스크 `Create`(OWE-712 `account` 이전). postcard는 `#[serde(default)]`를 모르므로 따로 읽는다.
 #[derive(Deserialize)]
 struct LegacyCreate {
@@ -282,6 +296,49 @@ struct LegacyLayout<C> {
     files: BTreeMap<PaneId, PathBuf>,
 }
 
+/// v6 디스크 레이아웃. `tabs`만[`LegacyTabV6`], 실행 정보는 v5와 같은 `Create`다.
+#[derive(Deserialize)]
+struct LegacyLayoutV6 {
+    tabs: Vec<LegacyTabV6>,
+    active: usize,
+    sidebar_width: f32,
+    panel_width: f32,
+    next_pane: u32,
+    sessions: BTreeMap<PaneId, SessionId>,
+    launches: BTreeMap<PaneId, Create>,
+    files: BTreeMap<PaneId, PathBuf>,
+}
+
+impl From<LegacyLayoutV6> for Layout {
+    fn from(old: LegacyLayoutV6) -> Self {
+        let tabs = old
+            .tabs
+            .into_iter()
+            .map(|t| Tab {
+                root: t.root,
+                focused: t.focused,
+                pinned: t.pinned,
+                color: t.color,
+                custom_title: None,
+            })
+            .collect();
+        let mut layout = Self {
+            tabs,
+            active: old.active,
+            sidebar_width: old.sidebar_width,
+            panel_width: old.panel_width,
+            next_pane: old.next_pane,
+            sessions: old.sessions,
+            launches: old.launches,
+            hosts: BTreeMap::new(),
+            files: old.files,
+            mru: MruState::default(),
+        };
+        layout.record_mru(layout.active);
+        layout
+    }
+}
+
 impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
     fn from(old: LegacyLayout<C>) -> Self {
         let tabs = old
@@ -292,6 +349,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
                 focused: t.focused,
                 pinned: false,
                 color: None,
+                custom_title: None,
             })
             .collect();
         let launches = old
@@ -393,6 +451,30 @@ impl Layout {
     pub fn set_tab_color(&mut self, index: usize, color: Option<TabColor>) {
         if let Some(tab) = self.tabs.get_mut(index) {
             tab.color = color;
+        }
+    }
+
+    /// OWE-870: 탭의 사용자 지정 제목. 없거나 비어 있으면 `None`(자동 제목을 쓴다).
+    pub fn tab_title(&self, index: usize) -> Option<&str> {
+        self.tabs
+            .get(index)
+            .and_then(|t| t.custom_title.as_deref())
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+    }
+
+    /// OWE-870: 탭의 사용자 지정 제목을 정한다. 비어 있으면 지운다(자동 제목으로 복귀).
+    /// 제어 문자는 빼고 128자로 자른다(사이드바 이름 변경과 같은 규칙).
+    pub fn set_tab_title(&mut self, index: usize, title: Option<&str>) {
+        if let Some(tab) = self.tabs.get_mut(index) {
+            let cleaned: String = title
+                .unwrap_or_default()
+                .trim()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(128)
+                .collect();
+            tab.custom_title = (!cleaned.is_empty()).then_some(cleaned);
         }
     }
 
@@ -729,6 +811,19 @@ impl Layout {
         self.retain_tabs(prefer, |i, tab| i <= index || tab.pinned);
     }
 
+    /// OWE-870: 지정한 탭의 왼쪽에 있는 비고정 탭을 모두 닫는다(핀 고정 탭은 유지).
+    pub fn close_tabs_to_left(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        let prefer = if self.active >= index {
+            self.active
+        } else {
+            index
+        };
+        self.retain_tabs(prefer, |i, tab| i >= index || tab.pinned);
+    }
+
     /// 비고정 에디터(파일) 탭을 모두 닫는다(핀 고정 탭과 터미널 탭은 유지).
     pub fn close_all_editor_tabs(&mut self) {
         let editor_flags: Vec<bool> = (0..self.tabs.len())
@@ -922,7 +1017,7 @@ impl Layout {
         let missing = match version {
             2 => 2,
             3 => 1,
-            4 | 5 | FORMAT_VERSION => 0,
+            4 | 5 | 6 | FORMAT_VERSION => 0,
             _ => return Err(invalid("unknown layout format version")),
         };
         let mut migrated;
@@ -935,6 +1030,7 @@ impl Layout {
         };
         let mut layout = match version {
             FORMAT_VERSION => postcard::from_bytes::<Self>(body),
+            6 => postcard::from_bytes::<LegacyLayoutV6>(body).map(Self::from),
             5 => postcard::from_bytes::<LegacyLayout<Create>>(body).map(Self::from),
             _ => postcard::from_bytes::<LegacyLayout<LegacyCreate>>(body).map(Self::from),
         }
