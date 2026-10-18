@@ -185,8 +185,9 @@ fn server_panel_toggle_invite_copy_expiry_and_revoke_confirmation(cx: &mut TestA
         assert_ne!(second.link, first_invite.link);
     });
 
-    // 7. 기기 연결 끊기(회수): 버튼 클릭 → 확인 대화상자 표시 → 취소 시 유지 → 확인 시 삭제.
-    assert!(vcx.debug_bounds("link-revoke-confirm").is_none());
+    // 7. 기기 연결 끊기(회수): 첫 클릭에 무장 → 같은 버튼을 다시 누르면 삭제.
+    // 목록이 밀리던 별도 확인 박스 대신 행 버튼 자체가 2단계 확인이 된다.
+    assert!(vcx.debug_bounds("link-revoke-btn-dev-air").is_some());
     click(vcx, "link-revoke-btn-dev-air");
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
@@ -195,21 +196,22 @@ fn server_panel_toggle_invite_copy_expiry_and_revoke_confirmation(cx: &mut TestA
             Some("dev-air")
         );
     });
-    assert!(vcx.debug_bounds("link-revoke-confirm").is_some());
+    // 무장 상태에서도 목록은 그대로 유지된다.
+    assert!(vcx.debug_bounds("link-device-row-dev-air").is_some());
+    assert!(vcx.debug_bounds("link-device-row-dev-mini").is_some());
 
-    // 취소하면 기기 목록이 그대로 유지된다.
-    click(vcx, "link-revoke-confirm-cancel");
-    vcx.update(|window, cx| {
-        window.draw(cx).clear(cx);
+    // 무장을 풀면 기기 목록이 그대로 유지된다.
+    vcx.update(|_, cx| {
+        panel.update(cx, super::ServerPanel::cancel_revoke);
         assert!(panel.read(cx).confirm_revoke().is_none());
         assert_eq!(panel.read(cx).devices().len(), 2);
     });
-    assert!(vcx.debug_bounds("link-revoke-confirm").is_none());
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
 
-    // 다시 눌러 확인하면 dev-air가 회수되어 목록에서 사라진다.
+    // 다시 눌러 무장하고 한 번 더 누르면 dev-air가 회수되어 목록에서 사라진다.
     click(vcx, "link-revoke-btn-dev-air");
     vcx.update(|window, cx| window.draw(cx).clear(cx));
-    click(vcx, "link-revoke-confirm-yes");
+    click(vcx, "link-revoke-btn-dev-air");
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
         let devices = panel.read(cx).devices();

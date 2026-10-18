@@ -5,7 +5,7 @@
 //!   `cx.background_executor()`에서 실행해 UI 스레드를 블로킹하지 않는다(CONVENTIONS T7).
 //! - [`qr`]: [`QrMatrixSource`] 트레이트(`Vec<Vec<bool>>`)와 gpui 모듈 격자 렌더러.
 //! - [`ServerPanel`]: "이 Mac에 다른 기기 접속 허용" 서버 패널(켜기/끄기 토글, 1회용 초대 링크·QR·복사·유효시간,
-//!   짝지은 기기 목록 및 연결 끊기 확인 대화상자).
+//!   짝지은 기기 목록 및 행内 2단계 연결 끊기 확인 버튼).
 //! - [`ClientDialog`]: "다른 Mac 추가" 클라이언트 대화상자(초대 링크 붙여넣기·클립보드 자동 채움 제안,
 //!   이 기기 이름 자동 채움, 연결 진행 상태 및 비개발자 한국어 실패 사유, 같은 Wi-Fi 근처 Mac 목록).
 //! - [`PairingView`]: 서버 패널과 클라이언트 대화상자를 한 화면에서 함께 볼 수 있는 통합 뷰.
@@ -333,13 +333,13 @@ impl ServerPanel {
         }
     }
 
-    /// 특정 기기의 "연결 끊기(회수)" 확인 대화상자를 연다.
+    /// 특정 기기의 "연결 끊기(회수)" 버튼을 무장한다. 같은 버튼을 다시 누르면 실행된다.
     pub fn request_revoke(&mut self, device: PairedDevice, cx: &mut Context<Self>) {
         self.confirm_revoke = Some(device);
         cx.notify();
     }
 
-    /// "연결 끊기(회수)" 확인 대화상자를 닫는다.
+    /// "연결 끊기(회수)" 버튼 무장을 푼다.
     pub fn cancel_revoke(&mut self, cx: &mut Context<Self>) {
         self.confirm_revoke = None;
         cx.notify();
@@ -380,21 +380,12 @@ impl ServerPanel {
     }
 
     fn render_invite_section(&self, p: &crate::ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
-        let mut section = div()
-            .flex()
-            .flex_col()
-            .gap_2p5()
-            .p_3()
-            .rounded(crate::ui::RADIUS_MD)
-            .bg(p.background)
-            .border_1()
-            .border_color(p.border);
+        // 서버 카드 안에 또 카드를 얹지 않는다(STYLEGUIDE §8.4). 초대 영역은 카드 안
+        // 구분 구역으로 평탄하게 그린다.
+        let mut section = div().flex().flex_col().gap_2p5();
 
-        let create_btn = Button::new("link-create-invite")
-            .small()
-            .primary()
+        let create_btn = crate::ui::primary("link-create-invite", text::CREATE_INVITE.get())
             .disabled(self.busy || !self.status.enabled)
-            .label(text::CREATE_INVITE.get())
             .debug_selector(|| "link-create-invite".into())
             .on_click(cx.listener(|this, _, _, cx| this.create_invite(cx)));
 
@@ -406,6 +397,8 @@ impl ServerPanel {
                 .gap_2()
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .flex()
                         .flex_col()
                         .gap_0p5()
@@ -422,7 +415,7 @@ impl ServerPanel {
                                 .child(text::INVITE_GUIDE.get()),
                         ),
                 )
-                .child(create_btn),
+                .child(crate::ui::controls().child(create_btn)),
         );
 
         if let Some(invite) = &self.invite {
@@ -437,22 +430,27 @@ impl ServerPanel {
                         .gap_2()
                         .p_2p5()
                         .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.card)
+                        .bg(p.warning.opacity(0.1))
                         .border_1()
-                        .border_color(p.warning)
+                        .border_color(p.warning.opacity(0.3))
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(crate::ui::TEXT_XS)
                                 .text_color(p.warning)
                                 .child(text::INVITE_EXPIRED.get()),
                         )
                         .child(
-                            Button::new("link-recreate-invite")
-                                .small()
-                                .primary()
-                                .label(text::RECREATE_INVITE.get())
+                            crate::ui::controls().child(
+                                crate::ui::primary(
+                                    "link-recreate-invite",
+                                    text::RECREATE_INVITE.get(),
+                                )
                                 .debug_selector(|| "link-recreate-invite".into())
                                 .on_click(cx.listener(|this, _, _, cx| this.create_invite(cx))),
+                            ),
                         ),
                 );
             } else {
@@ -475,7 +473,7 @@ impl ServerPanel {
                         .child(
                             div()
                                 .flex_1()
-                                .min_w(px(180.))
+                                .min_w_0()
                                 .flex()
                                 .flex_col()
                                 .gap_2()
@@ -483,6 +481,9 @@ impl ServerPanel {
                                     div()
                                         .id("link-invite-text")
                                         .debug_selector(|| "link-invite-text".into())
+                                        .w_full()
+                                        .min_w_0()
+                                        .truncate()
                                         .p_2()
                                         .rounded(crate::ui::RADIUS_XS)
                                         .bg(p.muted)
@@ -502,19 +503,25 @@ impl ServerPanel {
                                             div()
                                                 .id("link-invite-countdown")
                                                 .debug_selector(|| "link-invite-countdown".into())
+                                                .flex_1()
+                                                .min_w_0()
+                                                .truncate()
+                                                .font_family(crate::ui::FONT_MONO)
                                                 .text_size(crate::ui::TEXT_XS)
                                                 .text_color(p.muted_foreground)
                                                 .child(remaining),
                                         )
                                         .child(
-                                            Button::new("link-copy-invite")
-                                                .small()
-                                                .outline()
-                                                .label(copy_label)
+                                            crate::ui::controls().child(
+                                                crate::ui::secondary(
+                                                    "link-copy-invite",
+                                                    copy_label,
+                                                )
                                                 .debug_selector(|| "link-copy-invite".into())
                                                 .on_click(cx.listener(|this, _, _, cx| {
                                                     this.copy_invite(cx);
                                                 })),
+                                            ),
                                         ),
                                 ),
                         ),
@@ -533,82 +540,29 @@ impl ServerPanel {
                 .child(text::DEVICES_TITLE.get()),
         );
 
-        if let Some(target) = &self.confirm_revoke {
-            let prompt_title = text::REVOKE_CONFIRM_TITLE.format(&[("name", &target.name)]);
-            section = section.child(
-                div()
-                    .id("link-revoke-confirm")
-                    .debug_selector(|| "link-revoke-confirm".into())
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
-                    .border_1()
-                    .border_color(p.destructive)
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_SM)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(p.destructive)
-                            .child(prompt_title),
-                    )
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(text::REVOKE_CONFIRM_DETAIL.get()),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new("link-revoke-confirm-yes")
-                                    .small()
-                                    .danger()
-                                    .label(text::REVOKE_CONFIRM_YES.get())
-                                    .debug_selector(|| "link-revoke-confirm-yes".into())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.confirm_revoke_now(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("link-revoke-confirm-cancel")
-                                    .small()
-                                    .ghost()
-                                    .label(text::REVOKE_CONFIRM_CANCEL.get())
-                                    .debug_selector(|| "link-revoke-confirm-cancel".into())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.cancel_revoke(cx);
-                                    })),
-                            ),
-                    ),
-            );
-        }
-
         if self.devices.is_empty() {
             section = section.child(
                 div()
                     .id("link-devices-empty")
                     .debug_selector(|| "link-devices-empty".into())
-                    .p_3()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
-                    .border_1()
-                    .border_color(p.border)
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     .child(text::DEVICES_EMPTY.get()),
             );
         } else {
-            for dev in &self.devices {
+            let last = self.devices.len() - 1;
+            for (index, dev) in self.devices.iter().enumerate() {
                 let row_id = format!("link-device-row-{}", dev.id);
                 let btn_id = format!("link-revoke-btn-{}", dev.id);
                 let meta = format_device_meta(dev, self.now_secs);
+                let armed = self
+                    .confirm_revoke
+                    .as_ref()
+                    .is_some_and(|target| target.id == dev.id);
+                let dev_id = dev.id.clone();
                 let dev_cl = dev.clone();
+                let btn_dbg = btn_id.clone();
+                let out_id = dev.id.clone();
                 section = section.child(
                     div()
                         .id(SharedString::from(row_id.clone()))
@@ -617,11 +571,8 @@ impl ServerPanel {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .p_2p5()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.background)
-                        .border_1()
-                        .border_color(p.border)
+                        .py_2()
+                        .when(index != last, |d| d.border_b_1().border_color(p.border))
                         .child(
                             div()
                                 .flex_1()
@@ -631,26 +582,53 @@ impl ServerPanel {
                                 .gap_0p5()
                                 .child(
                                     div()
+                                        .truncate()
                                         .text_size(crate::ui::TEXT_SM)
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                         .child(dev.name.clone()),
                                 )
                                 .child(
                                     div()
+                                        .truncate()
                                         .text_size(crate::ui::TEXT_XS)
                                         .text_color(p.muted_foreground)
                                         .child(meta),
                                 ),
                         )
                         .child(
-                            Button::new(gpui::ElementId::Name(btn_id.clone().into()))
-                                .small()
-                                .outline()
-                                .label(text::REVOKE_BUTTON.get())
-                                .debug_selector(move || btn_id.clone())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.request_revoke(dev_cl.clone(), cx);
-                                })),
+                            crate::ui::controls().child(
+                                crate::ui::danger_confirm(
+                                    gpui::ElementId::Name(btn_id.clone().into()),
+                                    text::REVOKE_BUTTON.get(),
+                                    text::REVOKE_CONFIRM_AGAIN.get(),
+                                    armed,
+                                )
+                                .debug_selector(move || btn_dbg.clone())
+                                .when(armed, |b| {
+                                    b.on_mouse_down_out(cx.listener(move |this, _, _, cx| {
+                                        if this
+                                            .confirm_revoke
+                                            .as_ref()
+                                            .is_some_and(|t| t.id == out_id)
+                                        {
+                                            this.cancel_revoke(cx);
+                                        }
+                                    }))
+                                })
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        if this
+                                            .confirm_revoke
+                                            .as_ref()
+                                            .is_some_and(|t| t.id == dev_id)
+                                        {
+                                            this.confirm_revoke_now(cx);
+                                        } else {
+                                            this.request_revoke(dev_cl.clone(), cx);
+                                        }
+                                    },
+                                )),
+                            ),
                         ),
                 );
             }
@@ -670,29 +648,30 @@ impl Render for ServerPanel {
             text::SERVER_DESC_OFF.get()
         };
 
-        let toggle = gpui_component::switch::Switch::new("link-server-toggle")
-            .checked(enabled)
-            .disabled(self.busy)
-            .label(if enabled {
-                text::TOGGLE_ON.get()
-            } else {
-                text::TOGGLE_OFF.get()
-            })
-            .accessibility_label(text::SERVER_TITLE.get())
-            .on_click(cx.listener(|this, enabled, _, cx| this.set_server_enabled(*enabled, cx)));
+        let toggle_label = if enabled {
+            text::TOGGLE_ON.get()
+        } else {
+            text::TOGGLE_OFF.get()
+        };
+        let weak = cx.entity().downgrade();
+        let toggle = crate::ui::switch(
+            p,
+            "link-server-toggle",
+            enabled,
+            self.busy,
+            move |next, _, cx| {
+                weak.update(cx, |this, cx| this.set_server_enabled(next, cx))
+                    .ok();
+            },
+        );
 
-        div()
+        crate::ui::card(p)
             .id("link-server-panel")
             .debug_selector(|| "link-server-panel".into())
             .flex()
             .flex_col()
             .gap_3()
-            .p_3()
-            .rounded(crate::ui::RADIUS_MD)
-            .bg(p.card)
             .text_color(p.card_foreground)
-            .border_1()
-            .border_color(p.border)
             .child(
                 div()
                     .flex()
@@ -720,11 +699,14 @@ impl Render for ServerPanel {
                             ),
                     )
                     .child(
-                        div().flex_none().flex().items_center().gap_1p5().child(
-                            div()
-                                .debug_selector(|| "link-server-toggle".into())
-                                .child(toggle),
-                        ),
+                        crate::ui::controls()
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(toggle_label),
+                            )
+                            .child(toggle),
                     ),
             )
             .when(!enabled, |d| {
@@ -742,12 +724,9 @@ impl Render for ServerPanel {
             })
             .when_some(self.error.clone(), |d, err| {
                 d.child(
-                    div()
+                    crate::ui::error_banner(p, err)
                         .id("link-server-error")
-                        .debug_selector(|| "link-server-error".into())
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.destructive)
-                        .child(err),
+                        .debug_selector(|| "link-server-error".into()),
                 )
             })
             .when(enabled, |d| d.child(self.render_invite_section(p, cx)))
@@ -1020,9 +999,9 @@ impl ClientDialog {
                     .debug_selector(|| "link-client-status-paired".into())
                     .p_2p5()
                     .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
+                    .bg(p.success.opacity(0.1))
                     .border_1()
-                    .border_color(p.success)
+                    .border_color(p.success.opacity(0.3))
                     .text_size(crate::ui::TEXT_XS)
                     .text_color(p.success)
                     .child(text::STATUS_PAIRED.format(&[("name", &dev.name)])),
@@ -1036,18 +1015,9 @@ impl ClientDialog {
                     div()
                         .id("link-client-status-failed")
                         .debug_selector(|| "link-client-status-failed".into())
-                        .p_2p5()
-                        .rounded(crate::ui::RADIUS_SM)
-                        .bg(p.card)
-                        .border_1()
-                        .border_color(p.destructive)
-                        .text_size(crate::ui::TEXT_XS)
-                        .text_color(p.destructive)
                         .child(
-                            div()
-                                .id(SharedString::from(specific_id.clone()))
-                                .debug_selector(move || specific_id.clone())
-                                .child(full_msg),
+                            crate::ui::error_banner(p, full_msg)
+                                .debug_selector(move || specific_id.clone()),
                         ),
                 )
             }
@@ -1081,23 +1051,30 @@ impl ClientDialog {
                     .gap_2()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(crate::ui::TEXT_SM)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .child(text::NEARBY_TITLE.get()),
                     )
                     .child(
-                        Button::new("link-nearby-refresh")
-                            .small()
-                            .ghost()
-                            .label(text::NEARBY_REFRESH.get())
-                            .debug_selector(|| "link-nearby-refresh".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh_nearby(cx))),
+                        crate::ui::controls().child(
+                            Button::new("link-nearby-refresh")
+                                .small()
+                                .ghost()
+                                .label(text::NEARBY_REFRESH.get())
+                                .debug_selector(|| "link-nearby-refresh".into())
+                                .on_click(cx.listener(|this, _, _, cx| this.refresh_nearby(cx))),
+                        ),
                     ),
             );
 
+        let last = self.nearby.len() - 1;
         for (idx, mac) in self.nearby.iter().enumerate() {
             let row_id = format!("link-nearby-item-{idx}");
             let conn_id = format!("link-nearby-connect-{idx}");
+            let conn_dbg = conn_id.clone();
             section = section.child(
                 div()
                     .id(SharedString::from(row_id.clone()))
@@ -1106,27 +1083,29 @@ impl ClientDialog {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .p_2p5()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
-                    .border_1()
-                    .border_color(p.border)
+                    .py_2()
+                    .when(idx != last, |d| d.border_b_1().border_color(p.border))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
                             .text_size(crate::ui::TEXT_SM)
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(mac.name.clone()),
                     )
                     .child(
-                        div().flex().items_center().gap_1p5().child(
-                            Button::new(gpui::ElementId::Name(conn_id.clone().into()))
-                                .small()
-                                .primary()
-                                .label(text::NEARBY_CONNECT.get())
-                                .debug_selector(move || conn_id.clone())
-                                .on_click(cx.listener(move |this, _, window, cx| {
+                        crate::ui::controls().child(
+                            crate::ui::primary(
+                                gpui::ElementId::Name(conn_id.clone().into()),
+                                text::NEARBY_CONNECT.get(),
+                            )
+                            .debug_selector(move || conn_dbg.clone())
+                            .on_click(cx.listener(
+                                move |this, _, window, cx| {
                                     this.connect_nearby(idx, window, cx);
-                                })),
+                                },
+                            )),
                         ),
                     ),
             );
@@ -1162,18 +1141,13 @@ impl Render for ClientDialog {
             .is_some_and(|sug| sug != &current_link);
         let is_connecting = matches!(self.phase, ClientPhase::Connecting);
 
-        div()
+        crate::ui::card(p)
             .id("link-client-dialog")
             .debug_selector(|| "link-client-dialog".into())
             .flex()
             .flex_col()
             .gap_3()
-            .p_3()
-            .rounded(crate::ui::RADIUS_MD)
-            .bg(p.card)
             .text_color(p.card_foreground)
-            .border_1()
-            .border_color(p.border)
             .child(
                 div()
                     .flex()
@@ -1208,19 +1182,26 @@ impl Render for ClientDialog {
                         .border_color(p.border)
                         .child(
                             div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
                                 .text_size(crate::ui::TEXT_XS)
                                 .text_color(p.foreground)
                                 .child(text::CLIPBOARD_FOUND.get()),
                         )
                         .child(
-                            Button::new("link-clipboard-fill")
-                                .small()
-                                .primary()
-                                .label(text::CLIPBOARD_AUTO_FILL.get())
+                            crate::ui::controls().child(
+                                crate::ui::primary(
+                                    "link-clipboard-fill",
+                                    text::CLIPBOARD_AUTO_FILL.get(),
+                                )
                                 .debug_selector(|| "link-clipboard-fill".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.apply_clipboard_suggestion(window, cx);
-                                })),
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        this.apply_clipboard_suggestion(window, cx);
+                                    },
+                                )),
+                            ),
                         ),
                 )
             })
@@ -1230,11 +1211,7 @@ impl Render for ClientDialog {
                     .flex_col()
                     .gap_1()
                     .text_size(crate::ui::TEXT_XS)
-                    .child(
-                        div()
-                            .text_color(p.muted_foreground)
-                            .child(text::LINK_LABEL.get()),
-                    )
+                    .child(crate::ui::field_label(text::LINK_LABEL.get(), None, p))
                     .child(
                         div()
                             .flex()
@@ -1245,17 +1222,22 @@ impl Render for ClientDialog {
                                     .id("link-client-input-link")
                                     .debug_selector(|| "link-client-input-link".into())
                                     .flex_1()
+                                    .min_w_0()
                                     .child(Input::new(&self.link_input).small()),
                             )
                             .child(
-                                Button::new("link-client-paste-btn")
-                                    .small()
-                                    .outline()
-                                    .label(text::PASTE_BUTTON.get())
+                                crate::ui::controls().child(
+                                    crate::ui::secondary(
+                                        "link-client-paste-btn",
+                                        text::PASTE_BUTTON.get(),
+                                    )
                                     .debug_selector(|| "link-client-paste-btn".into())
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.paste_from_clipboard(window, cx);
-                                    })),
+                                    .on_click(cx.listener(
+                                        |this, _, window, cx| {
+                                            this.paste_from_clipboard(window, cx);
+                                        },
+                                    )),
+                                ),
                             ),
                     ),
             )
@@ -1265,11 +1247,11 @@ impl Render for ClientDialog {
                     .flex_col()
                     .gap_1()
                     .text_size(crate::ui::TEXT_XS)
-                    .child(
-                        div()
-                            .text_color(p.muted_foreground)
-                            .child(text::DEVICE_NAME_LABEL.get()),
-                    )
+                    .child(crate::ui::field_label(
+                        text::DEVICE_NAME_LABEL.get(),
+                        None,
+                        p,
+                    ))
                     .child(
                         div()
                             .id("link-client-input-device-name")
@@ -1282,25 +1264,20 @@ impl Render for ClientDialog {
                 div()
                     .flex()
                     .items_center()
+                    .justify_end()
                     .gap_2()
                     .child(
-                        Button::new("link-client-connect-btn")
-                            .small()
-                            .primary()
-                            .disabled(is_connecting)
-                            .label(text::CONNECT_BUTTON.get())
-                            .debug_selector(|| "link-client-connect-btn".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.submit_pair(cx))),
-                    )
-                    .child(
-                        Button::new("link-client-close-btn")
-                            .small()
-                            .ghost()
-                            .label(text::CLIENT_CLEAR.get())
+                        crate::ui::ghost("link-client-close-btn", text::CLIENT_CLEAR.get())
                             .debug_selector(|| "link-client-close-btn".into())
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.reset_form(window, cx);
                             })),
+                    )
+                    .child(
+                        crate::ui::primary("link-client-connect-btn", text::CONNECT_BUTTON.get())
+                            .disabled(is_connecting)
+                            .debug_selector(|| "link-client-connect-btn".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.submit_pair(cx))),
                     ),
             )
             .children(self.render_nearby_section(p, cx))
