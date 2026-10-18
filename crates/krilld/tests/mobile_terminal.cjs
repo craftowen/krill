@@ -1,0 +1,66 @@
+// Standalone terminal adapter regression harness: node crates/krilld/tests/mobile_terminal.cjs
+'use strict';
+const assert=require('node:assert/strict'),fs=require('node:fs'),path=require('node:path'),vm=require('node:vm');
+const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/terminal.js'),'utf8');
+class Element extends EventTarget {
+ constructor(tag){super();this.tagName=tag;this.children=[];this.dataset={};this.attrs={};this.style={setProperty(k,v){this[k]=v;},removeProperty(k){delete this[k];}};this.classList={add(){},remove(){}};this.value='';this.clientWidth=390;this.scrollTop=0;this.scrollHeight=0;this.namespaceURI='http://www.w3.org/2000/svg';}
+ append(...nodes){this.children.push(...nodes);for(const n of nodes)n.parent=this;}
+ replaceChildren(...nodes){this.children=[];this.append(...nodes);}
+ setAttribute(k,v){this.attrs[k]=v;}
+ getAttribute(k){return this.attrs[k];}
+ remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}
+ focus(){this.dispatchEvent(new Event('focus'));}
+ blur(){this.dispatchEvent(new Event('blur'));}
+ getContext(){return new Proxy({},{get:()=>()=>{},set:()=>true});}
+ setPointerCapture(){}
+}
+function fixture(){
+ globalThis.MkCrypto={enc:new TextEncoder(),concat:(...arrays)=>{const out=new Uint8Array(arrays.reduce((n,a)=>n+a.length,0));let at=0;for(const a of arrays){out.set(a,at);at+=a.length;}return out;},unhex:()=>new Uint8Array(32),hex:()=>'',sha256:a=>a,Channel:class{seal(a){return a;}open(a){return new Uint8Array(a);}}};
+ globalThis.sockets=[];globalThis.FakeSocket=class extends EventTarget {
+  constructor(){super();this.readyState=1;this.sent=[];sockets.push(this);}
+  send(data){this.sent.push(data);if(this.autoAck&&data instanceof Uint8Array&&data[4]===0x13){const r=MkTerminalCodec.reader(data.slice(5)),id=r.n();queueMicrotask(()=>this.frame(0x27,MkTerminalCodec.v(id),MkTerminalCodec.v(0)));}}
+  message(data){const e=new Event('message');e.data=data;this.dispatchEvent(e);}
+  frame(kind,...bytes){this.message(MkTerminalCodec.frame(kind,MkCrypto.concat(...bytes)));}
+  close(){if(this.readyState===3)return;this.readyState=3;this.dispatchEvent(new Event('close'));}
+  handshake(){const T=MkTerminalCodec;this.message(JSON.stringify({version:2,challenge:''}));this.message(new TextEncoder().encode('{}'));this.frame(1,T.v(1),T.v(1),T.v((1n<<56n)|4096n|5n));this.frame(0x2c,T.v(0));}
+  screen(text='Krill · live terminal'){const T=MkTerminalCodec,C=MkCrypto,chars=[...text],cell=ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));this.frame(0x21,T.v(1),T.v(1),T.v(1),T.v(4),T.v(0),T.v(80),T.v(24),T.v(2),T.v(0),T.v(chars.length),...chars.map(cell),T.v(3),T.v(1),T.v(2),T.v(1),T.v(4),T.text('Terminal #7'));}
+ };
+ globalThis.mountFixture=(root,sessionId=7,extra={})=>KrillMobile.terminal.mount(root,{sessionId,connect:()=>({socket:new FakeSocket(),credentials:{device_id:'fixture',credential:''}}),...extra});
+}
+const viewport=Object.assign(new EventTarget(),{scale:1,height:844,offsetTop:0});
+const globalEvents=new EventTarget(),storage=new Map(),timers=new Map();let clock=0,nextTimer=0;
+const context=vm.createContext({Event,EventTarget,AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,Map,Set,Promise,console,queueMicrotask,crypto:require('node:crypto').webcrypto,innerHeight:844,devicePixelRatio:1,visualViewport:viewport,document:{createElement:tag=>new Element(tag),createElementNS:(_,tag)=>new Element(tag)},localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},addEventListener:globalEvents.addEventListener.bind(globalEvents),setTimeout:(fn,delay)=>{const id=++nextTimer;timers.set(id,{fn,at:clock+delay});return id;},clearTimeout:id=>timers.delete(id)});
+vm.runInContext(`(${fixture})()`,context);vm.runInContext(source,context);
+const api=context.KrillMobile.terminal,T=context.MkTerminalCodec,C=context.MkCrypto;
+const event=(el,type,props={})=>{const e=new Event(type,{cancelable:true});Object.assign(e,props);el.dispatchEvent(e);return e;};
+const find=(root,cls)=>{if(root.className?.split(' ').includes(cls))return root;for(const c of root.children){const found=find(c,cls);if(found)return found;}};
+const key=(root,id)=>find(root,'keybar').children.find(el=>el.dataset.keyId===id);
+const flush=async()=>{for(let i=0;i<8;i++)await Promise.resolve();};
+async function advance(ms){const end=clock+ms;for(;;){const next=[...timers].filter(([,t])=>t.at<=end).sort((a,b)=>a[1].at-b[1].at)[0];if(!next)break;clock=next[1].at;timers.delete(next[0]);next[1].fn();await flush();}clock=end;await flush();}
+const inputs=socket=>Array.from(socket.sent).filter(a=>a instanceof Uint8Array&&a[4]===0x13).map(a=>{const r=T.reader(a.slice(5));r.n();return r.text();});
+async function mount(id=7,extra={}){const root=new Element('div'),handle=context.mountFixture(root,id,extra);await flush();const socket=context.sockets.at(-1);socket.handshake();socket.screen();await flush();return {root,handle,socket};}
+async function main(){
+ assert(!source.includes('innerHTML'));assert(!source.includes('getElementById'));assert.equal(api.keys.length,20);
+ const expected=['\x1b','\t','\r','\x1b[Z',' ','\x7f','\x1b[3~','\x1b[A','\x1b[B','\x1b[D','\x1b[C','\x03','\x04','\x0c','\x1a','\x12','\x01','\x05','\x17','\x15'];
+ let {root,handle,socket}=await mount();socket.autoAck=true;
+ for(const k of api.keys)await handle.sendKey(k.id);assert.deepEqual(inputs(socket),expected);console.log('PASS exact 20-key order and bytes');
+ viewport.height=544;event(viewport,'resize');assert.equal(root.style['--keyboard-inset'],'300px');assert.equal(find(root,'dismiss-keyboard').hidden,false);viewport.scale=1.5;event(viewport,'resize');assert.equal(root.style['--keyboard-inset'],'0px');assert.equal(find(root,'dismiss-keyboard').hidden,true);viewport.scale=1;viewport.height=844;event(viewport,'resize');console.log('PASS visualViewport keyboard inset excludes browser zoom');
+ const attach=socket.sent.find(a=>a[4]===0x10),role=socket.sent.find(a=>a[4]===0x17);assert.deepEqual([...attach.slice(-2)],[0,0]);assert.deepEqual([...role.slice(5)],[0,2,0]);
+ let count=inputs(socket).length;event(key(root,'backspace'),'pointerdown',{button:0,pointerId:1});await flush();assert.equal(inputs(socket).length,count+1);await advance(399);assert.equal(inputs(socket).length,count+1);await advance(1);assert.equal(inputs(socket).length,count+2);await advance(45);assert.equal(inputs(socket).length,count+3);event(key(root,'backspace'),'pointerup');await advance(500);assert.equal(inputs(socket).length,count+3);console.log('PASS repeat immediate / 400ms / 45ms and release');
+ const capture=find(root,'live-capture');handle.focus();count=inputs(socket).length;event(capture,'compositionstart');capture.value='ㅎ';event(capture,'input',{isComposing:true});capture.value='한';event(capture,'input',{isComposing:true});assert.equal(inputs(socket).length,count);event(capture,'compositionend',{data:'한'});capture.value='한';event(capture,'input',{isComposing:false});await flush();assert.deepEqual(inputs(socket).slice(count),['한']);
+ event(capture,'compositionstart');capture.value='글';const pending=handle.sendKey('enter');event(capture,'compositionend',{data:'글'});await pending;assert.deepEqual(inputs(socket).slice(-2),['글','\r']);console.log('PASS Korean IME commit once and control-key ordering');
+ count=inputs(socket).length;event(capture,'compositionstart');handle.setInputMode('buffered');handle.setInputMode('direct');event(capture,'compositionend',{data:'늦음'});capture.value='늦음';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(capture.value,'');
+ handle.focus();event(capture,'compositionstart');handle.unmount();event(capture,'compositionend',{data:'이전'});capture.value='이전';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(root.children.length,0);console.log('PASS generation discard on mode switch / unmount');
+ ({root,handle,socket}=await mount());handle.setInputMode('buffered');let command=find(root,'command-input');command.value='echo 한글';event(command,'input');event(find(root,'buffered-command'),'submit');await flush();assert.equal(command.value,'echo 한글');let sent=socket.sent.at(-1),r=T.reader(sent.slice(5)),id=r.n();socket.frame(0x27,T.v(id),T.v(0));await flush();assert.equal(command.value,'');
+ command.value='saved draft';event(command,'input');handle.unmount();({root,handle,socket}=await mount());assert.equal(handle.getInputMode(),'buffered');assert.equal(find(root,'command-input').value,'saved draft');console.log('PASS buffered draft retention, opt-out and ACK-only clear');
+ let fit=handle.fitToPhone();assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');socket.frame(0x2c,T.v(1));await assert.rejects(fit,/rejected/);assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');fit=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fit;assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'true');fit=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fit;
+ count=socket.sent.filter(a=>a[4]===0x17).length;handle.setFontScale(1.4);assert.equal(socket.sent.filter(a=>a[4]===0x17).length,count);assert.equal(find(root,'terminal-history').style.fontSize,'20px');console.log('PASS Fit ownership ACK, failure rollback and local font sizing');
+ handle.loadHistory();sent=socket.sent.at(-1);r=T.reader(sent.slice(5));const req=r.n();assert.equal(r.n(),0);assert.equal(r.n(),0);assert.equal(r.n(),100);const rows=Array.from({length:100},()=>[{ch:'x',zero:'',flags:0}]);const row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));socket.frame(0x26,T.v(req),T.v(100),T.v(2),T.v(0),T.v(100),...Array(100).fill(row));handle.loadHistory();r=T.reader(socket.sent.at(-1).slice(5));r.n();assert.equal(r.n(),1);assert.equal(r.n(),1);let historyReq;for(let page=0;page<9;page++){r=T.reader(socket.sent.at(-1).slice(5));historyReq=r.n();socket.frame(0x26,T.v(historyReq),T.v(10000),T.v(2),T.v(page*100),T.v(100),...Array(100).fill(row));handle.loadHistory();}assert.equal(find(root,'terminal-history').textContent.split('\n').length,1001);assert.equal(find(root,'load-history').disabled,true);const before=socket.sent.length;handle.loadHistory();assert.equal(socket.sent.length,before);console.log('PASS 100-row hot-to-cold history and 1000-row cap');
+ handle.unmount();let lastStatus;({root,handle,socket}=await mount(99,{onStatus:s=>{lastStatus=s;}}));const uncertain=handle.sendKey('ctrlC');socket.close();await assert.rejects(uncertain,/Input delivery is uncertain; input will not be resent\./);assert.match(lastStatus.message,/will not be resent/);assert.equal(inputs(socket).length,1);handle.unmount();console.log('PASS disconnect uncertainty, no retry and listener cleanup');
+ console.log('All terminal adapter regression checks passed.');
+}
+if(process.argv.includes('--harness')){
+ const directory='/tmp/mk-mobile/term';fs.mkdirSync(directory,{recursive:true});fs.writeFileSync(path.join(directory,'fixture.js'),`(${fixture})();\n${source}\n globalThis.handle=mountFixture(document.querySelector('main'));setTimeout(()=>{sockets[0].handshake();sockets[0].screen('~/krill  git: mobile-orca-ui');sockets[0].autoAck=true;},0);`);
+ fs.writeFileSync(path.join(directory,'term-harness.html'),'<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><link rel="stylesheet" href="/app.css"><main class="terminal-mount"></main><script src="/fixture.js"></script>');
+ console.log('Harness written to '+directory);
+}else{const watchdog=setTimeout(()=>{console.error('Terminal checks did not settle');process.exitCode=1;},5000);main().catch(e=>{console.error(e);process.exitCode=1;}).finally(()=>clearTimeout(watchdog));}
