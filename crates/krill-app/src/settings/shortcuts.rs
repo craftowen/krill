@@ -6,7 +6,9 @@
 //! 미지 키·주석·빈 줄·바꾸지 않은 항목의 순서를 보존한다.
 use std::path::Path;
 
-use gpui::{App, Context, KeyBinding, Keystroke, SharedString, Window, div, prelude::*};
+use gpui::{
+    App, Context, KeyBinding, KeyDownEvent, Keystroke, SharedString, Window, div, prelude::*,
+};
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 
@@ -363,7 +365,8 @@ impl SettingsView {
         };
         let id = format!("sc-{action}-{}", old.as_deref().unwrap_or("add"));
         let selector = id.clone();
-        let cap = layout::keycap(p, label);
+        let old_for_key = old.clone();
+        let cap = layout::keycap(p, label.clone());
         let cap = if recording {
             cap.border_color(p.primary).text_color(p.primary)
         } else {
@@ -372,6 +375,15 @@ impl SettingsView {
         div()
             .id(SharedString::from(id))
             .debug_selector(move || selector.clone())
+            // OWE-860: 키캡을 키보드 Tab·접근성 트리에 노출한다. Enter로도 기록 모드를 시작한다.
+            .role(gpui::Role::Button)
+            .aria_label(label.clone())
+            .tab_index(0)
+            .on_key_down(cx.listener(move |this, e: &KeyDownEvent, window, cx| {
+                if e.keystroke.key == "enter" {
+                    this.start_recording(action, old_for_key.clone(), window, cx);
+                }
+            }))
             .cursor_pointer()
             .child(cap)
             .on_click(cx.listener(move |this, _, window, cx| {

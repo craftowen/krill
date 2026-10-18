@@ -10,8 +10,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use gpui::{
-    App, AppContext as _, Bounds, Context, Global, KeyBinding, Keystroke, Render, SharedString,
-    Subscription, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px, size,
+    App, AppContext as _, Bounds, Context, Global, KeyBinding, KeyDownEvent, Keystroke, Render,
+    SharedString, Subscription, Window, WindowBounds, WindowOptions, actions, div, prelude::*, px,
+    size,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, ThemeMode};
@@ -1110,6 +1111,19 @@ fn close_settings_page_for(view: Option<gpui::EntityId>, window: &mut Window, cx
 }
 
 pub fn open_window(cx: &mut App) {
+    // OWE-860: ⌘, 재입력 시 이미 열린 설정 창은 현재 탭을 유지한 채 앞으로만 가져온다(일반 탭 강제 초기화 없음).
+    if let Some(handle) = cx
+        .windows()
+        .into_iter()
+        .find_map(|w| w.downcast::<SettingsView>())
+    {
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        });
+        return;
+    }
     open_window_at_tab(AdminTab::General, cx);
 }
 
@@ -8478,6 +8492,7 @@ impl Render for SettingsView {
         let mut nav = div()
             .id("admin-sidebar")
             .debug_selector(|| "admin-sidebar".into())
+            .tab_group()
             .w(crate::ui::SETTINGS_NAV_WIDTH)
             .h_full()
             .flex_none()
@@ -8598,6 +8613,15 @@ impl Render for SettingsView {
                     div()
                         .id(sel)
                         .debug_selector(move || sel.into())
+                        // OWE-860: 좌측 탭을 키보드 Tab·접근성 트리에 노출한다. Enter로도 탭을 전환한다.
+                        .role(gpui::Role::Tab)
+                        .aria_label(tab.label())
+                        .tab_index(0)
+                        .on_key_down(cx.listener(move |this, e: &KeyDownEvent, _, cx| {
+                            if e.keystroke.key == "enter" {
+                                this.set_tab(tab, cx);
+                            }
+                        }))
                         .h(px(30.))
                         .px_2()
                         .rounded(crate::ui::RADIUS_SM)
