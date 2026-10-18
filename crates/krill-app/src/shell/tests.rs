@@ -5327,6 +5327,16 @@ fn pinned_tab_guards_close_and_context_menu_colors_persist(cx: &mut TestAppConte
     // 다시 탭 0을 우클릭해 Purple 색상 태그를 지정한다.
     cx.simulate_mouse_down(tab0, MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
+    let none_bounds = cx
+        .debug_bounds("tab-menu-color-none")
+        .expect("tab-menu-color-none");
+    let gray_bounds = cx
+        .debug_bounds("tab-menu-color-gray")
+        .expect("tab-menu-color-gray");
+    assert_eq!(
+        none_bounds.origin.y, gray_bounds.origin.y,
+        "all 10 tab color swatches (none + 9 colors) must fit on a single horizontal row without wrapping"
+    );
     let purple = cx
         .debug_bounds("tab-menu-color-purple")
         .expect("tab-menu-color-purple")
