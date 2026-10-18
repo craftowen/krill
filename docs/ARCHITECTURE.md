@@ -191,7 +191,7 @@ holder 채널(`krill_proto::holder`)은 별도 번호 공간이다(`0x01`~`0x08`
 
 첫 encrypted payload는 클라의 label JSON proof와 데몬의 device_id·credential JSON 응답이다. 인증 성공 뒤부터 각 encrypted WS payload는 기존 IPC 프레임 하나이며 내부 UnixStream pair와 동일 Registry 경로를 탄다. 데몬의 장기 검증자는 공개 기기 목록·상태에서 지운다. 전체 회수는 대기 QR까지 폐기하고 리스너·열린 WS를 즉시 닫는다.
 
-PWA는 `/`, `/manifest.json`, `/app.js`, `/app.css`, `/icon.svg`를 gzip 사전 압축 에셋으로 내장한다. LAN/Tailscale HTTP에서도 순수 JS SHA256·HKDF·ChaCha20-Poly1305와 `crypto.getRandomValues`로 동작하며, QR fragment를 즉시 지우고 기기 credential은 localStorage에 보관한다. 기존 모바일 enum 끝에 추가한 `MobileRequest::Workflow(String)`(postcard variant 7) / `MobileReply::Workflow(String)`(variant 6)은 인증된 JSON 워크플로를 운반한다. 세션·입력·계정·Git 정보는 UnixStream pair의 기존 Registry 경로를 사용하고 M8 질문·gate는 동일한 원자 저장소를 사용한다. observer·세션 범위 피어는 Workflow를 호출할 수 없다.
+PWA는 `/`, `/manifest.json`, `/app.js`, `/app.css`, `/icon.svg`를 gzip 사전 압축 에셋으로 내장한다. LAN/Tailscale HTTP에서도 순수 JS SHA256·HKDF·ChaCha20-Poly1305와 `crypto.getRandomValues`로 동작하며, QR fragment를 즉시 지우고 기기 credential은 localStorage에 보관한다. 기존 모바일 enum 끝에 추가한 `MobileRequest::Workflow(String)`(postcard variant 7) / `MobileReply::Workflow(String)`(variant 6)은 인증된 JSON 워크플로를 운반한다. 세션·입력·계정·Git 정보는 UnixStream pair의 기존 Registry 경로를 사용하고 M8 질문·gate는 동일한 원자 저장소를 사용한다. observer·세션 범위 피어는 Workflow를 호출할 수 없다. JSON `snapshot`은 경로 바이트 기반 repo/worktree 그룹·상태 근거·64세션 제한 여부·실제 hostname/platform과 capabilities를 제공하며, `create_terminal {cwd_session}`은 서버에서 조회한 cwd의 로그인 셸만 생성하고 `close_terminal {session}`은 명시 요청을 기존 Close IPC로 전달한다.
 
 ## 5. UI와 터미널 렌더링 (T3)
 
