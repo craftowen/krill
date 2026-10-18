@@ -105,6 +105,15 @@ enum Got {
     Cold(krill_proto::SessionId, krill_proto::control::Cold),
 }
 
+/// 마우스 선택 단위(OWE-866): 더블클릭=단어, 트리플클릭=줄. 드래그 중에도 단위를 유지한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum SelectKind {
+    #[default]
+    Char,
+    Word,
+    Line,
+}
+
 /// 보이는 칸 하나의 세션 연결과 입력 상태. 지우면 소켓을 닫아 IO 태스크도 끝난다.
 struct Live {
     pane: Pane<pane::Writer>,
@@ -126,6 +135,8 @@ struct Live {
     selection_text: Option<String>,
     /// 왼쪽 버튼으로 선택을 끄는 중.
     selecting: bool,
+    /// 끄는 중인 선택 단위(OWE-866).
+    selecting_kind: SelectKind,
     task: Task<()>,
 }
 
@@ -143,6 +154,7 @@ impl Live {
             selection: None,
             selection_text: None,
             selecting: false,
+            selecting_kind: SelectKind::Char,
             task,
         }
     }
@@ -157,6 +169,7 @@ impl Live {
     fn clear_selection(&mut self) {
         self.selection = None;
         self.selection_text = None;
+        self.selecting_kind = SelectKind::Char;
     }
 
     /// 확정된 선택의 그 자리 글자를 기록한다(AS-17: 출력으로 내용이 바뀌면 지우기 위해).
@@ -2336,40 +2349,102 @@ impl Shell {
             .is_some_and(|l| modifiers.shift || !l.pane.modes().mouse())
     }
 
-    /// 선택을 시작하거나(`start`) 끝점을 옮긴다. 그리드 밖이면 그대로.
-    fn select_at(
+    /// 왼쪽 버튼 누름(OWE-866): Shift+클릭은 기존 anchor를 유지한 채 head만 옮기고,
+    /// 더블클릭은 단어, 트리플클릭은 줄을 선택한다. 그리드 밖이면 그대로.
+    fn select_begin(
         &mut self,
         pane: PaneId,
         position: Point<Pixels>,
-        start: bool,
+        click_count: usize,
+        shift: bool,
         cx: &mut Context<Self>,
     ) {
         let Some(l) = self.live.get_mut(&pane) else {
             return;
         };
-        let Some((column, line)) = cell_at(&l.painted, &l.pane.shown(), position) else {
+        let screen = l.pane.shown();
+        let Some((column, line)) = cell_at(&l.painted, &screen, position) else {
             return;
         };
         let at = select::Point { line, column };
-        match (&mut l.selection, start) {
-            (Some(sel), false) if l.selecting => sel.head = at,
-            (_, true) => {
-                l.selection = Some(Selection::new(at));
-                l.selection_text = None;
-                l.selecting = true;
+        if shift && l.selection.is_some() {
+            let anchor = l.selection.map_or(at, |sel| sel.anchor);
+            l.selection = Some(Selection { anchor, head: at });
+            l.selection_text = None;
+            l.selecting = true;
+            l.selecting_kind = SelectKind::Char;
+            cx.notify();
+            return;
+        }
+        let (selection, kind) = if click_count >= 3 {
+            (Selection::line_at(&screen, at), SelectKind::Line)
+        } else if click_count == 2 {
+            (Selection::word_at(&screen, at), SelectKind::Word)
+        } else {
+            (Selection::new(at), SelectKind::Char)
+        };
+        l.selection = Some(selection);
+        l.selection_text = None;
+        l.selecting = true;
+        l.selecting_kind = kind;
+        cx.notify();
+    }
+
+    /// 선택 끌기 중 끝점 이동: 누름 때 정한 단위(글자·단어·줄)를 유지한다(OWE-866).
+    fn select_move(&mut self, pane: PaneId, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(l) = self.live.get_mut(&pane) else {
+            return;
+        };
+        let screen = l.pane.shown();
+        let Some((column, line)) = cell_at(&l.painted, &screen, position) else {
+            return;
+        };
+        let at = select::Point { line, column };
+        let (Some(mut sel), selecting, kind) = (l.selection, l.selecting, l.selecting_kind) else {
+            return;
+        };
+        if !selecting {
+            return;
+        }
+        match kind {
+            SelectKind::Char => sel.head = at,
+            SelectKind::Word => {
+                let word = Selection::word_at(&screen, at);
+                sel.head = if at >= sel.anchor {
+                    word.head
+                } else {
+                    word.anchor
+                };
             }
-            _ => return,
+            SelectKind::Line => {
+                let cols = screen.cols;
+                sel.head = if at.line >= sel.anchor.line {
+                    select::Point {
+                        line: at.line,
+                        column: cols.saturating_sub(1),
+                    }
+                } else {
+                    select::Point {
+                        line: at.line,
+                        column: 0,
+                    }
+                };
+            }
         }
         cx.notify();
     }
 
-    /// 선택 끌기를 마친다. 움직이지 않은 클릭이면 선택을 지운다. 끌던 중이었으면 `true`.
+    /// 선택 끌기를 마친다. 움직이지 않은 클릭이면 선택을 지운다(OWE-866: 단어·줄
+    /// 선택은 한 칸짜리라도 유지한다). 끌던 중이었으면 `true`.
     fn select_end(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
         let Some(l) = self.live.get_mut(&pane).filter(|l| l.selecting) else {
+        l.selection = Some(sel);
             return false;
         };
         l.selecting = false;
-        if l.selection.is_some_and(|s| s.anchor == s.head) {
+        let keep_single = l.selecting_kind != SelectKind::Char;
+        l.selecting_kind = SelectKind::Char;
+        if l.selection.is_some_and(|s| s.anchor == s.head) && !keep_single {
             l.clear_selection();
         } else {
             l.snapshot_selection();
@@ -3220,7 +3295,7 @@ impl Shell {
                     }
                     this.change(true, cx, |l| l.focus(id));
                     if this.selects(id, e.modifiers) {
-                        this.select_at(id, e.position, true, cx);
+                        this.select_begin(id, e.position, e.click_count, e.modifiers.shift, cx);
                     } else {
                         this.mouse_input(
                             id,
@@ -3295,7 +3370,7 @@ impl Shell {
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
                 {
-                    this.select_at(id, e.position, false, cx);
+                    this.select_move(id, e.position, cx);
                     return;
                 }
                 let b = match e.pressed_button {
