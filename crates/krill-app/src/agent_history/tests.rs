@@ -14,6 +14,7 @@ pub(super) fn sample() -> Entry {
 
 #[gpui::test]
 fn on_demand_scan_refresh_and_resume_emit_new_session(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
     let log = Arc::new(Mutex::new(Vec::new()));
     let seen = log.clone();
     let call: Call = Arc::new(move |r| {
@@ -89,6 +90,7 @@ fn older_daemon_receives_no_new_variant() {
 
 #[gpui::test]
 fn failed_resume_preserves_list_and_emits_nothing(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
     let (panel, cx) = cx.add_window_view(|_, _| {
         Panel::new(Arc::new(|_| {
             Ok(Reply::Failed(krill_proto::control::Failure::NoHolder))
@@ -113,6 +115,7 @@ fn failed_resume_preserves_list_and_emits_nothing(cx: &mut TestAppContext) {
 /// OWE-652: 바깥 클릭은 팝오버를 닫는다.
 #[gpui::test]
 fn outside_click_closes_popover(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
     let call: Call = Arc::new(|_| {
         Ok(Reply::AgentHistory(Response::Scanned(Snapshot {
             entries: vec![sample()],
@@ -165,6 +168,7 @@ fn highlight_spans_splits_matching_query_tokens_and_ignores_operators() {
 
 #[gpui::test]
 fn vault_panel_filters_by_scope_and_agent_and_one_click_resumes(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
     let log = Arc::new(Mutex::new(Vec::new()));
     let seen = log.clone();
     let sample_hits = vec![
@@ -301,6 +305,7 @@ fn vault_panel_filters_by_scope_and_agent_and_one_click_resumes(cx: &mut TestApp
 /// 검색어·범위·에이전트 필터가 바뀌면 유실하지 않고 완료 직후 최신 조건으로 재검색한다.
 #[gpui::test]
 fn query_and_filter_changes_while_busy_run_latest_vault_search(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
     let log = Arc::new(Mutex::new(Vec::new()));
     let seen = log.clone();
     let call: Call = Arc::new(move |r| {
@@ -374,4 +379,43 @@ fn query_and_filter_changes_while_busy_run_latest_vault_search(cx: &mut TestAppC
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].title, "Refresh Handler");
     });
+}
+
+/// OWE-857: 팝오버가 열리면 상단 제목·새로고침 버튼이 보이고 검색창에 자동 포커스된다.
+#[gpui::test]
+fn opening_popover_focuses_search_and_shows_header(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let call: Call = Arc::new(|_| {
+        Ok(Reply::AgentHistory(Response::Scanned(Snapshot {
+            entries: Vec::new(),
+            truncated: false,
+            skipped: false,
+        })))
+    });
+    let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
+    panel.update(cx, Panel::toggle);
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("agent-history-popover").is_some(),
+        "popover opens"
+    );
+    assert!(
+        cx.debug_bounds("agent-history-title").is_some(),
+        "header shows the session history title"
+    );
+    assert!(
+        cx.debug_bounds("agent-history-refresh").is_some(),
+        "header shows a refresh button, not plain text"
+    );
+    cx.simulate_input("hello");
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| assert_eq!(p.query(), "hello"));
+}
+
+/// OWE-857: 빈 상태 문구는 특정 에이전트에 고정되지 않는다.
+#[test]
+fn empty_message_is_agent_neutral() {
+    let msg = crate::i18n::catalog::agent_history::EMPTY.get();
+    assert_eq!(msg, "세션 기록이 없습니다");
+    assert!(!msg.contains("Claude") && !msg.contains("Codex"));
 }

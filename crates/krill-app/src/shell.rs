@@ -43,7 +43,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, AnyWindowHandle, App, Bounds, ClipboardItem, Context, DragMoveEvent, ElementId,
     ElementInputHandler, Empty, EntityInputHandler, ExternalPaths, FocusHandle, KeyBinding,
-    KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, Pixels, Point, ScrollWheelEvent,
+    KeyDownEvent, KeyUpEvent, Modifiers, MouseButton, Pixels, Point, PromptLevel, ScrollWheelEvent,
     SharedString, Subscription, Task, UTF16Selection, Window, actions, canvas, div, point,
     prelude::*, px, relative,
 };
@@ -429,6 +429,8 @@ pub struct Shell {
     sidebar: gpui::Entity<sidebar::Sidebar>,
     _sidebar_selection: Subscription,
     _sidebar_new_session: Subscription,
+    _sidebar_close_session: Subscription,
+    _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
@@ -607,6 +609,22 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
+        let close_session =
+            cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::CloseSession, cx| {
+                let host = sidebar
+                    .update(cx, |s, _| s.take_action_host())
+                    .unwrap_or(krill_app::hosts::HostId::Local);
+                this.request_close_sidebar_session(host, e.0, cx);
+            });
+        let continue_session = cx.subscribe(
+            &sidebar,
+            |this, sidebar, e: &sidebar::ContinueSession, cx| {
+                let host = sidebar
+                    .update(cx, |s, _| s.take_action_host())
+                    .unwrap_or(krill_app::hosts::HostId::Local);
+                this.continue_sidebar_session(&host, e.0, cx);
+            },
+        );
         // OWE-654·723: 사이드바 폴더 아이콘·빈 상태 '폴더 열기'는 Orca처럼 프로젝트 추가 모달을 연다.
         cx.subscribe(&sidebar, |this, _, _: &sidebar::OpenFolder, cx| {
             let Some(win) = this.window else {
@@ -768,6 +786,8 @@ impl Shell {
             system_appearance: None,
             _sidebar_selection: selection,
             _sidebar_new_session: new_session,
+            _sidebar_close_session: close_session,
+            _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
             _sidebar_tabs: sidebar_tabs,
             layout,
@@ -2842,19 +2862,7 @@ impl Shell {
         if let Some(old) = self.layout.focused() {
             self.commit_ime(old, None, cx);
         }
-        let mut target = None;
-        for i in 0..self.layout.tabs().len() {
-            let mut layout = self.layout.clone();
-            layout.activate(i);
-            if let Some(pane) = layout
-                .visible()
-                .into_iter()
-                .find(|&p| layout.session(p) == Some(session) && *layout.host(p) == host)
-            {
-                target = Some((i, pane));
-                break;
-            }
-        }
+        let target = self.tab_pane_for_session_on(&host, session);
         self.change(true, cx, |l| {
             if let Some((tab, pane)) = target {
                 l.activate(tab);
@@ -2885,6 +2893,137 @@ impl Shell {
             cx.update_window(handle, |_, window, cx| window.focus(&focus, cx))
                 .ok();
         }
+    }
+
+    /// 지정한 호스트·세션이 붙은 칸을 찾는다(탭 인덱스·칸). OWE-854 사이드바 이어하기가 쓴다.
+    fn tab_pane_for_session_on(
+        &self,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+    ) -> Option<(usize, PaneId)> {
+        for i in 0..self.layout.tabs().len() {
+            let mut layout = self.layout.clone();
+            layout.activate(i);
+            if let Some(pane) = layout
+                .visible()
+                .into_iter()
+                .find(|&p| layout.session(p) == Some(session) && layout.host(p) == host)
+            {
+                return Some((i, pane));
+            }
+        }
+        None
+    }
+
+    /// OWE-854: 사이드바 세션 행의 '새 세션에 이어하기…'. 칸에 없으면 먼저 붙이고 모달을 연다.
+    fn continue_sidebar_session(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        let mut target = self.tab_pane_for_session_on(host, session);
+        if target.is_none() {
+            self.open_session_on(host.clone(), session, cx);
+            target = self.tab_pane_for_session_on(host, session);
+        }
+        let Some((_, pane)) = target else {
+            return;
+        };
+        let Some(handle) = self.window.and_then(|h| h.downcast::<Shell>()) else {
+            self.notice = Some(text::SIDEBAR_NO_WINDOW.get().to_owned());
+            cx.notify();
+            return;
+        };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |this, window, cx| {
+                    this.open_continue_session(pane, window, cx);
+                })
+                .ok();
+        });
+    }
+
+    /// OWE-854: 사이드바 세션 행의 '세션 종료…'. 확인 후 해당 호스트 데몬에 `Request::Close`를 보낸다.
+    fn request_close_sidebar_session(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.target_for_host(&host).is_none() {
+            self.notice = Some(text::DAEMON_FAILED.get().to_owned());
+            cx.notify();
+            return;
+        }
+        let Some(handle) = self.window.and_then(|h| h.downcast::<Shell>()) else {
+            self.notice = Some(text::SIDEBAR_NO_WINDOW.get().to_owned());
+            cx.notify();
+            return;
+        };
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |this, window, cx| {
+                    this.confirm_close_sidebar_session(&host, session, window, cx);
+                })
+                .ok();
+        });
+    }
+
+    /// '세션 종료…' 확인 대화상자 뒤에 호스트 데몬에 종료를 요청한다. 결과는 알림에 남긴다.
+    fn confirm_close_sidebar_session(
+        &mut self,
+        host: &krill_app::hosts::HostId,
+        session: krill_proto::SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_app::i18n::catalog::resources as rtext;
+        let Some(target) = self.target_for_host(host) else {
+            self.notice = Some(text::DAEMON_FAILED.get().to_owned());
+            cx.notify();
+            return;
+        };
+        let title = rtext::KILL_TITLE
+            .get()
+            .replace("{id}", &session.0.to_string());
+        let detail = rtext::KILL_DETAIL.get().to_owned();
+        let yes = rtext::KILL_CONFIRM.get().to_owned();
+        let no = rtext::CANCEL.get().to_owned();
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            &title,
+            Some(&detail),
+            &[yes.as_str(), no.as_str()],
+            cx,
+        );
+        let weak = cx.weak_entity();
+        cx.spawn(async move |_, cx| {
+            if answer.await != Ok(0) {
+                return;
+            }
+            let sent = cx
+                .background_executor()
+                .spawn(async move {
+                    let call = krill_app::resources::daemon_call_for(Some(target));
+                    let req = krill_proto::control::Request::Close { session };
+                    match call(&req) {
+                        Ok(krill_proto::control::Reply::Failed(f)) => f.to_string(),
+                        Ok(_) => rtext::KILL_SENT.get().to_owned(),
+                        Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                            rtext::OUTDATED.get().to_owned()
+                        }
+                        Err(e) => e.to_string(),
+                    }
+                })
+                .await;
+            weak.update(cx, |this, cx| {
+                this.notice = Some(sent);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn refresh_detached(&mut self, cx: &mut Context<Self>) {

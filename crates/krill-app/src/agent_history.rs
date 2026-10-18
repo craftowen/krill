@@ -4,8 +4,9 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use gpui::{Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
+use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
 use gpui_component::Sizable as _;
+use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
 use krill_proto::SessionId;
 use krill_proto::agent_history::{
@@ -157,6 +158,10 @@ fn path_matches_scope(cwd: &str, filter_paths: &[String]) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct Open(pub SessionId);
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "팝오버 열림·처리 중·재검색 대기·열림 포커스 예약의 독립 UI 상태"
+)]
 pub struct Panel {
     call: Call,
     open: bool,
@@ -171,6 +176,7 @@ pub struct Panel {
     project_paths: Vec<String>,
     input: Option<Entity<InputState>>,
     input_sub: Option<Subscription>,
+    focus_on_open: bool,
     language: crate::i18n::Language,
     error: Option<String>,
     task: Option<Task<()>>,
@@ -212,6 +218,7 @@ impl Panel {
             project_paths: Vec::new(),
             input: None,
             input_sub: None,
+            focus_on_open: false,
             language: crate::i18n::language(),
             error: None,
             task: None,
@@ -229,6 +236,8 @@ impl Panel {
             return;
         }
         self.open = true;
+        // OWE-857: 다음 렌더에서 검색창에 자동 포커스한다.
+        self.focus_on_open = true;
         self.scan(cx);
     }
 
@@ -246,6 +255,7 @@ impl Panel {
             self.open = false;
             self.busy = false;
             self.pending_search = false;
+            self.focus_on_open = false;
             self.data = None;
             self.vault = None;
             self.task = None;
@@ -410,13 +420,25 @@ impl Panel {
     }
 
     /// OWE-652: 헤더 클릭. 바깥 닫기와 같은 제스처(약 150ms 안)면 닫힌 채로 둔다.
-    fn on_toggle_click(&mut self, cx: &mut Context<Self>) {
+    fn on_toggle_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let same_gesture = self
             .dismissed_at
             .take()
             .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(150));
         if !same_gesture {
             self.toggle(cx);
+            // OWE-857: 열릴 때 검색창에 자동 포커스한다.
+            self.focus_search(window, cx);
+        }
+    }
+
+    /// OWE-857: 열린 팝오버의 검색창에 포커스를 둔다. 입력 엔티티가 아직
+    /// 없으면 다음 렌더의 `focus_on_open` 소비가 대신 수행한다.
+    pub fn focus_search(&self, window: &mut Window, cx: &mut App) {
+        if self.open
+            && let Some(input) = &self.input
+        {
+            input.update(cx, |s, cx| s.focus(window, cx));
         }
     }
 
@@ -509,8 +531,11 @@ impl Render for Panel {
             let input = self
                 .input
                 .get_or_insert_with(|| {
+                    let query = self.query.clone();
                     cx.new(|cx| {
-                        InputState::new(window, cx).placeholder(text::SEARCH_PLACEHOLDER.get())
+                        InputState::new(window, cx)
+                            .placeholder(text::SEARCH_PLACEHOLDER.get())
+                            .default_value(query)
                     })
                 })
                 .clone();
@@ -527,6 +552,11 @@ impl Render for Panel {
                 input.update(cx, |s, cx| {
                     s.set_placeholder(text::SEARCH_PLACEHOLDER.get(), window, cx);
                 });
+            }
+            // OWE-857: 열림 요청(`toggle`)이 남긴 포커스 예약을 여기서 소비한다.
+            if self.focus_on_open {
+                self.focus_on_open = false;
+                input.update(cx, |s, cx| s.focus(window, cx));
             }
         }
 
@@ -561,7 +591,7 @@ impl Render for Panel {
             .tooltip(move |window, cx| {
                 crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
             })
-            .on_click(cx.listener(|this, _, _, cx| this.on_toggle_click(cx)));
+            .on_click(cx.listener(|this, _, window, cx| this.on_toggle_click(window, cx)));
 
         let popover = self.open.then(|| {
             let search_bar = if let Some(input) = &self.input {
@@ -772,27 +802,47 @@ impl Render for Panel {
                 .text_color(p.popover_foreground)
                 .border_1()
                 .border_color(p.border)
-                .shadow_md()
+                .shadow_lg()
                 .text_size(crate::ui::TEXT_XS)
                 // OWE-652: 바깥 클릭·다른 팝오버가 열리면 닫는다.
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| this.on_outside_down(cx)))
                 .child(
                     div()
-                        .id("agent-history-refresh")
-                        .py_1()
-                        .cursor_pointer()
-                        .child(if self.busy {
-                            text::BUSY.get()
-                        } else {
-                            text::REFRESH.get()
-                        })
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            if this.has_vault_filters() || this.vault.is_some() {
-                                this.search_vault(cx);
-                            } else {
-                                this.run(Action::Scan, cx);
-                            }
-                        })),
+                        .id("agent-history-header")
+                        .debug_selector(|| "agent-history-header".into())
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pb_1()
+                        .child(
+                            div()
+                                .id("agent-history-title")
+                                .debug_selector(|| "agent-history-title".into())
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.foreground)
+                                .child(text::TITLE.get()),
+                        )
+                        .child(
+                            Button::new("agent-history-refresh")
+                                .icon(gpui_component::IconName::RefreshCw)
+                                .label(if self.busy {
+                                    text::BUSY.get()
+                                } else {
+                                    text::REFRESH.get()
+                                })
+                                .ghost()
+                                .xsmall()
+                                .debug_selector(|| "agent-history-refresh".into())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.has_vault_filters() || this.vault.is_some() {
+                                        this.search_vault(cx);
+                                    } else {
+                                        this.run(Action::Scan, cx);
+                                    }
+                                })),
+                        ),
                 )
                 .child(search_bar)
                 .child(scope_bar)

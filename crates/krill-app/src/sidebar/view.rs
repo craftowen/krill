@@ -13,6 +13,7 @@ use gpui_component::checkbox::Checkbox;
 use gpui_component::input::Input;
 use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_component::{Icon, IconName, Sizable as _};
+use krill_proto::SessionId;
 use krill_proto::control::{AgentProfile, Program};
 
 use super::{
@@ -35,16 +36,25 @@ struct TreeMenuMeta {
     sleeping: bool,
 }
 
-/// 행 컨텍스트 메뉴: 여기서 새 터미널·에이전트(N4), Open in(폴더가 있을 때), 워크트리면 핀·이름 변경·계보 작업(MK-176).
+/// OWE-854: 세션 행 메뉴에 필요한 대상(행 위치·세션).
+#[derive(Clone)]
+struct SessionMenuMeta {
+    index: usize,
+    id: SessionId,
+}
+
+/// 행 컨텍스트 메뉴: 세션 행이면 세션 제어(열기·이어하기·종료)를 먼저 두고,
+/// 여기서 새 터미널·에이전트(N4), Open in(폴더가 있을 때), 워크트리면 핀·이름 변경·계보 작업(MK-176).
 #[expect(
     clippy::too_many_arguments,
-    reason = "context menu builder receives row state, host, worktree lineage meta, and gpui contexts"
+    reason = "context menu builder receives row state, host, session meta, worktree lineage meta, and gpui contexts"
 )]
 fn row_menu(
     mut menu: PopupMenu,
     this: &gpui::WeakEntity<Sidebar>,
     host: &HostId,
     folder: Option<&PathBuf>,
+    session: Option<&SessionMenuMeta>,
     tree: Option<&TreeMenuMeta>,
     header: Option<&PathBuf>,
     agents: &[AgentProfile],
@@ -52,6 +62,40 @@ fn row_menu(
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
+    if let Some(sess) = session {
+        let (open_this, open_index, open_id) = (this.clone(), sess.index, sess.id);
+        menu = menu.item(
+            PopupMenuItem::new(text::OPEN_SESSION.get()).on_click(move |_, _, cx| {
+                open_this
+                    .update(cx, |s, cx| s.select_session(open_index, open_id, cx))
+                    .ok();
+            }),
+        );
+        let (cont_this, cont_index, cont_id) = (this.clone(), sess.index, sess.id);
+        menu = menu.item(PopupMenuItem::new(text::CONTINUE_SESSION.get()).on_click(
+            move |_, _, cx| {
+                cont_this
+                    .update(cx, |s, cx| {
+                        s.request_continue_session(cont_index, cont_id, cx);
+                    })
+                    .ok();
+            },
+        ));
+        let (close_this, close_index, close_id) = (this.clone(), sess.index, sess.id);
+        menu = menu
+            .item(
+                PopupMenuItem::new(text::CLOSE_SESSION.get())
+                    .icon(IconName::Close)
+                    .on_click(move |_, _, cx| {
+                        close_this
+                            .update(cx, |s, cx| {
+                                s.request_close_session(close_index, close_id, cx);
+                            })
+                            .ok();
+                    }),
+            )
+            .separator();
+    }
     if let Some(folder) = folder {
         let (term_this, term_host, term_folder) = (this.clone(), host.clone(), folder.clone());
         menu = menu.item(
@@ -751,8 +795,8 @@ impl Sidebar {
                     ))
                     .child(
                         div()
-                            .flex_none()
-                            .max_w_3_4()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(name),
@@ -1699,9 +1743,11 @@ impl Sidebar {
                             if let Some(sess) = single_session {
                                 let (sess_name, _) = self.session_label(sess);
                                 let sess_unread = self.is_unread(sess.id);
+                                let sess_id = sess.id;
                                 d.child(
                                     div()
                                         .id(("fold", index))
+                                        .debug_selector(move || format!("card-session-{index}"))
                                         .w_full()
                                         .h(px(20.))
                                         .flex()
@@ -1730,7 +1776,20 @@ impl Sidebar {
                                         )
                                         .on_click(cx.listener(move |s, _, _, cx| {
                                             cx.stop_propagation();
-                                            s.toggle_card_sessions(&fold, cx);
+                                            // OWE-854: 1개 세션 줄은 펼치기 토글이 아니라 해당 세션 선택이다.
+                                            let idx = s
+                                                .rows
+                                                .iter()
+                                                .position(|r| {
+                                                    matches!(r, Row::Session(item, _) if item.id == sess_id)
+                                                })
+                                                .unwrap_or(index);
+                                            s.select_session_on(
+                                                idx,
+                                                s.row_host(idx).clone(),
+                                                sess_id,
+                                                cx,
+                                            );
                                         })),
                                 )
                             } else {
@@ -1817,12 +1876,12 @@ impl Sidebar {
             }))
     }
 
-    /// 행 + 우클릭 메뉴(여기서 새 터미널·에이전트·Open in·핀·이름 변경·계보 작업).
+    /// 행 + 우클릭 메뉴(세션 행은 열기·이어하기·종료 + 여기서 새 터미널·에이전트·Open in, 워크트리·폴더는 핀·이름 변경·계보 작업).
     /// 저장소·폴더 헤더는 접기 대상 경로를 `header`로 넘겨 '프로젝트 제거' 메뉴를 붙인다(OWE-845).
     fn render_row_with_menu(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let element = self.render_row(index, row, cx);
         let host = self.row_host(index).clone();
-        let (folder, tree, header) = match row {
+        let (folder, session, tree, header) = match row {
             Row::Worktree(path) => {
                 let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
                 let is_primary = self.snapshot_for(&host).trees.contains_key(path);
@@ -1849,6 +1908,7 @@ impl Sidebar {
                 let sleeping = host.is_local() && self.is_worktree_sleeping(path);
                 (
                     Some(path.clone()),
+                    None,
                     Some(TreeMenuMeta {
                         path: path.clone(),
                         pinned,
@@ -1861,9 +1921,14 @@ impl Sidebar {
                     None,
                 )
             }
-            Row::Session(s, _) => (s.worktree.clone().or_else(|| s.cwd.clone()), None, None),
+            Row::Session(s, _) => (
+                s.worktree.clone().or_else(|| s.cwd.clone()),
+                Some(SessionMenuMeta { index, id: s.id }),
+                None,
+                None,
+            ),
             Row::Repository(path) | Row::Folder(path) => {
-                (Some(path.clone()), None, Some(path.clone()))
+                (Some(path.clone()), None, None, Some(path.clone()))
             }
             _ => return element.into_any_element(),
         };
@@ -1880,6 +1945,7 @@ impl Sidebar {
                     &this,
                     &host,
                     folder.as_ref(),
+                    session.as_ref(),
                     tree.as_ref(),
                     header.as_ref(),
                     &agents,
