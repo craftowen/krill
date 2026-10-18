@@ -6134,3 +6134,284 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
 
     fs::remove_dir_all(d).ok();
 }
+
+/// OWE-797: AI 제공자 계정(Accounts) 탭에서 프로바이더 상태 배지, 계정 행 배지(사용 중·로그인 필요·한도 도달),
+/// 5h/7d 초기화 시각 메타, 비활성 계정 행 클릭 즉시 전환, 자동전환 및 고급 정책 `ui::switch`/`ui::segmented_control`이
+/// 동작하며 좁은 창(820px)에서도 우측 경계를 넘지 않는다.
+#[gpui::test]
+fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut TestAppContext) {
+    use krill_proto::usage::{
+        AccountConnection, AccountPolicyState, AccountStatus, AccountStatusInfo, AdvancedPolicy,
+        ConnectionStatus, ConnectionsSnapshot, ProviderKind, Snapshot, UsageRequest, Window,
+    };
+
+    let d = dir("owe797-accounts-tab");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Accounts, cx);
+            for label in ["Primary", "Work", "Relogin"] {
+                v.apply_account_request(
+                    UsageRequest::AddAccount {
+                        provider: ProviderKind::Claude,
+                        label: label.into(),
+                        email: Some(format!("{}@example.com", label.to_ascii_lowercase())),
+                        profile_dir: d.join("claude").join(label).display().to_string(),
+                    },
+                    cx,
+                );
+            }
+            v.apply_account_request(
+                UsageRequest::SwitchAccount {
+                    provider: ProviderKind::Claude,
+                    account_id: "claude-primary".into(),
+                },
+                cx,
+            );
+            if let Some(primary) = v
+                .accounts_snapshot
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == "claude-primary")
+            {
+                primary.usage = Snapshot {
+                    five_hour: Some(Window {
+                        percent: 72,
+                        resets_at: Some("4102444800".into()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 45,
+                        resets_at: Some("4102444800".into()),
+                    }),
+                };
+            }
+            v.accounts_snapshot.statuses = vec![
+                AccountStatusInfo {
+                    account_id: "claude-primary".into(),
+                    status: AccountStatus::RateLimited,
+                    updated_at: Some(crate::accounts::display::now()),
+                    detail: None,
+                },
+                AccountStatusInfo {
+                    account_id: "claude-relogin".into(),
+                    status: AccountStatus::NeedsLogin,
+                    updated_at: Some(crate::accounts::display::now()),
+                    detail: None,
+                },
+            ];
+            *v.accounts_snapshot.connections = ConnectionsSnapshot {
+                supported: true,
+                direct_usage: false,
+                accounts: vec![
+                    AccountConnection {
+                        account_id: "claude-primary".into(),
+                        status: ConnectionStatus::Connected,
+                    },
+                    AccountConnection {
+                        account_id: "claude-work".into(),
+                        status: ConnectionStatus::Connected,
+                    },
+                    AccountConnection {
+                        account_id: "claude-relogin".into(),
+                        status: ConnectionStatus::NeedsLogin,
+                    },
+                ],
+            };
+            v.accounts_snapshot.advanced = AccountPolicyState {
+                supported: true,
+                policy: AdvancedPolicy::default(),
+                ..AccountPolicyState::default()
+            };
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let pt = vcx
+            .debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+            .center();
+        vcx.simulate_click(pt, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let column = bounds(vcx, "admin-content-column");
+
+    // 1) 프로바이더 헤더 상태 배지 및 계정 행 상태 배지(사용 중 / 한도 도달 / 로그인 필요)·초기화 카운트다운·아바타 상태 점(STATE_DOT)·툴팁 검증
+    assert!(vcx.debug_bounds("admin-provider-status-claude").is_some());
+    let dot_bounds = bounds(vcx, "admin-account-dot-claude-primary");
+    assert_eq!(dot_bounds.size.width, crate::ui::STATE_DOT);
+    assert_eq!(dot_bounds.size.height, crate::ui::STATE_DOT);
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-primary")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-work")
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-rate-limited-claude-primary")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-needs-login-claude-relogin")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-login-account-claude-relogin")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-switch-account-claude-relogin")
+            .is_none()
+    );
+    assert!(vcx.debug_bounds("admin-usage-reset-5h").is_some());
+    assert!(vcx.debug_bounds("admin-usage-reset-7d").is_some());
+
+    for (hover_sel, tip_sel) in [
+        (
+            "admin-account-status-claude-primary",
+            "tooltip:admin-account-status-claude-primary",
+        ),
+        (
+            "admin-account-usage-claude-primary",
+            "tooltip:admin-account-usage-claude-primary",
+        ),
+    ] {
+        let b = bounds(vcx, hover_sel);
+        vcx.simulate_mouse_move(b.center(), None, gpui::Modifiers::default());
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds(tip_sel).is_some(),
+            "hovering {hover_sel} must show {tip_sel}"
+        );
+    }
+
+    // 2) 비활성 정상 계정 행(`admin-account-row-claude-work`) 좌측 영역을 직접 클릭하면 즉시 전환된다.
+    let work_row = bounds(vcx, "admin-account-row-claude-work");
+    let row_left_click = gpui::point(
+        work_row.origin.x + px(20.),
+        work_row.origin.y + work_row.size.height * 0.5,
+    );
+    vcx.simulate_click(row_left_click, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let active = view
+            .read(cx)
+            .accounts()
+            .accounts
+            .iter()
+            .find(|a| a.provider == ProviderKind::Claude && a.active)
+            .unwrap();
+        assert_eq!(active.id, "claude-work");
+    });
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-work")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-primary")
+            .is_none()
+    );
+
+    // 우측 보조 `전환` 버튼(`admin-switch-account-claude-primary`)으로도 다시 전환된다.
+    click(vcx, "admin-switch-account-claude-primary");
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-primary")
+            .is_some()
+    );
+
+    // 3) 자동전환 & 고급 정책 스위치(`ui::switch`) 및 쿨다운 세그먼트(`ui::segmented_control`) 검증
+    for switch_sel in [
+        "admin-auto-switch-toggle",
+        "admin-rate-limit-toggle",
+        "admin-direct-usage-toggle",
+        "admin-predict-exhaustion-toggle",
+        "admin-prefer-soonest-reset-toggle",
+    ] {
+        let b = bounds(vcx, switch_sel);
+        assert_eq!(b.size.width, crate::ui::SWITCH_WIDTH, "{switch_sel}");
+        assert_eq!(b.size.height, crate::ui::SWITCH_HEIGHT, "{switch_sel}");
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "switch {switch_sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    let rl_before = vcx.update(|_, cx| view.read(cx).accounts().auto_switch.switch_on_rate_limit);
+    let rl_thumb_before = bounds(vcx, "admin-rate-limit-toggle-thumb").origin.x;
+    click(vcx, "admin-rate-limit-toggle");
+    let rl_after = vcx.update(|_, cx| view.read(cx).accounts().auto_switch.switch_on_rate_limit);
+    let rl_thumb_after = bounds(vcx, "admin-rate-limit-toggle-thumb").origin.x;
+    assert_eq!(rl_after, !rl_before);
+    assert_ne!(rl_thumb_before, rl_thumb_after);
+
+    let pred_before =
+        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.predict_exhaustion);
+    click(vcx, "admin-predict-exhaustion-toggle");
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.predict_exhaustion),
+        !pred_before
+    );
+
+    let soon_before = vcx.update(|_, cx| {
+        view.read(cx)
+            .accounts()
+            .advanced
+            .policy
+            .prefer_soonest_reset
+    });
+    click(vcx, "admin-prefer-soonest-reset-toggle");
+    assert_eq!(
+        vcx.update(|_, cx| {
+            view.read(cx)
+                .accounts()
+                .advanced
+                .policy
+                .prefer_soonest_reset
+        }),
+        !soon_before
+    );
+
+    for cd_sel in [
+        "admin-cooldown-0m",
+        "admin-cooldown-5m",
+        "admin-cooldown-15m",
+        "admin-cooldown-30m",
+    ] {
+        let b = bounds(vcx, cd_sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "cooldown segment {cd_sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+    click(vcx, "admin-cooldown-15m");
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.cooldown_secs),
+        15 * 60
+    );
+
+    // 4) 계정 오류 배너(`ui::error_banner`) 노출 검증
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.account_error = Some("account sync failed".into());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let err_b = bounds(vcx, "admin-account-error");
+    assert!(err_b.right() <= column.right() + px(0.5));
+
+    fs::remove_dir_all(d).ok();
+}
