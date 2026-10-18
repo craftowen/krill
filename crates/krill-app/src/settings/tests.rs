@@ -2030,8 +2030,8 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx));
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("sound-on").is_some());
-    click(vcx, "sound-off");
+    assert!(vcx.debug_bounds("sound-toggle").is_some());
+    click(vcx, "sound-toggle");
     vcx.update(|_, cx| {
         assert_eq!(current(cx).terminal_font_size(), 14);
         assert_eq!(current(cx).terminal_opacity_pct(), 95);
@@ -2041,14 +2041,15 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("hib-on").is_some());
-    assert!(vcx.debug_bounds("hib-off").is_some());
-    click(vcx, "hib-off");
+    assert!(vcx.debug_bounds("hib-toggle").is_some());
     vcx.update(|_, cx| assert!(!current(cx).hibernation_enabled));
     assert!(!d.join(HIBERNATION_FLAG).exists());
-    click(vcx, "hib-on");
+    click(vcx, "hib-toggle");
     vcx.update(|_, cx| assert!(current(cx).hibernation_enabled));
     assert!(d.join(HIBERNATION_FLAG).is_file());
+    click(vcx, "hib-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).hibernation_enabled));
+    assert!(!d.join(HIBERNATION_FLAG).exists());
     fs::remove_dir_all(d).ok();
 }
 
@@ -2287,25 +2288,22 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
         "cursor-block",
         "cursor-bar",
         "cursor-underline",
-        "cursor-blink-on",
-        "cursor-blink-off",
-        "option-meta-on",
-        "option-meta-off",
-        "copy-select-on",
-        "copy-select-off",
+        "cursor-blink-toggle",
+        "option-meta-toggle",
+        "copy-select-toggle",
     ] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
     }
     click(vcx, "cursor-bar");
-    click(vcx, "cursor-blink-on");
-    click(vcx, "option-meta-on");
-    click(vcx, "copy-select-on");
+    click(vcx, "cursor-blink-toggle");
+    click(vcx, "option-meta-toggle");
+    click(vcx, "copy-select-toggle");
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.terminal_cursor_shape, TerminalCursorShape::Bar);
         assert!(s.terminal_cursor_blink && s.option_as_meta && s.copy_on_select);
     });
-    click(vcx, "option-meta-off");
+    click(vcx, "option-meta-toggle");
     vcx.update(|_, cx| assert!(!current(cx).option_as_meta));
     fs::remove_dir_all(d).ok();
 }
@@ -3203,7 +3201,10 @@ fn owe719_accounts_content_starts_next_to_sidebar_and_rows_fill_column(cx: &mut 
             gap >= px(31.) && gap <= px(33.),
             "{width}: content must start right after the sidebar, gap {gap:?}"
         );
-        assert!(column.size.width <= px(760.), "{width}: {column:?}");
+        assert!(
+            column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH,
+            "{width}: {column:?}"
+        );
         let row = bounds(vcx, "admin-account-row-claude-work");
         assert_eq!(row.origin.x, column.origin.x, "{width}");
         assert_eq!(row.right(), column.right(), "{width}");
@@ -3379,8 +3380,7 @@ fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
     vcx.run_until_parked();
 
     assert!(vcx.debug_bounds("settings-update-check").is_some());
-    assert!(vcx.debug_bounds("update-auto-restart-on").is_some());
-    assert!(vcx.debug_bounds("update-auto-restart-off").is_some());
+    assert!(vcx.debug_bounds("update-auto-restart-toggle").is_some());
     assert!(vcx.debug_bounds("settings-update-restart").is_none());
 
     // [업데이트 확인] 버튼 클릭 시 수동 점검이 시작되어 UpdateState가 갱신된다.
@@ -3395,7 +3395,7 @@ fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
         assert!(!matches!(status, CheckStatus::Idle));
     });
 
-    let toggle = vcx.debug_bounds("update-auto-restart-on").unwrap();
+    let toggle = vcx.debug_bounds("update-auto-restart-toggle").unwrap();
     vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     vcx.update(|_, cx| {
@@ -3463,8 +3463,8 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-719 QA D4: "사용량 직접 조회"·"자동 계정 전환"이 현재 상태 없이 버튼 하나("켜기")만 보였다. 다른 설정과
-/// 같은 켜기/끄기 세그먼트여야 하고, 같은 쪽을 다시 눌러도 상태가 뒤집히지 않는다.
+/// OWE-719 QA D4 + OWE-793: "사용량 직접 조회"·"자동 계정 전환"이 다른 불리언 설정과 같은
+/// `ui::switch` 트랙·썸 스위치로 렌더링되며 클릭할 때마다 상태와 썸 위치가 전환된다.
 #[gpui::test]
 fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
     use krill_proto::usage::ConnectionsSnapshot;
@@ -3486,10 +3486,10 @@ fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     for id in [
-        "admin-direct-usage-on",
-        "admin-direct-usage-off",
-        "admin-auto-switch-on",
-        "admin-auto-switch-off",
+        "admin-direct-usage-toggle",
+        "admin-direct-usage-toggle-thumb",
+        "admin-auto-switch-toggle",
+        "admin-auto-switch-toggle-thumb",
     ] {
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
@@ -3497,26 +3497,28 @@ fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
         vcx.update(|_, cx| view.read(cx).accounts().auto_switch.enabled)
     };
     let initial = enabled(vcx);
-    let target = if initial {
-        "admin-auto-switch-on"
-    } else {
-        "admin-auto-switch-off"
-    };
-    for _ in 0..2 {
-        let at = vcx.debug_bounds(target).unwrap().center();
-        vcx.simulate_click(at, gpui::Modifiers::default());
-        vcx.run_until_parked();
-        assert_eq!(enabled(vcx), initial, "pressing the current side keeps it");
-    }
-    let other = if initial {
-        "admin-auto-switch-off"
-    } else {
-        "admin-auto-switch-on"
-    };
-    let at = vcx.debug_bounds(other).unwrap().center();
+    let thumb_before = vcx
+        .debug_bounds("admin-auto-switch-toggle-thumb")
+        .unwrap()
+        .origin
+        .x;
+    let at = vcx
+        .debug_bounds("admin-auto-switch-toggle")
+        .unwrap()
+        .center();
     vcx.simulate_click(at, gpui::Modifiers::default());
     vcx.run_until_parked();
     assert_eq!(enabled(vcx), !initial);
+    let thumb_after = vcx
+        .debug_bounds("admin-auto-switch-toggle-thumb")
+        .unwrap()
+        .origin
+        .x;
+    assert_ne!(
+        thumb_before, thumb_after,
+        "switch thumb must move on toggle"
+    );
+    fs::remove_dir_all(d).ok();
 }
 
 #[gpui::test]
@@ -3668,14 +3670,11 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     vcx.run_until_parked();
 
     for id in [
-        "auto-rename-branch-on",
-        "auto-rename-branch-off",
-        "prompt-cache-timer-on",
-        "prompt-cache-timer-off",
+        "auto-rename-branch-toggle",
+        "prompt-cache-timer-toggle",
         "prompt-cache-ttl-5m",
         "prompt-cache-ttl-1h",
-        "workspace-trust-preset-on",
-        "workspace-trust-preset-off",
+        "workspace-trust-preset-toggle",
     ] {
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
@@ -3694,9 +3693,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         assert!(!s.workspace_trust_preset_enabled);
     });
 
-    // 신뢰 프리셋 '켜기' 첫 클릭 시 바로 켜지지 않고 변경 파일·키 diff 확인 상자가 열린다.
+    // 신뢰 프리셋 토글 첫 클릭 시 바로 켜지지 않고 변경 파일·키 diff 확인 상자가 열린다.
     let trust_on_at = vcx
-        .debug_bounds("workspace-trust-preset-on")
+        .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
         .center();
     vcx.simulate_click(trust_on_at, gpui::Modifiers::default());
@@ -3718,9 +3717,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         &d
     )));
 
-    // 다시 '켜기' → '동의 후 켜기' 클릭 시 비로소 활성화되고 플래그 파일이 생성된다.
+    // 다시 토글 → '동의 후 켜기' 클릭 시 비로소 활성화되고 플래그 파일이 생성된다.
     let trust_on_at = vcx
-        .debug_bounds("workspace-trust-preset-on")
+        .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
         .center();
     vcx.simulate_click(trust_on_at, gpui::Modifiers::default());
@@ -3735,8 +3734,11 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         &d
     )));
 
-    // '끄기'와 '1시간' 클릭 시 settings.toml 및 플래그 파일 반영 확인.
-    let off_at = vcx.debug_bounds("auto-rename-branch-off").unwrap().center();
+    // 자동 이름 변경 토글과 '1시간' 클릭 시 settings.toml 및 플래그 파일 반영 확인.
+    let off_at = vcx
+        .debug_bounds("auto-rename-branch-toggle")
+        .unwrap()
+        .center();
     vcx.simulate_click(off_at, gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(!krill_proto::git::is_auto_rename_enabled(Some(&d)));
@@ -3750,9 +3752,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     assert_eq!(saved.prompt_cache_ttl_secs, 3_600);
     assert!(saved.workspace_trust_preset_enabled);
 
-    // 신뢰 프리셋 '끄기' 클릭 시 즉시 비활성화되고 플래그 파일이 지워진다.
+    // 신뢰 프리셋 다시 토글 클릭 시 즉시 비활성화되고 플래그 파일이 지워진다.
     let trust_off_at = vcx
-        .debug_bounds("workspace-trust-preset-off")
+        .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
         .center();
     vcx.simulate_click(trust_off_at, gpui::Modifiers::default());
@@ -4936,6 +4938,148 @@ fn owe776_schedule_modal_allows_empty_optional_prompt_and_localizes_validation_e
         after_edit.schedule[0].command,
         vec!["/bin/echo".to_owned(), "two words".to_owned()]
     );
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-793: 설정 화면의 공통 프리미티브(`ui::switch`, `ui::segmented_control`, `ui::card`/`row`/`label`/`controls`)가
+/// 적용되어 좁은 창(820px)에서도 에이전트 탭의 스킬 행·프로필 카드·일반 탭 스위치 등 우측 컨트롤이
+/// 부모 카드/행의 우측 경계를 절대 넘어가지 않는다.
+#[gpui::test]
+fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_window(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe793-layout-primitives");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+
+    // 좁은 창(820px)에서도 모든 카드·행 내부 우측 컨트롤이 부모 우측 경계 안에 들어와야 한다.
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+
+    // 1) General 탭: 사이드바·본문 폭 토큰 및 스위치·세그먼트 컨트롤 경계 검증
+    let sidebar = bounds(vcx, "admin-sidebar");
+    let column = bounds(vcx, "admin-content-column");
+    assert_eq!(sidebar.size.width, crate::ui::SETTINGS_NAV_WIDTH);
+    assert!(column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH);
+
+    for sel in [
+        "theme-dark",
+        "theme-light",
+        "theme-system",
+        "language-ko",
+        "language-en",
+        "notif-toggle",
+        "notif-toggle-thumb",
+        "notify-input-toggle",
+        "notify-done-toggle",
+        "notify-bell-toggle",
+        "sound-toggle",
+        "notify-inactive-toggle",
+        "update-auto-restart-toggle",
+        "settings-update-check",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "general control {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    let notif_track = bounds(vcx, "notif-toggle");
+    assert_eq!(notif_track.size.width, crate::ui::SWITCH_WIDTH);
+    assert_eq!(notif_track.size.height, crate::ui::SWITCH_HEIGHT);
+
+    // 2) Agents 탭: 스킬 설치 카드의 '전체 설치'(primary)와 각 스킬 행의 '스킬 설치'(secondary)가
+    //    부모 행·카드 오른쪽 테두리를 절대 뚫고 나가지 않는지 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let skills_card = bounds(vcx, "admin-skills-card");
+    assert!(
+        skills_card.right() <= column.right() + px(0.5),
+        "skills_card ({skills_card:?}) overflowed column ({column:?})"
+    );
+    let install_all = bounds(vcx, "admin-install-all-skills");
+    assert!(
+        install_all.right() <= skills_card.right() + px(0.5),
+        "install-all button ({install_all:?}) overflowed skills_card ({skills_card:?})"
+    );
+
+    for (row_sel, btn_sel) in [
+        ("admin-skill-row-minikrill", "admin-install-skill-minikrill"),
+        (
+            "admin-skill-row-orchestration",
+            "admin-install-skill-orchestration",
+        ),
+        (
+            "admin-skill-row-computer-use",
+            "admin-install-skill-computer-use",
+        ),
+        (
+            "admin-skill-row-worktree-checkpoints",
+            "admin-install-skill-worktree-checkpoints",
+        ),
+    ] {
+        let row_b = bounds(vcx, row_sel);
+        let btn_b = bounds(vcx, btn_sel);
+        assert!(
+            row_b.right() <= skills_card.right() + px(0.5),
+            "skill row {row_sel} ({row_b:?}) overflowed skills_card ({skills_card:?})"
+        );
+        assert!(
+            btn_b.right() <= row_b.right() + px(0.5),
+            "skill button {btn_sel} ({btn_b:?}) overflowed skill row {row_sel} ({row_b:?})"
+        );
+        assert!(
+            btn_b.origin.x >= row_b.origin.x,
+            "skill button {btn_sel} ({btn_b:?}) left of skill row {row_sel} ({row_b:?})"
+        );
+    }
+
+    for (card_sel, hook_sel) in [
+        ("admin-agent-card-claude", "admin-agent-hook-claude"),
+        ("admin-agent-card-codex", "admin-agent-hook-codex"),
+        ("admin-agent-card-agy", "admin-agent-hook-agy"),
+        ("admin-agent-card-cursor", "admin-agent-hook-cursor"),
+        ("admin-agent-card-opencode", "admin-agent-hook-opencode"),
+    ] {
+        let card_b = bounds(vcx, card_sel);
+        let hook_b = bounds(vcx, hook_sel);
+        assert!(
+            card_b.right() <= column.right() + px(0.5),
+            "agent card {card_sel} ({card_b:?}) overflowed column ({column:?})"
+        );
+        assert!(
+            hook_b.right() <= card_b.right() + px(0.5),
+            "agent hook button {hook_sel} ({hook_b:?}) overflowed card {card_sel} ({card_b:?})"
+        );
+    }
+
+    for sel in [
+        "admin-yolo-toggle",
+        "hib-toggle",
+        "auto-rename-branch-toggle",
+        "prompt-cache-timer-toggle",
+        "prompt-cache-ttl-5m",
+        "prompt-cache-ttl-1h",
+        "workspace-trust-preset-toggle",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "agent control {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
 
     fs::remove_dir_all(d).ok();
 }
