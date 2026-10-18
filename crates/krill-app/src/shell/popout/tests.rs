@@ -51,11 +51,34 @@ fn provider_popup_exposes_account_status_and_updated_row(cx: &mut TestAppContext
     let pill = vcx.debug_bounds("status-provider-pill-claude").unwrap();
     vcx.simulate_click(pill.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("status-provider-status-claude").is_some());
+    // OWE-851d: 상태 배지는 계정 행에만 그린다(헤더 카드 중복 제거).
+    assert!(vcx.debug_bounds("status-provider-status-claude").is_none());
     assert!(
         vcx.debug_bounds("status-provider-account-claude-claude-status-test-status")
             .is_some()
     );
+}
+
+/// 하-4: 상태바를 우클릭하면 상태바 동작 메뉴가 열린다.
+#[gpui::test]
+fn status_bar_right_click_opens_menu(cx: &mut TestAppContext) {
+    let (_shell, handle) = open(cx);
+    cx.run_until_parked();
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    assert!(vcx.debug_bounds("status-bar-menu-refresh").is_none());
+    let bar = vcx.debug_bounds("status-bar").unwrap();
+    vcx.simulate_mouse_down(
+        bar.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    vcx.simulate_mouse_up(
+        bar.center(),
+        gpui::MouseButton::Right,
+        gpui::Modifiers::default(),
+    );
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("status-bar-menu-refresh").is_some());
 }
 
 fn open(cx: &mut TestAppContext) -> (Entity<Shell>, gpui::AnyWindowHandle) {
