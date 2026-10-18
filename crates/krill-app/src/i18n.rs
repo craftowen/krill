@@ -450,6 +450,8 @@ catalog! {
         TITLE => ("Krill이 지난번에 비정상 종료됐습니다", "Krill quit unexpectedly last time"),
         BUNDLE => ("진단 번들 만들기", "Create diagnostic bundle"),
         DISMISS => ("닫기", "Close"),
+        BUNDLE_FAILED => ("진단 번들을 만들지 못했습니다", "Could not create the diagnostic bundle"),
+        BUNDLE_FAILED_DETAIL => ("{error}\n크래시 로그는 남겨 두었고 다음 실행 때 다시 묻습니다.", "{error}\nThe crash logs were kept and you will be asked again next launch."),
         DETAIL => ("크래시 로그 {n}개가 남아 있습니다. 진단 번들은 API 키·토큰·PEM·사용자명을 가린 텍스트 파일이며 자동으로 보내지 않습니다.", "{n} crash logs remain. The diagnostic bundle is a text file with API keys, tokens, PEM data, and usernames redacted. It is never sent automatically."),
     }
     sidebar {
