@@ -2072,6 +2072,10 @@ impl SettingsView {
         if tab == AdminTab::Ssh && !self.tailscale_loaded {
             self.refresh_tailscale_peers(cx);
         }
+        if tab == AdminTab::Mobile {
+            // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
+            self.mobile_enter(cx);
+        }
         if tab == AdminTab::Resources && self.space.report.is_none() && !self.space.scanning {
             self.scan_workspace_space(cx);
         }
