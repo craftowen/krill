@@ -4540,6 +4540,10 @@ impl Render for Shell {
                 // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다(줌 해제·기록은 확정 뒤에).
                 if let Some(pane) = this.layout.focused() {
                     this.maybe_close_pane(pane, cx);
+                } else {
+                    // K11: 탭이 없는 빈 작업 공간에서는 macOS처럼 ⌘W가 창을 닫는다.
+                    // 파일 탭도 탭이라 여기서는 미저장 파일이 없다.
+                    window.remove_window();
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
