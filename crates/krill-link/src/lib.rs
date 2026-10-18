@@ -143,4 +143,5 @@ pub(crate) fn unsupported_platform() -> Error {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod unsupported_tests;

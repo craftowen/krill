@@ -7623,4 +7623,5 @@ mod search;
 mod shortcuts;
 pub mod space;
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

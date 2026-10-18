@@ -1030,4 +1030,5 @@ pub fn clamp_column(width: f32, total: f32, other: f32) -> f32 {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

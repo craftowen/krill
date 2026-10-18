@@ -1123,4 +1123,5 @@ fn after_overlap(page: &[Vec<Cell>], hot: &[Vec<Cell>]) -> usize {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

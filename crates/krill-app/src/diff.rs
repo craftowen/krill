@@ -1715,7 +1715,9 @@ impl Render for Panel {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 use krill_proto::daemon::Paths;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

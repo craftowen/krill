@@ -354,5 +354,6 @@ pub fn file_name(path: &Path) -> String {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 #[path = "editor/tests.rs"]
 mod tests;

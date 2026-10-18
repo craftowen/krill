@@ -14,6 +14,7 @@ pub mod raster;
 pub mod view;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;
 
 /// 앞부분에서 NUL을 찾는 바이트 수. git과 Orca(`BINARY_PROBE_BYTES`)가 쓰는 휴리스틱과 같다.
