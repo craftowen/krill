@@ -36,6 +36,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod ssh_hosts;
 pub mod terminal;
+pub mod terminal_font;
 pub mod ui;
 pub mod updater;
 pub mod webhook;

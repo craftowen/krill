@@ -353,6 +353,9 @@ pub struct SettingsImportSummary {
     pub settings_updated: bool,
     #[serde(default)]
     pub default_agent: Option<String>,
+    /// 가져오지 않은 터미널 글꼴과 사유(OWE-899, CLI `SettingsImportSummary`와 1:1).
+    #[serde(default)]
+    pub terminal_font_skipped: Option<String>,
     #[serde(default)]
     pub quick_commands_merged: usize,
     #[serde(default)]
@@ -1082,6 +1085,16 @@ pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>>
                             .text_size(TEXT_XS)
                             .text_color(p.warning)
                             .child(text::DAEMON_REQUIRED_NOTE.format(&[("reason", reason)]))
+                    }))
+                    // OWE-899: 가져오지 않은 터미널 글꼴이 있으면 사유를 밝힌다.
+                    .children(res.settings.terminal_font_skipped.as_deref().map(|reason| {
+                        let note_id = format!("{id_prefix}-orca-import-font-skipped");
+                        div()
+                            .id(SharedString::from(note_id.clone()))
+                            .debug_selector(move || note_id.clone())
+                            .text_size(TEXT_XS)
+                            .text_color(p.warning)
+                            .child(reason.to_owned())
                     }))
             }))
             .children(
