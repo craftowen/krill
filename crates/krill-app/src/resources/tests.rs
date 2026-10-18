@@ -209,3 +209,23 @@ fn outside_click_closes_popover_and_stops_poll(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(log.lock().unwrap().len(), 2, "closed panel does not poll");
 }
+
+/// OWE-856: 상태바 토글은 버튼 역할·이름을 노출한다.
+#[gpui::test]
+fn toggle_exposes_button_role_and_label(cx: &mut TestAppContext) {
+    let (call, _) = fake();
+    let (panel, cx) = open(cx, call);
+    let (role, label) = cx.update(|_, cx| {
+        panel.update(cx, |p, cx| {
+            let el = p.render_toggle(cx);
+            let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+            gpui::Element::write_a11y_info(&el, &mut node);
+            (
+                gpui::Element::a11y_role(&el),
+                node.label().map(str::to_owned),
+            )
+        })
+    });
+    assert_eq!(role, Some(gpui::Role::Button));
+    assert_eq!(label.as_deref(), Some(text::TITLE.get()));
+}

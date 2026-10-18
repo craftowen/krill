@@ -1073,6 +1073,8 @@ impl Panel {
             .debug_selector(move || selector.into())
             .role(gpui::Role::Tab)
             .aria_label(tip)
+            // OWE-856: 활성 탭을 `aria_selected`로 알린다(VALUE 0 보고 수정).
+            .aria_selected(active)
             .relative()
             .h(px(24.))
             .min_w(px(26.))
@@ -1291,12 +1293,16 @@ impl Panel {
             ))
     }
 
-    fn render_file_row(
+    /// OWE-856: 파일 행 본문(목록 항목 역할·이름·선택 노출).
+    /// 우클릭 메뉴는 호출자(`render_file_row`)가 단다.
+    fn render_file_row_content(
         &self,
         i: usize,
         file: &ChangedFile,
+        pos: usize,
+        total: usize,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
         let stats = match self.comparison {
             Comparison::Index => file.staged.or(file.unstaged),
@@ -1306,14 +1312,21 @@ impl Panel {
         let code = status_code(file.status, self.comparison);
         let (basename, dir_hint) = abbreviate_path(&file.path, file.old_path.as_deref());
         let selected = self.selected == Some(i);
-        let full = self.repo.join(OsStr::from_bytes(&file.path));
-        let open = full.clone();
-        let weak = cx.weak_entity();
-        let comparison = self.comparison;
+        let open = self.repo.join(OsStr::from_bytes(&file.path));
+        // OWE-856: 파일 행을 목록 항목으로 노출한다(이름·상태·선택).
+        let a11y = match &dir_hint {
+            Some(hint) => format!("{basename}, {hint}, {code}"),
+            None => format!("{basename}, {code}"),
+        };
 
         div()
             .id(("changed-file", i))
             .debug_selector(move || format!("changed-file-{i}"))
+            .role(gpui::Role::ListItem)
+            .aria_label(a11y)
+            .aria_position_in_set(pos)
+            .aria_size_of_set(total)
+            .aria_selected(selected)
             .h(px(26.))
             .px_2()
             .mx_1()
@@ -1406,14 +1419,14 @@ impl Panel {
                     .items_center()
                     .gap_0p5()
                     .ml_1()
-                    .when(comparison == Comparison::Worktree, |d| {
+                    .when(self.comparison == Comparison::Worktree, |d| {
                         d.child(self.discard_button(i, cx)).child(self.edit_button(
                             i,
                             Comparison::Worktree,
                             cx,
                         ))
                     })
-                    .when(comparison == Comparison::Index, |d| {
+                    .when(self.comparison == Comparison::Index, |d| {
                         d.child(self.edit_button(i, Comparison::Index, cx))
                     }),
             )
@@ -1425,67 +1438,81 @@ impl Panel {
                     this.select(i, cx);
                 }
             }))
-            .context_menu(move |menu, _, _| {
-                let (weak, full) = (weak.clone(), full.clone());
-                let w_stage = weak.clone();
-                let w_discard = weak.clone();
-                let w_unstage = weak.clone();
-                let menu = menu.item(
-                    gpui_component::menu::PopupMenuItem::new(text::OPEN_IN_EDITOR.get()).on_click(
-                        move |_, _, cx| {
-                            weak.update(cx, |this, cx| {
-                                this.open_file_preview = false;
-                                cx.emit(OpenFile(full.clone()));
-                            })
-                            .ok();
-                        },
-                    ),
-                );
-                if comparison == Comparison::Worktree {
-                    menu.separator()
-                        .item(
-                            gpui_component::menu::PopupMenuItem::new(
-                                crate::i18n::catalog::diff_edit::STAGE.get(),
-                            )
-                            .icon(IconName::Plus)
-                            .on_click(move |_, _, cx| {
-                                w_stage
-                                    .update(cx, |this, cx| {
-                                        this.edit_file(i, Comparison::Worktree, cx);
-                                    })
-                                    .ok();
-                            }),
-                        )
-                        .item(
-                            gpui_component::menu::PopupMenuItem::new(
-                                crate::i18n::catalog::diff_edit::DISCARD.get(),
-                            )
-                            .icon(Icon::default().data(crate::ui::icons::ROTATE_CCW_SVG))
-                            .on_click(move |_, window, cx| {
-                                w_discard
-                                    .update(cx, |this, cx| {
-                                        this.confirm_discard_file(i, window, cx);
-                                    })
-                                    .ok();
-                            }),
-                        )
-                } else {
-                    menu.separator().item(
+    }
+
+    fn render_file_row(
+        &self,
+        i: usize,
+        file: &ChangedFile,
+        pos: usize,
+        total: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let row = self.render_file_row_content(i, file, pos, total, cx);
+        let full = self.repo.join(OsStr::from_bytes(&file.path));
+        let weak = cx.weak_entity();
+        let comparison = self.comparison;
+        row.context_menu(move |menu, _, _| {
+            let (weak, full) = (weak.clone(), full.clone());
+            let w_stage = weak.clone();
+            let w_discard = weak.clone();
+            let w_unstage = weak.clone();
+            let menu = menu.item(
+                gpui_component::menu::PopupMenuItem::new(text::OPEN_IN_EDITOR.get()).on_click(
+                    move |_, _, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.open_file_preview = false;
+                            cx.emit(OpenFile(full.clone()));
+                        })
+                        .ok();
+                    },
+                ),
+            );
+            if comparison == Comparison::Worktree {
+                menu.separator()
+                    .item(
                         gpui_component::menu::PopupMenuItem::new(
-                            crate::i18n::catalog::diff_edit::UNSTAGE.get(),
+                            crate::i18n::catalog::diff_edit::STAGE.get(),
                         )
-                        .icon(IconName::Minus)
+                        .icon(IconName::Plus)
                         .on_click(move |_, _, cx| {
-                            w_unstage
+                            w_stage
                                 .update(cx, |this, cx| {
-                                    this.edit_file(i, Comparison::Index, cx);
+                                    this.edit_file(i, Comparison::Worktree, cx);
                                 })
                                 .ok();
                         }),
                     )
-                }
-            })
-            .into_any_element()
+                    .item(
+                        gpui_component::menu::PopupMenuItem::new(
+                            crate::i18n::catalog::diff_edit::DISCARD.get(),
+                        )
+                        .icon(Icon::default().data(crate::ui::icons::ROTATE_CCW_SVG))
+                        .on_click(move |_, window, cx| {
+                            w_discard
+                                .update(cx, |this, cx| {
+                                    this.confirm_discard_file(i, window, cx);
+                                })
+                                .ok();
+                        }),
+                    )
+            } else {
+                menu.separator().item(
+                    gpui_component::menu::PopupMenuItem::new(
+                        crate::i18n::catalog::diff_edit::UNSTAGE.get(),
+                    )
+                    .icon(IconName::Minus)
+                    .on_click(move |_, _, cx| {
+                        w_unstage
+                            .update(cx, |this, cx| {
+                                this.edit_file(i, Comparison::Index, cx);
+                            })
+                            .ok();
+                    }),
+                )
+            }
+        })
+        .into_any_element()
     }
 
     fn render_empty_state(
@@ -1662,12 +1689,11 @@ impl Render for Panel {
                 }
                 range
                     .filter_map(|row_ix| {
+                        let total = list_indices.len();
                         let file_idx = *list_indices.get(row_ix)?;
-                        this.changes
-                            .files
-                            .get(file_idx)
-                            .cloned()
-                            .map(|file| this.render_file_row(file_idx, &file, cx))
+                        this.changes.files.get(file_idx).cloned().map(|file| {
+                            this.render_file_row(file_idx, &file, row_ix + 1, total, cx)
+                        })
                     })
                     .collect()
             }),

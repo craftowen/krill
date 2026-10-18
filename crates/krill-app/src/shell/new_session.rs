@@ -66,6 +66,134 @@ fn session_accounts(
 }
 
 impl Shell {
+    /// OWE-856: 점프 검색 행(버튼 역할·이름 노출). 클릭 배선은 호출자가 단다.
+    fn jump_row(
+        p: &krill_app::ui::Palette,
+        yolo: bool,
+        menu: impl gpui::IntoElement,
+    ) -> gpui::Stateful<gpui::Div> {
+        use krill_app::i18n::catalog::sidebar as sb_text;
+
+        div()
+            .id("sidebar-jump")
+            .group("sidebar-search-row")
+            .role(gpui::Role::Button)
+            .aria_label(sb_text::SEARCH_SHORT.get())
+            .w_full()
+            .h(gpui::px(30.))
+            .mb_1()
+            .px_2p5()
+            .rounded(krill_app::ui::RADIUS_SM)
+            .border_1()
+            .border_color(p.sidebar_border)
+            .bg(p.sidebar_accent.opacity(0.65))
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_1p5()
+            .text_size(krill_app::ui::TEXT_MD)
+            .text_color(p.sidebar_foreground.opacity(0.45))
+            .hover(|d| {
+                d.bg(p.sidebar_accent)
+                    .text_color(p.sidebar_foreground.opacity(0.75))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .min_w_0()
+                    .child(
+                        gpui_component::Icon::new(IconName::Search)
+                            .with_size(gpui::px(14.))
+                            .text_color(p.sidebar_foreground.opacity(0.38)),
+                    )
+                    .child(div().truncate().child(sb_text::SEARCH_SHORT.get())),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover("sidebar-search-row", gpui::Styled::visible)
+                            .font_family(krill_app::ui::FONT_MONO)
+                            .text_size(krill_app::ui::TEXT_2XS)
+                            .text_color(p.sidebar_foreground.opacity(0.4))
+                            .child(krill_app::i18n::catalog::general::JUMP_SHORTCUT.get()),
+                    )
+                    .when(yolo, |d| {
+                        d.child(
+                            div()
+                                .id("yolo-global")
+                                .debug_selector(|| "yolo-global".into())
+                                .invisible()
+                                .group_hover("sidebar-search-row", gpui::Styled::visible)
+                                .px_1()
+                                .rounded(krill_app::ui::RADIUS_XS)
+                                .bg(p.warning)
+                                .text_color(p.warning_foreground)
+                                .text_size(krill_app::ui::TEXT_2XS)
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(krill_app::i18n::catalog::general::YOLO.get())
+                                .tooltip(|window, cx| {
+                                    krill_app::ui::tooltip_view(
+                                        "yolo-global",
+                                        text::YOLO_TOGGLE.get(),
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id("new-session-wrap")
+                            .debug_selector(|| "new-session".into())
+                            .invisible()
+                            .group_hover("sidebar-search-row", gpui::Styled::visible)
+                            .on_click(|_, _, cx| cx.stop_propagation())
+                            .child(menu),
+                    ),
+            )
+    }
+
+    /// OWE-856: 탐색 행(버튼 역할·이름 노출). 클릭 배선은 호출자가 단다.
+    fn nav_row(
+        p: &krill_app::ui::Palette,
+        id: &'static str,
+        svg: &'static [u8],
+        label: &'static str,
+    ) -> gpui::Stateful<gpui::Div> {
+        use krill_app::ui::icons;
+
+        let nav_icon_color = p.sidebar_foreground.opacity(0.4);
+        let nav_text_color = p.sidebar_foreground.opacity(0.68);
+        let nav_hover_bg = p.sidebar_accent.opacity(0.6);
+        div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .role(gpui::Role::Button)
+            .aria_label(label)
+            .w_full()
+            .h(gpui::px(28.))
+            .px_2()
+            .rounded(krill_app::ui::RADIUS_SM)
+            .cursor_pointer()
+            .flex()
+            .items_center()
+            .gap_2p5()
+            .text_size(krill_app::ui::TEXT_MD)
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(nav_text_color)
+            .hover(|d| d.bg(nav_hover_bg).text_color(p.sidebar_foreground))
+            .child(icons::svg_icon(svg, 15., nav_icon_color))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+    }
     pub(super) fn new_agent_with_account(
         &mut self,
         id: String,
@@ -285,29 +413,6 @@ impl Shell {
             )
         });
 
-        let nav_icon_color = p.sidebar_foreground.opacity(0.4);
-        let nav_text_color = p.sidebar_foreground.opacity(0.68);
-        let nav_hover_bg = p.sidebar_accent.opacity(0.6);
-        let nav_row = |id: &'static str, svg: &'static [u8], label: &'static str| {
-            div()
-                .id(id)
-                .debug_selector(move || id.into())
-                .w_full()
-                .h(gpui::px(28.))
-                .px_2()
-                .rounded(krill_app::ui::RADIUS_SM)
-                .cursor_pointer()
-                .flex()
-                .items_center()
-                .gap_2p5()
-                .text_size(krill_app::ui::TEXT_MD)
-                .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(nav_text_color)
-                .hover(|d| d.bg(nav_hover_bg).text_color(p.sidebar_foreground))
-                .child(icons::svg_icon(svg, 15., nav_icon_color))
-                .child(div().flex_1().min_w_0().truncate().child(label))
-        };
-
         div()
             .id("agents")
             .role(gpui::Role::Group)
@@ -319,94 +424,12 @@ impl Shell {
             .flex_col()
             .gap_0p5()
             .child(
-                div()
-                    .id("sidebar-jump")
-                    .group("sidebar-search-row")
-                    .w_full()
-                    .h(gpui::px(30.))
-                    .mb_1()
-                    .px_2p5()
-                    .rounded(krill_app::ui::RADIUS_SM)
-                    .border_1()
-                    .border_color(p.sidebar_border)
-                    .bg(p.sidebar_accent.opacity(0.65))
-                    .cursor_pointer()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_1p5()
-                    .text_size(krill_app::ui::TEXT_MD)
-                    .text_color(p.sidebar_foreground.opacity(0.45))
-                    .hover(|d| {
-                        d.bg(p.sidebar_accent)
-                            .text_color(p.sidebar_foreground.opacity(0.75))
-                    })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .min_w_0()
-                            .child(
-                                gpui_component::Icon::new(IconName::Search)
-                                    .with_size(gpui::px(14.))
-                                    .text_color(p.sidebar_foreground.opacity(0.38)),
-                            )
-                            .child(div().truncate().child(sb_text::SEARCH_SHORT.get())),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .invisible()
-                                    .group_hover("sidebar-search-row", gpui::Styled::visible)
-                                    .font_family(krill_app::ui::FONT_MONO)
-                                    .text_size(krill_app::ui::TEXT_2XS)
-                                    .text_color(p.sidebar_foreground.opacity(0.4))
-                                    .child(krill_app::i18n::catalog::general::JUMP_SHORTCUT.get()),
-                            )
-                            .when(permission == Permission::Yolo, |d| {
-                                d.child(
-                                    div()
-                                        .id("yolo-global")
-                                        .debug_selector(|| "yolo-global".into())
-                                        .invisible()
-                                        .group_hover("sidebar-search-row", gpui::Styled::visible)
-                                        .px_1()
-                                        .rounded(krill_app::ui::RADIUS_XS)
-                                        .bg(p.warning)
-                                        .text_color(p.warning_foreground)
-                                        .text_size(krill_app::ui::TEXT_2XS)
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child(krill_app::i18n::catalog::general::YOLO.get())
-                                        .tooltip(|window, cx| {
-                                            krill_app::ui::tooltip_view(
-                                                "yolo-global",
-                                                text::YOLO_TOGGLE.get(),
-                                                window,
-                                                cx,
-                                            )
-                                        }),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id("new-session-wrap")
-                                    .debug_selector(|| "new-session".into())
-                                    .invisible()
-                                    .group_hover("sidebar-search-row", gpui::Styled::visible)
-                                    .on_click(|_, _, cx| cx.stop_propagation())
-                                    .child(menu),
-                            ),
-                    )
+                Self::jump_row(p, permission == Permission::Yolo, menu)
                     .on_click(cx.listener(|this, _, window, cx| this.toggle_jump(window, cx))),
             )
             .child(
-                nav_row(
+                Self::nav_row(
+                    p,
                     "nav-agent-dashboard",
                     icons::LAYOUT_DASHBOARD_SVG,
                     sb_text::NAV_AGENT_DASHBOARD.get(),
@@ -496,5 +519,32 @@ mod tests {
             detail: None,
         });
         assert!(session_accounts(&snap, "codex").is_empty());
+    }
+
+    /// OWE-856: 점프 검색·대시보드 행은 버튼 역할·이름을 노출한다.
+    #[test]
+    fn jump_and_dashboard_rows_expose_button_role_and_label() {
+        use krill_app::i18n::catalog::sidebar as sb_text;
+
+        let p = &krill_app::ui::DARK;
+        let jump_label = sb_text::SEARCH_SHORT.get();
+        for yolo in [false, true] {
+            let el = Shell::jump_row(p, yolo, gpui::div());
+            let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+            gpui::Element::write_a11y_info(&el, &mut node);
+            assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Button));
+            assert_eq!(node.label(), Some(jump_label));
+        }
+        let dashboard_label = sb_text::NAV_AGENT_DASHBOARD.get();
+        let el = Shell::nav_row(
+            p,
+            "nav-agent-dashboard",
+            krill_app::ui::icons::LAYOUT_DASHBOARD_SVG,
+            dashboard_label,
+        );
+        let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+        gpui::Element::write_a11y_info(&el, &mut node);
+        assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Button));
+        assert_eq!(node.label(), Some(dashboard_label));
     }
 }

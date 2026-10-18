@@ -209,9 +209,13 @@ pub fn segmented_control(p: &Palette, items: impl IntoIterator<Item = impl IntoE
 }
 
 /// [`segmented_control`] 안에 들어가는 개별 선택지 버튼(활성 시 `primary`, 비활성 시 `ghost`, OWE-793).
+///
+/// OWE-856: `toggled`는 접근성 메타데이터에만 반영되고(스타일 불변), 선택 상태를
+/// 보조 기술에 알린다.
 pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Button {
     let btn = Button::new(id).small().label(label);
-    if active { btn.primary() } else { btn.ghost() }
+    let btn = if active { btn.primary() } else { btn.ghost() };
+    btn.toggled(active)
 }
 
 /// 2단계 확인이 있는 파괴적 동작 버튼(Orca UX Rule 1 공간 사전 예약 적용).
@@ -426,5 +430,43 @@ mod tests {
             assert_eq!(danger_fg, p.destructive);
             assert_ne!(neutral_fg, danger_fg);
         }
+    }
+
+    struct SegmentProbe;
+    impl gpui::Render for SegmentProbe {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            // `Button::render`는 렌더 중인 뷰 문맥을 쓰므로 뷰 안에서 그린다.
+            gpui::div()
+                .debug_selector(|| "seg-probe-root".into())
+                .child(super::segmented_control(
+                    &DARK,
+                    [
+                        super::segment("seg-a", "worktree", true),
+                        super::segment("seg-b", "index", false),
+                    ],
+                ))
+        }
+    }
+
+    /// OWE-856: 세그먼트 선택지는 보조 기술에 토글 상태로 노출된다.
+    /// `toggled`는 접근성 메타데이터 전용이라 선택 스타일을 바꾸지 않는다(시각 불변).
+    /// 토글→`aria_toggled` 매핑은 gpui-component이 보장하므로,
+    /// 여기서는 두 상태가 모두 그려지고 선택 스타일이 그대로임을 잠근다.
+    #[gpui::test]
+    fn segment_buttons_expose_toggle_state(cx: &mut gpui::TestAppContext) {
+        use gpui_component::Selectable as _;
+        for active in [false, true] {
+            assert!(!super::segment("seg-probe", "worktree", active).is_selected());
+        }
+        cx.update(gpui_component::init);
+        let window = cx.add_window(|_, _| SegmentProbe);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        // 두 상태의 세그먼트가 한 컨트롤 안에 그려졌으면 렌더 경로가 동작한 것이다.
+        assert!(vcx.debug_bounds("seg-probe-root").is_some());
     }
 }

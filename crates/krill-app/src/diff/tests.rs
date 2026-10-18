@@ -2237,3 +2237,59 @@ fn reactivating_panel_keeps_running_watch_task(cx: &mut gpui::TestAppContext) {
     );
     assert!(cx.update(|_, cx| view.read(cx).is_active()));
 }
+
+/// OWE-856: 우측 패널 상단 탭은 역할·라벨·선택 상태를 노출한다.
+#[gpui::test]
+fn panel_tab_buttons_expose_role_label_and_selected(cx: &mut gpui::TestAppContext) {
+    let p = cx.update(|cx| crate::ui::palette(cx));
+    for tab in PanelTab::ALL {
+        for active in [false, true] {
+            let el = Panel::render_tab_button(tab, active, p);
+            let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+            gpui::Element::write_a11y_info(&el, &mut node);
+            assert_eq!(
+                gpui::Element::a11y_role(&el),
+                Some(gpui::Role::Tab),
+                "{tab:?}"
+            );
+            assert_eq!(node.label(), Some(tab.tooltip()), "{tab:?}");
+            assert_eq!(node.is_selected(), Some(active), "{tab:?}");
+        }
+    }
+}
+
+/// OWE-856: 변경 파일 행은 목록 항목 역할·이름·위치·선택 상태를 노출한다.
+#[gpui::test]
+fn changed_file_rows_expose_list_item_role_label_and_selection(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let repo = Repo::plain();
+    let (view, cx) = cx.add_window_view(|_, cx| Panel::unconnected(repo.0.clone(), cx));
+    let file = Repo::file(b"main.rs", *b"M ");
+    let mut probe = |selected: Option<usize>, index: usize| {
+        cx.update(|_, cx| {
+            view.update(cx, |panel, cx| {
+                panel.selected = selected;
+                let el = panel.render_file_row_content(index, &file, index + 1, 3, cx);
+                let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
+                gpui::Element::write_a11y_info(&el, &mut node);
+                (
+                    gpui::Element::a11y_role(&el),
+                    node.label().map(str::to_owned),
+                    node.position_in_set(),
+                    node.size_of_set(),
+                    node.is_selected(),
+                )
+            })
+        })
+    };
+    let (role, label, pos, total, selected) = probe(Some(0), 0);
+    assert_eq!(role, Some(gpui::Role::ListItem));
+    assert_eq!(label.as_deref(), Some("main.rs, M"));
+    assert_eq!(pos, Some(1));
+    assert_eq!(total, Some(3));
+    assert_eq!(selected, Some(true));
+    let (role, _, pos, _, selected) = probe(None, 1);
+    assert_eq!(role, Some(gpui::Role::ListItem));
+    assert_eq!(pos, Some(2));
+    assert_eq!(selected, Some(false));
+}
