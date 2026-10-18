@@ -3213,6 +3213,97 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
     }
 }
 
+/// OWE-870: 사용자 지정 탭 제목은 자동 제목을 덮어쓰고 `layout.bin`에 영속된다.
+/// 비우면 자동 제목으로 복귀한다.
+#[gpui::test]
+fn custom_tab_title_overrides_label_and_persists(cx: &mut TestAppContext) {
+    let path = state_path("tab-rename");
+    let (view, cx) = open(cx, path.clone());
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| l.set_tab_title(1, Some("  배포 탭  ")));
+    });
+    cx.run_until_parked();
+    let label = cx.update(|_, cx| view.read(cx).tab_display_label(1, cx));
+    assert_eq!(label, "배포 탭");
+    let saved = layout_of(&view, cx);
+    assert_eq!(saved.tab_title(1), Some("배포 탭"));
+    assert_eq!(Layout::load(&path).unwrap(), saved);
+    // 비우면 자동 제목으로 복귀한다.
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| l.set_tab_title(1, Some("   ")));
+    });
+    cx.run_until_parked();
+    let (label, auto) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        (
+            s.tab_display_label(1, cx),
+            s.pane_label(s.layout.tabs()[1].focused, cx),
+        )
+    });
+    assert_eq!(label, auto);
+}
+
+/// OWE-870: 이름 변경 대화상자에서 저장·초기화를 누르면 제목이 바뀌고 대화상자가 닫힌다.
+#[gpui::test]
+fn tab_rename_dialog_saves_and_clears(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-rename-dialog"));
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.begin_tab_rename(0, window, cx));
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("tab-rename-dialog").is_some());
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            let rename = s.tab_rename.as_ref().expect("rename open");
+            rename.input.update(cx, |input, cx| {
+                input.set_value("  배포 탭  ", window, cx);
+            });
+        });
+    });
+    let save: &'static str = "save-tab-rename";
+    let at = cx.debug_bounds(save).expect("save button").center();
+    let none = Modifiers::default();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tab_title(0), Some("배포 탭"));
+    assert!(cx.debug_bounds("tab-rename-dialog").is_none());
+    // 다시 열어 초기화를 누르면 자동 제목으로 복귀한다.
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| s.begin_tab_rename(0, window, cx));
+    });
+    cx.run_until_parked();
+    let clear: &'static str = "clear-tab-title";
+    let at = cx.debug_bounds(clear).expect("clear button").center();
+    cx.simulate_mouse_down(at, MouseButton::Left, none);
+    cx.simulate_mouse_up(at, MouseButton::Left, none);
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tab_title(0), None);
+}
+
+/// OWE-870: 왼쪽 탭 닫기는 기준 탭 왼쪽의 비고정 탭만 닫고 닫은 세션을 기록한다(⌘⇧T 복원용).
+#[gpui::test]
+fn close_tabs_to_left_keeps_pinned_and_records(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-close-left"));
+    cx.simulate_keystrokes("cmd-t cmd-t cmd-t");
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            l.toggle_pin_tab(1);
+            l.activate(2);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| s.close_tabs_to_left(2, cx));
+    cx.run_until_parked();
+    let l = layout_of(&view, cx);
+    assert_eq!(l.tabs().len(), 3);
+    assert!(l.is_tab_pinned(0));
+    assert_eq!(l.active(), 1);
+}
+
 /// OWE-653: 단일 칸은 패인 헤더 줄을 숨기고(분할하면 보인다), 저장 명령·맥락 복사는 별도 툴바 줄이 아니라
 /// 탭 바 안의 아이콘으로 남는다.
 #[gpui::test]

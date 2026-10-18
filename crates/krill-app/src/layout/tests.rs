@@ -198,7 +198,7 @@ fn deepest_nesting_within_cap_does_not_overflow() {
     for _ in 0..levels {
         bytes.extend([0, 0]); // 각 단계의 second 잎(중복 id라 불변식 위반)
     }
-    bytes.extend([0, 0, 0, 0]); // focused, pinned, color, active
+    bytes.extend([0, 0, 0, 0, 0]); // focused, pinned, color, custom_title(None), active
     bytes.extend(240f32.to_le_bytes());
     bytes.extend(280f32.to_le_bytes());
     bytes.push(1); // next_pane
@@ -682,4 +682,94 @@ fn ctrl_tab_mru_cycles_and_commits_recent_order() {
     assert_eq!(l.active(), 0);
     assert!(l.commit_mru());
     assert_eq!(l.mru_order(), vec![0, 3, 1, 2]);
+}
+
+/// OWE-870: 왼쪽 탭 닫기는 기준 탭 왼쪽의 비고정 탭만 닫고 핀 고정 탭은 유지한다.
+#[test]
+fn close_tabs_to_left_skips_pinned_tabs() {
+    let mut l = Layout::default(); // tab 0 (pane 0)
+    l.new_tab(); // tab 1 (pane 1) - pinned
+    l.new_tab(); // tab 2 (pane 2) - keep
+    l.new_tab(); // tab 3 (pane 3)
+    l.toggle_pin_tab(1);
+    l.close_tabs_to_left(2);
+    let panes: Vec<PaneId> = l.tabs().iter().map(|t| t.focused).collect();
+    assert_eq!(panes, vec![PaneId(1), PaneId(2), PaneId(3)]);
+    assert!(l.is_tab_pinned(0));
+    assert!(l.is_valid());
+    // 범위를 벗어나면 아무 일도 없다.
+    let before = l.clone();
+    l.close_tabs_to_left(99);
+    assert_eq!(l, before);
+}
+
+/// OWE-870: 탭 사용자 지정 제목은 다듬고·비우면 지우며 `layout.bin`에 저장·복원된다.
+#[test]
+fn tab_custom_title_normalizes_and_persists() {
+    let mut l = Layout::default();
+    assert_eq!(l.tab_title(0), None);
+    l.set_tab_title(0, Some("  서버 로그  "));
+    assert_eq!(l.tab_title(0), Some("서버 로그"));
+    l.set_tab_title(0, Some("   "));
+    assert_eq!(l.tab_title(0), None);
+    l.set_tab_title(0, Some("a\u{0}b"));
+    assert_eq!(l.tab_title(0), Some("ab"));
+    l.set_tab_title(99, Some("무시"));
+    assert_eq!(l.tab_title(99), None);
+
+    let path = temp_path("custom-title");
+    l.set_tab_title(0, Some("배포 탭"));
+    l.save(&path).unwrap();
+    let loaded = Layout::load(&path).unwrap();
+    assert_eq!(loaded, l);
+    assert_eq!(loaded.tab_title(0), Some("배포 탭"));
+}
+
+/// OWE-870: v6 레이아웃(핀·색상 있음, 제목 없음)은 핀·색상을 유지하고 제목 없이 읽힌다.
+#[test]
+fn v6_layout_migrates_with_pin_color_and_no_title() {
+    #[derive(Serialize)]
+    struct OldTab<'a> {
+        root: &'a PaneTree,
+        focused: PaneId,
+        pinned: bool,
+        color: Option<TabColor>,
+    }
+    let path = temp_path("v6");
+    let mut l = Layout::default();
+    l.new_tab();
+    l.toggle_pin_tab(0);
+    l.set_tab_color(1, Some(TabColor::Blue));
+    let tabs: Vec<OldTab<'_>> = l
+        .tabs
+        .iter()
+        .map(|t| OldTab {
+            root: &t.root,
+            focused: t.focused,
+            pinned: t.pinned,
+            color: t.color,
+        })
+        .collect();
+    let mut old = vec![6];
+    old.extend(
+        postcard::to_stdvec(&(
+            &tabs,
+            l.active,
+            l.sidebar_width,
+            l.panel_width,
+            l.next_pane,
+            &l.sessions,
+            &l.launches,
+            &l.files,
+        ))
+        .unwrap(),
+    );
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, old).unwrap();
+    let loaded = Layout::load(&path).unwrap();
+    assert_eq!(loaded, l);
+    assert!(loaded.is_tab_pinned(0));
+    assert_eq!(loaded.tab_color(1), Some(TabColor::Blue));
+    assert_eq!(loaded.tab_title(0), None);
+    assert_eq!(loaded.tab_title(1), None);
 }

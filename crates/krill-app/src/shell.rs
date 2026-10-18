@@ -465,6 +465,8 @@ pub struct Shell {
     pub(super) tab_context_menu: Option<(usize, Point<Pixels>)>,
     /// OWE-734: 고정된 탭을 닫으려 할 때 확인 대화상자 대상 탭 인덱스.
     pub(super) confirm_close_tab: Option<usize>,
+    /// OWE-870: 탭 이름 변경 대화상자(인라인 편집 대신 모달 + `InputState`).
+    tab_rename: Option<tabs::TabRename>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
     pub(super) nav_history: NavHistory,
 }
@@ -725,6 +727,7 @@ impl Shell {
             pending_focus: PendingFocus::None,
             tab_context_menu: None,
             confirm_close_tab: None,
+            tab_rename: None,
             nav_history: NavHistory::default(),
         };
         shell.record_workspace_nav(cx);
@@ -2162,6 +2165,12 @@ impl Shell {
                 "enter" => self.confirm_close_pinned_tab(cx),
                 _ => {}
             }
+            cx.stop_propagation();
+            return;
+        }
+        // OWE-870: 이름 변경 대화상자가 열려 있으면 Esc로 닫는다(Enter 저장은 입력창 구독이 맡는다).
+        if self.tab_rename.is_some() && e.keystroke.key == "escape" {
+            self.cancel_tab_rename(cx);
             cx.stop_propagation();
             return;
         }
@@ -3825,6 +3834,7 @@ impl Render for Shell {
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
+            .children(self.render_tab_rename_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
             .children(
                 (self.role == WindowRole::Main)
