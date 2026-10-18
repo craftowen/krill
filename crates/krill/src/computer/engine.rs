@@ -209,12 +209,17 @@ pub fn list_apps() -> Result<Vec<AppSummary>, String> {
     }
     let script = r#"
 ObjC.import("AppKit");
-const apps = $.NSWorkspace.sharedWorkspace.runningApplications.js;
+const rawApps = $.NSWorkspace.sharedWorkspace.runningApplications;
+const apps = rawApps ? (rawApps.js || []) : [];
 const rows = [];
-for (const app of apps) {
+for (let i = 0; i < apps.length; i++) {
+  const app = apps[i];
   const policy = Number(app.activationPolicy);
   if (policy !== 0 && policy !== 1) continue;
-  const name = ObjC.unwrap(app.localizedName) || "";
+  let name = ObjC.unwrap(app.localizedName) || "";
+  if (!name && app.executableURL) {
+    try { name = ObjC.unwrap(app.executableURL.lastPathComponent) || ""; } catch (_) {}
+  }
   if (!name) continue;
   rows.push({
     name,
@@ -282,36 +287,46 @@ pub fn resolve_live_app(app_selector: &str) -> Result<AppSummary, String> {
 fn list_windows_for_app(app: &AppSummary) -> Result<Vec<WindowSummary>, String> {
     let script = r#"
 ObjC.import("CoreGraphics");
-const targetPid = Number($.NSProcessInfo.processInfo.arguments.js[4]);
-const targetName = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[5]);
-const targetBundle = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[6]) || null;
-const list = ObjC.deepUnwrap($.CGWindowListCopyWindowInfo(1, 0)) || [];
-const rows = [];
-let idx = 1;
-for (const w of list) {
-  if (Number(w.kCGWindowOwnerPID) !== targetPid) continue;
-  if (Number(w.kCGWindowLayer || 0) !== 0) continue;
-  const b = w.kCGWindowBounds || { X: 0, Y: 0, Width: 0, Height: 0 };
-  rows.push({
-    id: String(w.kCGWindowNumber || idx),
-    index: idx,
-    title: String(w.kCGWindowName || targetName),
-    appName: targetName,
-    bundleId: targetBundle,
-    pid: targetPid,
-    bounds: {
-      x: Number(b.X || 0),
-      y: Number(b.Y || 0),
-      width: Number(b.Width || 0),
-      height: Number(b.Height || 0),
-    },
-    isFocused: idx === 1,
-    isMain: idx === 1,
-    isMinimized: false,
-  });
-  idx += 1;
+function run(argv) {
+  const targetPid = Number(argv[0] || 0);
+  const targetName = String(argv[1] || "");
+  const targetBundle = argv[2] ? String(argv[2]) : null;
+  let list = [];
+  try {
+    const rawRef = $.CGWindowListCopyWindowInfo(1, 0);
+    if (rawRef) {
+      const unwrapped = ObjC.deepUnwrap(ObjC.castRefToObject(rawRef));
+      if (Array.isArray(unwrapped)) list = unwrapped;
+    }
+  } catch (_) {}
+  const rows = [];
+  let idx = 1;
+  for (let i = 0; i < list.length; i++) {
+    const w = list[i];
+    if (!w || Number(w.kCGWindowOwnerPID) !== targetPid) continue;
+    if (Number(w.kCGWindowLayer || 0) !== 0) continue;
+    const b = w.kCGWindowBounds || { X: 0, Y: 0, Width: 0, Height: 0 };
+    rows.push({
+      id: String(w.kCGWindowNumber || idx),
+      index: idx,
+      title: String(w.kCGWindowName || targetName),
+      appName: targetName,
+      bundleId: targetBundle,
+      pid: targetPid,
+      bounds: {
+        x: Number(b.X || 0),
+        y: Number(b.Y || 0),
+        width: Number(b.Width || 0),
+        height: Number(b.Height || 0),
+      },
+      isFocused: idx === 1,
+      isMain: idx === 1,
+      isMinimized: false,
+    });
+    idx += 1;
+  }
+  return JSON.stringify(rows);
 }
-JSON.stringify(rows);
 "#;
     let out = run_jxa(
         script,
@@ -574,172 +589,183 @@ fn query_live_window_ax_tree(
     restore_window: bool,
 ) -> Result<ElementNode, String> {
     let script = r#"
-const targetPid = Number($.NSProcessInfo.processInfo.arguments.js[4]);
-const targetName = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[5]);
-const restore = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[6]) === "1";
-const targetWinId = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[7]) || "";
-const targetWinIndex = Number($.NSProcessInfo.processInfo.arguments.js[8] || "0");
-const targetWinTitle = ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[9]) || "";
+function run(argv) {
+  const targetPid = Number(argv[0] || 0);
+  const targetName = String(argv[1] || "");
+  const restore = String(argv[2] || "0") === "1";
+  const targetWinId = String(argv[3] || "");
+  const targetWinIndex = Number(argv[4] || "0");
+  const targetWinTitle = String(argv[5] || "");
 
-const se = Application("System Events");
-let proc = null;
-if (targetPid > 0) {
-  try {
-    const byPid = se.processes.whose({ unixId: targetPid })();
-    if (byPid && byPid.length > 0) proc = byPid[0];
-  } catch (_) {}
-}
-if (!proc) {
-  proc = se.processes.byName(targetName);
-}
-if (restore) {
-  try { proc.visible = true; } catch (_) {}
-}
-
-function selectTargetWindow(wins, winId, winIndex, winTitle) {
-  if (!wins || wins.length === 0) return null;
-  if (winId) {
-    for (const cand of wins) {
-      try {
-        const axNum = cand.attributes.byName("AXWindowNumber").value();
-        if (axNum !== null && axNum !== undefined && String(axNum) === winId) return cand;
-      } catch (_) {}
-      try {
-        if (String(cand.id()) === winId) return cand;
-      } catch (_) {}
-    }
-  }
-  if (winIndex >= 1 && winIndex <= wins.length) {
-    const byIdx = wins[winIndex - 1];
-    if (!winTitle) return byIdx;
+  const se = Application("System Events");
+  let proc = null;
+  if (targetPid > 0) {
     try {
-      if (String(byIdx.name() || "") === winTitle) return byIdx;
+      const byPid = se.processes.whose({ unixId: targetPid })();
+      if (byPid && byPid.length > 0) proc = byPid[0];
     } catch (_) {}
-    for (const cand of wins) {
-      try {
-        if (String(cand.name() || "") === winTitle) return cand;
-      } catch (_) {}
-    }
-    return byIdx;
   }
-  if (winTitle) {
-    for (const cand of wins) {
-      try {
-        if (String(cand.name() || "") === winTitle) return cand;
-      } catch (_) {}
-    }
+  if (!proc) {
+    proc = se.processes.byName(targetName);
   }
-  if (!winId && !winTitle && winIndex === 0) {
+  if (restore) {
+    try { proc.visible = true; } catch (_) {}
+  }
+
+  function selectTargetWindow(wins, winId, winIndex, winTitle) {
+    if (!wins || wins.length === 0) return null;
+    if (winId) {
+      for (let i = 0; i < wins.length; i++) {
+        const cand = wins[i];
+        try {
+          const axNum = cand.attributes.byName("AXWindowNumber").value();
+          if (axNum !== null && axNum !== undefined && String(axNum) === winId) return cand;
+        } catch (_) {}
+        try {
+          if (String(cand.id()) === winId) return cand;
+        } catch (_) {}
+      }
+    }
+    if (winIndex >= 1 && winIndex <= wins.length) {
+      const byIdx = wins[winIndex - 1];
+      if (!winTitle) return byIdx;
+      try {
+        if (String(byIdx.name() || "") === winTitle) return byIdx;
+      } catch (_) {}
+      for (let i = 0; i < wins.length; i++) {
+        const cand = wins[i];
+        try {
+          if (String(cand.name() || "") === winTitle) return cand;
+        } catch (_) {}
+      }
+      return byIdx;
+    }
+    if (winTitle) {
+      for (let i = 0; i < wins.length; i++) {
+        const cand = wins[i];
+        try {
+          if (String(cand.name() || "") === winTitle) return cand;
+        } catch (_) {}
+      }
+    }
     return wins[0];
   }
-  return null;
-}
 
-let budget = 160;
-function readNode(el, depth) {
-  budget -= 1;
-  let role = "AXGroup";
-  let subrole = null;
-  let title = null;
-  let description = null;
-  let val = null;
-  let b = null;
-  let enabled = true;
-  let focused = false;
-  let selected = false;
-  let actions = [];
-  try { role = String(el.role() || "AXGroup"); } catch (_) {}
-  try { const sr = el.subrole(); if (sr) subrole = String(sr); } catch (_) {}
-  try { const t = el.title(); if (t) title = String(t); } catch (_) {}
-  try { const d = el.description(); if (d) description = String(d); } catch (_) {}
-  try {
-    const v = el.value();
-    if (v !== null && v !== undefined && (typeof v === "string" || typeof v === "number" || typeof v === "boolean")) {
-      val = String(v).slice(0, 500);
-    }
-  } catch (_) {}
-  try {
-    const p = el.position();
-    const s = el.size();
-    b = { x: Number(p[0] || 0), y: Number(p[1] || 0), width: Number(s[0] || 0), height: Number(s[1] || 0) };
-  } catch (_) {}
-  try { enabled = Boolean(el.enabled()); } catch (_) {}
-  try { focused = Boolean(el.focused()); } catch (_) {}
-  try { selected = Boolean(el.selected()); } catch (_) {}
-  try {
-    const rawActs = el.actions();
-    for (let i = 0; i < Math.min(rawActs.length, 8); i++) {
-      try {
-        const an = rawActs[i].name();
-        if (an) actions.push(String(an));
-      } catch (_) {}
-    }
-  } catch (_) {}
-  const children = [];
-  if (depth < 4 && budget > 0) {
-    try {
-      const sub = el.uiElements();
-      for (let i = 0; i < Math.min(sub.length, 40) && budget > 0; i++) {
-        children.push(readNode(sub[i], depth + 1));
-      }
-    } catch (_) {}
-  }
-  return {
-    role,
-    subrole,
-    title,
-    description,
-    value: val,
-    bounds: b,
-    enabled,
-    focused,
-    selected,
-    actions,
-    children,
+  const INTERACTIVE_ROLES = {
+    AXButton: true,
+    AXTextField: true,
+    AXTextArea: true,
+    AXCheckBox: true,
+    AXRadioButton: true,
+    AXPopUpButton: true,
+    AXComboBox: true,
+    AXMenuItem: true,
+    AXLink: true,
+    AXTab: true,
+    AXSlider: true,
+    AXRow: true,
+    AXCell: true,
   };
-}
 
-let winTitle = targetWinTitle || targetName;
-const winBounds = { x: 0, y: 0, width: 800, height: 600 };
-let children = [];
-try {
-  const wins = proc.windows();
-  const w = selectTargetWindow(wins, targetWinId, targetWinIndex, targetWinTitle);
-  if (w) {
-    if (restore) {
-      try { w.attributes.byName("AXMinimized").value = false; } catch (_) {}
+  let budget = 160;
+  function readChildren(parent, depth) {
+    if (depth >= 4 || budget <= 0) return [];
+    let elems = [];
+    try { elems = parent.uiElements(); } catch (_) { return []; }
+    const count = Math.min(elems.length, 40);
+    if (count === 0) return [];
+    let roles = [], subroles = [], titles = [], descs = [], vals = [], positions = [], sizes = [], enableds = [], focuseds = [];
+    try { roles = parent.uiElements.role(); } catch (_) {}
+    try { subroles = parent.uiElements.subrole(); } catch (_) {}
+    try { titles = parent.uiElements.title(); } catch (_) {}
+    try { descs = parent.uiElements.description(); } catch (_) {}
+    try { vals = parent.uiElements.value(); } catch (_) {}
+    try { positions = parent.uiElements.position(); } catch (_) {}
+    try { sizes = parent.uiElements.size(); } catch (_) {}
+    try { enableds = parent.uiElements.enabled(); } catch (_) {}
+    try { focuseds = parent.uiElements.focused(); } catch (_) {}
+    const out = [];
+    for (let i = 0; i < count && budget > 0; i++) {
+      budget -= 1;
+      const el = elems[i];
+      const role = roles[i] ? String(roles[i]) : "AXGroup";
+      const subrole = subroles[i] ? String(subroles[i]) : null;
+      const title = titles[i] ? String(titles[i]) : null;
+      const description = descs[i] ? String(descs[i]) : null;
+      const rawVal = vals[i];
+      const val = (rawVal !== null && rawVal !== undefined && (typeof rawVal === "string" || typeof rawVal === "number" || typeof rawVal === "boolean"))
+        ? String(rawVal).slice(0, 500)
+        : null;
+      const p = positions[i];
+      const s = sizes[i];
+      const b = (Array.isArray(p) && Array.isArray(s))
+        ? { x: Number(p[0] || 0), y: Number(p[1] || 0), width: Number(s[0] || 0), height: Number(s[1] || 0) }
+        : null;
+      const enabled = enableds[i] !== undefined ? Boolean(enableds[i]) : true;
+      const focused = Boolean(focuseds[i]);
+      const actions = INTERACTIVE_ROLES[role] ? ["AXPress"] : [];
+      const children = readChildren(el, depth + 1);
+      out.push({
+        role,
+        subrole,
+        title,
+        description,
+        value: val,
+        bounds: b,
+        enabled,
+        focused,
+        selected: false,
+        actions,
+        children,
+      });
     }
-    try {
-      const nm = w.name();
-      if (nm) winTitle = String(nm);
-    } catch (_) {}
-    try {
-      const pos = w.position();
-      const sz = w.size();
-      winBounds.x = Number(pos[0] || 0);
-      winBounds.y = Number(pos[1] || 0);
-      winBounds.width = Number(sz[0] || 800);
-      winBounds.height = Number(sz[1] || 600);
-    } catch (_) {}
-    const elems = w.uiElements();
-    for (let i = 0; i < Math.min(elems.length, 40) && budget > 0; i++) {
-      children.push(readNode(elems[i], 1));
-    }
+    return out;
   }
-} catch (_) {}
-JSON.stringify({
-  role: "AXWindow",
-  title: winTitle,
-  bounds: winBounds,
-  enabled: true,
-  focused: true,
-  selected: false,
-  actions: [],
-  children,
-});
+
+  let winTitle = targetWinTitle || targetName;
+  let winBounds = null;
+  let children = [];
+  try {
+    const wins = proc.windows();
+    const w = selectTargetWindow(wins, targetWinId, targetWinIndex, targetWinTitle);
+    if (w) {
+      if (restore) {
+        try { w.attributes.byName("AXMinimized").value = false; } catch (_) {}
+      }
+      try {
+        const nm = w.name();
+        if (nm && (!targetWinTitle || targetWinTitle === targetName)) winTitle = String(nm);
+      } catch (_) {}
+      try {
+        const pos = w.position();
+        const sz = w.size();
+        winBounds = {
+          x: Number(pos[0] || 0),
+          y: Number(pos[1] || 0),
+          width: Number(sz[0] || 800),
+          height: Number(sz[1] || 600),
+        };
+      } catch (_) {}
+      children = readChildren(w, 0);
+    }
+  } catch (_) {}
+  return JSON.stringify({
+    role: "AXWindow",
+    title: winTitle,
+    bounds: winBounds,
+    enabled: true,
+    focused: true,
+    selected: false,
+    actions: [],
+    children,
+  });
+}
 "#;
     let pid_str = app.pid.to_string();
-    let restore_str = if restore_window { "1" } else { "0" };
+    let effective_restore = restore_window
+        && (std::env::var_os("KRILL_TEST_OFFLINE").is_none()
+            || std::env::var_os("KRILL_COMPUTER_OSASCRIPT_BIN").is_some());
+    let restore_str = if effective_restore { "1" } else { "0" };
     let win_id_str = win.map_or("", |w| w.id.as_str());
     let win_idx_str = win.map_or(0usize, |w| w.index).to_string();
     let win_title_str = win.map_or("", |w| w.title.as_str());
@@ -763,6 +789,13 @@ JSON.stringify({
         if node.bounds.is_none() {
             node.bounds = Some(w.bounds);
         }
+    } else if node.bounds.is_none() {
+        node.bounds = Some(Rect {
+            x: 0.0,
+            y: 0.0,
+            width: 800.0,
+            height: 600.0,
+        });
     }
     Ok(node)
 }
@@ -999,7 +1032,8 @@ ObjC.import("AppKit");
 ObjC.import("CoreGraphics");
 ObjC.import("Foundation");
 
-const req = JSON.parse(ObjC.unwrap($.NSProcessInfo.processInfo.arguments.js[4]));
+function run(argv) {
+const req = JSON.parse(String(argv[0] || "{}"));
 const se = Application("System Events");
 
 function activateTargetApp() {
@@ -1045,7 +1079,8 @@ function selectTargetWindow(wins, winId, winIndex, winTitle) {
   const idxNum = Number(winIndex || 0);
   const titleStr = winTitle ? String(winTitle) : "";
   if (idStr) {
-    for (const cand of wins) {
+    for (let i = 0; i < wins.length; i++) {
+      const cand = wins[i];
       try {
         const axNum = cand.attributes.byName("AXWindowNumber").value();
         if (axNum !== null && axNum !== undefined && String(axNum) === idStr) return cand;
@@ -1061,7 +1096,8 @@ function selectTargetWindow(wins, winId, winIndex, winTitle) {
     try {
       if (String(byIdx.name() || "") === titleStr) return byIdx;
     } catch (_) {}
-    for (const cand of wins) {
+    for (let i = 0; i < wins.length; i++) {
+      const cand = wins[i];
       try {
         if (String(cand.name() || "") === titleStr) return cand;
       } catch (_) {}
@@ -1069,16 +1105,14 @@ function selectTargetWindow(wins, winId, winIndex, winTitle) {
     return byIdx;
   }
   if (titleStr) {
-    for (const cand of wins) {
+    for (let i = 0; i < wins.length; i++) {
+      const cand = wins[i];
       try {
         if (String(cand.name() || "") === titleStr) return cand;
       } catch (_) {}
     }
   }
-  if (!idStr && !titleStr && idxNum === 0) {
-    return wins[0];
-  }
-  return null;
+  return wins[0];
 }
 
 const INTERACTIVE_ROLES = {
@@ -1101,39 +1135,29 @@ function findInteractiveElementByRef(win, targetRef) {
   if (!win || !targetRef || targetRef < 1) return null;
   let budget = 160;
   let nextRef = 1;
-  function visit(el, depth) {
-    budget -= 1;
-    let role = "AXGroup";
-    let hasActions = false;
-    try { role = String(el.role() || "AXGroup"); } catch (_) {}
-    try {
-      const rawActs = el.actions();
-      hasActions = rawActs && rawActs.length > 0;
-    } catch (_) {}
-    if (hasActions || INTERACTIVE_ROLES[role]) {
-      const assigned = nextRef;
-      nextRef += 1;
-      if (assigned === targetRef) return el;
-    }
-    if (depth < 4 && budget > 0) {
-      try {
-        const sub = el.uiElements();
-        for (let i = 0; i < Math.min(sub.length, 40) && budget > 0; i++) {
-          const found = visit(sub[i], depth + 1);
-          if (found) return found;
-        }
-      } catch (_) {}
+  function visitChildren(parent, depth) {
+    if (depth >= 4 || budget <= 0) return null;
+    let elems = [];
+    try { elems = parent.uiElements(); } catch (_) { return null; }
+    const count = Math.min(elems.length, 40);
+    if (count === 0) return null;
+    let roles = [];
+    try { roles = parent.uiElements.role(); } catch (_) {}
+    for (let i = 0; i < count && budget > 0; i++) {
+      budget -= 1;
+      const el = elems[i];
+      const role = roles[i] ? String(roles[i]) : "AXGroup";
+      if (INTERACTIVE_ROLES[role]) {
+        const assigned = nextRef;
+        nextRef += 1;
+        if (assigned === targetRef) return el;
+      }
+      const found = visitChildren(el, depth + 1);
+      if (found) return found;
     }
     return null;
   }
-  try {
-    const elems = win.uiElements();
-    for (let i = 0; i < Math.min(elems.length, 40) && budget > 0; i++) {
-      const found = visit(elems[i], 1);
-      if (found) return found;
-    }
-  } catch (_) {}
-  return null;
+  return visitChildren(win, 0);
 }
 
 function postMouseClick(pt, button, clickCount, cgFlags) {
@@ -1400,7 +1424,8 @@ function executeRequest() {
   return { ok: false, status: "unverified", reason: "unsupported live action kind: " + kind, note: null };
 }
 
-JSON.stringify(executeRequest());
+return JSON.stringify(executeRequest());
+}
 "#;
 
 pub fn execute_live_action(

@@ -1640,5 +1640,43 @@ esac
         String::from_utf8_lossy(&big_out.stderr)
     );
 
+    // Scenario 5 (OWE-775): real /usr/bin/osascript JXA execution for list-apps and list-windows --app pid:<N>
+    if cfg!(target_os = "macos") && Path::new("/usr/bin/osascript").exists() {
+        let apps_out = Command::new(&bin_path)
+            .args(["computer", "list-apps", "--json"])
+            .env("KRILL_STATE_DIR", &dir)
+            .env("HOME", &dir)
+            .env("KRILL_TEST_OFFLINE", "1")
+            .env_remove("KRILL_COMPUTER_OSASCRIPT_BIN")
+            .output()
+            .unwrap();
+        assert!(
+            apps_out.status.success(),
+            "real list-apps failed: {}",
+            String::from_utf8_lossy(&apps_out.stderr)
+        );
+        let apps_json: serde_json::Value = serde_json::from_slice(&apps_out.stdout).unwrap();
+        let apps_arr = apps_json["apps"].as_array().unwrap();
+        if let Some(first_app) = apps_arr.first() {
+            let pid = first_app["pid"].as_u64().unwrap();
+            let pid_sel = format!("pid:{pid}");
+            let wins_out = Command::new(&bin_path)
+                .args(["computer", "list-windows", "--app", &pid_sel, "--json"])
+                .env("KRILL_STATE_DIR", &dir)
+                .env("HOME", &dir)
+                .env("KRILL_TEST_OFFLINE", "1")
+                .env_remove("KRILL_COMPUTER_OSASCRIPT_BIN")
+                .output()
+                .unwrap();
+            assert!(
+                wins_out.status.success(),
+                "real list-windows --app {pid_sel} failed: {}",
+                String::from_utf8_lossy(&wins_out.stderr)
+            );
+            let wins_json: serde_json::Value = serde_json::from_slice(&wins_out.stdout).unwrap();
+            assert!(wins_json["windows"].is_array());
+        }
+    }
+
     fs::remove_dir_all(&dir).ok();
 }

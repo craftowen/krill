@@ -1034,6 +1034,7 @@ fn workspace_search_engine_options_and_globs_work() {
 fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx: &mut gpui::TestAppContext,
 ) {
+    use gpui::Focusable as _;
     use std::cell::RefCell;
     use std::fmt::Write as _;
     use std::rc::Rc;
@@ -1064,7 +1065,7 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
         })
     });
 
-    // Click `diff-tab-search` to switch to Search tab.
+    // Click `diff-tab-search` to switch to Search tab and focus the query input.
     let search_tab = cx.debug_bounds("diff-tab-search").unwrap();
     cx.simulate_mouse_down(search_tab.center(), MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(search_tab.center(), MouseButton::Left, Modifiers::default());
@@ -1074,16 +1075,56 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
         cx.update(|_, cx| view.read(cx).active_tab()),
         PanelTab::Search
     );
+    assert!(
+        cx.update(|window, cx| {
+            view.read(cx)
+                .search
+                .query_input
+                .as_ref()
+                .unwrap()
+                .focus_handle(cx)
+                .is_focused(window)
+        }),
+        "clicking diff-tab-search must focus the search query input"
+    );
     assert!(cx.debug_bounds("search-pane").is_some());
     assert!(cx.debug_bounds("search-toolbar").is_some());
     assert!(cx.debug_bounds("search-filters").is_some());
     assert!(cx.debug_bounds("search-empty-idle").is_some());
 
-    // Run search for "needle_item".
-    cx.update(|_, cx| {
-        view.update(cx, |p, cx| p.set_search_query("needle_item", cx));
+    // OWE-777: Type "needle_ite", switch to Files tab via `show_files` (⇧⌘E),
+    // then click `diff-tab-search` with the mouse and immediately type "m".
+    cx.simulate_keystrokes("n e e d l e _ i t e");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search_options().query.clone()),
+        "needle_ite"
+    );
+
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| p.show_files(window, cx));
     });
     cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).active_tab()),
+        PanelTab::Files
+    );
+
+    let search_tab = cx.debug_bounds("diff-tab-search").unwrap();
+    cx.simulate_mouse_down(search_tab.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(search_tab.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    cx.simulate_keystrokes("m");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).search_options().query.clone()),
+        "needle_item"
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).explorer.filter_query.clone()),
+        ""
+    );
 
     assert!(cx.debug_bounds("search-summary").is_some());
     assert_eq!(
@@ -1354,4 +1395,164 @@ fn workspace_search_long_line_highlight_regex_step_cap_and_rg_truncation_work() 
     );
     assert!(ignored.contains("file_00.ignored"));
     assert!(ignored.iter().all(|entry| entry.ends_with(".ignored")));
+}
+
+#[test]
+fn fit_highlighted_preview_for_cols_elides_leading_context_and_adapts_to_panel_width() {
+    let repo = Repo::new();
+    let long_line = format!("{}NEEDLE\n", "x".repeat(320));
+    std::fs::write(repo.0.join("long.txt"), &long_line).unwrap();
+    std::fs::write(
+        repo.0.join("source.rs"),
+        "fn main() { println!(\"CHANGED NEEDLE\"); }\n",
+    )
+    .unwrap();
+
+    let res = search_worktree_fallback(
+        &repo.0,
+        &SearchOptions {
+            query: "NEEDLE".to_owned(),
+            case_sensitive: true,
+            ..SearchOptions::default()
+        },
+    )
+    .unwrap();
+    let long_hit = &res
+        .files
+        .iter()
+        .find(|f| f.relative_path == "long.txt")
+        .unwrap()
+        .matches[0];
+    let source_hit = &res
+        .files
+        .iter()
+        .find(|f| f.relative_path == "source.rs")
+        .unwrap()
+        .matches[0];
+
+    let default_cols = max_cols_for_row_width(280.0, 6.6);
+    assert_eq!(default_cols, 30);
+
+    let (long_before_narrow, long_matched_narrow, long_after_narrow) =
+        fit_highlighted_preview_for_cols(
+            &long_hit.line_content,
+            long_hit.column,
+            long_hit.match_length,
+            default_cols,
+        );
+    assert_eq!(long_matched_narrow, "NEEDLE");
+    assert!(long_before_narrow.starts_with('…'));
+    assert!(
+        long_before_narrow.chars().count() + long_matched_narrow.chars().count() <= default_cols,
+        "elided before + matched must fit inside default 280pt panel column budget"
+    );
+    assert!(long_after_narrow.is_empty());
+
+    let (src_before_narrow, src_matched_narrow, src_after_narrow) =
+        fit_highlighted_preview_for_cols(
+            &source_hit.line_content,
+            source_hit.column,
+            source_hit.match_length,
+            default_cols,
+        );
+    assert_eq!(src_matched_narrow, "NEEDLE");
+    assert!(src_before_narrow.starts_with('…'));
+    assert!(src_before_narrow.ends_with("println!(\"CHANGED "));
+    assert_eq!(src_after_narrow, "\"); }");
+
+    let wide_cols = max_cols_for_row_width(500.0, 6.6);
+    let (long_before_wide, long_matched_wide, _) = fit_highlighted_preview_for_cols(
+        &long_hit.line_content,
+        long_hit.column,
+        long_hit.match_length,
+        wide_cols,
+    );
+    assert_eq!(long_matched_wide, "NEEDLE");
+    assert!(
+        long_before_wide.chars().count() > long_before_narrow.chars().count(),
+        "wider panel must expose more leading context before the match"
+    );
+
+    let (src_before_wide, src_matched_wide, _) = fit_highlighted_preview_for_cols(
+        &source_hit.line_content,
+        source_hit.column,
+        source_hit.match_length,
+        wide_cols,
+    );
+    assert_eq!(src_matched_wide, "NEEDLE");
+    assert_eq!(src_before_wide, "fn main() { println!(\"CHANGED ");
+}
+
+#[gpui::test]
+fn workspace_search_default_width_panel_keeps_long_line_highlight_visible(
+    cx: &mut gpui::TestAppContext,
+) {
+    struct NarrowHost(Entity<Panel>);
+    impl Render for NarrowHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(280.)).h(px(600.)).flex().flex_col().child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.0.clone()),
+            )
+        }
+    }
+
+    let repo = Repo::new();
+    std::fs::write(
+        repo.0.join("long.txt"),
+        format!("{}NEEDLE\n", "x".repeat(320)),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.0.join("source.rs"),
+        "fn main() { println!(\"CHANGED NEEDLE\"); }\n",
+    )
+    .unwrap();
+
+    cx.update(gpui_component::init);
+    let repo_path = repo.0.clone();
+    let mut panel_handle: Option<Entity<Panel>> = None;
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        let p = cx.new(|cx| Panel::unconnected(repo_path, cx));
+        panel_handle = Some(p.clone());
+        NarrowHost(p)
+    });
+    let view = panel_handle.unwrap();
+    cx.run_until_parked();
+
+    let search_tab = cx.debug_bounds("diff-tab-search").unwrap();
+    cx.simulate_mouse_down(search_tab.center(), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(search_tab.center(), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_search_query("NEEDLE", cx));
+    });
+    cx.run_until_parked();
+
+    let long_match = cx.debug_bounds("search-match-long.txt-1-321").unwrap();
+    let long_highlight = cx.debug_bounds("search-highlight-long.txt-1-321").unwrap();
+    assert!(
+        long_highlight.size.width > px(0.),
+        "long.txt NEEDLE highlight must have non-zero width"
+    );
+    assert!(
+        long_highlight.origin.x >= long_match.origin.x
+            && long_highlight.right() <= long_match.right(),
+        "long.txt NEEDLE highlight ({long_highlight:?}) must stay inside 280pt match row ({long_match:?})"
+    );
+
+    let src_match = cx.debug_bounds("search-match-source.rs-1-31").unwrap();
+    let src_highlight = cx.debug_bounds("search-highlight-source.rs-1-31").unwrap();
+    assert!(
+        src_highlight.size.width > px(0.),
+        "source.rs NEEDLE highlight must have non-zero width"
+    );
+    assert!(
+        src_highlight.origin.x >= src_match.origin.x && src_highlight.right() <= src_match.right(),
+        "source.rs NEEDLE highlight ({src_highlight:?}) must stay inside 280pt match row ({src_match:?})"
+    );
 }
