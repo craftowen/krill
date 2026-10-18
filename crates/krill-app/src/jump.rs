@@ -897,11 +897,12 @@ impl Render for Palette {
             });
         }
         let pal = crate::ui::palette(cx);
-        let (bg, fg, border, accent, warning, muted) = (
+        let (bg, fg, border, accent, accent_fg, warning, muted) = (
             pal.popover,
             pal.popover_foreground,
             pal.border,
             pal.accent,
+            pal.accent_foreground,
             pal.agent_question,
             pal.muted_foreground,
         );
@@ -933,13 +934,15 @@ impl Render for Palette {
                                 .cursor_pointer()
                                 .text_size(crate::ui::TEXT_SM)
                                 .text_color(fg)
-                                .when(session_base + i == p.selected, |d| d.bg(accent))
+                                .when(session_base + i == p.selected, |d| {
+                                    d.bg(accent).text_color(accent_fg)
+                                })
                                 .child(
                                     div()
-                                        .text_size(crate::ui::TEXT_2XS)
-                                        .text_color(warning)
-                                        .when(!item.needs_you, Styled::invisible)
-                                        .child("●"),
+                                        .size(crate::ui::STATE_DOT)
+                                        .rounded_full()
+                                        .bg(warning)
+                                        .when(!item.needs_you, Styled::invisible),
                                 )
                                 .children((!item.agent.is_empty()).then(|| {
                                     crate::ui::icons::agent_brand_icon(
@@ -993,7 +996,7 @@ impl Render for Palette {
                     .cursor_pointer()
                     .text_size(crate::ui::TEXT_SM)
                     .text_color(fg)
-                    .when(is_selected, |d| d.bg(accent))
+                    .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
                     .child(div().flex_1().truncate().child(entry.label.clone()));
                 if entry.session.is_none() {
                     row = row.child(
@@ -1049,7 +1052,7 @@ impl Render for Palette {
                         .cursor_pointer()
                         .text_size(crate::ui::TEXT_SM)
                         .text_color(fg)
-                        .when(is_selected, |d| d.bg(accent))
+                        .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
                         .child(div().flex_1().truncate().child(action.label.clone()))
                         .on_click(cx.listener(move |p, _, _, cx| {
                             p.selected = row_index;
@@ -1088,7 +1091,7 @@ impl Render for Palette {
                         .cursor_pointer()
                         .text_size(crate::ui::TEXT_SM)
                         .text_color(fg)
-                        .when(is_selected, |d| d.bg(accent))
+                        .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
                         .child(div().flex_1().truncate().child(command.name.clone()))
                         .on_click(cx.listener(move |p, _, _, cx| {
                             p.selected = row_index;
@@ -1118,7 +1121,63 @@ impl Render for Palette {
             || self.scope != VaultScope::All
             || self.agent_filter.is_some();
         let vault_section = show_vault.then(|| {
-            let mut filter_bar = div()
+            let scope_control = crate::ui::segmented_control(
+                pal,
+                [
+                    (
+                        "jump-scope-all",
+                        VaultScope::All,
+                        vault_text::SCOPE_ALL.get(),
+                    ),
+                    (
+                        "jump-scope-project",
+                        VaultScope::Project,
+                        vault_text::SCOPE_PROJECT.get(),
+                    ),
+                    (
+                        "jump-scope-workspace",
+                        VaultScope::Workspace,
+                        vault_text::SCOPE_WORKSPACE.get(),
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, scope, label)| {
+                    let active = self.scope == scope;
+                    crate::ui::segment(id, label, active)
+                        .debug_selector(move || id.into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_scope(scope, cx);
+                        }))
+                }),
+            );
+            let agent_control = crate::ui::segmented_control(
+                pal,
+                [
+                    ("jump-agent-all", None, vault_text::AGENT_ALL.get()),
+                    ("jump-agent-claude", Some(VaultAgent::Claude), "Claude"),
+                    ("jump-agent-codex", Some(VaultAgent::Codex), "Codex"),
+                    ("jump-agent-agy", Some(VaultAgent::Agy), "Antigravity"),
+                    (
+                        "jump-agent-opencode",
+                        Some(VaultAgent::OpenCode),
+                        "OpenCode",
+                    ),
+                ]
+                .into_iter()
+                .map(|(id, agent, label)| {
+                    let active = self.agent_filter == agent;
+                    let btn =
+                        crate::ui::segment(id, label, active).debug_selector(move || id.into());
+                    let btn = match agent {
+                        Some(ag) => btn.icon(crate::ui::icons::agent_menu_icon(ag.profile())),
+                        None => btn,
+                    };
+                    btn.on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_agent_filter(agent, cx);
+                    }))
+                }),
+            );
+            let filter_bar = div()
                 .flex()
                 .flex_wrap()
                 .items_center()
@@ -1126,83 +1185,9 @@ impl Render for Palette {
                 .pt_1()
                 .border_t_1()
                 .border_color(border)
-                .text_size(crate::ui::TEXT_XS);
-            for (id, scope, label) in [
-                (
-                    "jump-scope-all",
-                    VaultScope::All,
-                    vault_text::SCOPE_ALL.get(),
-                ),
-                (
-                    "jump-scope-project",
-                    VaultScope::Project,
-                    vault_text::SCOPE_PROJECT.get(),
-                ),
-                (
-                    "jump-scope-workspace",
-                    VaultScope::Workspace,
-                    vault_text::SCOPE_WORKSPACE.get(),
-                ),
-            ] {
-                let active = self.scope == scope;
-                filter_bar = filter_bar.child(
-                    div()
-                        .id(id)
-                        .debug_selector(move || id.into())
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .cursor_pointer()
-                        .bg(if active { pal.accent } else { pal.secondary })
-                        .text_color(if active {
-                            pal.accent_foreground
-                        } else {
-                            pal.secondary_foreground
-                        })
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_scope(scope, cx);
-                        })),
-                );
-            }
-            for (id, agent, label) in [
-                ("jump-agent-all", None, vault_text::AGENT_ALL.get()),
-                ("jump-agent-claude", Some(VaultAgent::Claude), "Claude"),
-                ("jump-agent-codex", Some(VaultAgent::Codex), "Codex"),
-                ("jump-agent-agy", Some(VaultAgent::Agy), "Antigravity"),
-                (
-                    "jump-agent-opencode",
-                    Some(VaultAgent::OpenCode),
-                    "OpenCode",
-                ),
-            ] {
-                let active = self.agent_filter == agent;
-                filter_bar = filter_bar.child(
-                    div()
-                        .id(id)
-                        .debug_selector(move || id.into())
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .px_1p5()
-                        .py_0p5()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .cursor_pointer()
-                        .bg(if active { pal.accent } else { pal.secondary })
-                        .text_color(if active {
-                            pal.accent_foreground
-                        } else {
-                            pal.secondary_foreground
-                        })
-                        .children(agent.map(|ag| {
-                            crate::ui::icons::agent_brand_icon(ag.profile(), crate::ui::ICON_XS, fg)
-                        }))
-                        .child(label)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_agent_filter(agent, cx);
-                        })),
-                );
-            }
+                .text_size(crate::ui::TEXT_XS)
+                .child(scope_control)
+                .child(agent_control);
 
             let mut rows_div = div()
                 .id("jump-vault-list")
@@ -1254,27 +1239,24 @@ impl Render for Palette {
                             .items_center()
                             .gap_2()
                             .cursor_pointer()
-                            .when(is_selected, |d| d.bg(accent))
+                            .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.selected = row_index;
                                 this.resume_vault_at(hit_idx, cx);
                             }))
                             .child(col)
                             .child(
-                                div()
-                                    .id(("jump-vault-resume", hit_idx))
-                                    .debug_selector(move || format!("jump-vault-resume-{hit_idx}"))
-                                    .px_2()
-                                    .py_0p5()
-                                    .rounded(crate::ui::RADIUS_XS)
-                                    .bg(pal.secondary)
-                                    .text_color(pal.secondary_foreground)
-                                    .cursor_pointer()
-                                    .child(vault_text::RESUME.get())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                crate::ui::secondary(
+                                    ("jump-vault-resume", hit_idx),
+                                    vault_text::RESUME.get(),
+                                )
+                                .debug_selector(move || format!("jump-vault-resume-{hit_idx}"))
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.selected = row_index;
                                         this.resume_vault_at(hit_idx, cx);
-                                    })),
+                                    },
+                                )),
                             ),
                     );
                 }
@@ -1314,6 +1296,7 @@ impl Render for Palette {
         // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc 처리를 대신한다.
         let mut palette = div()
             .w(crate::ui::COMMAND_PALETTE_WIDTH)
+            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
             .p_2()
             .flex()
             .flex_col()
