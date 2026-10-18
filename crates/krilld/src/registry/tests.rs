@@ -197,6 +197,7 @@ fn closed_session_leaves_list_only_after_release_reaches_holder() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
@@ -810,6 +811,7 @@ fn session_accounts_returns_launch_account_with_label() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
@@ -1012,6 +1014,7 @@ fn fork_creates_new_session_and_keeps_original_session_alive() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {

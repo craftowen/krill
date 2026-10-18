@@ -19,6 +19,7 @@ fn exited_release_during_holder_upgrade_does_not_block_reader() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
@@ -87,6 +88,7 @@ fn exited_handler_panic_does_not_stop_worker() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
