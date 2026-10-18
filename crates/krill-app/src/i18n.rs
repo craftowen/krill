@@ -1063,7 +1063,8 @@ catalog! {
         FONT_SIZE_DESC => ("터미널 글자 크기입니다(터미널 포커스 시 ⌘= / ⌘- / ⌘0).", "Terminal text size (⌘= / ⌘- / ⌘0 when terminal is focused)."),
         OPACITY_DESC => ("터미널 배경의 불투명도입니다.", "Opacity of the terminal background."),
         TERMINAL_FONT => ("글꼴", "Font family"),
-        TERMINAL_FONT_DESC => ("터미널 글꼴입니다. 고정폭 글꼴을 권장합니다.", "Terminal font. Monospace fonts are recommended."),
+        TERMINAL_FONT_DESC => ("터미널 글꼴입니다. 목록에는 고정폭 글꼴만 나옵니다.", "Terminal font. Only monospace fonts are listed."),
+        TERMINAL_FONT_FALLBACK => ("“{requested}”은(는) 고정폭으로 쓸 수 없어 “{effective}”(으)로 표시합니다.", "“{requested}” is not a usable monospace font, so the terminal shows “{effective}” instead."),
         CURSOR_SHAPE => ("커서 모양", "Cursor shape"),
         CURSOR_SHAPE_DESC => ("프로그램이 커서 모양을 지정하지 않을 때 쓰는 기본 모양입니다.", "Default shape when a program does not set one."),
         CURSOR_BLOCK => ("블록", "Block"),
@@ -1713,7 +1714,16 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
     (
         crate::settings::AdminTab::Terminal,
         catalog::settings::TERMINAL_FONT,
-        &["글꼴", "폰트", "서체", "font", "typeface", "menlo"],
+        &[
+            "글꼴",
+            "폰트",
+            "서체",
+            "고정폭",
+            "font",
+            "typeface",
+            "monospace",
+            "menlo",
+        ],
     ),
     (
         crate::settings::AdminTab::Terminal,
@@ -2057,6 +2067,20 @@ mod tests {
         let dirty = catalog::sidebar::DIRTY_COUNT.format(&[("n", "3")]);
         assert!(dirty.contains('3'), "{dirty}");
         assert!(!catalog::sidebar::EMPTY.get().is_empty());
+    }
+
+    /// OWE-899: 글꼴 폴백 경고가 지정값·대체값을 모두 밝힌다.
+    #[test]
+    fn terminal_font_fallback_names_both_fonts() {
+        let msg = catalog::settings::TERMINAL_FONT_FALLBACK
+            .format(&[("requested", "SF Mono"), ("effective", "Menlo")]);
+        assert!(msg.contains("SF Mono"), "{msg}");
+        assert!(msg.contains("Menlo"), "{msg}");
+        assert!(
+            catalog::settings::TERMINAL_FONT_FALLBACK
+                .in_language(super::Language::En)
+                .contains("{requested}")
+        );
     }
 }
 
