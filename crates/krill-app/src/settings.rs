@@ -1261,13 +1261,6 @@ fn edit(cx: &mut App, f: impl FnOnce(&mut Settings)) {
     }
 }
 
-/// 기본 에이전트를 저장한다(온보딩 첫 화면, OWE-714). 설정 초기화 전이거나 같으면 쓰지 않는다.
-pub fn set_default_agent(id: &str, cx: &mut App) {
-    if cx.has_global::<Config>() && current(cx).default_agent != id {
-        edit(cx, |s| id.clone_into(&mut s.default_agent));
-    }
-}
-
 /// Select the UI language, apply it to open windows, and persist it in settings.toml.
 pub fn set_language(language: Language, cx: &mut App) {
     let previous = current(cx).language;

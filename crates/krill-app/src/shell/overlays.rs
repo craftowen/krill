@@ -1,4 +1,4 @@
-//! OWE-903: 온보딩·기기 연결(짝짓기) 인앱 모달 호스팅.
+//! OWE-903: 점검(온보딩)·기기 연결(짝짓기) 인앱 모달 호스팅.
 //!
 //! 별도 OS 창(`cx.open_window`) 대신 메인 창 안 `ui::modal_backdrop` 모달로 연다.
 //! 라이브러리(`link_ui`·`onboarding`)가 호스트 요청을 디스패치하면 메인 `Shell`이
@@ -16,7 +16,7 @@ pub(super) struct PairingModal {
     _close: Subscription,
 }
 
-/// 온보딩 모달 슬롯.
+/// 점검 모달 슬롯.
 pub(super) struct OnboardingModal {
     pub(super) view: Entity<onboarding::welcome::Wizard>,
     _close: Subscription,
@@ -27,7 +27,7 @@ pub(super) struct OnboardingModal {
 #[derive(Default)]
 pub(super) struct PendingOverlays {
     pub(super) pairing: bool,
-    pub(super) onboarding: Option<onboarding::HostCommand>,
+    pub(super) onboarding: Option<onboarding::Env>,
 }
 
 impl super::Shell {
@@ -66,14 +66,8 @@ impl super::Shell {
             self.pending.pairing = false;
             self.open_pairing_modal(window, cx);
         }
-        if let Some(onboarding::HostCommand::Open {
-            env,
-            start,
-            consent_only,
-        }) = self.pending.onboarding.take()
-        {
-            // Rerun은 요청 시점에 열린 모달을 재시작하므로 여기까지 남지 않는다.
-            self.open_onboarding_modal(env, start, consent_only, window, cx);
+        if let Some(env) = self.pending.onboarding.take() {
+            self.open_onboarding_modal(env, window, cx);
         }
     }
 
@@ -87,45 +81,19 @@ impl super::Shell {
         cx.notify();
     }
 
-    /// 온보딩 모달 요청. 명시적 재실행(`Rerun`)은 열린 모달을 동의부터 다시 시작한다.
+    /// 점검 모달 요청. 열려 있으면 앞으로 가져오고, 닫혀 있으면 렌더에서 연다.
     pub(super) fn request_onboarding(
         &mut self,
         cmd: &onboarding::HostCommand,
         cx: &mut Context<Self>,
     ) {
-        match cmd {
-            onboarding::HostCommand::Open {
-                env,
-                start,
-                consent_only,
-            } => {
-                if self.onboarding.is_some() {
-                    self.activate_host_window(cx);
-                    return;
-                }
-                self.pending.onboarding = Some(onboarding::HostCommand::Open {
-                    env: env.clone(),
-                    start: *start,
-                    consent_only: *consent_only,
-                });
-                cx.notify();
-            }
-            onboarding::HostCommand::Rerun { env } => {
-                if let Some(modal) = &self.onboarding {
-                    let view = modal.view.clone();
-                    view.update(cx, onboarding::welcome::Wizard::restart_to_consent);
-                    self.activate_host_window(cx);
-                    cx.notify();
-                } else {
-                    self.pending.onboarding = Some(onboarding::HostCommand::Open {
-                        env: env.clone(),
-                        start: onboarding::state::Step::Consent,
-                        consent_only: false,
-                    });
-                    cx.notify();
-                }
-            }
+        let onboarding::HostCommand::Open { env } = cmd;
+        if self.onboarding.is_some() {
+            self.activate_host_window(cx);
+            return;
         }
+        self.pending.onboarding = Some(env.clone());
+        cx.notify();
     }
 
     fn activate_host_window(&self, cx: &mut Context<Self>) {
@@ -165,21 +133,18 @@ impl super::Shell {
         cx.notify();
     }
 
-    /// 온보딩 모달 엔티티를 만들고 수집 시작·재포커스 재검사·닫기를 연결한다.
+    /// 점검 모달 엔티티를 만들고 수집 시작·재포커스 재검사·닫기를 연결한다.
     pub(super) fn open_onboarding_modal(
         &mut self,
         env: onboarding::Env,
-        start: onboarding::state::Step,
-        consent_only: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.onboarding.is_some() {
             return;
         }
-        let view = cx.new(|cx| onboarding::welcome::Wizard::new(env, start, consent_only, cx));
+        let view = cx.new(|cx| onboarding::welcome::Wizard::new(env, cx));
         view.update(cx, |w, cx| {
-            w.mount_consent(cx);
             w.observe_activation(window, cx);
             w.begin_collect(cx);
         });

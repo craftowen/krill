@@ -1,14 +1,11 @@
-//! 온보딩 모달(MK-161, OWE-714, OWE-903): 첫 실행 1장 + 설정 점검 화면을 한 모달이 맡는다.
+//! 점검 모달(MK-161, OWE-714, OWE-903, OWE-904). 첫 실행에는 뜨지 않고 설정 > 일반 >
+//! 설정 점검·메뉴·상태바에서 연다.
 //!
-//! - 첫 실행(동의 단계)은 1장이다. 짧은 동의(요약 3줄 + 자세히 보기), 감지된 기본 에이전트,
-//!   [시작하기]. 체크리스트는 보여 주지 않는다. 시작하면 동의를 기록하고 완료로 저장한 뒤
-//!   닫는다. 백그라운드 점검에서 필수 실패가 나왔을 때만 점검 화면으로 넘어가 막는다.
-//! - 점검 화면(설정 > 일반 > 설정 점검 재진입, 필수 실패)은 staged `krill doctor --json
-//!   --no-start` + `app.*`를 등급별 카드로 보여 준다. 행 오른쪽에 조치 버튼과 펼침 chevron,
-//!   고정 헤더(제목·요약·모두 다시 검사)와 고정 푸터(닫기). 창 재포커스 재검사(1초 디바운스).
-//! - Enter = 주 버튼, Esc = 나중에/닫기. 별도 OS 창 대신 메인 창 안 `ui::modal_backdrop`
-//!   중앙 모달(`SETTINGS_MODAL_WIDTH`)로 뜨며, 닫기는 [`Event::Close`]로 호스트(`Shell`)에
-//!   알린다(OWE-903).
+//! - staged `krill doctor --json --no-start` + `app.*`를 등급별 카드로 보여 준다. 행 오른쪽에
+//!   조치 버튼과 펼침 chevron, 고정 헤더(제목·요약·모두 자동 설정·모두 다시 검사)와 고정
+//!   푸터(닫기). 창 재포커스 재검사(1초 디바운스).
+//! - Enter·Esc = 닫기. 별도 OS 창 대신 메인 창 안 `ui::modal_backdrop` 중앙 모달
+//!   (`SETTINGS_MODAL_WIDTH`)로 뜨며, 닫기는 [`Event::Close`]로 호스트(`Shell`)에 알린다(OWE-903).
 //!
 //! 호스트가 없는 테스트에서는 [`Event::Close`]를 구독한 테스트 호스트가 창을 닫는다.
 
@@ -17,16 +14,14 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, AppContext as _, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent,
-    Render, Subscription, Task, Window, actions, div, prelude::*, px,
+    ClipboardItem, Context, EventEmitter, FocusHandle, KeyDownEvent, Render, Subscription, Task,
+    Window, actions, div, prelude::*, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use krill_proto::doctor::{Check, FixKind, Level, Status};
 use krill_proto::hook_install::{Plan, TargetAgent};
 
-use super::consent::view::ConsentView;
-use super::state::{OnboardingState, STATE_VERSION, Step, save};
 use super::{
     Cli, Collected, Env, Survey, check_text, check_title, clip, collect, install_cli_link,
     is_replaceable_broken_symlink, mk_hook,
@@ -54,7 +49,7 @@ pub(super) const KEY_CONTEXT: &str = "Wizard";
 /// 마법사 모달이 외부(호스트 `Shell`)로 알리는 이벤트. 모달은 OS 창을 직접 닫지 않는다.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
-    /// 모달을 닫는다([나중에]/[닫기]·Esc·⌘W·바깥 클릭·[시작하기] 완료).
+    /// 모달을 닫는다([닫기]·Enter·Esc·⌘W·바깥 클릭).
     Close,
 }
 
@@ -85,10 +80,6 @@ enum Fix {
 
 pub struct Wizard {
     pub(super) env: Env,
-    pub(super) step: Step,
-    /// 기존 완료 사용자의 재동의(MK-127). 기본 에이전트를 묻지 않고 동의만 기록한다.
-    pub(super) consent_only: bool,
-    pub(super) consent: Option<Entity<ConsentView>>,
     pub(super) survey: Option<Survey>,
     pub(super) staged: Option<PathBuf>,
     /// `doctor` + `app.*` 합본. `None`이면 검사 중.
@@ -106,22 +97,17 @@ pub struct Wizard {
     /// 점검 ID별 마지막 실행기 조치 실패(충돌 안내 포함).
     pub(super) fix_errors: HashMap<String, super::actions::FixError>,
     folder_check_requested: bool,
-    /// 첫 화면에서 고른 기본 에이전트(감지된 것 중).
-    pub(super) agent: Option<String>,
     pub(super) last_recheck: Instant,
     focus: FocusHandle,
     task: Option<Task<()>>,
     fix_tasks: HashMap<String, Task<()>>,
     activation: Option<Subscription>,
-    consent_watch: Option<Subscription>,
 }
 
 impl std::fmt::Debug for Wizard {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Wizard")
-            .field("step", &self.step)
             .field("checks", &self.checks.as_ref().map(Vec::len))
-            .field("agent", &self.agent)
             .finish_non_exhaustive()
     }
 }
@@ -140,40 +126,10 @@ fn merge_checks(doctor: Vec<Check>, app: Vec<Check>) -> Vec<Check> {
     doctor.into_iter().chain(app).collect()
 }
 
-/// 감지된(실행 파일이 있는) 에이전트 `(id, 이름)`.
-fn detected_agents(survey: &Survey) -> Vec<(String, String)> {
-    survey
-        .agents
-        .iter()
-        .filter(|a| a.exe.is_some())
-        .map(|a| (a.id.clone(), a.name.clone()))
-        .collect()
-}
-
-/// 첫 화면 기본 선택: 설정의 기본 에이전트가 감지됐으면 그것, 아니면 처음 감지된 것.
-fn pick_default_agent(detected: &[(String, String)], current: &str) -> Option<String> {
-    detected
-        .iter()
-        .find(|(id, _)| id == current)
-        .or_else(|| detected.first())
-        .map(|(id, _)| id.clone())
-}
-
 impl Wizard {
-    pub fn new(env: Env, step: Step, consent_only: bool, cx: &mut Context<Self>) -> Self {
-        crate::orca_import::set_env_paths(
-            Some(env.home.clone()),
-            None,
-            Some(env.state.clone()),
-            None,
-            cx,
-        );
-        crate::orca_import::ensure_scanned(cx);
+    pub fn new(env: Env, cx: &mut Context<Self>) -> Self {
         Self {
             env,
-            step,
-            consent_only,
-            consent: None,
             survey: None,
             staged: None,
             checks: None,
@@ -185,13 +141,11 @@ impl Wizard {
             hook_plans: HashMap::new(),
             fix_errors: HashMap::new(),
             folder_check_requested: false,
-            agent: None,
             last_recheck: Instant::now(),
             focus: cx.focus_handle(),
             task: None,
             fix_tasks: HashMap::new(),
             activation: None,
-            consent_watch: None,
         }
     }
 
@@ -210,105 +164,6 @@ impl Wizard {
         self.focus.clone()
     }
 
-    /// 동의 단계면 동의 뷰를 얹는다. 체크 상태가 바뀌면 푸터 [시작하기]를 다시 그린다.
-    pub fn mount_consent(&mut self, cx: &mut Context<Self>) {
-        if self.step != Step::Consent || self.consent.is_some() {
-            return;
-        }
-        let state = self.env.state.clone();
-        let view = cx.new(|_| ConsentView::new(state));
-        self.consent_watch = Some(cx.observe(&view, |_, _, cx| cx.notify()));
-        self.consent = Some(view);
-    }
-
-    /// [시작하기]: 동의를 기록하고 완료로 저장한다. 기록이 실패해도 닫고 다음 실행에 다시 묻는다.
-    /// 백그라운드 점검에 필수 실패가 있으면 닫지 않고 점검 화면으로 넘어간다.
-    /// 닫기는 OS 창을 직접 닫지 않고 [`Event::Close`]로 호스트에 알린다(OWE-903).
-    fn on_consented(&mut self, cx: &mut Context<Self>) {
-        if let Err(e) =
-            super::consent::record_consent(&self.env.state, std::time::SystemTime::now())
-        {
-            tracing::warn!(%e, "consent record failed");
-        }
-        if !self.consent_only
-            && let Some(agent) = self.agent.clone()
-        {
-            crate::settings::set_default_agent(&agent, cx);
-        }
-        let done = OnboardingState {
-            completed: false,
-            step: Step::Done,
-            version: STATE_VERSION,
-        }
-        .completed();
-        if let Err(e) = save(&self.env.state, &done) {
-            tracing::warn!(%e, "onboarding completion save failed");
-        }
-        self.consent = None;
-        self.consent_watch = None;
-        let blocked = self
-            .checks
-            .as_deref()
-            .is_some_and(|c| !required_blockers(c).is_empty());
-        if blocked && !self.consent_only && !self.env.is_isolated_state() {
-            // 필수 실패는 자동 준비와 재검사 뒤에도 남을 때만 막는다.
-            let prepare = super::actions::auto_prepare(self.env.clone(), cx);
-            let env = self.env.clone();
-            self.busy.insert("auto-prepare".to_owned());
-            self.task = Some(cx.spawn(async move |this, cx| {
-                prepare.await.ok();
-                let collected = cx
-                    .background_executor()
-                    .spawn(async move { collect(&env) })
-                    .await;
-                this.update(cx, |w, cx| {
-                    w.busy.remove("auto-prepare");
-                    w.apply_collected(collected, cx);
-                    if w.checks
-                        .as_deref()
-                        .is_some_and(|checks| !required_blockers(checks).is_empty())
-                    {
-                        w.step = Step::Checklist;
-                    } else {
-                        Self::close(cx);
-                    }
-                    cx.notify();
-                })
-                .ok();
-            }));
-        } else if blocked && !self.consent_only {
-            self.step = Step::Checklist;
-            cx.notify();
-        } else {
-            if !self.env.is_isolated_state() {
-                super::actions::auto_prepare(self.env.clone(), cx).detach();
-            }
-            Self::close(cx);
-        }
-    }
-
-    /// 온보딩 다시 실행: 첫 화면부터 다시 시작한다(열려 있는 모달을 재사용).
-    /// 명시적 재실행은 전체 흐름이므로 `consent_only`를 끈다.
-    pub fn restart_to_consent(&mut self, cx: &mut Context<Self>) {
-        self.step = Step::Consent;
-        self.consent_only = false;
-        self.consent = None;
-        self.mount_consent(cx);
-        self.persist_step();
-        cx.notify();
-    }
-
-    fn persist_step(&self) {
-        let state = OnboardingState {
-            completed: false,
-            step: self.step,
-            version: STATE_VERSION,
-        };
-        if let Err(e) = save(&self.env.state, &state) {
-            tracing::warn!(%e, "onboarding step save failed");
-        }
-    }
-
     /// 모달이 처음 열릴 때 수집 시작.
     pub fn begin_collect(&mut self, cx: &mut Context<Self>) {
         if self.checks_loading {
@@ -323,7 +178,7 @@ impl Wizard {
                 .spawn(async move { collect(&env) })
                 .await;
             this.update(cx, |w, cx| {
-                w.apply_collected(collected, cx);
+                w.apply_collected(collected);
                 if let Some(checks) = &w.checks {
                     super::store_snapshot(cx, checks.clone());
                 }
@@ -333,13 +188,9 @@ impl Wizard {
         }));
     }
 
-    fn apply_collected(&mut self, collected: Collected, cx: &App) {
+    fn apply_collected(&mut self, collected: Collected) {
         self.checks_loading = false;
         self.staged = collected.staged;
-        let detected = detected_agents(&collected.survey);
-        if self.agent.is_none() {
-            self.agent = pick_default_agent(&detected, &crate::settings::current(cx).default_agent);
-        }
         self.survey = Some(collected.survey);
         self.checks = Some(merge_checks(collected.doctor, collected.app));
         self.last_recheck = Instant::now();
@@ -375,7 +226,7 @@ impl Wizard {
                 })
                 .await;
             this.update(cx, |w, cx| {
-                w.apply_collected(collected, cx);
+                w.apply_collected(collected);
                 if let Some(checks) = &w.checks {
                     super::store_snapshot(cx, checks.clone());
                 }
@@ -389,45 +240,14 @@ impl Wizard {
     /// 호스트가 창 활성화를 관찰해 부른다.
     pub fn activated(&mut self, cx: &mut Context<Self>) {
         super::actions::recheck_needed(cx).detach();
-        if self.step != Step::Consent
-            && !self.checks_loading
-            && self.last_recheck.elapsed() > RECHECK_DEBOUNCE
-        {
+        if !self.checks_loading && self.last_recheck.elapsed() > RECHECK_DEBOUNCE {
             self.recheck(cx);
         }
-    }
-
-    /// `[나중에]`/`[닫기]`(Esc). 첫 화면이면 다음 실행에 다시 묻도록 단계를 남긴다.
-    /// 모달 자체는 닫지 않고 [`Event::Close`]로 호스트에 알린다(OWE-903).
-    fn later(&mut self, cx: &mut Context<Self>) {
-        if self.step == Step::Consent {
-            self.persist_step();
-        }
-        Self::close(cx);
     }
 
     /// 모달 닫기를 호스트에 알린다.
     fn close(cx: &mut Context<Self>) {
         cx.emit(Event::Close);
-    }
-
-    /// 동의 체크박스가 체크됐나. 체크 전에는 [시작하기]·Enter가 아무 일도 하지 않는다.
-    pub(super) fn accepted(&self, cx: &App) -> bool {
-        self.consent.as_ref().is_some_and(|v| v.read(cx).accepted())
-    }
-
-    /// 주 버튼(Enter). 첫 화면은 [시작하기](체크 전이면 무시), 점검 화면은 닫기.
-    fn primary(&mut self, cx: &mut Context<Self>) {
-        match self.step {
-            Step::Consent if self.accepted(cx) => self.on_consented(cx),
-            Step::Consent => {}
-            _ => self.later(cx),
-        }
-    }
-
-    /// [종료]: 동의 거절 = 앱 프로세스만 끝낸다. 데몬·세션은 살려 두고 아무것도 쓰지 않는다.
-    fn quit(cx: &mut App) {
-        cx.quit();
     }
 
     // ---- 점검 행 동작 ----
@@ -853,13 +673,6 @@ fn status_icon(status: Status) -> IconName {
 impl Wizard {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
-        let (title, subtitle) = match self.step {
-            Step::Consent => (
-                crate::i18n::catalog::consent::TITLE.get().to_owned(),
-                crate::i18n::catalog::consent::INTRO.get().to_owned(),
-            ),
-            _ => (text::CHECKS_TITLE.get().to_owned(), self.summary_line()),
-        };
         let fix_all_busy = self.busy.contains("fix-all");
         div()
             .id("wizard-header")
@@ -882,16 +695,16 @@ impl Wizard {
                         div()
                             .text_size(ui::TEXT_LG)
                             .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(title),
+                            .child(text::CHECKS_TITLE.get()),
                     )
                     .child(
                         div()
                             .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
-                            .child(subtitle),
+                            .child(self.summary_line()),
                     ),
             )
-            .children((self.step != Step::Consent).then(|| {
+            .child(
                 div()
                     .flex_none()
                     .flex()
@@ -915,8 +728,8 @@ impl Wizard {
                                 .disabled(self.checks_loading || self.checks.is_none())
                                 .on_click(cx.listener(|s, _, _, cx| s.recheck(cx))),
                         ),
-                    )
-            }))
+                    ),
+            )
     }
 
     /// 점검 화면 헤더의 요약(통과·주의·건너뜀·실패 개수).
@@ -933,32 +746,9 @@ impl Wizard {
         ])
     }
 
-    /// 고정 푸터. 왼쪽 [나중에]/[닫기](Esc), 오른쪽 주 동작.
-    fn render_footer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 고정 푸터. 왼쪽 [닫기](Esc).
+    fn render_footer(cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
-        let first = self.step == Step::Consent;
-        let accepted = self.accepted(cx);
-        let mut right = div().flex().items_center().gap_2();
-        if first {
-            right = right
-                .child(
-                    div().debug_selector(|| "consent-quit".into()).child(
-                        ui::ghost(
-                            "consent-quit-btn",
-                            crate::i18n::catalog::consent::QUIT.get(),
-                        )
-                        .on_click(|_, _, cx| Self::quit(cx)),
-                    ),
-                )
-                .child(
-                    div().debug_selector(|| "consent-continue".into()).child(
-                        ui::primary("consent-continue-btn", text::START_NOW.get())
-                            .tooltip(text::START_HINT.get())
-                            .disabled(!accepted)
-                            .on_click(cx.listener(|s, _, _, cx| s.primary(cx))),
-                    ),
-                );
-        }
         div()
             .id("wizard-footer")
             .debug_selector(|| "wizard-footer".into())
@@ -969,97 +759,13 @@ impl Wizard {
             .border_color(p.border)
             .flex()
             .items_center()
-            .justify_between()
             .child(
                 div().debug_selector(|| "wizard-later".into()).child(
-                    ui::ghost(
-                        "wizard-later",
-                        if first {
-                            text::LATER.get()
-                        } else {
-                            text::CLOSE.get()
-                        },
-                    )
-                    .tooltip(text::LATER_HINT.get())
-                    .on_click(cx.listener(|s, _, _, cx| s.later(cx))),
+                    ui::ghost("wizard-later", text::CLOSE.get())
+                        .tooltip(text::LATER_HINT.get())
+                        .on_click(cx.listener(|_, _, _, cx| Self::close(cx))),
                 ),
             )
-            .child(right)
-    }
-
-    /// 첫 화면 본문: 동의 + 기본 에이전트.
-    fn render_first(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let p = ui::palette(cx);
-        let consent = match &self.consent {
-            Some(view) => view.clone().into_any_element(),
-            None => div().child(text::CHECKING.get()).into_any_element(),
-        };
-        let mut body = div()
-            .id("wizard-first-body")
-            .debug_selector(|| "wizard-first-body".into())
-            .flex_1()
-            .min_h_0()
-            .overflow_y_scroll()
-            .px_6()
-            .pb_4()
-            .flex()
-            .flex_col()
-            .gap_4()
-            .child(div().flex_none().child(consent));
-        if !self.consent_only {
-            let detected = self.survey.as_ref().map(detected_agents);
-            let choices: gpui::AnyElement = match detected {
-                None => div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .text_color(p.muted_foreground)
-                    .child(Icon::new(IconName::LoaderCircle).small())
-                    .child(text::AGENT_DETECTING.get())
-                    .into_any_element(),
-                Some(found) if found.is_empty() => div()
-                    .text_size(ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::AGENT_NONE.get())
-                    .into_any_element(),
-                Some(found) => ui::segmented_control(
-                    p,
-                    found.into_iter().map(|(id, name)| {
-                        let selected = self.agent.as_deref() == Some(id.as_str());
-                        let selector = format!("wizard-agent-{id}");
-                        let debug = selector.clone();
-                        let agent = id.clone();
-                        ui::segment(gpui::SharedString::from(selector), name, selected)
-                            .icon(ui::icons::agent_menu_icon(&agent))
-                            .debug_selector(move || debug.clone())
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.agent = Some(agent.clone());
-                                cx.notify();
-                            }))
-                    }),
-                )
-                .flex_wrap()
-                .into_any_element(),
-            };
-            body = body.child(
-                ui::card(p)
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .debug_selector(|| "wizard-agent".into())
-                    .child(ui::label(
-                        p,
-                        text::AGENT_LABEL.get(),
-                        Some(text::AGENT_HINT.get()),
-                    ))
-                    .child(div().flex_none().max_w(px(360.)).child(choices)),
-            );
-            if let Some(orca_card) = crate::orca_import::render_banner("onboarding", cx) {
-                body = body.child(orca_card.flex_none());
-            }
-        }
-        body.into_any_element()
     }
 
     fn render_check_row(
@@ -1369,9 +1075,6 @@ impl Wizard {
             .flex()
             .flex_col()
             .gap_4();
-        if let Some(orca_card) = crate::orca_import::render_banner("onboarding-checks", cx) {
-            body = body.child(orca_card);
-        }
         let Some(checks) = &self.checks else {
             return body
                 .child(
@@ -1446,13 +1149,9 @@ impl Wizard {
 impl Render for Wizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
-        let body = match self.step {
-            Step::Consent => self.render_first(cx),
-            Step::Checklist | Step::Connect | Step::Done => self.render_checks(cx),
-        };
+        let body = self.render_checks(cx);
         // OWE-903: 별도 OS 창 대신 메인 창 안 중앙 모달. 가짜 타이틀바는 그리지 않는다.
-        // 카드는 내용 높이에 맞추고 최대 높이만 둔다(넘치면 본문이 스크롤). 고정 높이는
-        // 동의 화면에 큰 빈 공백을 남겼다(맥미니-설 실기).
+        // 카드는 내용 높이에 맞추고 최대 높이만 둔다(넘치면 본문이 스크롤).
         let card = div()
             .id("onboarding-wizard")
             .debug_selector(|| "onboarding-wizard".into())
@@ -1474,28 +1173,18 @@ impl Render for Wizard {
             .border_1()
             .border_color(p.border)
             .shadow_lg()
-            .on_action(cx.listener(|this, _: &CloseWizard, _, cx| {
-                this.later(cx);
-            }))
-            .on_key_down(cx.listener(|s, e: &KeyDownEvent, _, cx| {
-                match e.keystroke.key.as_str() {
-                    "escape" => {
-                        if crate::orca_import::state(cx).is_some_and(|st| st.modal_open) {
-                            crate::orca_import::close_modal(cx);
-                        } else {
-                            s.later(cx);
-                        }
-                    }
-                    "enter" => s.primary(cx),
-                    _ => return,
+            .on_action(cx.listener(|_, _: &CloseWizard, _, cx| Self::close(cx)))
+            .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
+                if !matches!(e.keystroke.key.as_str(), "escape" | "enter") {
+                    return;
                 }
+                Self::close(cx);
                 cx.stop_propagation();
             }))
-            .on_mouse_down_out(cx.listener(|s, _, _, cx| s.later(cx)))
+            .on_mouse_down_out(cx.listener(|_, _, _, cx| Self::close(cx)))
             .child(self.render_header(cx))
             .child(body)
-            .child(self.render_footer(cx))
-            .children(crate::orca_import::render_modal(window, cx));
+            .child(Self::render_footer(cx));
         ui::modal_backdrop(window.viewport_size(), card)
     }
 }
