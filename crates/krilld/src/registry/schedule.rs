@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::control::CaptureFormat;
@@ -16,6 +16,8 @@ use krill_proto::schedule::{
     Cron, MAX_OUTPUT_BYTES, MAX_RUNS, PREVIOUS_RUNS, RUN_NOW, RUNS, ScheduleRun as Run, Schedules,
     WorkspaceMode, take_run_now, truncate_output,
 };
+
+use crate::child::{kill_and_reap as kill_precheck, nonblocking as set_nonblocking};
 
 use super::{Create, Peer, Program, Registry, Reply, Scope, lock};
 
@@ -204,20 +206,6 @@ fn drain_pipe(
             Err(e) => return Err(e),
         }
     }
-}
-
-fn set_nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
-}
-
-fn kill_precheck(child: &mut Child) {
-    if let Some(pid) = rustix::process::Pid::from_raw(child.id().cast_signed()) {
-        rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).ok();
-    }
-    child.kill().ok();
-    child.wait().ok();
 }
 
 impl Registry {
