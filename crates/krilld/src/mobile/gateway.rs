@@ -534,17 +534,42 @@ fn serve(
     if !ws::upgrade(&mut socket)? {
         return Ok(());
     }
+    let channel = match authenticate(&mut socket, shared, id) {
+        Ok(channel) => channel,
+        Err(error) => {
+            // RFC 6455 policy violation은 인증/프로토콜 거부만 나타낸다.
+            // EOF·timeout·쓰기 오류는 이 신호를 보내지 않아 클라이언트가 전송 실패와 구별한다.
+            if error.kind() == io::ErrorKind::InvalidData {
+                ws::write(&mut socket, 8, &1008_u16.to_be_bytes()).ok();
+                socket.shutdown(Shutdown::Write).ok();
+                socket
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .ok();
+                let mut drain = [0; 512];
+                let _ = io::Read::read(&mut socket, &mut drain);
+            }
+            return Err(error);
+        }
+    };
+    shared.changed.notify_all();
+    let registry = registry.upgrade().ok_or_else(invalid)?;
+    let ping = lock(&shared.state).ping;
+    socket.set_read_timeout(Some(ping))?;
+    bridge(socket, channel, registry, hello.clone())
+}
+
+fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Result<Channel> {
     // 주소와 무관한 실패 예산. 미인증 연결은 최대 4개·5초로 제한한다.
     lock(&shared.state).devices.attempt(now_ms())?;
     let challenge = random()?;
     ws::write(
-        &mut socket,
+        socket,
         ws::TEXT,
         serde_json::to_vec(&serde_json::json!({"version":2,"challenge":hex(&challenge)}))
             .map_err(io::Error::other)?
             .as_slice(),
     )?;
-    let (opcode, body) = ws::read_limited(&mut socket, 4096)?;
+    let (opcode, body) = ws::read_limited(socket, 4096)?;
     if opcode != ws::TEXT {
         return Err(invalid());
     }
@@ -567,7 +592,7 @@ fn serve(
         *a = b;
     }
     let mut channel = Channel::new(&secret, &salt, Endpoint::Daemon)?;
-    let (opcode, body) = ws::read_limited(&mut socket, 512)?;
+    let (opcode, body) = ws::read_limited(socket, 512)?;
     if opcode != ws::BINARY {
         return Err(invalid());
     }
@@ -575,7 +600,7 @@ fn serve(
     let authenticated = {
         let mut s = lock(&shared.state);
         if s.stopped || !s.connections.contains_key(&id) {
-            return Err(invalid());
+            return Err(io::ErrorKind::ConnectionAborted.into());
         }
         let (device_id, credential) = if let Some(token) = token {
             let (device, credential) = s.devices.pair(&token, &proof.label, now_ms())?;
@@ -593,12 +618,8 @@ fn serve(
         }
     };
     let payload = channel.seal(&serde_json::to_vec(&authenticated).map_err(io::Error::other)?)?;
-    ws::write(&mut socket, ws::BINARY, &payload)?;
-    shared.changed.notify_all();
-    let registry = registry.upgrade().ok_or_else(invalid)?;
-    let ping = lock(&shared.state).ping;
-    socket.set_read_timeout(Some(ping))?;
-    bridge(socket, channel, registry, hello.clone())
+    ws::write(socket, ws::BINARY, &payload)?;
+    Ok(channel)
 }
 
 /// 암호화 페이로드 하나는 IPC 프레임 하나다. 연결이 끊기면 이 pair만 닫는다.
