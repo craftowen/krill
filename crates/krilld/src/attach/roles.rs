@@ -1,8 +1,8 @@
 //! 연결 수명에 맞춘 역할·뷰포트와 세션별 입력 직렬화. PTY 리더는 이 잠금을 잡지 않는다.
 
+use crate::os::BorrowedFd;
+use krill_proto::os::net::UnixStream;
 use std::io::{self, Write};
-use std::os::fd::BorrowedFd;
-use std::os::unix::net::UnixStream;
 
 use krill_proto::holder::WinSize;
 use krill_proto::ipc;

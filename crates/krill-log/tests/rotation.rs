@@ -1,6 +1,7 @@
 //! Real files and independent processes exercise the shared 20 MB invariant.
 use std::fs::{self, File};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -56,9 +57,11 @@ fn rotates_before_limit_and_retains_latest_after_restart() -> io::Result<()> {
         let entry = entry?;
         let metadata = entry.metadata()?;
         assert!(metadata.len() <= FILE_BYTES);
+        #[cfg(unix)]
         assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
         assert!(fs::read_to_string(entry.path()).is_ok());
     }
+    #[cfg(unix)]
     assert_eq!(fs::metadata(&dir.0)?.permissions().mode() & 0o777, 0o700);
     Ok(())
 }
@@ -81,11 +84,19 @@ fn lock_contention_drops_event_and_recovers() -> io::Result<()> {
 }
 
 #[test]
-fn startup_repairs_oversize_and_refuses_file_symlinks() -> io::Result<()> {
+fn startup_repairs_oversize() -> io::Result<()> {
     let dir = Directory::new()?;
     File::create(dir.0.join("krill-app.log.3"))?.set_len(FILE_BYTES + 10)?;
-    let log = RollingLog::open(&dir.0, Component::App)?;
+    RollingLog::open(&dir.0, Component::App)?;
     assert_eq!(total(&dir)?, FILE_BYTES);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn refuses_file_symlinks() -> io::Result<()> {
+    let dir = Directory::new()?;
+    let log = RollingLog::open(&dir.0, Component::App)?;
     let victim = dir.0.join("unrelated");
     fs::write(&victim, "preserve")?;
     fs::remove_file(dir.0.join("krill-app.log"))?;

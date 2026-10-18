@@ -1188,9 +1188,12 @@ impl Sidebar {
                     .find(|r| r.id == *id)
                     .map_or_else(|| id.clone(), |r| r.label.clone()),
             ),
-            HostId::Local => {
-                (!self.remote_hosts.is_empty()).then(|| text::HOST_LOCAL.get().to_owned())
-            }
+            HostId::Local => (!self.remote_hosts.is_empty()).then(|| {
+                text::HOST_LOCAL
+                    .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                    .get()
+                    .to_owned()
+            }),
         }
     }
 
@@ -1370,7 +1373,10 @@ fn render_options_menu_panel(
             } else {
                 std::iter::once(HostMenuEntry {
                     id: HostId::Local,
-                    label: text::HOST_LOCAL.get().to_owned(),
+                    label: text::HOST_LOCAL
+                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                        .get()
+                        .to_owned(),
                     status_label: host_status_label(s.local_status),
                 })
                 .chain(s.remote_hosts.iter().map(|r| HostMenuEntry {

@@ -12,9 +12,11 @@ mod checks;
 mod tests;
 
 use std::ffi::OsString;
+#[cfg(unix)]
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+#[cfg(unix)]
 use std::sync::mpsc;
 use std::time::Duration;
 
@@ -25,13 +27,16 @@ use krill_proto::doctor::{Check, Report, SCHEMA, Status};
 use krill_proto::history;
 use krill_proto::ipc::ClientRole;
 use krill_proto::telemetry::{self, Consent, Reason};
+#[cfg(unix)]
 use rustix::fs::{Access, access};
 
 use checks::{Agent as AgentFact, CliPath, Daemon, Facts, HOOK_IDS, Helpers, History, State};
 
 /// 로그인 셸이 PATH를 알려 주기까지 기다리는 최대 시간(앱 온보딩과 같은 5초).
+#[cfg(unix)]
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// rc 파일이 stdout에 무엇을 찍어도 PATH 줄을 골라내기 위한 표시.
+#[cfg(unix)]
 const PATH_MARK: &str = "__MK_PATH__=";
 /// 데몬을 띄우지 않는 ping의 Hello 상한.
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
@@ -108,7 +113,10 @@ fn render_head(collected: &Collected) {
         println!("krill-holder  unknown ({error})");
         println!("krilld     unknown ({error})");
     }
+    #[cfg(unix)]
     println!("launch     dev build (posix_spawn + setsid; TCC attribution follows the launcher)");
+    #[cfg(windows)]
+    println!("launch     SKIP: starting krilld is not supported on Windows yet");
 }
 
 /// 현행 줄 형식을 그대로 그리는 항목(helpers·state·crash·record·telemetry·git·daemon·history).
@@ -255,7 +263,7 @@ fn collect(no_start: bool) -> Collected {
         Some(p) if !helpers_ok || !state_ok => Daemon::Skipped {
             reason: "fix the failures above first".to_owned(),
         },
-        Some(p) if no_start => ping_daemon(p),
+        Some(p) if no_start && cfg!(unix) => ping_daemon(p),
         Some(p) => connect_daemon(p),
     };
     let daemon_build = match &daemon {
@@ -279,7 +287,7 @@ fn collect(no_start: bool) -> Collected {
         .map(str::to_owned)
         .collect();
     let krill_exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("krill"));
-    let home: Option<PathBuf> = std::env::var_os("HOME").map(PathBuf::from);
+    let home: Option<PathBuf> = crate::hook_install::home_dir().map(PathBuf::from);
     let facts = Facts {
         helpers: Helpers {
             ok: helpers_ok,
@@ -336,7 +344,7 @@ fn check_helpers(paths: Option<&Paths>) -> (bool, Vec<String>, String) {
     };
     let mut missing = Vec::new();
     for (name, bin) in [("krill-holder", &paths.holder), ("krilld", &paths.krilld)] {
-        if access(bin, Access::EXEC_OK).is_err() {
+        if !executable(bin) {
             missing.push(name.to_owned());
         }
     }
@@ -356,6 +364,7 @@ fn check_helpers(paths: Option<&Paths>) -> (bool, Vec<String>, String) {
 }
 
 /// 상태 디렉터리·`run/` 쓰기 가능, 소유자=현재 사용자. 없으면 데몬이 만든다.
+#[cfg(unix)]
 fn state_writable(state: &Path) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let me = rustix::process::geteuid().as_raw();
@@ -382,6 +391,7 @@ fn probe_holder(paths: &Paths) -> Option<HolderStatus> {
 }
 
 /// krilld에 붙는다. 없으면 holder를 띄워 재결합까지 기다린다(현행 doctor).
+#[cfg(unix)]
 fn connect_daemon(paths: &Paths) -> Daemon {
     let hello = daemon::client_hello(ClientRole::Cli, "krill doctor");
     match daemon::connect(paths, &hello) {
@@ -430,6 +440,7 @@ fn history_recording_off(state: &Path) -> bool {
 /// `shell -l -i -c`로 로그인·대화형 셸의 PATH를 얻는다. 실패하거나 [`SHELL_TIMEOUT`]을 넘기면 `None`.
 /// 앱 온보딩(`login_path`)과 같은 방식. 읽기는 별도 스레드+시간 제한이라 rc가 파이프를
 /// 쥐고 버텨도 호출자는 돌아온다.
+#[cfg(unix)]
 fn login_path() -> Option<OsString> {
     let shell = std::env::var_os("SHELL")
         .filter(|s| !s.is_empty())
@@ -497,11 +508,13 @@ fn builtin_install_hint() -> String {
         .unwrap_or_else(|| "curl -fsSL https://claude.ai/install.sh | bash".to_owned())
 }
 
+#[cfg(unix)]
 fn is_broken_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok() && std::fs::metadata(path).is_err()
 }
 
 /// PATH의 `krill`가 이 설치와 같은 파일인지(앱 온보딩 `Cli`와 같은 네 가지).
+#[cfg(unix)]
 fn cli_path(exe: &Path, path: &OsString, home: Option<&Path>) -> CliPath {
     for dir in std::env::split_paths(path) {
         let candidate = dir.join("krill");
@@ -579,6 +592,77 @@ pub fn bundle() -> ExitCode {
         Err(e) => {
             println!("bundle     FAIL: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+#[cfg(unix)]
+fn executable(path: &Path) -> bool {
+    access(path, Access::EXEC_OK).is_ok()
+}
+
+#[cfg(windows)]
+fn executable(path: &Path) -> bool {
+    path.parent().is_some_and(|dir| {
+        path.to_str()
+            .and_then(|program| agent::which(program, dir.as_os_str()))
+            .is_some()
+    })
+}
+
+#[cfg(windows)]
+fn login_path() -> Option<OsString> {
+    std::env::var_os("PATH")
+}
+
+/// Windows에는 아직 데몬 기동 경로가 없다(holder exec 핸드오프는 Unix 전용). 떠 있으면 ping으로 붙고,
+/// 아니면 고장이 아니라 미지원으로 건너뛴다(`--no-start`도 같다).
+#[cfg(windows)]
+fn connect_daemon(paths: &Paths) -> Daemon {
+    match ping_daemon(paths) {
+        Daemon::Down { error } => Daemon::Skipped {
+            reason: format!(
+                "{} (ping: {error})",
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "starting krilld is not supported on Windows yet",
+                )
+            ),
+        },
+        up => up,
+    }
+}
+
+/// 상태 디렉터리·`run/`에 실제로 써 본다. Unix 소유자(uid) 검사는 Windows ACL에 대응하는 것이 없어 건너뛴다
+/// ([`checks`]가 이유를 보인다). 없는 디렉터리는 데몬이 만든다.
+#[cfg(windows)]
+fn state_writable(state: &Path) -> bool {
+    [state.to_path_buf(), state.join("run")]
+        .iter()
+        .filter(|dir| dir.exists())
+        .all(|dir| {
+            let probe = dir.join(format!(".krill-doctor-{}", std::process::id()));
+            let written = std::fs::write(&probe, b"").is_ok();
+            std::fs::remove_file(&probe).ok();
+            written
+        })
+}
+
+#[cfg(windows)]
+fn cli_path(exe: &Path, path: &OsString, _home: Option<&Path>) -> CliPath {
+    if let Some(found) = agent::which("krill", path) {
+        let same = std::fs::canonicalize(&found)
+            .ok()
+            .zip(std::fs::canonicalize(exe).ok())
+            .is_some_and(|(found, mine)| found == mine);
+        if same {
+            CliPath::Installed
+        } else {
+            CliPath::Conflict { found }
+        }
+    } else {
+        CliPath::Manual {
+            hint: format!("add {} to PATH", exe.parent().unwrap_or(exe).display()),
         }
     }
 }

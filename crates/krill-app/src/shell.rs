@@ -30,12 +30,12 @@ mod release;
 pub(crate) mod security;
 mod tabs;
 
+use krill_proto::os::ffi::OsStringExt as _;
+use krill_proto::os::net::UnixStream;
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
 use std::net::Shutdown;
 use std::ops::Range;
-use std::os::unix::ffi::OsStringExt as _;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -72,7 +72,7 @@ use krill_app::layout::{self, Axis, Branch, Layout, PaneId, PaneTree};
 
 use krill_app::{jump, sidebar};
 use krill_proto::control::{Create, Program};
-use std::os::unix::ffi::OsStrExt as _;
+use krill_proto::os::ffi::OsStrExt as _;
 
 const KEY_CONTEXT: &str = "Shell";
 /// 커서 깜박임 반주기(OWE-658, macOS 기본 텍스트 커서와 비슷한 값 — 추정).
@@ -349,47 +349,47 @@ impl NavHistory {
 pub fn bind_keys(cx: &mut App) {
     let ctx = Some(KEY_CONTEXT);
     cx.bind_keys([
-        KeyBinding::new("cmd-t", NewTab, ctx),
-        KeyBinding::new("cmd-alt-t", NewAgentTab, ctx),
-        KeyBinding::new("cmd-shift-w", CloseTab, ctx),
-        KeyBinding::new("cmd-shift-t", ReopenClosedTab, ctx),
-        KeyBinding::new("cmd-shift-]", NextTab, ctx),
-        KeyBinding::new("cmd-shift-[", PrevTab, ctx),
-        KeyBinding::new("cmd-alt-]", NextTab, ctx),
-        KeyBinding::new("cmd-alt-[", PrevTab, ctx),
+        krill_app::keys::bind("cmd-t", NewTab, ctx),
+        krill_app::keys::bind("cmd-alt-t", NewAgentTab, ctx),
+        krill_app::keys::bind("cmd-shift-w", CloseTab, ctx),
+        krill_app::keys::bind("cmd-shift-t", ReopenClosedTab, ctx),
+        krill_app::keys::bind("cmd-shift-]", NextTab, ctx),
+        krill_app::keys::bind("cmd-shift-[", PrevTab, ctx),
+        krill_app::keys::bind("cmd-alt-]", NextTab, ctx),
+        krill_app::keys::bind("cmd-alt-[", PrevTab, ctx),
         KeyBinding::new("ctrl-tab", NextRecentTab, ctx),
         KeyBinding::new("ctrl-shift-tab", PrevRecentTab, ctx),
         KeyBinding::new("ctrl-pagedown", NextTab, ctx),
         KeyBinding::new("ctrl-pageup", PrevTab, ctx),
-        KeyBinding::new("cmd-d", SplitRight, ctx),
-        KeyBinding::new("cmd-shift-d", SplitDown, ctx),
-        KeyBinding::new("cmd-w", ClosePane, ctx),
-        KeyBinding::new("cmd-]", FocusNextPane, ctx),
-        KeyBinding::new("cmd-[", FocusPrevPane, ctx),
-        KeyBinding::new("cmd-alt-down", FocusNextPane, ctx),
-        KeyBinding::new("cmd-alt-up", FocusPrevPane, ctx),
-        KeyBinding::new("cmd-alt-left", NavigateBack, None),
-        KeyBinding::new("cmd-alt-right", NavigateForward, None),
+        krill_app::keys::bind("cmd-d", SplitRight, ctx),
+        krill_app::keys::bind("cmd-shift-d", SplitDown, ctx),
+        krill_app::keys::bind("cmd-w", ClosePane, ctx),
+        krill_app::keys::bind("cmd-]", FocusNextPane, ctx),
+        krill_app::keys::bind("cmd-[", FocusPrevPane, ctx),
+        krill_app::keys::bind("cmd-alt-down", FocusNextPane, ctx),
+        krill_app::keys::bind("cmd-alt-up", FocusPrevPane, ctx),
+        krill_app::keys::bind("cmd-alt-left", NavigateBack, None),
+        krill_app::keys::bind("cmd-alt-right", NavigateForward, None),
         // OWE-871: ⌘⌥화살표는 히스토리·순환에 그대로 두고, 기하 방향 이동은 ⌘⌥⇧+화살표다.
-        KeyBinding::new("cmd-alt-shift-left", FocusPaneLeft, ctx),
-        KeyBinding::new("cmd-alt-shift-right", FocusPaneRight, ctx),
-        KeyBinding::new("cmd-alt-shift-up", FocusPaneUp, ctx),
-        KeyBinding::new("cmd-alt-shift-down", FocusPaneDown, ctx),
-        KeyBinding::new("cmd-shift-enter", ToggleZoomPane, ctx),
-        KeyBinding::new("cmd-k", ClearPane, ctx),
-        KeyBinding::new("cmd-a", SelectAll, ctx),
-        KeyBinding::new("cmd-shift-up", PrevSession, ctx),
-        KeyBinding::new("cmd-shift-down", NextSession, ctx),
-        KeyBinding::new("cmd-n", NewWorktree, ctx),
-        KeyBinding::new("cmd-1", ActivateTab1, ctx),
-        KeyBinding::new("cmd-2", ActivateTab2, ctx),
-        KeyBinding::new("cmd-3", ActivateTab3, ctx),
-        KeyBinding::new("cmd-4", ActivateTab4, ctx),
-        KeyBinding::new("cmd-5", ActivateTab5, ctx),
-        KeyBinding::new("cmd-6", ActivateTab6, ctx),
-        KeyBinding::new("cmd-7", ActivateTab7, ctx),
-        KeyBinding::new("cmd-8", ActivateTab8, ctx),
-        KeyBinding::new("cmd-9", ActivateTab9, ctx),
+        krill_app::keys::bind("cmd-alt-shift-left", FocusPaneLeft, ctx),
+        krill_app::keys::bind("cmd-alt-shift-right", FocusPaneRight, ctx),
+        krill_app::keys::bind("cmd-alt-shift-up", FocusPaneUp, ctx),
+        krill_app::keys::bind("cmd-alt-shift-down", FocusPaneDown, ctx),
+        krill_app::keys::bind("cmd-shift-enter", ToggleZoomPane, ctx),
+        krill_app::keys::bind("cmd-k", ClearPane, ctx),
+        krill_app::keys::bind("cmd-a", SelectAll, ctx),
+        krill_app::keys::bind("cmd-shift-up", PrevSession, ctx),
+        krill_app::keys::bind("cmd-shift-down", NextSession, ctx),
+        krill_app::keys::bind("cmd-n", NewWorktree, ctx),
+        krill_app::keys::bind("cmd-1", ActivateTab1, ctx),
+        krill_app::keys::bind("cmd-2", ActivateTab2, ctx),
+        krill_app::keys::bind("cmd-3", ActivateTab3, ctx),
+        krill_app::keys::bind("cmd-4", ActivateTab4, ctx),
+        krill_app::keys::bind("cmd-5", ActivateTab5, ctx),
+        krill_app::keys::bind("cmd-6", ActivateTab6, ctx),
+        krill_app::keys::bind("cmd-7", ActivateTab7, ctx),
+        krill_app::keys::bind("cmd-8", ActivateTab8, ctx),
+        krill_app::keys::bind("cmd-9", ActivateTab9, ctx),
         KeyBinding::new("ctrl-1", ActivateTab1, ctx),
         KeyBinding::new("ctrl-2", ActivateTab2, ctx),
         KeyBinding::new("ctrl-3", ActivateTab3, ctx),
@@ -399,23 +399,23 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-7", ActivateTab7, ctx),
         KeyBinding::new("ctrl-8", ActivateTab8, ctx),
         KeyBinding::new("ctrl-9", ActivateTab9, ctx),
-        KeyBinding::new("cmd-b", ToggleSidebar, ctx),
-        KeyBinding::new("cmd-shift-0", FocusSidebar, ctx),
-        KeyBinding::new("cmd-shift-e", ToggleExplorer, ctx),
-        KeyBinding::new("cmd-shift-f", ToggleSearch, ctx),
-        KeyBinding::new("cmd-alt-b", TogglePanel, ctx),
-        KeyBinding::new("cmd-l", TogglePanel, ctx),
-        KeyBinding::new("cmd-shift-g", ToggleChanges, ctx),
-        KeyBinding::new("cmd-q", Quit, None),
-        KeyBinding::new("cmd-,", krill_app::settings::OpenSettings, None),
-        KeyBinding::new("cmd-j", Jump, ctx),
-        KeyBinding::new("cmd-shift-p", CommandPalette, ctx),
-        KeyBinding::new("cmd-f", Find, ctx),
-        KeyBinding::new("cmd-g", FindNext, ctx),
+        krill_app::keys::bind("cmd-b", ToggleSidebar, ctx),
+        krill_app::keys::bind("cmd-shift-0", FocusSidebar, ctx),
+        krill_app::keys::bind("cmd-shift-e", ToggleExplorer, ctx),
+        krill_app::keys::bind("cmd-shift-f", ToggleSearch, ctx),
+        krill_app::keys::bind("cmd-alt-b", TogglePanel, ctx),
+        krill_app::keys::bind("cmd-l", TogglePanel, ctx),
+        krill_app::keys::bind("cmd-shift-g", ToggleChanges, ctx),
+        krill_app::keys::bind("cmd-q", Quit, None),
+        krill_app::keys::bind("cmd-,", krill_app::settings::OpenSettings, None),
+        krill_app::keys::bind("cmd-j", Jump, ctx),
+        krill_app::keys::bind("cmd-shift-p", CommandPalette, ctx),
+        krill_app::keys::bind("cmd-f", Find, ctx),
+        krill_app::keys::bind("cmd-g", FindNext, ctx),
         // OWE-868: ⇧⌘G는 검색 바가 열려 있을 때만 이전 찾기다. 바깥에서는 기존 TogglePanel(우측 패널)을 유지한다.
-        KeyBinding::new("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
-        KeyBinding::new("cmd-c", Copy, ctx),
-        KeyBinding::new("cmd-v", Paste, ctx),
+        krill_app::keys::bind("cmd-shift-g", FindPrev, Some(krill_app::search::CONTEXT)),
+        krill_app::keys::bind("cmd-c", Copy, ctx),
+        krill_app::keys::bind("cmd-v", Paste, ctx),
     ]);
     new_session::bind_keys(cx);
     files::bind_keys(cx);
@@ -4278,7 +4278,7 @@ impl Shell {
                 this.on_scroll(id, e, window, cx);
             }))
             .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
-                use std::os::unix::ffi::OsStrExt as _;
+                use krill_proto::os::ffi::OsStrExt as _;
                 this.change(true, cx, |l| l.focus(id));
                 let text = krill_term::paste::dropped(
                     paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
@@ -5242,6 +5242,7 @@ impl Shell {
     }
 
     /// IO 태스크 없이 칸을 `sock`(krilld 쪽 대신)에 붙인다.
+    #[cfg(unix)]
     fn attach_test(
         &mut self,
         pane: PaneId,
@@ -5419,4 +5420,5 @@ fn is_permanent_error(err: &std::io::Error) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

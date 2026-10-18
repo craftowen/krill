@@ -5,6 +5,7 @@
 //!
 //! `MK062_UPGRADES=<n>`이면 업그레이드를 n번 반복하고 공백(요청 → 새 krilld Hello) 분포를 찍는다(기본 2).
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

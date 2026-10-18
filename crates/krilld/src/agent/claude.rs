@@ -3,12 +3,12 @@
 //! 파일 이름은 `<세션 id>-<uuid>.json`이라 세션이 끝나면(Exited·생성 실패·닫기)
 //! 그 세션의 파일만 지우고, krilld 재기동 때는 살아남은 세션의 파일만 남긴다.
 
+use krill_proto::os::ffi::OsStrExt as _;
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -359,4 +359,5 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

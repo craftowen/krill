@@ -1,4 +1,5 @@
 //! MK-059: 실제 PTY 12,000행 → 세그먼트 → UDS 검색 → History 좌표/셀 하이라이트 검증.
+#![cfg(unix)]
 #![expect(clippy::unwrap_used, reason = "통합 테스트 헬퍼")]
 
 use std::fs;

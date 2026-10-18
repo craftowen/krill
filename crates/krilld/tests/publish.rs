@@ -1,6 +1,7 @@
 //! MK-022: krilld 바이너리 100개를 같은 소켓 경로로 동시에 띄우면 하나만 남고, 소켓 경로는 그 하나에 붙는다.
 //! 살아남은 krilld를 SIGKILL한 뒤(죽은 소켓·남은 `.tmp`) 다시 100개를 띄워도 같다.
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

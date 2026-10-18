@@ -3,8 +3,8 @@
 //! The marker precedes checkout, so daemon restart can remove an interrupted preparation.
 
 use crate::git::worktree::compat::read_config;
+use krill_proto::os::fs::DirBuilderExt as _;
 use std::collections::VecDeque;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread;
@@ -515,7 +515,7 @@ pub(crate) fn disk_usage(path: &Path, limit: u64) -> io::Result<u64> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
-        *used = used.saturating_add(m.len().max(m.blocks().saturating_mul(512)));
+        *used = used.saturating_add(m.len().max(crate::os::allocated(&m)));
         if *used > limit {
             return Err(io::Error::other("preparation exceeds disk budget"));
         }
@@ -555,4 +555,5 @@ pub fn serve(req: &PrepareWorktree) -> Reply {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

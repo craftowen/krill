@@ -27,12 +27,12 @@
 //!   살아 있으면 연결은 backlog에서 krilld를 기다렸다 붙는다. 고아 상태도 초기 감시 프레임으로 확인해 holder를
 //!   다시 띄운다. 앱 없이 실행한 `krill`도 같은 경로로 복구한다.
 
+use crate::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use crate::os::net::UnixStream;
 use std::ffi::OsString;
 use std::fmt;
 use std::fs::{DirBuilder, OpenOptions, TryLockError};
 use std::io::{self, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
@@ -122,7 +122,8 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
         let consumed = reader.read;
         match frame {
             Ok(Some((kind, body))) if kind == HOLDER_STATUS => {
-                if HolderStatus::decode(kind, &body)? == HolderStatus::Orphan {
+                // Windows는 Adopt 전까지 고아 krilld를 계속 쓴다(ready_handshake 참고) — 상실 통보로 깨지 않는다.
+                if cfg!(unix) && HolderStatus::decode(kind, &body)? == HolderStatus::Orphan {
                     return Ok(());
                 }
             }
@@ -215,7 +216,11 @@ pub const LEGACY_HOLDER_LABEL: &str = "dev.minikrill.app.holder";
 /// holder에게 "launchd 밖에서 떴으니 스스로 setsid하라"고 알리는 첫 인자. launchd 경로에서는 주지 않는다.
 pub const DETACH_ARG: &str = "--detach";
 /// macOS `sockaddr_un.sun_path` 크기(NUL 포함). 소켓 경로는 자르지 않고 오류로 본다(CONVENTIONS A6).
+#[cfg(not(windows))]
 pub const SUN_PATH_MAX: usize = 104;
+/// Windows `afunix.h` `UNIX_PATH_MAX`(NUL 포함).
+#[cfg(windows)]
+pub const SUN_PATH_MAX: usize = 108;
 /// launchd 잡 소프트 fd 한도(launchd 기본 256, C2 실측). holder가 스스로 올리는 값과 같다.
 const NOFILE: u32 = 10_240;
 /// 띄운 뒤 소켓이 생길 때까지 기다리는 최대 시간.
@@ -239,13 +244,17 @@ pub fn state_dir_override() -> Option<OsString> {
     std::env::var_os("KRILL_STATE_DIR")
 }
 
-/// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`.
+/// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`
+/// (Windows는 `%LOCALAPPDATA%\Krill`).
 /// 이관 전(새 디렉터리 없음 + 옛 디렉터리가 실제 디렉터리)에는 옛 번들 id 경로다([`migrate::run`]).
 pub fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = state_dir_override() {
         return Some(PathBuf::from(dir));
     }
+    #[cfg(not(windows))]
     let home = std::env::var_os("HOME")?;
+    #[cfg(windows)]
+    let home = std::env::var_os("LOCALAPPDATA")?;
     Some(state_dir_in(Path::new(&home)))
 }
 
@@ -355,6 +364,7 @@ pub fn exe_near(bin: &Path, name: &str) -> PathBuf {
 }
 
 fn find_exe(bin: &Path, apps: &[PathBuf], name: &str) -> PathBuf {
+    let name = &format!("{name}{}", std::env::consts::EXE_SUFFIX);
     let direct = bin.join(name);
     if direct.is_file() {
         return direct;
@@ -469,7 +479,7 @@ pub fn watch_hello(role: ClientRole, name: &str) -> ClientHello {
 /// krilld 종료·크래시 또는 holder 상실 통보까지 막고 기다린다(유휴 웨이크업 없음).
 pub fn wait_closed(stream: &mut UnixStream) {
     while let Ok(Some((kind, body))) = ipc::read_frame(stream) {
-        if HolderStatus::decode(kind, &body) == Ok(HolderStatus::Orphan) {
+        if cfg!(unix) && HolderStatus::decode(kind, &body) == Ok(HolderStatus::Orphan) {
             return;
         }
     }
@@ -486,20 +496,24 @@ pub fn wait_closed(stream: &mut UnixStream) {
 /// 절대 경로의 일반 파일이 아니면 `ENOENT`, 실행 실패는 OS 오류(`EACCES`·`ENOEXEC` 등), 시그널 종료는 `EPERM`.
 pub fn preflight(path: &Path) -> io::Result<()> {
     use std::io::Read as _;
-    use std::os::unix::fs::PermissionsExt as _;
 
     if !path.is_absolute() || !path.is_file() {
         return Err(io::Error::from_raw_os_error(2)); // ENOENT
     }
-    if std::fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
-        return Err(io::Error::from_raw_os_error(13)); // EACCES
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if std::fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
+            return Err(io::Error::from_raw_os_error(13)); // EACCES
+        }
     }
     // std::process::Command는 내부에서 posix_spawnp를 써서 ENOEXEC를 만나면 /bin/sh로 폴백한다.
-    // holder execve가 받는 Mach-O(단일·fat)·ELF(Linux 원격 호스트) 또는 #! 스크립트 매직인지 먼저 확인한다.
+    // holder execve가 받는 Mach-O(단일·fat)·ELF(Linux 원격 호스트)·PE(Windows) 또는 #! 스크립트 매직인지 먼저 확인한다.
     let mut magic = [0_u8; 4];
     let n = std::fs::File::open(path)?.read(&mut magic)?;
     let valid_magic = magic.starts_with(b"#!")
         || (cfg!(target_os = "linux") && magic == *b"\x7fELF")
+        || (cfg!(windows) && magic.starts_with(b"MZ"))
         || (n == 4
             && matches!(
                 u32::from_ne_bytes(magic),
@@ -633,8 +647,19 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
         Err(e) if is_absent(&e) => {}
         Err(e) => return Err(Error::Io(e)),
     }
-    let mut holder = Command::new(&paths.holder)
-        .arg(DETACH_ARG)
+    let mut command = Command::new(&paths.holder);
+    #[cfg(unix)]
+    command.arg(DETACH_ARG);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        // Short-lived bootstrap only. The holder FFI boundary creates the real
+        // holder with bInheritHandles=false and explicit Job breakaway.
+        command
+            .arg("--bootstrap")
+            .creation_flags(0x0000_0008 | 0x0000_0200);
+    }
+    let mut holder = command
         .arg(&paths.krilld)
         .arg(&paths.socket)
         .stdin(Stdio::null())
@@ -660,7 +685,12 @@ pub fn connect(paths: &Paths, hello: &ClientHello) -> Result<Connection, Error> 
             Err(e) => return Err(Error::Io(e)),
         }
         if let Some(status) = holder.try_wait().map_err(Error::Io)? {
+            #[cfg(unix)]
             return Err(Error::HolderExited(status));
+            #[cfg(windows)]
+            if !status.success() {
+                return Err(Error::HolderExited(status));
+            }
         }
         if Instant::now() >= deadline {
             // 백오프로 krilld를 계속 다시 띄우는 holder를 남기지 않는다.
@@ -691,7 +721,9 @@ fn ready_handshake(socket: &Path, hello: &ClientHello) -> io::Result<Option<Conn
     // 호출자가 기한을 명시한 handshake/dial 경로와 hook(수십 ms 예산)은 그대로 둔다.
     let first_hello = default_hello_timeout(hello.role);
     let c = handshake(socket, &watch, first_hello)?;
-    if c.holder_status == Some(HolderStatus::Orphan) {
+    // Windows holder는 아직 Adopt(새 holder 재결합)를 못 한다. 새 holder를 띄우면 재결합 없이 5초 Timeout 뒤
+    // holder+krilld가 남으므로(OWE-836 실측), 고아 krilld에 그대로 붙어 기존 세션을 계속 쓴다(새 세션은 NoHolder).
+    if cfg!(unix) && c.holder_status == Some(HolderStatus::Orphan) {
         return Ok(None);
     }
     if is_watch(hello.features) {
@@ -714,6 +746,10 @@ fn default_hello_timeout(role: ClientRole) -> Duration {
 
 /// 소켓 파일이 없거나(처음) 죽은 소켓만 남았다(krilld가 죽음).
 fn is_absent(e: &io::Error) -> bool {
+    // Windows AF_UNIX reports a missing socket as WSAENETDOWN (OWE-828).
+    if cfg!(windows) && e.raw_os_error() == Some(10050) {
+        return true;
+    }
     matches!(
         e.kind(),
         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused

@@ -3,8 +3,8 @@
 //! 플로팅 창은 기존 Shell의 입력·IME·재접속을 재사용하고 레이아웃 파일은 쓰지 않는다.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, Subscription, TitlebarOptions, WeakEntity, Window,
-    WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
+    App, Bounds, Context, Entity, Subscription, WeakEntity, Window, WindowBounds, WindowHandle,
+    WindowOptions, actions, div, prelude::*, px,
 };
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -131,11 +131,11 @@ actions!(popout, [FloatTerminal, DashboardPopout, CloseDashboard]);
 
 pub(super) fn bind_keys(cx: &mut App) {
     cx.bind_keys([
-        KeyBinding::new("cmd-w", CloseDashboard, Some("Dashboard")),
+        krill_app::keys::bind("cmd-w", CloseDashboard, Some("Dashboard")),
         // OWE-851: 대시보드도 Esc로 닫힌다(터미널 입력이 없어 PTY 전달 걱정이 없다).
-        KeyBinding::new("escape", CloseDashboard, Some("Dashboard")),
-        KeyBinding::new("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
-        KeyBinding::new("alt-cmd-shift-a", DashboardPopout, Some(super::KEY_CONTEXT)),
+        krill_app::keys::bind("escape", CloseDashboard, Some("Dashboard")),
+        krill_app::keys::bind("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
+        krill_app::keys::bind("alt-cmd-shift-a", DashboardPopout, Some(super::KEY_CONTEXT)),
     ]);
 }
 
@@ -144,11 +144,7 @@ fn options(title: &str, dimensions: gpui::Size<gpui::Pixels>, cx: &App) -> Windo
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
             None, dimensions, cx,
         ))),
-        titlebar: Some(TitlebarOptions {
-            title: Some(title.to_owned().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(ui::titlebar(title.to_owned())),
         ..Default::default()
     }
 }
@@ -2026,4 +2022,5 @@ impl Render for Dashboard {
 pub(crate) mod bench;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

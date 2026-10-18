@@ -19,10 +19,15 @@ macro_rules! println {
 mod account;
 mod artifacts;
 mod changes;
+#[cfg(target_os = "macos")]
 mod computer;
 mod doctor;
 mod file;
 mod history;
+#[cfg(unix)]
+mod hook;
+#[cfg(windows)]
+#[path = "hook_windows.rs"]
 mod hook;
 mod hook_install;
 mod import;
@@ -45,7 +50,23 @@ use std::process::ExitCode;
 use krill_proto::agent::{self, Agents, Permission};
 use krill_proto::daemon;
 
-const USAGE: &str = "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill computer <cmd> | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]";
+#[cfg(target_os = "macos")]
+macro_rules! computer_usage {
+    () => {
+        " | krill computer <cmd>"
+    };
+}
+#[cfg(not(target_os = "macos"))]
+macro_rules! computer_usage {
+    () => {
+        ""
+    };
+}
+
+const USAGE: &str = concat!(
+    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
+    computer_usage!()
+);
 
 fn main() -> ExitCode {
     run(std::env::args_os().skip(1).collect())
@@ -161,6 +182,7 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
     if raw.first().is_some_and(|s| s == "skills") {
         return skills::run_skills(&raw[1..]);
     }
+    #[cfg(target_os = "macos")]
     if raw.first().is_some_and(|s| s == "computer") {
         return computer::run(&raw[1..]);
     }
@@ -274,6 +296,11 @@ mod tests {
             assert_eq!(run(vec![OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
         }
         assert_eq!(run(Vec::new()), ExitCode::from(2));
+    }
+
+    #[test]
+    fn computer_command_is_advertised_only_on_macos() {
+        assert_eq!(USAGE.contains("krill computer"), cfg!(target_os = "macos"));
     }
 
     #[test]

@@ -1,4 +1,5 @@
 //! OWE-589: Exited가 exec 응답보다 먼저 와도 holder 리더가 Release 송신에 막히지 않는다.
+#![cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::os::unix::net::UnixStream;
 use std::sync::{Arc, mpsc};
@@ -18,6 +19,7 @@ fn exited_release_during_holder_upgrade_does_not_block_reader() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {
@@ -86,6 +88,7 @@ fn exited_handler_panic_does_not_stop_worker() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {

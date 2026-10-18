@@ -4,7 +4,8 @@
 //! - 데몬 미기동 시 `accounts` 도메인 `'데몬 필요'` 건너뛰기 + 로컬 `accounts.toml` 미접촉 + 나머지 도메인 정상 이관 검증
 //! - 데몬(`run/krilld.sock`) 연결 시 `ListAccounts` -> `AddAccount` -> `SwitchAccount` IPC 호출 및 재실행 멱등성 검증
 
-#![expect(clippy::unwrap_used, reason = "integration test helpers")]
+#![cfg_attr(unix, expect(clippy::unwrap_used, reason = "integration test helpers"))]
+#![cfg(unix)]
 
 use std::fs;
 use std::io::Write as _;

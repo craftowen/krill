@@ -2,9 +2,9 @@
 //! 60MiB는 정상 운영 목표이지 재시작 상한이 아니다. 재시작 시각은 상태 디렉터리에 남겨 30분 쿨다운을 지킨다.
 //! 세션 생존은 holder가 맡고, 출력 보장은 ARCHITECTURE §4.1의 krilld 크래시 범위와 같다.
 
+use krill_proto::os::fs::OpenOptionsExt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc::Sender};
 use std::thread;
@@ -154,6 +154,7 @@ fn private_file(path: &Path) -> io::Result<std::fs::File> {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;

@@ -4,8 +4,10 @@
 //!
 //! 라이트/다크는 터미널 팔레트도 바꾸며 셸이 krilld에 전달한다(OWE-590). 줌은 rem 기반 UI 크기에 적용한다.
 
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -496,12 +498,12 @@ impl Global for Config {}
 
 fn own_bindings() -> Vec<KeyBinding> {
     vec![
-        KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("cmd-=", ZoomIn, None),
-        KeyBinding::new("cmd-+", ZoomIn, None),
-        KeyBinding::new("cmd--", ZoomOut, None),
-        KeyBinding::new("cmd-0", ZoomReset, None),
-        KeyBinding::new("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
+        crate::keys::bind("cmd-,", OpenSettings, None),
+        crate::keys::bind("cmd-=", ZoomIn, None),
+        crate::keys::bind("cmd-+", ZoomIn, None),
+        crate::keys::bind("cmd--", ZoomOut, None),
+        crate::keys::bind("cmd-0", ZoomReset, None),
+        crate::keys::bind("cmd-f", FocusSearch, Some(SEARCH_CONTEXT)),
     ]
 }
 
@@ -1289,8 +1291,8 @@ pub fn set_language(language: Language, cx: &mut App) {
 /// `base`는 [`edit`]이 읽은 디스크 원문이다. 저장 직전 다시 읽은 원문과 다르면
 /// 외부 편집이 낀 것이므로 덮어쓰지 않고 오류를 낸다(AS-07 lost-update 방지).
 fn save_settings(path: &Path, settings: &Settings, base: Option<&str>) -> std::io::Result<()> {
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::io::{self, Write as _};
-    use std::os::unix::fs::OpenOptionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -1375,6 +1377,7 @@ fn write_settings(path: &Path, body: &str) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
+    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let result = (|| {
         use std::io::Write as _;
@@ -1589,11 +1592,7 @@ fn window_options(cx: &App) -> WindowOptions {
             size(px(1100.), px(740.)),
             cx,
         ))),
-        titlebar: Some(gpui::TitlebarOptions {
-            title: Some(text::TITLE.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(crate::ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(crate::ui::titlebar(text::TITLE.get())),
         ..Default::default()
     }
 }
@@ -4069,7 +4068,12 @@ impl SettingsView {
             )
             .child(
                 row()
-                    .child(label(text::THEME.get(), text::THEME_DESC.get()))
+                    .child(label(
+                        text::THEME.get(),
+                        text::THEME_DESC
+                            .mac_or(crate::i18n::catalog::other_os::THEME_DESC)
+                            .get(),
+                    ))
                     .child(
                         layout::controls().child(layout::segmented_control(
                             p,
@@ -4127,7 +4131,9 @@ impl SettingsView {
                 row()
                     .child(label(
                         text::NOTIFICATIONS.get(),
-                        text::NOTIFICATIONS_DESC.get(),
+                        text::NOTIFICATIONS_DESC
+                            .mac_or(crate::i18n::catalog::other_os::NOTIFICATIONS_DESC)
+                            .get(),
                     ))
                     .child(layout::controls().child(layout::switch(
                         p,
@@ -4217,7 +4223,12 @@ impl SettingsView {
             ))
             .child(
                 row()
-                    .child(label(text::KEEP_AWAKE.get(), text::KEEP_AWAKE_DESC.get()))
+                    .child(label(
+                        text::KEEP_AWAKE.get(),
+                        text::KEEP_AWAKE_DESC
+                            .mac_or(crate::i18n::catalog::other_os::KEEP_AWAKE_DESC)
+                            .get(),
+                    ))
                     .child(
                         layout::controls().child(layout::segmented_control(
                             p,
@@ -4281,7 +4292,10 @@ impl SettingsView {
                             ),
                     ),
             )
-            .children(Self::render_update_rows(s, cx))
+            // 자체 업데이터는 macOS 번들 전용이라 다른 OS에서는 숨긴다(규칙 10).
+            .when(cfg!(target_os = "macos"), |el| {
+                el.children(Self::render_update_rows(s, cx))
+            })
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
@@ -9364,23 +9378,26 @@ impl SettingsView {
                     ))
                     .child(layout::controls().child(clear)),
             )
-            .child(
-                row()
-                    .child(label(
-                        crate::security::text::SECURE_KEYBOARD_MENU.get(),
-                        text::SECURE_KB_DESC.get(),
-                    ))
-                    .child(layout::controls().child(layout::switch(
-                        p,
-                        "admin-secure-kb-toggle",
-                        s.secure_keyboard_entry,
-                        false,
-                        |next, _, cx| {
-                            edit(cx, |s| s.secure_keyboard_entry = next);
-                            crate::platform::set_secure_event_input(next);
-                        },
-                    ))),
-            )
+            // Secure Keyboard Entry는 macOS 전용이라 다른 OS에서는 숨긴다(규칙 10).
+            .when(cfg!(target_os = "macos"), |el| {
+                el.child(
+                    row()
+                        .child(label(
+                            crate::security::text::SECURE_KEYBOARD_MENU.get(),
+                            text::SECURE_KB_DESC.get(),
+                        ))
+                        .child(layout::controls().child(layout::switch(
+                            p,
+                            "admin-secure-kb-toggle",
+                            s.secure_keyboard_entry,
+                            false,
+                            |next, _, cx| {
+                                edit(cx, |s| s.secure_keyboard_entry = next);
+                                crate::platform::set_secure_event_input(next);
+                            },
+                        ))),
+                )
+            })
             .child(
                 row()
                     .child(label(text::DOCTOR_TITLE.get(), text::DOCTOR_DESC.get()))
@@ -9976,4 +9993,5 @@ mod search;
 mod shortcuts;
 pub mod space;
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

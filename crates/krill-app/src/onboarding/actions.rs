@@ -254,7 +254,7 @@ fn hook_prepare_error(agent: TargetAgent, error: &io::Error) -> FixError {
 }
 
 fn stage_helpers(env: &Env) -> Result<PathBuf, String> {
-    use rustix::fs::{Access, access};
+    use super::{Access, access};
     let parent = env
         .krill
         .parent()
@@ -326,7 +326,14 @@ fn install_managed_cli_at(env: &Env, path: &std::ffi::OsStr) -> FixOutcome {
     std::fs::create_dir_all(directory).map_err(|e| e.to_string())?;
     if std::fs::symlink_metadata(&link).is_err() {
         // symlink는 기존 파일을 덮어쓰지 않는다. 동시 생성된 파일의 소유권도 추측하지 않는다.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(staged, &link).map_err(|e| e.to_string())?;
+        #[cfg(not(unix))]
+        return Err(format!(
+            "symlink {}: {}",
+            staged.display(),
+            io::ErrorKind::Unsupported
+        ));
     }
     if dirs.contains(directory) {
         Ok(())
@@ -336,7 +343,8 @@ fn install_managed_cli_at(env: &Env, path: &std::ffi::OsStr) -> FixOutcome {
 }
 
 fn safe_cli_dir(home: &Path, directory: &Path) -> FixOutcome {
-    use rustix::fs::{Access, access};
+    use super::{Access, access};
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt as _;
     if directory.starts_with(home) {
         return safe_managed_dir(home, directory);
@@ -345,8 +353,12 @@ fn safe_cli_dir(home: &Path, directory: &Path) -> FixOutcome {
         return Err(atext::INVALID_PATH.get().to_owned());
     }
     let meta = std::fs::symlink_metadata(directory).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    let owned = meta.uid() == rustix::process::geteuid().as_raw();
+    #[cfg(not(unix))]
+    let owned = true;
     if !meta.is_dir()
-        || meta.uid() != rustix::process::geteuid().as_raw()
+        || !owned
         || access(directory, Access::WRITE_OK | Access::EXEC_OK).is_err()
         || directory.ancestors().any(|path| {
             std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
@@ -679,4 +691,5 @@ mod notifications;
 pub use notifications::{dismiss_notification, show_notification};
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

@@ -9,8 +9,8 @@
 //! 오류를 알린다.
 //! 실패·시간 초과는 알림으로 알린다. 브리프는 클립보드에 남아 있어 직접 붙여넣을 수 있다.
 
+use krill_proto::os::net::UnixStream;
 use std::io::{self, Write as _};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Context, WeakEntity};
@@ -21,6 +21,7 @@ use krill_proto::control::{
 };
 use krill_proto::daemon;
 #[cfg(test)]
+#[cfg(unix)]
 use krill_proto::daemon::Paths;
 use krill_proto::input::Now;
 use krill_proto::ipc::{self, ClientRole};
@@ -433,7 +434,7 @@ impl Shell {
     }
 
     fn pane_cwd_bytes(&self, pane: PaneId, cx: &App) -> Vec<u8> {
-        use std::os::unix::ffi::OsStrExt as _;
+        use krill_proto::os::ffi::OsStrExt as _;
         let host = self.layout.host(pane);
         if let Some(cwd) = self
             .layout
@@ -547,10 +548,13 @@ async fn deliver_handoff(
     }
 }
 
+// 실제 PTY(rustix-openpty) e2e라 Unix 전용.
 #[cfg(test)]
+#[cfg(unix)]
 mod e2e_tests;
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

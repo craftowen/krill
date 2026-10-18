@@ -1422,3 +1422,188 @@ fn owe883_localize_reason_maps_known_english_reasons() {
     assert!(!timeout.contains("did not report ready"), "{timeout}");
     assert_eq!(relaunch::localize_reason("mystery"), "mystery");
 }
+
+/// OWE-837: Windows 이름 바꾸기 교체([`relaunch::Mode::Rename`])를 플랫폼 중립 파일 연산으로 검증한다.
+/// 실행 중 exe를 지울 수 없는 Windows 특성은 VM에서 실측했다(docs/research/windows-spike-OWE-837.md).
+mod rename_mode {
+    use super::super::relaunch::{Mode, recover_with, rollback_with, swap_with};
+    use super::*;
+
+    #[derive(Debug)]
+    struct Accept;
+    impl CodeVerifier for Accept {
+        fn verify(&self, _: &Path) -> Result<(), Error> {
+            Ok(())
+        }
+    }
+
+    fn write(dir: &Path, rel: &str, body: &str) {
+        let path = dir.join(rel);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, body).unwrap();
+    }
+
+    fn read(dir: &Path, rel: &str) -> Option<String> {
+        fs::read_to_string(dir.join(rel)).ok()
+    }
+
+    /// 구 설치(krill-link.exe는 새 패키지에서 빠짐)와 새 스테이징(conpty.dll 추가).
+    fn layout(root: &Path) -> (PathBuf, PathBuf) {
+        let install = root.join("Krill");
+        let staging = staging_path(&install);
+        for rel in [
+            "Krill.json",
+            "krill-app.exe",
+            "krilld.exe",
+            "x64/OpenConsole.exe",
+            "krill-link.exe",
+        ] {
+            write(&install, rel, "old");
+        }
+        for rel in [
+            "Krill.json",
+            "krill-app.exe",
+            "krilld.exe",
+            "x64/OpenConsole.exe",
+            "conpty.dll",
+        ] {
+            write(&staging, rel, "new");
+        }
+        (install, staging)
+    }
+
+    fn swap(install: &Path, state: &Path) -> Result<Journal, Error> {
+        swap_with(
+            Mode::Rename,
+            install,
+            state,
+            "0.1.0",
+            "0.2.0",
+            Duration::from_secs(1),
+            &Accept,
+        )
+    }
+
+    #[test]
+    fn updater_rename_swap_then_rollback_restores_old_files() {
+        let d = TempGuard(temp_dir("rename-swap"));
+        let state = d.0.join("state");
+        let (install, staging) = layout(&d.0);
+
+        let journal = swap(&install, &state).unwrap();
+        assert_eq!(journal.stage, Stage::VerifyingLaunch);
+        assert!(!staging.exists());
+        assert_eq!(
+            read(&install, "x64/OpenConsole.exe").as_deref(),
+            Some("new")
+        );
+        assert_eq!(read(&install, "conpty.dll").as_deref(), Some("new"));
+        assert_eq!(read(&install, "krill-link.exe"), None);
+        assert_eq!(
+            read(&prev_path(&install), "krill-app.exe").as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            read(&prev_path(&install), "krill-link.exe").as_deref(),
+            Some("old")
+        );
+
+        rollback_with(Mode::Rename, &install, &state, "health").unwrap();
+        for rel in [
+            "Krill.json",
+            "krill-app.exe",
+            "krilld.exe",
+            "x64/OpenConsole.exe",
+            "krill-link.exe",
+        ] {
+            assert_eq!(read(&install, rel).as_deref(), Some("old"), "{rel}");
+        }
+        assert_eq!(
+            read(&install, "conpty.dll"),
+            None,
+            "new-only file must not survive rollback"
+        );
+        assert!(!prev_path(&install).exists());
+        let j = Journal::load(&state).unwrap().unwrap();
+        assert!(matches!(j.stage, Stage::RolledBack { .. }), "{j:?}");
+    }
+
+    #[test]
+    fn updater_rename_refuses_unknown_files_in_install_dir() {
+        let d = TempGuard(temp_dir("rename-unknown"));
+        let state = d.0.join("state");
+        let (install, staging) = layout(&d.0);
+        write(&install, "notes.txt", "user data");
+
+        let err = swap(&install, &state).unwrap_err();
+        assert!(err.to_string().contains("notes.txt"), "{err}");
+        assert_eq!(read(&install, "notes.txt").as_deref(), Some("user data"));
+        assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("old"));
+        assert!(staging.exists());
+        assert!(Journal::load(&state).unwrap().is_none());
+    }
+
+    #[test]
+    fn updater_rename_failure_mid_move_restores_without_losing_old_files() {
+        let d = TempGuard(temp_dir("rename-midfail"));
+        let state = d.0.join("state");
+        let (install, _staging) = layout(&d.0);
+        // 쓰기 금지 폴더에서는 파일을 옮길 수 없다 → 1단계(구 파일 옮기기) 중 실패를 만든다.
+        let x64 = install.join("x64");
+        fs::set_permissions(&x64, fs::Permissions::from_mode(0o500)).unwrap();
+        let err = swap(&install, &state);
+        fs::set_permissions(&x64, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(err.is_err(), "{err:?}");
+        for rel in [
+            "Krill.json",
+            "krill-app.exe",
+            "krilld.exe",
+            "x64/OpenConsole.exe",
+            "krill-link.exe",
+        ] {
+            assert_eq!(read(&install, rel).as_deref(), Some("old"), "{rel}");
+        }
+        let j = Journal::load(&state).unwrap().unwrap();
+        assert!(matches!(j.stage, Stage::RolledBack { .. }), "{j:?}");
+    }
+
+    #[test]
+    fn updater_rename_recover_interrupted_moves() {
+        // 1단계(구 파일 옮기기) 중 중단: 옮긴 파일을 되돌리고 저널을 버린다.
+        let d = TempGuard(temp_dir("rename-recover"));
+        let state = d.0.join("state");
+        let (install, staging) = layout(&d.0);
+        let prev = prev_path(&install);
+        write(&prev, "krill-app.exe", "old");
+        fs::remove_file(install.join("krill-app.exe")).unwrap();
+        let mut j = Journal {
+            bundle: install.clone(),
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            health_timeout_ms: 1_000,
+            stage: Stage::MovingToPrev,
+        };
+        j.save(&state).unwrap();
+        assert!(recover_with(Mode::Rename, &state).unwrap().is_none());
+        assert_eq!(read(&install, "krill-app.exe").as_deref(), Some("old"));
+        assert!(!journal_path(&state).exists());
+
+        // 2단계(새 파일 놓기) 중 중단: 남은 스테이징을 마저 옮겨 검증 단계로 이어간다.
+        rename::move_tree(&install, &prev, &trash_path(&install)).unwrap();
+        fs::rename(staging.join("krill-app.exe"), install.join("krill-app.exe")).unwrap();
+        j.stage = Stage::MovingStagingToTarget;
+        j.save(&state).unwrap();
+        let recovered = recover_with(Mode::Rename, &state).unwrap().unwrap();
+        assert_eq!(recovered.stage, Stage::VerifyingLaunch);
+        assert!(!staging.exists());
+        for rel in [
+            "Krill.json",
+            "krill-app.exe",
+            "krilld.exe",
+            "x64/OpenConsole.exe",
+            "conpty.dll",
+        ] {
+            assert_eq!(read(&install, rel).as_deref(), Some("new"), "{rel}");
+        }
+    }
+}

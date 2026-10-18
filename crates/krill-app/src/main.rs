@@ -6,8 +6,8 @@
 mod shell;
 
 use gpui::{
-    App, AppContext as _, Bounds, KeyBinding, Menu, MenuItem, QuitMode, TitlebarOptions,
-    WindowBounds, WindowHandle, WindowOptions, actions, px, size,
+    App, AppContext as _, Bounds, Menu, MenuItem, QuitMode, WindowBounds, WindowHandle,
+    WindowOptions, actions, px, size,
 };
 use std::path::PathBuf;
 
@@ -168,11 +168,9 @@ fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell:
         );
     let options = WindowOptions {
         window_bounds: Some(window_bounds),
-        titlebar: Some(TitlebarOptions {
-            title: Some(krill_app::i18n::catalog::security::APP_MENU.get().into()),
-            appears_transparent: true,
-            traffic_light_position: Some(krill_app::ui::TRAFFIC_LIGHT_INSET),
-        }),
+        titlebar: Some(krill_app::ui::titlebar(
+            krill_app::i18n::catalog::security::APP_MENU.get(),
+        )),
         ..Default::default()
     };
     let opened = cx.open_window(options, |window, cx| {
@@ -225,7 +223,8 @@ fn init(cx: &mut App) {
     shell::bind_keys(cx);
     krill_app::link_ui::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
-    cx.set_quit_mode(QuitMode::Explicit);
+    // macOS는 마지막 창을 닫아도 메뉴바·Dock에 남는다. 메뉴바 항목이 없는 Windows는 마지막 창을 닫으면 끝낸다(트레이는 후속).
+    cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
         let services = krill_app::hosts::link::begin_shutdown();
         cx.background_executor().spawn(async move {
@@ -237,13 +236,13 @@ fn init(cx: &mut App) {
     .detach();
     cx.bind_keys([
         // OWE-859: ⌘N은 메인 창 안 새 워크트리(Orca와 같음), 새 창은 ⇧⌘N(메뉴 표기도 여기서 나온다).
-        KeyBinding::new("cmd-shift-n", NewWindow, None),
-        KeyBinding::new("cmd-alt-w", CloseWindow, None),
+        krill_app::keys::bind("cmd-shift-n", NewWindow, None),
+        krill_app::keys::bind("cmd-alt-w", CloseWindow, None),
         // OWE-864: macOS 표준 창·앱 동작. 터미널 문맥 바인딩과 겹치지 않는 전역 키만 쓴다.
-        KeyBinding::new("cmd-h", HideApp, None),
-        KeyBinding::new("cmd-alt-h", HideOthers, None),
-        KeyBinding::new("cmd-m", MinimizeWindow, None),
-        KeyBinding::new("ctrl-cmd-f", ToggleFullscreen, None),
+        krill_app::keys::bind("cmd-h", HideApp, None),
+        krill_app::keys::bind("cmd-alt-h", HideOthers, None),
+        krill_app::keys::bind("cmd-m", MinimizeWindow, None),
+        krill_app::keys::bind("ctrl-cmd-f", ToggleFullscreen, None),
     ]);
     cx.on_action(|_: &NewWindow, cx| {
         let _ = new_window(cx);
@@ -306,32 +305,40 @@ pub(crate) fn set_menus(security: &krill_app::security::State, cx: &mut App) {
 
 fn refresh_menus(cx: &mut App) {
     let secure = cx.try_global::<MenuSecurity>().is_some_and(|state| state.0);
-    cx.set_menus([
-        Menu::new(krill_app::i18n::catalog::security::APP_MENU.get()).items([
-            MenuItem::action(
-                krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
-                krill_app::settings::OpenSettings,
-            ),
-            MenuItem::action(
-                krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
-                krill_app::onboarding::OpenChecks,
-            ),
+    let mut app_items = vec![
+        MenuItem::action(
+            krill_app::i18n::catalog::general::SETTINGS_MENU.get(),
+            krill_app::settings::OpenSettings,
+        ),
+        MenuItem::action(
+            krill_app::i18n::catalog::onboarding::MENU_OPEN_CHECKS.get(),
+            krill_app::onboarding::OpenChecks,
+        ),
+    ];
+    // Secure Keyboard Entry는 macOS 전용이다(규칙 10).
+    if cfg!(target_os = "macos") {
+        app_items.push(
             MenuItem::action(
                 krill_app::security::text::SECURE_KEYBOARD_MENU.get(),
                 shell::security::ToggleSecureInput,
             )
             .checked(secure),
-            MenuItem::separator(),
-            // OWE-864: macOS 표준 가리기. `cx.hide` 계열이라 창이 없어도 동작한다.
-            MenuItem::action(krill_app::i18n::catalog::general::HIDE_APP.get(), HideApp),
-            MenuItem::action(
-                krill_app::i18n::catalog::general::HIDE_OTHERS.get(),
-                HideOthers,
-            ),
-            MenuItem::action(krill_app::i18n::catalog::general::SHOW_ALL.get(), ShowAll),
-            MenuItem::separator(),
-            MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
-        ]),
+        );
+    }
+    app_items.extend([
+        MenuItem::separator(),
+        // OWE-864: macOS 표준 가리기. `cx.hide` 계열이라 창이 없어도 동작한다.
+        MenuItem::action(krill_app::i18n::catalog::general::HIDE_APP.get(), HideApp),
+        MenuItem::action(
+            krill_app::i18n::catalog::general::HIDE_OTHERS.get(),
+            HideOthers,
+        ),
+        MenuItem::action(krill_app::i18n::catalog::general::SHOW_ALL.get(), ShowAll),
+        MenuItem::separator(),
+        MenuItem::action(krill_app::i18n::catalog::general::QUIT.get(), shell::Quit),
+    ]);
+    cx.set_menus([
+        Menu::new(krill_app::i18n::catalog::security::APP_MENU.get()).items(app_items),
         Menu::new(krill_app::i18n::catalog::general::FILE.get()).items([
             MenuItem::action(
                 krill_app::i18n::catalog::general::NEW_WINDOW.get(),

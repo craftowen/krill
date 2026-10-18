@@ -303,10 +303,12 @@ impl HostTarget {
 
 /// 원격 포워딩 소켓이 아직 열리지 않았을 때의 `NotFound`를 일시적 연결 거부(`ConnectionRefused`)로 정규화해
 /// 상위 재연결 루프가 영구 실패로 오판하지 않게 한다.
+/// 원격 소켓 부재를 재시도할 일시 오류로 맞춘다. Windows `AF_UNIX`는 경로가 없으면 `NotFound` 대신
+/// 10050 `NetworkDown`을 돌려준다(VM 실측).
 fn normalize_remote_io_error(err: io::Error) -> io::Error {
     if matches!(
         err.kind(),
-        io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+        io::ErrorKind::NotFound | io::ErrorKind::WouldBlock | io::ErrorKind::NetworkDown
     ) {
         io::Error::new(io::ErrorKind::ConnectionRefused, err.to_string())
     } else {

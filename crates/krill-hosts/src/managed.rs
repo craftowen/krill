@@ -741,5 +741,7 @@ fn install_remote_with_program(
     })
 }
 
+// 가짜 ssh·셸 스크립트와 unix 소켓으로 원격 설치를 흉내 내므로 unix 전용이다.
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

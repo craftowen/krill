@@ -633,11 +633,19 @@ impl Wizard {
             (FixKind::Command | FixKind::Copy, _, _) if !check.fix.value.is_empty() => {
                 Some((Fix::Copy, text::FIX_COPY.get()))
             }
-            (FixKind::OpenUrl, _, _) if check.fix.value == perm::APPLICATIONS_URL => {
-                Some((Fix::Reveal, text::FIX_REVEAL.get()))
-            }
+            (FixKind::OpenUrl, _, _) if check.fix.value == perm::APPLICATIONS_URL => Some((
+                Fix::Reveal,
+                text::FIX_REVEAL
+                    .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                    .get(),
+            )),
             (FixKind::OpenUrl, _, _) => Some((Fix::OpenSettings, text::FIX_OPEN_SETTINGS.get())),
-            (FixKind::Reinstall, _, _) => Some((Fix::Reveal, text::FIX_REVEAL.get())),
+            (FixKind::Reinstall, _, _) => Some((
+                Fix::Reveal,
+                text::FIX_REVEAL
+                    .mac_or(crate::i18n::catalog::other_os::REVEAL)
+                    .get(),
+            )),
             (FixKind::None, perm::NOTIFICATIONS_ID, Status::Warn) => {
                 Some((Fix::AllowNotifications, text::FIX_ALLOW_NOTIFICATIONS.get()))
             }

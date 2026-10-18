@@ -1,5 +1,8 @@
-use std::fs::{self, DirBuilder, File, OpenOptions, Permissions, TryLockError};
+#[cfg(unix)]
+use std::fs::Permissions;
+use std::fs::{self, DirBuilder, File, OpenOptions, TryLockError};
 use std::io::{self, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -19,10 +22,13 @@ pub struct RollingLog {
 impl RollingLog {
     pub fn open(directory: impl Into<PathBuf>, component: Component) -> io::Result<Self> {
         let directory = directory.into();
-        DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(&directory)?;
+        let mut builder = DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        builder.mode(0o700);
+        builder.create(&directory)?;
+        // Windows has no equivalent private-mode guarantee yet; OWE-833 adds explicit ACLs.
+        #[cfg(unix)]
         fs::set_permissions(&directory, Permissions::from_mode(0o700))?;
         let log = Self {
             directory,
@@ -102,14 +108,17 @@ impl RollingLog {
 }
 
 fn open_file(path: &Path) -> io::Result<File> {
-    let flags = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).map_err(io::Error::other)?;
-    let file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .read(true)
-        .mode(0o600)
-        .custom_flags(flags)
-        .open(path)?;
+    let mut options = OpenOptions::new();
+    options.create(true).append(true).read(true);
+    // Windows has no equivalent private-mode or no-follow guarantee yet; OWE-833
+    // restores these with explicit ACLs and reparse-point handling.
+    #[cfg(unix)]
+    {
+        let flags = i32::try_from(rustix::fs::OFlags::NOFOLLOW.bits()).map_err(io::Error::other)?;
+        options.mode(0o600).custom_flags(flags);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
     file.set_permissions(Permissions::from_mode(0o600))?;
     Ok(file)
 }

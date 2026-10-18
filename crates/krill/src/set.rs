@@ -455,6 +455,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn symlink_parent_normalization_and_cycle_rejection() -> io::Result<()> {
         let root = std::env::temp_dir().join(format!("mk-set-symlink-{}", std::process::id()));
         fs::remove_dir_all(&root).ok();

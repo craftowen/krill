@@ -2,6 +2,7 @@
 //! - MK-019: 세션 단위 panic 격리, DEC 2026 sync 마감.
 //! - MK-020: 클라이언트가 하나도 없어도 krilld가 질의에 답한다(내장 기본 테마 → 저장된 테마), 모드 2031 알림.
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

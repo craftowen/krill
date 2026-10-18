@@ -4,12 +4,12 @@
 //! Shared between `krill` CLI and `krill-app` GUI via `state_dir` atomic files
 //! (`orchestration.json` and `worktree-comments.toml`) without extending `krilld` IPC.
 
+#[cfg(unix)]
+use crate::os::fs::{DirBuilderExt, OpenOptionsExt};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-#[cfg(unix)]
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

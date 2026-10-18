@@ -1,10 +1,10 @@
 //! 사이드바 스냅샷을 krilld에서 읽는다(백그라운드 스레드에서만 호출).
 
+use krill_proto::os::ffi::{OsStrExt as _, OsStringExt as _};
+use krill_proto::os::net::UnixStream;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -642,6 +642,7 @@ fn fetch_from(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
 

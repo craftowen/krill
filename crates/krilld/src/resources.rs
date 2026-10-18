@@ -3,7 +3,6 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
 
 use krill_proto::SessionId;
@@ -95,7 +94,7 @@ fn disk_usage(dir: &Path, depth: u8) -> u64 {
         .flatten()
         .filter_map(|e| Some((e.metadata().ok()?, e.path())))
         .map(|(m, path)| {
-            let own = m.blocks().saturating_mul(512);
+            let own = crate::os::allocated(&m);
             if m.is_dir() && depth > 0 {
                 own.saturating_add(disk_usage(&path, depth - 1))
             } else {
@@ -106,6 +105,7 @@ fn disk_usage(dir: &Path, depth: u8) -> u64 {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use std::process::Command;
 

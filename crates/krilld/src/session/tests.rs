@@ -1,6 +1,6 @@
+use krill_proto::os::net::UnixStream;
 use std::io::Write;
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
 use krill_proto::input::{FEAT_INPUT, Input, InputAck, InputId, InputResult};

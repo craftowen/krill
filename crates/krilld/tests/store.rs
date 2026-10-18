@@ -5,6 +5,7 @@
 //!
 //! 크래시·쓰기 실패는 이 테스트 바이너리를 자식 프로세스로 다시 실행해서 만든다(`#[ignore]`된 `child_*` 테스트).
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     reason = "통합 테스트 헬퍼(#[test] 밖이라 clippy.toml의 테스트 허용이 닿지 않는다)"

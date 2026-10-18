@@ -1,10 +1,10 @@
 //! MK-053: 한 큐 작업 안에서 status와 staged/unstaged numstat을 스트림으로 읽는다.
 //! 개수·바이트 상한, 취소, 제한시간, 파싱 실패의 모든 경로에서 자식을 kill + wait한다.
 
+use krill_proto::os::ffi::OsStrExt;
 use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use krill_proto::control::Reply;
 use krill_proto::git::{ChangedFile, Changes, MAX_FILES, MAX_PATH_BYTES, Numstat};
+
+use crate::child::nonblocking;
 
 use super::GitQueue;
 
@@ -270,12 +272,6 @@ fn interrupted(cancel: &AtomicBool, deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
-fn nonblocking(pipe: &impl std::os::fd::AsFd) -> io::Result<()> {
-    let flags = rustix::fs::fcntl_getfl(pipe)?;
-    rustix::fs::fcntl_setfl(pipe, flags | rustix::fs::OFlags::NONBLOCK)?;
-    Ok(())
-}
-
 fn stream(
     program: &Path,
     repo: &Path,
@@ -371,4 +367,5 @@ fn stream(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 pub(super) mod tests;

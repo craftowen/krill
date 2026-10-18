@@ -458,9 +458,8 @@ fn create_command(folder: &Path, branch: &str, title: &str, body: &str) -> Comma
 }
 
 fn executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt as _;
     path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
 }
 
 struct Reap(Child);
@@ -483,6 +482,8 @@ pub(super) fn execute(cmd: &mut Command, timeout: Duration) -> io::Result<Vec<u8
         .take()
         .ok_or_else(|| io::Error::other("missing gh stdout"))?;
     // Nonblocking pipe reads avoid pipe backpressure and reader threads surviving a timeout.
+    // ponytail: Windows 파이프는 블로킹이라 `gh`가 멈추면 타임아웃이 늦다. 실구현은 OWE-834.
+    #[cfg(unix)]
     rustix::fs::fcntl_setfl(&stdout, rustix::fs::OFlags::NONBLOCK)?;
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();

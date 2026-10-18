@@ -25,10 +25,10 @@ mod segment;
 
 pub use recorder::Recorder;
 
+use krill_proto::os::fs::DirBuilderExt;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -578,8 +578,8 @@ fn start_of(path: &Path) -> Option<u64> {
 
 /// 세션 디렉터리에 스크롤백 지우기 기준선을 남긴다. 최선형이라 실패해도 메모리 기준선은 동작한다.
 fn write_cleared(dir: &Path, seq: u64) {
+    use krill_proto::os::fs::OpenOptionsExt as _;
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
     if let Ok(mut file) = fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -1029,8 +1029,11 @@ fn replay_harvest(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod encryption_tests;
 #[cfg(test)]
+#[cfg(unix)]
 mod keyframe_tests;
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

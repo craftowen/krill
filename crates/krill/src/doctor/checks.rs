@@ -31,6 +31,10 @@ pub enum CliPath {
     /// PATH에 다른 `krill`가 있다. 덮어쓰지 않는다.
     Conflict { found: PathBuf },
     /// 이 경로에 링크를 만들 수 있다.
+    #[cfg_attr(
+        all(windows, not(test)),
+        expect(dead_code, reason = "Windows does not offer Unix symlinks")
+    )]
     Offer { link: PathBuf },
     /// PATH 안에 쓰기 가능한 후보 디렉터리가 없다.
     Manual { hint: String },
@@ -216,21 +220,38 @@ fn bin_version(facts: &Facts) -> Check {
 
 fn state_writable(facts: &Facts) -> Check {
     if facts.state.ok {
+        #[cfg(unix)]
+        let detail = format!("{}", facts.state.dir.display());
+        #[cfg(windows)]
+        let detail = format!(
+            "{} (write probe; owner check skipped: Unix only)",
+            facts.state.dir.display()
+        );
         check(
             "state.writable",
             Level::Required,
             Status::Ok,
             "state directory is writable",
-            &format!("{}", facts.state.dir.display()),
+            &detail,
             fix(FixKind::None, ""),
         )
     } else {
-        check(
-            "state.writable",
-            Level::Required,
-            Status::Fail,
+        #[cfg(windows)]
+        let (summary, detail, remedy) = (
             "state directory is not writable",
-            &format!(
+            format!(
+                "{} is not writable (check ACL: icacls)",
+                facts.state.dir.display()
+            ),
+            fix(
+                FixKind::Command,
+                &format!("icacls \"{}\"", facts.state.dir.display()),
+            ),
+        );
+        #[cfg(unix)]
+        let (summary, detail, remedy) = (
+            "state directory is not writable",
+            format!(
                 "{} is not writable (check owner: ls -ld)",
                 facts.state.dir.display()
             ),
@@ -238,6 +259,14 @@ fn state_writable(facts: &Facts) -> Check {
                 FixKind::Command,
                 &format!("ls -ld {}", facts.state.dir.display()),
             ),
+        );
+        check(
+            "state.writable",
+            Level::Required,
+            Status::Fail,
+            summary,
+            &detail,
+            remedy,
         )
     }
 }

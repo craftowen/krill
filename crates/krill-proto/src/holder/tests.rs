@@ -22,7 +22,10 @@ fn to_holder() -> Vec<ToHolder> {
             req: 3,
             id: SessionId(7),
         },
-        ToHolder::HoldListener { req: 4 },
+        ToHolder::HoldListener {
+            req: 4,
+            info: Vec::new(),
+        },
         ToHolder::UpgradeKrilld {
             req: 5,
             path: b"/k".to_vec(),
@@ -39,6 +42,7 @@ fn from_holder() -> Vec<FromHolder> {
         FromHolder::Hello {
             version: 1,
             holder_pid: 0x1234,
+            inbox: false,
         },
         FromHolder::Session {
             id: SessionId(7),
@@ -50,7 +54,7 @@ fn from_holder() -> Vec<FromHolder> {
             pid: 100,
             status: Some(0x0100),
         },
-        FromHolder::Listener,
+        FromHolder::Listener { info: Vec::new() },
         FromHolder::Ready,
         FromHolder::Spawned {
             req: 1,
@@ -137,6 +141,7 @@ fn fixtures_v2() {
             FromHolder::Hello {
                 version: 2,
                 holder_pid: 0x1234,
+                inbox: false,
             },
             "080000008100020034120000",
         ),
@@ -165,10 +170,176 @@ fn fixtures_v3() {
     assert_eq!(hex(&b), "0e0000000800090000000700000000000000");
     assert_eq!(ToHolder::decode(one(&b)), Ok(m));
     let hello = FromHolder::Hello {
-        version: VERSION,
+        version: 3,
         holder_pid: 0x1234,
+        inbox: false,
     };
     assert_eq!(hex(&hello.encode().unwrap()), "080000008100030034120000");
+}
+
+/// v4에서 추가한 메시지(OWE-831)의 고정 바이트.
+#[test]
+fn fixtures_v4() {
+    let m = ToHolder::Resize {
+        req: 10,
+        id: SessionId(7),
+        size: WinSize {
+            cols: 120,
+            rows: 40,
+        },
+    };
+    let b = m.encode().unwrap();
+    assert_eq!(hex(&b), "1200000009000a000000070000000000000078002800");
+    assert_eq!(ToHolder::decode(one(&b)), Ok(m.clone()));
+    // v3 holder에게는 모르는 kind다: fd 없이 오고 req를 읽어 ENOSYS로 답할 수 있다.
+    let f = one(&b);
+    assert_eq!((f.kind, f.fds), (0x09, 0));
+    assert_eq!(request_id(f.body), Some(10));
+    // 핸들 없는 kind는 Windows 프레임도 Unix와 바이트가 같다.
+    assert_eq!(m.encode_handles(&[]).unwrap(), b);
+    let hello = FromHolder::Hello {
+        version: VERSION,
+        holder_pid: 0x1234,
+        inbox: false,
+    };
+    assert_eq!(hex(&hello.encode().unwrap()), "080000008100040034120000");
+}
+
+/// Windows 핸들 값 프레임: `[len][kind][n][n × u64][body]`. Unix 인코딩은 그대로다(위 v1~v3 표).
+#[test]
+fn windows_handles() {
+    let spawned = FromHolder::Spawned {
+        req: 1,
+        id: SessionId(7),
+        pid: 99,
+    };
+    let b = spawned.encode_handles(&[0x10, 0x14, 0x18]).unwrap();
+    assert_eq!(
+        hex(&b),
+        "2a0000008503".to_owned()
+            + "1000000000000000"
+            + "1400000000000000"
+            + "1800000000000000"
+            + "01000000070000000000000063000000"
+    );
+    assert_eq!(
+        FromHolder::decode_handles(one(&b)),
+        Ok((spawned.clone(), vec![0x10, 0x14, 0x18]))
+    );
+    // 선택 핸들(ref·proc)까지 5개.
+    let session = FromHolder::Session {
+        id: SessionId(8),
+        pid: 100,
+        status: None,
+    };
+    let h = [1, 2, 3, 4, 0xffff_ffff_ffff_fffe];
+    let b = session.encode_handles(&h).unwrap();
+    assert_eq!(
+        FromHolder::decode_handles(one(&b)),
+        Ok((session, h.to_vec()))
+    );
+    let adopt = ToHolder::Adopt {
+        req: 2,
+        id: SessionId(8),
+        pid: 100,
+    };
+    let b = adopt.encode_handles(&h[..3]).unwrap();
+    assert_eq!(
+        ToHolder::decode_handles(one(&b)),
+        Ok((adopt, h[..3].to_vec()))
+    );
+    for (m, n) in [
+        (
+            ToHolder::HoldListener {
+                req: 3,
+                info: Vec::new(),
+            }
+            .encode_handles(&[9]),
+            1,
+        ),
+        (
+            FromHolder::Listener { info: Vec::new() }.encode_handles(&[9]),
+            1,
+        ),
+    ] {
+        assert_eq!(one(&m.unwrap()).fds, n);
+    }
+    // 핸들 수가 kind와 맞지 않으면 보내지도 받지도 않는다.
+    assert_eq!(
+        spawned.encode_handles(&[1, 2]),
+        Err(Error::FdCount { kind: 0x85, got: 2 }),
+        "sig가 빠진 세션"
+    );
+    assert_eq!(
+        FromHolder::Done { req: 1 }.encode_handles(&[1]),
+        Err(Error::FdCount { kind: 0x87, got: 1 })
+    );
+    assert_eq!(
+        FromHolder::Listener { info: Vec::new() }.encode_handles(&[]),
+        Err(Error::FdCount { kind: 0x83, got: 0 })
+    );
+    let mut b = FromHolder::Done { req: 1 }.encode().unwrap();
+    b[5] = 1;
+    assert_eq!(FromHolder::decode_handles(one(&b)), Err(Error::Truncated));
+}
+
+/// OWE-832 끝 필드: `Hello.inbox`·`Listener.info`·`HoldListener.info`. 비어 있으면 v4 바이트와 같고,
+/// v3·v4 피어가 보낸 바이트는 거짓·빈 값으로 읽는다.
+#[test]
+fn tail_fields_owe832() {
+    let v4 = "080000008100040034120000";
+    let hello = |inbox| FromHolder::Hello {
+        version: VERSION,
+        holder_pid: 0x1234,
+        inbox,
+    };
+    assert_eq!(hex(&hello(false).encode().unwrap()), v4);
+    let b = hello(true).encode().unwrap();
+    assert_eq!(hex(&b), "09000000810004003412000001");
+    assert_eq!(FromHolder::decode(one(&b)), Ok(hello(true)));
+    let mut old = b.clone();
+    old.pop();
+    old[0] -= 1;
+    assert_eq!(
+        FromHolder::decode(one(&old)),
+        Ok(hello(false)),
+        "v3·v4 holder"
+    );
+    // Windows 소켓 정보는 핸들 0개로 싣는다. Unix(빈 info)는 fd 1개 그대로.
+    let info = vec![7u8; 4];
+    let lis = FromHolder::Listener { info: info.clone() };
+    let b = lis.encode_handles(&[]).unwrap();
+    assert_eq!(hex(&b), "0a00000083000400000007070707");
+    assert_eq!(
+        FromHolder::decode_handles(one(&b)),
+        Ok((lis.clone(), vec![]))
+    );
+    assert_eq!(
+        lis.encode_handles(&[9]),
+        Err(Error::FdCount { kind: 0x83, got: 1 })
+    );
+    let hold = ToHolder::HoldListener { req: 3, info };
+    let b = hold.encode_handles(&[]).unwrap();
+    assert_eq!(ToHolder::decode_handles(one(&b)), Ok((hold, vec![])));
+    let unix = ToHolder::HoldListener {
+        req: 4,
+        info: Vec::new(),
+    };
+    assert_eq!(hex(&unix.encode().unwrap()), "06000000040104000000");
+}
+
+#[test]
+fn windows_unknown_kind_handles_can_be_closed() {
+    // 미래 kind 0x40이 핸들 2개를 싣고 오면 kind를 몰라도 값을 꺼내 닫고 req로 답한다.
+    let mut b = vec![0x16, 0, 0, 0, 0x40, 2];
+    b.extend(5u64.to_le_bytes());
+    b.extend(6u64.to_le_bytes());
+    b.extend(42u32.to_le_bytes());
+    let f = one(&b);
+    assert_eq!(ToHolder::decode_handles(f), Err(Error::UnknownKind(0x40)));
+    let (h, body) = f.handles().unwrap();
+    assert_eq!(h, vec![5, 6]);
+    assert_eq!(request_id(body), Some(42));
 }
 
 #[test]
@@ -228,7 +399,7 @@ fn rejects_bad_frames() {
         Err(Error::BadLength(u32::from_le_bytes(big)))
     );
     // fd 수가 kind와 다르면 거절(fd 대기열이 어긋난 것).
-    let mut b = FromHolder::Listener.encode().unwrap();
+    let mut b = FromHolder::Listener { info: Vec::new() }.encode().unwrap();
     b[5] = 0;
     assert_eq!(
         FromHolder::decode(one(&b)),
@@ -269,6 +440,8 @@ fn random_bytes_never_panic() {
         if let Ok(Some((f, _))) = parse_frame(&b) {
             ToHolder::decode(f).ok();
             FromHolder::decode(f).ok();
+            ToHolder::decode_handles(f).ok();
+            FromHolder::decode_handles(f).ok();
         }
     }
 }
@@ -282,6 +455,8 @@ proptest::proptest! {
         if let Ok(Some((f, _))) = parse_frame(&bytes) {
             ToHolder::decode(f).ok();
             FromHolder::decode(f).ok();
+            ToHolder::decode_handles(f).ok();
+            FromHolder::decode_handles(f).ok();
         }
     }
 }

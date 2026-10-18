@@ -446,13 +446,13 @@ fn unnegotiated_mobile_feature_is_rejected() {
 #[test]
 fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
     use crate::holder::{Holder, Kept};
+    use crate::os::OwnedFd;
     use krill_proto::{
         holder::{FromHolder, VERSION},
         input::{Input, InputAck, InputId, InputResult},
         roles::{self, Role},
         screen::{Attach, Seq, Stream},
     };
-    use std::os::fd::OwnedFd;
     use std::process::{Child, Command, Stdio};
     struct Running(Child);
     impl Drop for Running {
@@ -486,6 +486,7 @@ fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
         FromHolder::Hello {
             version: VERSION,
             holder_pid: 1,
+            inbox: false,
         },
         FromHolder::Ready,
     ] {

@@ -128,7 +128,9 @@ pub fn save(state_dir: &Path, state: &OnboardingState) -> io::Result<()> {
 /// `settings.rs`의 `write_settings`와 같은 원자 교체다. 그 헬퍼는 settings 전용이라
 /// 여기서 필요한 최소 형태(0600·고유 임시 파일·fsync·rename·실패 시 임시 파일 정리)만 둔다.
 pub(crate) fn atomic_write_0600(path: &Path, body: &str) -> io::Result<()> {
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    use krill_proto::os::fs::OpenOptionsExt as _;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -147,6 +149,7 @@ pub(crate) fn atomic_write_0600(path: &Path, body: &str) -> io::Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(&tmp)?;
+    #[cfg(unix)]
     file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     let result = (|| {
         use std::io::Write as _;

@@ -285,7 +285,7 @@ const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 /// - 이미지 항목(`ClipboardEntry::Image`)이 있으면 `$TMPDIR/minikrill-paste/` 아래에 `0600` 파일로 저장하고
 ///   셸 이스케이프된 파일 경로를 반환한다.
 pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt as _;
+    use krill_proto::os::ffi::OsStrExt as _;
 
     for entry in item.entries() {
         if let gpui::ClipboardEntry::ExternalPaths(paths) = entry
@@ -344,7 +344,7 @@ pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::pa
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt as _;
+        use krill_proto::os::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
     let mut file = opts.open(&path)?;

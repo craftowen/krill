@@ -1,11 +1,11 @@
 //! MK-093: 워크트리 코멘트(`krill set --comment`) 조회와 외부 `.claude/worktrees` 감지·숨김 분류·표시.
 //! 선행 MK-046(`sidebar.rs`)에 대한 의존과 UI 표시 헬퍼는 이 모듈로 격리한다.
 
+use krill_proto::os::fs::DirBuilderExt as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
@@ -1058,7 +1058,7 @@ pub fn resolve_claude_bin(explicit: Option<&str>, path_env: &OsStr, home: &Path)
 
 fn is_executable(path: &Path) -> bool {
     path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        .is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m))
 }
 
 /// `ps -eo pid,ppid` 출력 파서(pid → ppid). 헤더·깨진 행은 건너뛴다.
@@ -1202,6 +1202,7 @@ pub fn render_hidden_row(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use krill_proto::orchestration::{OrchestrationStore, WorktreeStore};
@@ -1531,6 +1532,7 @@ parent_worktree_path = "/Users/test/repo"
 
 /// OWE-803: 과거 이관분(`[[projects]]` 원본 경로 vs `[worktrees]` 정규 경로)이 섞여도
 /// 사이드바 트리는 하나의 저장소로 합쳐진다.
+#[cfg(unix)]
 #[test]
 fn owe803_symlink_alias_imports_merge_into_single_repo() {
     let root = std::env::temp_dir().join(format!("owe803-sidebar-{}", std::process::id()));

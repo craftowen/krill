@@ -515,6 +515,7 @@ impl SettingsView {
     }
 
     #[cfg(test)]
+    #[cfg(unix)]
     pub(super) fn set_shortcut_search(
         &mut self,
         value: &str,
