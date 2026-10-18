@@ -1,7 +1,9 @@
 //! 전역 할당기 설정(OWE-477). krilld는 jemalloc을 쓰고(`main.rs`의 `#[global_allocator]`), 해제한 페이지를
 //! decay 없이 바로 OS에 돌려준다. macOS 기본 malloc은 강등으로 해제한 200열 행(4,800B)을 footprint로 돌려주지 않았고,
 //! jemalloc 기본 decay(10초)는 할당이 멈춘 유휴 데몬에서 진행되지 않았다(실측, docs/spikes/OWE-477.md).
-//! Windows는 jemalloc-sys가 빌드되지 않아 시스템 할당기를 쓰고, 아래 함수는 할 일이 없다(OWE-819).
+//! Windows는 jemalloc-sys가 빌드되지 않아 시스템 할당기(프로세스 힙)를 쓰고, 아래 함수는 할 일이 없다(OWE-819).
+//! 4,800B 행 2만 개(사적 커밋 97.9MiB)를 모두 해제하면 기다림 없이 1.2~1.9MiB로 내려갔다(합성 측정, Server 2022,
+//! docs/research/windows-spike-OWE-833.md). 실제 krilld 세션 강등의 반납은 미측정.
 
 #[cfg(windows)]
 use std::io::Error;
