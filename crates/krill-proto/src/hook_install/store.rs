@@ -140,5 +140,8 @@ pub fn replace(path: &Path, expected: Option<&str>, next: Option<&str>) -> io::R
         }
         fs::remove_file(path)?;
     }
-    File::open(parent)?.sync_all()
+    // Windows는 디렉터리를 `File::open`으로 열 수 없다.
+    #[cfg(unix)]
+    File::open(parent)?.sync_all()?;
+    Ok(())
 }
