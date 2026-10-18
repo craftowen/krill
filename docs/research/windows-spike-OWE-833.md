@@ -2,7 +2,7 @@
 
 측정일: 2026-10-18. 공유 GCP `krill-win`, Windows Server 2022 Datacenter 10.0.20348, Rust 1.98.1 x86_64-pc-windows-msvc, 관리자 계정 `krill`의 OpenSSH(키 인증) 세션. 브랜치 `craftowen/win-p3-krilld`.
 
-**결론: holder 링크 없이 할 수 있는 krilld Windows 항목(DPAPI 키, 기본 셸·`.cmd`, 프로세스 조회, NOFOLLOW, 디렉터리 fsync, 피어 SID 검증, cwd 보고 추적)은 구현했고, 그중 Windows 전용 테스트 9개가 VM에서 통과했다. DPAPI는 SSH 키 인증 로그온에서 `ERROR_ACCESS_DENIED`(5)로 실패하고, 비밀번호 로그온(예약 작업)에서는 통과했다. 세션 리더 스레드·`Resize`·DA1 응답 경로는 OWE-832의 holder 링크 API(`Master = krill_holder::link::Pty`)가 병합된 뒤 한다.** 이 보고서는 조사 기록이며 ARCHITECTURE §4.1을 바꾸지 않는다.
+**결론: holder 링크 없이 할 수 있는 krilld Windows 항목(DPAPI 키, 기본 셸·`.cmd`, 프로세스 조회, NOFOLLOW, 디렉터리 fsync, 피어 SID 검증, cwd 보고 추적)은 구현했고, 이번에 넣은 Windows 테스트 8개가 VM에서 통과했다(DPAPI 2개는 비밀번호 로그온에서). DPAPI는 SSH 키 인증 로그온에서 `ERROR_ACCESS_DENIED`(5)로 실패하고, 비밀번호 로그온(예약 작업)에서는 통과했다. 세션 리더 스레드·`Resize`·DA1 응답 경로는 OWE-832의 holder 링크 API(`Master = krill_holder::link::Pty`)가 병합된 뒤 한다.** 이 보고서는 조사 기록이며 ARCHITECTURE §4.1을 바꾸지 않는다.
 
 ## 실측 표
 
@@ -44,7 +44,7 @@ krilld Windows는 시스템 할당기(Rust std → 프로세스 힙 `HeapAlloc`)
 
 ## Windows nextest (`cargo nextest run -p krilld --locked`, SSH 세션)
 
-119개 중 114개 통과, 5개 실패(마지막 전체 실행은 셸 테스트 추가 전 118개 중 113개 통과·5개 실패).
+119개 중 114개 통과, 5개 실패(커밋 `OWE-833: Windows krilld 실측 보고서…` 시점 1회 실행).
 
 | 실패 | 원인 | 처리 |
 |---|---|---|
