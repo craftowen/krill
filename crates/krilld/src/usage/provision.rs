@@ -102,7 +102,8 @@ pub fn provision_if_enabled(
         }
         Ok(_) => {}
         Err(error) if provider == ProviderKind::Antigravity => {
-            tracing::warn!(kind = ?error.kind(), "agy native account switching is unsupported; owner decision required");
+            // OWE-901: agy 미지원은 예상된 보류 상태라 debug로 둔다(매 실행 warn 스팸 방지).
+            tracing::debug!(kind = ?error.kind(), "agy native account switching is unsupported; owner decision required");
         }
         Err(error) => {
             tracing::warn!(provider = provider.as_str(), kind = ?error.kind(), "profile provisioning failed");

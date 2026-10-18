@@ -1,6 +1,8 @@
-//! agy 계정 격리 보류(OWE-721, MK-158). 실제 키체인·~/.gemini 어댑터는 만들지 않는다.
+//! agy 계정 격리 보류(OWE-721). 실제 키체인·~/.gemini 어댑터는 만들지 않는다.
 //! 설계 참고: Orca antigravity/native-account-launch.ts·native-account-service.ts
-//! (MIT, Copyright (c) 2026 Lovecast Inc.). 코드 복사 없음. 근거·선택지: docs/spikes/MK-158.md.
+//! (MIT, Copyright (c) 2026 Lovecast Inc.). 코드 복사 없음.
+//! 네이티브 자격증명 전환은 오너 결정이 필요해 보류 중이다(OWE-721).
+//! 프로필 격리 실행(`--gemini_dir`)은 `agent.rs`의 가드·폴백이 맡는다(OWE-901).
 
 use std::io;
 use std::path::Path;

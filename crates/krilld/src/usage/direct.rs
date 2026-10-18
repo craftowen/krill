@@ -24,6 +24,9 @@ const INTERVAL: Duration = Duration::from_secs(60);
 const MAX_BYTES: u64 = 512 * 1024;
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
+    if provider == ProviderKind::Antigravity {
+        return agy::cached(home, dir);
+    }
     lock(&CACHE)
         .get(&(home.to_path_buf(), provider, dir.to_path_buf()))
         .filter(|(at, _)| at.elapsed() < Duration::from_secs(180))
@@ -35,11 +38,13 @@ pub fn refresh(home: &Path, state: Option<&Path>) {
     let file = accounts::load_file(home, state);
     if !file.direct_usage {
         lock(&CACHE).retain(|(h, _, _), _| h != home);
+        agy::evict(home);
         return;
     }
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
+    agy::refresh(home, state, &file);
     let profiles = [ProviderKind::Claude, ProviderKind::Codex]
         .into_iter()
         .map(|p| (p, accounts::host_default_dir(home, p), true))
@@ -312,17 +317,30 @@ fn pipe_command(exe: &str, args: &[&str], input: &[u8]) -> Option<Zeroizing<Vec<
 
 pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
     if !host {
-        let token = dir.join(".gemini/antigravity-cli/antigravity-oauth-token");
-        let metadata = std::fs::symlink_metadata(token).ok()?;
+        // 프로필 판정은 krill-proto와 공유한다(OWE-901 중복 제거). 내용은 읽지 않는다.
         return Some(AuthStatus {
-            logged_in: metadata.is_file()
-                && !metadata.file_type().is_symlink()
-                && metadata.len() > 0,
+            logged_in: krill_proto::account_login::agy_token_logged_in(dir),
             identity: None,
         });
     }
-    let raw = keychain("gemini", "antigravity")?;
-    parse_antigravity_auth(&raw)
+    // 호스트(OWE-901): 키체인 파싱 → 토큰 파일 존재 순(코디네이터 결정: 마커 검사 없음).
+    // 파일은 존재·크기만 보고 내용을 읽지 않는다. 호스트 `dir`은 이미
+    // `~/.gemini/antigravity-cli`라 토큰 파일명을 직접 붙인다(프로필 헬퍼와 다름).
+    if let Some(raw) = keychain("gemini", "antigravity")
+        && let Some(status) = parse_antigravity_auth(&raw)
+    {
+        return Some(status);
+    }
+    let token = dir.join("antigravity-oauth-token");
+    if std::fs::symlink_metadata(&token)
+        .is_ok_and(|m| m.is_file() && !m.file_type().is_symlink() && m.len() > 0)
+    {
+        return Some(AuthStatus {
+            logged_in: true,
+            identity: None,
+        });
+    }
+    None
 }
 
 fn parse_antigravity_auth(raw: &[u8]) -> Option<AuthStatus> {
@@ -383,6 +401,653 @@ fn parse_codex_backend(text: &str) -> Usage {
         });
     }
     usage
+}
+
+/// OWE-901: agy 프로필·호스트 사용량 실조회.
+///
+/// `agy [--gemini_dir=<프로필>/.gemini] -p /usage --output-format json --print-timeout 20s`를
+/// `SSH_CONNECTION=krill`과 함께 백그라운드 스레드에서 주기 실행한다. `--disable-slash-commands`는
+/// 절대 붙이지 않는다(일반 프롬프트 실행과 구분이 안 되면 모델 턴을 소모할 수 있다).
+/// 토큰·응답 원문은 캐시·로그·IPC에 넣지 않고 파싱된 5h/7d 수치만 둔다.
+///
+/// 안전장치:
+/// - agy 1.1.11 미만·버전 미상이면 건너뛴다(구버전은 `/usage`를 프롬프트로 받아 모델 턴을 쓸 수 있다).
+/// - 응답에 모델 턴(`num_turns`>0) 흔적이 있으면 프로세스 전역 래치로 영구 중단한다.
+/// - 출력 512KB 상한·실행 30초 타임아웃.
+pub(crate) mod agy {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use krill_proto::usage::ProviderKind;
+
+    use super::super::{ProfileUsage, Usage, Window, accounts};
+    use super::MAX_BYTES;
+    use crate::session::lock;
+
+    type Key = (PathBuf, PathBuf);
+    static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
+    static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
+    /// 주기 실행 간격(5분)·캐시 유효(10분). 5h·주간 창에는 충분하고 agy 실행 부담을 낮춘다.
+    const INTERVAL: Duration = Duration::from_secs(300);
+    const TTL: Duration = Duration::from_secs(600);
+    /// `agy -p /usage` 실행 타임아웃(agy 자체 `--print-timeout 20s`보다 길게).
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    /// `/usage`를 지원하는 최소 agy 버전(OWE-901).
+    const MIN_VERSION: (u64, u64, u64) = (1, 1, 11);
+    /// 버전 확인용 `agy --version` 타임아웃.
+    const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// 모델 턴 흔적을 본 뒤에는 이 프로세스에서 agy 사용량 조회를 영구 중단한다.
+    static MODEL_TURN_LATCH: AtomicBool = AtomicBool::new(false);
+
+    pub(super) fn latched() -> bool {
+        MODEL_TURN_LATCH.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(super) fn reset_latch_for_tests() {
+        MODEL_TURN_LATCH.store(false, Ordering::SeqCst);
+        lock(&CACHE).clear();
+        lock(&PENDING).clear();
+        lock(&VERSION_CACHE).clear();
+        lock(&VERSION_TEXT_CACHE).clear();
+    }
+
+    pub(super) fn cached(home: &Path, dir: &Path) -> Option<ProfileUsage> {
+        if latched() {
+            return None;
+        }
+        lock(&CACHE)
+            .get(&(home.to_path_buf(), dir.to_path_buf()))
+            .filter(|(at, _)| at.elapsed() < TTL)
+            .map(|(_, usage)| usage.clone())
+    }
+
+    pub(super) fn evict(home: &Path) {
+        lock(&CACHE).retain(|(h, _), _| h != home);
+        lock(&PENDING).retain(|(h, _)| h != home);
+    }
+
+    /// `direct::refresh`가 `SAVE_LOCK` 없이 호출한다. 실제 실행은 스레드에서만.
+    pub(super) fn refresh(home: &Path, state: Option<&Path>, file: &accounts::AccountsFile) {
+        if cfg!(test) || latched() {
+            return;
+        }
+        let mut profiles = vec![(
+            accounts::host_default_dir(home, ProviderKind::Antigravity),
+            true,
+        )];
+        for a in &file.accounts {
+            if ProviderKind::parse(&a.provider) != Some(ProviderKind::Antigravity) {
+                continue;
+            }
+            let dir = PathBuf::from(&a.profile_dir);
+            if dir.as_os_str().is_empty() || !dir.is_dir() {
+                continue;
+            }
+            profiles.push((dir, false));
+        }
+        for (dir, host) in profiles {
+            let key = (home.to_path_buf(), dir);
+            if lock(&CACHE)
+                .get(&key)
+                .is_some_and(|(at, _)| at.elapsed() < INTERVAL)
+                || !lock(&PENDING).insert(key.clone())
+            {
+                continue;
+            }
+            spawn(&key, host, state.map(Path::to_path_buf));
+        }
+    }
+
+    fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
+        let job = key.clone();
+        let launched = std::thread::Builder::new()
+            .name("agy-usage".into())
+            .spawn(move || {
+                let usage = std::panic::catch_unwind(|| {
+                    let exe = super::agy_exe()?;
+                    fetch(&exe, &job.1, host)
+                })
+                .ok()
+                .flatten();
+                // 조회 중 사용자가 직접 조회를 끄면 결과도 버린다.
+                let enabled = accounts::load_file(&job.0, state.as_deref()).direct_usage;
+                if enabled && let Some(usage) = usage {
+                    // 한도 도달(100%)이면 다음 실행부터 다른 계정이 잡히게 기록한다(OWE-901).
+                    if usage_max(&usage) >= 100
+                        && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
+                    {
+                        accounts::record_rate_limited(ProviderKind::Antigravity, &id);
+                    }
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs());
+                    let mut cache = lock(&CACHE);
+                    cache.retain(|_, (at, _)| at.elapsed() < TTL);
+                    if cache.len() >= 256 {
+                        cache.pop_first();
+                    }
+                    cache.insert(
+                        job.clone(),
+                        (
+                            Instant::now(),
+                            ProfileUsage {
+                                usage,
+                                updated_at: now,
+                                ..ProfileUsage::default()
+                            },
+                        ),
+                    );
+                }
+                lock(&PENDING).remove(&job);
+            });
+        if launched.is_err() {
+            lock(&PENDING).remove(key);
+        }
+    }
+
+    fn usage_max(usage: &Usage) -> u8 {
+        usage
+            .five_hour
+            .as_ref()
+            .map_or(0, |w| w.percent)
+            .max(usage.seven_day.as_ref().map_or(0, |w| w.percent))
+    }
+
+    /// 프로필 폴더로 계정 id를 찾는다(읽기 전용). 호스트는 호스트 id다.
+    fn account_id_for(home: &Path, state: Option<&Path>, dir: &Path, host: bool) -> Option<String> {
+        if host {
+            return Some(accounts::host_default_id(ProviderKind::Antigravity));
+        }
+        let file = accounts::load_file(home, state);
+        file.accounts.iter().find_map(|a| {
+            (ProviderKind::parse(&a.provider) == Some(ProviderKind::Antigravity)
+                && Path::new(&a.profile_dir) == dir)
+                .then(|| a.id.clone())
+        })
+    }
+
+    /// 버전 게이트를 포함한 실조회 한 번. `exe`는 호출자가 정한다(실행은 로그인 셸 PATH의 agy,
+    /// 테스트는 가짜 바이너리).
+    fn fetch(exe: &Path, dir: &Path, host: bool) -> Option<Usage> {
+        if latched() {
+            return None;
+        }
+        if !version_supported(exe) {
+            return None;
+        }
+        let gemini_dir;
+        let gemini_flag;
+        let mut argv: Vec<String> = Vec::new();
+        if !host {
+            gemini_dir = dir.join(".gemini");
+            let text = gemini_dir.to_str()?;
+            gemini_flag = format!("--gemini_dir={text}");
+            argv.push(gemini_flag);
+        }
+        argv.extend(
+            [
+                "-p",
+                "/usage",
+                "--output-format",
+                "json",
+                "--print-timeout",
+                "20s",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        // `--disable-slash-commands`는 절대 붙이지 않는다(OWE-901).
+        debug_assert!(!argv.iter().any(|a| a.contains("disable-slash-commands")));
+        let body = run_agy(exe, &argv, TIMEOUT, MAX_BYTES)?;
+        let text = std::str::from_utf8(&body).ok()?;
+        if has_model_turn_trace(text) {
+            MODEL_TURN_LATCH.store(true, Ordering::SeqCst);
+            return None;
+        }
+        let usage = krill_proto::usage::parse_antigravity_usage(text);
+        (!usage.is_empty()).then_some(from_proto_snapshot(&usage))
+    }
+
+    /// krill-proto 봉투를 krilld 내부 사용량으로 옮긴다(토큰·원문은 버린다).
+    fn from_proto_snapshot(snap: &krill_proto::usage::Snapshot) -> Usage {
+        let window = |w: Option<&krill_proto::usage::Window>| {
+            w.map(|w| Window {
+                percent: w.percent,
+                resets_at: w.resets_at.clone(),
+            })
+        };
+        Usage {
+            five_hour: window(snap.five_hour.as_ref()),
+            seven_day: window(snap.seven_day.as_ref()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn fetch_for_tests(exe: &Path, dir: &Path, host: bool) -> Option<Usage> {
+        fetch(exe, dir, host)
+    }
+
+    #[cfg(test)]
+    pub(super) fn probe_version_for_tests(exe: &Path) -> bool {
+        version_supported(exe)
+    }
+
+    /// `agy --version` 첫 `X.Y.Z`가 1.1.11 이상이면 참. 모르면 거짓(건너뜀).
+    /// 캐시 키는 (실행 경로, mtime, 버전 문자열)이라 업그레이드하면 자동으로 다시 본다.
+    fn version_supported(exe: &Path) -> bool {
+        let (mtime, len) = std::fs::symlink_metadata(exe)
+            .and_then(|m| {
+                m.modified().map(|t| {
+                    (
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs()),
+                        m.len(),
+                    )
+                })
+            })
+            .unwrap_or((0, 0));
+        let version = version_string(exe, mtime, len);
+        if let Some(cached) = lock(&VERSION_CACHE)
+            .get(&(exe.to_path_buf(), mtime, version.clone()))
+            .map(|(_, supported)| *supported)
+        {
+            return cached;
+        }
+        let supported = parse_version(&version).is_some_and(|v| v >= MIN_VERSION);
+        let mut cache = lock(&VERSION_CACHE);
+        if cache.len() >= 64 {
+            cache.pop_first();
+        }
+        cache.insert(
+            (exe.to_path_buf(), mtime, version),
+            (Instant::now(), supported),
+        );
+        supported
+    }
+
+    /// 버전 문자열 조회(바이너리 식별용 캐시). 내용은 파싱 전 원문 그대로 둔다.
+    fn version_string(exe: &Path, mtime: u64, len: u64) -> String {
+        if let Some(hit) = lock(&VERSION_TEXT_CACHE).get(&(exe.to_path_buf(), mtime, len)) {
+            return hit.clone();
+        }
+        let mut text = run_agy(exe, &["--version".to_owned()], VERSION_TIMEOUT, 64 * 1024)
+            .and_then(|b| String::from_utf8(b).ok())
+            .unwrap_or_default();
+        // 키 팽창 방지: 앞 64바이트만 쓴다(버전 표기는 앞에 있다).
+        text.truncate(64);
+        let mut cache = lock(&VERSION_TEXT_CACHE);
+        if cache.len() >= 64 {
+            cache.pop_first();
+        }
+        cache.insert((exe.to_path_buf(), mtime, len), text.clone());
+        text
+    }
+
+    pub(crate) fn version_text_for_guard(exe: &Path) -> String {
+        let (mtime, len) = std::fs::symlink_metadata(exe)
+            .and_then(|m| {
+                m.modified().map(|t| {
+                    (
+                        t.duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |d| d.as_secs()),
+                        m.len(),
+                    )
+                })
+            })
+            .unwrap_or((0, 0));
+        version_string(exe, mtime, len)
+    }
+
+    type VersionKey = (PathBuf, u64, String);
+    static VERSION_CACHE: Mutex<BTreeMap<VersionKey, (Instant, bool)>> =
+        Mutex::new(BTreeMap::new());
+    static VERSION_TEXT_CACHE: Mutex<BTreeMap<(PathBuf, u64, u64), String>> =
+        Mutex::new(BTreeMap::new());
+
+    /// 출력에서 첫 `X.Y.Z`를 찾는다. 인덱싱 없이 `.get()`으로만 읽는다.
+    fn parse_version(text: &str) -> Option<(u64, u64, u64)> {
+        let bytes = text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            if !bytes.get(pos).is_some_and(u8::is_ascii_digit) {
+                pos += 1;
+                continue;
+            }
+            let mut parts = [0u64; 3];
+            let mut cur = pos;
+            let mut ok = true;
+            for (idx, slot) in parts.iter_mut().enumerate() {
+                let start = cur;
+                while bytes.get(cur).is_some_and(u8::is_ascii_digit) {
+                    cur += 1;
+                }
+                if start == cur {
+                    ok = false;
+                    break;
+                }
+                *slot = text.get(start..cur)?.parse().ok()?;
+                if idx < 2 {
+                    if bytes.get(cur) != Some(&b'.') {
+                        ok = false;
+                        break;
+                    }
+                    cur += 1;
+                }
+            }
+            if ok {
+                let [first, second, third] = parts;
+                return Some((first, second, third));
+            }
+            pos += 1;
+        }
+        None
+    }
+
+    const NUM_TURNS_PAT: &str = "\"num_turns\"";
+
+    /// 모델 턴 흔적(`num_turns`>0). 파싱되면 재귀 탐색, 아니면 `"num_turns":<0이 아닌 숫자>`.
+    fn has_model_turn_trace(text: &str) -> bool {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+            return contains_num_turns(&value);
+        }
+        let mut rest = text;
+        while let Some(found) = rest.find(NUM_TURNS_PAT) {
+            let Some(tail) = rest.get(found + NUM_TURNS_PAT.len()..) else {
+                return false;
+            };
+            rest = tail;
+            let after = tail.trim_start_matches([' ', '\t', '\r', '\n']);
+            let Some(num) = after.strip_prefix(':') else {
+                continue;
+            };
+            let num = num.trim_start_matches([' ', '\t', '\r', '\n']);
+            if let Some(d) = num.as_bytes().first()
+                && d.is_ascii_digit()
+                && *d != b'0'
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn contains_num_turns(value: &serde_json::Value) -> bool {
+        match value {
+            serde_json::Value::Object(map) => map.iter().any(|(k, v)| {
+                (k == "num_turns"
+                    && match v {
+                        serde_json::Value::Number(n) => {
+                            n.as_u64().is_some_and(|n| n > 0) || n.as_f64().is_some_and(|f| f > 0.0)
+                        }
+                        _ => false,
+                    })
+                    || contains_num_turns(v)
+            }),
+            serde_json::Value::Array(items) => items.iter().any(contains_num_turns),
+            _ => false,
+        }
+    }
+
+    /// agy 한 번 실행. 타임아웃·출력 상한을 지킨다. 파이프 교착을 피하려고 stdout은 별도 스레드에서 읽는다.
+    fn run_agy(exe: &Path, args: &[String], timeout: Duration, max_bytes: u64) -> Option<Vec<u8>> {
+        let mut child = Command::new(exe)
+            .args(args)
+            .env("SSH_CONNECTION", "krill")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let stdout = child.stdout.take()?;
+        let reader = std::thread::Builder::new()
+            .name("agy-read".into())
+            .spawn(move || {
+                use std::io::Read as _;
+                let mut buf = Vec::new();
+                let limit = max_bytes.saturating_add(1);
+                stdout.take(limit).read_to_end(&mut buf).ok()?;
+                (u64::try_from(buf.len()).ok()? <= max_bytes).then_some(buf)
+            })
+            .ok()?;
+        let deadline = Instant::now() + timeout;
+        let ok = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if Instant::now() >= deadline => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    break false;
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                _ => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    break false;
+                }
+            }
+        };
+        if !ok {
+            return None;
+        }
+        reader.join().ok()?
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        use super::*;
+        use crate::session::lock;
+
+        /// 래치·캐시는 프로세스 전역이라 agy 테스트끼리 직렬화한다.
+        static SERIAL: Mutex<()> = Mutex::new(());
+
+        fn serial() -> std::sync::MutexGuard<'static, ()> {
+            lock(&SERIAL)
+        }
+
+        fn write_fake_agy(dir: &std::path::Path, name: &str, script: &str) -> PathBuf {
+            let exe = dir.join(name);
+            std::fs::write(&exe, script).unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+            exe
+        }
+
+        const USAGE_ENVELOPE: &str = r#"{
+          "status": "SUCCESS",
+          "command": {"name": "usage", "data": {"groups": [
+            {"name": "Gemini Models", "buckets": [
+              {"id": "g-5h", "window": "5h", "remaining_fraction": 0.65, "reset_time": "2026-10-16T15:00:00Z"},
+              {"id": "g-wk", "window": "weekly", "remaining_fraction": 0.20, "reset_time": "2026-10-22T00:00:00Z"}
+            ]}
+          ]}}
+        }"#;
+
+        /// 가짜 agy: `--version`은 버전 출력, 그 밖은 인자 검증 뒤 봉투 출력.
+        /// `SSH_CONNECTION=krill`이 아니면 실패하고, `--disable-slash-commands`가 있으면 실패한다.
+        fn usage_script(version: &str, body: &str) -> String {
+            format!(
+                "#!/bin/sh\n\
+                 if [ \"$1\" = '--version' ]; then printf '%s\\n' '{version}'; exit 0; fi\n\
+                 [ \"$SSH_CONNECTION\" = krill ] || exit 3\n\
+                 case \" $* \" in *'--disable-slash-commands'*) exit 4;; esac\n\
+                 case \"$1\" in --gemini_dir=*) shift;; esac\n\
+                 [ \"$1 $2 $3 $4 $5 $6\" = '-p /usage --output-format json --print-timeout 20s' ] || exit 5\n\
+                 printf '%s' '{body}'\n",
+            )
+        }
+
+        #[test]
+        fn version_gate_parses_first_triplet_and_rejects_old_or_unknown() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root = std::env::temp_dir().join(format!("owe901-agy-ver-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::create_dir_all(&root).unwrap();
+            let old = write_fake_agy(&root, "agy-old", "#!/bin/sh\necho 'agy 1.1.10'\n");
+            let min = write_fake_agy(
+                &root,
+                "agy-min",
+                "#!/bin/sh\necho 'agy version 1.1.11 (darwin arm64)'\n",
+            );
+            let new = write_fake_agy(&root, "agy-new", "#!/bin/sh\necho '2.0.0'\n");
+            let unknown =
+                write_fake_agy(&root, "agy-unknown", "#!/bin/sh\necho 'no version here'\n");
+            let failing = write_fake_agy(&root, "agy-fail", "#!/bin/sh\nexit 1\n");
+            assert!(!probe_version_for_tests(&old));
+            assert!(probe_version_for_tests(&min));
+            assert!(probe_version_for_tests(&new));
+            assert!(!probe_version_for_tests(&unknown));
+            assert!(!probe_version_for_tests(&failing));
+            assert!(!probe_version_for_tests(&root.join("missing")));
+            assert_eq!(parse_version("agy 1.2.3-beta"), Some((1, 2, 3)));
+            assert_eq!(parse_version(""), None);
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn live_query_checks_env_and_flags_then_parses_envelope() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root = std::env::temp_dir().join(format!("owe901-agy-live-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::create_dir_all(&root).unwrap();
+            let exe = write_fake_agy(&root, "agy", &usage_script("agy 1.1.11", USAGE_ENVELOPE));
+            assert!(probe_version_for_tests(&exe));
+            // 프로필 조회는 `--gemini_dir=<profile>/.gemini`을 붙인다.
+            let profile = root.join("profile");
+            std::fs::create_dir_all(&profile).unwrap();
+            let usage = fetch_for_tests(&exe, &profile, false).unwrap();
+            assert_eq!(usage.five_hour.unwrap().percent, 35);
+            assert_eq!(usage.seven_day.unwrap().percent, 80);
+            // 호스트 조회는 플래그 없이 뜬다.
+            let usage = fetch_for_tests(&exe, &root, true).unwrap();
+            assert_eq!(usage.five_hour.unwrap().percent, 35);
+            // 오래된 버전이면 건너뛴다.
+            let old = write_fake_agy(
+                &root,
+                "agy-old",
+                &usage_script("agy 1.1.10", USAGE_ENVELOPE),
+            );
+            assert!(fetch_for_tests(&old, &profile, false).is_none());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn model_turn_trace_latches_permanently() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root =
+                std::env::temp_dir().join(format!("owe901-agy-latch-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::create_dir_all(&root).unwrap();
+            assert!(!latched());
+            let turning = write_fake_agy(
+                &root,
+                "agy-turn",
+                &usage_script(
+                    "agy 1.1.11",
+                    r#"{"command":{"name":"usage"},"num_turns":2}"#,
+                ),
+            );
+            assert!(fetch_for_tests(&turning, &root, true).is_none());
+            assert!(latched());
+            // 래치 뒤에는 정상 봉투도 조회하지 않는다.
+            let good = write_fake_agy(
+                &root,
+                "agy-good",
+                &usage_script("agy 1.1.11", USAGE_ENVELOPE),
+            );
+            assert!(fetch_for_tests(&good, &root, true).is_none());
+            assert!(cached(&root, &root).is_none());
+            // 순수 함수 수준 확인.
+            assert!(has_model_turn_trace(r#"{"a":{"num_turns":1}}"#));
+            assert!(!has_model_turn_trace(USAGE_ENVELOPE));
+            assert!(!has_model_turn_trace(r#"{"num_turns":0}"#));
+            assert!(!has_model_turn_trace("not json at all"));
+            reset_latch_for_tests();
+            assert!(!latched());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn output_over_cap_is_rejected() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root = std::env::temp_dir().join(format!("owe901-agy-cap-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            std::fs::create_dir_all(&root).unwrap();
+            let big = write_fake_agy(
+                &root,
+                "agy-big",
+                "#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo 'agy 1.1.11'; exit 0; fi\nhead -c 600000 /dev/zero | tr '\\0' 'x'\n",
+            );
+            assert!(probe_version_for_tests(&big));
+            assert!(fetch_for_tests(&big, &root, true).is_none());
+            std::fs::remove_dir_all(root).unwrap();
+        }
+
+        #[test]
+        fn host_auth_falls_back_to_token_file_without_reading_it() {
+            let _serial = serial();
+            reset_latch_for_tests();
+            let root = std::env::temp_dir().join(format!("owe901-agy-auth-{}", std::process::id()));
+            std::fs::remove_dir_all(&root).ok();
+            // 단위 테스트의 키체인은 항상 비어 있다. 토큰 파일만으로 호스트 로그인이 선다.
+            let host = root.join("home").join(".gemini").join("antigravity-cli");
+            std::fs::create_dir_all(&host).unwrap();
+            assert!(super::super::antigravity_auth(&host, true).is_none());
+            let token = host.join("antigravity-oauth-token");
+            std::fs::write(&token, b"fixture-only-exists").unwrap();
+            assert!(
+                super::super::antigravity_auth(&host, true)
+                    .unwrap()
+                    .logged_in
+            );
+            // 프로필 판정은 공유 헬퍼와 같다.
+            let profile = root.join("profile");
+            std::fs::create_dir_all(&profile).unwrap();
+            assert!(
+                !super::super::antigravity_auth(&profile, false)
+                    .unwrap()
+                    .logged_in
+            );
+            let profile_token = profile.join(".gemini/antigravity-cli/antigravity-oauth-token");
+            std::fs::create_dir_all(profile_token.parent().unwrap()).unwrap();
+            std::fs::write(&profile_token, b"fixture").unwrap();
+            assert!(
+                super::super::antigravity_auth(&profile, false)
+                    .unwrap()
+                    .logged_in
+            );
+            assert_eq!(
+                std::fs::read(&token).unwrap(),
+                b"fixture-only-exists",
+                "판정은 내용을 읽지 않는다"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
+}
+
+/// `PATH`에서 agy를 찾는다(테스트·오프라인에서는 호출하지 않는다).
+#[cfg(not(test))]
+fn agy_exe() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
+    krill_proto::agent::which("agy", path)
+}
+
+#[cfg(test)]
+fn agy_exe() -> Option<PathBuf> {
+    None
 }
 
 #[cfg(test)]

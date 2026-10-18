@@ -401,6 +401,7 @@ proptest::proptest! {
         let _ = decode(&bytes);
         let _ = normalize(&bytes);
         let _ = stop_failure_rate_limited(&bytes);
+        let _ = agy_rate_limited(&bytes);
     }
 }
 
@@ -506,6 +507,12 @@ fn non_rate_limit_stop_failure_does_not_trigger() {
         ("codex", RATE_PAYLOAD),
         ("cursor", RATE_PAYLOAD),
         ("", RATE_PAYLOAD),
+        // OWE-901: 에이전트·봉투가 어긋나면 평가하지 않는다.
+        ("agy", RATE_PAYLOAD),
+        (
+            "claude",
+            r#"{"hook_event_name":"Stop","error":"rate_limit"}"#,
+        ),
     ] {
         assert!(
             auto_switch_on_rate_limit(&home, Some(&state), agent, payload.as_bytes()).is_none(),
@@ -516,6 +523,79 @@ fn non_rate_limit_stop_failure_does_not_trigger() {
     fs::remove_dir_all(home.parent().unwrap()).ok();
 }
 
+/// OWE-901용 임시 홈: agy 계정 High·Low + 사용량 파일, 활성은 High.
+fn agy_rate_limit_home(tag: &str, high_five: u8, low_five: u8) -> (PathBuf, PathBuf) {
+    use krill_proto::usage::ProviderKind;
+    let root = std::env::temp_dir().join(format!("krilld-agy-fail-{tag}-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    for (label, five) in [("High", high_five), ("Low", low_five)] {
+        let profile = home.join(format!("agy-{label}"));
+        accounts::add_account(
+            &home,
+            Some(&state),
+            ProviderKind::Antigravity,
+            label,
+            None,
+            &profile.display().to_string(),
+        )
+        .unwrap();
+        fs::write(
+            profile.join("usage.json"),
+            format!(r#"{{"five_hour":{{"utilization":{five}}}}}"#),
+        )
+        .unwrap();
+    }
+    accounts::switch_account(&home, Some(&state), ProviderKind::Antigravity, "agy-high").unwrap();
+    (home, state)
+}
+
+fn active_agy(home: &Path, state: &Path) -> Option<String> {
+    accounts::load_file(home, Some(state))
+        .active
+        .get("agy")
+        .cloned()
+}
+
+/// OWE-901: agy 한도 봉투(`Stop`·`PostInvocation` + `error: "rate_limit"`)만 감지한다.
+#[test]
+fn agy_rate_limit_detects_only_exact_limit_envelope() {
+    for p in [
+        r#"{"hook_event_name":"Stop","error":"rate_limit"}"#,
+        r#"{"hook_event_name":"PostInvocation","error":"rate_limit"}"#,
+        r#"{"hookEventName":"Stop","error":"rate_limit"}"#,
+    ] {
+        assert!(agy_rate_limited(p.as_bytes()), "{p}");
+    }
+    for p in [
+        r#"{"hook_event_name":"StopFailure","error":"rate_limit"}"#,
+        r#"{"hook_event_name":"Stop","error":"server_error"}"#,
+        r#"{"hook_event_name":"Stop"}"#,
+        r#"{"hook_event_name":"PreInvocation","error":"rate_limit"}"#,
+        r#"{"hook_event_name":"Stop","error":"Rate_Limit"}"#,
+        "not json",
+    ] {
+        assert!(!agy_rate_limited(p.as_bytes()), "{p}");
+    }
+    // Claude 감지기와 겹치지 않는다.
+    assert!(!stop_failure_rate_limited(
+        br#"{"hook_event_name":"Stop","error":"rate_limit"}"#
+    ));
+}
+
+/// OWE-901: agy 한도 봉투가 오면 즉시 자동전환을 평가해 여유 계정으로 전환한다.
+#[test]
+fn agy_limit_envelope_triggers_immediate_auto_switch() {
+    let (home, state) = agy_rate_limit_home("switch", 100, 10);
+    let payload = r#"{"hook_event_name":"Stop","error":"rate_limit"}"#;
+    let switched = auto_switch_on_rate_limit(&home, Some(&state), "agy", payload.as_bytes())
+        .expect("agy rate_limit evaluates");
+    assert_eq!(switched.len(), 1);
+    assert_eq!(switched[0].to_id, "agy-low");
+    assert_eq!(active_agy(&home, &state).as_deref(), Some("agy-low"));
+    fs::remove_dir_all(home.parent().unwrap()).ok();
+}
 /// OWE-710: 기존 정책 존중 — 자동전환 꺼짐·히스테리시스 근소 우위면 평가만 하고 전환하지 않는다.
 #[test]
 fn rate_limit_trigger_respects_existing_policy() {
