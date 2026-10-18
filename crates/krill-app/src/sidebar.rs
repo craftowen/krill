@@ -311,13 +311,41 @@ fn rows(snapshot: &Snapshot, prefs: &Preferences, collapsed: &BTreeSet<PathBuf>)
 const FORMAT_VERSION: u8 = 1;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
+/// 사이드바 접힘/펼침 및 마지막 선택 워크트리 상태(`sidebar.bin` 4번째 구간, OWE-842).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct UiExpansionState {
+    pub collapsed: BTreeSet<PathBuf>,
+    pub collapsed_groups: BTreeSet<GroupKey>,
+    pub collapsed_hosts: BTreeSet<HostId>,
+    pub expanded_cards: BTreeSet<PathBuf>,
+    pub selected_worktree: Option<PathBuf>,
+}
+
+impl UiExpansionState {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.collapsed.is_empty()
+            && self.collapsed_groups.is_empty()
+            && self.collapsed_hosts.is_empty()
+            && self.expanded_cards.is_empty()
+            && self.selected_worktree.is_none()
+    }
+}
+
+type PersistedSidebarState = (
+    Preferences,
+    WorkspaceOptions,
+    lineage::LineageState,
+    UiExpansionState,
+);
+
 /// 저장 파일을 읽는다. 손상·미지원 버전은 덮어쓰지 않도록 `.corrupt`로 보존한 뒤 오류를 돌려준다.
 #[cfg(test)]
 fn load(path: &Path) -> io::Result<Preferences> {
-    load_state(path).map(|(prefs, _, _)| prefs)
+    load_state(path).map(|(prefs, _, _, _)| prefs)
 }
 
-fn load_state(path: &Path) -> io::Result<(Preferences, WorkspaceOptions, lineage::LineageState)> {
+fn load_state(path: &Path) -> io::Result<PersistedSidebarState> {
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(MAX_FILE_BYTES + 1)
@@ -332,9 +360,7 @@ fn load_state(path: &Path) -> io::Result<(Preferences, WorkspaceOptions, lineage
     result
 }
 
-fn decode_state(
-    bytes: &[u8],
-) -> io::Result<(Preferences, WorkspaceOptions, lineage::LineageState)> {
+fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
     let invalid = |msg: &str| io::Error::new(io::ErrorKind::InvalidData, msg.to_owned());
     if u64::try_from(bytes.len()).map_or(true, |n| n > MAX_FILE_BYTES) {
         return Err(invalid("sidebar file too large"));
@@ -352,16 +378,27 @@ fn decode_state(
             prefs,
             WorkspaceOptions::default(),
             lineage::LineageState::default(),
+            UiExpansionState::default(),
         ));
     }
     let (opts, rest) =
         postcard::take_from_bytes::<WorkspaceOptions>(rest).map_err(|e| invalid(&e.to_string()))?;
-    let lin = if rest.is_empty() {
-        lineage::LineageState::default()
+    if rest.is_empty() {
+        return Ok((
+            prefs,
+            opts,
+            lineage::LineageState::default(),
+            UiExpansionState::default(),
+        ));
+    }
+    let (lin, rest) = postcard::take_from_bytes::<lineage::LineageState>(rest)
+        .map_err(|e| invalid(&e.to_string()))?;
+    let ui = if rest.is_empty() {
+        UiExpansionState::default()
     } else {
-        postcard::from_bytes::<lineage::LineageState>(rest).map_err(|e| invalid(&e.to_string()))?
+        postcard::from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?
     };
-    Ok((prefs, opts, lin))
+    Ok((prefs, opts, lin, ui))
 }
 
 #[cfg(test)]
@@ -371,6 +408,7 @@ fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
         prefs,
         &WorkspaceOptions::default(),
         &lineage::LineageState::default(),
+        &UiExpansionState::default(),
     )
 }
 
@@ -379,12 +417,16 @@ fn save_state(
     prefs: &Preferences,
     opts: &WorkspaceOptions,
     lin: &lineage::LineageState,
+    ui: &UiExpansionState,
 ) -> io::Result<()> {
     let mut bytes = postcard::to_stdvec(prefs).map_err(io::Error::other)?;
-    if opts.is_customized() || !lin.is_empty() {
+    if opts.is_customized() || !lin.is_empty() || !ui.is_empty() {
         bytes.extend(postcard::to_stdvec(opts).map_err(io::Error::other)?);
-        if !lin.is_empty() {
+        if !lin.is_empty() || !ui.is_empty() {
             bytes.extend(postcard::to_stdvec(lin).map_err(io::Error::other)?);
+            if !ui.is_empty() {
+                bytes.extend(postcard::to_stdvec(ui).map_err(io::Error::other)?);
+            }
         }
     }
     if u64::try_from(bytes.len()).map_or(true, |n| n >= MAX_FILE_BYTES) {
@@ -463,6 +505,8 @@ pub struct Sidebar {
     collapsed: BTreeSet<PathBuf>,
     /// 카드 하단 요약 알약을 눌러 개별 세션 행을 펼친 워크트리 집합(Orca 기본값: 접힘).
     expanded_cards: BTreeSet<PathBuf>,
+    /// 마지막으로 선택·활성화된 워크트리/폴더 경로(`sidebar.bin`에 영속화, OWE-842).
+    selected_worktree: Option<PathBuf>,
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
@@ -545,7 +589,7 @@ impl Sidebar {
     pub fn new(path: Option<PathBuf>) -> Self {
         let mut error = None;
         let mut writable = true;
-        let (prefs, options, lin) = match path.as_deref().map(load_state) {
+        let (prefs, options, lin, ui) = match path.as_deref().map(load_state) {
             Some(Ok(state)) => state,
             Some(Err(err)) if err.kind() != io::ErrorKind::NotFound => {
                 writable = path
@@ -556,12 +600,14 @@ impl Sidebar {
                     Preferences::default(),
                     WorkspaceOptions::default(),
                     lineage::LineageState::default(),
+                    UiExpansionState::default(),
                 )
             }
             _ => (
                 Preferences::default(),
                 WorkspaceOptions::default(),
                 lineage::LineageState::default(),
+                UiExpansionState::default(),
             ),
         };
         let comments = external::load_comments_from_sidebar_path(path.as_deref());
@@ -574,7 +620,7 @@ impl Sidebar {
             remote_task: None,
             remote_manager: None,
             remote_info: BTreeMap::new(),
-            collapsed_hosts: BTreeSet::new(),
+            collapsed_hosts: ui.collapsed_hosts,
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -583,7 +629,7 @@ impl Sidebar {
             rows: Vec::new(),
             prefs,
             options,
-            collapsed_groups: BTreeSet::new(),
+            collapsed_groups: ui.collapsed_groups,
             worktree_statuses: BTreeMap::new(),
             worktree_updated_at: BTreeMap::new(),
             issues: BTreeMap::new(),
@@ -596,8 +642,9 @@ impl Sidebar {
             collapsed_lineage: lin.collapsed_lineage,
             sleeping_worktrees: lin.sleeping_worktrees,
             shown_external: BTreeSet::new(),
-            collapsed: BTreeSet::new(),
-            expanded_cards: BTreeSet::new(),
+            collapsed: ui.collapsed,
+            expanded_cards: ui.expanded_cards,
+            selected_worktree: ui.selected_worktree,
             path: path.filter(|_| writable),
             error,
             poll_error: None,
@@ -661,6 +708,12 @@ impl Sidebar {
                 Vec::new()
             };
             this.row_hosts = vec![HostId::Local; this.rows.len()];
+            if let Some(sel) = &this.selected_worktree {
+                this.cursor = this.rows.iter().position(|r| match r {
+                    Row::Worktree(p) | Row::Folder(p) | Row::Repository(p) => p == sel,
+                    _ => false,
+                });
+            }
         }
         this
     }
@@ -813,6 +866,38 @@ impl Sidebar {
         self.collapsed_hosts.contains(host)
     }
 
+    /// 워크트리·폴더가 접혀 있는지.
+    #[must_use]
+    pub fn is_collapsed(&self, path: &Path) -> bool {
+        self.collapsed.contains(path)
+    }
+
+    /// 상태·PR 그룹 헤더가 접혀 있는지.
+    #[must_use]
+    pub fn is_group_collapsed(&self, key: GroupKey) -> bool {
+        self.collapsed_groups.contains(&key)
+    }
+
+    /// 워크트리 카드의 하위 세션 행이 펼쳐져 있는지.
+    #[must_use]
+    pub fn is_card_expanded(&self, path: &Path) -> bool {
+        self.expanded_cards.contains(path)
+    }
+
+    /// 마지막으로 선택·활성화된 워크트리/폴더 경로.
+    #[must_use]
+    pub fn selected_worktree(&self) -> Option<&Path> {
+        self.selected_worktree.as_deref()
+    }
+
+    /// 선택된 워크트리/폴더 경로를 갱신하고 영속화한다(OWE-842).
+    pub fn select_worktree(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.selected_worktree != path {
+            self.selected_worktree = path;
+            self.persist(cx);
+        }
+    }
+
     /// 호스트 섹션 접기/펼치기.
     pub fn fold_host(&mut self, host: &HostId, open: Option<bool>, cx: &mut Context<Self>) {
         let closed = self.collapsed_hosts.contains(host);
@@ -821,7 +906,7 @@ impl Sidebar {
         } else {
             self.collapsed_hosts.insert(host.clone());
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     /// 끊긴 원격 호스트의 '다시 연결' 버튼을 눌렀을 때 상태를 `Connecting`으로 바꾸고 재연결을 요청한다.
@@ -1168,6 +1253,14 @@ impl Sidebar {
         let changed = self.focused != session;
         self.focused = session;
         let cleared = session.is_some_and(|id| self.unread.remove(&id));
+        if let Some(wt) = session
+            .and_then(|id| self.folder(id))
+            .map(Path::to_path_buf)
+            && self.selected_worktree.as_ref() != Some(&wt)
+        {
+            self.selected_worktree = Some(wt);
+            self.write_state();
+        }
         if changed || cleared {
             cx.notify();
         }
@@ -1204,8 +1297,13 @@ impl Sidebar {
                 }
             }
         }
+        if target_wt.is_some() && self.selected_worktree != target_wt {
+            self.selected_worktree.clone_from(&target_wt);
+        }
         if uncollapsed {
-            self.rebuild(cx);
+            self.persist(cx);
+        } else if target_wt.is_some() {
+            self.write_state();
         }
         let idx = self.rows.iter().position(|r| match r {
             Row::Worktree(p) | Row::Folder(p) => target_wt.as_ref() == Some(p),
@@ -1220,7 +1318,7 @@ impl Sidebar {
     }
 
     /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
-    pub(super) fn toggle_card_sessions(&mut self, path: &Path, cx: &mut Context<Self>) {
+    pub fn toggle_card_sessions(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.expanded_cards.remove(path) {
             if let Some(c) = self.cursor
                 && matches!(
@@ -1233,11 +1331,12 @@ impl Sidebar {
                     .iter()
                     .position(|r| matches!(r, Row::Worktree(p) if p == path));
             }
+            self.write_state();
             cx.notify();
         } else {
             self.expanded_cards.insert(path.to_path_buf());
             self.collapsed.remove(path);
-            self.rebuild(cx);
+            self.persist(cx);
         }
     }
 
@@ -1370,6 +1469,14 @@ impl Sidebar {
             }
             self.rows = rows;
             self.row_hosts = row_hosts;
+        }
+        if self.cursor.is_none()
+            && let Some(sel) = &self.selected_worktree
+        {
+            self.cursor = self.rows.iter().position(|r| match r {
+                Row::Worktree(p) | Row::Folder(p) | Row::Repository(p) => p == sel,
+                _ => false,
+            });
         }
         self.cursor = self
             .cursor
@@ -1536,7 +1643,7 @@ impl Sidebar {
         }));
     }
 
-    fn persist(&mut self, cx: &mut Context<Self>) {
+    fn write_state(&mut self) {
         let persisted_parents = if self.state_dir().is_some() {
             BTreeMap::new()
         } else {
@@ -1548,10 +1655,21 @@ impl Sidebar {
                 collapsed_lineage: self.collapsed_lineage.clone(),
                 sleeping_worktrees: self.sleeping_worktrees.clone(),
             };
-            if let Err(e) = save_state(path, &self.prefs, &self.options, &lin) {
+            let ui = UiExpansionState {
+                collapsed: self.collapsed.clone(),
+                collapsed_groups: self.collapsed_groups.clone(),
+                collapsed_hosts: self.collapsed_hosts.clone(),
+                expanded_cards: self.expanded_cards.clone(),
+                selected_worktree: self.selected_worktree.clone(),
+            };
+            if let Err(e) = save_state(path, &self.prefs, &self.options, &lin, &ui) {
                 self.error = Some(e.to_string());
             }
         }
+    }
+
+    fn persist(&mut self, cx: &mut Context<Self>) {
+        self.write_state();
         self.rebuild(cx);
     }
 
@@ -1602,6 +1720,12 @@ impl Sidebar {
             .cursor
             .map_or(0, |i| i.saturating_add_signed(delta).min(last));
         self.cursor = Some(next);
+        if let Some(folder) = self.cursor_folder()
+            && self.selected_worktree.as_ref() != Some(&folder)
+        {
+            self.selected_worktree = Some(folder);
+            self.write_state();
+        }
         self.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         cx.notify();
     }
@@ -1639,6 +1763,12 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.cursor = Some(index);
+        if let Some(wt) = self.folder_on(&host, id).map(Path::to_path_buf)
+            && self.selected_worktree.as_ref() != Some(&wt)
+        {
+            self.selected_worktree = Some(wt);
+            self.write_state();
+        }
         self.action_host = Some(host);
         cx.emit(Selected(id));
         cx.notify();
@@ -1653,6 +1783,10 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.cursor = Some(index);
+        if self.selected_worktree.as_ref() != Some(&path) {
+            self.selected_worktree = Some(path.clone());
+            self.write_state();
+        }
         if let Some(sess_id) = self
             .snapshot_for(&host)
             .sessions
@@ -1731,7 +1865,7 @@ impl Sidebar {
     }
 
     /// `open`: `None`이면 뒤집고, `Some(true)`면 펼치고, `Some(false)`면 접는다.
-    fn fold(&mut self, path: &Path, open: Option<bool>, cx: &mut Context<Self>) {
+    pub fn fold(&mut self, path: &Path, open: Option<bool>, cx: &mut Context<Self>) {
         let closed = self.collapsed.contains(path);
         if open.unwrap_or(closed) {
             self.collapsed.remove(path);
@@ -1740,7 +1874,7 @@ impl Sidebar {
             self.collapsed.insert(path.to_path_buf());
             self.expanded_cards.remove(path);
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     fn fold_cursor(&mut self, open: bool, cx: &mut Context<Self>) {

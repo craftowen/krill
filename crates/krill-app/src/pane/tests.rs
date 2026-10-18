@@ -1013,3 +1013,41 @@ fn ensure_session_in_refuses_fork_without_feat_session_fork() {
     assert!(server.join().unwrap().is_none());
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// OWE-842 시나리오 B: 죽은 세션의 콜드 스크롤백 + 마지막 화면이 새 라이브 세션 연결 뒤에도
+/// 스크롤백 위쪽에 보존되어 위로 스크롤하면 이전 세션 로그를 볼 수 있다.
+#[test]
+fn owe_842_cold_to_live_preserves_prior_scrollback_and_screen_above_new_session() {
+    let mut p = Pane::<Vec<u8>>::default();
+    p.show_cold(
+        SessionId(10),
+        Cold {
+            screen: snapshot(["cold-scr1", "cold-scr2", ""]),
+            history: vec![row("cold-hist1"), row("cold-hist2")],
+        },
+    )
+    .unwrap();
+    assert!(p.is_cold());
+
+    // 새 라이브 세션(SessionId(11))으로 전환하면 직전 콜드 히스토리 2행 + 콜드 화면 비어있지 않은 2행 = 총 4행이 prior로 보존된다.
+    p.link(SessionId(11), 1, Vec::new(), input::FEAT_INPUT, Now::get());
+    assert!(!p.is_cold());
+    update(&mut p, 1, snapshot(["live-1", "live-2", "live-3"]));
+    assert_eq!(p.shown().rows[0], row("live-1"));
+
+    // 위로 2행 스크롤하면 prior의 아랫부분(cold-scr1, cold-scr2)과 live-1이 보인다.
+    assert!(p.scroll(2));
+    let shown2 = p.shown();
+    assert_eq!(
+        shown2.rows,
+        vec![row("cold-scr1"), row("cold-scr2"), row("live-1")]
+    );
+
+    // 위로 끝까지(총 4행) 스크롤하면 가장 오래된 콜드 스크롤백부터 보인다.
+    assert!(p.scroll(10));
+    let shown4 = p.shown();
+    assert_eq!(
+        shown4.rows,
+        vec![row("cold-hist1"), row("cold-hist2"), row("cold-scr1")]
+    );
+}

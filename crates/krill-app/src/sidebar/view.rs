@@ -796,7 +796,12 @@ impl Sidebar {
             });
         let is_active_worktree = selected
             || focused_wt == Some(path)
-            || (focused_wt.is_none() && self.cursor.is_none() && is_first_default);
+            || (focused_wt.is_none()
+                && self.cursor.is_none()
+                && self
+                    .selected_worktree
+                    .as_deref()
+                    .map_or(is_first_default, |sel| sel == path));
         let (fold, pin, edit, fresh, card_path, fresh_host) = (
             path.to_path_buf(),
             path.to_path_buf(),

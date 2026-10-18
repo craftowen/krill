@@ -734,3 +734,188 @@ fn preview_tab_reuses_pane_until_pinned_or_closed() {
     assert_ne!(p5, p4);
     assert_eq!(l.tabs().len(), 3);
 }
+
+/// OWE-842: 창 크기/위치/모드, 사이드바/우측 패널 접힘·활성 탭, 파일 탭 커서/편집 모드가 `layout.bin`에 저장·복원되며,
+/// 꼬리(`LayoutTail`)가 없는 기존 v6 `layout.bin`도 그대로 읽힌다.
+#[test]
+fn owe_842_layout_tail_persists_window_sidebar_panel_and_file_states() {
+    let mut l = Layout::default();
+    let file_pane = l.open_file(PathBuf::from("/repo/src/lib.rs"));
+    let bounds = SavedWindowBounds {
+        x: 120.0,
+        y: 80.0,
+        width: 1440.0,
+        height: 900.0,
+        mode: SavedWindowMode::Fullscreen,
+    };
+    assert!(bounds.is_valid());
+    assert!(
+        !(SavedWindowBounds {
+            width: MIN_WINDOW_WIDTH - 1.0,
+            ..bounds
+        })
+        .is_valid()
+    );
+    assert!(l.set_window_bounds(bounds));
+    assert!(!l.set_window_bounds(bounds));
+    l.sidebar_collapsed = true;
+    l.panel_collapsed = false;
+    assert!(l.set_panel_tab(crate::diff::PanelTab::Search));
+    l.set_file_state(
+        file_pane,
+        SavedFileState {
+            line: 42,
+            column: 7,
+            preview: true,
+        },
+    );
+
+    let path = temp_path("owe-842-tail");
+    l.save(&path).unwrap();
+    assert_eq!(Layout::peek_window_bounds(&path), Some(bounds));
+
+    let loaded = Layout::load(&path).unwrap();
+    assert_eq!(loaded, l);
+    assert_eq!(loaded.window_bounds(), Some(bounds));
+    assert!(loaded.sidebar_collapsed);
+    assert!(!loaded.panel_collapsed);
+    assert_eq!(loaded.panel_tab(), crate::diff::PanelTab::Search);
+    assert_eq!(
+        loaded.file_state(file_pane),
+        Some(SavedFileState {
+            line: 42,
+            column: 7,
+            preview: true,
+        })
+    );
+
+    // 파일 탭을 닫으면 해당 파일 칸의 SavedFileState도 정리된다.
+    let mut closed = loaded.clone();
+    closed.close_tab(1);
+    assert_eq!(closed.file_state(file_pane), None);
+
+    // 꼬리 없는 기존 v6(9-튜플) 바이트는 기본 꼬리로 하위 호환 복원된다.
+    let v6_no_tail_path = temp_path("owe-842-v6-no-tail");
+    let base = Layout::default();
+    let mut raw = vec![FORMAT_VERSION];
+    raw.extend(
+        postcard::to_stdvec(&(
+            &base.tabs,
+            base.active,
+            base.sidebar_width,
+            base.panel_width,
+            base.next_pane,
+            &base.sessions,
+            &base.launches,
+            &base.files,
+            &base.hosts,
+        ))
+        .unwrap(),
+    );
+    fs::create_dir_all(v6_no_tail_path.parent().unwrap()).unwrap();
+    fs::write(&v6_no_tail_path, raw).unwrap();
+    assert_eq!(Layout::load(&v6_no_tail_path).unwrap(), base);
+}
+
+/// OWE-842: 재스폰용 최신 cwd는 폴더(`launches`)와 분리 보관되어 `layout.bin` 꼬리로 영속되고,
+/// 칸을 닫으면 함께 정리된다.
+#[test]
+fn owe_842_respawn_cwd_persists_separately_and_prunes_with_pane() {
+    let mut l = Layout::default();
+    let pane = l.active_tab().focused;
+    l.set_session(pane, SessionId(11));
+    l.set_launch(
+        pane,
+        Create {
+            program: Program::Login,
+            cwd: b"/repo/tree".to_vec(),
+            cols: 80,
+            rows: 24,
+            account: None,
+        },
+    );
+    // 같은 cwd면 저장 불필요, 빈 cwd·없는 칸이면 무시.
+    assert!(l.set_respawn_cwd(pane, b"/repo/tree/src".to_vec()));
+    assert!(!l.set_respawn_cwd(pane, b"/repo/tree/src".to_vec()));
+    assert!(!l.set_respawn_cwd(pane, Vec::new()));
+    assert!(!l.set_respawn_cwd(PaneId(999), b"/tmp/x".to_vec()));
+    assert_eq!(l.respawn_cwd(pane), Some(&b"/repo/tree/src"[..]));
+
+    let path = temp_path("owe-842-respawn");
+    l.save(&path).unwrap();
+    let loaded = Layout::load(&path).unwrap();
+    assert_eq!(loaded, l);
+    // 폴더는 워크트리 루트 그대로, 재스폰 cwd는 최신 cwd로 각각 복원.
+    assert_eq!(
+        loaded.launch(pane).map(|c| c.cwd.as_slice()),
+        Some(&b"/repo/tree"[..])
+    );
+    assert_eq!(loaded.respawn_cwd(pane), Some(&b"/repo/tree/src"[..]));
+
+    // 칸을 닫으면(탭 닫기) 재스폰 보관도 정리된다.
+    let mut closed = loaded.clone();
+    closed.close_tab(0);
+    assert!(closed.tabs().is_empty());
+    assert_eq!(closed.respawn_cwd(pane), None);
+    assert!(closed.is_valid());
+}
+
+/// OWE-842: `respawn_cwds`가 붙기 전 중간 커밋의 5-필드 꼬리도 읽힌다(재스폰 보관만 비어 있음).
+#[test]
+fn owe_842_legacy_five_field_tail_loads_with_empty_respawn() {
+    #[derive(Serialize)]
+    struct OldTail<'a> {
+        window_bounds: &'a Option<SavedWindowBounds>,
+        sidebar_collapsed: &'a bool,
+        panel_collapsed: &'a bool,
+        panel_tab: &'a crate::diff::PanelTab,
+        file_states: &'a BTreeMap<PaneId, SavedFileState>,
+    }
+    let mut l = Layout::default();
+    let file_pane = l.open_file(PathBuf::from("/repo/src/lib.rs"));
+    l.sidebar_collapsed = true;
+    l.set_file_state(
+        file_pane,
+        SavedFileState {
+            line: 1,
+            column: 2,
+            preview: false,
+        },
+    );
+
+    let path = temp_path("owe-842-legacy-tail");
+    let panel_tab = l.panel_tab();
+    let file_states = BTreeMap::from([(file_pane, l.file_state(file_pane).expect("file state"))]);
+    let mut raw = vec![FORMAT_VERSION];
+    raw.extend(
+        postcard::to_stdvec(&(
+            &l.tabs,
+            l.active,
+            l.sidebar_width,
+            l.panel_width,
+            l.next_pane,
+            &l.sessions,
+            &l.launches,
+            &l.files,
+            &l.hosts,
+        ))
+        .unwrap(),
+    );
+    raw.extend(
+        postcard::to_stdvec(&OldTail {
+            window_bounds: &l.window_bounds,
+            sidebar_collapsed: &l.sidebar_collapsed,
+            panel_collapsed: &l.panel_collapsed,
+            panel_tab: &panel_tab,
+            file_states: &file_states,
+        })
+        .unwrap(),
+    );
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, raw).unwrap();
+
+    let loaded = Layout::load(&path).unwrap();
+    assert_eq!(loaded, l);
+    assert!(loaded.sidebar_collapsed);
+    assert_eq!(loaded.respawn_cwd(file_pane), None);
+}
