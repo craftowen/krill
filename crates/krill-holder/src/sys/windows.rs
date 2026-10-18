@@ -411,8 +411,10 @@ pub struct Process {
 impl Process {
     pub fn status(&self) -> io::Result<Option<i32>> {
         // SAFETY: borrowed process handle, nonblocking wait.
-        if unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } != 0 {
-            return Ok(None);
+        match unsafe { WaitForSingleObject(self.handle.as_raw_handle(), 0) } {
+            0 => {}
+            258 => return Ok(None),
+            _ => return Err(io::Error::last_os_error()),
         }
         let mut code = 0;
         // SAFETY: live handle and writable DWORD output.
@@ -748,6 +750,141 @@ pub fn restore_socket(bytes: &[u8]) -> io::Result<OwnedSocket> {
 fn wsa_error() -> io::Error {
     // SAFETY: retrieves this thread's Winsock error code.
     io::Error::from_raw_os_error(unsafe { WSAGetLastError() })
+}
+
+use std::io::{Read, Write};
+use std::os::windows::io::IntoRawHandle;
+const STATE_ENV: &str = "KRILL_HOLDER_STATE";
+pub fn handoff(
+    path: &OsStr,
+    args: &[OsString],
+    metadata: &str,
+    handles: &[BorrowedHandle<'_>],
+    listener: Option<BorrowedSocket<'_>>,
+) -> io::Result<()> {
+    let (boot_read, boot_write) = pipe()?;
+    let (ack_read, ack_write) = pipe()?;
+    let mut copies = handles
+        .iter()
+        .copied()
+        .chain([boot_read.as_handle(), ack_write.as_handle()])
+        .map(inheritable)
+        .collect::<io::Result<Vec<_>>>()?;
+    let values = copies
+        .iter()
+        .map(|h| (h.as_raw_handle() as usize).to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut env: Vec<_> = std::env::vars_os()
+        .filter(|(k, _)| k != STATE_ENV && k != LINK_ENV)
+        .collect();
+    env.push((STATE_ENV.into(), format!("{values}\n{metadata}").into()));
+    let process = spawn(
+        path,
+        args,
+        &env,
+        None,
+        None,
+        &copies.iter().map(AsHandle::as_handle).collect::<Vec<_>>(),
+        None,
+    )?;
+    copies.clear();
+    drop(ack_write);
+    drop(boot_read);
+    let info = listener
+        .map(|s| duplicate_socket(s, process.pid))
+        .transpose()?
+        .unwrap_or_default();
+    let mut boot = std::fs::File::from(boot_write);
+    boot.write_all(
+        &u32::try_from(info.len())
+            .map_err(|_| io::ErrorKind::InvalidData)?
+            .to_le_bytes(),
+    )?;
+    boot.write_all(&info)?;
+    drop(boot);
+    let mut reader = std::fs::File::from(ack_read);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while available(reader.as_handle()).unwrap_or_default() == 0 {
+        if process.status()?.is_some() || std::time::Instant::now() >= deadline {
+            terminate(&process).ok();
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let mut ack = [0];
+    reader.read_exact(&mut ack)?;
+    if ack != [1] {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(())
+}
+type Handoff = (String, Vec<OwnedHandle>, std::fs::File, Option<OwnedSocket>);
+pub fn take_handoff() -> io::Result<Option<Handoff>> {
+    let Some(state) = std::env::var_os(STATE_ENV) else {
+        return Ok(None);
+    };
+    let state = state.to_str().ok_or(io::ErrorKind::InvalidData)?;
+    let (values, metadata) = state.split_once('\n').ok_or(io::ErrorKind::InvalidData)?;
+    let values = values
+        .split(',')
+        .map(|v| v.parse().map_err(|_| io::ErrorKind::InvalidData.into()))
+        .collect::<io::Result<Vec<u64>>>()?;
+    let mut handles = received_handles(values)?;
+    let ack = handles.pop().ok_or(io::ErrorKind::InvalidData)?;
+    let mut boot = std::fs::File::from(handles.pop().ok_or(io::ErrorKind::InvalidData)?);
+    let mut len = [0; 4];
+    boot.read_exact(&mut len)?;
+    let len = usize::try_from(u32::from_le_bytes(len)).map_err(|_| io::ErrorKind::InvalidData)?;
+    if len != 0 && len != size_of::<WSAPROTOCOL_INFOW>() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut info = vec![0; len];
+    boot.read_exact(&mut info)?;
+    let listener = (!info.is_empty())
+        .then(|| restore_socket(&info))
+        .transpose()?;
+    Ok(Some((metadata.to_owned(), handles, ack.into(), listener)))
+}
+impl Console {
+    pub fn pack(api: Api, pty: Pty) -> io::Result<Self> {
+        let pack = api.pack.ok_or(io::ErrorKind::Unsupported)?;
+        let signal = pty.signal.try_clone()?;
+        let reference = pty
+            .reference
+            .as_ref()
+            .ok_or(io::ErrorKind::InvalidData)?
+            .try_clone()?;
+        let process = pty
+            .process
+            .as_ref()
+            .ok_or(io::ErrorKind::InvalidData)?
+            .try_clone()?;
+        let mut h = 0;
+        // SAFETY: live independent copies transferred to HPCON on success; matches conpty.h ABI.
+        hr(unsafe {
+            pack(
+                process.as_raw_handle(),
+                reference.as_raw_handle(),
+                signal.as_raw_handle(),
+                &raw mut h,
+            )
+        })?;
+        // Successful Pack adopts these copies. Pty retains its separate original copies.
+        let _transferred = [
+            signal.into_raw_handle(),
+            reference.into_raw_handle(),
+            process.into_raw_handle(),
+        ];
+        Ok(Self {
+            handle: Some(h),
+            api,
+            pty,
+        })
+    }
+    pub fn relinquish(&mut self) {
+        self.handle = None;
+    }
 }
 
 #[cfg(test)]

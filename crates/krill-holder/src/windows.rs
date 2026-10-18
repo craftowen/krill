@@ -11,7 +11,7 @@ use krill_proto::{
     },
 };
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Write};
 use std::os::windows::io::{AsHandle, AsSocket, OwnedHandle, OwnedSocket};
 use std::time::{Duration, Instant};
 
@@ -55,8 +55,17 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         previous: None,
         listener: None,
     };
+    if let Some((metadata, handles, mut ack, listener)) = sys::take_handoff()? {
+        let req = h.restore(&metadata, handles)?;
+        h.listener = listener;
+        h.send(&h.hello(), None)?;
+        h.send(&FromHolder::Done { req }, None)?;
+        ack.write_all(&[1])?;
+    }
     loop {
-        h.poll();
+        if h.poll() {
+            return Ok(());
+        }
         std::thread::sleep(Duration::from_millis(10));
     }
 }
@@ -123,7 +132,7 @@ impl Holder {
                 d.target.as_handle(),
             )
     }
-    fn poll(&mut self) {
+    fn poll(&mut self) -> bool {
         if self.daemon.is_none() && Instant::now() >= self.restart {
             match self.start() {
                 Ok(d) => self.daemon = Some(d),
@@ -167,7 +176,9 @@ impl Holder {
         match packets {
             Some(Ok(packets)) => {
                 for p in packets {
-                    self.request(p);
+                    if self.request(p) {
+                        return true;
+                    }
                 }
             }
             Some(Err(_)) => {
@@ -196,6 +207,7 @@ impl Holder {
         for m in events {
             self.send(&m, None).ok();
         }
+        false
     }
     fn failed(&mut self) {
         self.streak = self.streak.saturating_add(1);
@@ -217,9 +229,26 @@ impl Holder {
                     .min(30_000)
             });
     }
-    fn request(&mut self, packet: Packet) {
+    fn request(&mut self, packet: Packet) -> bool {
         let req = request_id(&packet.body).unwrap_or(0);
         let decoded = ToHolder::decode(packet.frame());
+        if let Ok(ToHolder::UpgradeHolder { req, ref path }) = decoded {
+            let result = text(path.clone()).and_then(|path| self.upgrade(&path, req));
+            match result {
+                Ok(()) => return true,
+                Err(e) => {
+                    self.send(
+                        &FromHolder::Failed {
+                            req,
+                            errno: e.raw_os_error().unwrap_or(5),
+                        },
+                        None,
+                    )
+                    .ok();
+                    return false;
+                }
+            }
+        }
         drop(packet);
         let result = match decoded {
             Ok(m) => self.handle(m),
@@ -241,6 +270,7 @@ impl Holder {
                 .ok();
             }
         }
+        false
     }
     fn handle(&mut self, m: ToHolder) -> io::Result<Option<FromHolder>> {
         let req = m.req();
@@ -266,8 +296,8 @@ impl Holder {
                     .map(|(k, v)| Ok((text(k)?, text(v)?)))
                     .collect::<io::Result<Vec<_>>>()?;
                 let cwd = text(cwd)?;
-                let mut console = Console::create(self.api, size)?;
                 let job = Job::new()?;
+                let mut console = Console::create(self.api, size)?;
                 let process = match sys::spawn(
                     path,
                     args,
@@ -332,21 +362,122 @@ impl Holder {
                 self.previous = Some(std::mem::replace(&mut self.path, path));
                 self.streak = 0;
             }
-            ToHolder::UpgradeHolder { .. } => {
-                return Err(io::Error::from_raw_os_error(
-                    if self.api.inbox() && !self.sessions.is_empty() {
-                        16
-                    } else {
-                        38
-                    },
-                ));
-            }
             ToHolder::HoldListener { info, .. } => {
                 self.listener = Some(sys::restore_socket(&info)?);
             }
-            ToHolder::Adopt { .. } => return Err(io::Error::from_raw_os_error(38)),
+            ToHolder::Adopt { .. } | ToHolder::UpgradeHolder { .. } => {
+                return Err(io::Error::from_raw_os_error(38));
+            }
         }
         Ok(Some(FromHolder::Done { req }))
+    }
+    fn upgrade(&mut self, path: &std::ffi::OsStr, req: u32) -> io::Result<()> {
+        if self.api.inbox() && !self.sessions.is_empty() {
+            return Err(io::Error::from_raw_os_error(16));
+        }
+        if self.sessions.iter().any(|s| s.deadline.is_some()) {
+            return Err(io::Error::from_raw_os_error(16));
+        }
+        let d = self.daemon.as_ref().ok_or(io::ErrorKind::NotConnected)?;
+        let link = d.link.as_ref().ok_or(io::ErrorKind::NotConnected)?;
+        if link.has_pending() {
+            return Err(io::Error::from_raw_os_error(16));
+        }
+        let mut metadata = format!("{req} {}\n", d.process.pid);
+        let mut handles = vec![
+            d.process.handle.as_handle(),
+            d.target.as_handle(),
+            link.input.as_handle(),
+            link.output.as_handle(),
+        ];
+        for s in &self.sessions {
+            use std::fmt::Write as _;
+            writeln!(
+                metadata,
+                "{} {} {}",
+                s.id.0,
+                s.process.pid,
+                s.status
+                    .map_or_else(|| "live".to_owned(), |v| v.to_string())
+            )
+            .map_err(io::Error::other)?;
+            handles.push(s.process.handle.as_handle());
+            handles.extend(s.console.pty.handles());
+            handles.extend([s.job.handle.as_handle(), s.job.port.as_handle()]);
+        }
+        let args = std::iter::once(self.path.clone())
+            .chain(self.args.clone())
+            .collect::<Vec<_>>();
+        sys::handoff(
+            path,
+            &args,
+            &metadata,
+            &handles,
+            self.listener.as_ref().map(AsSocket::as_socket),
+        )?;
+        for s in &mut self.sessions {
+            s.console.relinquish();
+        }
+        Ok(())
+    }
+    fn restore(&mut self, metadata: &str, handles: Vec<OwnedHandle>) -> io::Result<u32> {
+        let mut words = metadata.split_whitespace();
+        let req = number(words.next())?;
+        let pid = number(words.next())?;
+        let remaining = words.clone().count();
+        if !remaining.is_multiple_of(3) || handles.len() != 4 + remaining / 3 * 8 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut handles = handles.into_iter();
+        let mut next = || handles.next().ok_or(io::ErrorKind::InvalidData.into());
+        let process = Process {
+            handle: next()?,
+            pid,
+        };
+        let target = next()?;
+        let link = Link::from_handles(next()?, next()?);
+        self.daemon = Some(Daemon {
+            process,
+            target,
+            link: Some(link),
+            started: Instant::now(),
+        });
+        while let Some(id) = words.next() {
+            let id = SessionId(number(Some(id))?);
+            let pid = number(words.next())?;
+            let status = words.next().ok_or(io::ErrorKind::InvalidData)?;
+            let status = if status == "live" {
+                None
+            } else {
+                Some(number(Some(status))?)
+            };
+            let process = Process {
+                handle: next()?,
+                pid,
+            };
+            let pty =
+                crate::link::Pty::from_handles((0..5).map(|_| next()).collect::<io::Result<_>>()?)?;
+            let mut console = Console::pack(self.api, pty)?;
+            if status.is_some() {
+                console.close();
+            }
+            let job = Job {
+                handle: next()?,
+                port: next()?,
+            };
+            self.sessions.push(Session {
+                id,
+                process,
+                console,
+                job,
+                status,
+                deadline: None,
+            });
+        }
+        if handles.next().is_some() {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(req)
     }
     fn live(&mut self, id: SessionId) -> io::Result<&mut Session> {
         self.sessions
@@ -361,4 +492,10 @@ fn text(bytes: Vec<u8>) -> io::Result<OsString> {
         return Err(io::ErrorKind::InvalidInput.into());
     }
     Ok(s.into())
+}
+
+fn number<T: std::str::FromStr>(word: Option<&str>) -> io::Result<T> {
+    word.ok_or(io::ErrorKind::InvalidData)?
+        .parse()
+        .map_err(|_| io::ErrorKind::InvalidData.into())
 }
