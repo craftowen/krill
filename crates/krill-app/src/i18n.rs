@@ -401,6 +401,11 @@ catalog! {
         PINNED_CLOSE_CONFIRM => ("탭 닫기", "Close Tab"),
         PINNED_CLOSE_CANCEL => ("취소", "Cancel"),
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
+        EMPTY_NEW_AGENT => ("새 에이전트", "New agent"),
+        EMPTY_OPEN_FILE => ("파일 열기", "Open file"),
+        SHORTCUT_NEW_TAB => ("⌘T", "⌘T"),
+        SHORTCUT_NEW_AGENT_TAB => ("⌘⌥T", "⌘⌥T"),
+        SHORTCUT_QUICK_OPEN => ("⌘P", "⌘P"),
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),

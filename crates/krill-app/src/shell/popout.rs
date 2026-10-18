@@ -97,7 +97,9 @@ fn open_floating(
                         if shell.layout.tabs().is_empty() {
                             shell.layout.new_tab();
                         }
-                        let pane = shell.layout.active_tab().focused;
+                        let Some(pane) = shell.layout.focused() else {
+                            return;
+                        };
                         if shell.layout.session(pane) != Some(session) {
                             shell.commit_ime(pane, Some(window), cx);
                             shell.live.clear();
@@ -126,12 +128,16 @@ fn open_floating(
             shell.panel_collapsed = true;
             shell.sidebar.update(cx, |s, cx| s.set_visible(false, cx));
             shell.terminal_theme = theme;
-            let pane = shell.layout.active_tab().focused;
-            if let Some(t) = &target {
-                shell.layout.set_host(pane, t.host().clone());
-                shell.paths = t.local_paths().cloned();
+            if shell.layout.tabs().is_empty() {
+                shell.layout.new_tab();
             }
-            shell.layout.set_session(pane, session);
+            if let Some(pane) = shell.layout.focused() {
+                if let Some(t) = &target {
+                    shell.layout.set_host(pane, t.host().clone());
+                    shell.paths = t.local_paths().cloned();
+                }
+                shell.layout.set_session(pane, session);
+            }
             // AS-21: 링크를 직접 대입하지 않고 `set_link`로 연결한다. 데몬 상태를
             // "연결됨"으로 확정하고 에이전트 목록·계정·분리 세션을 함께 불러온다.
             shell.set_link(Link::Up, cx);
@@ -844,8 +850,11 @@ impl Shell {
     }
 
     pub(super) fn float_terminal(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let pane = self.layout.active_tab().focused;
-        let target = if self.layout.session(pane) == Some(session) {
+        let target = if let Some(pane) = self
+            .layout
+            .focused()
+            .filter(|&pane| self.layout.session(pane) == Some(session))
+        {
             self.target_for_pane(pane)
         } else {
             self.local_target()

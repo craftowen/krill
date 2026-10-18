@@ -293,10 +293,11 @@ impl Shell {
         let mut forked_pane = None;
         self.change(true, cx, |l| {
             l.new_tab_after(tab_idx);
-            let p = l.active_tab().focused;
-            l.set_host(p, host);
-            l.set_launch(p, create);
-            forked_pane = Some(p);
+            if let Some(p) = l.focused() {
+                l.set_host(p, host);
+                l.set_launch(p, create);
+                forked_pane = Some(p);
+            }
         });
         let agent_name = self
             .agents
@@ -414,10 +415,11 @@ impl Shell {
         let mut target_pane = source_pane;
         self.change(true, cx, |l| {
             l.new_tab_after(tab_idx);
-            let p = l.active_tab().focused;
-            l.set_host(p, host);
-            l.set_launch(p, create);
-            target_pane = p;
+            if let Some(p) = l.focused() {
+                l.set_host(p, host);
+                l.set_launch(p, create);
+                target_pane = p;
+            }
         });
         self.notice = Some(text::HANDOFF_WAITING.format(&[("agent", &agent_id)]));
         cx.notify();
@@ -450,7 +452,9 @@ impl Shell {
         let bytes = brief.as_bytes().to_vec();
         cx.write_to_clipboard(ClipboardItem::new_string(brief));
         self.new_agent(agent_id.to_owned(), cx);
-        let pane = self.layout.active_tab().focused;
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
         self.notice = Some(text::HANDOFF_WAITING.format(&[("agent", agent_id)]));
         cx.notify();
         self.start_handoff_delivery(pane, agent_id.to_owned(), bytes, BOOT_TIMEOUT, cx);

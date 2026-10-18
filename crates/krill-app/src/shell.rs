@@ -1275,8 +1275,10 @@ impl Shell {
         let host = self.launch_host.clone();
         self.change(true, cx, |l| {
             l.new_tab();
-            if host.is_remote() {
-                l.set_host(l.active_tab().focused, host);
+            if host.is_remote()
+                && let Some(pane) = l.focused()
+            {
+                l.set_host(pane, host);
             }
         });
     }
@@ -1595,17 +1597,18 @@ impl Shell {
                 .unwrap_or_else(|| folder::default_folder().as_os_str().as_bytes().to_vec());
             self.change(true, cx, |l| {
                 l.new_tab();
-                let pane = l.active_tab().focused;
-                l.set_launch(
-                    pane,
-                    Create {
-                        account: None,
-                        program: Program::Login,
-                        cwd,
-                        cols: pane::SIZE.0,
-                        rows: pane::SIZE.1,
-                    },
-                );
+                if let Some(pane) = l.focused() {
+                    l.set_launch(
+                        pane,
+                        Create {
+                            account: None,
+                            program: Program::Login,
+                            cwd,
+                            cols: pane::SIZE.0,
+                            rows: pane::SIZE.1,
+                        },
+                    );
+                }
             });
         }
         let Some(l) = self.focused_live() else {
@@ -1703,8 +1706,11 @@ impl Shell {
     /// 새 탭에서 에이전트를 지금 보이는 폴더(MK-055)로 띄운다. 선택된 실행 위치가 원격이면 원격 기본 디렉터리에서 시작한다.
     fn new_agent(&mut self, id: String, cx: &mut Context<Self>) {
         let host = self.launch_host.clone();
-        let focused = self.layout.active_tab().focused;
-        let cwd = if host.is_remote() && *self.layout.host(focused) != host {
+        let same_host = self
+            .layout
+            .focused()
+            .is_some_and(|focused| *self.layout.host(focused) == host);
+        let cwd = if host.is_remote() && !same_host {
             PathBuf::new()
         } else {
             self.folder()
@@ -2431,6 +2437,7 @@ impl Shell {
                 };
             }
         }
+        l.selection = Some(sel);
         cx.notify();
     }
 
@@ -2438,7 +2445,6 @@ impl Shell {
     /// 선택은 한 칸짜리라도 유지한다). 끌던 중이었으면 `true`.
     fn select_end(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
         let Some(l) = self.live.get_mut(&pane).filter(|l| l.selecting) else {
-        l.selection = Some(sel);
             return false;
         };
         l.selecting = false;
@@ -2627,12 +2633,14 @@ impl Shell {
                 l.focus(pane);
             } else {
                 l.new_tab();
-                let pane = l.active_tab().focused;
-                l.set_host(pane, host);
-                l.set_session(pane, session);
+                if let Some(pane) = l.focused() {
+                    l.set_host(pane, host);
+                    l.set_session(pane, session);
+                }
             }
-            if let Some(folder) = folder {
-                let pane = l.active_tab().focused;
+            if let Some(folder) = folder
+                && let Some(pane) = l.focused()
+            {
                 let mut launch = l.launch(pane).cloned().unwrap_or(Create {
                     account: None,
                     program: Program::Login,
@@ -3557,7 +3565,10 @@ impl Render for Shell {
                     .get(self.layout.active())
                     .map(|t| t.root.clone())
             };
-            root.map(|r| self.render_tree(&r, &mut Vec::new(), cx))
+            Some(match root {
+                Some(r) => self.render_tree(&r, &mut Vec::new(), cx),
+                None => Self::render_empty_workspace(cx),
+            })
         } else {
             None
         };
@@ -3593,18 +3604,10 @@ impl Render for Shell {
                 this.on_recent_tab(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
-                if this.settings.is_some() {
-                    return;
-                }
-                this.zoomed_pane = None;
-                this.change(true, cx, |l| l.split(Axis::Horizontal));
+                this.split_active(Axis::Horizontal, cx);
             }))
             .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
-                if this.settings.is_some() {
-                    return;
-                }
-                this.zoomed_pane = None;
-                this.change(true, cx, |l| l.split(Axis::Vertical));
+                this.split_active(Axis::Vertical, cx);
             }))
             .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
                 if this.settings.is_some() {
@@ -3910,6 +3913,90 @@ impl Render for Shell {
 }
 
 impl Shell {
+    pub(super) fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            return;
+        }
+        self.zoomed_pane = None;
+        if self.layout.tabs().is_empty() {
+            self.new_tab_on_launch_host(cx);
+        } else {
+            self.change(true, cx, |l| l.split(axis));
+        }
+    }
+
+    fn render_empty_workspace(cx: &mut Context<Self>) -> AnyElement {
+        let p = krill_app::ui::palette(cx);
+        let action_row = |id: &'static str, label: &'static str, shortcut: &'static str| {
+            div()
+                .id(id)
+                .debug_selector(move || id.into())
+                .cursor_pointer()
+                .px_3()
+                .py_1p5()
+                .rounded(krill_app::ui::RADIUS_SM)
+                .hover(|s| s.bg(p.accent))
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_6()
+                .text_size(krill_app::ui::TEXT_SM)
+                .text_color(p.muted_foreground)
+                .child(div().text_color(p.foreground).child(label))
+                .child(krill_app::ui::keycap(p, shortcut))
+        };
+        div()
+            .id("empty-workspace")
+            .debug_selector(|| "empty-workspace".into())
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .w(px(240.))
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        action_row(
+                            "empty-new-terminal",
+                            text::NEW_TERMINAL.get(),
+                            text::SHORTCUT_NEW_TAB.get(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.new_tab_on_launch_host(cx);
+                        })),
+                    )
+                    .child(
+                        action_row(
+                            "empty-new-agent",
+                            text::EMPTY_NEW_AGENT.get(),
+                            text::SHORTCUT_NEW_AGENT_TAB.get(),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.link == Link::Up && this.agents.is_some() {
+                                this.new_default_agent(cx);
+                            } else {
+                                this.new_tab_on_launch_host(cx);
+                            }
+                        })),
+                    )
+                    .child(
+                        action_row(
+                            "empty-open-file",
+                            text::EMPTY_OPEN_FILE.get(),
+                            text::SHORTCUT_QUICK_OPEN.get(),
+                        )
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_quick_open(window, cx);
+                        })),
+                    ),
+            )
+            .into_any_element()
+    }
+
     // Design adapted from Orca (.ref/orca/src/renderer/src/components/UpdateCard.tsx,
     // UpdateDownloadCardContent.tsx), MIT License — Copyright (c) 2026 Orca Contributors.
     fn render_update_card(cx: &mut Context<Self>) -> Option<gpui::Stateful<gpui::Div>> {

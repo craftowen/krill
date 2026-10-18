@@ -484,7 +484,7 @@ impl Layout {
             return pane;
         }
         self.new_tab();
-        let pane = self.active_tab().focused;
+        let pane = self.focused().unwrap_or(PaneId(0));
         self.files.insert(pane, path);
         pane
     }
@@ -783,13 +783,14 @@ impl Layout {
         self.record_mru(self.active);
     }
 
-    /// 활성 탭의 포커스 칸을 반으로 나누고 새 칸에 포커스한다.
+    /// 활성 탭의 포커스 칸을 반으로 나누고 새 칸에 포커스한다. 모든 탭이 닫혀 있으면 첫 탭을 만든다(OWE-869).
     pub fn split(&mut self, axis: Axis) {
-        if self.tabs.is_empty() {
+        let Some(focused) = self.focused() else {
+            self.new_tab();
             return;
-        }
+        };
         let launch = self.inherited_launch();
-        let host = self.host(self.active_tab().focused).clone();
+        let host = self.host(focused).clone();
         let new = self.alloc_pane();
         let tab = &mut self.tabs[self.active];
         let target = tab.focused;
