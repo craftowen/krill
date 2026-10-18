@@ -26,9 +26,15 @@ pub const ANTIGRAVITY_CREST_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="htt
 /// Source: `.ref/orca/src/renderer/src/lib/agent-icon-glyphs.tsx` (MIT License).
 pub const OPENCODE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M320 224V352H192V224H320Z" fill="currentColor" fill-opacity="0.28"/><path fill-rule="evenodd" clip-rule="evenodd" d="M384 416H128V96H384V416ZM320 160H192V352H320V160Z" fill="currentColor"/></svg>"#;
 
+/// `OpenCode` 내부 코어 블록 레이어 SVG (`viewBox="0 0 512 512"`).
+pub const OPENCODE_CORE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M320 224V352H192V224H320Z" fill="currentColor"/></svg>"#;
+
 /// Cursor 공식 아이소메트릭 큐브·커서 마크 SVG (`viewBox="0 0 24 24"`).
 /// Source geometry adapted from `.ref/orca/src/shared/agent-icons/cursor.png` (MIT License).
 pub const CURSOR_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" fill-rule="evenodd" d="M12 1.75L20.88 6.88V17.12L12 22.25L3.12 17.12V6.88L12 1.75ZM5.4 8.2L12 12.0V19.6L18.6 8.2H5.4Z"/></svg>"#;
+
+/// Cursor 큐브 상단 패싯 하이라이트 레이어 SVG (`viewBox="0 0 24 24"`).
+pub const CURSOR_TOP_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" d="M12 1.75L20.88 6.88L12 12.0L3.12 6.88L12 1.75Z"/></svg>"#;
 
 /// Lucide `trash-2` 아이콘 SVG(ISC License). gpui-component 기본 아이콘 번들에 휴지통이 없어 인라인으로 둔다.
 pub const TRASH_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M10 11v6"/><path d="M14 11v6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>"#;
@@ -118,14 +124,41 @@ pub const PENCIL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="c
 /// Source: `packaging/macos/krill-mono.svg` (뾰족한 두흉부·눈·더듬이·3단 아치 등갑·부채꼴 미절).
 pub const KRILL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path fill="currentColor" fill-rule="evenodd" d="M20.36 7.07C18.5 5.8 15.02 4.99 12.24 5.91C11.31 6.26 10.73 6.73 10.36 7.43L11.55 10.7C13.86 10.9 16.76 9.97 18.5 8.7C19.2 8.18 19.78 7.65 20.36 7.07ZM15.14 7.42A0.81 0.81 0 1 0 16.76 7.42A0.81 0.81 0 1 0 15.14 7.42ZM18.27 6.49C15.6 3.01 9.22 2.08 3.77 5.91C9.11 2.9 15.26 3.94 17.81 6.73ZM17.69 6.84C15.02 4.52 10.38 4.06 6.32 6.61C10.27 4.75 14.68 5.33 17.23 7.07ZM9.49 7.82A6.84 6.84 0 0 0 6.2 11.75L9.5 12.82A3.36 3.36 0 0 1 11.12 10.89ZM6.4 12.29A6.5 6.5 0 0 0 6.97 16.9L9.48 15.57A3.65 3.65 0 0 1 9.16 12.98ZM7.59 17.06A6.03 6.03 0 0 0 10.84 19.6L11.48 17.61A3.94 3.94 0 0 1 9.35 15.95ZM11.66 18.21Q15.02 16.93 18.97 17.63Q17.11 19.14 12.82 19.48ZM12.82 19.72Q16.76 19.83 18.62 21.92Q14.79 21.92 11.66 19.83Z"/></svg>"#;
 
+// ---- 프로바이더·에이전트 아이콘 크기 토큰 (OWE-875) ----
+
+/// 소형 아이콘(12px): 사이드바 개별 세션 행, 에이전트 그룹 헤더, 필터 칩(AI Vault·Jump).
+pub const ICON_XS: f32 = 12.0;
+/// 기본 소형 아이콘(13px): 워크트리 카드 에이전트 요약, 탭 바 탭, 상태바 알약, 이어하기 모달 칩.
+pub const ICON_SM: f32 = 13.0;
+/// 중형 아이콘(14px): 상태바 사용량 팝오버 헤더, 메뉴 항목, 탭 드래그 프리뷰, 최근 탭 전환기, 대시보드 카드, AI Vault·Jump 결과 행, 온보딩·설정 버튼.
+pub const ICON_MD: f32 = 14.0;
+/// 대형 아이콘(16px): 설정 > 계정 프로바이더 섹션 헤더.
+pub const ICON_LG: f32 = 16.0;
+/// 특대형 아이콘(18px): 설정 > 에이전트 프로필 카드(32×32 배지 내부).
+pub const ICON_XL: f32 = 18.0;
+
+// ---- 프로바이더·에이전트 공식 브랜드 컬러 (OWE-875) ----
+
 /// Krill 공식 리빙 코랄 브랜드 컬러(`#FF5238`).
 pub const KRILL_CORAL: u32 = 0x00ff_5238;
-/// Claude 공식 브랜드 컬러(`#D97757`).
+/// Claude 공식 브랜드 컬러(`#D97757`, Terracotta).
 pub const CLAUDE_COLOR: u32 = 0x00d9_7757;
+/// `OpenAI` / Codex 공식 브랜드 컬러(`#10A37F`, Emerald).
+pub const CODEX_COLOR: u32 = 0x0010_a37f;
 /// Google Antigravity 공식 브랜드 블루(`#4285F4`).
 pub const ANTIGRAVITY_BLUE: u32 = 0x0042_85f4;
 /// Google Antigravity 상단 크레스트 코랄(`#EA4335`).
 pub const ANTIGRAVITY_CORAL: u32 = 0x00ea_4335;
+/// `OpenCode` 공식 브랜드 시안(`#06B6D4`).
+pub const OPENCODE_COLOR: u32 = 0x0006_b6d4;
+/// `OpenCode` 내부 코어 스카이(`#67E8F9`).
+pub const OPENCODE_CORE_COLOR: u32 = 0x0067_e8f9;
+/// Cursor 공식 브랜드 인디고(`#6366F1`).
+pub const CURSOR_COLOR: u32 = 0x0063_66f1;
+/// Cursor 큐브 상단 패싯 하이라이트(`#A5B4FC`).
+pub const CURSOR_HIGHLIGHT_COLOR: u32 = 0x00a5_b4fc;
+/// 사용자 정의 커스텀 에이전트 기본 브랜드 앰버(`#F59E0B`).
+pub const CUSTOM_AGENT_COLOR: u32 = 0x00f5_9e0b;
 
 /// 에이전트 ID에 대응하는 공식 SVG 바이트를 돌려준다.
 #[must_use]
@@ -145,6 +178,7 @@ pub const fn provider_svg_bytes(provider: ProviderKind) -> &'static [u8] {
     match provider {
         ProviderKind::Claude => CLAUDE_SVG,
         ProviderKind::Codex => OPENAI_SVG,
+        // `Gemini`는 제거된 wire tombstone(krill-proto `usage.rs`)이라 빈 값을 유지한다.
         ProviderKind::Gemini => &[],
         ProviderKind::Antigravity => ANTIGRAVITY_SVG,
         ProviderKind::OpenCode => OPENCODE_SVG,
@@ -156,31 +190,67 @@ pub const fn provider_svg_bytes(provider: ProviderKind) -> &'static [u8] {
 pub fn provider_brand_color(provider: ProviderKind, fg: Hsla) -> Hsla {
     match provider {
         ProviderKind::Claude => rgb(CLAUDE_COLOR).into(),
+        ProviderKind::Codex => rgb(CODEX_COLOR).into(),
+        // `Gemini`는 제거된 wire tombstone이라 호출자 전경색으로 폴백한다.
+        ProviderKind::Gemini => fg,
         ProviderKind::Antigravity => rgb(ANTIGRAVITY_BLUE).into(),
-        ProviderKind::Codex | ProviderKind::Gemini | ProviderKind::OpenCode => fg,
+        ProviderKind::OpenCode => rgb(OPENCODE_COLOR).into(),
     }
 }
 
+/// 에이전트 ID 대표 브랜드 색을 돌려준다.
+#[must_use]
+pub fn agent_brand_color(agent_id: &str, _fg: Hsla) -> Hsla {
+    match krill_proto::agent::canonical_id(agent_id) {
+        "claude" => rgb(CLAUDE_COLOR).into(),
+        "codex" => rgb(CODEX_COLOR).into(),
+        "agy" => rgb(ANTIGRAVITY_BLUE).into(),
+        "opencode" => rgb(OPENCODE_COLOR).into(),
+        "cursor" | "cursor-agent" => rgb(CURSOR_COLOR).into(),
+        _ => rgb(CUSTOM_AGENT_COLOR).into(),
+    }
+}
+
+/// 버튼·팝업 메뉴 항목(`Button::icon`, `PopupMenuItem::icon`)에 넣는 브랜드 색상 적용 프로바이더 [`Icon`].
+#[must_use]
+pub fn provider_menu_icon(provider: ProviderKind) -> Icon {
+    let color = provider_brand_color(provider, rgb(CLAUDE_COLOR).into());
+    Icon::default()
+        .data(provider_svg_bytes(provider))
+        .text_color(color)
+}
+
+/// 버튼·팝업 메뉴 항목(`Button::icon`, `PopupMenuItem::icon`, `PopupMenu::submenu_with_icon`)에 넣는 브랜드 색상 적용 에이전트 [`Icon`].
+#[must_use]
+pub fn agent_menu_icon(agent_id: &str) -> Icon {
+    let color = agent_brand_color(agent_id, rgb(CLAUDE_COLOR).into());
+    Icon::default()
+        .data(agent_svg_bytes(agent_id))
+        .text_color(color)
+}
+
 /// 프로바이더 공식 로고 아이콘 요소를 만든다(관리자 페이지·상태바 공용).
-pub fn provider_icon(provider: ProviderKind, size_px: f32, fg: Hsla) -> gpui::Div {
+pub fn provider_icon(provider: ProviderKind, size_px: f32, _fg: Hsla) -> gpui::Div {
     match provider {
         ProviderKind::Claude => svg_box(CLAUDE_SVG, size_px, rgb(CLAUDE_COLOR).into()),
-        ProviderKind::Codex => svg_box(OPENAI_SVG, size_px, fg),
+        ProviderKind::Codex => svg_box(OPENAI_SVG, size_px, rgb(CODEX_COLOR).into()),
+        // `Gemini`는 제거된 wire tombstone이라 빈 박스를 유지한다.
         ProviderKind::Gemini => div().size(px(size_px)),
         ProviderKind::Antigravity => antigravity_box(size_px),
-        ProviderKind::OpenCode => svg_box(OPENCODE_SVG, size_px, fg),
+        ProviderKind::OpenCode => opencode_box(size_px),
     }
 }
 
 /// 에이전트 ID에 맞는 공식 브랜드 아이콘 요소를 만든다(관리자 페이지·탭 바·사이드바 공용).
-pub fn agent_brand_icon(agent_id: &str, size_px: f32, fg: Hsla) -> gpui::Div {
+pub fn agent_brand_icon(agent_id: &str, size_px: f32, _fg: Hsla) -> gpui::Div {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => svg_box(CLAUDE_SVG, size_px, rgb(CLAUDE_COLOR).into()),
-        "codex" => svg_box(OPENAI_SVG, size_px, fg),
+        "codex" => svg_box(OPENAI_SVG, size_px, rgb(CODEX_COLOR).into()),
         "agy" => antigravity_box(size_px),
-        "opencode" => svg_box(OPENCODE_SVG, size_px, fg),
-        "cursor" | "cursor-agent" => svg_box(CURSOR_SVG, size_px, fg),
+        "opencode" => opencode_box(size_px),
+        "cursor" | "cursor-agent" => cursor_box(size_px),
         other => {
+            let brand: Hsla = rgb(CUSTOM_AGENT_COLOR).into();
             let letter = other
                 .chars()
                 .next()
@@ -192,10 +262,11 @@ pub fn agent_brand_icon(agent_id: &str, size_px: f32, fg: Hsla) -> gpui::Div {
                 .items_center()
                 .justify_center()
                 .rounded(px(3.))
+                .bg(brand.opacity(0.14))
                 .border_1()
-                .border_color(fg.opacity(0.35))
+                .border_color(brand.opacity(0.45))
                 .text_size(px((size_px * 0.65).max(9.)))
-                .text_color(fg)
+                .text_color(brand)
                 .child(letter)
         }
     }
@@ -226,9 +297,13 @@ pub fn krill_brand_icon(size_px: f32) -> gpui::Div {
     svg_box(KRILL_SVG, size_px, rgb(KRILL_CORAL).into())
 }
 
-fn antigravity_box(size_px: f32) -> gpui::Div {
-    let blue: Hsla = rgb(ANTIGRAVITY_BLUE).into();
-    let coral: Hsla = rgb(ANTIGRAVITY_CORAL).into();
+fn layered_svg_box(
+    base_svg: &'static [u8],
+    base_color: Hsla,
+    overlay_svg: &'static [u8],
+    overlay_color: Hsla,
+    size_px: f32,
+) -> gpui::Div {
     div()
         .relative()
         .size(px(size_px))
@@ -238,9 +313,9 @@ fn antigravity_box(size_px: f32) -> gpui::Div {
         .justify_center()
         .child(
             Icon::default()
-                .data(ANTIGRAVITY_SVG)
+                .data(base_svg)
                 .with_size(px(size_px))
-                .text_color(blue),
+                .text_color(base_color),
         )
         .child(
             div()
@@ -251,9 +326,215 @@ fn antigravity_box(size_px: f32) -> gpui::Div {
                 .justify_center()
                 .child(
                     Icon::default()
-                        .data(ANTIGRAVITY_CREST_SVG)
+                        .data(overlay_svg)
                         .with_size(px(size_px))
-                        .text_color(coral),
+                        .text_color(overlay_color),
                 ),
         )
+}
+
+fn antigravity_box(size_px: f32) -> gpui::Div {
+    layered_svg_box(
+        ANTIGRAVITY_SVG,
+        rgb(ANTIGRAVITY_BLUE).into(),
+        ANTIGRAVITY_CREST_SVG,
+        rgb(ANTIGRAVITY_CORAL).into(),
+        size_px,
+    )
+}
+
+fn opencode_box(size_px: f32) -> gpui::Div {
+    let core: Hsla = rgb(OPENCODE_CORE_COLOR).into();
+    layered_svg_box(
+        OPENCODE_SVG,
+        rgb(OPENCODE_COLOR).into(),
+        OPENCODE_CORE_SVG,
+        core.opacity(0.45),
+        size_px,
+    )
+}
+
+fn cursor_box(size_px: f32) -> gpui::Div {
+    let top: Hsla = rgb(CURSOR_HIGHLIGHT_COLOR).into();
+    layered_svg_box(
+        CURSOR_SVG,
+        rgb(CURSOR_COLOR).into(),
+        CURSOR_TOP_SVG,
+        top.opacity(0.55),
+        size_px,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::InteractiveElement as _;
+    use gpui::IntoElement;
+
+    // 크기 토큰 단조성은 컴파일 타임에 보장한다(OWE-875 회귀 방지).
+    const _: () = {
+        assert!(ICON_XS < ICON_SM && ICON_SM < ICON_MD && ICON_MD < ICON_LG && ICON_LG < ICON_XL);
+    };
+
+    #[test]
+    fn icon_size_tokens_match_styleguide() {
+        assert!((ICON_XS - 12.0).abs() < f32::EPSILON);
+        assert!((ICON_SM - 13.0).abs() < f32::EPSILON);
+        assert!((ICON_MD - 14.0).abs() < f32::EPSILON);
+        assert!((ICON_LG - 16.0).abs() < f32::EPSILON);
+        assert!((ICON_XL - 18.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn all_providers_and_agents_have_chromatic_brand_colors_and_valid_svgs() {
+        let fallback = gpui::hsla(0.0, 0.0, 0.5, 1.0);
+        for provider in ProviderKind::ALL {
+            let bytes = provider_svg_bytes(provider);
+            let svg = std::str::from_utf8(bytes).expect("provider SVG must be valid UTF-8");
+            assert!(
+                svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"),
+                "invalid SVG for {provider:?}"
+            );
+            let color = provider_brand_color(provider, fallback);
+            assert!(
+                color.s > 0.35,
+                "provider {provider:?} brand color must be chromatic: {color:?}"
+            );
+            assert!(
+                color.l > 0.25 && color.l < 0.80,
+                "provider {provider:?} brand color must remain legible on light and dark surfaces: {color:?}"
+            );
+        }
+
+        for agent in [
+            "claude",
+            "codex",
+            "agy",
+            "antigravity",
+            "gemini",
+            "opencode",
+            "cursor",
+            "cursor-agent",
+            "custom-agent",
+            "",
+        ] {
+            let bytes = agent_svg_bytes(agent);
+            let svg = std::str::from_utf8(bytes).expect("agent SVG must be valid UTF-8");
+            assert!(
+                svg.starts_with("<svg") && svg.trim_end().ends_with("</svg>"),
+                "invalid SVG for {agent}"
+            );
+            let color = agent_brand_color(agent, fallback);
+            assert!(
+                color.s > 0.35,
+                "agent {agent} brand color must be chromatic: {color:?}"
+            );
+            assert!(
+                color.l > 0.25 && color.l < 0.80,
+                "agent {agent} brand color must remain legible on light and dark surfaces: {color:?}"
+            );
+        }
+    }
+
+    struct IconGallery;
+
+    /// 갤러리 셀렉터는 `debug_bounds(&'static str)` 규격에 맞춰 정적 문자열로 둔다.
+    const GALLERY_PROVIDERS: [(ProviderKind, &str); 4] = [
+        (ProviderKind::Claude, "gallery-provider-claude"),
+        (ProviderKind::Codex, "gallery-provider-codex"),
+        (ProviderKind::Antigravity, "gallery-provider-agy"),
+        (ProviderKind::OpenCode, "gallery-provider-opencode"),
+    ];
+
+    const GALLERY_AGENTS: [(&str, f32, &str, &str); 6] = [
+        (
+            "claude",
+            ICON_XS,
+            "gallery-agent-claude",
+            "gallery-menu-claude",
+        ),
+        (
+            "codex",
+            ICON_SM,
+            "gallery-agent-codex",
+            "gallery-menu-codex",
+        ),
+        ("agy", ICON_MD, "gallery-agent-agy", "gallery-menu-agy"),
+        (
+            "opencode",
+            ICON_LG,
+            "gallery-agent-opencode",
+            "gallery-menu-opencode",
+        ),
+        (
+            "cursor",
+            ICON_XL,
+            "gallery-agent-cursor",
+            "gallery-menu-cursor",
+        ),
+        (
+            "custom-bot",
+            ICON_SM,
+            "gallery-agent-custom-bot",
+            "gallery-menu-custom-bot",
+        ),
+    ];
+
+    impl gpui::Render for IconGallery {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let p = crate::ui::palette(cx);
+            let mut root = div().flex().flex_col().gap_2();
+            for (provider, sel) in GALLERY_PROVIDERS {
+                root = root.child(
+                    provider_icon(provider, ICON_LG, p.foreground)
+                        .id(gpui::SharedString::from(sel))
+                        .debug_selector(move || sel.to_owned()),
+                );
+            }
+            for (agent, size, sel, menu_sel) in GALLERY_AGENTS {
+                root = root.child(
+                    agent_brand_icon(agent, size, p.foreground)
+                        .id(gpui::SharedString::from(sel))
+                        .debug_selector(move || sel.to_owned()),
+                );
+                root = root.child(
+                    div()
+                        .id(gpui::SharedString::from(menu_sel))
+                        .debug_selector(move || menu_sel.to_owned())
+                        .child(agent_menu_icon(agent)),
+                );
+            }
+            root
+        }
+    }
+
+    #[gpui::test]
+    fn gpui_renders_all_colored_provider_and_agent_icons_across_themes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let window = cx.add_window(|_, _| IconGallery);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+
+        for (provider, sel) in GALLERY_PROVIDERS {
+            assert!(
+                vcx.debug_bounds(sel).is_some(),
+                "missing provider icon bounds for {provider:?}"
+            );
+        }
+        for (_, _, sel, menu_sel) in GALLERY_AGENTS {
+            assert!(
+                vcx.debug_bounds(sel).is_some(),
+                "missing agent icon bounds for {sel}"
+            );
+            assert!(
+                vcx.debug_bounds(menu_sel).is_some(),
+                "missing menu icon bounds for {menu_sel}"
+            );
+        }
+    }
 }

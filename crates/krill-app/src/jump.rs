@@ -27,18 +27,44 @@ pub struct Item {
     pub id: SessionId,
     pub label: String,
     pub needs_you: bool,
+    pub agent: String,
     chars: Vec<char>,
 }
 
 impl Item {
     pub fn new(id: SessionId, label: String, needs_you: bool) -> Self {
+        let agent = label
+            .split_whitespace()
+            .next()
+            .filter(|w| {
+                matches!(
+                    *w,
+                    "claude"
+                        | "codex"
+                        | "agy"
+                        | "antigravity"
+                        | "gemini"
+                        | "cursor"
+                        | "cursor-agent"
+                        | "opencode"
+                )
+            })
+            .unwrap_or_default()
+            .to_owned();
         let chars = label.chars().flat_map(char::to_lowercase).collect();
         Self {
             id,
             label,
             needs_you,
+            agent,
             chars,
         }
+    }
+
+    #[must_use]
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = agent.into();
+        self
     }
 }
 
@@ -915,6 +941,13 @@ impl Render for Palette {
                                         .when(!item.needs_you, Styled::invisible)
                                         .child("●"),
                                 )
+                                .children((!item.agent.is_empty()).then(|| {
+                                    crate::ui::icons::agent_brand_icon(
+                                        &item.agent,
+                                        crate::ui::ICON_SM,
+                                        fg,
+                                    )
+                                }))
                                 .child(div().flex_1().truncate().child(item.label.clone()))
                                 .on_click(cx.listener(move |p, _, _, cx| {
                                     p.selected = session_base + i;
@@ -1148,6 +1181,9 @@ impl Render for Palette {
                     div()
                         .id(id)
                         .debug_selector(move || id.into())
+                        .flex()
+                        .items_center()
+                        .gap_1()
                         .px_1p5()
                         .py_0p5()
                         .rounded(crate::ui::RADIUS_XS)
@@ -1158,6 +1194,9 @@ impl Render for Palette {
                         } else {
                             pal.secondary_foreground
                         })
+                        .children(agent.map(|ag| {
+                            crate::ui::icons::agent_brand_icon(ag.profile(), crate::ui::ICON_XS, fg)
+                        }))
                         .child(label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_agent_filter(agent, cx);
@@ -1185,12 +1224,18 @@ impl Render for Palette {
                     } else {
                         format!("{} · {}", hit.agent.profile(), hit.title)
                     };
-                    let mut col = div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .child(render_vault_highlight(&title, &self.query, pal));
+                    let mut col = div().flex_1().flex().flex_col().overflow_hidden().child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(crate::ui::icons::agent_brand_icon(
+                                hit.agent.profile(),
+                                crate::ui::ICON_SM,
+                                fg,
+                            ))
+                            .child(render_vault_highlight(&title, &self.query, pal)),
+                    );
                     if !hit.snippet.is_empty() {
                         col = col.child(div().text_color(muted).child(render_vault_highlight(
                             &hit.snippet,

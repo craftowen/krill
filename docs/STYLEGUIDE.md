@@ -197,12 +197,35 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 ### 6.4 아이콘 및 에이전트 상태 인디케이터 (`ui::icons`, `ui::status`)
 
-- **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Gemini/Antigravity, OpenCode, Cursor 및 Krill 코랄 로고는 외부 이미지 디코더나 네트워크 없이 인라인 벡터(`ui::icons::agent_brand_icon`, `provider_icon`, `krill_brand_icon`)로 즉시 그린다.
+- **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Gemini, Antigravity, OpenCode, Cursor 및 Krill 코랄 로고는 외부 이미지 디코더나 네트워크 없이 인라인 벡터(`ui::icons::agent_brand_icon`, `ui::icons::provider_icon`, `ui::icons::agent_menu_icon`, `ui::icons::provider_menu_icon`, `ui::icons::krill_brand_icon`)로 즉시 그린다.
 - **UI 아이콘**: `gpui-component`의 Lucide 아이콘(`IconName`)과 `ui/icons.rs`의 Lucide SVG 상수를 사용한다. 다른 아이콘 세트를 섞지 않는다.
 - **상태 글리프 (`ui::status::status_glyph`)**:
   - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 12스텝)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전한다.
   - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 3/4 링이 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
 - **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 겹쳐 그리고 나머지는 `+N`으로 축약한다.
+
+### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)
+
+프로바이더(`ProviderKind`: Claude, Codex, Antigravity, OpenCode)나 에이전트(`claude`, `codex`, `agy` / `antigravity`, `opencode`, `cursor` / `cursor-agent`, 커스텀 에이전트)가 표기되는 모든 화면 지점은 단색 회색 아이콘이나 텍스트 단독 표기 대신 반드시 [`ui/icons.rs`](../crates/krill-app/src/ui/icons.rs)의 **색상 있는 브랜드 아이콘**과 **토큰화된 아이콘 크기(`ICON_*`)**를 사용한다. `ProviderKind::Gemini`는 제거된 wire tombstone(계정·사용량 화면에 미표시)이라 빈 박스로 두고, 미분류·제거된 에이전트 ID는 앰버 문자 폴백으로 그린다.
+
+1. **브랜드 색상 상수 (라이트·다크 모드 공통 시인성 보장)**:
+   - **Claude**: `CLAUDE_COLOR` (`#D97757`, 테라코타 스파클)
+   - **Codex (OpenAI)**: `CODEX_COLOR` (`#10A37F`, 에메랄드 블로섬)
+   - **Antigravity**: `ANTIGRAVITY_BLUE` (`#4285F4`) + `ANTIGRAVITY_CORAL` (`#EA4335`, 2레이어 A-링)
+   - **OpenCode**: `OPENCODE_COLOR` (`#06B6D4`, 시안 프레임) + `OPENCODE_CORE_COLOR` (`#67E8F9`, 코어 블록)
+   - **Cursor**: `CURSOR_COLOR` (`#6366F1`, 인디고 큐브) + `CURSOR_HIGHLIGHT_COLOR` (`#A5B4FC`, 상단 면 하이라이트)
+   - **커스텀 / 미분류 에이전트**: `CUSTOM_AGENT_COLOR` (`#F59E0B`, 앰버 봇 폴백)
+2. **아이콘 크기 토큰 (`crate::ui::ICON_*`)**:
+   - `ICON_XS` (`12px`): 고밀도 인라인 배지 — 사이드바 세션 행(`session_row`), 관리자 계정 행 프로바이더 배지, AI Vault / Jump 에이전트 필터 칩
+   - `ICON_SM` (`13px`): 기본 행·탭 아이콘 — 상단 탭 바 탭, 워크트리 카드 하단 에이전트 알약 및 요약 칩(`summary_element`), 다른 계정으로 이어가기 모달, Jump 팔레트 세션/Vault 행, AI Vault 검색 결과 행, 온보딩 점검 행(`agent.*`, `hook.*`)
+   - `ICON_MD` (`14px`): 카드·팝오버 헤더 — 상태바 프로바이더 사용량 팝오버 헤더, 탭 드래그 프리뷰, 최근 탭 전환기(`Ctrl+Tab`), 에이전트 대시보드 카드, 예약 실행(Schedules) 카드, 메뉴/드롭다운 항목(`provider_menu_icon`, `agent_menu_icon`)
+   - `ICON_LG` (`16px`): 섹션 머리글 — 관리자 > 계정(`Accounts`) 프로바이더 섹션 헤더
+   - `ICON_XL` (`18px`): 프로필 아바타 — 관리자 > 에이전트(`Agents`) 프로필 카드(32×32px 타일 내부)
+3. **렌더링 헬퍼 선택 및 텍스트 병기 원칙**:
+   - 일반 `div` 자식에는 다중 레이어 브랜드 색상이 적용되는 `ui::icons::provider_icon(provider, size_px, fallback)` / `ui::icons::agent_brand_icon(agent_id, size_px, fallback)`을 사용한다.
+   - `gpui_component`의 `Button::icon`, `PopupMenuItem::icon`, `PopupMenu::submenu_with_icon`처럼 `Icon` 타입을 요구하는 위젯에는 `.text_color(brand_color)`가 입혀진 `ui::icons::provider_menu_icon(provider)` / `ui::icons::agent_menu_icon(agent_id)`을 사용해 버튼·메뉴 전경색에 덮어쓰이지 않게 한다.
+   - **텍스트 유지/대체 기준**: 탭·사이드바 세션 행·워크트리 요약 알약처럼 세션/워크트리 제목이 함께 표시되는 고밀도 영역은 색상 아이콘만으로 에이전트를 식별하고, 메뉴 항목·설정 섹션 헤더·필터 칩·온보딩 선택지처럼 명확한 이름 식별이나 접근성이 필요한 곳은 `[색상 아이콘 + 텍스트]`를 함께 표기한다.
+   - 제3자 상표·아이콘 출처 고지는 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)(`docs/licensing/generate_notices.py`)에 유지한다.
 
 ---
 

@@ -4543,6 +4543,11 @@ impl SettingsView {
             .items_center()
             .gap_2()
             .min_w_0()
+            .child(crate::ui::icons::provider_icon(
+                acc.provider,
+                crate::ui::ICON_XS,
+                p.foreground,
+            ))
             .map(|d| match renaming {
                 Some(input) => d.child(Self::render_rename_row(acc, &input, cx)),
                 None => d.child(
@@ -5010,7 +5015,11 @@ impl SettingsView {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(crate::ui::icons::provider_icon(provider, 16., p.foreground))
+                        .child(crate::ui::icons::provider_icon(
+                            provider,
+                            crate::ui::ICON_LG,
+                            p.foreground,
+                        ))
                         .child(
                             div()
                                 .text_size(crate::ui::TEXT_MD)
@@ -5549,59 +5558,16 @@ impl SettingsView {
             let btn_id = format!("admin-default-agent-{agent_id}");
             let check_id = format!("admin-default-agent-check-{agent_id}");
             let selected = s.default_agent == agent_id;
-            div()
-                .id(gpui::ElementId::Name(btn_id.clone().into()))
-                .debug_selector(move || btn_id.clone())
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_2()
-                .px_3()
-                .py_1p5()
-                .rounded(crate::ui::RADIUS_SM)
-                .border_1()
-                .cursor_pointer()
-                .text_size(crate::ui::TEXT_SM)
-                .when(selected, |d| {
-                    d.border_color(p.muted_foreground.opacity(0.4))
-                        .bg(p.accent)
-                        .text_color(p.accent_foreground)
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                })
-                .when(!selected, |d| {
-                    d.border_color(p.border)
-                        .bg(p.background.opacity(0.5))
-                        .text_color(p.muted_foreground)
-                        .hover(|st| {
-                            st.border_color(p.muted_foreground.opacity(0.35))
-                                .text_color(p.foreground)
-                        })
-                })
-                .on_click(move |_, _, cx| {
-                    edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
-                })
-                .child(crate::ui::icons::agent_brand_icon(
-                    agent_id,
-                    14.,
-                    if selected {
-                        p.accent_foreground
-                    } else {
-                        p.muted_foreground
-                    },
-                ))
-                .child(label)
-                .when(selected, |d| {
-                    d.child(
-                        div()
-                            .id(gpui::ElementId::Name(check_id.clone().into()))
-                            .debug_selector(move || check_id.clone())
-                            .flex()
-                            .items_center()
-                            .child(
-                                gpui_component::Icon::new(gpui_component::IconName::Check).xsmall(),
-                            ),
-                    )
-                })
+            layout::segment(
+                gpui::ElementId::Name(btn_id.clone().into()),
+                label,
+                selected,
+            )
+            .icon(crate::ui::icons::agent_menu_icon(agent_id))
+            .debug_selector(move || btn_id.clone())
+            .on_click(move |_, _, cx| {
+                edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
+            })
         });
         let default_agent_row = layout::card(p)
             .id("admin-default-agent-card")
@@ -6305,7 +6271,7 @@ impl SettingsView {
                                     .justify_center()
                                     .child(crate::ui::icons::agent_brand_icon(
                                         agent_id,
-                                        16.,
+                                        crate::ui::ICON_XL,
                                         p.foreground,
                                     )),
                             )

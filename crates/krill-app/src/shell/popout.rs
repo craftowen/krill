@@ -477,7 +477,7 @@ fn provider_usage_menu(
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
-                                .child(ui::icons::provider_icon(provider, 14., brand_color))
+                                .child(ui::icons::provider_icon(provider, ui::ICON_MD, brand_color))
                                 .child(
                                     div()
                                         .text_size(ui::TEXT_XS)
@@ -1102,10 +1102,7 @@ impl Shell {
                     Button::new(gpui::SharedString::from(selector.clone()))
                         .label(label)
                         .font_family(ui::FONT_MONO)
-                        .icon(
-                            gpui_component::Icon::default()
-                                .data(ui::icons::provider_svg_bytes(provider)),
-                        )
+                        .icon(ui::icons::provider_menu_icon(provider))
                         .text_color(color)
                         .ghost()
                         .xsmall()
@@ -1382,8 +1379,9 @@ impl Shell {
                         menu = menu
                             .separator()
                             .item(
-                                PopupMenuItem::new(text::ORCH_HANDOFF_CODEX.get()).on_click(
-                                    move |_, _, cx| {
+                                PopupMenuItem::new(text::ORCH_HANDOFF_CODEX.get())
+                                    .icon(ui::icons::agent_menu_icon("codex"))
+                                    .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             body_codex.clone(),
                                         ));
@@ -1396,12 +1394,12 @@ impl Shell {
                                                 );
                                             })
                                             .ok();
-                                    },
-                                ),
+                                    }),
                             )
                             .item(
-                                PopupMenuItem::new(text::ORCH_HANDOFF_CLAUDE.get()).on_click(
-                                    move |_, _, cx| {
+                                PopupMenuItem::new(text::ORCH_HANDOFF_CLAUDE.get())
+                                    .icon(ui::icons::agent_menu_icon("claude"))
+                                    .on_click(move |_, _, cx| {
                                         cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                             body_claude.clone(),
                                         ));
@@ -1414,8 +1412,7 @@ impl Shell {
                                                 );
                                             })
                                             .ok();
-                                    },
-                                ),
+                                    }),
                             );
                     }
                     let open_weak = weak.clone();
@@ -1935,7 +1932,21 @@ impl Render for Dashboard {
                                             .flex()
                                             .flex_col()
                                             .gap_2()
-                                            .child(item.label.clone())
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    // OWE-875: 세션 카드 제목 앞에 프로바이더 브랜드 아이콘.
+                                                    .children((!item.agent.is_empty()).then(|| {
+                                                        ui::icons::agent_brand_icon(
+                                                            &item.agent,
+                                                            ui::ICON_MD,
+                                                            p.foreground,
+                                                        )
+                                                    }))
+                                                    .child(item.label.clone()),
+                                            )
                                             .when_some(screen, |d, screen| {
                                                 d.child(
                                                     div()
