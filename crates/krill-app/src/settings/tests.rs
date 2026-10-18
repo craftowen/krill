@@ -6691,7 +6691,9 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
     });
 
     // 개별 기기 해제 및 전체 해제 버튼 동작 확인
+    // (OWE-880: 전체 해제는 2단계 확인이라 두 번 눌러야 실행된다.)
     click(vcx, "mobile-revoke-0");
+    click(vcx, "mobile-revoke-all");
     click(vcx, "mobile-revoke-all");
     {
         let log = requests.lock().unwrap();
