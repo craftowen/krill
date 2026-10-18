@@ -20,12 +20,12 @@ use gpui::{
     Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
-use gpui_component::{Disableable as _, Sizable as _};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use serde::{Deserialize, Serialize};
 
 use crate::i18n::catalog::orca_import as text;
 use crate::ui::{
-    self, BadgeTone, DIALOG_WIDTH, Palette, RADIUS_LG, RADIUS_MD, RADIUS_SM, TEXT_MD, TEXT_SM,
+    self, BadgeTone, DIALOG_WIDTH, Palette, RADIUS_LG, RADIUS_SM, SPACE_4, TEXT_LG, TEXT_SM,
     TEXT_XS,
 };
 
@@ -1128,13 +1128,14 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
         .id("orca-import-modal")
         .debug_selector(|| "orca-import-modal".to_owned())
         .w(DIALOG_WIDTH)
-        .max_w(px(560.))
+        .max_w(window.viewport_size().width - SPACE_4 * 2.)
         .p_5()
         .rounded(RADIUS_LG)
         .bg(p.popover)
         .border_1()
         .border_color(p.border)
-        .text_color(p.foreground)
+        .shadow_lg()
+        .text_color(p.popover_foreground)
         .flex()
         .flex_col()
         .gap_3()
@@ -1146,7 +1147,7 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
                 .gap_1()
                 .child(
                     div()
-                        .text_size(TEXT_MD)
+                        .text_size(TEXT_LG)
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(text::MODAL_TITLE.get()),
                 )
@@ -1198,7 +1199,7 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
                 .child(
                     ui::controls()
                         .child(
-                            ui::secondary("orca-modal-cancel", text::CANCEL.get())
+                            ui::ghost("orca-modal-cancel", text::CANCEL.get())
                                 .debug_selector(|| "orca-modal-cancel".to_owned())
                                 .disabled(importing)
                                 .on_click(|_, _, cx| close_modal(cx)),
@@ -1226,7 +1227,6 @@ fn render_domain_row(
     p: &Palette,
 ) -> Stateful<Div> {
     let row_id: SharedString = format!("orca-domain-{}", domain.as_str()).into();
-    let check_mark = if checked { "✓" } else { "" };
     let border_col = if checked {
         p.foreground.opacity(0.35)
     } else {
@@ -1235,13 +1235,9 @@ fn render_domain_row(
     let box_bg = if checked { p.foreground } else { p.background };
     let box_fg = if checked { p.background } else { p.foreground };
 
-    div()
+    ui::card(p)
         .id(row_id.clone())
         .debug_selector(move || row_id.to_string())
-        .p_3()
-        .rounded(RADIUS_MD)
-        .bg(p.card)
-        .border_1()
         .border_color(border_col)
         .cursor_pointer()
         .flex()
@@ -1265,13 +1261,14 @@ fn render_domain_row(
                         .border_1()
                         .border_color(border_col)
                         .bg(box_bg)
-                        .text_color(box_fg)
-                        .text_size(TEXT_XS)
-                        .font_weight(FontWeight::BOLD)
                         .flex()
                         .items_center()
                         .justify_center()
-                        .child(check_mark),
+                        .children(checked.then(|| {
+                            Icon::new(IconName::Check)
+                                .with_size(px(12.))
+                                .text_color(box_fg)
+                        })),
                 )
                 .child(
                     div()

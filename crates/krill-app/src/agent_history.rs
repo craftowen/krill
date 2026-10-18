@@ -5,9 +5,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
-use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputState};
+use gpui_component::{Disableable as _, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::agent_history::{
     Action, Entry, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, Response, SearchQuery, SearchSnapshot,
@@ -616,9 +616,9 @@ impl Render for Panel {
                     })
             };
 
-            let scope_bar = {
-                let mut bar = div().flex().items_center().gap_1().py_1();
-                for (id, scope, label) in [
+            let scope_bar = div().py_1().child(crate::ui::segmented_control(
+                p,
+                [
                     ("vault-scope-all", VaultScope::All, text::SCOPE_ALL.get()),
                     (
                         "vault-scope-project",
@@ -630,34 +630,21 @@ impl Render for Panel {
                         VaultScope::Workspace,
                         text::SCOPE_WORKSPACE.get(),
                     ),
-                ] {
+                ]
+                .into_iter()
+                .map(|(id, scope, label)| {
                     let active = self.scope == scope;
-                    bar = bar.child(
-                        div()
-                            .id(id)
-                            .debug_selector(move || id.into())
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .bg(if active { p.accent } else { p.secondary })
-                            .text_color(if active {
-                                p.accent_foreground
-                            } else {
-                                p.secondary_foreground
-                            })
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_scope(scope, cx);
-                            })),
-                    );
-                }
-                bar
-            };
+                    crate::ui::segment(id, label, active)
+                        .debug_selector(move || id.into())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_scope(scope, cx);
+                        }))
+                }),
+            ));
 
-            let agent_bar = {
-                let mut bar = div().flex().flex_wrap().items_center().gap_1().pb_1();
-                for (id, agent, label) in [
+            let agent_bar = div().pb_1().child(crate::ui::segmented_control(
+                p,
+                [
                     ("vault-agent-all", None, text::AGENT_ALL.get()),
                     ("vault-agent-claude", Some(VaultAgent::Claude), "Claude"),
                     ("vault-agent-codex", Some(VaultAgent::Codex), "Codex"),
@@ -667,40 +654,21 @@ impl Render for Panel {
                         Some(VaultAgent::OpenCode),
                         "OpenCode",
                     ),
-                ] {
+                ]
+                .into_iter()
+                .map(|(id, agent, label)| {
                     let active = self.agent_filter == agent;
-                    bar = bar.child(
-                        div()
-                            .id(id)
-                            .debug_selector(move || id.into())
-                            .flex()
-                            .items_center()
-                            .gap_1()
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .bg(if active { p.accent } else { p.secondary })
-                            .text_color(if active {
-                                p.accent_foreground
-                            } else {
-                                p.secondary_foreground
-                            })
-                            .children(agent.map(|ag| {
-                                crate::ui::icons::agent_brand_icon(
-                                    ag.profile(),
-                                    crate::ui::ICON_XS,
-                                    p.foreground,
-                                )
-                            }))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.set_agent_filter(agent, cx);
-                            })),
-                    );
-                }
-                bar
-            };
+                    let btn =
+                        crate::ui::segment(id, label, active).debug_selector(move || id.into());
+                    let btn = match agent {
+                        Some(ag) => btn.icon(crate::ui::icons::agent_menu_icon(ag.profile())),
+                        None => btn,
+                    };
+                    btn.on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_agent_filter(agent, cx);
+                    }))
+                }),
+            ));
 
             let mut content = div()
                 .id("agent-history-list")
@@ -759,6 +727,7 @@ impl Render for Panel {
                 detail = detail.child(
                     div()
                         .truncate()
+                        .font_family(crate::ui::FONT_MONO)
                         .text_color(p.muted_foreground)
                         .child(hit.cwd.clone()),
                 );
@@ -767,16 +736,9 @@ impl Render for Panel {
                 let target = hit.target();
                 content = content.child(
                     row.child(
-                        div()
-                            .id(("agent-history-resume", i))
+                        crate::ui::secondary(("agent-history-resume", i), text::RESUME.get())
                             .debug_selector(move || format!("agent-history-resume-{i}"))
-                            .px_2()
-                            .py_1()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .bg(p.secondary)
-                            .text_color(p.secondary_foreground)
-                            .cursor_pointer()
-                            .child(text::RESUME.get())
+                            .disabled(busy)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !busy {
                                     if let Some(entry) = &matching_entry {

@@ -596,7 +596,7 @@ impl Render for Dialog {
                         .flex_col()
                         .gap_1()
                         .child(crate::ui::field_label(text::NAME_LABEL.get(), None, p))
-                        .child(Input::new(&self.name).h(px(32.))),
+                        .child(Input::new(&self.name)),
                 )
                 .child(
                     div()
@@ -608,7 +608,7 @@ impl Render for Dialog {
                             Some(text::OPTIONAL.get()),
                             p,
                         ))
-                        .child(Input::new(&self.base).h(px(32.)))
+                        .child(Input::new(&self.base))
                         .when(!base_candidates.is_empty(), |d| {
                             d.child(
                                 div()
@@ -691,7 +691,7 @@ impl Render for Dialog {
                             .id("worktree-symlinks-preview")
                             .debug_selector(|| "worktree-symlinks-preview".into())
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_XS)
                             .text_color(muted)
                             .child(text::SYMLINKS_PREVIEW.format(&[("paths", &paths)])),
                     )
@@ -702,7 +702,7 @@ impl Render for Dialog {
                             .id("worktree-setup-preview")
                             .debug_selector(|| "worktree-setup-preview".into())
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_XS)
                             .text_color(muted)
                             .child(text::SETUP_PREVIEW.format(&[("script", &visible(&script))])),
                     )
@@ -713,7 +713,7 @@ impl Render for Dialog {
                             .id("worktree-archive-preview")
                             .debug_selector(|| "worktree-archive-preview".into())
                             .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
+                            .text_size(crate::ui::TEXT_XS)
                             .text_color(muted)
                             .child(text::ARCHIVE_PREVIEW.format(&[("script", &visible(&script))])),
                     )
