@@ -531,7 +531,7 @@ impl SettingsView {
             return;
         };
         let sock = dir.join("run/krilld.sock");
-        let daemon_live = sock.exists() && std::os::unix::net::UnixStream::connect(&sock).is_ok();
+        let daemon_live = sock.exists() && krill_proto::os::net::UnixStream::connect(&sock).is_ok();
         if !daemon_live {
             self.schedule_error = Some(text::ACCOUNTS_DAEMON_REQUIRED.get().into());
             cx.notify();

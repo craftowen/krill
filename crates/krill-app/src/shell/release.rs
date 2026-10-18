@@ -7,8 +7,8 @@
 //! 앞에서 실패하면 디스패치 상태는 그대로 두고 오류를 알린다. PTY가 살아 있는데 UI에서
 //! 사라지는 일을 막는다.
 
+use krill_proto::os::net::UnixStream;
 use std::io::{self, Write as _};
-use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 use gpui::Context;

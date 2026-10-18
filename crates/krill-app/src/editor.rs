@@ -11,9 +11,9 @@
 
 pub mod quick_open;
 
+use krill_proto::os::fs::OpenOptionsExt as _;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::SystemTime;

@@ -3,9 +3,9 @@
 //! IPC는 사이드바 [`Source`] 뒤에 있어 gpui 테스트는 인메모리 응답을 쓴다.
 //! setup 스크립트는 내용과 해시를 보여 주고 사람이 승인한 해시만 돌려보낸다(krilld가 내용 변경 시 다시 묻는다).
 
+use krill_proto::os::ffi::OsStrExt as _;
 use ring::rand::{SecureRandom as _, SystemRandom};
 use std::fmt::Write as _;
-use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
