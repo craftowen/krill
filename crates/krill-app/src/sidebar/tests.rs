@@ -2887,3 +2887,250 @@ fn delete_worktree_failure_preserves_lineage_and_ssot_respects_cli_changes(
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-791: 사이드바 '프로젝트' 헤더의 워크스페이스 옵션·필터 메뉴가 Orca 구성(그룹화 4세그먼트 토글 바,
+/// 호스트/프로젝트/정렬/카드 레이아웃/속성 표시 접힌 서브메뉴, 스위치 토글 필터 행, 활성 필터 배지·초기화 버튼)으로 동작하고 영속화된다.
+#[gpui::test]
+fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
+    cx: &mut TestAppContext,
+) {
+    use super::options::{
+        format_filter_badge_count, host_visibility_summary, project_visibility_summary,
+        properties_summary,
+    };
+
+    assert_eq!(format_filter_badge_count(1), "1");
+    assert_eq!(format_filter_badge_count(9), "9");
+    assert_eq!(format_filter_badge_count(10), "9+");
+
+    let dir = std::env::temp_dir().join(format!("mk-owe791-menu-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    vcx.simulate_resize(gpui::size(gpui::px(420.), gpui::px(900.)));
+
+    let repo_a = PathBuf::from("/repo-alpha");
+    let repo_b = PathBuf::from("/repo-beta");
+    let wt_a = PathBuf::from("/repo-alpha/main");
+    let wt_b = PathBuf::from("/repo-beta/main");
+
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([
+                    (repo_a.clone(), vec![wt_a.clone()]),
+                    (repo_b.clone(), vec![wt_b.clone()]),
+                ]),
+            };
+            s.remote_hosts = vec![RemoteHost {
+                id: "studio".into(),
+                label: "Mac Studio".into(),
+                status: crate::hosts::HostStatus::Connected,
+                snapshot: Snapshot::default(),
+                meta: Meta::new(),
+                source: None,
+            }];
+            s.rebuild(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    // 1. 옵션 버튼 클릭 전에는 메뉴와 배지가 닫혀/숨겨져 있다.
+    assert!(vcx.debug_bounds("sidebar-options").is_some());
+    assert!(vcx.debug_bounds("sidebar-options-badge").is_none());
+    assert!(vcx.debug_bounds("sidebar-options-menu").is_none());
+
+    // 2. 슬라이더 아이콘 클릭 시 Orca 구조의 컴팩트 메뉴가 열리고, 하위 섹션 패널들은 기본 접혀 있다.
+    let btn_bounds = vcx.debug_bounds("sidebar-options").unwrap();
+    vcx.simulate_click(btn_bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("sidebar-options-menu").is_some());
+    assert!(vcx.debug_bounds("sidebar-options-header").is_some());
+    assert!(vcx.debug_bounds("sidebar-submenu-hosts").is_some());
+    assert!(vcx.debug_bounds("sidebar-submenu-projects").is_some());
+    assert!(vcx.debug_bounds("sidebar-hosts-panel").is_none());
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_none());
+    assert!(vcx.debug_bounds("sidebar-sort-panel").is_none());
+    assert!(vcx.debug_bounds("sidebar-card-layout-panel").is_none());
+    assert!(vcx.debug_bounds("sidebar-card-properties-panel").is_none());
+
+    // 2b. 표시(호스트·프로젝트) 서브메뉴 열기/선택/초기화 검증
+    let hosts_trigger = vcx.debug_bounds("sidebar-submenu-hosts").unwrap();
+    vcx.simulate_click(hosts_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-hosts-panel").is_some());
+    let host_studio = vcx.debug_bounds("sidebar-host-item-studio").unwrap();
+    vcx.simulate_click(host_studio.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| { view.read(cx).options().filters.hosts.contains("studio") }));
+    let host_all = vcx.debug_bounds("sidebar-host-all").unwrap();
+    vcx.simulate_click(host_all.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| view.read(cx).options().filters.hosts.is_empty()));
+
+    let projects_trigger = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    vcx.simulate_click(projects_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-hosts-panel").is_none());
+    assert!(vcx.debug_bounds("sidebar-projects-panel").is_some());
+    let proj_alpha = vcx.debug_bounds("sidebar-project-item-repo-alpha").unwrap();
+    vcx.simulate_click(proj_alpha.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| { view.read(cx).options().filters.repos.contains(&repo_a) }));
+    let proj_clear = vcx.debug_bounds("sidebar-projects-clear").unwrap();
+    vcx.simulate_click(proj_clear.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| view.read(cx).options().filters.repos.is_empty()));
+    let projects_trigger = vcx.debug_bounds("sidebar-submenu-projects").unwrap();
+    vcx.simulate_click(projects_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    // 3. 그룹화 4세그먼트(`없음`·`상태`·`PR`·`프로젝트`)가 한 줄에 나란히 배치되고 클릭 즉시 반영된다.
+    let seg_none = vcx.debug_bounds("sidebar-group-by-none").unwrap();
+    let seg_status = vcx.debug_bounds("sidebar-group-by-status").unwrap();
+    let seg_pr = vcx.debug_bounds("sidebar-group-by-pr").unwrap();
+    let seg_repo = vcx.debug_bounds("sidebar-group-by-repo").unwrap();
+    assert!(
+        (f32::from(seg_none.origin.y) - f32::from(seg_status.origin.y)).abs() < 1.0
+            && (f32::from(seg_status.origin.y) - f32::from(seg_pr.origin.y)).abs() < 1.0
+            && (f32::from(seg_pr.origin.y) - f32::from(seg_repo.origin.y)).abs() < 1.0,
+        "all 4 GroupBy segments must render on a single horizontal row"
+    );
+
+    vcx.simulate_click(seg_status.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).options().group_by),
+        GroupBy::WorkspaceStatus
+    );
+    assert!(
+        vcx.debug_bounds("sidebar-options-menu").is_some(),
+        "options menu must remain open after segment click"
+    );
+
+    // 4. 정렬·카드 레이아웃·속성 표시 서브메뉴 토글 및 선택 반영
+    let sort_trigger = vcx.debug_bounds("sidebar-submenu-sort").unwrap();
+    vcx.simulate_click(sort_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-sort-panel").is_some());
+
+    let sort_recent = vcx.debug_bounds("sidebar-sort-recent").unwrap();
+    vcx.simulate_click(sort_recent.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).options().sort_by),
+        SortBy::Recent
+    );
+
+    let layout_trigger = vcx.debug_bounds("sidebar-submenu-card-layout").unwrap();
+    vcx.simulate_click(layout_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("sidebar-sort-panel").is_none(),
+        "opening card layout submenu must collapse sort submenu"
+    );
+    assert!(vcx.debug_bounds("sidebar-card-layout-panel").is_some());
+
+    let layout_compact = vcx.debug_bounds("sidebar-card-layout-compact").unwrap();
+    vcx.simulate_click(layout_compact.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).options().card_layout),
+        CardLayout::Compact
+    );
+
+    let props_trigger = vcx.debug_bounds("sidebar-submenu-card-properties").unwrap();
+    vcx.simulate_click(props_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sidebar-card-properties-panel").is_some());
+    assert!(
+        vcx.debug_bounds("sidebar-card-properties-hover-hint")
+            .is_some(),
+        "compact mode must display hover hint in card properties panel"
+    );
+
+    let prop_ports = vcx.debug_bounds("sidebar-prop-ports").unwrap();
+    vcx.simulate_click(prop_ports.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(!vcx.update(|_, cx| view.read(cx).options().card_properties.ports));
+
+    // 서브메뉴를 다시 닫아 필터 행들이 뷰포트 안에 오도록 한다.
+    let props_trigger = vcx.debug_bounds("sidebar-submenu-card-properties").unwrap();
+    vcx.simulate_click(props_trigger.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+
+    // 5. 가시성 필터 스위치 토글 행(`FilterToggleRow`)과 조건부 들여쓰기(`always_show_default_branch`), 배지·초기화 버튼 검증
+    assert!(
+        vcx.debug_bounds("sidebar-filter-keep-default-branch")
+            .is_none()
+    );
+    assert!(vcx.debug_bounds("sidebar-filter-reset").is_none());
+
+    let hide_sleeping = vcx.debug_bounds("sidebar-filter-hide-sleeping").unwrap();
+    vcx.simulate_click(hide_sleeping.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| view.read(cx).options().filters.hide_sleeping));
+    assert!(
+        vcx.debug_bounds("sidebar-filter-keep-default-branch")
+            .is_some(),
+        "enabling hide_sleeping must immediately reveal indented default-branch row"
+    );
+    assert!(vcx.debug_bounds("sidebar-filter-reset").is_some());
+    assert!(vcx.debug_bounds("sidebar-options-badge").is_some());
+
+    let hide_auto = vcx.debug_bounds("sidebar-filter-hide-automation").unwrap();
+    vcx.simulate_click(hide_auto.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).options().active_filter_count()),
+        2
+    );
+
+    // 요약 헬퍼 검증
+    vcx.update(|_, cx| {
+        let opts = view.read(cx).options().clone();
+        assert_eq!(
+            properties_summary(&opts),
+            super::text::SHOW_PROPERTIES_HOVER.get()
+        );
+        let hosts = vec![
+            (HostId::Local, "내 Mac".to_owned()),
+            (HostId::Remote("studio".into()), "Mac Studio".to_owned()),
+        ];
+        assert_eq!(
+            host_visibility_summary(&opts.filters, &hosts),
+            super::text::ALL_HOSTS.get()
+        );
+        assert_eq!(
+            project_visibility_summary(&opts.filters, &[repo_a.clone(), repo_b.clone()]),
+            super::text::ALL_PROJECTS.get()
+        );
+    });
+
+    // `sidebar.bin` 영속화 확인 후 필터 초기화 클릭
+    let persisted = Sidebar::new(Some(sidebar_bin.clone()));
+    assert_eq!(persisted.options().group_by, GroupBy::WorkspaceStatus);
+    assert_eq!(persisted.options().sort_by, SortBy::Recent);
+    assert_eq!(persisted.options().card_layout, CardLayout::Compact);
+    assert!(!persisted.options().card_properties.ports);
+    assert!(persisted.options().filters.hide_sleeping);
+    assert!(persisted.options().filters.hide_automation);
+
+    let reset_btn = vcx.debug_bounds("sidebar-filter-reset").unwrap();
+    vcx.simulate_click(reset_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).options().active_filter_count()),
+        0
+    );
+    assert!(vcx.debug_bounds("sidebar-options-badge").is_none());
+    assert!(vcx.debug_bounds("sidebar-filter-reset").is_none());
+
+    fs::remove_dir_all(dir).ok();
+}
