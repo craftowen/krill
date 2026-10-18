@@ -35,6 +35,7 @@ pub mod security;
 pub mod settings;
 pub mod sidebar;
 pub mod ssh_hosts;
+pub mod star_nag;
 pub mod terminal;
 pub mod terminal_font;
 pub mod ui;
