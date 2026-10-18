@@ -121,6 +121,43 @@ pub fn build_permission_capabilities(
     ]
 }
 
+/// `krill computer` 권한 프로브용 JXA 스크립트.
+///
+/// macOS 26.6 이후 일부 환경에서는 JXA `ObjC` 브리지에
+/// `CGPreflightScreenCaptureAccess` 심볼이 노출되지 않아 호출 시
+/// `TypeError: $.CGPreflightScreenCaptureAccess is not a function (-2700)`으로
+/// 프로브 전체가 실패한다(OWE-902). 호출 전 `typeof`로 존재 여부를 확인하고,
+/// 심볼이 없으면 화면 기록 권한 확인을 생략(허용으로 간주하고 진행)한다.
+/// 스크린샷 실패는 호출 측에서 무시하므로(`get_app_state`의 `.ok()`),
+/// 생략하고 진행해도 안전하다. 손쉬운 사용 프로브가 불가능한 경우는
+/// 실패 닫힘(거부)으로 보고한다.
+pub const PERMISSION_PROBE_JXA_SCRIPT: &str = r#"
+ObjC.import("ApplicationServices");
+ObjC.import("CoreGraphics");
+let accessibility = false;
+try {
+  if (typeof $.AXIsProcessTrusted === "function") {
+    accessibility = Boolean($.AXIsProcessTrusted());
+  }
+} catch (_) {}
+let screenshots = true;
+try {
+  if (typeof $.CGPreflightScreenCaptureAccess === "function") {
+    screenshots = Boolean($.CGPreflightScreenCaptureAccess());
+  }
+} catch (_) {}
+JSON.stringify({ accessibility: accessibility, screenshots: screenshots });
+"#;
+
+/// JXA 권한 프로브 출력(`{"accessibility": bool, "screenshots": bool}`) 파싱.
+pub fn parse_permission_probe_json(raw: &str) -> Result<(bool, bool), String> {
+    let val: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("parse permission probe: {e}"))?;
+    let accessibility = val["accessibility"].as_bool().unwrap_or(false);
+    let screenshots = val["screenshots"].as_bool().unwrap_or(false);
+    Ok((accessibility, screenshots))
+}
+
 pub fn query_permissions() -> Result<(bool, bool), String> {
     if let Some(mock) = load_mock_env()? {
         return Ok((mock.accessibility_granted, mock.screenshots_granted));
@@ -128,19 +165,8 @@ pub fn query_permissions() -> Result<(bool, bool), String> {
     if std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
         return Ok((true, true));
     }
-    let script = r#"
-ObjC.import("ApplicationServices");
-ObjC.import("CoreGraphics");
-const ax = Boolean($.AXIsProcessTrusted());
-const sc = Boolean($.CGPreflightScreenCaptureAccess());
-JSON.stringify({ accessibility: ax, screenshots: sc });
-"#;
-    let out = run_jxa(script, &[])?;
-    let val: serde_json::Value =
-        serde_json::from_str(&out).map_err(|e| format!("parse permission probe: {e}"))?;
-    let ax = val["accessibility"].as_bool().unwrap_or(false);
-    let sc = val["screenshots"].as_bool().unwrap_or(false);
-    Ok((ax, sc))
+    let out = run_jxa(PERMISSION_PROBE_JXA_SCRIPT, &[])?;
+    parse_permission_probe_json(&out)
 }
 
 pub fn open_permission_settings(id: PermissionId) -> Result<(), String> {
