@@ -43,6 +43,9 @@ struct Holder {
 }
 pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     let path = args.next().ok_or(io::ErrorKind::InvalidInput)?;
+    if path == "--bootstrap" {
+        return sys::bootstrap(&args.collect::<Vec<_>>());
+    }
     krill_log::init(krill_log::Component::Holder).ok();
     let mut h = Holder {
         path,

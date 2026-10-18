@@ -130,6 +130,13 @@ impl std::os::fd::AsFd for Listener {
     }
 }
 
+#[cfg(windows)]
+impl std::os::windows::io::AsSocket for Listener {
+    fn as_socket(&self) -> std::os::windows::io::BorrowedSocket<'_> {
+        self.sock.as_socket()
+    }
+}
+
 /// `<path>.lock`을 0600으로 열어 flock을 잡는다. 이미 잡혀 있으면 `AddrInUse`.
 fn lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
