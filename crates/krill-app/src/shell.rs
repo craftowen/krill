@@ -257,6 +257,7 @@ actions!(
         ToggleSearch,
         Quit,
         Jump,
+        CommandPalette,
         Find,
         FindNext,
         FindPrev,
@@ -392,6 +393,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-,", krill_app::settings::OpenSettings, None),
         KeyBinding::new("cmd-j", Jump, ctx),
+        KeyBinding::new("cmd-shift-p", CommandPalette, ctx),
         KeyBinding::new("cmd-f", Find, ctx),
         KeyBinding::new("cmd-g", FindNext, ctx),
         // OWE-868: ⇧⌘G는 검색 바가 열려 있을 때만 이전 찾기다. 바깥에서는 기존 TogglePanel(우측 패널)을 유지한다.
@@ -1150,6 +1152,8 @@ impl Shell {
     }
 
     /// Cmd+J: Jump 팔레트를 열거나(사이드바 스냅샷으로) 닫는다. 설정이 열려 있으면 먼저 닫고 연다(OWE-860).
+    /// 열 때 칸의 조합 중 글자는 확정한다(포커스 이탈).
+    /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫는다.
     fn toggle_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.settings.is_some() {
             self.close_settings(Some(&mut *window), cx);
@@ -1159,6 +1163,7 @@ impl Shell {
             cx.notify();
             return;
         }
+        self.files.close_quick_open();
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
@@ -1167,8 +1172,13 @@ impl Shell {
         self.history
             .update(cx, |h, _| h.set_scope_paths(ws.clone(), Vec::new()));
         let history = self.history.clone();
+        let worktrees = self.sidebar.read(cx).worktree_entries();
+        let (actions, quick_commands) = Self::palette_entries(cx);
         let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
         palette.update(cx, |p, cx| {
+            p.set_worktrees(worktrees, cx);
+            p.set_actions(actions, cx);
+            p.set_quick_commands(quick_commands, cx);
             p.set_scope_paths(ws, Vec::new(), cx);
             p.connect_history(&history, cx);
             p.focus(window, cx);
@@ -1177,21 +1187,7 @@ impl Shell {
             &palette,
             window,
             |this, palette, e: &jump::Event, window, cx| {
-                let vault_target = match *e {
-                    jump::Event::ResumeVault(idx) => palette
-                        .read(cx)
-                        .vault_hit(idx)
-                        .map(krill_proto::agent_history::VaultHit::target),
-                    _ => None,
-                };
-                this.jump = None;
-                if let jump::Event::Confirm(id) = *e {
-                    this.open_session(id, cx);
-                } else if let Some(target) = vault_target {
-                    this.history.update(cx, |h, cx| h.resume_vault(target, cx));
-                }
-                window.focus(&this.focus, cx);
-                cx.notify();
+                this.on_palette_event(palette, e, window, cx);
             },
         );
         self.jump = Some((palette, events));
@@ -1210,6 +1206,175 @@ impl Shell {
         {
             l.pane.search(&query, direction);
         }
+    }
+
+    /// OWE-865: 팔레트 빠른 액션(내장 8개)과 설정의 빠른 명령 목록.
+    fn palette_entries(
+        cx: &gpui::App,
+    ) -> (
+        Vec<jump::ActionEntry>,
+        Vec<krill_app::commands::QuickCommand>,
+    ) {
+        use jump::ActionKind as Kind;
+        use krill_app::i18n::catalog::jump as jtext;
+        let actions = [
+            (Kind::NewWorktree, jtext::ACT_NEW_WORKTREE.get()),
+            (Kind::NewTab, jtext::ACT_NEW_TAB.get()),
+            (Kind::SplitRight, jtext::ACT_SPLIT_RIGHT.get()),
+            (Kind::SplitDown, jtext::ACT_SPLIT_DOWN.get()),
+            (Kind::OpenSettings, jtext::ACT_OPEN_SETTINGS.get()),
+            (Kind::ToggleSidebar, jtext::ACT_TOGGLE_SIDEBAR.get()),
+            (Kind::ToggleExplorer, jtext::ACT_TOGGLE_EXPLORER.get()),
+            (Kind::ToggleSearch, jtext::ACT_TOGGLE_SEARCH.get()),
+        ]
+        .into_iter()
+        .map(|(kind, label)| jump::ActionEntry::new(kind, label.to_owned()))
+        .collect();
+        (actions, krill_app::settings::current(cx).quick_commands)
+    }
+
+    /// ⇧⌘P: 명령 팔레트(OWE-865). Jump와 같은 슬롯을 쓰되 액션부터 보여주고,
+    /// 파일 빠른 열기가 열려 있으면 닫고 시작한다.
+    fn toggle_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.jump.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
+            return;
+        }
+        self.files.close_quick_open();
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, Some(window), cx);
+        }
+        let items = self.sidebar.read(cx).jump_items();
+        let ws = Some(self.folder().display().to_string());
+        self.history
+            .update(cx, |h, _| h.set_scope_paths(ws.clone(), Vec::new()));
+        let history = self.history.clone();
+        let worktrees = self.sidebar.read(cx).worktree_entries();
+        let (actions, quick_commands) = Self::palette_entries(cx);
+        let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
+        palette.update(cx, |p, cx| {
+            p.set_mode(jump::Mode::Commands, cx);
+            p.set_worktrees(worktrees, cx);
+            p.set_actions(actions, cx);
+            p.set_quick_commands(quick_commands, cx);
+            p.set_scope_paths(ws, Vec::new(), cx);
+            p.connect_history(&history, cx);
+            p.input().update(cx, |input, cx| {
+                input.set_placeholder(
+                    krill_app::i18n::catalog::jump::PLACEHOLDER_COMMANDS.get(),
+                    window,
+                    cx,
+                );
+            });
+            p.focus(window, cx);
+        });
+        let events = cx.subscribe_in(
+            &palette,
+            window,
+            |this, palette, e: &jump::Event, window, cx| {
+                this.on_palette_event(palette, e, window, cx);
+            },
+        );
+        self.jump = Some((palette, events));
+        cx.notify();
+    }
+
+    /// Jump·명령 팔레트 이벤트를 한곳에서 처리한다(OWE-865).
+    fn on_palette_event(
+        &mut self,
+        palette: &gpui::Entity<jump::Palette>,
+        event: &jump::Event,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let vault_target = match *event {
+            jump::Event::ResumeVault(idx) => palette
+                .read(cx)
+                .vault_hit(idx)
+                .map(krill_proto::agent_history::VaultHit::target),
+            _ => None,
+        };
+        let worktree = match *event {
+            jump::Event::OpenWorktree(idx) => palette.read(cx).worktree_entry(idx).cloned(),
+            _ => None,
+        };
+        self.jump = None;
+        match *event {
+            jump::Event::Confirm(id) => self.open_session(id, cx),
+            jump::Event::OpenWorktree(_) => {
+                if let Some(entry) = worktree {
+                    self.open_palette_worktree(&entry, cx);
+                }
+            }
+            jump::Event::Action(kind) => self.run_palette_action(kind, window, cx),
+            jump::Event::ResumeVault(_) => {
+                if let Some(target) = vault_target {
+                    self.history.update(cx, |h, cx| h.resume_vault(target, cx));
+                }
+            }
+            jump::Event::Dismiss => {}
+        }
+        window.focus(&self.focus, cx);
+        cx.notify();
+    }
+
+    /// OWE-865: 팔레트에서 고른 워크트리 열기. 세션이 있으면 그 세션으로,
+    /// 없으면 새 탭에 새 세션을 만든다(사이드바 카드 클릭과 같다).
+    fn open_palette_worktree(&mut self, entry: &jump::WorktreeEntry, cx: &mut Context<Self>) {
+        if let Some(id) = entry.session {
+            self.open_session(id, cx);
+        } else {
+            self.new_folder_tab_on(
+                krill_app::hosts::HostId::Local,
+                &entry.path,
+                Program::Login,
+                cx,
+            );
+        }
+    }
+
+    /// OWE-865: 팔레트 빠른 액션 실행. 모두 이미 구현된 기능만 둔다.
+    fn run_palette_action(
+        &mut self,
+        kind: jump::ActionKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match kind {
+            jump::ActionKind::NewWorktree => self.open_new_worktree_dialog(window, cx),
+            jump::ActionKind::NewTab => self.new_tab_on_launch_host(cx),
+            jump::ActionKind::SplitRight => self.split_active(Axis::Horizontal, cx),
+            jump::ActionKind::SplitDown => self.split_active(Axis::Vertical, cx),
+            jump::ActionKind::OpenSettings => {
+                self.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+            }
+            jump::ActionKind::ToggleSidebar => self.toggle_sidebar(cx),
+            jump::ActionKind::ToggleExplorer => self.toggle_explorer(window, cx),
+            jump::ActionKind::ToggleSearch => self.toggle_workspace_search(window, cx),
+            jump::ActionKind::QuickCommand(index) => {
+                if let Some(command) = krill_app::settings::current(cx)
+                    .quick_commands
+                    .get(index)
+                    .cloned()
+                {
+                    self.inject_command(&command, window, cx);
+                }
+            }
+        }
+    }
+
+    /// OWE-865: Jump 팔레트가 열려 있으면 ⌘1~9를 탭 전환 대신 N번째 행 즉시
+    /// 실행으로 쓴다. 팔레트가 없으면 false(기존 탭 전환이 이어진다).
+    fn jump_to_palette_row(&mut self, row: usize, cx: &mut Context<Self>) -> bool {
+        let Some((palette, _)) = &self.jump else {
+            return false;
+        };
+        let palette = palette.clone();
+        palette.update(cx, |p, cx| {
+            p.jump_to_row(row, cx);
+        });
+        true
     }
 
     /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
@@ -1797,6 +1962,19 @@ impl Shell {
                 }
             }
         }
+    }
+
+    fn open_new_worktree_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘N을 누르면 설정을 닫고 대화상자를 연다.
+        if self.settings.is_some() {
+            self.close_settings(Some(&mut *window), cx);
+        }
+        let repo = self.folder();
+        if self.sidebar_collapsed {
+            self.toggle_sidebar(cx);
+        }
+        self.sidebar
+            .update(cx, |s, cx| s.new_worktree(repo, window, cx));
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -4194,25 +4372,53 @@ impl Render for Shell {
                 this.navigate_forward(Some(window), cx);
             }))
             .on_action(cx.listener(|this, _: &NewWorktree, window, cx| {
-                if this.settings.is_some() {
-                    this.close_settings(Some(&mut *window), cx);
-                }
-                let repo = this.folder();
-                if this.sidebar_collapsed {
-                    this.toggle_sidebar(cx);
-                }
-                this.sidebar
-                    .update(cx, |s, cx| s.new_worktree(repo, window, cx));
+                this.open_new_worktree_dialog(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| this.activate_tab_index(0, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| this.activate_tab_index(1, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| this.activate_tab_index(2, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab4, _, cx| this.activate_tab_index(3, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab5, _, cx| this.activate_tab_index(4, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab6, _, cx| this.activate_tab_index(5, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| this.activate_tab_index(6, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| this.activate_tab_index(7, cx)))
-            .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| this.activate_tab_index(8, cx)))
+            .on_action(cx.listener(|this, _: &ActivateTab1, _, cx| {
+                if !this.jump_to_palette_row(0, cx) {
+                    this.activate_tab_index(0, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab2, _, cx| {
+                if !this.jump_to_palette_row(1, cx) {
+                    this.activate_tab_index(1, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab3, _, cx| {
+                if !this.jump_to_palette_row(2, cx) {
+                    this.activate_tab_index(2, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab4, _, cx| {
+                if !this.jump_to_palette_row(3, cx) {
+                    this.activate_tab_index(3, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab5, _, cx| {
+                if !this.jump_to_palette_row(4, cx) {
+                    this.activate_tab_index(4, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab6, _, cx| {
+                if !this.jump_to_palette_row(5, cx) {
+                    this.activate_tab_index(5, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab7, _, cx| {
+                if !this.jump_to_palette_row(6, cx) {
+                    this.activate_tab_index(6, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab8, _, cx| {
+                if !this.jump_to_palette_row(7, cx) {
+                    this.activate_tab_index(7, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| {
+                if !this.jump_to_palette_row(8, cx) {
+                    this.activate_tab_index(8, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
                 // OWE-860: 설정에서 호출하면 설정을 닫고 사이드바에 포커스를 둔다.
@@ -4241,6 +4447,9 @@ impl Render for Shell {
                 }),
             )
             .on_action(cx.listener(|this, _: &Jump, window, cx| this.toggle_jump(window, cx)))
+            .on_action(cx.listener(|this, _: &CommandPalette, window, cx| {
+                this.toggle_command_palette(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &Find, window, cx| this.toggle_search(window, cx)))
             .on_action(cx.listener(|this, _: &FindNext, _, cx| {
                 this.step_search(krill_proto::search::Direction::Next, cx);

@@ -118,6 +118,7 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::ToggleExplorer", text::SC_EXPLORER),
     ("shell::ToggleSearch", text::SC_WORKSPACE_SEARCH),
     ("shell::Jump", text::SC_JUMP),
+    ("shell::CommandPalette", text::SC_COMMAND_PALETTE),
     ("shell::PrevSession", text::SC_PREV_SESSION),
     ("shell::NextSession", text::SC_NEXT_SESSION),
     ("shell::NavigateBack", text::SC_NAV_BACK),

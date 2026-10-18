@@ -1252,11 +1252,17 @@ impl Shell {
     }
 
     /// ⌘P: 작업 폴더의 파일을 퍼지 검색해 연다. 목록은 백그라운드에서 만든 뒤 팔레트를 띄운다.
+    /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫고, 파일 모드로 연다.
     pub(super) fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.files.quick_open.take().is_some() {
             self.files.refocus = true;
             cx.notify();
             return;
+        }
+        // ⌘J·⇧⌘P가 열려 있으면 먼저 닫는다(같은 위치 중복 마운트 방지).
+        if self.jump.take().is_some() {
+            window.focus(&self.focus, cx);
+            cx.notify();
         }
         let root = self.folder();
         cx.spawn_in(window, async move |this, cx| {
@@ -1270,15 +1276,15 @@ impl Shell {
                     // OWE-860: 설정에서 ⌘P를 누르면 설정을 닫고 빠른 열기로 전환한다.
                     this.close_settings(Some(&mut *window), cx);
                 }
+                // 스캔 중에 ⌘J·⇧⌘P가 열렸으면 닫고 파일 팔레트를 띄운다(단일 모달, 마지막 요청 우선).
+                this.jump = None;
                 if let Some(pane) = this.layout.focused() {
                     this.commit_ime(pane, Some(window), cx);
                 }
                 let items = editor::quick_open::items(&files);
                 let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
                 palette.update(cx, |p, cx| {
-                    p.input().update(cx, |input, cx| {
-                        input.set_placeholder(etext::QUICK_OPEN.get(), window, cx);
-                    });
+                    p.set_mode(jump::Mode::Files, cx);
                     p.focus(window, cx);
                 });
                 let events =
