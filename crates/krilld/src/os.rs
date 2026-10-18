@@ -2,8 +2,8 @@
 //!
 //! Windows는 컴파일 전용이다.
 //! - fd: krilld가 fd로 다루는 것(holder 링크·클라이언트 소켓·PTY master) 중 Windows에서 지금 실제로 있는 것은
-//!   `AF_UNIX` 소켓뿐이라 소켓 타입을 쓴다. holder 링크([`crate::holder`])가 늘 실패해 PTY master는 만들어지지
-//!   않는다. `ConPTY` 핸들 모델은 Phase 3(OWE-833)에서 정한다.
+//!   `AF_UNIX` 소켓은 소켓 타입을 쓴다. `ConPTY`는 [`crate::holder::Master`]로 별도 구분하며
+//!   `ReadFile` 세션 리더 연결은 OWE-833-8에서 진행한다.
 //! - 권한: 소유자·모드 검사는 없다(`krill_proto::os`처럼 `%LOCALAPPDATA%` ACL 상속에 맡김, 추정). DACL 검사는 후속.
 //!   `O_NOFOLLOW` 대신 `FILE_FLAG_OPEN_REPARSE_POINT`로 열고 심볼릭 링크·정션이면 거부한다([`open_no_follow`]).
 
@@ -31,15 +31,12 @@ impl<T: std::os::windows::io::AsSocket> AsFd for T {
 
 /// 연결된 소켓을 holder 링크([`crate::holder::link::Link`])용 fd로 바꾼다.
 #[cfg(unix)]
-#[expect(clippy::unnecessary_wraps, reason = "Windows 판과 같은 시그니처")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "재결합 호출부의 Result 계약을 유지한다"
+)]
 pub(crate) fn link_fd(s: krill_proto::os::net::UnixStream) -> std::io::Result<OwnedFd> {
     Ok(OwnedFd::from(s))
-}
-
-/// Windows에는 holder 링크가 없다.
-#[cfg(windows)]
-pub(crate) fn link_fd(_s: krill_proto::os::net::UnixStream) -> std::io::Result<OwnedFd> {
-    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 /// 심볼릭 링크 `dst` → `src`.
