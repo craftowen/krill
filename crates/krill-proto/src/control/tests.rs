@@ -961,3 +961,28 @@ fn resume_and_hibernation_account_tails_decode_old_bytes() {
         assert_eq!(Request::decode(kind::REQUEST, &body).unwrap(), request);
     }
 }
+
+/// `Failure::Os`는 와이어에 macOS errno 번호로 실린다. Linux 원격의 ENOSYS(38)가 Mac에서 ENOSYS(78)로 읽혀야 한다.
+#[test]
+fn os_failure_errno_travels_in_macos_numbering() {
+    use super::wire_errno::{from_wire, to_wire};
+    // 1~34는 두 OS가 같아 그대로다.
+    assert_eq!(to_wire(2), 2);
+    assert_eq!(from_wire(13), 13);
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(to_wire(38), 78);
+        assert_eq!(from_wire(78), 38);
+        assert_eq!(to_wire(11), 35);
+        assert_eq!(from_wire(35), 11);
+    }
+    for errno in [1, 2, 11, 35, 38, 62, 63, 78, 110] {
+        assert_eq!(from_wire(to_wire(errno)), errno);
+    }
+    // ENOSYS 바이트는 두 OS에서 같다(macOS 78 = Linux 38 → 와이어 78).
+    let enosys = if cfg!(target_os = "linux") { 38 } else { 78 };
+    assert_eq!(
+        roundtrip(&Reply::Failed(Failure::Os(enosys))),
+        "050000003103069c01"
+    );
+}
