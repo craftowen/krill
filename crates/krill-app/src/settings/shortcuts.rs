@@ -44,6 +44,8 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::ClearPane", text::SC_CLEAR),
     ("shell::SelectAll", text::SC_SELECT_ALL),
     ("shell::Find", text::SC_FIND),
+    ("shell::FindNext", text::SC_FIND_NEXT),
+    ("shell::FindPrev", text::SC_FIND_PREV),
     ("shell::Copy", text::SC_COPY),
     ("shell::Paste", text::SC_PASTE),
     ("shell::ToggleSidebar", text::SC_SIDEBAR),

@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use gpui::TestAppContext;
+use gpui::{Modifiers, TestAppContext};
 use krill_proto::screen::{Cell, Revision, Seq};
 use krill_proto::search::{Direction, Hit, SearchResult, Snapshot, Source};
 
@@ -153,6 +153,33 @@ fn search_bar_emits_query_steps_and_dismiss(cx: &mut TestAppContext) {
             Event::Dismiss,
         ]
     );
+}
+
+/// OWE-868: ⇧Enter는 이전 찾기다(Enter·↓ 다음, ↑ 이전).
+#[gpui::test]
+fn shift_enter_steps_previous(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(Bar::new);
+    cx.update(|window, cx| view.update(cx, |b, cx| b.focus(window, cx)));
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let got = events.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, e: &Event, _| {
+            got.borrow_mut().push(e.clone());
+        })
+        .detach();
+    });
+    cx.run_until_parked();
+    cx.simulate_input("err");
+    cx.run_until_parked();
+    cx.simulate_modifiers_change(Modifiers {
+        shift: true,
+        ..Modifiers::default()
+    });
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    cx.simulate_modifiers_change(Modifiers::default());
+    assert_eq!(*events.borrow(), [Event::Step(Direction::Previous)]);
 }
 
 #[gpui::test]
