@@ -95,6 +95,8 @@ pub use crate::ipc::FEAT_GIT_SYNC;
 /// 세션별 사용 계정 꼬리(OWE-707, MK-147). [`Reply::Sessions`]의 [`Info::account`]를
 /// 받을 수 있다는 표시. 없는 피어에게는 꼬리를 비워 보낸다.
 pub const FEAT_SESSION_ACCOUNT: u64 = 1 << 58;
+/// 세션 스크롤백 지우기 요청(OWE-873b, 지휘자 배정). [`Request::ClearScrollback`]·[`Reply::ScrollbackCleared`] 한 쌍.
+pub const FEAT_CLEAR_SCROLLBACK: u64 = 1 << 47;
 /// 캡처 한 번의 최대 바이트. 넘으면 잘라내지 않고 `BadRequest`로 거부한다.
 pub const MAX_CAPTURE: usize = 512 * 1024;
 
@@ -212,6 +214,11 @@ pub enum Request {
     /// `FEAT_SESSION_ACCOUNT` 필요(OWE-707). 범위 내 세션의 실행 당시 계정 표시용 목록.
     /// `List`와 함께 읽어 탭·사이드바 배지를 그린다. PTY에는 손대지 않는다.
     SessionAccounts,
+    /// `FEAT_CLEAR_SCROLLBACK` 필요(OWE-873b). 지정한 세션의 핫 스크롤백과 콜드 히스토리 기준선을 지운다.
+    /// 세션·PTY·현재 보이는 화면은 건드리지 않는다.
+    ClearScrollback {
+        session: SessionId,
+    },
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -810,6 +817,8 @@ pub enum Reply {
     /// `FEAT_SESSION_ACCOUNT` 필요(OWE-707). [`Request::SessionAccounts`]의 답.
     /// 범위 밖 세션은 담지 않는다. 셸·구 기록 세션은 원소가 없어 배지를 숨긴다.
     SessionAccounts(Vec<SessionAccount>),
+    /// `FEAT_CLEAR_SCROLLBACK` 필요(OWE-873b). [`Request::ClearScrollback`]의 답.
+    ScrollbackCleared,
 }
 
 /// 프로세스가 사라진 세션의 마지막 화면과 스크롤백(디스크 세그먼트 재생, 읽기 전용). 필드는 끝에만 붙인다.

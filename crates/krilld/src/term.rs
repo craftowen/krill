@@ -347,11 +347,16 @@ impl Engine {
         self.term.grid().history_size()
     }
 
+    /// 핫 스크롤백을 비운다. 보이는 화면·커서·모드는 그대로 둔다(OWE-873b).
+    pub(crate) fn clear_history(&mut self) {
+        self.term.grid_mut().clear_history();
+    }
+
     /// 스크롤백을 오래된 행부터 꺼내고 비운다. 콜드 페이지 재생이 메모리를 일정하게 두려고 쓴다.
     pub(crate) fn take_history(&mut self) -> Vec<Vec<Cell>> {
         let n = self.history_len();
         let (_, rows) = self.history_rows(0, n);
-        self.term.grid_mut().clear_history();
+        self.clear_history();
         rows
     }
 

@@ -25,6 +25,7 @@ mod segment;
 
 pub use recorder::Recorder;
 
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::fs::DirBuilderExt;
@@ -54,6 +55,8 @@ const WINDOW_LOG: u32 = 20;
 /// 재생 때 스크롤백을 거두는 간격. 이 안에서 [`HOT_LINES`](crate::HOT_LINES)행 넘게 밀려나면 넘친 행은 페이지에서 빠진다.
 // ponytail: 256B로 1,000행을 넘기려면 `CSI n S` 반복 같은 병적 입력뿐이다. 실제로 잘리면 간격을 줄이거나 재생 Term 상한을 키운다.
 const REPLAY_STEP: usize = 256;
+/// 세션별 스크롤백 지우기 기준선(`u64` LE 8B)을 남기는 파일 이름(OWE-873b).
+const CLEARED_FILE: &str = "cleared";
 
 /// 저장소 상한. 기본값이 ARCHITECTURE §4의 값이다(MB = 10⁶B).
 #[derive(Debug, Clone)]
@@ -133,6 +136,8 @@ pub struct Store {
     written: AtomicU64,
     /// 일시중지 ACK는 진행 중인 쓰기가 끝난 뒤에만 돌려준다.
     pause: RwLock<Pause>,
+    /// 세션별 스크롤백 지우기 기준선 `(generation, cleared_seq)`(OWE-873b).
+    cleared: Mutex<HashMap<SessionId, (u64, u64)>>,
 }
 
 #[derive(Debug, Default)]
@@ -196,6 +201,7 @@ impl Store {
             limits,
             written: AtomicU64::new(0),
             pause: RwLock::default(),
+            cleared: Mutex::default(),
         })
     }
 
@@ -237,15 +243,110 @@ impl Store {
         result
     }
 
+    /// 세션 `id`의 콜드 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
+    /// 세그먼트 파일은 지우지 않고 기준선 이전 원본에서 밀려난 행만 히스토리 응답에서 제외한다.
+    pub fn clear_scrollback(&self, id: SessionId, seq: u64) {
+        let pause = self.record_guard();
+        let _gate = lock(&self.gate);
+        let generation = self.generation.load(Ordering::Acquire);
+        let target = {
+            let mut cleared = lock(&self.cleared);
+            let entry = cleared.entry(id).or_insert((generation, 0));
+            if entry.0 == generation {
+                entry.1 = entry.1.max(seq);
+            } else {
+                *entry = (generation, seq);
+            }
+            entry.1
+        };
+        if self.recording && !pause.paused {
+            let dir = self.session_dir(id);
+            if dir.is_dir() {
+                write_cleared(&dir, target);
+            }
+        }
+    }
+
+    /// 닫힌(콜드) 세션 `id`의 마지막 세그먼트 끝까지 스크롤백 기준선을 올린다(OWE-873b).
+    /// 디스크에 남은 세그먼트가 있으면 `true`.
+    pub fn clear_cold_scrollback(&self, id: SessionId) -> bool {
+        if !self.recording {
+            return false;
+        }
+        let Ok(mut paths) = segments(&self.session_dir(id)) else {
+            return false;
+        };
+        while let Some(path) = paths.pop() {
+            if let Ok(Some(seg)) = segment::read(&path, self.key.as_deref())
+                && !seg.records.is_empty()
+            {
+                self.clear_scrollback(id, seg.end_seq());
+                return true;
+            }
+        }
+        false
+    }
+
+    fn cleared_seq(&self, id: SessionId) -> u64 {
+        let generation = self.generation.load(Ordering::Acquire);
+        {
+            let cleared = lock(&self.cleared);
+            if let Some(&(recorded_gen, seq)) = cleared.get(&id)
+                && recorded_gen == generation
+            {
+                return seq;
+            }
+        }
+        if !self.recording {
+            return 0;
+        }
+        let seq = read_cleared(&self.session_dir(id)).unwrap_or(0);
+        if seq > 0 {
+            let mut cleared = lock(&self.cleared);
+            let entry = cleared.entry(id).or_insert((generation, 0));
+            if entry.0 == generation {
+                entry.1 = entry.1.max(seq);
+            } else {
+                *entry = (generation, seq);
+            }
+            return entry.1;
+        }
+        0
+    }
+
     /// 세션의 콜드 이력(디스크에 남은 세그먼트 목록).
     pub fn history(&self, id: SessionId) -> io::Result<History> {
+        let segs = if self.recording {
+            segments(&self.session_dir(id))?
+        } else {
+            Vec::new()
+        };
+        let cleared_seq = self.cleared_seq(id);
+        let mut first_page = 0usize;
+        if cleared_seq > 0 {
+            while let Some(path) = segs.get(first_page) {
+                if segs
+                    .get(first_page + 1)
+                    .and_then(|p| start_of(p))
+                    .is_some_and(|next| next <= cleared_seq)
+                {
+                    first_page += 1;
+                    continue;
+                }
+                if let Ok(Some(seg)) = segment::read(path, self.key.as_deref())
+                    && seg.end_seq() <= cleared_seq
+                {
+                    first_page += 1;
+                    continue;
+                }
+                break;
+            }
+        }
         Ok(History {
             key: self.key.clone(),
-            segs: if self.recording {
-                segments(&self.session_dir(id))?
-            } else {
-                Vec::new()
-            },
+            segs,
+            first_page,
+            cleared_seq,
         })
     }
 
@@ -475,6 +576,27 @@ fn start_of(path: &Path) -> Option<u64> {
         .ok()
 }
 
+/// 세션 디렉터리에 스크롤백 지우기 기준선을 남긴다. 최선형이라 실패해도 메모리 기준선은 동작한다.
+fn write_cleared(dir: &Path, seq: u64) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(dir.join(CLEARED_FILE))
+    {
+        file.write_all(&seq.to_le_bytes()).ok();
+    }
+}
+
+fn read_cleared(dir: &Path) -> Option<u64> {
+    let bytes = fs::read(dir.join(CLEARED_FILE)).ok()?;
+    let arr: [u8; 8] = bytes.try_into().ok()?;
+    Some(u64::from_le_bytes(arr))
+}
+
 /// [`Store::raw`]가 넘기는 원본 구간 조각.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Piece {
@@ -500,10 +622,12 @@ pub struct Page {
     pub gaps: Vec<Gap>,
 }
 
-/// 디스크에 남은 한 세션의 세그먼트 목록. 페이지 번호 = 세그먼트 순서(0이 가장 오래됨).
+/// 디스크에 남은 한 세션의 세그먼트 목록. 페이지 번호 = 기준선(`cleared_seq`) 이후 세그먼트 순서(0이 가장 오래됨).
 #[derive(Debug)]
 pub struct History {
     segs: Vec<PathBuf>,
+    first_page: usize,
+    cleared_seq: u64,
     key: Option<Arc<crypto::Key>>,
 }
 
@@ -561,23 +685,35 @@ impl Page {
 
 impl History {
     pub fn len(&self) -> usize {
-        self.segs.len()
+        self.segs.len().saturating_sub(self.first_page)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.segs.is_empty()
+        self.len() == 0
+    }
+
+    fn raw_index(&self, i: usize) -> io::Result<usize> {
+        let raw_i = self
+            .first_page
+            .checked_add(i)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such page"))?;
+        if raw_i >= self.segs.len() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "no such page"));
+        }
+        Ok(raw_i)
     }
 
     /// 페이지 `i`를 재생한다. 메모리는 재생 Term 하나(화면 + 최대 [`HOT_LINES`](crate::HOT_LINES)행)와 세그먼트 원본(≤ 봉인 크기) 정도다.
     pub fn page(&self, i: usize) -> io::Result<Page> {
-        let seg = self.read(i)?;
+        let raw_i = self.raw_index(i)?;
+        let seg = self.read_raw(raw_i)?;
         let look = no_theme();
-        let mut engine = self.warm(i, &seg, &look);
+        let mut engine = self.warm(raw_i, &seg, &look);
         engine.take_history(); // 워밍업에서 밀려난 행은 앞 페이지 몫
         let mut rows = Vec::new();
-        let gaps = replay(&mut engine, &seg, &look, Some(&mut rows));
+        let gaps = replay(&mut engine, &seg, &look, Some(&mut rows), self.cleared_seq);
         Ok(Page {
-            start_seq: seg.header.start_seq,
+            start_seq: seg.header.start_seq.max(self.cleared_seq),
             end_seq: seg.end_seq(),
             rows,
             gaps,
@@ -587,11 +723,12 @@ impl History {
     /// Lazy screen history: retain only the requested rows, even for a large segment.
     /// Two bounded replays determine the total first, then harvest the requested range.
     pub fn rows(&self, i: usize, skip: usize, count: usize) -> io::Result<(usize, Vec<Vec<Cell>>)> {
-        let seg = self.read(i)?;
+        let raw_i = self.raw_index(i)?;
+        let seg = self.read_raw(raw_i)?;
         let look = no_theme();
         let mut total = 0usize;
         {
-            let mut engine = self.warm(i, &seg, &look);
+            let mut engine = self.warm(raw_i, &seg, &look);
             engine.take_history();
             replay_harvest(
                 &mut engine,
@@ -601,6 +738,7 @@ impl History {
                     total = total.saturating_add(batch.len());
                 }),
                 None,
+                self.cleared_seq,
             );
         }
         let end = total.saturating_sub(skip);
@@ -608,7 +746,7 @@ impl History {
             end.saturating_sub(count.min(usize::from(krill_proto::screen::MAX_HISTORY_ROWS)));
         let mut rows = Vec::new();
         if start < end {
-            let mut engine = self.warm(i, &seg, &look);
+            let mut engine = self.warm(raw_i, &seg, &look);
             engine.take_history();
             let mut at = 0usize;
             replay_harvest(
@@ -624,6 +762,7 @@ impl History {
                     }
                 }),
                 None,
+                self.cleared_seq,
             );
         }
         Ok((total, rows))
@@ -631,7 +770,14 @@ impl History {
 
     /// 페이지 `i`를 `limit_seq`까지만 재생한다. 세그먼트 시작이 `limit_seq` 이상이면 `None`.
     pub fn page_until(&self, i: usize, limit_seq: u64) -> Option<io::Result<Page>> {
-        let seg = match self.read(i) {
+        if limit_seq <= self.cleared_seq {
+            return None;
+        }
+        let raw_i = match self.raw_index(i) {
+            Ok(raw_i) => raw_i,
+            Err(e) => return Some(Err(e)),
+        };
+        let seg = match self.read_raw(raw_i) {
             Ok(seg) => seg,
             Err(e) => return Some(Err(e)),
         };
@@ -639,13 +785,22 @@ impl History {
             return None;
         }
         let look = no_theme();
-        let mut engine = self.warm(i, &seg, &look);
+        let mut engine = self.warm(raw_i, &seg, &look);
         engine.take_history(); // 워밍업에서 밀려난 행은 앞 페이지 몫
         let mut rows = Vec::new();
-        let (gaps, end_seq) =
-            replay_until(&mut engine, &seg, &look, Some(&mut rows), Some(limit_seq));
+        let (gaps, end_seq) = replay_until(
+            &mut engine,
+            &seg,
+            &look,
+            Some(&mut rows),
+            Some(limit_seq),
+            self.cleared_seq,
+        );
+        if end_seq <= self.cleared_seq {
+            return None;
+        }
         Some(Ok(Page {
-            start_seq: seg.header.start_seq,
+            start_seq: seg.header.start_seq.max(self.cleared_seq),
             end_seq,
             rows,
             gaps,
@@ -654,41 +809,41 @@ impl History {
 
     /// 마지막 세그먼트까지 재생해 화면과 핫 스크롤백을 되살린다.
     pub fn restore(&self) -> io::Result<Restored> {
-        let i = self
+        let raw_i = self
             .segs
             .len()
             .checked_sub(1)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no segments"))?;
-        let seg = self.read(i)?;
+        let seg = self.read_raw(raw_i)?;
         let look = no_theme();
-        let mut engine = self.warm(i, &seg, &look);
-        replay(&mut engine, &seg, &look, None);
+        let mut engine = self.warm(raw_i, &seg, &look);
+        replay(&mut engine, &seg, &look, None, self.cleared_seq);
         Ok(Restored {
             engine,
             end_seq: seg.end_seq(),
         })
     }
 
-    fn read(&self, i: usize) -> io::Result<Segment> {
+    fn read_raw(&self, raw_i: usize) -> io::Result<Segment> {
         let path = self
             .segs
-            .get(i)
+            .get(raw_i)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such page"))?;
         segment::read(path, self.key.as_deref())?
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad segment header"))
     }
 
-    /// 세그먼트 `seg`(= `i`번)의 시작 상태를 복원한 엔진. 키프레임이 있으면 바로 주입하고, 없으면 앞 세그먼트를 재생한다.
-    fn warm(&self, i: usize, seg: &Segment, look: &Appearance) -> Engine {
+    /// 세그먼트 `seg`(= `raw_i`번)의 시작 상태를 복원한 엔진. 키프레임이 있으면 바로 주입하고, 없으면 앞 세그먼트를 재생한다.
+    fn warm(&self, raw_i: usize, seg: &Segment, look: &Appearance) -> Engine {
         if seg.header.base == Base::Start {
             return Engine::new(seg.header.size);
         }
         // 안전하지 않은 TUI 상태가 여러 세그먼트에 걸쳐도 마지막 안전 키프레임/시작점부터 순서대로 재생한다.
         // 한 번에 세그먼트 하나만 메모리에 두며, GC로 끊긴 구간 너머는 재생하지 않는다.
-        let mut first = i;
+        let mut first = raw_i;
         let mut start = seg.header.start_seq;
         while let Some(p) = first.checked_sub(1) {
-            let Ok(prev) = self.read(p) else { break };
+            let Ok(prev) = self.read_raw(p) else { break };
             if prev.end_seq() != start {
                 break;
             }
@@ -699,7 +854,7 @@ impl History {
             }
         }
         // 남은 원본이 우선이다. 앞 원본이 GC된 가장 이른 세그먼트에서만 시작 키프레임을 쓴다.
-        let initial = self.read(first).ok();
+        let initial = self.read_raw(first).ok();
         let mut engine = initial
             .as_ref()
             .and_then(|s| {
@@ -710,13 +865,19 @@ impl History {
             .unwrap_or_else(|| {
                 Engine::new(initial.as_ref().map_or(seg.header.size, |s| s.header.size))
             });
-        for p in first..i {
-            if let Ok(previous) = self.read(p) {
+        for p in first..raw_i {
+            if let Ok(previous) = self.read_raw(p) {
                 engine.resize(previous.header.size);
-                replay(&mut engine, &previous, look, None);
+                if previous.header.start_seq < self.cleared_seq {
+                    engine.clear_history();
+                }
+                replay(&mut engine, &previous, look, None, self.cleared_seq);
             }
         }
         engine.resize(seg.header.size);
+        if seg.header.start_seq <= self.cleared_seq {
+            engine.clear_history();
+        }
         engine
     }
 }
@@ -744,8 +905,9 @@ fn replay(
     seg: &Segment,
     look: &Appearance,
     harvest: Option<&mut Vec<Vec<Cell>>>,
+    cleared_seq: u64,
 ) -> Vec<Gap> {
-    replay_until(engine, seg, look, harvest, None).0
+    replay_until(engine, seg, look, harvest, None, cleared_seq).0
 }
 
 fn replay_until(
@@ -754,6 +916,7 @@ fn replay_until(
     look: &Appearance,
     harvest: Option<&mut Vec<Vec<Cell>>>,
     limit_seq: Option<u64>,
+    cleared_seq: u64,
 ) -> (Vec<Gap>, u64) {
     match harvest {
         Some(rows) => replay_harvest(
@@ -762,8 +925,9 @@ fn replay_until(
             look,
             Some(&mut |batch| rows.extend(batch)),
             limit_seq,
+            cleared_seq,
         ),
-        None => replay_harvest(engine, seg, look, None, limit_seq),
+        None => replay_harvest(engine, seg, look, None, limit_seq, cleared_seq),
     }
 }
 
@@ -773,6 +937,7 @@ fn replay_harvest(
     look: &Appearance,
     mut harvest: Option<&mut dyn FnMut(Vec<Vec<Cell>>)>,
     limit_seq: Option<u64>,
+    cleared_seq: u64,
 ) -> (Vec<Gap>, u64) {
     let mut gaps = Vec::new();
     let mut seq = seg.header.start_seq;
@@ -784,6 +949,9 @@ fn replay_harvest(
             h(engine.take_history());
         }
     };
+    if seq <= cleared_seq {
+        engine.clear_history();
+    }
     for rec in &seg.records {
         if limit_seq.is_some_and(|limit| seq >= limit) {
             break;
@@ -795,7 +963,20 @@ fn replay_harvest(
                         .unwrap_or(usize::MAX)
                         .min(d.len())
                 });
-                for part in d.get(..take).unwrap_or(d).chunks(REPLAY_STEP) {
+                let slice = d.get(..take).unwrap_or(d);
+                let pre = usize::try_from(cleared_seq.saturating_sub(seq))
+                    .unwrap_or(usize::MAX)
+                    .min(slice.len());
+                for part in slice.get(..pre).unwrap_or_default().chunks(REPLAY_STEP) {
+                    let fed = panic::catch_unwind(AssertUnwindSafe(|| {
+                        engine.feed(part, Feed::Replay, look);
+                    }));
+                    if fed.is_err() {
+                        *engine = Engine::new(size);
+                    }
+                    engine.clear_history();
+                }
+                for part in slice.get(pre..).unwrap_or_default().chunks(REPLAY_STEP) {
                     // 라이브에서 panic한 바이트는 재생에서도 panic한다. 세션 리더와 같은 방식으로 엔진을 새로 만든다.
                     let fed = panic::catch_unwind(AssertUnwindSafe(|| {
                         engine.feed(part, Feed::Replay, look);
@@ -815,12 +996,27 @@ fn replay_harvest(
             Record::Resize(s) => {
                 size = *s;
                 engine.resize(size);
-                reap(engine);
+                if seq < cleared_seq {
+                    engine.clear_history();
+                } else {
+                    reap(engine);
+                }
             }
             Record::Gap(n) => {
                 let len = limit_seq.map_or(*n, |limit| (*n).min(limit.saturating_sub(seq)));
-                gaps.push(Gap { start: seq, len });
-                seq = seq.saturating_add(len);
+                let end = seq.saturating_add(len);
+                if *n == 0 {
+                    if seq >= cleared_seq {
+                        gaps.push(Gap { start: seq, len: 0 });
+                    }
+                } else if end > cleared_seq {
+                    let start = seq.max(cleared_seq);
+                    gaps.push(Gap {
+                        start,
+                        len: end - start,
+                    });
+                }
+                seq = end;
                 if len < *n {
                     break;
                 }

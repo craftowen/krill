@@ -157,6 +157,15 @@ impl Client {
         drop(clients);
         self.tap.write_input(bytes, Some(peer))
     }
+
+    pub(super) fn can_modify(&self) -> bool {
+        let clients = lock(self.tap.clients());
+        clients
+            .entries
+            .iter()
+            .find(|e| e.id == self.id)
+            .is_some_and(|e| e.role != Role::Observer)
+    }
 }
 
 impl Drop for Client {

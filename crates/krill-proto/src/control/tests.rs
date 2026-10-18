@@ -901,6 +901,19 @@ fn session_accounts_wire_contract() {
 }
 
 #[test]
+fn clear_scrollback_wire_contract() {
+    assert_eq!(
+        roundtrip(&Request::ClearScrollback {
+            session: SessionId(7),
+        }),
+        "03000000301707"
+    );
+    assert_eq!(roundtrip(&Reply::ScrollbackCleared), "02000000311b");
+    assert_eq!(FEAT_CLEAR_SCROLLBACK, 1 << 47);
+    assert_ne!(crate::ipc::FEATURES & FEAT_CLEAR_SCROLLBACK, 0);
+}
+
+#[test]
 fn create_account_tail_preserves_n_minus_one_prefix_in_both_directions() {
     let legacy = (
         0_u8,
