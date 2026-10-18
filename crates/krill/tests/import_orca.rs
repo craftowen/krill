@@ -20,9 +20,9 @@ use krill_proto::orchestration::WorktreeStore;
 use krill_proto::schedule::Schedules;
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
-    AccountInfo, AccountsSnapshot, FEAT_ACCOUNT_CONNECTION, FEAT_ACCOUNT_POLICY, FEAT_USAGE,
-    FEAT_USAGE_AGY, FEAT_USAGE_MANAGE, FEAT_USAGE_RATELIMIT, FEAT_USAGE_RULES, FEAT_USAGE_STATUS,
-    Snapshot, UsageReply, UsageRequest,
+    AccountConnection, AccountInfo, AccountsSnapshot, ConnectionStatus, ConnectionsSnapshot,
+    FEAT_ACCOUNT_CONNECTION, FEAT_ACCOUNT_POLICY, FEAT_USAGE, FEAT_USAGE_AGY, FEAT_USAGE_MANAGE,
+    FEAT_USAGE_RATELIMIT, FEAT_USAGE_RULES, FEAT_USAGE_STATUS, Snapshot, UsageReply, UsageRequest,
 };
 
 fn create_sqlite_db(db_path: &Path, rows: &[(&str, &str)]) {
@@ -55,6 +55,33 @@ fn create_sqlite_db(db_path: &Path, rows: &[(&str, &str)]) {
         })
         .unwrap();
     assert!(status.success());
+}
+
+/// OWE-896: Orca 원본 스냅샷(상대경로·크기·mtime). 이관 전후 동일해야 한다.
+fn orca_snapshot(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(top) = stack.pop() {
+        for entry in fs::read_dir(&top).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let meta = fs::symlink_metadata(&path).unwrap();
+                out.push((
+                    path.strip_prefix(dir)
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned(),
+                    meta.len(),
+                    meta.modified().unwrap(),
+                ));
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 fn spawn_fake_krilld(
@@ -157,6 +184,19 @@ fn spawn_fake_krilld(
             }
             let reply = UsageReply::Accounts(AccountsSnapshot {
                 accounts: accounts.clone(),
+                connections: Box::new(ConnectionsSnapshot {
+                    supported: true,
+                    direct_usage: false,
+                    // OWE-896: 실제 데몬처럼 등록 계정을 `Connected`로 보고해
+                    // 이관 리포트의 연결 상태(`connection`) 결선을 검증한다.
+                    accounts: accounts
+                        .iter()
+                        .map(|a| AccountConnection {
+                            account_id: a.id.clone(),
+                            status: ConnectionStatus::Connected,
+                        })
+                        .collect(),
+                }),
                 ..AccountsSnapshot::default()
             });
             stream.write_all(&reply.encode().unwrap()).ok();
@@ -193,6 +233,23 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     let codex_home = orca_dir.join("codex-accounts").join(codex_id).join("home");
     fs::create_dir_all(&claude_home).unwrap();
     fs::create_dir_all(&codex_home).unwrap();
+    // OWE-896: `claude-accounts/<id>/auth` 폴백에는 `.claude.json`이 있지만
+    // 프로필 home에는 없다. 구 동작은 폴백 파일을 home에 복사했지만(Orca 원본 쓰기),
+    // 이제는 읽기만으로 이메일을 보강하고 복사하지 않는다.
+    let claude_auth = orca_dir
+        .join("claude-accounts")
+        .join(claude_id)
+        .join("auth");
+    fs::create_dir_all(&claude_auth).unwrap();
+    fs::write(
+        claude_auth.join(".claude.json"),
+        r#"{"oauthAccount":{"emailAddress":"dev@example.com","organizationUuid":"org-dev","organizationName":"Dev Org"}}"#,
+    )
+    .unwrap();
+    // OWE-896: agy vault는 존재만 감지한다(암호화 — 개별 이관 불가).
+    let agy_vault_dir = orca_dir.join("antigravity-accounts");
+    fs::create_dir_all(&agy_vault_dir).unwrap();
+    fs::write(agy_vault_dir.join("vault"), b"encrypted-fixture").unwrap();
 
     let profile_dir = orca_dir.join("profiles").join("default");
     let settings_json = serde_json::json!({
@@ -320,6 +377,16 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     assert_eq!(dry_report["projects"]["worktrees_migrated"], 1);
     assert_eq!(dry_report["settings"]["settings_updated"], true);
     assert!(!state_dir.join("accounts.toml").exists());
+    // OWE-896: dry-run 리포트에도 agy 감지 + 항목별 연결 상태 필드가 있다.
+    assert_eq!(dry_report["accounts"]["agy_detected"], true);
+    assert!(
+        dry_report["accounts"]["agy_note"]
+            .as_str()
+            .is_some_and(|s| s.contains("vault"))
+    );
+    for item in dry_report["accounts"]["items"].as_array().unwrap() {
+        assert_eq!(item["connection"], "unknown");
+    }
 
     // 2. Without running krilld: `accounts` domain is skipped with `'데몬 필요'`, local `accounts.toml`
     // is never touched, no daemon is spawned, and other selected domains (`ssh`) succeed.
@@ -369,6 +436,8 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     assert!(!state_dir.join("projects.toml").exists());
 
     // 3. Start fake krilld on `run/krilld.sock` and run full import (human output)
+    // OWE-896: Orca 원본 스냅샷 — 이관 전후로 파일 집합·크기·mtime이 같아야 한다.
+    let orca_before = orca_snapshot(&orca_dir);
     let (stop, server_handle) = spawn_fake_krilld(&state_dir);
 
     let full_out = Command::new(bin)
@@ -384,6 +453,17 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     let stdout_str = String::from_utf8_lossy(&full_out.stdout);
     assert!(stdout_str.contains("Orca import [APPLIED]"));
     assert!(stdout_str.contains("accounts: claude +1 (~0), codex +1 (~0)"));
+    // OWE-896: Orca 원본에 쓰지 않는다 — 폴백 `.claude.json`이 home에 복사되지 않고,
+    // 다른 파일도 그대로다.
+    assert!(
+        !claude_home.join(".claude.json").exists(),
+        "orca profile home must stay untouched (read-only)"
+    );
+    assert_eq!(
+        orca_snapshot(&orca_dir),
+        orca_before,
+        "import must not write into the Orca directory"
+    );
 
     // Verify files created in `state_dir` for projects, worktrees, and schedules
     let proj_raw = fs::read_to_string(state_dir.join("projects.toml")).unwrap();
@@ -424,6 +504,13 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
     assert_eq!(rerun_report["projects"]["projects_added"], 0);
     assert_eq!(rerun_report["settings"]["settings_updated"], false);
     assert_eq!(rerun_report["settings"]["schedules_merged"], 0);
+    // OWE-896: 재실행 리포트는 실제 데몬 연결 상태(`connected`)와 agy 감지를 담는다.
+    assert_eq!(rerun_report["accounts"]["agy_detected"], true);
+    let rerun_items = rerun_report["accounts"]["items"].as_array().unwrap();
+    assert_eq!(rerun_items.len(), 2);
+    for item in rerun_items {
+        assert_eq!(item["connection"], "connected");
+    }
 
     stop.store(true, Ordering::Relaxed);
     UnixStream::connect(state_dir.join("run/krilld.sock")).ok();
