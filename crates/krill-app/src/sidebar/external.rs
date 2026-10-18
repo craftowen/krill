@@ -26,6 +26,16 @@ type Store = krill_proto::orchestration::WorktreeStore;
 
 /// 워크트리 경로의 체크포인트 배지(`● REVIEW #128 OWE-626 🔗2`)를 구성한다(MK-116, MK-118).
 pub fn checkpoint_badge_for(sidebar_path: Option<&Path>, worktree: &Path) -> Option<String> {
+    checkpoint_badge_for_card(sidebar_path, worktree, false)
+}
+
+/// 카드 렌더링용 체크포인트 배지. 별도 `issue_badge`가 이미 표시될 때(`omit_issue == true`)는
+/// 이슈 키 중복 출력을 생략해 배지가 길어져 잘리는 현상을 막는다(OWE-846).
+pub fn checkpoint_badge_for_card(
+    sidebar_path: Option<&Path>,
+    worktree: &Path,
+    omit_issue: bool,
+) -> Option<String> {
     let dir = sidebar_path
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty())?;
@@ -39,7 +49,9 @@ pub fn checkpoint_badge_for(sidebar_path: Option<&Path>, worktree: &Path) -> Opt
             .and_then(|s| krill_proto::orchestration::WorkspaceStatus::parse(s).ok())
             .map(krill_proto::orchestration::WorkspaceStatus::badge_label);
         let pr = store.prs.get(&key).copied();
-        let issue = store.issues.get(&key).map(String::as_str);
+        let issue = (!omit_issue)
+            .then(|| store.issues.get(&key).map(String::as_str))
+            .flatten();
         let refs_len = store.references.get(&key).map_or(0, Vec::len);
         if !unread && status.is_none() && pr.is_none() && issue.is_none() && refs_len == 0 {
             continue;

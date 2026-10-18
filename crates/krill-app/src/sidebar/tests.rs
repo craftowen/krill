@@ -3191,3 +3191,270 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
 
     fs::remove_dir_all(dir).ok();
 }
+
+/// OWE-846:
+/// 1) 핀 고정 시 우측 `★` 버튼이 제목·`[기본]` 배지·우측 배지와 겹치지 않고, 이름 변경 버튼(`worktree-rename-*`)이 동작한다.
+/// 2) `card_title == branch_subtitle`(`main`)이면 중복 브랜치 줄을 생략하고, 배지가 많은 카드에서는
+///    브랜치 줄과 배지 줄을 분리해 브랜치명이 `...`로 찌그러지거나 체크포인트 배지가 `88px`에서 잘리지 않는다.
+/// 3) 100행 이상 가상화 모드에서도 워크트리 행 마우스 클릭이 `Selected` / `NewSession`을 발생시킨다.
+#[gpui::test]
+fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
+    cx: &mut TestAppContext,
+) {
+    use crate::pull_request::Status as PrStatus;
+    use gpui::{Modifiers, px, size};
+    use krill_proto::control::Program;
+    use krill_proto::orchestration::WorktreeStore;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let dir = std::env::temp_dir().join(format!("mk-owe846-card-ux-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let sidebar_bin = dir.join("sidebar.bin");
+
+    let repo = PathBuf::from("/repo");
+    let wt_feature = PathBuf::from("/repo/feat-ux");
+    let store = WorktreeStore {
+        statuses: BTreeMap::from([(
+            wt_feature.to_string_lossy().into_owned(),
+            "in-review".into(),
+        )]),
+        unread: BTreeMap::from([(wt_feature.to_string_lossy().into_owned(), true)]),
+        prs: BTreeMap::from([(wt_feature.to_string_lossy().into_owned(), 128)]),
+        issues: BTreeMap::from([(wt_feature.to_string_lossy().into_owned(), "OWE-626".into())]),
+        references: BTreeMap::from([(
+            wt_feature.to_string_lossy().into_owned(),
+            vec![
+                "https://example.com/1".into(),
+                "https://example.com/2".into(),
+            ],
+        )]),
+        ..WorktreeStore::default()
+    };
+    store.save(&dir).unwrap();
+
+    assert_eq!(
+        external::checkpoint_badge_for(Some(&sidebar_bin), &wt_feature).as_deref(),
+        Some("● REVIEW #128 OWE-626 🔗2")
+    );
+    assert_eq!(
+        external::checkpoint_badge_for_card(Some(&sidebar_bin), &wt_feature, true).as_deref(),
+        Some("● REVIEW #128 🔗2"),
+        "card checkpoint badge must omit issue key when issue_badge is separately shown"
+    );
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        bind_keys(cx);
+    });
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    vcx.simulate_resize(size(px(240.), px(720.)));
+
+    let selected_events: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected_got = selected_events.clone();
+    let _sub_sel = vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, ev: &Selected, _| {
+            selected_got.borrow_mut().push(ev.0);
+        })
+    });
+    let launched_events: Rc<RefCell<Vec<NewSession>>> = Rc::new(RefCell::new(Vec::new()));
+    let launched_got = launched_events.clone();
+    let _sub_new = vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, ev: &NewSession, _| {
+            launched_got.borrow_mut().push(ev.clone());
+        })
+    });
+
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([(repo.clone(), vec![repo.clone(), wt_feature.clone()])]),
+            };
+            s.meta.insert(
+                repo.clone(),
+                Tree {
+                    branch: Some("main".into()),
+                    dirty: None,
+                },
+            );
+            s.meta.insert(
+                wt_feature.clone(),
+                Tree {
+                    branch: Some("feat/owe-846-worktree-card-ux".into()),
+                    dirty: Some(3),
+                },
+            );
+            s.prs.insert(wt_feature.clone(), PrStatus::Open);
+            s.set_worktree_issue(wt_feature.clone(), "OWE-626", cx);
+            // 기본 워크트리(repo)를 핀 고정해 `[기본]` 배지와 `★` 핀 버튼이 겹치지 않는지 확인한다.
+            s.toggle_pin(repo.clone(), cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    // row 1: 핀 고정된 기본 워크트리(`repo`, `main`), row 2: `wt_feature`
+    assert!(
+        vcx.debug_bounds("worktree-branch-1").is_none(),
+        "default branch card where card_title == branch_subtitle ('main') must not duplicate branch on row 2"
+    );
+    let default_badge = vcx
+        .debug_bounds("worktree-default-badge-1")
+        .expect("default worktree badge must render");
+    let pin_btn = vcx
+        .debug_bounds("worktree-pin-1")
+        .expect("pin button must render");
+    let rename_btn = vcx
+        .debug_bounds("worktree-rename-1")
+        .expect("rename button must render");
+    let new_btn = vcx
+        .debug_bounds("worktree-new-session-1")
+        .expect("new session button must render");
+    assert!(
+        f32::from(pin_btn.origin.x) > f32::from(rename_btn.origin.x)
+            && f32::from(rename_btn.origin.x) > f32::from(new_btn.origin.x),
+        "pin button must be placed at the right end of the action bar so idle pinned star sits at the right edge"
+    );
+    assert!(
+        f32::from(default_badge.origin.x + default_badge.size.width) <= f32::from(pin_btn.origin.x),
+        "default badge right edge ({default_badge:?}) must not overlap pinned star button ({pin_btn:?})"
+    );
+
+    // 배지가 많은 `wt_feature`(row 2): 브랜치 줄이 전체 폭을 쓰고 배지 줄이 아래에 배치되어야 한다.
+    let branch_bounds = vcx
+        .debug_bounds("worktree-branch-2")
+        .expect("distinct branch subtitle must render on feature worktree");
+    let checkpoint_bounds = vcx
+        .debug_bounds("checkpoint-badge-2")
+        .expect("checkpoint badge must render");
+    assert!(
+        f32::from(branch_bounds.size.width) >= 140.0,
+        "branch subtitle width ({branch_bounds:?}) must not be crushed to '...' by badges"
+    );
+    assert!(
+        f32::from(checkpoint_bounds.origin.y) >= f32::from(branch_bounds.origin.y) + 10.0,
+        "dense badges must wrap onto a separate row below the branch subtitle ({checkpoint_bounds:?} vs {branch_bounds:?})"
+    );
+
+    // Compact 모드에서도 핀 고정된 카드의 우측 배지가 `★` 버튼과 겹치지 않고 `main` 중복 브랜치가 없어야 한다.
+    // 두 카드 모두 핀 고정되면 스마트 정렬이 브랜치명순으로 재정렬해 순서가 바뀔 수 있어 인덱스에 의존하지 않는다.
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.toggle_pin(wt_feature.clone(), cx);
+            s.set_card_layout(CardLayout::Compact, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    let repo_idx: usize = if vcx.debug_bounds("worktree-default-badge-1").is_some() {
+        1
+    } else {
+        2
+    };
+    let feature_idx: usize = if repo_idx == 1 { 2 } else { 1 };
+    let repo_branch: &'static str = if repo_idx == 1 {
+        "worktree-branch-1"
+    } else {
+        "worktree-branch-2"
+    };
+    let feature_branch: &'static str = if feature_idx == 1 {
+        "worktree-branch-1"
+    } else {
+        "worktree-branch-2"
+    };
+    let feature_pr: &'static str = if feature_idx == 1 {
+        "pr-badge-1"
+    } else {
+        "pr-badge-2"
+    };
+    let feature_pin: &'static str = if feature_idx == 1 {
+        "worktree-pin-1"
+    } else {
+        "worktree-pin-2"
+    };
+    let repo_rename: &'static str = if repo_idx == 1 {
+        "worktree-rename-1"
+    } else {
+        "worktree-rename-2"
+    };
+    assert!(
+        vcx.debug_bounds(repo_branch).is_none(),
+        "compact layout must also suppress duplicate branch when card_title == branch_subtitle"
+    );
+    assert!(
+        vcx.debug_bounds(feature_branch).is_some(),
+        "compact layout must keep distinct branch subtitle on feature worktree"
+    );
+    let compact_pr = vcx
+        .debug_bounds(feature_pr)
+        .expect("compact pr badge must render");
+    let compact_pin = vcx
+        .debug_bounds(feature_pin)
+        .expect("compact pin button must render");
+    assert!(
+        f32::from(compact_pr.origin.x + compact_pr.size.width) <= f32::from(compact_pin.origin.x),
+        "compact right badges ({compact_pr:?}) must not overlap pinned star ({compact_pin:?})"
+    );
+
+    // 이름 변경(연필) 버튼 클릭 시 인라인 이름 편집 입력창이 열려야 한다.
+    // 호버 전용 버튼이라 먼저 마우스를 올려 가시화한다(OWE-612 패턴).
+    let rename_at = vcx.debug_bounds(repo_rename).unwrap().center();
+    vcx.simulate_mouse_move(rename_at, None::<gpui::MouseButton>, Modifiers::default());
+    vcx.run_until_parked();
+    vcx.simulate_click(rename_at, Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.update(|_, cx| view.read(cx).editing.is_some()),
+        "clicking rename pencil button must start inline rename"
+    );
+    vcx.update(|_, cx| view.update(cx, |s, cx| s.finish_rename(None, cx)));
+
+    // 3) 100행 이상 가상화 모드에서 워크트리 행 클릭 시 `activate_worktree_card`가 호출되어야 한다.
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.set_card_layout(CardLayout::Detailed, cx);
+            let trees: Vec<PathBuf> = (0..120)
+                .map(|i| PathBuf::from(format!("/repo/wt-{i:03}")))
+                .collect();
+            let sess = session(77, AgentState::Working, Some("/repo/wt-000"));
+            s.snapshot = Snapshot {
+                sessions: vec![sess],
+                trees: BTreeMap::from([(repo.clone(), trees)]),
+            };
+            s.rebuild(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    assert!(vcx.update(|_, cx| view.read(cx).rows.len()) >= 100);
+
+    // 세션이 있는 첫 워크트리(index 1: `/repo/wt-000`) 클릭 → `Selected(SessionId(77))`
+    let wt0_center = vcx
+        .debug_bounds("worktree-card-1")
+        .expect("virtualized worktree row 1 must have debug_bounds")
+        .center();
+    vcx.simulate_click(wt0_center, Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(selected_events.borrow().as_slice(), &[SessionId(77)]);
+
+    // 세션이 없는 두 번째 워크트리(`/repo/wt-001`) 클릭 → `NewSession`.
+    // `wt-000`에 세션이 있어 행 구조가 [Repo, wt-000, Session77, wt-001, ...]이므로
+    // 두 번째 워크트리 카드는 index 3이다.
+    let wt1_center = vcx
+        .debug_bounds("worktree-card-3")
+        .expect("virtualized worktree row 3 must have debug_bounds")
+        .center();
+    vcx.simulate_click(wt1_center, Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        launched_events.borrow().as_slice(),
+        &[NewSession {
+            cwd: PathBuf::from("/repo/wt-001"),
+            program: Program::Login,
+        }]
+    );
+
+    fs::remove_dir_all(dir).ok();
+}

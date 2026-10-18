@@ -135,10 +135,12 @@ fn row_menu(
                     }),
             )
             .item(
-                PopupMenuItem::new(text::RENAME.get()).on_click(move |_, window, cx| {
-                    b.update(cx, |s, cx| s.rename(edit.clone(), window, cx))
-                        .ok();
-                }),
+                PopupMenuItem::new(text::RENAME.get())
+                    .icon(Icon::default().data(ui::icons::PENCIL_SVG))
+                    .on_click(move |_, window, cx| {
+                        b.update(cx, |s, cx| s.rename(edit.clone(), window, cx))
+                            .ok();
+                    }),
             );
 
         if host.is_local() {
@@ -870,7 +872,7 @@ impl Sidebar {
         let mut label = super::external::worktree_a11y_label(text::TITLE.get(), &name, comment);
         for part in [
             branch.clone(),
-            checkpoint_badge.clone(),
+            checkpoint_badge,
             dirty.map(|n| format!("{} {n}", text::DIRTY.get())),
         ]
         .into_iter()
@@ -885,6 +887,7 @@ impl Sidebar {
         // 500행 가상화 벤치마크 모드: 고정 높이(ROW_HEIGHT) 1줄 행.
         if self.rows.len() >= 100 {
             return base
+                .debug_selector(move || format!("worktree-card-{index}"))
                 .aria_label(label)
                 .aria_expanded(!closed)
                 .h(px(ROW_HEIGHT))
@@ -897,7 +900,17 @@ impl Sidebar {
                 .gap_1()
                 .text_size(ui::TEXT_SM)
                 .text_color(p.worktree_sidebar_foreground)
-                .child(div().flex_1().min_w_0().truncate().child(name));
+                .cursor_pointer()
+                .child(div().flex_1().min_w_0().truncate().child(name))
+                .on_click(cx.listener(move |s, _, window, cx| {
+                    s.activate_worktree_card(
+                        index,
+                        row_host.clone(),
+                        card_path.clone(),
+                        Some(window),
+                        cx,
+                    );
+                }));
         }
 
         let left_status = if unread {
@@ -940,36 +953,64 @@ impl Sidebar {
             hover_only(frame).child(button)
         };
 
-        let pin_btn = div().flex_none().flex().when(!pinned, hover_only).child(
-            Button::new(("pin", index))
-                .ghost()
-                .xsmall()
-                .icon(if pinned {
-                    IconName::StarFill
-                } else {
-                    IconName::Star
+        let pin_btn = {
+            let frame = div()
+                .flex_none()
+                .flex()
+                .rounded(ui::RADIUS_XS)
+                .when(pinned, |d| {
+                    d.bg(if is_active_worktree {
+                        p.worktree_sidebar
+                    } else {
+                        p.sidebar
+                    })
+                    .group_hover(ROW_GROUP, |d| {
+                        d.bg(if is_active_worktree {
+                            p.worktree_sidebar
+                        } else {
+                            p.sidebar_accent
+                        })
+                    })
                 })
-                .accessibility_label(text::PIN.get())
-                .toggled(pinned)
-                .tooltip(text::PIN.get())
-                .on_click(cx.listener(move |s, _, _, cx| {
-                    cx.stop_propagation();
-                    s.toggle_pin(pin.clone(), cx);
-                })),
-        );
+                .when(!pinned, hover_only);
+            #[cfg(test)]
+            let frame = frame.debug_selector(move || format!("worktree-pin-{index}"));
+            frame.child(
+                Button::new(("pin", index))
+                    .ghost()
+                    .xsmall()
+                    .icon(if pinned {
+                        IconName::StarFill
+                    } else {
+                        IconName::Star
+                    })
+                    .accessibility_label(text::PIN.get())
+                    .toggled(pinned)
+                    .tooltip(text::PIN.get())
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        cx.stop_propagation();
+                        s.toggle_pin(pin.clone(), cx);
+                    })),
+            )
+        };
 
-        let rename_btn = hover_only(div().flex_none()).child(
-            Button::new(("rename", index))
-                .ghost()
-                .xsmall()
-                .icon(IconName::Ellipsis)
-                .accessibility_label(text::RENAME.get())
-                .tooltip(text::RENAME.get())
-                .on_click(cx.listener(move |s, _, window, cx| {
-                    cx.stop_propagation();
-                    s.rename(edit.clone(), window, cx);
-                })),
-        );
+        let rename_btn = {
+            let frame = div().flex_none();
+            #[cfg(test)]
+            let frame = frame.debug_selector(move || format!("worktree-rename-{index}"));
+            hover_only(frame).child(
+                Button::new(("rename", index))
+                    .ghost()
+                    .xsmall()
+                    .icon(Icon::default().data(ui::icons::PENCIL_SVG))
+                    .accessibility_label(text::RENAME.get())
+                    .tooltip(text::RENAME.get())
+                    .on_click(cx.listener(move |s, _, window, cx| {
+                        cx.stop_propagation();
+                        s.rename(edit.clone(), window, cx);
+                    })),
+            )
+        };
 
         let dirty_badge = dirty.map(|n| {
             let dirty_label = text::DIRTY_COUNT.format(&[("n", &n.to_string())]);
@@ -991,6 +1032,11 @@ impl Sidebar {
         });
 
         let props = self.options.card_properties;
+        let show_branch_subtitle = props.branch
+            && !branch_subtitle.is_empty()
+            && !card_title
+                .trim()
+                .eq_ignore_ascii_case(branch_subtitle.trim());
         let pr_badge = props
             .pr
             .then(|| {
@@ -1044,25 +1090,33 @@ impl Sidebar {
                     })
             });
 
-        let issue_badge = props
-            .issue
-            .then(|| self.issue_for(path))
-            .flatten()
-            .map(|iss| {
-                div()
-                    .id(("issue-badge", index))
-                    .role(gpui::Role::Status)
-                    .aria_label(iss.clone())
-                    .debug_selector(move || format!("issue-badge-{index}"))
-                    .flex_none()
-                    .px_1()
-                    .rounded(ui::RADIUS_XS)
-                    .bg(p.muted)
-                    .font_family(ui::FONT_MONO)
-                    .text_size(ui::TEXT_2XS)
-                    .text_color(p.accent_foreground)
-                    .child(iss)
-            });
+        let issue_text = props.issue.then(|| self.issue_for(path)).flatten();
+        let has_issue_badge = issue_text.is_some();
+        let issue_badge = issue_text.map(|iss| {
+            div()
+                .id(("issue-badge", index))
+                .role(gpui::Role::Status)
+                .aria_label(iss.clone())
+                .debug_selector(move || format!("issue-badge-{index}"))
+                .flex_none()
+                .px_1()
+                .rounded(ui::RADIUS_XS)
+                .bg(p.muted)
+                .font_family(ui::FONT_MONO)
+                .text_size(ui::TEXT_2XS)
+                .text_color(p.accent_foreground)
+                .child(iss)
+        });
+        let card_checkpoint_badge = row_host
+            .is_local()
+            .then(|| {
+                super::external::checkpoint_badge_for_card(
+                    self.path.as_deref(),
+                    path,
+                    has_issue_badge,
+                )
+            })
+            .flatten();
 
         let ports_list = if props.ports {
             self.ports_for(&row_host, path)
@@ -1170,6 +1224,12 @@ impl Sidebar {
                 }))
         });
 
+        let action_hover_bg = if is_active_worktree {
+            p.worktree_sidebar
+        } else {
+            p.sidebar_accent
+        };
+
         if self.options.card_layout == super::CardLayout::Compact {
             let compact_path = card_path.clone();
             let compact_fold = fold.clone();
@@ -1224,6 +1284,7 @@ impl Sidebar {
                         .gap_1p5()
                         .child(
                             div()
+                                .debug_selector(move || format!("worktree-title-{index}"))
                                 .min_w_0()
                                 .truncate()
                                 .text_size(ui::TEXT_SM)
@@ -1231,7 +1292,7 @@ impl Sidebar {
                                 .child(card_title),
                         )
                         .children(lineage_toggle_btn)
-                        .when(props.branch, |d| {
+                        .when(show_branch_subtitle, |d| {
                             d.child(
                                 div()
                                     .debug_selector(move || format!("worktree-branch-{index}"))
@@ -1260,6 +1321,7 @@ impl Sidebar {
                         .flex()
                         .items_center()
                         .gap_1()
+                        .when(pinned, |d| d.pr(px(26.)))
                         .children(host_badge)
                         .children(issue_badge)
                         .children(ports_badge)
@@ -1292,12 +1354,15 @@ impl Sidebar {
                         .right_2()
                         .top_0()
                         .h(px(28.))
+                        .pl_1()
+                        .rounded(ui::RADIUS_SM)
+                        .group_hover(ROW_GROUP, move |d| d.bg(action_hover_bg))
                         .flex()
                         .items_center()
                         .gap_0p5()
                         .child(new_session_btn)
-                        .child(pin_btn)
-                        .child(rename_btn),
+                        .child(rename_btn)
+                        .child(pin_btn),
                 )
                 .on_click(cx.listener(move |s, _, window, cx| {
                     s.activate_worktree_card(
@@ -1309,6 +1374,32 @@ impl Sidebar {
                     );
                 }));
         }
+
+        let badge_count = usize::from(card_checkpoint_badge.is_some())
+            + usize::from(worktree_cache_badge.is_some())
+            + usize::from(host_badge.is_some())
+            + usize::from(issue_badge.is_some())
+            + usize::from(ports_badge.is_some())
+            + usize::from(dirty_badge.is_some())
+            + usize::from(pr_badge.is_some());
+        let has_badges = badge_count > 0;
+        let has_line2 = show_branch_subtitle || has_badges;
+        let dense_badges = badge_count >= 2 || card_checkpoint_badge.is_some();
+        let checkpoint_pill = card_checkpoint_badge.map(|cb| {
+            div()
+                .id(("checkpoint-badge", index))
+                .role(gpui::Role::Status)
+                .aria_label(cb.clone())
+                .debug_selector(move || format!("checkpoint-badge-{index}"))
+                .flex_none()
+                .px_1()
+                .rounded(ui::RADIUS_XS)
+                .bg(p.muted)
+                .font_family(ui::FONT_MONO)
+                .text_size(ui::TEXT_2XS)
+                .text_color(p.accent_foreground)
+                .child(cb)
+        });
 
         base.debug_selector(move || format!("worktree-card-{index}"))
             .aria_label(label)
@@ -1365,8 +1456,10 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
+                            .when(pinned, |d| d.pr(px(26.)))
                             .child(
                                 div()
+                                    .debug_selector(move || format!("worktree-title-{index}"))
                                     .min_w_0()
                                     .truncate()
                                     .text_size(ui::TEXT_MD)
@@ -1376,6 +1469,9 @@ impl Sidebar {
                             .when(is_default_tree, |d| {
                                 d.child(
                                     div()
+                                        .debug_selector(move || {
+                                            format!("worktree-default-badge-{index}")
+                                        })
                                         .flex_none()
                                         .px_1p5()
                                         .py(px(1.))
@@ -1395,58 +1491,94 @@ impl Sidebar {
                             .right_0()
                             .top_0()
                             .h(px(20.))
+                            .pl_1()
+                            .rounded(ui::RADIUS_SM)
+                            .group_hover(ROW_GROUP, move |d| d.bg(action_hover_bg))
                             .flex()
                             .items_center()
                             .gap_0p5()
                             .child(new_session_btn)
-                            .child(pin_btn)
-                            .child(rename_btn),
+                            .child(rename_btn)
+                            .child(pin_btn),
                     ),
             )
             // 2행: 들여쓴 브랜치 이름 + 체크포인트·캐시 타이머·호스트·이슈·포트·미커밋·PR 배지
-            .child(
-                div()
-                    .w_full()
-                    .h(px(18.))
-                    .pl(px(20.))
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_1p5()
-                    .child(div().flex_1().min_w_0().when(props.branch, |d| {
-                        d.debug_selector(move || format!("worktree-branch-{index}"))
-                            .truncate()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(branch_subtitle)
-                    }))
-                    .child(
+            .when(has_line2, |d| {
+                if show_branch_subtitle && dense_badges {
+                    d.child(
                         div()
-                            .flex_none()
+                            .w_full()
+                            .pl(px(20.))
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("worktree-branch-{index}"))
+                                    .w_full()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(branch_subtitle),
+                            )
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_wrap()
+                                    .items_center()
+                                    .gap_1()
+                                    .children(checkpoint_pill)
+                                    .children(worktree_cache_badge)
+                                    .children(host_badge)
+                                    .children(issue_badge)
+                                    .children(ports_badge)
+                                    .children(dirty_badge)
+                                    .children(pr_badge),
+                            ),
+                    )
+                } else {
+                    d.child(
+                        div()
+                            .w_full()
+                            .min_h(px(18.))
+                            .pl(px(20.))
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .children(checkpoint_badge.map(|cb| {
-                                div()
-                                    .flex_none()
-                                    .max_w(px(88.))
-                                    .truncate()
-                                    .px_1()
-                                    .rounded(ui::RADIUS_XS)
-                                    .bg(p.muted)
-                                    .font_family(ui::FONT_MONO)
-                                    .text_size(ui::TEXT_2XS)
-                                    .text_color(p.accent_foreground)
-                                    .child(cb)
-                            }))
-                            .children(worktree_cache_badge)
-                            .children(host_badge)
-                            .children(issue_badge)
-                            .children(ports_badge)
-                            .children(dirty_badge)
-                            .children(pr_badge),
-                    ),
-            )
+                            .justify_between()
+                            .gap_1p5()
+                            .when(show_branch_subtitle, |d| {
+                                d.child(
+                                    div()
+                                        .debug_selector(move || format!("worktree-branch-{index}"))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_size(ui::TEXT_XS)
+                                        .text_color(p.muted_foreground)
+                                        .child(branch_subtitle),
+                                )
+                            })
+                            .when(has_badges, |d| {
+                                d.child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap_1()
+                                        .children(checkpoint_pill)
+                                        .children(worktree_cache_badge)
+                                        .children(host_badge)
+                                        .children(issue_badge)
+                                        .children(ports_badge)
+                                        .children(dirty_badge)
+                                        .children(pr_badge),
+                                )
+                            }),
+                    )
+                }
+            })
             // 3행: 코멘트 또는 에이전트 상태 요약(1개 세션이면 인라인 요약 줄, 다중 세션이면 알약 바)
             .when(has_line3, |d| {
                 let single_session = if tree_session_count == 1 && !card_expanded {
