@@ -52,7 +52,7 @@ type Pending = Option<HashMap<u32, Sender<Answer>>>;
 pub struct Holder {
     version: u16,
     #[cfg(windows)]
-    holder_pid: u32,
+    pid: u32,
     /// 받는 쪽과 같은 소켓의 사본. 프레임 하나를 한 번에 보내도록 잠근다.
     out: Mutex<Link>,
     pending: Mutex<Pending>,
@@ -89,7 +89,7 @@ impl Holder {
         Ok((
             Self {
                 version,
-                holder_pid: link.peer_pid.ok_or(io::ErrorKind::InvalidData)?,
+                pid: link.peer_pid.ok_or(io::ErrorKind::InvalidData)?,
                 out: Mutex::new(out),
                 pending: Mutex::new(Some(HashMap::new())),
                 next: AtomicU32::new(1),
@@ -189,7 +189,7 @@ impl Holder {
         return self.send(
             &ToHolder::HoldListener {
                 req,
-                info: link::duplicate_socket(fd, self.holder_pid)?,
+                info: link::duplicate_socket(fd, self.pid)?,
             },
             &[],
         );
