@@ -9,6 +9,7 @@
 //! `MKH_UPGRADES=10 cargo nextest run -p krill-holder --locked --no-capture exec_handoff`
 //! holder만 크래시한 뒤 재결합(OWE-478): `cargo nextest run -p krill-holder --locked holder_crash_adopt`
 
+#![cfg(unix)]
 #![expect(
     clippy::unwrap_used,
     clippy::expect_used,
