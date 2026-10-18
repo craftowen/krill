@@ -1106,7 +1106,8 @@ impl Shell {
                 .await;
             this.update_in(cx, |this, window, cx| {
                 if this.settings.is_some() {
-                    return;
+                    // OWE-860: 설정에서 ⌘P를 누르면 설정을 닫고 빠른 열기로 전환한다.
+                    this.close_settings(Some(&mut *window), cx);
                 }
                 if let Some(pane) = this.layout.focused() {
                     this.commit_ime(pane, Some(window), cx);

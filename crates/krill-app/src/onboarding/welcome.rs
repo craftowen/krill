@@ -1379,6 +1379,10 @@ impl Render for Wizard {
         };
         div()
             .id("onboarding-wizard")
+            .key_context("Wizard")
+            .on_action(cx.listener(|s, _: &super::CloseWizard, window, cx| {
+                s.later(window, cx);
+            }))
             .track_focus(&self.focus)
             .role(gpui::Role::Dialog)
             .aria_label(text::TITLE.get())

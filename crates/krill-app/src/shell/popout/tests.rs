@@ -434,6 +434,74 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     assert_eq!(cx.windows().len(), 2);
 }
 
+/// OWE-861: 대시보드 팝아웃은 Esc로 닫히고, 실시간 미리보기가 있는 카드에는
+/// '미리보기 없음'이 중복 출력되지 않는다.
+#[gpui::test]
+fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
+    let (main, main_window) = open(cx);
+    // 세션 2번 칸에 테스트 PTY를 붙여 미리보기가 생기게 한다.
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    cx.update(|cx| {
+        main.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_session(pane, SessionId(2));
+            s.attach_test(pane, SessionId(2), ours, cx);
+        });
+    });
+    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.run_until_parked();
+    let dashboard = cx.read(|cx| existing::<Dashboard>(cx).unwrap());
+    dashboard
+        .update(cx, |d, _, cx| {
+            d.sidebar
+                .update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let mut visual = VisualTestContext::from_window(dashboard.into(), cx);
+    // 미리보기가 있는 세션 2번 카드: PREVIEW만 있고 NO_PREVIEW는 없다.
+    assert!(visual.debug_bounds("dashboard-preview-2").is_some());
+    assert!(
+        visual.debug_bounds("dashboard-no-preview-2").is_none(),
+        "preview card must not show NO_PREVIEW"
+    );
+    // 미리보기가 없는 세션 0번 카드: NO_PREVIEW만 있고 PREVIEW는 없다.
+    assert!(visual.debug_bounds("dashboard-no-preview-0").is_some());
+    assert!(visual.debug_bounds("dashboard-preview-0").is_none());
+    // Esc로 닫힌다.
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert_eq!(cx.windows().len(), 1, "escape closes dashboard");
+}
+
+/// OWE-861: 플로팅 창에서 터미널 단축키(⌘F 찾기)가 Shell 키 문맥으로 동작한다.
+#[gpui::test]
+fn floating_find_shortcut_opens_search(cx: &mut TestAppContext) {
+    let (main, main_window) = open(cx);
+    let (ours, _peer) = UnixStream::pair().unwrap();
+    cx.update(|cx| {
+        main.update(cx, |s, cx| {
+            let pane = s.layout.active_tab().focused;
+            s.layout.set_session(pane, SessionId(61));
+            s.attach_test(pane, SessionId(61), ours, cx);
+        });
+    });
+    cx.simulate_keystrokes(main_window, "alt-cmd-a");
+    cx.run_until_parked();
+    let floating = cx.read(|cx| existing::<Floating>(cx).unwrap());
+    let child = floating.update(cx, |f, _, _| f.shell.clone()).unwrap();
+    assert!(
+        child.read_with(cx, |s, _| s.search.is_none()),
+        "search starts closed"
+    );
+    cx.simulate_keystrokes(floating.into(), "cmd-f");
+    cx.run_until_parked();
+    assert!(
+        child.read_with(cx, |s, _| s.search.is_some()),
+        "cmd-f opens terminal search in floating window"
+    );
+}
+
 #[gpui::test]
 fn dashboard_stable_poll_does_not_notify_and_changed_snapshot_refreshes(cx: &mut TestAppContext) {
     struct Empty;

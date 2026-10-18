@@ -20,13 +20,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use gpui::{App, Window, actions};
+use gpui::{App, KeyBinding, Window, actions};
 use krill_proto::agent::hooks::Agent;
 use krill_proto::agent::{self, Agents};
 use krill_proto::doctor::{Check, Fix, FixKind, Level, Status};
 use rustix::fs::{Access, access};
 
-actions!(onboarding, [OpenChecks, RerunOnboarding]);
+actions!(onboarding, [OpenChecks, RerunOnboarding, CloseWizard]);
 
 /// 끝까지 간 뒤 상태 디렉터리에 만드는 표시 파일(구 방식, 마이그레이션 입력으로만 읽는다).
 pub const DONE_FILE: &str = "onboarding.done";
@@ -380,6 +380,8 @@ pub fn offer(env: Env, _window: &mut Window, cx: &mut App) {
 
 /// 메뉴·팔레트 액션을 등록한다. 앱 시작 때 한 번 부른다.
 pub fn init_actions(cx: &mut App) {
+    // OWE-861: 점검 창에서도 ⌘W로 닫힌다(⌥⌘W는 전역 CloseWindow가 맡는다).
+    cx.bind_keys([KeyBinding::new("cmd-w", CloseWizard, Some("Wizard"))]);
     cx.on_action(|_: &OpenChecks, cx| open_checks_current(cx));
     cx.on_action(|_: &RerunOnboarding, cx| {
         if let Some(env) = Env::current() {

@@ -3876,12 +3876,13 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     );
     assert!(cx.update(|_, cx| view.read(cx).live.contains_key(&pane)));
 
-    // 2. Terminal workspace shortcuts (Cmd-K clear, Cmd-V paste, Cmd-W close pane, Cmd-D split)
+    // 2. Terminal edit shortcuts (Cmd-K clear, Cmd-V paste, Cmd-D split)
     //    must not leak to the hidden PTY or mutate hidden terminal panes while Settings is open.
+    //    OWE-860: Cmd-W (ClosePane) closes Settings instead, still without touching panes.
     cx.update(|_, cx| {
         cx.write_to_clipboard(ClipboardItem::new_string("leaked-clipboard".into()));
     });
-    cx.simulate_keystrokes("cmd-k cmd-v cmd-w cmd-d");
+    cx.simulate_keystrokes("cmd-k cmd-v cmd-d");
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx).tabs().len(), 1);
     assert_eq!(layout_of(&view, cx).visible().len(), 1);
@@ -3889,6 +3890,26 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
         cx.debug_bounds("admin-center").is_some(),
         "Settings view remains open and hidden terminal pane is untouched"
     );
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("admin-center").is_none(),
+        "OWE-860: Cmd-W closes Settings"
+    );
+    assert_eq!(layout_of(&view, cx).tabs().len(), 1);
+    assert_eq!(
+        layout_of(&view, cx).visible().len(),
+        1,
+        "closing Settings via Cmd-W must not close the pane"
+    );
+
+    // Settings를 다시 열어 Cmd-F 검색 경로를 검증한다.
+    let btn = cx
+        .debug_bounds("sidebar-settings")
+        .expect("sidebar-settings button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-center").is_some());
 
     // Cmd-F inside in-app Settings focuses search input; typing does not leak to the PTY.
     cx.simulate_keystrokes("cmd-f t h e m e");
@@ -3941,6 +3962,67 @@ fn settings_view_switches_in_app_without_second_window_and_preserves_sessions(
     cx.run_until_parked();
     let (k, b) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
     assert_eq!(Input::decode(k, &b).unwrap().bytes, b"x");
+}
+
+/// OWE-860: ⌘,는 설정 토글이다. 열린 상태에서 누르면 닫히고, 탐색 단축키(⌘J·⌘B)는
+/// 설정을 먼저 닫고 동작한다. Shell 키 문맥이 설정 화면에서도 유지되기 때문이다.
+#[gpui::test]
+fn settings_cmd_comma_toggles_and_nav_keys_close_first(cx: &mut TestAppContext) {
+    let layout = state_path("owe-860-toggle");
+    let (view, cx) = open(cx, layout);
+    cx.run_until_parked();
+    let btn = cx
+        .debug_bounds("sidebar-settings")
+        .expect("sidebar-settings button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-center").is_some());
+    // 단축키 탭으로 옮긴 뒤 ⌘, → 토글로 닫힌다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.open_settings(krill_app::settings::AdminTab::Shortcuts, None, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-center").is_some());
+    cx.simulate_keystrokes("cmd-,");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("admin-center").is_none(),
+        "cmd-, closes in-app settings"
+    );
+    // 닫힌 상태에서 ⌘, → 일반 탭으로 다시 열린다.
+    cx.simulate_keystrokes("cmd-,");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-center").is_some());
+    // ⌘J는 설정을 닫고 Jump 팔레트를 연다.
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("admin-center").is_none(),
+        "cmd-j closes settings first"
+    );
+    assert!(
+        cx.update(|_, cx| view.read(cx).jump.is_some()),
+        "jump palette opens"
+    );
+    // Jump를 닫고 설정을 다시 열어 ⌘B를 확인한다.
+    cx.simulate_keystrokes("cmd-j");
+    cx.run_until_parked();
+    let btn = cx
+        .debug_bounds("sidebar-settings")
+        .expect("sidebar-settings button");
+    cx.simulate_click(btn.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-center").is_some());
+    assert!(!cx.update(|_, cx| view.read(cx).sidebar_collapsed));
+    cx.simulate_keystrokes("cmd-b");
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("admin-center").is_none(),
+        "cmd-b closes settings first"
+    );
+    assert!(cx.update(|_, cx| view.read(cx).sidebar_collapsed));
 }
 
 #[gpui::test]
