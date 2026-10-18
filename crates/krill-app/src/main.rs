@@ -180,7 +180,8 @@ fn init(cx: &mut App) {
     krill_app::ui::apply(gpui_component::ThemeMode::Dark, cx);
     shell::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
-    cx.set_quit_mode(QuitMode::Explicit);
+    // macOS는 마지막 창을 닫아도 메뉴바·Dock에 남는다. 메뉴바 항목이 없는 Windows는 마지막 창을 닫으면 끝낸다(트레이는 후속).
+    cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
         let services = krill_app::hosts::link::begin_shutdown();
         cx.background_executor().spawn(async move {
