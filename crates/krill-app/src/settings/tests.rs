@@ -2816,6 +2816,8 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
     ] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
     }
+    // 대체가 없으면 경고 행이 없다(OWE-899).
+    assert!(vcx.debug_bounds("terminal-font-fallback").is_none());
     click(vcx, "cursor-bar");
     click(vcx, "cursor-blink-toggle");
     click(vcx, "option-meta-toggle");
@@ -2827,6 +2829,30 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
     });
     click(vcx, "option-meta-toggle");
     vcx.update(|_, cx| assert!(!current(cx).option_as_meta));
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-899: 쓸 수 있는 지정 글꼴은 접근자가 그대로 돌리고 경고는 없다.
+/// (headless 글꼴 목은 모든 advance를 균일하게 돌려줘서 대체 판정 로직 자체는
+/// `terminal_font` 순수 테스트에서 검증한다.)
+#[gpui::test]
+fn owe899_terminal_font_passthrough_and_no_fallback_for_usable(cx: &mut TestAppContext) {
+    let d = dir("owe899-passthrough");
+    init(cx, &d);
+    cx.update(|cx| {
+        assert_eq!(terminal_font_family(cx), "Menlo");
+        assert!(terminal_font_fallback(cx).is_none());
+        edit(cx, |s| {
+            s.terminal_font_family = "JetBrains Mono".to_owned();
+        });
+        assert_eq!(terminal_font_family(cx), "JetBrains Mono");
+        assert!(terminal_font_fallback(cx).is_none());
+        edit(cx, |s| {
+            s.terminal_font_family = "  ".to_owned();
+        });
+        assert_eq!(terminal_font_family(cx), "Menlo");
+        assert!(terminal_font_fallback(cx).is_none());
+    });
     fs::remove_dir_all(d).ok();
 }
 
