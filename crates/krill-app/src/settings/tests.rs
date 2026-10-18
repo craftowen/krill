@@ -5090,6 +5090,9 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
         );
     }
 
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-806: 자동 라벨이 조직명(`orgName`)으로 바뀐 뒤 `account_detail`이 라벨과 조직명을
 /// `Krill QA Org · Krill QA Org`처럼 두 번 반복하지 않는다. 사용자가 다른 라벨을 붙인 경우에만
 /// `라벨 · 조직명`으로 이어 붙인다.
