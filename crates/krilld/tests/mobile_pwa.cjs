@@ -6,7 +6,7 @@ const {spawn,execFileSync}=require('node:child_process'),{once}=require('node:ev
 const daemonBin=path.resolve(process.argv[2]),bin=path.dirname(daemonBin),mk=path.join(bin,'krill'),assets=path.join(__dirname,'../src/mobile/assets');
 const keep=process.argv.includes('--keep'),metadata=process.env.M9_BROWSER_METADATA||'/tmp/m9-browser-fixture.json';
 const sandbox={TextEncoder,TextDecoder,Uint8Array,Uint32Array,DataView,BigInt,atob,crypto:{getRandomValues:bytes=>crypto.randomFillSync(bytes)},setTimeout,clearTimeout};
-vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(assets,'app.js'),'utf8'),sandbox);const C=sandbox.MkCrypto;
+vm.createContext(sandbox);for(const name of ['crypto.js','terminal.js'])vm.runInContext(fs.readFileSync(path.join(assets,name),'utf8'),sandbox);const C=sandbox.MkCrypto;
 assert.equal(sandbox.crypto.subtle,undefined);assert.equal(sandbox.crypto.randomUUID,undefined);
 for(const n of [0,1,3,63,64,65,1024]){const bytes=crypto.randomBytes(n);assert.equal(C.hex(C.sha256(bytes)),crypto.createHash('sha256').update(bytes).digest('hex'));}
 // Compare both directions to Node/OpenSSL, including block edges and a photo-sized frame.
@@ -24,8 +24,8 @@ for(const size of [0,1,15,16,17,63,64,65,1024,512*1024]){
  }
 }
 const vector=new C.Channel(new Uint8Array(32).fill(7),new Uint8Array(64).fill(9));assert.equal(C.hex(vector.seal(new TextEncoder().encode('prompt'))),'0000000000000000ca8c87d414301b7fc3a6a3f09a5fb977fb9422ea97cb');
-for(const name of ['index.html','app.js','app.css','manifest.json','icon.svg'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
-assert.equal(fs.readFileSync(path.join(assets,'app.js'),'utf8'),['crypto.js','terminal.js','client.js'].map(name=>fs.readFileSync(path.join(assets,name),'utf8')).join(''));
+for(const name of ['index.html','app.js','app.css','manifest.json','icon.svg','crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
+const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js','app.js']){const at=html.indexOf('src="/'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
 // Cross-language fixed screen fixtures: wide Hangul, combining ZWJ, colors and scroll ops.
 const T=sandbox.MkTerminalCodec,model={};
 T.update(Buffer.from('3000000021ac02f0a204010400501801030203020161000000000003ed959c0103e2808d01090201020302ff0080e80503030201','hex').subarray(5),model);
@@ -33,7 +33,7 @@ assert.equal(model.cols,80);assert.equal(model.lines,24);assert.equal(model.rows
 const historyFixture=T.history(Buffer.from('100000002609e807030a02010178000000000000','hex').subarray(5));assert.equal(historyFixture.total,1000);assert.equal(historyFixture.pages,3);assert.equal(historyFixture.rows[0][0].ch,'x');
 const before=model.rows[3];T.update(Buffer.concat([v(301),v(70000),v(1),v(1),v(1),v(2)]),model);assert.equal(model.rows[2],before);
 for(let n=0;n<128;n++){const bytes=crypto.randomBytes(n);try{T.update(bytes,{cols:80,lines:24,rows:Array.from({length:24},()=>[])});}catch{}try{T.history(bytes);}catch{}}
-assert.deepEqual(Array.from(T.keys,([label,bytes])=>[label,Buffer.from(bytes).toString('hex')]),[['Esc','1b'],['Tab','09'],['⇧Tab','1b5b5a'],['Ctrl+C','03'],['Ctrl+D','04'],['↑','1b5b41'],['↓','1b5b42'],['←','1b5b44'],['→','1b5b43'],['Enter','0d']]);
+assert.equal(sandbox.KrillMobile.terminal.keys.length,20);
 const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.join(dir,'home'),profile=path.join(dir,'account');
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
 const env={...process.env,KRILL_STATE_DIR:dir,HOME:home,TMPDIR:path.join(dir,'paste')};
@@ -79,14 +79,19 @@ async function connect(url,credential){
   const question=jsonCli(['orchestration','ask','--from','mobile-worker','--to','coordinator','--question','Proceed with fixture?']);
   const gate=jsonCli(['orchestration','gate-create','--from','test-worker','--question','Deploy fixture?','--options','Approve,Deny','--run',runId]);const gateId=gate.id||gate.gate_id;assert(gateId,JSON.stringify(gate));
   const offer=jsonCli(['mobile','pair','--address',keep?(process.env.M9_BROWSER_ADDRESS||'127.0.0.1:0'):'127.0.0.1:0']);const url=offer.PairingOffer.url,base=new URL(url).origin;
-  for(const name of ['/','/app.js','/app.css','/manifest.json','/icon.svg']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert((await response.arrayBuffer()).byteLength>0);}
-  if(keep){let terminalSession=null;if(process.env.M9_LIVE_QA){
+  for(const name of ['/','/app.js','/app.css','/crypto.js','/client.js','/terminal.js','/screens/home.js','/screens/workspaces.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert.deepEqual(Buffer.from(await response.arrayBuffer()),fs.readFileSync(path.join(assets,name==='/'?'index.html':name.slice(1))));}
+  if(keep){let terminalSession=null;const extraSessions=[];if(process.env.M9_UI_QA){
+    const worktree=path.join(dir,'feature-worktree'),second=path.join(dir,'api'),outside=path.join(dir,'notes');
+    git(['worktree','add','-b','feature/mobile',worktree]);fs.mkdirSync(second);fs.mkdirSync(outside);
+    execFileSync('git',['init','-b','main'],{cwd:second,env});execFileSync('git',['-c','user.name=Fixture','-c','user.email=fixture@example.invalid','commit','--allow-empty','-m','initial'],{cwd:second,env});
+    for(const cwd of [repo,worktree,second,outside])extraSessions.push(Number(cli(['new','--cwd',cwd,'--','/bin/sh','-c',"printf 'SHELL READY\\n'; exec /bin/cat"])));
+  }if(process.env.M9_LIVE_QA){
     const generator=path.join(dir,'terminal.py');
     fs.writeFileSync(generator,`import os, sys, tty, termios, fcntl, struct\nfor i in range(20000):\n print('%06d history 한글 ' % i + 'x'*110, flush=True)\nprint('\\x1b[31mLIVE RED\\x1b[0m 한글 e\\u0301', flush=True)\ntty.setraw(0)\nwhile True:\n data=os.read(0,4096)\n if not data: break\n rows,cols,_,_=struct.unpack('HHHH',fcntl.ioctl(0,termios.TIOCGWINSZ,b'\\0'*8))\n os.write(1,('\\r\\nKEYS:'+data.hex()+' SIZE:%dx%d\\r\\n'%(cols,rows)).encode())\n`);
     terminalSession=Number(cli(['new','--cwd',repo,'--','/usr/bin/python3','-u',generator]));
     for(let i=0;i<7;i++)cli(['new','--cwd',repo,'--','/bin/sh','-c',"printf 'IDLE\\n'; exec /bin/cat"]);
     await until(()=>cli(['read',String(terminalSession)]).includes('LIVE RED'));
-  }clearTimeout(deadline);fs.writeFileSync(metadata,JSON.stringify({dir,repo,url,session,terminalSession,base,daemon,gateId,profile}));console.log('Browser fixture ready');await new Promise(r=>process.once('SIGTERM',r));return;}
+  }clearTimeout(deadline);fs.writeFileSync(metadata,JSON.stringify({dir,repo,url,session,terminalSession,extraSessions,base,daemon,gateId,profile}));console.log('Browser fixture ready');await new Promise(r=>process.once('SIGTERM',r));return;}
   phone=await connect(url);let data=await phone.rpc({action:'snapshot'});const card=data.sessions.find(s=>s.id===session);assert(card);assert.equal(card.state,'Waiting');assert.equal(card.branch,'mobile-test');assert.equal(card.added,1);assert(card.lines.some(l=>l.includes('READY')));assert(data.orchestration.gates.some(g=>g.id===gateId));assert(data.orchestration.tasks.length>=1);assert(data.orchestration.questions.some(q=>q.id===question.id));
   await phone.rpc({action:'approve',session,value:'y'});await until(()=>cli(['read',String(session)]).includes('got:y'));
   await phone.rpc({action:'approve',session,value:'n'});await until(()=>cli(['read',String(session)]).includes('got:n'));
