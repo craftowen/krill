@@ -871,3 +871,63 @@ fn open_sweeps_crashed_history_deletion_leftovers() {
     assert!(root.join("keep.txt").exists(), "unrelated files stay");
     fs::remove_dir_all(root).unwrap();
 }
+
+/// OWE-873b: 스크롤백 지우기 기준선 이전 세그먼트·행은 히스토리/복원 스크롤백에서 제외되고,
+/// 지운 뒤 들어온 새 출력만 스크롤백으로 돌아오며 마지막 보이는 화면은 그대로 유지된다.
+#[test]
+fn clear_scrollback_excludes_prior_rows_and_preserves_new_output_and_screen() {
+    let root = tmp("clear-scrollback");
+    let id = SessionId(77);
+    let small = WinSize { cols: 20, rows: 3 };
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let mut rec = store.recorder(id, small).unwrap();
+    rec.append(b"l1\r\nl2\r\nl3\r\nl4\r\n");
+    rec.seal();
+    rec.append(b"l5\r\nl6\r\nl7\r\nl8");
+    let cleared_at = rec.seq();
+
+    // 지우기 전: 콜드 페이지 2개에 스크롤백 행이 있다.
+    assert_eq!(store.history(id).unwrap().len(), 2);
+
+    // 지운 직후: 콜드 페이지 수는 0이고, 복원 화면(l6..l8)은 유지되나 복원 스크롤백은 비어 있다.
+    store.clear_scrollback(id, cleared_at);
+    let h = store.history(id).unwrap();
+    assert_eq!(h.len(), 0);
+    assert!(h.is_empty());
+    let restored = h.restore().unwrap();
+    assert_eq!(
+        restored
+            .screen_text()
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>(),
+        vec!["l6", "l7", "l8"]
+    );
+    assert!(restored.history().is_empty());
+
+    // 지운 뒤 새 출력: 그때부터 밀려난 행(l6..l9)만 히스토리에 잡히고 l1..l5는 돌아오지 않는다.
+    rec.append(b"\r\nl9\r\nl10\r\nl11\r\nl12");
+    rec.seal();
+    drop(rec);
+
+    for reopened in [store, Store::open(&root, Limits::default()).unwrap()] {
+        let h = reopened.history(id).unwrap();
+        assert_eq!(h.len(), 1);
+        let page = h.page(0).unwrap();
+        assert_eq!(page.lines(), vec!["l6", "l7", "l8", "l9"]);
+        let (total, rows) = h.rows(0, 0, 10).unwrap();
+        assert_eq!(total, 4);
+        assert_eq!(rows.len(), 4);
+        let restored = h.restore().unwrap();
+        assert_eq!(
+            restored
+                .screen_text()
+                .lines()
+                .map(str::trim_end)
+                .collect::<Vec<_>>(),
+            vec!["l10", "l11", "l12"]
+        );
+        assert_eq!(restored.history().len(), 4);
+    }
+    fs::remove_dir_all(root).unwrap();
+}

@@ -538,6 +538,23 @@ impl Tap {
         lock(&self.0.live).engine.history_rows(skip, count)
     }
 
+    /// 핫 스크롤백을 비우고 콜드 세그먼트의 스크롤백 기준선(`seq`)을 기록한다(OWE-873b).
+    /// 보이는 화면·세션·PTY는 건드리지 않는다.
+    pub fn clear_scrollback(&self) -> u64 {
+        let seq = {
+            let mut live = lock(&self.0.live);
+            panic::catch_unwind(AssertUnwindSafe(|| live.engine.clear_history())).ok();
+            live.seq
+        };
+        // guarded()가 live.seq를 먼저 올린 뒤 recorder.append()와 publish()를 부르므로
+        // 지운 시점 seq까지의 기록이 디스크에 안착할 때까지 기다린 뒤 기준선을 남긴다.
+        self.wait(|p| p.end >= seq || p.closed);
+        if let Some(store) = &self.0.store {
+            store.clear_scrollback(self.0.id, seq);
+        }
+        seq
+    }
+
     /// 디스크 저장소(콜드 페이지·링 밖 원본). 기록하지 않는 세션이면 `None`.
     pub fn store(&self) -> Option<&Arc<Store>> {
         self.0.store.as_ref()

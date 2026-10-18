@@ -294,6 +294,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_RESUME", crate::control::FEAT_RESUME, 42),
         ("FEAT_GIT_WATCH", crate::control::FEAT_GIT_WATCH, 44),
         ("FEAT_HEARTBEAT", crate::daemon::FEAT_HEARTBEAT, 45),
+        (
+            "FEAT_CLEAR_SCROLLBACK",
+            crate::control::FEAT_CLEAR_SCROLLBACK,
+            47,
+        ),
         ("FEAT_GIT_EDIT", crate::control::FEAT_GIT_EDIT, 48),
         (
             "FEAT_AGENT_HISTORY",
