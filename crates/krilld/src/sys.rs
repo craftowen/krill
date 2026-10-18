@@ -158,3 +158,11 @@ pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr)>>
     unsafe { libc::freeifaddrs(head) };
     Ok(out)
 }
+
+/// PTY 마스터의 전경 프로세스 그룹 ID(`tcgetpgrp`). 그룹이 없거나(0) 실패하면 `None`.
+pub(crate) fn tcgetpgrp(fd: std::os::fd::BorrowedFd<'_>) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `fd`는 호출 동안 살아 있는 유효한 파일 디스크립터다.
+    let pgrp = unsafe { libc::tcgetpgrp(fd.as_raw_fd()) };
+    (pgrp > 0).then(|| u32::try_from(pgrp).ok()).flatten()
+}

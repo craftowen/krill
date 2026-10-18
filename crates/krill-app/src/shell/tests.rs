@@ -360,6 +360,100 @@ fn running_close_dont_ask_persists(cx: &mut TestAppContext) {
     );
 }
 
+/// OWE-872 테스트용: 일반 셸(`AgentState::Unknown`)에 전경 프로세스 이름만 있는 스냅샷을 연결한다.
+fn attach_foreground(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+    panes: &[(PaneId, krill_proto::SessionId, &str)],
+) {
+    use std::sync::Arc;
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let sessions = panes
+        .iter()
+        .map(|(_, sid, process)| sidebar::Session {
+            id: *sid,
+            status: krill_proto::control::AgentStatus {
+                state: krill_proto::control::AgentState::Unknown,
+                foreground: Some((*process).into()),
+                ..krill_proto::control::AgentStatus::UNKNOWN
+            },
+            worktree: None,
+            cwd: None,
+            account: None,
+        })
+        .collect();
+    let snapshot = sidebar::Snapshot {
+        sessions,
+        trees: std::collections::BTreeMap::default(),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            for (pane, sid, _) in panes {
+                s.layout.set_session(*pane, *sid);
+            }
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+}
+
+/// OWE-872: 일반 셸에서 에이전트가 아니더라도 전경 프로세스(예: `npm`, `cargo`)가 돌고 있으면
+/// 탭·칸을 닫을 때 확인 대화상자를 띄우고 프로세스 이름을 문구에 표시한다.
+#[gpui::test]
+fn foreground_process_close_asks_and_shows_process_name(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("fg-proc-close"));
+    cx.simulate_keystrokes("cmd-t");
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).tabs()[1].focused;
+    cx.simulate_keystrokes("cmd-d");
+    cx.run_until_parked();
+    let split_pane = layout_of(&view, cx)
+        .focused()
+        .expect("split focuses a pane");
+    assert_ne!(pane, split_pane);
+    attach_foreground(
+        &view,
+        cx,
+        &[
+            (pane, krill_proto::SessionId(25), "npm"),
+            (split_pane, krill_proto::SessionId(26), "cargo"),
+        ],
+    );
+
+    // 분할 칸 닫기에서 전경 프로세스 이름을 표시하고 확인 시 닫힌다.
+    cx.update(|_, cx| view.update(cx, |s, cx| s.maybe_close_pane(split_pane, cx)));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    let pane_detail = cx.update(|_, cx| view.read(cx).running_close_detail(cx).unwrap());
+    assert!(
+        pane_detail.contains("cargo"),
+        "expected process name in: {pane_detail}"
+    );
+    click(cx, "confirm-running-close");
+    assert_eq!(layout_of(&view, cx).visible().len(), 1);
+
+    // 남은 탭 닫기에서도 전경 프로세스 이름을 표시하고 취소 시 탭이 남는다.
+    cx.update(|_, cx| view.update(cx, |s, cx| s.request_close_tab(1, cx)));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+    assert!(cx.debug_bounds("running-close-dialog").is_some());
+    let detail = cx.update(|_, cx| view.read(cx).running_close_detail(cx).unwrap());
+    assert!(detail.contains("npm"), "expected process name in: {detail}");
+    assert!(
+        krill_app::i18n::catalog::shell::RUNNING_CLOSE_PROCESS_DETAIL
+            .in_language(krill_app::i18n::Language::En)
+            .contains("{process}")
+    );
+    click(cx, "cancel-running-close");
+    assert_eq!(layout_of(&view, cx).tabs().len(), 2);
+}
+
 /// MK-025·MK-026: 데몬 기동 실패 이유와 끊김이 셸 배너로 보이고, 다시 붙으면 사라진다.
 #[gpui::test]
 fn daemon_link_shows_banner(cx: &mut TestAppContext) {

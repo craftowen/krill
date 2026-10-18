@@ -543,7 +543,20 @@ impl Shell {
         self.maybe_close_tab(index, cx);
     }
 
-    /// OWE-872: 탭 안의 칸에 실행 중인 에이전트(Working·Waiting·Blocked)가 있으면 true.
+    /// OWE-872: 칸에서 실행 중인 전경 프로세스 이름(루트 셸 제외).
+    pub(super) fn pane_running_process(&self, pane: PaneId, cx: &App) -> Option<String> {
+        let host = self.layout.host(pane);
+        self.layout
+            .session(pane)
+            .and_then(|id| self.sidebar.read(cx).session_on(host, id))
+            .and_then(|s| s.status.foreground.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// OWE-872: 탭 안의 칸에 실행 중인 에이전트(Working·Waiting·Blocked)나
+    /// 셸이 아닌 전경 프로세스가 있으면 true.
     pub(super) fn pane_is_running(&self, pane: PaneId, cx: &App) -> bool {
         let host = self.layout.host(pane);
         self.layout
@@ -553,7 +566,11 @@ impl Shell {
                 matches!(
                     s.status.state,
                     AgentState::Working | AgentState::Waiting | AgentState::Blocked
-                )
+                ) || s
+                    .status
+                    .foreground
+                    .as_deref()
+                    .is_some_and(|name| !name.trim().is_empty())
             })
     }
 
@@ -1269,31 +1286,48 @@ impl Shell {
         Some(ui::modal_backdrop(window.viewport_size(), card))
     }
 
+    /// OWE-872: 실행 중 닫기 확인 대화상자의 본문 문구. 전경 프로세스 이름이 있으면 함께 보인다.
+    pub(super) fn running_close_detail(&self, cx: &App) -> Option<String> {
+        let (pending, _) = self.pending_running_close.as_ref()?;
+        let (title, process) = match *pending {
+            PendingRunningClose::Tab(index) => {
+                if index >= self.layout.tabs().len() {
+                    return None;
+                }
+                let process = self
+                    .layout
+                    .tab_panes(index)
+                    .into_iter()
+                    .find_map(|p| self.pane_running_process(p, cx));
+                (self.tab_display_label(index, cx), process)
+            }
+            PendingRunningClose::Pane(pane) => {
+                if !self.layout.tabs().iter().any(|t| t.root.contains(pane)) {
+                    return None;
+                }
+                (
+                    self.pane_label(pane, cx),
+                    self.pane_running_process(pane, cx),
+                )
+            }
+        };
+        Some(match process {
+            Some(process) => text::RUNNING_CLOSE_PROCESS_DETAIL
+                .format(&[("title", title.as_str()), ("process", process.as_str())]),
+            None => text::RUNNING_CLOSE_DETAIL.format(&[("title", title.as_str())]),
+        })
+    }
+
     /// OWE-872: 실행 중인 탭·칸 닫기 확인 대화상자('다시 묻지 않기' 포함).
     pub(super) fn render_running_close_dialog(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Deferred> {
-        let (pending, dont_ask) = self.pending_running_close.as_ref()?;
-        let pending = *pending;
+        let (_, dont_ask) = self.pending_running_close.as_ref()?;
         let checked = *dont_ask;
         // 대화상자를 기다리는 동안 대상이 사라졌으면 그리지 않는다.
-        let title = match pending {
-            PendingRunningClose::Tab(index) => {
-                if index >= self.layout.tabs().len() {
-                    return None;
-                }
-                self.tab_display_label(index, cx)
-            }
-            PendingRunningClose::Pane(pane) => {
-                if !self.layout.tabs().iter().any(|t| t.root.contains(pane)) {
-                    return None;
-                }
-                self.pane_label(pane, cx)
-            }
-        };
-        let detail = text::RUNNING_CLOSE_DETAIL.format(&[("title", title.as_str())]);
+        let detail = self.running_close_detail(cx)?;
         let p = ui::palette(cx);
         let card = div()
             .id("running-close-dialog")

@@ -385,5 +385,22 @@ pub fn take_spool(
     f.set_len(0)
 }
 
+/// OWE-872: 루트 셸(`root`)과 전경 프로세스 그룹(`fg`)을 비교해, 루트 셸이 아닌 전경 프로세스가
+/// 돌고 있으면 그 이름을 돌려준다. 루트 셸 자신이거나 끝난 세션·이름 불명이면 `None`.
+pub(crate) fn foreground_process(
+    root: u32,
+    fg: Option<u32>,
+    exited: bool,
+    resolve: impl FnOnce(u32) -> Option<String>,
+) -> Option<String> {
+    if exited {
+        return None;
+    }
+    let pid = fg.filter(|&pid| pid != 0 && pid != root)?;
+    resolve(pid)
+        .map(|name| name.trim().to_owned())
+        .filter(|name| !name.is_empty() && name.len() <= krill_proto::control::MAX_AGENT_TEXT)
+}
+
 #[cfg(test)]
 mod tests;

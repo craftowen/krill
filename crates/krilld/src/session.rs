@@ -487,9 +487,7 @@ impl Tap {
 
     /// 전경 프로세스 그룹. PTY 소유권은 holder에 그대로 둔다.
     pub(crate) fn foreground(&self) -> Option<u32> {
-        rustix::termios::tcgetpgrp(&self.0.master)
-            .ok()
-            .and_then(|p| u32::try_from(p.as_raw_nonzero().get()).ok())
+        crate::sys::tcgetpgrp(self.0.master.as_fd())
     }
 
     /// CLI 화면과 원본 위치를 한 잠금 안에서 뜬다.

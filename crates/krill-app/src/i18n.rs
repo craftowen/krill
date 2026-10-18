@@ -395,6 +395,7 @@ catalog! {
         ZOOMED_BADGE => ("확대됨", "Zoomed"),
         RUNNING_CLOSE_TITLE => ("실행 중인 작업을 닫을까요?", "Close while running?"),
         RUNNING_CLOSE_DETAIL => ("'{title}'에서 에이전트가 실행 중입니다. 닫으면 작업이 중단될 수 있습니다.", "An agent is still running in '{title}'. Closing may interrupt its work."),
+        RUNNING_CLOSE_PROCESS_DETAIL => ("'{title}'에서 '{process}' 프로세스가 실행 중입니다. 닫으면 작업이 중단될 수 있습니다.", "'{process}' is still running in '{title}'. Closing may interrupt its work."),
         RUNNING_CLOSE_CONFIRM => ("닫기", "Close"),
         RUNNING_CLOSE_CANCEL => ("취소", "Cancel"),
         DONT_ASK_AGAIN => ("다시 묻지 않기", "Don't ask again"),
