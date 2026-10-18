@@ -364,14 +364,14 @@ fn render_popover_usage_row(
             div()
                 .w_full()
                 .h(px(5.))
-                .rounded(px(2.5))
+                .rounded_full()
                 .bg(p.muted)
                 .overflow_hidden()
                 .child(
                     div()
                         .h_full()
                         .w(gpui::relative(f32::from(pct) / 100.0))
-                        .rounded(px(2.5))
+                        .rounded_full()
                         .bg(bar_color),
                 ),
         )
@@ -1054,6 +1054,7 @@ impl Shell {
                 ui::button_with_tooltip(
                     Button::new(gpui::SharedString::from(selector.clone()))
                         .label(label)
+                        .font_family(ui::FONT_MONO)
                         .icon(
                             gpui_component::Icon::default()
                                 .data(ui::icons::provider_svg_bytes(provider)),
@@ -1091,6 +1092,7 @@ impl Shell {
             Button::new("status-ssh-switcher")
                 .icon(gpui_component::Icon::default().data(ui::icons::SERVER_SVG))
                 .label(ssh_count_label)
+                .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
                 .debug_selector(|| "status-ssh-switcher".into()),
@@ -1113,8 +1115,8 @@ impl Shell {
                 );
             }
             let open_weak = weak.clone();
-            menu.separator().item(
-                PopupMenuItem::new(text::OPEN_ADMIN_ACCOUNTS.get()).on_click(
+            menu.separator()
+                .item(PopupMenuItem::new(text::OPEN_SSH_SETTINGS.get()).on_click(
                     move |_, window, cx| {
                         open_settings_from_menu(
                             &open_weak,
@@ -1123,8 +1125,7 @@ impl Shell {
                             cx,
                         );
                     },
-                ),
-            )
+                ))
         });
         let state_dir = self.state_dir(cx);
         let orch_store = state_dir
@@ -1147,6 +1148,7 @@ impl Shell {
             Button::new("status-orchestration-menu")
                 .icon(gpui_component::Icon::default().data(ui::icons::WORKFLOW_SVG))
                 .label(orch_compact_label)
+                .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
                 .debug_selector(|| "status-orchestration-menu".into()),
@@ -1367,7 +1369,7 @@ impl Shell {
                     }
                     let open_weak = weak.clone();
                     menu.separator().item(
-                        PopupMenuItem::new(text::OPEN_ADMIN_ACCOUNTS.get()).on_click(
+                        PopupMenuItem::new(text::OPEN_WORKFLOWS_SETTINGS.get()).on_click(
                             move |_, window, cx| {
                                 open_settings_from_menu(
                                     &open_weak,
@@ -1424,6 +1426,7 @@ impl Shell {
             Button::new("status-ports-menu")
                 .icon(gpui_component::Icon::default().data(ui::icons::PLUG_SVG))
                 .label(ports_count_label)
+                .font_family(ui::FONT_MONO)
                 .ghost()
                 .xsmall()
                 .debug_selector(|| "status-ports-menu".into()),
@@ -1504,6 +1507,7 @@ impl Shell {
                                                     .data(ui::icons::TRIANGLE_ALERT_SVG),
                                             )
                                             .label(failures.len().to_string())
+                                            .font_family(ui::FONT_MONO)
                                             .text_color(p.warning)
                                             .ghost()
                                             .xsmall(),
@@ -1597,6 +1601,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap_1()
+                                    .font_family(ui::FONT_MONO)
                                     .child(
                                         gpui_component::Icon::default()
                                             .data(ui::icons::TERMINAL_SVG)
@@ -1611,6 +1616,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap_1()
+                                    .font_family(ui::FONT_MONO)
                                     .text_color(needs_you_color)
                                     .child(
                                         gpui_component::Icon::default()
