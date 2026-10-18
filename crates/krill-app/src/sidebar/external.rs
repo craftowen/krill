@@ -3,9 +3,9 @@
 
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::fs;
-use std::io::{self, Read as _};
-use std::os::unix::fs::PermissionsExt as _;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
@@ -293,6 +293,208 @@ pub fn include_claude_worktrees(trees: &mut BTreeMap<PathBuf, Vec<PathBuf>>) {
 
 pub const PROJECTS_FILE: &str = "projects.toml";
 const MAX_PROJECTS_BYTES: u64 = 512 * 1024;
+
+/// OWE-852: `프로젝트 추가`로 연 폴더를 `<state_dir>/projects.toml`에 영속 등록한다.
+/// 이미 등록(동일 경로, 미보관)돼 있으면 `Ok(false)`로 아무것도 쓰지 않는다.
+/// 보관(`archived`)된 동일 경로는 보관 해제하고 `Ok(true)`를 돌려준다.
+/// 파싱 실패·상한 초과 등에서는 폴더 열기를 막지 않도록 `Ok(false)`로 조용히 넘어간다.
+pub fn register_project(state_dir: &Path, path: &Path) -> io::Result<bool> {
+    let normalized = normalize_project_path(path);
+    if normalized.is_empty() {
+        return Ok(false);
+    }
+    let file_path = state_dir.join(PROJECTS_FILE);
+    let mut raw = String::new();
+    if let Ok(file) = fs::File::open(&file_path) {
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_PROJECTS_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .is_err()
+            || u64::try_from(bytes.len()).map_or(true, |n| n > MAX_PROJECTS_BYTES)
+        {
+            return Ok(false);
+        }
+        if !bytes.is_empty() {
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => raw.push_str(text),
+                Err(_) => return Ok(false),
+            }
+        }
+    }
+    let mut value: toml::Value = if raw.trim().is_empty() {
+        toml::Value::Table(toml::map::Map::new())
+    } else {
+        match toml::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return Ok(false),
+        }
+    };
+    let Some(table) = value.as_table_mut() else {
+        return Ok(false);
+    };
+    let projects = table
+        .entry("projects".to_owned())
+        .or_insert(toml::Value::Array(Vec::new()));
+    let Some(list) = projects.as_array_mut() else {
+        return Ok(false);
+    };
+    for entry in list.iter_mut() {
+        let Some(item) = entry.as_table_mut() else {
+            continue;
+        };
+        let entry_path = item
+            .get("path")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if !same_project_path(&entry_path, &normalized) {
+            continue;
+        }
+        let archived = item
+            .get("archived")
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(false);
+        if archived {
+            item.insert("archived".to_owned(), toml::Value::Boolean(false));
+            write_projects_file(&file_path, &value)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
+    let basename = Path::new(&normalized)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("project")
+        .to_owned();
+    let kind = if Path::new(&normalized).join(".git").exists() {
+        "git"
+    } else {
+        "folder"
+    };
+    let mut used: Vec<String> = list
+        .iter()
+        .filter_map(|e| {
+            e.as_table()?
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut id = slugify_project_id(&basename);
+    if used.iter().any(|u| u == &id) {
+        let mut n: u32 = 2;
+        loop {
+            let candidate = format!("{id}-{n}");
+            if !used.iter().any(|u| u == &candidate) {
+                id = candidate;
+                break;
+            }
+            n = n.saturating_add(1);
+            if n > 9999 {
+                return Ok(false);
+            }
+        }
+    }
+    used.push(id.clone());
+    let mut item = toml::map::Map::new();
+    item.insert("id".to_owned(), toml::Value::String(id));
+    item.insert("path".to_owned(), toml::Value::String(normalized.clone()));
+    item.insert("display_name".to_owned(), toml::Value::String(basename));
+    item.insert("kind".to_owned(), toml::Value::String(kind.to_owned()));
+    item.insert("pinned".to_owned(), toml::Value::Boolean(false));
+    item.insert("archived".to_owned(), toml::Value::Boolean(false));
+    list.push(toml::Value::Table(item));
+    write_projects_file(&file_path, &value)?;
+    Ok(true)
+}
+
+fn normalize_project_path(path: &Path) -> String {
+    if path.as_os_str().is_empty() {
+        return String::new();
+    }
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    canonical.to_string_lossy().trim().to_owned()
+}
+
+fn strip_private_prefix(s: &str) -> &str {
+    s.strip_prefix("/private").unwrap_or(s)
+}
+
+fn same_project_path(a: &str, b: &str) -> bool {
+    let a = a.trim();
+    let b = b.trim();
+    if a == b {
+        return true;
+    }
+    strip_private_prefix(a) == strip_private_prefix(b)
+}
+
+fn slugify_project_id(name: &str) -> String {
+    let mut out = String::new();
+    let mut prev_dash = true;
+    for c in name.to_lowercase().chars() {
+        if c.is_ascii_alphanumeric() {
+            out.push(c);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+        if out.len() >= 64 {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_owned();
+    if trimmed.is_empty() {
+        "project".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+fn write_projects_file(path: &Path, value: &toml::Value) -> io::Result<()> {
+    let body = toml::to_string(value).map_err(io::Error::other)?;
+    if u64::try_from(body.len()).map_or(true, |n| n > MAX_PROJECTS_BYTES) {
+        return Err(io::Error::new(
+            io::ErrorKind::QuotaExceeded,
+            "projects.toml exceeds size limit",
+        ));
+    }
+    let Some(parent) = path.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "projects path has no parent",
+        ));
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(parent)?;
+    let tmp = parent.join(format!(".{}.tmp.{}", PROJECTS_FILE, std::process::id()));
+    let result = (|| -> io::Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&tmp, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    result
+}
 
 #[derive(Debug, Default, Deserialize)]
 struct ImportedProjectsFile {
@@ -1046,4 +1248,42 @@ parent_worktree_path = "/Users/test/repo"
     );
 
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(test)]
+#[test]
+fn owe852_register_project_persists_and_dedupes() {
+    let dir = std::env::temp_dir().join(format!("owe852-register-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let repo = std::env::temp_dir().join(format!("owe852-repo-{}", std::process::id()));
+    fs::remove_dir_all(&repo).ok();
+    fs::create_dir_all(repo.join(".git")).unwrap();
+
+    assert!(register_project(&dir, &repo).unwrap());
+    assert!(
+        !register_project(&dir, &repo).unwrap(),
+        "duplicate registers nothing"
+    );
+    let body = fs::read_to_string(dir.join(PROJECTS_FILE)).unwrap();
+    let value: toml::Value = toml::from_str(&body).unwrap();
+    let projects = value["projects"].as_array().unwrap();
+    assert_eq!(projects.len(), 1);
+    let expected = fs::canonicalize(&repo)
+        .unwrap_or_else(|_| repo.clone())
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    assert_eq!(projects[0]["path"].as_str().unwrap(), expected);
+    assert_eq!(projects[0]["kind"].as_str(), Some("git"));
+
+    let other = repo.join("sibling");
+    fs::create_dir_all(&other).unwrap();
+    assert!(register_project(&dir, &other).unwrap());
+    let body = fs::read_to_string(dir.join(PROJECTS_FILE)).unwrap();
+    let value: toml::Value = toml::from_str(&body).unwrap();
+    assert_eq!(value["projects"].as_array().unwrap().len(), 2);
+
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&repo).ok();
 }
