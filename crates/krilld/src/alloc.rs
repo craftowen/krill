@@ -1,7 +1,11 @@
 //! 전역 할당기 설정(OWE-477). krilld는 jemalloc을 쓰고(`main.rs`의 `#[global_allocator]`), 해제한 페이지를
 //! decay 없이 바로 OS에 돌려준다. macOS 기본 malloc은 강등으로 해제한 200열 행(4,800B)을 footprint로 돌려주지 않았고,
 //! jemalloc 기본 decay(10초)는 할당이 멈춘 유휴 데몬에서 진행되지 않았다(실측, docs/spikes/OWE-477.md).
+//! Windows는 jemalloc-sys가 빌드되지 않아 시스템 할당기를 쓰고, 아래 함수는 할 일이 없다(OWE-819).
 
+#[cfg(windows)]
+use std::io::Error;
+#[cfg(not(windows))]
 use tikv_jemalloc_ctl::{Access, AsName, Error};
 
 /// 이후 해제되는 페이지를 즉시 OS에 돌려주도록 jemalloc decay를 0으로 둔다. `main` 첫 줄, 스레드를 띄우기 전에 부른다.
@@ -11,6 +15,7 @@ use tikv_jemalloc_ctl::{Access, AsName, Error};
 /// # Errors
 ///
 /// jemalloc이 mallctl 쓰기를 거부하면 그 오류.
+#[cfg(not(windows))]
 pub fn return_freed_pages() -> Result<(), Error> {
     for key in [
         b"arenas.dirty_decay_ms\0".as_slice(),
@@ -23,7 +28,13 @@ pub fn return_freed_pages() -> Result<(), Error> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+#[expect(clippy::unnecessary_wraps, reason = "jemalloc 판과 같은 시그니처")]
+pub fn return_freed_pages() -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
 mod tests {
     use super::*;
 
@@ -39,12 +50,19 @@ mod tests {
 /// Mobile uses short-lived RPC workers and a small number of long-lived stream workers.
 /// Share arena 0 and bypass per-thread caches so reconnects/history do not retain arenas
 /// proportional to the number of worker threads. This changes this calling thread only.
+#[cfg(not(windows))]
 pub(crate) fn mobile_thread() -> Result<(), Error> {
     b"thread.arena\0".name().write(0_u32)?;
     b"thread.tcache.enabled\0".name().write(false)
 }
 
-#[cfg(test)]
+#[cfg(windows)]
+#[expect(clippy::unnecessary_wraps, reason = "jemalloc 판과 같은 시그니처")]
+pub(crate) fn mobile_thread() -> Result<(), Error> {
+    Ok(())
+}
+
+#[cfg(all(test, not(windows)))]
 mod mobile_tests {
     use super::*;
     #[test]

@@ -1,4 +1,4 @@
-//! 마스터 키(macOS 키체인, Linux는 상태 디렉터리의 0600 파일)와 세그먼트별 인증 암호화.
+//! 마스터 키(macOS 키체인, Linux는 상태 디렉터리의 0600 파일, Windows는 아직 없음)와 세그먼트별 인증 암호화.
 //! 잠정 MK-024 포맷에 대한 암호 의존은 이 모듈에 둔다.
 
 use std::fmt;
@@ -94,6 +94,15 @@ impl Key {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Windows 마스터 키(DPAPI)는 OWE-833에서 만든다. 그 전에는 평문 키 파일로 대신하지 않고 키 생성을 거부한다.
+    #[cfg(windows)]
+    pub(super) fn load(_root: &Path, _existing: bool) -> io::Result<Arc<Self>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "segment key unavailable (Windows DPAPI not implemented)",
+        ))
     }
 
     /// 명시한 키체인만 검색한다. 테스트는 임시 키체인으로 같은 경로를 검증한다.
