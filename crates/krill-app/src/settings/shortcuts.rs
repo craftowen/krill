@@ -1,19 +1,80 @@
-//! 단축키 탭(OWE-660): 기본 키맵(`Config.defaults`)과 `keys.toml`을 병합해 적용된 키맵으로 행을 만든다.
-//! 키캡을 누르면 기록 모드가 되어 다음 키 조합을 `keys.toml`에 쓰고 바로 다시 적용한다(Esc 취소).
-//! 행별 초기화는 그 액션의 `keys.toml` 항목을 지운다. 다른 액션과 겹치는 키는 저장 전에 확인을 받는다.
+//! 단축키 탭(OWE-660 · OWE-799): 기본 키맵(`Config.defaults`)과 `keys.toml`을 병합해 적용된 키맵으로
+//! 기능 영역별(워크트리·탭/창·터미널·에이전트·오케스트레이션/패널·일반) 그룹과 행을 만든다.
+//! 상단 로컬 검색과 상태 필터(`전체` / `수정됨`)로 즉시 거르고, 키캡을 누르면 인라인 기록 모드가 되어
+//! 다음 키 조합을 `keys.toml`에 쓰고 바로 다시 적용한다(Esc 취소).
+//! 행별 초기화는 그 액션의 `keys.toml` 항목을 지우고, 전체 초기화는 모든 재정의를 지운다.
 //!
 //! `keys.toml`은 공용 원문 편집기로 고쳐 인라인 표·여러 줄 문자열에서도
 //! 미지 키·주석·빈 줄·바꾸지 않은 항목의 순서를 보존한다.
 use std::path::Path;
 
 use gpui::{
-    App, Context, KeyBinding, KeyDownEvent, Keystroke, SharedString, Window, div, prelude::*,
+    App, Context, FontWeight, KeyBinding, KeyDownEvent, Keystroke, SharedString, Window, div,
+    prelude::*,
 };
-use gpui_component::Sizable as _;
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 
-use super::{Config, KEYS_FILE, Keys, SettingsView, layout, open_file, text};
-use crate::i18n::Message;
+use super::{
+    Config, KEYS_FILE, Keys, SettingsView, close_settings_page_for, layout, open_file, text,
+};
+use crate::i18n::{Language, Message};
+use crate::ui::BadgeTone;
+
+/// 단축키 기능 영역 카테고리(OWE-799).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Category {
+    Worktree,
+    Tabs,
+    Terminal,
+    Agents,
+    Panels,
+    General,
+}
+
+impl Category {
+    pub(super) const ALL: &[Self] = &[
+        Self::Worktree,
+        Self::Tabs,
+        Self::Terminal,
+        Self::Agents,
+        Self::Panels,
+        Self::General,
+    ];
+
+    pub(super) const fn selector(self) -> &'static str {
+        match self {
+            Self::Worktree => "sc-group-worktree",
+            Self::Tabs => "sc-group-tabs",
+            Self::Terminal => "sc-group-terminal",
+            Self::Agents => "sc-group-agents",
+            Self::Panels => "sc-group-panels",
+            Self::General => "sc-group-general",
+        }
+    }
+
+    pub(super) const fn message(self) -> Message {
+        match self {
+            Self::Worktree => text::SC_GROUP_WORKTREE,
+            Self::Tabs => text::SC_GROUP_TABS,
+            Self::Terminal => text::SC_GROUP_TERMINAL,
+            Self::Agents => text::SC_GROUP_AGENTS,
+            Self::Panels => text::SC_GROUP_PANELS,
+            Self::General => text::SC_GROUP_GENERAL,
+        }
+    }
+
+    pub(super) fn label(self) -> &'static str {
+        self.message().get()
+    }
+}
+
+/// 단축키 상태 필터(OWE-799): 전체 또는 기본값에서 변경된 단축키만.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ShortcutFilter {
+    #[default]
+    All,
+    Modified,
+}
 
 /// 단축키 탭 행 순서와 설명. 설명의 `{n}`은 액션 이름 끝 숫자로 채운다. 기본 키맵에도 적용된 키맵에도
 /// 없는 액션(예: 셸 없는 테스트)은 행을 그리지 않는다.
@@ -72,6 +133,55 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("settings::ZoomReset", text::SC_ZOOM_RESET),
 ];
 
+/// 액션을 6개 기능 영역 카테고리로 분류한다(OWE-799).
+pub(super) fn action_category(action: &str) -> Category {
+    match action {
+        "shell::NewWorktree"
+        | "shell::PrevSession"
+        | "shell::NextSession"
+        | "shell::Jump"
+        | "shell::NavigateBack"
+        | "shell::NavigateForward" => Category::Worktree,
+        "shell::NewTab"
+        | "shell::CloseTab"
+        | "shell::ReopenClosedTab"
+        | "shell::NextTab"
+        | "shell::PrevTab"
+        | "shell::ActivateTab1"
+        | "shell::ActivateTab2"
+        | "shell::ActivateTab3"
+        | "shell::ActivateTab4"
+        | "shell::ActivateTab5"
+        | "shell::ActivateTab6"
+        | "shell::ActivateTab7"
+        | "shell::ActivateTab8"
+        | "shell::ActivateTab9"
+        | "minikrill::NewWindow"
+        | "minikrill::CloseWindow" => Category::Tabs,
+        "shell::SplitRight"
+        | "shell::SplitDown"
+        | "shell::ClosePane"
+        | "shell::FocusNextPane"
+        | "shell::FocusPrevPane"
+        | "shell::ToggleZoomPane"
+        | "shell::ClearPane"
+        | "shell::SelectAll"
+        | "shell::Find"
+        | "shell::Copy"
+        | "shell::Paste"
+        | "popout::FloatTerminal" => Category::Terminal,
+        "shell::NewAgentTab" | "shell::NewAgent1" | "shell::NewAgent2" | "shell::NewAgent3"
+        | "shell::NewAgent4" => Category::Agents,
+        "shell::ToggleSidebar"
+        | "shell::FocusSidebar"
+        | "shell::TogglePanel"
+        | "shell::ToggleExplorer"
+        | "shell::ToggleSearch"
+        | "popout::DashboardPopout" => Category::Panels,
+        _ => Category::General,
+    }
+}
+
 /// 기록 대상: 액션과 바꿀 기존 키(`None`이면 키 추가).
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Target {
@@ -87,6 +197,26 @@ pub(super) struct Recorder {
     conflict: Option<(Target, String, Vec<&'static str>)>,
     error: Option<SharedString>,
     intercept: Option<gpui::Subscription>,
+    pub(super) filter: ShortcutFilter,
+    pub(super) search: Option<(
+        gpui::Entity<gpui_component::input::InputState>,
+        gpui::Subscription,
+    )>,
+}
+
+impl Recorder {
+    pub(super) fn search_query(&self, cx: &App) -> String {
+        self.search
+            .as_ref()
+            .map(|(input, _)| input.read(cx).value().to_string())
+            .unwrap_or_default()
+    }
+
+    pub(super) fn clear_search(&mut self, window: &mut Window, cx: &mut App) {
+        if let Some((input, _)) = &self.search {
+            input.update(cx, |s, cx| s.set_value("", window, cx));
+        }
+    }
 }
 
 /// (액션 이름, 정규화한 키) 쌍.
@@ -133,6 +263,14 @@ fn keys_of(pairs: &[Pair], action: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// 적용된 키 목록과 기본 키 목록이 다른지 판별한다.
+pub(super) fn is_modified(current: &[String], default: &[String]) -> bool {
+    let (mut a, mut b) = (current.to_vec(), default.to_vec());
+    a.sort();
+    b.sort();
+    a != b
 }
 
 /// `key`를 이미 쓰는 다른 액션들(문맥은 따지지 않는다: 같은 키가 다른 곳에서 다른 일을 하면 알린다).
@@ -262,7 +400,85 @@ fn action_label(action: &str) -> String {
     )
 }
 
+fn action_label_in(action: &str, lang: Language) -> String {
+    ACTIONS.iter().find(|(a, _)| *a == action).map_or_else(
+        || action.to_owned(),
+        |(_, m)| {
+            let n = action.trim_start_matches(|c: char| !c.is_ascii_digit());
+            m.in_language(lang).replace("{n}", n)
+        },
+    )
+}
+
+/// 로컬 검색어(`query`)가 액션 이름(한·영·식별자), 카테고리 이름(한·영), 또는 바인딩 키(원문·키캡 표기)와 맞는지 검사한다(OWE-799).
+pub(super) fn matches_query(
+    action: &str,
+    current: &[String],
+    default: &[String],
+    query: &str,
+) -> bool {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return true;
+    }
+    let cat = action_category(action).message();
+    let label_ko = action_label_in(action, Language::Ko).to_lowercase();
+    let label_en = action_label_in(action, Language::En).to_lowercase();
+    let cat_ko = cat.in_language(Language::Ko).to_lowercase();
+    let cat_en = cat.in_language(Language::En).to_lowercase();
+    let action_lower = action.to_lowercase();
+
+    query.split_whitespace().all(|token| {
+        action_lower.contains(token)
+            || label_ko.contains(token)
+            || label_en.contains(token)
+            || cat_ko.contains(token)
+            || cat_en.contains(token)
+            || current.iter().chain(default.iter()).any(|k| {
+                k.to_lowercase().contains(token) || keycap_text(k).to_lowercase().contains(token)
+            })
+    })
+}
+
 impl SettingsView {
+    fn shortcut_search_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<gpui_component::input::InputState> {
+        if let Some((input, _)) = &self.shortcuts.search {
+            return input.clone();
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::SC_SEARCH_PLACEHOLDER.get())
+        });
+        let sub = cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
+            cx.notify();
+        });
+        self.shortcuts.search = Some((input.clone(), sub));
+        input
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_shortcut_search(
+        &mut self,
+        value: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = self.shortcut_search_input(window, cx);
+        input.update(cx, |s, cx| s.set_value(value, window, cx));
+        cx.notify();
+    }
+
+    pub(super) fn set_shortcut_filter(&mut self, filter: ShortcutFilter, cx: &mut Context<Self>) {
+        if self.shortcuts.filter != filter {
+            self.shortcuts.filter = filter;
+            cx.notify();
+        }
+    }
+
     /// 키캡 클릭: 다음 키 조합을 가로챈다. 바인딩 매칭 전에 가로채므로 ⌘Q·⌘W 같은 키도 실행되지 않고 기록된다.
     pub(super) fn start_recording(
         &mut self,
@@ -284,11 +500,10 @@ impl SettingsView {
             view.update(cx, |this, cx| this.on_recorded(&keystroke, cx))
                 .ok();
         });
-        self.shortcuts = Recorder {
-            target: Some(Target { action, old }),
-            intercept: Some(intercept),
-            ..Recorder::default()
-        };
+        self.shortcuts.target = Some(Target { action, old });
+        self.shortcuts.conflict = None;
+        self.shortcuts.error = None;
+        self.shortcuts.intercept = Some(intercept);
         cx.notify();
     }
 
@@ -347,6 +562,11 @@ impl SettingsView {
         self.write_keys(cx, |t, defaults| reset_action(t, defaults, action));
     }
 
+    pub(super) fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
+        self.shortcuts.conflict = None;
+        self.write_keys(cx, |t, _| t.clear());
+    }
+
     fn key_button(
         &self,
         action: &'static str,
@@ -393,45 +613,230 @@ impl SettingsView {
             }))
     }
 
-    pub(super) fn render_shortcuts_tab(&self, cx: &mut Context<Self>) -> gpui::Div {
+    pub(super) fn render_shortcuts_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let p = crate::ui::palette(cx);
+        let search_input = self.shortcut_search_input(window, cx);
+        let query = self.shortcuts.search_query(cx);
+        let active_filter = self.shortcuts.filter;
         let live = live_pairs(cx);
         let defaults = cx
             .try_global::<Config>()
             .map_or_else(Vec::new, |c| pairs(&c.defaults));
-        let mut list = div().flex().flex_col().gap_1p5();
+
+        let mut total_count = 0usize;
+        let mut modified_count = 0usize;
+        let mut visible_count = 0usize;
+
         for &(action, _) in ACTIONS {
             let current = keys_of(&live, action);
             let default = keys_of(&defaults, action);
             if current.is_empty() && default.is_empty() {
                 continue;
             }
-            let mut caps = layout::controls();
-            for key in &current {
-                caps = caps.child(self.key_button(action, Some(key.clone()), cx));
+            total_count += 1;
+            if is_modified(&current, &default) {
+                modified_count += 1;
             }
-            caps = caps.child(self.key_button(action, None, cx));
-            let (mut a, mut b) = (current, default);
-            a.sort();
-            b.sort();
-            if a != b {
-                let id = format!("sc-reset-{action}");
-                let selector = id.clone();
-                caps = caps.child(
-                    layout::secondary(SharedString::from(id), text::SC_RESET.get())
-                        .debug_selector(move || selector.clone())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.reset_shortcut(action, cx);
-                        })),
+        }
+
+        let mut list = div().flex().flex_col().gap_4();
+        for &cat in Category::ALL {
+            let mut group_rows = Vec::new();
+            for &(action, _) in ACTIONS {
+                if action_category(action) != cat {
+                    continue;
+                }
+                let current = keys_of(&live, action);
+                let default = keys_of(&defaults, action);
+                if current.is_empty() && default.is_empty() {
+                    continue;
+                }
+                let modified = is_modified(&current, &default);
+                if active_filter == ShortcutFilter::Modified && !modified {
+                    continue;
+                }
+                if !matches_query(action, &current, &default, &query) {
+                    continue;
+                }
+                visible_count += 1;
+
+                let mut caps = layout::controls();
+                for key in &current {
+                    caps = caps.child(self.key_button(action, Some(key.clone()), cx));
+                }
+                caps = caps.child(self.key_button(action, None, cx));
+                if modified {
+                    let id = format!("sc-reset-{action}");
+                    let selector = id.clone();
+                    caps = caps.child(
+                        layout::ghost(SharedString::from(id), text::SC_RESET.get())
+                            .debug_selector(move || selector.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reset_shortcut(action, cx);
+                            })),
+                    );
+                }
+
+                let mut left = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .text_size(crate::ui::TEXT_SM)
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(action_label(action)),
+                    );
+                if modified {
+                    let mod_id = format!("sc-modified-{action}");
+                    left = left.child(
+                        div()
+                            .id(SharedString::from(mod_id.clone()))
+                            .debug_selector(move || mod_id.clone())
+                            .child(crate::ui::badge(
+                                p,
+                                BadgeTone::Muted,
+                                text::SC_MODIFIED_BADGE.get(),
+                            )),
+                    );
+                }
+
+                let row_id = format!("sc-row-{action}");
+                group_rows.push(
+                    layout::row(p)
+                        .id(SharedString::from(row_id.clone()))
+                        .debug_selector(move || row_id.clone())
+                        .py_2()
+                        .child(left)
+                        .child(caps),
                 );
             }
+
+            if !group_rows.is_empty() {
+                let sel = cat.selector();
+                let header_id = match cat {
+                    Category::Worktree => "sc-header-worktree",
+                    Category::Tabs => "sc-header-tabs",
+                    Category::Terminal => "sc-header-terminal",
+                    Category::Agents => "sc-header-agents",
+                    Category::Panels => "sc-header-panels",
+                    Category::General => "sc-header-general",
+                };
+                list = list.child(
+                    div()
+                        .id(sel)
+                        .debug_selector(move || sel.into())
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .child(layout::section_title(p, header_id, cat.label()))
+                        .children(group_rows),
+                );
+            }
+        }
+
+        if visible_count == 0 {
             list = list.child(
                 layout::row(p)
-                    .py_2()
-                    .child(layout::label(p, action_label(action), None))
-                    .child(caps),
+                    .id("sc-empty")
+                    .debug_selector(|| "sc-empty".into())
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::SC_EMPTY.get()),
+                    ),
             );
         }
+
+        let clear_btn = (!query.is_empty()).then(|| {
+            layout::ghost("sc-search-clear", text::SC_SEARCH_CLEAR.get())
+                .debug_selector(|| "sc-search-clear".into())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.shortcuts.clear_search(window, cx);
+                    cx.notify();
+                }))
+        });
+
+        let filter_bar = layout::row(p)
+            .id("sc-filter-bar")
+            .debug_selector(|| "sc-filter-bar".into())
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("sc-search")
+                            .debug_selector(|| "sc-search".into())
+                            .flex_1()
+                            .min_w_0()
+                            .capture_action(cx.listener(
+                                |this, _: &gpui_component::input::Escape, window, cx| {
+                                    cx.stop_propagation();
+                                    if !this.shortcuts.search_query(cx).is_empty() {
+                                        this.shortcuts.clear_search(window, cx);
+                                    } else if this.shortcuts.target.is_none() {
+                                        close_settings_page_for(Some(cx.entity_id()), window, cx);
+                                    }
+                                },
+                            ))
+                            .child(
+                                gpui_component::input::Input::new(&search_input)
+                                    .small()
+                                    .prefix(Icon::new(IconName::Search).xsmall()),
+                            ),
+                    )
+                    .children(clear_btn),
+            )
+            .child(
+                layout::controls()
+                    .child(
+                        div()
+                            .id("sc-count")
+                            .debug_selector(|| "sc-count".into())
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_size(crate::ui::TEXT_2XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::SC_COUNT_SUMMARY.format(&[
+                                ("visible", &visible_count.to_string()),
+                                ("total", &total_count.to_string()),
+                            ])),
+                    )
+                    .child(layout::segmented_control(
+                        p,
+                        [
+                            layout::segment(
+                                "sc-filter-all",
+                                text::SC_FILTER_ALL.get(),
+                                active_filter == ShortcutFilter::All,
+                            )
+                            .debug_selector(|| "sc-filter-all".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_shortcut_filter(ShortcutFilter::All, cx);
+                            })),
+                            layout::segment(
+                                "sc-filter-modified",
+                                text::SC_FILTER_MODIFIED.get(),
+                                active_filter == ShortcutFilter::Modified,
+                            )
+                            .debug_selector(|| "sc-filter-modified".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_shortcut_filter(ShortcutFilter::Modified, cx);
+                            })),
+                        ],
+                    )),
+            );
 
         let conflict = self.shortcuts.conflict.as_ref().map(|(_, key, others)| {
             let names = others
@@ -442,21 +847,18 @@ impl SettingsView {
             let msg = text::SC_CONFLICT.format(&[("key", &keycap_text(key)), ("actions", &names)]);
             layout::row(p)
                 .debug_selector(|| "sc-conflict".into())
-                .bg(p.warning)
-                .text_color(p.warning_foreground)
+                .border_color(p.warning.opacity(0.3))
+                .bg(p.warning.opacity(0.1))
                 .child(layout::label(p, msg, None))
                 .child(
                     layout::controls()
                         .child(
-                            Button::new("sc-conflict-save")
-                                .small()
-                                .primary()
-                                .label(text::SC_CONFLICT_SAVE.get())
+                            layout::primary("sc-conflict-save", text::SC_CONFLICT_SAVE.get())
                                 .debug_selector(|| "sc-conflict-save".into())
                                 .on_click(cx.listener(|this, _, _, cx| this.confirm_conflict(cx))),
                         )
                         .child(
-                            layout::secondary("sc-conflict-cancel", text::SC_CANCEL.get())
+                            layout::ghost("sc-conflict-cancel", text::SC_CANCEL.get())
                                 .debug_selector(|| "sc-conflict-cancel".into())
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.shortcuts.conflict = None;
@@ -465,12 +867,11 @@ impl SettingsView {
                         ),
                 )
         });
-        let error = self.shortcuts.error.clone().map(|e| {
-            div()
-                .text_size(crate::ui::TEXT_XS)
-                .text_color(p.warning)
-                .child(e)
-        });
+        let error = self
+            .shortcuts
+            .error
+            .clone()
+            .map(|e| crate::ui::error_banner(p, e));
 
         div()
             .flex()
@@ -484,15 +885,25 @@ impl SettingsView {
                         Some(text::SHORTCUTS_DESC.get()),
                     ))
                     .child(
-                        layout::controls().child(
-                            layout::secondary("shortcuts-open-keys", text::OPEN_KEYS.get())
-                                .debug_selector(|| "shortcuts-open-keys".into())
-                                .on_click(|_, _, cx| {
-                                    open_file(KEYS_FILE, text::KEYS_TEMPLATE.get(), cx);
-                                }),
-                        ),
+                        layout::controls()
+                            .child(
+                                layout::secondary("shortcuts-reset-all", text::SC_RESET_ALL.get())
+                                    .disabled(modified_count == 0)
+                                    .debug_selector(|| "shortcuts-reset-all".into())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.reset_all_shortcuts(cx);
+                                    })),
+                            )
+                            .child(
+                                layout::secondary("shortcuts-open-keys", text::OPEN_KEYS.get())
+                                    .debug_selector(|| "shortcuts-open-keys".into())
+                                    .on_click(|_, _, cx| {
+                                        open_file(KEYS_FILE, text::KEYS_TEMPLATE.get(), cx);
+                                    }),
+                            ),
                     ),
             )
+            .child(filter_bar)
             .children(conflict)
             .children(error)
             .child(list)

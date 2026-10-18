@@ -8947,7 +8947,8 @@ impl Render for SettingsView {
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
                 AdminTab::Ssh => self.render_ssh_tab(window, cx),
                 AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
-                AdminTab::Shortcuts => self.render_shortcuts_tab(cx),
+                // OWE-799: 단축키 탭은 카테고리 그룹·로컬 검색·인라인 기록을 위해 window를 받는다.
+                AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),
                 AdminTab::Resources => self.render_resources_tab(&s, cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
             }
@@ -9038,6 +9039,18 @@ impl Render for SettingsView {
                 }
                 if ev.keystroke.key == "escape"
                     && !ev.keystroke.modifiers.modified()
+                    && this.tab == AdminTab::Shortcuts
+                    && !this.shortcuts.search_query(cx).is_empty()
+                    && this.shortcuts.target.is_none()
+                {
+                    this.shortcuts.clear_search(window, cx);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+                if ev.keystroke.key == "escape"
+                    && !ev.keystroke.modifiers.modified()
+                    && this.search_query(cx).is_empty()
                     && this.shortcuts.target.is_none()
                 {
                     cx.stop_propagation();

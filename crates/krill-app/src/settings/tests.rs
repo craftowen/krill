@@ -2381,6 +2381,183 @@ fn owe660_recorder_records_conflicts_and_resets(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-799: 50개 단축키 액션이 6개 기능 영역 카테고리에 빠짐없이 분류되고, 로컬 검색·수정 여부가 정확히 판별된다.
+#[test]
+fn owe799_category_mapping_and_search_matching() {
+    use shortcuts::{ACTIONS, Category, action_category, is_modified, matches_query};
+
+    assert_eq!(ACTIONS.len(), 50);
+    for &cat in Category::ALL {
+        let count = ACTIONS
+            .iter()
+            .filter(|(a, _)| action_category(a) == cat)
+            .count();
+        assert!(count > 0, "category {cat:?} should not be empty");
+    }
+    assert_eq!(action_category("shell::NewWorktree"), Category::Worktree);
+    assert_eq!(action_category("shell::NewTab"), Category::Tabs);
+    assert_eq!(action_category("shell::SplitRight"), Category::Terminal);
+    assert_eq!(action_category("shell::NewAgentTab"), Category::Agents);
+    assert_eq!(action_category("shell::ToggleSidebar"), Category::Panels);
+    assert_eq!(action_category("settings::ZoomIn"), Category::General);
+
+    let cur = vec!["cmd-y".to_owned()];
+    let def = vec!["cmd-=".to_owned()];
+    assert!(is_modified(&cur, &def));
+    assert!(!is_modified(&def, &def));
+
+    // 명령 이름(한·영)·액션 ID·카테고리·키 문자열·키캡 기호 모두 매칭된다.
+    assert!(matches_query("settings::ZoomIn", &cur, &def, "확대"));
+    assert!(matches_query("settings::ZoomIn", &cur, &def, "zoom in"));
+    assert!(matches_query("settings::ZoomIn", &cur, &def, "cmd-y"));
+    assert!(matches_query("settings::ZoomIn", &cur, &def, "⌘Y"));
+    assert!(matches_query("settings::ZoomIn", &cur, &def, "⌘="));
+    assert!(matches_query(
+        "shell::SplitRight",
+        &["cmd-d".into()],
+        &["cmd-d".into()],
+        "터미널 분할"
+    ));
+    assert!(!matches_query("settings::ZoomIn", &cur, &def, "워크트리"));
+}
+
+/// OWE-799 실화면 흐름: 6개 카테고리 섹션·상단 로컬 검색·전체/수정됨 상태 필터·인라인 레코더·전체 초기화.
+#[gpui::test]
+fn owe799_shortcuts_categories_search_filter_and_reset_all(cx: &mut TestAppContext) {
+    mod shell_actions {
+        gpui::actions!(
+            shell,
+            [NewWorktree, NewTab, SplitRight, NewAgentTab, ToggleSidebar]
+        );
+    }
+
+    let d = dir("owe799-shortcuts");
+    let d_clone = d.clone();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        cx.bind_keys([
+            KeyBinding::new("cmd-shift-n", shell_actions::NewWorktree, Some("Shell")),
+            KeyBinding::new("cmd-t", shell_actions::NewTab, Some("Shell")),
+            KeyBinding::new("cmd-d", shell_actions::SplitRight, Some("Shell")),
+            KeyBinding::new("cmd-shift-t", shell_actions::NewAgentTab, Some("Shell")),
+            KeyBinding::new("cmd-b", shell_actions::ToggleSidebar, Some("Shell")),
+        ]);
+        init_at(Some(d_clone), cx);
+    });
+
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(3000.)));
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let keys = || fs::read_to_string(d.join(KEYS_FILE)).unwrap_or_default();
+
+    // 1. 6개 카테고리 섹션 헤더와 상단 필터 바 컨트롤이 모두 그려진다.
+    for selector in [
+        "sc-filter-bar",
+        "sc-search",
+        "sc-count",
+        "sc-filter-all",
+        "sc-filter-modified",
+        "shortcuts-reset-all",
+        "shortcuts-open-keys",
+        "sc-group-worktree",
+        "sc-group-tabs",
+        "sc-group-terminal",
+        "sc-group-agents",
+        "sc-group-panels",
+        "sc-group-general",
+    ] {
+        assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+
+    // 2. 로컬 검색: 명령어("오른쪽 분할")로 검색하면 터미널 그룹만 남고 다른 그룹은 숨겨진다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_shortcut_search("오른쪽 분할", window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sc-group-terminal").is_some());
+    assert!(vcx.debug_bounds("sc-row-shell::SplitRight").is_some());
+    assert!(vcx.debug_bounds("sc-group-worktree").is_none());
+    assert!(vcx.debug_bounds("sc-group-tabs").is_none());
+    assert!(vcx.debug_bounds("sc-search-clear").is_some());
+
+    // 키캡 문자열("⌘=")로 검색하면 일반 그룹의 확대 행만 남는다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_shortcut_search("⌘=", window, cx));
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sc-group-general").is_some());
+    assert!(vcx.debug_bounds("sc-row-settings::ZoomIn").is_some());
+    assert!(vcx.debug_bounds("sc-group-terminal").is_none());
+
+    // 일치하는 항목이 없으면 빈 상태("sc-empty")가 표시된다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_shortcut_search("no-such-shortcut-xyz", window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("sc-empty").is_some());
+
+    // 검색어 지우기 버튼으로 전체 목록 복원.
+    click(vcx, "sc-search-clear");
+    assert!(vcx.debug_bounds("sc-empty").is_none());
+    assert!(vcx.debug_bounds("sc-group-worktree").is_some());
+    assert!(vcx.debug_bounds("sc-group-general").is_some());
+
+    // 3. 상태 필터: 수정된 단축키가 없을 때 '수정됨' 필터를 누르면 빈 상태가 표시된다.
+    click(vcx, "sc-filter-modified");
+    assert!(vcx.debug_bounds("sc-empty").is_some());
+    click(vcx, "sc-filter-all");
+    assert!(vcx.debug_bounds("sc-empty").is_none());
+
+    // 4. 인라인 레코더로 두 개 단축키(ZoomIn: ⌘= → ⌘Y, NewTab: ⌘T → ⌘U)를 변경한다.
+    click(vcx, "sc-settings::ZoomIn-cmd-=");
+    vcx.simulate_keystrokes("cmd-y");
+    vcx.run_until_parked();
+    click(vcx, "sc-shell::NewTab-cmd-t");
+    vcx.simulate_keystrokes("cmd-u");
+    vcx.run_until_parked();
+
+    assert!(vcx.debug_bounds("sc-modified-settings::ZoomIn").is_some());
+    assert!(vcx.debug_bounds("sc-modified-shell::NewTab").is_some());
+
+    // '수정됨' 필터를 켜면 변경된 탭·일반 그룹만 남고 나머지 그룹은 숨겨진다.
+    click(vcx, "sc-filter-modified");
+    assert!(vcx.debug_bounds("sc-group-tabs").is_some());
+    assert!(vcx.debug_bounds("sc-group-general").is_some());
+    assert!(vcx.debug_bounds("sc-row-shell::NewTab").is_some());
+    assert!(vcx.debug_bounds("sc-row-settings::ZoomIn").is_some());
+    assert!(vcx.debug_bounds("sc-row-settings::ZoomOut").is_none());
+    assert!(vcx.debug_bounds("sc-group-worktree").is_none());
+    assert!(vcx.debug_bounds("sc-group-terminal").is_none());
+
+    // 5. 전체 초기화("shortcuts-reset-all")를 누르면 모든 재정의가 지워지고 기본 키로 돌아간다.
+    click(vcx, "shortcuts-reset-all");
+    assert!(Keys::parse(&keys()).unwrap().bindings.is_empty());
+    // 여전히 '수정됨' 필터 상태이므로 수정된 항목이 0개가 되어 빈 상태가 보인다.
+    assert!(vcx.debug_bounds("sc-empty").is_some());
+
+    click(vcx, "sc-filter-all");
+    assert!(vcx.debug_bounds("sc-modified-settings::ZoomIn").is_none());
+    assert!(vcx.debug_bounds("sc-modified-shell::NewTab").is_none());
+    assert!(vcx.debug_bounds("sc-reset-settings::ZoomIn").is_none());
+    vcx.update(|_, cx| {
+        assert_eq!(bound(cx, "cmd-="), Some(ZoomIn.name()));
+        assert_eq!(bound(cx, "cmd-t"), Some("shell::NewTab"));
+    });
+
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-658: 터미널 탭 설정의 기본값·직렬화 왕복과 옛 settings.toml 호환.
 #[gpui::test]
 fn owe658_terminal_settings_defaults_and_serialization(cx: &mut TestAppContext) {
