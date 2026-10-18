@@ -453,7 +453,7 @@ impl Render for Panel {
                 .text_color(p.popover_foreground)
                 .border_1()
                 .border_color(p.border)
-                .shadow_md()
+                .shadow_lg()
                 .flex()
                 .flex_col()
                 // OWE-652: 바깥 클릭·다른 팝오버가 열리면 닫는다.

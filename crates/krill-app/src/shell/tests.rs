@@ -5882,3 +5882,54 @@ fn owe_842_full_workspace_restoration_scenarios_a_and_b(cx: &mut TestAppContext)
 
     std::fs::remove_file(&tmp_file).ok();
 }
+
+/// OWE-854: 데몬에 닿지 않으면 '세션 종료…'는 확인 없이 알림만 남긴다.
+#[gpui::test]
+fn close_sidebar_session_without_target_sets_notice(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|cx| Shell::new(None, cx));
+    view.update(cx, |s, cx| {
+        s.request_close_sidebar_session(
+            krill_app::hosts::HostId::Local,
+            krill_proto::SessionId(7),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.notice.clone()),
+        Some(
+            krill_app::i18n::catalog::shell::DAEMON_FAILED
+                .get()
+                .to_owned()
+        )
+    );
+}
+
+/// OWE-854: 붙은 칸이 없는 세션의 '이어하기…'는 새 탭에 붙이고, 창이 없어 모달을 못 열면 알림을 남긴다.
+#[gpui::test]
+fn continue_sidebar_session_attaches_detached_session(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let view = cx.new(|cx| Shell::new(None, cx));
+    view.update(cx, |s, cx| {
+        s.continue_sidebar_session(
+            &krill_app::hosts::HostId::Local,
+            krill_proto::SessionId(77),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    let (session, notice) = view.read_with(cx, |s, _| {
+        let pane = s.layout.active_tab().focused;
+        (s.layout.session(pane), s.notice.clone())
+    });
+    assert_eq!(session, Some(krill_proto::SessionId(77)));
+    assert_eq!(
+        notice,
+        Some(
+            krill_app::i18n::catalog::shell::SIDEBAR_NO_WINDOW
+                .get()
+                .to_owned()
+        )
+    );
+}

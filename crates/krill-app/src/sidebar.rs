@@ -490,6 +490,14 @@ pub struct NewSession {
     pub program: Program,
 }
 
+/// OWE-854: 사이드바 세션 행 메뉴의 '세션 종료…'. 셸이 확인 후 데몬에 `Request::Close`를 보낸다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CloseSession(pub SessionId);
+
+/// OWE-854: 사이드바 세션 행 메뉴의 '새 세션에 이어하기…'. 셸이 이어하기 모달을 연다.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContinueSession(pub SessionId);
+
 /// 끊긴 원격 호스트 섹션에서 '다시 연결'을 눌렀을 때 내보내는 이벤트(MK-131).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectHost(pub HostId);
@@ -580,6 +588,8 @@ pub struct Sidebar {
 
 impl EventEmitter<Selected> for Sidebar {}
 impl EventEmitter<NewSession> for Sidebar {}
+impl EventEmitter<CloseSession> for Sidebar {}
+impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
 
@@ -1805,6 +1815,32 @@ impl Sidebar {
         }
         self.action_host = Some(host);
         cx.emit(Selected(id));
+        cx.notify();
+    }
+
+    /// OWE-854: 세션 행 메뉴의 '세션 종료…'. 호스트를 남기고 셸에 확인·종료를 맡긴다.
+    pub(crate) fn request_close_session(
+        &mut self,
+        index: usize,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.cursor = Some(index);
+        self.action_host = Some(self.row_host(index).clone());
+        cx.emit(CloseSession(id));
+        cx.notify();
+    }
+
+    /// OWE-854: 세션 행 메뉴의 '새 세션에 이어하기…'. 호스트를 남기고 셸에 모달을 맡긴다.
+    pub(crate) fn request_continue_session(
+        &mut self,
+        index: usize,
+        id: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        self.cursor = Some(index);
+        self.action_host = Some(self.row_host(index).clone());
+        cx.emit(ContinueSession(id));
         cx.notify();
     }
 
