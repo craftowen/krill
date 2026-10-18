@@ -7,6 +7,7 @@ use gpui::{
     div, prelude::*,
 };
 use gpui_component::Icon;
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
 use gpui_kit_assets::IconName;
@@ -333,6 +334,7 @@ impl Render for Dialog {
                     .child(
                         Button::new("add-project-close")
                             .ghost()
+                            .small()
                             .icon(gpui_component::IconName::Close)
                             .accessibility_label(text::CLOSE.get())
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),

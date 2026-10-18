@@ -35,6 +35,7 @@ fn fake() -> (Call, Arc<Mutex<Vec<Request>>>) {
 }
 
 fn open(cx: &mut TestAppContext, call: Call) -> (gpui::Entity<Panel>, &mut VisualTestContext) {
+    cx.update(gpui_component::init);
     let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
     (panel, cx)
 }

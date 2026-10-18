@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{Context, Entity, EventEmitter, PromptLevel, Task, WeakEntity, Window, div, prelude::*};
-use gpui_component::Sizable as _;
+use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{IconName, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -297,7 +298,7 @@ fn row(label: impl Into<String>, value: impl Into<String>, p: &crate::ui::Palett
         )
         .child(
             div()
-                .font_family(crate::ui::FONT_UI)
+                .font_family(crate::ui::FONT_MONO)
                 .text_color(p.popover_foreground)
                 .child(value.into()),
         )
@@ -399,18 +400,30 @@ impl Render for Panel {
                                 .child(
                                     row(self.session_name(cx, id), value, p).child(
                                         div()
-                                            .id(("resources-kill", id.0))
                                             .ml_2()
                                             .pl_2()
                                             .border_l_1()
                                             .border_color(p.border)
-                                            .cursor_pointer()
-                                            .text_color(p.destructive)
-                                            .child(text::KILL.get())
-                                            .on_click(cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.confirm_kill(id, window, cx);
-                                            })),
+                                            .child(
+                                                crate::ui::button_with_tooltip(
+                                                    Button::new(("resources-kill", id.0))
+                                                        .ghost()
+                                                        .xsmall()
+                                                        .icon(IconName::Close),
+                                                    format!("resources-kill-{}", id.0),
+                                                    text::KILL_CONFIRM.get(),
+                                                )
+                                                .debug_selector(move || {
+                                                    format!("resources-kill-{}", id.0)
+                                                })
+                                                .accessibility_label(text::KILL_CONFIRM.get())
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.confirm_kill(id, window, cx);
+                                                    },
+                                                )),
+                                            ),
                                     ),
                                 )
                         }))
@@ -426,18 +439,9 @@ impl Render for Panel {
                 }
             };
             let restart = (!self.outdated).then(|| {
-                div()
-                    .id("resources-restart")
+                crate::ui::secondary("resources-restart", text::RESTART.get())
+                    .debug_selector(|| "resources-restart".into())
                     .mt_2()
-                    .px_2()
-                    .py_1()
-                    .rounded(crate::ui::RADIUS_XS)
-                    .bg(p.secondary)
-                    .text_color(p.secondary_foreground)
-                    .hover(|d| d.bg(p.accent).text_color(p.accent_foreground))
-                    .cursor_pointer()
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(text::RESTART.get())
                     .on_click(cx.listener(|this, _, window, cx| this.confirm_restart(window, cx)))
             });
             div()

@@ -1041,7 +1041,7 @@ impl Render for Dialog {
                             .flex_col()
                             .gap_1()
                             .child(crate::ui::field_label(text::TITLE_LABEL.get(), None, p))
-                            .child(Input::new(&self.title).h(px(32.)).disabled(busy)),
+                            .child(Input::new(&self.title).disabled(busy)),
                     )
                     .child(
                         div()
