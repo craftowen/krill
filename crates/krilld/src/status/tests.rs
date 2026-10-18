@@ -636,3 +636,44 @@ fn rate_limit_trigger_respects_existing_policy() {
     assert_eq!(active_claude(&home, &state).as_deref(), Some("claude-high"));
     fs::remove_dir_all(home.parent().unwrap()).ok();
 }
+
+/// OWE-872: 전경 프로세스 그룹이 루트 셸과 같거나 종료된 세션이면 `None`,
+/// 다른 pgrp에서 실행 중인 명령이면 `process_name`으로 이름을 채운다.
+#[test]
+fn foreground_process_distinguishes_root_shell_and_child_command() {
+    assert_eq!(
+        foreground_process(100, Some(100), false, |_| panic!("root shell skips lookup")),
+        None
+    );
+    assert_eq!(
+        foreground_process(100, None, false, |_| unreachable!()),
+        None
+    );
+    assert_eq!(
+        foreground_process(100, Some(0), false, |_| unreachable!()),
+        None
+    );
+    assert_eq!(
+        foreground_process(100, Some(200), true, |_| Some("npm".into())),
+        None
+    );
+    assert_eq!(
+        foreground_process(100, Some(200), false, |pid| {
+            assert_eq!(pid, 200);
+            Some("npm\n".into())
+        }),
+        Some("npm".into())
+    );
+    assert_eq!(
+        foreground_process(100, Some(200), false, |_| Some("   ".into())),
+        None
+    );
+    assert_eq!(foreground_process(100, Some(200), false, |_| None), None);
+
+    // 현재 프로세스 PID를 자식 pgrp처럼 조회해 OS process_name 연동도 확인한다.
+    let me = std::process::id();
+    let resolved = foreground_process(me.wrapping_add(1), Some(me), false, |pid| {
+        crate::sys::process_name(pid).ok()
+    });
+    assert!(resolved.is_some_and(|name| !name.is_empty()));
+}

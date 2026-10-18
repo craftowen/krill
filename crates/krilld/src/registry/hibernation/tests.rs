@@ -16,6 +16,7 @@ fn done(ns: u64) -> AgentStatus {
         confidence: Confidence::High,
         agent: "codex".into(),
         since_unix_ns: ns,
+        ..AgentStatus::UNKNOWN
     }
 }
 
