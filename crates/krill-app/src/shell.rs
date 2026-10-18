@@ -998,8 +998,11 @@ impl Shell {
         cx.notify();
     }
 
-    /// Cmd+J: Jump 팔레트를 열거나(사이드바 스냅샷으로) 닫는다. 열 때 칸의 조합 중 글자는 확정한다(포커스 이탈).
+    /// Cmd+J: Jump 팔레트를 열거나(사이드바 스냅샷으로) 닫는다. 설정이 열려 있으면 먼저 닫고 연다(OWE-860).
     fn toggle_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.settings.is_some() {
+            self.close_settings(Some(&mut *window), cx);
+        }
         if self.jump.take().is_some() {
             window.focus(&self.focus, cx);
             cx.notify();
@@ -1625,6 +1628,10 @@ impl Shell {
     }
 
     fn activate_tab_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘1~9를 누르면 설정을 닫고 해당 탭으로 전환한다.
+        if self.settings.is_some() {
+            self.close_settings(None, cx);
+        }
         let len = self.layout.tabs().len();
         if len == 0 {
             return;
@@ -1640,6 +1647,10 @@ impl Shell {
     }
 
     fn cycle_session_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘⇧↑/↓를 누르면 설정을 닫고 세션을 전환한다.
+        if self.settings.is_some() {
+            self.close_settings(None, cx);
+        }
         let items = self.sidebar.read(cx).jump_items();
         if items.is_empty() {
             self.change(true, cx, |l| l.cycle(delta));
@@ -2593,6 +2604,10 @@ impl Shell {
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘B를 누르면 설정을 닫고 사이드바를 전환한다.
+        if self.settings.is_some() {
+            self.close_settings(None, cx);
+        }
         self.sidebar_collapsed = !self.sidebar_collapsed;
         let visible = !self.sidebar_collapsed;
         self.sidebar.update(cx, |s, cx| s.set_visible(visible, cx));
@@ -2600,6 +2615,10 @@ impl Shell {
     }
 
     fn toggle_panel(&mut self, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘L 등을 누르면 설정을 닫고 패널을 전환한다.
+        if self.settings.is_some() {
+            self.close_settings(None, cx);
+        }
         self.panel_collapsed = !self.panel_collapsed;
         let visible = !self.panel_collapsed && self.security.is_window_active();
         self.diff.update(cx, |d, cx| d.set_visible(visible, cx));
@@ -2607,8 +2626,9 @@ impl Shell {
     }
 
     fn toggle_explorer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘⇧E를 누르면 설정을 닫고 탐색기로 전환한다.
         if self.settings.is_some() {
-            return;
+            self.close_settings(Some(&mut *window), cx);
         }
         if self.panel_collapsed {
             self.panel_collapsed = false;
@@ -2631,8 +2651,9 @@ impl Shell {
     }
 
     fn toggle_workspace_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // OWE-860: 설정에서 ⌘⇧F를 누르면 설정을 닫고 작업공간 검색으로 전환한다.
         if self.settings.is_some() {
-            return;
+            self.close_settings(Some(&mut *window), cx);
         }
         if self.panel_collapsed {
             self.panel_collapsed = false;
@@ -3491,30 +3512,59 @@ impl Render for Shell {
         let (warning, warning_fg) = (p.warning, p.warning_foreground);
 
         div()
-            .when(settings_view.is_none(), |d| d.key_context(KEY_CONTEXT))
+            // OWE-860: 설정 화면에서도 Shell 키 문맥을 유지해 전역 탐색 단축키(⌘J·⌘B·⌘P 등)와
+            // 커스텀 ClosePane(⌘W) 바인딩이 동작하게 한다. 터미널 편집 액션은 각 핸들러의 settings 가드가 막는다.
+            .key_context(KEY_CONTEXT)
             .track_focus(&self.focus)
             .on_action(
                 cx.listener(|this, _: &krill_app::settings::OpenSettings, window, cx| {
-                    this.open_settings(krill_app::settings::AdminTab::General, Some(window), cx);
+                    // OWE-860: ⌘,는 설정 토글이다. 이미 열려 있으면 닫고(현재 탭 초기화 없음),
+                    // 닫혀 있을 때만 일반 탭으로 연다.
+                    if this.settings.is_some() {
+                        this.close_settings(Some(&mut *window), cx);
+                    } else {
+                        this.open_settings(
+                            krill_app::settings::AdminTab::General,
+                            Some(window),
+                            cx,
+                        );
+                    }
                 }),
             )
-            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_tab_on_launch_host(cx)))
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
+                this.new_tab_on_launch_host(cx);
+            }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
                 if this.settings.is_some() {
                     return;
                 }
                 this.request_close_tab(this.layout.active(), cx);
             }))
-            .on_action(
-                cx.listener(|this, _: &NextTab, _, cx| this.change(true, cx, |l| l.cycle(1))),
-            )
-            .on_action(
-                cx.listener(|this, _: &PrevTab, _, cx| this.change(true, cx, |l| l.cycle(-1))),
-            )
+            .on_action(cx.listener(|this, _: &NextTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
+                this.change(true, cx, |l| l.cycle(1));
+            }))
+            .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
+                this.change(true, cx, |l| l.cycle(-1));
+            }))
             .on_action(cx.listener(|this, _: &NextRecentTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
                 this.on_recent_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevRecentTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
                 this.on_recent_tab(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &SplitRight, _, cx| {
@@ -3610,6 +3660,9 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &NewAgentTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
                 if this.link == Link::Up && this.agents.is_some() {
                     this.new_default_agent(cx);
                 } else {
@@ -3617,6 +3670,9 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ReopenClosedTab, _, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(None, cx);
+                }
                 if let Some(session) = this.closed_sessions.pop() {
                     this.open_session(session, cx);
                 } else {
@@ -3636,6 +3692,9 @@ impl Render for Shell {
                 this.navigate_forward(Some(window), cx);
             }))
             .on_action(cx.listener(|this, _: &NewWorktree, window, cx| {
+                if this.settings.is_some() {
+                    this.close_settings(Some(&mut *window), cx);
+                }
                 let repo = this.folder();
                 if this.sidebar_collapsed {
                     this.toggle_sidebar(cx);
@@ -3654,6 +3713,10 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &ActivateTab9, _, cx| this.activate_tab_index(8, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, window, cx| {
+                // OWE-860: 설정에서 호출하면 설정을 닫고 사이드바에 포커스를 둔다.
+                if this.settings.is_some() {
+                    this.close_settings(Some(&mut *window), cx);
+                }
                 let back = this.focus.clone();
                 this.sidebar.update(cx, |s, cx| s.focus(back, window, cx));
             }))
