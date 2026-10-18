@@ -68,6 +68,10 @@ for bin in krill krill-holder krilld; do
     mv -f "$PREFIX/bin/.$bin.new" "$PREFIX/bin/$bin"
 done
 echo "installed $(basename "$SRC") -> $PREFIX/bin"
+# 돌고 있는 데몬이 있으면 세션을 유지한 채 새 바이너리로 교체한다(같은 버전이면 그대로 둔다).
+if [ -S "${KRILL_STATE_DIR:-$HOME/.local/share/dev.krill.app}/run/krilld.sock" ]; then
+    "$PREFIX/bin/krill" update || echo "warning: running daemon was not upgraded; sessions keep running on the old version" >&2
+fi
 case ":${PATH}:" in
     *":$PREFIX/bin:"*) ;;
     *) echo "note: $PREFIX/bin is not on PATH for this shell (the Mac app finds it anyway)" ;;
