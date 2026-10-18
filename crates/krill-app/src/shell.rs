@@ -591,7 +591,13 @@ impl Shell {
         let diff = cx.new(|cx| krill_app::diff::Panel::unconnected(folder, cx));
         let diff_send = Self::subscribe_diff(&diff, cx);
         cx.subscribe(&diff, |this, _, e: &krill_app::diff::OpenFile, cx| {
-            this.open_file(e.0.clone(), cx);
+            // 단일 클릭 미리보기면 같은 칸을 재사용하고, 고정 열기면 탭을 확정한다(OWE-849).
+            let preview = this.diff.update(cx, |d, _| d.take_open_file_preview());
+            if preview {
+                this.open_file_preview(e.0.clone(), cx);
+            } else {
+                this.open_file(e.0.clone(), cx);
+            }
         })
         .detach();
         cx.subscribe(&diff, |this, _, e: &krill_app::diff::OpenFileAt, cx| {
@@ -3785,11 +3791,16 @@ impl Render for Shell {
                                 div()
                                     .flex_1()
                                     .min_h_0()
+                                    .relative()
                                     .bg(krill_app::ui::terminal_surface_alpha(
                                         self.terminal_theme,
                                         krill_app::settings::terminal_opacity_pct(cx),
                                     ))
-                                    .children(tree),
+                                    .children(tree)
+                                    // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
+                                    // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
+                                    // 너비·접힘과 무관하게 항상 터미널 우측에 붙는다.
+                                    .children(self.search.as_ref().map(|(bar, _)| bar.clone())),
                             ),
                     )
                     .when(!self.panel_collapsed, |d| {
@@ -3821,7 +3832,6 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(dialog, _)| dialog.clone()),
             )
-            .children(self.search.as_ref().map(|(bar, _)| bar.clone()))
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))

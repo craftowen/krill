@@ -237,6 +237,10 @@ pub struct Layout {
     hosts: BTreeMap<PaneId, HostId>,
     /// 파일 칸(MK-119): 세션 대신 이 파일을 에디터로 보인다. 세션을 붙이지 않는다.
     files: BTreeMap<PaneId, PathBuf>,
+    /// 단일 클릭 미리보기 탭 슬롯(OWE-849): 다음 단일 클릭이 같은 칸을 재사용한다.
+    /// 고정 열기·칸 닫기로 무효화된다. 런타임 전용이라 저장하지 않는다.
+    #[serde(skip)]
+    preview: Option<(PaneId, PathBuf)>,
     #[serde(skip)]
     mru: MruState,
 }
@@ -309,6 +313,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             launches,
             hosts: BTreeMap::new(),
             files: old.files,
+            preview: None,
             mru: MruState::default(),
         };
         layout.record_mru(layout.active);
@@ -328,6 +333,7 @@ impl Default for Layout {
             launches: BTreeMap::new(),
             hosts: BTreeMap::new(),
             files: BTreeMap::new(),
+            preview: None,
             mru: MruState {
                 order: vec![0],
                 cursor: None,
@@ -470,23 +476,81 @@ impl Layout {
 
     /// 파일을 연다: 이미 어느 탭의 칸에 열려 있으면 그 탭·칸으로, 아니면 새 탭(폴더는 지금 칸을 물려받는다).
     pub fn open_file(&mut self, path: PathBuf) -> PaneId {
-        if let Some((tab, pane)) = self.tabs.iter().enumerate().find_map(|(i, t)| {
-            let mut leaves = Vec::new();
-            t.root.leaves(&mut leaves);
-            leaves
-                .into_iter()
-                .find(|p| self.files.get(p) == Some(&path))
-                .map(|p| (i, p))
-        }) {
+        if let Some((tab, pane)) = self.find_file_pane(&path) {
+            self.active = tab;
+            self.tabs[tab].focused = pane;
+            self.record_mru(tab);
+            // 미리보기로 열려 있던 파일을 고정으로 여는 것이므로 슬롯을 비운다.
+            if self.preview == Some((pane, path)) {
+                self.preview = None;
+            }
+            return pane;
+        }
+        self.clear_stale_preview();
+        self.new_tab();
+        let pane = self.active_tab().focused;
+        self.files.insert(pane, path);
+        pane
+    }
+
+    /// 파일을 미리보기로 연다(OWE-849): 이미 열려 있으면 그 탭·칸으로 포커스만 옮기고,
+    /// 살아 있는 미리보기 칸이 있으면 그 칸을 재사용하며, 아니면 새 탭을 열어 슬롯에 기록한다.
+    pub fn open_file_preview(&mut self, path: PathBuf) -> PaneId {
+        if let Some((tab, pane)) = self.find_file_pane(&path) {
             self.active = tab;
             self.tabs[tab].focused = pane;
             self.record_mru(tab);
             return pane;
         }
-        self.new_tab();
-        let pane = self.active_tab().focused;
-        self.files.insert(pane, path);
+        if let Some((pane, _)) = self.preview.clone()
+            && self.preview_is_live()
+            && let Some(tab) = self.tab_with(pane)
+        {
+            self.files.insert(pane, path.clone());
+            self.preview = Some((pane, path));
+            self.active = tab;
+            self.tabs[tab].focused = pane;
+            self.record_mru(tab);
+            return pane;
+        }
+        let pane = self.open_file(path.clone());
+        self.preview = Some((pane, path));
         pane
+    }
+
+    /// 미리보기 슬롯이 가리키는 칸이 아직 같은 파일을 보이고 있으면 `true`를 반환한다.
+    fn preview_is_live(&self) -> bool {
+        self.preview
+            .as_ref()
+            .is_some_and(|(pane, old)| self.files.get(pane) == Some(old))
+    }
+
+    /// 기록과 달라진 미리보기 슬롯을 비운다. `prune`에서도 호출된다.
+    fn clear_stale_preview(&mut self) {
+        if !self.preview_is_live() {
+            self.preview = None;
+        }
+    }
+
+    /// `path`가 열린 (탭 인덱스, 칸)을 찾는다.
+    fn find_file_pane(&self, path: &Path) -> Option<(usize, PaneId)> {
+        self.tabs.iter().enumerate().find_map(|(i, t)| {
+            let mut leaves = Vec::new();
+            t.root.leaves(&mut leaves);
+            leaves
+                .into_iter()
+                .find(|p| self.files.get(p).is_some_and(|f| f == path))
+                .map(|p| (i, p))
+        })
+    }
+
+    /// `pane`을 포함한 탭 인덱스를 찾는다.
+    fn tab_with(&self, pane: PaneId) -> Option<usize> {
+        self.tabs.iter().position(|t| {
+            let mut leaves = Vec::new();
+            t.root.leaves(&mut leaves);
+            leaves.contains(&pane)
+        })
     }
 
     fn inherited_launch(&self) -> Option<Create> {
@@ -512,13 +576,14 @@ impl Layout {
         out
     }
 
-    /// 닫힌 칸의 세션 항목을 지운다.
+    /// 닫힌 칸의 세션 항목을 지운다. 미리보기 슬롯이 가리킨 칸이 사라졌으면 함께 비운다.
     fn prune(&mut self) {
         let live = self.panes();
         self.sessions.retain(|p, _| live.contains(p));
         self.launches.retain(|p, _| live.contains(p));
         self.hosts.retain(|p, _| live.contains(p));
         self.files.retain(|p, _| live.contains(p));
+        self.clear_stale_preview();
     }
 
     fn alloc_pane(&mut self) -> PaneId {

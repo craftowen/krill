@@ -692,6 +692,7 @@ catalog! {
         EXPLORER_CANCEL => ("취소", "Cancel"),
         EXPLORER_EMPTY => ("표시할 파일이 없습니다", "No files to show"),
         EXPLORER_FILTER_EMPTY => ("일치하는 파일이 없습니다", "No matching files"),
+        EXPLORER_LOADING => ("파일 목록을 읽는 중…", "Loading files…"),
         SEARCH => ("검색", "Search"),
         SEARCH_TOOLTIP => ("워크스페이스 검색 (⇧⌘F)", "Search in Workspace (⇧⌘F)"),
         SEARCH_PLACEHOLDER => ("파일에서 검색…", "Search in files…"),
@@ -705,6 +706,7 @@ catalog! {
         SEARCH_SUMMARY => ("{files}개 파일에서 {matches}개 결과", "{matches} results in {files} files"),
         SEARCH_TRUNCATED => ("{files}개 파일에서 {matches}+개 결과 (일부 생략)", "{matches}+ results in {files} files (results truncated)"),
         SEARCH_IDLE => ("검색어를 입력해 워크스페이스 파일을 검색하세요", "Type to search across files in this worktree"),
+        SEARCH_LOADING => ("검색 중…", "Searching…"),
         SEARCH_NO_RESULTS => ("일치하는 결과가 없습니다", "No results found"),
         SEARCH_COPY_LINE_PATH => ("상대 경로:줄 복사", "Copy Path:Line"),
     }
