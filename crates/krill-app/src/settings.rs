@@ -365,6 +365,8 @@ pub struct Config {
     pending_terminal_commands: std::collections::VecDeque<String>,
     /// 관리자 YOLO 토글이 요청한 새 세션 권한(메인 셸 창이 꺼내 데몬에 적용).
     pending_permission: Option<krill_proto::agent::Permission>,
+    /// `ssh-copy-id` 실행 안내처럼 설정 창이 닫힌 뒤에도 보여야 할 문구(메인 셸 창이 꺼내 배너로 표시).
+    pending_notice: Option<String>,
 }
 
 impl std::fmt::Debug for Config {
@@ -494,6 +496,29 @@ pub fn take_pending_permission(cx: &mut App) -> Option<krill_proto::agent::Permi
     cx.global_mut::<Config>().pending_permission.take()
 }
 
+/// 설정 창이 닫힌 뒤 메인 셸 배너로 보여줄 문구를 예약한다.
+pub fn queue_notice(msg: impl Into<String>, cx: &mut App) {
+    let msg = msg.into();
+    if msg.trim().is_empty() {
+        return;
+    }
+    if !cx.has_global::<Config>() {
+        cx.set_global(Config::default());
+    }
+    cx.global_mut::<Config>().pending_notice = Some(msg);
+}
+
+/// 예약된 메인 셸 배너 문구를 꺼낸다.
+pub fn take_pending_notice(cx: &mut App) -> Option<String> {
+    if cx
+        .try_global::<Config>()
+        .is_none_or(|c| c.pending_notice.is_none())
+    {
+        return None;
+    }
+    cx.global_mut::<Config>().pending_notice.take()
+}
+
 /// 설정을 읽어 적용하고, 1초마다 파일 변경을 보는 태스크를 띄운다. 앱 기본 키를 모두 묶은 뒤에
 /// 부른다(그때의 키맵이 재정의의 바탕이 된다). 첫 창 전에도 언어를 적용하고, 줌은 열린 창에 적용한다.
 pub fn init(cx: &mut App) {
@@ -531,6 +556,7 @@ pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
         pending_ssh_connect: None,
         pending_terminal_commands: std::collections::VecDeque::new(),
         pending_permission: None,
+        pending_notice: None,
     });
     reload(cx);
 }
@@ -1804,6 +1830,8 @@ pub struct SettingsView {
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     ssh_host_statuses: std::collections::BTreeMap<String, SshHostCardStatus>,
     ssh_status: Option<SharedString>,
+    /// 연결 테스트 실행 중인 호스트 id. 결과(`apply_ssh_test_result`)가 오면 빠진다(OWE-884).
+    ssh_test_pending: std::collections::BTreeSet<String>,
     ssh_form: Option<SshForm>,
     tailscale_peers: Vec<crate::ssh_hosts::TailscalePeer>,
     tailscale_loaded: bool,
@@ -1899,6 +1927,8 @@ struct SshForm {
     identity_file: gpui::Entity<gpui_component::input::InputState>,
     editing_id: Option<String>,
     error: Option<SharedString>,
+    /// Enter 제출 구독. 버리면 구독이 취소되므로 폼 수명 동안 둔다(OWE-884).
+    _subs: Vec<Subscription>,
 }
 
 /// 워크플로 탭의 저장소별 공유 심볼릭 링크·setup/archive 훅 입력 폼(MK-174).
@@ -1939,6 +1969,7 @@ impl SettingsView {
             ssh_hosts: Vec::new(),
             ssh_host_statuses: std::collections::BTreeMap::new(),
             ssh_status: None,
+            ssh_test_pending: std::collections::BTreeSet::new(),
             ssh_form: None,
             tailscale_peers: Vec::new(),
             tailscale_loaded: false,
@@ -2695,6 +2726,20 @@ impl SettingsView {
             gpui_component::input::InputState::new(window, cx)
                 .placeholder(text::SSH_KEY_PLACEHOLDER.get())
         });
+        // 입력칸 Enter 제출(Orca `SshTargetForm` form onSubmit 대응, OWE-884).
+        // 네 칸 중 어디서 Enter를 눌러도 추가·저장 버튼과 같은 경로로 제출한다.
+        let mut subs = Vec::with_capacity(4);
+        for input in [&label, &address, &port, &identity_file] {
+            subs.push(cx.subscribe_in(
+                input,
+                window,
+                |this, _, event: &gpui_component::input::InputEvent, window, cx| {
+                    if matches!(event, gpui_component::input::InputEvent::PressEnter { .. }) {
+                        this.submit_ssh_host_form(window, cx);
+                    }
+                },
+            ));
+        }
         self.ssh_form = Some(SshForm {
             label,
             address,
@@ -2702,6 +2747,7 @@ impl SettingsView {
             identity_file,
             editing_id: None,
             error: None,
+            _subs: subs,
         });
     }
 
@@ -2907,6 +2953,7 @@ impl SettingsView {
         res: Result<String, String>,
         cx: &mut Context<Self>,
     ) {
+        self.ssh_test_pending.remove(&host.id);
         match res {
             Ok(ok) => {
                 self.ssh_host_statuses
@@ -2943,7 +2990,13 @@ impl SettingsView {
         cx.notify();
     }
 
-    pub fn test_ssh_host(host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
+    pub fn test_ssh_host(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
+        // 같은 호스트의 중복 실행은 막는다. 완료·실패는 `apply_ssh_test_result`가 푼다.
+        if !self.ssh_test_pending.insert(host.id.clone()) {
+            return;
+        }
+        self.ssh_status = Some(format!("{}: {}", host.label, text::SSH_TESTING.get()).into());
+        cx.notify();
         cx.spawn(async move |this, cx| {
             let host_for_bg = host.clone();
             let res = cx
@@ -2956,6 +3009,11 @@ impl SettingsView {
             .ok();
         })
         .detach();
+    }
+
+    /// 호스트의 연결 테스트가 실행 중인지(진행 표시·버튼 비활성화용, OWE-884).
+    pub fn is_ssh_test_pending(&self, id: &str) -> bool {
+        self.ssh_test_pending.contains(id)
     }
 
     fn ssh_home_dir(cx: &App) -> PathBuf {
@@ -3010,15 +3068,15 @@ impl SettingsView {
     }
 
     /// 새 터미널 탭에서 `ssh-copy-id`(비밀번호 1회 입력)를 실행한다.
+    /// 설정 창은 셸이 닫으므로(`on_config_changed`), 안내 문구는 메인 창 배너로도
+    /// 전달해 터미널 탭에서 비밀번호 입력을 볼 수 있게 한다(OWE-884).
     pub fn launch_ssh_copy_id(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
         let label = host.label.clone();
         self.ssh_auth_failed_host = None;
         self.ssh_keygen_confirm_host = None;
-        self.ssh_status = Some(
-            text::SSH_REGISTER_STARTED
-                .format(&[("label", &label)])
-                .into(),
-        );
+        let started: String = text::SSH_REGISTER_STARTED.format(&[("label", &label)]);
+        self.ssh_status = Some(started.clone().into());
+        queue_notice(started, cx);
         let copy_host = host.with_copy_id();
         cx.defer(move |cx| {
             if cx.has_global::<Config>() {
@@ -6455,19 +6513,26 @@ impl SettingsView {
                         .child(
                             layout::controls()
                                 .child(connect_or_disconnect_btn)
-                                .child(
+                                .child({
+                                    let testing = self.is_ssh_test_pending(&host.id);
+                                    let test_label = if testing {
+                                        text::SSH_TESTING.get()
+                                    } else {
+                                        text::SSH_TEST.get()
+                                    };
                                     layout::secondary(
                                         gpui::ElementId::Name(test_id.clone().into()),
-                                        text::SSH_TEST.get(),
+                                        test_label,
                                     )
                                     .small()
+                                    .disabled(testing)
                                     .debug_selector(move || test_id.clone())
                                     .on_click(cx.listener(
-                                        move |_, _, _, cx| {
-                                            Self::test_ssh_host(host_cl.clone(), cx);
+                                        move |this, _, _, cx| {
+                                            this.test_ssh_host(host_cl.clone(), cx);
                                         },
-                                    )),
-                                )
+                                    ))
+                                })
                                 .child(
                                     layout::ghost(
                                         gpui::ElementId::Name(edit_id.clone().into()),
@@ -6481,19 +6546,15 @@ impl SettingsView {
                                         },
                                     )),
                                 )
-                                .child(
-                                    layout::ghost(
-                                        gpui::ElementId::Name(rm_id.clone().into()),
-                                        text::SSH_REMOVE.get(),
-                                    )
-                                    .small()
-                                    .debug_selector(move || rm_id.clone())
-                                    .on_click(cx.listener(
-                                        move |this, _, _, cx| {
-                                            this.remove_ssh_host(&rm_host_id, cx);
-                                        },
-                                    )),
-                                ),
+                                .child(self.confirm_button(
+                                    rm_id.clone(),
+                                    text::SSH_REMOVE.get(),
+                                    cx,
+                                    move |this, cx| {
+                                        let id = rm_host_id.clone();
+                                        this.remove_ssh_host(&id, cx);
+                                    },
+                                )),
                         ),
                 );
             }

@@ -880,6 +880,7 @@ catalog! {
         SSH_OPEN_TOML => ("hosts.toml 열기", "Open hosts.toml"),
         SSH_EMPTY => ("등록된 SSH 호스트가 없습니다. 위 입력 폼에서 추가하거나 ~/.ssh/config에서 가져오세요.", "No SSH hosts registered. Add one using the form above or import from ~/.ssh/config."),
         SSH_TEST => ("연결 테스트", "Test"),
+        SSH_TESTING => ("연결 테스트 중…", "Testing connection…"),
         SSH_CONNECT => ("연결", "Connect"),
         SSH_DISCONNECT => ("연결 해제", "Disconnect"),
         SSH_EDIT => ("편집", "Edit"),
