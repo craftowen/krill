@@ -621,3 +621,61 @@ fn notification_deep_link_exists_only_while_gateway_is_exposed_and_has_no_secret
     });
     assert!(gateway.deep_link(id).is_none());
 }
+#[test]
+fn connect_mode_survives_daemon_restart() {
+    let dir = std::env::temp_dir().join(format!("mk-mobile-intent-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
+    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Lan);
+    g.request(MobileRequest::SetConnectMode {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+    });
+    drop(g);
+    let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
+    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
+    drop(g);
+    // 손상된 파일은 모바일을 끄지 않고 LAN으로 시작한다.
+    std::fs::write(dir.join(INTENT_FILE), b"{").unwrap();
+    let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
+    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Lan);
+    drop(g);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+#[test]
+fn supervisor_replaces_unreachable_tunnel_with_backoff() {
+    let (_r, g) = start();
+    offer(&g);
+    let mut s = lock(&g.shared.state);
+    let port = s.selected.unwrap().port();
+    s.tunnel = Some(super::super::tunnel::Tunnel::stale(port).unwrap());
+    reconcile(&mut s, now_ms()).unwrap();
+    assert!(s.tunnel.is_none());
+    assert_eq!(s.tunnel_failures, 1);
+    assert!(s.tunnel_retry_at.is_some());
+    // 백오프가 지나면 새 터널을 띄우고, 준비되면 실패 횟수를 되돌린다.
+    s.tunnel_retry_at = None;
+    reconcile(&mut s, now_ms()).unwrap();
+    assert!(s.tunnel.as_ref().unwrap().ready_url().is_some());
+    reconcile(&mut s, now_ms()).unwrap();
+    assert_eq!(s.tunnel_failures, 0);
+}
+#[test]
+fn idle_authenticated_socket_is_pinged_then_closed_without_pong() {
+    let (_r, g) = start();
+    lock(&g.shared.state).ping = Duration::from_millis(100);
+    let (port, t) = offer(&g);
+    let mut phone = Client::pair(port, &t);
+    phone.ipc();
+    let (op, body) = receive(&mut phone.socket).unwrap();
+    assert_eq!((op, body.len()), (9, 0));
+    // pong 없이 IDLE_PINGS 주기가 지나면 죽은 연결로 보고 닫는다.
+    loop {
+        match receive(&mut phone.socket) {
+            Ok((9, _)) => {}
+            Ok(other) => panic!("unexpected frame {other:?}"),
+            Err(_) => break,
+        }
+    }
+    until(|| lock(&g.shared.state).connections.is_empty());
+}
