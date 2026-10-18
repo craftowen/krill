@@ -1556,3 +1556,305 @@ fn workspace_search_default_width_panel_keeps_long_line_highlight_visible(
         "source.rs NEEDLE highlight ({src_highlight:?}) must stay inside 280pt match row ({src_match:?})"
     );
 }
+
+#[gpui::test]
+fn right_panel_icon_only_tabs_switch_on_click_show_tooltips_and_fit_default_width(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::i18n::Language;
+    use crate::pull_request::{
+        Action, CheckItem, CheckState, PrInspection, ReviewComment, Runner, Service, Status,
+    };
+
+    struct MockPrRunner;
+    impl Runner for MockPrRunner {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            Ok(Status::Open)
+        }
+
+        fn inspect_pr(&self, _: &Path, _: &str) -> io::Result<PrInspection> {
+            Ok(PrInspection {
+                status: Status::Open,
+                number: Some(787),
+                title: "Icon-only right panel tabs".into(),
+                url: "https://github.com/acme/krill/pull/787".into(),
+                checks: vec![
+                    CheckItem {
+                        name: "cargo nextest".into(),
+                        state: CheckState::Failed,
+                        description: Some("1 test failed".into()),
+                        details_url: None,
+                        run_id: None,
+                        job_id: None,
+                        log_tail: None,
+                    },
+                    CheckItem {
+                        name: "cargo clippy".into(),
+                        state: CheckState::Passed,
+                        description: None,
+                        details_url: None,
+                        run_id: None,
+                        job_id: None,
+                        log_tail: None,
+                    },
+                ],
+                review_comments: vec![ReviewComment {
+                    id: "c1".into(),
+                    thread_id: Some("t1".into()),
+                    author: "owen".into(),
+                    is_bot: false,
+                    body: "Looks good".into(),
+                    path: "crates/krill-app/src/diff.rs".into(),
+                    line: Some(10),
+                    original_line: Some(10),
+                    diff_hunk: String::new(),
+                    created_at: "2026-10-18T00:00:00Z".into(),
+                    url: String::new(),
+                    is_resolved: false,
+                    is_outdated: false,
+                    replies: Vec::new(),
+                }],
+            })
+        }
+    }
+
+    struct NarrowHost(Entity<Panel>);
+    impl Render for NarrowHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().w(px(280.)).h(px(600.)).flex().flex_col().child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.0.clone()),
+            )
+        }
+    }
+
+    cx.update(gpui_component::init);
+    cx.update(|cx| crate::i18n::set_language(Language::Ko, cx));
+    assert_eq!(PanelTab::Changes.label(), "변경 사항");
+    assert_eq!(PanelTab::Files.label(), "파일");
+    assert_eq!(PanelTab::Search.label(), "검색");
+    assert_eq!(PanelTab::Checks.label(), "PR · CI");
+    assert_eq!(PanelTab::Changes.tooltip(), "변경 사항 (⇧⌘G)");
+    assert_eq!(PanelTab::Files.tooltip(), "파일 탐색기 (⇧⌘E)");
+    assert_eq!(PanelTab::Search.tooltip(), "워크스페이스 검색 (⇧⌘F)");
+    assert_eq!(PanelTab::Checks.tooltip(), "PR · CI");
+
+    cx.update(|cx| crate::i18n::set_language(Language::En, cx));
+    assert_eq!(PanelTab::Changes.label(), "Changes");
+    assert_eq!(PanelTab::Files.label(), "Files");
+    assert_eq!(PanelTab::Search.label(), "Search");
+    assert_eq!(PanelTab::Checks.label(), "PR · CI");
+    assert_eq!(PanelTab::Changes.tooltip(), "Changes (⇧⌘G)");
+    assert_eq!(PanelTab::Files.tooltip(), "File Explorer (⇧⌘E)");
+    assert_eq!(PanelTab::Search.tooltip(), "Search in Workspace (⇧⌘F)");
+    assert_eq!(PanelTab::Checks.tooltip(), "PR · CI");
+    cx.update(|cx| crate::i18n::set_language(Language::Ko, cx));
+
+    let repo = Repo::new();
+    std::fs::write(repo.0.join("changed.rs"), "pub fn demo() {}\n").unwrap();
+
+    let repo_path = repo.0.clone();
+    let pr_service = Arc::new(Service::new(Arc::new(MockPrRunner)));
+    let mut panel_handle: Option<Entity<Panel>> = None;
+    let (_, cx) = cx.add_window_view(|_, cx| {
+        let p = cx.new(|cx| {
+            let mut panel = Panel::unconnected(repo_path, cx);
+            panel.set_pr_service(pr_service);
+            panel.set_checks_branch("craftowen/m10-owe-787");
+            panel
+        });
+        panel_handle = Some(p.clone());
+        NarrowHost(p)
+    });
+    let view = panel_handle.unwrap();
+    cx.run_until_parked();
+
+    // Default tab is Changes; only Changes active indicator bar is rendered.
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).active_tab()),
+        PanelTab::Changes
+    );
+    assert!(cx.debug_bounds("diff-tab-changes-active").is_some());
+    assert!(cx.debug_bounds("diff-tab-files-active").is_none());
+    assert!(cx.debug_bounds("diff-tab-search-active").is_none());
+    assert!(cx.debug_bounds("diff-tab-checks-active").is_none());
+    assert!(cx.debug_bounds("diff-file-count").is_some());
+
+    // Icon-only tabs stay compact (< 40pt for icon-only tabs without badges) and all 4 tabs fit before refresh/collapse buttons in 280pt panel.
+    let files_bounds = cx.debug_bounds("diff-tab-files").unwrap();
+    let search_bounds = cx.debug_bounds("diff-tab-search").unwrap();
+    let checks_bounds = cx.debug_bounds("diff-tab-checks").unwrap();
+    let refresh_bounds = cx.debug_bounds("diff-refresh").unwrap();
+    assert!(
+        files_bounds.size.width <= px(36.) && search_bounds.size.width <= px(36.),
+        "icon-only tabs must not include inline text labels: files={files_bounds:?}, search={search_bounds:?}"
+    );
+    assert!(
+        checks_bounds.right() <= refresh_bounds.origin.x,
+        "all 4 icon tabs must fit left of refresh button inside 280pt panel: checks={checks_bounds:?}, refresh={refresh_bounds:?}"
+    );
+
+    let click = |selector: &'static str, cx: &mut gpui::VisualTestContext| {
+        let bounds = cx.debug_bounds(selector).unwrap();
+        cx.simulate_mouse_down(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(bounds.center(), MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+    };
+
+    // Click each tab and verify active_tab() + active bottom indicator bar transition.
+    for tab in [
+        PanelTab::Files,
+        PanelTab::Search,
+        PanelTab::Checks,
+        PanelTab::Changes,
+    ] {
+        click(tab.selector(), cx);
+        assert_eq!(cx.update(|_, cx| view.read(cx).active_tab()), tab);
+        for candidate in PanelTab::ALL {
+            assert_eq!(
+                cx.debug_bounds(candidate.active_selector()).is_some(),
+                candidate == tab,
+                "active indicator mismatch for {candidate:?} when active tab is {tab:?}"
+            );
+        }
+    }
+
+    // After Checks inspection completes, both status dot and actionable count badge are rendered on the Checks tab icon button and still fit inside 280pt.
+    assert!(cx.debug_bounds("diff-checks-dot").is_some());
+    assert!(cx.debug_bounds("diff-checks-count").is_some());
+    let checks_with_badge = cx.debug_bounds("diff-tab-checks").unwrap();
+    let refresh_after = cx.debug_bounds("diff-refresh").unwrap();
+    assert!(
+        checks_with_badge.right() <= refresh_after.origin.x,
+        "Checks tab with status dot and count badge must still fit left of refresh button in 280pt panel"
+    );
+
+    // Hovering each tab icon opens its specific tooltip popup.
+    for tab in PanelTab::ALL {
+        cx.simulate_mouse_move(gpui::point(px(275.), px(595.)), None, Modifiers::default());
+        cx.run_until_parked();
+        let bounds = cx.debug_bounds(tab.selector()).unwrap();
+        cx.simulate_mouse_move(bounds.center(), None, Modifiers::default());
+        cx.executor().advance_clock(Duration::from_millis(600));
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds(tab.tooltip_selector()).is_some(),
+            "hovering {} must display tooltip '{}' ({})",
+            tab.selector(),
+            tab.tooltip(),
+            tab.tooltip_selector()
+        );
+    }
+}
+
+/// OWE-844: 창이 비포커스(`set_active(false)`)되어도 패널이 열려 있으면(`visible == true`)
+/// `GitWatch`를 숨김으로 전환하지 않고 완화된 주기로 변경 사항을 계속 반영하며, 수동 새로고침은 즉시 실행된다.
+#[gpui::test]
+fn unfocused_panel_keeps_git_watch_and_manual_refresh_working(cx: &mut gpui::TestAppContext) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    struct DynamicWatchSource {
+        generation: AtomicU64,
+        hidden_seen: AtomicBool,
+        changes: Mutex<Changes>,
+    }
+    impl Source for DynamicWatchSource {
+        fn watch(&self, req: &GitWatchRequest) -> io::Result<GitWatchReply> {
+            if !req.visible {
+                self.hidden_seen.store(true, Ordering::SeqCst);
+                return Ok(GitWatchReply::Hidden);
+            }
+            let cur = self.generation.load(Ordering::SeqCst);
+            if req.since < cur || req.force {
+                Ok(GitWatchReply::Changed {
+                    generation: cur,
+                    changes: self.changes.lock().unwrap().clone(),
+                })
+            } else {
+                Ok(GitWatchReply::Unchanged { pending: false })
+            }
+        }
+    }
+
+    let source = Arc::new(DynamicWatchSource {
+        generation: AtomicU64::new(1),
+        hidden_seen: AtomicBool::new(false),
+        changes: Mutex::new(Changes {
+            files: vec![ChangedFile {
+                path: b"src/lib.rs".to_vec(),
+                old_path: None,
+                status: *b".M",
+                staged: None,
+                unstaged: None,
+            }],
+            limited: false,
+        }),
+    });
+
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(PathBuf::from("/repo"), cx);
+        p.connect_source(source.clone(), cx);
+        p
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).changes.files.len()), 1);
+
+    // 창이 비포커스되어도 `visible`은 유지되고 `visible: false` 요청을 보내지 않는다.
+    cx.update(|_, cx| view.update(cx, |p, cx| p.set_active(false, cx)));
+    cx.run_until_parked();
+    assert!(cx.update(|_, cx| view.read(cx).is_visible()));
+    assert!(!cx.update(|_, cx| view.read(cx).is_active()));
+    assert!(
+        !source.hidden_seen.load(Ordering::SeqCst),
+        "unfocused visible diff panel must not send GitWatch visible=false"
+    );
+
+    // 비포커스 상태에서 파일이 추가되면 백그라운드 감시 주기에 맞춰 자동 반영된다.
+    *source.changes.lock().unwrap() = Changes {
+        files: vec![
+            ChangedFile {
+                path: b"src/lib.rs".to_vec(),
+                old_path: None,
+                status: *b".M",
+                staged: None,
+                unstaged: None,
+            },
+            ChangedFile {
+                path: b"src/main.rs".to_vec(),
+                old_path: None,
+                status: *b"??",
+                staged: None,
+                unstaged: None,
+            },
+        ],
+        limited: false,
+    };
+    source.generation.store(2, Ordering::SeqCst);
+    for _ in 0..3 {
+        cx.executor().advance_clock(Duration::from_millis(500));
+        cx.run_until_parked();
+    }
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).changes.files.len()),
+        2,
+        "unfocused visible diff panel must continue updating Git changes"
+    );
+
+    // 비포커스 상태에서 수동 새로고침(`refresh`) 호출 시 타이머를 기다리지 않고 즉시 반영된다.
+    *source.changes.lock().unwrap() = Changes {
+        files: Vec::new(),
+        limited: false,
+    };
+    source.generation.store(3, Ordering::SeqCst);
+    cx.update(|_, cx| view.update(cx, Panel::refresh));
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).changes.files.len()),
+        0,
+        "manual diff refresh must execute immediately while window is unfocused"
+    );
+}

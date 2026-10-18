@@ -121,6 +121,22 @@ impl SshHost {
         }
         remote_socket_for_home(remote_home)
     }
+
+    /// 호스트 카드 부제용 `user@host:port` 및 선택 키 파일 요약(`user@host:port • key_path`, OWE-800).
+    #[must_use]
+    pub fn format_summary(&self) -> String {
+        let port = self.port.unwrap_or(22);
+        let endpoint = format!("{}:{port}", self.destination.trim());
+        match self
+            .identity_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            Some(key) => format!("{endpoint} \u{2022} {key}"),
+            None => endpoint,
+        }
+    }
 }
 
 /// 원격 질의 답(`$HOME`, 있으면 소켓을 찾은 번들 id)으로 원격 krilld 소켓 경로를 계산한다(MK-170, 새 → 옛).
@@ -339,6 +355,65 @@ pub fn add_host(
     }
     save_hosts(state_dir, &hosts)?;
     Ok(hosts)
+}
+
+/// 기존 등록 호스트(`id`)의 표시 이름·주소·포트·키 경로를 제자리 수정해 `hosts.toml`에 저장한다(OWE-800).
+pub fn update_host(
+    state_dir: Option<&Path>,
+    id: &str,
+    label: &str,
+    destination: &str,
+    port: Option<u16>,
+    identity_file: Option<String>,
+) -> io::Result<Vec<SshHost>> {
+    let dest = destination.trim();
+    if dest.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH destination cannot be empty",
+        ));
+    }
+    if !valid_host(dest) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid SSH destination: {dest}"),
+        ));
+    }
+    if port == Some(0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "SSH port cannot be 0",
+        ));
+    }
+    let clean_identity = match identity_file {
+        Some(s) if !s.trim().is_empty() => {
+            let trimmed = s.trim();
+            if !valid_identity_file(trimmed) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid SSH identity file path",
+                ));
+            }
+            Some(trimmed.to_owned())
+        }
+        _ => None,
+    };
+    let clean_label = if label.trim().is_empty() {
+        dest
+    } else {
+        label.trim()
+    };
+    let mut hosts = load_hosts(state_dir);
+    if let Some(ex) = hosts.iter_mut().find(|h| h.id == id) {
+        clean_label.clone_into(&mut ex.label);
+        dest.clone_into(&mut ex.destination);
+        ex.port = port;
+        ex.identity_file = clean_identity;
+        save_hosts(state_dir, &hosts)?;
+        Ok(hosts)
+    } else {
+        add_host(state_dir, label, destination, port, clean_identity)
+    }
 }
 
 pub fn remove_host(state_dir: Option<&Path>, id: &str) -> io::Result<Vec<SshHost>> {
@@ -1028,6 +1103,43 @@ Host dev-box
             classify_ssh_error("ssh: Could not resolve hostname unknown.local"),
             SshTestFailureKind::Other
         );
+    }
+
+    #[test]
+    fn format_summary_and_update_host_in_place() {
+        let dir = std::env::temp_dir().join(format!("owe800-ssh-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let list = add_host(Some(&dir), "Home Mini", "owen@10.0.0.5", None, None).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].format_summary(), "owen@10.0.0.5:22");
+        let original_id = list[0].id.clone();
+
+        let updated = update_host(
+            Some(&dir),
+            &original_id,
+            "Studio Pro",
+            "deploy@10.0.0.9",
+            Some(2222),
+            Some("~/.ssh/id_ed25519".into()),
+        )
+        .unwrap();
+        assert_eq!(updated.len(), 1);
+        assert_eq!(updated[0].id, original_id);
+        assert_eq!(updated[0].label, "Studio Pro");
+        assert_eq!(updated[0].destination, "deploy@10.0.0.9");
+        assert_eq!(updated[0].port, Some(2222));
+        assert_eq!(
+            updated[0].identity_file.as_deref(),
+            Some("~/.ssh/id_ed25519")
+        );
+        assert_eq!(
+            updated[0].format_summary(),
+            "deploy@10.0.0.9:2222 \u{2022} ~/.ssh/id_ed25519"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 

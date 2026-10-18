@@ -53,6 +53,18 @@ pub struct Schedules {
     pub schedule: Vec<Schedule>,
 }
 
+const fn default_enabled() -> bool {
+    true
+}
+
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &T signature"
+)]
+const fn is_enabled(enabled: &bool) -> bool {
+    *enabled
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Schedule {
@@ -69,6 +81,9 @@ pub struct Schedule {
     /// Workspace execution mode (`reuse` existing `cwd` vs `isolate` in a newly created worktree).
     #[serde(default, skip_serializing_if = "WorkspaceMode::is_reuse")]
     pub workspace_mode: WorkspaceMode,
+    /// Whether automatic cron triggers are active for this schedule (default `true`).
+    #[serde(default = "default_enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

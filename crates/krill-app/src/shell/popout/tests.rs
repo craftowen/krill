@@ -840,3 +840,170 @@ fn update_card_and_status_bar_badge_toggle_collapse_and_expand(cx: &mut TestAppC
     server.join().ok();
     fs::remove_dir_all(&tmp).ok();
 }
+
+/// OWE-788: 상태바 우측 항목은 아이콘 중심으로 축약되어 그려지고, 마우스 오버 시 전체 이름·상세 툴팁이 노출되며 클릭 동작을 유지한다.
+#[gpui::test]
+fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut TestAppContext) {
+    use krill_app::updater::{CheckStatus, StagedUpdate, UpdateState};
+    use krill_proto::doctor::{Check, Fix, FixKind, Level, Status as DoctorStatus};
+    use std::path::PathBuf;
+
+    let (shell, handle) = open(cx);
+    cx.update(|cx| {
+        krill_app::onboarding::store_snapshot(
+            cx,
+            vec![Check {
+                id: "git.identity".to_owned(),
+                level: Level::Required,
+                status: DoctorStatus::Fail,
+                summary: "user.name 미설정".to_owned(),
+                detail: String::new(),
+                fix: Fix {
+                    kind: FixKind::None,
+                    value: String::new(),
+                },
+            }],
+        );
+
+        let staged = StagedUpdate {
+            from_version: "0.1.0".to_owned(),
+            to_version: "0.2.0".to_owned(),
+            manifest_url: "http://127.0.0.1/latest.json".to_owned(),
+            state_dir: PathBuf::from("/tmp/krill-state"),
+            app_bundle: PathBuf::from("/tmp/Krill.app"),
+            relaunched: false,
+        };
+        cx.set_global(UpdateState {
+            status: CheckStatus::Ready(staged.clone()),
+            staged: Some(staged),
+            card_collapsed: true,
+        });
+    });
+    shell.update(cx, |s, cx| {
+        s.recording = krill_app::recording::Status::Unavailable;
+        s.link = Link::Up;
+        if let Some(pane) = s.layout.focused() {
+            s.layout.set_session(pane, SessionId(1));
+        }
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+
+    // 아이콘 전용·점 전용 항목은 텍스트 라벨 없이 좁은 폭(≤ 32px)으로 축약되어야 한다.
+    for icon_only_id in [
+        "status-recording-warning",
+        "status-daemon",
+        "float-terminal",
+        "dashboard-popout",
+        "agent-history-toggle",
+        "resources-toggle",
+    ] {
+        let b = vcx
+            .debug_bounds(icon_only_id)
+            .unwrap_or_else(|| panic!("missing {icon_only_id}"));
+        assert!(
+            b.size.width <= gpui::px(32.),
+            "{icon_only_id} should be compact icon/dot, got width {:?}",
+            b.size.width
+        );
+    }
+    assert!(vcx.debug_bounds("status-sessions").is_some());
+    assert!(vcx.debug_bounds("status-needs-you").is_some());
+
+    let ssh_count = vcx.read(|cx| shell.read(cx).ssh_hosts.len().to_string());
+    let ssh_full = text::SSH_MENU_BTN.format(&[("count", &ssh_count)]);
+    let orch_full = text::ORCH_MENU_BTN.format(&[("runs", "0"), ("tasks", "0")]);
+    let ports_full = text::PORTS_MENU_BTN.format(&[("count", "0")]);
+    let checks_warn = krill_app::i18n::catalog::onboarding::STATUS_CHECKS_WARN.get();
+    let update_badge = krill_app::i18n::catalog::updater_relaunch::STATUS_READY_BADGE
+        .format(&[("version", "0.2.0")]);
+
+    let expected_tooltips = [
+        (
+            "status-recording-warning",
+            krill_app::i18n::catalog::recording::WARNING
+                .get()
+                .to_owned(),
+        ),
+        (
+            "status-checks-warning",
+            format!("{checks_warn}: user.name 미설정"),
+        ),
+        ("status-update-ready", update_badge),
+        ("status-daemon", text::DAEMON_UP.get().to_owned()),
+        ("status-usage", counts(0, 0)),
+        (
+            "status-orchestration-menu",
+            format!("{} — {orch_full}", text::ORCH_MENU_TITLE.get()),
+        ),
+        (
+            "status-ports-menu",
+            format!("{} — {ports_full}", text::PORTS_MENU_TITLE.get()),
+        ),
+        (
+            "status-ssh-switcher",
+            format!("{} — {ssh_full}", text::SSH_MENU_TITLE.get()),
+        ),
+        (
+            "float-terminal",
+            format!("{} — {}", text::FLOAT_BUTTON.get(), text::FLOAT_LABEL.get()),
+        ),
+        (
+            "dashboard-popout",
+            format!(
+                "{} — {}",
+                text::DASHBOARD.get(),
+                text::DASHBOARD_LABEL.get()
+            ),
+        ),
+        (
+            "agent-history-toggle",
+            krill_app::i18n::catalog::agent_history::TITLE
+                .get()
+                .to_owned(),
+        ),
+        (
+            "resources-toggle",
+            krill_app::i18n::catalog::resources::TITLE.get().to_owned(),
+        ),
+    ];
+
+    for (selector, expected_text) in expected_tooltips {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing selector {selector}"));
+        vcx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+        vcx.executor().advance_clock(Duration::from_millis(600));
+        vcx.run_until_parked();
+        let tip_sel: &'static str = Box::leak(format!("tooltip:{selector}").into_boxed_str());
+        let text_sel: &'static str =
+            Box::leak(format!("tooltip-text:{selector}:{expected_text}").into_boxed_str());
+        assert!(
+            vcx.debug_bounds(tip_sel).is_some(),
+            "hovering {selector} must show its tooltip"
+        );
+        assert!(
+            vcx.debug_bounds(text_sel).is_some(),
+            "tooltip for {selector} must render '{expected_text}'"
+        );
+    }
+
+    // 업데이트 배지 클릭 시 업데이트 카드가 펼쳐지고, 리소스 아이콘 클릭 시 리소스 팝오버가 열린다.
+    let update_bounds = vcx.debug_bounds("status-update-ready").unwrap();
+    vcx.simulate_click(update_bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("update-card").is_some(),
+        "clicking status-update-ready expands update card"
+    );
+
+    let resources_bounds = vcx.debug_bounds("resources-toggle").unwrap();
+    vcx.simulate_click(resources_bounds.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("resources-popover").is_some(),
+        "clicking resources-toggle opens resources popover"
+    );
+}

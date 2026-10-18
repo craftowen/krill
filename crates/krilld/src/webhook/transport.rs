@@ -29,7 +29,8 @@ impl fmt::Debug for Endpoint {
 }
 
 impl Endpoint {
-    fn url(&self) -> &str {
+    #[must_use]
+    pub fn url(&self) -> &str {
         match self {
             Self::Ntfy { url } | Self::Telegram { url, .. } | Self::Discord { url } => url,
         }

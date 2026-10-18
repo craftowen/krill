@@ -141,8 +141,10 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **사이드바·패널·상태바**:
   - `SIDEBAR_DEFAULT_WIDTH = 240pt`, `SIDEBAR_HEADER_HEIGHT = 32px`, `SIDEBAR_EMPTY_PY = 24px`
   - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 24px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
-- **오버레이·보조 창**:
-  - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지)
+- **오버레이·보조 창·설정 레이아웃**:
+  - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
+  - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
+  - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 520px`, 세션 히스토리 `AGENT_HISTORY_WIDTH = 520px` (`MAX_HEIGHT = 360px`)
   - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`, 대시보드 `DASHBOARD_SIZE = 760×480`
 
@@ -162,9 +164,9 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 | 변형 | 메서드 | 용도 |
 |---|---|---|
-| **Primary** | `.primary()` | 한 화면/대화상자 흐름에서 단 하나의 긍정 주 동작(생성, 저장, 승인) 또는 세그먼트 토글의 활성 항목 |
-| **Outline / Secondary** | `ui::secondary(id, label)` (`.small().outline()`) | 주 동작 옆의 보조 동작, 파일 열기, 가져오기, 테스트 알림 보내기 등 채움 버튼이 무거울 때 |
-| **Ghost** | `.ghost()` | 아이콘 전용 툴바 버튼, 목록 행 액션, 비활성 세그먼트 항목, **취소(Cancel)·닫기(Close)·건너뛰기(Skip)** |
+| **Primary** | `ui::primary(id, label)` (`.small().primary()`) | 한 화면/대화상자 흐름 또는 카드 헤더의 대표 일괄 액션(생성, 저장, 승인, 전체 설치, 모두 자동 설정) 또는 세그먼트 토글의 활성 항목 |
+| **Outline / Secondary** | `ui::secondary(id, label)` (`.small().outline()`) | 주 동작 옆의 보조 동작, 개별 행 액션(스킬 설치, 연결 테스트, 폴더 열기, 가져오기, 복사) 등 채움 버튼이 무거울 때 |
+| **Ghost** | `ui::ghost(id, label)` (`.small().ghost()`) | 아이콘 전용 툴바 버튼, 목록 행 부가 액션(초기화·해제), 비활성 세그먼트 항목, **취소(Cancel)·닫기(Close)·건너뛰기(Skip)** |
 | **Danger** | `.danger()` / `ui::danger_confirm(...)` | 삭제, 기록 지우기, 신뢰되지 않은 스크립트 강제 실행 등 되돌릴 수 없는 파괴적 동작. **절대 취소/닫기에 쓰지 않는다.** |
 
 - 버튼 크기는 주변 행 높이에 맞춘다(24~28px 툴바·상태바에는 `.xsmall()`, 설정 행에는 `.small()`, 모달 하단 주 동작에는 기본 크기).
@@ -185,8 +187,10 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 설정 탭과 폼 화면은 [`ui/primitives.rs`](../crates/krill-app/src/ui/primitives.rs)의 2열 문법을 표준으로 삼는다.
 
 - **섹션 머리글**: `ui::section_title(p, id, title)` — `TEXT_SM` + `SEMIBOLD` + `p.muted_foreground` + 하단 1px 구분선.
-- **2열 설정 행**: `ui::row(p)` 안에 왼쪽 `ui::label(p, title, Some(desc))`과 오른쪽 `ui::controls()`를 배치한다.
-  - **불변식**: `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생한다(OWE-651).
+- **2열 설정 행**: `ui::row(p)` 안에 왼쪽 `ui::label(p, title, desc)`과 오른쪽 `ui::controls()`를 배치한다.
+  - **불변식**: `ui::card`와 `ui::row`는 항상 `w_full().min_w_0()`을 가져 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에 부모 폭 밖으로 넘치지 않게 한다. `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생하며(OWE-651), 반대로 `flex_1().min_w_0()` 없이 긴 설명문을 넣으면 우측 버튼이 카드 테두리 밖으로 밀려 나간다(OWE-793).
+- **불리언 토글 스위치**: `ui::switch(p, id, checked, disabled, on_toggle)` — 켜기/끄기 불리언 설정은 2버튼 나열 대신 단일 알약 트랙(`SWITCH_WIDTH` × `SWITCH_HEIGHT`)과 원형 썸(`SWITCH_THUMB`) 스위치로 일관되게 표현한다.
+- **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다.
 - **모달 입력 필드 라벨**: `ui::field_label(name, optional_suffix, p)` — `<Input>` 바로 위에 `gap_1`로 쌓는다.
 - **인라인 오류 배너**: `ui::error_banner(p, message)` — 모달이나 폼 안에서 실패 사유를 사용자가 읽고 재시도할 수 있게 고정 표시한다.
 - **단축키 칩**: `ui::keycap(p, keys)` — 단축키 표시가 필요한 곳에서는 개별 스타일을 만들지 않고 반드시 `ui::keycap`을 쓴다. 실제 플랫폼 바인딩(`⌘`, `⇧`, `⌥`, `⌃`)과 표기가 정확히 일치해야 한다.

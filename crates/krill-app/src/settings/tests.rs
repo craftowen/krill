@@ -1623,6 +1623,140 @@ fn settings_window_draws_themed_titlebar(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-795: 미구현 호스트 범위 가짜 드롭다운(`admin-host-scope-bar`)은 노출하지 않고,
+/// 사이드바 검색 지우기(`X`)·0건 본문 빈 상태·페이지 헤더(제목+1줄 부제+우측 보조 동작 슬롯)를 그린다.
+#[gpui::test]
+fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_header(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe795-shell");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1600.), px(1000.)));
+    vcx.run_until_parked();
+
+    for tab in AdminTab::ALL {
+        assert!(!tab.subtitle_message().in_language(Language::Ko).is_empty());
+        assert!(!tab.subtitle_message().in_language(Language::En).is_empty());
+        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(tab, cx)));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("admin-host-scope-bar").is_none(),
+            "fake host scope dropdown must not render on {tab:?}"
+        );
+        assert!(vcx.debug_bounds("admin-page-header").is_some());
+        assert!(vcx.debug_bounds("admin-page-title").is_some());
+        assert!(vcx.debug_bounds("admin-page-subtitle").is_some());
+        assert!(vcx.debug_bounds("admin-page-header-actions").is_some());
+        assert_eq!(
+            vcx.debug_bounds("admin-page-badge").is_some(),
+            tab.badge().is_some(),
+            "badge mismatch on {tab:?}"
+        );
+        let col = vcx
+            .debug_bounds("admin-content-column")
+            .expect("missing admin-content-column");
+        assert!(
+            col.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH + px(1.),
+            "content column width {:?} exceeds max width",
+            col.size.width
+        );
+    }
+
+    // 검색어가 비어 있을 때는 ⌘F 힌트가 보이고 X 지우기 버튼은 숨겨진다.
+    assert!(vcx.debug_bounds("admin-search-hint").is_some());
+    assert!(vcx.debug_bounds("admin-search-clear").is_none());
+
+    // 검색어를 입력하면 우측 X 지우기 버튼이 나타나고, 클릭 시 검색어가 지워지며 전체 탭이 복원된다.
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_input("ssh");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-search-clear").is_some());
+    assert!(vcx.debug_bounds("admin-search-hint").is_none());
+    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-tab-general").is_none());
+
+    let clear_btn = vcx
+        .debug_bounds("admin-search-clear")
+        .expect("missing admin-search-clear");
+    vcx.simulate_click(clear_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-search-clear").is_none());
+    assert!(vcx.debug_bounds("admin-search-hint").is_some());
+    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+
+    // 검색 결과가 0건이면 우측 본문 영역에 빈 상태 카드가 표시되고 기존 탭 본문 헤더는 숨겨진다.
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_input("zzz-no-such-setting");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-search-empty").is_some());
+    assert!(vcx.debug_bounds("admin-content-search-empty").is_some());
+    assert!(vcx.debug_bounds("admin-page-header").is_none());
+
+    // 본문 빈 상태 카드의 '검색 지우기' 버튼을 누르면 검색어가 비워지고 탭 본문이 복원된다.
+    let clear_empty_btn = vcx
+        .debug_bounds("admin-content-search-clear")
+        .expect("missing admin-content-search-clear");
+    vcx.simulate_click(clear_empty_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-content-search-empty").is_none());
+    assert!(vcx.debug_bounds("admin-page-header").is_some());
+    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-858: `#admin-content`는 뷰포트 높이로 제한(`min_h_0`)되어 짧은 창에서도
+/// 스크롤 컨테이너로 동작해야 한다. 단축키 탭(50행) 본문이 창 밖으로 새지 않고,
+/// 탭 전환 시 스크롤 id가 바뀌어 최상단부터 다시 보인다.
+#[gpui::test]
+fn settings_content_is_height_constrained_and_resets_scroll_on_tab_switch(cx: &mut TestAppContext) {
+    let d = dir("owe858-content-scroll");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    // 짧은 창: 단축키 탭 전체(약 50행)는 460px 안에 다 들어갈 수 없다.
+    vcx.simulate_resize(size(px(1200.), px(500.)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+
+    let content = vcx
+        .debug_bounds("admin-content")
+        .expect("missing admin-content");
+    assert!(
+        content.size.height <= px(500.),
+        "admin-content height {:?} escapes the 500px viewport (min_h_0 missing?)",
+        content.size.height
+    );
+    // 페이지 헤더는 본문 최상단에 보인다.
+    let header = vcx
+        .debug_bounds("admin-page-header")
+        .expect("missing admin-page-header");
+    assert!(
+        header.origin.y >= content.origin.y,
+        "page header {:?} is clipped above the scroll container {:?}",
+        header.origin,
+        content.origin
+    );
+
+    // 다른 탭으로 갔다가 돌아와도 본문 높이는 계속 창 안에 머문다.
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx)));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(AdminTab::Shortcuts, cx)));
+    vcx.run_until_parked();
+    let content = vcx
+        .debug_bounds("admin-content")
+        .expect("missing admin-content after tab switch");
+    assert!(
+        content.size.height <= px(500.),
+        "admin-content height {:?} escapes the viewport after tab switch",
+        content.size.height
+    );
+    assert!(vcx.debug_bounds("admin-page-header").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
+
 #[test]
 fn agent_card_save_writes_args_env_and_rejects_bad_lines() {
     let d = dir("owe657");
@@ -1662,6 +1796,14 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        vcx.debug_bounds("admin-agent-save-codex").is_none(),
+        "에이전트 행은 기본적으로 접혀 있어야 한다"
+    );
+    let toggle = vcx.debug_bounds("admin-agent-toggle-codex").unwrap();
+    vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
     let set_env = |vcx: &mut gpui::VisualTestContext, value: &'static str| {
         vcx.update(|window, cx| {
             let env = view.read(cx).agent_edits["codex"].env.clone();
@@ -1688,7 +1830,8 @@ fn agent_card_shows_row_error_and_saves_valid_env(cx: &mut TestAppContext) {
     let text = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
     let a = krill_proto::agent::Agents::load(Some(&text)).unwrap();
     assert_eq!(a.profiles["codex"].env["GOOD"], "1");
-    assert!(vcx.debug_bounds("admin-agent-open-toml-codex").is_some());
+    assert!(vcx.debug_bounds("admin-agents-open-toml").is_some());
+    assert!(vcx.debug_bounds("admin-agent-open-toml-codex").is_none());
     fs::remove_dir_all(&d).ok();
 }
 
@@ -2030,8 +2173,8 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.set_tab(AdminTab::General, cx));
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("sound-on").is_some());
-    click(vcx, "sound-off");
+    assert!(vcx.debug_bounds("sound-toggle").is_some());
+    click(vcx, "sound-toggle");
     vcx.update(|_, cx| {
         assert_eq!(current(cx).terminal_font_size(), 14);
         assert_eq!(current(cx).terminal_opacity_pct(), 95);
@@ -2041,14 +2184,15 @@ fn owe655_settings_controls_toggle_and_persist(cx: &mut TestAppContext) {
         view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
         window.draw(cx).clear(cx);
     });
-    assert!(vcx.debug_bounds("hib-on").is_some());
-    assert!(vcx.debug_bounds("hib-off").is_some());
-    click(vcx, "hib-off");
+    assert!(vcx.debug_bounds("hib-toggle").is_some());
     vcx.update(|_, cx| assert!(!current(cx).hibernation_enabled));
     assert!(!d.join(HIBERNATION_FLAG).exists());
-    click(vcx, "hib-on");
+    click(vcx, "hib-toggle");
     vcx.update(|_, cx| assert!(current(cx).hibernation_enabled));
     assert!(d.join(HIBERNATION_FLAG).is_file());
+    click(vcx, "hib-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).hibernation_enabled));
+    assert!(!d.join(HIBERNATION_FLAG).exists());
     fs::remove_dir_all(d).ok();
 }
 
@@ -2287,25 +2431,22 @@ fn owe658_terminal_tab_controls_toggle_and_persist(cx: &mut TestAppContext) {
         "cursor-block",
         "cursor-bar",
         "cursor-underline",
-        "cursor-blink-on",
-        "cursor-blink-off",
-        "option-meta-on",
-        "option-meta-off",
-        "copy-select-on",
-        "copy-select-off",
+        "cursor-blink-toggle",
+        "option-meta-toggle",
+        "copy-select-toggle",
     ] {
         assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
     }
     click(vcx, "cursor-bar");
-    click(vcx, "cursor-blink-on");
-    click(vcx, "option-meta-on");
-    click(vcx, "copy-select-on");
+    click(vcx, "cursor-blink-toggle");
+    click(vcx, "option-meta-toggle");
+    click(vcx, "copy-select-toggle");
     vcx.update(|_, cx| {
         let s = current(cx);
         assert_eq!(s.terminal_cursor_shape, TerminalCursorShape::Bar);
         assert!(s.terminal_cursor_blink && s.option_as_meta && s.copy_on_select);
     });
-    click(vcx, "option-meta-off");
+    click(vcx, "option-meta-toggle");
     vcx.update(|_, cx| assert!(!current(cx).option_as_meta));
     fs::remove_dir_all(d).ok();
 }
@@ -2330,21 +2471,18 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
 
-    // Tailscale 피어가 없으면 발견된 기기 카드가 조용히 숨겨진다.
+    // Tailscale 피어가 없으면 발견된 기기 카드가 조용히 숨겨지고, 2열 그리드 4개 입력이 모두 보인다.
     assert!(vcx.debug_bounds("admin-ssh-discovered").is_none());
     assert!(vcx.debug_bounds("admin-ssh-form").is_some());
-    assert!(vcx.debug_bounds("admin-ssh-input-port").is_none());
+    assert!(vcx.debug_bounds("admin-ssh-input-label").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-input-address").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-input-port").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-input-key").is_some());
 
     // 빈 주소로 추가 클릭 시 한국어 검증 오류가 표시된다.
     click(vcx, "admin-ssh-add-submit");
     vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("admin-ssh-form-error").is_some());
-
-    // 고급 옵션 펼치기 → 포트·키 입력 노출.
-    click(vcx, "admin-ssh-advanced-toggle");
-    vcx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(vcx.debug_bounds("admin-ssh-input-port").is_some());
-    assert!(vcx.debug_bounds("admin-ssh-input-key").is_some());
 
     // 잘못된 포트/주소 검증 실패 후 정상 호스트 추가.
     vcx.update(|_, cx| {
@@ -2486,6 +2624,199 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
         let cmd = crate::ssh_hosts::build_connect_command(&pending);
         assert!(cmd.starts_with("ssh-copy-id"), "unexpected cmd: {cmd}");
     });
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-800: 설정 원격 호스트(SSH) 탭 — 2열 추가/편집 폼, 호스트 카드 상태 점(Connected/Disconnected/Error),
+/// 연결/연결 해제 버튼 전환, 호스트 인플레이스 편집(hosts.toml 갱신)을 검증한다.
+#[gpui::test]
+fn owe800_ssh_tab_host_card_status_dot_edit_disconnect_and_two_column_form(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe800-ssh-card-edit");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2800.)));
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Ssh, cx));
+        window.draw(cx).clear(cx);
+    });
+
+    // 1. 2열 그리드 배치 검증: [표시 이름 | 호스트], [포트 | SSH 키 경로]
+    let b_label = vcx.debug_bounds("admin-ssh-input-label").unwrap();
+    let b_addr = vcx.debug_bounds("admin-ssh-input-address").unwrap();
+    let b_port = vcx.debug_bounds("admin-ssh-input-port").unwrap();
+    let b_key = vcx.debug_bounds("admin-ssh-input-key").unwrap();
+    assert!(
+        (b_label.origin.y - b_addr.origin.y).abs() < px(2.),
+        "label and address should be on row 1"
+    );
+    assert!(
+        b_label.origin.x < b_addr.origin.x,
+        "label should be left of address"
+    );
+    assert!(
+        (b_port.origin.y - b_key.origin.y).abs() < px(2.),
+        "port and key should be on row 2"
+    );
+    assert!(
+        b_port.origin.x < b_key.origin.x,
+        "port should be left of key"
+    );
+    assert!(
+        b_port.origin.y > b_label.origin.y,
+        "row 2 should be below row 1"
+    );
+
+    // 2. 호스트 추가 후 호스트 카드·상태 점·액션 버튼 검증
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.submit_ssh_host(
+                "Prod Box",
+                "deploy@10.0.0.8",
+                "2222",
+                "~/.ssh/id_ed25519",
+                cx,
+            )
+            .unwrap();
+        });
+    });
+    vcx.run_until_parked();
+    let host_id = vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let h = &view.read(cx).ssh_hosts()[0];
+        assert_eq!(h.id, "ssh-prod-box");
+        assert_eq!(
+            h.format_summary(),
+            "deploy@10.0.0.8:2222 • ~/.ssh/id_ed25519"
+        );
+        assert_eq!(
+            view.read(cx).ssh_host_status(&h.id),
+            SshHostCardStatus::Disconnected
+        );
+        h.id.clone()
+    });
+
+    assert!(vcx.debug_bounds("admin-ssh-card-ssh-prod-box").is_some());
+    assert!(
+        vcx.debug_bounds("admin-ssh-status-dot-ssh-prod-box")
+            .is_some()
+    );
+    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_some());
+    assert!(
+        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+            .is_none()
+    );
+    assert!(vcx.debug_bounds("admin-ssh-test-ssh-prod-box").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-edit-ssh-prod-box").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-remove-ssh-prod-box").is_some());
+
+    // 3. 연결 클릭 → Connected 상태 + 연결 해제 버튼 전환 → 연결 해제 클릭 → Disconnected 복귀
+    click(vcx, "admin-ssh-connect-ssh-prod-box");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Connected
+        );
+    });
+    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_none());
+    assert!(
+        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+            .is_some()
+    );
+
+    click(vcx, "admin-ssh-disconnect-ssh-prod-box");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Disconnected
+        );
+        assert!(take_pending_ssh_connect(cx).is_none());
+    });
+    assert!(vcx.debug_bounds("admin-ssh-connect-ssh-prod-box").is_some());
+    assert!(
+        vcx.debug_bounds("admin-ssh-disconnect-ssh-prod-box")
+            .is_none()
+    );
+
+    // 4. 연결 테스트 결과에 따른 Error / Connected 상태 전환
+    let host_snap = vcx.update(|_, cx| view.read(cx).ssh_hosts()[0].clone());
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.apply_ssh_test_result(host_snap.clone(), Err("timeout".into()), cx);
+        });
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Error
+        );
+        view.update(cx, |v, cx| {
+            v.apply_ssh_test_result(host_snap.clone(), Ok("krill-ssh-ok".into()), cx);
+        });
+        window.draw(cx).clear(cx);
+        assert_eq!(
+            view.read(cx).ssh_host_status(&host_id),
+            SshHostCardStatus::Connected
+        );
+    });
+
+    // 5. 편집 버튼 클릭 → 폼이 편집 모드로 전환되고 제출 시 hosts.toml 인플레이스 수정
+    click(vcx, "admin-ssh-edit-ssh-prod-box");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert_eq!(view.read(cx).editing_ssh_host_id(), Some(host_id.as_str()));
+    });
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_some());
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.submit_ssh_host("Prod Renamed", "root@10.0.0.99", "2200", "", cx)
+                .unwrap();
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(view.read(cx).editing_ssh_host_id().is_none());
+        let hosts = view.read(cx).ssh_hosts();
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].id, host_id);
+        assert_eq!(hosts[0].label, "Prod Renamed");
+        assert_eq!(hosts[0].destination, "root@10.0.0.99");
+        assert_eq!(hosts[0].port, Some(2200));
+        assert_eq!(hosts[0].identity_file, None);
+    });
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_none());
+
+    // 디스크(hosts.toml)에도 인플레이스 반영되었는지 검증
+    let disk_hosts = crate::ssh_hosts::load_hosts(Some(&d));
+    assert_eq!(disk_hosts.len(), 1);
+    assert_eq!(disk_hosts[0].id, host_id);
+    assert_eq!(disk_hosts[0].label, "Prod Renamed");
+    assert_eq!(disk_hosts[0].destination, "root@10.0.0.99");
+    assert_eq!(disk_hosts[0].port, Some(2200));
+
+    // 편집 취소 동작 검증
+    click(vcx, "admin-ssh-edit-ssh-prod-box");
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_some());
+    click(vcx, "admin-ssh-edit-cancel");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(view.read(cx).editing_ssh_host_id().is_none());
+    });
+    assert!(vcx.debug_bounds("admin-ssh-edit-cancel").is_none());
 
     fs::remove_dir_all(d).ok();
 }
@@ -3241,7 +3572,10 @@ fn owe719_accounts_content_starts_next_to_sidebar_and_rows_fill_column(cx: &mut 
             gap >= px(31.) && gap <= px(33.),
             "{width}: content must start right after the sidebar, gap {gap:?}"
         );
-        assert!(column.size.width <= px(760.), "{width}: {column:?}");
+        assert!(
+            column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH,
+            "{width}: {column:?}"
+        );
         let row = bounds(vcx, "admin-account-row-claude-work");
         assert_eq!(row.origin.x, column.origin.x, "{width}");
         assert_eq!(row.right(), column.right(), "{width}");
@@ -3417,8 +3751,7 @@ fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
     vcx.run_until_parked();
 
     assert!(vcx.debug_bounds("settings-update-check").is_some());
-    assert!(vcx.debug_bounds("update-auto-restart-on").is_some());
-    assert!(vcx.debug_bounds("update-auto-restart-off").is_some());
+    assert!(vcx.debug_bounds("update-auto-restart-toggle").is_some());
     assert!(vcx.debug_bounds("settings-update-restart").is_none());
 
     // [업데이트 확인] 버튼 클릭 시 수동 점검이 시작되어 UpdateState가 갱신된다.
@@ -3433,7 +3766,7 @@ fn general_tab_renders_update_rows_and_toggles_auto_restart(cx: &mut TestAppCont
         assert!(!matches!(status, CheckStatus::Idle));
     });
 
-    let toggle = vcx.debug_bounds("update-auto-restart-on").unwrap();
+    let toggle = vcx.debug_bounds("update-auto-restart-toggle").unwrap();
     vcx.simulate_click(toggle.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
     vcx.update(|_, cx| {
@@ -3501,8 +3834,8 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-719 QA D4: "사용량 직접 조회"·"자동 계정 전환"이 현재 상태 없이 버튼 하나("켜기")만 보였다. 다른 설정과
-/// 같은 켜기/끄기 세그먼트여야 하고, 같은 쪽을 다시 눌러도 상태가 뒤집히지 않는다.
+/// OWE-719 QA D4 + OWE-793: "사용량 직접 조회"·"자동 계정 전환"이 다른 불리언 설정과 같은
+/// `ui::switch` 트랙·썸 스위치로 렌더링되며 클릭할 때마다 상태와 썸 위치가 전환된다.
 #[gpui::test]
 fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
     use krill_proto::usage::ConnectionsSnapshot;
@@ -3524,10 +3857,10 @@ fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
     });
     vcx.run_until_parked();
     for id in [
-        "admin-direct-usage-on",
-        "admin-direct-usage-off",
-        "admin-auto-switch-on",
-        "admin-auto-switch-off",
+        "admin-direct-usage-toggle",
+        "admin-direct-usage-toggle-thumb",
+        "admin-auto-switch-toggle",
+        "admin-auto-switch-toggle-thumb",
     ] {
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
@@ -3535,26 +3868,28 @@ fn owe719_account_toggles_are_on_off_segments(cx: &mut TestAppContext) {
         vcx.update(|_, cx| view.read(cx).accounts().auto_switch.enabled)
     };
     let initial = enabled(vcx);
-    let target = if initial {
-        "admin-auto-switch-on"
-    } else {
-        "admin-auto-switch-off"
-    };
-    for _ in 0..2 {
-        let at = vcx.debug_bounds(target).unwrap().center();
-        vcx.simulate_click(at, gpui::Modifiers::default());
-        vcx.run_until_parked();
-        assert_eq!(enabled(vcx), initial, "pressing the current side keeps it");
-    }
-    let other = if initial {
-        "admin-auto-switch-off"
-    } else {
-        "admin-auto-switch-on"
-    };
-    let at = vcx.debug_bounds(other).unwrap().center();
+    let thumb_before = vcx
+        .debug_bounds("admin-auto-switch-toggle-thumb")
+        .unwrap()
+        .origin
+        .x;
+    let at = vcx
+        .debug_bounds("admin-auto-switch-toggle")
+        .unwrap()
+        .center();
     vcx.simulate_click(at, gpui::Modifiers::default());
     vcx.run_until_parked();
     assert_eq!(enabled(vcx), !initial);
+    let thumb_after = vcx
+        .debug_bounds("admin-auto-switch-toggle-thumb")
+        .unwrap()
+        .origin
+        .x;
+    assert_ne!(
+        thumb_before, thumb_after,
+        "switch thumb must move on toggle"
+    );
+    fs::remove_dir_all(d).ok();
 }
 
 #[gpui::test]
@@ -3706,14 +4041,11 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     vcx.run_until_parked();
 
     for id in [
-        "auto-rename-branch-on",
-        "auto-rename-branch-off",
-        "prompt-cache-timer-on",
-        "prompt-cache-timer-off",
+        "auto-rename-branch-toggle",
+        "prompt-cache-timer-toggle",
         "prompt-cache-ttl-5m",
         "prompt-cache-ttl-1h",
-        "workspace-trust-preset-on",
-        "workspace-trust-preset-off",
+        "workspace-trust-preset-toggle",
     ] {
         assert!(vcx.debug_bounds(id).is_some(), "missing {id}");
     }
@@ -3732,9 +4064,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         assert!(!s.workspace_trust_preset_enabled);
     });
 
-    // 신뢰 프리셋 '켜기' 첫 클릭 시 바로 켜지지 않고 변경 파일·키 diff 확인 상자가 열린다.
+    // 신뢰 프리셋 토글 첫 클릭 시 바로 켜지지 않고 변경 파일·키 diff 확인 상자가 열린다.
     let trust_on_at = vcx
-        .debug_bounds("workspace-trust-preset-on")
+        .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
         .center();
     vcx.simulate_click(trust_on_at, gpui::Modifiers::default());
@@ -3756,9 +4088,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         &d
     )));
 
-    // 다시 '켜기' → '동의 후 켜기' 클릭 시 비로소 활성화되고 플래그 파일이 생성된다.
+    // 다시 토글 → '동의 후 켜기' 클릭 시 비로소 활성화되고 플래그 파일이 생성된다.
     let trust_on_at = vcx
-        .debug_bounds("workspace-trust-preset-on")
+        .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
         .center();
     vcx.simulate_click(trust_on_at, gpui::Modifiers::default());
@@ -3773,8 +4105,11 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
         &d
     )));
 
-    // '끄기'와 '1시간' 클릭 시 settings.toml 및 플래그 파일 반영 확인.
-    let off_at = vcx.debug_bounds("auto-rename-branch-off").unwrap().center();
+    // 자동 이름 변경 토글과 '1시간' 클릭 시 settings.toml 및 플래그 파일 반영 확인.
+    let off_at = vcx
+        .debug_bounds("auto-rename-branch-toggle")
+        .unwrap()
+        .center();
     vcx.simulate_click(off_at, gpui::Modifiers::default());
     vcx.run_until_parked();
     assert!(!krill_proto::git::is_auto_rename_enabled(Some(&d)));
@@ -3788,9 +4123,9 @@ fn owe737_agent_settings_toggle_auto_rename_and_cache_timer_and_sync_flag_file(
     assert_eq!(saved.prompt_cache_ttl_secs, 3_600);
     assert!(saved.workspace_trust_preset_enabled);
 
-    // 신뢰 프리셋 '끄기' 클릭 시 즉시 비활성화되고 플래그 파일이 지워진다.
+    // 신뢰 프리셋 다시 토글 클릭 시 즉시 비활성화되고 플래그 파일이 지워진다.
     let trust_off_at = vcx
-        .debug_bounds("workspace-trust-preset-off")
+        .debug_bounds("workspace-trust-preset-toggle")
         .unwrap()
         .center();
     vcx.simulate_click(trust_off_at, gpui::Modifiers::default());
@@ -4055,11 +4390,27 @@ fn owe729_cleanup_modal_filters_and_bulk_delete_with_branch_safety(cx: &mut Test
 
     click(vcx, "admin-worktree-cleanup-open");
     assert!(vcx.debug_bounds("admin-cleanup-modal").is_some());
+    assert!(vcx.debug_bounds("admin-cleanup-exclude-dirty").is_some());
+    assert!(
+        vcx.debug_bounds("admin-cleanup-exclude-dirty-thumb")
+            .is_some()
+    );
+    assert!(vcx.debug_bounds("admin-cleanup-summary").is_some());
 
     // 기본 필터(MergedOrClosed, 경과 일수 전체, dirty 제외): dirty 1개를 제외한 3개 일치
     vcx.update(|_, cx| {
         let matched = view.read(cx).space.filtered_candidates();
         assert_eq!(matched.len(), 3);
+        assert_eq!(view.read(cx).space.selected.len(), 3);
+    });
+    // 후보 행 체크박스 토글 동작 확인
+    click(vcx, "admin-cleanup-select-wt-merged-old");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).space.selected.len(), 2);
+    });
+    click(vcx, "admin-cleanup-select-wt-merged-old");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).space.selected.len(), 3);
     });
 
     // 7일 이상 필터 클릭 -> wt-merged-old(20d), wt-closed-unmerged(16d) 2개 일치
@@ -4974,6 +5325,1403 @@ fn owe776_schedule_modal_allows_empty_optional_prompt_and_localizes_validation_e
         after_edit.schedule[0].command,
         vec!["/bin/echo".to_owned(), "two words".to_owned()]
     );
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-793: 설정 화면의 공통 프리미티브(`ui::switch`, `ui::segmented_control`, `ui::card`/`row`/`label`/`controls`)가
+/// 적용되어 좁은 창(820px)에서도 에이전트 탭의 스킬 행·프로필 카드·일반 탭 스위치 등 우측 컨트롤이
+/// 부모 카드/행의 우측 경계를 절대 넘어가지 않는다.
+#[gpui::test]
+fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_window(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe793-layout-primitives");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+
+    // 좁은 창(820px)에서도 모든 카드·행 내부 우측 컨트롤이 부모 우측 경계 안에 들어와야 한다.
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+
+    // 1) General 탭: 사이드바·본문 폭 토큰 및 스위치·세그먼트 컨트롤 경계 검증
+    let sidebar = bounds(vcx, "admin-sidebar");
+    let column = bounds(vcx, "admin-content-column");
+    assert_eq!(sidebar.size.width, crate::ui::SETTINGS_NAV_WIDTH);
+    assert!(column.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH);
+
+    for sel in [
+        "theme-dark",
+        "theme-light",
+        "theme-system",
+        "language-ko",
+        "language-en",
+        "notif-toggle",
+        "notif-toggle-thumb",
+        "notify-input-toggle",
+        "notify-done-toggle",
+        "notify-bell-toggle",
+        "sound-toggle",
+        "notify-inactive-toggle",
+        "update-auto-restart-toggle",
+        "settings-update-check",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "general control {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    let notif_track = bounds(vcx, "notif-toggle");
+    assert_eq!(notif_track.size.width, crate::ui::SWITCH_WIDTH);
+    assert_eq!(notif_track.size.height, crate::ui::SWITCH_HEIGHT);
+
+    // 2) Agents 탭: 스킬 설치 카드의 '전체 설치'(primary)와 각 스킬 행의 '스킬 설치'(secondary)가
+    //    부모 행·카드 오른쪽 테두리를 절대 뚫고 나가지 않는지 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let skills_card = bounds(vcx, "admin-skills-card");
+    assert!(
+        skills_card.right() <= column.right() + px(0.5),
+        "skills_card ({skills_card:?}) overflowed column ({column:?})"
+    );
+    let install_all = bounds(vcx, "admin-install-all-skills");
+    assert!(
+        install_all.right() <= skills_card.right() + px(0.5),
+        "install-all button ({install_all:?}) overflowed skills_card ({skills_card:?})"
+    );
+
+    for (row_sel, btn_sel) in [
+        ("admin-skill-row-minikrill", "admin-install-skill-minikrill"),
+        (
+            "admin-skill-row-orchestration",
+            "admin-install-skill-orchestration",
+        ),
+        (
+            "admin-skill-row-computer-use",
+            "admin-install-skill-computer-use",
+        ),
+        (
+            "admin-skill-row-worktree-checkpoints",
+            "admin-install-skill-worktree-checkpoints",
+        ),
+    ] {
+        let row_b = bounds(vcx, row_sel);
+        let btn_b = bounds(vcx, btn_sel);
+        assert!(
+            row_b.right() <= skills_card.right() + px(0.5),
+            "skill row {row_sel} ({row_b:?}) overflowed skills_card ({skills_card:?})"
+        );
+        assert!(
+            btn_b.right() <= row_b.right() + px(0.5),
+            "skill button {btn_sel} ({btn_b:?}) overflowed skill row {row_sel} ({row_b:?})"
+        );
+        assert!(
+            btn_b.origin.x >= row_b.origin.x,
+            "skill button {btn_sel} ({btn_b:?}) left of skill row {row_sel} ({row_b:?})"
+        );
+    }
+
+    for (card_sel, hook_sel) in [
+        ("admin-agent-card-claude", "admin-agent-hook-claude"),
+        ("admin-agent-card-codex", "admin-agent-hook-codex"),
+        ("admin-agent-card-agy", "admin-agent-hook-agy"),
+        ("admin-agent-card-cursor", "admin-agent-hook-cursor"),
+        ("admin-agent-card-opencode", "admin-agent-hook-opencode"),
+    ] {
+        let card_b = bounds(vcx, card_sel);
+        let hook_b = bounds(vcx, hook_sel);
+        assert!(
+            card_b.right() <= column.right() + px(0.5),
+            "agent card {card_sel} ({card_b:?}) overflowed column ({column:?})"
+        );
+        assert!(
+            hook_b.right() <= card_b.right() + px(0.5),
+            "agent hook button {hook_sel} ({hook_b:?}) overflowed card {card_sel} ({card_b:?})"
+        );
+    }
+
+    for sel in [
+        "admin-yolo-toggle",
+        "hib-toggle",
+        "auto-rename-branch-toggle",
+        "prompt-cache-timer-toggle",
+        "prompt-cache-ttl-5m",
+        "prompt-cache-ttl-1h",
+        "workspace-trust-preset-toggle",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "agent control {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-806: 자동 라벨이 조직명(`orgName`)으로 바뀐 뒤 `account_detail`이 라벨과 조직명을
+/// `Krill QA Org · Krill QA Org`처럼 두 번 반복하지 않는다. 사용자가 다른 라벨을 붙인 경우에만
+/// `라벨 · 조직명`으로 이어 붙인다.
+#[gpui::test]
+fn owe806_account_detail_does_not_repeat_org_name_when_auto_label_matches_org(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::usage::{AccountInfo, ProviderKind, Snapshot};
+
+    let d = dir("owe806-account-detail");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |v, _| {
+            v.identities.0.insert(
+                "claude-claude-code-profile-1".into(),
+                crate::accounts::Identity {
+                    email: "qa-login@example.com".into(),
+                    org_id: Some("org-qa-700".into()),
+                    org_name: Some("Krill QA Org".into()),
+                },
+            );
+            let mut acc = AccountInfo {
+                id: "claude-claude-code-profile-1".into(),
+                provider: ProviderKind::Claude,
+                label: "Krill QA Org".into(),
+                email: Some("qa-login@example.com".into()),
+                profile_dir: "/tmp/profiles/claude/claude-code-profile-1".into(),
+                active: false,
+                host_default: false,
+                stale: false,
+                usage: Snapshot::default(),
+            };
+            let (_, heading) = account_heading(&acc);
+            assert_eq!(v.account_detail(&acc, heading), "Krill QA Org");
+
+            acc.label = "Work".into();
+            let (_, heading) = account_heading(&acc);
+            assert_eq!(v.account_detail(&acc, heading), "Work · Krill QA Org");
+        });
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-796: 에이전트 탭의 알약형 기본 에이전트 선택기(체크 아이콘), Yolo/수동 세그먼트,
+/// 조건부 프롬프트 캐시 TTL 하위 행, 단일 `agents.toml 열기` 헤더와 접이식 에이전트 카탈로그 행을 검증한다.
+#[gpui::test]
+fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut TestAppContext) {
+    let d = dir("owe796-agents-tab");
+    init(cx, &d);
+
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+
+    // 1) 기본 에이전트 알약형 선택기: 초기 claude 선택 시 claude에만 체크 아이콘이 표시되고,
+    //    codex 클릭 시 codex로 체크 아이콘과 설정이 이동한다.
+    assert!(vcx.debug_bounds("admin-default-agent-card").is_some());
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-claude")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-codex")
+            .is_none()
+    );
+    let codex_pill = bounds(vcx, "admin-default-agent-codex");
+    vcx.simulate_click(codex_pill.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert_eq!(current(cx).default_agent, "codex");
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-claude")
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-default-agent-check-codex")
+            .is_some()
+    );
+
+    // 2) 권한 모드(Yolo / 수동) 세그먼트 전환 검증
+    let manual_seg = bounds(vcx, "admin-yolo-manual");
+    vcx.simulate_click(manual_seg.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(!current(cx).yolo_mode);
+        assert_eq!(
+            cx.global::<Config>().pending_permission,
+            Some(krill_proto::agent::Permission::Manual)
+        );
+    });
+    let yolo_seg = bounds(vcx, "admin-yolo-yolo");
+    vcx.simulate_click(yolo_seg.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        assert!(current(cx).yolo_mode);
+        assert_eq!(
+            cx.global::<Config>().pending_permission,
+            Some(krill_proto::agent::Permission::Yolo)
+        );
+    });
+
+    // 3) 프롬프트 캐시 TTL: 타이머가 켜진 동안에만 하위 행으로 보이고, 끄면 숨겨진다.
+    assert!(vcx.debug_bounds("prompt-cache-ttl-row").is_some());
+    let cache_toggle = bounds(vcx, "prompt-cache-timer-toggle");
+    vcx.simulate_click(cache_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(!current(cx).prompt_cache_timer_enabled);
+        window.draw(cx).clear(cx);
+    });
+    assert!(
+        vcx.debug_bounds("prompt-cache-ttl-row").is_none(),
+        "타이머가 꺼지면 캐시 TTL 하위 행은 숨겨져야 한다"
+    );
+    let cache_toggle = bounds(vcx, "prompt-cache-timer-toggle");
+    vcx.simulate_click(cache_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        assert!(current(cx).prompt_cache_timer_enabled);
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("prompt-cache-ttl-row").is_some());
+
+    // 4) 에이전트 카탈로그 카드: 헤더 우측에 `agents.toml 열기`가 한 번만 배치되고,
+    //    5개 에이전트 행은 기본적으로 모두 접혀 있으며 요약·배지가 표시된다.
+    let catalog_card = bounds(vcx, "admin-agents-catalog-card");
+    let open_toml = bounds(vcx, "admin-agents-open-toml");
+    assert!(open_toml.right() <= catalog_card.right() + px(0.5));
+    for (open_sel, badge_sel, summary_sel, editor_sel) in [
+        (
+            "admin-agent-open-toml-claude",
+            "admin-agent-installed-badge-claude",
+            "admin-agent-summary-claude",
+            "admin-agent-editor-claude",
+        ),
+        (
+            "admin-agent-open-toml-codex",
+            "admin-agent-installed-badge-codex",
+            "admin-agent-summary-codex",
+            "admin-agent-editor-codex",
+        ),
+        (
+            "admin-agent-open-toml-agy",
+            "admin-agent-installed-badge-agy",
+            "admin-agent-summary-agy",
+            "admin-agent-editor-agy",
+        ),
+        (
+            "admin-agent-open-toml-cursor",
+            "admin-agent-installed-badge-cursor",
+            "admin-agent-summary-cursor",
+            "admin-agent-editor-cursor",
+        ),
+        (
+            "admin-agent-open-toml-opencode",
+            "admin-agent-installed-badge-opencode",
+            "admin-agent-summary-opencode",
+            "admin-agent-editor-opencode",
+        ),
+    ] {
+        assert!(
+            vcx.debug_bounds(open_sel).is_none(),
+            "행마다 중복된 agents.toml 열기 버튼이 있으면 안 된다"
+        );
+        assert!(vcx.debug_bounds(badge_sel).is_some());
+        assert!(vcx.debug_bounds(summary_sel).is_some());
+        assert!(
+            vcx.debug_bounds(editor_sel).is_none(),
+            "{editor_sel} 편집기는 기본 접힘 상태여야 한다"
+        );
+    }
+
+    // codex 행만 펼치기 → 저장 → 초기화 → 다시 접기
+    let codex_toggle = bounds(vcx, "admin-agent-toggle-codex");
+    vcx.simulate_click(codex_toggle.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-agent-editor-codex").is_some());
+    assert!(vcx.debug_bounds("admin-agent-editor-claude").is_none());
+
+    vcx.update(|window, cx| {
+        let edit = &view.read(cx).agent_edits["codex"];
+        let args = edit.args.clone();
+        let env = edit.env.clone();
+        args.update(cx, |s, cx| s.set_value("--model o3", window, cx));
+        env.update(cx, |s, cx| s.set_value("FOO=bar", window, cx));
+        window.draw(cx).clear(cx);
+    });
+    let save_btn = bounds(vcx, "admin-agent-save-codex");
+    vcx.simulate_click(save_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    let saved_toml = fs::read_to_string(d.join(krill_proto::agent::FILE_NAME)).unwrap();
+    let loaded = krill_proto::agent::Agents::load(Some(&saved_toml)).unwrap();
+    assert_eq!(
+        loaded.profiles["codex"].env.get("FOO").map(String::as_str),
+        Some("bar")
+    );
+
+    let reset_btn = bounds(vcx, "admin-agent-reset-codex");
+    vcx.simulate_click(reset_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        let edit = &view.read(cx).agent_edits["codex"];
+        assert!(edit.env.read(cx).value().is_empty());
+        window.draw(cx).clear(cx);
+    });
+
+    // 좁은 창(820px)에서도 펼쳐진 에이전트 카드·기본 에이전트 카드·스킬 카드가 컬럼 경계를 넘지 않는다.
+    let column = bounds(vcx, "admin-content-column");
+    for sel in [
+        "admin-default-agent-card",
+        "admin-agents-catalog-card",
+        "admin-agent-editor-codex",
+        "admin-skills-card",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "{sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-798: 일반·외관(General) 및 터미널(Terminal) 탭의 섹션 그룹화, 세그먼트 순서,
+/// `UIZoomControl` 스타일 고정폭 스테퍼 및 최솟값·최댓값 `.disabled(...)`,
+/// 마스터 알림(`notif-toggle`) 꺼짐 시 하위 알림 스위치·테스트 버튼 비활성화를 검증한다.
+#[gpui::test]
+fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notifications_disabled(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe798-general-terminal");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let b = bounds(vcx, s);
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // 1. General 탭 섹션 머리글 존재 및 위→아래 순서 검증
+    let column = bounds(vcx, "admin-content-column");
+    let sec_appearance = bounds(vcx, "general-section-appearance");
+    let sec_notif = bounds(vcx, "general-section-notifications");
+    let sec_power = bounds(vcx, "general-section-power");
+    let sec_files = bounds(vcx, "general-section-files");
+    assert!(sec_appearance.origin.y < sec_notif.origin.y);
+    assert!(sec_notif.origin.y < sec_power.origin.y);
+    assert!(sec_power.origin.y < sec_files.origin.y);
+
+    // 2. 세그먼트 선택지 좌→우 순서 검증 (한국어/English, 다크/라이트/시스템, 끄기/작업 중/항상)
+    assert!(bounds(vcx, "language-ko").origin.x < bounds(vcx, "language-en").origin.x);
+    assert!(bounds(vcx, "theme-dark").origin.x < bounds(vcx, "theme-light").origin.x);
+    assert!(bounds(vcx, "theme-light").origin.x < bounds(vcx, "theme-system").origin.x);
+    assert!(bounds(vcx, "awake-off").origin.x < bounds(vcx, "awake-agent").origin.x);
+    assert!(bounds(vcx, "awake-agent").origin.x < bounds(vcx, "awake-on").origin.x);
+
+    // 3. UI 줌 스테퍼 고정폭 및 경계값 비활성화·초기화 검증
+    let zoom_val_before = bounds(vcx, "zoom-value");
+    assert_eq!(zoom_val_before.size.width, px(48.));
+    click(vcx, "zoom-out"); // 100% -> 90% (3자리 -> 2자리)
+    vcx.update(|_, cx| assert!((current(cx).zoom() - 0.9).abs() < 1e-4));
+    assert_eq!(
+        bounds(vcx, "zoom-value").size.width,
+        zoom_val_before.size.width,
+        "zoom-value width must remain fixed across 100% -> 90%"
+    );
+    click(vcx, "zoom-reset");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - 1.0).abs() < 1e-4));
+
+    vcx.update(|window, cx| {
+        edit(cx, |s| s.zoom = ZOOM_MIN);
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    click(vcx, "zoom-out");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - ZOOM_MIN).abs() < 1e-4));
+
+    vcx.update(|window, cx| {
+        edit(cx, |s| s.zoom = ZOOM_MAX);
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    click(vcx, "zoom-in");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - ZOOM_MAX).abs() < 1e-4));
+    click(vcx, "zoom-reset");
+    vcx.update(|_, cx| assert!((current(cx).zoom() - 1.0).abs() < 1e-4));
+
+    // 4. 마스터 알림(notif-toggle) OFF 시 하위 알림 행·컨트롤 비활성화 검증
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert!(s.notifications);
+        assert!(s.notify_on_input);
+        assert!(s.notify_on_done);
+        assert!(s.notify_on_bell);
+        assert!(s.notification_sound);
+        assert!(!s.notify_only_inactive);
+    });
+    click(vcx, "notif-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).notifications));
+
+    for sub_sel in [
+        "notify-input-toggle",
+        "notify-done-toggle",
+        "notify-bell-toggle",
+        "sound-toggle",
+        "notify-inactive-toggle",
+        "send-test-notification",
+    ] {
+        click(vcx, sub_sel);
+    }
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert!(
+            s.notify_on_input
+                && s.notify_on_done
+                && s.notify_on_bell
+                && s.notification_sound
+                && !s.notify_only_inactive,
+            "subordinate notification toggles must be disabled while master notifications is false"
+        );
+    });
+
+    // 다시 마스터 알림을 켜면 하위 스위치가 정상 동작한다.
+    click(vcx, "notif-toggle");
+    vcx.update(|_, cx| assert!(current(cx).notifications));
+    click(vcx, "notify-input-toggle");
+    vcx.update(|_, cx| assert!(!current(cx).notify_on_input));
+    click(vcx, "notify-input-toggle");
+    vcx.update(|_, cx| assert!(current(cx).notify_on_input));
+
+    // 5. Terminal 탭 섹션 머리글·세그먼트 순서·스테퍼 고정폭 및 경계값 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Terminal, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let term_app = bounds(vcx, "terminal-section-appearance");
+    let term_cur = bounds(vcx, "terminal-section-cursor");
+    let term_kbd = bounds(vcx, "terminal-section-keyboard");
+    assert!(term_app.origin.y < term_cur.origin.y);
+    assert!(term_cur.origin.y < term_kbd.origin.y);
+
+    assert!(bounds(vcx, "cursor-block").origin.x < bounds(vcx, "cursor-bar").origin.x);
+    assert!(bounds(vcx, "cursor-bar").origin.x < bounds(vcx, "cursor-underline").origin.x);
+
+    let opacity_val_before = bounds(vcx, "opacity-value");
+    let opacity_inc_before = bounds(vcx, "opacity-inc");
+    // 기본 불투명도 100%(최댓값)에서 '+' 클릭은 무효, '-' 클릭 시 95%로 감소하되 버튼 위치 고정
+    click(vcx, "opacity-inc");
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 100));
+    click(vcx, "opacity-dec");
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 95));
+    assert_eq!(
+        bounds(vcx, "opacity-value").size.width,
+        opacity_val_before.size.width,
+        "opacity-value width must remain fixed across 100% -> 95%"
+    );
+    assert_eq!(
+        bounds(vcx, "opacity-inc").origin.x,
+        opacity_inc_before.origin.x,
+        "opacity-inc button must not shift horizontally across 100% -> 95%"
+    );
+    click(vcx, "opacity-reset");
+    vcx.update(|_, cx| assert_eq!(current(cx).terminal_opacity_pct(), 100));
+
+    // 글꼴 크기 최솟값(10pt)·최댓값(24pt) 및 불투명도 최솟값(50%) 경계 검증
+    vcx.update(|window, cx| {
+        edit(cx, |s| {
+            s.terminal_font_size = 10;
+            s.terminal_opacity_pct = 50;
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    click(vcx, "font-dec");
+    click(vcx, "opacity-dec");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).terminal_font_size(), 10);
+        assert_eq!(current(cx).terminal_opacity_pct(), 50);
+    });
+    click(vcx, "font-reset");
+    click(vcx, "opacity-reset");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).terminal_font_size(), 13);
+        assert_eq!(current(cx).terminal_opacity_pct(), 100);
+    });
+
+    // 좁은 창(820px)에서 Terminal 탭의 모든 컨트롤이 본문 열 우측 경계를 넘지 않는다.
+    for sel in [
+        "terminal-font-family",
+        "font-dec",
+        "font-size-value",
+        "font-inc",
+        "font-reset",
+        "opacity-dec",
+        "opacity-value",
+        "opacity-inc",
+        "opacity-reset",
+        "cursor-block",
+        "cursor-bar",
+        "cursor-underline",
+        "cursor-blink-toggle",
+        "option-meta-toggle",
+        "copy-select-toggle",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "terminal control {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-802: 모바일 리모컨(Mobile) 탭의 연결 경로 라디오 카드·티켓 URL 복사 피드백·기기 해제·오류 배너와
+/// 시스템·보안(Resources) 탭의 스위치·진단 버튼·디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`)
+/// 우측 경계(좁은 창 포함)를 검증한다.
+#[gpui::test]
+fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::mobile::{
+        ConnectMode, MobileReply, MobileRequest, NetworkInterface, PairedMobileDevice,
+    };
+
+    let d = dir("owe802-mobile-resources");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let record = requests.clone();
+    let should_fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fail_flag = should_fail.clone();
+
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile = mobile::Panel::new(std::sync::Arc::new(move |request| {
+                record.lock().unwrap().push(request.clone());
+                if fail_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err("simulated mobile gateway error".into());
+                }
+                let devices = vec![
+                    PairedMobileDevice {
+                        device_id: "dev-iphone".into(),
+                        label: "Owen iPhone".into(),
+                        key_fingerprint: "fp-iphone".into(),
+                        shared_secret_hash: String::new(),
+                        created_at_ms: 1_700_000_000_000,
+                        last_seen_ms: 1_700_000_120_000,
+                        revoked_at_ms: None,
+                    },
+                    PairedMobileDevice {
+                        device_id: "dev-ipad".into(),
+                        label: "Owen iPad".into(),
+                        key_fingerprint: "fp-ipad".into(),
+                        shared_secret_hash: String::new(),
+                        created_at_ms: 1_700_000_000_000,
+                        last_seen_ms: 1_700_000_050_000,
+                        revoked_at_ms: None,
+                    },
+                ];
+                Ok(match request {
+                    MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
+                        url: format!("https://example.test/?pair=owe802&mode={mode:?}#key=secret"),
+                        host: "example.test".into(),
+                        port: 8443,
+                        expires_at_ms: krill_proto::mobile::client::now_ms() + 300_000,
+                        mode,
+                        interfaces: vec![NetworkInterface {
+                            name: "en0".into(),
+                            address: "192.168.1.25".into(),
+                            default_route: true,
+                        }],
+                    },
+                    MobileRequest::CurrentPairingOffer => MobileReply::PairingOffer {
+                        url: "https://example.test/?pair=owe802&mode=Lan#key=secret".into(),
+                        host: "example.test".into(),
+                        port: 8443,
+                        expires_at_ms: krill_proto::mobile::client::now_ms() + 300_000,
+                        mode: ConnectMode::Lan,
+                        interfaces: vec![NetworkInterface {
+                            name: "en0".into(),
+                            address: "192.168.1.25".into(),
+                            default_route: true,
+                        }],
+                    },
+                    MobileRequest::Status
+                    | MobileRequest::ListDevices
+                    | MobileRequest::RevokeDevice { .. } => MobileReply::Devices(devices),
+                    MobileRequest::ConnectedDevices => {
+                        MobileReply::ConnectedDevices(vec!["dev-iphone".into()])
+                    }
+                    _ => MobileReply::Devices(Vec::new()),
+                })
+            }));
+            v.set_tab(AdminTab::Mobile, cx);
+        });
+    });
+
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Lan, None, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let b = bounds(vcx, s);
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+
+    // 1) Mobile 탭: 연결 경로 라디오 카드·QR 카드·페어링된 기기 카드 렌더링 및 경계 검증
+    let column = bounds(vcx, "admin-content-column");
+    let mode_card = bounds(vcx, "mobile-mode-card");
+    assert!(
+        mode_card.right() <= column.right() + px(0.5),
+        "mobile-mode-card ({mode_card:?}) overflowed column ({column:?})"
+    );
+    for sel in ["mobile-lan", "mobile-tailscale", "mobile-tunnel"] {
+        let opt = bounds(vcx, sel);
+        assert!(
+            opt.right() <= mode_card.right() + px(0.5),
+            "radio row {sel} ({opt:?}) overflowed mobile-mode-card ({mode_card:?})"
+        );
+    }
+    for sel in [
+        "admin-mobile-pair-section",
+        "admin-mobile-devices-section",
+        "mobile-new-qr",
+        "mobile-refresh",
+        "mobile-qr-card",
+        "mobile-ticket-url",
+        "mobile-copy-link",
+        "mobile-if-0",
+        "mobile-device-row-0",
+        "mobile-device-row-1",
+        "mobile-revoke-0",
+        "mobile-revoke-1",
+        "mobile-revoke-all",
+    ] {
+        let b = bounds(vcx, sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "mobile element {sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    // 티켓 URL 복사 버튼 클릭 → 클립보드 복사 및 copied_url 상태 전환 확인
+    vcx.update(|_, cx| assert!(view.read(cx).mobile.copied_url.is_none()));
+    click(vcx, "mobile-copy-link");
+    vcx.update(|_, cx| {
+        let expected_url = view.read(cx).mobile.offer.as_ref().unwrap().0.clone();
+        assert_eq!(
+            view.read(cx).mobile.copied_url.as_deref(),
+            Some(expected_url.as_str())
+        );
+        assert_eq!(
+            cx.read_from_clipboard()
+                .and_then(|item| item.text())
+                .as_deref(),
+            Some(expected_url.as_str())
+        );
+    });
+
+    // 라디오 카드 모드 전환(Tailscale -> Tunnel) 시 copied_url 초기화 및 MintPairingTicket 호출 확인
+    click(vcx, "mobile-tailscale");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).mobile.mode, ConnectMode::Tailscale);
+        assert!(view.read(cx).mobile.copied_url.is_none());
+    });
+    click(vcx, "mobile-tunnel");
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).mobile.mode, ConnectMode::Tunnel);
+    });
+
+    // 개별 기기 해제 및 전체 해제 버튼 동작 확인
+    click(vcx, "mobile-revoke-0");
+    click(vcx, "mobile-revoke-all");
+    {
+        let log = requests.lock().unwrap();
+        assert!(log.iter().any(|r| matches!(
+            r,
+            MobileRequest::RevokeDevice {
+                device_id: Some(id),
+                all: false,
+            } if id == "dev-iphone"
+        )));
+        assert!(log.iter().any(|r| matches!(
+            r,
+            MobileRequest::RevokeDevice {
+                device_id: None,
+                all: true,
+            }
+        )));
+    }
+
+    // 오류 발생 시 ui::error_banner(#mobile-error-banner) 표시 확인
+    should_fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    click(vcx, "mobile-refresh");
+    assert!(vcx.debug_bounds("mobile-error-banner").is_some());
+
+    // 2) Resources 탭: 스위치·진단 버튼 및 좁은 창(720px / 820px)·넓은 창(1200px)에서
+    //    디스크 용량 카드 헤더 버튼(`admin-worktree-cleanup-open`) 우측 잘림 없음 검증
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Resources, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    for width in [720., 820., 1200.] {
+        vcx.simulate_resize(size(px(width), px(5000.)));
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let column = bounds(vcx, "admin-content-column");
+        for sel in [
+            "admin-recording-paused",
+            "admin-recording-paused-thumb",
+            "admin-secure-kb-toggle",
+            "admin-secure-kb-toggle-thumb",
+            "admin-run-doctor",
+            "admin-history-clear",
+        ] {
+            let b = bounds(vcx, sel);
+            assert!(
+                b.right() <= column.right() + px(0.5),
+                "width={width}: resources control {sel} ({b:?}) overflowed column ({column:?})"
+            );
+        }
+
+        let space_card = bounds(vcx, "admin-space-section");
+        let header_row = bounds(vcx, "admin-space-header-row");
+        let scan_btn = bounds(vcx, "admin-space-scan");
+        let cleanup_btn = bounds(vcx, "admin-worktree-cleanup-open");
+
+        assert!(
+            space_card.right() <= column.right() + px(0.5),
+            "width={width}: admin-space-section ({space_card:?}) overflowed column ({column:?})"
+        );
+        assert!(
+            header_row.right() <= space_card.right() + px(0.5),
+            "width={width}: admin-space-header-row ({header_row:?}) overflowed card ({space_card:?})"
+        );
+        for (name, btn) in [
+            ("admin-space-scan", scan_btn),
+            ("admin-worktree-cleanup-open", cleanup_btn),
+        ] {
+            assert!(
+                btn.origin.x >= header_row.origin.x - px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed left of header_row ({header_row:?})"
+            );
+            assert!(
+                btn.right() <= header_row.right() + px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed right of header_row ({header_row:?})"
+            );
+            assert!(
+                btn.bottom() <= header_row.bottom() + px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed bottom of header_row ({header_row:?})"
+            );
+            assert!(
+                btn.right() <= space_card.right() + px(0.5),
+                "width={width}: {name} ({btn:?}) overflowed right of space_card ({space_card:?})"
+            );
+        }
+    }
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-797: AI 제공자 계정(Accounts) 탭에서 프로바이더 상태 배지, 계정 행 배지(사용 중·로그인 필요·한도 도달),
+/// 5h/7d 초기화 시각 메타, 비활성 계정 행 클릭 즉시 전환, 자동전환 및 고급 정책 `ui::switch`/`ui::segmented_control`이
+/// 동작하며 좁은 창(820px)에서도 우측 경계를 넘지 않는다.
+#[gpui::test]
+fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut TestAppContext) {
+    use krill_proto::usage::{
+        AccountConnection, AccountPolicyState, AccountStatus, AccountStatusInfo, AdvancedPolicy,
+        ConnectionStatus, ConnectionsSnapshot, ProviderKind, Snapshot, UsageRequest, Window,
+    };
+
+    let d = dir("owe797-accounts-tab");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Accounts, cx);
+            for label in ["Primary", "Work", "Relogin"] {
+                v.apply_account_request(
+                    UsageRequest::AddAccount {
+                        provider: ProviderKind::Claude,
+                        label: label.into(),
+                        email: Some(format!("{}@example.com", label.to_ascii_lowercase())),
+                        profile_dir: d.join("claude").join(label).display().to_string(),
+                    },
+                    cx,
+                );
+            }
+            v.apply_account_request(
+                UsageRequest::SwitchAccount {
+                    provider: ProviderKind::Claude,
+                    account_id: "claude-primary".into(),
+                },
+                cx,
+            );
+            if let Some(primary) = v
+                .accounts_snapshot
+                .accounts
+                .iter_mut()
+                .find(|a| a.id == "claude-primary")
+            {
+                primary.usage = Snapshot {
+                    five_hour: Some(Window {
+                        percent: 72,
+                        resets_at: Some("4102444800".into()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 45,
+                        resets_at: Some("4102444800".into()),
+                    }),
+                };
+            }
+            v.accounts_snapshot.statuses = vec![
+                AccountStatusInfo {
+                    account_id: "claude-primary".into(),
+                    status: AccountStatus::RateLimited,
+                    updated_at: Some(crate::accounts::display::now()),
+                    detail: None,
+                },
+                AccountStatusInfo {
+                    account_id: "claude-relogin".into(),
+                    status: AccountStatus::NeedsLogin,
+                    updated_at: Some(crate::accounts::display::now()),
+                    detail: None,
+                },
+            ];
+            *v.accounts_snapshot.connections = ConnectionsSnapshot {
+                supported: true,
+                direct_usage: false,
+                accounts: vec![
+                    AccountConnection {
+                        account_id: "claude-primary".into(),
+                        status: ConnectionStatus::Connected,
+                    },
+                    AccountConnection {
+                        account_id: "claude-work".into(),
+                        status: ConnectionStatus::Connected,
+                    },
+                    AccountConnection {
+                        account_id: "claude-relogin".into(),
+                        status: ConnectionStatus::NeedsLogin,
+                    },
+                ],
+            };
+            v.accounts_snapshot.advanced = AccountPolicyState {
+                supported: true,
+                policy: AdvancedPolicy::default(),
+                ..AccountPolicyState::default()
+            };
+            cx.notify();
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+
+    let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        vcx.debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+    };
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let pt = vcx
+            .debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"))
+            .center();
+        vcx.simulate_click(pt, gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    let column = bounds(vcx, "admin-content-column");
+
+    // 1) 프로바이더 헤더 상태 배지 및 계정 행 상태 배지(사용 중 / 한도 도달 / 로그인 필요)·초기화 카운트다운·아바타 상태 점(STATE_DOT)·툴팁 검증
+    assert!(vcx.debug_bounds("admin-provider-status-claude").is_some());
+    let dot_bounds = bounds(vcx, "admin-account-dot-claude-primary");
+    assert_eq!(dot_bounds.size.width, crate::ui::STATE_DOT);
+    assert_eq!(dot_bounds.size.height, crate::ui::STATE_DOT);
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-primary")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-work")
+            .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-rate-limited-claude-primary")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-needs-login-claude-relogin")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-login-account-claude-relogin")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-switch-account-claude-relogin")
+            .is_none()
+    );
+    assert!(vcx.debug_bounds("admin-usage-reset-5h").is_some());
+    assert!(vcx.debug_bounds("admin-usage-reset-7d").is_some());
+
+    for (hover_sel, tip_sel) in [
+        (
+            "admin-account-status-claude-primary",
+            "tooltip:admin-account-status-claude-primary",
+        ),
+        (
+            "admin-account-usage-claude-primary",
+            "tooltip:admin-account-usage-claude-primary",
+        ),
+    ] {
+        let b = bounds(vcx, hover_sel);
+        vcx.simulate_mouse_move(b.center(), None, gpui::Modifiers::default());
+        vcx.executor()
+            .advance_clock(std::time::Duration::from_millis(600));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds(tip_sel).is_some(),
+            "hovering {hover_sel} must show {tip_sel}"
+        );
+    }
+
+    // 2) 비활성 정상 계정 행(`admin-account-row-claude-work`) 좌측 영역을 직접 클릭하면 즉시 전환된다.
+    let work_row = bounds(vcx, "admin-account-row-claude-work");
+    let row_left_click = gpui::point(
+        work_row.origin.x + px(20.),
+        work_row.origin.y + work_row.size.height * 0.5,
+    );
+    vcx.simulate_click(row_left_click, gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let active = view
+            .read(cx)
+            .accounts()
+            .accounts
+            .iter()
+            .find(|a| a.provider == ProviderKind::Claude && a.active)
+            .unwrap();
+        assert_eq!(active.id, "claude-work");
+    });
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-work")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-primary")
+            .is_none()
+    );
+
+    // 우측 보조 `전환` 버튼(`admin-switch-account-claude-primary`)으로도 다시 전환된다.
+    click(vcx, "admin-switch-account-claude-primary");
+    assert!(
+        vcx.debug_bounds("admin-account-in-use-claude-primary")
+            .is_some()
+    );
+
+    // 3) 자동전환 & 고급 정책 스위치(`ui::switch`) 및 쿨다운 세그먼트(`ui::segmented_control`) 검증
+    for switch_sel in [
+        "admin-auto-switch-toggle",
+        "admin-rate-limit-toggle",
+        "admin-direct-usage-toggle",
+        "admin-predict-exhaustion-toggle",
+        "admin-prefer-soonest-reset-toggle",
+    ] {
+        let b = bounds(vcx, switch_sel);
+        assert_eq!(b.size.width, crate::ui::SWITCH_WIDTH, "{switch_sel}");
+        assert_eq!(b.size.height, crate::ui::SWITCH_HEIGHT, "{switch_sel}");
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "switch {switch_sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+
+    let rl_before = vcx.update(|_, cx| view.read(cx).accounts().auto_switch.switch_on_rate_limit);
+    let rl_thumb_before = bounds(vcx, "admin-rate-limit-toggle-thumb").origin.x;
+    click(vcx, "admin-rate-limit-toggle");
+    let rl_after = vcx.update(|_, cx| view.read(cx).accounts().auto_switch.switch_on_rate_limit);
+    let rl_thumb_after = bounds(vcx, "admin-rate-limit-toggle-thumb").origin.x;
+    assert_eq!(rl_after, !rl_before);
+    assert_ne!(rl_thumb_before, rl_thumb_after);
+
+    let pred_before =
+        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.predict_exhaustion);
+    click(vcx, "admin-predict-exhaustion-toggle");
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.predict_exhaustion),
+        !pred_before
+    );
+
+    let soon_before = vcx.update(|_, cx| {
+        view.read(cx)
+            .accounts()
+            .advanced
+            .policy
+            .prefer_soonest_reset
+    });
+    click(vcx, "admin-prefer-soonest-reset-toggle");
+    assert_eq!(
+        vcx.update(|_, cx| {
+            view.read(cx)
+                .accounts()
+                .advanced
+                .policy
+                .prefer_soonest_reset
+        }),
+        !soon_before
+    );
+
+    for cd_sel in [
+        "admin-cooldown-0m",
+        "admin-cooldown-5m",
+        "admin-cooldown-15m",
+        "admin-cooldown-30m",
+    ] {
+        let b = bounds(vcx, cd_sel);
+        assert!(
+            b.right() <= column.right() + px(0.5),
+            "cooldown segment {cd_sel} ({b:?}) overflowed column ({column:?})"
+        );
+    }
+    click(vcx, "admin-cooldown-15m");
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).accounts().advanced.policy.cooldown_secs),
+        15 * 60
+    );
+
+    // 4) 계정 오류 배너(`ui::error_banner`) 노출 검증
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.account_error = Some("account sync failed".into());
+            cx.notify();
+        });
+    });
+    vcx.run_until_parked();
+    let err_b = bounds(vcx, "admin-account-error");
+    assert!(err_b.right() <= column.right() + px(0.5));
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// OWE-801: Workflows 탭의 컨텍스트 줄 수 `SegmentedControl`, 저장소 선택 컨텍스트 통합,
+/// 심볼릭 링크 등폭 칩 추가/제거, 빠른 명령 추가/수정/삭제, 완료 웹훅 배지+URL 표시 및 추가/삭제,
+/// 예약 작업 활성/일시정지 `Switch` 및 820px 좁은 창 경계 준수를 검증한다.
+#[gpui::test]
+fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_schedule_switch(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::schedule::Schedules;
+
+    let d = dir("owe801-workflows");
+    let repo_a_dir = d.join("repo-alpha");
+    let repo_b_dir = d.join("repo-beta");
+    fs::create_dir_all(&repo_a_dir).unwrap();
+    fs::create_dir_all(&repo_b_dir).unwrap();
+    let repo_a = fs::canonicalize(&repo_a_dir)
+        .unwrap_or_else(|_| repo_a_dir.clone())
+        .display()
+        .to_string();
+    let repo_b = fs::canonicalize(&repo_b_dir)
+        .unwrap_or_else(|_| repo_b_dir.clone())
+        .display()
+        .to_string();
+
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(6000.)));
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Workflows, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let click_sel = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let b = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing selector {selector}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+        vcx.update(|window, cx| window.draw(cx).clear(cx));
+    };
+
+    // 1) 컨텍스트 줄 수 SegmentedControl (50/100/250/500)
+    assert!(vcx.debug_bounds("admin-context-lines-control").is_some());
+    click_sel(vcx, "admin-context-lines-100");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 100));
+    click_sel(vcx, "admin-context-lines-250");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 250));
+    click_sel(vcx, "admin-context-lines-500");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 500));
+    click_sel(vcx, "admin-context-lines-50");
+    vcx.update(|_, cx| assert_eq!(current(cx).copy_context_lines, 50));
+
+    // 2) 저장소 선택 컨텍스트 통합 및 심볼릭 링크 등폭 칩 추가/제거
+    assert!(vcx.debug_bounds("admin-workflow-repo-card").is_some());
+    assert!(vcx.debug_bounds("admin-workflow-repo-input").is_some());
+    assert!(
+        vcx.debug_bounds("admin-worktree-symlinks-repo-input")
+            .is_none(),
+        "duplicate repo input in symlinks card must be removed"
+    );
+    assert!(
+        vcx.debug_bounds("admin-hooks-repo-input").is_none(),
+        "duplicate repo input in hooks card must be removed"
+    );
+
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.add_worktree_symlink_for(&repo_a, ".env", cx).unwrap();
+            v.add_worktree_symlink_for(&repo_a, "node_modules", cx)
+                .unwrap();
+            v.save_repo_hooks_for(&repo_a, Some("pnpm install"), Some("./cleanup-a.sh"), cx)
+                .unwrap();
+            v.save_repo_hooks_for(&repo_b, Some("cargo check"), Some("./cleanup-b.sh"), cx)
+                .unwrap();
+            v.load_repo_hooks_for(&repo_a, window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    assert!(vcx.debug_bounds("admin-workflow-repo-select").is_some());
+    assert!(vcx.debug_bounds("admin-workflow-repo-chips").is_some());
+    assert!(vcx.debug_bounds("admin-symlinks-repo-badge").is_some());
+    assert!(vcx.debug_bounds("admin-hooks-repo-badge").is_some());
+    assert!(vcx.debug_bounds("admin-worktree-symlinks-chips").is_some());
+    assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
+    assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
+
+    // repo-b 칩을 클릭하면 훅 입력창이 repo-b로 동기화되고 심볼릭 링크 카드는 repo-b 기준(빈 상태)으로 바뀐다.
+    click_sel(vcx, "admin-workflow-repo-chip-1");
+    vcx.update(|_, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.setup_script.read(cx).value().as_str(), "cargo check");
+        assert_eq!(
+            form.archive_script.read(cx).value().as_str(),
+            "./cleanup-b.sh"
+        );
+    });
+    assert!(vcx.debug_bounds("admin-worktree-symlinks-empty").is_some());
+
+    // 다시 repo-a 칩을 클릭하면 심볼릭 링크 칩 2개가 나타나고 × 버튼으로 제거할 수 있다.
+    click_sel(vcx, "admin-workflow-repo-chip-0");
+    assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
+    assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
+    click_sel(vcx, "admin-symlink-remove-0");
+    let store = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
+    assert_eq!(store.symlinks_for(&repo_a), vec!["node_modules".to_owned()]);
+
+    // 3) 빠른 명령(Quick Commands) 추가·수정·삭제
+    assert!(vcx.debug_bounds("admin-qc-card").is_some());
+    assert!(vcx.debug_bounds("admin-qc-empty").is_some());
+    vcx.update(|window, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        let name_inp = form.qc_name.clone();
+        let text_inp = form.qc_text.clone();
+        name_inp.update(cx, |inp, cx| inp.set_value("상태 확인", window, cx));
+        text_inp.update(cx, |inp, cx| inp.set_value("git status -sb", window, cx));
+    });
+    click_sel(vcx, "admin-qc-add");
+    assert!(vcx.debug_bounds("admin-qc-row-0").is_some());
+    assert!(vcx.debug_bounds("admin-qc-edit-0").is_some());
+    assert!(vcx.debug_bounds("admin-qc-remove-0").is_some());
+    vcx.update(|_, cx| {
+        let cmds = &current(cx).quick_commands;
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].name, "상태 확인");
+        assert_eq!(cmds[0].text, "git status -sb");
+    });
+
+    click_sel(vcx, "admin-qc-edit-0");
+    assert!(vcx.debug_bounds("admin-qc-cancel").is_some());
+    vcx.update(|window, cx| {
+        let form = view.read(cx).workflow_form.as_ref().unwrap();
+        assert_eq!(form.qc_editing, Some(0));
+        assert_eq!(form.qc_name.read(cx).value().as_str(), "상태 확인");
+        let text_inp = form.qc_text.clone();
+        text_inp.update(cx, |inp, cx| inp.set_value("git status", window, cx));
+    });
+    click_sel(vcx, "admin-qc-add");
+    assert!(vcx.debug_bounds("admin-qc-cancel").is_none());
+    vcx.update(|_, cx| {
+        let cmds = &current(cx).quick_commands;
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].text, "git status");
+    });
+
+    click_sel(vcx, "admin-qc-remove-0");
+    assert!(vcx.debug_bounds("admin-qc-empty").is_some());
+    vcx.update(|_, cx| assert!(current(cx).quick_commands.is_empty()));
+
+    // 4) 완료 웹훅 배지+URL 표시 및 추가·검증·삭제 ({:?} [redacted] 노출 금지)
+    assert!(vcx.debug_bounds("admin-webhooks-card").is_some());
+    assert!(vcx.debug_bounds("admin-webhooks-empty").is_some());
+    vcx.update(|window, cx| {
+        let url_inp = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .webhook_url
+            .clone();
+        url_inp.update(cx, |inp, cx| inp.set_value("invalid-url", window, cx));
+    });
+    click_sel(vcx, "admin-webhook-add");
+    assert!(vcx.debug_bounds("admin-webhook-error").is_some());
+
+    let discord_url = "https://discord.com/api/webhooks/12345/token-abc";
+    vcx.update(|window, cx| {
+        let url_inp = view
+            .read(cx)
+            .workflow_form
+            .as_ref()
+            .unwrap()
+            .webhook_url
+            .clone();
+        url_inp.update(cx, |inp, cx| inp.set_value(discord_url, window, cx));
+    });
+    click_sel(vcx, "admin-webhook-add");
+    assert!(vcx.debug_bounds("admin-webhook-error").is_none());
+    assert!(vcx.debug_bounds("admin-webhook-row-0").is_some());
+    assert!(vcx.debug_bounds("admin-webhook-badge-0").is_some());
+    assert!(vcx.debug_bounds("admin-webhook-url-0").is_some());
+    vcx.update(|_, cx| {
+        let hooks = &current(cx).webhooks;
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].provider_badge(), "Discord");
+        assert_eq!(hooks[0].url(), discord_url);
+        assert!(!hooks[0].url().contains("[redacted]"));
+    });
+
+    // 5) 예약 작업 활성/일시정지 Switch 및 좁은 창(820px) 경계 검증
+    click_sel(vcx, "admin-schedule-add");
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_schedule_modal_values(
+                "nightly-check",
+                "0 3 * * *",
+                &repo_a,
+                "/bin/echo ok",
+                "",
+                "",
+                krill_proto::schedule::WorkspaceMode::Reuse,
+                window,
+                cx,
+            );
+        });
+    });
+    click_sel(vcx, "admin-schedule-modal-save");
+    assert!(
+        vcx.debug_bounds("admin-schedule-row-nightly-check")
+            .is_some()
+    );
+    assert!(
+        vcx.debug_bounds("admin-schedule-status-nightly-check")
+            .is_some()
+    );
+    let sw_bounds = vcx
+        .debug_bounds("admin-schedule-toggle-nightly-check")
+        .expect("schedule switch");
+    assert_eq!(sw_bounds.size.width, crate::ui::SWITCH_WIDTH);
+    assert_eq!(sw_bounds.size.height, crate::ui::SWITCH_HEIGHT);
+
+    click_sel(vcx, "admin-schedule-toggle-nightly-check");
+    assert!(!Schedules::load(&d).unwrap().schedule[0].enabled);
+    click_sel(vcx, "admin-schedule-toggle-nightly-check");
+    assert!(Schedules::load(&d).unwrap().schedule[0].enabled);
+
+    // 좁은 창(820px)에서도 카드 및 예약 작업 행 우측 버튼이 부모 우측 경계를 넘어가지 않는다.
+    vcx.simulate_resize(size(px(820.), px(6000.)));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+
+    let col_b = vcx.debug_bounds("admin-content-column").unwrap();
+    for card_sel in [
+        "admin-workflow-repo-card",
+        "admin-worktree-symlinks-card",
+        "admin-repo-hooks-card",
+        "admin-schedules-card",
+        "admin-qc-card",
+        "admin-webhooks-card",
+    ] {
+        let cb = vcx.debug_bounds(card_sel).unwrap();
+        assert!(
+            cb.right() <= col_b.right() + px(0.5),
+            "workflow card {card_sel} ({cb:?}) overflowed column ({col_b:?})"
+        );
+    }
+    let sched_row_b = vcx
+        .debug_bounds("admin-schedule-row-nightly-check")
+        .unwrap();
+    for ctrl_sel in [
+        "admin-schedule-toggle-nightly-check",
+        "admin-schedule-run-now-nightly-check",
+        "admin-schedule-edit-nightly-check",
+        "admin-schedule-remove-nightly-check",
+    ] {
+        let b = vcx.debug_bounds(ctrl_sel).unwrap();
+        assert!(
+            b.right() <= sched_row_b.right() + px(0.5),
+            "schedule control {ctrl_sel} ({b:?}) overflowed row ({sched_row_b:?})"
+        );
+    }
+
+    click_sel(vcx, "admin-webhook-remove-0");
+    assert!(vcx.debug_bounds("admin-webhooks-empty").is_some());
 
     fs::remove_dir_all(d).ok();
 }
