@@ -3481,6 +3481,8 @@ impl Shell {
             .child(
                 div()
                     .id("titlebar-title")
+                    // K1 OWE-843: 좁은 사이드바·큰 UI 배율에서도 앱 이름을 찌그러뜨리지 않는다.
+                    .flex_none()
                     .px_1()
                     .truncate()
                     .text_size(krill_app::ui::TEXT_SM)
