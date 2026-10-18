@@ -181,16 +181,28 @@ impl OrcaImportReport {
             .saturating_add(usize::from(self.settings.settings_updated))
     }
 
+    /// 0개인 항목은 빼고 ` · `로 잇는다(예: "원격 호스트 1개 · 프로젝트/폴더 1개").
     #[must_use]
     pub fn summary_line(&self) -> String {
-        text::SUMMARY.format(&[
-            ("claude", &self.claude_count().to_string()),
-            ("codex", &self.codex_count().to_string()),
-            ("ssh", &self.ssh_count().to_string()),
-            ("projects", &self.projects_count().to_string()),
-            ("worktrees", &self.worktrees_count().to_string()),
-            ("commands", &self.commands_and_schedules_count().to_string()),
-        ])
+        let counts = [
+            ("claude", self.claude_count()),
+            ("codex", self.codex_count()),
+            ("ssh", self.ssh_count()),
+            ("projects", self.projects_count()),
+            ("worktrees", self.worktrees_count()),
+            ("commands", self.commands_and_schedules_count()),
+        ];
+        text::SUMMARY
+            .get()
+            .split(" · ")
+            .filter_map(|part| {
+                let (key, n) = counts
+                    .iter()
+                    .find(|(key, _)| part.contains(&format!("{{{key}}}")))?;
+                (*n > 0).then(|| part.replace(&format!("{{{key}}}"), &n.to_string()))
+            })
+            .collect::<Vec<_>>()
+            .join(" · ")
     }
 
     /// 데몬 미실행으로 `accounts` 도메인이 건너뛰어졌을 때 사유 문자열을 돌려준다.
@@ -1360,6 +1372,19 @@ fn render_domain_row(
 
 #[cfg(test)]
 mod tests {
+    /// 0개 항목은 요약에서 빠진다(맥미니-설 실기 캡처의 "Claude 계정 0개 · …" 잡음).
+    #[test]
+    fn summary_line_hides_zero_counts() {
+        let mut r = OrcaImportReport::default();
+        assert_eq!(r.summary_line(), "");
+        r.ssh.hosts_added = 1;
+        r.projects.projects_added = 2;
+        let line = r.summary_line();
+        assert!(!line.contains(" 0"), "{line}");
+        assert_eq!(line.matches(" · ").count(), 1, "{line}");
+        assert!(line.contains('1') && line.contains('2'), "{line}");
+    }
+
     use std::fs;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
