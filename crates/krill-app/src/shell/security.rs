@@ -2,6 +2,7 @@
 //! `shell.rs` 병합 충돌을 줄이려고 동작·그리기를 이 모듈에 둔다.
 
 use gpui::{AnyElement, App, Context, Pixels, Point, Window, actions, div, prelude::*};
+use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use krill_app::keys;
 use krill_app::layout::PaneId;
@@ -135,6 +136,7 @@ impl Shell {
                 .text_color(p.popover_foreground)
                 .border_1()
                 .border_color(p.border)
+                .shadow_lg()
                 .font_family(krill_app::ui::FONT_MONO)
                 .text_size(krill_app::ui::TEXT_XS)
                 .child(format_link_preview(uri))
@@ -169,6 +171,7 @@ impl Shell {
                                 .label(sec_text::PASTE_CONFIRM.get())
                                 .debug_selector(|| "paste-confirm".into())
                                 .primary()
+                                .xsmall()
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.confirm_pending_paste(window, cx);
                                 })),
@@ -178,6 +181,7 @@ impl Shell {
                                 .label(sec_text::PASTE_CANCEL.get())
                                 .debug_selector(|| "paste-cancel".into())
                                 .ghost()
+                                .xsmall()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.cancel_pending_paste(cx);
                                 })),
@@ -193,18 +197,22 @@ impl Shell {
         use krill_app::ui::icons;
         let p = krill_app::ui::palette(cx);
         let on = self.security.is_secure_keyboard_enabled();
+        // OWE-886: 상태(켜기/끄기)는 접근성 라벨에 유지하고, 툴팁은 공용 헬퍼로 통일한다.
         let sec_label = if on {
             sec_text::SECURE_KEYBOARD_ON.get()
         } else {
             sec_text::SECURE_KEYBOARD_OFF.get()
         };
-        let btn = Button::new("secure-keyboard-entry")
-            .icon(Icon::default().data(icons::SHIELD_SVG))
-            .xsmall()
-            .accessibility_label(sec_label)
-            .tooltip(sec_text::SECURE_KEYBOARD_TOOLTIP.get())
-            .debug_selector(|| "secure-keyboard-entry".into())
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_secure_keyboard(cx)));
+        let btn = krill_app::ui::button_with_tooltip(
+            Button::new("secure-keyboard-entry")
+                .icon(Icon::default().data(icons::SHIELD_SVG))
+                .xsmall()
+                .debug_selector(|| "secure-keyboard-entry".into())
+                .on_click(cx.listener(|this, _, _, cx| this.toggle_secure_keyboard(cx))),
+            "secure-keyboard-entry",
+            sec_text::SECURE_KEYBOARD_TOOLTIP.get(),
+        )
+        .accessibility_label(sec_label);
         div()
             .h(krill_app::ui::SIDEBAR_HEADER_HEIGHT)
             .px_2()
@@ -219,16 +227,12 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_0p5()
-                    .child(
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new("sidebar-settings")
                             .icon(IconName::Settings)
                             .ghost()
                             .xsmall()
                             .debug_selector(|| "sidebar-settings".into())
-                            .tooltip(krill_app::i18n::catalog::general::SETTINGS_HINT.get())
-                            .accessibility_label(
-                                krill_app::i18n::catalog::general::SETTINGS_HINT.get(),
-                            )
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_settings(
                                     krill_app::settings::AdminTab::General,
@@ -236,7 +240,9 @@ impl Shell {
                                     cx,
                                 );
                             })),
-                    )
+                        "sidebar-settings",
+                        krill_app::i18n::catalog::general::SETTINGS_HINT.get(),
+                    ))
                     .child(if on { btn.primary() } else { btn.ghost() }),
             )
             .child(
@@ -244,31 +250,27 @@ impl Shell {
                     .flex()
                     .items_center()
                     .gap_0p5()
-                    .child(
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new("sidebar-reveal-active")
                             .icon(Icon::default().data(icons::CROSSHAIR_SVG))
                             .ghost()
                             .xsmall()
-                            .tooltip(krill_app::i18n::catalog::sidebar::REVEAL_ACTIVE.get())
-                            .accessibility_label(
-                                krill_app::i18n::catalog::sidebar::REVEAL_ACTIVE.get(),
-                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.sidebar
                                     .update(cx, krill_app::sidebar::Sidebar::reveal_focused);
                             })),
-                    )
-                    .child(
+                        "sidebar-reveal-active",
+                        krill_app::i18n::catalog::sidebar::REVEAL_ACTIVE.get(),
+                    ))
+                    .child(krill_app::ui::button_with_tooltip(
                         Button::new("sidebar-board-view")
                             .icon(Icon::default().data(icons::KANBAN_SVG))
                             .ghost()
                             .xsmall()
-                            .tooltip(krill_app::i18n::catalog::sidebar::NAV_AGENT_DASHBOARD.get())
-                            .accessibility_label(
-                                krill_app::i18n::catalog::sidebar::NAV_AGENT_DASHBOARD.get(),
-                            )
                             .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
-                    ),
+                        "sidebar-board-view",
+                        krill_app::i18n::catalog::sidebar::NAV_AGENT_DASHBOARD.get(),
+                    )),
             )
     }
 }
