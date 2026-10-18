@@ -74,7 +74,7 @@ impl SshHost {
             "-o".to_owned(),
             "StrictHostKeyChecking=accept-new".to_owned(),
             self.destination.clone(),
-            "uname -sr && (command -v krill >/dev/null 2>&1 && echo 'krill: ready' || echo 'krill: not installed')".to_owned(),
+            "uname -sr && ([ -x \"$HOME/.local/bin/krill\" ] || command -v krill >/dev/null 2>&1) && echo 'krill: ready' || echo 'krill: not installed'".to_owned(),
         ]);
         args
     }
@@ -546,6 +546,8 @@ pub struct TailscalePeer {
     pub ipv4: Option<String>,
     /// SSH 접속에 쓸 추천 주소(`dns_name` 우선, 없으면 `ipv4` 또는 `hostname`).
     pub address: String,
+    /// Linux 피어(원격 호스트용 Krill). 접속 사용자를 알 수 없어 바로 추가하지 않고 입력 폼을 채운다.
+    pub linux: bool,
 }
 
 #[derive(Deserialize)]
@@ -584,7 +586,7 @@ struct RawTailscaleNode {
     tailscale_ips: Vec<String>,
 }
 
-/// `tailscale status --json` 출력을 파싱해 온라인 상태인 macOS 피어(자기 자신 제외)만 돌려준다.
+/// `tailscale status --json` 출력을 파싱해 온라인 상태인 macOS·Linux 피어(자기 자신 제외)만 돌려준다.
 #[must_use]
 pub fn parse_tailscale_status(json: &str) -> Vec<TailscalePeer> {
     let Ok(status) = serde_json::from_str::<RawTailscaleStatus>(json) else {
@@ -603,7 +605,8 @@ pub fn parse_tailscale_status(json: &str) -> Vec<TailscalePeer> {
 
     let mut peers = Vec::new();
     for (node_key, node) in status.peer {
-        if !node.online || !node.os.eq_ignore_ascii_case("macos") {
+        let linux = node.os.eq_ignore_ascii_case("linux");
+        if !node.online || !(linux || node.os.eq_ignore_ascii_case("macos")) {
             continue;
         }
         if let (Some(sid), Some(nid)) = (self_id, node.id.as_deref())
@@ -643,6 +646,7 @@ pub fn parse_tailscale_status(json: &str) -> Vec<TailscalePeer> {
             dns_name,
             ipv4,
             address,
+            linux,
         });
     }
     peers.sort_by(|a, b| a.hostname.cmp(&b.hostname).then(a.address.cmp(&b.address)));
@@ -650,7 +654,7 @@ pub fn parse_tailscale_status(json: &str) -> Vec<TailscalePeer> {
     peers
 }
 
-/// 로컬 맥에서 `tailscale status --json`을 실행해 온라인 macOS 피어를 조회한다.
+/// 로컬 맥에서 `tailscale status --json`을 실행해 온라인 macOS·Linux 피어를 조회한다.
 /// Tailscale이 없거나 꺼져 있으면 빈 목록을 돌려준다(오류 아님).
 /// 반드시 백그라운드 실행기에서 호출해야 한다(CONVENTIONS T7).
 #[must_use]
@@ -965,7 +969,7 @@ Host dev-box
     }
 
     #[test]
-    fn tailscale_status_fixture_filters_online_macos_peers_excluding_self() {
+    fn tailscale_status_fixture_filters_online_macos_and_linux_peers_excluding_self() {
         let fixture = r#"{
             "BackendState": "Running",
             "Self": {
@@ -1005,6 +1009,15 @@ Host dev-box
                     "Online": true,
                     "TailscaleIPs": ["100.100.1.3"]
                 },
+                "nodekey:win555": {
+                    "ID": "n5",
+                    "PublicKey": "nodekey:win555",
+                    "HostName": "gaming-pc",
+                    "DNSName": "gaming-pc.tail123.ts.net.",
+                    "OS": "windows",
+                    "Online": true,
+                    "TailscaleIPs": ["100.100.1.5"]
+                },
                 "nodekey:mac444": {
                     "ID": "n4",
                     "PublicKey": "nodekey:mac444",
@@ -1017,11 +1030,16 @@ Host dev-box
             }
         }"#;
         let peers = parse_tailscale_status(fixture);
-        assert_eq!(peers.len(), 1);
-        assert_eq!(peers[0].hostname, "오웬의 Mac Studio");
-        assert_eq!(peers[0].dns_name, "owen-studio.tail123.ts.net");
-        assert_eq!(peers[0].ipv4.as_deref(), Some("100.100.1.2"));
-        assert_eq!(peers[0].address, "owen-studio.tail123.ts.net");
+        // 자기 자신·오프라인·Windows는 빠지고, Linux는 원격 호스트 후보로 남는다(이름순).
+        assert_eq!(peers.len(), 2);
+        assert_eq!(peers[0].hostname, "ubuntu-server");
+        assert_eq!(peers[0].address, "ubuntu.tail123.ts.net");
+        assert!(peers[0].linux);
+        assert_eq!(peers[1].hostname, "오웬의 Mac Studio");
+        assert_eq!(peers[1].dns_name, "owen-studio.tail123.ts.net");
+        assert_eq!(peers[1].ipv4.as_deref(), Some("100.100.1.2"));
+        assert_eq!(peers[1].address, "owen-studio.tail123.ts.net");
+        assert!(!peers[1].linux);
 
         // Stopped backend returns empty list quietly.
         let stopped = r#"{"BackendState": "Stopped", "Peer": {}}"#;
@@ -1061,8 +1079,10 @@ Host dev-box
         assert!(home_args.windows(2).any(|w| w == ["-p", "2201"]));
         assert_eq!(home_args.last().unwrap(), &krill_hosts::ssh::remote_query());
         assert_eq!(
-            host.resolve_remote_socket_from_home("/Users/remoteowen\ndev.minikrill.app\n")
-                .unwrap(),
+            host.resolve_remote_socket_from_home(
+                "/Users/remoteowen\nLibrary/Application Support/dev.minikrill.app\n",
+            )
+            .unwrap(),
             PathBuf::from(
                 "/Users/remoteowen/Library/Application Support/dev.minikrill.app/run/krilld.sock"
             )

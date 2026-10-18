@@ -961,3 +961,37 @@ fn resume_and_hibernation_account_tails_decode_old_bytes() {
         assert_eq!(Request::decode(kind::REQUEST, &body).unwrap(), request);
     }
 }
+
+/// `Failure::Os` 와이어: 같은 OS끼리는 늘 원래 errno로 돌아오고, Linux 번호는 표식으로 구분돼 macOS가 아는 것만 옮긴다.
+#[test]
+fn os_failure_errno_travels_in_macos_numbering() {
+    use super::wire_errno::{from_wire, to_wire};
+    for errno in [1, 2, 11, 13, 34, 35, 38, 40, 62, 63, 78, 110, 4000] {
+        assert_eq!(
+            from_wire(to_wire(errno)),
+            errno,
+            "same-OS roundtrip {errno}"
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(to_wire(2), 2);
+        assert_eq!(to_wire(38), 10_038);
+        assert_eq!(from_wire(78), 38, "원격 Mac의 ENOSYS");
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        assert_eq!(to_wire(78), 78);
+        assert_eq!(from_wire(10_038), 78, "Linux ENOSYS → macOS ENOSYS");
+        assert_eq!(
+            from_wire(10_062),
+            10_062,
+            "모르는 Linux 번호는 틀린 문구 대신 그대로"
+        );
+        assert_eq!(
+            roundtrip(&Reply::Failed(Failure::Os(78))),
+            "050000003103069c01",
+            "macOS 와이어 바이트 불변"
+        );
+    }
+}

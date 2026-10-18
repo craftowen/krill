@@ -148,3 +148,57 @@ fn stalled_home_query_does_not_block_ui_state_or_other_hosts() {
     assert_eq!(manager.tunnel_starts("studio"), 0);
     assert_eq!(manager.specs()[0].port, Some(2223));
 }
+
+/// 터널은 사는데 원격 krilld에 닿지 못하면(ssh가 채널을 바로 닫음 → Hello EOF) 터널을 내려, 다음 시도에서
+/// 원격 경로를 다시 찾고 데몬을 깨운다. "다시 연결"은 살아 있는 터널도 내린다.
+#[test]
+fn eof_through_live_tunnel_and_reconnect_now_rebuild_the_tunnel() {
+    let dir = std::env::temp_dir().join(format!("m131-eof-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("ssh");
+    // 가짜 ssh: `-L <local>:<remote>`의 local에서 받자마자 닫는다(원격 소켓이 없는 ssh 포워딩과 같은 관측).
+    fs::write(
+        &script,
+        r#"#!/bin/sh
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-L" ]; then fwd="$a"; fi
+  prev="$a"
+done
+exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $ARGV[0], Listen => 5) or exit 3; while ($c = $s->accept) { close $c }' "${fwd%%:*}"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+    let manager = HostManager::with_ssh_program(dir.clone(), script.into_os_string());
+    manager.sync_specs(&[spec(Some("/tmp/remote.sock"))]);
+    let target = manager
+        .target_for(&HostId::Remote("studio".into()), None)
+        .unwrap();
+    let hello = krill_proto::daemon::client_hello(krill_proto::ipc::ClientRole::App, "m131-eof");
+
+    assert!(target.connect(&hello).is_err());
+    assert_eq!(manager.tunnel_starts("studio"), 1);
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+    assert_eq!(
+        manager.tunnel_pid("studio"),
+        None,
+        "EOF must drop the live tunnel"
+    );
+
+    thread::sleep(HostManager::backoff_delay(1) + Duration::from_millis(50));
+    assert!(target.connect(&hello).is_err());
+    assert_eq!(manager.tunnel_starts("studio"), 2, "next attempt rebuilds");
+
+    // 터널을 살린 채로 "다시 연결": 백오프를 풀고 터널을 새로 만든다.
+    manager.reconnect_now("studio");
+    manager.ensure_tunnel_socket("studio").unwrap();
+    assert!(manager.tunnel_pid("studio").is_some());
+    manager.reconnect_now("studio");
+    assert_eq!(manager.tunnel_pid("studio"), None);
+    manager.ensure_tunnel_socket("studio").unwrap();
+    assert_eq!(manager.tunnel_starts("studio"), 4);
+    drop(manager);
+    fs::remove_dir_all(&dir).ok();
+}

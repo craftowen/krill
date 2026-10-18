@@ -528,6 +528,7 @@ fn kill_group(child: &mut Child) {
 
 /// MK-096 완료 조건(설정 켜짐): ad-hoc 서명 피어는 전체 권한을 유지한다.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: 코드서명(codesign)")]
 fn real_adhoc_peer_passes_when_signing_required() {
     let dir = Dir::new("sign-real-pass");
     let sock = dir.0.join("s");
@@ -555,6 +556,7 @@ fn real_adhoc_peer_passes_when_signing_required() {
 
 /// MK-096 완료 조건(설정 켜짐): 요구 식별자와 다른 서명의 피어는 전체 권한을 잃는다.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: 코드서명(codesign)")]
 fn real_identifier_mismatch_is_denied() {
     let dir = Dir::new("sign-real-mismatch");
     let sock = dir.0.join("s");
@@ -583,6 +585,7 @@ fn real_identifier_mismatch_is_denied() {
 
 /// MK-096(설정 꺼짐): 서명 여부와 무관하게 기존처럼 전체 권한이다.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: 코드서명(codesign)")]
 fn real_policy_off_keeps_full() {
     let dir = Dir::new("sign-real-off");
     let sock = dir.0.join("s");

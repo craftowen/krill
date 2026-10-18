@@ -90,11 +90,12 @@ fn child(name: &str, dir: &Path, wrap: &str) -> Child {
 #[test]
 fn cold_pages_beyond_10k_lines_match_original() {
     let root = tmp("pages");
-    // 봉인을 작게 잡아 세그먼트 여러 개(워밍업 재생 경로)를 지나게 한다.
+    // 봉인을 작게 잡아 세그먼트 여러 개(워밍업 재생 경로)를 지나게 한다. 봉인은 PTY 읽기 단위 경계에서 일어나
+    // Linux(한 번에 수십 KB)는 macOS보다 크게 넘친다. 276KB 출력에서 어느 쪽이든 3개 이상 나오도록 64KiB로 잡는다.
     let store = Store::open(
         &root,
         Limits {
-            seal_bytes: 128 << 10,
+            seal_bytes: 64 << 10,
             ..Limits::default()
         },
     )

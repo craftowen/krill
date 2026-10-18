@@ -50,6 +50,10 @@ fn directory_in(get: impl Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
     if let Some(dir) = get("KRILL_LOG_DIR") {
         return Some(PathBuf::from(dir));
     }
+    // Linux 원격 호스트: `~/.local/state/krill/logs`(XDG state). macOS 경로를 만들지 않는다.
+    if cfg!(target_os = "linux") {
+        return get("HOME").map(|h| PathBuf::from(h).join(".local/state/krill/logs"));
+    }
     get("HOME").map(|h| {
         let logs = PathBuf::from(h).join("Library/Logs");
         let (new, old) = (logs.join("Krill"), logs.join("Minikrill"));
@@ -86,15 +90,18 @@ mod tests {
             Some(PathBuf::from("/KRILL_LOG_DIR"))
         );
         let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
-        assert_eq!(
-            directory_in(home),
-            Some(PathBuf::from("/h/Library/Logs/Krill"))
-        );
+        let want = if cfg!(target_os = "linux") {
+            "/h/.local/state/krill/logs"
+        } else {
+            "/h/Library/Logs/Krill"
+        };
+        assert_eq!(directory_in(home), Some(PathBuf::from(want)));
         assert_eq!(directory_in(|_| None), None);
     }
 
     /// MK-170: 이관 전에는 옛 `Logs/Minikrill`, 옮겨진 뒤(옛 자리는 링크)에는 `Logs/Krill`.
     #[test]
+    #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: ~/Library/Logs 이관")]
     fn directory_follows_bundle_migration() {
         let home = std::env::temp_dir().join(format!("mk170-log-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();
