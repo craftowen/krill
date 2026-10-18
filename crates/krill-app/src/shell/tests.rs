@@ -1841,16 +1841,21 @@ fn shell_sidebar_worktree_launches_session_and_tracks_visibility(cx: &mut TestAp
     cx.run_until_parked();
     assert!(cx.update(|_, cx| view.read(cx).sidebar.read(cx).is_visible()));
 
-    // 창이 비활성화되면 사이드바·Git 패널 가시성이 꺼지고, 활성화되면 열린 상태로 복원된다.
+    // OWE-844: 창이 비포커스되어도 열려 있는 사이드바·Git 패널의 가시성(`is_visible`)과 폴링은 유지되고
+    // 활성 상태(`is_active`)만 분리해 추적한다.
     cx.update(|_, cx| view.update(cx, |s, cx| s.on_window_active_changed(false, cx)));
     cx.run_until_parked();
-    assert!(!cx.update(|_, cx| view.read(cx).sidebar.read(cx).is_visible()));
-    assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
+    assert!(cx.update(|_, cx| view.read(cx).sidebar.read(cx).is_visible()));
+    assert!(!cx.update(|_, cx| view.read(cx).sidebar.read(cx).is_active()));
+    assert!(cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
+    assert!(!cx.update(|_, cx| view.read(cx).diff.read(cx).is_active()));
 
     cx.update(|_, cx| view.update(cx, |s, cx| s.on_window_active_changed(true, cx)));
     cx.run_until_parked();
     assert!(cx.update(|_, cx| view.read(cx).sidebar.read(cx).is_visible()));
+    assert!(cx.update(|_, cx| view.read(cx).sidebar.read(cx).is_active()));
     assert!(cx.update(|_, cx| view.read(cx).diff.read(cx).is_visible()));
+    assert!(cx.update(|_, cx| view.read(cx).diff.read(cx).is_active()));
 }
 
 /// N10(OWE-596): 재개 시도는 성공하기 전까지 레이아웃의 옛 세션 연결을 지우지 않고,
