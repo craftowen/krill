@@ -147,7 +147,7 @@
 | MK-124 | 1-스캔 QR 페어링: 관리자 페이지 `Mobile` 전용 탭(8번째 탭) + `krill mobile` CLI + Cloudflare Quick Tunnel(`--tunnel`) | M9 | P0 | `Mobile` 8번째 설정 탭 UI 동작, QR 생성·만료·모드 전환 시 무효화/갱신, `krill mobile pair/devices/revoke/serve` CLI 및 `--tunnel` URL 파싱 단위·통합 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-109 | M9 | OWE-680 |
 | MK-125 | 내장 모바일 PWA 클라이언트 코어(`Needs You` 최상단·세션 카드·원탭 권한 승인·프롬프트/사진 첨부·오케스트레이션·계정 스위처·Git 변경) | M9 | P0 | 모바일 PWA 정적 에셋 내장 서빙(비보안 HTTP 컨텍스트 호환), 세션 목록·원탭 승인·프롬프트/이미지 첨부·오케스트레이션/계정 전환 E2E 테스트 통과, `scripts/check.sh` 0 | MK-123, MK-124 | M9 | OWE-681 |
 | MK-126 | 모바일 라이브 터미널 그리드 뷰(화면 델타·핫/콜드 스크롤백·특수키 바·`Fit to Phone`) + 딥링크 웹훅 알림 및 실화면 QA | M9 | P1 | 라이브 그리드 델타·콜드 스크롤백·보조 키바·Fit to Phone·웹훅 딥링크 테스트 통과, 실화면 검증 완료, `scripts/check.sh` 0 | MK-125, MK-086 | M9 | OWE-682 |
-| MK-127 | 설치 후 온보딩 v2(상위): 동의·macOS 권한 점검·필수 요소 체크리스트 | M4 | P1 | 새 계정에서 동의→체크리스트→완료 실화면, 동의 거절 시 세션 생존, 기존 사용자는 동의만 1회, `scripts/check.sh` 0 | MK-073 | crates/krill-app/src/onboarding.rs | OWE-688 |
+| MK-127 | 설치 후 온보딩 v2(상위): macOS 권한 점검·필수 요소 체크리스트(첫 실행 동의 화면 없음, OWE-904) | M4 | P1 | 새 계정 첫 실행에 모달 없이 완료·자동 준비, 필수 설치 안내는 조치 배너·빠른 점검(상태바)·점검 모달로, `scripts/check.sh` 0 | MK-073 | crates/krill-app/src/onboarding.rs | OWE-688 |
 | MK-128 | 온보딩 점검 엔진(`krill doctor --json`, 공용 점검 ID·등급·수정 방법) | M4 | P1 | 판정 순수 함수 항목별 경계 테스트, 사람용 출력 회귀 없음, `scripts/check.sh` 0 | MK-067 | crates/krill/src/doctor.rs | OWE-689 |
 | MK-129 | 온보딩 동의 화면 + `consent.toml` 버전 재동의 | M4 | P1 | 파일 없음·구버전·손상·0600·원자 쓰기 테스트, 거절 시 앱만 종료·세션 생존 | MK-075 | crates/krilld/src/store/privacy.rs | OWE-690 |
 | MK-160 | 앱 전용 점검(설치 위치·알림 권한·폴더/전체 디스크 접근, TCC 귀속 측정 선행) | M4 | P1 | TCC 귀속 측정값, 판정 순수 함수 테스트, `scripts/check.sh` 0 | MK-044 | crates/krill-app/src/alert.rs | OWE-691 |
