@@ -5,8 +5,8 @@
 use std::path::Path;
 
 use gpui::{Focusable as _, PromptLevel};
+use gpui_component::Icon;
 use gpui_component::input::{Editor, EditorState, InputEvent};
-use gpui_component::{Icon, Selectable as _};
 use krill_app::editor::{self, Disk, Doc, Opened, Poll, Preview, SaveError, Unopenable};
 use krill_app::file_format::view::{self as fview, CsvView, ImageView};
 use krill_app::file_format::{Kind, csv, ipynb};
@@ -544,6 +544,7 @@ impl Shell {
                     .flex_1()
                     .min_w_0()
                     .truncate()
+                    .font_family(krill_app::ui::FONT_MONO)
                     .text_size(krill_app::ui::TEXT_XS)
                     .text_color(p.muted_foreground)
                     // OWE-849: 절대 경로 대신 워크트리 상대 경로(또는 `~` 축약)를 보인다.
@@ -583,10 +584,12 @@ impl Shell {
                 .gap_2()
                 .px_2()
                 .py_1()
-                .bg(p.warning)
-                .text_color(p.warning_foreground)
+                .border_b_1()
+                .border_color(p.warning.opacity(0.3))
+                .bg(p.warning.opacity(0.12))
+                .text_color(p.warning)
                 .text_size(krill_app::ui::TEXT_XS)
-                .child(div().min_w_0().child(msg.to_owned()))
+                .child(div().flex_1().min_w_0().truncate().child(msg.to_owned()))
         };
         let disk = tab
             .and_then(|t| t.doc.as_ref())
@@ -606,7 +609,9 @@ impl Shell {
                             .gap_1()
                             .child(
                                 Button::new(("file-reload", id.get()))
+                                    .debug_selector(|| "file-reload".into())
                                     .label(etext::RELOAD.get())
+                                    .outline()
                                     .xsmall()
                                     .on_click(cx.listener(move |this, _, window, cx| {
                                         this.reload_file(id, window, cx);
@@ -614,6 +619,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new(("file-keep", id.get()))
+                                    .debug_selector(|| "file-keep".into())
                                     .label(etext::KEEP.get())
                                     .ghost()
                                     .xsmall()
@@ -635,12 +641,11 @@ impl Shell {
         };
         let error = tab.and_then(|t| t.error.clone()).map(|e| {
             div()
-                .debug_selector(|| "file-error".into())
+                .flex_none()
                 .px_2()
                 .py_1()
-                .text_size(krill_app::ui::TEXT_XS)
-                .text_color(p.destructive)
-                .child(e)
+                .child(krill_app::ui::error_banner(p, e))
+                .debug_selector(|| "file-error".into())
         });
         let notice = |msg: String| {
             div()
@@ -657,15 +662,16 @@ impl Shell {
             Some(Body::Text {
                 shown: Some(shown), ..
             }) => match shown {
-                Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone()),
+                Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
                 Shown::Table(view) => view.clone().into_any_element(),
                 Shown::Notebook(Ok(nb)) => fview::notebook(("file-ipynb", id.get()), nb, cx),
                 Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
                 Shown::Image(view) => view.clone().into_any_element(),
             },
-            Some(Body::Text { state, .. }) => Editor::new(state)
-                .bordered(false)
-                .h(gpui::relative(1.))
+            Some(Body::Text { state, .. }) => div()
+                .size_full()
+                .bg(p.editor_surface)
+                .child(Editor::new(state).bordered(false).h(gpui::relative(1.)))
                 .into_any_element(),
             Some(Body::Image(view)) => view.clone().into_any_element(),
             Some(Body::Table(view)) => view.clone().into_any_element(),
@@ -714,25 +720,24 @@ impl Shell {
         };
         let (preview_label, edit_label) = toggle_labels(*preview);
         let previewing = shown.is_some();
-        let button = |name: &'static str, label: &'static str, on: bool| {
-            Button::new((name, id.get()))
-                .label(label)
-                .ghost()
-                .xsmall()
-                .selected(previewing == on)
+        let p = krill_app::ui::palette(cx);
+        let segment_button = |name: &'static str, label: &'static str, on: bool| {
+            krill_app::ui::segment((name, id.get()), label, previewing == on)
+                .debug_selector(move || name.to_owned())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();
                     this.set_preview(id, on, window, cx);
                 }))
         };
         Some(
-            div()
-                .flex()
-                .flex_none()
-                .gap_0p5()
-                .debug_selector(|| "file-preview-toggle".into())
-                .child(button("file-preview", preview_label, true))
-                .child(button("file-edit", edit_label, false)),
+            krill_app::ui::segmented_control(
+                p,
+                [
+                    segment_button("file-preview", preview_label, true),
+                    segment_button("file-edit", edit_label, false),
+                ],
+            )
+            .debug_selector(|| "file-preview-toggle".into()),
         )
     }
 
@@ -862,7 +867,7 @@ impl Shell {
                     d.child(
                         div()
                             .debug_selector(|| "file-dirty".into())
-                            .size(px(6.))
+                            .size(krill_app::ui::STATE_DOT)
                             .rounded_full()
                             .bg(p.foreground),
                     )

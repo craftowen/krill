@@ -1146,20 +1146,13 @@ impl Panel {
                         Self::render_tab_button(PanelTab::Changes, changes_active, p)
                             .when(show_badge, |d| {
                                 d.child(
-                                    div()
-                                        .id("diff-file-count")
-                                        .debug_selector(|| "diff-file-count".into())
-                                        .px_1()
-                                        .rounded(crate::ui::RADIUS_XS)
-                                        .bg(p.muted)
-                                        .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_2XS)
-                                        .text_color(if changes_active {
-                                            p.sidebar_accent_foreground
-                                        } else {
-                                            p.muted_foreground
-                                        })
-                                        .child(file_count.to_string()),
+                                    crate::ui::badge(
+                                        p,
+                                        crate::ui::BadgeTone::Muted,
+                                        file_count.to_string(),
+                                    )
+                                    .id("diff-file-count")
+                                    .debug_selector(|| "diff-file-count".into()),
                                 )
                             })
                             .on_click(
@@ -1190,22 +1183,17 @@ impl Panel {
                             })
                             .when_some(checks_badge, |d, count| {
                                 d.child(
-                                    div()
-                                        .id("diff-checks-count")
-                                        .debug_selector(|| "diff-checks-count".into())
-                                        .px_1()
-                                        .rounded(crate::ui::RADIUS_XS)
-                                        .bg(p.muted)
-                                        .font_family(crate::ui::FONT_MONO)
-                                        .text_size(crate::ui::TEXT_2XS)
-                                        .text_color(if count > 0 {
-                                            p.destructive
-                                        } else if checks_active {
-                                            p.sidebar_accent_foreground
+                                    crate::ui::badge(
+                                        p,
+                                        if count > 0 {
+                                            crate::ui::BadgeTone::Destructive
                                         } else {
-                                            p.muted_foreground
-                                        })
-                                        .child(count.to_string()),
+                                            crate::ui::BadgeTone::Muted
+                                        },
+                                        count.to_string(),
+                                    )
+                                    .id("diff-checks-count")
+                                    .debug_selector(|| "diff-checks-count".into()),
                                 )
                             })
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -1263,7 +1251,8 @@ impl Panel {
             .gap_1()
             .border_b_1()
             .border_color(p.sidebar_border)
-            .children(
+            .child(crate::ui::segmented_control(
+                p,
                 [Comparison::Worktree, Comparison::Index]
                     .into_iter()
                     .enumerate()
@@ -1275,42 +1264,8 @@ impl Panel {
                         } else {
                             text::INDEX.get()
                         };
-                        div()
-                            .id(("comparison", i))
+                        crate::ui::segment(("comparison", i), format!("{label} {count}"), active)
                             .debug_selector(move || format!("comparison-{i}"))
-                            .flex_1()
-                            .h(px(24.))
-                            .px_2()
-                            .rounded(crate::ui::RADIUS_XS)
-                            .cursor_pointer()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .gap_1p5()
-                            .text_size(crate::ui::TEXT_XS)
-                            .font_weight(if active {
-                                FontWeight::SEMIBOLD
-                            } else {
-                                FontWeight::NORMAL
-                            })
-                            .text_color(if active {
-                                p.sidebar_accent_foreground
-                            } else {
-                                p.muted_foreground
-                            })
-                            .when(active, |d| d.bg(p.sidebar_accent))
-                            .hover(|d| {
-                                d.bg(p.sidebar_accent)
-                                    .text_color(p.sidebar_accent_foreground)
-                            })
-                            .child(label)
-                            .child(
-                                div()
-                                    .font_family(crate::ui::FONT_MONO)
-                                    .text_size(crate::ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(count.to_string()),
-                            )
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if this.comparison != comparison {
                                     this.comparison = comparison;
@@ -1333,7 +1288,7 @@ impl Panel {
                                 }
                             }))
                     }),
-            )
+            ))
     }
 
     fn render_file_row(
@@ -1405,6 +1360,9 @@ impl Panel {
                     .child(
                         div()
                             .flex_none()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(crate::ui::FONT_MONO)
                             .font_weight(if selected {
                                 FontWeight::SEMIBOLD
                             } else {
@@ -1438,14 +1396,7 @@ impl Panel {
                         .when(deleted > 0 || added == 0, |d| {
                             d.child(div().text_color(p.destructive).child(format!("−{deleted}")))
                         }),
-                    _ => div()
-                        .flex_none()
-                        .px_1()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .bg(p.muted)
-                        .text_size(crate::ui::TEXT_2XS)
-                        .text_color(p.muted_foreground)
-                        .child(text::BINARY.get()),
+                    _ => crate::ui::badge(p, crate::ui::BadgeTone::Muted, text::BINARY.get()),
                 }
             }))
             .child(
@@ -1551,7 +1502,7 @@ impl Panel {
             .flex_1()
             .min_h_0()
             .px_4()
-            .py_6()
+            .py(crate::ui::SIDEBAR_EMPTY_PY)
             .flex()
             .flex_col()
             .items_center()
