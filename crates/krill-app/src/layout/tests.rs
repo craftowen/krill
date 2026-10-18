@@ -773,3 +773,31 @@ fn v6_layout_migrates_with_pin_color_and_no_title() {
     assert_eq!(loaded.tab_title(0), None);
     assert_eq!(loaded.tab_title(1), None);
 }
+
+/// OWE-871: 기하 방향 이동은 분할 배치대로 포커스를 옮기고, 없는 쪽이면 그대로 둔다.
+#[test]
+fn focus_direction_moves_geometrically() {
+    let mut l = Layout::default(); // pane 0
+    l.split(Axis::Horizontal); // pane 1이 오른쪽, 포커스는 1
+    assert_eq!(l.focused(), Some(PaneId(1)));
+    l.focus_direction(Direction::Left);
+    assert_eq!(l.focused(), Some(PaneId(0)));
+    l.focus_direction(Direction::Left);
+    assert_eq!(l.focused(), Some(PaneId(0)));
+    l.focus_direction(Direction::Up);
+    assert_eq!(l.focused(), Some(PaneId(0)));
+    l.focus_direction(Direction::Right);
+    assert_eq!(l.focused(), Some(PaneId(1)));
+
+    // 왼쪽 칸을 상하로 가른다: root H[ V[0, 2], 1 ].
+    l.focus(PaneId(0));
+    l.split(Axis::Vertical); // pane 2가 아래, 포커스는 2
+    assert_eq!(l.focused(), Some(PaneId(2)));
+    l.focus_direction(Direction::Up);
+    assert_eq!(l.focused(), Some(PaneId(0)));
+    l.focus_direction(Direction::Right);
+    assert_eq!(l.focused(), Some(PaneId(1)));
+    l.focus_direction(Direction::Down);
+    assert_eq!(l.focused(), Some(PaneId(2)));
+    assert!(l.is_valid());
+}

@@ -52,6 +52,20 @@ pub enum Branch {
     Second,
 }
 
+/// OWE-871: 기하 방향 포커스 이동(⌘⌥⇧+화살표)에 쓰는 4방향.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// `[x, y, w, h]` 사각형의 중심점.
+fn center(rect: [f32; 4]) -> (f32, f32) {
+    (rect[0] + rect[2] / 2., rect[1] + rect[3] / 2.)
+}
+
 /// 탭 색상 태그(MK-180, Orca 9색 패리티).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum TabColor {
@@ -940,6 +954,75 @@ impl Layout {
         let len = leaves.len().cast_signed();
         let next = (cur.cast_signed() + step).rem_euclid(len).cast_unsigned();
         self.tabs[self.active].focused = leaves[next];
+    }
+
+    /// OWE-871: 활성 탭 안에서 `dir` 쪽에 가장 가까운 칸으로 포커스를 옮긴다.
+    /// 칸 배치는 분할 트리의 비율로 0~1 정사각형에 펼쳐 중심점으로 견준다.
+    /// 같은 쪽에 칸이 없으면 그대로 둔다.
+    pub fn focus_direction(&mut self, dir: Direction) {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return;
+        };
+        let mut rects = Vec::new();
+        Self::leaf_rects(&tab.root, [0., 0., 1., 1.], &mut rects);
+        let cur = rects
+            .iter()
+            .find(|(p, _)| *p == tab.focused)
+            .map(|(_, r)| center(*r));
+        let Some((cur_x, cur_y)) = cur else {
+            return;
+        };
+        let mut best: Option<(PaneId, f32)> = None;
+        for (pane, rect) in &rects {
+            if *pane == tab.focused {
+                continue;
+            }
+            let (cand_x, cand_y) = center(*rect);
+            let (primary, perp) = match dir {
+                Direction::Left => (cur_x - cand_x, (cur_y - cand_y).abs()),
+                Direction::Right => (cand_x - cur_x, (cur_y - cand_y).abs()),
+                Direction::Up => (cur_y - cand_y, (cur_x - cand_x).abs()),
+                Direction::Down => (cand_y - cur_y, (cur_x - cand_x).abs()),
+            };
+            if primary <= f32::EPSILON {
+                continue;
+            }
+            let score = primary + perp * 2.;
+            if best.is_none_or(|(_, s)| score < s) {
+                best = Some((*pane, score));
+            }
+        }
+        if let Some((pane, _)) = best {
+            self.tabs[self.active].focused = pane;
+        }
+    }
+
+    /// 분할 트리를 0~1 정사각형에 펼쳐 잎마다 `[x, y, w, h]`를 모은다.
+    fn leaf_rects(node: &PaneTree, rect: [f32; 4], out: &mut Vec<(PaneId, [f32; 4])>) {
+        match node {
+            PaneTree::Leaf(id) => out.push((*id, rect)),
+            PaneTree::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let [left, top, width, height] = rect;
+                let clamped = ratio.clamp(0., 1.);
+                let (first_rect, second_rect) = match axis {
+                    Axis::Horizontal => (
+                        [left, top, width * clamped, height],
+                        [left + width * clamped, top, width * (1. - clamped), height],
+                    ),
+                    Axis::Vertical => (
+                        [left, top, width, height * clamped],
+                        [left, top + height * clamped, width, height * (1. - clamped)],
+                    ),
+                };
+                Self::leaf_rects(first, first_rect, out);
+                Self::leaf_rects(second, second_rect, out);
+            }
+        }
     }
 
     /// 활성 탭에서 `path`의 분할 비율을 바꾼다. 범위 밖 값은 무시한다.

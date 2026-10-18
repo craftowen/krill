@@ -299,6 +299,8 @@ pub struct TerminalElement {
     pub cursor: CursorStyle,
     /// 깜박임의 꺼진 순간(OWE-658). 셸 타이머가 뒤집는다.
     pub cursor_hidden: bool,
+    /// 비포커스 칸의 빈 테두리 블록 커서(OWE-871). 셸이 포커스 칸이 아닐 때 켠다.
+    pub cursor_hollow: bool,
 }
 
 impl TerminalElement {
@@ -315,6 +317,7 @@ impl TerminalElement {
             link: None,
             opacity: 1.,
             cursor_hidden: false,
+            cursor_hollow: false,
         }
     }
 
@@ -583,6 +586,24 @@ impl Element for TerminalElement {
         if cur.visible && !self.cursor_hidden {
             let origin = point(col_x(cur.column), line_y(cur.line));
             let width = cell.width * f32::from(self.screen.cursor_width());
+            // OWE-871: 비포커스 칸의 블록 커서는 채우지 않고 테두리만 그린다.
+            if self.cursor_hollow && self.cursor.shape == CursorShape::Block {
+                let color = hsla(theme.cursor);
+                let top = Bounds::new(origin, size(width, CURSOR_THIN));
+                let bottom = Bounds::new(
+                    point(origin.x, origin.y + cell.height - CURSOR_THIN),
+                    size(width, CURSOR_THIN),
+                );
+                let left = Bounds::new(origin, size(CURSOR_THIN, cell.height));
+                let right = Bounds::new(
+                    point(origin.x + width - CURSOR_THIN, origin.y),
+                    size(CURSOR_THIN, cell.height),
+                );
+                for bounds in [top, bottom, left, right] {
+                    window.paint_quad(fill(bounds, color));
+                }
+                return;
+            }
             let (origin, extent, alpha) = match self.cursor.shape {
                 CursorShape::Block => (origin, size(width, cell.height), CURSOR_ALPHA),
                 CursorShape::Underline => (
