@@ -1623,6 +1623,89 @@ fn settings_window_draws_themed_titlebar(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
+/// OWE-795: 미구현 호스트 범위 가짜 드롭다운(`admin-host-scope-bar`)은 노출하지 않고,
+/// 사이드바 검색 지우기(`X`)·0건 본문 빈 상태·페이지 헤더(제목+1줄 부제+우측 보조 동작 슬롯)를 그린다.
+#[gpui::test]
+fn settings_shell_removes_fake_host_bar_and_renders_search_clear_empty_and_page_header(
+    cx: &mut TestAppContext,
+) {
+    let d = dir("owe795-shell");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1600.), px(1000.)));
+    vcx.run_until_parked();
+
+    for tab in AdminTab::ALL {
+        assert!(!tab.subtitle_message().in_language(Language::Ko).is_empty());
+        assert!(!tab.subtitle_message().in_language(Language::En).is_empty());
+        vcx.update(|_, cx| view.update(cx, |v, cx| v.set_tab(tab, cx)));
+        vcx.run_until_parked();
+        assert!(
+            vcx.debug_bounds("admin-host-scope-bar").is_none(),
+            "fake host scope dropdown must not render on {tab:?}"
+        );
+        assert!(vcx.debug_bounds("admin-page-header").is_some());
+        assert!(vcx.debug_bounds("admin-page-title").is_some());
+        assert!(vcx.debug_bounds("admin-page-subtitle").is_some());
+        assert!(vcx.debug_bounds("admin-page-header-actions").is_some());
+        assert_eq!(
+            vcx.debug_bounds("admin-page-badge").is_some(),
+            tab.badge().is_some(),
+            "badge mismatch on {tab:?}"
+        );
+        let col = vcx
+            .debug_bounds("admin-content-column")
+            .expect("missing admin-content-column");
+        assert!(
+            col.size.width <= crate::ui::SETTINGS_CONTENT_MAX_WIDTH + px(1.),
+            "content column width {:?} exceeds max width",
+            col.size.width
+        );
+    }
+
+    // 검색어가 비어 있을 때는 ⌘F 힌트가 보이고 X 지우기 버튼은 숨겨진다.
+    assert!(vcx.debug_bounds("admin-search-hint").is_some());
+    assert!(vcx.debug_bounds("admin-search-clear").is_none());
+
+    // 검색어를 입력하면 우측 X 지우기 버튼이 나타나고, 클릭 시 검색어가 지워지며 전체 탭이 복원된다.
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_input("ssh");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-search-clear").is_some());
+    assert!(vcx.debug_bounds("admin-search-hint").is_none());
+    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-tab-general").is_none());
+
+    let clear_btn = vcx
+        .debug_bounds("admin-search-clear")
+        .expect("missing admin-search-clear");
+    vcx.simulate_click(clear_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-search-clear").is_none());
+    assert!(vcx.debug_bounds("admin-search-hint").is_some());
+    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+
+    // 검색 결과가 0건이면 우측 본문 영역에 빈 상태 카드가 표시되고 기존 탭 본문 헤더는 숨겨진다.
+    vcx.simulate_keystrokes("cmd-f");
+    vcx.simulate_input("zzz-no-such-setting");
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-search-empty").is_some());
+    assert!(vcx.debug_bounds("admin-content-search-empty").is_some());
+    assert!(vcx.debug_bounds("admin-page-header").is_none());
+
+    // 본문 빈 상태 카드의 '검색 지우기' 버튼을 누르면 검색어가 비워지고 탭 본문이 복원된다.
+    let clear_empty_btn = vcx
+        .debug_bounds("admin-content-search-clear")
+        .expect("missing admin-content-search-clear");
+    vcx.simulate_click(clear_empty_btn.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-content-search-empty").is_none());
+    assert!(vcx.debug_bounds("admin-page-header").is_some());
+    assert!(vcx.debug_bounds("admin-tab-general").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
+
 #[test]
 fn agent_card_save_writes_args_env_and_rejects_bad_lines() {
     let d = dir("owe657");
