@@ -264,12 +264,13 @@ fn rows_expose_voiceover_names_roles_and_press(cx: &mut TestAppContext) {
                 .collect::<Vec<_>>()
         })
     });
+    // OWE-900: 저장소 헤더 접근성 레이블에 워크트리 수(자기 자신 제외)가 붙는다.
     assert_eq!(
         labels,
         [
             text::NEEDS_YOU.get(),
             "claude · a, 입력 대기",
-            "저장소 repo",
+            "저장소 repo 1",
             "워크트리 a, 입력 대기",
             "세션",
             "세션 3, 작업 중",
@@ -405,9 +406,14 @@ fn claude_worktrees_hidden_card_and_toggle(cx: &mut TestAppContext) {
             (labels, expanded)
         })
     });
+    // OWE-900: 저장소 헤더 접근성 레이블에 워크트리 수(자기 자신 제외)가 붙는다.
     assert_eq!(
         collapsed_labels,
-        ["저장소 repo", "워크트리 repo", ".claude/worktrees 숨김 (2)"]
+        [
+            "저장소 repo 2",
+            "워크트리 repo",
+            ".claude/worktrees 숨김 (2)"
+        ]
     );
     assert_eq!(hidden_expanded, Some(false));
 
@@ -3242,6 +3248,209 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     );
     assert!(vcx.debug_bounds("sidebar-options-badge").is_none());
     assert!(vcx.debug_bounds("sidebar-filter-reset").is_none());
+
+    fs::remove_dir_all(dir).ok();
+}
+
+/// OWE-900: Orca 이관 직후(16개 프로젝트·122개 이상 워크트리·세션 없음)에도 워크트리 행이
+/// 평문 1줄이 아니라 카드(상태·브랜치·들여쓰기)로 렌더되고, 16개 프로젝트가 모두 보인다.
+///
+/// 회귀 원인: `rows >= VIRTUALIZED_ROWS` 구간에서 `render_worktree`가 카드 대신
+/// `debug_selector` 없는 평문 행을 돌려줘, 아이콘·브랜치·상태·들여쓰기가 사라졌다.
+/// 가상화(`uniform_list` 고정 높이)에서는 가변 높이 상세 카드 대신 고정 높이 컴팩트 카드를
+/// 렌더한다. 카드 요소 자체가 `ml(left_margin)` 들여쓰기를 가지므로 카드 존재가
+/// 들여쓰기 유지를 구조적으로 보장한다.
+#[gpui::test]
+fn owe900_imported_idle_worktrees_render_as_cards_and_all_projects_visible(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
+
+    // 실측 이관 결과(프로젝트 16·워크트리 122)를 본뜬 세션 없는 스냅샷.
+    let mut trees: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    let mut meta = Meta::new();
+    for i in 0..16 {
+        let repo = PathBuf::from(format!("/repo-{i:02}"));
+        let mut list = Vec::new();
+        for j in 0..8 {
+            let wt = PathBuf::from(format!("/repo-{i:02}/wt-{j:02}"));
+            meta.insert(
+                wt.clone(),
+                Tree {
+                    branch: Some(format!("m10-owe-{i:02}{j}")),
+                    dirty: None,
+                },
+            );
+            list.push(wt);
+        }
+        trees.insert(repo, list);
+    }
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees,
+            };
+            s.meta = meta;
+            s.rebuild(cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let (repo_count, wt_count, row_count) = cx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .fold((0, 0, 0), |(repos, wts, total), row| match row {
+                Row::Repository(_) => (repos + 1, wts, total + 1),
+                Row::Worktree(_) => (repos, wts + 1, total + 1),
+                _ => (repos, wts, total + 1),
+            })
+    });
+    assert_eq!(repo_count, 16, "16 imported projects must all be visible");
+    assert_eq!(wt_count, 128, "all imported idle worktrees must be visible");
+    assert!(
+        row_count >= VIRTUALIZED_ROWS,
+        "fixture must hit the virtualized path (rows={row_count})"
+    );
+    // 기본 필터(빈 repos/hosts)는 모든 프로젝트·호스트를 보인다.
+    cx.update(|_, cx| {
+        let opts = view.read(cx).options();
+        assert_eq!(opts.active_filter_count(), 0);
+        assert!(opts.filters.contains_repo(Path::new("/repo-15")));
+        assert!(opts.filters.contains_host(&HostId::Local));
+    });
+
+    // 첫 워크트리 행(rows[1])이 카드로 그려진다. 평문 폴백 행에는
+    // `debug_selector`가 없어 이 assert가 회귀를 잡는다.
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    for selector in ["worktree-card-1", "worktree-branch-1"] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "{selector} must render for idle imported worktree in virtualized list"
+        );
+    }
+    // 저장소 헤더와 워크트리 수 배지가 보인다(rows[0] = 첫 프로젝트, 워크트리 8개).
+    assert!(cx.debug_bounds("repo-header-0").is_some());
+    assert!(cx.debug_bounds("repo-count-0").is_some());
+}
+
+/// OWE-900: 세션 없는 워크트리가 10개를 넘는 프로젝트는 접힌 상태로 시작한다.
+/// 핀·세션이 있는 프로젝트는 펼친 채로 두고, 사용자가 펼치면 재시작 후에도 유지된다.
+#[gpui::test]
+fn owe900_idle_heavy_repo_auto_collapses_and_expand_persists(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("owe900-auto-collapse-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+
+    let big: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("/repo-big/wt-{i:02}")))
+        .collect();
+    let small: Vec<PathBuf> = (0..3)
+        .map(|i| PathBuf::from(format!("/repo-small/wt-{i:02}")))
+        .collect();
+    let active: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("/repo-active/wt-{i:02}")))
+        .collect();
+    let pinned: Vec<PathBuf> = (0..12)
+        .map(|i| PathBuf::from(format!("/repo-pinned/wt-{i:02}")))
+        .collect();
+    let mut active_sess = session(1, AgentState::Working, Some("/repo-active/wt-00"));
+    active_sess.status.agent = "claude".into();
+
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![active_sess],
+                trees: BTreeMap::from([
+                    (PathBuf::from("/repo-active"), active.clone()),
+                    (PathBuf::from("/repo-big"), big.clone()),
+                    (PathBuf::from("/repo-pinned"), pinned.clone()),
+                    (PathBuf::from("/repo-small"), small.clone()),
+                ]),
+            };
+            s.prefs.insert(
+                PathBuf::from("/repo-pinned/wt-00"),
+                Preference {
+                    pinned: true,
+                    name: String::new(),
+                },
+            );
+            let (_, auto_changed) = s.sync_imported_projects_from_disk();
+            assert!(auto_changed, "idle-heavy repo must trigger auto-collapse");
+            s.rebuild(cx);
+            assert!(
+                s.collapsed.contains(Path::new("/repo-big")),
+                "repo with 12 idle worktrees must start collapsed"
+            );
+            for repo in ["/repo-active", "/repo-pinned", "/repo-small"] {
+                assert!(
+                    !s.collapsed.contains(Path::new(repo)),
+                    "{repo} must stay expanded"
+                );
+            }
+        });
+    });
+    cx.run_until_parked();
+
+    // 접힌 프로젝트는 헤더+수 배지만 보이고 하위 워크트리 행은 없다.
+    let big_idx = cx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/repo-big")))
+            .unwrap()
+    });
+    assert!(
+        !cx.update(|_, cx| view
+            .read(cx)
+            .rows
+            .iter()
+            .any(|r| matches!(r, Row::Worktree(p) if p.starts_with("/repo-big")))),
+        "collapsed repo must hide its worktree rows"
+    );
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    // `debug_bounds`는 `&'static str` 선택자를 받으므로 동적 인덱스를 누수시킨다(테스트 1회성).
+    let header_sel: &'static str = Box::leak(format!("repo-header-{big_idx}").into_boxed_str());
+    let count_sel: &'static str = Box::leak(format!("repo-count-{big_idx}").into_boxed_str());
+    assert!(cx.debug_bounds(header_sel).is_some());
+    assert!(cx.debug_bounds(count_sel).is_some());
+
+    // 사용자가 펼치면 파일에 저장되고, 재시작 후에도 펼쳐진 채로 유지된다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.fold(&PathBuf::from("/repo-big"), Some(true), cx);
+        });
+    });
+    cx.run_until_parked();
+    let mut restored = Sidebar::new(Some(path.clone()));
+    assert!(
+        !restored.collapsed.contains(Path::new("/repo-big")),
+        "user-expanded repo must stay expanded after restart"
+    );
+    assert!(
+        restored.prefs.contains_key(Path::new("/repo-big")),
+        "auto-collapse marker must persist so restart does not re-collapse"
+    );
+    restored.snapshot = Snapshot {
+        sessions: Vec::new(),
+        trees: BTreeMap::from([(PathBuf::from("/repo-big"), big.clone())]),
+    };
+    let (_, auto_changed) = restored.sync_imported_projects_from_disk();
+    assert!(
+        !auto_changed,
+        "seen repo must not auto-collapse again after restart"
+    );
+    assert!(!restored.collapsed.contains(Path::new("/repo-big")));
 
     fs::remove_dir_all(dir).ok();
 }
