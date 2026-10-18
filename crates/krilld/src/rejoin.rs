@@ -119,6 +119,7 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     let hello = FromHolder::Hello {
         version: krill_proto::holder::VERSION,
         holder_pid: std::process::id(),
+        inbox: false,
     };
     send(&link, &hello, None)?;
     let mut sent = Ok(());

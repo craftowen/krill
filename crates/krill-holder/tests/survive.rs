@@ -202,6 +202,7 @@ fn role_krilld() {
                 FromHolder::Hello {
                     version,
                     holder_pid,
+                    ..
                 },
                 _,
             ) => {
@@ -214,7 +215,7 @@ fn role_krilld() {
                 }
                 masters.push((id, fds.pop().unwrap()));
             }
-            (FromHolder::Listener, mut fds) => listener = fds.pop(),
+            (FromHolder::Listener { .. }, mut fds) => listener = fds.pop(),
             (FromHolder::Ready, _) => break,
             (m, _) => panic!("복원 중 예상 밖: {m:?}"),
         }
@@ -270,7 +271,14 @@ fn role_krilld() {
     let upgrades = env_u64("MKH_UPGRADES_RUN", 0);
     if upgrades > 0 {
         let l = UnixListener::bind(dir.join("l.sock")).unwrap();
-        send(&link, &ToHolder::HoldListener { req: 900 }, &[l.as_fd()]);
+        send(
+            &link,
+            &ToHolder::HoldListener {
+                req: 900,
+                info: Vec::new(),
+            },
+            &[l.as_fd()],
+        );
         assert_eq!(reply(&mut link, &dir).0, FromHolder::Done { req: 900 });
         // holder만 사본을 보관한다. exec 뒤 krilld 재기동으로 실제 복원을 검사한다.
         let next = dir.join("holder-next");
@@ -502,7 +510,14 @@ fn contract(link: &mut Link, dir: &Path, sessions: usize, listener: Option<Owned
     ) {}
     fs::remove_file(&sock).ok();
     let l = UnixListener::bind(&sock).unwrap();
-    let (r, _) = ask(link, ToHolder::HoldListener { req: 10 }, &[l.as_fd()]);
+    let (r, _) = ask(
+        link,
+        ToHolder::HoldListener {
+            req: 10,
+            info: Vec::new(),
+        },
+        &[l.as_fd()],
+    );
     assert_eq!(r, FromHolder::Done { req: 10 });
     let path = b"/nonexistent/holder".to_vec();
     let (r, _) = ask(link, ToHolder::UpgradeHolder { req: 12, path }, &[]);
