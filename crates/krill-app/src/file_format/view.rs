@@ -436,7 +436,8 @@ pub(crate) fn size_label(len: u64) -> String {
 fn spawn_open(mut cmd: Command, cx: &App) {
     cx.background_spawn(async move {
         match cmd.status() {
-            Ok(status) if status.success() => {}
+            // explorer.exe는 열기에 성공해도 1로 끝난다.
+            Ok(status) if status.success() || cfg!(windows) => {}
             Ok(status) => tracing::warn!(?status, "open failed"),
             Err(error) => tracing::warn!(kind = ?error.kind(), "open failed to start"),
         }
