@@ -3,7 +3,7 @@
 //! 플로팅 창은 기존 Shell의 입력·IME·재접속을 재사용하고 레이아웃 파일은 쓰지 않는다.
 
 use gpui::{
-    App, Bounds, Context, Entity, KeyBinding, KeyDownEvent, Subscription, TitlebarOptions,
+    App, Bounds, Context, Entity, KeyBinding, Subscription, TitlebarOptions,
     WeakEntity, Window, WindowBounds, WindowHandle, WindowOptions, actions, div, prelude::*, px,
 };
 use gpui_component::Sizable as _;
