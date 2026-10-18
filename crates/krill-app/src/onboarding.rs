@@ -20,10 +20,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+#[cfg(not(unix))]
+use self::access_shim::{Access, access};
 use gpui::{App, Window, actions};
 use krill_proto::agent::hooks::Agent;
 use krill_proto::agent::{self, Agents};
 use krill_proto::doctor::{Check, Fix, FixKind, Level, Status};
+#[cfg(unix)]
 use rustix::fs::{Access, access};
 
 actions!(onboarding, [OpenChecks, RerunOnboarding]);
@@ -140,6 +143,7 @@ pub fn login_path(shell: &OsStr) -> Option<OsString> {
     // 파이프를 쥔 좀비 자식과 함께 리더 스레드가 영원히 잠들지 않게 논블로킹
     // 조각 읽기로 바꾼다. fcntl 실패면 기존 블로킹 읽기로 둔다(호출자 타임아웃은
     // 그대로라 반환은 보장되고, 리더만 좀비 자식 수명만큼 산다).
+    #[cfg(unix)]
     rustix::fs::fcntl_setfl(&stdout, rustix::fs::OFlags::NONBLOCK).ok();
     // rc가 띄운 백그라운드 프로세스가 파이프를 쥐면 읽기가 끝나지 않으므로 시간으로 끊는다.
     let (tx, rx) = mpsc::channel();
@@ -499,12 +503,12 @@ fn ago_text(elapsed: Duration) -> String {
 /// 백그라운드에서만 부른다. 벽시계는 호출자가 잰다.
 #[must_use]
 pub fn quick_checks(env: &Env) -> Vec<Check> {
-    vec![
-        quick_helpers(env),
-        quick_version(env),
-        quick_state(env),
-        app_location_check(env),
-    ]
+    let mut checks = vec![quick_helpers(env), quick_version(env), quick_state(env)];
+    // `app.*`(설치 위치·TCC 권한)는 macOS 전용이라 다른 OS에서는 보이지 않는다(규칙 10).
+    if cfg!(target_os = "macos") {
+        checks.push(app_location_check(env));
+    }
+    checks
 }
 
 /// 빠른 점검을 백그라운드에서 돌려 스냅샷에 저장한다. 시작 경로를 막지 않는다.
@@ -525,7 +529,7 @@ fn quick_helpers(env: &Env) -> Check {
         .into_iter()
         .filter(|name| {
             let path = env.krill.parent().unwrap_or(Path::new("")).join(name);
-            rustix::fs::access(&path, Access::EXEC_OK).is_err()
+            access(&path, Access::EXEC_OK).is_err()
         })
         .map(str::to_owned)
         .collect();
@@ -918,6 +922,9 @@ fn doctor_failed_check(cause: &str) -> Check {
 /// `app.*` 점검 묶음. 폴더 프로브는 자동 실행하지 않고 대기 상태로 둔다(버튼 게이트).
 pub(super) fn app_checks(env: &Env) -> Vec<Check> {
     use crate::platform::permissions as perm;
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
     let bundled = perm::is_bundled();
     let exe = std::env::current_exe()
         .ok()
@@ -973,10 +980,21 @@ fn install_cli_link(krill: &Path, home: &Path, link: &Path) -> io::Result<()> {
     if is_broken_symlink(link) {
         std::fs::remove_file(link)?;
     }
-    std::os::unix::fs::symlink(&target, link)
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, link)
+    }
+    #[cfg(not(unix))]
+    {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("symlink {}", target.display()),
+        ))
+    }
 }
 
 fn stage_executable(src: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
 
     if std::fs::canonicalize(src).ok() == std::fs::canonicalize(dst).ok() && dst.is_file() {
@@ -987,8 +1005,35 @@ fn stage_executable(src: &Path, dst: &Path) -> io::Result<()> {
     }
     let tmp = dst.with_extension(format!("tmp-{}", std::process::id()));
     std::fs::copy(src, &tmp)?;
+    #[cfg(unix)]
     std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     std::fs::rename(&tmp, dst)
+}
+
+/// `rustix::fs::access` 대역(비Unix). 실행·쓰기 비트가 없으니 경로가 있는지만 본다.
+#[cfg(not(unix))]
+mod access_shim {
+    use std::io;
+    use std::path::Path;
+
+    #[derive(Clone, Copy)]
+    pub struct Access;
+
+    impl Access {
+        pub const EXEC_OK: Self = Self;
+        pub const WRITE_OK: Self = Self;
+    }
+
+    impl std::ops::BitOr for Access {
+        type Output = Self;
+        fn bitor(self, _: Self) -> Self {
+            self
+        }
+    }
+
+    pub fn access(path: &Path, _mode: Access) -> io::Result<()> {
+        std::fs::metadata(path).map(drop)
+    }
 }
 
 pub mod actions;

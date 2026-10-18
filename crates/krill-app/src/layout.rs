@@ -2,10 +2,10 @@
 //!
 //! gpui에 의존하지 않는다. UI 프레임워크가 바뀌어도(MK-002 잠정 결정) 이 모듈과 저장 파일은 그대로 쓴다.
 
+use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::collections::BTreeMap;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 use krill_proto::SessionId;

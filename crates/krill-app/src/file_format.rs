@@ -227,9 +227,8 @@ impl Zoom {
 /// "기본 앱으로 열기" — Launch Services(`open`)가 확장자에 맞는 앱을 고른다.
 /// 실행 비트가 있는 파일은 `open`이 터미널에서 **실행**하므로 Finder에서 보기로 바꾼다(저장소 속 바이너리 한 번 클릭 실행 방지).
 pub fn open_default_command(path: &Path) -> Command {
-    use std::os::unix::fs::PermissionsExt as _;
     let executable =
-        std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+        std::fs::metadata(path).is_ok_and(|m| m.is_file() && crate::platform::has_exec_bits(&m));
     if executable {
         return reveal_command(path);
     }
@@ -241,6 +240,7 @@ pub fn reveal_command(path: &Path) -> Command {
     open_command(&["-R"], path)
 }
 
+// ponytail: macOS `open`만 있다. Windows(`ShellExecuteW`)는 OWE-834 — 그 전까지 spawn이 실패한다.
 fn open_command(flags: &[&str], path: &Path) -> Command {
     let mut cmd = Command::new("/usr/bin/open");
     cmd.args(flags).arg("--").arg(path);

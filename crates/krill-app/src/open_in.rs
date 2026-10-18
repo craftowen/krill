@@ -44,6 +44,10 @@ impl Target {
 
     /// 백그라운드에서 호출한다. 없는 앱·폴더와 Launch Services 오류를 호출자에게 돌려준다.
     pub fn open(self, folder: &Path) -> io::Result<()> {
+        // Launch Services 전용. Windows 열기는 OWE-834.
+        if !cfg!(target_os = "macos") {
+            return Err(io::ErrorKind::Unsupported.into());
+        }
         let folder = std::fs::canonicalize(folder)?;
         if !folder.is_dir() {
             return Err(io::Error::new(

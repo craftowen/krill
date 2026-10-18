@@ -69,17 +69,17 @@ impl StatusItem {
 
     pub fn set_menu_labels(&self, open: &str, quit: &str) {
         for (item, label) in self.labels.iter().zip([open, quit]) {
-            let Some(label) = super::cf_string(label) else {
+            let Some(label) = super::macos::cf_string(label) else {
                 continue;
             };
             // SAFETY: item is a retained NSMenuItem on the UI thread; setTitle copies NSString.
             let (): () = unsafe { msg_send![&**item, setTitle: label.cast::<AnyObject>()] };
-            super::cf_release(label);
+            super::macos::cf_release(label);
         }
     }
 
     pub fn set_title(&self, title: &str) {
-        let Some(title) = super::cf_string(title) else {
+        let Some(title) = super::macos::cf_string(title) else {
             return;
         };
         // SAFETY: item은 이 핸들이 보유한 NSStatusItem이다.
@@ -90,7 +90,7 @@ impl StatusItem {
             // SAFETY: setToolTip은 같은 유효한 NSString을 복사한다.
             let (): () = unsafe { msg_send![button, setToolTip: title.cast::<AnyObject>()] };
         }
-        super::cf_release(title);
+        super::macos::cf_release(title);
     }
 
     pub fn take_command() -> Option<Command> {
@@ -136,15 +136,15 @@ fn add_item(
     action: Sel,
     target: &AnyObject,
 ) -> Option<Retained<AnyObject>> {
-    let label = super::cf_string(label)?;
-    let empty = super::cf_string("")?;
+    let label = super::macos::cf_string(label)?;
+    let empty = super::macos::cf_string("")?;
     // SAFETY: NSMenu가 NSString 제목과 key equivalent를 복사하며 action은 등록한 selector다.
     let item: *mut AnyObject = unsafe {
         msg_send![menu, addItemWithTitle: label.cast::<AnyObject>(), action: action,
             keyEquivalent: empty.cast::<AnyObject>()]
     };
-    super::cf_release(label);
-    super::cf_release(empty);
+    super::macos::cf_release(label);
+    super::macos::cf_release(empty);
     if item.is_null() {
         return None;
     }
@@ -173,7 +173,7 @@ fn icon(cx: &App) -> Option<Retained<AnyObject>> {
         .ok()?;
     let pixels = image.as_bytes(0)?;
     let bitmap_class = AnyClass::get(c"NSBitmapImageRep")?;
-    let color = super::cf_string("NSDeviceRGBColorSpace")?;
+    let color = super::macos::cf_string("NSDeviceRGBColorSpace")?;
     // SAFETY: alloc이 init까지 소유할 NSBitmapImageRep를 반환한다.
     let bitmap: *mut AnyObject = unsafe { msg_send![bitmap_class, alloc] };
     // SAFETY: planes=nil이면 AppKit이 edge*edge*4 RGBA 영역을 할당한다. 크기는 고정 UI 토큰이다.
@@ -184,7 +184,7 @@ fn icon(cx: &App) -> Option<Retained<AnyObject>> {
             isPlanar: false, colorSpaceName: color.cast::<AnyObject>(),
             bytesPerRow: 0_isize, bitsPerPixel: 32_isize]
     };
-    super::cf_release(color);
+    super::macos::cf_release(color);
     // SAFETY: init 계열이 반환한 +1 소유권을 RAII로 옮긴다.
     let bitmap = unsafe { Retained::from_raw(bitmap) }?;
     // SAFETY: 비 planar bitmapData가 위에서 할당한 연속 RGBA 영역을 반환한다.

@@ -14,15 +14,21 @@
 //!   `C`·`objc2` 콜백 밖으로 패닉이 나가지 않는다(CONVENTIONS U10).
 
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::ptr::NonNull;
 use std::sync::mpsc;
 use std::time::Duration;
 
+#[cfg(target_os = "macos")]
 use block2::RcBlock;
 use krill_proto::doctor::{Check, Fix, FixKind, Level, Status};
+#[cfg(target_os = "macos")]
 use objc2::msg_send;
+#[cfg(target_os = "macos")]
 use objc2::runtime::{AnyClass, AnyObject, Bool};
+#[cfg(target_os = "macos")]
 use objc2_foundation::{NSBundle, NSError, NSString, NSURL};
+#[cfg(target_os = "macos")]
 use objc2_user_notifications::{
     UNAuthorizationOptions, UNNotificationSettings, UNUserNotificationCenter,
 };
@@ -137,6 +143,7 @@ pub const APPLICATIONS_URL: &str = "file:///Applications/";
 pub const SETTINGS_ROOT_URL: &str = "x-apple.systempreferences:";
 
 const NOTIFICATIONS_SETTINGS_PAGE: &str = "com.apple.Notifications-Settings.extension";
+#[cfg(target_os = "macos")]
 const QUARANTINE_ATTR: &str = "com.apple.quarantine";
 const FDA_CANARY: &str = "/Library/Application Support/com.apple.TCC/TCC.db";
 
@@ -374,10 +381,15 @@ pub fn decide_full_disk(can_read_canary: bool) -> Check {
 }
 
 /// 번들 식별자. 비번들 실행(`cargo run` 등)이면 `None`이다.
+#[cfg(target_os = "macos")]
 pub fn bundle_id() -> Option<String> {
     NSBundle::mainBundle()
         .bundleIdentifier()
         .map(|id| id.to_string())
+}
+#[cfg(not(target_os = "macos"))]
+pub fn bundle_id() -> Option<String> {
+    None
 }
 
 /// 번들로 실행 중이면 `true`다. `UN` 조회·요청의 가드다.
@@ -389,6 +401,7 @@ pub fn is_bundled() -> bool {
 ///
 /// 비번들이면 `UN`을 건드리지 않고 `None`을 돌려준다(무가드 호출은 `SIGABRT`,
 /// MK-016 실측). 어떤 스레드에서 호출해도 된다. 시간 안에 답이 없으면 `None`이다.
+#[cfg(target_os = "macos")]
 pub fn query_notification_status(timeout: Duration) -> Option<NotificationStatus> {
     if !is_bundled() {
         return None;
@@ -408,11 +421,16 @@ pub fn query_notification_status(timeout: Duration) -> Option<NotificationStatus
     let _keep_alive = block;
     rx.recv_timeout(timeout).ok()
 }
+#[cfg(not(target_os = "macos"))]
+pub fn query_notification_status(_timeout: Duration) -> Option<NotificationStatus> {
+    None
+}
 
 /// `[알림 허용]` 버튼용 요청. 시스템 허용 대화상자를 띄우므로 버튼 맥락에서만 부른다.
 ///
 /// 비번들이면 요청을 보내지 않고 `Unavailable`을 돌려준다. 어떤 스레드에서
 /// 호출해도 된다. 허용 대화상자의 클릭은 사람이 하므로 결과 확인은 미측정이다.
+#[cfg(target_os = "macos")]
 pub fn request_notification_authorization(timeout: Duration) -> AuthRequestOutcome {
     if !is_bundled() {
         return AuthRequestOutcome::Unavailable;
@@ -446,6 +464,10 @@ pub fn request_notification_authorization(timeout: Duration) -> AuthRequestOutco
         Err(_) => AuthRequestOutcome::Timeout,
     }
 }
+#[cfg(not(target_os = "macos"))]
+pub fn request_notification_authorization(_timeout: Duration) -> AuthRequestOutcome {
+    AuthRequestOutcome::Unavailable
+}
 
 /// `URL`을 순서대로 열어 처음 성공한 것을 돌려준다. 특정 설정 화면이 안
 /// 열리면 시스템 설정 루트로 폴백한다. 후보가 없으면 `false`다.
@@ -454,6 +476,7 @@ pub fn open_first_available(urls: &[&str]) -> bool {
 }
 
 /// `URL`을 연다(시스템 설정·`Finder`). 열기 요청을 전달하면 `true`다.
+#[cfg(target_os = "macos")]
 pub fn open_url(url: &str) -> bool {
     let Some(workspace_class) = AnyClass::get(c"NSWorkspace") else {
         return false;
@@ -471,8 +494,14 @@ pub fn open_url(url: &str) -> bool {
     let opened: Bool = unsafe { msg_send![workspace, openURL: &*ns_url] };
     opened.as_bool()
 }
+#[cfg(not(target_os = "macos"))]
+// ponytail: Windows `ShellExecuteW` 열기는 OWE-834.
+pub fn open_url(_url: &str) -> bool {
+    false
+}
 
 /// 번들 경로의 `com.apple.quarantine` 유무.
+#[cfg(target_os = "macos")]
 pub fn has_quarantine_attr(path: &Path) -> bool {
     let mut buf = vec![0u8; 4096];
     match rustix::fs::listxattr(path, buf.as_mut_slice()) {
@@ -483,6 +512,10 @@ pub fn has_quarantine_attr(path: &Path) -> bool {
             .any(|name| name == QUARANTINE_ATTR.as_bytes()),
         Err(_) => false,
     }
+}
+#[cfg(not(target_os = "macos"))]
+pub fn has_quarantine_attr(_path: &Path) -> bool {
+    false
 }
 
 /// 전체 디스크 접근 카나리아 읽기. 읽히면 접근 허용 상태다.
@@ -587,15 +620,25 @@ impl ComputerUsePermissions {
 }
 
 /// 손쉬운 사용(Accessibility) TCC 권한 허용 여부(`AXIsProcessTrusted`, 프롬프트 없음).
+#[cfg(target_os = "macos")]
 pub fn probe_accessibility() -> bool {
     // SAFETY: `ApplicationServices`의 `AXIsProcessTrusted`는 인자 없는 읽기 전용 C 함수다.
     unsafe { AXIsProcessTrusted() != 0 }
 }
+#[cfg(not(target_os = "macos"))]
+pub fn probe_accessibility() -> bool {
+    false
+}
 
 /// 화면 기록(Screen Recording) TCC 권한 허용 여부(`CGPreflightScreenCaptureAccess`, 프롬프트 없음).
+#[cfg(target_os = "macos")]
 pub fn probe_screen_recording() -> bool {
     // SAFETY: `CoreGraphics`의 `CGPreflightScreenCaptureAccess`는 인자 없는 읽기 전용 C 함수다.
     unsafe { CGPreflightScreenCaptureAccess() }
+}
+#[cfg(not(target_os = "macos"))]
+pub fn probe_screen_recording() -> bool {
+    false
 }
 
 /// Computer Use에 필요한 두 TCC 권한(손쉬운 사용·화면 기록)을 프롬프트 없이 조회한다.
@@ -611,11 +654,13 @@ pub fn open_computer_use_settings(kind: ComputerUsePermissionKind) -> bool {
     open_first_available(&[kind.settings_url(), SETTINGS_ROOT_URL])
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> u8;
 }
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGPreflightScreenCaptureAccess() -> bool;

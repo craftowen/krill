@@ -2,13 +2,16 @@
 
 use std::fs::{self, DirBuilder};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use gpui::{App, PromptLevel, Window};
+use krill_proto::os::fs::DirBuilderExt as _;
+#[cfg(unix)]
 use rustix::process::{Pid, test_kill_process};
 use serde::{Deserialize, Serialize};
 
@@ -157,7 +160,13 @@ fn copy_dir_in_place(src: &Path, dst: &Path) -> io::Result<()> {
                 fs::remove_file(&t)?;
             }
             let target = fs::read_link(&s)?;
+            #[cfg(unix)]
             std::os::unix::fs::symlink(target, &t)?;
+            #[cfg(not(unix))]
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("bundle symlink {}", target.display()),
+            ));
         } else {
             let file_name = entry.file_name();
             let tmp = dst.join(format!(
@@ -365,6 +374,7 @@ fn spawn_bundle_app(
     cmd.spawn()
 }
 
+#[cfg(unix)]
 fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
     let pid = i32::try_from(raw_pid)
         .ok()
@@ -389,6 +399,11 @@ fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
     }
 }
 
+#[cfg(not(unix))]
+fn wait_process_exit(_raw_pid: u32, _timeout: Duration) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
+}
+
 /// 현재 실행 파일을 `<state_dir>/update/relauncher`로 복사한 뒤 별도 프로세스로 띄운다.
 pub fn spawn_detached_relauncher(
     relauncher_source_exe: &Path,
@@ -404,6 +419,7 @@ pub fn spawn_detached_relauncher(
     let bin = dir.join(RELAUNCHER_BIN);
     fs::remove_file(&bin).ok();
     fs::copy(relauncher_source_exe, &bin)?;
+    #[cfg(unix)]
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
 
     let mut cmd = Command::new(&bin);
