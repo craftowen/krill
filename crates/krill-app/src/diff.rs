@@ -687,6 +687,8 @@ impl Panel {
     }
 
     /// 오른쪽 패널 가시성을 바꾼다(OWE-585). 숨기면 즉시 감시를 끄고 진행 중인 git 자식을 회수한다.
+    /// OWE-898: 숨길 때 진행 중인 패치·Checks 조회도 취소해 최대 4MiB 패치 버퍼와 검사 결과가
+    /// 백그라운드에 머물지 않게 한다(표시 중인 패치 화면은 유지).
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;
@@ -697,6 +699,12 @@ impl Panel {
             self.start_watch(cx);
         } else {
             self.watch_task = None;
+            // 진행 중인 패치·Checks는 무효화만 하고 표시 중인 내용은 둔다.
+            self.patch_gen = self.patch_gen.wrapping_add(1);
+            self.patch_task = None;
+            self.checks.generation = self.checks.generation.wrapping_add(1);
+            self.checks.task = None;
+            self.checks.loading = false;
             if let Some(source) = self.source.clone() {
                 let req = GitWatchRequest {
                     repo: self.repo.as_os_str().as_bytes().to_vec(),
@@ -721,12 +729,15 @@ impl Panel {
 
     /// 창 활성 여부를 반영한다(OWE-844). 비포커스 상태에서도 패널이 열려 있으면(`visible`)
     /// 완화된 주기로 `GitWatch`를 유지하고, 포커스를 되찾으면 즉시 빠른 감시 주기로 복귀한다.
+    /// OWE-898: 이미 감시 루프가 살아 있으면 재시작하지 않는다. 재시작은 진행 중인 `watch`
+    /// IPC(최신 `Changes` 보유)와 새 루프의 조회가 겹쳐 피크를 2배로 만들기 때문이다.
+    /// 살아 있는 루프는 다음 반복에서 빠른 주기로 자동 복귀한다.
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active == active {
             return;
         }
         self.active = active;
-        if active && self.visible {
+        if active && self.visible && self.watch_task.is_none() {
             self.start_watch(cx);
         }
         cx.notify();
