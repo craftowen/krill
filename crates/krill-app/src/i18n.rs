@@ -550,8 +550,15 @@ catalog! {
         SLEEP_WITH_DESCENDANTS => ("자손 포함 수면 전환 ({n})", "Sleep with Descendants ({n})"),
         DELETE_WORKTREE => ("워크트리 삭제", "Delete"),
         DELETE_WITH_DESCENDANTS => ("자손 포함 삭제 ({n})", "Delete with Descendants ({n})"),
+        DELETE_TITLE => ("워크트리 삭제", "Delete worktree"),
+        DELETE_DESC => ("'{name}'을(를) 삭제합니다. 이 작업은 되돌릴 수 없습니다.", "Delete '{name}'? This cannot be undone."),
+        DELETE_DESC_WITH_DESCENDANTS => ("'{name}'과(와) 자손 워크트리 {n}개를 삭제합니다. 이 작업은 되돌릴 수 없습니다.", "Delete '{name}' and {n} descendant worktrees? This cannot be undone."),
+        DELETE_DIRTY => ("미커밋 변경 {n}개가 있습니다.", "{n} uncommitted changes."),
+        DELETE_FORCE => ("미커밋 변경도 함께 삭제합니다 (강제 삭제)", "Also delete uncommitted changes (force)"),
+        DELETE_CONFIRM => ("삭제", "Delete"),
         FOLD_CHILDREN => ("자식 워크트리 접기", "Collapse children"),
         UNFOLD_CHILDREN => ("자식 워크트리 펼치기", "Expand children"),
+        REMOVE_PROJECT => ("프로젝트 제거", "Remove Project"),
     }
     link {
         RECONNECTING => ("세션 데몬에 다시 연결하는 중… 세션은 그대로 살아 있습니다", "Reconnecting to the session daemon… Sessions are still running"),

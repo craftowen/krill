@@ -169,6 +169,17 @@ struct Preference {
 
 type Preferences = BTreeMap<PathBuf, Preference>;
 
+/// 워크트리 삭제 확인 모달 상태(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않고
+/// 이 상태로 모달을 띄운 뒤, 확인 버튼에서 `force` 플래그와 함께 삭제한다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DeleteConfirm {
+    pub path: PathBuf,
+    pub with_descendants: bool,
+    pub descendant_count: usize,
+    pub dirty: usize,
+    pub force: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
     HostHeader {
@@ -311,14 +322,23 @@ fn rows(snapshot: &Snapshot, prefs: &Preferences, collapsed: &BTreeSet<PathBuf>)
 const FORMAT_VERSION: u8 = 1;
 const MAX_FILE_BYTES: u64 = 1024 * 1024;
 
-/// 사이드바 접힘/펼침 및 마지막 선택 워크트리 상태(`sidebar.bin` 4번째 구간, OWE-842).
+/// 사이드바 접힘/펼침·제거 UI 상태 및 마지막 선택 워크트리(`sidebar.bin` 4번째 구간, OWE-842·OWE-845).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UiExpansionState {
+    #[serde(default)]
     pub collapsed: BTreeSet<PathBuf>,
+    #[serde(default)]
     pub collapsed_groups: BTreeSet<GroupKey>,
+    #[serde(default)]
     pub collapsed_hosts: BTreeSet<HostId>,
+    #[serde(default)]
     pub expanded_cards: BTreeSet<PathBuf>,
+    #[serde(default)]
     pub selected_worktree: Option<PathBuf>,
+    #[serde(default)]
+    pub shown_external: BTreeSet<PathBuf>,
+    #[serde(default)]
+    pub removed_projects: BTreeSet<PathBuf>,
 }
 
 impl UiExpansionState {
@@ -329,6 +349,8 @@ impl UiExpansionState {
             && self.collapsed_hosts.is_empty()
             && self.expanded_cards.is_empty()
             && self.selected_worktree.is_none()
+            && self.shown_external.is_empty()
+            && self.removed_projects.is_empty()
     }
 }
 
@@ -507,6 +529,10 @@ pub struct Sidebar {
     expanded_cards: BTreeSet<PathBuf>,
     /// 마지막으로 선택·활성화된 워크트리/폴더 경로(`sidebar.bin`에 영속화, OWE-842).
     selected_worktree: Option<PathBuf>,
+    /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
+    removed_projects: BTreeSet<PathBuf>,
+    /// 워크트리 삭제 확인 모달 상태(OWE-847). `Some`일 때 모달을 띄운다.
+    delete_confirm: Option<DeleteConfirm>,
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
@@ -641,10 +667,12 @@ impl Sidebar {
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
             sleeping_worktrees: lin.sleeping_worktrees,
-            shown_external: BTreeSet::new(),
+            shown_external: ui.shown_external,
             collapsed: ui.collapsed,
             expanded_cards: ui.expanded_cards,
             selected_worktree: ui.selected_worktree,
+            removed_projects: ui.removed_projects,
+            delete_confirm: None,
             path: path.filter(|_| writable),
             error,
             poll_error: None,
@@ -898,7 +926,7 @@ impl Sidebar {
         }
     }
 
-    /// 호스트 섹션 접기/펼치기.
+    /// 호스트 섹션 접기/펼치기(OWE-845: `UiExpansionState`에 저장해 재시작 후에도 유지).
     pub fn fold_host(&mut self, host: &HostId, open: Option<bool>, cx: &mut Context<Self>) {
         let closed = self.collapsed_hosts.contains(host);
         if open.unwrap_or(closed) {
@@ -1318,6 +1346,8 @@ impl Sidebar {
     }
 
     /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
+    /// 워크트리 카드의 3행 에이전트 알약 바 클릭 시 하위 세션 목록을 펼치거나 접는다.
+    /// 펼침 집합은 `UiExpansionState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub fn toggle_card_sessions(&mut self, path: &Path, cx: &mut Context<Self>) {
         if self.expanded_cards.remove(path) {
             if let Some(c) = self.cursor
@@ -1336,8 +1366,8 @@ impl Sidebar {
         } else {
             self.expanded_cards.insert(path.to_path_buf());
             self.collapsed.remove(path);
-            self.persist(cx);
         }
+        self.persist(cx);
     }
 
     /// Open in·새 에이전트의 폴더. git 세션은 워크트리 루트, 일반 세션은 작업 디렉터리.
@@ -1413,12 +1443,12 @@ impl Sidebar {
         external::comment_for(&self.comments, path)
     }
 
-    /// MK-093: 저장소의 `.claude/worktrees` 숨김 카드를 펼치거나 접는다.
+    /// MK-093: 저장소의 `.claude/worktrees` 숨김 카드를 펼치거나 접는다(OWE-845: 영속화).
     pub fn toggle_external(&mut self, repo: &Path, cx: &mut Context<Self>) {
         if !self.shown_external.remove(repo) {
             self.shown_external.insert(repo.to_path_buf());
         }
-        self.rebuild(cx);
+        self.persist(cx);
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -1661,6 +1691,8 @@ impl Sidebar {
                 collapsed_hosts: self.collapsed_hosts.clone(),
                 expanded_cards: self.expanded_cards.clone(),
                 selected_worktree: self.selected_worktree.clone(),
+                shown_external: self.shown_external.clone(),
+                removed_projects: self.removed_projects.clone(),
             };
             if let Err(e) = save_state(path, &self.prefs, &self.options, &lin, &ui) {
                 self.error = Some(e.to_string());
@@ -1850,6 +1882,10 @@ impl Sidebar {
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, None, cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, None, cx),
+            Some(Row::Repository(path)) => {
+                self.cursor = Some(cursor);
+                self.fold(&path, None, cx);
+            }
             Some(Row::Session(session, _)) => {
                 self.action_host = Some(self.row_host(cursor).clone());
                 cx.emit(Selected(session.id));
@@ -1865,6 +1901,7 @@ impl Sidebar {
     }
 
     /// `open`: `None`이면 뒤집고, `Some(true)`면 펼치고, `Some(false)`면 접는다.
+    /// 저장소·폴더·워크트리의 접힘은 `UiExpansionState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub fn fold(&mut self, path: &Path, open: Option<bool>, cx: &mut Context<Self>) {
         let closed = self.collapsed.contains(path);
         if open.unwrap_or(closed) {
@@ -1881,7 +1918,9 @@ impl Sidebar {
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, Some(open), cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, Some(open), cx),
-            Some(Row::Worktree(path) | Row::Folder(path)) => self.fold(&path, Some(open), cx),
+            Some(Row::Worktree(path) | Row::Folder(path) | Row::Repository(path)) => {
+                self.fold(&path, Some(open), cx);
+            }
             _ => {}
         }
     }
@@ -1988,6 +2027,89 @@ impl Sidebar {
                 window.focus(focus, cx);
             }
             self.persist(cx);
+        }
+    }
+
+    /// 이름 변경 편집을 저장하지 않고 닫는다(OWE-847: Esc·취소 버튼).
+    fn cancel_rename(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.editing = None;
+            self.edit_subscription = None;
+            if let (Some(window), Some(focus)) = (window, &self.focus) {
+                window.focus(focus, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// 저장소·폴더 프로젝트를 목록에서 제거한다(OWE-845).
+    /// `projects.toml`에 기록된 이관 프로젝트는 파일에서도 지우고,
+    /// 그 외에는 제거 집합에 넣어 행을 숨긴다(재시작 후에도 유지).
+    pub fn remove_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
+            external::remove_imported_project(&dir, &path);
+            self.sync_imported_projects_from_disk();
+        }
+        self.collapsed.remove(&path);
+        self.expanded_cards.remove(&path);
+        self.shown_external.remove(&path);
+        self.removed_projects.insert(path);
+        self.persist(cx);
+    }
+
+    /// 워크트리 삭제 확인 모달을 연다(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않는다.
+    pub(super) fn request_delete_worktree(
+        &mut self,
+        path: PathBuf,
+        with_descendants: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let host = HostId::Local;
+        let descendant_count = if with_descendants {
+            self.lineage_descendants(&path).len()
+        } else {
+            0
+        };
+        let dirty = self
+            .meta_for(&host)
+            .get(&path)
+            .and_then(|m| m.dirty)
+            .unwrap_or(0);
+        self.delete_confirm = Some(DeleteConfirm {
+            path,
+            with_descendants,
+            descendant_count,
+            dirty,
+            force: false,
+        });
+        cx.notify();
+    }
+
+    /// 삭제 확인 모달을 닫는다(OWE-847: 취소 버튼·Esc).
+    pub(super) fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        if self.delete_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 삭제 확인 모달의 강제 삭제 토글(OWE-847: 미커밋 변경 포함).
+    pub(super) fn toggle_delete_force(&mut self, cx: &mut Context<Self>) {
+        if let Some(confirm) = self.delete_confirm.as_mut() {
+            confirm.force = !confirm.force;
+            cx.notify();
+        }
+    }
+
+    /// 삭제 확인 모달에서 삭제를 확정한다(OWE-847).
+    pub(super) fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.delete_confirm.take() else {
+            return;
+        };
+        cx.notify();
+        if confirm.with_descendants {
+            self.delete_with_descendants(confirm.path, confirm.force, cx);
+        } else {
+            self.delete_worktree(confirm.path, confirm.force, cx);
         }
     }
 
