@@ -683,3 +683,33 @@ fn ctrl_tab_mru_cycles_and_commits_recent_order() {
     assert!(l.commit_mru());
     assert_eq!(l.mru_order(), vec![0, 3, 1, 2]);
 }
+
+/// OWE-849: 단일 클릭 미리보기는 같은 칸을 재사용하고, 고정 열기·탭 닫기로 슬롯이 비워진다.
+#[test]
+fn preview_tab_reuses_pane_until_pinned_or_closed() {
+    let mut l = Layout::default(); // tab 0 (terminal)
+    let a = PathBuf::from("/tmp/preview-a.rs");
+    let b = PathBuf::from("/tmp/preview-b.rs");
+    let p1 = l.open_file_preview(a.clone());
+    assert_eq!(l.tabs().len(), 2);
+    // 두 번째 미리보기는 같은 칸을 재사용한다.
+    let p2 = l.open_file_preview(b.clone());
+    assert_eq!(p1, p2);
+    assert_eq!(l.tabs().len(), 2);
+    assert_eq!(l.file(p2), Some(b.as_path()));
+    // 이미 열린 파일을 미리보기로 열면 포커스만 옮긴다.
+    assert_eq!(l.open_file_preview(b.clone()), p2);
+    // 고정으로 열면 슬롯이 비워지고 같은 탭에 머문다.
+    assert_eq!(l.open_file(b.clone()), p2);
+    assert_eq!(l.tabs().len(), 2);
+    // 다음 미리보기는 슬롯이 비었으므로 새 탭을 연다.
+    let p4 = l.open_file_preview(a.clone());
+    assert_ne!(p4, p2);
+    assert_eq!(l.tabs().len(), 3);
+    // 미리보기 탭을 닫으면 슬롯이 함께 비워진다.
+    l.activate(2);
+    l.close_tab(2);
+    let p5 = l.open_file_preview(a.clone());
+    assert_ne!(p5, p4);
+    assert_eq!(l.tabs().len(), 3);
+}

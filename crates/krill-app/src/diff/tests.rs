@@ -904,6 +904,174 @@ fn file_explorer_virtualized_tree_and_editor_open_work(cx: &mut gpui::TestAppCon
     std::fs::remove_dir_all(&tmp_home).ok();
 }
 
+/// OWE-849: 탐색기 이름 필터는 키 입력마다 동기 스캔하지 않고 디바운스 후
+/// 백그라운드에서 적용되며, 대기 중 빈 행에는 로딩 표시가 뜬다.
+#[gpui::test]
+fn explorer_filter_debounces_then_applies_async(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::new();
+    std::fs::create_dir_all(repo.0.join("src")).unwrap();
+    std::fs::write(repo.0.join("src/alpha.rs"), "pub fn alpha() {}\n").unwrap();
+    std::fs::write(repo.0.join("src/beta.rs"), "pub fn beta() {}\n").unwrap();
+    std::fs::write(repo.0.join("notes.txt"), "notes\n").unwrap();
+    let tmp_home = std::env::temp_dir().join(format!(
+        "krill-explorer-filter-home-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::remove_dir_all(&tmp_home).ok();
+    std::fs::create_dir_all(&tmp_home).unwrap();
+
+    cx.update(gpui_component::init);
+    let repo_path = repo.0.clone();
+    let home_for_panel = tmp_home.clone();
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut p = Panel::unconnected(repo_path, cx);
+        p.set_explorer_home(home_for_panel);
+        p
+    });
+    cx.run_until_parked();
+
+    // `show_files`는 비동기 로드를 킥하고 필터 입력에 포커스를 둔다.
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| p.show_files(window, cx));
+    });
+    cx.run_until_parked();
+    let initial_rows = cx.update(|_, cx| view.read(cx).explorer_rows().len());
+    // 최상위: `notes.txt` + `src/` (접힘).
+    assert_eq!(initial_rows, 2);
+
+    // 필터 입력: 쿼리는 즉시 반영되지만 전체 스캔은 디바운스 대기한다.
+    cx.simulate_keystrokes("a l p h a");
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).explorer.filter_query.clone()),
+        "alpha"
+    );
+    assert!(
+        cx.update(|_, cx| view.read(cx).explorer.filter_task.is_some()),
+        "filter scan must wait for debounce instead of blocking the UI thread"
+    );
+    assert!(
+        cx.update(|_, cx| view.read(cx).explorer.filter_files_cache.is_none()),
+        "no synchronous full scan per keystroke"
+    );
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).explorer_rows().len()),
+        initial_rows,
+        "stale rows stay visible until the debounced scan completes"
+    );
+
+    cx.executor()
+        .advance_clock(super::explorer::EXPLORER_FILTER_DEBOUNCE + Duration::from_millis(50));
+    cx.run_until_parked();
+    let rels: Vec<String> = cx.update(|_, cx| {
+        view.read(cx)
+            .explorer_rows()
+            .iter()
+            .map(|r| r.relative_path.clone())
+            .collect()
+    });
+    assert_eq!(rels, vec!["src".to_owned(), "src/alpha.rs".to_owned()]);
+
+    // 일치 없음 필터는 정착 후 빈 메시지를 보이고 로딩 표시가 아니다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.apply_explorer_filter_now("zzz-no-match".to_owned(), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(cx.update(|_, cx| view.read(cx).explorer_rows().len()), 0);
+    assert!(cx.debug_bounds("explorer-empty").is_some());
+    assert!(cx.debug_bounds("explorer-loading").is_none());
+
+    // 새로고침은 필터 캐시를 무효화하고 디바운스 경로로 다시 스캔한다.
+    // 대기 중(행 비어 있음 + 스캔 진행 중)에는 로딩 표시가 뜬다.
+    cx.update(|_, cx| {
+        view.update(cx, Panel::refresh_explorer_async);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explorer-loading").is_some());
+    cx.executor()
+        .advance_clock(super::explorer::EXPLORER_FILTER_DEBOUNCE + Duration::from_millis(50));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explorer-loading").is_none());
+    assert_eq!(cx.update(|_, cx| view.read(cx).explorer_rows().len()), 0);
+
+    // 인라인 이름 입력은 트리 안에 그려지고(상단 바 아님) 취소된다.
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| {
+            p.start_explorer_edit(
+                EditKind::NewFile {
+                    parent: repo.0.clone(),
+                },
+                window,
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explorer-edit-inline").is_some());
+    assert!(cx.debug_bounds("explorer-edit-bar").is_none());
+    cx.update(|_, cx| {
+        view.update(cx, Panel::cancel_explorer_edit);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("explorer-edit-inline").is_none());
+
+    std::fs::remove_dir_all(&tmp_home).ok();
+}
+
+/// OWE-849: 화살표 키 탐색 헬퍼는 클램프되고 부모 행을 찾는다.
+#[test]
+fn explorer_keyboard_navigation_clamps_and_finds_parent() {
+    let repo = Repo::plain();
+    let mut ex = Explorer::new(repo.0.clone());
+    ex.rows = vec![
+        TreeRow {
+            name: "src".to_owned(),
+            path: repo.0.join("src"),
+            relative_path: "src".to_owned(),
+            is_dir: true,
+            depth: 0,
+            expanded: true,
+            ignored: false,
+        },
+        TreeRow {
+            name: "a.rs".to_owned(),
+            path: repo.0.join("src/a.rs"),
+            relative_path: "src/a.rs".to_owned(),
+            is_dir: false,
+            depth: 1,
+            expanded: false,
+            ignored: false,
+        },
+        TreeRow {
+            name: "b.txt".to_owned(),
+            path: repo.0.join("b.txt"),
+            relative_path: "b.txt".to_owned(),
+            is_dir: false,
+            depth: 0,
+            expanded: false,
+            ignored: false,
+        },
+    ];
+
+    assert_eq!(ex.selected_index(), None);
+    ex.move_selection(1);
+    assert_eq!(ex.selected_index(), Some(0));
+    ex.move_selection(1);
+    assert_eq!(ex.selected_index(), Some(1));
+    ex.move_selection(10);
+    assert_eq!(ex.selected_index(), Some(2));
+    ex.move_selection(-10);
+    assert_eq!(ex.selected_index(), Some(0));
+    // 깊이 0 행에서는 부모가 없다.
+    assert!(!ex.select_parent());
+    ex.move_selection(1);
+    assert!(ex.select_parent());
+    assert_eq!(ex.selected_index(), Some(0));
+}
+
 #[test]
 fn workspace_search_engine_options_and_globs_work() {
     let repo = Repo::new();
@@ -1100,6 +1268,13 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
         cx.update(|_, cx| view.read(cx).search_options().query.clone()),
         "needle_ite"
     );
+    // OWE-849: 디바운스 대기 중에는 로딩 표시만 뜨고 결과 없음/요약이 먼저 뜨지 않는다.
+    assert!(cx.debug_bounds("search-loading").is_some());
+    assert!(cx.debug_bounds("search-summary").is_none());
+    assert!(cx.debug_bounds("search-empty-no-results").is_none());
+    cx.executor()
+        .advance_clock(search::SEARCH_DEBOUNCE + Duration::from_millis(50));
+    cx.run_until_parked();
 
     cx.update(|window, cx| {
         view.update(cx, |p, cx| p.show_files(window, cx));
@@ -1115,6 +1290,10 @@ fn workspace_search_panel_tab_virtualized_rows_and_open_file_at_work(
     cx.simulate_mouse_up(search_tab.center(), MouseButton::Left, Modifiers::default());
     cx.run_until_parked();
     cx.simulate_keystrokes("m");
+    cx.run_until_parked();
+    // OWE-849: 디바운스 대기(150ms)가 끝나야 새 검색이 실행된다.
+    cx.executor()
+        .advance_clock(search::SEARCH_DEBOUNCE + Duration::from_millis(50));
     cx.run_until_parked();
 
     assert_eq!(

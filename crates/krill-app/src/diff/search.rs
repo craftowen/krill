@@ -44,6 +44,9 @@ const MAX_RG_STDOUT_BYTES: usize = 16 * 1024 * 1024;
 /// `rg` 프로세스 실행 제한 시간.
 const RG_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// 워크스페이스 검색 입력 디바운스 지연 시간(키 입력마다 `rg`/스캔 중복 스폰 방지).
+pub const SEARCH_DEBOUNCE: Duration = Duration::from_millis(150);
+
 /// `git check-ignore` 프로세스 실행 제한 시간.
 const GIT_IGNORE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1795,6 +1798,10 @@ impl Panel {
     }
 
     pub(crate) fn spawn_async_search(&mut self, cx: &mut Context<Self>) {
+        self.schedule_async_search(false, cx);
+    }
+
+    pub(crate) fn schedule_async_search(&mut self, debounce: bool, cx: &mut Context<Self>) {
         self.search.generation = self.search.generation.wrapping_add(1);
         let generation = self.search.generation;
         if self.search.options.query.is_empty() {
@@ -1809,9 +1816,18 @@ impl Panel {
             return;
         }
         self.search.searching = true;
+        self.search.error = None;
         let repo = self.search.repo.clone();
         let options = self.search.options.clone();
         self.search.search_task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor().timer(SEARCH_DEBOUNCE).await;
+                // 대기 중 새 입력이 들어왔으면 `rg`를 스폰하지 않고 조용히 끝낸다.
+                let current = this.update(cx, |this, _| this.search.generation).ok();
+                if current != Some(generation) {
+                    return;
+                }
+            }
             let outcome = cx
                 .background_executor()
                 .spawn(async move { search_worktree(&repo, &options) })
@@ -1869,13 +1885,13 @@ impl Panel {
                 let val = state.read(cx).value().to_string();
                 if this.search.options.query != val {
                     this.search.options.query = val;
-                    this.spawn_async_search(cx);
+                    this.schedule_async_search(true, cx);
                 }
             }
             InputEvent::PressEnter { .. } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.query = val;
-                this.spawn_async_search(cx);
+                this.schedule_async_search(false, cx);
             }
             _ => {}
         });
@@ -1904,13 +1920,13 @@ impl Panel {
                 let val = state.read(cx).value().to_string();
                 if this.search.options.include_pattern != val {
                     this.search.options.include_pattern = val;
-                    this.spawn_async_search(cx);
+                    this.schedule_async_search(true, cx);
                 }
             }
             InputEvent::PressEnter { .. } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.include_pattern = val;
-                this.spawn_async_search(cx);
+                this.schedule_async_search(false, cx);
             }
             _ => {}
         });
@@ -1939,13 +1955,13 @@ impl Panel {
                 let val = state.read(cx).value().to_string();
                 if this.search.options.exclude_pattern != val {
                     this.search.options.exclude_pattern = val;
-                    this.spawn_async_search(cx);
+                    this.schedule_async_search(true, cx);
                 }
             }
             InputEvent::PressEnter { .. } => {
                 let val = state.read(cx).value().to_string();
                 this.search.options.exclude_pattern = val;
-                this.spawn_async_search(cx);
+                this.schedule_async_search(false, cx);
             }
             _ => {}
         });
@@ -2138,6 +2154,15 @@ impl Panel {
                 "search-empty-idle",
                 IconName::Search,
                 text::SEARCH_IDLE.get(),
+                "",
+                cx,
+            )
+            .into_any_element()
+        } else if self.search.searching && row_count == 0 {
+            Self::render_empty_state(
+                "search-loading",
+                IconName::Search,
+                text::SEARCH_LOADING.get(),
                 "",
                 cx,
             )

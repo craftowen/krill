@@ -15,13 +15,14 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
     AppContext as _, ClipboardItem, Context, ElementId, Entity, FontWeight,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, SharedString,
-    StatefulInteractiveElement as _, Styled as _, Subscription, UniformListScrollHandle, Window,
-    div, px, uniform_list,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Task, UniformListScrollHandle,
+    Window, div, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -36,6 +37,9 @@ const ROW_HEIGHT: f32 = 26.0;
 
 /// 필터 검색 시 재귀 스캔하는 최대 엔트리 수 상한(메모리 ≤ 120MB 및 응답성 보호).
 const MAX_FILTER_ENTRIES: usize = 10_000;
+
+/// 파일 탐색기 이름 필터 입력 디바운스 지연 시간(키 입력마다 동기 스캔·`git check-ignore` 블로킹 방지).
+pub const EXPLORER_FILTER_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// 디렉터리 엔트리 캐시 항목.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,10 +81,19 @@ pub struct PendingDelete {
 }
 
 /// 파일 탐색기 상태.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "로드 상태·표시 토글 독립 플래그들(OWE-849 비동기 로드 추가로 4개)"
+)]
 pub struct Explorer {
     pub(crate) repo: PathBuf,
     pub(crate) home: PathBuf,
     pub(crate) loaded_root: bool,
+    pub(crate) loading: bool,
+    pub(crate) load_generation: u64,
+    pub(crate) load_task: Option<Task<()>>,
+    pub(crate) filter_generation: u64,
+    pub(crate) filter_task: Option<Task<()>>,
     pub(crate) dir_cache: BTreeMap<PathBuf, Vec<DirEntry>>,
     pub(crate) expanded: BTreeSet<PathBuf>,
     pub(crate) ignored: BTreeSet<String>,
@@ -92,6 +105,7 @@ pub struct Explorer {
     pub(crate) rows: Vec<TreeRow>,
     pub(crate) selected: Option<PathBuf>,
     pub(crate) scroll: UniformListScrollHandle,
+    pub(crate) tree_focus: Option<gpui::FocusHandle>,
     pub(crate) filter_input: Option<Entity<InputState>>,
     pub(crate) filter_sub: Option<Subscription>,
     pub(crate) editing: Option<(EditKind, Entity<InputState>, Option<Subscription>)>,
@@ -107,6 +121,7 @@ impl std::fmt::Debug for Explorer {
             .field("repo", &self.repo)
             .field("home", &self.home)
             .field("loaded_root", &self.loaded_root)
+            .field("loading", &self.loading)
             .field("show_dotfiles", &self.show_dotfiles)
             .field("show_ignored", &self.show_ignored)
             .field("filter_query", &self.filter_query)
@@ -122,6 +137,11 @@ impl Explorer {
             repo,
             home: crate::accounts::default_home(),
             loaded_root: false,
+            loading: false,
+            load_generation: 0,
+            load_task: None,
+            filter_generation: 0,
+            filter_task: None,
             dir_cache: BTreeMap::new(),
             expanded: BTreeSet::new(),
             ignored: BTreeSet::new(),
@@ -133,6 +153,7 @@ impl Explorer {
             rows: Vec::new(),
             selected: None,
             scroll: UniformListScrollHandle::new(),
+            tree_focus: None,
             filter_input: None,
             filter_sub: None,
             editing: None,
@@ -152,6 +173,11 @@ impl Explorer {
     pub fn set_repo(&mut self, repo: PathBuf, load_now: bool) {
         self.repo = repo;
         self.loaded_root = false;
+        self.loading = false;
+        self.load_generation = self.load_generation.wrapping_add(1);
+        self.load_task = None;
+        self.filter_generation = self.filter_generation.wrapping_add(1);
+        self.filter_task = None;
         self.dir_cache.clear();
         self.expanded.clear();
         self.ignored.clear();
@@ -167,10 +193,82 @@ impl Explorer {
         }
     }
 
+    /// 인라인 편집 입력 행이 가상 리스트 내 어느 위치에 들어가야 하는지 `(virtual_index, depth, replaces_row)`를 반환한다.
+    pub(crate) fn inline_edit_slot(&self) -> Option<(usize, usize, bool)> {
+        let (kind, _, _) = self.editing.as_ref()?;
+        match kind {
+            EditKind::Rename { target } => {
+                if let Some(idx) = self.rows.iter().position(|r| &r.path == target) {
+                    Some((idx, self.rows[idx].depth, true))
+                } else {
+                    Some((0, 0, false))
+                }
+            }
+            EditKind::NewFile { parent } | EditKind::NewFolder { parent } => {
+                if parent == &self.repo {
+                    Some((0, 0, false))
+                } else if let Some(idx) = self.rows.iter().position(|r| &r.path == parent) {
+                    Some((
+                        idx.saturating_add(1),
+                        self.rows[idx].depth.saturating_add(1),
+                        false,
+                    ))
+                } else {
+                    Some((0, 0, false))
+                }
+            }
+        }
+    }
+
+    /// 현재 선택 행의 가상 리스트 인덱스를 반환한다.
+    pub fn selected_index(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        self.rows.iter().position(|row| &row.path == selected)
+    }
+
+    /// 화살표 키 탐색용: 선택을 `delta`만큼 옮기고 클램프한다.
+    pub fn move_selection(&mut self, delta: isize) {
+        if self.rows.is_empty() {
+            return;
+        }
+        let last = self.rows.len() - 1;
+        let next = match self.selected_index() {
+            Some(index) => (index.cast_signed().saturating_add(delta))
+                .clamp(0, last.cast_signed())
+                .cast_unsigned(),
+            None => {
+                if delta < 0 {
+                    last
+                } else {
+                    0
+                }
+            }
+        };
+        self.selected = self.rows.get(next).map(|row| row.path.clone());
+    }
+
+    /// 선택 행의 부모 폴더를 선택한다(좌측 화살표 탐색용).
+    pub fn select_parent(&mut self) -> bool {
+        let Some(index) = self.selected_index() else {
+            return false;
+        };
+        let depth = self.rows[index].depth;
+        if depth == 0 {
+            return false;
+        }
+        for row in self.rows[..index].iter().rev() {
+            if row.depth == depth - 1 {
+                self.selected = Some(row.path.clone());
+                return true;
+            }
+        }
+        false
+    }
     /// 루트 폴더가 아직 로드되지 않았으면 지연 로드한다.
     pub fn ensure_loaded(&mut self) {
         if !self.loaded_root {
             self.loaded_root = true;
+            self.loading = false;
             let root = self.repo.clone();
             self.load_dir(&root);
             self.rebuild_rows();
@@ -839,10 +937,205 @@ impl Panel {
     /// `Files` 탭으로 전환하고 파일 필터 입력창을 준비한다.
     pub fn show_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.tab = super::PanelTab::Files;
-        self.explorer.ensure_loaded();
+        self.ensure_explorer_loaded_async(cx);
         let input = self.ensure_explorer_filter_input(window, cx);
         input.update(cx, |s, cx| s.focus(window, cx));
         cx.notify();
+    }
+
+    /// 루트 폴더 지연 로드를 백그라운드에서 수행한다(UI 스레드 블로킹 방지, OWE-849).
+    ///
+    /// 디스크 읽기(`read_dir_entries`)와 `git check-ignore` 자식 프로세스를 백그라운드
+    /// 스레드로 옮기고, 완료 세대가 최신일 때만 캐시·행에 반영한다.
+    pub fn ensure_explorer_loaded_async(&mut self, cx: &mut Context<Self>) {
+        if self.explorer.loaded_root || self.explorer.loading {
+            return;
+        }
+        self.explorer.loaded_root = true;
+        self.explorer.loading = true;
+        self.explorer.load_generation = self.explorer.load_generation.wrapping_add(1);
+        let generation = self.explorer.load_generation;
+        let repo = self.explorer.repo.clone();
+        self.explorer.load_task = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let entries = read_dir_entries(&repo, &repo);
+                    let rels: Vec<String> =
+                        entries.iter().map(|e| e.relative_path.clone()).collect();
+                    let ignored = query_git_ignored(&repo, &rels);
+                    (repo, entries, ignored)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.explorer.load_generation != generation {
+                    return;
+                }
+                this.explorer.load_task = None;
+                this.explorer.loading = false;
+                let (root, entries, ignored) = loaded;
+                for rel in ignored {
+                    this.explorer.ignored.insert(rel);
+                }
+                this.explorer.dir_cache.insert(root, entries);
+                this.explorer.rebuild_rows();
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// 새로고침 버튼용: 루트와 펼쳐진 폴더를 백그라운드에서 다시 읽는다(OWE-849).
+    pub fn refresh_explorer_async(&mut self, cx: &mut Context<Self>) {
+        if self.explorer.loading {
+            return;
+        }
+        self.explorer.loaded_root = true;
+        self.explorer.loading = true;
+        self.explorer.load_generation = self.explorer.load_generation.wrapping_add(1);
+        let generation = self.explorer.load_generation;
+        let repo = self.explorer.repo.clone();
+        let dirs: Vec<PathBuf> = self.explorer.expanded.iter().cloned().collect();
+        self.explorer.load_task = Some(cx.spawn(async move |this, cx| {
+            let loaded = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out = Vec::new();
+                    let mut all_ignored = Vec::new();
+                    let mut targets = vec![repo.clone()];
+                    targets.extend(dirs.into_iter().filter(|dir| dir.is_dir()));
+                    for dir in targets {
+                        let entries = read_dir_entries(&repo, &dir);
+                        let rels: Vec<String> =
+                            entries.iter().map(|e| e.relative_path.clone()).collect();
+                        all_ignored.extend(query_git_ignored(&repo, &rels));
+                        out.push((dir, entries));
+                    }
+                    (out, all_ignored)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.explorer.load_generation != generation {
+                    return;
+                }
+                this.explorer.load_task = None;
+                this.explorer.loading = false;
+                let (dirs_loaded, ignored) = loaded;
+                this.explorer.ignored.clear();
+                for rel in ignored {
+                    this.explorer.ignored.insert(rel);
+                }
+                let mut live: BTreeSet<PathBuf> = BTreeSet::new();
+                for (dir, entries) in dirs_loaded {
+                    live.insert(dir.clone());
+                    this.explorer.dir_cache.insert(dir, entries);
+                }
+                let stale: Vec<PathBuf> = this
+                    .explorer
+                    .expanded
+                    .iter()
+                    .filter(|dir| !live.contains(*dir))
+                    .cloned()
+                    .collect();
+                for dir in stale {
+                    this.explorer.expanded.remove(&dir);
+                    this.explorer.dir_cache.remove(&dir);
+                }
+                // 필터 캐시는 무효화하고, 필터가 켜져 있으면 디바운스 경로로 다시 스캔한다.
+                this.explorer.filter_files_cache = None;
+                let query = this.explorer.filter_query.clone();
+                if query.trim().is_empty() {
+                    this.explorer.rebuild_rows();
+                    cx.notify();
+                } else {
+                    this.schedule_explorer_filter(query, cx);
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// 파일명 필터 입력 디바운스 UI 경로(OWE-849): 키 입력마다 동기 스캔하지 않고,
+    /// 스캔 캐시가 없으면 150ms 조용해진 뒤 백그라운드에서 전체 스캔한다.
+    pub fn schedule_explorer_filter(&mut self, query: String, cx: &mut Context<Self>) {
+        self.schedule_explorer_filter_inner(query, true, cx);
+    }
+
+    /// 필터 `Enter` 확정용(OWE-849): 디바운스 대기 없이 즉시 백그라운드에서 스캔한다.
+    /// UI 스레드에서 동기 전체 스캔·`git check-ignore`를 실행하지 않는다.
+    pub fn apply_explorer_filter_now(&mut self, query: String, cx: &mut Context<Self>) {
+        self.schedule_explorer_filter_inner(query, false, cx);
+    }
+
+    fn schedule_explorer_filter_inner(
+        &mut self,
+        query: String,
+        debounce: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let empty = query.trim().is_empty();
+        if empty {
+            self.explorer.filter_collapsed.clear();
+        }
+        self.explorer.filter_query = query;
+        self.explorer.filter_generation = self.explorer.filter_generation.wrapping_add(1);
+        let generation = self.explorer.filter_generation;
+        // 빈 쿼리나 이미 스캔된 캐시가 있으면 동기 재구성으로 충분하다.
+        if empty || self.explorer.filter_files_cache.is_some() {
+            self.explorer.filter_task = None;
+            self.explorer.rebuild_rows();
+            cx.notify();
+            return;
+        }
+        let repo = self.explorer.repo.clone();
+        self.explorer.filter_task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                cx.background_executor()
+                    .timer(EXPLORER_FILTER_DEBOUNCE)
+                    .await;
+            }
+            // 대기 중 새 입력이 들어왔으면 스캔·`git check-ignore`를 스폰하지 않는다.
+            let current = this
+                .update(cx, |this, _| this.explorer.filter_generation)
+                .ok();
+            if current != Some(generation) {
+                return;
+            }
+            let scanned = cx
+                .background_executor()
+                .spawn(async move {
+                    let entries = scan_worktree_entries(&repo, MAX_FILTER_ENTRIES);
+                    let rels: Vec<String> =
+                        entries.iter().map(|e| e.relative_path.clone()).collect();
+                    let ignored = query_git_ignored(&repo, &rels);
+                    (entries, ignored)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.explorer.filter_generation != generation {
+                    return;
+                }
+                this.explorer.filter_task = None;
+                let (entries, ignored) = scanned;
+                for rel in ignored {
+                    this.explorer.ignored.insert(rel);
+                }
+                this.explorer.filter_files_cache = Some(entries);
+                this.explorer.rebuild_rows();
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// 진행 중인 인라인 이름 입력을 취소한다(`Esc`, OWE-849).
+    pub(crate) fn cancel_explorer_edit(&mut self, cx: &mut Context<Self>) {
+        if self.explorer.editing.take().is_some() {
+            cx.notify();
+        }
     }
 
     /// 파일 탐색기 가시 행 목록.
@@ -997,10 +1290,17 @@ impl Panel {
                 .clean_on_escape()
         });
         let sub = cx.subscribe(&input, |this, state, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) {
-                let val = state.read(cx).value().to_string();
-                this.explorer.set_filter_query(val);
-                cx.notify();
+            match event {
+                InputEvent::Change => {
+                    let val = state.read(cx).value().to_string();
+                    this.schedule_explorer_filter(val, cx);
+                }
+                InputEvent::PressEnter { .. } => {
+                    // Enter는 디바운스 없이 즉시 백그라운드 스캔으로 반영한다.
+                    let val = state.read(cx).value().to_string();
+                    this.apply_explorer_filter_now(val, cx);
+                }
+                _ => {}
             }
         });
         self.explorer.filter_input = Some(input.clone());
@@ -1070,7 +1370,11 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        self.explorer.ensure_loaded();
+        // 비동기 로드 진행 중에는 첫 페인트를 막지 않고 로딩 표시만 한다(OWE-849).
+        // 비동기 킥 없이 렌더된 경우에만 동기 백스톱으로 채운다.
+        if !self.explorer.loaded_root && !self.explorer.loading {
+            self.explorer.ensure_loaded();
+        }
         let filter_input = self.ensure_explorer_filter_input(window, cx);
         let p = ui::palette(cx);
         let show_dotfiles = self.explorer.show_dotfiles;
@@ -1165,42 +1469,6 @@ impl Panel {
                     })),
             );
 
-        let edit_bar = self.explorer.editing.as_ref().map(|(_, input, _)| {
-            div()
-                .id("explorer-edit-bar")
-                .debug_selector(|| "explorer-edit-bar".into())
-                .flex_none()
-                .px_2()
-                .py_1()
-                .flex()
-                .items_center()
-                .gap_1()
-                .border_b_1()
-                .border_color(p.border)
-                .child(div().flex_1().min_w_0().child(Input::new(input).xsmall()))
-                .child(
-                    Button::new("explorer-edit-save")
-                        .debug_selector(|| "explorer-edit-save".into())
-                        .label(text::EXPLORER_SAVE.get())
-                        .primary()
-                        .xsmall()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.submit_explorer_edit(cx);
-                        })),
-                )
-                .child(
-                    Button::new("explorer-edit-cancel")
-                        .debug_selector(|| "explorer-edit-cancel".into())
-                        .label(text::EXPLORER_CANCEL.get())
-                        .ghost()
-                        .xsmall()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.explorer.editing = None;
-                            cx.notify();
-                        })),
-                )
-        });
-
         let error_bar = self.explorer.error.as_ref().map(|msg| {
             div()
                 .flex_none()
@@ -1208,19 +1476,42 @@ impl Panel {
                 .child(ui::error_banner(p, msg.clone()))
         });
 
-        let body = if count == 0 {
+        // 인라인 편집 행: 이름 변경이면 해당 행을 대체하고, 새 파일/폴더면 부모 다음에 삽입한다.
+        let edit_slot = self.explorer.inline_edit_slot();
+        let edit_inserts = edit_slot.is_some_and(|(_, _, replaces)| !replaces);
+        let total_rows = count.saturating_add(usize::from(edit_inserts));
+        let loading = self.explorer.loading;
+        let filter_pending = self.explorer.filter_task.is_some();
+        let tree_focus = self
+            .explorer
+            .tree_focus
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+
+        let body = if total_rows == 0 {
             let empty_msg = if has_filter {
                 text::EXPLORER_FILTER_EMPTY.get()
             } else {
                 text::EXPLORER_EMPTY.get()
             };
-            Self::render_empty_state("explorer-empty", IconName::Folder, empty_msg, "", cx)
+            if loading || (has_filter && filter_pending) {
+                Self::render_empty_state(
+                    "explorer-loading",
+                    IconName::Folder,
+                    text::EXPLORER_LOADING.get(),
+                    "",
+                    cx,
+                )
                 .into_any_element()
+            } else {
+                Self::render_empty_state("explorer-empty", IconName::Folder, empty_msg, "", cx)
+                    .into_any_element()
+            }
         } else {
             let scroll = self.explorer.scroll.clone();
             uniform_list(
                 "explorer-files",
-                count,
+                total_rows,
                 cx.processor(Self::render_explorer_rows),
             )
             .track_scroll(&scroll)
@@ -1238,11 +1529,14 @@ impl Panel {
             .flex()
             .flex_col()
             .child(toolbar)
-            .children(edit_bar)
             .children(error_bar)
             .child(
                 div()
                     .id("explorer-tree-container")
+                    .track_focus(&tree_focus)
+                    .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                        this.on_explorer_tree_key(ev.keystroke.key.as_str(), cx);
+                    }))
                     .flex_1()
                     .min_h_0()
                     .context_menu(move |menu, _, _| {
@@ -1251,6 +1545,58 @@ impl Panel {
                     .child(body),
             )
             .children(confirm_dialog)
+    }
+
+    /// 트리 화살표 키 탐색(OWE-849): `↑/↓` 이동, `→` 펼치기, `←` 접기/부모로, `Enter` 고정 열기.
+    fn on_explorer_tree_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        match key {
+            "up" => {
+                cx.stop_propagation();
+                self.explorer.move_selection(-1);
+                cx.notify();
+            }
+            "down" => {
+                cx.stop_propagation();
+                self.explorer.move_selection(1);
+                cx.notify();
+            }
+            "right" => {
+                cx.stop_propagation();
+                if let Some(selected) = self.explorer.selected.clone()
+                    && selected.is_dir()
+                    && !self.explorer.expanded.contains(&selected)
+                {
+                    self.toggle_explorer_dir(&selected, cx);
+                }
+            }
+            "left" => {
+                cx.stop_propagation();
+                if let Some(selected) = self.explorer.selected.clone() {
+                    if selected.is_dir() && self.explorer.expanded.contains(&selected) {
+                        self.toggle_explorer_dir(&selected, cx);
+                    } else {
+                        self.explorer.select_parent();
+                        cx.notify();
+                    }
+                }
+            }
+            "enter" => {
+                cx.stop_propagation();
+                if let Some(selected) = self.explorer.selected.clone() {
+                    if selected.is_dir() {
+                        self.toggle_explorer_dir(&selected, cx);
+                    } else {
+                        self.open_file_preview = false;
+                        cx.emit(OpenFile(selected));
+                    }
+                }
+            }
+            "escape" if self.explorer.editing.is_some() => {
+                cx.stop_propagation();
+                self.cancel_explorer_edit(cx);
+            }
+            _ => {}
+        }
     }
 
     fn render_delete_confirm_dialog(
@@ -1364,15 +1710,47 @@ impl Panel {
             self.explorer.rendered_rows += range.len();
         }
         let p = ui::palette(cx);
-        let selected_bg = p.accent;
         let hover_bg = p.accent.opacity(0.6);
         let fg = p.foreground;
         let muted = p.muted_foreground;
+        let tree_focus = self
+            .explorer
+            .tree_focus
+            .clone()
+            .unwrap_or_else(|| cx.focus_handle());
+        // 인라인 편집 행의 가상 위치(대체/삽입)와 입력 엔티티를 미리 꺼낸다.
+        let edit_slot = self.explorer.inline_edit_slot();
+        let edit_input = self
+            .explorer
+            .editing
+            .as_ref()
+            .map(|(_, input, _)| input.clone());
+        let edit_is_dir = self
+            .explorer
+            .editing
+            .as_ref()
+            .is_some_and(|(kind, _, _)| match kind {
+                EditKind::Rename { target } => target.is_dir(),
+                EditKind::NewFile { .. } => false,
+                EditKind::NewFolder { .. } => true,
+            });
 
         range
             .filter_map(|ix| {
-                let row = self.explorer.rows.get(ix)?.clone();
+                // 인라인 편집 위치면 이름 입력창을 행으로 그린다(OWE-849: 상단 바 대신 트리 인라인).
+                if let Some((slot, depth, _)) = edit_slot
+                    && ix == slot
+                    && let Some(input) = edit_input.clone()
+                {
+                    return Some(Self::render_inline_edit_row(depth, edit_is_dir, &input, cx));
+                }
+                let data_ix = match edit_slot {
+                    Some((slot, _, false)) if ix > slot => ix.saturating_sub(1),
+                    _ => ix,
+                };
+                let row = self.explorer.rows.get(data_ix)?.clone();
                 let is_selected = self.explorer.selected.as_ref() == Some(&row.path);
+                let selected_bg = p.accent;
                 let indent_px =
                     f32::from(u16::try_from(row.depth).unwrap_or(16).min(16)) * 14.0 + 8.0;
                 let row_path = row.path.clone();
@@ -1409,6 +1787,8 @@ impl Panel {
                 let selector = format!("explorer-row-{ix}");
                 let path_selector = format!("explorer-item-{}", row.relative_path);
                 let row_fg = if row.ignored { muted } else { fg };
+                let focus = tree_focus.clone();
+                let row_path_click = row_path.clone();
 
                 Some(
                     div()
@@ -1440,16 +1820,26 @@ impl Panel {
                         )
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, _, window, cx| {
+                                window.focus(&focus, cx);
                                 if is_dir {
                                     this.toggle_explorer_dir(&row_path, cx);
                                 } else {
                                     this.explorer.selected = Some(row_path.clone());
+                                    // 단일 클릭은 미리보기 탭으로 연다(OWE-849).
+                                    this.open_file_preview = true;
                                     cx.emit(OpenFile(row_path.clone()));
                                     cx.notify();
                                 }
                             }),
                         )
+                        .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                            // 더블클릭은 고정 탭으로 연다(OWE-849).
+                            if e.click_count() >= 2 && !is_dir {
+                                this.open_file_preview = false;
+                                cx.emit(OpenFile(row_path_click.clone()));
+                            }
+                        }))
                         .context_menu(move |menu, _, _| {
                             row_context_menu(menu, &weak, &menu_row, &repo)
                         })
@@ -1457,6 +1847,44 @@ impl Panel {
                 )
             })
             .collect()
+    }
+
+    /// 인라인 이름 입력 행(OWE-849): `Esc` 취소, `Enter` 확정(구독에서 처리).
+    fn render_inline_edit_row(
+        depth: usize,
+        is_dir: bool,
+        input: &Entity<InputState>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let indent_px = f32::from(u16::try_from(depth).unwrap_or(16).min(16)) * 14.0 + 8.0;
+        div()
+            .id("explorer-edit-inline")
+            .debug_selector(|| "explorer-edit-inline".into())
+            .h(px(ROW_HEIGHT))
+            .w_full()
+            .pl(px(indent_px))
+            .pr_2()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .child(div().w(px(12.)).flex_none())
+            .child(
+                Icon::new(if is_dir {
+                    IconName::Folder
+                } else {
+                    IconName::File
+                })
+                .xsmall()
+                .text_color(ui::palette(cx).foreground),
+            )
+            .child(div().flex_1().min_w_0().child(Input::new(input).xsmall()))
+            .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                if ev.keystroke.key.as_str() == "escape" {
+                    cx.stop_propagation();
+                    this.cancel_explorer_edit(cx);
+                }
+            }))
+            .into_any_element()
     }
 }
 
@@ -1552,7 +1980,11 @@ fn row_context_menu(
                 .icon(IconName::FileText)
                 .on_click(move |_, _, cx| {
                     w_open
-                        .update(cx, |_, cx| cx.emit(OpenFile(open_path.clone())))
+                        .update(cx, |this, cx| {
+                            // 컨텍스트 메뉴 열기는 고정 탭이다(OWE-849).
+                            this.open_file_preview = false;
+                            cx.emit(OpenFile(open_path.clone()));
+                        })
                         .ok();
                 }),
         );

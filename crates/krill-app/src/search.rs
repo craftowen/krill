@@ -147,6 +147,7 @@ impl Render for Bar {
         );
         let bar = div()
             .id("search-bar")
+            .debug_selector(|| "search-bar".into())
             .w(px(360.))
             .p_1()
             .flex()
@@ -219,8 +220,8 @@ impl Render for Bar {
         deferred(
             div()
                 .absolute()
-                .top(crate::ui::TITLEBAR_HEIGHT + crate::ui::TAB_BAR_HEIGHT + crate::ui::SPACE_2)
-                .right(px(crate::ui::PANEL_DEFAULT_WIDTH) + crate::ui::SPACE_4)
+                .top(crate::ui::SPACE_2)
+                .right(crate::ui::SPACE_4)
                 .child(bar),
         )
     }
