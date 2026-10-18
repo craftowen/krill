@@ -311,11 +311,9 @@ impl HostManager {
         let Ok(mut s) = slot.lock() else {
             return;
         };
-        if let Some(t) = &mut s.tunnel
-            && !t.is_alive()
-        {
-            s.tunnel = None;
-        }
+        // 살아 있는 터널도 내린다: 원격 데몬 재탐색·깨우기는 터널을 새로 만들 때만 돈다(remote_query).
+        s.generation = s.generation.wrapping_add(1);
+        s.tunnel = None;
         s.next_retry_at = None;
         s.status = HostStatus::Connecting;
     }
@@ -488,6 +486,18 @@ impl HostManager {
         if let Some(t) = &mut s.tunnel
             && !t.is_alive()
         {
+            s.tunnel = None;
+        }
+        // 터널은 살았는데 원격 krilld에 닿지 못했다(원격 소켓 없음·데몬 죽음 → ssh가 채널을 닫음). 터널을 내려야
+        // 다음 시도에서 원격 경로를 다시 찾고 데몬을 깨운다. 그대로 두면 앱을 재시작할 때까지 계속 실패했다.
+        if err.is_some_and(|e| {
+            matches!(
+                e.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+            )
+        }) {
             s.tunnel = None;
         }
         s.failures = s.failures.saturating_add(1);
