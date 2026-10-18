@@ -197,6 +197,17 @@ impl UiFoldState {
     }
 }
 
+/// 워크트리 삭제 확인 모달 상태(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않고
+/// 이 상태로 모달을 띄운 뒤, 확인 버튼에서 `force` 플래그와 함께 삭제한다.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct DeleteConfirm {
+    pub path: PathBuf,
+    pub with_descendants: bool,
+    pub descendant_count: usize,
+    pub dirty: usize,
+    pub force: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Row {
     HostHeader {
@@ -522,6 +533,8 @@ pub struct Sidebar {
     expanded_cards: BTreeSet<PathBuf>,
     /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
     removed_projects: BTreeSet<PathBuf>,
+    /// 워크트리 삭제 확인 모달 상태(OWE-847). `Some`일 때 모달을 띄운다.
+    delete_confirm: Option<DeleteConfirm>,
     path: Option<PathBuf>,
     error: Option<String>,
     /// 연결 오류는 폴링 복구 시 지운다. 저장·손상 오류(`error`)는 사용자가 확인할 때까지 유지한다.
@@ -660,6 +673,7 @@ impl Sidebar {
             collapsed_groups: ui.collapsed_groups,
             expanded_cards: ui.expanded_cards,
             removed_projects: ui.removed_projects,
+            delete_confirm: None,
             path: path.filter(|_| writable),
             error,
             poll_error: None,
@@ -1888,6 +1902,18 @@ impl Sidebar {
         }
     }
 
+    /// 이름 변경 편집을 저장하지 않고 닫는다(OWE-847: Esc·취소 버튼).
+    fn cancel_rename(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.editing.is_some() {
+            self.editing = None;
+            self.edit_subscription = None;
+            if let (Some(window), Some(focus)) = (window, &self.focus) {
+                window.focus(focus, cx);
+            }
+            cx.notify();
+        }
+    }
+
     /// 저장소·폴더 프로젝트를 목록에서 제거한다(OWE-845).
     /// `projects.toml`에 기록된 이관 프로젝트는 파일에서도 지우고,
     /// 그 외에는 제거 집합에 넣어 행을 숨긴다(재시작 후에도 유지).
@@ -1901,6 +1927,62 @@ impl Sidebar {
         self.shown_external.remove(&path);
         self.removed_projects.insert(path);
         self.persist(cx);
+    }
+
+    /// 워크트리 삭제 확인 모달을 연다(OWE-847). 메뉴 클릭 시 즉시 삭제하지 않는다.
+    pub(super) fn request_delete_worktree(
+        &mut self,
+        path: PathBuf,
+        with_descendants: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let host = HostId::Local;
+        let descendant_count = if with_descendants {
+            self.lineage_descendants(&path).len()
+        } else {
+            0
+        };
+        let dirty = self
+            .meta_for(&host)
+            .get(&path)
+            .and_then(|m| m.dirty)
+            .unwrap_or(0);
+        self.delete_confirm = Some(DeleteConfirm {
+            path,
+            with_descendants,
+            descendant_count,
+            dirty,
+            force: false,
+        });
+        cx.notify();
+    }
+
+    /// 삭제 확인 모달을 닫는다(OWE-847: 취소 버튼·Esc).
+    pub(super) fn cancel_delete(&mut self, cx: &mut Context<Self>) {
+        if self.delete_confirm.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// 삭제 확인 모달의 강제 삭제 토글(OWE-847: 미커밋 변경 포함).
+    pub(super) fn toggle_delete_force(&mut self, cx: &mut Context<Self>) {
+        if let Some(confirm) = self.delete_confirm.as_mut() {
+            confirm.force = !confirm.force;
+            cx.notify();
+        }
+    }
+
+    /// 삭제 확인 모달에서 삭제를 확정한다(OWE-847).
+    pub(super) fn confirm_delete(&mut self, cx: &mut Context<Self>) {
+        let Some(confirm) = self.delete_confirm.take() else {
+            return;
+        };
+        cx.notify();
+        if confirm.with_descendants {
+            self.delete_with_descendants(confirm.path, confirm.force, cx);
+        } else {
+            self.delete_worktree(confirm.path, confirm.force, cx);
+        }
     }
 
     /// 바꾼 이름 → 브랜치 → 첫 프롬프트 자동 제목 → 폴더 이름.
