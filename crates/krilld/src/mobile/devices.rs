@@ -3,7 +3,7 @@ use super::e2ee::{invalid, random};
 use krill_proto::mobile::{PairedMobileDevice, PairingTicket};
 use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
 use ring::{digest, hmac};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -216,7 +216,10 @@ impl Devices {
             file.write_all(&serde_json::to_vec(devices).map_err(io::Error::other)?)?;
             file.sync_all()?;
             fs::rename(&tmp, path)?;
-            File::open(dir)?.sync_all()
+            // Windows는 디렉터리를 File::open으로 열지 못한다(os error 5, OWE-835 실측).
+            #[cfg(unix)]
+            fs::File::open(dir)?.sync_all()?;
+            Ok(())
         })();
         if result.is_err() {
             fs::remove_file(tmp).ok();
