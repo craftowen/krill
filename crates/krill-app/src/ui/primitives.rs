@@ -233,6 +233,48 @@ pub fn modal_backdrop(viewport: gpui::Size<Pixels>, content: impl IntoElement) -
     .with_priority(1)
 }
 
+/// 상태바·툴바 요소의 마우스 오버 툴팁 뷰를 생성한다(OWE-788).
+///
+/// `gpui_base::Root` 없이 `Shell`을 루트로 여는 창에서도 GPUI 기본 툴팁 파이프라인으로 그려지며,
+/// 테스트에서는 `tooltip:{id}` 및 `tooltip-text:{id}:{text}` 선택자로 노출 여부와 문구를 검증한다.
+pub fn tooltip_view(
+    id: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+    window: &mut gpui::Window,
+    cx: &mut gpui::App,
+) -> gpui::AnyView {
+    let id: SharedString = id.into();
+    let text: SharedString = text.into();
+    gpui_component::tooltip::Tooltip::element(move |_, _| {
+        let id = id.clone();
+        let text = text.clone();
+        let text_id = id.clone();
+        let text_val = text.clone();
+        div().debug_selector(move || format!("tooltip:{id}")).child(
+            div()
+                .debug_selector(move || format!("tooltip-text:{text_id}:{text_val}"))
+                .child(text),
+        )
+    })
+    .build(window, cx)
+}
+
+/// [`Button`]에 GPUI 기본 마우스 오버 툴팁과 접근성 라벨을 함께 연결한다(OWE-788).
+pub fn button_with_tooltip(
+    mut button: Button,
+    id: impl Into<SharedString>,
+    text: impl Into<SharedString>,
+) -> Button {
+    let id: SharedString = id.into();
+    let text: SharedString = text.into();
+    let tip_id = id;
+    let tip_text = text.clone();
+    button
+        .interactivity()
+        .tooltip(move |window, cx| tooltip_view(tip_id.clone(), tip_text.clone(), window, cx));
+    button.tooltip(text.clone()).accessibility_label(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

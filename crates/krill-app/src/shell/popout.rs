@@ -977,10 +977,17 @@ impl Shell {
 
     pub(super) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let p = ui::palette(cx);
-        let (color, label) = match self.link {
-            Link::Up => (p.success, text::DAEMON_UP.get()),
-            Link::Connecting | Link::Down => (p.warning, text::DAEMON_CONNECTING.get()),
-            Link::Failed(_) => (p.destructive, text::DAEMON_FAILED.get()),
+        let (color, daemon_tooltip) = match &self.link {
+            Link::Up => (p.success, text::DAEMON_UP.get().to_owned()),
+            Link::Connecting | Link::Down => (p.warning, text::DAEMON_CONNECTING.get().to_owned()),
+            Link::Failed(err) => (
+                p.destructive,
+                if err.is_empty() {
+                    text::DAEMON_FAILED.get().to_owned()
+                } else {
+                    format!("{}: {err}", text::DAEMON_FAILED.get())
+                },
+            ),
         };
         let items = self.sidebar.read(cx).jump_items();
         let needs_you = items.iter().filter(|i| i.needs_you).count();
@@ -1044,102 +1051,109 @@ impl Shell {
                 |s| format!("{} · {} · {}", provider.display_name(), s.label, s.updated),
             );
             provider_pills = provider_pills.child(
-                Button::new(gpui::SharedString::from(selector))
-                    .label(label)
-                    .icon(
-                        gpui_component::Icon::default()
-                            .data(ui::icons::provider_svg_bytes(provider)),
-                    )
-                    .text_color(color)
-                    .ghost()
-                    .xsmall()
-                    .tooltip(description.clone())
-                    .accessibility_label(description)
-                    .debug_selector(move || debug_selector.clone())
-                    .dropdown_menu(move |menu, window, cx| {
-                        provider_usage_menu(
-                            menu,
-                            &provider_snap,
-                            provider,
-                            weak.clone(),
-                            window,
-                            cx,
+                ui::button_with_tooltip(
+                    Button::new(gpui::SharedString::from(selector.clone()))
+                        .label(label)
+                        .icon(
+                            gpui_component::Icon::default()
+                                .data(ui::icons::provider_svg_bytes(provider)),
                         )
-                    }),
+                        .text_color(color)
+                        .ghost()
+                        .xsmall()
+                        .debug_selector(move || debug_selector.clone()),
+                    selector,
+                    description,
+                )
+                .dropdown_menu(move |menu, window, cx| {
+                    provider_usage_menu(menu, &provider_snap, provider, weak.clone(), window, cx)
+                }),
             );
         }
         let weak = cx.weak_entity();
-        let refresh_button = Button::new("status-usage-refresh")
-            .icon(gpui_component::IconName::RefreshCw)
-            .ghost()
-            .xsmall()
-            .tooltip(provider_text::PROVIDER_REFRESH_USAGE.get())
-            .accessibility_label(provider_text::PROVIDER_REFRESH_USAGE.get())
-            .debug_selector(|| "status-usage-refresh".into())
-            .on_click(cx.listener(|shell, _, _, cx| {
-                shell.refresh_accounts(UsageRequest::ListAccounts, cx);
-            }));
+        let refresh_button = ui::button_with_tooltip(
+            Button::new("status-usage-refresh")
+                .icon(gpui_component::IconName::RefreshCw)
+                .ghost()
+                .xsmall()
+                .debug_selector(|| "status-usage-refresh".into()),
+            "status-usage-refresh",
+            provider_text::PROVIDER_REFRESH_USAGE.get(),
+        )
+        .on_click(cx.listener(|shell, _, _, cx| {
+            shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+        }));
         let ssh_hosts = self.ssh_hosts.clone();
-        let ssh_label = text::SSH_MENU_BTN.format(&[("count", &ssh_hosts.len().to_string())]);
-        let ssh_menu = Button::new("status-ssh-switcher")
-            .label(ssh_label)
-            .ghost()
-            .xsmall()
-            .tooltip(text::SSH_MENU_TITLE.get())
-            .accessibility_label(text::SSH_MENU_TITLE.get())
-            .debug_selector(|| "status-ssh-switcher".into())
-            .dropdown_menu(move |mut menu, _, _| {
-                menu = menu.min_w(px(240.)).label(text::SSH_MENU_TITLE.get());
-                for host in &ssh_hosts {
-                    let item_label = format!("{} ({})", host.label, host.destination);
-                    let host = host.clone();
-                    let weak = weak.clone();
-                    menu = menu.item(PopupMenuItem::new(item_label).on_click(
-                        move |_, window, cx| {
-                            weak.update(cx, |this, cx| {
-                                this.connect_ssh_host(&host, Some(window), cx);
-                            })
-                            .ok();
-                        },
-                    ));
-                }
-                let open_weak = weak.clone();
-                menu.separator().item(
-                    PopupMenuItem::new(text::OPEN_ADMIN_ACCOUNTS.get()).on_click(
-                        move |_, window, cx| {
-                            open_settings_from_menu(
-                                &open_weak,
-                                krill_app::settings::AdminTab::Ssh,
-                                window,
-                                cx,
-                            );
-                        },
-                    ),
-                )
-            });
+        let ssh_count_label = ssh_hosts.len().to_string();
+        let ssh_full_label = text::SSH_MENU_BTN.format(&[("count", &ssh_count_label)]);
+        let ssh_tooltip = format!("{} — {ssh_full_label}", text::SSH_MENU_TITLE.get());
+        let ssh_menu = ui::button_with_tooltip(
+            Button::new("status-ssh-switcher")
+                .icon(gpui_component::Icon::default().data(ui::icons::SERVER_SVG))
+                .label(ssh_count_label)
+                .ghost()
+                .xsmall()
+                .debug_selector(|| "status-ssh-switcher".into()),
+            "status-ssh-switcher",
+            ssh_tooltip,
+        )
+        .dropdown_menu(move |mut menu, _, _| {
+            menu = menu.min_w(px(240.)).label(text::SSH_MENU_TITLE.get());
+            for host in &ssh_hosts {
+                let item_label = format!("{} ({})", host.label, host.destination);
+                let host = host.clone();
+                let weak = weak.clone();
+                menu = menu.item(
+                    PopupMenuItem::new(item_label).on_click(move |_, window, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.connect_ssh_host(&host, Some(window), cx);
+                        })
+                        .ok();
+                    }),
+                );
+            }
+            let open_weak = weak.clone();
+            menu.separator().item(
+                PopupMenuItem::new(text::OPEN_ADMIN_ACCOUNTS.get()).on_click(
+                    move |_, window, cx| {
+                        open_settings_from_menu(
+                            &open_weak,
+                            krill_app::settings::AdminTab::Ssh,
+                            window,
+                            cx,
+                        );
+                    },
+                ),
+            )
+        });
         let state_dir = self.state_dir(cx);
         let orch_store = state_dir
             .as_deref()
             .map(krill_proto::orchestration::OrchestrationStore::load_cached)
             .unwrap_or_default();
-        let orch_label = text::ORCH_MENU_BTN.format(&[
+        let orch_compact_label = format!("{}·{}", orch_store.runs.len(), orch_store.tasks.len());
+        let orch_full_label = text::ORCH_MENU_BTN.format(&[
             ("runs", &orch_store.runs.len().to_string()),
             ("tasks", &orch_store.tasks.len().to_string()),
         ]);
+        let orch_tooltip = format!("{} — {orch_full_label}", text::ORCH_MENU_TITLE.get());
         let active_handoff_text = session.and_then(|sid| {
             self.live
                 .values()
                 .find(|l| l.pane.session() == Some(sid))
                 .map(|l| (sid.0, screen_plain_text(&l.pane.shown())))
         });
-        let orch_menu = Button::new("status-orchestration-menu")
-            .label(orch_label)
-            .ghost()
-            .xsmall()
-            .tooltip(text::ORCH_MENU_TITLE.get())
-            .accessibility_label(text::ORCH_MENU_TITLE.get())
-            .debug_selector(|| "status-orchestration-menu".into())
-            .dropdown_menu({
+        let orch_menu = ui::button_with_tooltip(
+            Button::new("status-orchestration-menu")
+                .icon(gpui_component::Icon::default().data(ui::icons::WORKFLOW_SVG))
+                .label(orch_compact_label)
+                .ghost()
+                .xsmall()
+                .debug_selector(|| "status-orchestration-menu".into()),
+            "status-orchestration-menu",
+            orch_tooltip,
+        )
+        .dropdown_menu({
                 let weak = cx.weak_entity();
                 let state_dir = state_dir.clone();
                 move |mut menu, _, _| {
@@ -1403,33 +1417,36 @@ impl Shell {
                 .values()
                 .any(|live| live.pane.session().is_some_and(|sid| sid.0 == *id))
         });
-        let ports_label =
-            text::PORTS_MENU_BTN.format(&[("count", &detected_ports.len().to_string())]);
-        let ports_menu = Button::new("status-ports-menu")
-            .label(ports_label)
-            .ghost()
-            .xsmall()
-            .tooltip(text::PORTS_MENU_TITLE.get())
-            .accessibility_label(text::PORTS_MENU_TITLE.get())
-            .debug_selector(|| "status-ports-menu".into())
-            .dropdown_menu(move |mut menu, _, _| {
-                menu = menu.min_w(px(240.)).label(text::PORTS_MENU_TITLE.get());
-                if detected_ports.is_empty() {
-                    menu = menu.item(PopupMenuItem::new(text::PORTS_EMPTY.get()).disabled(true));
-                } else {
-                    for entry in &detected_ports {
-                        let label =
-                            format!("s{} · :{} → {}", entry.session_id, entry.port, entry.url);
-                        let url = entry.url.clone();
-                        menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
-                            // AS-23: 자식 프로세스로 `open`을 띄우면 회수하지 않아 좀비가 쌓인다.
-                            // 같은 동작(기본 브라우저로 URL 열기)을 플랫폼에 맡긴다.
-                            cx.open_url(&url);
-                        }));
-                    }
+        let ports_count_label = detected_ports.len().to_string();
+        let ports_full_label = text::PORTS_MENU_BTN.format(&[("count", &ports_count_label)]);
+        let ports_tooltip = format!("{} — {ports_full_label}", text::PORTS_MENU_TITLE.get());
+        let ports_menu = ui::button_with_tooltip(
+            Button::new("status-ports-menu")
+                .icon(gpui_component::Icon::default().data(ui::icons::PLUG_SVG))
+                .label(ports_count_label)
+                .ghost()
+                .xsmall()
+                .debug_selector(|| "status-ports-menu".into()),
+            "status-ports-menu",
+            ports_tooltip,
+        )
+        .dropdown_menu(move |mut menu, _, _| {
+            menu = menu.min_w(px(240.)).label(text::PORTS_MENU_TITLE.get());
+            if detected_ports.is_empty() {
+                menu = menu.item(PopupMenuItem::new(text::PORTS_EMPTY.get()).disabled(true));
+            } else {
+                for entry in &detected_ports {
+                    let label = format!("s{} · :{} → {}", entry.session_id, entry.port, entry.url);
+                    let url = entry.url.clone();
+                    menu = menu.item(PopupMenuItem::new(label).on_click(move |_, _, cx| {
+                        // AS-23: 자식 프로세스로 `open`을 띄우면 회수하지 않아 좀비가 쌓인다.
+                        // 같은 동작(기본 브라우저로 URL 열기)을 플랫폼에 맡긴다.
+                        cx.open_url(&url);
+                    }));
                 }
-                menu
-            });
+            }
+            menu
+        });
         div()
             .id("status-bar")
             .debug_selector(|| "status-bar".into())
@@ -1462,34 +1479,43 @@ impl Shell {
                     .debug_selector(|| "status-bar-right".into())
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2()
                     .children(krill_app::recording::warning(self.recording, cx))
-                    .children(
-                        (!krill_app::onboarding::required_failures(
-                            &krill_app::onboarding::snapshot(cx).checks,
-                        )
-                        .is_empty())
-                        .then(|| {
+                    .children({
+                        let checks = krill_app::onboarding::snapshot(cx).checks;
+                        let failures = krill_app::onboarding::required_failures(&checks);
+                        (!failures.is_empty()).then(|| {
+                            let warn_title =
+                                krill_app::i18n::catalog::onboarding::STATUS_CHECKS_WARN.get();
+                            let details: Vec<&str> =
+                                failures.iter().map(|c| c.summary.as_str()).collect();
+                            let warn_tooltip = if details.is_empty() {
+                                warn_title.to_owned()
+                            } else {
+                                format!("{warn_title}: {}", details.join(", "))
+                            };
                             div()
                                 .debug_selector(|| "status-checks-warning".into())
                                 .child(
-                                Button::new("status-checks-warning")
-                                    .ghost()
-                                    .xsmall()
-                                    .label(
-                                        krill_app::i18n::catalog::onboarding::STATUS_CHECKS_WARN
-                                            .get(),
-                                    )
-                                    .tooltip(
-                                        krill_app::i18n::catalog::onboarding::STATUS_CHECKS_WARN
-                                            .get(),
+                                    ui::button_with_tooltip(
+                                        Button::new("status-checks-warning")
+                                            .icon(
+                                                gpui_component::Icon::default()
+                                                    .data(ui::icons::TRIANGLE_ALERT_SVG),
+                                            )
+                                            .label(failures.len().to_string())
+                                            .text_color(p.warning)
+                                            .ghost()
+                                            .xsmall(),
+                                        "status-checks-warning",
+                                        warn_tooltip,
                                     )
                                     .on_click(|_, _, cx| {
                                         krill_app::onboarding::open_checks_current(cx);
                                     }),
-                            )
-                        }),
-                    )
+                                )
+                        })
+                    })
                     // Design adapted from Orca (.ref/orca/src/renderer/src/components/status-bar/UpdateStatusSegment.tsx),
                     // MIT License — Copyright (c) 2026 Orca Contributors.
                     .children(
@@ -1499,14 +1525,23 @@ impl Shell {
                                 let badge =
                                     krill_app::i18n::catalog::updater_relaunch::STATUS_READY_BADGE
                                         .format(&[("version", &staged.to_version)]);
-                                Button::new("status-update-ready")
-                                    .label(badge.clone())
-                                    .tooltip(badge.clone())
-                                    .accessibility_label(badge)
-                                    .debug_selector(|| "status-update-ready".into())
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(|_, _, _, cx| {
+                                let compact = format!("v{}", staged.to_version);
+                                ui::button_with_tooltip(
+                                    Button::new("status-update-ready")
+                                        .icon(
+                                            gpui_component::Icon::default()
+                                                .data(ui::icons::CIRCLE_ARROW_UP_SVG),
+                                        )
+                                        .label(compact)
+                                        .text_color(p.success)
+                                        .debug_selector(|| "status-update-ready".into())
+                                        .ghost()
+                                        .xsmall(),
+                                    "status-update-ready",
+                                    badge,
+                                )
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| {
                                         let mut u = cx
                                             .try_global::<krill_app::updater::UpdateState>()
                                             .cloned()
@@ -1515,52 +1550,126 @@ impl Shell {
                                         cx.set_global(u);
                                         cx.refresh_windows();
                                         cx.notify();
-                                    }))
+                                    },
+                                ))
                             }),
                     )
-                    .child(
+                    .child({
+                        let tip = daemon_tooltip;
                         div()
                             .id("status-daemon")
                             .debug_selector(|| "status-daemon".into())
+                            .aria_label(tip.clone())
                             .flex()
                             .items_center()
-                            .gap_1p5()
-                            .child(div().text_size(ui::TEXT_2XS).text_color(color).child("●"))
-                            .child(label),
-                    )
-                    .child(
+                            .justify_center()
+                            .px_1()
+                            .py_0p5()
+                            .rounded(ui::RADIUS_XS)
+                            .child(div().size(ui::STATE_DOT).rounded_full().bg(color))
+                            .tooltip(move |window, cx| {
+                                ui::tooltip_view("status-daemon", tip.clone(), window, cx)
+                            })
+                    })
+                    .child({
+                        let usage_tip = counts(items.len(), needs_you);
+                        let sessions_count = items.len().to_string();
+                        let needs_you_count = needs_you.to_string();
+                        let needs_you_color = if needs_you > 0 {
+                            p.agent_question
+                        } else {
+                            p.muted_foreground
+                        };
                         div()
                             .id("status-usage")
                             .debug_selector(|| "status-usage".into())
-                            .child(counts(items.len(), needs_you)),
-                    )
+                            .aria_label(usage_tip.clone())
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_1()
+                            .py_0p5()
+                            .rounded(ui::RADIUS_XS)
+                            .child(
+                                div()
+                                    .id("status-sessions")
+                                    .debug_selector(|| "status-sessions".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        gpui_component::Icon::default()
+                                            .data(ui::icons::TERMINAL_SVG)
+                                            .with_size(gpui_component::Size::XSmall),
+                                    )
+                                    .child(sessions_count),
+                            )
+                            .child(
+                                div()
+                                    .id("status-needs-you")
+                                    .debug_selector(|| "status-needs-you".into())
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .text_color(needs_you_color)
+                                    .child(
+                                        gpui_component::Icon::default()
+                                            .data(ui::icons::BELL_SVG)
+                                            .with_size(gpui_component::Size::XSmall)
+                                            .text_color(needs_you_color),
+                                    )
+                                    .child(needs_you_count),
+                            )
+                            .tooltip(move |window, cx| {
+                                ui::tooltip_view("status-usage", usage_tip.clone(), window, cx)
+                            })
+                    })
                     .child(orch_menu)
                     .child(ports_menu)
                     .child(ssh_menu)
                     .when(session.is_some(), |d| {
+                        let float_tip =
+                            format!("{} — {}", text::FLOAT_BUTTON.get(), text::FLOAT_LABEL.get());
                         d.child(
-                            Button::new("float-terminal")
-                                .label(text::FLOAT_BUTTON.get())
-                                .ghost()
-                                .xsmall()
-                                .accessibility_label(text::FLOAT_LABEL.get())
-                                .tooltip(text::FLOAT_LABEL.get())
-                                .debug_selector(|| "float-terminal".into())
-                                .on_click(cx.listener(|this, _, window, cx| {
+                            ui::button_with_tooltip(
+                                Button::new("float-terminal")
+                                    .icon(
+                                        gpui_component::Icon::default()
+                                            .data(ui::icons::PANELS_TOP_LEFT_SVG),
+                                    )
+                                    .ghost()
+                                    .xsmall()
+                                    .debug_selector(|| "float-terminal".into()),
+                                "float-terminal",
+                                float_tip,
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
                                     this.on_float_terminal(&FloatTerminal, window, cx);
-                                })),
+                                },
+                            )),
                         )
                     })
-                    .child(
-                        Button::new("dashboard-popout")
-                            .label(text::DASHBOARD.get())
-                            .ghost()
-                            .xsmall()
-                            .accessibility_label(text::DASHBOARD_LABEL.get())
-                            .tooltip(text::DASHBOARD_LABEL.get())
-                            .debug_selector(|| "dashboard-popout".into())
-                            .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx))),
-                    )
+                    .child({
+                        let dashboard_tip = format!(
+                            "{} — {}",
+                            text::DASHBOARD.get(),
+                            text::DASHBOARD_LABEL.get()
+                        );
+                        ui::button_with_tooltip(
+                            Button::new("dashboard-popout")
+                                .icon(
+                                    gpui_component::Icon::default()
+                                        .data(ui::icons::LAYOUT_DASHBOARD_SVG),
+                                )
+                                .ghost()
+                                .xsmall()
+                                .debug_selector(|| "dashboard-popout".into()),
+                            "dashboard-popout",
+                            dashboard_tip,
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx)))
+                    })
                     .child(self.history.clone())
                     .child(self.resources.clone()),
             )
