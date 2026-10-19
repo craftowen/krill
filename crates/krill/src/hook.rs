@@ -17,7 +17,7 @@ use rustix::event::{PollFd, PollFlags, Timespec, poll};
 use rustix::io::Errno;
 
 /// `main` 진입부터 끝까지의 예산(재시도·spool 포함). ARCHITECTURE §6의 50ms는 에이전트가 보는 wall-clock이라
-/// exec·종료와 macOS 타이머 지연(20ms 대기가 21.7~30ms에 깸) 몫으로 15ms를 남긴다(docs/spikes/MK-038.md).
+/// exec·종료와 macOS 타이머 지연(20ms 대기가 21.7~30ms에 깸) 몫으로 15ms를 남긴다(비공개 MK-038 스파이크 기록).
 const BUDGET: Duration = Duration::from_millis(35);
 /// stdin이 닫히기를 기다리는 시간(시작부터). 넘으면 payload 없이 보낸다. 에이전트는 JSON을 쓰고 바로 닫는다.
 const STDIN_WAIT: Duration = Duration::from_millis(10);

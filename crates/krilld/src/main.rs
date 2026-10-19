@@ -32,7 +32,7 @@ use krilld::rejoin::{self, Handover};
 #[cfg(unix)]
 use rustix::fs::{FileType, fstat};
 
-// 해제한 핫 스크롤백·sync 버퍼를 footprint로 돌려주는 할당기(OWE-477, docs/spikes/OWE-477.md).
+// 해제한 핫 스크롤백·sync 버퍼를 footprint로 돌려주는 할당기(OWE-477, 비공개 OWE-477 스파이크 기록).
 #[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

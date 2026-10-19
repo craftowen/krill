@@ -1,4 +1,4 @@
-//! holder 재결합(OWE-479, docs/spikes/MK-018.md '재결합 절차'): holder를 잃은 krilld의 고아 운영과, 새 holder가
+//! holder 재결합(OWE-479, 비공개 MK-018 스파이크 기록 '재결합 절차'): holder를 잃은 krilld의 고아 운영과, 새 holder가
 //! 띄운 krilld로의 인계.
 //!
 //! - **고아 운영**([`orphan`]): holder 링크가 끊기면 krilld는 끝나지 않고 세션을 계속 서빙한다. 세션 종료는
