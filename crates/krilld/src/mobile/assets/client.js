@@ -8,11 +8,13 @@
  // Pairing input is consumed once, before UI routing or networking.
  function bootstrap(){
   const match=/^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname),fixed=!!match,hash=match?.[1];
-  const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1)),ticket=fragment.get('pair'),secret=fragment.get('key'),pair=ticket&&secret?{ticket,secret}:null;
-  const sensitive=['pair','key','t','r'],consumed=sensitive.some(key=>fragment.has(key));for(const key of sensitive)parameters.delete(key);
+  const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1)),ticket=fragment.get('pair'),secret=fragment.get('key'),STORE='minikrill-mobile-v2';
+  let stored;try{stored=JSON.parse(localStorage.getItem(STORE)||'null');}catch{stored=null;}
+  // Home Screen launches reopen the same install link (#…&install=1): it pairs only an empty store, later launches keep the saved device.
+  const pair=ticket&&secret&&!(fragment.has('install')&&stored?.credential)?{ticket,secret}:null;
+  const sensitive=['pair','key','t','r','install'],consumed=sensitive.some(key=>fragment.has(key));for(const key of sensitive)parameters.delete(key);
   history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?(pair?'#/pair-confirm':''):location.hash));
-  const STORE='minikrill-mobile-v2';
-  let credentials;try{credentials=pair?null:JSON.parse(localStorage.getItem(STORE)||'null');}catch{credentials=null;}
+  let credentials=pair?null:stored;
   // A link without both pairing secrets cannot replace a saved destination.
   const rid=pair?fragment.get('r'):credentials?.rid;
   let url=pair?(fragment.get('t')?'https://'+fragment.get('t'):null):credentials?.url;

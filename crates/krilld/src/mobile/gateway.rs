@@ -421,6 +421,11 @@ impl Gateway {
     }
     pub fn request(&self, request: MobileRequest) -> MobileReply {
         if let MobileRequest::Workflow(json) = request {
+            if serde_json::from_str::<serde_json::Value>(&json).ok()
+                == Some(serde_json::json!({"action":"install_handoff"}))
+            {
+                return MobileReply::Workflow(self.install_handoff().to_string());
+            }
             return MobileReply::Workflow(self.backend.request(&json));
         }
         let reply = match self.handle(request) {
@@ -429,6 +434,25 @@ impl Gateway {
         };
         self.shared.wake();
         reply
+    }
+    /// 홈 화면 앱(iOS는 Safari와 저장소가 분리) 넘김: 기존 5분 일회용 페어링 티켓의 URL 조각만 준다.
+    /// 장기 기기 자격증명은 넘기지 않고, 앱은 이 조각으로 자기 기기로 따로 페어링한다(회수도 따로).
+    fn install_handoff(&self) -> serde_json::Value {
+        let fragment = (|| -> io::Result<String> {
+            let mut state = lock(&self.shared.state);
+            let now = now_ms();
+            state.devices.mint(now, false)?;
+            let MobileReply::PairingOffer { url, .. } = pairing_offer(&state, now)? else {
+                return Err(invalid());
+            };
+            let (_, fragment) = url.split_once('#').ok_or_else(invalid)?;
+            Ok(fragment.to_owned())
+        })();
+        self.shared.wake();
+        match fragment {
+            Ok(fragment) => serde_json::json!({"ok":true,"data":{"fragment":fragment}}),
+            Err(e) => serde_json::json!({"ok":false,"error":e.to_string()}),
+        }
     }
     fn handle(&self, request: MobileRequest) -> io::Result<MobileReply> {
         let mut state = lock(&self.shared.state);
