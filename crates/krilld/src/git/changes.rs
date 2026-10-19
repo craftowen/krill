@@ -10,13 +10,12 @@ use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::control::Reply;
 use krill_proto::git::{ChangedFile, Changes, MAX_FILES, MAX_PATH_BYTES, Numstat};
 
-use crate::child::nonblocking;
+use crate::child::{AsFd, nonblocking};
 
 use super::GitQueue;
 
@@ -31,6 +30,25 @@ pub fn query(
     repo: PathBuf,
     cancel: Arc<AtomicBool>,
 ) -> Receiver<Result<Changes, String>> {
+    submit(q, repo, cancel, |(changes, _)| changes)
+}
+
+/// [`query`]에 status `--branch` 헤더의 현재 브랜치를 더한다. 분리 HEAD는 빈 문자열이다
+/// (`git branch --show-current`와 같다). 와이어 [`Changes`]는 바꾸지 않는 krilld 내부용.
+pub(crate) fn query_with_branch(
+    q: &GitQueue,
+    repo: PathBuf,
+    cancel: Arc<AtomicBool>,
+) -> Receiver<Result<(Changes, String), String>> {
+    submit(q, repo, cancel, |result| result)
+}
+
+fn submit<T: Send + 'static>(
+    q: &GitQueue,
+    repo: PathBuf,
+    cancel: Arc<AtomicBool>,
+    map: fn((Changes, String)) -> T,
+) -> Receiver<Result<T, String>> {
     let (tx, rx) = mpsc::channel();
     q.enqueue(
         repo,
@@ -39,7 +57,7 @@ pub fn query(
             let result = if cancel.load(Ordering::Acquire) {
                 Err("git query cancelled".to_owned())
             } else {
-                run(program, repo, &cancel)
+                run(program, repo, &cancel).map(map)
             };
             tx.send(result).ok();
         }),
@@ -64,7 +82,7 @@ pub fn serve(repo: &[u8]) -> Reply {
     }
 }
 
-fn run(program: &Path, repo: &Path, cancel: &AtomicBool) -> Result<Changes, String> {
+fn run(program: &Path, repo: &Path, cancel: &AtomicBool) -> Result<(Changes, String), String> {
     let deadline = Instant::now() + TIMEOUT;
     let mut parser = StatusParser::default();
     stream(
@@ -84,6 +102,7 @@ fn run(program: &Path, repo: &Path, cancel: &AtomicBool) -> Result<Changes, Stri
     if parser.rename_pending {
         return Err("truncated status rename record".to_owned());
     }
+    let branch = parser.branch;
     let mut changes = parser.changes;
     let paths: HashMap<Vec<u8>, usize> = changes
         .files
@@ -92,7 +111,7 @@ fn run(program: &Path, repo: &Path, cancel: &AtomicBool) -> Result<Changes, Stri
         .map(|(i, f)| (f.path.clone(), i))
         .collect();
     if changes.files.is_empty() {
-        return Ok(changes);
+        return Ok((changes, branch));
     }
     for staged in [true, false] {
         let mut args = vec![
@@ -131,12 +150,13 @@ fn run(program: &Path, repo: &Path, cancel: &AtomicBool) -> Result<Changes, Stri
             return Err("truncated numstat rename record".to_owned());
         }
     }
-    Ok(changes)
+    Ok((changes, branch))
 }
 
 #[derive(Default)]
 struct StatusParser {
     changes: Changes,
+    branch: String,
     path_bytes: usize,
     rename_pending: bool,
 }
@@ -157,7 +177,14 @@ impl StatusParser {
             return Ok(self.cap());
         }
         let (fields, rename) = match record.first() {
-            Some(b'#') => return Ok(false),
+            Some(b'#') => {
+                if let Some(head) = record.strip_prefix(b"# branch.head ")
+                    && head != b"(detached)"
+                {
+                    self.branch = String::from_utf8_lossy(head).into_owned();
+                }
+                return Ok(false);
+            }
             Some(b'?') => (2, false),
             Some(b'1') => (9, false),
             Some(b'2') => (10, true),
@@ -297,9 +324,11 @@ fn stream(
     let mut errors = Vec::new();
     let mut buf = [0u8; 8192];
     let mut eof = false;
+    let mut stderr_eof = false;
     loop {
         interrupted(cancel, deadline)?;
         match stderr.read(&mut buf) {
+            Ok(0) => stderr_eof = true,
             Ok(n) => errors.extend(
                 buf.iter()
                     .take(n)
@@ -362,7 +391,14 @@ fn stream(
             }
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(10));
+        // 10ms 상한은 취소·제한시간 확인 주기다(이전 sleep 폴링과 같다).
+        crate::child::wait_readable(
+            &[
+                (!eof).then_some(&stdout as &dyn AsFd),
+                (!stderr_eof).then_some(&stderr as &dyn AsFd),
+            ],
+            Duration::from_millis(10),
+        );
     }
 }
 

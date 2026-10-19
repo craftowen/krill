@@ -19,7 +19,7 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use crate::child::{kill_and_reap, nonblocking};
+use crate::child::{AsFd, kill_and_reap, nonblocking};
 use crate::session::lock;
 
 pub mod changes;
@@ -279,16 +279,24 @@ fn run_guarded(
     let mut err = Vec::new();
     let mut buf = [0u8; 8192];
     let deadline = Instant::now() + TIMEOUT;
+    let (mut out_eof, mut err_eof) = (false, false);
     loop {
         if let Err(error) = guard() {
             kill_and_reap(&mut child);
             return Err(error);
         }
-        let a = drain(&mut stdout, &mut out, &mut buf);
-        let b = drain(&mut stderr, &mut err, &mut buf);
-        if let Err(e) = a.and(b) {
-            kill_and_reap(&mut child);
-            return Err(e);
+        match (
+            drain(&mut stdout, &mut out, &mut buf),
+            drain(&mut stderr, &mut err, &mut buf),
+        ) {
+            (Ok(a), Ok(b)) => {
+                out_eof |= a;
+                err_eof |= b;
+            }
+            (Err(e), _) | (_, Err(e)) => {
+                kill_and_reap(&mut child);
+                return Err(e);
+            }
         }
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -313,14 +321,22 @@ fn run_guarded(
             terminate_gracefully(&mut child);
             return Err(io::Error::new(io::ErrorKind::TimedOut, "git timed out"));
         }
-        thread::sleep(Duration::from_millis(5));
+        // 5ms 상한은 guard(취소·디스크 상한) 확인 주기다(이전 sleep 폴링과 같다).
+        crate::child::wait_readable(
+            &[
+                (!out_eof).then_some(&stdout as &dyn AsFd),
+                (!err_eof).then_some(&stderr as &dyn AsFd),
+            ],
+            Duration::from_millis(5),
+        );
     }
 }
 
-fn drain(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<()> {
+/// 지금 읽을 수 있는 만큼 읽는다. EOF면 `true`.
+fn drain(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Result<bool> {
     loop {
         match pipe.read(buf) {
-            Ok(0) => return Ok(()),
+            Ok(0) => return Ok(true),
             Ok(n) => dst.extend(buf.iter().take(n).copied()),
             Err(e)
                 if matches!(
@@ -328,7 +344,7 @@ fn drain(pipe: &mut impl io::Read, dst: &mut Vec<u8>, buf: &mut [u8]) -> io::Res
                     io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
                 ) =>
             {
-                return Ok(());
+                return Ok(false);
             }
             Err(e) => return Err(e),
         }
