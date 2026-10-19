@@ -1401,6 +1401,15 @@ catalog! {
         PROMPT => ("다음 diff 검토 주석을 반영해 주세요. 경로와 줄 번호는 주석 작성 당시 비교 기준입니다.", "Please address these diff review comments. Paths and line numbers refer to the comparison when the comments were written."),
         CLEAR_ALL => ("전체 삭제", "Clear all"),
     }
+    chat {
+        EMPTY_BOUND => ("아직 기록된 대화 턴이 없습니다.", "No conversation turns recorded yet."),
+        EMPTY_UNBOUND => ("에이전트 훅 또는 트랜스크립트 바인딩 대기 중입니다. 하단 Term 버튼으로 언제든 원시 터미널을 볼 수 있습니다.", "Waiting for an agent hook or transcript binding. Use the Term button below to see the raw terminal at any time."),
+        SUBMIT => ("제출 ({n})", "Submit ({n})"),
+        APPROVE => ("승인 (y)", "Approve (y)"),
+        DENY => ("거부 (n)", "Deny (n)"),
+        REFRESH => ("새로고침", "Refresh"),
+        TERM => ("Term →", "Term →"),
+    }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),
         ROLLBACK_DONE_DETAIL => ("Krill {to} 실행 확인에 실패해 이전 버전({from})으로 복원했습니다.\n사유: {reason}", "Krill {to} failed its launch check; restored version {from}.\nReason: {reason}"),
