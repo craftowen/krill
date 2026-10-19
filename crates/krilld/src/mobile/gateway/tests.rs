@@ -850,6 +850,7 @@ fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
     assert!(pairing_offer(&state, now_ms()).is_err());
 }
 #[test]
+#[cfg(unix)]
 fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
     use std::os::unix::fs::PermissionsExt;
     let dir = std::env::temp_dir().join(format!("mk-mobile-migrate-{}", std::process::id()));
@@ -938,6 +939,7 @@ fn mint_waits_for_pending_download_without_holding_state_lock() {
 }
 
 #[test]
+#[cfg(unix)]
 fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
     let (_r, g) = start();
     let (port, _) = offer(&g);
