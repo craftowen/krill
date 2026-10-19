@@ -3193,6 +3193,43 @@ fn clipboard_image_and_external_paths_paste_into_focused_pane(cx: &mut TestAppCo
     };
     let payload = security::clipboard_paste_payload(&ext_item).unwrap();
     assert_eq!(payload, b"'/tmp/my screenshot 1.png' ");
+
+    // 3. Dead screenshot temp path + filename String + Image falls back to saving the Image (#28245).
+    let dead_screenshot = ClipboardItem {
+        entries: vec![
+            ClipboardEntry::ExternalPaths(ExternalPaths(
+                [PathBuf::from(
+                    "/var/folders/dead-screenshot-preview/Screen Shot.png",
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            ClipboardEntry::String(ClipboardString::new("Screen Shot.png".into())),
+            ClipboardEntry::Image(img.clone()),
+        ],
+    };
+    let fallback_payload =
+        String::from_utf8(security::clipboard_paste_payload(&dead_screenshot).unwrap()).unwrap();
+    assert!(
+        fallback_payload.contains("minikrill-paste/clipboard-")
+            && std::path::Path::new(fallback_payload.trim_end())
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
+        "expected saved clipboard image path, got: {fallback_payload}"
+    );
+
+    // 4. CleanShot X JPEG bytes declared as ImageFormat::Png are saved as .jpg via magic-byte sniffing (#27345, #26739).
+    let fake_jpeg = gpui::Image::from_bytes(
+        ImageFormat::Png,
+        vec![0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F'],
+    );
+    let saved_jpg = security::save_clipboard_image(&fake_jpeg).unwrap();
+    assert_eq!(
+        saved_jpg.extension().and_then(|e| e.to_str()),
+        Some("jpg"),
+        "JPEG bytes declared as PNG must be saved with .jpg extension"
+    );
+    std::fs::remove_file(saved_jpg).ok();
 }
 
 #[gpui::test]

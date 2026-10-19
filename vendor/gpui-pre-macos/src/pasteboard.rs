@@ -1,3 +1,6 @@
+// Minikrill 변경(OWE-927, Apache-2.0 §4(b)): macOS 스크린샷·CleanShot X 등이 NSFilenamesPboardType/String과
+// 이미지(PNG/TIFF)를 동시에 올릴 때 앞선 항목이 죽은 임시 경로이거나 공백 문자열이어도 이미지로 폴백할 수 있도록
+// Pasteboard::read에서 이미지 엔트리를 함께 수집한다.
 use core::slice;
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
@@ -51,6 +54,8 @@ impl Pasteboard {
 
     pub fn read(&self) -> Option<ClipboardItem> {
         unsafe {
+            let mut entries = Vec::new();
+
             // Check for file paths first
             let filenames = NSPasteboard::propertyListForType(*self.inner, NSFilenamesPboardType);
             if filenames != nil && NSArray::count(filenames) > 0 {
@@ -61,37 +66,32 @@ impl Pasteboard {
                     paths.push(PathBuf::from(path));
                 }
                 if !paths.is_empty() {
-                    let mut entries = vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))];
-
-                    // Also include the string representation so text editors can
-                    // paste the path as text.
-                    if let Some(string_item) = self.read_string_from_pasteboard() {
-                        entries.push(string_item);
-                    }
-
-                    return Some(ClipboardItem { entries });
+                    entries.push(ClipboardEntry::ExternalPaths(ExternalPaths(paths)));
                 }
             }
 
-            // Next, check for a plain string.
+            // Include the string representation if present.
             if let Some(string_entry) = self.read_string_from_pasteboard() {
-                return Some(ClipboardItem {
-                    entries: vec![string_entry],
-                });
+                entries.push(string_entry);
             }
 
-            // Finally, try the various supported image types.
+            // Also include the first supported image representation if present.
             for format in ImageFormat::iter() {
-                if let Some(item) = self.read_image(format) {
-                    return Some(item);
+                if let Some(image_entry) = self.read_image_entry(format) {
+                    entries.push(image_entry);
+                    break;
                 }
+            }
+
+            if !entries.is_empty() {
+                return Some(ClipboardItem { entries });
             }
         }
 
         None
     }
 
-    fn read_image(&self, format: ImageFormat) -> Option<ClipboardItem> {
+    fn read_image_entry(&self, format: ImageFormat) -> Option<ClipboardEntry> {
         let ut_type: UTType = format.into();
 
         unsafe {
@@ -100,10 +100,7 @@ impl Pasteboard {
                 self.data_for_type(ut_type.inner_mut()).map(|bytes| {
                     let bytes = bytes.to_vec();
                     let id = hash(&bytes);
-
-                    ClipboardItem {
-                        entries: vec![ClipboardEntry::Image(Image { format, bytes, id })],
-                    }
+                    ClipboardEntry::Image(Image { format, bytes, id })
                 })
             } else {
                 None
