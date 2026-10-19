@@ -400,6 +400,269 @@ pub(super) fn discard_worktree_file(
     }
 }
 
+pub fn extract_patch_header_and_hunks(raw_patch: &str) -> (String, Vec<String>) {
+    let mut header = String::new();
+    let mut hunks = Vec::new();
+    let mut current_hunk: Option<String> = None;
+    for line in raw_patch.lines() {
+        if line.starts_with("@@ ") {
+            if let Some(h) = current_hunk.take() {
+                hunks.push(h);
+            }
+            let mut h = String::new();
+            h.push_str(line);
+            h.push('\n');
+            current_hunk = Some(h);
+        } else if let Some(ref mut h) = current_hunk {
+            h.push_str(line);
+            h.push('\n');
+        } else {
+            header.push_str(line);
+            header.push('\n');
+        }
+    }
+    if let Some(h) = current_hunk {
+        hunks.push(h);
+    }
+    (header, hunks)
+}
+
+#[must_use]
+pub fn build_hunk_patch(raw_patch: &str, hunk_index: usize) -> Option<String> {
+    let (header, hunks) = extract_patch_header_and_hunks(raw_patch);
+    if header.trim().is_empty() {
+        return None;
+    }
+    let hunk = hunks.get(hunk_index)?;
+    let mut out = header;
+    out.push_str(hunk);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+fn parse_hunk_header_starts(header_line: &str) -> Option<(usize, usize, String)> {
+    let after_at = header_line.strip_prefix("@@ ")?;
+    let (coords, suffix) = after_at.split_once(" @@")?;
+    let mut parts = coords.split_whitespace();
+    let old_part = parts.next()?.strip_prefix('-')?;
+    let new_part = parts.next()?.strip_prefix('+')?;
+    let old_start = old_part
+        .split_once(',')
+        .map_or(old_part, |(s, _)| s)
+        .parse::<usize>()
+        .ok()?;
+    let new_start = new_part
+        .split_once(',')
+        .map_or(new_part, |(s, _)| s)
+        .parse::<usize>()
+        .ok()?;
+    Some((old_start, new_start, suffix.to_owned()))
+}
+
+#[must_use]
+pub fn build_line_patch(
+    raw_patch: &str,
+    is_reverse: bool,
+    start_line: usize,
+    end_line: usize,
+    use_new_line_numbers: bool,
+) -> Option<String> {
+    let (lo, hi) = if start_line <= end_line {
+        (start_line, end_line)
+    } else {
+        (end_line, start_line)
+    };
+    let (header, hunks) = extract_patch_header_and_hunks(raw_patch);
+    if header.trim().is_empty() || hunks.is_empty() {
+        return None;
+    }
+    let mut out_hunks = Vec::new();
+    for hunk in &hunks {
+        let mut lines = hunk.lines();
+        let Some(hunk_header) = lines.next() else {
+            continue;
+        };
+        let Some((old_start, new_start, suffix)) = parse_hunk_header_starts(hunk_header) else {
+            continue;
+        };
+        let mut old_ln = old_start;
+        let mut new_ln = new_start;
+        let mut body_lines: Vec<String> = Vec::new();
+        let mut changed = false;
+        let mut minus_group: Vec<(usize, String)> = Vec::new();
+        let mut plus_group: Vec<(usize, String)> = Vec::new();
+        let flush_group = |minus_group: &mut Vec<(usize, String)>,
+                           plus_group: &mut Vec<(usize, String)>,
+                           body_lines: &mut Vec<String>,
+                           changed: &mut bool| {
+            if minus_group.is_empty() && plus_group.is_empty() {
+                return;
+            }
+            let max_len = minus_group.len().max(plus_group.len());
+            for i in 0..max_len {
+                let m = minus_group.get(i);
+                let p = plus_group.get(i);
+                let selected = if use_new_line_numbers {
+                    p.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi)
+                        || (p.is_none() && m.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi))
+                } else {
+                    m.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi)
+                        || (m.is_none() && p.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi))
+                };
+                if selected {
+                    if let Some((_, text)) = m {
+                        body_lines.push(format!("-{text}"));
+                        *changed = true;
+                    }
+                    if let Some((_, text)) = p {
+                        body_lines.push(format!("+{text}"));
+                        *changed = true;
+                    }
+                } else if !is_reverse {
+                    if let Some((_, text)) = m {
+                        body_lines.push(format!(" {text}"));
+                    }
+                } else if let Some((_, text)) = p {
+                    body_lines.push(format!(" {text}"));
+                }
+            }
+            minus_group.clear();
+            plus_group.clear();
+        };
+        for raw_line in lines {
+            if let Some(rest) = raw_line.strip_prefix('-') {
+                minus_group.push((old_ln, rest.to_owned()));
+                old_ln += 1;
+            } else if let Some(rest) = raw_line.strip_prefix('+') {
+                plus_group.push((new_ln, rest.to_owned()));
+                new_ln += 1;
+            } else if let Some(rest) = raw_line.strip_prefix(' ') {
+                flush_group(
+                    &mut minus_group,
+                    &mut plus_group,
+                    &mut body_lines,
+                    &mut changed,
+                );
+                body_lines.push(format!(" {rest}"));
+                old_ln += 1;
+                new_ln += 1;
+            } else if raw_line.starts_with('\\') {
+                // Keep "\ No newline at end of file" metadata when adjacent to emitted lines.
+                flush_group(
+                    &mut minus_group,
+                    &mut plus_group,
+                    &mut body_lines,
+                    &mut changed,
+                );
+                body_lines.push(raw_line.to_owned());
+            }
+        }
+        flush_group(
+            &mut minus_group,
+            &mut plus_group,
+            &mut body_lines,
+            &mut changed,
+        );
+        if !changed {
+            continue;
+        }
+        let old_count = body_lines
+            .iter()
+            .filter(|l| l.starts_with(' ') || l.starts_with('-'))
+            .count();
+        let new_count = body_lines
+            .iter()
+            .filter(|l| l.starts_with(' ') || l.starts_with('+'))
+            .count();
+        let mut hunk_out =
+            format!("@@ -{old_start},{old_count} +{new_start},{new_count} @@{suffix}\n");
+        for bl in body_lines {
+            hunk_out.push_str(&bl);
+            hunk_out.push('\n');
+        }
+        out_hunks.push(hunk_out);
+    }
+    if out_hunks.is_empty() {
+        return None;
+    }
+    let mut out = header;
+    for h in out_hunks {
+        out.push_str(&h);
+    }
+    Some(out)
+}
+
+pub fn apply_git_patch(
+    repo: &Path,
+    patch_text: &str,
+    cached: bool,
+    reverse: bool,
+) -> io::Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(repo)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["apply", "--unidiff-zero", "--whitespace=nowarn"]);
+    if cached {
+        cmd.arg("--cached");
+    }
+    if reverse {
+        cmd.arg("--reverse");
+    }
+    cmd.arg("-");
+    let mut child = super::Reap(
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()?,
+    );
+    if let Some(mut stdin) = child.0.stdin.take() {
+        stdin.write_all(patch_text.as_bytes())?;
+    }
+    let stderr = child
+        .0
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("missing git apply stderr"))?;
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.take(64 * 1024).read_to_end(&mut bytes)?;
+        Ok::<_, io::Error>(bytes)
+    });
+    let deadline = Instant::now() + TIMEOUT;
+    let status = loop {
+        match child.0.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
+            Ok(None) => {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "git apply timed out",
+                ));
+            }
+            Err(e) => break Err(e),
+        }
+    };
+    child.0.kill().ok();
+    child.0.wait().ok();
+    let err_bytes = reader
+        .join()
+        .map_err(|_| io::Error::other("git apply reader failed"))??;
+    let status = status?;
+    if status.success() {
+        Ok(())
+    } else {
+        let msg = String::from_utf8_lossy(&err_bytes).trim().to_owned();
+        Err(io::Error::other(if msg.is_empty() {
+            "git apply failed".to_owned()
+        } else {
+            msg
+        }))
+    }
+}
+
 pub(super) struct State {
     pub source: Arc<dyn EditSource>,
     pub pr_service: Arc<crate::pull_request::Service>,
@@ -579,6 +842,119 @@ impl Panel {
                         this.editing.failure = None;
                         this.editing.note = text::DONE.get().into();
                         this.explorer.refresh();
+                        this.refresh(cx);
+                    }
+                    Err(e) => {
+                        this.editing.note = e.to_string();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub fn stage_hunk(&mut self, hunk_index: usize, cx: &mut Context<Self>) {
+        if self.editing.busy || self.comparison != Comparison::Worktree {
+            return;
+        }
+        let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            return;
+        };
+        self.submit_patch_apply(patch_text, true, false, cx);
+    }
+
+    pub fn unstage_hunk(&mut self, hunk_index: usize, cx: &mut Context<Self>) {
+        if self.editing.busy || self.comparison != Comparison::Index {
+            return;
+        }
+        let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            return;
+        };
+        self.submit_patch_apply(patch_text, true, true, cx);
+    }
+
+    pub fn discard_hunk(&mut self, hunk_index: usize, cx: &mut Context<Self>) {
+        if self.editing.busy || self.comparison != Comparison::Worktree {
+            return;
+        }
+        let Some(patch_text) = build_hunk_patch(&self.raw_patch, hunk_index) else {
+            return;
+        };
+        self.submit_patch_apply(patch_text, false, true, cx);
+    }
+
+    pub fn stage_selected_lines(&mut self, cx: &mut Context<Self>) {
+        if self.editing.busy || self.comparison != Comparison::Worktree {
+            return;
+        }
+        let Some(range) = self.state.read(cx).selected_lines() else {
+            return;
+        };
+        let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
+        let Some(patch_text) =
+            build_line_patch(&self.raw_patch, false, range.start(), range.end(), use_new)
+        else {
+            return;
+        };
+        self.submit_patch_apply(patch_text, true, false, cx);
+    }
+
+    pub fn unstage_selected_lines(&mut self, cx: &mut Context<Self>) {
+        if self.editing.busy || self.comparison != Comparison::Index {
+            return;
+        }
+        let Some(range) = self.state.read(cx).selected_lines() else {
+            return;
+        };
+        let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
+        let Some(patch_text) =
+            build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
+        else {
+            return;
+        };
+        self.submit_patch_apply(patch_text, true, true, cx);
+    }
+
+    pub fn discard_selected_lines(&mut self, cx: &mut Context<Self>) {
+        if self.editing.busy || self.comparison != Comparison::Worktree {
+            return;
+        }
+        let Some(range) = self.state.read(cx).selected_lines() else {
+            return;
+        };
+        let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
+        let Some(patch_text) =
+            build_line_patch(&self.raw_patch, true, range.start(), range.end(), use_new)
+        else {
+            return;
+        };
+        self.submit_patch_apply(patch_text, false, true, cx);
+    }
+
+    fn submit_patch_apply(
+        &mut self,
+        patch_text: String,
+        cached: bool,
+        reverse: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.editing.busy = true;
+        self.editing.note = text::BUSY.get().into();
+        self.editing.failure = None;
+        let repo = self.repo.clone();
+        self.editing.task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { apply_git_patch(&repo, &patch_text, cached, reverse) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.editing.busy = false;
+                match result {
+                    Ok(()) => {
+                        this.editing.failure = None;
+                        this.editing.note = text::DONE.get().into();
                         this.refresh(cx);
                     }
                     Err(e) => {

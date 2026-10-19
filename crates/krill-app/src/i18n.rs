@@ -678,6 +678,9 @@ catalog! {
         PROMPT_DISMISS => ("숨기기", "Dismiss"),
         PROMPT_SETTINGS => ("설정 열기", "Open Settings"),
         PARENT_LABEL => ("부모 워크트리", "Parent worktree"),
+        AGENTS_LABEL => ("에이전트 실행 (복수 선택 시 Fan-Out)", "Launch agents (multi-select for Fan-Out)"),
+        INITIAL_PROMPT_LABEL => ("초기 프롬프트", "Initial prompt"),
+        INITIAL_PROMPT_PLACEHOLDER => ("생성 직후 에이전트에 보낼 초기 지시문", "Initial instructions to send after creation"),
     }
     resources {
         TITLE => ("리소스", "Resources"),
@@ -761,6 +764,14 @@ catalog! {
         SEARCH_LOADING => ("검색 중…", "Searching…"),
         SEARCH_NO_RESULTS => ("일치하는 결과가 없습니다", "No results found"),
         SEARCH_COPY_LINE_PATH => ("상대 경로:줄 복사", "Copy Path:Line"),
+        STAGE_HUNK => ("Hunk 스테이징", "Stage Hunk"),
+        UNSTAGE_HUNK => ("Hunk 해제", "Unstage Hunk"),
+        DISCARD_HUNK => ("Hunk 버리기", "Discard Hunk"),
+        STAGE_LINE => ("줄 스테이징", "Stage Line"),
+        UNSTAGE_LINE => ("줄 해제", "Unstage Line"),
+        DISCARD_LINE => ("줄 버리기", "Discard Line"),
+        VIEW_UNIFIED => ("Unified", "Unified"),
+        VIEW_SPLIT => ("Split", "Split"),
     }
     editor {
         QUICK_OPEN => ("파일 열기 (⌘P)", "Open file (⌘P)"),
@@ -1525,6 +1536,14 @@ catalog! {
         FIX_SENT => ("선택한 항목을 활성 에이전트 세션에 전달했습니다", "Sent selected items to the active agent session"),
         FIX_FAILED => ("에이전트 세션에 전달하지 못했습니다. 연결 상태를 확인하세요", "Could not deliver prompt to agent session. Check the connection."),
         FIX_NO_AGENT => ("연결된 에이전트 세션을 먼저 선택하세요", "Select a connected agent session first"),
+        MERGE_SQUASH => ("Squash 병합", "Squash & Merge"),
+        MERGE_REBASE => ("Rebase 병합", "Rebase & Merge"),
+        MERGE_COMMIT => ("Merge 커밋", "Create Merge Commit"),
+        MARK_READY => ("리뷰 준비 완료", "Ready for Review"),
+        CONVERT_DRAFT => ("초안으로 전환", "Convert to Draft"),
+        MERGING => ("처리 중…", "Processing…"),
+        ACTION_SUCCESS => ("PR 상태를 업데이트했습니다", "Updated PR status"),
+        ACTION_FAILED => ("PR 작업 실패: {reason}", "PR action failed: {reason}"),
     }
     agent_history {
         TITLE => ("세션 히스토리", "Session history"),

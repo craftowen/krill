@@ -605,3 +605,90 @@ fn parse_helpers_and_offline_repo_commit_message_synthesis() {
         "Update crates/krill-app/src/diff.rs"
     );
 }
+
+#[test]
+fn hunk_and_line_stage_unstage_discard_on_real_repo() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-hunk-line-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+
+    let initial =
+        "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10\nline11\nline12\n";
+    std::fs::write(dir.join("file.txt"), initial).unwrap();
+    Command::new("git")
+        .args(["add", "file.txt"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+
+    // Modify line 1, line 2 (hunk 0) and line 12 (hunk 1).
+    let mut lines: Vec<String> = (1..=12).map(|i| format!("line{i}")).collect();
+    lines[0] = "line1_mod".into();
+    lines[1] = "line2_mod".into();
+    lines[11] = "line12_mod".into();
+    std::fs::write(dir.join("file.txt"), format!("{}\n", lines.join("\n"))).unwrap();
+
+    let file = ChangedFile {
+        path: b"file.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    let (_, hunks) = extract_patch_header_and_hunks(&wt_patch);
+    assert_eq!(hunks.len(), 2);
+
+    // 1. Stage only line 2 from hunk 0.
+    let stage_line2 = build_line_patch(&wt_patch, false, 2, 2, true).unwrap();
+    apply_git_patch(&dir, &stage_line2, true, false).unwrap();
+
+    let staged_patch = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(staged_patch.contains("+line2_mod"));
+    assert!(!staged_patch.contains("+line1_mod"));
+    assert!(!staged_patch.contains("+line12_mod"));
+
+    // 2. Unstage line 2 from Index.
+    let unstage_line2 = build_line_patch(&staged_patch, true, 2, 2, true).unwrap();
+    apply_git_patch(&dir, &unstage_line2, true, true).unwrap();
+    let staged_after_unstage = super::super::raw_patch(&dir, &file, Comparison::Index).unwrap();
+    assert!(staged_after_unstage.trim().is_empty());
+
+    // 3. Stage hunk 0, discard hunk 1.
+    let hunk0 = build_hunk_patch(&wt_patch, 0).unwrap();
+    apply_git_patch(&dir, &hunk0, true, false).unwrap();
+    let hunk1 = build_hunk_patch(&wt_patch, 1).unwrap();
+    apply_git_patch(&dir, &hunk1, false, true).unwrap();
+
+    let disk_after = std::fs::read_to_string(dir.join("file.txt")).unwrap();
+    assert!(disk_after.contains("line1_mod\nline2_mod\n"));
+    assert!(disk_after.contains("line12\n"));
+    assert!(!disk_after.contains("line12_mod"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
