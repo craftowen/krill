@@ -489,7 +489,8 @@ fn remote_new_rejects_relative_cwd_and_worktree() {
         .code(),
         Some(2)
     );
-    // 원격 --worktree는 지원된다(OWE-920). 저장소가 아닌 --cwd는 데몬이 거절해 실행 실패(1)로 끝난다.
+    // OWE-920부터 원격 --worktree는 원격 데몬에 워크트리 생성을 요청한다. 저장소가 아닌 --cwd면
+    // 사용법 오류(2)가 아니라 실행 실패(1)이고, 세션을 만들지 않는다.
     assert_eq!(
         r.run(&[
             "--host",

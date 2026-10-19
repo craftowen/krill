@@ -427,10 +427,33 @@ pub fn update_host(
 }
 
 pub fn remove_host(state_dir: Option<&Path>, id: &str) -> io::Result<Vec<SshHost>> {
+    remove_hosts(state_dir, &[id.to_owned()])
+}
+
+/// 여러 호스트를 한 번에 지운다(같은 기기 중복 정리).
+pub fn remove_hosts(state_dir: Option<&Path>, ids: &[String]) -> io::Result<Vec<SshHost>> {
     let mut hosts = load_hosts(state_dir);
-    hosts.retain(|h| h.id != id);
+    hosts.retain(|h| !ids.contains(&h.id));
     save_hosts(state_dir, &hosts)?;
     Ok(hosts)
+}
+
+/// 같은 기기(`ssh -G`의 사용자·주소·포트)를 가리키는 중복 등록. 먼저 등록한 항목을 남기고 `(중복 id, 남길 id)`를
+/// 돌려준다. 기기마다 `ssh -G`를 한 번씩 돌리므로 UI 스레드 밖에서 부른다.
+#[must_use]
+pub fn duplicate_hosts(hosts: &[SshHost]) -> Vec<(String, String)> {
+    let mut first: BTreeMap<String, &str> = BTreeMap::new();
+    let mut dups = Vec::new();
+    for h in hosts {
+        let key = krill_hosts::ssh::machine_key(h.destination.trim(), h.port);
+        match first.get(&key) {
+            Some(kept) => dups.push((h.id.clone(), (*kept).to_owned())),
+            None => {
+                first.insert(key, &h.id);
+            }
+        }
+    }
+    dups
 }
 
 /// `~/.ssh/config` 내용을 파싱해 와일드카드(`*`, `?`)가 아닌 `Host` 항목들을 추출한다.
@@ -533,11 +556,19 @@ pub fn import_from_ssh_config(
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let parsed = parse_ssh_config(&text);
     let mut hosts = load_hosts(state_dir);
+    // 별칭이 달라도 같은 기기면 다시 넣지 않는다(예: `mbp`·`macbook`이 같은 IP).
+    let mut machines: Vec<String> = hosts
+        .iter()
+        .map(|h| krill_hosts::ssh::machine_key(&h.destination, h.port))
+        .collect();
     for item in parsed {
-        if !hosts
-            .iter()
-            .any(|h| h.id == item.id || h.destination == item.destination)
+        let key = krill_hosts::ssh::machine_key(&item.destination, item.port);
+        if !machines.contains(&key)
+            && !hosts
+                .iter()
+                .any(|h| h.id == item.id || h.destination == item.destination)
         {
+            machines.push(key);
             hosts.push(item);
         }
     }
@@ -1038,6 +1069,40 @@ Host dev-box
 
         let after = remove_host(Some(&dir), &list[0].id).unwrap();
         assert!(after.is_empty());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn duplicate_hosts_keep_the_first_entry_per_machine() {
+        let host = |id: &str, dest: &str| SshHost {
+            id: id.into(),
+            label: id.into(),
+            destination: dest.into(),
+            port: Some(22),
+            identity_file: None,
+            remote_socket: None,
+            imported: true,
+            copy_id_first: false,
+        };
+        let hosts = [
+            host("a", "owen@10.0.0.8"),
+            host("b", "owen@10.0.0.9"),
+            host("c", "OWEN@10.0.0.8"),
+            host("d", "owen@10.0.0.8"),
+        ];
+        assert_eq!(
+            duplicate_hosts(&hosts),
+            [("c".into(), "a".into()), ("d".into(), "a".into())]
+        );
+        let dir = std::env::temp_dir().join(format!("mk-dedupe-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        save_hosts(Some(&dir), &hosts).unwrap();
+        let left = remove_hosts(Some(&dir), &["c".into(), "d".into()]).unwrap();
+        assert_eq!(
+            left.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

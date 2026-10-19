@@ -197,6 +197,132 @@ pub fn write(stream: &mut impl Write, opcode: u8, body: &[u8]) -> io::Result<()>
     stream.write_all(&frame)
 }
 
+/// 클라이언트 → 서버 RFC 6455 마스킹 프레임을 인코딩한다(DO 릴레이 호스트 연결용).
+pub fn encode_masked(opcode: u8, body: &[u8], mask: [u8; 4]) -> io::Result<Vec<u8>> {
+    let n = body.len();
+    let mut frame = Vec::with_capacity(n.saturating_add(14));
+    frame.push(0x80 | opcode);
+    if n < 126 {
+        frame.push(0x80 | u8::try_from(n).map_err(|_| invalid())?);
+    } else if n <= 65_535 {
+        frame.push(0x80 | 0x7e);
+        frame.extend(u16::try_from(n).map_err(|_| invalid())?.to_be_bytes());
+    } else {
+        frame.push(0x80 | 0x7f);
+        frame.extend(u64::try_from(n).map_err(|_| invalid())?.to_be_bytes());
+    }
+    frame.extend_from_slice(&mask);
+    for (byte, key) in body.iter().zip(mask.into_iter().cycle()) {
+        frame.push(byte ^ key);
+    }
+    Ok(frame)
+}
+
+/// DO 릴레이 서버 → 클라이언트 비마스킹 프레임을 누적 버퍼에서 비차단으로 하나 꺼낸다.
+pub fn try_decode_unmasked(buf: &mut Vec<u8>, limit: usize) -> io::Result<Option<(u8, Vec<u8>)>> {
+    let (Some(&flags), Some(&length)) = (buf.first(), buf.get(1)) else {
+        return Ok(None);
+    };
+    if flags & 0xf0 != 0x80 || length & 0x80 != 0 {
+        return Err(invalid());
+    }
+    let opcode = flags & 0x0f;
+    if ![TEXT, BINARY, 8, 9, 10].contains(&opcode) {
+        return Err(invalid());
+    }
+    let small = length & 0x7f;
+    let (header_len, len) = match small {
+        126 => {
+            let Some(slice) = buf.get(2..4) else {
+                return Ok(None);
+            };
+            let b: [u8; 2] = slice.try_into().map_err(|_| invalid())?;
+            let n = usize::from(u16::from_be_bytes(b));
+            if n < 126 {
+                return Err(invalid());
+            }
+            (4_usize, n)
+        }
+        127 => {
+            let Some(slice) = buf.get(2..10) else {
+                return Ok(None);
+            };
+            let b: [u8; 8] = slice.try_into().map_err(|_| invalid())?;
+            let n = usize::try_from(u64::from_be_bytes(b)).map_err(|_| invalid())?;
+            if n < 65_536 {
+                return Err(invalid());
+            }
+            (10_usize, n)
+        }
+        n => (2_usize, usize::from(n)),
+    };
+    if len > limit || (opcode >= 8 && len > 125) || (opcode == TEXT && len > 4096) {
+        return Err(invalid());
+    }
+    let total = header_len.checked_add(len).ok_or_else(invalid)?;
+    if buf.len() < total {
+        return Ok(None);
+    }
+    let body = buf.get(header_len..total).ok_or_else(invalid)?.to_vec();
+    buf.drain(..total);
+    if opcode == TEXT && std::str::from_utf8(&body).is_err() {
+        return Err(invalid());
+    }
+    Ok(Some((opcode, body)))
+}
+
+/// DO 릴레이(`GET /r/<rid>...`)로 아웃바운드 WebSocket 클라이언트 핸드셰이크를 수행한다.
+pub fn connect_client(
+    stream: &mut (impl Read + Write),
+    host: &str,
+    path: &str,
+    bearer: &str,
+) -> io::Result<()> {
+    let raw_nonce = super::e2ee::random()?;
+    let sec_key = base64(raw_nonce.get(..16).ok_or_else(invalid)?, false);
+    write!(
+        stream,
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: {sec_key}\r\nAuthorization: Bearer {bearer}\r\n\r\n"
+    )?;
+    stream.flush()?;
+    let mut bytes = Vec::new();
+    while !bytes.ends_with(b"\r\n\r\n") {
+        if bytes.len() >= 8192 {
+            return Err(invalid());
+        }
+        let mut byte = [0];
+        stream.read_exact(&mut byte)?;
+        bytes.extend(byte);
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| invalid())?;
+    let mut lines = text.split("\r\n");
+    let status = lines.next().ok_or_else(invalid)?;
+    if !status.starts_with("HTTP/1.1 101") {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            format!("relay upgrade failed: {status}"),
+        ));
+    }
+    let mut headers = std::collections::HashMap::new();
+    for line in lines.filter(|s| !s.is_empty()) {
+        let (name, value) = line.split_once(':').ok_or_else(invalid)?;
+        headers.insert(name.to_ascii_lowercase(), value.trim());
+    }
+    let challenge = format!("{sec_key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let expected_accept = base64(
+        digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, challenge.as_bytes()).as_ref(),
+        false,
+    );
+    if !headers
+        .get("upgrade")
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        || headers.get("sec-websocket-accept") != Some(&expected_accept.as_str())
+    {
+        return Err(invalid());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +356,27 @@ mod tests {
             read(&mut [0x82, 0x82, 1, 2, 3, 4, b'a' ^ 1, b'b' ^ 2].as_slice()).unwrap(),
             (BINARY, b"ab".to_vec())
         );
+    }
+    #[test]
+    fn masked_encode_and_unmasked_sans_io_decode_roundtrip() {
+        for len in [0, 5, 125, 126, 1024] {
+            let payload: Vec<u8> = (0..len).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let masked = encode_masked(BINARY, &payload, [11, 22, 33, 44]).unwrap();
+            assert_eq!(
+                read(&mut masked.as_slice()).unwrap(),
+                (BINARY, payload.clone())
+            );
+            let mut unmasked = Vec::new();
+            write(&mut unmasked, BINARY, &payload).unwrap();
+            let mut partial = unmasked.get(..1).unwrap().to_vec();
+            assert!(try_decode_unmasked(&mut partial, 4096).unwrap().is_none());
+            assert_eq!(partial.len(), 1);
+            assert_eq!(
+                try_decode_unmasked(&mut unmasked, 4096).unwrap(),
+                Some((BINARY, payload))
+            );
+            assert!(unmasked.is_empty());
+        }
     }
     fn handshake(origin: &str, allowed: Option<&str>, query: &str) -> (io::Result<bool>, String) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

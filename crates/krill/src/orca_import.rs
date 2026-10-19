@@ -1712,11 +1712,18 @@ fn resolve_codex_profile_dir(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| expand_tilde(home, s));
+    let short_orca_home = home
+        .join(".orca")
+        .join("codex-homes")
+        .join(krill_proto::usage::profiles::codex_short_key(raw_id));
     let codex_accounts_home = orca_dir.join("codex-accounts").join(raw_id).join("home");
     if let Some(ref exp) = explicit
         && exp.is_dir()
     {
         return exp.clone();
+    }
+    if short_orca_home.is_dir() {
+        return short_orca_home;
     }
     if codex_accounts_home.is_dir() {
         return codex_accounts_home;
@@ -1866,6 +1873,17 @@ fn import_ssh_domain(
                 continue;
             };
             if !valid_ssh_destination(&host) {
+                continue;
+            }
+            // Orca 원격 환경 주소에는 SSH 사용자가 없다. 이미 SSH 대상으로 등록된 기기면 사용자 없는 중복을 만들지 않는다.
+            let env_host = host.to_ascii_lowercase();
+            if file.hosts.iter().any(|h| {
+                !h.id.starts_with("orca-env-")
+                    && krill_hosts::ssh::machine_key(&h.destination, h.port)
+                        .split_once('@')
+                        .and_then(|(_, rest)| rest.rsplit_once(':'))
+                        .is_some_and(|(name, _)| name == env_host)
+            }) {
                 continue;
             }
             let id = format!(

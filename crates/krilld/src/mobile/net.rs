@@ -58,13 +58,11 @@ pub fn select(
     mode: ConnectMode,
     custom: Option<&str>,
 ) -> io::Result<SocketAddrV4> {
-    let custom = custom.map(parse).transpose()?;
     if mode == ConnectMode::Tunnel {
-        return Ok(SocketAddrV4::new(
-            Ipv4Addr::LOCALHOST,
-            custom.map_or(0, |s| s.port()),
-        ));
+        let port = custom.and_then(|c| parse(c).ok()).map_or(0, |s| s.port());
+        return Ok(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     }
+    let custom = custom.map(parse).transpose()?;
     if let Some(address) = custom {
         return Ok(address);
     }

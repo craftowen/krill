@@ -115,6 +115,12 @@ pub fn is_system_secure_event_input_enabled() -> bool {
     false
 }
 
+/// TIFF→PNG `AppKit` 변환은 macOS 전용이다.
+#[must_use]
+pub fn tiff_to_png(_tiff: &[u8]) -> Option<Vec<u8>> {
+    None
+}
+
 /// Win32 호출(CONVENTIONS U1: mk-app의 platform FFI 구역).
 #[cfg(windows)]
 #[expect(

@@ -1531,6 +1531,74 @@ fn unread_clears_when_session_is_focused(cx: &mut TestAppContext) {
     });
 }
 
+/// 연결 안 됐고 세션도 없는 원격 호스트는 Orca처럼 맨 아래 한 줄('연결 안 된 호스트 N개')로 묶이고,
+/// 누르면 펼쳐지며, 끊긴 이유(꺼짐·인증 거부·Krill 없음)가 상태 자리에 보인다.
+#[gpui::test]
+fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let remote = |id: &str, status, sessions: Vec<Session>, error: Option<&str>| RemoteHost {
+        id: id.into(),
+        label: id.into(),
+        status,
+        snapshot: Snapshot {
+            sessions,
+            trees: BTreeMap::new(),
+        },
+        meta: Meta::new(),
+        source: None,
+        error: error.map(str::to_owned),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.remote_hosts = vec![
+                remote("mbp", HostStatus::Disconnected, vec![], Some("ssh remote HOME query to mbp failed: ssh: connect to host 100.65.102.14 port 22: Operation timed out")),
+                remote("oci", HostStatus::Connected, vec![], None),
+                remote("seol", HostStatus::Disconnected, vec![], Some("ssh: Permission denied (publickey,password).")),
+                remote("kak", HostStatus::Disconnected, vec![session(3, AgentState::Done, Some("/r/wt"))], Some("unexpected EOF")),
+            ];
+            s.rebuild(cx);
+        });
+    });
+    let headers = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::HostHeader { host, .. } => Some(host.as_key().to_owned()),
+                    Row::OfflineHosts(n) => Some(format!("offline:{n}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘만 묶인다.
+    assert_eq!(headers(cx), ["local", "oci", "kak", "offline:2"]);
+    cx.update(|_, cx| view.update(cx, |s, cx| s.toggle_offline_hosts(None, cx)));
+    assert_eq!(
+        headers(cx),
+        ["local", "oci", "kak", "offline:2", "mbp", "seol"]
+    );
+
+    assert_eq!(
+        super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
+        text::HOST_REASON_OFFLINE.get()
+    );
+    assert_eq!(
+        super::view::disconnect_reason("Permission denied (publickey)"),
+        text::HOST_REASON_AUTH.get()
+    );
+    assert_eq!(
+        super::view::disconnect_reason("krill is not installed on the remote host"),
+        text::HOST_REASON_NO_KRILL.get()
+    );
+    assert_eq!(
+        super::view::disconnect_reason("weird"),
+        text::HOST_DISCONNECTED.get()
+    );
+}
+
 /// MK-131(OWE-667): 원격 호스트가 설정되면 최상단 `'내 Mac'` 섹션과 원격 호스트 섹션으로 묶이고,
 /// 각 호스트 헤더에 연결 상태 점(`연결됨` / `연결 중` / `끊김`)과 세션 수 배지·접기/펼치기가 동작하며,
 /// 끊긴 호스트는 마지막으로 알려진 세션 목록을 흐리게(`is_row_dimmed`) 유지하고 `'다시 연결'` 버튼을 제공한다.
@@ -1595,6 +1663,7 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
                     },
                     meta: Meta::new(),
                     source: None,
+                    error: None,
                 },
                 RemoteHost {
                     id: "mini".into(),
@@ -1609,6 +1678,7 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
                     },
                     meta: Meta::new(),
                     source: None,
+                    error: None,
                 },
             ];
             s.rebuild(cx);
@@ -2732,6 +2802,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
                 },
                 meta: Meta::new(),
                 source: None,
+                error: None,
             }];
             s.rebuild(cx);
         });
@@ -3085,6 +3156,7 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
                 snapshot: Snapshot::default(),
                 meta: Meta::new(),
                 source: None,
+                error: None,
             }];
             s.rebuild(cx);
         });
@@ -3637,7 +3709,7 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     );
 
     // Compact 모드에서도 핀 고정된 카드의 우측 배지가 `★` 버튼과 겹치지 않고 `main` 중복 브랜치가 없어야 한다.
-    // 두 카드 모두 핀 고정되면 스마트 정렬이 브랜치명순으로 재정렬해 순서가 바뀔 수 있어 인덱스에 의존하지 않는다.
+    // 두 카드 모두 핀 고정돼도 [기본] 워크트리(repo)는 항상 맨 위(행 1)다.
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.toggle_pin(wt_feature.clone(), cx);
@@ -3646,11 +3718,7 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    let repo_idx: usize = if vcx.debug_bounds("worktree-default-badge-1").is_some() {
-        1
-    } else {
-        2
-    };
+    let repo_idx: usize = 1;
     let feature_idx: usize = if repo_idx == 1 { 2 } else { 1 };
     let repo_branch: &'static str = if repo_idx == 1 {
         "worktree-branch-1"
@@ -4000,11 +4068,11 @@ fn fresh_list_after_reconnect_emits_relisted_once(cx: &mut TestAppContext) {
 #[test]
 fn local_reconnecting_host_is_preserve() {
     let p = &crate::ui::DARK;
-    let (c, label) = view::host_status_tone(HostStatus::Disconnected, true, p);
+    let (c, label) = view::host_status_tone(HostStatus::Disconnected, true, None, p);
     assert_eq!((c, label), (p.preserve, text::HOST_RECONNECTING.get()));
-    let (c, _) = view::host_status_tone(HostStatus::Disconnected, false, p);
+    let (c, _) = view::host_status_tone(HostStatus::Disconnected, false, None, p);
     assert_eq!(c, p.destructive);
-    let (c, _) = view::host_status_tone(HostStatus::Connected, true, p);
+    let (c, _) = view::host_status_tone(HostStatus::Connected, true, None, p);
     assert_eq!(c, p.success);
 }
 
@@ -4028,8 +4096,8 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     assert!(
-        vcx.debug_bounds("rename-inline-1").is_some(),
-        "이름 변경 입력창은 워크트리 카드 제목 자리(행 1)에 있어야 한다"
+        vcx.debug_bounds("rename-inline-2").is_some(),
+        "이름 변경 입력창은 워크트리 카드 제목 자리(행 2, [기본] /repo 다음)에 있어야 한다"
     );
     // Esc: 저장하지 않고 닫는다.
     vcx.simulate_keystrokes("escape");
@@ -4043,7 +4111,7 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
             );
         });
     });
-    assert!(vcx.debug_bounds("rename-inline-1").is_none());
+    assert!(vcx.debug_bounds("rename-inline-2").is_none());
     // Enter: 저장한다.
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
@@ -4351,4 +4419,186 @@ fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
         assert!(s.ports.contains_key(&wt_live));
         assert!(s.collapsed.contains(&wt_gone));
     });
+}
+
+/// Orca처럼 프로젝트 머리줄을 끌어다 놓으면 순서가 바뀌고, `sidebar.bin`에 남아 다시 열어도 유지된다.
+#[gpui::test]
+fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("mk-project-order-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("sidebar.bin");
+    let snapshot = Snapshot {
+        sessions: vec![],
+        trees: BTreeMap::from([
+            (PathBuf::from("/p/a"), vec![PathBuf::from("/p/a")]),
+            (PathBuf::from("/p/b"), vec![PathBuf::from("/p/b")]),
+            (PathBuf::from("/p/c"), vec![PathBuf::from("/p/c")]),
+        ]),
+    };
+    let repos = |s: &Sidebar| {
+        s.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Repository(p) => Some(p.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let path = file.clone();
+    let (view, cx) = cx.add_window_view(move |_, _| Sidebar::new(Some(path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = snapshot.clone();
+            s.rebuild(cx);
+            assert_eq!(repos(s), ["/p/a", "/p/b", "/p/c"]);
+            s.move_project(Path::new("/p/c"), Path::new("/p/a"), cx);
+            assert_eq!(repos(s), ["/p/c", "/p/a", "/p/b"]);
+        });
+    });
+    let (_, _, _, _, order) = load_state(&file).unwrap();
+    assert_eq!(
+        order,
+        [
+            PathBuf::from("/p/c"),
+            PathBuf::from("/p/a"),
+            PathBuf::from("/p/b")
+        ]
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// [기본] 워크트리(저장소 본 체크아웃)는 정렬 기준·활동·이름·핀과 무관하게 프로젝트 맨 위에 오고,
+/// 계보 자식은 여전히 부모 바로 아래에 붙는다.
+#[test]
+fn primary_worktree_is_always_first_in_project() {
+    let repo = PathBuf::from("/r/minikrill");
+    let brand = PathBuf::from("/r/brand-identity");
+    let ci = PathBuf::from("/r/harness-ci");
+    let child = PathBuf::from("/r/harness-ci-child");
+    let snapshot = Snapshot {
+        sessions: vec![session(1, AgentState::Waiting, brand.to_str())],
+        trees: BTreeMap::from([(
+            repo.clone(),
+            vec![repo.clone(), brand.clone(), ci.clone(), child.clone()],
+        )]),
+    };
+    let mut prefs = Preferences::new();
+    prefs.insert(
+        ci.clone(),
+        Preference {
+            pinned: true,
+            name: String::new(),
+        },
+    );
+    let updated_at = BTreeMap::from([(brand.clone(), 900), (ci.clone(), 800), (repo.clone(), 1)]);
+    let parents = BTreeMap::from([(child.clone(), ci.clone())]);
+    let ctx = options::WorktreeContext {
+        updated_at: Some(&updated_at),
+        parents: Some(&parents),
+        ..options::WorktreeContext::default()
+    };
+    for sort_by in [SortBy::Smart, SortBy::Recent, SortBy::Name] {
+        let opts = WorkspaceOptions {
+            sort_by,
+            ..WorkspaceOptions::default()
+        };
+        let order: Vec<PathBuf> = options::rows_with_options(
+            &snapshot,
+            &prefs,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &opts,
+            &ctx,
+        )
+        .into_iter()
+        .filter_map(|r| match r {
+            Row::Worktree(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+        // 기본 → 핀(harness-ci) → 그 자식 → 나머지(대기 중·최근·이름이 앞서는 brand-identity).
+        assert_eq!(
+            order,
+            vec![repo.clone(), ci.clone(), child.clone(), brand.clone()],
+            "{sort_by:?}"
+        );
+    }
+}
+
+/// v0.1.17: 워크트리 카드 아래 세션 행은 카드 제목 글자 아래에서 시작해 카드의 자식으로 보인다.
+/// 계보 자식 워크트리의 세션은 그 워크트리 들여쓰기를 따르고, 폴더 > 세션도 폴더 이름 아래로 들여 쓴다.
+#[gpui::test]
+fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-nested-indent-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let parent = PathBuf::from("/repo/parent");
+    let child = PathBuf::from("/repo/child");
+    let mut loose = session(3, AgentState::Working, None);
+    loose.cwd = Some("/tmp/x".into());
+    let sb_path = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sb_path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_sort_by(SortBy::Name, cx);
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/repo/parent")),
+                    session(2, AgentState::Working, Some("/repo/child")),
+                    loose,
+                ],
+                trees: BTreeMap::from([(
+                    PathBuf::from("/repo"),
+                    vec![parent.clone(), child.clone()],
+                )]),
+            };
+            s.expanded_cards.insert(parent.clone());
+            s.expanded_cards.insert(child.clone());
+            s.set_worktree_parent(child.clone(), parent.clone(), cx);
+            s.rebuild(cx);
+            assert_eq!(s.lineage_depth(&child), 1);
+        });
+    });
+    cx.run_until_parked();
+    let rows = cx.update(|_, cx| view.read(cx).rows.clone());
+    let at = |pred: &dyn Fn(&Row) -> bool| rows.iter().position(pred).expect("row");
+    let parent_row = at(&|r| matches!(r, Row::Worktree(p) if p == Path::new("/repo/parent")));
+    let child_row = at(&|r| matches!(r, Row::Worktree(p) if p == Path::new("/repo/child")));
+    let s1 = at(&|r| matches!(r, Row::Session(s, true) if s.id == SessionId(1)));
+    let s2 = at(&|r| matches!(r, Row::Session(s, true) if s.id == SessionId(2)));
+    let folder = at(&|r| matches!(r, Row::Folder(_)));
+    let s3 = at(&|r| matches!(r, Row::Session(s, true) if s.id == SessionId(3)));
+    let x = |cx: &mut gpui::VisualTestContext, sel: String| {
+        cx.debug_bounds(sel.clone().leak())
+            .unwrap_or_else(|| panic!("missing {sel}"))
+            .origin
+            .x
+    };
+    for layout in [CardLayout::Detailed, CardLayout::Compact] {
+        cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(layout, cx)));
+        cx.run_until_parked();
+        for (tree, sess) in [(parent_row, s1), (child_row, s2)] {
+            let card = x(cx, format!("worktree-card-{tree}"));
+            let title = x(cx, format!("worktree-title-{tree}"));
+            let glyph = x(cx, format!("session-state-{sess}"));
+            assert!(
+                glyph >= title && glyph >= card + gpui::px(16.),
+                "{layout:?}: session {sess} glyph={glyph:?} must sit under card {tree} title={title:?} (card={card:?})"
+            );
+        }
+        assert!(
+            x(cx, format!("session-state-{s2}")) > x(cx, format!("session-state-{s1}")),
+            "{layout:?}: lineage child sessions follow their deeper card"
+        );
+        let folder_title = x(cx, format!("folder-title-{folder}"));
+        let glyph = x(cx, format!("session-state-{s3}"));
+        assert!(
+            glyph >= folder_title,
+            "{layout:?}: folder session glyph={glyph:?} title={folder_title:?}"
+        );
+    }
 }

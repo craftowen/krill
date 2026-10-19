@@ -29,11 +29,61 @@ pub struct UrlLink {
     pub uri: String,
 }
 
+/// 전각 문장부호·괄호(한·중·일 문장 안 경로·URL 경계, #30213, #30093).
+fn is_fullwidth_punct(c: char) -> bool {
+    matches!(
+        c,
+        '（' | '）'
+            | '「'
+            | '」'
+            | '『'
+            | '』'
+            | '【'
+            | '】'
+            | '〈'
+            | '〉'
+            | '《'
+            | '》'
+            | '〔'
+            | '〕'
+            | '［'
+            | '］'
+            | '｛'
+            | '｝'
+            | '、'
+            | '。'
+            | '・'
+            | '：'
+            | '；'
+            | '！'
+            | '？'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+    )
+}
+
+/// 한글·가나·한자 등 공백 없이 조사·서술어가 이어지는 동아시아 문자(#30213, #30093, #30037).
+fn is_cjk_or_hangul(c: char) -> bool {
+    matches!(
+        c as u32,
+        0x1100..=0x11FF
+            | 0x3040..=0x30FF
+            | 0x3130..=0x318F
+            | 0x3400..=0x4DBF
+            | 0x4E00..=0x9FFF
+            | 0xAC00..=0xD7AF
+            | 0xF900..=0xFAFF
+    )
+}
+
 /// 경로를 끊는 글자. `:`는 `path:line`에 쓰여 끊지 않는다.
 fn breaks(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
         || is_bidi_control(c)
+        || is_fullwidth_punct(c)
         || matches!(
             c,
             '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | ',' | ';'
@@ -45,46 +95,10 @@ fn url_breaks(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
         || is_bidi_control(c)
+        || is_fullwidth_punct(c)
         || matches!(
             c,
-            '"' | '\''
-                | '`'
-                | '<'
-                | '>'
-                | '{'
-                | '}'
-                | '|'
-                | '\\'
-                | '^'
-                | '（'
-                | '）'
-                | '「'
-                | '」'
-                | '『'
-                | '』'
-                | '【'
-                | '】'
-                | '〈'
-                | '〉'
-                | '《'
-                | '》'
-                | '〔'
-                | '〕'
-                | '［'
-                | '］'
-                | '｛'
-                | '｝'
-                | '、'
-                | '。'
-                | '・'
-                | '：'
-                | '；'
-                | '！'
-                | '？'
-                | '“'
-                | '”'
-                | '‘'
-                | '’'
+            '"' | '\'' | '`' | '<' | '>' | '{' | '}' | '|' | '\\' | '^'
         )
 }
 
@@ -169,9 +183,33 @@ pub fn url_at(row: &[Cell], column: u16) -> Option<UrlLink> {
             i = start + scheme_len;
             continue;
         }
+        let mut in_path = false;
+        let mut seg_ascii = false;
         let raw_end = rest
             .iter()
-            .position(|&(_, c, _)| url_breaks(c))
+            .enumerate()
+            .position(|(idx, &(_, c, _))| {
+                if url_breaks(c) {
+                    return true;
+                }
+                if idx >= scheme_len {
+                    if matches!(c, '/' | '?' | '#' | '=' | '&') {
+                        in_path = true;
+                        seg_ascii = false;
+                        return false;
+                    }
+                    if !in_path && !c.is_ascii() {
+                        return true;
+                    }
+                    if in_path && seg_ascii && is_cjk_or_hangul(c) {
+                        return true;
+                    }
+                    if c.is_ascii_alphanumeric() {
+                        seg_ascii = true;
+                    }
+                }
+                false
+            })
             .map_or(len, |off| start + off);
         // 같은 공백 단위 토큰 안에 제어·양방향 위장 문자가 섞여 있으면 전체 후보를 버린다.
         let token_poisoned = rest
@@ -268,7 +306,8 @@ fn split_location(text: &[char]) -> (String, Option<u32>, Option<u32>, usize) {
     let digit_at = |i: usize| text.get(i).is_some_and(char::is_ascii_digit);
     let Some(colon) = (0..text.len()).find(|&i| text.get(i) == Some(&':') && digit_at(i + 1))
     else {
-        return (text.iter().collect(), None, None, text.len());
+        let used = trim_cjk_suffix_after_ascii_ext(text);
+        return (text.iter().take(used).collect(), None, None, used);
     };
     let number = |from: usize| {
         let s: String = text
@@ -287,6 +326,21 @@ fn split_location(text: &[char]) -> (String, Option<u32>, Option<u32>, usize) {
         used += 1 + m;
     }
     (text.iter().take(colon).collect(), line, col, used)
+}
+
+/// `src/main.rs에서`처럼 ASCII 확장자 뒤에 바로 이어진 한·중·일 조사를 잘라낸다(#30093).
+fn trim_cjk_suffix_after_ascii_ext(text: &[char]) -> usize {
+    let Some(dot) = text.iter().rposition(|&c| c == '.') else {
+        return text.len();
+    };
+    let after_dot = text.get(dot + 1..).unwrap_or_default();
+    if after_dot.first().is_none_or(|c| !c.is_ascii_alphanumeric()) {
+        return text.len();
+    }
+    after_dot
+        .iter()
+        .position(|&c| is_cjk_or_hangul(c))
+        .map_or(text.len(), |off| dot + 1 + off)
 }
 
 /// 찾아 볼 실제 경로들(앞이 우선). URL·빈 경로·제어 문자는 링크가 아니다.
