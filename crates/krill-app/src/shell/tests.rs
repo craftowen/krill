@@ -2306,6 +2306,36 @@ fn update_ready_waits_for_successful_link(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(state).unwrap();
 }
 
+/// 설 실기(v0.1.11): 보이는 칸이 원격뿐이면(호스트 꺼짐) 원격 연결을 기다리지 않고 바로 ready를 보낸다.
+/// 기다리면 30초 health 기한을 넘겨 업데이트가 롤백된다.
+#[gpui::test]
+fn update_ready_does_not_wait_for_remote_only_panes(cx: &mut TestAppContext) {
+    let state = std::env::temp_dir().join(format!("mk-shell-ready-remote-{}", std::process::id()));
+    std::fs::remove_dir_all(&state).ok();
+    let (view, cx) = open(cx, state_path("update-ready-remote"));
+    let ready = krill_app::updater::ready_path(&state, env!("CARGO_PKG_VERSION"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.paths = Some(krill_proto::daemon::Paths {
+                socket: state.join("run/krilld.sock"),
+                holder: PathBuf::from("/bin/echo"),
+                krilld: PathBuf::from("/bin/echo"),
+            });
+            let pane = s.layout.active_tab().focused;
+            s.layout
+                .set_host(pane, krill_app::hosts::HostId::Remote("gone-host".into()));
+            s.arm_update_ready(state.clone());
+            s.sync(cx);
+            assert!(
+                ready.exists(),
+                "remote-only visible panes must not block update health"
+            );
+            assert!(s.update_ready.is_none());
+        });
+    });
+    std::fs::remove_dir_all(state).ok();
+}
+
 /// OWE-598(N4, PRD 시나리오 3 + N19): 사이드바 워크트리 행에서 Enter(또는 에이전트 단축키)가
 /// 해당 워크트리 폴더(`cwd`)로 새 탭 세션을 띄우고, 사이드바 접기·창 비활성 시 사이드바 가시성이 꺼진다.
 #[gpui::test]

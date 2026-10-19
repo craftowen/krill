@@ -2225,7 +2225,9 @@ impl Shell {
             if self.layout.file(p).is_some() {
                 continue; // 파일 칸은 세션에 붙지 않는다(MK-119)
             }
-            any_terminal = true;
+            // 업데이트 health는 로컬 칸 연결로 판정한다. 원격 칸만 보이면 호스트가 꺼졌거나 SSH가 느릴 때
+            // 30초 안에 붙지 못해 업데이트가 매번 롤백됐다(설 실기, v0.1.10→0.1.11).
+            any_terminal |= self.layout.host(p).is_local();
             if self.layout.launch(p).is_none() {
                 self.layout.set_launch(p, self.launch_for(p));
                 self.save();
