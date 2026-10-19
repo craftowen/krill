@@ -170,6 +170,7 @@ mod tests {
             signal,
             reference: None,
             process: None,
+            recovery: Vec::new(),
         };
         (master, input, output)
     }
