@@ -91,6 +91,52 @@ impl Cache {
     }
 }
 
+/// 앱에 등록된 프로젝트(`<state>/projects.toml`)를 루트 경로만 덧붙인다. 원격 앱이 세션 없는
+/// 프로젝트까지 볼 수 있게 하려는 것이다(로컬 앱은 같은 파일을 이미 합치므로 결과가 같다). git 호출 없음.
+pub(super) fn include_projects(data: &mut SidebarData) {
+    if let Some(dir) = krill_proto::daemon::state_dir() {
+        merge_projects(data, &dir);
+    }
+}
+
+fn merge_projects(data: &mut SidebarData, state_dir: &Path) {
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct File {
+        projects: Vec<Project>,
+    }
+    #[derive(Default, serde::Deserialize)]
+    #[serde(default)]
+    struct Project {
+        path: String,
+        archived: bool,
+        host_id: Option<String>,
+    }
+    let Ok(raw) = std::fs::read_to_string(state_dir.join("projects.toml")) else {
+        return;
+    };
+    let Ok(file) = toml::from_str::<File>(&raw) else {
+        return;
+    };
+    for p in file.projects {
+        let path = p.path.trim().as_bytes();
+        if p.archived || p.host_id.is_some() || path.is_empty() || path.len() > 4096 {
+            continue;
+        }
+        let path = path.to_vec();
+        if let Some(repo) = data.repositories.iter_mut().find(|r| r.repo == path) {
+            if !repo.worktrees.contains(&path) && repo.worktrees.len() < 512 {
+                repo.worktrees.push(path);
+            }
+        } else if data.repositories.len() < krill_proto::holder::MAX_SESSIONS {
+            data.repositories.push(RepositoryTrees {
+                repo: path.clone(),
+                worktrees: vec![path],
+            });
+        }
+    }
+}
+
 fn discover(cwd: &Path) -> Option<RepositoryTrees> {
     // All reads share the existing repository queue and fixed git environment.
     let queue = crate::git::queue().ok()?;
@@ -137,6 +183,36 @@ fn parse(bytes: &[u8]) -> Option<RepositoryTrees> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn registered_projects_join_without_duplicates() {
+        let dir =
+            std::env::temp_dir().join(format!("krilld-sidebar-projects-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("projects.toml"),
+            "[[projects]]\npath = \"/repo\"\n\n[[projects]]\npath = \"/folder\"\n\n\
+             [[projects]]\npath = \"/old\"\narchived = true\n\n\
+             [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
+        )
+        .unwrap();
+        let mut data = SidebarData {
+            sessions: Vec::new(),
+            repositories: vec![RepositoryTrees {
+                repo: b"/repo".to_vec(),
+                worktrees: vec![b"/repo".to_vec(), b"/repo-wt".to_vec()],
+            }],
+        };
+        merge_projects(&mut data, &dir);
+        std::fs::remove_dir_all(&dir).ok();
+        let repos: Vec<_> = data
+            .repositories
+            .iter()
+            .map(|r| r.repo.as_slice())
+            .collect();
+        assert_eq!(repos, [&b"/repo"[..], &b"/folder"[..]]);
+        assert_eq!(data.repositories[0].worktrees.len(), 2);
+    }
 
     #[test]
     fn nul_paths_preserve_newlines_and_non_utf8() {
