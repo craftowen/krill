@@ -11,8 +11,10 @@
 
 use std::ffi::OsStr;
 use std::io;
+#[cfg(unix)]
 use std::io::Write as _;
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 
 use krill_proto::control::is_newer;
@@ -169,30 +171,35 @@ impl RemoteInfo {
     /// 원격 `~/.krill/bin` 절대 경로.
     #[must_use]
     pub fn bin_dir(&self) -> PathBuf {
-        PathBuf::from(&self.home).join(REMOTE_BIN_DIR)
+        PathBuf::from(format!("{}/{REMOTE_BIN_DIR}", self.home))
     }
 
     /// `VERSION` 파일 원격 경로.
     #[must_use]
     pub fn version_file(&self) -> PathBuf {
-        self.bin_dir().join(REMOTE_VERSION_FILE)
+        PathBuf::from(format!(
+            "{}/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}",
+            self.home
+        ))
     }
 
     /// 원격 krilld 소켓 경로(프로브의 소켓 번들, 없으면 새 번들).
     #[must_use]
     pub fn socket_path(&self) -> PathBuf {
         let bundle = self.socket_bundle.as_deref().unwrap_or(daemon::BUNDLE_ID);
-        PathBuf::from(&self.home).join(format!(
-            "Library/Application Support/{bundle}/run/krilld.sock"
+        PathBuf::from(format!(
+            "{}/Library/Application Support/{bundle}/run/krilld.sock",
+            self.home
         ))
     }
 
     /// 원격 `LaunchAgents` plist 경로.
     #[must_use]
     pub fn plist_path(&self) -> PathBuf {
-        PathBuf::from(&self.home)
-            .join("Library/LaunchAgents")
-            .join(format!("{HOLDER_LABEL}.plist"))
+        PathBuf::from(format!(
+            "{}/Library/LaunchAgents/{HOLDER_LABEL}.plist",
+            self.home
+        ))
     }
 
     #[must_use]
@@ -563,6 +570,25 @@ fn run_ssh(
     stdin_bytes: Option<&[u8]>,
 ) -> io::Result<std::process::Output> {
     opts.validate()?;
+    #[cfg(windows)]
+    {
+        ssh::windows_output(
+            ssh_bin,
+            args,
+            stdin_bytes,
+            std::time::Duration::from_secs(300),
+        )
+    }
+    #[cfg(unix)]
+    run_piped_ssh(ssh_bin, args, stdin_bytes)
+}
+
+#[cfg(unix)]
+fn run_piped_ssh(
+    ssh_bin: &OsStr,
+    args: &[String],
+    stdin_bytes: Option<&[u8]>,
+) -> io::Result<std::process::Output> {
     let mut child = Command::new(ssh_bin)
         .args(args)
         .stdin(if stdin_bytes.is_some() {
@@ -657,6 +683,14 @@ fn install_remote_with_program(
             remote.platform.describe(),
         ));
     }
+    // 관리형 설치는 로컬 바이너리를 그대로 보낸다. Windows PE로 원격 Mac의 실행 파일을 덮어쓰지 않는다.
+    if cfg!(windows) {
+        return Err(InstallError::new(
+            InstallFailureKind::Other,
+            "check-platform",
+            "local Windows binaries cannot be installed on macOS; install Krill on the remote host first",
+        ));
+    }
     if !remote.platform.accepts_local_arch(local_arch) {
         return Err(InstallError::new(
             InstallFailureKind::ArchMismatch,
@@ -745,3 +779,29 @@ fn install_remote_with_program(
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn local_windows_binaries_are_rejected_before_remote_install() {
+        let remote = parse_probe(
+            "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=/Users/test\nkrill-version=missing\n",
+        )
+        .unwrap();
+        let spec = InstallSpec::new(&remote.home, "0.1.10").unwrap();
+        let error = install_remote(
+            &SshOptions::new("owner@test"),
+            &spec,
+            "x86_64",
+            &[],
+            "",
+            &remote,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, InstallFailureKind::Other);
+        assert_eq!(error.step, "check-platform");
+        assert!(error.detail.contains("Windows binaries"));
+    }
+}

@@ -6,6 +6,19 @@ use std::io;
 
 use gpui::{AnyWindowHandle, App, Window};
 
+#[cfg(windows)]
+mod shell;
+
+/// Apply native title-bar appearance and the current attention overlay.
+pub fn sync_window(window: &Window, dark: bool) {
+    #[cfg(windows)]
+    if let Some(hwnd) = win::hwnd(window) {
+        shell::sync_window(hwnd, window.window_handle().window_id(), dark);
+    }
+    #[cfg(not(windows))]
+    let _ = (window, dark);
+}
+
 /// macOS는 디스플레이 링크 틱을 건너뛰고 바로 그린다. 여기서는 gpui 다음 프레임에 맡긴다.
 pub fn draw_now(_handle: AnyWindowHandle, _cx: &App) {}
 
@@ -26,18 +39,24 @@ pub fn beep() {
     win::beep();
 }
 
-/// Dock 배지는 macOS 전용이다. Windows 작업 표시줄 오버레이(`ITaskbarList3::SetOverlayIcon`)는 COM 인터페이스와
-/// 글자를 그린 HICON이 필요해 후속으로 남긴다(OWE-834 보고서).
-pub fn set_dock_badge(_label: Option<&str>) {}
+/// Windows uses a taskbar attention overlay; the full unread count stays in the app.
+pub fn set_dock_badge(label: Option<&str>) {
+    #[cfg(windows)]
+    shell::set_badge(label);
+    #[cfg(not(windows))]
+    let _ = label;
+}
 
-/// Dock 배지는 macOS 전용이다.
 pub fn dock_badge() -> Option<String> {
+    #[cfg(windows)]
+    return shell::badge();
+    #[cfg(not(windows))]
     None
 }
 
-/// Dock 배지는 macOS 전용이다.
-pub fn sync_dock_tile(_label: Option<&str>) -> Option<String> {
-    None
+pub fn sync_dock_tile(label: Option<&str>) -> Option<String> {
+    set_dock_badge(label);
+    dock_badge()
 }
 
 /// 유휴 잠자기 방지 핸들(MK-044). Windows는 `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`로 잡고 Drop 시
@@ -177,7 +196,11 @@ mod win {
     }
 }
 
-/// 메뉴바 상태 항목은 macOS 전용이다. `StatusItem::new`가 `None`이라 모니터는 항목 없이 돈다.
+#[cfg(windows)]
+pub use shell::menu_bar;
+
+#[cfg(not(windows))]
+/// Linux has no status item.
 pub mod menu_bar {
     use gpui::App;
 

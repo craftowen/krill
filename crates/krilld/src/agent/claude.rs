@@ -7,7 +7,9 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::{DirBuilder, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::File;
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -62,18 +64,25 @@ impl Settings {
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let state = state.canonicalize()?;
         let krill = krill.canonicalize()?;
+        #[cfg(not(windows))]
         let command = format!(
             "env KRILL_STATE_DIR={} {} hook claude",
             quote(&state)?,
             quote(&krill)?
         );
+        #[cfg(windows)]
+        let command = krill
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path is not utf-8"))?
+            .to_owned();
+        let handler = krill_proto::agent::hooks::claude_hook(&command);
         let hooks: serde_json::Map<String, serde_json::Value> = claude::events(version)
             .into_iter()
             .map(|event| {
                 (
                     event.to_owned(),
                     serde_json::json!([{
-                        "matcher": "*", "hooks": [{"type": "command", "command": command}]
+                        "matcher": "*", "hooks": [handler]
                     }]),
                 )
             })
@@ -282,6 +291,7 @@ fn owner(name: &OsStr) -> Option<SessionId> {
     sid.parse().ok().map(SessionId)
 }
 
+#[cfg(not(windows))]
 fn quote(path: &Path) -> io::Result<String> {
     let text = path
         .to_str()
@@ -301,7 +311,15 @@ fn statusline_command(krill: &Path) -> io::Result<String> {
 
 fn uuid() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
+    #[cfg(not(windows))]
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    #[cfg(windows)]
+    {
+        use ring::rand::SecureRandom as _;
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("OS random source unavailable"))?;
+    }
     let version = bytes.get_mut(6).ok_or(io::ErrorKind::InvalidData)?;
     *version = (*version & 0x0f) | 0x40;
     let variant = bytes.get_mut(8).ok_or(io::ErrorKind::InvalidData)?;
@@ -322,7 +340,13 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
     profile.launch = vec![profile.program()?.to_owned(), "--version".into()];
     let launch = wrap(&profile, Permission::Manual, login.clone());
     let (program, args) = launch.argv.split_first()?;
-    let mut child = Command::new(OsStr::from_bytes(program))
+    let mut command = Command::new(OsStr::from_bytes(program));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .args(args.iter().map(|a| OsStr::from_bytes(a)))
         .env_clear()
         .envs(
@@ -361,3 +385,26 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[test]
+    fn session_settings_use_native_exec_hook_and_os_random_uuid() {
+        let state = std::env::temp_dir().join(format!("owe917-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        let exe = state.join("krill 한글 '$`.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let settings =
+            super::Settings::create(&state, &exe, krill_proto::SessionId(17), None).unwrap();
+        assert!(super::is_uuid(&settings.id));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings.path).unwrap()).unwrap();
+        let handler = &value["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(
+            std::path::Path::new(handler["command"].as_str().unwrap()),
+            exe.canonicalize().unwrap()
+        );
+        assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
+        std::fs::remove_dir_all(state).ok();
+    }
+}

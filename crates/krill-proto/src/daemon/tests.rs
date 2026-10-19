@@ -552,3 +552,44 @@ fn absent_socket_errors_are_platform_specific() {
         io::ErrorKind::PermissionDenied
     )));
 }
+
+#[cfg(windows)]
+#[test]
+fn windows_executable_prefixes_preserve_dos_unc_and_device_paths() {
+    for (input, expected) in [
+        (
+            r"\\?\C:\사용자 이름\Krill\krill.exe",
+            r"C:\사용자 이름\Krill\krill.exe",
+        ),
+        (
+            r"\\?\UNC\server\share\Krill\krill.exe",
+            r"\\server\share\Krill\krill.exe",
+        ),
+        (r"\\.\device", r"\\.\device"),
+    ] {
+        assert_eq!(executable_path(Path::new(input)), Path::new(expected));
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_paths_choose_flat_then_exact_version_holder() {
+    let root = dir("windows-holder-candidates");
+    std::fs::create_dir_all(&root).unwrap();
+    let app = root.join("krill-app.exe");
+    let holder = root.join("krill-holder.exe");
+    let current = root.join(format!("krill-holder-{}.exe", env!("CARGO_PKG_VERSION")));
+    let old = root.join("krill-holder-0.0.0.exe");
+    for path in [&app, &current, &old] {
+        std::fs::write(path, b"MZ").unwrap();
+    }
+    let paths = Paths::from_exe(&app, &root.join("state"), &[]).unwrap();
+    assert_eq!(paths.holder, executable_path(&current));
+    assert!(!paths.holder.to_string_lossy().starts_with(r"\\?\"));
+    std::fs::write(&holder, b"MZ").unwrap();
+    assert_eq!(exe_near(&root, "krill-holder"), holder);
+    std::fs::remove_file(&holder).unwrap();
+    std::fs::remove_file(&current).unwrap();
+    assert_eq!(exe_near(&root, "krill-holder"), holder);
+    std::fs::remove_dir_all(root).unwrap();
+}

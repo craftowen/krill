@@ -1924,6 +1924,44 @@ fn cmd_g_steps_and_cmd_f_ignores_editor_tab(cx: &mut TestAppContext) {
     std::fs::remove_file(&tmp).ok();
 }
 
+/// 설 실기(v0.1.12): 탭이 많을 때 ⌘숫자·새 탭처럼 클릭 없이 바뀐 활성 탭이 넘침 영역에 가려졌다.
+/// 활성 탭은 언제나 탭 줄 안(오른쪽 명령 버튼들 왼쪽)에 보여야 한다.
+#[gpui::test]
+fn active_tab_stays_visible_after_keyboard_switch(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let (view, cx) = open(cx, state_path("tab-reveal"));
+    for _ in 0..14 {
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+    }
+    let visible = |cx: &mut gpui::VisualTestContext, view: &gpui::Entity<Shell>| {
+        let active = layout_of(view, cx).active();
+        // 탭 위치는 앞 프레임 레이아웃에서 오므로 몇 프레임을 실제로 그린다.
+        for _ in 0..60 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.update(gpui::Window::simulate_next_frame);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let tab = cx
+            .debug_bounds(Box::leak(format!("session-tab-{active}").into_boxed_str()))
+            .unwrap();
+        let limit = cx.debug_bounds("quick-commands").unwrap();
+        (
+            active,
+            tab.right() <= limit.left() && tab.left() >= gpui::px(0.),
+        )
+    };
+    let (active, ok) = visible(cx, &view);
+    assert!(ok, "new last tab {active} must be visible");
+    cx.simulate_keystrokes("cmd-1");
+    cx.run_until_parked();
+    let (active, ok) = visible(cx, &view);
+    assert_eq!(active, 0);
+    assert!(ok, "first tab must scroll back into view");
+}
+
 #[gpui::test]
 fn tabs_middle_close_and_drag_keep_session_identity(cx: &mut TestAppContext) {
     let path = state_path("tab-pointer");
@@ -2304,6 +2342,36 @@ fn update_ready_waits_for_successful_link(cx: &mut TestAppContext) {
         });
     });
     std::fs::remove_dir_all(state).unwrap();
+}
+
+/// 설 실기(v0.1.11): 보이는 칸이 원격뿐이면(호스트 꺼짐) 원격 연결을 기다리지 않고 바로 ready를 보낸다.
+/// 기다리면 30초 health 기한을 넘겨 업데이트가 롤백된다.
+#[gpui::test]
+fn update_ready_does_not_wait_for_remote_only_panes(cx: &mut TestAppContext) {
+    let state = std::env::temp_dir().join(format!("mk-shell-ready-remote-{}", std::process::id()));
+    std::fs::remove_dir_all(&state).ok();
+    let (view, cx) = open(cx, state_path("update-ready-remote"));
+    let ready = krill_app::updater::ready_path(&state, env!("CARGO_PKG_VERSION"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.paths = Some(krill_proto::daemon::Paths {
+                socket: state.join("run/krilld.sock"),
+                holder: PathBuf::from("/bin/echo"),
+                krilld: PathBuf::from("/bin/echo"),
+            });
+            let pane = s.layout.active_tab().focused;
+            s.layout
+                .set_host(pane, krill_app::hosts::HostId::Remote("gone-host".into()));
+            s.arm_update_ready(state.clone());
+            s.sync(cx);
+            assert!(
+                ready.exists(),
+                "remote-only visible panes must not block update health"
+            );
+            assert!(s.update_ready.is_none());
+        });
+    });
+    std::fs::remove_dir_all(state).ok();
 }
 
 /// OWE-598(N4, PRD 시나리오 3 + N19): 사이드바 워크트리 행에서 Enter(또는 에이전트 단축키)가

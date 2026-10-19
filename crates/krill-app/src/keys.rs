@@ -18,6 +18,9 @@ pub fn bind<A: gpui::Action>(mac: &str, action: A, context: Option<&str>) -> gpu
 /// Ctrl+W·Ctrl+`[` = Esc)라 Windows Terminal처럼 Shift를 더한다(복사·붙여넣기 = Ctrl+Shift+C/V). 원래 Shift가 있던 키는
 /// 겹치지 않게 Alt도 더한다. 숫자·`,` `=` `-`·화살표처럼 셸이 쓰지 않는 키는 Ctrl로만 바꾼다. `cmd`가 없으면 그대로다.
 pub fn windows_keys(mac: &str) -> String {
+    if mac == "ctrl-cmd-f" {
+        return "f11".to_owned();
+    }
     let (mut cmd, mut alt, mut shift) = (false, false, false);
     let mut key = mac;
     loop {
@@ -50,6 +53,15 @@ pub fn windows_keys(mac: &str) -> String {
         if alt { "alt-" } else { "" },
         if shift { "shift-" } else { "" }
     )
+}
+
+/// Modifier used to open terminal links, matching the platform's click hint.
+pub fn link_modifier(modifiers: gpui::Modifiers) -> bool {
+    if cfg!(target_os = "macos") {
+        modifiers.platform
+    } else {
+        modifiers.control
+    }
 }
 
 /// 키 하나의 PTY 바이트. 글자 키(IME가 맡음)나 모르는 키는 `None`.
@@ -176,6 +188,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_link_modifier_matches_platform_hint() {
+        let control = gpui::Modifiers {
+            control: true,
+            ..Default::default()
+        };
+        let platform = gpui::Modifiers {
+            platform: true,
+            ..Default::default()
+        };
+        assert_eq!(super::link_modifier(control), !cfg!(target_os = "macos"));
+        assert_eq!(super::link_modifier(platform), cfg!(target_os = "macos"));
+    }
+
+    #[test]
     fn windows_keys_keep_shell_control_chars_and_never_collide() {
         for (mac, win) in [
             ("cmd-c", "ctrl-shift-c"),
@@ -193,6 +219,7 @@ mod tests {
             ("cmd-alt-left", "ctrl-alt-left"),
             ("ctrl-tab", "ctrl-tab"),
             ("f2", "f2"),
+            ("ctrl-cmd-f", "f11"),
         ] {
             assert_eq!(super::windows_keys(mac), win, "{mac}");
         }

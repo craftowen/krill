@@ -21,9 +21,10 @@ pub fn request(
             "update the daemon to use mobile control",
         ));
     }
+    // Tunnel 페어링은 데몬이 터널 준비를 최대 45초(MINT_WAIT) 기다린 뒤 답한다.
     connection
         .stream
-        .set_read_timeout(Some(Duration::from_secs(20)))?;
+        .set_read_timeout(Some(Duration::from_secs(60)))?;
     connection
         .stream
         .set_write_timeout(Some(Duration::from_secs(20)))?;

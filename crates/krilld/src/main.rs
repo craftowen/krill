@@ -156,7 +156,9 @@ fn main() -> ExitCode {
     let lis = match lis {
         Ok(l) => l,
         Err(h) => {
-            rejoin::adopt(&registry, adopt);
+            if rejoin::adopt(&registry, adopt).is_err() {
+                return ExitCode::FAILURE; // old daemon retains ownership until every Adopt is acknowledged
+            }
             match h.finish(&path) {
                 Ok(l) => l,
                 // 세션은 holder가 맡았다. holder가 다음 krilld에 다시 넘긴다.

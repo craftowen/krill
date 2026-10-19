@@ -110,6 +110,7 @@ pub fn inherited_link() -> io::Result<Link> {
     ))
 }
 /// Failed sends reclaim remote copies; target is always our own child daemon.
+#[derive(Debug)]
 pub struct Remote<'a> {
     target: BorrowedHandle<'a>,
     values: Vec<u64>,
@@ -146,6 +147,11 @@ impl<'a> Remote<'a> {
         Ok(out)
     }
     pub fn encode(&self, message: &krill_proto::holder::FromHolder) -> io::Result<Vec<u8>> {
+        message
+            .encode_handles(&self.values)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    }
+    pub fn request(&self, message: &krill_proto::holder::ToHolder) -> io::Result<Vec<u8>> {
         message
             .encode_handles(&self.values)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -337,6 +343,7 @@ impl Console {
             signal: fields.next().ok_or(io::ErrorKind::InvalidData)?,
             reference: fields.next(),
             process: fields.next(),
+            recovery: Vec::new(),
         };
         Ok(Self {
             handle: Some(h),
@@ -345,7 +352,19 @@ impl Console {
         })
     }
     pub fn resize(&self, size: WinSize) -> io::Result<()> {
-        let h = self.handle.ok_or(io::ErrorKind::NotConnected)?;
+        let Some(h) = self.handle else {
+            // Inbox has no Pack API. Use the existing signal protocol (OWE-826 §5).
+            let size = coord(size)?;
+            let mut signal = std::fs::File::from(self.pty.signal.try_clone()?);
+            return signal.write_all(
+                &[
+                    8_u16.to_le_bytes(),
+                    size.X.to_le_bytes(),
+                    size.Y.to_le_bytes(),
+                ]
+                .concat(),
+            );
+        };
         // SAFETY: this Console owns the live HPCON.
         hr(unsafe { (self.api.resize)(h, coord(size)?) })
     }
@@ -616,7 +635,7 @@ pub fn child_link(path: &OsStr, args: &[OsString]) -> io::Result<(Process, Link)
     Ok((p, parent))
 }
 pub fn duplicate_target(pid: u32) -> io::Result<OwnedHandle> {
-    // SAFETY: caller supplies only the pid from its own newly created child Process.
+    // SAFETY: pid comes from our child or an authenticated same-user IPC peer.
     let raw = unsafe { OpenProcess(PROCESS_DUP_HANDLE, 0, pid) };
     // SAFETY: OpenProcess returns a new owned handle or an error sentinel.
     unsafe { owned(raw) }
@@ -860,7 +879,13 @@ pub fn take_handoff() -> io::Result<Option<Handoff>> {
 }
 impl Console {
     pub fn pack(api: Api, pty: Pty) -> io::Result<Self> {
-        let pack = api.pack.ok_or(io::ErrorKind::Unsupported)?;
+        let Some(pack) = api.pack else {
+            return Ok(Self {
+                handle: None,
+                api,
+                pty,
+            });
+        };
         let signal = pty.signal.try_clone()?;
         let reference = pty
             .reference

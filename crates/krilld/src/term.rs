@@ -232,7 +232,11 @@ impl Engine {
     /// 바이트를 처리하고, 그 안의 질의에 대한 응답(PTY에 쓸 바이트)을 질의 순서대로 돌려준다.
     pub(crate) fn feed(&mut self, bytes: &[u8], feed: Feed, look: &Appearance) -> String {
         self.cli_boundary.advance(bytes);
-        self.scan.advance(&mut self.scheme, bytes);
+        // RawScan only observes escape sequences; printable ASCII and C0 controls
+        // have no side effects while its parser has no pending sequence/codepoint.
+        if !self.scan.mk_is_ground() || !bytes.is_ascii() || bytes.contains(&0x1b) {
+            self.scan.advance(&mut self.scheme, bytes);
+        }
         self.parser.advance(&mut self.term, bytes);
         self.replies(feed, look)
     }

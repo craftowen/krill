@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
@@ -904,7 +904,7 @@ fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return Vec::new();
     }
-    let Ok(mut child) = Command::new("git")
+    let Ok(mut child) = crate::platform::background_command("git")
         .current_dir(repo)
         .args(["check-ignore", "--stdin", "-z"])
         .stdin(Stdio::piped())

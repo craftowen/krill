@@ -1,5 +1,6 @@
 use super::*;
 use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+use std::process::Command;
 use std::sync::Mutex;
 
 #[derive(Default)]

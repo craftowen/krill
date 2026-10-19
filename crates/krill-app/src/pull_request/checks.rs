@@ -714,7 +714,7 @@ pub fn build_fix_with_ai_prompt(
 
 fn gh_base_command(folder: &Path) -> Command {
     let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(executable);
+    let mut cmd = crate::platform::background_command(executable);
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")

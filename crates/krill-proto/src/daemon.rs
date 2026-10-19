@@ -122,8 +122,7 @@ fn watch_for(stream: &mut UnixStream, interval: Duration, probe: Duration) -> io
         let consumed = reader.read;
         match frame {
             Ok(Some((kind, body))) if kind == HOLDER_STATUS => {
-                // Windows는 Adopt 전까지 고아 krilld를 계속 쓴다(ready_handshake 참고) — 상실 통보로 깨지 않는다.
-                if cfg!(unix) && HolderStatus::decode(kind, &body)? == HolderStatus::Orphan {
+                if HolderStatus::decode(kind, &body)? == HolderStatus::Orphan {
                     return Ok(());
                 }
             }
@@ -286,6 +285,8 @@ impl Paths {
 
     fn from_exe(exe: &Path, state: &Path, apps: &[PathBuf]) -> io::Result<Self> {
         let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+        #[cfg(windows)]
+        let exe = executable_path(&exe);
         let bin = exe.parent().ok_or(io::ErrorKind::NotFound)?;
         Ok(Self {
             socket: state.join("run/krilld.sock"),
@@ -293,6 +294,34 @@ impl Paths {
             krilld: find_exe(bin, apps, "krilld"),
         })
     }
+}
+
+/// Canonicalization adds Win32 verbatim prefixes. Pass ordinary DOS/UNC paths to
+/// launchers and shell integrations, without a lossy Unicode round trip. Other
+/// device namespaces stay verbatim (stripping them would change their meaning).
+#[cfg(windows)]
+fn executable_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let base = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut base = PathBuf::from(r"\\");
+                base.push(server);
+                base.push(share);
+                base
+            }
+            _ => return path.to_owned(),
+        },
+        _ => return path.to_owned(),
+    };
+    components
+        .filter(|c| !matches!(c, Component::RootDir))
+        .fold(base, |mut base, part| {
+            base.push(part.as_os_str());
+            base
+        })
 }
 
 fn is_temp_home(home: &Path) -> bool {
@@ -368,6 +397,15 @@ fn find_exe(bin: &Path, apps: &[PathBuf], name: &str) -> PathBuf {
     let direct = bin.join(name);
     if direct.is_file() {
         return direct;
+    }
+    // Exact-version side-by-side holder only: never choose a random old holder
+    // left behind by an update. The flat zip layout remains the first choice.
+    #[cfg(windows)]
+    if name == "krill-holder.exe" {
+        let versioned = bin.join(format!("krill-holder-{}.exe", env!("CARGO_PKG_VERSION")));
+        if versioned.is_file() {
+            return versioned;
+        }
     }
     if let Some(contents) = bin
         .ancestors()
@@ -479,7 +517,7 @@ pub fn watch_hello(role: ClientRole, name: &str) -> ClientHello {
 /// krilld 종료·크래시 또는 holder 상실 통보까지 막고 기다린다(유휴 웨이크업 없음).
 pub fn wait_closed(stream: &mut UnixStream) {
     while let Ok(Some((kind, body))) = ipc::read_frame(stream) {
-        if cfg!(unix) && HolderStatus::decode(kind, &body) == Ok(HolderStatus::Orphan) {
+        if HolderStatus::decode(kind, &body) == Ok(HolderStatus::Orphan) {
             return;
         }
     }
@@ -529,7 +567,13 @@ pub fn preflight(path: &Path) -> io::Result<()> {
     if !valid_magic {
         return Err(io::Error::from_raw_os_error(8)); // ENOEXEC
     }
-    let status = Command::new(path)
+    let mut command = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let status = command
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -721,9 +765,7 @@ fn ready_handshake(socket: &Path, hello: &ClientHello) -> io::Result<Option<Conn
     // 호출자가 기한을 명시한 handshake/dial 경로와 hook(수십 ms 예산)은 그대로 둔다.
     let first_hello = default_hello_timeout(hello.role);
     let c = handshake(socket, &watch, first_hello)?;
-    // Windows holder는 아직 Adopt(새 holder 재결합)를 못 한다. 새 holder를 띄우면 재결합 없이 5초 Timeout 뒤
-    // holder+krilld가 남으므로(OWE-836 실측), 고아 krilld에 그대로 붙어 기존 세션을 계속 쓴다(새 세션은 NoHolder).
-    if cfg!(unix) && c.holder_status == Some(HolderStatus::Orphan) {
+    if c.holder_status == Some(HolderStatus::Orphan) {
         return Ok(None);
     }
     if is_watch(hello.features) {

@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::os::windows::io::{AsHandle, BorrowedHandle, BorrowedSocket, OwnedHandle};
 
 use crate::sys;
-pub use crate::sys::{duplicate_socket, restore_socket};
+pub use crate::sys::{Remote, duplicate_socket, duplicate_target, packet, restore_socket};
 use krill_proto::holder::{Frame, FromHolder, parse_frame};
 
 /// `ConPTY` 수명은 signal 사본으로 유지한다. 입출력 핸들만으로는 유지되지 않는다.
@@ -15,17 +15,24 @@ pub struct Pty {
     pub signal: OwnedHandle,
     pub reference: Option<OwnedHandle>,
     pub process: Option<OwnedHandle>,
+    /// Session process, Job and its original completion port, retained for Adopt.
+    pub recovery: Vec<OwnedHandle>,
 }
 impl Pty {
     pub fn from_handles(handles: Vec<OwnedHandle>) -> io::Result<Self> {
         let mut it = handles.into_iter();
-        Ok(Self {
+        let pty = Self {
             input: it.next().ok_or(io::ErrorKind::InvalidData)?,
             output: it.next().ok_or(io::ErrorKind::InvalidData)?,
             signal: it.next().ok_or(io::ErrorKind::InvalidData)?,
             reference: it.next(),
             process: it.next(),
-        })
+            recovery: it.collect(),
+        };
+        if !matches!(pty.recovery.len(), 0 | 3) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        Ok(pty)
     }
     pub fn handles(&self) -> Vec<BorrowedHandle<'_>> {
         let mut v = vec![
@@ -35,6 +42,7 @@ impl Pty {
         ];
         v.extend(self.reference.as_ref().map(AsHandle::as_handle));
         v.extend(self.process.as_ref().map(AsHandle::as_handle));
+        v.extend(self.recovery.iter().map(AsHandle::as_handle));
         v
     }
     pub fn try_clone(&self) -> io::Result<Self> {
@@ -163,6 +171,46 @@ fn invalid(e: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Error 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn adopt_round_trip_preserves_all_recovery_handles() -> io::Result<()> {
+        let (a, mut b) = Link::pair()?;
+        let (read, write) = std::io::pipe()?;
+        let handles = (0..8)
+            .map(|_| read.as_handle().try_clone_to_owned())
+            .collect::<io::Result<Vec<_>>>()?;
+        let pty = Pty::from_handles(handles)?;
+        let target = duplicate_target(std::process::id())?;
+        let remote = Remote::duplicate(target.as_handle(), &pty.handles())?;
+        let message = krill_proto::holder::ToHolder::Adopt {
+            req: 1,
+            id: krill_proto::SessionId(2),
+            pid: std::process::id(),
+        };
+        a.send(&remote.request(&message)?, &[])?;
+        remote.commit();
+        drop(pty);
+        let packet = b.recv()?.ok_or(io::ErrorKind::UnexpectedEof)?;
+        assert_eq!(
+            krill_proto::holder::ToHolder::decode(packet.frame()).map_err(invalid)?,
+            message
+        );
+        let restored = Pty::from_handles(packet.fds)?.try_clone()?;
+        assert_eq!(restored.handles().len(), 8);
+        assert_eq!(restored.recovery.len(), 3);
+        // Retained handles are still live after sender ownership is dropped.
+        (&write).write_all(b"x")?;
+        assert_eq!(
+            sys::available(
+                restored
+                    .recovery
+                    .first()
+                    .ok_or(io::ErrorKind::InvalidData)?
+                    .as_handle()
+            )?,
+            1
+        );
+        Ok(())
+    }
     #[test]
     fn frames_stay_separate_and_eof_is_clean() -> io::Result<()> {
         let (a, mut b) = Link::pair()?;

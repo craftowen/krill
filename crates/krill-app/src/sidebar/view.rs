@@ -17,10 +17,10 @@ use krill_proto::SessionId;
 use krill_proto::control::{AgentProfile, Program};
 
 use super::{
-    Activate, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2, NewAgent3, NewAgent4,
-    OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP, ROW_HEIGHT, Rename, Row,
-    SelectNext, SelectPrev, Sidebar, Target, TogglePin, VIRTUALIZED_ROWS, basename, state_text,
-    text,
+    Activate, CHILD_INDENT, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2,
+    NewAgent3, NewAgent4, OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP,
+    ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin, VIRTUALIZED_ROWS,
+    basename, state_text, text,
 };
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
@@ -380,6 +380,7 @@ impl Sidebar {
         let selected = self.cursor == Some(index);
         let dimmed = self.is_row_dimmed(index);
         let row_host = self.row_host(index).clone();
+        let host_indent = self.host_indent();
         let base = div()
             .id(index)
             .group(ROW_GROUP)
@@ -577,6 +578,7 @@ impl Sidebar {
                 let group_key = *key;
                 let label = key.label();
                 heading(base)
+                    .ml(px(4. + host_indent))
                     .debug_selector(move || format!("group-header-{slug}"))
                     .aria_label(format!("{label} ({count})"))
                     .aria_expanded(!closed)
@@ -658,6 +660,7 @@ impl Sidebar {
                             .count()
                     });
                 repo_heading(base)
+                    .ml(px(4. + host_indent))
                     .debug_selector(move || format!("repo-header-{index}"))
                     .aria_label(format!(
                         "{} {} {wt_count}",
@@ -739,6 +742,7 @@ impl Sidebar {
                     (path.clone(), path.clone(), path.clone(), row_host.clone());
                 let closed = self.collapsed.contains(path);
                 repo_heading(base)
+                    .ml(px(4. + host_indent))
                     .debug_selector(move || format!("folder-header-{index}"))
                     .aria_label(format!("{} {}", text::FOLDER.get(), basename(path)))
                     .aria_expanded(!closed)
@@ -803,6 +807,7 @@ impl Sidebar {
             }
             Row::HiddenWorktrees(repo, count, expanded) => {
                 super::external::render_hidden_row(base, repo, *count, *expanded, cx)
+                    .ml(px(6. + CHILD_INDENT + host_indent))
             }
             Row::Worktree(path) => self.render_worktree(base, index, path, cx),
             Row::Session(session, nested) => {
@@ -858,7 +863,7 @@ impl Sidebar {
                             String::new()
                         }
                     ))
-                    .when(*nested, |d| d.pl(px(30.)).pr_2())
+                    .when(*nested, |d| d.pl(px(33. + host_indent)).pr_2())
                     .cursor_pointer()
                     .text_color(p.sidebar_foreground)
                     .hover(|d| {
@@ -1368,7 +1373,7 @@ impl Sidebar {
         };
         let lineage_collapsed = row_host.is_local() && self.is_lineage_collapsed(path);
         let depth_px = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
-        let left_margin = px(6. + depth_px * 14.);
+        let left_margin = px(6. + CHILD_INDENT + self.host_indent() + depth_px * 14.);
         let lineage_toggle_btn = (lineage_child_count > 0).then(|| {
             let fold_path = path.to_path_buf();
             let count_str = lineage_child_count.to_string();

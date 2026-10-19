@@ -4,7 +4,7 @@
 use krill_proto::os::ffi::OsStrExt as _;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 use krill_proto::SessionId;
 
@@ -19,7 +19,7 @@ pub fn list(root: &Path) -> Vec<PathBuf> {
 }
 
 fn git_files(root: &Path) -> Option<Vec<PathBuf>> {
-    let out = Command::new("git")
+    let out = crate::platform::background_command("git")
         .current_dir(root)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
