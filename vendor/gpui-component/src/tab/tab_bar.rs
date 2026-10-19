@@ -463,26 +463,36 @@ impl RenderOnce for TabBar {
             .selected_index
             .filter(|&ix| self.reveal_selected && ix < num_tabs)
         {
-            // (완료한 선택, 현재 선택 재시도 횟수). 위치를 끝내 못 얻어도 다시 그리기를 무한히 요청하지 않게 10프레임까지만.
+            // (완료한 선택, 현재 선택 재시도 횟수, 지난 프레임 탭 크기·넘침 폭). 위치를 끝내 못 얻어도 다시 그리기를
+            // 무한히 요청하지 않게 30프레임까지만.
             let shown = window.use_keyed_state(format!("{}-revealed", self.id), cx, |_, _| {
-                (None::<usize>, 0u8)
+                (None::<usize>, 0u8, None::<(gpui::Size<Pixels>, Pixels)>)
             });
-            let (done, tries) = *shown.read(cx);
-            // 탭이 막 추가된 프레임은 최대 스크롤 폭이 옛 값이라 한 번에 못 닿는다. 목표에 실제로 닿을 때까지
-            // 다시 계산하고, 닿은 뒤에만 완료로 표시해 그 뒤의 수동 스크롤은 건드리지 않는다.
+            let (done, tries, last_size) = *shown.read(cx);
+            // 탭이 막 추가된 프레임은 최대 스크롤 폭이 옛 값이라 한 번에 못 닿는다. 새 탭은 들어오는 애니메이션
+            // 동안 폭이 자라므로(첫 프레임 12×0) 크기가 멈추고, 그 크기로 실제로 보일 때만 완료로 표시한다.
+            // 그 뒤의 수동 스크롤은 건드리지 않는다(Krill v0.1.17 실화면 QA: 넘치기 시작한 새 탭이 줄 밖에 남음).
             if done != Some(sel) {
+                // 앱을 다시 켜 탭을 복원하면 모든 탭이 함께 자라므로, 고른 탭 크기와 줄 전체 넘침 폭이 함께 멈춰야 한다.
+                let size = scroll_handle
+                    .bounds_for_item(sel)
+                    .map(|b| (b.size, scroll_handle.max_offset().x));
+                let settled = size.is_some_and(|(s, _)| s.height > px(0.)) && size == last_size;
                 match reveal.offset_revealing(sel) {
                     Some(to)
-                        if to == scroll_handle.offset().x && reveal.target.read(cx).is_none() =>
+                        if settled
+                            && to == scroll_handle.offset().x
+                            && reveal.target.read(cx).is_none()
+                            && reveal.visible_at(sel, to) =>
                     {
-                        shown.update(cx, |s, _| *s = (Some(sel), 0));
+                        shown.update(cx, |s, _| *s = (Some(sel), 0, None));
                     }
-                    _ if tries >= 10 => shown.update(cx, |s, _| *s = (Some(sel), 0)),
+                    _ if tries >= 30 => shown.update(cx, |s, _| *s = (Some(sel), 0, None)),
                     found => {
                         if found.is_some() {
                             reveal.reveal(sel, cx);
                         }
-                        shown.update(cx, |s, _| s.1 = tries + 1);
+                        shown.update(cx, |s, _| *s = (s.0, tries + 1, size));
                         cx.notify(window.current_view());
                     }
                 }
@@ -633,6 +643,7 @@ impl RenderOnce for TabBar {
             .when(self.menu, |this| {
                 this.child(
                     Button::new("more")
+                        .debug_selector(|| "tab-overflow-menu".into())
                         .xsmall()
                         .ghost()
                         .dropdown_caret(true)
@@ -708,6 +719,15 @@ impl TabReveal {
             None => *target = Some(RevealTarget { to, last: None }),
         });
         cx.notify(self.view);
+    }
+
+    /// Whether tab `ix` lies fully inside the viewport when the strip is scrolled to `offset`.
+    fn visible_at(&self, ix: usize, offset: Pixels) -> bool {
+        let viewport = self.scroll_handle.bounds();
+        self.scroll_handle.bounds_for_item(ix).is_some_and(|tab| {
+            tab.left() + offset >= viewport.left() - px(0.5)
+                && tab.right() + offset <= viewport.right() + px(0.5)
+        })
     }
 
     /// The horizontal offset that shows tab `ix` and `peek` of each neighbour,

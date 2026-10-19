@@ -445,6 +445,7 @@ impl Shell {
             .child(
                 div()
                     .id("titlebar-drag")
+                    .debug_selector(|| "titlebar-drag".into())
                     .w(px(36.))
                     .h_full()
                     .flex_none()
