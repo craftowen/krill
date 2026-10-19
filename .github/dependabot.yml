@@ -1,0 +1,14 @@
+# 공급망(레드팀 P2-5): 워크플로 action은 커밋 SHA로 고정하고(`# vX.Y.Z` 주석), 갱신은 Dependabot PR로 받는다.
+# cargo는 켜지 않는다. vendor/ 26개 크레이트와 [patch.crates-io]가 버전을 묶고 있어 Cargo.lock만 올리는 PR은
+# 대부분 빌드가 깨지거나 패치를 우회한다. 크레이트 보안 공지는 CI의 cargo deny advisories가 잡는다.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    # dev가 통합 브랜치다(main은 공개 릴리스 이력).
+    target-branch: dev
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ['*']
