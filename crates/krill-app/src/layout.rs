@@ -159,15 +159,22 @@ impl PaneTree {
         }
     }
 
-    /// `target` 잎을 지우고 그 부모 분할을 형제로 바꾼다. 형제의 첫 잎을 돌려준다.
+    fn last_leaf(&self) -> PaneId {
+        match self {
+            Self::Leaf(id) => *id,
+            Self::Split { second, .. } => second.last_leaf(),
+        }
+    }
+
+    /// `target` 잎을 지우고 그 부모 분할을 형제로 바꾼다. 닫힌 잎과 맞닿은 형제 쪽 이웃 잎을 돌려준다(#30326).
     fn remove_leaf(&mut self, target: PaneId) -> Option<PaneId> {
         let Self::Split { first, second, .. } = self else {
             return None;
         };
-        let sibling = if **first == Self::Leaf(target) {
-            second
+        let (sibling, choose_last) = if **first == Self::Leaf(target) {
+            (second, false)
         } else if **second == Self::Leaf(target) {
-            first
+            (first, true)
         } else {
             return first
                 .remove_leaf(target)
@@ -175,7 +182,11 @@ impl PaneTree {
         };
         let sibling = std::mem::replace(&mut **sibling, Self::Leaf(target));
         *self = sibling;
-        Some(self.first_leaf())
+        Some(if choose_last {
+            self.last_leaf()
+        } else {
+            self.first_leaf()
+        })
     }
 
     fn node_mut(&mut self, path: &[Branch]) -> Option<&mut Self> {
