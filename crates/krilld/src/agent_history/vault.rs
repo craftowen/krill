@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -37,10 +37,10 @@ struct CachedVaultDoc {
 static VAULT_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, CachedVaultDoc>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static VAULT_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn vault_cache_hits_for_test() -> usize {
     VAULT_CACHE_HITS.load(Ordering::Relaxed)
 }
@@ -66,7 +66,7 @@ fn lookup_cached_doc(path: &Path, mtime_ns: u128, size: u64) -> Option<CachedVau
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = guard.get(path)?;
     if entry.mtime_ns == mtime_ns && entry.size == size {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         VAULT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         Some(entry.clone())
     } else {
