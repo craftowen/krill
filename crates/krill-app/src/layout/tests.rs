@@ -81,6 +81,19 @@ fn close_pane_collapses_split_then_tab() {
     assert_eq!(l.focused(), None);
     assert!(l.visible().is_empty());
     assert!(l.is_valid());
+
+    // #30326: 왼쪽 형제가 다시 분할된 트리 `(칸 A | 칸 B) | 칸 C`에서 오른쪽 `칸 C`를 닫으면
+    // 첫 잎(`칸 A`)이 아니라 인접한 이웃 잎(`칸 B`)으로 포커스가 이동해야 한다.
+    l.new_tab(); // PaneId(4)
+    let a = l.focused().unwrap();
+    l.split(Axis::Horizontal); // a | c
+    let c = l.focused().unwrap();
+    l.focus(a);
+    l.split(Axis::Vertical); // (a / b) | c
+    let b = l.focused().unwrap();
+    l.focus(c);
+    l.close_pane();
+    assert_eq!(l.focused(), Some(b));
 }
 
 #[test]
