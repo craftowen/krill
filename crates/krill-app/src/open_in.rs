@@ -44,7 +44,7 @@ impl Target {
         expect(dead_code, reason = "macOS Launch Services 전용")
     )]
     fn command(self, folder: &Path) -> Command {
-        let mut cmd = Command::new("/usr/bin/open");
+        let mut cmd = crate::platform::background_command("/usr/bin/open");
         cmd.args(["-b", self.bundle(), "--"]).arg(folder);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())

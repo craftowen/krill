@@ -17,7 +17,7 @@ use krill_proto::os::net::UnixStream;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -281,7 +281,7 @@ pub fn patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io::Res
     if comparison == Comparison::Index && file.status == *b"??" {
         return Ok(Vec::new());
     }
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::platform::background_command("git");
     cmd.current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

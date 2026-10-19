@@ -492,8 +492,8 @@ fn states_from_json(raw: &str) -> BTreeMap<PathBuf, super::external::ExternalHit
 /// 바이너리가 없거나·시간을 넘기거나·실패하면 빈 목록으로 fail-open해 사이드바 폴링을 막지 않는다.
 fn read_cli_states_with(cli_bin: &Path) -> BTreeMap<PathBuf, super::external::ExternalHit> {
     use std::io::Read as _;
-    use std::process::{Command, Stdio};
-    let Ok(mut child) = Command::new(cli_bin)
+    use std::process::Stdio;
+    let Ok(mut child) = crate::platform::background_command(cli_bin)
         .args(["agents", "--json"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

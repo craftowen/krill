@@ -3,7 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
@@ -282,7 +282,7 @@ impl Lease {
             return Ok(socket);
         }
         if child.is_none() {
-            let process = Command::new(&self.slot.executable)
+            let process = crate::platform::background_command(&self.slot.executable)
                 .arg("--state-dir")
                 .arg(&self.slot.state_dir)
                 .args(["connect", &self.slot.host.id])
