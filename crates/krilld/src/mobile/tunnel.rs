@@ -8,9 +8,17 @@ use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// URL이 찍힌 뒤에도 엣지 등록·DNS 전파 전에는 530/NXDOMAIN이 난다(실측 1.8~34초).
-/// 프로브가 200을 받아야 `ready`이고, 이 시간 안에 준비되지 않으면 감시자가 다시 띄운다.
+/// URL이 찍힌 뒤에도 엣지 등록·DNS 전파 전에는 530/NXDOMAIN이 난다. 첫 200 뒤에도 한동안 530이 섞인다
+/// (2026-10-19 단독 퀵 터널 11회 실측: 10회는 URL 뒤 28.1~32.7초까지 530이 섞였고, 그 사이 200 연속이
+/// 최대 약 20회였다. 1회는 첫 200 뒤 530이 없었다). 연속 성공 횟수만으로는 가를 수 없어서, URL 뒤
+/// `READY_SETTLE`이 지났고 직전 `READY_STREAK`번이 연속 200이어야 `ready`다.
+/// `READY_DEADLINE` 안에 준비되지 않으면 감시자가 다시 띄운다.
 pub const READY_DEADLINE: Duration = Duration::from_secs(90);
+/// 실측 마지막 530(URL 뒤 최대 32.7초) 직후.
+const READY_SETTLE: Duration = Duration::from_secs(33);
+/// 정착 시점 앞뒤로 약 4초(curl 포함, 추정) 동안 530이 없어야 한다.
+const READY_STREAK: u32 = 8;
+const PROBE_INTERVAL: Duration = Duration::from_millis(400);
 type Probe = fn(&str) -> bool;
 
 /// 비밀은 Debug·프로세스 인자로 노출하지 않는다.
@@ -64,12 +72,13 @@ impl std::fmt::Debug for Tunnel {
 impl Tunnel {
     /// 즉시 반환한다. URL 발행과 준비 확인은 백그라운드 스레드가 하므로 게이트웨이 락을 잡고 기다리지 않는다.
     pub(super) fn start(binary: &OsStr, port: u16, publication: Publication) -> io::Result<Self> {
-        Self::spawn(binary, port, probe, Some(publication))
+        Self::spawn(binary, port, probe, READY_SETTLE, Some(publication))
     }
     fn spawn(
         binary: &OsStr,
         port: u16,
         probe: Probe,
+        settle: Duration,
         publication: Option<Publication>,
     ) -> io::Result<Self> {
         let mut child = Command::new(binary)
@@ -123,23 +132,18 @@ impl Tunnel {
                             .name("mobile-tunnel-probe".into())
                             .stack_size(128 * 1024)
                             .spawn(move || {
-                                let deadline = Instant::now() + READY_DEADLINE;
-                                while Instant::now() < deadline && !stop.cancelled() {
-                                    if probe(&found) {
-                                        prepare(
-                                            &found,
-                                            publication.as_ref(),
-                                            &ready,
-                                            &fixed,
-                                            &stop,
-                                            |url| http_status(url) == Some(200),
-                                            publish,
-                                        );
-                                        return;
-                                    }
-                                    if stop.wait(Duration::from_millis(500)) {
-                                        return;
-                                    }
+                                let start = Instant::now();
+                                let (settle, deadline) = (start + settle, start + READY_DEADLINE);
+                                if stable(&found, probe, &stop, settle, deadline, PROBE_INTERVAL) {
+                                    prepare(
+                                        &found,
+                                        publication.as_ref(),
+                                        &ready,
+                                        &fixed,
+                                        &stop,
+                                        |url| http_status(url) == Some(200),
+                                        publish,
+                                    );
                                 }
                             })
                             .ok();
@@ -221,6 +225,28 @@ impl Drop for Tunnel {
             child.wait().ok();
         }
     }
+}
+/// `settle` 뒤, 기한 안에 직전 `READY_STREAK`번이 연속 성공이면 참. 실패 한 번이면 연속을 처음부터 센다.
+/// 취소되면 거짓.
+fn stable(
+    url: &str,
+    mut probe: impl FnMut(&str) -> bool,
+    stop: &Stop,
+    settle: Instant,
+    deadline: Instant,
+    interval: Duration,
+) -> bool {
+    let mut streak = 0;
+    while Instant::now() < deadline && !stop.cancelled() {
+        streak = if probe(url) { streak + 1 } else { 0 };
+        if streak >= READY_STREAK && Instant::now() >= settle {
+            return true;
+        }
+        if stop.wait(interval) {
+            return false;
+        }
+    }
+    false
 }
 /// 판정이 끝난 뒤 ready를 공개한다. 게시 실패는 연결 준비를 막지 않고 취소 가능한 백오프로 재시도한다.
 fn prepare(
@@ -380,6 +406,38 @@ mod tests {
         }
     }
     #[test]
+    fn alternating_probe_is_never_stable_until_consecutive_streak() {
+        const URL: &str = "https://a.trycloudflare.com";
+        let stop = Stop::default();
+        let tick = Duration::from_millis(1);
+        let now = Instant::now();
+        let mut calls = 0;
+        let alternating = |_: &str| {
+            calls += 1;
+            calls % 2 == 0
+        };
+        let deadline = now + Duration::from_millis(300);
+        assert!(!stable(URL, alternating, &stop, now, deadline, tick));
+        assert!(calls > 2 * READY_STREAK);
+        // 실패 몇 번 뒤 연속 성공이 쌓이면 READY_STREAK번째에 준비된다.
+        let mut calls = 0;
+        let late = |_: &str| {
+            calls += 1;
+            calls > 3
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        assert!(stable(URL, late, &stop, now, deadline, tick));
+        assert_eq!(calls, 3 + READY_STREAK);
+        // 정착 시점 전에는 계속 성공해도 준비가 아니다.
+        let settle = Instant::now() + Duration::from_millis(100);
+        assert!(stable(URL, |_| true, &stop, settle, deadline, tick));
+        assert!(Instant::now() >= settle);
+        let early = Instant::now() + Duration::from_millis(50);
+        assert!(!stable(URL, |_| true, &stop, deadline, early, tick));
+        stop.cancel();
+        assert!(!stable(URL, |_| true, &stop, now, deadline, tick));
+    }
+    #[test]
     fn availability_is_decided_before_ready_and_failure_falls_back() {
         for enabled in [true, false] {
             let ready = AtomicBool::new(false);
@@ -509,8 +567,9 @@ mod tests {
         let script = dir.join("cloudflared");
         std::fs::write(&script,"#!/bin/sh\nprintf '%s\\n' \"$*\" >&2\nprintf 'https://test-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 30\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut tunnel = Tunnel::spawn(script.as_os_str(), 1234, |_| true, None).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut tunnel =
+            Tunnel::spawn(script.as_os_str(), 1234, |_| true, Duration::ZERO, None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
         while tunnel.ready_url().is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
@@ -537,7 +596,8 @@ mod tests {
         let script = dir.join("cloudflared");
         std::fs::write(&script,"#!/bin/sh\nprintf 'https://slow-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 30\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let mut tunnel = Tunnel::spawn(script.as_os_str(), 1234, |_| false, None).unwrap();
+        let mut tunnel =
+            Tunnel::spawn(script.as_os_str(), 1234, |_| false, Duration::ZERO, None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while tunnel.url().is_none() && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
