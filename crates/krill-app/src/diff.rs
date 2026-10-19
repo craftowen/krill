@@ -548,6 +548,7 @@ pub struct Panel {
     source: Option<Arc<dyn Source>>,
     _observe: Subscription,
     review: comments::Review,
+    viewed: std::collections::HashSet<Vec<u8>>,
     editing: edit::State,
     checks: checks::State,
     #[cfg(test)]
@@ -630,6 +631,7 @@ impl Panel {
             source: None,
             _observe: observe,
             review: comments::Review::default(),
+            viewed: std::collections::HashSet::new(),
             editing,
             checks: checks::State::default(),
             #[cfg(test)]
@@ -637,6 +639,24 @@ impl Panel {
             #[cfg(test)]
             renders: 0,
         }
+    }
+
+    /// 파일별 diff 검토 완료(`Viewed`) 상태를 조회한다(#29269).
+    #[must_use]
+    pub fn is_file_viewed(&self, path: &[u8]) -> bool {
+        self.viewed.contains(path)
+    }
+
+    /// 파일별 diff 검토 완료(`Viewed`) 상태를 토글한다(#29269).
+    pub fn toggle_file_viewed(&mut self, path: &[u8], cx: &mut Context<Self>) -> bool {
+        let is_viewed = if self.viewed.remove(path) {
+            false
+        } else {
+            self.viewed.insert(path.to_vec());
+            true
+        };
+        cx.notify();
+        is_viewed
     }
 
     /// 직전 `OpenFile` 이벤트가 단일 클릭 미리보기(preview) 열기인지 반환한다.
@@ -671,6 +691,7 @@ impl Panel {
             return;
         }
         self.review = comments::Review::default();
+        self.viewed.clear();
         self.editing.reset_repo();
         if repo.exists() {
             self.editing.has_remote = edit::repo_has_remote(&repo);
@@ -1795,6 +1816,12 @@ impl Render for Panel {
             Some(file) => {
                 let code = status_code(file.status, self.comparison);
                 let color = crate::ui::git_status_color(file.status, cx);
+                let path_bytes = file.path.clone();
+                let viewed_label = if self.is_file_viewed(&path_bytes) {
+                    format!("✓ {}", text::VIEWED.get())
+                } else {
+                    text::VIEWED.get().to_owned()
+                };
                 let full_path = String::from_utf8_lossy(&file.path).into_owned();
                 let mode = self.diff_mode(cx);
                 let hunk_count = self.hunk_count();
@@ -1936,6 +1963,16 @@ impl Render for Panel {
                                         this.set_diff_mode(DiffMode::Split, cx);
                                     })),
                             ),
+                    )
+                    .child(
+                        Button::new("diff-file-viewed")
+                            .debug_selector(|| "diff-file-viewed".into())
+                            .label(viewed_label)
+                            .xsmall()
+                            .ghost()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_file_viewed(&path_bytes, cx);
+                            })),
                     );
                 let content = if self.message.is_empty() {
                     div()

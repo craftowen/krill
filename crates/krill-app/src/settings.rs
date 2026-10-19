@@ -2255,6 +2255,9 @@ pub struct SettingsView {
     /// [터미널에서 실행] 버튼을 보이고, 버튼을 누르기 전에는 명령을 큐에 넣지 않는다.
     opencode_login_prompt: bool,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
+    /// 같은 기기 중복 등록 `(중복 id, 남길 id)`와 그것을 구한 호스트 목록(`ssh -G`, 백그라운드).
+    ssh_duplicates: Vec<(String, String)>,
+    ssh_duplicates_for: Option<Vec<crate::ssh_hosts::SshHost>>,
     ssh_host_statuses: std::collections::BTreeMap<String, SshHostCardStatus>,
     /// OWE-897: 호스트 카드별 원격 관리 상태(프로브·설치, 백그라운드에서만 갱신).
     ssh_remote_infos: std::collections::BTreeMap<String, RemoteCardState>,
@@ -2500,6 +2503,8 @@ impl SettingsView {
             login_pending: None,
             opencode_login_prompt: false,
             ssh_hosts: Vec::new(),
+            ssh_duplicates: Vec::new(),
+            ssh_duplicates_for: None,
             ssh_host_statuses: std::collections::BTreeMap::new(),
             ssh_remote_infos: std::collections::BTreeMap::new(),
             ssh_status: None,
@@ -3311,6 +3316,47 @@ impl SettingsView {
         let dir = state_dir(cx);
         if let Ok(hosts) = crate::ssh_hosts::import_from_ssh_config(dir.as_deref(), None) {
             self.ssh_hosts = hosts;
+            cx.defer(notify_external_change);
+            cx.notify();
+        }
+    }
+
+    /// 호스트 목록이 바뀌었으면 같은 기기 중복을 백그라운드에서 다시 구한다.
+    fn refresh_ssh_duplicates(&mut self, cx: &mut Context<Self>) {
+        if self.ssh_duplicates_for.as_ref() == Some(&self.ssh_hosts) {
+            return;
+        }
+        let hosts = self.ssh_hosts.clone();
+        self.ssh_duplicates_for = Some(hosts.clone());
+        cx.spawn(async move |this, cx| {
+            let dups = cx
+                .background_executor()
+                .spawn(async move { crate::ssh_hosts::duplicate_hosts(&hosts) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.ssh_duplicates = dups;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// 같은 기기 중복 등록을 지운다(먼저 등록한 항목만 남긴다).
+    pub fn remove_ssh_duplicates(&mut self, cx: &mut Context<Self>) {
+        let ids: Vec<String> = self
+            .ssh_duplicates
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect();
+        let dir = state_dir(cx);
+        if let Ok(hosts) = crate::ssh_hosts::remove_hosts(dir.as_deref(), &ids) {
+            self.ssh_hosts = hosts;
+            self.ssh_duplicates.clear();
+            for id in &ids {
+                self.ssh_host_statuses.remove(id);
+                self.ssh_remote_infos.remove(id);
+            }
             cx.defer(notify_external_change);
             cx.notify();
         }
@@ -7284,6 +7330,7 @@ impl SettingsView {
             self.refresh_tailscale_peers(cx);
         }
         self.ensure_ssh_form(window, cx);
+        self.refresh_ssh_duplicates(cx);
         let p = crate::ui::palette(cx);
         let mut root = div().flex().flex_col().gap_3().child(
             layout::row(p)
@@ -7314,6 +7361,44 @@ impl SettingsView {
                         ),
                 ),
         );
+
+        // 같은 기기 중복 등록(별칭·IP·Orca 가져오기) 정리 — 두 번 눌러 확인.
+        if !self.ssh_duplicates.is_empty() {
+            let label_of = |id: &str| {
+                self.ssh_hosts
+                    .iter()
+                    .find(|h| h.id == id)
+                    .map_or_else(|| id.to_owned(), |h| h.label.clone())
+            };
+            let list = self
+                .ssh_duplicates
+                .iter()
+                .map(|(dup, kept)| format!("{} → {}", label_of(dup), label_of(kept)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let remove = self.confirm_button(
+                "admin-ssh-dedupe",
+                text::SSH_DUPES_REMOVE.get(),
+                cx,
+                Self::remove_ssh_duplicates,
+            );
+            root = root.child(
+                layout::card(p)
+                    .id("admin-ssh-duplicates")
+                    .debug_selector(|| "admin-ssh-duplicates".into())
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(layout::label(
+                        p,
+                        text::SSH_DUPES_TITLE
+                            .format(&[("count", &self.ssh_duplicates.len().to_string())]),
+                        format!("{} {list}", text::SSH_DUPES_DESC.get()),
+                    ))
+                    .child(remove),
+            );
+        }
 
         // 1. Tailscale 자동 감지 피어("발견된 기기") — 없거나 꺼져 있으면 조용히 숨김
         if !self.tailscale_peers.is_empty() {

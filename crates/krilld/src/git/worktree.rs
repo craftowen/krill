@@ -674,18 +674,40 @@ fn copy_includes(
         warnings.push("include: cannot resolve repository paths".to_owned());
         return (copied, warnings);
     };
+    let mut ignored_files: Option<Vec<String>> = None;
     // 경로 검사를 먼저: check-ignore는 심링크 너머 경로가 하나라도 있으면 통째로 실패한다.
-    let mut safe = Vec::new();
+    let mut safe: Vec<String> = Vec::new();
     for e in entries {
         let rel = Path::new(e);
-        if e.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(n) if !n.as_bytes().eq_ignore_ascii_case(b".git"))) {
+        if e.is_empty()
+            || e.contains('\\')
+            || !rel.components().all(|c| {
+                matches!(c, Component::Normal(n) if !n.as_bytes().eq_ignore_ascii_case(b".git"))
+            })
+        {
             warnings.push(format!(
                 "include {e:?}: refused, path leaves the repository"
             ));
             continue;
         }
+        if is_glob_pattern(e) {
+            let candidates = ignored_files.get_or_insert_with(|| list_ignored_files(q, top));
+            for cand in candidates {
+                if glob_path_matches(e, cand)
+                    && safe_parent(&top_real, Path::new(cand), false).is_ok()
+                    && !safe.contains(cand)
+                {
+                    safe.push(cand.clone());
+                }
+            }
+            continue;
+        }
         match safe_parent(&top_real, rel, false) {
-            Ok(()) => safe.push(e.as_str()),
+            Ok(()) => {
+                if !safe.contains(e) {
+                    safe.push(e.clone());
+                }
+            }
             // 없는 항목(.env를 아직 안 만든 경우 등)은 조용히 건너뛴다.
             Err(err) if err.kind() == io::ErrorKind::NotFound => {}
             Err(err) => warnings.push(format!("include {e:?}: {err}")),
@@ -694,9 +716,9 @@ fn copy_includes(
     if safe.is_empty() {
         return (copied, warnings);
     }
-    for e in safe {
+    for e in &safe {
         // -z는 --stdin과 함께만 쓸 수 있다. 항목별 종료 코드로 판정하면 줄바꿈·한글 경로도 안전하다.
-        match git(q, top, ["check-ignore", "--quiet", "--", e]) {
+        match git(q, top, ["check-ignore", "--quiet", "--", e.as_str()]) {
             Ok(out) if out.status.success() => {}
             Ok(out) if out.status.code() == Some(1) => {
                 warnings.push(format!("include {e:?}: skipped, not ignored by git (tracked files come from the checkout)"));
@@ -724,11 +746,129 @@ fn copy_includes(
             continue;
         }
         match copy_tree(&top_real.join(rel), &dst, e, &mut warnings) {
-            Ok(()) => copied.push(e.to_owned()),
+            Ok(()) => copied.push(e.clone()),
             Err(err) => warnings.push(format!("include {e:?}: {err}")),
         }
     }
     (copied, warnings)
+}
+
+fn is_glob_pattern(s: &str) -> bool {
+    s.contains(['*', '?', '['])
+}
+
+fn list_ignored_files(q: &GitQueue, top: &Path) -> Vec<String> {
+    let Ok(out) = git(
+        q,
+        top,
+        ["ls-files", "--others", "-i", "--exclude-standard", "-z"],
+    ) else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    out.stdout
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| std::str::from_utf8(s).ok().map(str::to_owned))
+        .take(10_000)
+        .collect()
+}
+
+pub(crate) fn glob_path_matches(pattern: &str, path: &str) -> bool {
+    let pat: Vec<&str> = pattern
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    let segs: Vec<&str> = path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    match_glob_segments(&pat, &segs)
+}
+
+fn match_glob_segments(pat: &[&str], segs: &[&str]) -> bool {
+    let Some((&first, rest)) = pat.split_first() else {
+        return segs.is_empty();
+    };
+    if first == "**" {
+        return match_glob_segments(rest, segs)
+            || segs
+                .split_first()
+                .is_some_and(|(_, srest)| match_glob_segments(pat, srest));
+    }
+    let Some((&seg, seg_rest)) = segs.split_first() else {
+        return false;
+    };
+    match_glob_segment(first, seg) && match_glob_segments(rest, seg_rest)
+}
+
+fn match_glob_segment(pat: &str, text: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    match_glob_chars(&p, &t)
+}
+
+fn match_glob_chars(pat: &[char], text: &[char]) -> bool {
+    let Some((&pc, prest)) = pat.split_first() else {
+        return text.is_empty();
+    };
+    match pc {
+        '*' => {
+            match_glob_chars(prest, text)
+                || text
+                    .split_first()
+                    .is_some_and(|(_, trest)| match_glob_chars(pat, trest))
+        }
+        '?' => text
+            .split_first()
+            .is_some_and(|(_, trest)| match_glob_chars(prest, trest)),
+        '[' => {
+            let Some((&tc, trest)) = text.split_first() else {
+                return false;
+            };
+            let Some(close) = prest.iter().position(|&c| c == ']') else {
+                return pc == tc && match_glob_chars(prest, trest);
+            };
+            let class = prest.get(..close).unwrap_or_default();
+            let after = prest.get(close + 1..).unwrap_or_default();
+            if match_char_class(class, tc) {
+                match_glob_chars(after, trest)
+            } else {
+                false
+            }
+        }
+        c => text
+            .split_first()
+            .is_some_and(|(&tc, trest)| tc == c && match_glob_chars(prest, trest)),
+    }
+}
+
+fn match_char_class(class: &[char], target: char) -> bool {
+    let (negated, mut items) = match class.split_first() {
+        Some(('!' | '^', rest)) => (true, rest),
+        _ => (false, class),
+    };
+    let mut matched = false;
+    while let Some((&first, rest)) = items.split_first() {
+        if let Some((&'-', after_dash)) = rest.split_first()
+            && let Some((&end, tail)) = after_dash.split_first()
+        {
+            if (first..=end).contains(&target) {
+                matched = true;
+            }
+            items = tail;
+        } else {
+            if first == target {
+                matched = true;
+            }
+            items = rest;
+        }
+    }
+    if negated { !matched } else { matched }
 }
 
 /// 경로를 한 요소씩 검사한다. `create_dir_all` 뒤 검사하면 이미 밖에 디렉터리를 만들 수 있다.

@@ -253,9 +253,19 @@ fn draft_anchor_is_stable_and_limits_preserve_it(cx: &mut TestAppContext) {
             assert_eq!(p.review.comments.len(), MAX_COMMENTS);
             assert!(p.review.draft.is_some());
             assert_eq!(p.review.status, Some(text::LIMIT));
+            assert!(!p.is_file_viewed(b"a.rs"));
+            assert!(p.toggle_file_viewed(b"a.rs", cx));
+            assert!(p.is_file_viewed(b"a.rs"));
+            assert!(!p.toggle_file_viewed(b"a.rs", cx));
+            assert!(!p.is_file_viewed(b"a.rs"));
+            p.toggle_file_viewed(b"b.rs", cx);
+            p.clear_comments(cx);
+            assert!(p.review.comments.is_empty());
+            assert_eq!(p.review.status, None);
             p.set_repo("/other-review".into(), cx);
             assert!(p.review.comments.is_empty());
             assert!(p.review.draft.is_none());
+            assert!(!p.is_file_viewed(b"b.rs"));
         });
     });
 }

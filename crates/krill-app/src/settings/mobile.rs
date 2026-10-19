@@ -75,9 +75,11 @@ impl Panel {
             MobileReply::PairingOffer {
                 url,
                 expires_at_ms,
+                mode,
                 interfaces,
                 ..
             } => {
+                self.mode = mode;
                 if self.copied_url.as_deref() != Some(url.as_str()) {
                     self.copied_url = None;
                 }
@@ -90,7 +92,11 @@ impl Panel {
                 }
                 self.interfaces = interfaces;
             }
-            MobileReply::GatewayStatus { devices, .. } | MobileReply::Devices(devices) => {
+            MobileReply::GatewayStatus { mode, devices, .. } => {
+                self.mode = mode;
+                self.devices = devices;
+            }
+            MobileReply::Devices(devices) => {
                 self.devices = devices;
             }
             MobileReply::ConnectedDevices(ids) => self.connected = ids.into_iter().collect(),
@@ -285,16 +291,16 @@ impl SettingsView {
                     .get(),
             ),
             (
-                ConnectMode::Tailscale,
-                "mobile-tailscale",
-                text::TAILSCALE.get(),
-                text::TAILSCALE_DESC.get(),
-            ),
-            (
                 ConnectMode::Tunnel,
                 "mobile-tunnel",
                 text::TUNNEL.get(),
                 text::TUNNEL_DESC.get(),
+            ),
+            (
+                ConnectMode::Tailscale,
+                "mobile-tailscale",
+                text::TAILSCALE.get(),
+                text::TAILSCALE_DESC.get(),
             ),
         ];
         let mut mode_card = layout::card(p)

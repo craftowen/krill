@@ -170,6 +170,12 @@ impl Panel {
         cx.notify();
     }
 
+    pub fn clear_comments(&mut self, cx: &mut Context<Self>) {
+        self.review.comments.clear();
+        self.review.status = None;
+        cx.notify();
+    }
+
     pub fn comments_sent(&mut self, source: CommentSource, accepted: bool, cx: &mut Context<Self>) {
         match source {
             CommentSource::GitRecovery => {
@@ -328,21 +334,38 @@ impl Panel {
                 .children(comments),
         )
         .child(
-            Button::new("comments-send")
-                .debug_selector(|| "comments-send".into())
-                .label(format!(
-                    "{} ({})",
-                    text::SEND.get(),
-                    self.review.comments.len()
-                ))
-                .small()
-                .primary()
-                .disabled(self.review.comments.is_empty() || self.review.draft.is_some())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    if !this.review.comments.is_empty() && this.review.draft.is_none() {
-                        cx.emit(SendComments::review(prompt(&this.review.comments)));
-                    }
-                })),
+            div()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(
+                    Button::new("comments-send")
+                        .debug_selector(|| "comments-send".into())
+                        .label(format!(
+                            "{} ({})",
+                            text::SEND.get(),
+                            self.review.comments.len()
+                        ))
+                        .small()
+                        .primary()
+                        .disabled(self.review.comments.is_empty() || self.review.draft.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if !this.review.comments.is_empty() && this.review.draft.is_none() {
+                                cx.emit(SendComments::review(prompt(&this.review.comments)));
+                            }
+                        })),
+                )
+                .child(
+                    Button::new("comments-clear")
+                        .debug_selector(|| "comments-clear".into())
+                        .label(text::CLEAR_ALL.get())
+                        .small()
+                        .ghost()
+                        .disabled(self.review.comments.is_empty())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_comments(cx);
+                        })),
+                ),
         )
         .when_some(self.review.status, |d, status| {
             d.child(

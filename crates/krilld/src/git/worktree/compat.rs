@@ -194,15 +194,15 @@ pub(super) fn read_config_with_state(
     config.worktree.symlinks = clean_symlinks;
 
     if let Some(s) = read(&top.join(INCLUDE))? {
-        config.worktree.include.extend(include_entries(&s)?);
+        config
+            .worktree
+            .include
+            .extend(include_manifest_entries(&s)?);
     }
     if let Some(proj) = imported {
         for entry in proj.symlink_paths {
             let trimmed = entry.trim();
-            if !trimmed.is_empty()
-                && !trimmed.starts_with('!')
-                && !trimmed.contains(['*', '?', '[', ']', '{', '}'])
-            {
+            if !trimmed.is_empty() && !trimmed.starts_with('!') && !trimmed.contains(['{', '}']) {
                 config.worktree.include.push(trimmed.to_owned());
             }
         }
@@ -232,6 +232,7 @@ fn read(path: &Path) -> Result<Option<String>, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+#[cfg(all(test, unix))]
 fn include_entries(s: &str) -> Result<Vec<String>, String> {
     let mut entries = Vec::new();
     for (index, line) in s
@@ -243,8 +244,28 @@ fn include_entries(s: &str) -> Result<Vec<String>, String> {
         if index >= MAX_ENTRIES {
             return Err(format!("{INCLUDE}: exceeds {MAX_ENTRIES} entries"));
         }
-        // Orca와 같이 glob·부정 패턴은 해석하지 않는다. 경로·gitignore 검사는 공통 복사 경로가 맡는다.
         if line.starts_with('!') || line.contains(['*', '?', '[', ']', '{', '}']) {
+            continue;
+        }
+        entries.push(line.to_owned());
+    }
+    Ok(entries)
+}
+
+/// `.worktreeinclude` 항목 파서(#24675): 리터럴 경로와 glob 패턴(`**/.env*`, `*.key` 등)을 모두 허용하되,
+/// 부정(`!`)과 브레이스 확장(`{a,b}`)은 제외한다.
+fn include_manifest_entries(s: &str) -> Result<Vec<String>, String> {
+    let mut entries = Vec::new();
+    for (index, line) in s
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .enumerate()
+    {
+        if index >= MAX_ENTRIES {
+            return Err(format!("{INCLUDE}: exceeds {MAX_ENTRIES} entries"));
+        }
+        if line.starts_with('!') || line.contains(['{', '}']) {
             continue;
         }
         entries.push(line.to_owned());

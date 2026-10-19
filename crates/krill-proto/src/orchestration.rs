@@ -2074,7 +2074,7 @@ pub struct PortEntry {
 
 static LOCAL_URL_REGEX: LazyLock<Option<Regex>> = LazyLock::new(|| {
     Regex::new(
-        r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:[^\s\x22'<>)\]]*)?)|(?:(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)|\[::1\]):(\d{2,5})\b)",
+        r"(https?://(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]):(\d{2,5})(?:/[\x21\x23-\x26\x28\x2a-\x3b\x3d\x3f-\x5c\x5e-\x7e]*)?)|(?:(?:\b(?:localhost|127\.0\.0\.1|0\.0\.0\.0)|\[::1\]):(\d{2,5})\b)",
     )
     .ok()
 });
@@ -2099,6 +2099,7 @@ pub fn extract_local_urls(session_id: u64, text: &str, probe: bool) -> Vec<PortE
         }
         let url = match raw_url {
             Some(u) => u
+                .trim_end_matches(['.', ',', ';', ':', '!', '?'])
                 .replace("0.0.0.0", "localhost")
                 .replace("[::1]", "localhost"),
             None => format!("http://localhost:{port}"),

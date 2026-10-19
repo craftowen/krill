@@ -46,6 +46,9 @@ async function main(){
  const expected=['\x1b','\t','\r','\x1b[Z',' ','\x7f','\x1b[3~','\x1b[A','\x1b[B','\x1b[D','\x1b[C','\x03','\x04','\x0c','\x1a','\x12','\x01','\x05','\x17','\x15'];
  let {root,handle,socket}=await mount();socket.autoAck=true;
  for(const k of api.keys)await handle.sendKey(k.id);assert.deepEqual(inputs(socket),expected);console.log('PASS exact 20-key order and bytes');
+ assert.equal(handle.toggleShift(),true);assert.equal(key(root,'shift').getAttribute('aria-pressed'),'true');await handle.sendKey('tab');assert.equal(inputs(socket).at(-1),'\x1b[Z');assert.equal(key(root,'shift').getAttribute('aria-pressed'),'false');
+ event(key(root,'shift'),'click');await handle.sendKey('arrowUp');assert.equal(inputs(socket).at(-1),'\x1b[1;2A');
+ console.log('PASS Shift modifier');
  viewport.height=544;event(viewport,'resize');assert.equal(root.style['--keyboard-inset'],'300px');assert.equal(find(root,'dismiss-keyboard').hidden,false);viewport.scale=1.5;event(viewport,'resize');assert.equal(root.style['--keyboard-inset'],'0px');assert.equal(find(root,'dismiss-keyboard').hidden,true);viewport.scale=1;viewport.height=844;event(viewport,'resize');console.log('PASS visualViewport keyboard inset excludes browser zoom');
  const attach=socket.sent.find(a=>a[4]===0x10),role=socket.sent.find(a=>a[4]===0x17);assert.deepEqual([...attach.slice(-2)],[0,0]);assert.deepEqual([...role.slice(5)],[0,2,0]);
  let count=inputs(socket).length;event(key(root,'backspace'),'pointerdown',{button:0,pointerId:1});await flush();assert.equal(inputs(socket).length,count+1);await advance(399);assert.equal(inputs(socket).length,count+1);await advance(1);assert.equal(inputs(socket).length,count+2);await advance(45);assert.equal(inputs(socket).length,count+3);event(key(root,'backspace'),'pointerup');await advance(500);assert.equal(inputs(socket).length,count+3);console.log('PASS repeat immediate / 400ms / 45ms and release');
@@ -57,7 +60,7 @@ async function main(){
  await flush();assert.deepEqual(inputs(socket).slice(count),['ㅎ','\x7f','하','\x7f','한','ㄱ','\x7f','그','\x7f','글']);
  count=inputs(socket).length;capture.value='한글!';event(capture,'input');capture.value='한글?';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['!','\x7f?']);
  count=inputs(socket).length;await handle.sendKey('enter');assert.equal(capture.value,'');assert(type('','deleteContentBackward').defaultPrevented);event(capture,'keydown',{key:'Backspace'});await flush();assert.deepEqual(inputs(socket).slice(count),['\r','\x7f','\x7f']);
- capture.value='a';event(capture,'input');assert.equal(event(capture,'keydown',{key:'Backspace'}).defaultPrevented,false);await flush();console.log('PASS iOS-style replace-in-place Hangul keeps textarea context, diff sends DEL+syllable, control keys reset context');
+ capture.value='a';event(capture,'input');assert.equal(event(capture,'keydown',{key:'Backspace'}).defaultPrevented,false);await flush();count=inputs(socket).length;handle.toggleShift(true);capture.value='ab';event(capture,'input');await flush();assert.deepEqual(inputs(socket).slice(count),['B']);console.log('PASS iOS-style replace-in-place Hangul keeps textarea context, diff sends DEL+syllable, control keys reset context');
  count=inputs(socket).length;event(capture,'compositionstart');handle.setInputMode('buffered');handle.setInputMode('direct');event(capture,'compositionend',{data:'늦음'});capture.value='늦음';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(capture.value,'');
  handle.focus();event(capture,'compositionstart');handle.unmount();event(capture,'compositionend',{data:'이전'});capture.value='이전';event(capture,'input');await flush();assert.equal(inputs(socket).length,count);assert.equal(root.children.length,0);console.log('PASS generation discard on mode switch / unmount');
  ({root,handle,socket}=await mount());handle.setInputMode('buffered');let command=find(root,'command-input');command.value='echo 한글';event(command,'input');event(find(root,'buffered-command'),'submit');await flush();assert.equal(command.value,'echo 한글');let sent=socket.sent.at(-1),r=T.reader(sent.slice(5)),id=r.n();socket.frame(0x27,T.v(id),T.v(0));await flush();assert.equal(command.value,'');
@@ -98,6 +101,13 @@ async function main(){
  ({root,handle,socket}=await mount(45));let fitting=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fitting;const roles=()=>socket.sent.filter(a=>a[4]===0x17).length;let before17=roles();socket.frame(0x21,T.v(3),T.v(3),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(24)));await flush();viewport.offsetTop=5;event(viewport,'scroll');viewport.offsetTop=0;await flush();assert.equal(roles(),before17);handle.unmount();
  console.log('PASS disconnect reports typing for refocus, Fit skips same-column resize roles');
  console.log('PASS tap jitter focus, one-axis touch pan (no native horizontal), output/input keep scrollLeft, mode-switch refocus, text() and phase');
+ const warmSocket=new context.FakeSocket(),warmRoot=new Element('div');
+ const warmHandle=api.mount(warmRoot,{sessionId:42,connect:()=>({socket:warmSocket,credentials:{device_id:'fixture',credential:''},messages:[JSON.stringify({version:2,challenge:''})]})});
+ await flush();assert.equal(warmSocket.sent.length,5);assert.equal(warmSocket.sent[4][4],0x10);warmHandle.unmount();
+ const authWarmSocket=new context.FakeSocket(),authWarmRoot=new Element('div');
+ const authWarmHandle=api.mount(authWarmRoot,{sessionId:43,connect:()=>({socket:authWarmSocket,credentials:{device_id:'fixture',credential:''},channel:new C.Channel(),messages:[C.enc.encode('{}'),T.frame(1,C.concat(T.v(1),T.v(1),T.v((1n<<56n)|4096n|5n)))]})});
+ await flush();assert.equal(authWarmSocket.sent.length,2);assert.equal(authWarmSocket.sent[0][4],0x17);assert.equal(authWarmSocket.sent[1][4],0x10);authWarmSocket.frame(0x2c,T.v(0));authWarmSocket.screen();await flush();assert.equal(find(authWarmRoot,'terminal-status').textContent,'80 × 24');authWarmHandle.unmount();
+ console.log('PASS prewarmed terminal WebSocket replays buffered challenge or pre-authenticated channel immediately on mount');
  console.log('All terminal adapter regression checks passed.');
 }
 if(process.argv.includes('--harness')){

@@ -10,16 +10,111 @@ use std::path::{Component, Path, PathBuf};
 
 use super::{OrphanProfile, ProviderKind};
 
+/// Codex가 `$CODEX_HOME` 내부에 최대 ~44바이트 접미사 Unix 도메인 소켓을 생성하므로,
+/// macOS `SUN_PATH_MAX`(104바이트, 널 종료 제외 103바이트)를 넘지 않으려면
+/// `$CODEX_HOME` 경로가 59바이트 이하여야 한다(#18566).
+pub const MAX_CODEX_HOME_BYTES: usize = 59;
+
 /// Krill 기본 프로필 루트. 계정 추가 시 경로를 비워 두면 `<루트>/<provider>/<slug>`에 만든다.
 #[must_use]
 pub fn managed_root(home: &Path) -> PathBuf {
     home.join(".config").join("minikrill").join("profiles")
 }
 
+/// Codex 소켓 길이 제한(`<= 59B`)을 맞추기 위한 단축 관리 루트(`~/.krill/p`).
+#[must_use]
+pub fn short_managed_root(home: &Path) -> PathBuf {
+    home.join(".krill").join("p")
+}
+
+/// Codex 프로필 슬러그를 최대 12자 ASCII 키로 압축한다.
+/// 12자 이하 영숫자·`-`·`_` 슬러그는 그대로 유지하고, 초과분은 앞 7자 + `-` + FNV-1a 4자리 hex로 축약한다.
+#[must_use]
+pub fn codex_short_key(key: &str) -> String {
+    let mut clean: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    clean = clean.trim_matches(['-', '_']).to_owned();
+    if clean.is_empty() {
+        "default".clone_into(&mut clean);
+    }
+    if clean.len() <= 12 {
+        return clean;
+    }
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in key.as_bytes() {
+        hash ^= u32::from(b);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    let prefix = clean
+        .get(..7)
+        .unwrap_or(&clean)
+        .trim_end_matches(['-', '_']);
+    format!("{prefix}-{:04x}", hash & 0xffff)
+}
+
+/// Codex 단축 프로필 디렉터리(`~/.krill/p/codex/<short-key>`).
+#[must_use]
+pub fn short_codex_profile_dir(home: &Path, slug: &str) -> PathBuf {
+    short_managed_root(home)
+        .join(ProviderKind::Codex.as_str())
+        .join(codex_short_key(slug))
+}
+
+/// 공급자별 기본 프로필 디렉터리. Codex는 소켓 경로 길이 제한을 위해 [`short_codex_profile_dir`]를 쓴다.
+#[must_use]
+pub fn default_profile_dir(home: &Path, provider: ProviderKind, slug: &str) -> PathBuf {
+    if provider == ProviderKind::Codex {
+        short_codex_profile_dir(home, slug)
+    } else {
+        managed_root(home).join(provider.as_str()).join(slug)
+    }
+}
+
+/// 구 관리 루트(`~/.config/minikrill/profiles/codex/<slug>`)에 생성된 긴 Codex 프로필을
+/// 단축 경로(`~/.krill/p/codex/<short-key>`)로 무손실 복사·이관한다.
+/// 사용자가 직접 지정한 외부 경로는 건드리지 않는다.
+#[must_use]
+pub fn migrate_long_codex_profile_if_needed(
+    home: &Path,
+    slug: &str,
+    current_dir: &Path,
+) -> PathBuf {
+    let legacy_codex_root = managed_root(home).join(ProviderKind::Codex.as_str());
+    if current_dir.as_os_str().len() <= MAX_CODEX_HOME_BYTES
+        || !current_dir.starts_with(&legacy_codex_root)
+    {
+        return current_dir.to_path_buf();
+    }
+    let target = short_codex_profile_dir(home, slug);
+    if current_dir.is_dir() && std::fs::create_dir_all(&target).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).ok();
+        }
+        if let Ok(entries) = std::fs::read_dir(current_dir) {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                let dst = target.join(entry.file_name());
+                if src.is_file() && !dst.exists() {
+                    std::fs::copy(&src, &dst).ok();
+                }
+            }
+        }
+    }
+    target
+}
+
 /// `dir`이 관리 루트 바로 아래 `<provider>/<이름>` 폴더인가. `..`·심볼릭 링크는 아니다.
 #[must_use]
 pub fn is_managed(home: &Path, dir: &Path) -> bool {
-    let Ok(rel) = dir.strip_prefix(managed_root(home)) else {
+    let Ok(rel) = dir
+        .strip_prefix(managed_root(home))
+        .or_else(|_| dir.strip_prefix(short_managed_root(home)))
+    else {
         return false;
     };
     let mut parts = rel.components();
@@ -34,23 +129,26 @@ pub fn is_managed(home: &Path, dir: &Path) -> bool {
 /// 관리 루트에 있지만 `keep`(등록된 프로필·세션이 쓰는 폴더)에 없는 폴더. 경로순.
 #[must_use]
 pub fn orphans(home: &Path, keep: &[PathBuf]) -> Vec<OrphanProfile> {
-    let root = managed_root(home);
+    let roots = [managed_root(home), short_managed_root(home)];
     let mut out = Vec::new();
-    for provider in ProviderKind::ALL {
-        let Ok(entries) = std::fs::read_dir(root.join(provider.as_str())) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if entry.file_type().is_ok_and(|t| t.is_dir()) && !keep.iter().any(|k| k == &path) {
-                out.push(OrphanProfile {
-                    provider,
-                    dir: path.display().to_string(),
-                });
+    for root in &roots {
+        for provider in ProviderKind::ALL {
+            let Ok(entries) = std::fs::read_dir(root.join(provider.as_str())) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if entry.file_type().is_ok_and(|t| t.is_dir()) && !keep.iter().any(|k| k == &path) {
+                    out.push(OrphanProfile {
+                        provider,
+                        dir: path.display().to_string(),
+                    });
+                }
             }
         }
     }
     out.sort_by(|a, b| a.dir.cmp(&b.dir));
+    out.dedup_by(|a, b| a.dir == b.dir);
     out
 }
 
@@ -260,6 +358,45 @@ mod tests {
             h.join(".Trash").join("link")
         );
         assert!(outside.join("secret").is_file());
+        std::fs::remove_dir_all(h).unwrap();
+    }
+
+    #[test]
+    fn codex_short_profile_dir_stays_within_socket_budget_and_migrates() {
+        let realistic_home = Path::new("/Users/alexanderhamilton");
+        let dir = default_profile_dir(
+            realistic_home,
+            ProviderKind::Codex,
+            "enterprise-workspace-production-account-2",
+        );
+        assert!(
+            dir.as_os_str().len() <= MAX_CODEX_HOME_BYTES,
+            "codex profile path {} ({} bytes) exceeds {MAX_CODEX_HOME_BYTES}",
+            dir.display(),
+            dir.as_os_str().len()
+        );
+        let h = home("codex-short");
+        let legacy = managed_root(&h)
+            .join("codex")
+            .join("very-long-codex-account-slug-that-exceeds-socket-limit");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("auth.json"), r#"{"token":"ok"}"#).unwrap();
+        let migrated = migrate_long_codex_profile_if_needed(
+            &h,
+            "very-long-codex-account-slug-that-exceeds-socket-limit",
+            &legacy,
+        );
+        assert_eq!(
+            migrated,
+            short_codex_profile_dir(&h, "very-long-codex-account-slug-that-exceeds-socket-limit")
+        );
+        assert!(migrated.join("auth.json").is_file());
+        assert!(is_managed(&h, &migrated));
+        assert!(
+            orphans(&h, std::slice::from_ref(&legacy))
+                .iter()
+                .any(|o| o.dir == migrated.display().to_string())
+        );
         std::fs::remove_dir_all(h).unwrap();
     }
 }
