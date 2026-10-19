@@ -219,6 +219,17 @@ pub enum Request {
     ClearScrollback {
         session: SessionId,
     },
+    /// `FEAT_CLI` 필요(MK-225). 제어 연결 한 번으로 세션 PTY에 입력을 전달한다.
+    /// 세션이 bracketed paste 모드면 본문을 `\x1b[200~...\x1b[201~`로 감싸고 `submit`을 별도 `\r`로 보낸다.
+    SendInput {
+        session: SessionId,
+        #[serde(deserialize_with = "input_bytes")]
+        bytes: Vec<u8>,
+        submit: bool,
+        wait_submit: bool,
+    },
+    /// 멀티에이전트 오케스트레이션 제어·대기 요청(MK-227).
+    Orchestration(crate::orchestration::OrchAction),
 }
 
 /// A dialog owns one token; cancellation also applies if it arrives before preparation.
@@ -819,6 +830,10 @@ pub enum Reply {
     SessionAccounts(Vec<SessionAccount>),
     /// `FEAT_CLEAR_SCROLLBACK` 필요(OWE-873b). [`Request::ClearScrollback`]의 답.
     ScrollbackCleared,
+    /// `FEAT_CLI` 필요(MK-225). [`Request::SendInput`]의 답.
+    InputSent,
+    /// 멀티에이전트 오케스트레이션 응답(MK-227).
+    Orchestration(crate::orchestration::OrchResponse),
 }
 
 /// 프로세스가 사라진 세션의 마지막 화면과 스크롤백(디스크 세그먼트 재생, 읽기 전용). 필드는 끝에만 붙인다.
@@ -974,6 +989,10 @@ impl Msg for Reply {
 
 #[cfg(test)]
 mod tests;
+
+fn input_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+    bounded::<D, u8, { crate::input::MAX_INPUT }>(d)
+}
 
 // Bound the collection before allocating, including forged postcard length hints.
 fn capture_bytes<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
