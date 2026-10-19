@@ -757,6 +757,39 @@ fn idle_authenticated_socket_is_pinged_then_closed_without_pong() {
 }
 
 #[test]
+fn ws_closes_when_registry_ends_before_first_request() {
+    let (_r, g) = start();
+    let (port, t) = offer(&g);
+    let mut phone = Client::pair(port, &t);
+    phone.ipc();
+    // 첫 요청 없이 ATTACH_TIMEOUT이 지나면 레지스트리가 끝낸다. WS도 닫혀야 하며 응답 없이 멈추면 안 된다.
+    phone
+        .socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        match receive(&mut phone.socket) {
+            Ok((9, _)) => {}
+            Ok((8, _)) => break,
+            Ok(other) => panic!("unexpected frame {other:?}"),
+            Err(e) => {
+                assert!(
+                    !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ),
+                    "WS가 닫히지 않고 멈춤: {e}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(9));
+    until(|| lock(&g.shared.state).connections.is_empty());
+}
+
+#[test]
 fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
     let (_registry, gateway) = start();
     let (port, ticket) = offer(&gateway);

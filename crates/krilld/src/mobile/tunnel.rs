@@ -133,15 +133,32 @@ impl Tunnel {
                             .stack_size(128 * 1024)
                             .spawn(move || {
                                 let start = Instant::now();
-                                let (settle, deadline) = (start + settle, start + READY_DEADLINE);
-                                if stable(&found, probe, &stop, settle, deadline, PROBE_INTERVAL) {
+                                // 고정 출처 PWA는 터널 WS 530을 재시도로 견디므로 첫 200에서 준비로 본다.
+                                // 터널 출처는 페이지 자체가 530이면 열리지 않으므로 정착을 기다린다.
+                                let enabled = fixed_available(publication.as_ref(), |url| {
+                                    http_status(url) == Some(200)
+                                });
+                                let (settle, streak) = if enabled {
+                                    (start, 1)
+                                } else {
+                                    (start + settle, READY_STREAK)
+                                };
+                                let deadline = start + READY_DEADLINE;
+                                if stable(
+                                    &found,
+                                    probe,
+                                    &stop,
+                                    settle,
+                                    deadline,
+                                    PROBE_INTERVAL,
+                                    streak,
+                                ) {
                                     prepare(
                                         &found,
-                                        publication.as_ref(),
+                                        publication.as_ref().filter(|_| enabled),
                                         &ready,
                                         &fixed,
                                         &stop,
-                                        |url| http_status(url) == Some(200),
                                         publish,
                                     );
                                 }
@@ -226,7 +243,7 @@ impl Drop for Tunnel {
         }
     }
 }
-/// `settle` 뒤, 기한 안에 직전 `READY_STREAK`번이 연속 성공이면 참. 실패 한 번이면 연속을 처음부터 센다.
+/// `settle` 뒤, 기한 안에 직전 `needed`번이 연속 성공이면 참. 실패 한 번이면 연속을 처음부터 센다.
 /// 취소되면 거짓.
 fn stable(
     url: &str,
@@ -235,11 +252,12 @@ fn stable(
     settle: Instant,
     deadline: Instant,
     interval: Duration,
+    needed: u32,
 ) -> bool {
     let mut streak = 0;
     while Instant::now() < deadline && !stop.cancelled() {
         streak = if probe(url) { streak + 1 } else { 0 };
-        if streak >= READY_STREAK && Instant::now() >= settle {
+        if streak >= needed && Instant::now() >= settle {
             return true;
         }
         if stop.wait(interval) {
@@ -248,29 +266,36 @@ fn stable(
     }
     false
 }
-/// 판정이 끝난 뒤 ready를 공개한다. 게시 실패는 연결 준비를 막지 않고 취소 가능한 백오프로 재시도한다.
+/// 현재 에셋 해시가 고정 출처에 배포돼 있는지.
+fn fixed_available(
+    publication: Option<&Publication>,
+    available: impl FnOnce(&str) -> bool,
+) -> bool {
+    publication.is_some_and(|p| {
+        available(&format!(
+            "{}/m/{}/manifest.json",
+            p.origin,
+            super::pwa::asset_hash()
+        ))
+    })
+}
+/// 판정이 끝난 뒤 ready를 공개한다. `publication`은 고정 출처가 확인됐을 때만 온다.
+/// 게시 실패는 연결 준비를 막지 않고 취소 가능한 백오프로 재시도한다.
 fn prepare(
     url: &str,
     publication: Option<&Publication>,
     ready: &AtomicBool,
     fixed: &AtomicBool,
     stop: &Stop,
-    available: impl FnOnce(&str) -> bool,
     mut put: impl FnMut(&Publication, &str) -> bool,
 ) {
-    let enabled = publication.is_some_and(|p| {
-        available(&format!(
-            "{}/m/{}/manifest.json",
-            p.origin,
-            super::pwa::asset_hash()
-        ))
-    });
+    let enabled = publication.is_some();
     if stop.cancelled() {
         return;
     }
     fixed.store(enabled, Ordering::Release);
     ready.store(true, Ordering::Release);
-    if let Some(p) = publication.filter(|_| enabled) {
+    if let Some(p) = publication {
         let mut delay = Duration::from_secs(2);
         while !stop.cancelled() {
             if put(p, url) {
@@ -417,7 +442,15 @@ mod tests {
             calls % 2 == 0
         };
         let deadline = now + Duration::from_millis(300);
-        assert!(!stable(URL, alternating, &stop, now, deadline, tick));
+        assert!(!stable(
+            URL,
+            alternating,
+            &stop,
+            now,
+            deadline,
+            tick,
+            READY_STREAK
+        ));
         assert!(calls > 2 * READY_STREAK);
         // 실패 몇 번 뒤 연속 성공이 쌓이면 READY_STREAK번째에 준비된다.
         let mut calls = 0;
@@ -426,40 +459,66 @@ mod tests {
             calls > 3
         };
         let deadline = Instant::now() + Duration::from_secs(5);
-        assert!(stable(URL, late, &stop, now, deadline, tick));
+        assert!(stable(URL, late, &stop, now, deadline, tick, READY_STREAK));
         assert_eq!(calls, 3 + READY_STREAK);
         // 정착 시점 전에는 계속 성공해도 준비가 아니다.
         let settle = Instant::now() + Duration::from_millis(100);
-        assert!(stable(URL, |_| true, &stop, settle, deadline, tick));
+        assert!(stable(
+            URL,
+            |_| true,
+            &stop,
+            settle,
+            deadline,
+            tick,
+            READY_STREAK
+        ));
         assert!(Instant::now() >= settle);
         let early = Instant::now() + Duration::from_millis(50);
-        assert!(!stable(URL, |_| true, &stop, deadline, early, tick));
+        assert!(!stable(
+            URL,
+            |_| true,
+            &stop,
+            deadline,
+            early,
+            tick,
+            READY_STREAK
+        ));
         stop.cancel();
-        assert!(!stable(URL, |_| true, &stop, now, deadline, tick));
+        assert!(!stable(
+            URL,
+            |_| true,
+            &stop,
+            now,
+            deadline,
+            tick,
+            READY_STREAK
+        ));
     }
     #[test]
     fn availability_is_decided_before_ready_and_failure_falls_back() {
+        let manifest = format!(
+            "https://stage.test/m/{}/manifest.json",
+            super::super::pwa::asset_hash()
+        );
+        assert!(!fixed_available(None, |_| true));
         for enabled in [true, false] {
+            assert_eq!(
+                fixed_available(Some(&publication()), |url| {
+                    assert_eq!(url, manifest);
+                    enabled
+                }),
+                enabled
+            );
             let ready = AtomicBool::new(false);
             let fixed = AtomicBool::new(false);
             let mut puts = 0;
+            let p = publication();
             prepare(
                 "https://fixture.trycloudflare.com",
-                Some(&publication()),
+                enabled.then_some(&p),
                 &ready,
                 &fixed,
                 &Stop::default(),
-                |url| {
-                    assert!(!ready.load(Ordering::Acquire));
-                    assert_eq!(
-                        url,
-                        format!(
-                            "https://stage.test/m/{}/manifest.json",
-                            super::super::pwa::asset_hash()
-                        )
-                    );
-                    enabled
-                },
                 |_, _| {
                     assert!(ready.load(Ordering::Acquire));
                     assert!(fixed.load(Ordering::Acquire));
@@ -485,7 +544,6 @@ mod tests {
                 &AtomicBool::new(false),
                 &AtomicBool::new(false),
                 &stop,
-                |_| true,
                 |_, _| {
                     attempts += 1;
                     send.send(attempts).unwrap();

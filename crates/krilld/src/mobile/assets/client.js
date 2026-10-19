@@ -36,7 +36,7 @@
   const next=()=>queue.length?Promise.resolve(queue.shift()):failed?Promise.reject(failed):new Promise((resolve,reject)=>waiters.push({resolve,reject}));
   const send=bytes=>socket.send(channel.seal(bytes));
   const plain=async()=>channel.open(await next());
-  function retry(delay=retryDelay){clearTimeout(retryTimer);if(stopped||authBlocked||!credentials)return;retryTimer=setTimeout(connect,Math.max(delay,retryNotBefore-Date.now()));retryDelay=Math.min(retryDelay*2,15000);}
+  function retry(delay=retryDelay){clearTimeout(retryTimer);if(stopped||authBlocked||(!credentials&&!pair))return;retryTimer=setTimeout(connect,Math.max(delay,retryNotBefore-Date.now()));retryDelay=Math.min(retryDelay*2,15000);}
   function disconnect(error){if(failed)return;failed=error;connected=false;clearTimeout(timer);for(const w of waiters.splice(0))w.reject(error);status('disconnected',error.message);socket?.close();if(!connecting)retry();}
   const ask=request=>send(frame(0x45,C.concat(v(7),text(JSON.stringify(request)))));
   async function answer(current){
