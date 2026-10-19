@@ -3680,8 +3680,16 @@ impl SettingsView {
                     .insert(host.id.clone(), SshHostCardStatus::Error);
                 match crate::ssh_hosts::classify_ssh_error(&err) {
                     crate::ssh_hosts::SshTestFailureKind::AuthFailed => {
-                        let msg = text::SSH_AUTH_FAILED_GUIDE
+                        let mut msg = text::SSH_AUTH_FAILED_GUIDE
                             .format(&[("label", &host.label), ("error", &err)]);
+                        if !host.destination.contains('@')
+                            && let Ok(user) = std::env::var("USER")
+                        {
+                            msg.push_str(
+                                &text::SSH_AUTH_USER_HINT
+                                    .format(&[("user", &user), ("address", &host.destination)]),
+                            );
+                        }
                         self.ssh_auth_failed_host = Some(host);
                         self.ssh_keygen_confirm_host = None;
                         self.ssh_status = Some(msg.into());
