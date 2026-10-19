@@ -76,6 +76,13 @@ struct Waker {
     idle: Condvar,
 }
 impl Waker {
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Windows는 깨우기 소켓 없이 condvar만 쓴다"
+        )
+    )]
     fn new() -> io::Result<Self> {
         #[cfg(unix)]
         {
@@ -93,11 +100,25 @@ impl Waker {
         Ok(Self {})
     }
     /// 버퍼가 차 있으면(WouldBlock) 이미 깨울 바이트가 남아 있으므로 버린다.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Windows는 깨우기 소켓 없이 condvar만 쓴다"
+        )
+    )]
     fn ring(&self) {
         #[cfg(unix)]
         (&self.tx).write_all(&[1]).ok();
     }
     /// 상태 락을 쥔 채 리스너를 닫은 뒤 부른다. 수락 스레드는 poll을 끝낼 때 상태 락이 필요 없다.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Windows는 깨우기 소켓 없이 condvar만 쓴다"
+        )
+    )]
     fn quiesce(&self) {
         #[cfg(unix)]
         {
