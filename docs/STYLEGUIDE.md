@@ -143,20 +143,13 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - `SIDEBAR_DEFAULT_WIDTH = 240pt`, `SIDEBAR_HEADER_HEIGHT = 32px`, `SIDEBAR_EMPTY_PY = 24px`
   - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
   - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 24px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
-<<<<<<< main
   - 상태 요약 겹친 아이콘: `STATUS_GROUP_ICON = 15px`, 겹침 음수 마진 `STATUS_GROUP_OVERLAP = -3px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
   - 설정 화면 좌측 탐색 열 고정 너비: `SETTINGS_NAV_WIDTH = 248px`, 우측 본문 열 최대 너비 `SETTINGS_CONTENT_MAX_WIDTH = 1120px` (창 너비에 맞춰 유동 확장하되 초대형 모니터에서 과도한 행 길이 방지)
   - 토글 스위치(`ui::switch`) 치수: 트랙 `SWITCH_WIDTH = 36px` × `SWITCH_HEIGHT = 20px`, 썸 지름 `SWITCH_THUMB = 14px`
-  - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 520px`, 세션 히스토리 `AGENT_HISTORY_WIDTH = 520px` (`MAX_HEIGHT = 360px`)
-  - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`, 대시보드 `DASHBOARD_SIZE = 760×480`
-=======
-- **오버레이·보조 창**:
-  - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지)
   - 상단 커맨드/Jump 팔레트 너비: `COMMAND_PALETTE_WIDTH = 900px`, 세션 히스토리 `AGENT_HISTORY_WIDTH = 520px` (`MAX_HEIGHT = 360px`)
   - 팝아웃 기본 크기: `FLOATING_SIZE = 640×400`, 대시보드 `DASHBOARD_SIZE = 960×600`
->>>>>>> wip
 
 ### 5.4 입체감과 그림자 (Elevation & Shadows)
 
