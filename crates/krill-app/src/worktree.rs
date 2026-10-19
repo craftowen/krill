@@ -126,7 +126,7 @@ fn visible(script: &str) -> String {
         .collect()
 }
 
-fn hex(bytes: &[u8]) -> String {
+fn hex_string(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut s, b| {
         write!(s, "{b:02x}").ok();
         s
@@ -967,7 +967,10 @@ impl Render for Dialog {
                         .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_2XS)
                         .text_color(muted)
-                        .child(crate::i18n::catalog::general::HASH.format(&[("hash", &hex(hash))])),
+                        .child(
+                            crate::i18n::catalog::general::HASH
+                                .format(&[("hash", &hex_string(hash))]),
+                        ),
                 )
                 .child(
                     footer()
