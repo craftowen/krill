@@ -434,6 +434,8 @@ fn apply_outputs(cfg: &settings::Settings, cx: &mut App) {
         crate::onboarding::actions::dismiss_notification(&pane_tag(id), cx);
     }
     platform::set_dock_badge(badge_label.as_deref());
+    #[cfg(windows)]
+    platform::sync_windows(cx);
 }
 
 fn build_notification(session: &Session) -> SystemNotification {

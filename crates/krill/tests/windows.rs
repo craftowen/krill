@@ -1,4 +1,4 @@
-//! Windows 명령 노출·미지원 hook 계약, `%USERPROFILE%` 기준 hook·statusline 설치와 doctor 진단(OWE-835).
+//! Windows 명령 노출·native hook 계약, `%USERPROFILE%` 기준 hook·statusline 설치와 doctor 진단(OWE-835).
 //! 모든 자식은 임시 `USERPROFILE`·상태 디렉터리만 쓴다.
 #![cfg(windows)]
 #![cfg_attr(
@@ -7,9 +7,9 @@
 )]
 
 use std::fs;
-use std::io::Write as _;
+use std::io::{BufRead as _, BufReader, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 
 use serde_json::{Value, json};
 
@@ -46,17 +46,98 @@ fn git_bash() -> Option<PathBuf> {
         .filter(|p| p.is_file())
 }
 
-fn find_command(value: &Value, needle: &str) -> Option<String> {
-    match value {
-        Value::String(s) if s.contains(needle) => Some(s.clone()),
-        Value::Array(items) => items.iter().find_map(|v| find_command(v, needle)),
-        Value::Object(map) => map.values().find_map(|v| find_command(v, needle)),
-        _ => None,
-    }
-}
-
 fn read_json(path: &Path) -> Value {
     serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+}
+
+// PATH deliberately contains no Git, Bash or PowerShell. Exec-form hook invocations
+// use an absolute executable path and inherited native pipes only.
+fn hook_spawn(exe: &Path, home: &Path) -> Child {
+    Command::new(exe)
+        .args(["hook", "claude"])
+        .env("USERPROFILE", home)
+        .env("KRILL_STATE_DIR", home.join("state"))
+        .env("MK_PANE_ID", "1")
+        .env("PATH", "")
+        .env_remove("CLAUDE_CODE_GIT_BASH_PATH")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn hook_call(exe: &Path, home: &Path, payload: &[u8]) -> Output {
+    let mut child = hook_spawn(exe, home);
+    child.stdin.take().unwrap().write_all(payload).unwrap();
+    child.wait_with_output().unwrap()
+}
+
+#[test]
+fn native_hook_waits_for_delayed_payload_and_eof() {
+    let home = temp_home("delayed-input");
+    let mut child = hook_spawn(Path::new(KRILL), &home);
+    // Synchronize with the hook's initial response before delaying the writer:
+    // process startup time cannot accidentally make the old 10ms budget pass.
+    let mut response = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut response)
+        .unwrap();
+    assert_eq!(response.trim(), "{}");
+    let mut input = child.stdin.take().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    input.write_all(br#"{"hook_event_name":"#).unwrap();
+    input.flush().unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(25));
+    input.write_all(br#""Stop"}"#).unwrap();
+    drop(input);
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = krill_proto::hook::read_spool(&fs::read(home.join("state/hook.spool")).unwrap());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].input, krill_proto::hook::Input::Complete);
+    assert_eq!(events[0].payload, br#"{"hook_event_name":"Stop"}"#);
+    assert_eq!(events[0].ppid, std::process::id());
+    fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn native_hook_bounds_open_stdin_without_reporting_partial_input_complete() {
+    for (tag, payload) in [
+        ("open-empty", b"".as_slice()),
+        ("open-partial", b"{".as_slice()),
+    ] {
+        let home = temp_home(tag);
+        let mut child = hook_spawn(Path::new(KRILL), &home);
+        let mut response = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut response)
+            .unwrap();
+        assert_eq!(response.trim(), "{}");
+        let mut input = child.stdin.take().unwrap();
+        input.write_all(payload).unwrap();
+        input.flush().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while child.try_wait().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let exited = child.try_wait().unwrap().is_some();
+        if !exited {
+            child.kill().unwrap();
+        }
+        let output = child.wait_with_output().unwrap();
+        drop(input);
+        assert!(exited, "hook waited for the writer to close stdin");
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let events =
+            krill_proto::hook::read_spool(&fs::read(home.join("state/hook.spool")).unwrap());
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input, krill_proto::hook::Input::TimedOut);
+        assert!(events[0].payload.is_empty());
+        fs::remove_dir_all(home).ok();
+    }
 }
 
 #[test]
@@ -68,7 +149,7 @@ fn help_hides_computer_commands() {
 }
 
 #[test]
-fn unsupported_hook_preserves_agent_response_and_success() {
+fn hook_outside_panes_preserves_agent_response_and_success() {
     for (agent, event, expected) in [
         ("claude", "PreToolUse", "{}"),
         ("agy", "PreToolUse", r#"{"decision":"ask"}"#),
@@ -77,20 +158,17 @@ fn unsupported_hook_preserves_agent_response_and_success() {
     ] {
         let output = Command::new(KRILL)
             .args(["hook", agent, event])
+            .env_remove("MK_PANE_ID")
             .output()
             .unwrap();
         assert!(output.status.success());
         assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), expected);
-        assert!(
-            String::from_utf8(output.stderr)
-                .unwrap()
-                .contains("not supported")
-        );
+        assert!(output.stderr.is_empty());
     }
 }
 
 #[test]
-fn unsupported_hook_uses_event_environment_and_argument_precedence() {
+fn hook_uses_event_environment_and_argument_precedence() {
     for (args, expected) in [
         (vec!["hook", "agy"], r#"{"decision":"ask"}"#),
         (vec!["hook", "agy", "Stop"], r#"{"decision":""}"#),
@@ -98,6 +176,7 @@ fn unsupported_hook_uses_event_environment_and_argument_precedence() {
         let output = Command::new(KRILL)
             .args(args)
             .env("MK_HOOK_EVENT", "PreToolUse")
+            .env_remove("MK_PANE_ID")
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -106,9 +185,9 @@ fn unsupported_hook_uses_event_environment_and_argument_precedence() {
 }
 
 #[test]
-fn claude_hook_installs_under_userprofile_and_quotes_spaced_path_for_git_bash() {
+fn claude_hook_exec_form_delivers_without_git_bash_and_preserves_user_settings() {
     let home = temp_home("hook");
-    let bin = home.join("Krill 한글 dir");
+    let bin = home.join("Krill 한글 '$` & dir");
     fs::create_dir_all(&bin).unwrap();
     let exe = bin.join("krill.exe");
     fs::copy(KRILL, &exe).unwrap();
@@ -123,32 +202,25 @@ fn claude_hook_installs_under_userprofile_and_quotes_spaced_path_for_git_bash() 
     );
     let installed = read_json(&settings);
     assert_eq!(installed["theme"], "dark");
-    let command = find_command(&installed, "hook claude").unwrap();
-    assert!(
-        command.contains(&format!("'{}'", exe.display())),
-        "{command}"
+    let handler = &installed["hooks"]["PreToolUse"][0]["hooks"][0];
+    assert_eq!(Path::new(handler["command"].as_str().unwrap()), exe);
+    assert_eq!(handler["args"], json!(["hook", "claude"]));
+    assert!(handler.get("shell").is_none());
+    let out = hook_call(
+        &exe,
+        &home,
+        b"{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Read\"}",
     );
-
-    if let Some(bash) = git_bash() {
-        for pane in [None, Some("pane-1")] {
-            let mut shell = Command::new(&bash);
-            shell.arg("-c").arg(&command).env_remove("MK_PANE_ID");
-            if let Some(pane) = pane {
-                shell.env("MK_PANE_ID", pane);
-            }
-            let out = shell.output().unwrap();
-            assert!(out.status.success(), "{pane:?}: {out:?}");
-            assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
-            // 판 안에서는 공백·한글 경로의 krill.exe까지 실제로 닿아야 한다(미지원 hook 경고).
-            assert_eq!(
-                String::from_utf8_lossy(&out.stderr).contains("not supported"),
-                pane.is_some(),
-                "{out:?}"
-            );
-        }
-    } else {
-        eprintln!("Git Bash not found; skipped hook command execution");
-    }
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let events = krill_proto::hook::read_spool(&fs::read(home.join("state/hook.spool")).unwrap());
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].agent, "claude");
+    assert_eq!(events[0].ppid, std::process::id());
+    assert_eq!(events[0].input, krill_proto::hook::Input::Complete);
+    let payload: Value = serde_json::from_slice(&events[0].payload).unwrap();
+    assert_eq!(payload["tool_name"], "Read");
 
     let out = krill(&exe, &home, &["hook", "uninstall", "claude", "--yes"]);
     assert!(
@@ -257,4 +329,64 @@ fn doctor_json_probes_state_writes_and_skips_daemon() {
             .starts_with(".krill-doctor")
     }));
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn native_hook_sends_the_event_and_waits_for_ack_without_spooling() {
+    use krill_proto::{hook, ipc, os::net::UnixListener};
+    let home = temp_home("native-ack");
+    fs::create_dir_all(home.join("state/run")).unwrap();
+    let listener = UnixListener::bind(home.join("state/run/krilld.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let server = std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("hook connection: {error}"),
+            }
+        };
+        // Winsock accepted sockets inherit the listener's non-blocking mode.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        stream
+            .write_all(
+                &ipc::ServerHello {
+                    proto_min: ipc::PROTO_MIN,
+                    proto_max: ipc::PROTO_MAX,
+                    features: hook::FEAT_HOOK,
+                    build: "OWE-917-test".into(),
+                    instance_id: 1,
+                }
+                .encode()
+                .unwrap(),
+            )
+            .unwrap();
+        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        assert_eq!(
+            ipc::ClientHello::decode(kind, &body).unwrap().role,
+            ipc::ClientRole::Hook
+        );
+        let (kind, body) = ipc::read_frame(&mut stream).unwrap().unwrap();
+        let event = hook::HookEvent::decode(kind, &body).unwrap();
+        stream
+            .write_all(&ipc::encode_frame(hook::kind::ACK, &[]).unwrap())
+            .unwrap();
+        event
+    });
+    let output = hook_call(Path::new(KRILL), &home, br#"{"hook_event_name":"Stop"}"#);
+    assert!(output.status.success(), "{output:?}");
+    let event = server.join().unwrap();
+    assert_eq!(event.ppid, std::process::id());
+    assert_eq!(event.payload, br#"{"hook_event_name":"Stop"}"#);
+    assert!(!home.join("state/hook.spool").exists());
+    fs::remove_dir_all(home).ok();
 }

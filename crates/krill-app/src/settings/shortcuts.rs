@@ -416,10 +416,40 @@ fn keystroke_text(k: &Keystroke) -> String {
     let mut out = String::new();
     for (on, sym) in [
         (m.function, "fn"),
-        (m.control, "⌃"),
-        (m.alt, "⌥"),
-        (m.shift, "⇧"),
-        (m.platform, "⌘"),
+        (
+            m.control,
+            if cfg!(target_os = "macos") {
+                "⌃"
+            } else {
+                "Ctrl+"
+            },
+        ),
+        (
+            m.alt,
+            if cfg!(target_os = "macos") {
+                "⌥"
+            } else {
+                "Alt+"
+            },
+        ),
+        (
+            m.shift,
+            if cfg!(target_os = "macos") {
+                "⇧"
+            } else {
+                "Shift+"
+            },
+        ),
+        (
+            m.platform,
+            if cfg!(target_os = "macos") {
+                "⌘"
+            } else if cfg!(windows) {
+                "Win+"
+            } else {
+                "Super+"
+            },
+        ),
     ] {
         if on {
             out.push_str(sym);
@@ -1034,5 +1064,15 @@ impl SettingsView {
             .children(conflict)
             .children(error)
             .child(list)
+    }
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod platform_tests {
+    #[test]
+    fn keycaps_show_the_effective_windows_modifiers() {
+        assert_eq!(super::keycap_text("ctrl-shift-t"), "Ctrl+Shift+T");
+        assert_eq!(super::keycap_text("ctrl-alt-shift-w"), "Ctrl+Alt+Shift+W");
+        assert_eq!(super::keycap_text("ctrl-alt-left"), "Ctrl+Alt+←");
     }
 }

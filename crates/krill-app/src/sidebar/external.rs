@@ -1095,7 +1095,7 @@ pub fn parse_ps_parents(text: &str) -> BTreeMap<u32, u32> {
 
 /// 현재 프로세스 표(pid → ppid). 실패하면 `None`(호출자는 기존 cwd 동작으로 fail-open).
 pub fn parent_map() -> Option<BTreeMap<u32, u32>> {
-    let out = std::process::Command::new("ps")
+    let out = crate::platform::background_command("ps")
         .args(["-eo", "pid,ppid"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
