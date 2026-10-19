@@ -643,7 +643,15 @@ impl RenderOnce for Tab {
         };
         let radius = self.variant.radius(self.size, cx);
         let inner_radius = self.variant.inner_radius(self.size, cx);
-        let inner_paddings = self.variant.inner_paddings(self.size);
+        let mut inner_paddings = self.variant.inner_paddings(self.size);
+        // Krill: 앞/뒤 장식(prefix/suffix)이 있는 쪽은 호출부가 간격을 정한다(탭 안 아이콘-제목 간격).
+        let decorated = self.prefix.is_some() || self.suffix.is_some();
+        if self.prefix.is_some() {
+            inner_paddings.left = px(0.);
+        }
+        if self.suffix.is_some() {
+            inner_paddings.right = px(0.);
+        }
         let inner_margins = self.variant.inner_margins(self.size);
         let inner_height = self.variant.inner_height(self.size);
         let height = self.variant.height(self.size);
@@ -707,7 +715,8 @@ impl RenderOnce for Tab {
             .line_height(relative(1.25))
             .whitespace_nowrap()
             .items_center()
-            .justify_center()
+            // Krill: 장식이 있는 탭은 최소 폭으로 남는 자리에서 제목을 왼쪽에, 닫기 버튼을 오른쪽 끝에 둔다.
+            .when(!decorated, |this| this.justify_center())
             .overflow_hidden()
             .margins(inner_margins)
             // Normally the label decides the tab width, so it never shrinks. With

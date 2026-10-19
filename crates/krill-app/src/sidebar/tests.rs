@@ -4408,3 +4408,78 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
     );
     fs::remove_dir_all(&dir).ok();
 }
+
+/// v0.1.17: 워크트리 카드 아래 세션 행은 카드 제목 글자 아래에서 시작해 카드의 자식으로 보인다.
+/// 계보 자식 워크트리의 세션은 그 워크트리 들여쓰기를 따르고, 폴더 > 세션도 폴더 이름 아래로 들여 쓴다.
+#[gpui::test]
+fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-nested-indent-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let parent = PathBuf::from("/repo/parent");
+    let child = PathBuf::from("/repo/child");
+    let mut loose = session(3, AgentState::Working, None);
+    loose.cwd = Some("/tmp/x".into());
+    let sb_path = dir.join("sidebar.bin");
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sb_path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_sort_by(SortBy::Name, cx);
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/repo/parent")),
+                    session(2, AgentState::Working, Some("/repo/child")),
+                    loose,
+                ],
+                trees: BTreeMap::from([(
+                    PathBuf::from("/repo"),
+                    vec![parent.clone(), child.clone()],
+                )]),
+            };
+            s.expanded_cards.insert(parent.clone());
+            s.expanded_cards.insert(child.clone());
+            s.set_worktree_parent(child.clone(), parent.clone(), cx);
+            s.rebuild(cx);
+            assert_eq!(s.lineage_depth(&child), 1);
+        });
+    });
+    cx.run_until_parked();
+    let rows = cx.update(|_, cx| view.read(cx).rows.clone());
+    let at = |pred: &dyn Fn(&Row) -> bool| rows.iter().position(pred).expect("row");
+    let parent_row = at(&|r| matches!(r, Row::Worktree(p) if p == Path::new("/repo/parent")));
+    let child_row = at(&|r| matches!(r, Row::Worktree(p) if p == Path::new("/repo/child")));
+    let s1 = at(&|r| matches!(r, Row::Session(s, true) if s.id == SessionId(1)));
+    let s2 = at(&|r| matches!(r, Row::Session(s, true) if s.id == SessionId(2)));
+    let folder = at(&|r| matches!(r, Row::Folder(_)));
+    let s3 = at(&|r| matches!(r, Row::Session(s, true) if s.id == SessionId(3)));
+    let x = |cx: &mut gpui::VisualTestContext, sel: String| {
+        cx.debug_bounds(sel.clone().leak())
+            .unwrap_or_else(|| panic!("missing {sel}"))
+            .origin
+            .x
+    };
+    for layout in [CardLayout::Detailed, CardLayout::Compact] {
+        cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(layout, cx)));
+        cx.run_until_parked();
+        for (tree, sess) in [(parent_row, s1), (child_row, s2)] {
+            let card = x(cx, format!("worktree-card-{tree}"));
+            let title = x(cx, format!("worktree-title-{tree}"));
+            let glyph = x(cx, format!("session-state-{sess}"));
+            assert!(
+                glyph >= title && glyph >= card + gpui::px(16.),
+                "{layout:?}: session {sess} glyph={glyph:?} must sit under card {tree} title={title:?} (card={card:?})"
+            );
+        }
+        assert!(
+            x(cx, format!("session-state-{s2}")) > x(cx, format!("session-state-{s1}")),
+            "{layout:?}: lineage child sessions follow their deeper card"
+        );
+        let folder_title = x(cx, format!("folder-title-{folder}"));
+        let glyph = x(cx, format!("session-state-{s3}"));
+        assert!(
+            glyph >= folder_title,
+            "{layout:?}: folder session glyph={glyph:?} title={folder_title:?}"
+        );
+    }
+}

@@ -138,7 +138,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 
 - **상단 타이틀바 / 탭 바**: `TITLEBAR_HEIGHT = 36px`, `TAB_BAR_HEIGHT = 36px` (1단 통합 상단 바).
 - **macOS 신호등 여백**: `TRAFFIC_LIGHT_INSET = (12px, 10px)`, 신호등 우측 첫 컨트롤 여백 `TRAFFIC_LIGHT_PAD = 78px` (이 영역 안에는 클릭 타깃을 두지 않는다).
-- **탭 규칙**: `TAB_MAX_WIDTH = 220px`, 비활성 탭 아이콘·상태 점 투명도 `TAB_INACTIVE_OPACITY = 0.7`, 상태 점 지름 `STATE_DOT = 6px`.
+- **탭 규칙**: `TAB_MAX_WIDTH = 220px`, `TAB_MIN_WIDTH = 120px`, 탭 안쪽 왼쪽 여백 `SPACE_3`(12px)·아이콘-제목 간격 `SPACE_2`(8px)·닫기 버튼은 오른쪽 끝, 비활성 탭 사이 1px×16px 구분선(`border`, 활성 탭 양옆은 활성 탭 테두리가 대신한다), 비활성 탭 아이콘·상태 점 투명도 `TAB_INACTIVE_OPACITY = 0.7`, 상태 점 지름 `STATE_DOT = 6px`.
 - **사이드바·패널·상태바**:
   - `SIDEBAR_DEFAULT_WIDTH = 240pt`, `SIDEBAR_HEADER_HEIGHT = 32px`, `SIDEBAR_EMPTY_PY = 24px`
   - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
