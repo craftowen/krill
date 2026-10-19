@@ -1,6 +1,8 @@
 //! Cloudflare Quick Tunnel의 프로세스 수명. 키·pair token은 cloudflared 인자에 넣지 않는다.
 use std::ffi::OsStr;
 use std::io::{self, Read};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -31,7 +33,10 @@ impl Tunnel {
         Self::spawn(&binary, port, probe)
     }
     fn spawn(binary: &OsStr, port: u16, probe: Probe) -> io::Result<Self> {
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        let mut child = command
             .args([
                 "tunnel",
                 "--no-autoupdate",
@@ -45,7 +50,7 @@ impl Tunnel {
             .map_err(|e| {
                 io::Error::new(
                     e.kind(),
-                    "cloudflared unavailable; install with brew install cloudflared",
+                    "cloudflared unavailable; install cloudflared and add it to PATH",
                 )
             })?;
         let stderr = child.stderr.take();
@@ -122,7 +127,6 @@ impl Tunnel {
         alive && (self.ready.load(Ordering::Acquire) || self.started.elapsed() < READY_DEADLINE)
     }
     #[cfg(test)]
-    #[cfg(unix)]
     pub(super) fn fixture(port: u16) -> io::Result<Self> {
         if port == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -138,7 +142,6 @@ impl Tunnel {
     }
 }
 #[cfg(test)]
-#[cfg(unix)]
 impl Tunnel {
     /// URL은 찍혔지만 준비 기한을 넘긴 터널.
     pub(super) fn stale(port: u16) -> io::Result<Self> {
@@ -164,11 +167,14 @@ fn probe(url: &str) -> bool {
     let Some(host) = url.strip_prefix("https://") else {
         return false;
     };
-    match Command::new("curl")
+    let mut command = Command::new("curl");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    match command
         .args([
             "-sS",
             "-o",
-            "/dev/null",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
             "-w",
             "%{http_code}",
             "--max-time",
