@@ -229,6 +229,84 @@ impl Panel {
         cx.notify();
     }
 
+    pub fn merge_pr(&mut self, method: crate::pull_request::PrMergeMethod, cx: &mut Context<Self>) {
+        if self.checks.loading {
+            return;
+        }
+        self.checks.loading = true;
+        self.checks.fix_status = None;
+        let repo = self.repo.clone();
+        let branch_override = self.checks.branch_override.clone();
+        let service = Arc::clone(&self.editing.pr_service);
+        self.checks.task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let branch = resolve_branch(&repo, branch_override.as_deref());
+                    service.merge(&repo, &branch, method)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.checks.loading = false;
+                match result {
+                    Ok(()) => {
+                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
+                        this.refresh_checks(cx);
+                    }
+                    Err(_) => {
+                        this.checks.fix_status = Some(text::ACTION_FAILED);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    pub fn toggle_pr_draft(&mut self, cx: &mut Context<Self>) {
+        if self.checks.loading {
+            return;
+        }
+        let Some(pr) = &self.checks.inspection else {
+            return;
+        };
+        let to_draft = match pr.status {
+            Status::Open => true,
+            Status::Draft => false,
+            _ => return,
+        };
+        self.checks.loading = true;
+        self.checks.fix_status = None;
+        let repo = self.repo.clone();
+        let branch_override = self.checks.branch_override.clone();
+        let service = Arc::clone(&self.editing.pr_service);
+        self.checks.task = Some(cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let branch = resolve_branch(&repo, branch_override.as_deref());
+                    service.set_draft(&repo, &branch, to_draft)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.checks.loading = false;
+                match result {
+                    Ok(()) => {
+                        this.checks.fix_status = Some(text::ACTION_SUCCESS);
+                        this.refresh_checks(cx);
+                    }
+                    Err(_) => {
+                        this.checks.fix_status = Some(text::ACTION_FAILED);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
     pub(super) fn toggle_check_selection(&mut self, idx: usize, cx: &mut Context<Self>) {
         let Some(pr) = &self.checks.inspection else {
             return;
@@ -900,36 +978,124 @@ impl Panel {
                 }));
         }
 
-        let pr_header = pr_header.child(title_row).child(
-            div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_2()
-                .text_size(crate::ui::TEXT_2XS)
+        let pr_status = pr.status.clone();
+        let pr_busy = self.checks.loading;
+        let pr_header =
+            pr_header
+                .child(title_row)
                 .child(
                     div()
-                        .text_color(p.destructive)
-                        .child(text::SUMMARY_FAILED.format(&[("n", &failed.to_string())])),
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_2()
+                        .text_size(crate::ui::TEXT_2XS)
+                        .child(
+                            div()
+                                .text_color(p.destructive)
+                                .child(text::SUMMARY_FAILED.format(&[("n", &failed.to_string())])),
+                        )
+                        .child(
+                            div().text_color(p.warning).child(
+                                text::SUMMARY_PENDING.format(&[("n", &pending.to_string())]),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .text_color(p.success)
+                                .child(text::SUMMARY_PASSED.format(&[("n", &passed.to_string())])),
+                        )
+                        .when(skipped > 0, |d| {
+                            d.child(div().text_color(p.muted_foreground).child(
+                                text::SUMMARY_SKIPPED.format(&[("n", &skipped.to_string())]),
+                            ))
+                        }),
                 )
-                .child(
-                    div()
-                        .text_color(p.warning)
-                        .child(text::SUMMARY_PENDING.format(&[("n", &pending.to_string())])),
-                )
-                .child(
-                    div()
-                        .text_color(p.success)
-                        .child(text::SUMMARY_PASSED.format(&[("n", &passed.to_string())])),
-                )
-                .when(skipped > 0, |d| {
+                .when(matches!(pr_status, Status::Open | Status::Draft), |d| {
                     d.child(
                         div()
-                            .text_color(p.muted_foreground)
-                            .child(text::SUMMARY_SKIPPED.format(&[("n", &skipped.to_string())])),
+                            .id("pr-checks-actions")
+                            .debug_selector(|| "pr-checks-actions".into())
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_1()
+                            .pt_1()
+                            .when(pr_status == Status::Open, |row| {
+                                row.child(
+                                    Button::new("pr-merge-squash")
+                                        .debug_selector(|| "pr-merge-squash".into())
+                                        .xsmall()
+                                        .primary()
+                                        .disabled(pr_busy)
+                                        .label(text::MERGE_SQUASH.get())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.merge_pr(
+                                                crate::pull_request::PrMergeMethod::Squash,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Button::new("pr-merge-rebase")
+                                        .debug_selector(|| "pr-merge-rebase".into())
+                                        .xsmall()
+                                        .outline()
+                                        .disabled(pr_busy)
+                                        .label(text::MERGE_REBASE.get())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.merge_pr(
+                                                crate::pull_request::PrMergeMethod::Rebase,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Button::new("pr-merge-commit")
+                                        .debug_selector(|| "pr-merge-commit".into())
+                                        .xsmall()
+                                        .outline()
+                                        .disabled(pr_busy)
+                                        .label(text::MERGE_COMMIT.get())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.merge_pr(
+                                                crate::pull_request::PrMergeMethod::Merge,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                                .child(
+                                    Button::new("pr-convert-draft")
+                                        .debug_selector(|| "pr-convert-draft".into())
+                                        .xsmall()
+                                        .ghost()
+                                        .disabled(pr_busy)
+                                        .label(text::CONVERT_DRAFT.get())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_pr_draft(cx);
+                                        })),
+                                )
+                            })
+                            .when(pr_status == Status::Draft, |row| {
+                                row.child(
+                                    Button::new("pr-mark-ready")
+                                        .debug_selector(|| "pr-mark-ready".into())
+                                        .xsmall()
+                                        .primary()
+                                        .disabled(pr_busy)
+                                        .label(text::MARK_READY.get())
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            cx.stop_propagation();
+                                            this.toggle_pr_draft(cx);
+                                        })),
+                                )
+                            }),
                     )
-                }),
-        );
+                });
 
         let check_rows: Vec<AnyElement> = pr
             .checks

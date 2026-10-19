@@ -64,7 +64,7 @@ macro_rules! computer_usage {
 }
 
 const USAGE: &str = concat!(
-    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
+    "usage: krill mobile pair/devices/revoke/serve | krill ls/new/fork/send/read/wait/attach | krill kill <id> | krill file open|diff <path> | krill search <query> [--agent <id>] [--path <worktree>] [--limit <n>] [--json] | krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] | krill orchestration <cmd> | krill skills list/get/install | krill handoff --from <id> | krill reference list/add/remove/find | krill ports | krill schedule add/edit/run/rm/list/runs | krill account [list|switch|add|rm|auto-switch] | krill artifacts share|update|unshare|list|delete | krill set --comment <text> [--parent <path>|--clear-parent] | krill telemetry status|enable|disable | krill update [--check] [--app <path>] [--json] | krill history clear | krill doctor [--bundle|--json [--no-start]] | krill changes [--repo <path>] | krill agent list | krill hook <agent> | krill hook install|uninstall <claude|codex|agy|cursor|opencode> | krill statusline [--chain <command>] | krill statusline install|uninstall | krill worktree list/show/current/ps | krill worktree new <name> [--parent <path>] | krill worktree rm <path> | krill worktree cleanup [--pr merged|closed] [--idle-days <N>] | krill worktree space [--repo <path>] | krill worktree set [--parent <path>|--clear-parent] | krill worktree symlink <list|add|rm> [<path>] | krill worktree hooks [--setup <cmd>] [--archive <cmd>]",
     computer_usage!()
 );
 
@@ -130,6 +130,20 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         })
     {
         return session::run(&raw);
+    }
+    if raw.first().is_some_and(|s| s == "--host") && raw.get(2).is_some_and(|s| s == "worktree") {
+        let mut forwarded = vec![raw[0].clone(), raw[1].clone()];
+        forwarded.extend_from_slice(&raw[3..]);
+        return worktree::run(&forwarded);
+    }
+    if raw.first().is_some_and(|s| s == "--host")
+        && raw
+            .get(2)
+            .is_some_and(|s| s == "orchestration" || s == "orch")
+    {
+        let mut forwarded = vec![raw[0].clone(), raw[1].clone()];
+        forwarded.extend_from_slice(&raw[3..]);
+        return orchestration::run(&forwarded);
     }
     if raw.first().is_some_and(|s| s == "mobile") {
         return mobile::run(&raw[1..]);
@@ -257,7 +271,8 @@ fn agent_list() -> ExitCode {
         }
     );
     let path = std::env::var_os("PATH").unwrap_or_default();
-    let mut rows: Vec<_> = agents.profiles.iter().collect();
+    let all_profiles = agents.all_profiles_with_presets();
+    let mut rows: Vec<_> = all_profiles.iter().collect();
     rows.sort_by(|(a, _), (b, _)| {
         agent::profile_rank(a)
             .cmp(&agent::profile_rank(b))

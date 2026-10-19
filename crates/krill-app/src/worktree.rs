@@ -41,16 +41,34 @@ enum Phase {
     Done(Worktree),
 }
 
+/// `(NewWorktree, agent_id, initial_prompt)` 튜플.
+pub type FanOutPlanItem = (NewWorktree, Option<String>, Option<String>);
+
+/// 워크트리 생성 시 선택 가능한 멀티 에이전트(Fan-Out) 프리셋 목록.
+pub const FAN_OUT_AGENTS: &[(&str, &str)] = &[
+    ("claude", "Claude"),
+    ("codex", "Codex"),
+    ("agy", "Antigravity"),
+    ("opencode", "OpenCode"),
+    ("gemini", "Gemini"),
+    ("aider", "Aider"),
+];
+
 pub struct Dialog {
     language: crate::i18n::Language,
     repo: PathBuf,
     parent: Option<PathBuf>,
     name: Entity<InputState>,
     base: Entity<InputState>,
+    initial_prompt: Entity<InputState>,
+    selected_agents: Vec<String>,
+    pending_fan_out: usize,
+    last_created_agent: Option<String>,
+    last_created_prompt: Option<String>,
     phase: Phase,
     source: Arc<dyn Source>,
     task: Option<Task<()>>,
-    _enter: [Subscription; 3],
+    _enter: [Subscription; 4],
     preparation: Option<Preparation>,
     preparation_task: Option<Task<()>>,
     preparation_ready: bool,
@@ -245,6 +263,9 @@ impl Dialog {
     ) -> Self {
         let name = cx.new(|cx| InputState::new(window, cx).placeholder(text::NAME.get()));
         let base = cx.new(|cx| InputState::new(window, cx).placeholder(text::BASE.get()));
+        let initial_prompt = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get())
+        });
         name.update(cx, |input, cx| input.focus(window, cx));
         let enter = |cx: &mut Context<Self>, input: &Entity<InputState>| {
             cx.subscribe(input, |d, _, event: &InputEvent, cx| {
@@ -258,6 +279,7 @@ impl Dialog {
         let subscriptions = [
             enter(cx, &name),
             enter(cx, &base),
+            enter(cx, &initial_prompt),
             cx.subscribe(&base, |d, _, event: &InputEvent, cx| {
                 if matches!(event, InputEvent::Change) {
                     d.prepare(cx);
@@ -270,6 +292,11 @@ impl Dialog {
             parent,
             name,
             base,
+            initial_prompt,
+            selected_agents: Vec::new(),
+            pending_fan_out: 0,
+            last_created_agent: None,
+            last_created_prompt: None,
             phase: Phase::Edit(None),
             source,
             task: None,
@@ -287,6 +314,57 @@ impl Dialog {
     #[must_use]
     pub fn parent(&self) -> Option<&std::path::Path> {
         self.parent.as_deref()
+    }
+
+    #[must_use]
+    pub fn selected_agents(&self) -> &[String] {
+        &self.selected_agents
+    }
+
+    pub fn toggle_agent(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        let trimmed = agent_id.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Some(pos) = self.selected_agents.iter().position(|a| a == trimmed) {
+            self.selected_agents.remove(pos);
+        } else {
+            self.selected_agents.push(trimmed.to_owned());
+        }
+        cx.notify();
+    }
+
+    #[must_use]
+    pub fn initial_prompt_value(&self, cx: &App) -> Option<String> {
+        let trimmed = self.initial_prompt.read(cx).value().trim().to_owned();
+        (!trimmed.is_empty()).then_some(trimmed)
+    }
+
+    pub fn set_initial_prompt(
+        &mut self,
+        prompt: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.initial_prompt.update(cx, |input, cx| {
+            input.set_value(prompt, window, cx);
+        });
+        cx.notify();
+    }
+
+    #[must_use]
+    pub fn last_created_agent(&self) -> Option<&str> {
+        self.last_created_agent.as_deref()
+    }
+
+    #[must_use]
+    pub fn last_created_prompt(&self) -> Option<&str> {
+        self.last_created_prompt.as_deref()
+    }
+
+    #[must_use]
+    pub fn has_pending_fan_out(&self) -> bool {
+        self.pending_fan_out > 0
     }
 
     /// OWE-853: 기준 ref 후보를 교체한다(중복·빈값 제거, 최대 100개). 입력 필터는 렌더 시 계산한다.
@@ -520,43 +598,119 @@ impl Dialog {
         })
     }
 
+    /// OWE-924: 멀티 에이전트 Fan-Out 요청 목록을 만든다.
+    /// 에이전트를 2개 이상 고르면 `<name>-<agent>` 이름으로 N개 워크트리를 만들고,
+    /// 1개만 고르면 원래 `<name>`에 그 에이전트를 지정한다.
+    pub fn fan_out_requests(
+        &self,
+        setup: Setup,
+        cx: &Context<Self>,
+    ) -> Result<Vec<FanOutPlanItem>, &'static str> {
+        let base_req = self.request(setup, cx)?;
+        let prompt = self.initial_prompt_value(cx);
+        if self.selected_agents.is_empty() {
+            return Ok(vec![(base_req, None, prompt)]);
+        }
+        if self.selected_agents.len() == 1 {
+            return Ok(vec![(
+                base_req,
+                Some(self.selected_agents[0].clone()),
+                prompt,
+            )]);
+        }
+        let mut out = Vec::with_capacity(self.selected_agents.len());
+        for agent in &self.selected_agents {
+            let mut req = base_req.clone();
+            req.name = format!("{}-{agent}", base_req.name);
+            out.push((req, Some(agent.clone()), prompt.clone()));
+        }
+        Ok(out)
+    }
+
     /// 입력값으로 요청을 보낸다. setup 승인·건너뛰기는 같은 입력으로 다시 보낸다(입력은 그동안 숨겨져 있다).
     fn submit(&mut self, setup: Setup, cx: &mut Context<Self>) {
-        let req = match self.request(setup, cx) {
-            Ok(req) => req,
+        let requests = match self.fan_out_requests(setup, cx) {
+            Ok(reqs) => reqs,
             Err(e) => {
                 self.phase = Phase::Edit(Some(e.to_owned()));
                 cx.notify();
                 return;
             }
         };
+        self.pending_fan_out = requests.len();
         self.phase = Phase::Creating;
         cx.notify();
         let source = self.source.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
-            let reply = bg.spawn(async move { source.new_worktree(req) }).await;
-            this.update(cx, |d, cx| d.finish(reply, cx)).ok();
+            for (req, agent, prompt) in requests {
+                let source = source.clone();
+                let reply = bg.spawn(async move { source.new_worktree(req) }).await;
+                let cont = this
+                    .update(cx, |d, cx| d.finish_step(reply, agent, prompt, cx))
+                    .unwrap_or(false);
+                if !cont {
+                    break;
+                }
+            }
         }));
     }
 
-    fn finish(&mut self, reply: std::io::Result<Reply>, cx: &mut Context<Self>) {
-        self.phase = match reply {
+    fn finish_step(
+        &mut self,
+        reply: std::io::Result<Reply>,
+        agent: Option<String>,
+        prompt: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.pending_fan_out = self.pending_fan_out.saturating_sub(1);
+        match reply {
             Ok(Reply::WorktreeCreated(w)) => {
                 self.cancel_preparation(cx);
+                self.last_created_agent = agent;
+                self.last_created_prompt = prompt;
                 cx.emit(Event::Created(w.clone()));
-                Phase::Done(w)
+                self.phase = Phase::Done(w);
+                cx.notify();
+                self.pending_fan_out > 0
             }
-            Ok(Reply::SetupUntrusted { script, hash }) => Phase::Untrusted { script, hash },
-            Ok(Reply::WorktreeFailed(e)) => Phase::Edit(Some(e)),
-            Ok(Reply::Failed(f)) => Phase::Edit(Some(f.to_string())),
-            Ok(_) => Phase::Edit(Some(text::UNEXPECTED.get().to_owned())),
+            Ok(Reply::SetupUntrusted { script, hash }) => {
+                self.pending_fan_out = 0;
+                self.phase = Phase::Untrusted { script, hash };
+                cx.notify();
+                false
+            }
+            Ok(Reply::WorktreeFailed(e)) => {
+                self.pending_fan_out = 0;
+                self.phase = Phase::Edit(Some(e));
+                cx.notify();
+                false
+            }
+            Ok(Reply::Failed(f)) => {
+                self.pending_fan_out = 0;
+                self.phase = Phase::Edit(Some(f.to_string()));
+                cx.notify();
+                false
+            }
+            Ok(_) => {
+                self.pending_fan_out = 0;
+                self.phase = Phase::Edit(Some(text::UNEXPECTED.get().to_owned()));
+                cx.notify();
+                false
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
-                Phase::Edit(Some(text::UNSUPPORTED.get().to_owned()))
+                self.pending_fan_out = 0;
+                self.phase = Phase::Edit(Some(text::UNSUPPORTED.get().to_owned()));
+                cx.notify();
+                false
             }
-            Err(e) => Phase::Edit(Some(e.to_string())),
-        };
-        cx.notify();
+            Err(e) => {
+                self.pending_fan_out = 0;
+                self.phase = Phase::Edit(Some(e.to_string()));
+                cx.notify();
+                false
+            }
+        }
     }
 }
 
@@ -569,6 +723,9 @@ impl Render for Dialog {
             });
             self.base.update(cx, |input, cx| {
                 input.set_placeholder(text::BASE.get(), window, cx);
+            });
+            self.initial_prompt.update(cx, |input, cx| {
+                input.set_placeholder(text::INITIAL_PROMPT_PLACEHOLDER.get(), window, cx);
             });
         }
         let p = crate::ui::palette(cx);
@@ -588,6 +745,7 @@ impl Render for Dialog {
         };
         let highlight = self.highlight;
         let base_candidates = filtered.clone();
+        let selected_agents = self.selected_agents.clone();
         let body = match &self.phase {
             Phase::Edit(error) => body
                 .child(
@@ -683,6 +841,51 @@ impl Render for Dialog {
                                     ),
                             )
                         }),
+                )
+                .child(
+                    div()
+                        .id("worktree-fanout-agents")
+                        .debug_selector(|| "worktree-fanout-agents".into())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(crate::ui::field_label(
+                            text::AGENTS_LABEL.get(),
+                            Some(text::OPTIONAL.get()),
+                            p,
+                        ))
+                        .child(
+                            div().flex().flex_wrap().gap_1().children(
+                                FAN_OUT_AGENTS.iter().enumerate().map(
+                                    |(idx, &(agent_id, label))| {
+                                        let selected =
+                                            selected_agents.iter().any(|a| a == agent_id);
+                                        let btn = Button::new(("worktree-agent", idx))
+                                            .xsmall()
+                                            .label(label);
+                                        let btn =
+                                            if selected { btn.primary() } else { btn.ghost() };
+                                        btn.on_click(cx.listener(move |d, _, _, cx| {
+                                            d.toggle_agent(agent_id, cx);
+                                        }))
+                                    },
+                                ),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("worktree-initial-prompt")
+                        .debug_selector(|| "worktree-initial-prompt".into())
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(crate::ui::field_label(
+                            text::INITIAL_PROMPT_LABEL.get(),
+                            Some(text::OPTIONAL.get()),
+                            p,
+                        ))
+                        .child(Input::new(&self.initial_prompt)),
                 )
                 .when(!repo_hooks.effective_symlinks.is_empty(), |d| {
                     let paths = repo_hooks.effective_symlinks.join(", ");

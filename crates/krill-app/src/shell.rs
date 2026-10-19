@@ -503,6 +503,8 @@ pub struct Shell {
     pairing: Option<overlays::PairingModal>,
     /// OWE-903 렌더에서 지연 생성할 모달 요청.
     pending: overlays::PendingOverlays,
+    /// 인앱 에이전트 대시보드 모달.
+    pub(crate) dashboard: Option<gpui::Entity<popout::Dashboard>>,
     /// 열린 터미널 검색 바(MK-059)와 그 이벤트 구독.
     search: Option<(gpui::Entity<krill_app::search::Bar>, Subscription)>,
     /// Resource Manager(MK-071).
@@ -627,7 +629,23 @@ impl Shell {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
                 .unwrap_or(krill_app::hosts::HostId::Local);
+            let initial_prompt = sidebar.update(cx, |s, _| s.take_initial_prompt(&e.cwd));
             this.new_folder_tab_on(host, &e.cwd, e.program.clone(), cx);
+            if let Some(prompt) = initial_prompt
+                && let Some(pane) = this.layout.focused()
+            {
+                let agent_id = match &e.program {
+                    krill_proto::control::Program::Agent { id } => id.clone(),
+                    _ => "shell".to_owned(),
+                };
+                this.start_handoff_delivery(
+                    pane,
+                    agent_id,
+                    prompt.into_bytes(),
+                    handoff::BOOT_TIMEOUT,
+                    cx,
+                );
+            }
             if let Some(win) = this.window {
                 let focus = this.focus.clone();
                 win.update(cx, |_, window, cx| window.focus(&focus, cx))
@@ -877,6 +895,7 @@ impl Shell {
             onboarding: None,
             pairing: None,
             pending: overlays::PendingOverlays::default(),
+            dashboard: None,
             search: None,
             history,
             _history_open: history_open,
@@ -1117,6 +1136,9 @@ impl Shell {
                 worktree,
             } => {
                 let mut window = window;
+                if self.dashboard.is_some() {
+                    self.close_dashboard(window.as_deref_mut(), cx);
+                }
                 if self.settings.is_some() {
                     self.close_settings(window.as_deref_mut(), cx);
                 }
@@ -1174,6 +1196,8 @@ impl Shell {
         }
         self.jump = None;
         self.continue_session = None;
+        self.dashboard = None;
+        self.sync_sidebar_visibility(cx);
         self.files.close_quick_open();
         if self.search.take().is_some()
             && let Some(l) = self.focused_live()
@@ -1194,8 +1218,7 @@ impl Shell {
             created
         };
         self.nav_history.push(NavEntry::Settings(tab));
-        krill_app::alert::focus(None, cx);
-        self.sidebar.update(cx, |s, cx| s.set_focused(None, cx));
+        self.sync_focused_session(cx);
         if let Some(window) = window {
             self.window = Some(window.window_handle());
             let focus = view.read(cx).focus_handle();
@@ -1213,18 +1236,37 @@ impl Shell {
             return;
         }
         self.record_workspace_nav(cx);
-        let session = self.layout.focused().and_then(|p| {
-            self.layout
-                .session(p)
-                .filter(|_| self.layout.host(p).is_local())
-        });
-        krill_app::alert::focus(session, cx);
-        self.sidebar.update(cx, |s, cx| s.set_focused(session, cx));
+        self.sync_focused_session(cx);
         self.refresh_local_state(cx);
         self.files.refocus = true;
         if let Some(window) = window {
             window.focus(&self.focus, cx);
             self.pending_focus = PendingFocus::None;
+        } else {
+            self.pending_focus = PendingFocus::Workspace;
+        }
+        cx.notify();
+    }
+
+    /// 인앱 에이전트 대시보드 모달을 닫고 이전 화면(설정 또는 워크스페이스)으로 포커스를 돌려준다.
+    pub(super) fn close_dashboard(&mut self, window: Option<&mut Window>, cx: &mut Context<Self>) {
+        if self.dashboard.take().is_none() {
+            return;
+        }
+        self.sync_sidebar_visibility(cx);
+        self.sync_focused_session(cx);
+        if self.settings.is_none() {
+            self.files.refocus = true;
+        }
+        if let Some(window) = window {
+            let focus = self
+                .settings
+                .as_ref()
+                .map_or_else(|| self.focus.clone(), |s| s.read(cx).focus_handle());
+            window.focus(&focus, cx);
+            self.pending_focus = PendingFocus::None;
+        } else if self.settings.is_some() {
+            self.pending_focus = PendingFocus::Settings;
         } else {
             self.pending_focus = PendingFocus::Workspace;
         }
@@ -1244,15 +1286,21 @@ impl Shell {
             return;
         }
         self.files.close_quick_open();
+        if self.dashboard.take().is_some() {
+            self.sync_sidebar_visibility(cx);
+            self.sync_focused_session(cx);
+        }
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
-        let items = self.sidebar.read(cx).jump_items();
+        let (items, worktrees) = {
+            let sb = self.sidebar.read(cx);
+            (sb.jump_items(), sb.jump_worktrees())
+        };
         let ws = Some(self.folder().display().to_string());
         self.history
             .update(cx, |h, _| h.set_scope_paths(ws.clone(), Vec::new()));
         let history = self.history.clone();
-        let worktrees = self.sidebar.read(cx).worktree_entries();
         let (actions, quick_commands) = Self::palette_entries(cx);
         let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
         palette.update(cx, |p, cx| {
@@ -1322,15 +1370,21 @@ impl Shell {
             return;
         }
         self.files.close_quick_open();
+        if self.dashboard.take().is_some() {
+            self.sync_sidebar_visibility(cx);
+            self.sync_focused_session(cx);
+        }
         if let Some(pane) = self.layout.focused() {
             self.commit_ime(pane, Some(window), cx);
         }
-        let items = self.sidebar.read(cx).jump_items();
+        let (items, worktrees) = {
+            let sb = self.sidebar.read(cx);
+            (sb.jump_items(), sb.jump_worktrees())
+        };
         let ws = Some(self.folder().display().to_string());
         self.history
             .update(cx, |h, _| h.set_scope_paths(ws.clone(), Vec::new()));
         let history = self.history.clone();
-        let worktrees = self.sidebar.read(cx).worktree_entries();
         let (actions, quick_commands) = Self::palette_entries(cx);
         let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
         palette.update(cx, |p, cx| {
@@ -1401,8 +1455,8 @@ impl Shell {
 
     /// OWE-865: 팔레트에서 고른 워크트리 열기. 세션이 있으면 그 세션으로,
     /// 없으면 새 탭에 새 세션을 만든다(사이드바 카드 클릭과 같다).
-    fn open_palette_worktree(&mut self, entry: &jump::WorktreeEntry, cx: &mut Context<Self>) {
-        if let Some(id) = entry.session {
+    fn open_palette_worktree(&mut self, entry: &jump::WorktreeItem, cx: &mut Context<Self>) {
+        if let Some(id) = entry.session_id {
             self.open_session(id, cx);
         } else {
             self.new_folder_tab_on(
@@ -1460,6 +1514,9 @@ impl Shell {
     /// Cmd+F: 설정 페이지가 열려 있으면 설정 검색 입력으로 포커스를 옮기고, 파일 탭이 포커스면
     /// 에디터 내장 검색을 열며(OWE-874), 아니면 터미널 검색 바(MK-059)를 열거나 닫는다.
     fn toggle_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.is_some() {
+            return;
+        }
         if let Some(settings) = self.settings.clone() {
             settings.update(cx, |v, cx| v.focus_search(window, cx));
             return;
@@ -3065,7 +3122,7 @@ impl Shell {
     }
 
     fn copy(&mut self, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.settings.is_some() || self.dashboard.is_some() {
             return;
         }
         let Some(l) = self.focused_live() else { return };
@@ -3077,7 +3134,7 @@ impl Shell {
     }
 
     fn paste(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.settings.is_some() || self.dashboard.is_some() {
             return;
         }
         if let Some(item) = cx.read_from_clipboard() {
@@ -3136,21 +3193,16 @@ impl Shell {
             return;
         }
         let now_focused = self.layout.focused();
+        if self.zoomed_pane.is_some_and(|z| Some(z) != now_focused) {
+            self.zoomed_pane = None;
+        }
         if now_focused != focused {
             self.files.refocus = true;
             if let Some(old) = focused {
                 self.commit_ime(old, None, cx);
             }
         }
-        let session = now_focused
-            .and_then(|p| {
-                self.layout
-                    .session(p)
-                    .filter(|_| self.layout.host(p).is_local())
-            })
-            .filter(|_| self.settings.is_none());
-        krill_app::alert::focus(session, cx);
-        self.sidebar.update(cx, |s, cx| s.set_focused(session, cx));
+        self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
         if self.folder() != folder {
             let folder = self.folder();
@@ -3159,6 +3211,7 @@ impl Shell {
         self.sync(cx);
         self.poll_active_chat(cx);
         if save && self.layout != before {
+            self.close_dashboard(None, cx);
             self.close_settings(None, cx);
             self.record_workspace_nav(cx);
             self.save();
@@ -3167,9 +3220,25 @@ impl Shell {
         cx.notify();
     }
 
+    pub(super) fn focused_local_session(&self) -> Option<krill_proto::SessionId> {
+        if self.settings.is_some() || self.dashboard.is_some() {
+            return None;
+        }
+        let pane = self.layout.focused()?;
+        if self.layout.file(pane).is_some() || !self.layout.host(pane).is_local() {
+            return None;
+        }
+        self.layout.session(pane)
+    }
+
+    pub(super) fn sync_focused_session(&self, cx: &mut Context<Self>) {
+        let session = self.focused_local_session();
+        krill_app::alert::focus(session, cx);
+        self.sidebar.update(cx, |s, cx| s.set_focused(session, cx));
+    }
+
     /// 세션을 보인다: 어떤 탭의 칸에 있으면 그 탭·칸으로, 없으면(분리된 세션) 새 탭에 붙인다.
     pub(super) fn open_session(&mut self, session: krill_proto::SessionId, cx: &mut Context<Self>) {
-        self.close_settings(None, cx);
         self.open_session_on(krill_app::hosts::HostId::Local, session, cx);
     }
 
@@ -3179,6 +3248,9 @@ impl Shell {
         session: krill_proto::SessionId,
         cx: &mut Context<Self>,
     ) {
+        self.dashboard = None;
+        self.sync_sidebar_visibility(cx);
+        self.close_settings(None, cx);
         // CLI에서 만든 세션도 워크트리(비-git이면 작업 디렉터리)가 Open in·새 에이전트의 폴더가 된다(MK-055).
         let folder = self
             .sidebar
@@ -3214,6 +3286,7 @@ impl Shell {
                 l.set_launch(pane, launch);
             }
         });
+        self.sidebar.update(cx, sidebar::Sidebar::reveal_focused);
         if let Some(handle) = self.window {
             let focus = self.focus.clone();
             cx.update_window(handle, |_, window, cx| window.focus(&focus, cx))
@@ -3373,6 +3446,11 @@ impl Shell {
         }
     }
 
+    pub(super) fn sync_sidebar_visibility(&self, cx: &mut Context<Self>) {
+        let visible = !self.sidebar_collapsed || self.dashboard.is_some();
+        self.sidebar.update(cx, |s, cx| s.set_visible(visible, cx));
+    }
+
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         // OWE-860: 설정에서 ⌘B를 누르면 설정을 닫고 사이드바를 전환한다.
         if self.settings.is_some() {
@@ -3381,8 +3459,7 @@ impl Shell {
         self.sidebar_collapsed = !self.sidebar_collapsed;
         self.layout.sidebar_collapsed = self.sidebar_collapsed;
         self.save();
-        let visible = !self.sidebar_collapsed;
-        self.sidebar.update(cx, |s, cx| s.set_visible(visible, cx));
+        self.sync_sidebar_visibility(cx);
         cx.notify();
     }
 
@@ -4438,8 +4515,14 @@ impl Render for Shell {
         if self.language != krill_app::i18n::language() {
             self.language = krill_app::i18n::language();
             if let Some((palette, _)) = &self.jump {
-                let items = self.sidebar.read(cx).jump_items();
-                palette.update(cx, |palette, cx| palette.set_items(items, cx));
+                let (items, worktrees) = {
+                    let sb = self.sidebar.read(cx);
+                    (sb.jump_items(), sb.jump_worktrees())
+                };
+                palette.update(cx, |palette, cx| {
+                    palette.set_items(items, cx);
+                    palette.set_worktrees(worktrees, cx);
+                });
             }
         }
         if self.system_appearance.is_none() {
@@ -4506,18 +4589,8 @@ impl Render for Shell {
             }));
         }
         if window.is_window_active() {
-            let session = self
-                .layout
-                .focused()
-                .and_then(|p| {
-                    self.layout
-                        .session(p)
-                        .filter(|_| self.layout.host(p).is_local())
-                })
-                .filter(|_| self.settings.is_none());
-            krill_app::alert::focus(session, cx);
             // OWE-662: 창으로 돌아와 보고 있는 세션의 미확인 표시를 끈다.
-            self.sidebar.update(cx, |s, cx| s.set_focused(session, cx));
+            self.sync_focused_session(cx);
             krill_app::alert::set_active(true, cx);
         }
         let (focus, me) = (self.focus.clone(), cx.entity());
@@ -4581,7 +4654,7 @@ impl Render for Shell {
                 this.new_tab_on_launch_host(cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
-                if this.settings.is_some() {
+                if this.settings.is_some() || this.dashboard.is_some() {
                     return;
                 }
                 this.request_close_tab(this.layout.active(), cx);
@@ -4617,6 +4690,10 @@ impl Render for Shell {
                 this.split_active(Axis::Vertical, cx);
             }))
             .on_action(cx.listener(|this, _: &ClosePane, window, cx| {
+                if this.dashboard.is_some() {
+                    this.close_dashboard(Some(window), cx);
+                    return;
+                }
                 if this.settings.is_some() {
                     this.close_settings(Some(window), cx);
                     return;
@@ -4637,13 +4714,13 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusNextPane, _, cx| {
-                if this.settings.is_some() {
+                if this.settings.is_some() || this.dashboard.is_some() {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(1));
             }))
             .on_action(cx.listener(|this, _: &FocusPrevPane, _, cx| {
-                if this.settings.is_some() {
+                if this.settings.is_some() || this.dashboard.is_some() {
                     return;
                 }
                 this.change(true, cx, |l| l.cycle_pane(-1));
@@ -4682,7 +4759,7 @@ impl Render for Shell {
                 });
             }))
             .on_action(cx.listener(|this, _: &ToggleZoomPane, _, cx| {
-                if this.settings.is_some() {
+                if this.settings.is_some() || this.dashboard.is_some() {
                     return;
                 }
                 let Some(focused) = this.layout.focused() else {
@@ -4698,7 +4775,7 @@ impl Render for Shell {
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &ClearPane, _, cx| {
-                if this.settings.is_some() {
+                if this.settings.is_some() || this.dashboard.is_some() {
                     return;
                 }
                 let unlinked_session = this.layout.focused().and_then(|pane| {
@@ -4726,7 +4803,7 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| {
-                if this.settings.is_some() {
+                if this.settings.is_some() || this.dashboard.is_some() {
                     return;
                 }
                 if let Some(l) = this.focused_live() {
@@ -5021,6 +5098,7 @@ impl Render for Shell {
             // OWE-903: 온보딩·짝짓기는 메인 창 안 모달로 그린다(별도 OS 창 없음).
             .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
             .children(self.pairing.as_ref().map(|modal| modal.view.clone()))
+            .children(self.dashboard.clone())
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))
             .children(self.render_pinned_close_dialog(window, cx))
@@ -5042,7 +5120,7 @@ impl Render for Shell {
 
 impl Shell {
     pub(super) fn split_active(&mut self, axis: Axis, cx: &mut Context<Self>) {
-        if self.settings.is_some() {
+        if self.settings.is_some() || self.dashboard.is_some() {
             return;
         }
         self.zoomed_pane = None;

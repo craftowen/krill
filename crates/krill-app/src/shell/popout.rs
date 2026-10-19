@@ -24,8 +24,8 @@ use super::{Link, Shell, WindowRole};
 use krill_app::i18n::catalog::{popout as text, status as provider_text};
 
 const LANES: [krill_app::i18n::Message; 4] = [
-    text::LANE_WORKING,
     text::LANE_NEEDS_YOU,
+    text::LANE_WORKING,
     text::LANE_DONE,
     text::LANE_UNKNOWN,
 ];
@@ -135,7 +135,7 @@ pub(super) fn bind_keys(cx: &mut App) {
         // OWE-851: 대시보드도 Esc로 닫힌다(터미널 입력이 없어 PTY 전달 걱정이 없다).
         krill_app::keys::bind("escape", CloseDashboard, Some("Dashboard")),
         krill_app::keys::bind("alt-cmd-a", FloatTerminal, Some(super::KEY_CONTEXT)),
-        krill_app::keys::bind("alt-cmd-shift-a", DashboardPopout, Some(super::KEY_CONTEXT)),
+        krill_app::keys::bind("alt-cmd-shift-a", DashboardPopout, None),
     ]);
 }
 
@@ -151,6 +151,13 @@ fn options(title: &str, dimensions: gpui::Size<gpui::Pixels>, cx: &App) -> Windo
 
 fn existing<T: 'static>(cx: &App) -> Option<WindowHandle<T>> {
     cx.windows().into_iter().find_map(|w| w.downcast::<T>())
+}
+
+pub(crate) fn existing_dashboard(cx: &App) -> Option<Entity<Dashboard>> {
+    cx.windows()
+        .into_iter()
+        .find_map(|w| w.downcast::<Shell>())
+        .and_then(|w| w.read(cx).ok()?.dashboard.clone())
 }
 
 /// 별도 root 타입으로 메인 창의 레이아웃 쓰기 소유권과 구분한다.
@@ -953,35 +960,50 @@ impl Shell {
     }
 
     pub(super) fn dashboard(&mut self, cx: &mut Context<Self>) {
-        if let Some(handle) = existing::<Dashboard>(cx) {
-            handle
-                .update(cx, |_, window, _| window.activate_window())
-                .ok();
+        if self.role == WindowRole::Floating
+            && let Some(handle) = existing::<Shell>(cx)
+        {
+            if let Some(pane) = self.layout.focused() {
+                self.commit_ime(pane, None, cx);
+            }
+            cx.defer(move |cx| {
+                handle
+                    .update(cx, |shell, window, cx| {
+                        shell.dashboard(cx);
+                        window.activate_window();
+                    })
+                    .ok();
+            });
             return;
         }
-        let owner = cx.weak_entity();
-        let opts = options(text::DASHBOARD.get(), ui::DASHBOARD_SIZE, cx);
-        let opened = cx.open_window(opts, |window, cx| {
-            window.set_rem_size(px(16. * krill_app::settings::current(cx).zoom()));
-            cx.new(|cx| Dashboard::new(owner, window, cx))
-        });
-        if let Err(error) = opened {
-            self.notice = Some(error.to_string());
+        if let Some(dashboard) = &self.dashboard {
+            dashboard.update(cx, |d, cx| {
+                d.focus_on_render = true;
+                cx.notify();
+            });
             cx.notify();
+            return;
         }
-    }
-
-    /// OWE-851: 대시보드 카드·리소스 행 클릭 → 메인 창 해당 세션으로 포커스하고 메인 창을 앞으로.
-    pub(super) fn focus_session_window(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        self.open_session(session, cx);
-        if let Some(win) = self.window {
-            let focus = self.focus.clone();
-            win.update(cx, |_, window, cx| {
-                window.activate_window();
-                window.focus(&focus, cx);
-            })
-            .ok();
+        if let Some(pane) = self.layout.focused() {
+            self.commit_ime(pane, None, cx);
         }
+        self.jump = None;
+        self.continue_session = None;
+        self.add_project = None;
+        self.files.close_quick_open();
+        if self.search.take().is_some()
+            && let Some(l) = self.focused_live()
+        {
+            l.pane.clear_search();
+        }
+        let owner = cx.weak_entity();
+        let sidebar = self.sidebar.clone();
+        let previews = Dashboard::collect_previews(self);
+        let dashboard = cx.new(|cx| Dashboard::new(owner, sidebar, previews, cx));
+        self.dashboard = Some(dashboard);
+        self.sync_sidebar_visibility(cx);
+        self.sync_focused_session(cx);
+        cx.notify();
     }
 
     pub(crate) fn upsert_account_rule(&mut self, rule: AutoSwitchRule, cx: &mut Context<Self>) {
@@ -1778,8 +1800,8 @@ pub(super) fn unreleased_workers(
 
 fn lane(state: AgentState) -> usize {
     match state {
-        AgentState::Working => 0,
-        AgentState::Waiting | AgentState::Blocked => 1,
+        AgentState::Waiting | AgentState::Blocked => 0,
+        AgentState::Working => 1,
         AgentState::Done | AgentState::Exited => 2,
         AgentState::Unknown => 3,
     }
@@ -1817,65 +1839,213 @@ pub(super) fn screen_plain_text(screen: &Screen) -> String {
         .join("\n")
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct SidebarCard {
+    host: krill_app::hosts::HostId,
+    session: sidebar::Session,
+    name: String,
+    detail: String,
+    unread: bool,
+}
+
+type PreviewMap = std::collections::BTreeMap<(krill_app::hosts::HostId, SessionId), String>;
+
 pub(crate) struct Dashboard {
     owner: WeakEntity<Shell>,
     sidebar: Entity<sidebar::Sidebar>,
+    cards: Vec<SidebarCard>,
+    previews: PreviewMap,
     _changes: Subscription,
     _frames: Option<Subscription>,
-    _activation: Subscription,
     focus: gpui::FocusHandle,
+    focus_on_render: bool,
 }
 
 impl Dashboard {
-    fn new(owner: WeakEntity<Shell>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        // 기존 sidebar source를 재사용하되 메인 창 비활성화와 독립적으로 갱신한다.
-        let sidebar = cx.new(|_| sidebar::Sidebar::new(None));
-        let changes = cx.observe(&sidebar, |_, _, cx| cx.notify());
-        let frames = owner
-            .upgrade()
-            .map(|owner| cx.observe(&owner, |_, _, cx| cx.notify()));
-        let activation = cx.observe_window_activation(window, |this, window, cx| {
-            this.sidebar
-                .update(cx, |s, cx| s.set_active(window.is_window_active(), cx));
+    fn new(
+        owner: WeakEntity<Shell>,
+        sidebar: Entity<sidebar::Sidebar>,
+        previews: PreviewMap,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cards = Self::collect_sidebar(&sidebar, cx);
+        let changes = cx.observe(&sidebar, |this, sidebar, cx| {
+            let next = Self::collect_sidebar(&sidebar, cx);
+            if this.cards != next {
+                this.cards = next;
+                cx.notify();
+            }
+        });
+        let frames = owner.upgrade().map(|owner| {
+            cx.observe(&owner, |this, owner, cx| {
+                let next = Self::collect_previews(owner.read(cx));
+                if this.previews != next {
+                    this.previews = next;
+                    cx.notify();
+                }
+            })
         });
         let focus = cx.focus_handle();
-        window.focus(&focus, cx);
         Self {
             owner,
             sidebar,
+            cards,
+            previews,
             _changes: changes,
             _frames: frames,
-            _activation: activation,
             focus,
+            focus_on_render: true,
+        }
+    }
+
+    fn collect_sidebar(sidebar: &Entity<sidebar::Sidebar>, cx: &App) -> Vec<SidebarCard> {
+        let sidebar = sidebar.read(cx);
+        sidebar
+            .dashboard_sessions()
+            .into_iter()
+            .map(|(host, session)| {
+                let (name, detail) = sidebar.session_label_on(&host, &session);
+                let detail = match &host {
+                    krill_app::hosts::HostId::Local => detail,
+                    krill_app::hosts::HostId::Remote(id) => {
+                        if detail.is_empty() {
+                            id.clone()
+                        } else {
+                            format!("{id} · {detail}")
+                        }
+                    }
+                };
+                let unread = host.is_local() && sidebar.is_unread(session.id);
+                SidebarCard {
+                    host,
+                    session,
+                    name,
+                    detail,
+                    unread,
+                }
+            })
+            .collect()
+    }
+
+    fn collect_previews(shell: &Shell) -> PreviewMap {
+        let mut out = PreviewMap::new();
+        for (pane, live) in &shell.live {
+            if let Some(session) = live.pane.session() {
+                out.insert(
+                    (shell.layout.host(*pane).clone(), session),
+                    preview(&live.pane.shown()),
+                );
+            }
+        }
+        out
+    }
+
+    fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.update(cx, |shell, cx| {
+                shell.close_dashboard(Some(window), cx);
+            });
+        }
+    }
+
+    fn select_session(
+        &mut self,
+        host: krill_app::hosts::HostId,
+        session: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(owner) = self.owner.upgrade() {
+            owner.update(cx, |shell, cx| {
+                shell.dashboard = None;
+                shell.sync_sidebar_visibility(cx);
+                shell.close_settings(Some(window), cx);
+                shell.open_session_on(host, session, cx);
+                window.focus(&shell.focus, cx);
+                cx.notify();
+            });
         }
     }
 }
 
 impl Render for Dashboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        window.set_window_title(text::DASHBOARD.get());
+        if std::mem::take(&mut self.focus_on_render) {
+            window.focus(&self.focus, cx);
+        }
+        self.cards = Self::collect_sidebar(&self.sidebar, cx);
+        if let Some(owner) = self.owner.upgrade() {
+            self.previews = Self::collect_previews(owner.read(cx));
+        }
         let p = ui::palette(cx);
-        let sidebar = self.sidebar.read(cx);
-        let items = sidebar.jump_items();
-        let owner = self.owner.upgrade();
-        div()
+        let all_sessions = &self.cards;
+        let previews = &self.previews;
+        let viewport = window.viewport_size();
+        let card = div()
+            .id("dashboard-modal")
+            .debug_selector(|| "dashboard-modal".into())
             .key_context("Dashboard")
             .track_focus(&self.focus)
-            .on_action(|_: &CloseDashboard, window, _| window.remove_window())
-            .size_full()
+            .occlude()
+            .on_action(cx.listener(|this, _: &CloseDashboard, window, cx| this.close(window, cx)))
+            .capture_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
+                if e.keystroke.key == "escape" {
+                    cx.stop_propagation();
+                    this.close(window, cx);
+                }
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, window, cx| this.close(window, cx)))
+            .w(ui::DASHBOARD_SIZE.width)
+            .max_w(viewport.width - ui::SPACE_4 * 2.)
+            .h(ui::DASHBOARD_SIZE.height)
+            .max_h(viewport.height - ui::SPACE_4 * 2.)
+            .rounded(ui::RADIUS_LG)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .overflow_hidden()
             .flex()
             .flex_col()
-            .bg(p.background)
-            .text_color(p.foreground)
             .font_family(ui::FONT_UI)
             .text_size(ui::TEXT_SM)
             .child(
                 div()
-                    .h(ui::TITLEBAR_HEIGHT)
-                    .pl(super::traffic_light_pad(window))
+                    .px_4()
+                    .py_2p5()
+                    .border_b_1()
+                    .border_color(p.border)
                     .flex()
                     .items_center()
-                    .child(text::DASHBOARD.get()),
+                    .justify_between()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_LG)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .child(text::DASHBOARD.get()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(format!("({})", all_sessions.len())),
+                            ),
+                    )
+                    .child(
+                        Button::new("dashboard-close")
+                            .debug_selector(|| "dashboard-close".into())
+                            .ghost()
+                            .xsmall()
+                            .icon(gpui_component::IconName::Close)
+                            .accessibility_label(krill_app::i18n::catalog::add_project::CLOSE.get())
+                            .on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+                    ),
             )
             .child(
                 div()
@@ -1886,14 +2056,16 @@ impl Render for Dashboard {
                     .gap_2()
                     .p(ui::SPACE_2)
                     .children(LANES.iter().enumerate().map(|(column, title)| {
-                        let cards: Vec<_> = items
+                        let cards: Vec<_> = all_sessions
                             .iter()
-                            .filter(|i| {
-                                sidebar
-                                    .session(i.id)
-                                    .is_some_and(|s| lane(s.status.state) == column)
-                            })
+                            .filter(|item| lane(item.session.status.state) == column)
                             .collect();
+                        let lane_state = match column {
+                            0 => AgentState::Waiting,
+                            1 => AgentState::Working,
+                            2 => AgentState::Done,
+                            _ => AgentState::Unknown,
+                        };
                         div()
                             .id(("dashboard-lane", column))
                             .flex_1()
@@ -1906,7 +2078,44 @@ impl Render for Dashboard {
                             .bg(p.sidebar)
                             .text_color(p.sidebar_foreground)
                             .rounded(ui::RADIUS_SM)
-                            .child(format!("{} ({})", title.get(), cards.len()))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .min_w_0()
+                                            .child(
+                                                div()
+                                                    .size(ui::STATE_DOT)
+                                                    .flex_none()
+                                                    .rounded_full()
+                                                    .bg(ui::agent_state_color(lane_state, cx)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .truncate()
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .child(title.get()),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .rounded_full()
+                                            .bg(p.background)
+                                            .px_1p5()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(format!("{}", cards.len())),
+                                    ),
+                            )
                             .child(
                                 div()
                                     .id(("dashboard-cards", column))
@@ -1924,50 +2133,81 @@ impl Render for Dashboard {
                                         )
                                     })
                                     .children(cards.into_iter().map(|item| {
-                                        let session = item.id;
-                                        let screen = owner
-                                            .as_ref()
-                                            .and_then(|o| {
-                                                o.read(cx)
-                                                    .live
-                                                    .values()
-                                                    .find(|l| l.pane.session() == Some(session))
-                                            })
-                                            .map(|l| preview(&l.pane.shown()));
-                                        // OWE-851: 미리보기가 있으면 안내 문구를 덧붙이지 않는다.
-                                        let has_preview = screen.is_some();
-                                        div()
-                                            .id(("dashboard-session", session.0))
-                                            .debug_selector(move || {
+                                        let session = item.session.id;
+                                        let host_clone = item.host.clone();
+                                        let name = item.name.clone();
+                                        let detail = item.detail.clone();
+                                        let agent = item.session.status.agent.as_str();
+                                        let state = item.session.status.state;
+                                        let unread = item.unread;
+                                        let screen =
+                                            previews.get(&(item.host.clone(), session)).cloned();
+                                        let selector = match &item.host {
+                                            krill_app::hosts::HostId::Local => {
                                                 format!("dashboard-session-{}", session.0)
-                                            })
+                                            }
+                                            krill_app::hosts::HostId::Remote(id) => {
+                                                format!("dashboard-session-{id}-{}", session.0)
+                                            }
+                                        };
+                                        let debug_sel = selector.clone();
+                                        let (card_border, card_bg, hover_bg) = match state {
+                                            AgentState::Waiting | AgentState::Blocked => (
+                                                p.agent_question.opacity(0.4),
+                                                p.agent_question.opacity(0.06),
+                                                p.agent_question.opacity(0.12),
+                                            ),
+                                            AgentState::Done => (
+                                                p.success.opacity(0.4),
+                                                p.success.opacity(0.06),
+                                                p.success.opacity(0.12),
+                                            ),
+                                            _ => (p.border, p.card, p.accent),
+                                        };
+                                        div()
+                                            .id(gpui::SharedString::from(selector))
+                                            .debug_selector(move || debug_sel.clone())
                                             .p(ui::SPACE_2)
                                             .rounded(ui::RADIUS_XS)
-                                            .bg(p.card)
-                                            // OWE-876: 세션 카드에도 카드 테두리를 둔다.
                                             .border_1()
-                                            .border_color(p.border)
+                                            .border_color(card_border)
+                                            .bg(card_bg)
                                             .cursor_pointer()
-                                            .hover(|d| d.bg(p.accent))
+                                            .hover(move |d| d.bg(hover_bg))
                                             .flex()
                                             .flex_col()
-                                            .gap_2()
+                                            .gap_1p5()
                                             .child(
                                                 div()
                                                     .flex()
                                                     .items_center()
                                                     .gap_1p5()
-                                                    // OWE-875: 세션 카드 제목 앞에 프로바이더 브랜드 아이콘.
-                                                    .children((!item.agent.is_empty()).then(|| {
-                                                        ui::icons::agent_brand_icon(
-                                                            &item.agent,
-                                                            ui::ICON_MD,
-                                                            p.foreground,
-                                                        )
-                                                    }))
-                                                    .child(item.label.clone()),
+                                                    .child(ui::status::agent_icon(
+                                                        agent,
+                                                        ui::ICON_SM,
+                                                        p.muted_foreground,
+                                                    ))
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_w_0()
+                                                            .truncate()
+                                                            .font_weight(if unread {
+                                                                gpui::FontWeight::SEMIBOLD
+                                                            } else {
+                                                                gpui::FontWeight::MEDIUM
+                                                            })
+                                                            .child(name),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .size(ui::STATE_DOT)
+                                                            .flex_none()
+                                                            .rounded_full()
+                                                            .bg(ui::agent_state_color(state, cx)),
+                                                    ),
                                             )
-                                            .when_some(screen, |d, screen| {
+                                            .when_some(screen.clone(), |d, screen| {
                                                 d.child(
                                                     div()
                                                         // OWE-861: 미리보기 유무 회귀 검사 대상.
@@ -1989,7 +2229,7 @@ impl Render for Dashboard {
                                                         .child(screen),
                                                 )
                                             })
-                                            .when(!has_preview, |d| {
+                                            .when(screen.is_none(), |d| {
                                                 d.child(
                                                     div()
                                                         // OWE-861: 미리보기 유무 회귀 검사 대상.
@@ -2004,18 +2244,43 @@ impl Render for Dashboard {
                                                         .child(text::NO_PREVIEW.get()),
                                                 )
                                             })
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                // OWE-851: 별도 플로팅 창 대신 메인 창 해당 세션으로 포커스한다.
-                                                this.owner
-                                                    .update(cx, |shell, cx| {
-                                                        shell.focus_session_window(session, cx);
-                                                    })
-                                                    .ok();
+                                            .when(!detail.is_empty(), |d| {
+                                                d.child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .text_size(ui::TEXT_XS)
+                                                        .text_color(p.muted_foreground)
+                                                        .child(
+                                                            gpui_component::Icon::new(
+                                                                gpui_component::IconName::Folder,
+                                                            )
+                                                            .with_size(px(11.))
+                                                            .text_color(p.muted_foreground),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .flex_1()
+                                                                .min_w_0()
+                                                                .truncate()
+                                                                .child(detail),
+                                                        ),
+                                                )
+                                            })
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.select_session(
+                                                    host_clone.clone(),
+                                                    session,
+                                                    window,
+                                                    cx,
+                                                );
                                             }))
                                     })),
                             )
                     })),
-            )
+            );
+        ui::modal_backdrop(viewport, card)
     }
 }
 

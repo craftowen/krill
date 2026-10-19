@@ -975,8 +975,9 @@ impl Shell {
             self.files.watching = true;
             self.files.watch = Some(Self::watch_files(window, cx));
         }
-        // 팔레트·검색 바가 떠 있으면 그쪽 포커스를 뺏지 않는다.
+        // 팔레트·모달·검색 바가 떠 있으면 그쪽 포커스를 뺏지 않는다.
         if self.jump.is_none()
+            && self.dashboard.is_none()
             && self.search.is_none()
             && self.files.quick_open.is_none()
             && std::mem::take(&mut self.files.refocus)
@@ -1315,6 +1316,10 @@ impl Shell {
                 }
                 // 스캔 중에 ⌘J·⇧⌘P가 열렸으면 닫고 파일 팔레트를 띄운다(단일 모달, 마지막 요청 우선).
                 this.jump = None;
+                if this.dashboard.take().is_some() {
+                    this.sync_sidebar_visibility(cx);
+                    this.sync_focused_session(cx);
+                }
                 if let Some(pane) = this.layout.focused() {
                     this.commit_ime(pane, Some(window), cx);
                 }

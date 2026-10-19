@@ -229,6 +229,10 @@ impl Control {
 
     /// 서브에이전트·팀원 훅이거나 이미 바인딩된 부모 `session_id`와 다른 보조 프로세스(`claude -p` 등)의
     /// 외래 훅인지 판정한다(#30067, #29429, #28966).
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(dead_code, reason = "단위 테스트용 축약 진입점")
+    )]
     pub fn is_subagent_or_foreign_hook(&self, session: SessionId, payload: &[u8]) -> bool {
         let Ok(p) = serde_json::from_slice::<serde_json::Value>(payload) else {
             return false;
