@@ -288,13 +288,16 @@ pub fn request_local(
                 // 같은 라벨 재등록(멱등)이면 기존 프로필 디렉터리를 유지한다(krilld K-04와 동일).
                 // 수동 지정 디렉터리를 기본값으로 덮어쓰지 않기 위해서다.
                 if let Some(existing) = file.accounts.iter().find(|a| a.id == id) {
-                    PathBuf::from(&existing.profile_dir)
+                    let current = PathBuf::from(&existing.profile_dir);
+                    if *provider == ProviderKind::Codex {
+                        krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(
+                            home, &slug, &current,
+                        )
+                    } else {
+                        current
+                    }
                 } else {
-                    home.join(".config")
-                        .join("minikrill")
-                        .join("profiles")
-                        .join(provider.as_str())
-                        .join(&slug)
+                    krill_proto::usage::profiles::default_profile_dir(home, *provider, &slug)
                 }
             } else if let Some(rest) = profile_dir.trim().strip_prefix("~/") {
                 home.join(rest)
