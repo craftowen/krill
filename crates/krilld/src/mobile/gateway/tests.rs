@@ -760,6 +760,39 @@ fn idle_authenticated_socket_is_pinged_then_closed_without_pong() {
 }
 
 #[test]
+fn ws_closes_when_registry_ends_before_first_request() {
+    let (_r, g) = start();
+    let (port, t) = offer(&g);
+    let mut phone = Client::pair(port, &t);
+    phone.ipc();
+    // 첫 요청 없이 ATTACH_TIMEOUT이 지나면 레지스트리가 끝낸다. WS도 닫혀야 하며 응답 없이 멈추면 안 된다.
+    phone
+        .socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let started = Instant::now();
+    loop {
+        match receive(&mut phone.socket) {
+            Ok((9, _)) => {}
+            Ok((8, _)) => break,
+            Ok(other) => panic!("unexpected frame {other:?}"),
+            Err(e) => {
+                assert!(
+                    !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ),
+                    "WS가 닫히지 않고 멈춤: {e}"
+                );
+                break;
+            }
+        }
+    }
+    assert!(started.elapsed() < Duration::from_secs(9));
+    until(|| lock(&g.shared.state).connections.is_empty());
+}
+
+#[test]
 fn fixed_offer_deep_link_and_fallback_follow_shared_contract() {
     let (_registry, gateway) = start();
     let (port, ticket) = offer(&gateway);
@@ -896,10 +929,27 @@ fn mint_waits_for_pending_download_without_holding_state_lock() {
         state.tunnel_start = Some(super::super::tunnel::Tunnel::fixture);
         reconcile(&mut state, now_ms()).unwrap();
     }
-    gateway.shared.changed.notify_all();
+    gateway.shared.wake();
     assert!(matches!(
         receive.recv_timeout(Duration::from_secs(5)).unwrap(),
         MobileReply::PairingOffer { .. }
     ));
     worker.join().unwrap();
+}
+
+#[test]
+fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
+    let (_r, g) = start();
+    let (port, _) = offer(&g);
+    // 수락 스레드가 락 밖에서 리스너 복제 fd로 poll 중일 때 닫는다(깨우기 호출 없이).
+    until(|| *lock(&g.shared.waker.polling));
+    let mut s = lock(&g.shared.state);
+    s.devices.clear_ticket();
+    reconcile(&mut s, now_ms()).unwrap();
+    assert!(!*lock(&g.shared.waker.polling));
+    drop(s);
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+    // 다시 열면 깨우기로 바로 수락한다.
+    let (port, t) = offer(&g);
+    Client::pair(port, &t).ipc();
 }

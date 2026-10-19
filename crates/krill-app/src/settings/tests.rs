@@ -3240,6 +3240,14 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
             );
         });
         window.draw(cx).clear(cx);
+        // 주소에 사용자가 없으면 로컬 계정으로 접속했다는 힌트를 붙인다.
+        let status = view.read(cx).ssh_status.as_ref().unwrap().to_string();
+        let hinted = status.contains("계정@") || status.contains("account@");
+        assert_eq!(
+            hinted,
+            !target_host.destination.contains('@') && std::env::var("USER").is_ok(),
+            "unexpected status: {status}"
+        );
     });
     assert!(vcx.debug_bounds("admin-ssh-register-device").is_some());
     click(vcx, "admin-ssh-register-device");

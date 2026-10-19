@@ -18,12 +18,14 @@ use krill_proto::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -32,7 +34,11 @@ pub(super) struct Backend {
     dir: Option<PathBuf>,
     hello: ServerHello,
     host: Value,
+    /// 카드 git 요약(branch·added·deleted) cwd별 캐시. 실패도 `Null`로 캐시한다.
+    git_cache: Mutex<HashMap<PathBuf, (Instant, Value)>>,
 }
+/// 스냅샷 폴링이 같은 cwd마다 git 자식을 다시 띄우지 않게 하는 카드 요약 수명. 상세 git 화면은 캐시를 안 쓴다.
+const GIT_TTL: Duration = Duration::from_secs(5);
 impl std::fmt::Debug for Backend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Backend").finish_non_exhaustive()
@@ -91,6 +97,7 @@ impl Backend {
             dir: dir.map(Path::to_path_buf),
             hello,
             host: host_metadata(),
+            git_cache: Mutex::default(),
         }
     }
     pub(super) fn request(&self, request: &str) -> String {
@@ -338,19 +345,30 @@ impl Backend {
             },
         };
         let truncated = sessions.len() > 64;
+        let rows: Vec<_> = sessions
+            .into_iter()
+            .take(64)
+            .map(|info| {
+                let cwd = sidebar
+                    .sessions
+                    .iter()
+                    .find(|s| s.session == info.session)
+                    .map_or(&[][..], |s| s.cwd.as_slice());
+                let group = session_group(info.session, cwd, &sidebar.repositories);
+                (info, cwd, group)
+            })
+            .collect();
+        let git = self.git_summaries(
+            rows.iter()
+                .filter_map(|(_, cwd, group)| git_cwd(cwd, group)),
+        );
         let mut cards = Vec::new();
-        for info in sessions.into_iter().take(64) {
+        for (info, cwd_bytes, group) in rows {
             let state = states
                 .iter()
                 .find(|s| s.session == info.session)
                 .map_or(control::AgentStatus::UNKNOWN, |s| s.status.clone());
-            let cwd_bytes = sidebar
-                .sessions
-                .iter()
-                .find(|s| s.session == info.session)
-                .map_or(&[][..], |s| s.cwd.as_slice());
             let cwd = String::from_utf8_lossy(cwd_bytes);
-            let group = session_group(info.session, cwd_bytes, &sidebar.repositories);
             let text = match self.control(&Request::Capture {
                 session: info.session,
                 format: CaptureFormat::Plain,
@@ -366,7 +384,9 @@ impl Backend {
                 .map(|l| l.chars().take(500).collect::<String>())
                 .collect();
             lines.reverse();
-            let git = self.git(info.session.0, None).unwrap_or(Value::Null);
+            let git = git_cwd(cwd_bytes, &group)
+                .and_then(|path| git.get(&path))
+                .unwrap_or(&Value::Null);
             cards.push(json!({"id":info.session.0,"state":state.state,"agent":state.agent,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "repo_key":group.repo_key,"worktree_key":group.worktree_key,
                 "group_label":group.label,"group_path":group.path,
@@ -399,30 +419,67 @@ impl Backend {
             .collect();
         Ok(json!({"runs":store.runs,"tasks":store.tasks,"gates":gates,"questions":questions}))
     }
+    /// 카드용 git 요약을 cwd별로 모은다. 캐시에 없는 cwd는 큐에 전부 먼저 넣고 나서 받는다
+    /// (큐 워커 [`crate::git::MAX_CONCURRENT`]개가 서로 다른 cwd를 동시에 돈다. 같은 키만 직렬).
+    fn git_summaries(&self, cwds: impl IntoIterator<Item = PathBuf>) -> HashMap<PathBuf, Value> {
+        let mut found = HashMap::new();
+        let mut missing = Vec::new();
+        {
+            let mut cache = crate::session::lock(&self.git_cache);
+            cache.retain(|_, (at, _)| at.elapsed() < GIT_TTL);
+            for cwd in cwds {
+                if let Some((_, value)) = cache.get(&cwd) {
+                    found.insert(cwd, value.clone());
+                } else if !missing.contains(&cwd) {
+                    missing.push(cwd);
+                }
+            }
+        }
+        let queue = crate::git::queue().ok();
+        let pending: Vec<_> = missing
+            .into_iter()
+            .map(|cwd| {
+                let rx = queue.map(|q| {
+                    crate::git::changes::query_with_branch(
+                        q,
+                        cwd.clone(),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                });
+                (cwd, rx)
+            })
+            .collect();
+        for (cwd, rx) in pending {
+            let value = rx
+                .and_then(|rx| rx.recv().ok())
+                .and_then(Result::ok)
+                .map_or(Value::Null, |(changes, branch)| {
+                    let (added, deleted) = totals(&changes);
+                    json!({"branch":branch,"added":added,"deleted":deleted})
+                });
+            crate::session::lock(&self.git_cache)
+                .insert(cwd.clone(), (Instant::now(), value.clone()));
+            found.insert(cwd, value);
+        }
+        found
+    }
     fn git(&self, session: u64, path: Option<&str>) -> io::Result<Value> {
         let cwd = self.cwd(session)?;
-        let changes = match self.control(&Request::GitChanges {
-            repo: cwd.as_os_str().as_encoded_bytes().to_vec(),
-        })? {
-            Reply::GitChanges(c) => c,
-            Reply::GitChangesFailed(e) => return Err(io::Error::other(e)),
-            _ => return Err(invalid()),
-        };
-        let branch = crate::git::queue()
-            .map_err(io::Error::other)?
-            .submit(&cwd, ["branch", "--show-current"])
-            .recv()
-            .map_err(io::Error::other)??;
-        let mut files = Vec::new();
-        let mut added = 0_u64;
-        let mut deleted = 0_u64;
-        for file in changes.files {
-            for stat in [file.staged, file.unstaged].into_iter().flatten() {
-                added = added.saturating_add(stat.added.unwrap_or(0));
-                deleted = deleted.saturating_add(stat.deleted.unwrap_or(0));
-            }
-            files.push(String::from_utf8_lossy(&file.path).into_owned());
-        }
+        let queue = crate::git::queue().map_err(io::Error::other)?;
+        let (changes, branch) = crate::git::changes::query_with_branch(
+            queue,
+            cwd.clone(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .recv()
+        .map_err(io::Error::other)?
+        .map_err(io::Error::other)?;
+        let (added, deleted) = totals(&changes);
+        let files: Vec<_> = changes
+            .files
+            .iter()
+            .map(|file| String::from_utf8_lossy(&file.path).into_owned())
+            .collect();
         let patch = if let Some(path) = path {
             if !files.iter().any(|p| p == path)
                 || Path::new(path)
@@ -435,9 +492,7 @@ impl Backend {
         } else {
             String::new()
         };
-        Ok(
-            json!({"branch":String::from_utf8_lossy(&branch.stdout).trim(),"added":added,"deleted":deleted,"files":files,"patch":patch}),
-        )
+        Ok(json!({"branch":branch,"added":added,"deleted":deleted,"files":files,"patch":patch}))
     }
 }
 /// 표시용 lossy UTF-8과 분리해 OS 경로 바이트를 그대로 식별한다.
@@ -486,6 +541,26 @@ fn session_group(
         label: Some(path_label(bytes)),
         path: Some(String::from_utf8_lossy(bytes).into_owned()),
     }
+}
+/// 카드 git 요약을 물을 cwd. 저장소 밖(`repo_key` 없음)·cwd 미상은 git을 부르지 않는다(값은 `null`).
+fn git_cwd(cwd: &[u8], group: &SessionGroup) -> Option<PathBuf> {
+    group
+        .repo_key
+        .as_ref()
+        .map(|_| PathBuf::from(std::ffi::OsStr::from_bytes(cwd)))
+}
+fn totals(changes: &krill_proto::git::Changes) -> (u64, u64) {
+    changes
+        .files
+        .iter()
+        .flat_map(|file| [file.staged, file.unstaged])
+        .flatten()
+        .fold((0_u64, 0_u64), |(added, deleted), stat| {
+            (
+                added.saturating_add(stat.added.unwrap_or(0)),
+                deleted.saturating_add(stat.deleted.unwrap_or(0)),
+            )
+        })
 }
 fn path_label(bytes: &[u8]) -> String {
     let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
@@ -730,6 +805,81 @@ mod tests {
         assert!(first.label.is_none());
     }
 
+    fn test_backend() -> Backend {
+        Backend::new(
+            Weak::new(),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        )
+    }
+
+    #[test]
+    #[cfg(unix)] // git CLI
+    fn card_git_skips_non_repositories_dedups_cwds_and_expires_cache() {
+        let outside = session_group(SessionId(1), b"/tmp/not-a-repo", &[]);
+        assert_eq!(git_cwd(b"/tmp/not-a-repo", &outside), None);
+        assert_eq!(git_cwd(&[], &session_group(SessionId(2), &[], &[])), None);
+
+        let dir = std::env::temp_dir().join(format!("mk-pwa-git-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        };
+        git(&["init", "-q", "-b", "card"]);
+        fs::write(dir.join("f"), "a\n").unwrap();
+        git(&["add", "f"]);
+        git(&["commit", "-qm", "f"]);
+        fs::write(dir.join("f"), "a\nb\n").unwrap();
+        let repositories = vec![control::RepositoryTrees {
+            repo: dir.as_os_str().as_bytes().to_vec(),
+            worktrees: vec![dir.as_os_str().as_bytes().to_vec()],
+        }];
+        let inside = session_group(SessionId(3), dir.as_os_str().as_bytes(), &repositories);
+        assert_eq!(
+            git_cwd(dir.as_os_str().as_bytes(), &inside),
+            Some(dir.clone())
+        );
+
+        let backend = test_backend();
+        let expected = json!({"branch":"card","added":1,"deleted":0});
+        let first = backend.git_summaries([dir.clone(), dir.clone()]);
+        assert_eq!(first.len(), 1, "same cwd shares one query");
+        assert_eq!(first[&dir], expected);
+        fs::write(dir.join("f"), "a\nb\nc\n").unwrap();
+        assert_eq!(
+            backend.git_summaries([dir.clone()])[&dir],
+            expected,
+            "cached"
+        );
+        for (at, _) in crate::session::lock(&backend.git_cache).values_mut() {
+            *at = Instant::now().checked_sub(GIT_TTL).unwrap();
+        }
+        assert_eq!(
+            backend.git_summaries([dir.clone()])[&dir],
+            json!({"branch":"card","added":2,"deleted":0}),
+            "expired entry is queried again"
+        );
+        let missing = dir.join("missing");
+        assert_eq!(
+            backend.git_summaries([missing.clone()])[&missing],
+            Value::Null
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn host_metadata_reports_only_actual_hostname_and_platform() {
         let host = host_metadata();
@@ -784,17 +934,7 @@ mod tests {
 
     #[test]
     fn workflow_errors_are_bounded_and_json() {
-        let backend = Backend::new(
-            Weak::new(),
-            None,
-            ServerHello {
-                proto_min: 1,
-                proto_max: 1,
-                features: ipc::FEATURES,
-                build: "test".into(),
-                instance_id: 1,
-            },
-        );
+        let backend = test_backend();
         for request in [
             "",
             "{}",
