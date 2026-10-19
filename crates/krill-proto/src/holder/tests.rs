@@ -246,7 +246,14 @@ fn windows_handles() {
     let b = adopt.encode_handles(&h[..3]).unwrap();
     assert_eq!(
         ToHolder::decode_handles(one(&b)),
-        Ok((adopt, h[..3].to_vec()))
+        Ok((adopt.clone(), h[..3].to_vec()))
+    );
+    // OWE-913 appends session process, Job and IOCP after the original five handles.
+    let recovered = [1, 2, 3, 4, 5, 6, 7, 8];
+    let b = adopt.encode_handles(&recovered).unwrap();
+    assert_eq!(
+        ToHolder::decode_handles(one(&b)),
+        Ok((adopt, recovered.to_vec()))
     );
     for (m, n) in [
         (
