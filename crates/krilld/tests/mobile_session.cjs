@@ -34,6 +34,8 @@ async function main(){
  console.log('PASS latest session approval menus, stale action rejection and branch controls');
  await testTransportAuthRetries();
  console.log('PASS stage-2 transport retry cooldown vs explicit 1008 auth rejection');
+ await testPipelinedHandshakeAndPolling();
+ console.log('PASS pipelined ClientHello+snapshot before auth reply, hidden-tab skip and live-terminal poll interval');
  f=fixture();for(let i=0;i<100;i++)f.view.update();assert.equal(getEventListeners(f.abort.signal,'abort').length,0);
  const tab=f.buttons.filter(b=>b.className==='session-tab').at(-1),down=new Event('pointerdown');down.button=0;tab.dispatchEvent(down);assert.equal(f.timers.size,1);
  f.view.update();assert.equal(f.timers.size,0);f.advance(500);assert.equal(f.sheets.length,0);
@@ -76,6 +78,32 @@ async function testTransportAuthRetries(){
  assert.equal(timers.size,0);assert.match(errors.at(-1),/Desktop rejected authentication/);
  await advance(200000);t.resume();await flush();assert.equal(sockets.length,4);
  t.close();
+}
+async function testPipelinedHandshakeAndPolling(){
+ let now=0,nextId=0;const timers=new Map(),sockets=[],snapshots=[],statuses=[];
+ class FakeSocket extends EventTarget{
+  constructor(){super();this.sent=[];sockets.push(this);queueMicrotask(()=>this.dispatchEvent(new Event('open')));}
+  send(data){this.sent.push(data);}
+  close(){}
+  message(data){const e=new Event('message');e.data=data;this.dispatchEvent(e);}
+ }
+ const document={hidden:false},enc=new TextEncoder(),concat=(...a)=>{const out=new Uint8Array(a.reduce((n,x)=>n+x.length,0));let i=0;for(const x of a){out.set(x,i);i+=x.length;}return out;};
+ const sandbox={Event,EventTarget,TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,Promise,Math,Error,JSON,Number,document,Date:{now:()=>now},crypto:{getRandomValues:b=>b.fill(1)},setTimeout:(fn,ms)=>{const id=++nextId;timers.set(id,{fn,at:now+Math.max(0,ms)});return id;},clearTimeout:id=>timers.delete(id),WebSocket:FakeSocket,MkCrypto:{enc,concat,unhex:()=>new Uint8Array(32),hex:()=>'00'.repeat(32),sha256:a=>a,unbase64:()=>new Uint8Array(32),Channel:class{seal(a){return a;}open(a){return new Uint8Array(a);}}},KrillMobile:{}};
+ vm.createContext(sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/client.js'),'utf8'),sandbox);
+ const flush=()=>new Promise(r=>setImmediate(r));
+ const frame=(kind,body)=>{const h=new Uint8Array(5);new DataView(h.buffer).setUint32(0,body.length+1,true);h[4]=kind;return concat(h,body);};
+ const text=s=>{const b=enc.encode(s);return concat(Uint8Array.of(b.length),b);};
+ const t=sandbox.KrillMobile.transport.create({url:'ws://localhost/ws',credentials:{device_id:'dev1',credential:'aa'.repeat(32)},onSnapshot:d=>snapshots.push(d),onStatus:s=>statuses.push(s.phase),onError(){}});
+ t.connect();await flush();const socket=sockets[0];socket.message(JSON.stringify({version:2,challenge:'bb'.repeat(32)}));await flush();
+ // 인증 응답 전에 auth hello·proof·ClientHello·snapshot 요청이 모두 나가야 한다.
+ assert.equal(socket.sent.length,4);assert.equal(socket.sent[2][4],2);assert.equal(socket.sent[3][4],0x45);
+ const reply=()=>socket.message(frame(0x65,concat(Uint8Array.of(6),text(JSON.stringify({ok:true,data:{sessions:[]}})))));
+ socket.message(enc.encode('{"device_id":"dev1"}'));socket.message(frame(1,Uint8Array.of(1,1,0,0,1)));reply();await flush();
+ assert.equal(snapshots.length,1);assert.equal(statuses.at(-1),'ready');assert.equal(socket.sent.length,4);
+ const [[,poll]]=[...timers];assert.equal(poll.at,2500);
+ document.hidden=true;now=2500;timers.clear();poll.fn();await flush();assert.equal(socket.sent.length,4);
+ sandbox.KrillMobile.activeTerminal={};document.hidden=false;const [[,next]]=[...timers];timers.clear();next.fn();await flush();assert.equal(socket.sent.length,5);reply();await flush();assert.equal(snapshots.length,2);
+ const [[,slow]]=[...timers];assert.equal(slow.at-now,10000);t.close();
 }
 if(require.main===module)main().catch(e=>{console.error(e);process.exitCode=1;});
 module.exports={fixture,main};

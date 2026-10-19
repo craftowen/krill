@@ -70,6 +70,7 @@ fn input_is_processed_while_search_waits_for_recording() {
             FEAT_SEARCH | FEAT_INPUT,
             Some(attached),
             Role::Observer,
+            crate::attach::FRAME_MIN,
         )
     });
     assert_eq!(
@@ -554,6 +555,7 @@ fn clear_scrollback_drops_hot_and_cold_history_and_keeps_new_output() {
             FEAT_INPUT | FEAT_CLEAR_SCROLLBACK,
             Some(attached),
             Role::Interactive,
+            crate::attach::FRAME_MIN,
         )
     });
     assert_eq!(
@@ -646,4 +648,62 @@ fn clear_scrollback_drops_hot_and_cold_history_and_keeps_new_output() {
     drop(pty.user);
     session.wait().unwrap();
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// 모바일 연결은 계속 바뀌는 화면을 `MOBILE_FRAME_MIN` 간격으로 보낸다.
+#[test]
+fn mobile_attach_paces_continuous_updates() {
+    use krill_proto::screen::kind;
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let mut termios = rustix::termios::tcgetattr(&pty.user).unwrap();
+    termios.make_raw();
+    rustix::termios::tcsetattr(&pty.user, rustix::termios::OptionalActions::Now, &termios).unwrap();
+    let session = Session::start(
+        SessionId(1),
+        pty.controller,
+        WinSize { cols: 80, rows: 24 },
+        Arc::new(Appearance::load(PathBuf::new())),
+        None,
+    )
+    .unwrap();
+    let tap = session.tap();
+    let (mut client, server) = UnixStream::pair().unwrap();
+    let attached = tap.clone();
+    let worker = thread::spawn(move || {
+        crate::attach::run_as(
+            server,
+            Attach {
+                session: SessionId(1),
+                stream: Stream::Screen { known: None },
+            },
+            1,
+            0,
+            Some(attached),
+            Role::Interactive,
+            crate::attach::MOBILE_FRAME_MIN,
+        )
+    });
+    // 붙을 때의 스냅샷을 비운다.
+    client
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    while ipc::read_frame(&mut client).is_ok() {}
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let mut update_after = |text: &[u8]| {
+        rustix::io::write(&pty.user, text).unwrap();
+        loop {
+            let (k, _) = ipc::read_frame(&mut client).unwrap().unwrap();
+            if k == kind::UPDATE {
+                return std::time::Instant::now();
+            }
+        }
+    };
+    let first = update_after(b"a");
+    let second = update_after(b"b");
+    assert!(second - first >= Duration::from_millis(25));
+    client.shutdown(Shutdown::Both).ok();
+    drop(session);
+    worker.join().unwrap().ok();
 }
