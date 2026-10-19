@@ -9,19 +9,29 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use std::io::Write;
+
+use krill_proto::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
 use krill_proto::daemon;
+use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
-    GateStatus, MessageType, OrchestrationStore, SendParams, TaskStatus, worker_preamble,
+    DEFAULT_MAX_WORKER_DEPTH, Dispatch, GateStatus, MessageType, OrchAction, OrchResponse,
+    OrchestrationStore, Run, SendParams, TaskStatus, WorkerStartSpec, worker_preamble,
 };
+use krill_proto::screen::Msg;
+
+use crate::remote::Target;
 
 const USAGE: &str = "\
-usage: krill orchestration <subcommand> [options]
+usage: krill [--host <user@host>] orchestration <subcommand> [options]
   run-create --title <title> [--coordinator <session-id>] [--json]
+  run-use <run-id|--clear> [--json]
+  run-current [--json]
   run-list [--json]
-  task-create --run <run-id> --title <title> [--desc <text>] [--deps <t1,t2>] [--json]
+  task-create [--run <run-id>] --title <title> [--desc <text>] [--deps <t1,t2>] [--json]
   task-list [--run <run-id>] [--json]
   task-update <task-id> --status <pending|ready|dispatched|completed|failed|blocked> [--summary <text>] [--json]
-  worker-start --run <run-id> [--task <task-id>] --worker <name> [--agent <agent>] [--session <id>] [--cwd <dir>] --prompt <text> [--json]
+  worker-start [--spec <json>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--depth <N>] [--max-depth <N>] --prompt <text> [--json]
   send --from <name> --to <target> [--type <type>] --summary <text> [--body <text>] [--run <id>] [--task <id>] [--dispatch <id>] [--outcome <succeeded|failed>] [--json]
   check [--to <name>] [--types <t1,t2>] [--unread] [--ack] [--wait] [--timeout-ms <N>] [--json]
   ask --from <name> --to <target> --summary <question> [--body <text>] [--wait] [--timeout-ms <N>] [--json]
@@ -34,12 +44,149 @@ usage: krill orchestration <subcommand> [options]
   worker-read <worker-or-dispatch> [--lines <N>] [--json]
   worker-stop <worker-or-dispatch> [--json]
   worker-release <worker-or-dispatch> [--json]
+  worker-abandon <worker-or-dispatch> [--json]
   reset [--run <run-id>] [--json]";
 
+enum TargetRef<'a> {
+    Borrowed(&'a Target),
+    Owned(Target),
+}
+
+impl std::ops::Deref for TargetRef<'_> {
+    type Target = Target;
+    fn deref(&self) -> &Target {
+        match self {
+            Self::Borrowed(t) => t,
+            Self::Owned(t) => t,
+        }
+    }
+}
+
+struct OrchCtx<'a> {
+    target: Option<&'a Target>,
+    state_dir: &'a Path,
+}
+
+impl<'a> OrchCtx<'a> {
+    #[cfg(test)]
+    fn local(state_dir: &'a Path) -> Self {
+        Self {
+            target: None,
+            state_dir,
+        }
+    }
+
+    fn is_remote(&self) -> bool {
+        self.target.is_some_and(Target::is_remote)
+    }
+
+    fn effective_target(&self) -> io::Result<TargetRef<'a>> {
+        match self.target {
+            Some(t) => Ok(TargetRef::Borrowed(t)),
+            None => Target::establish(None).map(TargetRef::Owned),
+        }
+    }
+
+    /// Calls `krilld` via `Request::Orchestration` when remote (`--host`) or when a local
+    /// `krilld` socket is active for `daemon::state_dir()`. Returns `Ok(None)` when local
+    /// and no daemon is listening so unit tests and offline invocations can use disk fallback.
+    fn try_ipc(&self, action: &OrchAction, timeout: Duration) -> io::Result<Option<OrchResponse>> {
+        let is_remote = self.is_remote();
+        if !is_remote && daemon::state_dir().as_deref() != Some(self.state_dir) {
+            return Ok(None);
+        }
+        let target = match self.target {
+            Some(t) => TargetRef::Borrowed(t),
+            None => match Target::establish(None) {
+                Ok(t) => TargetRef::Owned(t),
+                Err(_) => return Ok(None),
+            },
+        };
+        let hello = daemon::client_hello(ClientRole::Cli, "krill");
+        let mut conn = if is_remote {
+            target
+                .connect(&hello)
+                .map_err(|e| io::Error::other(e.to_string()))?
+        } else {
+            match target.dial(&hello, Duration::from_secs(2)) {
+                Ok(c) => c,
+                Err(_) => return Ok(None),
+            }
+        };
+        let required = FEAT_CONTROL | FEAT_CLI;
+        if conn.negotiated.features & required != required {
+            if is_remote {
+                return Err(io::Error::other(
+                    "remote krilld does not support orchestration IPC; update the daemon",
+                ));
+            }
+            return Ok(None);
+        }
+        let io_wait = timeout.saturating_add(Duration::from_secs(5));
+        conn.stream.set_read_timeout(Some(io_wait))?;
+        conn.stream
+            .set_write_timeout(Some(Duration::from_secs(5)))?;
+        let encoded = Request::Orchestration(action.clone())
+            .encode()
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        if conn.stream.write_all(&encoded).is_err() {
+            if is_remote {
+                return Err(io::Error::other("remote krilld disconnected"));
+            }
+            return Ok(None);
+        }
+        let Some((kind, body)) = ipc::read_frame(&mut conn.stream)? else {
+            if is_remote {
+                return Err(io::Error::other("remote krilld disconnected"));
+            }
+            return Ok(None);
+        };
+        let reply = Reply::decode(kind, &body)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        match reply {
+            Reply::Orchestration(resp) => Ok(Some(resp)),
+            Reply::Failed(Failure::BadRequest) if !is_remote => Ok(None),
+            Reply::Failed(f) => Err(classify_daemon_failure(f)),
+            _ => Err(io::Error::other("unexpected orchestration reply")),
+        }
+    }
+
+    fn load_store(&self) -> io::Result<OrchestrationStore> {
+        if let Some(OrchResponse::Snapshot(store)) =
+            self.try_ipc(&OrchAction::Snapshot, Duration::from_secs(2))?
+        {
+            return Ok(store);
+        }
+        OrchestrationStore::load(self.state_dir)
+    }
+}
+
+fn classify_daemon_failure(f: Failure) -> io::Error {
+    let msg = f.to_string();
+    if msg.contains("not found") || msg.contains("no active run") {
+        io::Error::new(io::ErrorKind::NotFound, msg)
+    } else if msg.contains("must not be empty")
+        || msg.contains("not in gate options")
+        || msg.contains("unknown ")
+        || msg.contains("invalid ")
+        || msg.contains("max_depth")
+    {
+        io::Error::new(io::ErrorKind::InvalidInput, msg)
+    } else {
+        io::Error::other(msg)
+    }
+}
+
 pub fn run(raw: &[OsString]) -> ExitCode {
-    let Ok(args) = raw
-        .iter()
-        .cloned()
+    let (host, rest_os) = match crate::remote::extract_host(raw) {
+        Ok(parsed) => parsed,
+        Err(text) => {
+            eprintln!("orchestration: {text}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let Ok(args) = rest_os
+        .into_iter()
         .map(OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
     else {
@@ -50,31 +197,49 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
-    let Some(state_dir) = daemon::state_dir() else {
-        eprintln!("orchestration: HOME is not set");
-        return ExitCode::FAILURE;
+    let target = match Target::establish(host) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("orchestration: remote: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let state_dir = match daemon::state_dir() {
+        Some(dir) => dir,
+        None if target.is_remote() => PathBuf::from("/tmp"),
+        None => {
+            eprintln!("orchestration: HOME is not set");
+            return ExitCode::FAILURE;
+        }
+    };
+    let ctx = OrchCtx {
+        target: Some(&target),
+        state_dir: &state_dir,
     };
 
     let res = match sub.as_str() {
-        "run-create" => cmd_run_create(&state_dir, rest),
-        "run-list" | "runs" => cmd_run_list(&state_dir, rest),
-        "task-create" => cmd_task_create(&state_dir, rest),
-        "task-list" | "tasks" => cmd_task_list(&state_dir, rest),
-        "task-update" => cmd_task_update(&state_dir, rest),
-        "worker-start" => cmd_worker_start(&state_dir, rest),
-        "send" => cmd_send(&state_dir, rest),
-        "check" => cmd_check(&state_dir, rest),
-        "ask" => cmd_ask(&state_dir, rest),
-        "reply" => cmd_reply(&state_dir, rest),
-        "gate-create" => cmd_gate_create(&state_dir, rest),
-        "gate-list" | "gates" => cmd_gate_list(&state_dir, rest),
-        "gate-resolve" => cmd_gate_resolve(&state_dir, rest),
-        "worker-list" | "workers" => cmd_worker_list(&state_dir, rest),
-        "worker-show" => cmd_worker_show(&state_dir, rest),
-        "worker-read" => cmd_worker_read(&state_dir, rest),
-        "worker-stop" => cmd_worker_stop(&state_dir, rest, false),
-        "worker-release" => cmd_worker_stop(&state_dir, rest, true),
-        "reset" => cmd_reset(&state_dir, rest),
+        "run-create" => cmd_run_create_ctx(&ctx, rest),
+        "run-use" => cmd_run_use_ctx(&ctx, rest),
+        "run-current" => cmd_run_current_ctx(&ctx, rest),
+        "run-list" | "runs" => cmd_run_list_ctx(&ctx, rest),
+        "task-create" => cmd_task_create_ctx(&ctx, rest),
+        "task-list" | "tasks" => cmd_task_list_ctx(&ctx, rest),
+        "task-update" => cmd_task_update_ctx(&ctx, rest),
+        "worker-start" => cmd_worker_start_ctx(&ctx, rest),
+        "send" => cmd_send_ctx(&ctx, rest),
+        "check" => cmd_check_ctx(&ctx, rest),
+        "ask" => cmd_ask_ctx(&ctx, rest),
+        "reply" => cmd_reply_ctx(&ctx, rest),
+        "gate-create" => cmd_gate_create_ctx(&ctx, rest),
+        "gate-list" | "gates" => cmd_gate_list_ctx(&ctx, rest),
+        "gate-resolve" => cmd_gate_resolve_ctx(&ctx, rest),
+        "worker-list" | "workers" => cmd_worker_list_ctx(&ctx, rest),
+        "worker-show" => cmd_worker_show_ctx(&ctx, rest),
+        "worker-read" => cmd_worker_read_ctx(&ctx, rest),
+        "worker-stop" => cmd_worker_stop_ctx(&ctx, rest, false),
+        "worker-release" => cmd_worker_stop_ctx(&ctx, rest, true),
+        "worker-abandon" => cmd_worker_abandon_ctx(&ctx, rest),
+        "reset" => cmd_reset_ctx(&ctx, rest),
         _ => {
             eprintln!("unknown orchestration subcommand: {sub}\n{USAGE}");
             return ExitCode::from(2);
@@ -94,7 +259,12 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     }
 }
 
+#[cfg(test)]
 fn cmd_run_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_run_create_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_run_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut title = None;
     let mut coordinator = None;
     let mut json = false;
@@ -114,7 +284,16 @@ fn cmd_run_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
         }
     }
     let title = title.ok_or_else(|| bad_arg("missing --title"))?;
-    let created = OrchestrationStore::mutate(state_dir, |s| s.create_run(&title, coordinator))?;
+    let created = match ctx.try_ipc(
+        &OrchAction::CreateRun {
+            title: title.clone(),
+            coordinator_session_id: coordinator,
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Run(r)) => r,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.create_run(&title, coordinator))?,
+    };
     if json {
         print_json(&created)?;
     } else {
@@ -128,9 +307,82 @@ fn cmd_run_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_run_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
+fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let mut target_run: Option<Option<String>> = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--clear" => target_run = Some(None),
+            "--run" => {
+                let id = it.next().ok_or_else(|| bad_arg("missing --run"))?;
+                target_run = Some(Some(id.clone()));
+            }
+            "--json" => json = true,
+            s if !s.starts_with('-') && target_run.is_none() => {
+                target_run = Some(Some(s.to_owned()));
+            }
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
+    let run_id = target_run
+        .ok_or_else(|| bad_arg("usage: krill orchestration run-use <run-id|--clear> [--json]"))?;
+    let cur_id = match ctx.try_ipc(
+        &OrchAction::SetCurrentRun {
+            run_id: run_id.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::CurrentRun(c)) => c,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.set_current_run(run_id.as_deref()))?,
+    };
+    let active: Option<Run> =
+        cur_id.and_then(|id| ctx.load_store().ok()?.runs.into_iter().find(|r| r.id == id));
+    if json {
+        print_json(&serde_json::json!({
+            "active_run_id": active.as_ref().map(|r| r.id.as_str()),
+            "run": active,
+        }))?;
+    } else if let Some(r) = active {
+        println!("{}\t{}\t{}", r.id, r.status.as_str(), r.title);
+    } else {
+        println!("cleared");
+    }
+    Ok(())
+}
+
+fn cmd_run_current_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let json = has_flag(args, "--json");
-    let store = OrchestrationStore::load(state_dir)?;
+    if args.iter().any(|a| a != "--json") {
+        return Err(bad_arg("usage: krill orchestration run-current [--json]"));
+    }
+    let store = ctx.load_store()?;
+    let current: Option<Run> = store
+        .resolve_run_id(None)
+        .ok()
+        .and_then(|id| store.runs.into_iter().find(|r| r.id == id));
+    let Some(r) = current else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no active run; pass --run <id> or set one with `krill orchestration run-use <id>`",
+        ));
+    };
+    if json {
+        print_json(&r)?;
+    } else {
+        println!("{}\t{}\t{}", r.id, r.status.as_str(), r.title);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn cmd_run_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_run_list_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_run_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let json = has_flag(args, "--json");
+    let store = ctx.load_store()?;
     if json {
         print_json(&store.runs)?;
     } else {
@@ -143,7 +395,12 @@ fn cmd_run_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_task_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_task_create_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_task_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut run_id = None;
     let mut title = None;
     let mut desc = String::new();
@@ -171,10 +428,25 @@ fn cmd_task_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let run_id = run_id.ok_or_else(|| bad_arg("missing --run"))?;
     let title = title.ok_or_else(|| bad_arg("missing --title"))?;
-    let task =
-        OrchestrationStore::mutate(state_dir, |s| s.create_task(&run_id, &title, &desc, deps))?;
+    let resolved_run_id = match run_id {
+        Some(id) => id,
+        None => ctx.load_store()?.resolve_run_id(None)?,
+    };
+    let task = match ctx.try_ipc(
+        &OrchAction::CreateTask {
+            run_id: resolved_run_id.clone(),
+            title: title.clone(),
+            description: desc.clone(),
+            deps: deps.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Task(t)) => t,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
+            s.create_task(&resolved_run_id, &title, &desc, deps)
+        })?,
+    };
     if json {
         print_json(&task)?;
     } else {
@@ -189,7 +461,12 @@ fn cmd_task_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_task_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_task_list_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_task_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut run_filter = None;
     let mut json = false;
     let mut it = args.iter();
@@ -200,7 +477,7 @@ fn cmd_task_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let store = OrchestrationStore::load(state_dir)?;
+    let store = ctx.load_store()?;
     let tasks: Vec<_> = store
         .tasks
         .into_iter()
@@ -229,7 +506,7 @@ fn cmd_task_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_task_update(state_dir: &Path, args: &[String]) -> io::Result<()> {
+fn cmd_task_update_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let Some((task_id, rest)) = args.split_first() else {
         return Err(bad_arg("missing <task-id>"));
     };
@@ -249,8 +526,19 @@ fn cmd_task_update(state_dir: &Path, args: &[String]) -> io::Result<()> {
         }
     }
     let status = status.ok_or_else(|| bad_arg("missing --status"))?;
-    let updated =
-        OrchestrationStore::mutate(state_dir, |s| s.update_task(task_id, status, summary))?;
+    let updated = match ctx.try_ipc(
+        &OrchAction::UpdateTask {
+            task_id: task_id.clone(),
+            status,
+            summary: summary.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Task(t)) => t,
+        _ => {
+            OrchestrationStore::mutate(ctx.state_dir, |s| s.update_task(task_id, status, summary))?
+        }
+    };
     if json {
         print_json(&updated)?;
     } else {
@@ -264,89 +552,206 @@ fn cmd_task_update(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_worker_start(state_dir: &Path, args: &[String]) -> io::Result<()> {
-    let mut run_id = None;
-    let mut task_id = None;
-    let mut worker_name = None;
-    let mut agent = "claude".to_owned();
-    let mut session_id = None;
-    let mut cwd = None;
-    let mut prompt = None;
-    let mut no_spawn = false;
+    cmd_worker_start_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let mut spec = WorkerStartSpec::default();
+    let mut explicit_agent: Option<String> = None;
+    let mut explicit_depth: Option<u32> = None;
+    let mut explicit_max_depth: Option<u32> = None;
     let mut json = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--run" => run_id = it.next().cloned(),
-            "--task" => task_id = it.next().cloned(),
-            "--worker" | "--name" => worker_name = it.next().cloned(),
+            "--spec" => {
+                let raw = it.next().ok_or_else(|| bad_arg("missing --spec"))?;
+                let parsed: WorkerStartSpec = serde_json::from_str(raw)
+                    .map_err(|e| bad_arg(format!("invalid --spec JSON: {e}")))?;
+                if spec.run_id.is_none() {
+                    spec.run_id = parsed.run_id;
+                }
+                if spec.task_id.is_none() {
+                    spec.task_id = parsed.task_id;
+                }
+                if spec.worker.is_none() {
+                    spec.worker = parsed.worker;
+                }
+                if explicit_agent.is_none() && parsed.agent.is_some() {
+                    spec.agent = parsed.agent;
+                }
+                if spec.account.is_none() {
+                    spec.account = parsed.account;
+                }
+                if spec.session_id.is_none() {
+                    spec.session_id = parsed.session_id;
+                }
+                if spec.cwd.is_none() {
+                    spec.cwd = parsed.cwd;
+                }
+                if spec.prompt.is_none() {
+                    spec.prompt = parsed.prompt;
+                }
+                if explicit_depth.is_none() && parsed.depth.is_some() {
+                    spec.depth = parsed.depth;
+                }
+                if explicit_max_depth.is_none() && parsed.max_depth.is_some() {
+                    spec.max_depth = parsed.max_depth;
+                }
+                if parsed.no_spawn {
+                    spec.no_spawn = true;
+                }
+            }
+            "--run" => spec.run_id = it.next().cloned(),
+            "--task" => spec.task_id = it.next().cloned(),
+            "--worker" | "--name" => spec.worker = it.next().cloned(),
             "--agent" => {
-                agent.clone_from(take_opt(&mut it, "--agent")?);
+                explicit_agent = Some(take_opt(&mut it, "--agent")?.clone());
+            }
+            "--account" => {
+                spec.account = Some(take_opt(&mut it, "--account")?.clone());
             }
             "--session" => {
                 let v = it.next().ok_or_else(|| bad_arg("missing --session"))?;
-                session_id = Some(v.parse::<u64>().map_err(|_| bad_arg("invalid --session"))?);
+                spec.session_id = Some(v.parse::<u64>().map_err(|_| bad_arg("invalid --session"))?);
             }
-            "--cwd" => cwd = it.next().cloned(),
-            "--prompt" => prompt = it.next().cloned(),
-            "--no-spawn" => no_spawn = true,
+            "--cwd" => spec.cwd = it.next().cloned(),
+            "--prompt" => spec.prompt = it.next().cloned(),
+            "--depth" => {
+                let v = it.next().ok_or_else(|| bad_arg("missing --depth"))?;
+                explicit_depth = Some(v.parse::<u32>().map_err(|_| bad_arg("invalid --depth"))?);
+            }
+            "--max-depth" => {
+                let v = it.next().ok_or_else(|| bad_arg("missing --max-depth"))?;
+                explicit_max_depth = Some(
+                    v.parse::<u32>()
+                        .map_err(|_| bad_arg("invalid --max-depth"))?,
+                );
+            }
+            "--no-spawn" => spec.no_spawn = true,
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let run_id = run_id.ok_or_else(|| bad_arg("missing --run"))?;
-    let worker_name = worker_name.ok_or_else(|| bad_arg("missing --worker"))?;
-    let prompt = prompt.ok_or_else(|| bad_arg("missing --prompt"))?;
-    let agent = krill_proto::agent::canonical_id(&agent).to_owned();
-    let work_cwd = match cwd {
+    let worker_name = spec.worker.ok_or_else(|| bad_arg("missing --worker"))?;
+    let prompt = spec.prompt.ok_or_else(|| bad_arg("missing --prompt"))?;
+    let raw_agent = explicit_agent
+        .or(spec.agent)
+        .unwrap_or_else(|| "claude".to_owned());
+    let agent = krill_proto::agent::canonical_id(&raw_agent).to_owned();
+    let depth = explicit_depth
+        .or(spec.depth)
+        .or_else(|| {
+            std::env::var("MK_WORKER_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0);
+    let max_depth = explicit_max_depth
+        .or(spec.max_depth)
+        .or_else(|| {
+            std::env::var("MK_MAX_WORKER_DEPTH")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(DEFAULT_MAX_WORKER_DEPTH);
+
+    let work_cwd = match spec.cwd {
         Some(c) => PathBuf::from(c),
+        None if ctx.is_remote() => {
+            return Err(bad_arg(
+                "remote worker-start requires --cwd <absolute path on the remote host>",
+            ));
+        }
         None => std::env::current_dir()?,
     };
     let cwd_str = work_cwd.to_string_lossy().into_owned();
 
     // 스폰 전에 run/task 유효성과 상태를 먼저 검증해 잘못된 요청이 고아 PTY 세션을 남기지 않게 한다.
-    OrchestrationStore::load(state_dir)?.validate_worker_start(
+    let store = ctx.load_store()?;
+    let run_id = match spec.run_id {
+        Some(id) => id,
+        None => store
+            .resolve_run_id(None)
+            .map_err(|_| bad_arg("missing --run"))?,
+    };
+    store.validate_worker_start_with_depth(
         &run_id,
-        task_id.as_deref(),
+        spec.task_id.as_deref(),
         &worker_name,
+        depth,
+        max_depth,
     )?;
 
+    let target = ctx.effective_target()?;
+    let mut session_id = spec.session_id;
     // 존재하지 않는 세션을 지정하면 dispatch가 Active 고스트로 남고 stop/release가 영구 실패한다(C1).
     // mutate 전에 세션 존재를 확인해 고스트 기록 자체를 만들지 않는다.
     if let Some(sid) = session_id {
-        ensure_worker_session_exists(&worker_name, sid)?;
+        ensure_worker_session_exists_on_target(&target, &worker_name, sid)?;
     }
 
-    let newly_spawned = session_id.is_none() && !no_spawn;
+    let newly_spawned = session_id.is_none() && !spec.no_spawn;
     if newly_spawned {
-        let spawned = crate::session::spawn_agent_session(&agent, &work_cwd)
-            .map_err(|e| io::Error::other(format!("spawn {agent} worker session: {e}")))?;
+        let spawned = crate::session::spawn_agent_session_on_target(
+            &target,
+            &agent,
+            spec.account.clone(),
+            &work_cwd,
+        )
+        .map_err(|e| io::Error::other(format!("spawn {agent} worker session: {e}")))?;
         session_id = Some(spawned);
     }
 
-    let dispatch = match OrchestrationStore::mutate(state_dir, |s| {
-        s.start_worker(
-            &run_id,
-            task_id.as_deref(),
-            &worker_name,
-            &agent,
+    let dispatch_res: io::Result<Dispatch> = match ctx.try_ipc(
+        &OrchAction::StartWorker {
+            run_id: run_id.clone(),
+            task_id: spec.task_id.clone(),
+            worker_name: worker_name.clone(),
+            agent: agent.clone(),
             session_id,
-            &cwd_str,
-            &prompt,
-        )
-    }) {
+            cwd: cwd_str.clone(),
+            prompt: prompt.clone(),
+            depth,
+            max_depth,
+        },
+        Duration::from_secs(2),
+    ) {
+        Ok(Some(OrchResponse::Dispatch(d))) => Ok(d),
+        Ok(_) => OrchestrationStore::mutate(ctx.state_dir, |s| {
+            s.validate_worker_start_with_depth(
+                &run_id,
+                spec.task_id.as_deref(),
+                &worker_name,
+                depth,
+                max_depth,
+            )?;
+            s.start_worker(
+                &run_id,
+                spec.task_id.as_deref(),
+                &worker_name,
+                &agent,
+                session_id,
+                &cwd_str,
+                &prompt,
+            )
+        }),
+        Err(e) => Err(e),
+    };
+    let dispatch = match dispatch_res {
         Ok(d) => d,
         Err(e) => {
             if newly_spawned && let Some(sid) = session_id {
-                crate::session::close_session(sid).ok();
+                crate::session::close_session_on_target(&target, sid).ok();
             }
             return Err(e);
         }
     };
 
     let delivered = dispatch.session_id.map_or(Ok(()), |sid| {
-        let target = crate::remote::Target::establish(None).map_err(|e| e.to_string())?;
-        let preamble = worker_preamble(&dispatch).replace('\n', " | ");
+        let preamble = worker_preamble(&dispatch);
         if newly_spawned {
             crate::session::wait_for_spawned_agent_ready(
                 &target,
@@ -375,7 +780,12 @@ fn cmd_worker_start(state_dir: &Path, args: &[String]) -> io::Result<()> {
     delivered.map_err(|e| io::Error::other(format!("worker {}: {e}", dispatch.worker_name)))
 }
 
+#[cfg(test)]
 fn cmd_send(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_send_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_send_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut from = None;
     let mut to = None;
     let mut msg_type = MessageType::Status;
@@ -420,7 +830,13 @@ fn cmd_send(state_dir: &Path, args: &[String]) -> io::Result<()> {
         outcome,
         reply_to: None,
     };
-    let created = OrchestrationStore::mutate(state_dir, |s| s.send_message(&params))?;
+    let created = match ctx.try_ipc(
+        &OrchAction::SendMessage(params.clone()),
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Messages(m)) => m,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.send_message(&params))?,
+    };
     if json {
         print_json(&created)?;
     } else {
@@ -438,7 +854,12 @@ fn cmd_send(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_check(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_check_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut to = None;
     let mut types = Vec::new();
     let mut unread_only = false;
@@ -470,23 +891,37 @@ fn cmd_check(state_dir: &Path, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let start = Instant::now();
-    let deadline = Duration::from_millis(timeout_ms);
-    let messages = loop {
-        let mut preview_store = OrchestrationStore::load(state_dir)?;
-        let preview = preview_store.check_messages(to.as_deref(), &types, unread_only, false);
-        if !preview.is_empty() {
-            if ack {
-                break OrchestrationStore::mutate(state_dir, |s| {
-                    Ok(s.check_messages(to.as_deref(), &types, unread_only, true))
-                })?;
+    let wait_ms = if wait { timeout_ms } else { 0 };
+    let deadline = Duration::from_millis(wait_ms);
+    let messages = if let Some(OrchResponse::Messages(m)) = ctx.try_ipc(
+        &OrchAction::CheckMessages {
+            recipient: to.clone(),
+            types: types.clone(),
+            unread_only,
+            ack,
+            wait_ms,
+        },
+        deadline,
+    )? {
+        m
+    } else {
+        let start = Instant::now();
+        loop {
+            let mut preview_store = OrchestrationStore::load(ctx.state_dir)?;
+            let preview = preview_store.check_messages(to.as_deref(), &types, unread_only, false);
+            if !preview.is_empty() {
+                if ack {
+                    break OrchestrationStore::mutate(ctx.state_dir, |s| {
+                        Ok(s.check_messages(to.as_deref(), &types, unread_only, true))
+                    })?;
+                }
+                break preview;
             }
-            break preview;
+            if !wait || start.elapsed() >= deadline {
+                break Vec::new();
+            }
+            std::thread::sleep(Duration::from_millis(80));
         }
-        if !wait || start.elapsed() >= deadline {
-            break Vec::new();
-        }
-        std::thread::sleep(Duration::from_millis(80));
     };
     if json {
         print_json(&messages)?;
@@ -507,7 +942,12 @@ fn cmd_check(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_ask(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_ask_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut from = None;
     let mut to = None;
     let mut summary = None;
@@ -540,20 +980,25 @@ fn cmd_ask(state_dir: &Path, args: &[String]) -> io::Result<()> {
     let from = from.ok_or_else(|| bad_arg("missing --from"))?;
     let to = to.ok_or_else(|| bad_arg("missing --to"))?;
     let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
-    let sent = OrchestrationStore::mutate(state_dir, |s| {
-        s.send_message(&SendParams {
-            from: from.clone(),
-            to,
-            msg_type: MessageType::Question,
-            summary,
-            body,
-            run_id,
-            task_id,
-            dispatch_id: None,
-            outcome: None,
-            reply_to: None,
-        })
-    })?;
+    let params = SendParams {
+        from: from.clone(),
+        to,
+        msg_type: MessageType::Question,
+        summary,
+        body,
+        run_id,
+        task_id,
+        dispatch_id: None,
+        outcome: None,
+        reply_to: None,
+    };
+    let sent = match ctx.try_ipc(
+        &OrchAction::SendMessage(params.clone()),
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Messages(m)) => m,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.send_message(&params))?,
+    };
     let question = sent
         .into_iter()
         .next()
@@ -568,10 +1013,31 @@ fn cmd_ask(state_dir: &Path, args: &[String]) -> io::Result<()> {
         return Ok(());
     }
 
-    let start = Instant::now();
     let deadline = Duration::from_millis(timeout_ms);
+    if let Some(OrchResponse::Answer(ans_opt)) = ctx.try_ipc(
+        &OrchAction::WaitAnswer {
+            question_id: question.id.clone(),
+            wait_ms: timeout_ms,
+        },
+        deadline,
+    )? {
+        if let Some(ans) = ans_opt {
+            if json {
+                print_json(&ans)?;
+            } else {
+                println!("{}\tanswer\t{}", ans.id, ans.body);
+            }
+        } else if json {
+            print_json(&question)?;
+        } else {
+            println!("{}\tpending\t{}", question.id, question.summary);
+        }
+        return Ok(());
+    }
+
+    let start = Instant::now();
     loop {
-        let store = OrchestrationStore::load(state_dir)?;
+        let store = OrchestrationStore::load(ctx.state_dir)?;
         if let Some(ans) = store
             .messages
             .iter()
@@ -596,7 +1062,12 @@ fn cmd_ask(state_dir: &Path, args: &[String]) -> io::Result<()> {
     }
 }
 
+#[cfg(test)]
 fn cmd_reply(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_reply_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let Some((msg_id, rest)) = args.split_first() else {
         return Err(bad_arg("missing <msg-id>"));
     };
@@ -615,7 +1086,17 @@ fn cmd_reply(state_dir: &Path, args: &[String]) -> io::Result<()> {
         }
     }
     let body = body.ok_or_else(|| bad_arg("missing --body"))?;
-    let reply = OrchestrationStore::mutate(state_dir, |s| s.reply_message(msg_id, &from, &body))?;
+    let reply = match ctx.try_ipc(
+        &OrchAction::ReplyMessage {
+            question_id: msg_id.clone(),
+            from: from.clone(),
+            body: body.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Message(m)) => m,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(msg_id, &from, &body))?,
+    };
     if json {
         print_json(&reply)?;
     } else {
@@ -624,7 +1105,12 @@ fn cmd_reply(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_gate_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_gate_create_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_gate_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut from = "worker".to_owned();
     let mut question = None;
     let mut options = Vec::new();
@@ -658,9 +1144,21 @@ fn cmd_gate_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
     if options.is_empty() {
         options = vec!["approve".to_owned(), "reject".to_owned()];
     }
-    let gate = OrchestrationStore::mutate(state_dir, |s| {
-        s.create_gate(&from, &question, options, run_id, task_id)
-    })?;
+    let gate = match ctx.try_ipc(
+        &OrchAction::CreateGate {
+            from: from.clone(),
+            question: question.clone(),
+            options: options.clone(),
+            run_id: run_id.clone(),
+            task_id: task_id.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Gate(g)) => g,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
+            s.create_gate(&from, &question, options, run_id, task_id)
+        })?,
+    };
     if json {
         print_json(&gate)?;
     } else {
@@ -669,10 +1167,15 @@ fn cmd_gate_create(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_gate_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_gate_list_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_gate_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let pending_only = args.iter().any(|a| a == "--pending");
     let json = args.iter().any(|a| a == "--json");
-    let store = OrchestrationStore::load(state_dir)?;
+    let store = ctx.load_store()?;
     let gates: Vec<_> = store
         .gates
         .into_iter()
@@ -696,7 +1199,12 @@ fn cmd_gate_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_gate_resolve(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_gate_resolve_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_gate_resolve_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let Some((gate_id, rest)) = args.split_first() else {
         return Err(bad_arg("missing <gate-id>"));
     };
@@ -717,9 +1225,20 @@ fn cmd_gate_resolve(state_dir: &Path, args: &[String]) -> io::Result<()> {
         }
     }
     let decision = decision.ok_or_else(|| bad_arg("missing --decision"))?;
-    let gate = OrchestrationStore::mutate(state_dir, |s| {
-        s.resolve_gate(gate_id, &decision, rationale, &by)
-    })?;
+    let gate = match ctx.try_ipc(
+        &OrchAction::ResolveGate {
+            gate_id: gate_id.clone(),
+            decision: decision.clone(),
+            rationale: rationale.clone(),
+            resolved_by: by.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Gate(g)) => g,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
+            s.resolve_gate(gate_id, &decision, rationale, &by)
+        })?,
+    };
     if json {
         print_json(&gate)?;
     } else {
@@ -733,7 +1252,12 @@ fn cmd_gate_resolve(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_worker_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_worker_list_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_worker_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut run_filter = None;
     let mut json = false;
     let mut it = args.iter();
@@ -744,7 +1268,7 @@ fn cmd_worker_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let store = OrchestrationStore::load(state_dir)?;
+    let store = ctx.load_store()?;
     let workers: Vec<_> = store
         .dispatches
         .into_iter()
@@ -770,12 +1294,17 @@ fn cmd_worker_list(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_worker_show(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_worker_show_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_worker_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let Some((target, rest)) = args.split_first() else {
         return Err(bad_arg("missing <worker-or-dispatch>"));
     };
     let json = rest.iter().any(|a| a == "--json");
-    let store = OrchestrationStore::load(state_dir)?;
+    let store = ctx.load_store()?;
     let Some(disp) = store
         .dispatches
         .iter()
@@ -807,8 +1336,8 @@ fn cmd_worker_show(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_worker_read(state_dir: &Path, args: &[String]) -> io::Result<()> {
-    let Some((target, rest)) = args.split_first() else {
+fn cmd_worker_read_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let Some((target_name, rest)) = args.split_first() else {
         return Err(bad_arg("missing <worker-or-dispatch>"));
     };
     let mut lines = 40_usize;
@@ -826,23 +1355,24 @@ fn cmd_worker_read(state_dir: &Path, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let store = OrchestrationStore::load(state_dir)?;
+    let store = ctx.load_store()?;
     let Some(disp) = store
         .dispatches
         .iter()
         .rev()
-        .find(|d| d.id == *target || d.worker_name == *target)
+        .find(|d| d.id == *target_name || d.worker_name == *target_name)
     else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!("worker not found: {target}"),
+            format!("worker not found: {target_name}"),
         ));
     };
+    let target = ctx.effective_target()?;
     let mut screen_text = match (disp.status, disp.session_id) {
         (krill_proto::orchestration::DispatchStatus::Released, _) | (_, None) => {
             disp.archived_output.clone().unwrap_or_default()
         }
-        (_, Some(sid)) => crate::session::capture_session_text(sid)
+        (_, Some(sid)) => crate::session::capture_session_text_on_target(&target, sid)
             .ok()
             .or_else(|| disp.archived_output.clone())
             .unwrap_or_default(),
@@ -866,61 +1396,71 @@ fn cmd_worker_read(state_dir: &Path, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn cmd_worker_stop(state_dir: &Path, args: &[String], release: bool) -> io::Result<()> {
-    let Some((target, rest)) = args.split_first() else {
+    cmd_worker_stop_ctx(&OrchCtx::local(state_dir), args, release)
+}
+
+fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io::Result<()> {
+    let Some((target_name, rest)) = args.split_first() else {
         return Err(bad_arg("missing <worker-or-dispatch>"));
     };
     if let Some(arg) = rest.iter().find(|a| *a != "--json") {
         return Err(bad_arg(format!("unexpected argument {arg}")));
     }
     let json = rest.iter().any(|a| a == "--json");
-    let store = OrchestrationStore::load(state_dir)?;
+    let store = ctx.load_store()?;
     let selected = store
         .dispatches
         .iter()
         .rev()
-        .find(|d| d.id == *target || d.worker_name == *target)
+        .find(|d| d.id == *target_name || d.worker_name == *target_name)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("worker not found: {target}"),
+                format!("worker not found: {target_name}"),
             )
         })?;
+    let target = ctx.effective_target()?;
     let captured = match selected.session_id {
         Some(sid) if selected.status != krill_proto::orchestration::DispatchStatus::Released => {
-            match crate::session::capture_session_text(sid) {
+            match crate::session::capture_session_text_on_target(&target, sid) {
                 Ok(text) => Some(text),
                 Err(capture_err) => settle_missing_session_capture(
                     &selected.worker_name,
                     sid,
                     capture_err,
                     selected.archived_output.clone(),
-                    session_present(sid),
+                    session_present_on_target(&target, sid),
                 )?,
             }
         }
         _ => selected.archived_output.clone(),
     };
-    // Persist terminal output before closing. Failure must leave the dispatch status unchanged.
-    if let Some(text) = captured {
-        OrchestrationStore::mutate(state_dir, |s| {
+    // Persist terminal output before closing when using local store fallback.
+    // Failure to close must leave the dispatch status unchanged.
+    if let Some(ref text) = captured
+        && !ctx.is_remote()
+        && ctx.state_dir.join("orchestration.json").exists()
+    {
+        OrchestrationStore::mutate(ctx.state_dir, |s| {
             let stored = s
                 .dispatches
                 .iter_mut()
                 .find(|d| d.id == selected.id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "dispatch missing"))?;
-            stored.archived_output = Some(text);
+            stored.archived_output = Some(text.clone());
             Ok(())
         })?;
     }
-    let disp = complete_worker_stop(state_dir, &selected.id, release, || {
+    let disp = complete_worker_stop_ctx(ctx, &selected.id, release, captured, || {
         if selected.status != krill_proto::orchestration::DispatchStatus::Released
             && let Some(sid) = selected.session_id
-            && crate::session::list_session_ids()
+            && crate::session::list_session_ids_on_target(&target)
                 .map_err(io::Error::other)?
                 .contains(&sid)
         {
-            crate::session::close_session(sid).map_err(io::Error::other)?;
+            crate::session::close_session_on_target(&target, sid).map_err(io::Error::other)?;
         }
         Ok(())
     })?;
@@ -937,21 +1477,106 @@ fn cmd_worker_stop(state_dir: &Path, args: &[String], release: bool) -> io::Resu
     Ok(())
 }
 
+fn cmd_worker_abandon_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let Some((target_name, rest)) = args.split_first() else {
+        return Err(bad_arg("missing <worker-or-dispatch>"));
+    };
+    if let Some(arg) = rest.iter().find(|a| *a != "--json") {
+        return Err(bad_arg(format!("unexpected argument {arg}")));
+    }
+    let json = rest.iter().any(|a| a == "--json");
+    let store = ctx.load_store()?;
+    let selected = store
+        .dispatches
+        .iter()
+        .rev()
+        .find(|d| d.id == *target_name || d.worker_name == *target_name)
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("worker not found: {target_name}"),
+            )
+        })?;
+    let target = ctx.effective_target()?;
+    if let Some(sid) = selected.session_id
+        && let Ok(ids) = crate::session::list_session_ids_on_target(&target)
+        && ids.contains(&sid)
+    {
+        crate::session::close_session_on_target(&target, sid).ok();
+    }
+    let disp = match ctx.try_ipc(
+        &OrchAction::AbandonWorker {
+            worker_or_dispatch: selected.id.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Dispatch(d)) => d,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.abandon_worker(&selected.id))?,
+    };
+    if json {
+        print_json(&disp)?;
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            disp.id,
+            disp.worker_name,
+            disp.status.as_str()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn complete_worker_stop(
     state_dir: &Path,
     dispatch_id: &str,
     release: bool,
     close: impl FnOnce() -> io::Result<()>,
 ) -> io::Result<krill_proto::orchestration::Dispatch> {
+    complete_worker_stop_ctx(
+        &OrchCtx::local(state_dir),
+        dispatch_id,
+        release,
+        None,
+        close,
+    )
+}
+
+fn complete_worker_stop_ctx(
+    ctx: &OrchCtx<'_>,
+    dispatch_id: &str,
+    release: bool,
+    archived_output: Option<String>,
+    close: impl FnOnce() -> io::Result<()>,
+) -> io::Result<krill_proto::orchestration::Dispatch> {
     close()?;
-    OrchestrationStore::mutate(state_dir, |s| {
-        s.stop_or_release_worker(dispatch_id, release)
-    })
+    match ctx.try_ipc(
+        &OrchAction::StopOrReleaseWorker {
+            worker_or_dispatch: dispatch_id.to_owned(),
+            release,
+            archived_output: archived_output.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Dispatch(d)) => Ok(d),
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
+            if let Some(text) = archived_output
+                && let Some(stored) = s.dispatches.iter_mut().find(|d| d.id == dispatch_id)
+            {
+                stored.archived_output = Some(text);
+            }
+            s.stop_or_release_worker(dispatch_id, release)
+        }),
+    }
 }
 
 /// `worker-start --session <id>`용 세션 존재 확인. 데몬에 닿지 않으면 그 오류를 그대로 돌려준다.
-fn ensure_worker_session_exists(worker: &str, sid: u64) -> io::Result<()> {
-    match crate::session::list_session_ids() {
+fn ensure_worker_session_exists_on_target(
+    target: &Target,
+    worker: &str,
+    sid: u64,
+) -> io::Result<()> {
+    match crate::session::list_session_ids_on_target(target) {
         Ok(ids) => reject_missing_worker_session(worker, sid, &ids),
         Err(e) => Err(io::Error::other(format!("worker {worker}: {e}"))),
     }
@@ -970,8 +1595,8 @@ fn reject_missing_worker_session(worker: &str, sid: u64, sessions: &[u64]) -> io
 }
 
 /// 데몬 세션 목록에서 존재 여부를 확인한다. 데몬에 닿지 않으면 `None`(모름 → 기존 실패 유지).
-fn session_present(sid: u64) -> Option<bool> {
-    crate::session::list_session_ids()
+fn session_present_on_target(target: &Target, sid: u64) -> Option<bool> {
+    crate::session::list_session_ids_on_target(target)
         .ok()
         .map(|ids| ids.contains(&sid))
 }
@@ -998,7 +1623,12 @@ fn settle_missing_session_capture(
     Err(io::Error::other(capture_err))
 }
 
+#[cfg(test)]
 fn cmd_reset(state_dir: &Path, args: &[String]) -> io::Result<()> {
+    cmd_reset_ctx(&OrchCtx::local(state_dir), args)
+}
+
+fn cmd_reset_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut run_id = None;
     let mut json = false;
     let mut it = args.iter();
@@ -1009,10 +1639,20 @@ fn cmd_reset(state_dir: &Path, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    OrchestrationStore::mutate(state_dir, |s| {
-        s.reset(run_id.as_deref());
-        Ok(())
-    })?;
+    if ctx
+        .try_ipc(
+            &OrchAction::Reset {
+                run_id: run_id.clone(),
+            },
+            Duration::from_secs(2),
+        )?
+        .is_none()
+    {
+        OrchestrationStore::mutate(ctx.state_dir, |s| {
+            s.reset(run_id.as_deref());
+            Ok(())
+        })?;
+    }
     if json {
         print_json(&serde_json::json!({ "reset": true, "run": run_id }))?;
     } else {
@@ -1383,6 +2023,107 @@ mod tests {
             assert_eq!(result.unwrap_err().to_string(), "injected close failure");
             assert_eq!(OrchestrationStore::load(&dir)?, before);
         }
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn run_use_spec_abandon_and_depth_guard_work() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("mk-cli-orch-spec-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let ctx = OrchCtx::local(&dir);
+        cmd_run_create_ctx(&ctx, &args(&["--title", "Run One", "--json"]))?;
+        cmd_run_create_ctx(&ctx, &args(&["--title", "Run Two", "--json"]))?;
+        let runs = OrchestrationStore::load(&dir)?.runs;
+        let run1 = &runs[0].id;
+        let run2 = &runs[1].id;
+
+        cmd_run_use_ctx(&ctx, &args(&[run1, "--json"]))?;
+        cmd_run_current_ctx(&ctx, &args(&["--json"]))?;
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.current_run_id.as_deref(),
+            Some(run1.as_str())
+        );
+
+        // task-create without --run uses current_run_id (run1)
+        cmd_task_create_ctx(&ctx, &args(&["--title", "Task via active run", "--json"]))?;
+        let task = OrchestrationStore::load(&dir)?
+            .tasks
+            .first()
+            .unwrap()
+            .clone();
+        assert_eq!(&task.run_id, run1);
+
+        // worker-start with --spec JSON and depth guard
+        let spec_json = serde_json::json!({
+            "task_id": task.id,
+            "worker": "spec-w1",
+            "agent": "codex",
+            "cwd": dir.to_string_lossy(),
+            "prompt": "Line 1\nLine 2",
+            "depth": 1,
+            "max_depth": 2,
+            "no_spawn": true,
+        })
+        .to_string();
+        cmd_worker_start_ctx(&ctx, &args(&["--spec", &spec_json, "--json"]))?;
+        let d1 = OrchestrationStore::load(&dir)?
+            .dispatches
+            .first()
+            .unwrap()
+            .clone();
+        assert_eq!(d1.worker_name, "spec-w1");
+        assert_eq!(d1.status, DispatchStatus::Active);
+
+        // Exceeding max_depth is rejected
+        assert!(
+            cmd_worker_start_ctx(
+                &ctx,
+                &args(&[
+                    "--worker",
+                    "too-deep",
+                    "--prompt",
+                    "p",
+                    "--depth",
+                    "3",
+                    "--max-depth",
+                    "2",
+                    "--no-spawn"
+                ])
+            )
+            .is_err()
+        );
+
+        // Abandoning d1 frees the task for replacement
+        cmd_worker_abandon_ctx(&ctx, &args(&["spec-w1", "--json"]))?;
+        cmd_worker_start_ctx(
+            &ctx,
+            &args(&[
+                "--task",
+                &task.id,
+                "--worker",
+                "spec-w2",
+                "--cwd",
+                &dir.to_string_lossy(),
+                "--prompt",
+                "Retry",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let d2 = OrchestrationStore::load(&dir)?
+            .dispatches
+            .get(1)
+            .unwrap()
+            .clone();
+        assert_eq!(d2.worker_name, "spec-w2");
+        assert_eq!(d2.status, DispatchStatus::Active);
+
+        cmd_run_use_ctx(&ctx, &args(&[run2]))?;
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.current_run_id.as_deref(),
+            Some(run2.as_str())
+        );
+        cmd_run_use_ctx(&ctx, &args(&["--clear"]))?;
         std::fs::remove_dir_all(dir)
     }
 }
