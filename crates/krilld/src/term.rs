@@ -2,7 +2,7 @@
 //!
 //! 엔진을 바꾸거나 MK-006의 좁은 포크(잠정 결정)를 되돌리면 이 파일만 다시 쓴다.
 //!
-//! # 질의 응답 (MK-020, 응답 주체 표는 docs/spikes/MK-008.md §2)
+//! # 질의 응답 (MK-020, 응답 주체 표는 비공개 MK-008 스파이크 기록 §2)
 //!
 //! - alacritty가 내는 응답 이벤트를 질의 순서 그대로 모아 한 문자열로 돌려준다. 세 에이전트 모두 DA1을 질의 묶음의
 //!   센티널로 쓰므로 순서가 바뀌면 안 된다(MK-008 결정 5).
@@ -253,7 +253,7 @@ impl Engine {
     /// 남은 버퍼 용량도 돌려준다. 버린 행은 세그먼트(MK-024) 콜드 페이지에 있다.
     pub(crate) fn demote(&mut self, look: &Appearance) {
         self.set_history(0, look);
-        // `set_options`만으로는 alacritty가 캐시 1,000행을 남긴다(docs/spikes/MK-009.md 원인 3).
+        // `set_options`만으로는 alacritty가 캐시 1,000행을 남긴다(비공개 MK-009 스파이크 기록 원인 3).
         // ponytail: 대체 화면 중에는 기본 화면 grid가 비활성이라 공개 API로 truncate할 수 없어 캐시가 최대 1,000행
         // 남는다. 대체 화면을 오래 쓰는 에이전트가 문제가 되면 좁은 포크(MK-006)로 비활성 grid도 자른다.
         self.term.grid_mut().truncate();

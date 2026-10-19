@@ -1,4 +1,4 @@
-//! exec 핸드오프 환경변수 이름은 구 holder와의 계약이다(mk→krill 개명 감사, docs/testing/audit-2026-10-17/rename.md).
+//! exec 핸드오프 환경변수 이름은 구 holder와의 계약이다(mk→krill 개명 감사, 비공개 2026-10-17 감사 기록).
 //! 운영 중인 구 holder는 `MK_HOLDER_STATE`로 새 holder를 exec한다. 새 holder가 이 이름을 읽지 않으면
 //! 넘겨받은 세션 fd를 버리고 빈 holder로 시작해 세션을 잃는다.
 

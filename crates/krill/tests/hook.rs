@@ -2,7 +2,7 @@
 //! 받으면 spool에 쓰지 않고, 못 받으면(없음·죽은 소켓·hook 미지원·ACK 없음) spool에 붙인다. krilld 자리에는
 //! `krill_proto`로 만든 가짜 서버를 둔다(실제 krilld의 hook 수신은 MK-039).
 //!
-//! 지연 측정(200회 p50·p95)은 `bench_200`(`--run-ignored only`, docs/spikes/MK-038.md).
+//! 지연 측정(200회 p50·p95)은 `bench_200`(`--run-ignored only`, 비공개 MK-038 스파이크 기록).
 
 #![cfg_attr(
     unix,
