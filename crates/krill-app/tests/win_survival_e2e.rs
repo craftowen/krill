@@ -6,8 +6,8 @@
 //!    재생과 SHA-256·바이트 수가 같아야 한다(Gap 0, 누락 줄 0).
 //! 2. [`krilld_taskkill_during_output`]: 출력이 흐르는 중 krilld를 `taskkill /F` → holder가 새 krilld를 띄우고 세션이
 //!    산다. 손실은 ARCHITECTURE §4.1대로 생길 수 있어 단언하지 않고 잰다(재생 Gap·누락 줄).
-//! 3. [`holder_taskkill_keeps_orphan_serving`]: holder를 `taskkill /F` → krilld가 고아 세션을 계속 서빙하고 새 세션은
-//!    거절한다. 이어 krilld까지 죽이면 무엇이 남는지 기록한다(새 holder `Adopt`는 미구현).
+//! 3. [`holder_taskkill_adopts_without_loss`]: holder를 `taskkill /F` → 새 holder Adopt → 기존 세션
+//!    원본 SHA-256·줄 무손실, 새 세션 생성·크기 변경·종료, 잔여 프로세스 0을 확인한다.
 //! 4. [`big_output_and_alt_screen_hash`]: 수 MB 출력(`type`)과 대체 화면 TUI에서 실시간 원본과 재생 원본의 SHA-256이
 //!    같고, 생성한 줄이 빠짐없이 화면 출력에 있다.
 //!
@@ -1031,7 +1031,14 @@ fn krilld_taskkill_during_output() {
 
 #[test]
 #[ignore = "Windows 비밀번호 로그온 + release holder·krilld 필요(OWE-836)"]
-fn holder_taskkill_keeps_orphan_serving() {
+fn holder_taskkill_adopts_without_loss() {
+    for round in 0..env_num("KRILL_E2E_HOLDER_KILLS", 1) {
+        say(&format!("HOLDER_ROUND {round}"));
+        holder_adopt_round();
+    }
+}
+
+fn holder_adopt_round() {
     let mut rig = Rig::new("holder");
     let (holder, krilld) = rig.launch();
     let mut c = rig.control();
@@ -1059,13 +1066,27 @@ fn holder_taskkill_keeps_orphan_serving() {
             rows: 25,
         }),
     );
-    // 앱식 재접속: Windows는 Adopt 전까지 새 holder를 띄우지 않고 고아 krilld에 그대로 붙는다(daemon::ready_handshake).
+    // Standard app reconnect starts a replacement holder and waits for Adopt.
     let t_re = Instant::now();
-    let (mut child, rx) = spawn("launch", &rig.dir, &[]);
-    let reconnect = rx.recv_timeout(WAIT * 2).unwrap().replace(' ', ":");
-    child.wait().unwrap();
+    let (new_holder, new_krilld, launched) = rig.launch_full();
     let reconnect_ms = ms(t_re.elapsed());
+    assert!(launched && new_holder != holder && new_krilld != krilld);
+    assert!(wait_dead(krilld, WAIT), "orphan daemon did not retire");
+    assert!(alive(pid), "adopted session died");
+    drop(c);
+    let mut c = rig.control();
+    let (created, new_pid) = create(&mut c, &rig.dir);
+    rig.pids.push(new_pid);
+    type_line(
+        &rig.paths,
+        created,
+        "echo NEW_%COMPUTERNAME:~0,0%SESSION_OK",
+    );
+    wait_screen(&mut c, created, "new session input", |s| {
+        has_line(s, "NEW_SESSION_OK")
+    });
     let strays = rig.strays("");
+    assert!(strays.is_empty(), "unexpected processes {strays:?}");
     fs::write(rig.dir.join("stop"), b"").unwrap();
     wait_live(&live, "generator end", |b| {
         end_count(&plain(b), b'H').is_some()
@@ -1086,47 +1107,54 @@ fn holder_taskkill_keeps_orphan_serving() {
     let (seen, bad) = numbers(&plain(&full), b'H');
     say(&format!(
         "RESULT holder_kill lines={total} bytes={} gaps={} missing={} bad_tag={bad} sha_equal={} \
-         create_after={rejected:?} reconnect={reconnect} reconnect_ms={reconnect_ms:.0} strays={strays:?} \
-         krilld_alive={} session_alive={}",
+         create_orphan={rejected:?} new_session={} reconnect_ms={reconnect_ms:.0} strays={strays:?} \
+         krilld_alive={} session_alive={} sha256={}",
         full.len(),
         gaps.len(),
         missing(&seen, total),
         sha(&full) == sha(&live_bytes[..full.len().min(live_bytes.len())]),
-        alive(krilld),
+        created.0,
+        alive(new_krilld),
         alive(pid),
+        sha(&full),
     ));
     assert!(
         matches!(rejected, Reply::Failed(_)),
         "orphan create {rejected:?}"
     );
     assert!(
-        gaps.is_empty() && missing(&seen, total) == 0,
-        "orphan output lost"
+        gaps.is_empty() && missing(&seen, total) == 0 && bad == 0,
+        "adopted output lost"
     );
-    drop(c);
-    for &p in &strays {
-        taskkill(p, true);
-    }
-
-    // 이어서 krilld도 죽인다(holder·krilld 동시 소실). 새 holder Adopt는 미구현이라 결과만 기록한다.
-    assert!(taskkill(krilld, false));
-    assert!(wait_dead(krilld, WAIT));
-    let session_dead = wait_dead(pid, Duration::from_secs(10));
-    let (_, _, fresh_launched) = rig.launch_full();
-    let mut c = rig.control();
-    let listed = request(&mut c, &Request::List);
-    // 디스크 기록의 마지막 화면(읽기 전용 콜드 화면, MK-032).
-    let cold = pane::load_cold(&rig.paths, session).map(|v| {
-        let mut p: Pane<pane::Writer> = Pane::default();
-        p.show_cold(session, v).unwrap();
-        let rows: Vec<String> = texts(&p).into_iter().filter(|t| !t.is_empty()).collect();
-        let tail = rows[rows.len().saturating_sub(3)..].join("|");
-        (rows.iter().any(|t| t == "ORPHAN_INPUT_OK"), tail)
-    });
-    say(&format!(
-        "RESULT holder_then_krilld_kill session_dead_10s={session_dead} fresh_launched={fresh_launched} \
-         list={listed:?} cold_has_last_screen={cold:?}"
+    assert_eq!(full, live_bytes[..full.len()], "Adopt SHA-256 mismatch");
+    assert!(live.lock().unwrap().gaps.is_empty(), "live stream Gap");
+    assert!(matches!(
+        request(
+            &mut c,
+            &Request::Resize {
+                session,
+                cols: 90,
+                rows: 30
+            }
+        ),
+        Reply::Resized
     ));
+    // The original Job and IOCP must remain usable for both restored and new sessions.
+    for (id, process) in [(session, pid), (created, new_pid)] {
+        assert!(matches!(
+            request(&mut c, &Request::Close { session: id }),
+            Reply::Closed
+        ));
+        assert!(wait_dead(process, WAIT), "session survived close");
+    }
+    drop(c);
+    assert!(taskkill(new_holder, false));
+    assert!(wait_dead(new_holder, WAIT));
+    assert!(taskkill(new_krilld, false));
+    assert!(wait_dead(new_krilld, WAIT));
+    let remaining = rig.strays("");
+    assert!(remaining.is_empty(), "remaining processes {remaining:?}");
+    say("RESULT holder_adopt_cleanup remaining_holder_krilld=0");
 }
 
 #[test]

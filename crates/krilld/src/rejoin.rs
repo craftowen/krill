@@ -29,22 +29,29 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
-use krill_proto::holder::{FromHolder, STATUS_UNKNOWN, ToHolder};
+#[cfg(unix)]
+use krill_proto::holder::ToHolder;
+use krill_proto::holder::{FromHolder, STATUS_UNKNOWN};
 use krill_proto::os::net::{UnixListener, UnixStream};
 
-#[cfg(unix)]
 use crate::holder;
-use crate::holder::Kept;
+#[cfg(unix)]
 use crate::holder::link::Link;
+use crate::holder::{Kept, Master};
 use crate::ipc::{Listener, with_suffix};
-use crate::os::{AsFd, OwnedFd};
+use crate::os::AsFd;
 use crate::registry::Registry;
 use crate::sys::{self, ExitWatch};
 
 /// 인계 소켓 이름 = 소켓 경로 + 이 접미사. `.tmp`와 길이가 같아 [`Listener::bind`]의 경로 길이 검사 안에 든다.
 const SUFFIX: &str = ".hnd";
-/// 인계 중 상대를 기다리는 최대 시간(멈춘 상대가 고아 krilld를 붙잡지 못하게).
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::SocketLink as HandoffLink;
 #[cfg(unix)]
+type HandoffLink = Link;
+/// 인계 중 상대를 기다리는 최대 시간(멈춘 상대가 고아 krilld를 붙잡지 못하게).
 const PEER_TIMEOUT: Duration = Duration::from_secs(10);
 /// 리더가 멈추기를 기다리는 최대 시간. 리더는 읽은 묶음 하나(최대 64KiB)를 엔진에 넣고 멈춘다.
 const HALT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -114,12 +121,14 @@ fn watch_exits(reg: &Arc<Registry>) {
 }
 
 /// 리더를 멈추고 세션을 모두 넘긴 뒤 상대의 `Ready`를 기다린다.
-#[cfg(unix)]
 fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     halt_all(reg)?;
     s.set_read_timeout(Some(PEER_TIMEOUT))?;
     s.set_write_timeout(Some(PEER_TIMEOUT))?;
+    #[cfg(unix)]
     let mut link = Link::new(crate::os::link_fd(s)?);
+    #[cfg(windows)]
+    let mut link = HandoffLink::new(s)?;
     let hello = FromHolder::Hello {
         version: krill_proto::holder::VERSION,
         holder_pid: std::process::id(),
@@ -142,12 +151,6 @@ fn give(reg: &Registry, s: UnixStream) -> io::Result<()> {
     }
 }
 
-/// Windows 고아 세션은 계속 서빙한다. 새 holder의 Adopt·Job 복원은 후속 작업이다.
-#[cfg(windows)]
-fn give(_reg: &Registry, _stream: UnixStream) -> io::Result<()> {
-    Err(io::ErrorKind::Unsupported.into())
-}
-
 /// PTY 리더를 모두 멈추고(읽은 묶음은 기록·세그먼트 봉인까지) 끝나기를 기다린다. 되돌릴 수 없다.
 /// 인계와 업그레이드([`crate::upgrade`])가 쓴다.
 pub(crate) fn halt_all(reg: &Registry) -> io::Result<()> {
@@ -168,7 +171,7 @@ fn all_halted(reg: &Registry) -> bool {
     all
 }
 
-fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Result<()> {
+fn send(link: &HandoffLink, m: &FromHolder, with: Option<&crate::Session>) -> io::Result<()> {
     let frame = m
         .encode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
@@ -176,7 +179,7 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
         #[cfg(unix)]
         Some(s) => link.send(&frame, &[s.master()]),
         #[cfg(windows)]
-        Some(_) => Err(io::ErrorKind::Unsupported.into()),
+        Some(s) => link.send_session(m, s.master()),
         None => link.send(&frame, &[]),
     }
 }
@@ -185,8 +188,7 @@ fn send(link: &Link, m: &FromHolder, with: Option<&crate::Session>) -> io::Resul
 /// [`Handover::finish`] 순서로 쓴다.
 #[derive(Debug)]
 pub struct Handover {
-    link: Link,
-    #[cfg(unix)]
+    link: HandoffLink,
     sessions: Vec<Kept>,
 }
 
@@ -205,10 +207,15 @@ impl Handover {
         Ok(Self { link, sessions })
     }
 
-    /// Windows에서는 Unix 소켓 기반 fd 재결합을 사용하지 않는다.
+    /// Windows uses authenticated `AF_UNIX` with process-local `DuplicateHandle` values.
     #[cfg(windows)]
-    pub fn take(_sock: &Path) -> io::Result<Self> {
-        Err(io::ErrorKind::Unsupported.into())
+    pub fn take(sock: &Path) -> io::Result<Self> {
+        let stream = UnixStream::connect(handoff_path(sock))?;
+        stream.set_read_timeout(Some(PEER_TIMEOUT))?;
+        stream.set_write_timeout(Some(PEER_TIMEOUT))?;
+        let mut link = HandoffLink::new(stream)?;
+        let sessions = link.receive()?;
+        Ok(Self { link, sessions })
     }
 
     /// 받은 세션을 holder가 돌려준 목록 `kept`에 더하고, holder에 맡길 세션(끝나지 않은 것)의 id·pid·master 사본을
@@ -216,8 +223,7 @@ impl Handover {
     ///
     /// # Errors
     /// master fd 복제 실패.
-    #[cfg(unix)]
-    pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {
+    pub fn merge(&mut self, kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, Master)>> {
         let mut adopt = Vec::new();
         for k in self.sessions.drain(..) {
             if kept.iter().any(|h| h.id == k.id) {
@@ -229,13 +235,6 @@ impl Handover {
             kept.push(k);
         }
         Ok(adopt)
-    }
-
-    /// Windows 새 holder의 Adopt·ConPTY/Job 복원은 후속 작업이다.
-    #[cfg(windows)]
-    #[expect(clippy::unused_self, reason = "Unix merge와 같은 인계 진입점")]
-    pub fn merge(&mut self, _kept: &mut Vec<Kept>) -> io::Result<Vec<(SessionId, u32, OwnedFd)>> {
-        Err(io::ErrorKind::Unsupported.into())
     }
 
     /// `Ready`를 돌려주고 krilld#1이 끝나기를 기다린 뒤 소켓을 게시한다.
@@ -260,16 +259,24 @@ impl Handover {
 
 /// 넘겨받은 세션을 holder에 `Adopt`로 맡긴다(holder 리더 스레드가 돈 뒤). 그새 끝난 세션(`ESRCH`)은 끝난 것으로
 /// 표시한다.
-// ponytail: 그 밖의 실패(v1 holder의 ENOSYS 등)는 무시한다. 그 세션은 krilld가 master를 쥔 동안만 산다. 같은 빌드의
-// holder는 v2 이상이라 생기지 않는다.
-pub fn adopt(reg: &Registry, sessions: Vec<(SessionId, u32, OwnedFd)>) {
-    let Some(h) = reg.holder() else { return };
+// A failed Adopt must not acknowledge handover: the old daemon keeps its handles for a retry.
+pub fn adopt(reg: &Registry, sessions: Vec<(SessionId, u32, Master)>) -> io::Result<()> {
+    let h = reg.holder().ok_or(io::ErrorKind::NotConnected)?;
     for (id, pid, master) in sessions {
+        #[cfg(windows)]
+        let r = h.adopt(id, pid, &master);
+        #[cfg(unix)]
         let r = h.request_with(|req| ToHolder::Adopt { req, id, pid }, &[master.as_fd()]);
-        if let Ok((FromHolder::Failed { errno, .. }, _)) = r
-            && errno == libc::ESRCH
-        {
-            reg.on_exited(id, STATUS_UNKNOWN);
+        match r? {
+            (FromHolder::Done { .. }, _) => {}
+            (FromHolder::Failed { errno, .. }, _) if errno == libc::ESRCH => {
+                reg.on_exited(id, STATUS_UNKNOWN);
+            }
+            (FromHolder::Failed { errno, .. }, _) => {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+            _ => return Err(io::ErrorKind::InvalidData.into()),
         }
     }
+    Ok(())
 }

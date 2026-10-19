@@ -62,7 +62,8 @@
 //!   핸들을 싣지 않는 kind(`n` = 0)는 Unix와 바이트가 같고, Unix 인코딩([`ToHolder::encode`]·[`FromHolder::encode`])은
 //!   바뀌지 않는다. Windows는 [`ToHolder::encode_handles`]·[`ToHolder::decode_handles`](와 `FromHolder`의 같은 이름)를 쓴다.
 //!   - 세션 프레임(`Session`·`Spawned`·`Adopt`): `[in, out, sig, ref, proc]` 순서. 앞 3개(`n` ≥ 3)는 필수,
-//!     `ref`(conhost 참조)·`proc`(conhost 프로세스)는 선택이다. krilld가 `sig` 사본을 쥐어야 holder만 죽어도 세션이
+//!     `ref`(conhost 참조)·`proc`(conhost 프로세스)는 선택이다. OWE-913부터 뒤에 세션 프로세스·Job·IOCP
+//!     핸들 3개를 붙여 krilld가 보존하고 Adopt 때 되넘긴다(총 8개, 앞 5개 순서 유지). krilld가 `sig` 사본을 쥐어야 holder만 죽어도 세션이
 //!     살고, `ref`·`proc`가 있어야 새 holder가 `Adopt`로 HPCON을 다시 묶을 수 있다(스파이크 §1·§3).
 //!   - `Listener`·`HoldListener`: 소켓 1개(`n` = 1). (OWE-832) Windows는 핸들 대신 아래 `info`를 싣는다(`n` = 0).
 //!   - 받는 쪽은 쓰지 않는 핸들과 거절한 프레임의 핸들을 닫는다([`Frame::handles`]로 kind와 무관하게 꺼낸다).
