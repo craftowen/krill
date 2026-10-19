@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# git pre-push(설치: scripts/install-hooks.sh). AGENTS.md 규칙 9 기계 강제.
+# - main 브랜치·v* 태그 push는 막는다. 사람만 `KRILL_ALLOW_PROTECTED_PUSH=<사유> git push ...`로 우회한다(사유를 찍는다).
+# - push하는 각 ref의 끝 커밋을 풀어 scripts/public-surface.sh로 점검한다(내부 문서·비밀 유출 차단).
+# stdin 한 줄 = "<local ref> <local sha> <remote ref> <remote sha>" (githooks(5)).
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+zero=0000000000000000000000000000000000000000
+fail=0
+while read -r lref lsha rref rsha; do
+  case $rref in
+    refs/heads/main|refs/tags/v*)
+      if [[ -n ${KRILL_ALLOW_PROTECTED_PUSH-} ]]; then
+        echo "pre-push: 보호 ref $rref push 허용(KRILL_ALLOW_PROTECTED_PUSH 사유: $KRILL_ALLOW_PROTECTED_PUSH)" >&2
+      else
+        echo "pre-push: 보호 ref $rref push 차단 — 에이전트는 main·v* 태그에 push하지 않는다(AGENTS.md 규칙 9)." >&2
+        echo "          사람이 직접 할 때만: KRILL_ALLOW_PROTECTED_PUSH=<사유> git push ..." >&2
+        fail=1
+        continue
+      fi ;;
+  esac
+  [[ $lsha == "$zero" ]] && continue # ref 삭제는 내용 점검 없음
+  [[ $(git cat-file -t "$lsha") == commit ]] || continue # 주석 태그 등은 가리키는 커밋을 따로 push할 때 점검된다
+  if [[ ! -f $root/scripts/public-surface.sh ]]; then
+    echo "pre-push: scripts/public-surface.sh가 없어 공개 표면을 점검할 수 없다 — 차단" >&2
+    fail=1
+    continue
+  fi
+  dir=$(mktemp -d)
+  git -C "$root" archive "$lsha" | tar -x -C "$dir"
+  if ! bash "$root/scripts/public-surface.sh" "$dir"; then
+    echo "pre-push: $lref($lsha) 공개 표면 점검 실패 — 차단" >&2
+    fail=1
+  fi
+  rm -rf "$dir"
+done
+exit $fail
