@@ -359,3 +359,23 @@ fn owe751_archive_hook_trust_force_removal_timeout_and_output_cap() {
         forced_hang.warnings
     );
 }
+
+#[test]
+fn worktreeinclude_glob_patterns_copy_nested_gitignored_files() {
+    let f = Fixture::new("orca-glob", "");
+    fs::write(f.repo.join(".gitignore"), ".env*\napps/**/.env*\n").unwrap();
+    fs::write(f.repo.join(".worktreeinclude"), "**/.env*\n").unwrap();
+    fs::write(f.repo.join(".env.local"), "ROOT_ENV=1\n").unwrap();
+    fs::create_dir_all(f.repo.join("apps/web")).unwrap();
+    fs::write(f.repo.join("apps/web/.env.development"), "WEB_ENV=2\n").unwrap();
+    let (w, _) = f.created("glob-wt", Setup::Skip);
+    assert_eq!(w.copied, [".env.local", "apps/web/.env.development"]);
+    assert_eq!(
+        fs::read(path(&w).join(".env.local")).unwrap(),
+        b"ROOT_ENV=1\n"
+    );
+    assert_eq!(
+        fs::read(path(&w).join("apps/web/.env.development")).unwrap(),
+        b"WEB_ENV=2\n"
+    );
+}
