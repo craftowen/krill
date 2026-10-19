@@ -25,6 +25,8 @@ pub(crate) struct StoredLaunch {
     pub permission: Permission,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub cwd: Vec<u8>,
     /// 구 기록은 roster 관측이 없으므로 자동 종료를 허용하지 않는다.
@@ -191,6 +193,7 @@ impl Control {
             profile: launch.profile.clone(),
             permission: launch.permission,
             session_id,
+            transcript_path: None,
             cwd,
             hibernation_blocked: false,
             account,
@@ -224,25 +227,61 @@ impl Control {
         }))
     }
 
-    /// hook JSON payload에 `"session_id"`·`"conversation_id"`가 있으면 디스크 기록에 적어 둔다(MK-052).
-    pub fn record_hook_session(&self, session: SessionId, payload: &[u8]) {
-        let payload = serde_json::from_slice::<serde_json::Value>(payload);
-        let id = payload
-            .as_ref()
+    /// 서브에이전트·팀원 훅이거나 이미 바인딩된 부모 `session_id`와 다른 보조 프로세스(`claude -p` 등)의
+    /// 외래 훅인지 판정한다(#30067, #29429, #28966).
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(dead_code, reason = "단위 테스트용 축약 진입점")
+    )]
+    pub fn is_subagent_or_foreign_hook(&self, session: SessionId, payload: &[u8]) -> bool {
+        let Ok(p) = serde_json::from_slice::<serde_json::Value>(payload) else {
+            return false;
+        };
+        if is_explicit_subagent_payload(&p) {
+            return true;
+        }
+        let Some(id) = extract_hook_session_id(&p) else {
+            return false;
+        };
+        let Some(event) = p.get("hook_event_name").and_then(serde_json::Value::as_str) else {
+            return false;
+        };
+        if is_legitimate_session_id_rotation(event, &p) {
+            return false;
+        }
+        let _guard = lock(&self.config);
+        self.read_stored(session)
             .ok()
-            .and_then(|p| {
-                p.get("session_id")
-                    .or_else(|| p.get("conversation_id"))
-                    .or_else(|| p.get("conversationId"))
-            })
-            .and_then(serde_json::Value::as_str)
-            .filter(|s| valid_session_id(s));
+            .flatten()
+            .and_then(|s| s.session_id)
+            .is_some_and(|existing| existing != id)
+    }
+
+    /// hook JSON payload에 `"session_id"`·`"conversation_id"`·`"transcript_path"`가 있으면 디스크 기록에 적어 둔다(MK-052, OWE-944).
+    /// 서브에이전트·보조 세션의 외래 훅이면 부모 `session_id`·`transcript_path`를 덮어쓰지 않고 `true`를 반환한다(#30067).
+    #[cfg_attr(
+        not(all(test, unix)),
+        expect(dead_code, reason = "단위 테스트용 축약 진입점")
+    )]
+    pub fn record_hook_session(&self, session: SessionId, payload: &[u8]) -> bool {
+        self.record_hook_session_with_context(session, payload, None, None)
+    }
+
+    /// 로그인 셸(`Program::Login`) 안에서 사용자가 직접 실행한 에이전트(`claude`·`codex`·`agy`·`opencode`)가
+    /// 첫 훅 이벤트를 보낼 때도 `StoredLaunch`가 없으면 자동 바인딩한다(OWE-944 / MK-241).
+    pub fn record_hook_session_with_context(
+        &self,
+        session: SessionId,
+        payload: &[u8],
+        agent_hint: Option<&str>,
+        cwd_hint: Option<&[u8]>,
+    ) -> bool {
+        let payload = serde_json::from_slice::<serde_json::Value>(payload);
+        let id = payload.as_ref().ok().and_then(extract_hook_session_id);
+        let transcript_path = payload.as_ref().ok().and_then(extract_hook_transcript_path);
+        let explicit_subagent = payload.as_ref().is_ok_and(is_explicit_subagent_payload);
         // provider 내부 roster는 종료를 추정하지 않는다. 한 번 사용하면 이 프로세스 수명 동안 veto한다.
         let blocked = payload.as_ref().map_or(true, |p| {
-            let event = p
-                .get("hook_event_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("");
             let tool: String = p
                 .get("tool_name")
                 .and_then(serde_json::Value::as_str)
@@ -251,8 +290,7 @@ impl Control {
                 .filter(char::is_ascii_alphanumeric)
                 .flat_map(char::to_lowercase)
                 .collect();
-            event.starts_with("Subagent")
-                || event.starts_with("Teammate")
+            explicit_subagent
                 || matches!(
                     tool.as_str(),
                     "task" | "agent" | "spawnagent" | "createteam" | "teamcreate"
@@ -262,23 +300,104 @@ impl Control {
             self.block_hibernation(session);
         }
         let _guard = lock(&self.config);
-        let Ok(Some(mut stored)) = self.read_stored(session) else {
-            return;
+        let mut stored = match self.read_stored(session) {
+            Ok(Some(stored)) => stored,
+            Ok(None) => {
+                let profile = agent_hint
+                    .map(str::trim)
+                    .filter(|s| valid_session_id(s))
+                    .map(|s| {
+                        let c = krill_proto::agent::canonical_id(s);
+                        if c.eq_ignore_ascii_case("claude-code") {
+                            "claude"
+                        } else if c.eq_ignore_ascii_case("codex-cli") {
+                            "codex"
+                        } else {
+                            c
+                        }
+                    })
+                    .or_else(|| infer_profile_from_transcript(transcript_path));
+                if payload.is_err()
+                    || explicit_subagent
+                    || (id.is_none() && transcript_path.is_none() && profile.is_none())
+                {
+                    return explicit_subagent;
+                }
+                let payload_cwd = payload
+                    .as_ref()
+                    .ok()
+                    .and_then(|p| p.get("cwd").and_then(serde_json::Value::as_str))
+                    .filter(|s| !s.is_empty() && s.len() <= 4096)
+                    .map(|s| s.as_bytes().to_vec());
+                let cwd = payload_cwd
+                    .or_else(|| cwd_hint.filter(|c| !c.is_empty()).map(<[u8]>::to_vec))
+                    .unwrap_or_default();
+                // 로그인 셸에서 수동 실행된 에이전트는 셸 자체를 종료하면 안 되므로 휴면 종료를 막는다.
+                self.block_hibernation(session);
+                let bound = StoredLaunch {
+                    profile: profile.unwrap_or("claude").to_owned(),
+                    permission: Permission::Manual,
+                    session_id: id.map(str::to_owned),
+                    transcript_path: transcript_path.map(str::to_owned),
+                    cwd,
+                    hibernation_blocked: true,
+                    account: None,
+                };
+                if let Ok(path) = self.launch_path(session)
+                    && let Ok(bytes) = serde_json::to_vec(&bound)
+                {
+                    save(&path, &bytes).ok();
+                }
+                return false;
+            }
+            Err(_) => return explicit_subagent,
         };
-        if id.is_none_or(|id| stored.session_id.as_deref() == Some(id))
-            && (!blocked || stored.hibernation_blocked)
-        {
-            return;
+        let foreign_session_id = match (stored.session_id.as_deref(), id, payload.as_ref().ok()) {
+            (Some(existing), Some(incoming), Some(p)) if existing != incoming => {
+                match p.get("hook_event_name").and_then(serde_json::Value::as_str) {
+                    Some(event) => !is_legitimate_session_id_rotation(event, p),
+                    None => false,
+                }
+            }
+            _ => false,
+        };
+        let is_subagent_or_foreign = explicit_subagent || foreign_session_id;
+        if foreign_session_id {
+            self.block_hibernation(session);
         }
-        if let Some(id) = id {
+        let next_blocked = blocked || foreign_session_id;
+        let had_session_id = stored.session_id.is_some();
+        let should_update_id = !is_subagent_or_foreign
+            && id.is_some_and(|incoming| stored.session_id.as_deref() != Some(incoming));
+        let should_update_transcript = !is_subagent_or_foreign
+            && transcript_path
+                .is_some_and(|incoming| stored.transcript_path.as_deref() != Some(incoming));
+        let should_clear_stale_transcript = should_update_id
+            && had_session_id
+            && transcript_path.is_none()
+            && stored.transcript_path.is_some();
+        if !should_update_id
+            && !should_update_transcript
+            && !should_clear_stale_transcript
+            && (!next_blocked || stored.hibernation_blocked)
+        {
+            return is_subagent_or_foreign;
+        }
+        if should_update_id && let Some(id) = id {
             stored.session_id = Some(id.to_owned());
         }
-        stored.hibernation_blocked |= blocked;
+        if should_update_transcript && let Some(tp) = transcript_path {
+            stored.transcript_path = Some(tp.to_owned());
+        } else if should_clear_stale_transcript {
+            stored.transcript_path = None;
+        }
+        stored.hibernation_blocked |= next_blocked;
         if let Ok(path) = self.launch_path(session)
             && let Ok(bytes) = serde_json::to_vec(&stored)
         {
             save(&path, &bytes).ok();
         }
+        is_subagent_or_foreign
     }
 
     pub fn block_hibernation(&self, session: SessionId) {
@@ -300,6 +419,94 @@ impl Control {
 
 fn unknown_roster() -> bool {
     true
+}
+
+fn extract_hook_session_id(p: &serde_json::Value) -> Option<&str> {
+    p.get("session_id")
+        .or_else(|| p.get("conversation_id"))
+        .or_else(|| p.get("conversationId"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| valid_session_id(id))
+}
+
+pub(crate) fn valid_transcript_path(path: &str) -> bool {
+    if path.is_empty() || path.len() > 4096 || path.contains('\0') {
+        return false;
+    }
+    let p = Path::new(path);
+    p.is_absolute()
+        && !p
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        && p.extension().and_then(|e| e.to_str()).is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
+        })
+}
+
+fn extract_hook_transcript_path(p: &serde_json::Value) -> Option<&str> {
+    p.get("transcript_path")
+        .or_else(|| p.get("transcriptPath"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|path| valid_transcript_path(path))
+}
+
+fn infer_profile_from_transcript(transcript_path: Option<&str>) -> Option<&'static str> {
+    let path = transcript_path?;
+    if path.contains(".codex") || path.contains("/codex/") {
+        Some("codex")
+    } else if path.contains(".gemini") || path.contains("antigravity") {
+        Some("agy")
+    } else if path.contains("opencode") {
+        Some("opencode")
+    } else if path.contains(".claude") || path.contains("/claude/") {
+        Some("claude")
+    } else {
+        None
+    }
+}
+
+fn is_explicit_subagent_payload(p: &serde_json::Value) -> bool {
+    let event = p
+        .get("hook_event_name")
+        .or_else(|| p.get("hookEventName"))
+        .or_else(|| p.get("event"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    if event.starts_with("Subagent") || event.starts_with("Teammate") {
+        return true;
+    }
+    if p.get("is_subagent")
+        .or_else(|| p.get("isSubagent"))
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+    [
+        "agent_id",
+        "agentId",
+        "subagent_id",
+        "subagentId",
+        "parent_session_id",
+        "parentSessionId",
+        "teammate_id",
+        "teammateId",
+    ]
+    .iter()
+    .any(|key| {
+        p.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|s| !s.is_empty())
+    })
+}
+
+fn is_legitimate_session_id_rotation(event: &str, p: &serde_json::Value) -> bool {
+    matches!(event, "SessionStart" | "sessionStart")
+        && matches!(
+            p.get("source").and_then(serde_json::Value::as_str),
+            Some("clear" | "resume" | "compact")
+        )
 }
 
 /// 대화 ID를 옵션이나 경로로 해석하지 않게 ASCII 식별자로 제한한다.

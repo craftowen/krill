@@ -226,6 +226,76 @@ impl From<&Entry> for VaultTarget {
     }
 }
 
+/// Hybrid Chat 한 번의 증분 폴링이 반환하는 최대 항목 수(OWE-945 / MK-242).
+pub const MAX_CHAT_ITEMS: usize = 128;
+/// Hybrid Chat 개별 카드 본문 바이트 상한.
+pub const MAX_CHAT_TEXT: usize = 16_384;
+/// 질문 카드 한 건의 최대 선택지 수.
+pub const MAX_QUESTION_OPTIONS: usize = 16;
+
+/// 정규화된 Hybrid Chat 아이템 종류(OWE-945 / MK-242).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatItemKind {
+    #[default]
+    User,
+    Assistant,
+    Reasoning,
+    ToolCall,
+    ToolResult,
+    Question,
+    Permission,
+}
+
+/// `ChatItemKind::Question` 선택지 한 칸(OWE-945·OWE-946).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatQuestionOption {
+    #[serde(deserialize_with = "text")]
+    pub label: String,
+    #[serde(default, deserialize_with = "text")]
+    pub description: String,
+}
+
+/// 4대 에이전트(`claude`·`codex`·`agy`·`opencode`) 트랜스크립트를 단일 스키마로 정규화한 카드 항목(OWE-945 / MK-242).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatItem {
+    pub kind: ChatItemKind,
+    #[serde(deserialize_with = "chat_text")]
+    pub text: String,
+    #[serde(default, deserialize_with = "text")]
+    pub title: String,
+    #[serde(default, deserialize_with = "text")]
+    pub tool_name: String,
+    #[serde(default, deserialize_with = "text")]
+    pub tool_id: String,
+    #[serde(default, deserialize_with = "text")]
+    pub file_path: String,
+    #[serde(default)]
+    pub is_error: bool,
+    #[serde(default)]
+    pub multi_select: bool,
+    #[serde(default, deserialize_with = "question_options")]
+    pub options: Vec<ChatQuestionOption>,
+}
+
+/// Zero-State 증분 트랜스크립트 리더 응답(OWE-945 / MK-242).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatPollSnapshot {
+    #[serde(default, deserialize_with = "text")]
+    pub agent: String,
+    #[serde(default, deserialize_with = "text")]
+    pub session_id: String,
+    #[serde(default, deserialize_with = "text")]
+    pub transcript_path: String,
+    pub next_offset: u64,
+    /// 파일이 회전·절단되어 0바이트부터 다시 읽었으면 `true`(클라이언트는 기존 목록을 교체).
+    pub reset: bool,
+    /// 활성 세션에 바인딩된 에이전트 트랜스크립트를 찾았는지 여부.
+    pub bound: bool,
+    #[serde(default, deserialize_with = "chat_items")]
+    pub items: Vec<ChatItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Action {
     Scan,
@@ -235,6 +305,11 @@ pub enum Action {
     Search(SearchQuery),
     /// 멀티 에이전트 볼트 항목 재개(MK-181).
     ResumeVault(VaultTarget),
+    /// 활성 세션의 트랜스크립트를 `offset` 바이트부터 증분 정규화해 읽는다(OWE-945 / MK-242).
+    ChatPoll {
+        session: crate::SessionId,
+        offset: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,23 +317,34 @@ pub enum Response {
     Scanned(Snapshot),
     Resumed { session: crate::SessionId },
     Searched(SearchSnapshot),
+    ChatPolled(ChatPollSnapshot),
 }
 
 fn text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
-    struct Text;
-    impl serde::de::Visitor<'_> for Text {
+    bounded_string::<D, MAX_TEXT>(d)
+}
+
+fn chat_text<'de, D: serde::Deserializer<'de>>(d: D) -> Result<String, D::Error> {
+    bounded_string::<D, MAX_CHAT_TEXT>(d)
+}
+
+fn bounded_string<'de, D: serde::Deserializer<'de>, const LIMIT: usize>(
+    d: D,
+) -> Result<String, D::Error> {
+    struct Text<const N: usize>;
+    impl<const N: usize> serde::de::Visitor<'_> for Text<N> {
         type Value = String;
         fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("bounded history text")
         }
         fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<String, E> {
-            if s.len() > MAX_TEXT {
+            if s.len() > N {
                 return Err(E::custom("history text exceeds limit"));
             }
             Ok(s.to_owned())
         }
     }
-    d.deserialize_str(Text)
+    d.deserialize_str(Text::<LIMIT>)
 }
 
 fn entries<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Entry>, D::Error> {
@@ -271,6 +357,16 @@ fn hits<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<VaultHit>, D::Erro
 
 fn vault_agents<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<VaultAgent>, D::Error> {
     crate::control::bounded::<D, VaultAgent, MAX_FILTER_ITEMS>(d)
+}
+
+fn chat_items<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<ChatItem>, D::Error> {
+    crate::control::bounded::<D, ChatItem, MAX_CHAT_ITEMS>(d)
+}
+
+fn question_options<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<ChatQuestionOption>, D::Error> {
+    crate::control::bounded::<D, ChatQuestionOption, MAX_QUESTION_OPTIONS>(d)
 }
 
 fn filter_paths<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {

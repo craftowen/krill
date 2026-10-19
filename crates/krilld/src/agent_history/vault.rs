@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -37,10 +37,10 @@ struct CachedVaultDoc {
 static VAULT_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, CachedVaultDoc>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static VAULT_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn vault_cache_hits_for_test() -> usize {
     VAULT_CACHE_HITS.load(Ordering::Relaxed)
 }
@@ -66,7 +66,7 @@ fn lookup_cached_doc(path: &Path, mtime_ns: u128, size: u64) -> Option<CachedVau
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let entry = guard.get(path)?;
     if entry.mtime_ns == mtime_ns && entry.size == size {
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         VAULT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
         Some(entry.clone())
     } else {
@@ -112,6 +112,11 @@ pub(crate) fn valid_target(target: &VaultTarget) -> bool {
 }
 
 pub(crate) fn search(state_dir: Option<&Path>, query: &SearchQuery) -> SearchSnapshot {
+    let roots = collect_roots(state_dir);
+    search_in(&roots, query)
+}
+
+pub(super) fn collect_roots(state_dir: Option<&Path>) -> VaultRoots {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let env_or_home = |var: &str, default_rel: &str| {
         std::env::var_os(var)
@@ -159,7 +164,7 @@ pub(crate) fn search(state_dir: Option<&Path>, query: &SearchQuery) -> SearchSna
         state_dir,
     );
     add_account_roots(&mut roots, &accounts, state_dir);
-    search_in(&roots, query)
+    roots
 }
 
 fn add_account_roots(
@@ -285,7 +290,7 @@ pub(crate) fn profile_dir_for_vault_target_in(
     None
 }
 
-fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
+pub(super) fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
     let mut dirs = vec![
         dir.to_path_buf(),
         dir.join(".gemini/antigravity-cli"),
@@ -303,7 +308,7 @@ fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
     dirs
 }
 
-fn opencode_candidate_bases(dir: &Path) -> Vec<PathBuf> {
+pub(super) fn opencode_candidate_bases(dir: &Path) -> Vec<PathBuf> {
     let mut bases = Vec::new();
     for sub in [
         "storage/session",
@@ -2016,7 +2021,7 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
     }
 }
 
-fn extract_agy_user_request(content: &str) -> String {
+pub(super) fn extract_agy_user_request(content: &str) -> String {
     let opener = "<USER_REQUEST>";
     let closer = "</USER_REQUEST>";
     if let Some(start) = content.find(opener) {
