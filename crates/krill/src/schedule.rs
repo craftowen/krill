@@ -11,7 +11,7 @@ use krill_proto::schedule::{
     MAX_RUNS, PREVIOUS_RUNS, RUNS, Schedule, Schedules, WorkspaceMode, request_run_now,
 };
 
-const USAGE: &str = "usage: krill schedule add <id> --cron '<minute hour day month weekday>' --prompt <text> [--cwd <path>] [--precheck <cmd>] [--isolate] [--workspace-mode <reuse|isolate>] -- <executable> [args...] | krill schedule run <id> | krill schedule rm <id> | krill schedule list | krill schedule runs (cron is UTC; prompt is the last command argument)";
+const USAGE: &str = "usage: krill schedule add <id> --cron '<minute hour day month weekday>' --prompt <text> [--cwd <path>] [--precheck <cmd>] [--isolate] [--workspace-mode <reuse|isolate>] [--agent <profile> | -- <executable> [args...]] [--json] | krill schedule edit <id> [--cron <expr>] [--prompt <text>] [--cwd <path>] [--precheck <cmd>|--clear-precheck] [--workspace-mode <reuse|isolate>] [--enable|--disable] [--json] | krill schedule run <id> [--json] | krill schedule rm <id> [--json] | krill schedule list [--json] | krill schedule runs [--json] (cron is UTC; prompt is the last command argument)";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     match execute(raw) {
@@ -36,10 +36,21 @@ fn execute(raw: &[OsString]) -> io::Result<()> {
         })
         .collect::<io::Result<Vec<_>>>()?;
     let dir = daemon::state_dir().ok_or_else(|| error("state directory unavailable"))?;
-    match args.as_slice() {
+    execute_in(&dir, &args, true)
+}
+
+fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io::Result<()> {
+    match args {
         ["list"] => {
-            let schedules = Schedules::load(&dir)?;
+            let schedules = Schedules::load(dir)?;
             println!("{}", toml::to_string(&schedules).map_err(error)?);
+        }
+        ["list", "--json"] => {
+            let schedules = Schedules::load(dir)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&schedules.schedule).map_err(error)?
+            );
         }
         ["runs"] => {
             for name in [PREVIOUS_RUNS, RUNS] {
@@ -59,57 +70,108 @@ fn execute(raw: &[OsString]) -> io::Result<()> {
                 }
             }
         }
+        ["runs", "--json"] => {
+            let runs = krill_proto::schedule::load_coalesced_runs(dir)?;
+            println!("{}", serde_json::to_string_pretty(&runs).map_err(error)?);
+        }
         ["add", id, rest @ ..] => {
-            let entry = add(id, rest)?;
-            let _guard = Schedules::exclusive_edit(&dir)?;
-            let mut schedules = Schedules::load(&dir)?;
+            let (entry, json) = add(id, rest)?;
+            let _guard = Schedules::exclusive_edit(dir)?;
+            let mut schedules = Schedules::load(dir)?;
             if schedules.schedule.iter().any(|s| s.id == *id) {
                 return Err(error(
                     "schedule ID already exists; remove it before replacing",
                 ));
             }
-            schedules.schedule.push(entry);
-            schedules.save(&dir)?;
-            // Activate the daemon so reservations work with the app closed.
-            let paths = Paths::dev().map_err(error)?;
-            daemon::connect(
-                &paths,
-                &daemon::client_hello(ClientRole::Cli, "mk-schedule"),
-            )
-            .map_err(|e| error(format!("schedule saved, daemon startup failed: {e}")))?;
-            println!("saved {id} (UTC)");
+            schedules.schedule.push(entry.clone());
+            schedules.save(dir)?;
+            if connect_daemon {
+                // Activate the daemon so reservations work with the app closed.
+                let paths = Paths::dev().map_err(error)?;
+                daemon::connect(
+                    &paths,
+                    &daemon::client_hello(ClientRole::Cli, "mk-schedule"),
+                )
+                .map_err(|e| error(format!("schedule saved, daemon startup failed: {e}")))?;
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&entry).map_err(error)?);
+            } else {
+                println!("saved {id} (UTC)");
+            }
         }
-        ["run", id] => {
-            let schedules = Schedules::load(&dir)?;
+        ["edit", id, rest @ ..] => {
+            let _guard = Schedules::exclusive_edit(dir)?;
+            let mut schedules = Schedules::load(dir)?;
+            let Some(target) = schedules.schedule.iter_mut().find(|s| s.id == *id) else {
+                return Err(error("unknown schedule ID"));
+            };
+            let json = apply_edit(target, rest)?;
+            let updated = target.clone();
+            schedules.save(dir)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&updated).map_err(error)?);
+            } else {
+                println!("updated {id} (UTC)");
+            }
+        }
+        ["run", id] | ["run", id, "--json"] | ["run", "--json", id] => {
+            let json = args.contains(&"--json");
+            let schedules = Schedules::load(dir)?;
             if !schedules.schedule.iter().any(|s| s.id == *id) {
                 return Err(usage_error("unknown schedule ID"));
             }
-            let paths = Paths::dev().map_err(|e| error(format!("daemon required: {e}")))?;
-            daemon::connect(
-                &paths,
-                &daemon::client_hello(ClientRole::Cli, "mk-schedule"),
-            )
-            .map_err(|e| error(format!("daemon required: {e}")))?;
-            request_run_now(&dir, id)?;
-            println!("triggered {id}");
+            if connect_daemon {
+                let paths = Paths::dev().map_err(|e| error(format!("daemon required: {e}")))?;
+                daemon::connect(
+                    &paths,
+                    &daemon::client_hello(ClientRole::Cli, "mk-schedule"),
+                )
+                .map_err(|e| error(format!("daemon required: {e}")))?;
+            }
+            request_run_now(dir, id)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": id,
+                        "triggered": true,
+                    }))
+                    .map_err(error)?
+                );
+            } else {
+                println!("triggered {id}");
+            }
         }
-        ["rm", id] => {
-            let _guard = Schedules::exclusive_edit(&dir)?;
-            let mut schedules = Schedules::load(&dir)?;
+        ["rm", id] | ["rm", id, "--json"] | ["rm", "--json", id] => {
+            let json = args.contains(&"--json");
+            let _guard = Schedules::exclusive_edit(dir)?;
+            let mut schedules = Schedules::load(dir)?;
             let before = schedules.schedule.len();
             schedules.schedule.retain(|s| s.id != *id);
             if before == schedules.schedule.len() {
                 return Err(error("unknown schedule ID"));
             }
-            schedules.save(&dir)?;
-            println!("removed {id}");
+            schedules.save(dir)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "id": id,
+                        "removed": true,
+                    }))
+                    .map_err(error)?
+                );
+            } else {
+                println!("removed {id}");
+            }
         }
         _ => return Err(usage_error(USAGE)),
     }
     Ok(())
 }
 
-fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
+fn add(id: &str, args: &[&str]) -> io::Result<(Schedule, bool)> {
     let mut entry = Schedule {
         id: id.into(),
         cron: String::new(),
@@ -123,6 +185,7 @@ fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
         workspace_mode: WorkspaceMode::Reuse,
         enabled: true,
     };
+    let mut json = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match *arg {
@@ -130,10 +193,14 @@ fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
                 entry.command = args.map(|s| (*s).to_owned()).collect();
                 break;
             }
+            "--json" => json = true,
             "--isolate" => {
                 entry.workspace_mode = WorkspaceMode::Isolate;
             }
-            flag @ ("--cron" | "--cwd" | "--prompt" | "--precheck" | "--workspace-mode") => {
+            "--enable" => entry.enabled = true,
+            "--disable" => entry.enabled = false,
+            flag @ ("--cron" | "--cwd" | "--prompt" | "--precheck" | "--workspace-mode"
+            | "--agent") => {
                 let value = args.next().ok_or_else(|| usage_error(USAGE))?;
                 match flag {
                     "--cron" => entry.cron = (*value).into(),
@@ -157,6 +224,13 @@ fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
                             _ => return Err(usage_error(USAGE)),
                         };
                     }
+                    "--agent" => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            return Err(usage_error(USAGE));
+                        }
+                        entry.command = vec![trimmed.to_owned()];
+                    }
                     _ => entry.prompt = (*value).into(),
                 }
             }
@@ -166,7 +240,87 @@ fn add(id: &str, args: &[&str]) -> io::Result<Schedule> {
     if entry.cron.is_empty() || entry.command.is_empty() {
         return Err(usage_error(USAGE));
     }
-    Ok(entry)
+    Ok((entry, json))
+}
+
+fn apply_edit(entry: &mut Schedule, args: &[&str]) -> io::Result<bool> {
+    if args.is_empty() {
+        return Err(usage_error(USAGE));
+    }
+    let mut json = false;
+    let mut changed = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match *arg {
+            "--" => {
+                let cmd: Vec<String> = args.map(|s| (*s).to_owned()).collect();
+                if cmd.is_empty() {
+                    return Err(usage_error(USAGE));
+                }
+                entry.command = cmd;
+                changed = true;
+                break;
+            }
+            "--json" => json = true,
+            "--isolate" => {
+                entry.workspace_mode = WorkspaceMode::Isolate;
+                changed = true;
+            }
+            "--clear-precheck" => {
+                entry.precheck = None;
+                changed = true;
+            }
+            "--enable" => {
+                entry.enabled = true;
+                changed = true;
+            }
+            "--disable" => {
+                entry.enabled = false;
+                changed = true;
+            }
+            flag @ ("--cron" | "--cwd" | "--prompt" | "--precheck" | "--workspace-mode"
+            | "--agent") => {
+                let value = args.next().ok_or_else(|| usage_error(USAGE))?;
+                match flag {
+                    "--cron" => entry.cron = (*value).into(),
+                    "--cwd" => {
+                        entry.cwd = fs::canonicalize(value)?
+                            .into_os_string()
+                            .into_string()
+                            .map_err(|_| error("cwd must be UTF-8"))?;
+                    }
+                    "--precheck" => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            return Err(usage_error(USAGE));
+                        }
+                        entry.precheck = Some(trimmed.to_owned());
+                    }
+                    "--workspace-mode" => {
+                        entry.workspace_mode = match *value {
+                            "reuse" | "existing" => WorkspaceMode::Reuse,
+                            "isolate" | "isolated" | "new_worktree" => WorkspaceMode::Isolate,
+                            _ => return Err(usage_error(USAGE)),
+                        };
+                    }
+                    "--agent" => {
+                        let trimmed = value.trim();
+                        if trimmed.is_empty() {
+                            return Err(usage_error(USAGE));
+                        }
+                        entry.command = vec![trimmed.to_owned()];
+                    }
+                    _ => entry.prompt = (*value).into(),
+                }
+                changed = true;
+            }
+            _ => return Err(usage_error(USAGE)),
+        }
+    }
+    if !changed {
+        return Err(usage_error(USAGE));
+    }
+    Ok(json)
 }
 
 fn error(e: impl std::fmt::Display) -> io::Error {
@@ -175,4 +329,88 @@ fn error(e: impl std::fmt::Display) -> io::Error {
 
 fn usage_error(e: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schedule_add_edit_run_and_rm_preserve_fields() {
+        let dir = std::env::temp_dir().join(format!("krill-sched-cli-{}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).unwrap();
+
+        execute_in(
+            &dir,
+            &[
+                "add",
+                "nightly",
+                "--cron",
+                "0 2 * * *",
+                "--cwd",
+                dir.to_str().unwrap(),
+                "--prompt",
+                "check status",
+                "--agent",
+                "claude",
+                "--json",
+            ],
+            false,
+        )
+        .unwrap();
+
+        let loaded = Schedules::load(&dir).unwrap();
+        assert_eq!(loaded.schedule.len(), 1);
+        assert_eq!(loaded.schedule[0].id, "nightly");
+        assert_eq!(loaded.schedule[0].command, vec!["claude"]);
+        assert!(loaded.schedule[0].enabled);
+
+        execute_in(
+            &dir,
+            &[
+                "edit",
+                "nightly",
+                "--cron",
+                "15 3 * * *",
+                "--prompt",
+                "updated prompt",
+                "--precheck",
+                "git status",
+                "--isolate",
+                "--disable",
+                "--json",
+            ],
+            false,
+        )
+        .unwrap();
+
+        let edited = Schedules::load(&dir).unwrap();
+        assert_eq!(edited.schedule[0].cron, "15 3 * * *");
+        assert_eq!(edited.schedule[0].prompt, "updated prompt");
+        assert_eq!(edited.schedule[0].precheck.as_deref(), Some("git status"));
+        assert_eq!(edited.schedule[0].workspace_mode, WorkspaceMode::Isolate);
+        assert!(!edited.schedule[0].enabled);
+
+        execute_in(
+            &dir,
+            &["edit", "nightly", "--clear-precheck", "--enable"],
+            false,
+        )
+        .unwrap();
+        let cleared = Schedules::load(&dir).unwrap();
+        assert!(cleared.schedule[0].precheck.is_none());
+        assert!(cleared.schedule[0].enabled);
+
+        execute_in(&dir, &["run", "nightly", "--json"], false).unwrap();
+        assert_eq!(
+            krill_proto::schedule::take_run_now(&dir).unwrap(),
+            vec!["nightly"]
+        );
+
+        execute_in(&dir, &["rm", "nightly", "--json"], false).unwrap();
+        assert!(Schedules::load(&dir).unwrap().schedule.is_empty());
+
+        drop(fs::remove_dir_all(&dir));
+    }
 }
