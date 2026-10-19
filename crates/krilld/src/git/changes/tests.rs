@@ -264,3 +264,36 @@ fn path_budget_stops_before_adding_an_oversized_entry() {
             <= MAX_PATH_BYTES
     );
 }
+
+#[test]
+fn status_branch_header_matches_show_current() {
+    let dir = Dir::new("branch");
+    let q = GitQueue::new().unwrap();
+    let branch = |dir: &Dir| {
+        query_with_branch(&q, dir.0.clone(), Arc::new(AtomicBool::new(false)))
+            .recv()
+            .unwrap()
+            .unwrap()
+            .1
+    };
+    let show_current = |dir: &Dir| {
+        let out = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(&dir.0)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    dir.git(&["init", "-q", "-b", "새-브랜치"]);
+    assert_eq!(branch(&dir), "새-브랜치", "unborn HEAD");
+    fs::write(dir.0.join("a"), "a\n").unwrap();
+    dir.git(&["add", "a"]);
+    dir.git(&["commit", "-qm", "a"]);
+    assert_eq!(branch(&dir), show_current(&dir));
+    dir.git(&["checkout", "-q", "--detach"]);
+    assert_eq!(branch(&dir), "");
+    assert_eq!(show_current(&dir), "");
+    let mut status = StatusParser::default();
+    status.record(b"# branch.head (detached)").unwrap();
+    assert_eq!(status.branch, "");
+}
