@@ -402,6 +402,11 @@ impl Session {
         self.shared.master.as_fd()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn master(&self) -> &Master {
+        &self.shared.master
+    }
+
     pub fn gaps(&self) -> Vec<Gap> {
         lock(&self.shared.gaps).clone()
     }

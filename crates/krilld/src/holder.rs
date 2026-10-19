@@ -210,6 +210,25 @@ impl Holder {
         lock(&self.out).send(&frame, fds)
     }
 
+    #[cfg(windows)]
+    pub(crate) fn adopt(&self, id: SessionId, pid: u32, master: &Master) -> io::Result<Answer> {
+        use std::os::windows::io::AsHandle as _;
+        let (req, rx) = self.register()?;
+        let sent = (|| {
+            let target = link::duplicate_target(self.pid)?;
+            let remote = link::Remote::duplicate(target.as_handle(), &master.handles())?;
+            let frame = remote.request(&ToHolder::Adopt { req, id, pid })?;
+            lock(&self.out).send(&frame, &[])?;
+            remote.commit();
+            Ok::<_, io::Error>(())
+        })();
+        if let Err(error) = sent {
+            self.unregister(req);
+            return Err(error);
+        }
+        rx.recv().map_err(|_| io::ErrorKind::NotConnected.into())
+    }
+
     /// 리더: 답을 기다리는 요청에 나눠 주고 `Exited` 처리는 별도 큐로 넘긴다. 그 큐의 `Release` 송신이
     /// exec 핸드오프의 송신 잠금을 기다려도 리더는 `Done`을 받아 잠금을 풀 수 있다. 링크가 끊기면 기다리던
     /// 요청을 모두 `NotConnected`로 끝낸 뒤 종료 이벤트 큐를 비운다.
