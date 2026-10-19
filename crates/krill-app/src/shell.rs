@@ -16,6 +16,7 @@
 //! ⌘V·파일 드롭은 `krill_term::paste`로 bracketed paste·셸 이스케이프를 거쳐 입력으로 간다. 우클릭 메뉴(복사·붙여넣기)는
 //! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
 
+mod away;
 mod commands;
 mod diff;
 pub(crate) mod files;
@@ -484,6 +485,14 @@ pub struct Shell {
     /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
     reconnected: Option<String>,
     reconnected_task: Option<Task<()>>,
+    /// 자리 비운 사이 요약의 기준 시각. 이 프로세스의 첫 메인 창이 데몬에 처음 붙을 때 한 번 쓴다.
+    away_since: Option<u64>,
+    /// 자리 비운 사이 요약 한 줄(누르면 닫힘).
+    away: Option<String>,
+    away_task: Option<Task<()>>,
+    /// 마지막 생존 시각 주기 저장([`away::HEARTBEAT`]).
+    heartbeat: Option<Task<()>>,
+    app_quit: Option<Subscription>,
     window: Option<AnyWindowHandle>,
     activation: Option<Subscription>,
     bounds_observer: Option<Subscription>,
@@ -872,6 +881,11 @@ impl Shell {
             notice,
             reconnected: None,
             reconnected_task: None,
+            away_since: None,
+            away: None,
+            away_task: None,
+            heartbeat: None,
+            app_quit: None,
             window: None,
             activation: None,
             bounds_observer: None,
@@ -1548,6 +1562,7 @@ impl Shell {
         };
         let target = krill_app::hosts::HostTarget::local(paths.clone());
         self.paths = Some(paths);
+        self.start_away_tracking(cx);
         self.sidebar
             .update(cx, |s, cx| s.connect(target.clone(), cx));
         self.diff.update(cx, |d, cx| d.connect(target.clone(), cx));
@@ -1845,6 +1860,9 @@ impl Shell {
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
+            if let Some(since) = self.away_since.take() {
+                self.load_away_summary(since, cx);
+            }
             self.load_agents(None, cx);
             self.refresh_accounts(krill_proto::usage::UsageRequest::ListAccounts, cx);
             self.refresh_ssh_hosts(cx);
@@ -1858,6 +1876,63 @@ impl Shell {
             self.refresh_detached(cx);
         }
         cx.notify();
+    }
+
+    /// 메인 창이면 지난번 마지막 생존 시각을 요약 기준으로 잡고, 이후 주기·종료 때 생존 시각을 레이아웃에 쓴다.
+    /// 창을 닫았다 다시 연 같은 프로세스에서는 요약하지 않는다(앱은 계속 돌고 있었다).
+    fn start_away_tracking(&mut self, cx: &mut Context<Self>) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if self.path.is_none() || self.role != WindowRole::Main || self.heartbeat.is_some() {
+            return;
+        }
+        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.away_since = self.layout.last_seen_unix_ns();
+        }
+        self.heartbeat = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(away::HEARTBEAT).await;
+                if this.update(cx, |this, _| this.touch_last_seen()).is_err() {
+                    return;
+                }
+            }
+        }));
+        // 정상 종료·업데이트 재시작(`cx.quit`)은 종료 직전 시각을 디스크까지 쓴다. kill -9는 마지막 주기 저장값이 남는다.
+        self.app_quit = Some(cx.on_app_quit(|this, _| {
+            this.touch_last_seen();
+            this.saver.flush();
+            async {}
+        }));
+    }
+
+    fn touch_last_seen(&mut self) {
+        self.layout.set_last_seen_unix_ns(away::now_ns());
+        self.save();
+    }
+
+    /// 실제 상태 목록을 받은 뒤에만 요약을 세운다. 읽지 못하면 아무것도 보이지 않는다.
+    fn load_away_summary(&mut self, since: u64, cx: &mut Context<Self>) {
+        let Some(paths) = self.paths.clone() else {
+            return;
+        };
+        let target = krill_app::hosts::HostTarget::local(paths);
+        self.away_task = Some(cx.spawn(async move |this, cx| {
+            let statuses = cx
+                .background_executor()
+                .spawn(async move { away::fetch_statuses(&target) })
+                .await;
+            let Ok(statuses) = statuses else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some((away_for, counts)) =
+                    away::count(&statuses, Some(since), away::now_ns())
+                {
+                    this.away = Some(away::summary(away_for, counts));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
     }
 
     fn show_reconnected(&mut self, sessions: usize, cx: &mut Context<Self>) {
@@ -5019,6 +5094,14 @@ impl Render for Shell {
                                     .clone()
                                     .map(|msg| preserve_banner("reconnected-banner", msg, p)),
                             )
+                            .children(self.away.clone().map(|msg| {
+                                preserve_banner("away-summary", msg, p)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.away = None;
+                                        cx.notify();
+                                    }))
+                            }))
                             .children(self.notice.clone().map(|msg| {
                                 div()
                                     .id("notice")

@@ -540,6 +540,23 @@ fn reconnect_confirmation_waits_for_session_list(cx: &mut TestAppContext) {
     assert_eq!(shown(cx), None);
 }
 
+/// 자리 비운 사이 요약은 보존 톤 한 줄로 보이고 누르면 닫힌다.
+#[gpui::test]
+fn away_summary_banner_dismisses_on_click(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("away-summary"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.away = Some("Krill을 닫아 둔 2시간 동안 3개 완료".into());
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("away-summary").is_some());
+    click(cx, "away-summary");
+    assert_eq!(cx.update(|_, cx| view.read(cx).away.clone()), None);
+    assert!(cx.debug_bounds("away-summary").is_none());
+}
+
 /// 빈 작업 공간: 브랜드 타일·세션 생존 문구가 단축키 행 위에 보인다.
 #[gpui::test]
 fn empty_workspace_shows_brand_and_survival_line(cx: &mut TestAppContext) {
