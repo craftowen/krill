@@ -191,6 +191,8 @@ for binary in krill-holder krilld krill-link; do
 done
 [ -f "$root/packaging/macos/AppIcon.icns" ] || fail "missing icon: $root/packaging/macos/AppIcon.icns"
 cp -X "$root/packaging/macos/AppIcon.icns" "$app/Contents/Resources/AppIcon.icns"
+[ -f "$root/packaging/macos/krill-chime.caf" ] || fail "missing sound: $root/packaging/macos/krill-chime.caf"
+cp -X "$root/packaging/macos/krill-chime.caf" "$app/Contents/Resources/krill-chime.caf"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

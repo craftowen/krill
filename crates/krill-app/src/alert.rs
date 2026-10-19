@@ -329,13 +329,13 @@ pub fn beep_count(cx: &App) -> u64 {
         .map_or(0, |state| state.beep_count)
 }
 
-/// 알림음을 한 번 낸다. 횟수는 항상 세고, 실제 발음(`NSBeep`)은 단위 테스트가 아닐 때만 한다.
+/// 알림음을 한 번 낸다. 횟수는 항상 세고, 실제 발음(macOS Krill 차임, 없으면 `NSBeep`)은 단위 테스트가 아닐 때만 한다.
 fn play_notification_sound(cx: &mut App) {
     ensure_state(cx);
     let state = cx.global_mut::<AlertState>();
     state.beep_count = state.beep_count.saturating_add(1);
     #[cfg(not(test))]
-    crate::platform::beep();
+    crate::platform::play_notification_chime();
 }
 
 /// 터미널 벨 알림(OWE-659). 이벤트 토글이 꺼져 있으면 조용하고, 이미 게시된
