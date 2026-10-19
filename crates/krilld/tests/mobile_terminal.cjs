@@ -68,6 +68,22 @@ async function main(){
  handle.setFontScale(1.25);assert.deepEqual(await drawn(),{text:5,font:1,draws:1});assert.equal(canvas.width,Math.round(80*8*16/13));
  await advance(500);assert.match(canvas.getAttribute('aria-label'),/^abc\n\n\njk/);handle.unmount();
  console.log('PASS dirty-row canvas redraw: one changed row only, cursor rows, one frame per batch, Reset/font full');
+ ({root,handle,socket}=await mount(42));const port=find(root,'terminal-scroll'),capture2=find(root,'live-capture'),command2=find(root,'command-input');let focused=0,commandFocused=0;capture2.addEventListener('focus',()=>focused++);command2.addEventListener('focus',()=>commandFocused++);
+ assert.equal(root.dataset.phase,'ready');
+ event(port,'pointerdown',{clientX:100,clientY:100});event(port,'pointermove',{clientX:104,clientY:103});event(port,'click');assert.equal(focused,1);
+ event(port,'pointerdown',{clientX:100,clientY:100});event(port,'pointermove',{clientX:100,clientY:130});event(port,'click');assert.equal(focused,1);
+ port.scrollLeft=50;const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]});
+ touch('touchstart',200,400);let te=touch('touchmove',190,330);assert.equal(te.defaultPrevented,false);touch('touchmove',150,200);assert.equal(port.scrollLeft,50);touch('touchend');
+ touch('touchstart',200,400);te=touch('touchmove',190,398);assert(te.defaultPrevented);te=touch('touchmove',120,390);assert(te.defaultPrevented);assert.equal(port.scrollLeft,130);touch('touchend');
+ te=event(port,'wheel',{deltaX:30,deltaY:2});assert(te.defaultPrevented);assert.equal(port.scrollLeft,160);event(port,'wheel',{deltaX:1,deltaY:40});assert.equal(port.scrollLeft,160);
+ socket.autoAck=true;for(let i=0;i<5;i++){socket.screen(`flow ${i} `+'w'.repeat(70));await advance(16);}await handle.sendKey('enter');assert.equal(port.scrollLeft,160);
+ assert.match(handle.text(),/flow 4 w+$/);
+ context.document.activeElement=capture2;handle.setInputMode('buffered');assert.equal(commandFocused,1);context.document.activeElement=null;handle.setInputMode('direct');assert.equal(focused,1);
+ socket.close();assert.equal(root.dataset.phase,'disconnected');handle.unmount();assert.equal(root.dataset.phase,undefined);
+ ({root,handle,socket}=await mount(43));let statuses=[];handle.unmount();({root,handle,socket}=await mount(44,{onStatus:st=>statuses.push(st)}));context.document.activeElement=find(root,'live-capture');socket.close();assert.equal(statuses.at(-1).typing,true);context.document.activeElement=null;handle.unmount();
+ ({root,handle,socket}=await mount(45));let fitting=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fitting;const roles=()=>socket.sent.filter(a=>a[4]===0x17).length;let before17=roles();socket.frame(0x21,T.v(3),T.v(3),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(24)));await flush();viewport.offsetTop=5;event(viewport,'scroll');viewport.offsetTop=0;await flush();assert.equal(roles(),before17);handle.unmount();
+ console.log('PASS disconnect reports typing for refocus, Fit skips same-column resize roles');
+ console.log('PASS tap jitter focus, one-axis touch pan (no native horizontal), output/input keep scrollLeft, mode-switch refocus, text() and phase');
  console.log('All terminal adapter regression checks passed.');
 }
 if(process.argv.includes('--harness')){
