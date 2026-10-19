@@ -102,7 +102,7 @@ jobs:
 
       - name: nextest
         # PTY e2e(krill-holder survive, krill CLI 실PTY 테스트, krilld 통합) 포함.
-        run: cargo nextest run --workspace --locked --no-tests=pass
+        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass
         timeout-minutes: 60
 
       - name: doctest
