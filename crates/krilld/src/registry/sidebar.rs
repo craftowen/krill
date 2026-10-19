@@ -124,6 +124,14 @@ fn merge_projects(data: &mut SidebarData, state_dir: &Path) {
             continue;
         }
         let path = path.to_vec();
+        // 예전 앱이 연결 워크트리를 프로젝트로 등록했으면 이미 본 저장소 아래에 있다 — 따로 세우지 않는다.
+        if data
+            .repositories
+            .iter()
+            .any(|r| r.worktrees.contains(&path))
+        {
+            continue;
+        }
         if let Some(repo) = data.repositories.iter_mut().find(|r| r.repo == path) {
             if !repo.worktrees.contains(&path) && repo.worktrees.len() < 512 {
                 repo.worktrees.push(path);
@@ -192,6 +200,7 @@ mod tests {
         std::fs::write(
             dir.join("projects.toml"),
             "[[projects]]\npath = \"/repo\"\n\n[[projects]]\npath = \"/folder\"\n\n\
+             [[projects]]\npath = \"/repo-wt\"\n\n\
              [[projects]]\npath = \"/old\"\narchived = true\n\n\
              [[projects]]\npath = \"/remote\"\nhost_id = \"ssh-x\"\n",
         )
