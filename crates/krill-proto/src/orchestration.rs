@@ -2163,13 +2163,18 @@ pub fn builtin_skills() -> &'static [SkillEntry] {
     BUILTIN_SKILLS
 }
 
+/// Orca도 같은 이름으로 설치하는 스킬. 맨 이름 자리에 Krill 사본이 있으면 Orca가
+/// "별도 사본이라 업데이트할 수 없음"으로 보므로 항상 `mk-<name>`에 설치한다.
+const ORCA_SKILL_NAMES: &[&str] = &["orchestration", "computer-use"];
+
 pub fn install_skill(name: &str, base_dir: &Path) -> io::Result<PathBuf> {
     let Some(skill) = builtin_skills().iter().find(|s| s.name == name.trim()) else {
         return Err(not_found(format!("unknown skill: {name}")));
     };
+    let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
     let candidates = [skill.name.to_owned(), format!("mk-{}", skill.name)];
     let mut chosen = None;
-    for (index, candidate) in candidates.iter().enumerate() {
+    for (index, candidate) in candidates.iter().enumerate().skip(usize::from(orca_owned)) {
         let dir = base_dir.join(candidate);
         if skill_candidate_writable(&dir, skill)? {
             chosen = Some((dir, index != 0));
@@ -2195,6 +2200,14 @@ pub fn install_skill(name: &str, base_dir: &Path) -> io::Result<PathBuf> {
     };
     let content = format!("{content}\n<!-- minikrill-managed-skill -->\n");
     atomic_write(&path, content.as_bytes())?;
+    if orca_owned {
+        // 예전 버전이 맨 이름에 깔아 둔 자기 사본만 치워 Orca 자리를 돌려준다(남의 스킬·심링크는 그대로).
+        let bare = base_dir.join(skill.name);
+        if bare.join("SKILL.md").is_file() && skill_candidate_writable(&bare, skill)? {
+            fs::remove_file(bare.join("SKILL.md"))?;
+            fs::remove_dir(&bare).ok();
+        }
+    }
     Ok(path)
 }
 
@@ -2784,7 +2797,33 @@ mod tests {
         for skill in BUILTIN_SKILLS {
             let first = install_skill(skill.name, &fresh)?;
             assert_eq!(install_skill(skill.name, &fresh)?, first, "{}", skill.name);
-            assert!(first.ends_with(format!("{}/SKILL.md", skill.name)));
+            let expected = if ORCA_SKILL_NAMES.contains(&skill.name) {
+                format!("mk-{}/SKILL.md", skill.name)
+            } else {
+                format!("{}/SKILL.md", skill.name)
+            };
+            assert!(first.ends_with(&expected), "{}", skill.name);
+        }
+
+        // 예전 버전이 맨 이름에 깐 Krill 사본은 치우고, Orca 심링크는 건드리지 않는다.
+        let legacy = dir.join("legacy");
+        fs::create_dir_all(legacy.join("computer-use"))?;
+        fs::write(
+            legacy.join("computer-use/SKILL.md"),
+            "old\n<!-- minikrill-managed-skill -->\n",
+        )?;
+        install_skill("computer-use", &legacy)?;
+        assert!(!legacy.join("computer-use").exists());
+        assert!(legacy.join("mk-computer-use/SKILL.md").is_file());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&foreign_dir, legacy.join("orchestration"))?;
+            install_skill("orchestration", &legacy)?;
+            assert!(fs::symlink_metadata(legacy.join("orchestration"))?.is_symlink());
+            assert_eq!(
+                fs::read_to_string(legacy.join("orchestration/SKILL.md"))?,
+                "# Orca Orchestration\n"
+            );
         }
 
         let mut store = OrchestrationStore::default();
