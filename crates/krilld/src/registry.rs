@@ -536,7 +536,12 @@ impl Registry {
         if k == screen::kind::ATTACH && n.features & FEAT_SCREEN != 0 {
             let a = Attach::decode(k, &body)?;
             let tap = self.tap(&peer, a.session);
-            return attach::run_as(s, a, hello.instance_id, n.features, tap, role);
+            let frame_min = if mobile {
+                attach::MOBILE_FRAME_MIN
+            } else {
+                attach::FRAME_MIN
+            };
+            return attach::run_as(s, a, hello.instance_id, n.features, tap, role, frame_min);
         }
         if k == hook::kind::EVENT && n.features & FEAT_HOOK != 0 {
             if role == Role::Observer {
