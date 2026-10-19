@@ -87,7 +87,15 @@ async function fixedOriginTests(){
  const server=new C.Channel(new Uint8Array(32),C.concat(C.unhex('bc'.repeat(32)),new Uint8Array(32).fill(1)),false);
  socket.emit('message',server.seal(new TextEncoder().encode(JSON.stringify({device_id:'new-device',credential:'cd'.repeat(32)}))));socket.emit('message',server.seal(frame(1,Buffer.concat([v(1),v(1),v(0)]))));await flush();
  socket.emit('message',server.seal(frame(0x65,Buffer.concat([v(6),string(JSON.stringify({ok:true,data:{sessions:[]}}))]))));await flush();assert(t.ready);assert.equal(authenticated.rid,rid);assert.equal(authenticated.url,'https://paired.trycloudflare.com');assert.equal(authenticated.hash,hash);assert.equal(f.stored().credential,'cd'.repeat(32));const terminal=t.terminalConnect();assert.equal(terminal.socket.url,socket.url);assert.equal(terminal.credentials.rid,rid);t.close();
- console.log('PASS fixed-origin fragment cleanup, saved destination protection, rid/url/hash persistence, shared socket URLs, strict rendezvous validation, hash redirect and pre-open retry');
+ // Pure DO WebSocket relay mode (no t=) and automatic fallback when tunnel remains unreachable (e.g. 530).
+ f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&r=${rid}`,null);
+ assert.equal(f.endpoint.socketUrl(),`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);
+ f=fixture(fixed,saved,{url:'https://saved.trycloudflare.com',hash});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
+ t.connect();await flush();assert.equal(f.sockets[0].url,`wss://saved.trycloudflare.com/ws?v=${hash}`);
+ f.sockets[0].emit('error');await flush();
+ const relayRetry=[...f.timers.values()][0];relayRetry.fn();await flush();
+ assert.equal(f.sockets[1].url,`wss://krill-mobile.pages.dev/r/${rid}?v=${hash}`);t.close();
+ console.log('PASS fixed-origin fragment cleanup, saved destination protection, rid/url/hash persistence, DO WS relay & fallback, shared socket URLs, strict rendezvous validation, hash redirect and pre-open retry');
 }
 // Cross-language fixed screen fixtures: wide Hangul, combining ZWJ, colors and scroll ops.
 const T=sandbox.MkTerminalCodec,model={};

@@ -142,9 +142,9 @@ async function testTransportAuthRetries(){
 async function testPipelinedHandshakeAndPolling(){
  let now=0,nextId=0;const timers=new Map(),sockets=[],snapshots=[],statuses=[];
  class FakeSocket extends EventTarget{
-  constructor(){super();this.sent=[];sockets.push(this);queueMicrotask(()=>this.dispatchEvent(new Event('open')));}
+  constructor(){super();this.readyState=1;this.sent=[];sockets.push(this);queueMicrotask(()=>this.dispatchEvent(new Event('open')));}
   send(data){this.sent.push(data);}
-  close(){}
+  close(){this.closed=true;this.readyState=3;this.dispatchEvent(new Event('close'));}
   message(data){const e=new Event('message');e.data=data;this.dispatchEvent(e);}
  }
  const document={hidden:false},enc=new TextEncoder(),concat=(...a)=>{const out=new Uint8Array(a.reduce((n,x)=>n+x.length,0));let i=0;for(const x of a){out.set(x,i);i+=x.length;}return out;};
@@ -153,17 +153,34 @@ async function testPipelinedHandshakeAndPolling(){
  const flush=()=>new Promise(r=>setImmediate(r));
  const frame=(kind,body)=>{const h=new Uint8Array(5);new DataView(h.buffer).setUint32(0,body.length+1,true);h[4]=kind;return concat(h,body);};
  const text=s=>{const b=enc.encode(s);return concat(Uint8Array.of(b.length),b);};
- const t=sandbox.KrillMobile.transport.create({url:'ws://localhost/ws',credentials:{device_id:'dev1',credential:'aa'.repeat(32)},onSnapshot:d=>snapshots.push(d),onStatus:s=>statuses.push(s.phase),onError(){}});
+ const errors=[];
+ const t=sandbox.KrillMobile.transport.create({url:'ws://localhost/ws',credentials:{device_id:'dev1',credential:'aa'.repeat(32)},onSnapshot:d=>snapshots.push(d),onStatus:s=>statuses.push(s.phase),onError:e=>errors.push(e.message)});
  t.connect();await flush();const socket=sockets[0];socket.message(JSON.stringify({version:2,challenge:'bb'.repeat(32)}));await flush();
  // 인증 응답 전에 auth hello·proof·ClientHello·snapshot 요청이 모두 나가야 한다.
  assert.equal(socket.sent.length,4);assert.equal(socket.sent[2][4],2);assert.equal(socket.sent[3][4],0x45);
  const reply=()=>socket.message(frame(0x65,concat(Uint8Array.of(6),text(JSON.stringify({ok:true,data:{sessions:[]}})))));
  socket.message(enc.encode('{"device_id":"dev1"}'));socket.message(frame(1,Uint8Array.of(1,1,0,0,1)));reply();await flush();
  assert.equal(snapshots.length,1);assert.equal(statuses.at(-1),'ready');assert.equal(socket.sent.length,4);
+ // 컨트롤 소켓 ready 직후 백그라운드 터미널 WebSocket 1개가 프리워밍되며 challenge 수신 시 즉시 인증·ClientHello까지 마친다.
+ assert.equal(sockets.length,2);
+ const warmSocket=sockets[1];warmSocket.message(JSON.stringify({version:2,challenge:'cc'.repeat(32)}));
+ assert.equal(warmSocket.sent.length,3);assert.equal(warmSocket.sent[2][4],2);
+ warmSocket.message(enc.encode('{"device_id":"dev1"}'));warmSocket.message(frame(1,Uint8Array.of(1,1,0,0,1)));
+ const claimed=t.terminalConnect();assert.equal(claimed.socket,warmSocket);assert(claimed.channel);assert.equal(claimed.messages.length,2);
+ const fresh=t.terminalConnect();assert.notEqual(fresh.socket,warmSocket);assert.equal(sockets.length,3);
  const [[,poll]]=[...timers];assert.equal(poll.at,2500);
  document.hidden=true;now=2500;timers.clear();poll.fn();await flush();assert.equal(socket.sent.length,4);
  sandbox.KrillMobile.activeTerminal={};document.hidden=false;const [[,next]]=[...timers];timers.clear();next.fn();await flush();assert.equal(socket.sent.length,5);reply();await flush();assert.equal(snapshots.length,2);
- const [[,slow]]=[...timers];assert.equal(slow.at-now,10000);t.close();
+ const [[,slow]]=[...timers];assert.equal(slow.at-now,10000);
+ // resume() 시 소진된 터미널 프리워밍 소켓을 다시 채우고, 정상 응답이 1.5초 안에 오면 재연결하지 않는다.
+ t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);reply();await flush();assert.equal(snapshots.length,3);
+ for(const [id,tm] of [...timers])if(tm.at<=now+1500){timers.delete(id);tm.fn();}await flush();assert.equal(sockets.length,4);
+ // 1.5초 동안 응답이 없으면 좀비 소켓으로 판정해 즉시 reconnect()하며, 끊긴 refresh의 오류를 onError로 흘리지 않는다.
+ t.resume();await flush();assert.equal(socket.sent.length,7);
+ const zombieTimer=[...timers.values()].find(tm=>tm.at===now+1500);assert(zombieTimer);
+ zombieTimer.fn();await flush();
+ assert.equal(socket.closed,true);assert.equal(sockets.length,5);assert.deepEqual(errors,[]);
+ t.close();
 }
 if(require.main===module)main().catch(e=>{console.error(e);process.exitCode=1;});
 module.exports={fixture,main};
