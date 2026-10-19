@@ -4152,7 +4152,7 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                    if e.modifiers.platform {
+                    if keys::link_modifier(e.modifiers) {
                         let mut file = None;
                         let mut url = None;
                         if let Some(l) = this.live.get(&id) {
@@ -4259,7 +4259,7 @@ impl Shell {
             )
             .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
                 this.update_hover_link(id, e.position, cx);
-                this.update_path_hover(id, e.position, e.modifiers.platform, cx);
+                this.update_path_hover(id, e.position, keys::link_modifier(e.modifiers), cx);
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
                 {

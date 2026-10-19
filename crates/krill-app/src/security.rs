@@ -270,7 +270,12 @@ mod tests {
         let raw = "빌드\x00\x07\x08\t\r\n\x1b[2J\x7f\u{009b}\u{202e} 완료";
         assert_eq!(sanitize_title(raw), "빌드[2J 완료");
         let preview = format_link_preview("https://example.com/\x1b\u{202e}path");
-        assert_eq!(preview, "https://example.com/path (⌘+클릭하여 열기)");
+        let expected = if cfg!(target_os = "macos") {
+            "https://example.com/path (⌘+클릭하여 열기)"
+        } else {
+            "https://example.com/path (Ctrl+클릭하여 열기)"
+        };
+        assert_eq!(preview, expected);
     }
 
     #[test]
