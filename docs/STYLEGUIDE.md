@@ -4,11 +4,13 @@
 
 근거 및 출처: Orca 레포지토리(`.ref/orca/docs/STYLEGUIDE.md`, `.ref/orca/src/renderer/src/assets/main.css`, `.ref/orca/src/renderer/src/components/ui/*`, `.ref/orca/src/shared/terminal-themes/defaults.ts`, Copyright (c) 2026 Lovecast Inc., MIT License)의 검증된 디자인 토큰·컴포넌트 문법·UX 원칙을 순수 Rust(`gpui` + `gpui-component`) 체계로 이식했다.
 
+**Orca 패리티의 범위**: 레이아웃·치수·단축키·컴포넌트 문법은 Orca와 맞추는 것이 의도된 정책이다(Orca에서 넘어오는 사용자에게 익숙함이 곧 기능이다, `orca_parity_tokens` 테스트가 치수를 고정한다). **색·브랜드·카피 톤은 Krill 고유다** — 무채색 크롬의 심해 틴트, `preserve` 토큰, 코랄 브랜드 마크, 3분절 스피너, 떼 미터는 Orca에 없다.
+
 ---
 
 ## 1. 개요 및 시각 정체성 (Overview)
 
-Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 끊김 없이 병렬 실행하는 macOS 데스크톱 앱이다. 시각적 정체성은 **모노크롬과 절제(monochrome and quiet)**다 — 중립 무채색(neutral grays)이 앱 크롬을 지탱하고, 유채색은 오직 **의미 있는 상태**(포커스 링, 에이전트 작업/질문/차단/완료 상태, 파괴적 동작, Git 변경 장식)에만 아껴 쓴다.
+Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 끊김 없이 병렬 실행하는 macOS 데스크톱 앱이다. 앱이 죽거나 업데이트돼도 세션은 살아남는다. 시각적 정체성은 **심해의 고요 위 하나의 살아 있는 점**이다 — 크롬은 푸른 기 도는 심해 뉴트럴로 물러나고, 코랄은 Krill 자신(로고)에만, 상태색은 의미(에이전트 작업/질문/차단/완료, 파괴적 동작, Git 변경 장식)에만 쓰며, 세션 보존은 경고가 아닌 `preserve` 톤으로 보여 준다.
 
 앱 화면의 대부분은 터미널 격자, Diff 뷰, 코드 에디터가 차지하므로 Krill 자체의 크롬은 뒤로 물러나 콘텐츠를 감싸는 액자 역할을 해야 한다.
 
@@ -42,28 +44,39 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 
 | 토큰 필드 | Light (`LIGHT`) | Dark (`DARK`) | 용도 (Use it for) | 금지 용도 (Don't use it for) |
 |---|---|---|---|---|
-| `background` / `foreground` | `#ffffff` / `#0a0a0a` | `#0a0a0a` / `#fafafa` | 앱 기본 캔버스, 기본 본문 텍스트, 활성 탭 배경 | 카드, 팝오버, 사이드바(전용 토큰 사용) |
+| `background` / `foreground` | `#ffffff` / `#0a0a0a` | `#0b0d13` / `#fafafa` | 앱 기본 캔버스, 기본 본문 텍스트, 활성 탭 배경 | 카드, 팝오버, 사이드바(전용 토큰 사용) |
 | `editor_surface` | `#ffffff` | `#1e1e1e` | 코드 에디터·마크다운 편집기 표면(다크 모드에서 캔버스보다 살짝 밝은 VS Code식 표면) | 일반 앱 크롬 |
-| `card` / `card_foreground` | `#ffffff` / `#0a0a0a` | `#171717` / `#fafafa` | 캔버스 위에 얹힌 설정 행·패널·그룹 상자(`ui::card`) | 기본 캔버스 자체 |
-| `popover` / `popover_foreground` | `#ffffff` / `#0a0a0a` | `#171717` / `#fafafa` | 떠 있는 메뉴, 드롭다운, Jump 팔레트, 중앙 모달 대화상자 | 인라인 고정 UI |
+| `card` / `card_foreground` | `#ffffff` / `#0a0a0a` | `#161a24` / `#fafafa` | 캔버스 위에 얹힌 설정 행·패널·그룹 상자(`ui::card`) | 기본 캔버스 자체 |
+| `popover` / `popover_foreground` | `#ffffff` / `#0a0a0a` | `#161a24` / `#fafafa` | 떠 있는 메뉴, 드롭다운, Jump 팔레트, 중앙 모달 대화상자 | 인라인 고정 UI |
 | `primary` / `primary_foreground` | `#171717` / `#fafafa` | `#e5e5e5` / `#171717` | 한 흐름에서 단 하나의 긍정 주 동작 버튼(저장, 생성, 확인) | 장식용 강조, 호버 배경, 보조 동작 |
-| `secondary` / `secondary_foreground` | `#f5f5f5` / `#171717` | `#262626` / `#fafafa` | `primary` 옆에 놓이는 낮은 강조의 보조 버튼·보조 칩 | 주 긍정 동작 |
-| `muted` / `muted_foreground` | `#f5f5f5` / `#737373` | `#262626` / `#a1a1a1` | 보조 설명, 캡션, 플레이스홀더, 비활성 탭 글자, 키캡·코드 블록 배경 | 본문 텍스트, 주 동작 버튼 |
-| `accent` / `accent_foreground` | `#f5f5f5` / `#171717` | `#303030` / `#fafafa` | 고스트 버튼·목록 행·팔레트 항목의 호버/선택 배경 | 단색 채움 버튼(`secondary` 사용) |
+| `secondary` / `secondary_foreground` | `#f3f4f7` / `#171717` | `#1f2430` / `#fafafa` | `primary` 옆에 놓이는 낮은 강조의 보조 버튼·보조 칩 | 주 긍정 동작 |
+| `muted` / `muted_foreground` | `#f3f4f7` / `#646b78` | `#1f2430` / `#9aa3b5` | 보조 설명, 캡션, 플레이스홀더, 비활성 탭 글자, 키캡·코드 블록 배경 | 본문 텍스트, 주 동작 버튼 |
+| `accent` / `accent_foreground` | `#eef0f4` / `#171717` | `#2a3040` / `#fafafa` | 고스트 버튼·목록 행·팔레트 항목의 호버/선택 배경 | 단색 채움 버튼(`secondary` 사용) |
 | `destructive` / `destructive_foreground` | `#e40014` / `#fcf3f3` | `#ff6568` / `#fafafa` | 삭제·초기화·강제 종료 등 되돌릴 수 없는 파괴적 동작, 오류 배너/차단 상태 | 취소(Cancel)·닫기(Close) 버튼 |
-| `border` | `#e5e5e5` | `rgba(255,255,255,0.08)` | 모든 1px 구분선: 카드 테두리, 섹션 구분선, 입력칸 외곽선 | 강한 포커스 강조(`ring` 사용) |
-| `input` | `#e5e5e5` | `rgba(255,255,255,0.15)` | 입력 컨트롤(`Input`) 테두리·배경 | 폼 필드 바깥의 장식 |
-| `ring` | `#a1a1a1` | `#737373` | 키보드 포커스 링, 활성 칸 강조 테두리 | 상시 고정 테두리 |
-| `sidebar` / `sidebar_foreground` | `#fafafa` / `#0a0a0a` | `#171717` / `#fafafa` | 좌측 사이드바·통합 타이틀바·탭 바 크롬 표면과 기본 글자 | 메인 캔버스나 모달 내부 |
+| `border` | `#e4e7ec` | `rgba(255,255,255,0.08)` | 모든 1px 구분선: 카드 테두리, 섹션 구분선, 입력칸 외곽선 | 강한 포커스 강조(`ring` 사용) |
+| `input` | `#e4e7ec` | `rgba(255,255,255,0.15)` | 입력 컨트롤(`Input`) 테두리·배경 | 폼 필드 바깥의 장식 |
+| `ring` | `#9aa3b5` | `#5b6478` | 키보드 포커스 링, 활성 칸 강조 테두리 | 상시 고정 테두리 |
+| `sidebar` / `sidebar_foreground` | `#f6f7f9` / `#0a0a0a` | `#12151d` / `#fafafa` | 좌측 사이드바·통합 타이틀바·탭 바 크롬 표면과 기본 글자 | 메인 캔버스나 모달 내부 |
 | `sidebar_primary` / `sidebar_primary_foreground` | `#171717` / `#fafafa` | `#1447e6` / `#fafafa` | 사이드바 주요 강조점, Git 이름 변경(Renamed/Copied) 배지 | 일반 본문 |
-| `sidebar_accent` / `sidebar_accent_foreground` | `#f0f0f0` / `#171717` | `#262626` / `#fafafa` | 사이드바 내비게이션·세션 행 호버/선택 배경 | 사이드바 바깥의 패널 |
-| `sidebar_border` / `sidebar_ring` | `#e5e5e5` / `#a1a1a1` | `rgba(255,255,255,0.07)` / `#525252` | 사이드바 내부 구분선 및 포커스 링 | 분할선(`split_divider` 사용) |
-| `worktree_sidebar` / `worktree_sidebar_foreground` | `#f5f5f5` / `#0a0a0a` | `#2a2a2a` / `#fafafa` | 워크트리 카드/그룹 표면(다크 모드에서 `#0a0a0a` 캔버스와 구분되는 리프트 표면) | 일반 설정 카드 |
-| `worktree_sidebar_accent` / `worktree_sidebar_border` | `#eaeaea` / `#e5e5e5` | `#353535` / `rgba(255,255,255,0.07)` | 워크트리 행 호버·상태 요약 알약 배경 및 테두리 | 사이드바 외부 |
+| `sidebar_accent` / `sidebar_accent_foreground` | `#e9ecf1` / `#171717` | `#222836` / `#fafafa` | 사이드바 내비게이션·세션 행 호버/선택 배경 | 사이드바 바깥의 패널 |
+| `sidebar_border` / `sidebar_ring` | `#e4e7ec` / `#9aa3b5` | `rgba(255,255,255,0.07)` / `#4b5366` | 사이드바 내부 구분선 및 포커스 링 | 분할선(`split_divider` 사용) |
+| `worktree_sidebar` / `worktree_sidebar_foreground` | `#f1f3f6` / `#0a0a0a` | `#232836` / `#fafafa` | 워크트리 카드/그룹 표면(다크 모드에서 `#0b0d13` 캔버스와 구분되는 리프트 표면) | 일반 설정 카드 |
+| `worktree_sidebar_accent` / `worktree_sidebar_border` | `#e6e9ef` / `#e4e7ec` | `#2e3445` / `rgba(255,255,255,0.07)` | 워크트리 행 호버·상태 요약 알약 배경 및 테두리 | 사이드바 외부 |
 | `success` | `#15803d` | `#86efac` | 에이전트 완료(`Done`), Git 추가(`A`/`??`), 정상 연결 상태 | 일반 장식 |
 | `warning` / `warning_foreground` | `#ca8a04` / `#fafafa` | `#eab308` / `#171717` | 에이전트 작업 중(`Working` 노란 스피너), 주의 배너, Git 수정(`M`) | 질문 대기(`agent_question` 사용) |
 | `agent_question` | `#ea580c` | `#f97316` | 에이전트가 사용자에게 질문/입력 대기 중(`Waiting`, 주황색 — 작업 중 노란색과 한눈에 구분) | 일반 경고 |
+| `preserve` | `#0369a1` | `#7dd3fc` | **Krill 고유.** 세션이 안전하게 보존·이어지는 중: 데몬 재연결 중(세션은 krill-holder가 보관), 탭 밖 분리 세션. 배경 틴트는 `.opacity(0.12)`, 테두리 `.opacity(0.3)` | 에이전트 상태(작업/질문/차단/완료), 조치가 필요한 경고·실패(`warning`·`destructive` 유지), 정상 연결(`success`) |
 | `split_divider` / `split_divider_strong` | `#868690` / `#71717a` | `#71717a` / `#a1a1aa` | 터미널 분할선 기본 상태(`card` 대비 3:1 이상) 및 호버/드래그 강조 상태 | 일반 카드 테두리(`border` 사용) |
+
+### 3.1.1 심해 틴트와 대비 기준
+
+- 무채색 크롬(배경·사이드바·카드·팝오버·muted·accent·테두리·포커스 링)은 Orca의 순수 회색 대신 **Krill 심해 틴트**(남색 기, 색상각 약 220°)를 쓴다. 상태색(`success`·`warning`·`agent_question`·`destructive`), 탭 9색, Git 색, `primary`·`sidebar_primary`는 Orca 값 그대로다.
+- **대비 회귀 테스트 (`text_tokens_meet_wcag_aa_on_every_surface`)**: 양 팔레트에서 `foreground`·`muted_foreground`가 `background`·`sidebar`·`card`·`popover`·`muted`·`accent`·`sidebar_accent`·`worktree_sidebar` 위에서 WCAG 대비 4.5:1 이상이고, `preserve`가 `background` 위 4.5:1 이상인지 계산해 단언한다.
+- 최종 값 계산 결과(WCAG 상대휘도 공식, 2026-10-19):
+  - 다크 `muted_foreground` `#9aa3b5`: background 7.66 · sidebar 7.20 · card/popover 6.86 · muted 6.12 · sidebar_accent 5.81 · worktree_sidebar 5.80 · accent 5.19.
+  - 라이트 `muted_foreground` `#646b78`: background/card/popover 5.36 · sidebar 5.00 · muted 4.88 · worktree_sidebar 4.82 · accent 4.70 · sidebar_accent 4.53. (초안 `#666d7a`는 sidebar_accent 위 4.40이라 한 단계 어둡게 정했다.)
+  - `foreground`: 다크 12.61(accent)~18.61(background), 라이트 16.72(sidebar_accent)~19.80(background).
+  - `preserve`: 다크 `#7dd3fc` background 위 11.65, 라이트 `#0369a1` 흰 바탕 위 5.93.
 
 ### 3.2 특수 상태 상수 및 헬퍼 함수
 
@@ -95,7 +108,8 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 
 ### 3.4 터미널 팔레트 (`TERMINAL_DARK` / `TERMINAL_LIGHT`)
 
-- 다크 모드: `TERMINAL_DARK` (Orca `Ghostty Default Style Dark`, 배경 `#282c34`, 전경 `#ffffff`).
+- 다크 모드 기본: `TERMINAL_DARK` = **`Krill Deep`** (배경 `#10131b`, 전경 `#ffffff`, 커서 코랄 `#ff5238`, ANSI 16색은 Orca `Ghostty Default Style Dark` 그대로). 데몬이 앱 테마를 받기 전 색 질의(OSC 10/11/12/4)에 답하는 `krill_proto::theme::DEFAULT`와 같은 값이다 — 두 값이 어긋나면 에이전트가 실제와 다른 배경을 보고 색을 고른다. 배경이 어두워 OSC 11 응답은 계속 다크로 판정된다.
+- `TERMINAL_GHOSTTY_DARK`: Orca `Ghostty Default Style Dark`(배경 `#282c34`, 전경·커서 `#ffffff`). 내장 테마 목록 `TERMINAL_THEMES`에 선택지로 남긴다.
 - 라이트 모드: `TERMINAL_LIGHT` (Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
 - 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
 
@@ -201,11 +215,17 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 ### 6.4 아이콘 및 에이전트 상태 인디케이터 (`ui::icons`, `ui::status`)
 
 - **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Gemini, Antigravity, OpenCode, Cursor 및 Krill 코랄 로고는 외부 이미지 디코더나 네트워크 없이 인라인 벡터(`ui::icons::agent_brand_icon`, `ui::icons::provider_icon`, `ui::icons::agent_menu_icon`, `ui::icons::provider_menu_icon`, `ui::icons::krill_brand_icon`)로 즉시 그린다.
+- **Krill 브랜드 마크 (`ui::icons::krill_brand_icon(size_px, p)`, `ui::icons::brand_mark_tile(size_px)`)**:
+  - 마크는 코랄 크릴 하나로 통일한다(데스크톱·메뉴 막대 모노·모바일·웹). 사용처: 사이드바 헤더("Krill" 앞, `ICON_MD`), 빈 작업 공간 히어로(`brand_mark_tile`, 남색 `#08090e` 둥근 상자 `RADIUS_LG` 안 코랄 마크), 메뉴 막대(모노 크릴), 모바일 PWA·웹 랜딩(같은 크릴 SVG).
+  - 색: 다크 바탕 `KRILL_CORAL` `#ff5238`, 라이트 바탕 `KRILL_CORAL_LIGHT` `#d63a24`(흰 바탕 4.68:1; `#ff5238`은 3.09:1). `krill_brand_icon`이 팔레트 바탕에 맞춰 고르고(`ui::icons::krill_coral(p)`), `brand_mark_tile`은 바탕이 늘 남색이라 `#ff5238`을 쓴다.
+  - **코랄 규칙**: 코랄은 Krill 자신(브랜드 마크)에만 쓴다. 상태 의미(오류·경고·작업 중)에 쓰지 않는다 — `destructive`·탭 Red와 색상각이 9~13°밖에 차이 나지 않아 색약 사용자가 혼동한다. 버튼 채움·포커스 링·선택 배경에도 쓰지 않는다. 예외는 터미널 `Krill Deep` 커서 하나다.
 - **UI 아이콘**: `gpui-component`의 Lucide 아이콘(`IconName`)과 `ui/icons.rs`의 Lucide SVG 상수를 사용한다. 다른 아이콘 세트를 섞지 않는다.
 - **상태 글리프 (`ui::status::status_glyph`)**:
   - 모든 작업 중(`Working`) 스피너는 `Animation::repeat_synced()`(1초 12스텝)를 공유해 탭과 사이드바 전체에서 같은 위상으로 회전한다.
-  - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 3/4 링이 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
+  - 작업 중 스피너 모양은 Orca 3/4 링 대신 **120° 간격 3분절 아크**(크릴 등갑 모티프, `RING_SVG`)다.
+  - **접근성 감속(`cx.reduce_motion()`)**: 움직임 감속이 켜져 있으면 멈춘 분절 아크가 고장처럼 보이지 않도록 닫힌 정적 링(`RING_FULL_SVG`)으로 대체한다.
 - **워크트리 상태 요약 (`ui::status::summary_element`)**: 주의를 요하는 순서(`Waiting` → `Blocked` → `Working` → `Done` → `Exited` → `Unknown`)로 최대 3개 그룹(`MAX_GROUPS`), 그룹당 최대 3개 에이전트 아이콘(`MAX_GROUP_ICONS`)을 겹쳐 그리고 나머지는 `+N`으로 축약한다.
+- **떼(swarm) 미터 (`ui::status::swarm_meter(states, max, cx)`)**: 세션마다 3px 상태색 점(`agent_state_color`, 유휴는 50% 투명)을 요약과 같은 우선순위로 최대 `SWARM_MAX`(12)개 그리고, 넘치면 `+N`(`TEXT_XS`, `muted_foreground`)을 붙인다. 점 `max`개 칸과 `+N` 칸을 늘 예약해 세션 수가 바뀌어도 폭이 흔들리지 않는다(§7.3). 순서·넘침 계산은 `ui::status::swarm_dots`.
 
 ### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)
 
@@ -241,6 +261,13 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 - **있는 기능만 표기한다**: Orca의 UI/UX를 참조하더라도 **Krill에 실제로 구현되어 동작하는 기능만 화면에 그린다.** 아직 없는 기능(예: 아티팩트, 스킬 마켓, 작업/칸반 보드, 미구현 자동화 탭, 동작하지 않는 플레이스홀더 버튼/단축키 칩)을 껍데기만 복사해 노출하는 것은 엄격히 금지한다.
 - **조건부 노출**: 프로비저닝 설정이 켜져야만 성립하는 '다른 계정으로 이어가기'(`ui::status::continue_chip_visible`)나 데몬 기능 협상(`FEAT_*`)이 필요한 컨트롤은 해당 기능이 실제로 활성화된 상태에서만 노출한다.
 - **문구 정직성**: 코드가 실제 상태나 결과 데이터를 확인하기 전에는 "보호됨", "검증됨", "삭제됨", "적용 완료" 같은 결과 동사를 쓰지 않는다. 진행 중일 때는 중립적인 과정 문구를 쓰고, 실제 결과가 도착했을 때만 결과 문구를 표시한다.
+
+### 7.1.1 카피 톤 (Krill Voice)
+
+- **차분하고 사실만**: 감탄·과장·불안을 부르는 말("치명적", "위험!", "완벽하게")을 쓰지 않는다. 지금 무엇이 어떤 상태인지 한 문장으로 말한다.
+- **보존·이어짐 어휘**: 세션이 안전한 상황(데몬 재연결 중, 앱 재시작·업데이트, 탭 밖 분리 세션)은 "끊김"·"오류"가 아니라 "보존", "이어짐", "계속 실행 중"으로 말하고 `preserve` 톤으로 그린다. 사용자 조치가 필요한 실패(재연결 실패, 멈춤)만 `warning`·`destructive`를 쓴다.
+- **결과 동사 규칙**: "다시 연결했습니다", "세션 {n}개에 다시 연결했습니다" 같은 결과 문구는 실제 결과(세션 목록 도착 등)를 확인한 뒤에만 보인다(§7.1). 확인 전에는 "다시 연결하는 중…"처럼 과정 문구를 쓴다.
+- **프로세스 이름은 정확히**: PTY와 세션은 **krill-holder**가 소유하고, **krilld**는 세션 데몬(질의 응답·저장·상태)이다. "세션은 krilld에서 실행됩니다"처럼 쓰지 않는다. 사용자 문구에서는 프로세스 이름을 빼고 "세션은 계속 실행됩니다"로 쓰거나, 구조 설명이 필요할 때만 "세션은 krill-holder가 보관합니다"라고 쓴다.
 
 ### 7.2 인앱 페이지 전환 vs 모달 대화상자
 
@@ -295,3 +322,5 @@ UI 화면·스크린샷·PR을 검토할 때 아래 기준으로 판단한다.
 1. **생 색상 및 임의 픽셀 글자 크기 차단 (`no_raw_colors_or_arbitrary_font_sizes_outside_ui_module`)**: `crates/krill-app/src/` 아래의 모든 `.rs` 파일(`src/ui/` 및 터미널 셀 렌더러 `src/terminal.rs` 제외)을 스캔하여 `gpui::rgb(`, `gpui::hsla(`, `gpui::black(`, `gpui::white(`, `gpui::transparent_black(`, `gpui::red(` / `green(` / `blue(` / `yellow(`, `ui::hex(`, `ui::hexa(`, 비수식 `hex(0x` / `hexa(0x`, 비허용 그림자 단계(`.shadow_xs(` / `.shadow_sm(` / `.shadow_md(` / `.shadow_xl(` / `.shadow_2xl(`), `.text_size(px(` 호출이 발견되면 테스트가 즉시 실패한다.
 2. **문서-코드 토큰 동기화 검증 (`styleguide_doc_stays_in_sync_with_palette_and_tokens`)**: `Palette`의 모든 시맨틱 색 필드와 타이포그래피·반경·간격·프리미티브 식별자가 이 문서(`docs/STYLEGUIDE.md`)에 빠짐없이 문서화되어 있는지 검사한다.
 3. **Orca 패리티 토큰 회귀 검사 (`orca_parity_tokens`, `palettes_distinguish_light_and_dark_surfaces`)**: 라이트·다크 대비와 주요 치수 상수가 흔들리지 않도록 보장한다.
+4. **대비 회귀 검사 (`text_tokens_meet_wcag_aa_on_every_surface`)**: §3.1.1의 글자·표면 조합이 WCAG 4.5:1 미만으로 떨어지면 실패한다.
+5. **터미널 기본 테마 일치 (`krill_deep_terminal_matches_daemon_default`)**: 앱 `TERMINAL_DARK`와 데몬 `krill_proto::theme::DEFAULT`가 어긋나면 실패한다.

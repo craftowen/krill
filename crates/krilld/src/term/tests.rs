@@ -100,10 +100,10 @@ const QUERIES: &[&str] = &[
 const REPLIES_DEFAULT: &str = concat!(
     "\x1b[1;1R",
     "\x1b[?0u",
-    "\x1b]11;rgb:1c1c/1c1c/1c1c\x1b\\",
-    "\x1b]10;rgb:d0d0/d0d0/d0d0\x07",
-    "\x1b]12;rgb:d0d0/d0d0/d0d0\x07",
-    "\x1b]4;1;rgb:cdcd/3131/3131\x07",
+    "\x1b]11;rgb:1010/1313/1b1b\x1b\\",
+    "\x1b]10;rgb:ffff/ffff/ffff\x07",
+    "\x1b]12;rgb:ffff/5252/3838\x07",
+    "\x1b]4;1;rgb:cccc/6666/6666\x07",
     "\x1b]4;196;rgb:ffff/0000/0000\x07",
     "\x1b[?2026;2$y",
     "\x1b[?2031;2$y",
@@ -137,7 +137,7 @@ fn pushed_theme_cell_size_and_program_colors() {
     let q = "\x1b]11;?\x07\x1b[14t\x1b[c";
     assert_eq!(
         e.feed(q.as_bytes(), Feed::Live, &look),
-        "\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[4;720;720t\x1b[?6c"
+        "\x1b]11;rgb:1010/1313/1b1b\x07\x1b[4;720;720t\x1b[?6c"
     );
     // 프로그램이 OSC 11로 바꾼 배경색이 테마보다 먼저다.
     let r = e.feed(b"\x1b]11;#123456\x07\x1b]11;?\x07", Feed::Live, &look);

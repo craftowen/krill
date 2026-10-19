@@ -17,19 +17,25 @@ use gpui_kit_assets::IconName;
 use krill_proto::control::AgentState;
 
 use super::{
-    FONT_MONO, RADIUS_XS, STATE_DOT, TEXT_2XS, agent_state_color, icons, palette,
+    FONT_MONO, RADIUS_XS, STATE_DOT, TEXT_2XS, TEXT_XS, agent_state_color, icons, palette,
     theme::{AGENT_UNREAD, STATUS_GROUP_ICON, STATUS_GROUP_OVERLAP},
 };
 
-/// 3/4 링(위쪽이 빈 회전 스피너). 선 굵기는 6px 링에서 Orca `border-2`에 가깝게 잡았다.
-const RING_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="7" xmlns="http://www.w3.org/2000/svg"><path d="M20.5 12A8.5 8.5 0 1 1 12 3.5"/></svg>"#;
-/// 접근성 감속(reduce motion)에서는 멈춘 3/4 링이 고장처럼 보여 닫힌 링을 그린다(Orca와 같은 의도).
+/// 작업 중 스피너: 120° 간격 3분절 아크(크릴 등갑 모티프, 분절마다 80° + 틈 40°). 선 굵기는 6px 링에서 읽히게 굵게 잡았다.
+const RING_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="7" xmlns="http://www.w3.org/2000/svg"><path d="M14.91 4.01A8.5 8.5 0 0 1 20.37 13.48"/><path d="M17.46 18.51A8.5 8.5 0 0 1 6.54 18.51"/><path d="M3.63 13.48A8.5 8.5 0 0 1 9.09 4.01"/></svg>"#;
+/// 접근성 감속(reduce motion)에서는 멈춘 분절 아크가 고장처럼 보여 닫힌 링을 그린다(Orca와 같은 의도).
 const RING_FULL_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="7" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="8.5"/></svg>"#;
 /// Lucide `bell`(ISC License)을 채운 모양. 미확인 완료 표시.
 const BELL_FILLED_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg"><path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/></svg>"#;
 
 /// 1초에 한 바퀴, 12스텝. 모든 스피너가 앱 공용 시계(`repeat_synced`)를 따라 같은 위상으로 돈다.
 const SPIN_STEPS: f32 = 12.;
+
+/// 떼 미터 점 최대 수와 점 지름·간격·`+N` 칸 너비(px). 폭은 늘 이 값으로 예약한다(STYLEGUIDE §7.3).
+pub const SWARM_MAX: usize = 12;
+const SWARM_DOT: f32 = 3.;
+const SWARM_GAP: f32 = 2.;
+const SWARM_MORE_WIDTH: f32 = 22.;
 
 /// 워크트리 행에 보이는 상태 묶음 수와 묶음마다 겹쳐 그리는 에이전트 아이콘 수.
 pub const MAX_GROUPS: usize = 3;
@@ -251,6 +257,64 @@ pub fn summary_element(summary: &Summary<'_>, cx: &App) -> gpui::Div {
         .when(summary.hidden > 0, |d| d.child(more(summary.hidden)))
 }
 
+/// 떼 미터에 그릴 점(상태 우선순위 순, 최대 `max`개, `max`는 [`SWARM_MAX`]로 자른다)과 넘친 세션 수(`+N`).
+/// 순서는 [`summarize`]와 같다: 확인 필요(`Waiting`)·차단 → 작업 중 → 완료 → 유휴(`Exited`·`Unknown`).
+#[must_use]
+pub fn swarm_dots(states: &[AgentState], max: usize) -> (Vec<AgentState>, usize) {
+    let max = max.min(SWARM_MAX);
+    let mut dots: Vec<AgentState> = ORDER
+        .iter()
+        .flat_map(|o| states.iter().copied().filter(move |s| s == o))
+        .collect();
+    let more = dots.len().saturating_sub(max);
+    dots.truncate(max);
+    (dots, more)
+}
+
+/// 떼(swarm) 미터: 세션마다 3px 상태색 점, 넘치면 `+N`(`TEXT_XS` muted). 세션 수가 바뀌어도 폭이 흔들리지 않게
+/// 점 `max`개 칸과 `+N` 칸을 늘 예약한다. 접근성 라벨·툴팁은 호출자가 바깥 `div().id(..)`에 붙인다.
+pub fn swarm_meter(states: &[AgentState], max: usize, cx: &App) -> gpui::Div {
+    let p = palette(cx);
+    let (dots, more) = swarm_dots(states, max);
+    // `SWARM_MAX`(12) 이하라 u8에 늘 들어간다.
+    let slots = f32::from(u8::try_from(max.min(SWARM_MAX)).unwrap_or(u8::MAX));
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap(px(SWARM_GAP))
+        .child(
+            div()
+                .flex_none()
+                .w(px((slots * (SWARM_DOT + SWARM_GAP) - SWARM_GAP).max(0.)))
+                .flex()
+                .items_center()
+                .gap(px(SWARM_GAP))
+                .children(dots.into_iter().map(|state| {
+                    let color = agent_state_color(state, cx);
+                    let color = if glyph(state) == Glyph::Dot {
+                        color.opacity(0.5)
+                    } else {
+                        color
+                    };
+                    div()
+                        .flex_none()
+                        .size(px(SWARM_DOT))
+                        .rounded_full()
+                        .bg(color)
+                })),
+        )
+        .child(
+            div()
+                .flex_none()
+                .w(px(SWARM_MORE_WIDTH))
+                .font_family(FONT_MONO)
+                .text_size(TEXT_XS)
+                .text_color(p.muted_foreground)
+                .when(more > 0, |d| d.child(format!("+{more}"))),
+        )
+}
+
 /// 워크트리 행 왼쪽의 미확인 점(6px 호박색).
 #[must_use]
 pub fn unread_dot() -> gpui::Div {
@@ -404,6 +468,72 @@ mod tests {
         assert_eq!(glyph(AgentState::Done), Glyph::Check);
         assert_eq!(glyph(AgentState::Exited), Glyph::Dot);
         assert_eq!(glyph(AgentState::Unknown), Glyph::Dot);
+    }
+
+    /// 스피너는 120° 간격 3분절 아크, 감속 대체는 닫힌 링.
+    #[test]
+    fn spinner_is_three_segment_arc_and_reduce_motion_is_closed_ring() {
+        let ring = std::str::from_utf8(RING_SVG).unwrap();
+        assert!(ring.starts_with("<svg") && ring.ends_with("</svg>"));
+        assert_eq!(ring.matches("<path").count(), 3);
+        assert_eq!(ring.matches("A8.5 8.5 0 0 1").count(), 3);
+        let full = std::str::from_utf8(RING_FULL_SVG).unwrap();
+        assert!(full.contains("<circle"));
+    }
+
+    #[test]
+    fn swarm_dots_sort_by_attention_and_fold_overflow() {
+        use AgentState::{Blocked, Done, Exited, Unknown, Waiting, Working};
+        let (dots, more) = swarm_dots(&[Done, Unknown, Working, Exited, Blocked, Waiting], 12);
+        assert_eq!(dots, [Waiting, Blocked, Working, Done, Exited, Unknown]);
+        assert_eq!(more, 0);
+        // 15개 → 12점 + 3. 확인 필요가 먼저 남는다.
+        let mut many = vec![Done; 14];
+        many.push(Waiting);
+        let (dots, more) = swarm_dots(&many, 12);
+        assert_eq!(dots.len(), 12);
+        assert_eq!(dots[0], Waiting);
+        assert_eq!(more, 3);
+        // max는 SWARM_MAX로 자른다.
+        let (dots, more) = swarm_dots(&many, 99);
+        assert_eq!((dots.len(), more), (SWARM_MAX, 3));
+        assert_eq!(swarm_dots(&[], 12), (Vec::new(), 0));
+    }
+
+    #[gpui::test]
+    fn swarm_meter_reserves_width_regardless_of_count(cx: &mut gpui::TestAppContext) {
+        use gpui::{InteractiveElement as _, IntoElement as _};
+        struct Meters;
+        impl gpui::Render for Meters {
+            fn render(
+                &mut self,
+                _: &mut gpui::Window,
+                cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .child(
+                        swarm_meter(&[], SWARM_MAX, cx)
+                            .id("swarm-empty")
+                            .debug_selector(|| "swarm-empty".to_owned()),
+                    )
+                    .child(
+                        swarm_meter(&[AgentState::Working; 20], SWARM_MAX, cx)
+                            .id("swarm-full")
+                            .debug_selector(|| "swarm-full".to_owned()),
+                    )
+                    .into_any_element()
+            }
+        }
+        let window = cx.add_window(|_, _| Meters);
+        let mut vcx = gpui::VisualTestContext::from_window(window.into(), cx);
+        vcx.run_until_parked();
+        let empty = vcx.debug_bounds("swarm-empty").map(|b| b.size.width);
+        let full = vcx.debug_bounds("swarm-full").map(|b| b.size.width);
+        assert!(empty.is_some());
+        assert_eq!(empty, full);
     }
 
     #[test]

@@ -183,7 +183,7 @@ fn answers_without_client_and_keeps_last_theme() {
     assert!(child.wait().unwrap().success());
     assert_eq!(
         fs::read_to_string(&out).unwrap(),
-        "\x1b]10;rgb:d0d0/d0d0/d0d0\x1b\\\x1b]11;rgb:1c1c/1c1c/1c1c\x07\x1b[1;1R\x1b[?6c\x1b[?997;2n"
+        "\x1b]10;rgb:ffff/ffff/ffff\x1b\\\x1b]11;rgb:1010/1313/1b1b\x07\x1b[1;1R\x1b[?6c\x1b[?997;2n"
     );
     s.wait().unwrap();
 
