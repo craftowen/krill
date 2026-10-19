@@ -3781,7 +3781,7 @@ dependencies = [
 
 [[package]]
 name = "krill"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "krill-hosts",
  "krill-log",
@@ -3800,7 +3800,7 @@ dependencies = [
 
 [[package]]
 name = "krill-app"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "block2 0.6.2",
  "gpui-component",
@@ -3833,7 +3833,7 @@ dependencies = [
 
 [[package]]
 name = "krill-holder"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "krill-log",
  "krill-proto",
@@ -3846,7 +3846,7 @@ dependencies = [
 
 [[package]]
 name = "krill-hosts"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "krill-proto",
  "postcard",
@@ -3857,7 +3857,7 @@ dependencies = [
 
 [[package]]
 name = "krill-link"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "iroh",
  "krill-log",
@@ -3876,7 +3876,7 @@ dependencies = [
 
 [[package]]
 name = "krill-log"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "rustix",
  "tracing",
@@ -3884,7 +3884,7 @@ dependencies = [
 
 [[package]]
 name = "krill-proto"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "postcard",
  "proptest",
@@ -3900,7 +3900,7 @@ dependencies = [
 
 [[package]]
 name = "krill-term"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "krill-proto",
  "unicode-width",
@@ -3908,7 +3908,7 @@ dependencies = [
 
 [[package]]
 name = "krilld"
-version = "0.1.17"
+version = "0.1.18"
 dependencies = [
  "alacritty_terminal",
  "core-foundation 0.10.1",
