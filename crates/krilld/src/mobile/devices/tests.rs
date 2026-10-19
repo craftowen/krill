@@ -83,3 +83,33 @@ fn existing_user_owned_readable_state_directory_keeps_registry_private() {
     );
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn seen_within_flush_window_stays_in_memory_until_next_save() {
+    let dir = std::env::temp_dir().join(format!("mk-mobile-{}", hex(&random().unwrap())));
+    let path = dir.join("mobile-devices.json");
+    let mut devices = Devices::open(Some(&dir)).unwrap();
+    let t = devices.mint(1_000, true).unwrap();
+    let (d, _) = devices.pair(&t.token, "phone", 1_000).unwrap();
+    let paired = fs::read(&path).unwrap();
+    // 저장 뒤 창 안의 재접속 두 번은 파일을 건드리지 않고 메모리 값만 바꾼다.
+    devices.seen(&d.device_id, 2_000).unwrap();
+    devices.seen(&d.device_id, 3_000).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), paired);
+    assert_eq!(devices.list().first().unwrap().last_seen_ms, 3_000);
+    // 창이 지나면 디스크에 남긴다.
+    let late = 1_000 + SEEN_FLUSH_MS;
+    devices.seen(&d.device_id, late).unwrap();
+    let reopened = Devices::open(Some(&dir)).unwrap();
+    assert_eq!(reopened.list().first().unwrap().last_seen_ms, late);
+    // 회수는 창과 무관하게 즉시 영속한다.
+    devices.seen(&d.device_id, late + 1).unwrap();
+    assert_eq!(
+        devices.revoke(Some(&d.device_id), false, late + 2).unwrap(),
+        1
+    );
+    let reopened = Devices::open(Some(&dir)).unwrap();
+    assert_eq!(reopened.active_count(), 0);
+    assert_eq!(reopened.list().first().unwrap().last_seen_ms, late + 1);
+    fs::remove_dir_all(dir).unwrap();
+}

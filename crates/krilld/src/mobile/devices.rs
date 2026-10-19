@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 pub const TICKET_TTL_MS: u64 = 300_000;
 const MAX_DEVICES: usize = 32;
 const MAX_FILE: u64 = 1 << 20;
+/// 재접속 인증마다 fsync하지 않는다. `last_seen_ms`는 이 간격으로만(또는 다른 변경과 함께) 디스크에 남긴다.
+const SEEN_FLUSH_MS: u64 = 600_000;
 
 #[derive(Debug)]
 pub struct Devices {
@@ -18,6 +20,8 @@ pub struct Devices {
     ticket: Option<PairingTicket>,
     failures: u8,
     retry_at: u64,
+    /// 마지막으로 성공한 저장 시각(ms). 0이면 이 프로세스에서 아직 저장하지 않았다.
+    saved_at: u64,
 }
 impl Devices {
     pub fn open(dir: Option<&Path>) -> io::Result<Self> {
@@ -42,6 +46,7 @@ impl Devices {
             ticket: None,
             failures: 0,
             retry_at: 0,
+            saved_at: 0,
         })
     }
     /// 상태 응답에 재접속 검증자를 포함하지 않는다.
@@ -135,6 +140,7 @@ impl Devices {
         next.retain(|d| d.revoked_at_ms.is_none());
         next.push(device.clone());
         self.save(&next)?;
+        self.saved_at = now;
         self.entries = next;
         self.ticket = None;
         self.failures = 0;
@@ -143,15 +149,21 @@ impl Devices {
         public.shared_secret_hash.clear();
         Ok((public, credential))
     }
+    /// 메모리의 `last_seen_ms`만 바꾸고, 마지막 저장 뒤 `SEEN_FLUSH_MS`가 지났을 때만 디스크에 쓴다.
+    /// 저장 실패는 인증을 막지 않는다(메모리 값은 다음 저장 때 함께 남는다).
     pub fn seen(&mut self, id: &str, now: u64) -> io::Result<()> {
-        let mut next = self.entries.clone();
-        let d = next
+        let d = self
+            .entries
             .iter_mut()
             .find(|d| d.device_id == id && d.revoked_at_ms.is_none())
             .ok_or_else(invalid)?;
         d.last_seen_ms = now;
-        self.save(&next)?;
-        self.entries = next;
+        if now.saturating_sub(self.saved_at) >= SEEN_FLUSH_MS {
+            match self.save(&self.entries) {
+                Ok(()) => self.saved_at = now,
+                Err(error) => tracing::warn!(kind=?error.kind(), "mobile last_seen save failed"),
+            }
+        }
         self.failures = 0;
         self.retry_at = 0;
         Ok(())
@@ -169,6 +181,7 @@ impl Devices {
             }
         }
         self.save(&next)?;
+        self.saved_at = now;
         self.entries = next;
         // 전체 회수는 대기 QR도 폐기해야 즉시 노출이 끝난다.
         if all {
