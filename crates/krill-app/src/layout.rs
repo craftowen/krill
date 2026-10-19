@@ -292,6 +292,34 @@ struct LayoutTail {
     file_states: BTreeMap<PaneId, SavedFileState>,
     /// 셸 내부 `cd` 포함 최신 라이브 cwd(칸별). `launches`의 폴더(워크트리 루트·Open in 기준)와 분리 보관한다.
     respawn_cwds: BTreeMap<PaneId, Vec<u8>>,
+    /// 앱이 마지막으로 살아 있던 시각(UNIX ns, 0 = 모름). 정상 종료 때와 주기적으로 갱신한다.
+    /// 끝에 붙인 필드라 구버전 앱은 이 꼬리를 읽고 남는 바이트를 무시한다.
+    last_seen_unix_ns: u64,
+}
+
+/// `last_seen_unix_ns`가 붙기 전 6-필드 꼬리.
+#[derive(Deserialize)]
+struct TailV6 {
+    window_bounds: Option<SavedWindowBounds>,
+    sidebar_collapsed: bool,
+    panel_collapsed: bool,
+    panel_tab: crate::diff::PanelTab,
+    file_states: BTreeMap<PaneId, SavedFileState>,
+    respawn_cwds: BTreeMap<PaneId, Vec<u8>>,
+}
+
+impl From<TailV6> for LayoutTail {
+    fn from(old: TailV6) -> Self {
+        Self {
+            window_bounds: old.window_bounds,
+            sidebar_collapsed: old.sidebar_collapsed,
+            panel_collapsed: old.panel_collapsed,
+            panel_tab: old.panel_tab,
+            file_states: old.file_states,
+            respawn_cwds: old.respawn_cwds,
+            last_seen_unix_ns: 0,
+        }
+    }
 }
 
 /// `respawn_cwds`가 붙기 전 OWE-842 중간 형식의 5-필드 꼬리. 새 꼬리 디코딩에 실패할 때만 구 꼬리로 읽는다.
@@ -313,6 +341,7 @@ impl From<LegacyTail> for LayoutTail {
             panel_tab: old.panel_tab,
             file_states: old.file_states,
             respawn_cwds: BTreeMap::new(),
+            last_seen_unix_ns: 0,
         }
     }
 }
@@ -350,6 +379,9 @@ pub struct Layout {
     /// 시나리오 B 재스폰용 최신 라이브 cwd(칸별, 디스크에는 꼬리로 영속). `launches`와 분리.
     #[serde(skip)]
     respawn_cwds: BTreeMap<PaneId, Vec<u8>>,
+    /// [`LayoutTail::last_seen_unix_ns`]. 디스크에는 꼬리로만 영속한다.
+    #[serde(skip)]
+    last_seen_unix_ns: u64,
     #[serde(skip)]
     mru: MruState,
 }
@@ -447,6 +479,7 @@ impl From<LegacyLayoutV6> for Layout {
             panel_tab: crate::diff::PanelTab::default(),
             file_states: BTreeMap::new(),
             respawn_cwds: BTreeMap::new(),
+            last_seen_unix_ns: 0,
             mru: MruState::default(),
         };
         layout.record_mru(layout.active);
@@ -489,6 +522,7 @@ impl<C: Into<Create>> From<LegacyLayout<C>> for Layout {
             panel_tab: crate::diff::PanelTab::default(),
             file_states: BTreeMap::new(),
             respawn_cwds: BTreeMap::new(),
+            last_seen_unix_ns: 0,
             mru: MruState::default(),
         };
         layout.record_mru(layout.active);
@@ -515,6 +549,7 @@ impl Default for Layout {
             panel_tab: crate::diff::PanelTab::default(),
             file_states: BTreeMap::new(),
             respawn_cwds: BTreeMap::new(),
+            last_seen_unix_ns: 0,
             mru: MruState {
                 order: vec![0],
                 cursor: None,
@@ -672,6 +707,20 @@ impl Layout {
     /// 파일 칸이면 그 파일.
     pub fn file(&self, pane: PaneId) -> Option<&Path> {
         self.files.get(&pane).map(PathBuf::as_path)
+    }
+
+    /// 앱이 마지막으로 살아 있던 시각(UNIX ns). 저장된 적 없으면(구버전 파일 포함) `None`.
+    #[must_use]
+    pub const fn last_seen_unix_ns(&self) -> Option<u64> {
+        if self.last_seen_unix_ns == 0 {
+            None
+        } else {
+            Some(self.last_seen_unix_ns)
+        }
+    }
+
+    pub const fn set_last_seen_unix_ns(&mut self, ns: u64) {
+        self.last_seen_unix_ns = ns;
     }
 
     /// 시나리오 B 재스폰용 최신 라이브 cwd(셸 내부 `cd` 반영). 없으면 `launches`의 폴더를 쓴다.
@@ -1287,6 +1336,7 @@ impl Layout {
             panel_tab: self.panel_tab,
             file_states: self.file_states.clone(),
             respawn_cwds: self.respawn_cwds.clone(),
+            last_seen_unix_ns: self.last_seen_unix_ns,
         }
     }
 
@@ -1297,6 +1347,7 @@ impl Layout {
         self.panel_tab = tail.panel_tab;
         self.file_states = tail.file_states;
         self.respawn_cwds = tail.respawn_cwds;
+        self.last_seen_unix_ns = tail.last_seen_unix_ns;
     }
 
     fn is_valid(&self) -> bool {
@@ -1395,8 +1446,9 @@ impl Layout {
                         .map_err(|e| invalid(&e.to_string()))?;
                     l.hosts = hosts;
                     if !rest.is_empty() {
-                        // 6-필드 꼬리(OWE-842 `respawn_cwds` 포함)가 아니면 중간 커밋의 5-필드 꼬리로 읽는다.
+                        // 7-필드 꼬리가 아니면 6-필드(`last_seen` 이전), 그다음 중간 커밋의 5-필드 꼬리로 읽는다.
                         let tail = postcard::from_bytes::<LayoutTail>(rest)
+                            .or_else(|_| postcard::from_bytes::<TailV6>(rest).map(LayoutTail::from))
                             .or_else(|_| {
                                 postcard::from_bytes::<LegacyTail>(rest).map(LayoutTail::from)
                             })
