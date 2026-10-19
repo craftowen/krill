@@ -2098,6 +2098,49 @@ fn new_last_tab_is_revealed_with_motion_in_narrow_window(cx: &mut TestAppContext
             "tab {n}: active {active} {tab:?} hidden behind {limit:?} menu={menu:?}; all={all:?} drag={drag:?}"
         );
     }
+    // 다른 탭으로 갔다가 마지막 탭으로 돌아와도(복원처럼 이미 있는 탭) ⌄ 밑에 가리지 않는다.
+    for keys in ["cmd-1", "cmd-4"] {
+        cx.simulate_keystrokes(keys);
+        cx.run_until_parked();
+        for _ in 0..60 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.update(gpui::Window::simulate_next_frame);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+    }
+    let active = layout_of(&view, cx).active();
+    assert_eq!(active, 3);
+    let tab = cx.debug_bounds("session-tab-3").unwrap();
+    let menu = cx.debug_bounds("tab-overflow-menu").unwrap();
+    assert!(
+        tab.right() <= menu.left(),
+        "switch back: {tab:?} under menu {menu:?}"
+    );
+    // 표시가 끝난 뒤 앞 탭 제목이 길어져(복원 직후 데몬이 제목을 줌) 활성 탭이 밀려나도 다시 보이게 한다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.layout
+                .set_tab_title(1, Some("a-much-longer-restored-title"));
+            s.layout
+                .set_tab_title(2, Some("another-long-restored-title"));
+            cx.notify();
+        });
+    });
+    for _ in 0..60 {
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(16));
+        cx.update(gpui::Window::simulate_next_frame);
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+    }
+    let tab = cx.debug_bounds("session-tab-3").unwrap();
+    let menu = cx.debug_bounds("tab-overflow-menu").unwrap();
+    assert!(
+        tab.right() <= menu.left(),
+        "late titles: {tab:?} under menu {menu:?}"
+    );
 }
 
 #[gpui::test]
