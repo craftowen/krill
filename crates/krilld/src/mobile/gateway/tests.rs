@@ -893,10 +893,27 @@ fn mint_waits_for_pending_download_without_holding_state_lock() {
         state.tunnel_start = Some(super::super::tunnel::Tunnel::fixture);
         reconcile(&mut state, now_ms()).unwrap();
     }
-    gateway.shared.changed.notify_all();
+    gateway.shared.wake();
     assert!(matches!(
         receive.recv_timeout(Duration::from_secs(5)).unwrap(),
         MobileReply::PairingOffer { .. }
     ));
     worker.join().unwrap();
+}
+
+#[test]
+fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
+    let (_r, g) = start();
+    let (port, _) = offer(&g);
+    // 수락 스레드가 락 밖에서 리스너 복제 fd로 poll 중일 때 닫는다(깨우기 호출 없이).
+    until(|| *lock(&g.shared.waker.polling));
+    let mut s = lock(&g.shared.state);
+    s.devices.clear_ticket();
+    reconcile(&mut s, now_ms()).unwrap();
+    assert!(!*lock(&g.shared.waker.polling));
+    drop(s);
+    assert!(TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_err());
+    // 다시 열면 깨우기로 바로 수락한다.
+    let (port, t) = offer(&g);
+    Client::pair(port, &t).ipc();
 }
