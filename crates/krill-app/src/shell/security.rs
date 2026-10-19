@@ -105,7 +105,7 @@ impl Shell {
         cx.notify();
     }
 
-    /// 마우스가 가리키는 칸의 OSC 8 링크 미리보기를 갱신한다.
+    /// 마우스가 가리키는 칸의 OSC 8·평문 URL 링크 미리보기를 갱신한다.
     pub(super) fn update_hover_link(
         &mut self,
         pane: PaneId,
@@ -114,7 +114,12 @@ impl Shell {
     ) {
         let next = self.live.get(&pane).and_then(|l| {
             let screen = l.pane.shown();
-            link_target(&screen, &l.painted, position).map(|u| (pane, u.to_owned()))
+            link_target(&screen, &l.painted, position)
+                .map(|u| (pane, u.to_owned()))
+                .or_else(|| {
+                    krill_app::terminal::url_link_target(&screen, &l.painted, position)
+                        .map(|(_, u)| (pane, u))
+                })
         });
         if self.security.set_hover_link(next) {
             cx.notify();
@@ -260,34 +265,89 @@ impl Shell {
 /// 클립보드 이미지 최대 허용 크기(64 MiB). 비정상 대용량 버퍼로 인한 UI 지연을 막는다.
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
-/// 클립보드 항목에서 붙여넣을 바이트열을 추출한다(MK-111).
+/// 클립보드 이미지 바이트의 매직 넘버를 먼저 검사해 실제 포맷 확장자를 판정한다(#27345, #26739).
+/// `CleanShot` X 등이 `public.png` 타입으로 JPEG 바이트를 올릴 때 잘못된 `.png` 확장자로 저장되어
+/// Claude Code API가 MIME 불일치로 거부하는 문제를 막는다.
+#[must_use]
+pub(crate) fn sniff_clipboard_image_extension(
+    bytes: &[u8],
+    declared: gpui::ImageFormat,
+) -> &'static str {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "png"
+    } else if bytes.starts_with(b"\xff\xd8\xff") {
+        "jpg"
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        "gif"
+    } else if bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "webp"
+    } else if bytes.starts_with(b"BM") {
+        "bmp"
+    } else if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        "tiff"
+    } else {
+        declared.extension()
+    }
+}
+
+/// 클립보드 항목에서 붙여넣을 바이트열을 추출한다(MK-111, OWE-927).
 /// - Finder 등에서 복사한 파일(`ExternalPaths`)이 있으면(함께 들어오는 단순 파일명 문자열보다 우선)
-///   셸 이스케이프된 경로 목록을 반환한다.
-/// - 비어 있지 않은 문자열 항목이 있으면 텍스트를 그대로 반환한다.
+///   셸 이스케이프된 경로 목록을 반환한다. 단, 이미지 항목이 함께 있는데 `ExternalPaths`가 가리키는
+///   파일이 디스크에 존재하지 않는 죽은 스크린샷 임시 경로면(#28245) 경로와 파일명 문자열을 건너뛰고
+///   실제 이미지 바이트(`ClipboardEntry::Image`)를 저장해 붙여넣는다.
+/// - 비어 있지 않은 문자열 항목이 있으면 텍스트를 그대로 반환한다(이미지가 함께 있을 때는 공백만 있는 문자열은 건너뛴다).
 /// - 이미지 항목(`ClipboardEntry::Image`)이 있으면 `$TMPDIR/minikrill-paste/` 아래에 `0600` 파일로 저장하고
 ///   셸 이스케이프된 파일 경로를 반환한다.
 pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
     use krill_proto::os::ffi::OsStrExt as _;
 
+    let has_valid_image = item.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            gpui::ClipboardEntry::Image(img)
+                if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES
+        )
+    });
+    let mut skipped_dead_external_paths = false;
+
     for entry in item.entries() {
         if let gpui::ClipboardEntry::ExternalPaths(paths) = entry
             && !paths.paths().is_empty()
         {
-            return Some(krill_term::paste::dropped(
-                paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
-            ));
+            if has_valid_image {
+                let existing: Vec<&std::path::PathBuf> =
+                    paths.paths().iter().filter(|p| p.exists()).collect();
+                if !existing.is_empty() {
+                    return Some(krill_term::paste::dropped(
+                        existing.into_iter().map(|p| p.as_os_str().as_bytes()),
+                    ));
+                }
+                skipped_dead_external_paths = true;
+            } else {
+                return Some(krill_term::paste::dropped(
+                    paths.paths().iter().map(|p| p.as_os_str().as_bytes()),
+                ));
+            }
         }
     }
 
-    let has_non_empty_string = item
-        .entries()
-        .iter()
-        .any(|entry| matches!(entry, gpui::ClipboardEntry::String(s) if !s.text().is_empty()));
-    if has_non_empty_string
-        && let Some(text) = item.text()
-        && !text.is_empty()
-    {
-        return Some(text.into_bytes());
+    if !skipped_dead_external_paths {
+        let has_usable_string = item.entries().iter().any(|entry| match entry {
+            gpui::ClipboardEntry::String(s) => {
+                if has_valid_image {
+                    !s.text().trim().is_empty()
+                } else {
+                    !s.text().is_empty()
+                }
+            }
+            _ => false,
+        });
+        if has_usable_string
+            && let Some(text) = item.text()
+            && !text.is_empty()
+        {
+            return Some(text.into_bytes());
+        }
     }
 
     for entry in item.entries() {
@@ -304,6 +364,7 @@ pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<
 }
 
 pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::path::PathBuf> {
+    use std::borrow::Cow;
     use std::io::{self, Write as _};
 
     if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
@@ -319,7 +380,17 @@ pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::pa
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok();
     }
-    let ext = img.format.extension();
+    let sniffed_ext = sniff_clipboard_image_extension(&img.bytes, img.format);
+    let (ext, payload): (&str, Cow<'_, [u8]>) =
+        if sniffed_ext == "tiff" || img.format == gpui::ImageFormat::Tiff {
+            if let Some(png) = krill_app::platform::tiff_to_png(&img.bytes) {
+                ("png", Cow::Owned(png))
+            } else {
+                (sniffed_ext, Cow::Borrowed(img.bytes.as_slice()))
+            }
+        } else {
+            (sniffed_ext, Cow::Borrowed(img.bytes.as_slice()))
+        };
     let filename = format!("clipboard-{:016x}.{ext}", img.id);
     let path = dir.join(filename);
     let mut opts = std::fs::OpenOptions::new();
@@ -335,7 +406,7 @@ pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::pa
         use std::os::unix::fs::PermissionsExt as _;
         file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-    file.write_all(&img.bytes)?;
+    file.write_all(&payload)?;
     file.sync_all()?;
     Ok(path)
 }

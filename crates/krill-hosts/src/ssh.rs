@@ -395,6 +395,53 @@ pub fn resolve_remote_socket_with_program(
     remote_socket_for_home(&remote_home)
 }
 
+/// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
+/// 같은 기기를 하나로 묶는 데 쓴다. 네트워크에 붙지 않는다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+    let fallback = || match port {
+        Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
+        None => destination.to_ascii_lowercase(),
+    };
+    if !valid_host(destination) {
+        return fallback();
+    }
+    let mut args = vec!["-G".to_owned()];
+    if let Some(p) = port {
+        args.extend(["-p".to_owned(), p.to_string()]);
+    }
+    args.push(destination.to_owned());
+    #[cfg(windows)]
+    let out = windows::stdio::output(&ssh_program(), &args, None, Duration::from_secs(5));
+    #[cfg(unix)]
+    let out = Command::new(ssh_program())
+        .args(&args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            machine_key_from_config(&String::from_utf8_lossy(&o.stdout)).unwrap_or_else(fallback)
+        }
+        _ => fallback(),
+    }
+}
+
+/// `ssh -G` 출력에서 `user`·`hostname`·`port`를 뽑아 [`machine_key`] 형태로 만든다.
+fn machine_key_from_config(config: &str) -> Option<String> {
+    let field = |name: &str| {
+        config.lines().find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == name).then(|| v.trim().to_ascii_lowercase())
+        })
+    };
+    let host = field("hostname")?;
+    Some(format!(
+        "{}@{host}:{}",
+        field("user").unwrap_or_default(),
+        field("port").unwrap_or_else(|| "22".to_owned())
+    ))
+}
+
 /// 호스트 문자열 검사. ssh 마지막 인자로 그대로 가므로 플래그·경로·공백을 거부한다.
 pub fn valid_host(host: &str) -> bool {
     !host.is_empty()

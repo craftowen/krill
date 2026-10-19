@@ -67,6 +67,9 @@ pub const TAB_BAR_HEIGHT: Pixels = px(36.);
 /// `gpui-component` `TabBar`의 `max_width`는 탭당 최대라 넓은 화면 값(220px)을 쓴다.
 /// 내용 기반 너비라 한 탭 제목이 바뀌면 다른 탭 너비도 바뀐다(Orca는 고정폭) — API에 탭당 고정폭이 없어 고정하지 못한다.
 pub const TAB_MAX_WIDTH: Pixels = px(220.);
+/// 탭 최소 폭: 짧은 제목도 탭 모양을 유지한다. Orca는 고정폭 180px(창 1280px 미만)이지만 Krill은 넘치면
+/// 줄이지 않고 스크롤하므로, 1200px 창에서 탭이 몇 개 더 보이도록 그보다 작게 둔다.
+pub const TAB_MIN_WIDTH: Pixels = px(120.);
 /// 비활성 탭 앞부분(에이전트 아이콘·상태 점) 투명도(Orca 비활성 `opacity-70`).
 pub const TAB_INACTIVE_OPACITY: f32 = 0.7;
 /// 탭·사이드바 상태 점 지름(Orca `size-1.5`).
@@ -600,6 +603,7 @@ mod tests {
     #[test]
     fn orca_parity_tokens() {
         assert_eq!(TAB_MAX_WIDTH, px(220.));
+        assert_eq!(TAB_MIN_WIDTH, px(120.));
         assert!((TAB_INACTIVE_OPACITY - 0.7).abs() < f32::EPSILON);
         assert_eq!(STATE_DOT, px(6.));
         assert_eq!(SIDEBAR_HEADER_HEIGHT, px(32.));

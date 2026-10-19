@@ -228,6 +228,49 @@ pub fn is_system_secure_event_input_enabled() -> bool {
     unsafe { IsSecureEventInputEnabled() != 0 }
 }
 
+/// macOS `public.tiff` 클립보드 비트맵 바이트를 PNG 바이트로 변환한다(#28869).
+/// `NSBitmapImageRep`의 `representationUsingType:properties:`(`NSBitmapImageFileTypePNG = 4`)를 쓴다.
+#[must_use]
+pub fn tiff_to_png(tiff: &[u8]) -> Option<Vec<u8>> {
+    if tiff.is_empty() {
+        return None;
+    }
+    let ns_data_cls = AnyClass::get(c"NSData")?;
+    let rep_cls = AnyClass::get(c"NSBitmapImageRep")?;
+    let dict_cls = AnyClass::get(c"NSDictionary")?;
+    // SAFETY: `tiff.as_ptr()`는 `tiff.len()` 바이트 동안 유효하며 `dataWithBytes:length:`는 바이트를 복사한다.
+    let ns_data: *mut AnyObject = unsafe {
+        msg_send![ns_data_cls, dataWithBytes: tiff.as_ptr().cast::<c_void>(), length: tiff.len()]
+    };
+    if ns_data.is_null() {
+        return None;
+    }
+    // SAFETY: `ns_data`는 유효한 `NSData` 객체다. 유효한 이미지가 아니면 nil을 돌려준다.
+    let rep: *mut AnyObject = unsafe { msg_send![rep_cls, imageRepWithData: ns_data] };
+    if rep.is_null() {
+        return None;
+    }
+    // SAFETY: `[NSDictionary dictionary]`는 빈 불변 딕셔너리를 돌려준다.
+    let props: *mut AnyObject = unsafe { msg_send![dict_cls, dictionary] };
+    // NSBitmapImageFileTypePNG = 4
+    let png_type: usize = 4;
+    // SAFETY: `rep`은 유효한 `NSBitmapImageRep`이고 `representationUsingType:properties:`는 `nullable NSData *`를 돌려준다.
+    let png_data: *mut AnyObject =
+        unsafe { msg_send![rep, representationUsingType: png_type, properties: props] };
+    if png_data.is_null() {
+        return None;
+    }
+    // SAFETY: `png_data`는 널이 아닌 `NSData`다.
+    let len: usize = unsafe { msg_send![png_data, length] };
+    // SAFETY: `png_data`는 널이 아닌 `NSData`이며 `bytes`는 내부 버퍼 포인터를 돌려준다.
+    let ptr: *const u8 = unsafe { msg_send![png_data, bytes] };
+    if len == 0 || ptr.is_null() {
+        return None;
+    }
+    // SAFETY: `ptr`은 `png_data` 내부의 `len` 바이트 버퍼를 가리키며 아래 `to_vec()` 동안 살아 있다.
+    Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+}
+
 // `AppKit` 공개 심볼.
 unsafe extern "C" {
     static NSApp: *mut AnyObject;

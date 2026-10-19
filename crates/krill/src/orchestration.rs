@@ -31,10 +31,10 @@ usage: krill [--host <user@host>] orchestration <subcommand> [options]
   task-create [--run <run-id>] --title <title> [--desc <text>] [--deps <t1,t2>] [--json]
   task-list [--run <run-id>] [--json]
   task-update <task-id> --status <pending|ready|dispatched|completed|failed|blocked> [--summary <text>] [--json]
-  worker-start [--spec <json>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--depth <N>] [--max-depth <N>] --prompt <text> [--json]
+  worker-start [--spec <json>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--depth <N>] [--max-depth <N>] [--preamble <full|minimal|none>|--no-preamble] --prompt <text> [--json]
   send --from <name> --to <target> [--type <type>] --summary <text> [--body <text>] [--run <id>] [--task <id>] [--dispatch <id>] [--outcome <succeeded|failed>] [--json]
   check [--to <name>] [--types <t1,t2>] [--unread] [--ack] [--wait] [--timeout-ms <N>] [--json]
-  ask --from <name> --to <target> --summary <question> [--body <text>] [--wait] [--timeout-ms <N>] [--json]
+  ask (--from <name> --to <target> --summary <question> [--body <text>] | --question-id <msg-id>) [--wait] [--timeout-ms <N>] [--json]
   reply <msg-id> [--from <name>] --body <answer> [--json]
   gate-create --from <name> --question <text> [--options <a,b>] [--run <id>] [--task <id>] [--json]
   gate-list [--pending] [--json]
@@ -552,6 +552,46 @@ fn cmd_task_update_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PreambleMode {
+    #[default]
+    Full,
+    Minimal,
+    None,
+}
+
+impl PreambleMode {
+    fn parse(raw: &str) -> io::Result<Self> {
+        match raw {
+            "full" => Ok(Self::Full),
+            "minimal" => Ok(Self::Minimal),
+            "none" => Ok(Self::None),
+            _ => Err(bad_arg(format!(
+                "invalid --preamble {raw} (expected full|minimal|none)"
+            ))),
+        }
+    }
+}
+
+/// `--preamble full|minimal|none`: 워커 세션에 처음 보낼 지시문. `none`이면 아무것도 보내지 않는다.
+fn format_worker_preamble(
+    dispatch: &krill_proto::orchestration::Dispatch,
+    mode: PreambleMode,
+) -> Option<String> {
+    match mode {
+        PreambleMode::Full => Some(worker_preamble(dispatch)),
+        PreambleMode::Minimal => Some(format!(
+            "[Krill Worker] run={} task={} dispatch={} worker={}: {}",
+            dispatch.run_id,
+            dispatch.task_id.as_deref().unwrap_or("-"),
+            dispatch.id,
+            dispatch.worker_name,
+            dispatch.prompt.replace('\n', " | ")
+        )),
+        PreambleMode::None => None,
+    }
+}
+
 #[cfg(test)]
 fn cmd_worker_start(state_dir: &Path, args: &[String]) -> io::Result<()> {
     cmd_worker_start_ctx(&OrchCtx::local(state_dir), args)
@@ -562,6 +602,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut explicit_agent: Option<String> = None;
     let mut explicit_depth: Option<u32> = None;
     let mut explicit_max_depth: Option<u32> = None;
+    let mut preamble_mode = PreambleMode::Full;
     let mut json = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -630,6 +671,11 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                         .map_err(|_| bad_arg("invalid --max-depth"))?,
                 );
             }
+            "--preamble" => {
+                let raw = take_opt(&mut it, "--preamble")?;
+                preamble_mode = PreambleMode::parse(raw)?;
+            }
+            "--no-preamble" => preamble_mode = PreambleMode::None,
             "--no-spawn" => spec.no_spawn = true,
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
@@ -750,8 +796,10 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         }
     };
 
-    let delivered = dispatch.session_id.map_or(Ok(()), |sid| {
-        let preamble = worker_preamble(&dispatch);
+    let delivered: Result<(), String> = dispatch.session_id.map_or(Ok(()), |sid| {
+        let Some(preamble) = format_worker_preamble(&dispatch, preamble_mode) else {
+            return Ok(());
+        };
         if newly_spawned {
             crate::session::wait_for_spawned_agent_ready(
                 &target,
@@ -759,7 +807,8 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 crate::session::BOOT_TIMEOUT,
             )?;
         }
-        crate::session::send_session_line(&target, sid, &preamble)
+        crate::session::send_session_line(&target, sid, &preamble)?;
+        Ok(())
     });
 
     if json {
@@ -954,6 +1003,7 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut body = String::new();
     let mut run_id = None;
     let mut task_id = None;
+    let mut question_id = None;
     let mut wait = false;
     let mut timeout_ms = 5_000_u64;
     let mut json = false;
@@ -966,6 +1016,9 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             "--body" => body = it.next().cloned().unwrap_or_default(),
             "--run" => run_id = it.next().cloned(),
             "--task" => task_id = it.next().cloned(),
+            "--question-id" | "--id" => {
+                question_id = Some(take_opt(&mut it, "--question-id")?.clone());
+            }
             "--wait" => wait = true,
             "--timeout-ms" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --timeout-ms"))?;
@@ -977,32 +1030,42 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let from = from.ok_or_else(|| bad_arg("missing --from"))?;
-    let to = to.ok_or_else(|| bad_arg("missing --to"))?;
-    let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
-    let params = SendParams {
-        from: from.clone(),
-        to,
-        msg_type: MessageType::Question,
-        summary,
-        body,
-        run_id,
-        task_id,
-        dispatch_id: None,
-        outcome: None,
-        reply_to: None,
+    let question = if let Some(qid) = question_id {
+        // 타임아웃 뒤 같은 질문을 다시 기다린다. 새 Question을 만들지 않는다.
+        ctx.load_store()?
+            .messages
+            .into_iter()
+            .find(|m| m.id == qid && m.msg_type == MessageType::Question)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("question {qid} not found"))
+            })?
+    } else {
+        let from = from.ok_or_else(|| bad_arg("missing --from"))?;
+        let to = to.ok_or_else(|| bad_arg("missing --to"))?;
+        let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
+        let params = SendParams {
+            from,
+            to,
+            msg_type: MessageType::Question,
+            summary,
+            body,
+            run_id,
+            task_id,
+            dispatch_id: None,
+            outcome: None,
+            reply_to: None,
+        };
+        let sent = match ctx.try_ipc(
+            &OrchAction::SendMessage(params.clone()),
+            Duration::from_secs(2),
+        )? {
+            Some(OrchResponse::Messages(m)) => m,
+            _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.send_message(&params))?,
+        };
+        sent.into_iter()
+            .next()
+            .ok_or_else(|| bad_arg("failed to create question"))?
     };
-    let sent = match ctx.try_ipc(
-        &OrchAction::SendMessage(params.clone()),
-        Duration::from_secs(2),
-    )? {
-        Some(OrchResponse::Messages(m)) => m,
-        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.send_message(&params))?,
-    };
-    let question = sent
-        .into_iter()
-        .next()
-        .ok_or_else(|| bad_arg("failed to create question"))?;
 
     if !wait {
         if json {
@@ -2122,6 +2185,105 @@ mod tests {
             Some(run2.as_str())
         );
         cmd_run_use_ctx(&ctx, &args(&["--clear"]))?;
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn ask_question_id_rewaits_without_duplicate_and_worker_start_supports_preamble_modes()
+    -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("mk-ask-rewait-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let run = OrchestrationStore::mutate(&dir, |s| s.create_run("Preamble & Ask", None))?;
+        cmd_worker_start(
+            &dir,
+            &args(&[
+                "--run",
+                &run.id,
+                "--worker",
+                "w-min",
+                "--prompt",
+                "Check build",
+                "--preamble",
+                "minimal",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        cmd_worker_start(
+            &dir,
+            &args(&[
+                "--run",
+                &run.id,
+                "--worker",
+                "w-none",
+                "--prompt",
+                "Silent start",
+                "--no-preamble",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        let d = store.dispatches.first().unwrap();
+        assert!(
+            format_worker_preamble(d, PreambleMode::Minimal)
+                .unwrap()
+                .contains("Check build")
+        );
+        assert!(format_worker_preamble(d, PreambleMode::None).is_none());
+
+        cmd_ask(
+            &dir,
+            &args(&[
+                "--from",
+                "w-min",
+                "--to",
+                "coordinator",
+                "--question",
+                "Approve?",
+                "--wait",
+                "--timeout-ms",
+                "10",
+                "--json",
+            ]),
+        )?;
+        let qid = OrchestrationStore::load(&dir)?
+            .messages
+            .iter()
+            .find(|m| m.msg_type == MessageType::Question)
+            .unwrap()
+            .id
+            .clone();
+        let before_len = OrchestrationStore::load(&dir)?.messages.len();
+        // 타임아웃 후 --question-id 로 재대기해도 중복 Question이 생기지 않아야 한다(#30372).
+        cmd_ask(
+            &dir,
+            &args(&[
+                "--question-id",
+                &qid,
+                "--wait",
+                "--timeout-ms",
+                "10",
+                "--json",
+            ]),
+        )?;
+        assert_eq!(OrchestrationStore::load(&dir)?.messages.len(), before_len);
+        cmd_reply(&dir, &args(&[&qid, "--answer", "Yes", "--json"]))?;
+        cmd_ask(
+            &dir,
+            &args(&[
+                "--question-id",
+                &qid,
+                "--wait",
+                "--timeout-ms",
+                "10",
+                "--json",
+            ]),
+        )?;
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.messages.len(),
+            before_len + 1
+        );
         std::fs::remove_dir_all(dir)
     }
 }

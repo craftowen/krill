@@ -494,6 +494,8 @@ pub(super) struct WorktreeContext<'a> {
     pub collapsed_lineage: Option<&'a BTreeSet<PathBuf>>,
     pub sleeping_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
+    /// 사용자가 끌어다 놓아 정한 프로젝트 순서. 없는 프로젝트는 그 뒤에 이름순으로 온다.
+    pub project_order: Option<&'a [PathBuf]>,
 }
 
 pub(super) fn is_default_branch_worktree(
@@ -640,14 +642,22 @@ fn worktree_sort_name(path: &Path, prefs: &Preferences, meta: Option<&Meta>) -> 
         .unwrap_or_else(|| basename(path))
 }
 
+/// 카드에 [기본] 배지가 붙는 워크트리(저장소 본 체크아웃)인지. 배지와 정렬이 이 함수 하나로 판정한다.
+pub(super) fn is_primary_worktree(snapshot: &Snapshot, path: &Path) -> bool {
+    snapshot.trees.contains_key(path)
+}
+
+/// 정렬 기준과 무관하게 [기본] 워크트리 → 핀 고정 → 나머지(정렬 기준) 순서로 정렬한다.
 pub(super) fn sort_worktrees(
     trees: &mut [&PathBuf],
+    snapshot: &Snapshot,
     sessions_by_wt: &BTreeMap<&Path, Vec<&Session>>,
     prefs: &Preferences,
     sort_by: SortBy,
     ctx: &WorktreeContext<'_>,
 ) {
     trees.sort_by_cached_key(|a| {
+        let primary = !is_primary_worktree(snapshot, a);
         let pin = !prefs.get(*a).is_some_and(|v| v.pinned);
         let name = worktree_sort_name(a, prefs, ctx.meta);
         let recent = Reverse(ctx.updated_at.and_then(|u| u.get(*a)).copied().unwrap_or(0));
@@ -659,7 +669,7 @@ pub(super) fn sort_worktrees(
             SortBy::Smart | SortBy::Recent => recent,
             SortBy::Name => Reverse(0),
         };
-        (pin, rank, recent_key, name, *a)
+        (primary, pin, rank, recent_key, name, *a)
     });
 }
 
@@ -677,6 +687,18 @@ fn push_worktree_and_sessions(
             out.push(Row::Session(s.clone(), true));
         }
     }
+}
+
+/// 저장소를 사용자가 정한 순서(`order`)대로, 순서에 없는 것은 그 뒤에 원래(경로) 순서대로 돌려준다.
+fn ordered_projects<'a>(
+    snapshot: &'a Snapshot,
+    order: Option<&[PathBuf]>,
+) -> Vec<(&'a PathBuf, &'a Vec<PathBuf>)> {
+    let mut repos: Vec<_> = snapshot.trees.iter().collect();
+    if let Some(order) = order.filter(|o| !o.is_empty()) {
+        repos.sort_by_key(|(repo, _)| order.iter().position(|o| o == *repo).unwrap_or(usize::MAX));
+    }
+    repos
 }
 
 pub(super) fn rows_with_options<'a>(
@@ -719,7 +741,7 @@ pub(super) fn rows_with_options<'a>(
 
     match options.group_by {
         GroupBy::Repo => {
-            for (repo, trees) in &snapshot.trees {
+            for (repo, trees) in ordered_projects(snapshot, ctx.project_order) {
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
@@ -729,7 +751,14 @@ pub(super) fn rows_with_options<'a>(
                 }
                 out.push(Row::Repository(repo.clone()));
                 if !collapsed.contains(repo) {
-                    sort_worktrees(&mut vis, &sessions_by_wt, prefs, options.sort_by, ctx);
+                    sort_worktrees(
+                        &mut vis,
+                        snapshot,
+                        &sessions_by_wt,
+                        prefs,
+                        options.sort_by,
+                        ctx,
+                    );
                     let (normal, claude_ext) = external::partition_trees(repo, vis);
                     let normal = super::lineage::order_lineage_worktrees(
                         normal,
@@ -788,7 +817,14 @@ pub(super) fn rows_with_options<'a>(
                 let Some(mut bucket) = buckets.remove(&idx).filter(|b| !b.is_empty()) else {
                     continue;
                 };
-                sort_worktrees(&mut bucket, &sessions_by_wt, prefs, options.sort_by, ctx);
+                sort_worktrees(
+                    &mut bucket,
+                    snapshot,
+                    &sessions_by_wt,
+                    prefs,
+                    options.sort_by,
+                    ctx,
+                );
                 let key = GroupKey::WorkspaceStatus(status);
                 out.push(Row::GroupHeader {
                     key,
@@ -825,7 +861,14 @@ pub(super) fn rows_with_options<'a>(
                 let Some(mut bucket) = buckets.remove(&pr_group).filter(|b| !b.is_empty()) else {
                     continue;
                 };
-                sort_worktrees(&mut bucket, &sessions_by_wt, prefs, options.sort_by, ctx);
+                sort_worktrees(
+                    &mut bucket,
+                    snapshot,
+                    &sessions_by_wt,
+                    prefs,
+                    options.sort_by,
+                    ctx,
+                );
                 let key = GroupKey::PrStatus(pr_group);
                 out.push(Row::GroupHeader {
                     key,
@@ -851,7 +894,14 @@ pub(super) fn rows_with_options<'a>(
                 }
                 all_trees.extend(visible_in_repo(repo, trees));
             }
-            sort_worktrees(&mut all_trees, &sessions_by_wt, prefs, options.sort_by, ctx);
+            sort_worktrees(
+                &mut all_trees,
+                snapshot,
+                &sessions_by_wt,
+                prefs,
+                options.sort_by,
+                ctx,
+            );
             let ordered = super::lineage::order_lineage_worktrees(
                 all_trees,
                 ctx.parents,
@@ -940,6 +990,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
+            project_order: Some(&self.project_order),
         };
         rows_with_options(
             &self.snapshot,
@@ -966,6 +1017,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
+            project_order: Some(&self.project_order),
             ..WorktreeContext::default()
         };
         rows_with_options(

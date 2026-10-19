@@ -612,6 +612,12 @@ fn provider_usage_menu(
             account.id
         );
         let account_weak = weak.clone();
+        // 계정 한 줄: 이름(활성은 굵게)·자동전환 배지·사용량. ✓가 이름 줄에 붙어 고른 계정이 바로 보이고
+        // 줄 전체를 눌러 전환한다. 상태는 정상이 아닐 때(로그인 필요·한도 등)만 둘째 줄에 보인다.
+        let show_status = !matches!(
+            status.status,
+            krill_proto::usage::AccountStatus::Ok | krill_proto::usage::AccountStatus::Unknown
+        );
         menu = menu.item(
             PopupMenuItem::element(move |_, cx| {
                 let p = ui::palette(cx);
@@ -622,18 +628,17 @@ fn provider_usage_menu(
                     .w(px(264.))
                     .flex()
                     .flex_col()
-                    .items_start()
-                    .justify_between()
-                    .gap_2()
+                    .gap_1()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
+                            .w_full()
                             .flex()
                             .items_center()
                             .gap_1p5()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .truncate()
                                     .text_size(ui::TEXT_XS)
                                     .font_weight(if is_active {
@@ -654,21 +659,23 @@ fn provider_usage_menu(
                                     .text_size(ui::TEXT_2XS)
                                     .text_color(p.muted_foreground)
                                     .child(b)
-                            })),
+                            }))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .font_family(ui::FONT_MONO)
+                                    .text_size(ui::TEXT_2XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(usage_summary.clone()),
+                            ),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .font_family(ui::FONT_MONO)
-                            .text_size(ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(usage_summary.clone()),
-                    )
-                    .child(krill_app::accounts::display::render_status(
-                        format!("{row_id}-status"),
-                        &status,
-                        p,
-                    ))
+                    .when(show_status, |d| {
+                        d.child(krill_app::accounts::display::render_status(
+                            format!("{row_id}-status"),
+                            &status,
+                            p,
+                        ))
+                    })
             })
             .checked(is_active)
             .disabled(orca)
@@ -1190,7 +1197,23 @@ impl Shell {
                 .dropdown_menu(move |menu, window, cx| {
                     provider_usage_menu(menu, &provider_snap, provider, weak.clone(), window, cx)
                 })
-                .on_open_change(track_menu_open(cx.weak_entity())),
+                .on_open_change({
+                    let track = track_menu_open(cx.weak_entity());
+                    let shell = cx.weak_entity();
+                    // 열 때마다 데몬의 활성 계정·사용량을 다시 받는다(다른 곳에서 바꾼 전환이 늦게 보이지 않게).
+                    move |open: &bool, window: &mut Window, cx: &mut App| {
+                        track(open, window, cx);
+                        if *open {
+                            shell
+                                .update(cx, |s, cx| {
+                                    if s.link == Link::Up {
+                                        s.refresh_accounts(UsageRequest::ListAccounts, cx);
+                                    }
+                                })
+                                .ok();
+                        }
+                    }
+                }),
             );
         }
         let weak = cx.weak_entity();
@@ -1207,7 +1230,13 @@ impl Shell {
         .on_click(cx.listener(|shell, _, _, cx| {
             shell.refresh_accounts(UsageRequest::ListAccounts, cx);
         }));
-        let ssh_hosts = self.ssh_hosts.clone();
+        // 같은 기기 중복 등록은 사이드바처럼 한 번만 보인다(대표 항목만).
+        let ssh_hosts: Vec<_> = self
+            .ssh_hosts
+            .iter()
+            .filter(|h| !self.host_aliases.contains_key(&h.id))
+            .cloned()
+            .collect();
         let ssh_count_label = ssh_hosts.len().to_string();
         let ssh_full_label = text::SSH_MENU_BTN.format(&[("count", &ssh_count_label)]);
         let ssh_tooltip = format!("{} — {ssh_full_label}", text::SSH_MENU_TITLE.get());

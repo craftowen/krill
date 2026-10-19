@@ -217,12 +217,18 @@ impl Shell {
                     .aria_label(description)
                     .group(CLOSE_GROUP)
                     .debug_selector(move || format!("session-tab-{i}"))
+                    // 탭 안쪽 왼쪽 여백 12px, 짧은 제목도 탭 모양이 나게 최소 폭(STYLEGUIDE §5.3 탭 규칙).
+                    .pl(ui::SPACE_3)
+                    .min_w(ui::TAB_MIN_WIDTH)
                     .prefix(
                         div()
+                            .debug_selector(move || format!("tab-prefix-{i}"))
                             .flex()
                             .items_center()
                             // Orca `gap-1`(4px): 상태 글리프와 에이전트 아이콘 사이.
                             .gap(ui::SPACE_1)
+                            // 탭 기본 간격 4px과 더해 아이콘-제목 간격 8px.
+                            .pr(ui::SPACE_1)
                             // Orca 비활성 탭 `opacity-70`: 아이덴티티는 유지하고 강조만 낮춘다.
                             .when(!selected, |d| d.opacity(ui::TAB_INACTIVE_OPACITY))
                             .when(tab.pinned, |d| {
@@ -297,23 +303,40 @@ impl Shell {
                     )
                     .suffix(
                         div()
-                            .invisible()
-                            // Orca: 활성 탭의 닫기는 항상 보이고, 비활성은 호버 때만.
-                            .when(selected, Styled::visible)
-                            .group_hover(CLOSE_GROUP, Styled::visible)
-                            .child(ui::button_with_tooltip(
-                                Button::new(("close-tab", i))
-                                    .icon(IconName::Close)
-                                    .ghost()
-                                    .xsmall()
-                                    .debug_selector(move || format!("close-tab-{i}"))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        cx.stop_propagation();
-                                        this.request_close_tab(i, cx);
-                                    })),
-                                format!("close-tab-{i}"),
-                                text::CLOSE_TAB.get(),
-                            )),
+                            .flex()
+                            .items_center()
+                            .gap(ui::SPACE_1)
+                            .child(
+                                div()
+                                    .invisible()
+                                    // Orca: 활성 탭의 닫기는 항상 보이고, 비활성은 호버 때만.
+                                    .when(selected, Styled::visible)
+                                    .group_hover(CLOSE_GROUP, Styled::visible)
+                                    .child(ui::button_with_tooltip(
+                                        Button::new(("close-tab", i))
+                                            .icon(IconName::Close)
+                                            .ghost()
+                                            .xsmall()
+                                            .debug_selector(move || format!("close-tab-{i}"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.request_close_tab(i, cx);
+                                            })),
+                                        format!("close-tab-{i}"),
+                                        text::CLOSE_TAB.get(),
+                                    )),
+                            )
+                            // 탭 사이 구분선(Orca `border-r`). 활성 탭 양옆은 활성 탭 테두리가 대신해
+                            // 겹치지 않게 숨기되 자리는 지켜 탭 폭이 바뀌지 않는다.
+                            .child(
+                                div()
+                                    .debug_selector(move || format!("tab-separator-{i}"))
+                                    .flex_none()
+                                    .w(px(1.))
+                                    .h(ui::SPACE_4)
+                                    .bg(p.border)
+                                    .when(selected || i + 1 == active, Styled::invisible),
+                            ),
                     )
                     .on_mouse_down(
                         MouseButton::Left,

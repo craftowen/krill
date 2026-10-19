@@ -72,7 +72,7 @@ globalThis.MkTerminalCodec=(()=>{
    this.port.append(this.historyElement,this.canvas);this.statusEl=make('div','terminal-status');this.statusEl.dataset.testid='terminal-status';
    const controls=make('div','terminal-history-controls');this.historyButton=button('load-history','Load earlier output');this.historyStatus=make('span','history-status');this.historyStatus.setAttribute('role','status');controls.append(this.historyButton,this.historyStatus);this.frame.append(controls,this.port,this.statusEl);
    this.dock=make('footer','command-dock');const accessory=make('div','accessory-row');this.dismiss=button('dismiss-keyboard','Dismiss keyboard','dismiss');this.dismiss.hidden=true;
-   const keybar=make('div','keybar');keybar.setAttribute('role','toolbar');keybar.setAttribute('aria-label','Terminal keys');this.fitButton=button('accessory-key display-mode','Fit to Phone','monitor');this.fitButton.setAttribute('aria-pressed','false');this.directButton=button('accessory-key direct-toggle','Direct input','direct');keybar.append(this.fitButton,this.directButton);
+   const keybar=make('div','keybar');keybar.setAttribute('role','toolbar');keybar.setAttribute('aria-label','Terminal keys');this.fitButton=button('accessory-key display-mode','Fit to Phone','monitor');this.fitButton.setAttribute('aria-pressed','false');this.directButton=button('accessory-key direct-toggle','Direct input','direct');this.shiftButton=button('accessory-key shift-toggle','Shift');this.shiftButton.dataset.keyId='shift';this.shiftButton.dataset.testid='terminal-key-shift';this.shiftButton.setAttribute('aria-pressed','false');keybar.append(this.fitButton,this.directButton,this.shiftButton);
    const ordered=this.options.preferences?.orderedKeyIds||[],visible=this.options.preferences?.visibleKeyIds;
    const ids=[...new Set([...ordered,...KEYS.map(k=>k.id)])];for(const id of ids){const key=KEYS.find(k=>k.id===id);if(!key||visible&&!visible.includes(id))continue;const b=button('accessory-key',key.label);b.dataset.keyId=id;b.dataset.testid=`terminal-key-${id}`;keybar.append(b);this.bindKey(b,key);}
    accessory.append(this.dismiss,keybar);const inputRow=make('div','input-row');this.live=button('live-focus-target','Show keyboard for live terminal input','keyboard');const copy=make('span','live-input-copy');copy.append(make('strong',null,'Live input'),make('small',null,'Tap to show keyboard'));this.live.append(copy);
@@ -85,7 +85,7 @@ globalThis.MkTerminalCodec=(()=>{
    }
    this.dock.append(accessory,inputRow);this.root.append(this.frame,this.dock);
    this.listen(this.historyButton,'click',()=>this.guard(()=>this.loadHistory()));this.listen(this.port,'scroll',()=>{if(this.port.scrollTop<30)this.guard(()=>this.loadHistory());},{passive:true});
-   for(const b of [this.fitButton,this.directButton,this.historyButton])this.listen(b,'pointerdown',e=>e.preventDefault());
+   for(const b of [this.fitButton,this.directButton,this.shiftButton,this.historyButton])this.listen(b,'pointerdown',e=>e.preventDefault());this.listen(this.shiftButton,'click',()=>this.toggleShift());
    this.listen(this.fitButton,'click',()=>this.guard(()=>this.fitToPhone()));this.listen(this.directButton,'click',()=>this.setInputMode(this.inputMode==='direct'?'buffered':'direct'));
    this.listen(this.dismiss,'click',()=>{this.capture.blur();this.command.blur();});this.listen(this.live,'click',()=>this.focus());
    // 탭 판정은 10px 안의 손 떨림을 허용한다. 모든 pointermove를 이동으로 보면 실제 터치 탭이 거의 다 무시된다.
@@ -131,12 +131,15 @@ globalThis.MkTerminalCodec=(()=>{
   setInputMode(mode){if(this.disposed||!['direct','buffered'].includes(mode)||mode===this.inputMode)return;const typing=[this.capture,this.command].includes(globalThis.document?.activeElement);this.invalidateInput();this.inputMode=mode;modes.set(this.session,mode);const value=settings();value.terminalInputModes={...value.terminalInputModes,[this.session]:mode};try{localStorage.setItem(UI_KEY,JSON.stringify(value));}catch{}this.options.onPreferenceChange?.({inputMode:mode,sessionId:this.session});this.updateMode();if(typing)this.focus();}
   getInputMode(){return this.inputMode;}
   resetCapture(){this.capture.value='';this.sent='';}
-  syncCapture(){const before=[...this.sent||''],now=this.capture.value,after=[...now];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;this.sent=now;const bytes='\x7f'.repeat(before.length-same)+after.slice(same).join('');if(bytes)this.guard(()=>this.input(bytes));}
+  syncCapture(){const before=[...this.sent||''],now=this.capture.value,after=[...now];let same=0;while(same<before.length&&same<after.length&&before[same]===after[same])same++;this.sent=now;const added=after.slice(same).join(''),bytes='\x7f'.repeat(before.length-same)+(added?this.consumeShift(added,false):'');if(bytes)this.guard(()=>this.input(bytes));}
   // 제어 키는 커서·줄 문맥을 바꾸므로 보낸 뒤 textarea 문맥을 버린다.
   controlInput(bytes){this.resetCapture();return this.input(bytes);}
   focus(){if(!this.disposed)(this.inputMode==='direct'?this.capture:this.command).focus({preventScroll:true});}
   invalidateInput(){this.inputGeneration++;this.inputArmed=false;this.composing=false;this.resetCapture();this.capture.blur();this.command.blur();this.stopRepeat();this.deferredKeys.splice(0).forEach(p=>p.reject(Error('Input target changed')));}
-  sendKey(id){const key=KEYS.find(k=>k.id===id);if(!key)return Promise.reject(Error('Unknown terminal key'));if(this.disposed)return Promise.reject(Error('Input target changed'));if(this.composing)return new Promise((resolve,reject)=>this.deferredKeys.push({bytes:key.bytes,resolve,reject}));return this.controlInput(key.bytes);}
+  // Shift 토글은 다음 한 번만 적용한다: 글자는 첫 글자를 대문자로, Tab·Enter·화살표는 Shift 변형 시퀀스로 보낸다.
+  toggleShift(force){this.shiftArmed=typeof force==='boolean'?force:!this.shiftArmed;this.shiftButton.setAttribute('aria-pressed',String(!!this.shiftArmed));return !!this.shiftArmed;}
+  consumeShift(bytes,isKey=false){if(!this.shiftArmed)return bytes;this.toggleShift(false);if(isKey){if(bytes==='\t')return '\x1b[Z';if(bytes==='\r')return '\x1b[13;2u';const m=/^\x1b\[([ABCD])$/.exec(bytes);if(m)return `\x1b[1;2${m[1]}`;return bytes;}return bytes.replace(/^[a-z]/,c=>c.toUpperCase());}
+  sendKey(id){const key=KEYS.find(k=>k.id===id);if(!key)return Promise.reject(Error('Unknown terminal key'));if(this.disposed)return Promise.reject(Error('Input target changed'));const bytes=this.consumeShift(key.bytes,true);if(this.composing)return new Promise((resolve,reject)=>this.deferredKeys.push({bytes,resolve,reject}));return this.controlInput(bytes);}
   bindViewport(){
    const viewport=()=>{const vv=globalThis.visualViewport,inset=vv&&Math.abs(vv.scale-1)<.05?Math.max(0,innerHeight-vv.height-vv.offsetTop):0;this.root.style.setProperty('--keyboard-inset',`${inset}px`);const open=inset>80;if(open&&this.root.dataset.keyboardOpen!=='true')(globalThis.requestAnimationFrame||setTimeout)(()=>this.revealCursor());this.root.dataset.keyboardOpen=String(open);this.dismiss.hidden=!open;if(this.fit&&this.ready&&!this.fitPending)this.guard(()=>this.resize());};
    if(globalThis.visualViewport){this.listen(visualViewport,'resize',viewport);this.listen(visualViewport,'scroll',viewport);}this.listen(globalThis,'resize',viewport);this.listen(globalThis,'pagehide',()=>this.disconnect());this.listen(globalThis,'blur',()=>this.stopRepeat());viewport();
@@ -147,9 +150,11 @@ globalThis.MkTerminalCodec=(()=>{
    this.historyElement.style.fontFamily=FAMILY;this.historyElement.style.fontWeight='300';this.ctx.font=`300 ${this.fontSize}px ${FAMILY}`;this.font=null;const glyph=this.ctx.measureText?.('M')?.width,wide=this.ctx.measureText?.('한')?.width;if(glyph>0)this.historyElement.style.letterSpacing=`${this.cellWidth-glyph}px`;if(wide>0)this.historyElement.style.setProperty('--wide-spacing',`${2*this.cellWidth-wide}px`);this.schedule(true);if(notify)this.options.onPreferenceChange?.({textScale:this.fontScale});if(this.fit&&this.ready&&!this.fitPending)this.guard(()=>this.resize());}
   async open(){
    const generation=this.generation;let result;try{result=await this.options.connect({sessionId:this.session});}catch(e){if(generation===this.generation)this.disconnect('disconnected',e.message);return;}
-   const {socket,credentials}=result||{};if(this.disposed||generation!==this.generation){socket?.close();return;}if(!socket||!credentials){this.error(Error('Invalid terminal connection factory'));return;}
-   this.socket=socket;this.connectionTimer=setTimeout(()=>{if(generation===this.generation)this.disconnect('disconnected','Terminal connection timed out');},15000);socket.binaryType='arraybuffer';let phase=0,channel;
-   this.listen(socket,'message',e=>{if(generation!==this.generation||this.disposed)return;try{
+   const {socket,credentials,channel:warmChannel,messages}=result||{};if(this.disposed||generation!==this.generation){socket?.close();return;}if(!socket||!credentials){this.error(Error('Invalid terminal connection factory'));return;}
+   if(socket.readyState===2||socket.readyState===3||socket.closed){this.disconnect('disconnected','Disconnected');return;}
+   this.socket=socket;this.connectionTimer=setTimeout(()=>{if(generation===this.generation)this.disconnect('disconnected','Terminal connection timed out');},15000);socket.binaryType='arraybuffer';let phase=warmChannel?1:0,channel=warmChannel;
+   // 미리 연 터미널 소켓(client.js warmTerminal)은 인증·Hello까지 끝나 있다. 그 사이 받은 메시지를 이어서 처리한다.
+   const onMessage=e=>{if(generation!==this.generation||this.disposed)return;try{
     if(phase===0){const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');channel=new C.Channel(C.sha256(C.unhex(credentials.credential)),C.concat(C.unhex(challenge.challenge),nonce));this.channel=channel;socket.send(JSON.stringify({device_id:credentials.device_id,token:null,client_nonce:C.hex(nonce)}));socket.send(channel.seal(C.enc.encode('{"label":"Live terminal"}')));
      // 게이트웨이는 proof만 읽고 나머지를 IPC로 넘긴다(협상은 교집합). ServerHello를 기다리지 않고 Hello·role·attach를 함께 보낸다.
      this.send(2,C.concat(T.v(1),T.v(1),T.v((1n<<56n)|1n|4n|4096n),T.v(0),T.text('minikrill-mobile-grid')));this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));phase=1;return;}
@@ -165,8 +170,13 @@ globalThis.MkTerminalCodec=(()=>{
      case 0x24:this.disconnect('ended','Session ended');break;
      case 0x25:this.disconnect('error','Session unavailable');break;
     }
-   }catch(error){this.error(error);if(phase<3)socket.close();}});
+   }catch(error){this.error(error);if(phase<3)socket.close();}};
+   this.listen(socket,'message',onMessage);
    this.listen(socket,'close',e=>{if(generation===this.generation)this.disconnect(e.code===1008?'denied':'disconnected',e.code===1008?'Terminal authentication rejected':'Disconnected');});this.listen(socket,'error',()=>{if(generation===this.generation)this.disconnect('disconnected','Live terminal connection failed');});
+   try{
+    if(warmChannel){this.channel=warmChannel;this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));}
+    if(Array.isArray(messages))for(const data of messages.splice(0))onMessage({data});
+   }catch(error){this.error(error);if(phase<3)socket.close();}
   }
   send(kind,body){if(!this.socket||this.socket.readyState!==1||!this.channel)throw Error('Terminal disconnected');this.socket.send(this.channel.seal(T.frame(kind,body)));}
   // 키보드가 열리거나 입력을 보내면 커서 행이 보이게 세로로만 옮긴다. 가로 위치(scrollLeft)는 사용자가 둔 곳을 유지한다.
@@ -209,5 +219,5 @@ globalThis.MkTerminalCodec=(()=>{
   unmount(){if(this.disposed)return;drafts.set(this.session,this.command.value);this.disconnect();this.disposed=true;this.abort.abort();this.observer?.disconnect();clearTimeout(this.labelTimer);if(this.rafId)(globalThis.cancelAnimationFrame||clearTimeout)(this.rafId);this.frame.remove();this.dock.remove();this.root.classList.remove('terminal-mount');this.root.style.removeProperty('--keyboard-inset');delete this.root.dataset.keyboardOpen;delete this.root.dataset.inputMode;delete this.root.dataset.phase;}
  }
  const mobile=globalThis.KrillMobile||(globalThis.KrillMobile={});
- mobile.terminal=Object.freeze({keys:KEYS,fontScales:SCALES,mount(root,options){const instance=new Terminal(root,options);return Object.freeze(Object.fromEntries(['unmount','focus','setFontScale','setInputMode','getInputMode','sendKey','fitToPhone','loadHistory','text'].map(name=>[name,instance[name].bind(instance)])));}});
+ mobile.terminal=Object.freeze({keys:KEYS,fontScales:SCALES,mount(root,options){const instance=new Terminal(root,options);return Object.freeze(Object.fromEntries(['unmount','focus','setFontScale','setInputMode','getInputMode','sendKey','toggleShift','fitToPhone','loadHistory','text'].map(name=>[name,instance[name].bind(instance)])));}});
 })();
