@@ -713,7 +713,6 @@ pub(super) fn record_setup_trust(
     state_dir: &std::path::Path,
     raw_hash: &str,
 ) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt as _;
     let hash = raw_hash.trim().to_ascii_lowercase();
     if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err("hook trust requires a 64-digit SHA-256 hash".to_owned());
@@ -725,11 +724,14 @@ pub(super) fn record_setup_trust(
         return Ok(());
     }
     std::fs::create_dir_all(state_dir).map_err(|e| format!("cannot create state dir: {e}"))?;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(&trust_file)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    opts.open(&trust_file)
         .and_then(|mut f| writeln!(f, "{hash}"))
         .map_err(|e| format!("cannot record setup trust: {e}"))
 }
