@@ -340,7 +340,6 @@ fn old_daemon_watch_needs_no_status_frame() {
 fn preflight_validates_executable() {
     use std::os::unix::fs::PermissionsExt as _;
 
-    const EPERM: i32 = 1;
     const ENOENT: i32 = 2;
     const ENOEXEC: i32 = 8;
     const EACCES: i32 = 13;
@@ -378,14 +377,19 @@ fn preflight_validates_executable() {
     preflight(&valid).unwrap();
 
     // 코드 페이지 해시가 깨진 Mach-O는 macOS arm64에서 페이지 폴트 시 커널이 자식을 SIGKILL로 종료한다 -> EPERM.
-    let corrupt = d.join("corrupt");
-    let mut bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-    for b in bytes.iter_mut().skip(8192).step_by(16384) {
-        *b ^= 0xff;
+    // 코드서명 강제가 없는 Linux(CI 실측 ENOEXEC)·Intel Mac에서는 이 경로가 성립하지 않는다.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        const EPERM: i32 = 1;
+        let corrupt = d.join("corrupt");
+        let mut bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
+        for b in bytes.iter_mut().skip(8192).step_by(16384) {
+            *b ^= 0xff;
+        }
+        std::fs::write(&corrupt, &bytes).unwrap();
+        std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(preflight(&corrupt).unwrap_err().raw_os_error(), Some(EPERM));
     }
-    std::fs::write(&corrupt, &bytes).unwrap();
-    std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(preflight(&corrupt).unwrap_err().raw_os_error(), Some(EPERM));
 
     std::fs::remove_dir_all(d).ok();
 }
