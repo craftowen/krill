@@ -42,7 +42,7 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  T.toast('Photo attached',3000);notice.dispatchEvent(new Event('click'));assert.equal(notice.hidden,true);
  assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#t=x.trycloudflare.com&r=rid'),true);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
 console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
-for(const name of ['index.html','app.js','app.css','manifest.json','icon.svg','crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
+for(const name of ['index.html','app.js','app.css','manifest.json','icon.svg','icon.png','crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
 const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
 // Fixed-origin bootstrap and transport, with real crypto and deterministic sockets.
 async function fixedOriginTests(){
@@ -70,6 +70,9 @@ async function fixedOriginTests(){
  }
  f=fixture(fixed+'?pair=query&key=query&t=evil.trycloudflare.com&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.equal(f.location.search,'');
  f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,[]);
+ // Home Screen install link: pairs an empty store once; relaunches with the same start URL keep the saved device.
+ f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.location.href,fixed+'#/pair-confirm');
+ f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`);assert.equal(f.endpoint.pair,null);assert.deepEqual({...f.endpoint.credentials},saved);assert.equal(f.location.href,fixed);
  f=fixture(fixed+'#pair=ticket&key=secret&t=evil.test&r=bad');assert.throws(()=>f.endpoint.socketUrl(),/fresh QR/);
  for(const found of [{url:'https://evil.test',hash},{url:'https://ok.trycloudflare.com.evil.test',hash},{url:'https://ok.trycloudflare.com',hash:'../evil'},{url:'https://ok.trycloudflare.com',hash:'ABCDEF0123456789'},{url:'https://ok.trycloudflare.com',hash:1234567890123456}]){
   f=fixture(fixed,saved,found);assert.equal(await f.endpoint.locate(),false);assert.deepEqual(f.stored(),saved);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.deepEqual(f.redirects,[]);
@@ -109,7 +112,7 @@ const dir=fs.mkdtempSync('/tmp/m9pwa-'),repo=path.join(dir,'repo'),home=path.joi
 fs.mkdirSync(repo);fs.mkdirSync(home);fs.mkdirSync(profile);fs.mkdirSync(path.join(dir,'paste'),{mode:0o700});
 const env={...process.env,KRILL_STATE_DIR:dir,HOME:home,TMPDIR:path.join(dir,'paste')};
 const log=fs.openSync(path.join(dir,'holder.log'),'a');let holder,daemon=0,phone,other,webhookServer,files=[];
-const deadline=setTimeout(()=>{console.error('PWA E2E deadline exceeded');cleanup();process.exit(1);},90_000);
+const deadline=setTimeout(()=>{console.error('PWA E2E deadline exceeded');cleanup();process.exit(1);},150_000);
 function cli(args){return execFileSync(mk,args,{env,encoding:'utf8',timeout:20000,stdio:['ignore','pipe','pipe']}).trim();}
 function jsonCli(args){return JSON.parse(cli([...args,'--json']));}
 function git(args){return execFileSync('git',args,{cwd:repo,env,encoding:'utf8'}).trim();}
@@ -152,7 +155,7 @@ async function connect(url,credential){
   const question=jsonCli(['orchestration','ask','--from','mobile-worker','--to','coordinator','--question','Proceed with fixture?']);
   const gate=jsonCli(['orchestration','gate-create','--from','test-worker','--question','Deploy fixture?','--options','Approve,Deny','--run',runId]);const gateId=gate.id||gate.gate_id;assert(gateId,JSON.stringify(gate));
   const offer=jsonCli(['mobile','pair','--address',keep?(process.env.M9_BROWSER_ADDRESS||'127.0.0.1:0'):'127.0.0.1:0']);const url=offer.PairingOffer.url,base=new URL(url).origin;
-  for(const name of ['/','/app.js','/app.css','/crypto.js','/client.js','/terminal.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert.deepEqual(Buffer.from(await response.arrayBuffer()),fs.readFileSync(path.join(assets,name==='/'?'index.html':name.slice(1))));}
+  for(const name of ['/','/app.js','/app.css','/crypto.js','/client.js','/terminal.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg','/icon.png']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert.deepEqual(Buffer.from(await response.arrayBuffer()),fs.readFileSync(path.join(assets,name==='/'?'index.html':name.slice(1))));}
   if(keep){let terminalSession=null;const extraSessions=[];if(process.env.M9_UI_QA){
     const worktree=path.join(dir,'feature-worktree'),second=path.join(dir,'api'),outside=path.join(dir,'notes');
     git(['worktree','add','-b','feature/mobile',worktree]);fs.mkdirSync(second);fs.mkdirSync(outside);
@@ -188,6 +191,7 @@ async function connect(url,credential){
   const notifiedSession=Number(cli(['new','--cwd',repo,'--','/bin/sh','-c',hookCommand]));fs.writeFileSync(path.join(dir,'webhook-go'),'');await until(()=>posts.length===6);
   for(const provider of ['ntfy','telegram','discord']){const pair=posts.filter(p=>p.path==='/'+provider);assert.equal(pair.length,2);for(const p of pair){assert(p.body.includes(base+'/?session='+notifiedSession));assert(!p.body.includes('SECRET'));assert(!p.body.includes('pair='));assert(!p.body.includes('key='));}assert(pair[0].body.includes('waiting for input'));assert(pair[1].body.includes('completed'));}
   console.log('Daemon webhook E2E passed: ntfy, Telegram, Discord, waiting/done, credential-free deep links and no app process');
+  const {fragment}=await other.rpc({action:'install_handoff'});assert.match(fragment,/^pair=[0-9a-f]{64}&key=[\w-]{43}$/);await require('./mobile_install.cjs').main({base,fragment});
   console.log('PWA E2E passed: non-secure pure JS E2EE, gzip assets, approval, IME text, photo 0600, account switch, gate reply, diff, mock handoff and credential reconnect');
  } finally {cleanup();}
 })().catch(error=>{console.error(error.stack);process.exitCode=1;});
