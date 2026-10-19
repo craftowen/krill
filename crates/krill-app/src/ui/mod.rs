@@ -28,8 +28,8 @@ pub use theme::{
     SIDEBAR_HEADER_HEIGHT, SIDEBAR_ROW_HEIGHT, SPACE_1, SPACE_2, SPACE_3, SPACE_4, STATE_DOT,
     STATUS_BAR_HEIGHT, STATUS_GROUP_ICON, STATUS_GROUP_OVERLAP, SWITCH_HEIGHT, SWITCH_THUMB,
     SWITCH_WIDTH, TAB_BAR_HEIGHT, TAB_INACTIVE_OPACITY, TAB_MAX_WIDTH, TERMINAL_DARK,
-    TERMINAL_LIGHT, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM, TEXT_XS, TITLEBAR_HEIGHT,
-    TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, TRANSPARENT, agent_state_color, apply,
-    git_status_color, hex, hexa, palette, palette_for, sync, tab_tag_color, terminal_surface,
-    terminal_surface_alpha, terminal_theme, titlebar, transparent,
+    TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, TERMINAL_THEMES, TEXT_2XS, TEXT_LG, TEXT_MD, TEXT_SM,
+    TEXT_XS, TITLEBAR_HEIGHT, TRAFFIC_LIGHT_INSET, TRAFFIC_LIGHT_PAD, TRANSPARENT,
+    agent_state_color, apply, git_status_color, hex, hexa, palette, palette_for, sync,
+    tab_tag_color, terminal_surface, terminal_surface_alpha, terminal_theme, titlebar, transparent,
 };

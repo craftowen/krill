@@ -139,8 +139,13 @@ pub const ICON_XL: f32 = 18.0;
 
 // ---- 프로바이더·에이전트 공식 브랜드 컬러 (OWE-875) ----
 
-/// Krill 공식 리빙 코랄 브랜드 컬러(`#FF5238`).
+/// Krill 공식 리빙 코랄 브랜드 컬러(`#FF5238`). 브랜드 마크 전용이다 — 상태 의미·버튼 채움·포커스 링·선택 배경에 쓰지 않는다
+/// (destructive·탭 Red와 색상각이 가까워 색약 사용자가 혼동한다, STYLEGUIDE §6.4).
 pub const KRILL_CORAL: u32 = 0x00ff_5238;
+/// 라이트 배경용 코랄(`#D63A24`, 흰 배경 4.68:1). `#FF5238`은 흰 배경에서 3.09:1이라 작은 마크가 흐려진다.
+pub const KRILL_CORAL_LIGHT: u32 = 0x00d6_3a24;
+/// 큰 브랜드 마크 타일(빈 작업 공간 히어로) 남색 바탕(`#08090E`, 앱 아이콘 그라데이션 끝색).
+pub const BRAND_TILE_BG: u32 = 0x0008_090e;
 /// Claude 공식 브랜드 컬러(`#D97757`, Terracotta).
 pub const CLAUDE_COLOR: u32 = 0x00d9_7757;
 /// `OpenAI` / Codex 공식 브랜드 컬러(`#10A37F`, Emerald).
@@ -292,9 +297,37 @@ pub fn svg_box(bytes: &'static [u8], size_px: f32, color: Hsla) -> gpui::Div {
         .child(svg_icon(bytes, size_px, color))
 }
 
-/// Krill 공식 리빙 코랄 브랜드 아이콘 요소를 만든다.
-pub fn krill_brand_icon(size_px: f32) -> gpui::Div {
-    svg_box(KRILL_SVG, size_px, rgb(KRILL_CORAL).into())
+/// 팔레트 바탕(라이트/다크)에 맞는 코랄. 밝은 바탕이면 [`KRILL_CORAL_LIGHT`], 어두운 바탕이면 [`KRILL_CORAL`].
+#[must_use]
+pub fn krill_coral(p: &super::Palette) -> Hsla {
+    if p.background.l > 0.5 {
+        rgb(KRILL_CORAL_LIGHT).into()
+    } else {
+        rgb(KRILL_CORAL).into()
+    }
+}
+
+/// Krill 공식 리빙 코랄 브랜드 아이콘 요소를 만든다. 색은 현재 팔레트 바탕에 맞춘다([`krill_coral`]).
+pub fn krill_brand_icon(size_px: f32, p: &super::Palette) -> gpui::Div {
+    svg_box(KRILL_SVG, size_px, krill_coral(p))
+}
+
+/// 큰 히어로용 브랜드 타일: 남색 [`BRAND_TILE_BG`] 둥근 상자(`RADIUS_LG`) 가운데 코랄 마크.
+/// `size_px`는 타일 한 변이고 마크는 그 2/3다. 바탕이 늘 남색이라 테마와 무관하게 [`KRILL_CORAL`]을 쓴다.
+pub fn brand_mark_tile(size_px: f32) -> gpui::Div {
+    div()
+        .size(px(size_px))
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(super::theme::RADIUS_LG)
+        .bg(rgb(BRAND_TILE_BG))
+        .child(svg_icon(
+            KRILL_SVG,
+            size_px * 2. / 3.,
+            rgb(KRILL_CORAL).into(),
+        ))
 }
 
 fn layered_svg_box(
@@ -508,6 +541,17 @@ mod tests {
                         .child(agent_menu_icon(agent)),
                 );
             }
+            root = root
+                .child(
+                    krill_brand_icon(ICON_MD, p)
+                        .id("gallery-krill-mark")
+                        .debug_selector(|| "gallery-krill-mark".to_owned()),
+                )
+                .child(
+                    brand_mark_tile(72.)
+                        .id("gallery-krill-tile")
+                        .debug_selector(|| "gallery-krill-tile".to_owned()),
+                );
             root
         }
     }
@@ -536,5 +580,17 @@ mod tests {
                 "missing menu icon bounds for {menu_sel}"
             );
         }
+        assert!(vcx.debug_bounds("gallery-krill-mark").is_some());
+        let tile = vcx.debug_bounds("gallery-krill-tile");
+        assert_eq!(tile.map(|b| b.size.width), Some(px(72.)));
+    }
+
+    /// 코랄은 라이트 바탕에서 `#D63A24`, 다크 바탕에서 `#FF5238`. 히어로 타일은 늘 남색 위 `#FF5238`.
+    #[test]
+    fn krill_coral_follows_palette_background() {
+        let light: Hsla = rgb(KRILL_CORAL_LIGHT).into();
+        let dark: Hsla = rgb(KRILL_CORAL).into();
+        assert_eq!(krill_coral(&crate::ui::LIGHT), light);
+        assert_eq!(krill_coral(&crate::ui::DARK), dark);
     }
 }
