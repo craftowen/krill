@@ -84,6 +84,8 @@ windows-sys = "0.61.2"
 uds_windows = "1.2.1"
 # OWE-917: locked, cached safe Windows parent-PID lookup; refresh only the hook PID.
 sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }
+# krill-app Windows exe 아이콘 리소스(build.rs). gpui windows-manifest가 이미 쓰는 Cargo.lock 버전이라 새 크레이트가 아니다(MIT).
+embed-resource = "3.0.12"
 
 # gpui 묶음 vendor 사본(원본 그대로, 패치는 MK-103).
 [patch.crates-io]
