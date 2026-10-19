@@ -146,6 +146,33 @@ pub fn agent_icon(agent: &str, size_px: f32, fg: Hsla) -> AnyElement {
     }
 }
 
+/// 명시적 `agent`가 비어 있을 때 터미널 제목(`* Claude Code` 등)에서 에이전트 종류를 추론한다.
+#[must_use]
+pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
+    if !agent.is_empty()
+        && !matches!(
+            agent,
+            "zsh" | "bash" | "fish" | "sh" | "nu" | "pwsh" | "cmd"
+        )
+    {
+        return agent;
+    }
+    let lower = title.to_ascii_lowercase();
+    if lower.contains("claude") {
+        "claude"
+    } else if lower.contains("codex") {
+        "codex"
+    } else if lower.contains("antigravity") {
+        "agy"
+    } else if lower.contains("opencode") {
+        "opencode"
+    } else if lower.contains("cursor") {
+        "cursor"
+    } else {
+        agent
+    }
+}
+
 /// 같은 상태의 세션 묶음.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Group<'a> {

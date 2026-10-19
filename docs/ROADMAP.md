@@ -1,6 +1,6 @@
 # Krill 로드맵 v1 (2026-10-14)
 
-트랙별 이슈 후보(T1 41개, T2 29개, T3 30개, T4 41개, 합 141개)를 중복 제거·병합해 102개로 만들었고, 교차 검증으로 선행 관계·완료 조건을 고치고 MK-103~106을 더해 106개가 되었으며, 이후 M7 Orca 패리티(MK-107~113), M8 오케스트레이션·포트·에디터(MK-114~121), M9 모바일 원격 제어(MK-122~126), M10 Orca 이관·워크벤치 확장(MK-172~187), M11 Windows 포팅(MK-188~222, 리니어 OWE-807~841과 1:1)을 추가했다. 출처 열의 `T2#7`은 `docs/planning/T2-final.md` §7의 7번 후보다. 우선순위 P0=긴급, P1=높음, P2=보통, P3=낮음. 목표일은 1인 + 에이전트 병렬 개발 기준 **추정**이다.
+트랙별 이슈 후보(T1 41개, T2 29개, T3 30개, T4 41개, 합 141개)를 중복 제거·병합해 102개로 만들었고, 교차 검증으로 선행 관계·완료 조건을 고치고 MK-103~106을 더해 106개가 되었으며, 이후 M7 Orca 패리티(MK-107~113), M8 오케스트레이션·포트·에디터(MK-114~121), M9 모바일 원격 제어(MK-122~126), M10 Orca 이관·워크벤치 확장(MK-172~187), M11 Windows 포팅(MK-188~222, 리니어 OWE-807~841과 1:1), M12 Orca 심층 패리티(MK-223~229, 리니어 OWE-918~924)를 추가했다. 출처 열의 `T2#7`은 `docs/planning/T2-final.md` §7의 7번 후보다. 우선순위 P0=긴급, P1=높음, P2=보통, P3=낮음. 목표일은 1인 + 에이전트 병렬 개발 기준 **추정**이다.
 
 ## 마일스톤
 
@@ -17,6 +17,7 @@
 | M9 모바일 원격 제어 | `krilld` 모바일 기기 레지스트리·`ring` E2EE v2·지연 바인딩 게이트웨이(LAN/Tailscale/`cloudflared`)·1-스캔 QR 페어링(관리자 `Mobile` 8번째 탭 + `krill mobile`)·내장 모바일 PWA·라이브 터미널 뷰 | 2026-10-20 | MK-122~126 전부 통과, 데몬 ≤ 60MB, 실화면 검증 완료 |
 | M10 Orca 이관·워크벤치 확장 | Orca 설정·다계정·원격 SSH·등록 프로젝트/워크트리 원클릭 이관(`krill import orca`)·공유 심볼릭 링크·디스크 클린업·사이드바 계보/필터·우측 파일 탐색기/전문검색·탭 고정/색상/MRU·AI Vault 검색·세션 포크·Git/PR AI 복구·Precheck 스케줄러·`krill computer` | 2026-10-25 | MK-172~187 전부 통과, 앱 ≤ 120MB·데몬 ≤ 60MB, `scripts/check.sh` 0 |
 | M11 Windows 포팅 | Windows(주 타깃 `x86_64-pc-windows-msvc`) 지원: 공통 컴파일 계층(Mac에서 Windows 타깃 `cargo check` 0) → GCP Windows VM 네이티브 ConPTY 실기 스파이크(S-W1~S-W5) → 합격 시 네이티브 본구현·배포. WSL2·앱만 원격은 보류(PRD 플랫폼 절) | 미정 | MK-205 Windows check 0, 스파이크 결과표로 본구현 여부 결정, 본구현 시 MK-217 Windows 생존 e2e 손실 0, macOS `scripts/check.sh` 0 유지 |
+| M12 Orca 심층 패리티 | 서브모듈·심링크·`.worktreeinclude` 글롭·Codex `SUN_LEN` 격리·훅 서브에이전트 보호·재귀 자식 워크트리 안전 삭제·스케줄 실행 상세/취소·오케스트레이션 `--question-id`/`--preamble`·AI Vault 증분 인덱싱·멀티 에이전트 Fan-Out 생성·Hunk/Line 스테이징·인앱 PR 머지 | 2026-10-19 | MK-223~229 전부 통과, `scripts/check.sh` 0 |
 
 ## 이슈 (우선순위 → 선행 순으로 진행)
 
@@ -215,5 +216,13 @@
 | MK-220 | release 워크플로 Windows 잡 + Windows 메모리 게이트 | M11 | P3 | release 워크플로 Windows 잡, 메모리 게이트 Windows판(지표는 MK-209에서 정의) | MK-218 | boost Phase 4 | OWE-839 |
 | MK-221 | 원격·부가: krill-link·모바일 게이트웨이·krill-hosts SSH 포워딩 Windows화 | M11 | P3 | tokio Unix 대체, Windows OpenSSH 로컬 Unix 소켓 `-L` 지원 확인(안 되면 루프백 TCP + 토큰) | MK-205 | boost Phase 5 | OWE-840 |
 | MK-222 | (보류) WSL2 백엔드 | M11 | P3 | 보류 — 네이티브 스파이크 실패 시 재검토 | — | boost 전략 B | OWE-841 |
+| MK-223 | [M12 Epic] Orca 심층 패리티 (워크트리 엣지케이스·스케줄러·오케스트레이션·AI Vault·Fan-Out/Hunk/PR 머지) | M12 | P0 | 하위 MK-224~229 전부 통과, `scripts/check.sh` 0 | MK-172~187 | Orca 감사 | OWE-918 |
+| MK-224 | 워크트리·프로바이더·훅 엣지케이스 하드닝 (서브모듈·심링크·`.worktreeinclude` 글롭·Codex `SUN_LEN`·서브에이전트 훅 보호) | M12 | P0 | 서브모듈 워크트리 삭제·심링크 자기참조 루프 방지·글롭 복사·Codex 단축 홈·서브에이전트 훅 보호 테스트 통과 | MK-042, MK-043, MK-173 | Orca 감사 | OWE-919 |
+| MK-225 | 워크트리 & 세션 CLI 심층 패리티 (`--json`·`--delete-branch`·재귀 자식 워크트리 안전 삭제·`--cwd`·`--append`) | M12 | P1 | `krill worktree list/create/remove` 및 `krill new/read/send` 신규 플래그·재귀 자식 안전 삭제 테스트 통과 | MK-042, MK-043, MK-045 | Orca 감사 | OWE-920 |
+| MK-226 | 스케줄 자동화 실행 이력 상세 CLI (`runs`/`show`/`cancel`/`--enabled`/`--precheck`) & 타임아웃 프로세스 그룹 정리 | M12 | P1 | `krill schedule` 서브커맨드 확장 및 타임아웃 시 음수 PGID 그룹 시그널 정리 테스트 통과 | MK-101, MK-186 | Orca 감사 | OWE-921 |
+| MK-227 | 오케스트레이션 `ask --question-id` 멱등 재대기·`worker start --preamble` 3모드·스킬 공유 `--include- untracked` | M12 | P1 | `question_id` 중복 생성 방지·재대기, `preamble` 모드별 시스템 지시문 제어, untracked 스킬 동기화 테스트 통과 | MK-114, MK-115 | Orca 감사 | OWE-922 |
+| MK-228 | AI History Vault 대용량 JSONL(≤ 64 MiB) Head+Tail 분할 스캔·증분 mtime 캐시·최신순 정렬 | M12 | P1 | 8 MiB 초과 JSONL Head+Tail 파싱 및 `(path, mtime_ns, size)` 증분 캐시 재사용 테스트 통과 | MK-181 | Orca 감사 | OWE-923 |
+| MK-229 | 멀티 에이전트 Fan-Out 워크트리 생성 & 초기 프롬프트·Git Hunk/Line 스테이징·Unified/Split Diff·인앱 PR 머지 | M12 | P1 | 다중 에이전트 동시 워크트리 스폰·초기 프롬프트 주입, Hunk/Line stage/unstage/discard, PR Squash/Rebase/Merge 및 Draft 전환 테스트 통과 | MK-042, MK-054, MK-085, MK-185 | Orca 감사 | OWE-924 |
 
 M11의 `WCHK(X)`는 [docs/boost-2026-10-18-windows-port.md](boost-2026-10-18-windows-port.md) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
+

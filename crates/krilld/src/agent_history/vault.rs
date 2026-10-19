@@ -6,8 +6,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead as _, BufReader, Read as _};
+use std::io::{self, BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use krill_proto::agent_history::{
@@ -21,6 +24,68 @@ const FILE_BYTES: usize = 512 * 1024;
 const SCAN_TIME: Duration = Duration::from_secs(3);
 const SNIPPET_CHARS: usize = 140;
 const TITLE_CHARS: usize = 120;
+const MAX_CACHE_ENTRIES: usize = 2048;
+
+#[derive(Debug, Clone)]
+struct CachedVaultDoc {
+    mtime_ns: u128,
+    size: u64,
+    doc: VaultDoc,
+    has_primary_title: bool,
+}
+
+static VAULT_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, CachedVaultDoc>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+static VAULT_CACHE_HITS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn vault_cache_hits_for_test() -> usize {
+    VAULT_CACHE_HITS.load(Ordering::Relaxed)
+}
+
+fn file_stamp(path: &Path) -> Option<(u128, u64)> {
+    let meta = fs::metadata(path).ok()?;
+    let mtime_ns = meta
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    Some((mtime_ns, meta.len()))
+}
+
+fn file_mtime_ns(path: &Path) -> u128 {
+    file_stamp(path).map_or(0, |(mtime_ns, _)| mtime_ns)
+}
+
+fn lookup_cached_doc(path: &Path, mtime_ns: u128, size: u64) -> Option<CachedVaultDoc> {
+    let guard = VAULT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = guard.get(path)?;
+    if entry.mtime_ns == mtime_ns && entry.size == size {
+        #[cfg(test)]
+        VAULT_CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+        Some(entry.clone())
+    } else {
+        None
+    }
+}
+
+fn store_cached_doc(path: &Path, entry: CachedVaultDoc) {
+    let mut guard = VAULT_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if guard.len() >= MAX_CACHE_ENTRIES
+        && !guard.contains_key(path)
+        && let Some(first_key) = guard.keys().next().cloned()
+    {
+        guard.remove(&first_key);
+    }
+    guard.insert(path.to_path_buf(), entry);
+}
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VaultRoots {
@@ -727,32 +792,94 @@ impl Indexer {
     }
 
     fn read_lines(&mut self, path: &Path, mut on_line: impl FnMut(&[u8])) -> io::Result<u64> {
-        let file = File::open(path)?;
-        let modified = file
-            .metadata()?
+        let mut file = File::open(path)?;
+        let meta = file.metadata()?;
+        let modified = meta
             .modified()?
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let file_len = meta.len();
         let limit =
             u64::try_from(FILE_BYTES.min(MAX_BYTES.saturating_sub(self.bytes))).unwrap_or(u64::MAX);
-        let mut reader = BufReader::with_capacity(8192, file.take(limit));
+        if limit == 0 {
+            self.truncated = true;
+            return Ok(modified);
+        }
+
         let mut line = Vec::new();
-        loop {
-            line.clear();
-            match reader.read_until(b'\n', &mut line) {
-                Ok(0) => break,
-                Ok(_) => on_line(&line),
-                Err(_) => {
-                    self.skipped = true;
-                    break;
+        if file_len <= limit || limit < 2 {
+            let mut reader = BufReader::with_capacity(8192, file.take(limit));
+            loop {
+                line.clear();
+                match reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => on_line(&line),
+                    Err(_) => {
+                        self.skipped = true;
+                        break;
+                    }
                 }
             }
+            let read = limit.saturating_sub(reader.get_ref().limit());
+            self.bytes = self
+                .bytes
+                .saturating_add(usize::try_from(read).unwrap_or(usize::MAX));
+            return Ok(modified);
         }
-        let read = limit.saturating_sub(reader.get_ref().limit());
+
+        // 파일 크기가 FILE_BYTES(512KiB) 예산을 초과할 때는 Head(절반) + Tail(절반)을 분할해 읽는다.
+        // 앞부분의 세션 메타데이터(sessionId·cwd·첫 프롬프트)와 뒷부분의 최신 대화·customTitle·summary를 함께 보존한다.
+        let head_budget = limit / 2;
+        let tail_budget = limit.saturating_sub(head_budget);
+        let head_read = {
+            let mut head_reader = BufReader::with_capacity(8192, (&mut file).take(head_budget));
+            loop {
+                line.clear();
+                match head_reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => on_line(&line),
+                    Err(_) => {
+                        self.skipped = true;
+                        break;
+                    }
+                }
+            }
+            head_budget.saturating_sub(head_reader.get_ref().limit())
+        };
+
+        let tail_start = file_len.saturating_sub(tail_budget);
+        let mut tail_read = 0u64;
+        if tail_start > 0
+            && file
+                .seek(SeekFrom::Start(tail_start.saturating_sub(1)))
+                .is_ok()
+        {
+            let mut prev = [0u8; 1];
+            let starts_mid_line = file.read_exact(&mut prev).is_ok() && prev[0] != b'\n';
+            let mut tail_reader = BufReader::with_capacity(8192, (&mut file).take(tail_budget));
+            if starts_mid_line {
+                line.clear();
+                drop(tail_reader.read_until(b'\n', &mut line));
+            }
+            loop {
+                line.clear();
+                match tail_reader.read_until(b'\n', &mut line) {
+                    Ok(0) => break,
+                    Ok(_) => on_line(&line),
+                    Err(_) => {
+                        self.skipped = true;
+                        break;
+                    }
+                }
+            }
+            tail_read = tail_budget.saturating_sub(tail_reader.get_ref().limit());
+        }
+
+        let total_read = head_read.saturating_add(tail_read);
         self.bytes = self
             .bytes
-            .saturating_add(usize::try_from(read).unwrap_or(usize::MAX));
+            .saturating_add(usize::try_from(total_read).unwrap_or(usize::MAX));
         Ok(modified)
     }
 
@@ -786,6 +913,7 @@ impl Indexer {
         }
         let history = self.read_agy_history(root);
         if let Ok(dir) = fs::read_dir(&brain) {
+            let mut candidates: Vec<(u128, String, PathBuf)> = Vec::new();
             for item in dir {
                 if self.exhausted() {
                     break;
@@ -813,8 +941,15 @@ impl Indexer {
                 .into_iter()
                 .find(|p| p.is_file());
                 if let Some(transcript) = candidate {
-                    self.parse_agy_file(&transcript, Some(&conv_id), &history);
+                    candidates.push((file_mtime_ns(&transcript), conv_id, transcript));
                 }
+            }
+            candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            for (_, conv_id, transcript) in candidates {
+                if self.exhausted() {
+                    break;
+                }
+                self.parse_agy_file(&transcript, Some(&conv_id), &history);
             }
         }
         if sessions.is_dir() {
@@ -845,15 +980,23 @@ impl Indexer {
         codex_rollout_only: bool,
         mut on_file: impl FnMut(&mut Self, &Path),
     ) {
-        self.walk_jsonl_inner(path, depth, codex_rollout_only, &mut on_file);
+        let mut files = Vec::new();
+        self.collect_jsonl_files(path, depth, codex_rollout_only, &mut files);
+        files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, file_path) in files {
+            if self.exhausted() {
+                break;
+            }
+            on_file(self, &file_path);
+        }
     }
 
-    fn walk_jsonl_inner(
+    fn collect_jsonl_files(
         &mut self,
         path: &Path,
         depth: usize,
         codex_rollout_only: bool,
-        on_file: &mut impl FnMut(&mut Self, &Path),
+        files: &mut Vec<(u128, PathBuf)>,
     ) {
         if depth == 0 || self.exhausted() {
             return;
@@ -887,11 +1030,11 @@ impl Indexer {
                 if name_str == "subagents" {
                     continue;
                 }
-                self.walk_jsonl_inner(
+                self.collect_jsonl_files(
                     &item.path(),
                     depth.saturating_sub(1),
                     codex_rollout_only,
-                    on_file,
+                    files,
                 );
             } else if kind.is_file() {
                 let p = item.path();
@@ -901,12 +1044,20 @@ impl Indexer {
                 if codex_rollout_only && !name_str.starts_with("rollout-") {
                     continue;
                 }
-                on_file(self, &p);
+                files.push((file_mtime_ns(&p), p));
             }
         }
     }
 
     fn parse_claude_file(&mut self, path: &Path) {
+        let stamp = file_stamp(path);
+        if let Some((mtime_ns, size)) = stamp
+            && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
+        {
+            self.insert(cached.doc);
+            return;
+        }
+
         let mut id = String::new();
         let mut cwd = String::new();
         let mut custom_title = String::new();
@@ -1023,7 +1174,7 @@ impl Indexer {
         }
         let title = first_non_empty(&[&custom_title, &ai_title, &first_user, &summary, &id]);
         let sum = first_non_empty(&[&summary, &last_prompt, &first_assistant]);
-        self.insert(VaultDoc {
+        let doc = VaultDoc {
             agent: VaultAgent::Claude,
             id,
             cwd,
@@ -1031,7 +1182,19 @@ impl Indexer {
             title,
             summary: sum,
             messages,
-        });
+        };
+        if let Some((mtime_ns, size)) = stamp {
+            store_cached_doc(
+                path,
+                CachedVaultDoc {
+                    mtime_ns,
+                    size,
+                    doc: doc.clone(),
+                    has_primary_title: true,
+                },
+            );
+        }
+        self.insert(doc);
     }
 
     fn read_codex_title_index(&mut self, path: &Path) -> BTreeMap<String, String> {
@@ -1066,6 +1229,21 @@ impl Indexer {
     }
 
     fn parse_codex_file(&mut self, path: &Path, titles: &BTreeMap<String, String>) {
+        let stamp = file_stamp(path);
+        if let Some((mtime_ns, size)) = stamp
+            && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
+        {
+            let mut doc = cached.doc;
+            if !cached.has_primary_title
+                && let Some(t) = titles.get(&doc.id)
+                && !t.trim().is_empty()
+            {
+                t.trim().clone_into(&mut doc.title);
+            }
+            self.insert(doc);
+            return;
+        }
+
         let mut id = String::new();
         let mut cwd = String::new();
         let mut meta_title = String::new();
@@ -1243,7 +1421,7 @@ impl Indexer {
         let indexed_title = titles.get(&id).map_or("", String::as_str);
         let title = first_non_empty(&[&meta_title, indexed_title, &first_user, &summary, &id]);
         let sum = first_non_empty(&[&summary, &first_assistant]);
-        self.insert(VaultDoc {
+        let doc = VaultDoc {
             agent: VaultAgent::Codex,
             id,
             cwd,
@@ -1251,7 +1429,19 @@ impl Indexer {
             title,
             summary: sum,
             messages,
-        });
+        };
+        if let Some((mtime_ns, size)) = stamp {
+            store_cached_doc(
+                path,
+                CachedVaultDoc {
+                    mtime_ns,
+                    size,
+                    doc: doc.clone(),
+                    has_primary_title: !meta_title.is_empty(),
+                },
+            );
+        }
+        self.insert(doc);
     }
 
     fn read_agy_history(&mut self, root: &Path) -> BTreeMap<String, (String, String)> {
@@ -1298,6 +1488,21 @@ impl Indexer {
         fallback_id: Option<&str>,
         history: &BTreeMap<String, (String, String)>,
     ) {
+        let stamp = file_stamp(path);
+        if let Some((mtime_ns, size)) = stamp
+            && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
+        {
+            let mut doc = cached.doc;
+            if !cached.has_primary_title
+                && let Some((_, hist_display)) = history.get(&doc.id)
+                && !hist_display.is_empty()
+            {
+                doc.title.clone_from(hist_display);
+            }
+            self.insert(doc);
+            return;
+        }
+
         let mut id = fallback_id.unwrap_or("").to_owned();
         let mut cwd = String::new();
         let mut title = String::new();
@@ -1386,6 +1591,7 @@ impl Indexer {
             self.skipped = true;
             return;
         };
+        let has_primary_title = !title.is_empty();
         if let Some((hist_cwd, hist_display)) = history.get(&id) {
             if cwd.is_empty() {
                 cwd.clone_from(hist_cwd);
@@ -1400,7 +1606,7 @@ impl Indexer {
         }
         let resolved_title = first_non_empty(&[&title, &first_user, &summary, &id]);
         let resolved_summary = first_non_empty(&[&summary, &first_assistant]);
-        self.insert(VaultDoc {
+        let doc = VaultDoc {
             agent: VaultAgent::Agy,
             id,
             cwd,
@@ -1408,10 +1614,43 @@ impl Indexer {
             title: resolved_title,
             summary: resolved_summary,
             messages,
-        });
+        };
+        if let Some((mtime_ns, size)) = stamp {
+            store_cached_doc(
+                path,
+                CachedVaultDoc {
+                    mtime_ns,
+                    size,
+                    doc: doc.clone(),
+                    has_primary_title,
+                },
+            );
+        }
+        self.insert(doc);
     }
 
     fn walk_opencode_dir(&mut self, dir: &Path, storage_root: Option<&Path>, depth: usize) {
+        let mut files = Vec::new();
+        self.collect_opencode_files(dir, depth, &mut files);
+        files.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        for (_, path, is_json) in files {
+            if self.exhausted() {
+                break;
+            }
+            if is_json {
+                self.parse_opencode_json(&path, storage_root);
+            } else {
+                self.parse_opencode_jsonl(&path);
+            }
+        }
+    }
+
+    fn collect_opencode_files(
+        &mut self,
+        dir: &Path,
+        depth: usize,
+        files: &mut Vec<(u128, PathBuf, bool)>,
+    ) {
         if depth == 0 || self.exhausted() {
             return;
         }
@@ -1436,13 +1675,13 @@ impl Indexer {
             }
             let path = item.path();
             if kind.is_dir() {
-                self.walk_opencode_dir(&path, storage_root, depth.saturating_sub(1));
+                self.collect_opencode_files(&path, depth.saturating_sub(1), files);
             } else if kind.is_file() {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 if ext == "json" {
-                    self.parse_opencode_json(&path, storage_root);
+                    files.push((file_mtime_ns(&path), path, true));
                 } else if ext == "jsonl" {
-                    self.parse_opencode_jsonl(&path);
+                    files.push((file_mtime_ns(&path), path, false));
                 }
             }
         }
@@ -1607,6 +1846,14 @@ impl Indexer {
     }
 
     fn parse_opencode_jsonl(&mut self, path: &Path) {
+        let stamp = file_stamp(path);
+        if let Some((mtime_ns, size)) = stamp
+            && let Some(cached) = lookup_cached_doc(path, mtime_ns, size)
+        {
+            self.insert(cached.doc);
+            return;
+        }
+
         let mut id = path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -1667,7 +1914,7 @@ impl Indexer {
             .map(|(_, t)| truncate_chars(&one_line(t), TITLE_CHARS))
             .unwrap_or_default();
         let resolved_title = first_non_empty(&[&title, &first_user, &summary, &id]);
-        self.insert(VaultDoc {
+        let doc = VaultDoc {
             agent: VaultAgent::OpenCode,
             id,
             cwd,
@@ -1675,7 +1922,19 @@ impl Indexer {
             title: resolved_title,
             summary,
             messages,
-        });
+        };
+        if let Some((mtime_ns, size)) = stamp {
+            store_cached_doc(
+                path,
+                CachedVaultDoc {
+                    mtime_ns,
+                    size,
+                    doc: doc.clone(),
+                    has_primary_title: true,
+                },
+            );
+        }
+        self.insert(doc);
     }
 }
 

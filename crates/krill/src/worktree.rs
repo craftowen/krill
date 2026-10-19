@@ -14,11 +14,13 @@ use std::process::ExitCode;
 use krill_proto::control::{
     FEAT_CONTROL, FEAT_WORKTREE, NewWorktree, Reply, Request, Setup, Worktree,
 };
-use krill_proto::daemon::{self, Paths};
+use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg;
 
-const USAGE: &str = "usage: krill worktree new <name> [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--repo <path>] [--force]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--json]";
+use crate::remote::Target;
+
+const USAGE: &str = "usage: krill worktree new <name> [--host <user@host>] [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--host <user@host>] [--repo <path>] [--force]\n       krill worktree list [--repo <path>] [--json]\n       krill worktree show [<path>] [--json]\n       krill worktree current [--json]\n       krill worktree ps [--worktree <path>] [--json]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--json]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ParsedNew {
@@ -26,7 +28,15 @@ struct ParsedNew {
     parent: Option<PathBuf>,
 }
 
-pub fn run(args: &[OsString]) -> ExitCode {
+pub fn run(raw_args: &[OsString]) -> ExitCode {
+    let (host, args_vec) = match crate::remote::extract_host(raw_args) {
+        Ok(parsed) => parsed,
+        Err(text) => {
+            eprintln!("{text}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    };
+    let args = args_vec.as_slice();
     if args
         .first()
         .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
@@ -37,8 +47,27 @@ pub fn run(args: &[OsString]) -> ExitCode {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
+    let target = match Target::establish(host) {
+        Ok(target) => target,
+        Err(e) => {
+            eprintln!("remote: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if args.first().is_some_and(|a| a == "rm") {
-        return remove::run(&args[1..]);
+        return remove::run(&target, &args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "list" || a == "ls") {
+        return run_list(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "show") {
+        return run_show(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "current") {
+        return run_current(&args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "ps") {
+        return run_ps(&target, &args[1..]);
     }
     if args.first().is_some_and(|a| a == "cleanup" || a == "clean") {
         return cleanup::run_cleanup(&args[1..]);
@@ -58,7 +87,7 @@ pub fn run(args: &[OsString]) -> ExitCode {
     if args.first().is_some_and(|a| a == "hooks" || a == "hook") {
         return run_hooks(&args[1..]);
     }
-    let parsed = match parse(args) {
+    let parsed = match parse_with_remote(args, target.is_remote()) {
         Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("{e}\n{USAGE}");
@@ -66,10 +95,11 @@ pub fn run(args: &[OsString]) -> ExitCode {
         }
     };
     let parent = parsed.parent;
-    match create(parsed.req) {
+    match create_on_target(&target, parsed.req) {
         Ok(w) => {
             let created_path = PathBuf::from(OsStr::from_bytes(&w.path));
-            if let Some(parent_path) = parent
+            if !target.is_remote()
+                && let Some(parent_path) = parent
                 && let Some(state_dir) = daemon::state_dir()
                 && let Err(e) =
                     krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
@@ -95,7 +125,12 @@ pub fn run(args: &[OsString]) -> ExitCode {
     }
 }
 
+#[cfg(test)]
 fn parse(args: &[OsString]) -> Result<ParsedNew, String> {
+    parse_with_remote(args, false)
+}
+
+fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, String> {
     let mut args = args.iter();
     if args.next().is_none_or(|a| a != "new") {
         return Err("expected 'new'".to_owned());
@@ -162,6 +197,23 @@ fn parse(args: &[OsString]) -> Result<ParsedNew, String> {
             _ => return Err(format!("unexpected argument {flag:?}")),
         }
     }
+    if remote {
+        let repo_path = repo.or(parent).ok_or_else(|| {
+            "remote worktree new requires --repo <absolute path on the remote host>".to_owned()
+        })?;
+        if !repo_path.as_os_str().as_bytes().starts_with(b"/") {
+            return Err("remote --repo must be an absolute path on the remote host".to_owned());
+        }
+        return Ok(ParsedNew {
+            req: NewWorktree {
+                repo: repo_path.as_os_str().as_bytes().to_vec(),
+                name: name.ok_or("missing worktree name")?,
+                base,
+                setup,
+            },
+            parent: None,
+        });
+    }
     let resolved_parent = match parent {
         Some(p) => {
             let canon = std::fs::canonicalize(&p)
@@ -193,13 +245,10 @@ fn utf8(s: &OsStr) -> Result<&str, String> {
         .ok_or_else(|| "name and options must be UTF-8".to_owned())
 }
 
-pub(super) fn create(mut req: NewWorktree) -> Result<Worktree, String> {
-    let paths = Paths::dev().map_err(|e| e.to_string())?;
-    let mut conn = daemon::connect(
-        &paths,
-        &daemon::client_hello(ClientRole::Cli, "krill worktree new"),
-    )
-    .map_err(|e| e.to_string())?;
+pub(super) fn create_on_target(target: &Target, mut req: NewWorktree) -> Result<Worktree, String> {
+    let mut conn = target
+        .connect(&daemon::client_hello(ClientRole::Cli, "krill worktree new"))
+        .map_err(|e| e.to_string())?;
     let required = FEAT_CONTROL | FEAT_WORKTREE;
     if conn.negotiated.features & required != required {
         return Err("krilld does not support worktree creation; update the daemon".to_owned());
@@ -255,6 +304,288 @@ fn hex(bytes: &[u8]) -> String {
         write!(s, "{b:02x}").ok();
         s
     })
+}
+
+fn list_git_worktrees(repo: &std::path::Path) -> Result<Vec<(String, String, String)>, String> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .map_err(|e| format!("git worktree list failed: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).trim().to_owned());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut items = Vec::new();
+    let mut cur_path = String::new();
+    let mut cur_head = String::new();
+    let mut cur_branch = String::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("worktree ") {
+            if !cur_path.is_empty() {
+                items.push((
+                    std::mem::take(&mut cur_path),
+                    std::mem::take(&mut cur_branch),
+                    std::mem::take(&mut cur_head),
+                ));
+            }
+            rest.trim().clone_into(&mut cur_path);
+        } else if let Some(rest) = line.strip_prefix("HEAD ") {
+            cur_head = rest.trim().chars().take(8).collect();
+        } else if let Some(rest) = line.strip_prefix("branch ") {
+            rest.trim()
+                .strip_prefix("refs/heads/")
+                .unwrap_or(rest.trim())
+                .clone_into(&mut cur_branch);
+        } else if line.trim() == "detached" && cur_branch.is_empty() {
+            "(detached)".clone_into(&mut cur_branch);
+        }
+    }
+    if !cur_path.is_empty() {
+        items.push((cur_path, cur_branch, cur_head));
+    }
+    Ok(items)
+}
+
+fn run_list(args: &[OsString]) -> ExitCode {
+    let mut repo = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(raw) = it.next() {
+        let Ok(arg) = utf8(raw) else {
+            eprintln!("arguments must be UTF-8\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        if let Some(val) = arg.strip_prefix("--repo=") {
+            repo = Some(PathBuf::from(val));
+        } else {
+            match arg {
+                "--repo" => {
+                    let Some(v) = it.next() else {
+                        eprintln!("missing --repo value\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    repo = Some(PathBuf::from(v));
+                }
+                "--json" => json = true,
+                _ => {
+                    eprintln!("unexpected argument {arg:?}\n{USAGE}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    }
+    let root = match resolve_repo_arg(repo) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("worktree list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let worktrees = match list_git_worktrees(&root) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("worktree list: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let store = daemon::state_dir()
+        .and_then(|d| krill_proto::orchestration::WorktreeStore::load(&d).ok())
+        .unwrap_or_default();
+    if json {
+        let rows: Vec<_> = worktrees
+            .into_iter()
+            .map(|(path, branch, head)| {
+                let cp = store.checkpoint(&path);
+                serde_json::json!({
+                    "path": path,
+                    "branch": branch,
+                    "head": head,
+                    "status": cp.workspace_status,
+                    "comment": cp.comment,
+                    "pr": cp.pr,
+                    "issue": cp.issue,
+                    "parent": cp.parent,
+                    "unread": cp.unread,
+                })
+            })
+            .collect();
+        match serde_json::to_string_pretty(&rows) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("worktree list: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        println!("PATH\tBRANCH\tHEAD\tSTATUS\tPR\tCOMMENT");
+        for (path, branch, head) in worktrees {
+            let cp = store.checkpoint(&path);
+            println!(
+                "{path}\t{branch}\t{head}\t{}\t{}\t{}",
+                cp.workspace_status.as_deref().unwrap_or("-"),
+                cp.pr.map_or_else(|| "-".to_owned(), |n| format!("#{n}")),
+                cp.comment.as_deref().unwrap_or("-")
+            );
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_current(args: &[OsString]) -> ExitCode {
+    let mut json = false;
+    for raw in args {
+        let Ok(arg) = utf8(raw) else {
+            eprintln!("arguments must be UTF-8\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        if arg == "--json" {
+            json = true;
+        } else {
+            eprintln!("unexpected argument {arg:?}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    let base_dir = std::env::var_os("MK_PANE_ID")
+        .and_then(|s| s.to_str()?.parse::<u64>().ok())
+        .and_then(|sid| crate::session::resolve_session_cwd(sid).ok())
+        .or_else(|| std::env::current_dir().ok());
+    let Some(dir) = base_dir else {
+        eprintln!("worktree current: cannot determine current directory");
+        return ExitCode::FAILURE;
+    };
+    let root = crate::set::resolve_worktree(&dir);
+    show_worktree_info(&root, json)
+}
+
+fn run_show(args: &[OsString]) -> ExitCode {
+    let mut path: Option<PathBuf> = None;
+    let mut json = false;
+    for raw in args {
+        let Ok(arg) = utf8(raw) else {
+            eprintln!("arguments must be UTF-8\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        if arg == "--json" {
+            json = true;
+        } else if !arg.starts_with('-') && path.is_none() {
+            path = Some(PathBuf::from(arg));
+        } else {
+            eprintln!("unexpected argument {arg:?}\n{USAGE}");
+            return ExitCode::from(2);
+        }
+    }
+    let dir = match path {
+        Some(p) => p,
+        None => match std::env::current_dir() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("worktree show: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let canon = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let root = crate::set::resolve_worktree(&canon);
+    show_worktree_info(&root, json)
+}
+
+fn show_worktree_info(root: &std::path::Path, json: bool) -> ExitCode {
+    let key = krill_proto::orchestration::worktree_key(root);
+    let branch = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map_or_else(
+            || "-".to_owned(),
+            |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+        );
+    let store = daemon::state_dir()
+        .and_then(|d| krill_proto::orchestration::WorktreeStore::load(&d).ok())
+        .unwrap_or_default();
+    let cp = store.checkpoint(&key);
+    if json {
+        let payload = serde_json::json!({
+            "worktree": key,
+            "branch": branch,
+            "workspace_status": cp.workspace_status,
+            "comment": cp.comment,
+            "pr": cp.pr,
+            "issue": cp.issue,
+            "parent": cp.parent,
+            "references": cp.references,
+            "unread": cp.unread,
+            "updated_at_ms": cp.updated_at_ms,
+        });
+        match serde_json::to_string_pretty(&payload) {
+            Ok(out) => println!("{out}"),
+            Err(e) => {
+                eprintln!("worktree: {e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        println!("worktree:   {key}");
+        println!("branch:     {branch}");
+        println!(
+            "status:     {}",
+            cp.workspace_status.as_deref().unwrap_or("-")
+        );
+        println!("comment:    {}", cp.comment.as_deref().unwrap_or("-"));
+        println!(
+            "pr:         {}",
+            cp.pr.map_or_else(|| "-".to_owned(), |n| format!("#{n}"))
+        );
+        println!("issue:      {}", cp.issue.as_deref().unwrap_or("-"));
+        println!("parent:     {}", cp.parent.as_deref().unwrap_or("-"));
+    }
+    ExitCode::SUCCESS
+}
+
+fn run_ps(target: &Target, args: &[OsString]) -> ExitCode {
+    let mut wt: Option<OsString> = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(raw) = it.next() {
+        let Ok(arg) = utf8(raw) else {
+            eprintln!("arguments must be UTF-8\n{USAGE}");
+            return ExitCode::from(2);
+        };
+        match arg {
+            "--worktree" | "--cwd" => {
+                let Some(v) = it.next() else {
+                    eprintln!("missing --worktree value\n{USAGE}");
+                    return ExitCode::from(2);
+                };
+                wt = Some(v.clone());
+            }
+            "--json" => json = true,
+            s if !s.starts_with('-') && wt.is_none() => wt = Some(raw.clone()),
+            _ => {
+                eprintln!("unexpected argument {arg:?}\n{USAGE}");
+                return ExitCode::from(2);
+            }
+        }
+    }
+    let wt_arg = match wt {
+        Some(w) => w,
+        None => match std::env::current_dir() {
+            Ok(c) => crate::set::resolve_worktree(&c).into_os_string(),
+            Err(e) => {
+                eprintln!("worktree ps: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let mut ls_args = vec![OsString::from("ls"), OsString::from("--worktree"), wt_arg];
+    if json {
+        ls_args.push(OsString::from("--json"));
+    }
+    crate::session::run_with_target(target, &ls_args)
 }
 
 fn resolve_repo_arg(repo: Option<PathBuf>) -> Result<PathBuf, String> {

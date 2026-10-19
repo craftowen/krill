@@ -1281,3 +1281,127 @@ fn owe755_concurrent_hook_auto_rename_preserves_all_session_titles() {
     drop(reg);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn orchestration_ipc_wakes_check_messages_and_enforces_worker_depth() {
+    use krill_proto::orchestration::{MessageType, OrchAction, OrchResponse, SendParams};
+
+    let dir = std::env::temp_dir().join(format!("owe922-reg-orch-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+
+    let reg = Arc::new(Registry::new(None, Some(&dir)));
+    let peer = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+
+    let Reply::Orchestration(OrchResponse::Run(run)) = reg.handle(
+        &peer,
+        Request::Orchestration(OrchAction::CreateRun {
+            title: "ipc-run".into(),
+            coordinator_session_id: Some(1),
+        }),
+        &mut HashMap::new(),
+    ) else {
+        panic!("expected Run response");
+    };
+
+    // StartWorker with depth 1 <= max_depth 2 succeeds and persists depth = 1
+    let Reply::Orchestration(OrchResponse::Dispatch(disp)) = reg.handle(
+        &peer,
+        Request::Orchestration(OrchAction::StartWorker {
+            run_id: run.id.clone(),
+            task_id: None,
+            worker_name: "w1".into(),
+            agent: "claude".into(),
+            session_id: Some(42),
+            cwd: "/tmp".into(),
+            prompt: "work".into(),
+            depth: 1,
+            max_depth: 2,
+        }),
+        &mut HashMap::new(),
+    ) else {
+        panic!("expected Dispatch response");
+    };
+    assert_eq!(disp.depth, 1);
+
+    // StartWorker with depth 3 > max_depth 2 fails
+    let over_depth = reg.handle(
+        &peer,
+        Request::Orchestration(OrchAction::StartWorker {
+            run_id: run.id.clone(),
+            task_id: None,
+            worker_name: "w2".into(),
+            agent: "claude".into(),
+            session_id: Some(43),
+            cwd: "/tmp".into(),
+            prompt: "work".into(),
+            depth: 3,
+            max_depth: 2,
+        }),
+        &mut HashMap::new(),
+    );
+    assert!(matches!(
+        over_depth,
+        Reply::Orchestration(OrchResponse::Error(_))
+    ));
+
+    // Blocking CheckMessages with 5s timeout wakes up immediately when SendMessage fires
+    let reg_waiter = Arc::clone(&reg);
+    let waiter = std::thread::spawn(move || {
+        let start = Instant::now();
+        let reply = reg_waiter.handle(
+            &Peer {
+                pid: None,
+                scope: Scope::Full,
+            },
+            Request::Orchestration(OrchAction::CheckMessages {
+                recipient: Some("coordinator".into()),
+                types: vec![MessageType::WorkerDone],
+                unread_only: true,
+                ack: true,
+                wait_ms: 5000,
+            }),
+            &mut HashMap::new(),
+        );
+        (start.elapsed(), reply)
+    });
+
+    std::thread::sleep(Duration::from_millis(60));
+    let send_reply = reg.handle(
+        &peer,
+        Request::Orchestration(OrchAction::SendMessage(SendParams {
+            run_id: Some(run.id),
+            task_id: None,
+            dispatch_id: Some(disp.id),
+            from: "w1".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "done".into(),
+            body: "completed".into(),
+            outcome: Some("succeeded".into()),
+            reply_to: None,
+        })),
+        &mut HashMap::new(),
+    );
+    assert!(matches!(
+        send_reply,
+        Reply::Orchestration(OrchResponse::Messages(_))
+    ));
+
+    let (elapsed, wait_reply) = waiter.join().unwrap();
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "condvar wakeup took too long: {elapsed:?}"
+    );
+    let Reply::Orchestration(OrchResponse::Messages(msgs)) = wait_reply else {
+        panic!("expected Messages response");
+    };
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].summary, "done");
+
+    drop(reg);
+    fs::remove_dir_all(&dir).ok();
+}

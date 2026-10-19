@@ -150,6 +150,7 @@ pub struct Registry {
     app_opened: OnceLock<()>,
     mobile: OnceLock<Arc<crate::mobile::gateway::Gateway>>,
     webhooks: Mutex<crate::webhook::Dispatcher>,
+    orch_signal: (Mutex<u64>, std::sync::Condvar),
 }
 
 impl std::fmt::Debug for Registry {
@@ -193,6 +194,7 @@ impl Registry {
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
             webhooks: Mutex::new(crate::webhook::Dispatcher::new(dir)),
+            orch_signal: (Mutex::new(0), std::sync::Condvar::new()),
             watch: crate::watch::Watch::new(if holder.is_some() {
                 HolderStatus::Linked
             } else {
@@ -630,11 +632,9 @@ impl Registry {
                 {
                     Reply::Failed(Failure::BadRequest)
                 }
-                Ok(Request::Capture { .. } | Request::Resize { .. })
-                    if n.features & control::FEAT_CLI == 0 =>
-                {
-                    Reply::Failed(Failure::BadRequest)
-                }
+                Ok(
+                    Request::Capture { .. } | Request::Resize { .. } | Request::SendInput { .. },
+                ) if n.features & control::FEAT_CLI == 0 => Reply::Failed(Failure::BadRequest),
                 Ok(Request::WaitStatus { .. }) if n.features & control::FEAT_WAIT_STATUS == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
@@ -941,6 +941,13 @@ impl Registry {
                     Err(Failure::Denied)
                 }
             }
+            Request::SendInput {
+                session,
+                bytes,
+                submit,
+                wait_submit,
+            } => self.send_input(peer, session, &bytes, submit, wait_submit),
+            Request::Orchestration(action) => self.orchestration(peer, action),
         };
         r.unwrap_or_else(Reply::Failed)
     }
@@ -1952,6 +1959,335 @@ impl Registry {
             .map(|a| PathBuf::from(a.dir))
             .collect()
     }
+
+    pub(crate) fn deliver_input_to_tap(tap: &Tap, bytes: &[u8], submit: bool) -> io::Result<()> {
+        let (_, _, _, modes) = tap.capture_with_modes();
+        let bracketed = modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE);
+        let payload = if submit {
+            bytes
+                .strip_suffix(b"\r\n")
+                .or_else(|| bytes.strip_suffix(b"\n"))
+                .or_else(|| bytes.strip_suffix(b"\r"))
+                .unwrap_or(bytes)
+        } else {
+            bytes
+        };
+        let is_control_seq = payload.starts_with(b"\x1b")
+            || payload
+                .iter()
+                .any(|&b| b < 0x20 && b != b'\n' && b != b'\r' && b != b'\t');
+        let use_bracketed = bracketed
+            && !payload.is_empty()
+            && !is_control_seq
+            && (submit || payload.contains(&b'\n') || payload.contains(&b'\r'));
+        if use_bracketed {
+            let mut framed = Vec::with_capacity(payload.len() + 12);
+            framed.extend_from_slice(b"\x1b[200~");
+            let mut rest = payload;
+            while let Some(pos) = rest.windows(6).position(|w| w == b"\x1b[201~") {
+                framed.extend_from_slice(rest.get(..pos).unwrap_or_default());
+                rest = rest.get(pos + 6..).unwrap_or_default();
+            }
+            framed.extend_from_slice(rest);
+            framed.extend_from_slice(b"\x1b[201~");
+            tap.write_input(&framed, None)?;
+            if submit {
+                std::thread::sleep(Duration::from_millis(25));
+                tap.write_input(b"\r", None)?;
+            }
+        } else {
+            if !payload.is_empty() {
+                tap.write_input(payload, None)?;
+            }
+            if submit {
+                tap.write_input(b"\r", None)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_input(
+        &self,
+        peer: &Peer,
+        session: SessionId,
+        bytes: &[u8],
+        submit: bool,
+        wait_submit: bool,
+    ) -> Result<Reply, Failure> {
+        if bytes.len() > 256 * 1024 {
+            return Err(Failure::BadRequest);
+        }
+        let tap = self.tap(peer, session).ok_or(Failure::NoSession)?;
+        if wait_submit {
+            let idle_deadline = Instant::now() + Duration::from_millis(2500);
+            while Instant::now() < idle_deadline {
+                if tap.pulse().closed
+                    || self.status.get(session).state != control::AgentState::Working
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        let before_end = tap.pulse().end;
+        let was_working = self.status.get(session).state == control::AgentState::Working;
+        Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
+        if submit && wait_submit {
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                let p = tap.pulse();
+                if p.closed
+                    || p.end > before_end
+                    || (!was_working
+                        && self.status.get(session).state == control::AgentState::Working)
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        }
+        Ok(Reply::InputSent)
+    }
+
+    fn notify_orch(&self) {
+        let (lock_gen, cvar) = &self.orch_signal;
+        let mut g = lock(lock_gen);
+        *g = g.wrapping_add(1);
+        drop(g);
+        cvar.notify_all();
+    }
+
+    fn orchestration(
+        &self,
+        peer: &Peer,
+        action: krill_proto::orchestration::OrchAction,
+    ) -> Result<Reply, Failure> {
+        use krill_proto::orchestration::{OrchAction, OrchResponse, OrchestrationStore};
+        if matches!(peer.scope, Scope::Restricted) {
+            peer.deny("orchestration", &self.audit);
+            return Err(Failure::Denied);
+        }
+        let Some(dir) = self.state_dir() else {
+            return Err(Failure::Os(libc::EIO));
+        };
+        let res: io::Result<OrchResponse> = match action {
+            OrchAction::Snapshot => OrchestrationStore::load(&dir).map(OrchResponse::Snapshot),
+            OrchAction::CreateRun {
+                title,
+                coordinator_session_id,
+            } => OrchestrationStore::mutate(&dir, |s| s.create_run(&title, coordinator_session_id))
+                .map(|r| {
+                    self.notify_orch();
+                    OrchResponse::Run(r)
+                }),
+            OrchAction::SetCurrentRun { run_id } => OrchestrationStore::mutate(&dir, |s| {
+                s.set_current_run(run_id.as_deref())?;
+                Ok(OrchResponse::CurrentRun(s.current_run_id.clone()))
+            }),
+            OrchAction::CreateTask {
+                run_id,
+                title,
+                description,
+                deps,
+            } => OrchestrationStore::mutate(&dir, |s| {
+                s.create_task(&run_id, &title, &description, deps)
+            })
+            .map(|t| {
+                self.notify_orch();
+                OrchResponse::Task(t)
+            }),
+            OrchAction::UpdateTask {
+                task_id,
+                status,
+                summary,
+            } => OrchestrationStore::mutate(&dir, |s| s.update_task(&task_id, status, summary))
+                .map(|t| {
+                    self.notify_orch();
+                    OrchResponse::Task(t)
+                }),
+            OrchAction::StartWorker {
+                run_id,
+                task_id,
+                worker_name,
+                agent,
+                session_id,
+                cwd,
+                prompt,
+                depth,
+                max_depth,
+            } => OrchestrationStore::mutate(&dir, |s| {
+                s.start_worker_with_depth(
+                    &run_id,
+                    task_id.as_deref(),
+                    &worker_name,
+                    &agent,
+                    session_id,
+                    &cwd,
+                    &prompt,
+                    depth,
+                    max_depth,
+                )
+            })
+            .map(|d| {
+                self.notify_orch();
+                OrchResponse::Dispatch(d)
+            }),
+            OrchAction::SendMessage(params) => {
+                OrchestrationStore::mutate(&dir, |s| s.send_message(&params)).map(|msgs| {
+                    self.notify_orch();
+                    OrchResponse::Messages(msgs)
+                })
+            }
+            OrchAction::CheckMessages {
+                recipient,
+                types,
+                unread_only,
+                ack,
+                wait_ms,
+            } => {
+                let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
+                loop {
+                    let seen_gen = *lock(&self.orch_signal.0);
+                    let checked = if ack {
+                        OrchestrationStore::mutate(&dir, |s| {
+                            Ok(s.check_messages(recipient.as_deref(), &types, unread_only, true))
+                        })
+                    } else {
+                        OrchestrationStore::load(&dir).map(|mut s| {
+                            s.check_messages(recipient.as_deref(), &types, unread_only, false)
+                        })
+                    };
+                    match checked {
+                        Ok(msgs) if !msgs.is_empty() || Instant::now() >= deadline => {
+                            break Ok(OrchResponse::Messages(msgs));
+                        }
+                        Ok(_) => {
+                            let rem = deadline.saturating_duration_since(Instant::now());
+                            if rem.is_zero() {
+                                break Ok(OrchResponse::Messages(Vec::new()));
+                            }
+                            let (lock_gen, cvar) = &self.orch_signal;
+                            let g = lock(lock_gen);
+                            if *g == seen_gen {
+                                drop(cvar.wait_timeout(g, rem.min(Duration::from_millis(250))));
+                            }
+                        }
+                        Err(e) => break Err(e),
+                    }
+                }
+            }
+            OrchAction::WaitAnswer {
+                question_id,
+                wait_ms,
+            } => {
+                let deadline = Instant::now() + Duration::from_millis(wait_ms.min(300_000));
+                loop {
+                    let seen_gen = *lock(&self.orch_signal.0);
+                    let found = OrchestrationStore::load(&dir).ok().and_then(|s| {
+                        s.messages
+                            .iter()
+                            .find(|m| m.reply_to.as_deref() == Some(question_id.as_str()))
+                            .cloned()
+                    });
+                    if let Some(ans) = found {
+                        let ans_id = ans.id.clone();
+                        drop(OrchestrationStore::mutate(&dir, |s| {
+                            for m in &mut s.messages {
+                                if m.id == ans_id {
+                                    m.acked = true;
+                                }
+                            }
+                            Ok(())
+                        }));
+                        break Ok(OrchResponse::Answer(Some(ans)));
+                    }
+                    let rem = deadline.saturating_duration_since(Instant::now());
+                    if rem.is_zero() {
+                        break Ok(OrchResponse::Answer(None));
+                    }
+                    let (lock_gen, cvar) = &self.orch_signal;
+                    let g = lock(lock_gen);
+                    if *g == seen_gen {
+                        drop(cvar.wait_timeout(g, rem.min(Duration::from_millis(250))));
+                    }
+                }
+            }
+            OrchAction::ReplyMessage {
+                question_id,
+                from,
+                body,
+            } => OrchestrationStore::mutate(&dir, |s| s.reply_message(&question_id, &from, &body))
+                .map(|m| {
+                    self.notify_orch();
+                    OrchResponse::Message(m)
+                }),
+            OrchAction::CreateGate {
+                from,
+                question,
+                options,
+                run_id,
+                task_id,
+            } => OrchestrationStore::mutate(&dir, |s| {
+                s.create_gate(&from, &question, options, run_id, task_id)
+            })
+            .map(|g| {
+                self.notify_orch();
+                OrchResponse::Gate(g)
+            }),
+            OrchAction::ResolveGate {
+                gate_id,
+                decision,
+                rationale,
+                resolved_by,
+            } => OrchestrationStore::mutate(&dir, |s| {
+                s.resolve_gate(&gate_id, &decision, rationale, &resolved_by)
+            })
+            .map(|g| {
+                self.notify_orch();
+                OrchResponse::Gate(g)
+            }),
+            OrchAction::StopOrReleaseWorker {
+                worker_or_dispatch,
+                release,
+                archived_output,
+            } => OrchestrationStore::mutate(&dir, |s| {
+                if let Some(text) = archived_output
+                    && let Some(stored) =
+                        s.dispatches.iter_mut().rev().find(|d| {
+                            d.id == worker_or_dispatch || d.worker_name == worker_or_dispatch
+                        })
+                {
+                    stored.archived_output = Some(text);
+                }
+                s.stop_or_release_worker(&worker_or_dispatch, release)
+            })
+            .map(|d| {
+                self.notify_orch();
+                OrchResponse::Dispatch(d)
+            }),
+            OrchAction::AbandonWorker { worker_or_dispatch } => {
+                OrchestrationStore::mutate(&dir, |s| s.abandon_worker(&worker_or_dispatch)).map(
+                    |d| {
+                        self.notify_orch();
+                        OrchResponse::Dispatch(d)
+                    },
+                )
+            }
+            OrchAction::Reset { run_id } => OrchestrationStore::mutate(&dir, |s| {
+                s.reset(run_id.as_deref());
+                Ok(())
+            })
+            .map(|()| {
+                self.notify_orch();
+                OrchResponse::Reset
+            }),
+        };
+        let resp = match res {
+            Ok(resp) => resp,
+            Err(e) => OrchResponse::Error(e.to_string()),
+        };
+        Ok(Reply::Orchestration(resp))
+    }
 }
 
 fn os(e: &io::Error) -> Failure {
@@ -1976,6 +2312,10 @@ fn read_only(req: &Request) -> bool {
             | Request::AgentHistory(
                 krill_proto::agent_history::Action::Scan
                     | krill_proto::agent_history::Action::Search(_)
+            )
+            | Request::Orchestration(
+                krill_proto::orchestration::OrchAction::Snapshot
+                    | krill_proto::orchestration::OrchAction::CheckMessages { ack: false, .. }
             )
     )
 }

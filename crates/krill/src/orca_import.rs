@@ -1154,9 +1154,10 @@ fn import_accounts_domain_inner(
     }
 
     let socket = opts.state_dir.join("run").join("krilld.sock");
-    match daemon_usage_request(&socket, &UsageRequest::ListAccounts) {
+    let auto_start = should_auto_start_daemon(opts.dry_run);
+    match daemon_usage_request(&socket, &UsageRequest::ListAccounts, auto_start) {
         Err(e) if !opts.dry_run => {
-            // AS-03: 데몬이 안 떠 있으면 로컬 파일(accounts.toml)을 직접 쓰지 않고
+            // AS-03: 데몬 자동 기동까지 실패해 연결할 수 없으면 로컬 파일(accounts.toml)을 직접 쓰지 않고
             // '데몬 필요' 사유로 accounts 도메인을 스킵한 뒤 다른 도메인만 진행한다.
             summary.skipped = true;
             summary.skipped_reason = Some(format!(
@@ -1224,7 +1225,7 @@ fn import_accounts_domain_inner(
                                 provider: cand.provider,
                                 account_id: kept_id.clone(),
                             };
-                            match daemon_usage_request(&socket, &req) {
+                            match daemon_usage_request(&socket, &req, false) {
                                 Ok(updated) => snap = updated,
                                 Err(e) => {
                                     warnings.push(format!(
@@ -1285,7 +1286,7 @@ fn import_accounts_domain_inner(
                     email: cand.email.clone(),
                     profile_dir: cand.dir_str.clone(),
                 };
-                match daemon_usage_request(&socket, &add_req) {
+                match daemon_usage_request(&socket, &add_req, false) {
                     Ok(updated) => snap = updated,
                     Err(e) => {
                         summary.skipped = true;
@@ -1315,7 +1316,7 @@ fn import_accounts_domain_inner(
                         provider: cand.provider,
                         account_id: assigned_id.clone(),
                     };
-                    match daemon_usage_request(&socket, &switch_req) {
+                    match daemon_usage_request(&socket, &switch_req, false) {
                         Ok(updated) => snap = updated,
                         Err(e) => {
                             warnings.push(format!(
@@ -1383,7 +1384,7 @@ fn settle_account_connections(
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
-        match daemon_usage_request(socket, &UsageRequest::ListAccounts) {
+        match daemon_usage_request(socket, &UsageRequest::ListAccounts, false) {
             Ok(next) => *snap = next,
             Err(_) => break,
         }
@@ -1586,8 +1587,39 @@ fn read_codex_account_id(profile_dir: &Path) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// 실행 중인 `krilld` 소켓에 직접 핸드셰이크해 `UsageRequest`를 보낸다(데몬 자동 기동 없음).
-fn daemon_usage_request(socket: &Path, req: &UsageRequest) -> Result<AccountsSnapshot, String> {
+/// 단독 CLI 실행(`!dry_run`, 오프라인·단위테스트 환경 아님)에서는 `daemon::connect`로 데몬 자동 기동을 허용한다.
+fn should_auto_start_daemon(dry_run: bool) -> bool {
+    if dry_run {
+        return false;
+    }
+    if std::env::var_os("KRILL_ORCA_AUTO_START").is_some_and(|v| v == "1") {
+        return true;
+    }
+    if cfg!(test)
+        || std::env::var_os("KRILL_TEST_OFFLINE").is_some()
+        || std::env::var_os("NEXTEST").is_some()
+        || std::env::var_os("NEXTEST_EXECUTION_MODE").is_some()
+        || std::env::var_os("RUST_TEST_THREADS").is_some()
+    {
+        return false;
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && exe
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == "deps")
+    {
+        return false;
+    }
+    true
+}
+
+/// `krilld` 소켓에 연결(단독 CLI 실행 시 `daemon::connect` 자동 기동 포함)해 `UsageRequest`를 보낸다.
+fn daemon_usage_request(
+    socket: &Path,
+    req: &UsageRequest,
+    auto_start: bool,
+) -> Result<AccountsSnapshot, String> {
     let mut hello = daemon::client_hello(ClientRole::Cli, "krill import orca");
     hello.features = FEAT_USAGE
         | FEAT_USAGE_AGY
@@ -1597,8 +1629,22 @@ fn daemon_usage_request(socket: &Path, req: &UsageRequest) -> Result<AccountsSna
         | FEAT_USAGE_MANAGE
         | FEAT_ACCOUNT_CONNECTION
         | FEAT_ACCOUNT_POLICY;
-    let mut conn = daemon::handshake(socket, &hello, Duration::from_secs(10))
-        .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?;
+    let mut conn = match daemon::handshake(socket, &hello, Duration::from_secs(10)) {
+        Ok(conn) => conn,
+        Err(_first_err) if auto_start => {
+            let paths = daemon::Paths::dev()
+                .map(|mut p| {
+                    p.socket = socket.to_path_buf();
+                    p
+                })
+                .map_err(|e| {
+                    format!("cannot resolve daemon paths for {}: {e}", socket.display())
+                })?;
+            daemon::connect(&paths, &hello)
+                .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?
+        }
+        Err(e) => return Err(format!("cannot connect to {}: {e}", socket.display())),
+    };
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("krilld does not support FEAT_USAGE".to_owned());
     }

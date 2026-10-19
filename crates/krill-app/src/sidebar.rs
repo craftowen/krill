@@ -587,6 +587,8 @@ pub struct Sidebar {
     edit_subscription: Option<Subscription>,
     orca_import_subscription: Option<Subscription>,
     pub(crate) creating: Option<(Entity<worktree::Dialog>, Subscription)>,
+    /// OWE-924: 워크트리 생성 시 예약된 초기 프롬프트(워크트리 경로 → 프롬프트).
+    pending_prompts: BTreeMap<PathBuf, String>,
     /// OWE-854: 셸 탭에서 사용자가 직접 지정한 세션별 제목. 세션 행 라벨의 최우선 후보.
     custom_titles: BTreeMap<SessionId, String>,
     /// 셸이 아는 세션별 터미널 제목(보이는 칸만). 세션 이름의 첫 후보.
@@ -733,6 +735,7 @@ impl Sidebar {
             edit_subscription: None,
             orca_import_subscription: None,
             creating: None,
+            pending_prompts: BTreeMap::new(),
             custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
             auto_titles,
@@ -2222,7 +2225,6 @@ impl Sidebar {
         .detach();
     }
 
-    /// MK-057 Jump 팔레트 항목: 세션마다 "에이전트 id · 워크트리 이름(바꾼 이름 우선) · 상태".
     /// OWE-851: 에이전트명이 비면 워크트리 이름, 그것마저 비면 세션 번호를 보여
     /// `1 ·  · 알 수 없음` 같은 빈 칸 라벨이 나가지 않게 한다.
     pub fn session_who(&self, session: &Session) -> String {
@@ -2241,21 +2243,212 @@ impl Sidebar {
         format!("{} {}", text::SESSION.get(), session.id.0)
     }
 
+    /// MK-057 Jump 팔레트 항목: 세션마다 제목·에이전트·상태·경과 시간·현재 탭/워크트리·저장소/워크트리 칩을 채운다.
     pub fn jump_items(&self) -> Vec<Item> {
-        self.snapshot
+        let focused_id = self.focused;
+        let focused_folder = focused_id
+            .and_then(|id| self.folder(id))
+            .map(Path::to_path_buf);
+        let now_ns = self.now_unix_ns();
+        let host_label = crate::i18n::catalog::jump::LOCAL_MAC.get().to_owned();
+        let mut items: Vec<(u64, Item)> = self
+            .snapshot
             .sessions
             .iter()
             .map(|s| {
-                // STYLEGUIDE §7.4: 사이드바 세션 행과 같은 라벨 규칙(`session_label`)을 공유한다.
-                let (name, detail) = self.session_label(s);
-                let label = if detail.is_empty() {
-                    format!("{name} · {}", state_text(s.status.state))
+                let (title, detail) = self.session_label(s);
+                let agent =
+                    crate::ui::status::infer_agent_from_title(&s.status.agent, &title).to_owned();
+                let folder_path = s.worktree.as_deref().or(s.cwd.as_deref());
+                let (repo_name, worktree_name) = if let Some(wt) = s.worktree.as_deref() {
+                    let repo_path = self
+                        .snapshot
+                        .trees
+                        .iter()
+                        .find(|(repo, trees)| {
+                            repo.as_path() == wt || trees.iter().any(|t| t.as_path() == wt)
+                        })
+                        .map_or(wt, |(repo, _)| repo.as_path());
+                    (basename(repo_path), self.name(wt))
+                } else if let Some(cwd) = s.cwd.as_deref() {
+                    (basename(cwd), self.name(cwd))
                 } else {
-                    format!("{name} · {detail} · {}", state_text(s.status.state))
+                    (String::new(), String::new())
                 };
-                Item::new(s.id, label, needs_you(&s.status)).with_agent(s.status.agent.clone())
+                let is_current_tab = focused_id == Some(s.id);
+                let is_current_worktree = !is_current_tab
+                    && folder_path.is_some()
+                    && folder_path == focused_folder.as_deref();
+                let age = if s.status.since_unix_ns > 0 {
+                    crate::jump::format_age_ns(s.status.since_unix_ns, now_ns)
+                } else if let Some(&ts) = folder_path.and_then(|p| self.worktree_updated_at.get(p))
+                {
+                    crate::jump::format_age_secs(ts, now_ns / 1_000_000_000)
+                } else {
+                    crate::i18n::catalog::jump::AGE_UNDER_MIN.get().to_owned()
+                };
+                // STYLEGUIDE §7.4: 사이드바 세션 행과 같은 라벨 규칙(`session_label`)을 공유한다.
+                let label = if detail.is_empty() {
+                    format!("{title} · {}", state_text(s.status.state))
+                } else {
+                    format!("{title} · {detail} · {}", state_text(s.status.state))
+                };
+                let mut item = Item::new(s.id, label, needs_you(&s.status));
+                item.title = title;
+                item.agent = agent;
+                item.state = Some(s.status.state);
+                item.unread = self.unread.contains(&s.id);
+                item.age = age;
+                item.is_current_tab = is_current_tab;
+                item.is_current_worktree = is_current_worktree;
+                item.host_label.clone_from(&host_label);
+                item.repo_name = repo_name;
+                item.worktree_name = worktree_name;
+                item.rebuild_search_chars();
+                (s.status.since_unix_ns, item)
             })
-            .collect()
+            .collect();
+        items.sort_by_key(|(since_ns, item)| {
+            (
+                !item.is_current_tab,
+                !item.is_current_worktree,
+                !item.needs_you,
+                std::cmp::Reverse(*since_ns),
+            )
+        });
+        items.into_iter().map(|(_, item)| item).collect()
+    }
+
+    /// Jump 팔레트 '최근 작업 공간' 섹션 항목(git 워크트리 + 열린 폴더 워크스페이스).
+    pub fn jump_worktrees(&self) -> Vec<crate::jump::WorktreeItem> {
+        let focused_id = self.focused;
+        let focused_folder = focused_id
+            .and_then(|id| self.folder(id))
+            .map(Path::to_path_buf);
+        let now_ns = self.now_unix_ns();
+        let now_secs = now_ns / 1_000_000_000;
+        let host_label = crate::i18n::catalog::jump::LOCAL_MAC.get().to_owned();
+        let mut seen = BTreeSet::new();
+        let mut entries: Vec<(u64, crate::jump::WorktreeItem)> = Vec::new();
+
+        let mut push_path = |path: &Path, repo_path: &Path, is_primary: bool| {
+            if !seen.insert(path.to_path_buf()) {
+                return;
+            }
+            let pref_name = self
+                .prefs
+                .get(path)
+                .filter(|v| !v.name.is_empty())
+                .map(|v| v.name.as_str())
+                .filter(|n| !krill_proto::git::is_default_branch_or_worktree_name(n));
+            let name = pref_name.map_or_else(|| basename(path), str::to_owned);
+            let repo_name = basename(repo_path);
+            let branch = self.branch(path).unwrap_or_default().to_owned();
+            let is_current = focused_folder.as_deref() == Some(path);
+            let sessions_in_wt: Vec<&Session> = self
+                .snapshot
+                .sessions
+                .iter()
+                .filter(|s| {
+                    s.worktree.as_deref() == Some(path)
+                        || (s.worktree.is_none() && s.cwd.as_deref() == Some(path))
+                })
+                .collect();
+            let session_id = focused_id
+                .filter(|id| sessions_in_wt.iter().any(|s| s.id == *id))
+                .or_else(|| sessions_in_wt.first().map(|s| s.id));
+            let unread = sessions_in_wt.iter().any(|s| self.unread.contains(&s.id));
+            let pairs: Vec<_> = sessions_in_wt
+                .iter()
+                .filter(|s| {
+                    !s.status.agent.is_empty()
+                        || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
+                })
+                .map(|s| (s.status.state, s.status.agent.as_str()))
+                .collect();
+            let state = crate::ui::status::summarize(&pairs)
+                .groups
+                .first()
+                .map(|g| g.state)
+                .or_else(|| (!sessions_in_wt.is_empty()).then_some(AgentState::Done));
+            let latest_session_ns = sessions_in_wt
+                .iter()
+                .map(|s| s.status.since_unix_ns)
+                .max()
+                .unwrap_or(0);
+            let updated_secs = if latest_session_ns > 0 {
+                latest_session_ns / 1_000_000_000
+            } else if let Some(&ts) = self.worktree_updated_at.get(path) {
+                ts
+            } else {
+                fs::metadata(path)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_secs())
+            };
+            let age = if latest_session_ns > 0 {
+                crate::jump::format_age_ns(latest_session_ns, now_ns)
+            } else if updated_secs > 0 {
+                crate::jump::format_age_secs(updated_secs, now_secs)
+            } else if !sessions_in_wt.is_empty() {
+                crate::i18n::catalog::jump::AGE_UNDER_MIN.get().to_owned()
+            } else {
+                String::new()
+            };
+            let sort_ts = if latest_session_ns > 0 {
+                latest_session_ns
+            } else {
+                updated_secs.saturating_mul(1_000_000_000)
+            };
+            entries.push((
+                sort_ts,
+                crate::jump::WorktreeItem::new(
+                    path.to_path_buf(),
+                    session_id,
+                    name,
+                    branch,
+                    repo_name,
+                    host_label.clone(),
+                    age,
+                    state,
+                    unread,
+                    is_primary,
+                    is_current,
+                ),
+            ));
+        };
+
+        for (repo, trees) in &self.snapshot.trees {
+            let show_ext = self.shown_external.contains(repo);
+            for wt in trees {
+                if !show_ext
+                    && external::is_claude_worktree(wt)
+                    && focused_folder.as_ref() != Some(wt)
+                {
+                    continue;
+                }
+                push_path(wt, repo, wt == repo);
+            }
+        }
+        for s in &self.snapshot.sessions {
+            if s.worktree.is_none()
+                && let Some(cwd) = s.cwd.as_deref()
+            {
+                push_path(cwd, cwd, false);
+            }
+        }
+
+        entries.sort_by(|(ts_a, a), (ts_b, b)| {
+            (!a.is_current)
+                .cmp(&(!b.is_current))
+                .then_with(|| a.session_id.is_none().cmp(&b.session_id.is_none()))
+                .then_with(|| ts_b.cmp(ts_a))
+                .then_with(|| (!a.is_main).cmp(&(!b.is_main)))
+                .then_with(|| a.repo_name.cmp(&b.repo_name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        entries.into_iter().map(|(_, wt)| wt).collect()
     }
 
     /// OWE-865: Jump 팔레트용 워크트리 목록(세션 유무와 무관, 로컬만).
@@ -2471,6 +2664,36 @@ impl Sidebar {
         self.meta_for(host).get(path)?.branch.as_deref()
     }
 
+    /// 에이전트 대시보드에 표시할 모든 호스트(로컬 + 원격)의 세션 목록.
+    #[must_use]
+    pub fn dashboard_sessions(&self) -> Vec<(HostId, Session)> {
+        let mut out = Vec::new();
+        if self.options.filters.contains_host(&HostId::Local) {
+            out.extend(
+                self.snapshot
+                    .sessions
+                    .iter()
+                    .cloned()
+                    .map(|s| (HostId::Local, s)),
+            );
+        }
+        for remote in &self.remote_hosts {
+            let host = HostId::Remote(remote.id.clone());
+            if !self.options.filters.contains_host(&host) {
+                continue;
+            }
+            out.extend(
+                remote
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .cloned()
+                    .map(|s| (host.clone(), s)),
+            );
+        }
+        out
+    }
+
     pub fn session_label(&self, session: &Session) -> (String, String) {
         let custom_title = self
             .custom_titles
@@ -2488,6 +2711,15 @@ impl Sidebar {
             .or_else(|| self.auto_titles.get(&session.id).map(String::as_str))
             .or_else(|| self.titles.get(&session.id).map(String::as_str));
         session_label(session, title)
+    }
+
+    #[must_use]
+    pub fn session_label_on(&self, host: &HostId, session: &Session) -> (String, String) {
+        if host.is_local() {
+            self.session_label(session)
+        } else {
+            session_label(session, None)
+        }
     }
 
     /// OWE-662: 로컬 호스트 워크트리 세션의 상태 묶음과 미확인 세션이 있는지.
