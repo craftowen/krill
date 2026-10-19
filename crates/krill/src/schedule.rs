@@ -11,7 +11,7 @@ use krill_proto::schedule::{
     MAX_RUNS, PREVIOUS_RUNS, RUNS, Schedule, Schedules, WorkspaceMode, request_run_now,
 };
 
-const USAGE: &str = "usage: krill schedule add <id> --cron '<minute hour day month weekday>' --prompt <text> [--cwd <path>] [--precheck <cmd>] [--isolate] [--workspace-mode <reuse|isolate>] [--agent <profile> | -- <executable> [args...]] [--json] | krill schedule edit <id> [--cron <expr>] [--prompt <text>] [--cwd <path>] [--precheck <cmd>|--clear-precheck] [--workspace-mode <reuse|isolate>] [--enable|--disable] [--json] | krill schedule run <id> [--json] | krill schedule rm <id> [--json] | krill schedule list [--json] | krill schedule runs [--json] (cron is UTC; prompt is the last command argument)";
+const USAGE: &str = "usage: krill schedule add <id> --cron '<minute hour day month weekday>' --prompt <text> [--cwd|--workdir <path>] [--precheck <cmd>] [--isolate|--new-worktree|--no-new-worktree] [--workspace-mode <reuse|isolate>] [--enable|--enabled|--disable|--disabled] [--agent <profile> | -- <executable> [args...]] [--json] | krill schedule edit <id> [--cron <expr>] [--prompt <text>] [--cwd|--workdir <path>] [--precheck <cmd>|--clear-precheck] [--isolate|--new-worktree|--no-new-worktree] [--workspace-mode <reuse|isolate>] [--enable|--enabled|--disable|--disabled] [--json] | krill schedule show <id> [--json] | krill schedule enable <id> [--json] | krill schedule disable <id> [--json] | krill schedule run <id> [--json] | krill schedule rm <id> [--json] | krill schedule list [--json] | krill schedule runs [--json] (cron is UTC; prompt is the last command argument)";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     match execute(raw) {
@@ -51,6 +51,28 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
                 "{}",
                 serde_json::to_string_pretty(&schedules.schedule).map_err(error)?
             );
+        }
+        ["show", id] | ["show", id, "--json"] | ["show", "--json", id] if *id != "--json" => {
+            let json = args.contains(&"--json");
+            let schedules = Schedules::load(dir)?;
+            let Some(target) = schedules.schedule.iter().find(|s| s.id == *id) else {
+                return Err(error("unknown schedule ID"));
+            };
+            if json {
+                println!("{}", serde_json::to_string_pretty(target).map_err(error)?);
+            } else {
+                println!("{}", toml::to_string(target).map_err(error)?);
+            }
+        }
+        ["enable", id] | ["enable", id, "--json"] | ["enable", "--json", id] if *id != "--json" => {
+            let json = args.contains(&"--json");
+            set_enabled(dir, id, true, json)?;
+        }
+        ["disable", id] | ["disable", id, "--json"] | ["disable", "--json", id]
+            if *id != "--json" =>
+        {
+            let json = args.contains(&"--json");
+            set_enabled(dir, id, false, json)?;
         }
         ["runs"] => {
             for name in [PREVIOUS_RUNS, RUNS] {
@@ -115,7 +137,7 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
                 println!("updated {id} (UTC)");
             }
         }
-        ["run", id] | ["run", id, "--json"] | ["run", "--json", id] => {
+        ["run", id] | ["run", id, "--json"] | ["run", "--json", id] if *id != "--json" => {
             let json = args.contains(&"--json");
             let schedules = Schedules::load(dir)?;
             if !schedules.schedule.iter().any(|s| s.id == *id) {
@@ -143,7 +165,7 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
                 println!("triggered {id}");
             }
         }
-        ["rm", id] | ["rm", id, "--json"] | ["rm", "--json", id] => {
+        ["rm", id] | ["rm", id, "--json"] | ["rm", "--json", id] if *id != "--json" => {
             let json = args.contains(&"--json");
             let _guard = Schedules::exclusive_edit(dir)?;
             let mut schedules = Schedules::load(dir)?;
@@ -171,6 +193,25 @@ fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io:
     Ok(())
 }
 
+fn set_enabled(dir: &std::path::Path, id: &str, enabled: bool, json: bool) -> io::Result<()> {
+    let _guard = Schedules::exclusive_edit(dir)?;
+    let mut schedules = Schedules::load(dir)?;
+    let Some(target) = schedules.schedule.iter_mut().find(|s| s.id == id) else {
+        return Err(error("unknown schedule ID"));
+    };
+    target.enabled = enabled;
+    let updated = target.clone();
+    schedules.save(dir)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&updated).map_err(error)?);
+    } else if enabled {
+        println!("enabled {id}");
+    } else {
+        println!("disabled {id}");
+    }
+    Ok(())
+}
+
 fn add(id: &str, args: &[&str]) -> io::Result<(Schedule, bool)> {
     let mut entry = Schedule {
         id: id.into(),
@@ -194,17 +235,20 @@ fn add(id: &str, args: &[&str]) -> io::Result<(Schedule, bool)> {
                 break;
             }
             "--json" => json = true,
-            "--isolate" => {
+            "--isolate" | "--new-worktree" => {
                 entry.workspace_mode = WorkspaceMode::Isolate;
             }
-            "--enable" => entry.enabled = true,
-            "--disable" => entry.enabled = false,
-            flag @ ("--cron" | "--cwd" | "--prompt" | "--precheck" | "--workspace-mode"
-            | "--agent") => {
+            "--no-new-worktree" | "--reuse" => {
+                entry.workspace_mode = WorkspaceMode::Reuse;
+            }
+            "--enable" | "--enabled" => entry.enabled = true,
+            "--disable" | "--disabled" => entry.enabled = false,
+            flag @ ("--cron" | "--cwd" | "--workdir" | "--prompt" | "--precheck"
+            | "--workspace-mode" | "--agent") => {
                 let value = args.next().ok_or_else(|| usage_error(USAGE))?;
                 match flag {
                     "--cron" => entry.cron = (*value).into(),
-                    "--cwd" => {
+                    "--cwd" | "--workdir" => {
                         entry.cwd = fs::canonicalize(value)?
                             .into_os_string()
                             .into_string()
@@ -262,28 +306,32 @@ fn apply_edit(entry: &mut Schedule, args: &[&str]) -> io::Result<bool> {
                 break;
             }
             "--json" => json = true,
-            "--isolate" => {
+            "--isolate" | "--new-worktree" => {
                 entry.workspace_mode = WorkspaceMode::Isolate;
+                changed = true;
+            }
+            "--no-new-worktree" | "--reuse" => {
+                entry.workspace_mode = WorkspaceMode::Reuse;
                 changed = true;
             }
             "--clear-precheck" => {
                 entry.precheck = None;
                 changed = true;
             }
-            "--enable" => {
+            "--enable" | "--enabled" => {
                 entry.enabled = true;
                 changed = true;
             }
-            "--disable" => {
+            "--disable" | "--disabled" => {
                 entry.enabled = false;
                 changed = true;
             }
-            flag @ ("--cron" | "--cwd" | "--prompt" | "--precheck" | "--workspace-mode"
-            | "--agent") => {
+            flag @ ("--cron" | "--cwd" | "--workdir" | "--prompt" | "--precheck"
+            | "--workspace-mode" | "--agent") => {
                 let value = args.next().ok_or_else(|| usage_error(USAGE))?;
                 match flag {
                     "--cron" => entry.cron = (*value).into(),
-                    "--cwd" => {
+                    "--cwd" | "--workdir" => {
                         entry.cwd = fs::canonicalize(value)?
                             .into_os_string()
                             .into_string()
@@ -336,7 +384,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn schedule_add_edit_run_and_rm_preserve_fields() {
+    fn schedule_add_edit_show_enable_disable_run_and_rm_preserve_fields() {
         let dir = std::env::temp_dir().join(format!("krill-sched-cli-{}", std::process::id()));
         drop(fs::remove_dir_all(&dir));
         fs::create_dir_all(&dir).unwrap();
@@ -348,7 +396,7 @@ mod tests {
                 "nightly",
                 "--cron",
                 "0 2 * * *",
-                "--cwd",
+                "--workdir",
                 dir.to_str().unwrap(),
                 "--prompt",
                 "check status",
@@ -366,6 +414,8 @@ mod tests {
         assert_eq!(loaded.schedule[0].command, vec!["claude"]);
         assert!(loaded.schedule[0].enabled);
 
+        execute_in(&dir, &["show", "nightly", "--json"], false).unwrap();
+
         execute_in(
             &dir,
             &[
@@ -377,8 +427,8 @@ mod tests {
                 "updated prompt",
                 "--precheck",
                 "git status",
-                "--isolate",
-                "--disable",
+                "--new-worktree",
+                "--disabled",
                 "--json",
             ],
             false,
@@ -394,13 +444,25 @@ mod tests {
 
         execute_in(
             &dir,
-            &["edit", "nightly", "--clear-precheck", "--enable"],
+            &[
+                "edit",
+                "nightly",
+                "--clear-precheck",
+                "--no-new-worktree",
+                "--enabled",
+            ],
             false,
         )
         .unwrap();
         let cleared = Schedules::load(&dir).unwrap();
         assert!(cleared.schedule[0].precheck.is_none());
+        assert_eq!(cleared.schedule[0].workspace_mode, WorkspaceMode::Reuse);
         assert!(cleared.schedule[0].enabled);
+
+        execute_in(&dir, &["disable", "nightly", "--json"], false).unwrap();
+        assert!(!Schedules::load(&dir).unwrap().schedule[0].enabled);
+        execute_in(&dir, &["enable", "nightly", "--json"], false).unwrap();
+        assert!(Schedules::load(&dir).unwrap().schedule[0].enabled);
 
         execute_in(&dir, &["run", "nightly", "--json"], false).unwrap();
         assert_eq!(

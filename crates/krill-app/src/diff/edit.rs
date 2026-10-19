@@ -491,10 +491,11 @@ pub fn build_line_patch(
         let mut new_ln = new_start;
         let mut body_lines: Vec<String> = Vec::new();
         let mut changed = false;
-        let mut minus_group: Vec<(usize, String)> = Vec::new();
-        let mut plus_group: Vec<(usize, String)> = Vec::new();
-        let flush_group = |minus_group: &mut Vec<(usize, String)>,
-                           plus_group: &mut Vec<(usize, String)>,
+        let mut minus_group: Vec<(usize, String, bool)> = Vec::new();
+        let mut plus_group: Vec<(usize, String, bool)> = Vec::new();
+        let mut last_kind: Option<char> = None;
+        let flush_group = |minus_group: &mut Vec<(usize, String, bool)>,
+                           plus_group: &mut Vec<(usize, String, bool)>,
                            body_lines: &mut Vec<String>,
                            changed: &mut bool| {
             if minus_group.is_empty() && plus_group.is_empty() {
@@ -505,27 +506,39 @@ pub fn build_line_patch(
                 let m = minus_group.get(i);
                 let p = plus_group.get(i);
                 let selected = if use_new_line_numbers {
-                    p.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi)
-                        || (p.is_none() && m.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi))
+                    p.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi)
+                        || (p.is_none() && m.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi))
                 } else {
-                    m.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi)
-                        || (m.is_none() && p.is_some_and(|(ln, _)| *ln >= lo && *ln <= hi))
+                    m.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi)
+                        || (m.is_none() && p.is_some_and(|(ln, _, _)| *ln >= lo && *ln <= hi))
                 };
                 if selected {
-                    if let Some((_, text)) = m {
+                    if let Some((_, text, no_nl)) = m {
                         body_lines.push(format!("-{text}"));
+                        if *no_nl {
+                            body_lines.push("\\ No newline at end of file".to_owned());
+                        }
                         *changed = true;
                     }
-                    if let Some((_, text)) = p {
+                    if let Some((_, text, no_nl)) = p {
                         body_lines.push(format!("+{text}"));
+                        if *no_nl {
+                            body_lines.push("\\ No newline at end of file".to_owned());
+                        }
                         *changed = true;
                     }
                 } else if !is_reverse {
-                    if let Some((_, text)) = m {
+                    if let Some((_, text, no_nl)) = m {
                         body_lines.push(format!(" {text}"));
+                        if *no_nl {
+                            body_lines.push("\\ No newline at end of file".to_owned());
+                        }
                     }
-                } else if let Some((_, text)) = p {
+                } else if let Some((_, text, no_nl)) = p {
                     body_lines.push(format!(" {text}"));
+                    if *no_nl {
+                        body_lines.push("\\ No newline at end of file".to_owned());
+                    }
                 }
             }
             minus_group.clear();
@@ -533,11 +546,21 @@ pub fn build_line_patch(
         };
         for raw_line in lines {
             if let Some(rest) = raw_line.strip_prefix('-') {
-                minus_group.push((old_ln, rest.to_owned()));
+                if !plus_group.is_empty() {
+                    flush_group(
+                        &mut minus_group,
+                        &mut plus_group,
+                        &mut body_lines,
+                        &mut changed,
+                    );
+                }
+                minus_group.push((old_ln, rest.to_owned(), false));
                 old_ln += 1;
+                last_kind = Some('-');
             } else if let Some(rest) = raw_line.strip_prefix('+') {
-                plus_group.push((new_ln, rest.to_owned()));
+                plus_group.push((new_ln, rest.to_owned(), false));
                 new_ln += 1;
+                last_kind = Some('+');
             } else if let Some(rest) = raw_line.strip_prefix(' ') {
                 flush_group(
                     &mut minus_group,
@@ -548,15 +571,24 @@ pub fn build_line_patch(
                 body_lines.push(format!(" {rest}"));
                 old_ln += 1;
                 new_ln += 1;
+                last_kind = Some(' ');
             } else if raw_line.starts_with('\\') {
-                // Keep "\ No newline at end of file" metadata when adjacent to emitted lines.
-                flush_group(
-                    &mut minus_group,
-                    &mut plus_group,
-                    &mut body_lines,
-                    &mut changed,
-                );
-                body_lines.push(raw_line.to_owned());
+                match last_kind {
+                    Some('-') => {
+                        if let Some(last) = minus_group.last_mut() {
+                            last.2 = true;
+                        }
+                    }
+                    Some('+') => {
+                        if let Some(last) = plus_group.last_mut() {
+                            last.2 = true;
+                        }
+                    }
+                    Some(' ') => {
+                        body_lines.push("\\ No newline at end of file".to_owned());
+                    }
+                    _ => {}
+                }
             }
         }
         flush_group(
@@ -592,6 +624,52 @@ pub fn build_line_patch(
         out.push_str(&h);
     }
     Some(out)
+}
+
+#[must_use]
+pub fn hunk_index_for_line(
+    raw_patch: &str,
+    line: usize,
+    use_new_line_numbers: bool,
+) -> Option<usize> {
+    let (_, hunks) = extract_patch_header_and_hunks(raw_patch);
+    for (idx, hunk) in hunks.iter().enumerate() {
+        let mut lines = hunk.lines();
+        let Some(hunk_header) = lines.next() else {
+            continue;
+        };
+        let Some((old_start, new_start, _)) = parse_hunk_header_starts(hunk_header) else {
+            continue;
+        };
+        let mut old_ln = old_start;
+        let mut new_ln = new_start;
+        for raw_line in lines {
+            if raw_line.starts_with('-') {
+                if (!use_new_line_numbers && old_ln == line)
+                    || (use_new_line_numbers && new_ln == line)
+                {
+                    return Some(idx);
+                }
+                old_ln += 1;
+            } else if raw_line.starts_with('+') {
+                if (use_new_line_numbers && new_ln == line)
+                    || (!use_new_line_numbers && old_ln == line)
+                {
+                    return Some(idx);
+                }
+                new_ln += 1;
+            } else if raw_line.starts_with(' ') {
+                if (use_new_line_numbers && new_ln == line)
+                    || (!use_new_line_numbers && old_ln == line)
+                {
+                    return Some(idx);
+                }
+                old_ln += 1;
+                new_ln += 1;
+            }
+        }
+    }
+    None
 }
 
 pub fn apply_git_patch(

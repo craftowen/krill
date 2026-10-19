@@ -211,6 +211,8 @@ pub struct Dispatch {
     pub agent: String,
     #[serde(default)]
     pub session_id: Option<u64>,
+    #[serde(default)]
+    pub depth: u32,
     pub cwd: String,
     pub prompt: String,
     pub status: DispatchStatus,
@@ -760,6 +762,16 @@ impl OrchestrationStore {
         Ok(())
     }
 
+    #[must_use]
+    pub fn inferred_child_depth(&self, parent_session_id: Option<u64>) -> Option<u32> {
+        let sid = parent_session_id?;
+        self.dispatches
+            .iter()
+            .rev()
+            .find(|d| d.session_id == Some(sid))
+            .map(|d| d.depth.saturating_add(1))
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "worker dispatch captures full task/session binding"
@@ -774,7 +786,36 @@ impl OrchestrationStore {
         cwd: &str,
         prompt: &str,
     ) -> io::Result<Dispatch> {
-        self.validate_worker_start(run_id, task_id, worker_name)?;
+        self.start_worker_with_depth(
+            run_id,
+            task_id,
+            worker_name,
+            agent,
+            session_id,
+            cwd,
+            prompt,
+            0,
+            DEFAULT_MAX_WORKER_DEPTH,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "worker dispatch captures full task/session binding and depth guard"
+    )]
+    pub fn start_worker_with_depth(
+        &mut self,
+        run_id: &str,
+        task_id: Option<&str>,
+        worker_name: &str,
+        agent: &str,
+        session_id: Option<u64>,
+        cwd: &str,
+        prompt: &str,
+        depth: u32,
+        max_depth: u32,
+    ) -> io::Result<Dispatch> {
+        self.validate_worker_start_with_depth(run_id, task_id, worker_name, depth, max_depth)?;
         let worker_trimmed = worker_name.trim();
 
         let disp_id = self.alloc_id("disp");
@@ -786,6 +827,7 @@ impl OrchestrationStore {
             worker_name: worker_trimmed.to_owned(),
             agent: crate::agent::canonical_id(agent).to_owned(),
             session_id,
+            depth,
             cwd: cwd.trim().to_owned(),
             prompt: prompt.trim().to_owned(),
             status: DispatchStatus::Active,
