@@ -48,6 +48,7 @@ pub struct TabBar {
     children: SmallVec<[Tab; 2]>,
     last_empty_space: AnyElement,
     selected_index: Option<usize>,
+    reveal_selected: bool,
     variant: TabVariant,
     size: Size,
     menu: bool,
@@ -71,6 +72,7 @@ impl TabBar {
             size: Size::default(),
             last_empty_space: div().w_3().into_any_element(),
             selected_index: None,
+            reveal_selected: false,
             on_click: None,
             menu: false,
             max_width: None,
@@ -156,6 +158,13 @@ impl TabBar {
     }
 
     /// Set the selected index of the TabBar.
+    /// 선택 탭이 클릭 말고 코드로 바뀔 때도(단축키·복원·새 탭) 그 탭을 스크롤해 보이게 한다(Krill).
+    /// 기본은 꺼짐: 선택 변경은 사용자의 수동 스크롤을 옮기지 않는다.
+    pub fn reveal_selected(mut self, reveal: bool) -> Self {
+        self.reveal_selected = reveal;
+        self
+    }
+
     pub fn selected_index(mut self, index: usize) -> Self {
         self.selected_index = Some(index);
         self
@@ -448,6 +457,37 @@ impl RenderOnce for TabBar {
             num_tabs,
         };
         reveal.advance(window, cx);
+        // reveal_selected: 코드로 바뀐 선택 탭도 보이게 한다. 이전 프레임의 탭 위치가 있어야 계산되므로,
+        // 위치를 아직 모르면 다음 렌더에서 다시 시도한다.
+        if let Some(sel) = self
+            .selected_index
+            .filter(|&ix| self.reveal_selected && ix < num_tabs)
+        {
+            // (완료한 선택, 현재 선택 재시도 횟수). 위치를 끝내 못 얻어도 다시 그리기를 무한히 요청하지 않게 10프레임까지만.
+            let shown = window.use_keyed_state(format!("{}-revealed", self.id), cx, |_, _| {
+                (None::<usize>, 0u8)
+            });
+            let (done, tries) = *shown.read(cx);
+            // 탭이 막 추가된 프레임은 최대 스크롤 폭이 옛 값이라 한 번에 못 닿는다. 목표에 실제로 닿을 때까지
+            // 다시 계산하고, 닿은 뒤에만 완료로 표시해 그 뒤의 수동 스크롤은 건드리지 않는다.
+            if done != Some(sel) {
+                match reveal.offset_revealing(sel) {
+                    Some(to)
+                        if to == scroll_handle.offset().x && reveal.target.read(cx).is_none() =>
+                    {
+                        shown.update(cx, |s, _| *s = (Some(sel), 0));
+                    }
+                    _ if tries >= 10 => shown.update(cx, |s, _| *s = (Some(sel), 0)),
+                    found => {
+                        if found.is_some() {
+                            reveal.reveal(sel, cx);
+                        }
+                        shown.update(cx, |s, _| s.1 = tries + 1);
+                        cx.notify(window.current_view());
+                    }
+                }
+            }
+        }
 
         let padding_x = paddings.left;
         let indicator = self.render_indicator(&bounds_rc, window, cx);

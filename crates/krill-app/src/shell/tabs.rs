@@ -411,6 +411,7 @@ impl Shell {
                     .min_w_0()
                     .max_width(ui::TAB_MAX_WIDTH)
                     .menu(true)
+                    .reveal_selected(true)
                     .selected_index(self.layout.active())
                     .children(tabs)
                     .on_click(cx.listener(|this, i: &usize, _, cx| {
