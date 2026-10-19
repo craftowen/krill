@@ -15,6 +15,7 @@ use gpui_component::ActiveTheme as _;
 use gpui_component::Disableable as _;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use krill_app::i18n::catalog::shell as text;
 use krill_app::ui;
 use krill_proto::SessionId;
 use krill_proto::agent_history::{Action, ChatItem, ChatItemKind, ChatPollSnapshot, Response};
@@ -297,9 +298,9 @@ impl Shell {
 
         if items.is_empty() {
             let empty_msg = if bound {
-                "아직 기록된 대화 턴이 없습니다."
+                text::CHAT_EMPTY.get()
             } else {
-                "에이전트 훅 또는 트랜스크립트 바인딩 대기 중입니다. 하단 Term 버튼으로 언제든 원시 터미널을 볼 수 있습니다."
+                text::CHAT_UNBOUND.get()
             };
             feed = feed.child(
                 div()
@@ -422,7 +423,7 @@ impl Shell {
                         let picks: Vec<usize> = selected_set.into_iter().collect();
                         opts_row = opts_row.child(
                             Button::new(SharedString::from(format!("chat-q-submit-{idx}")))
-                                .label(format!("Submit ({})", picks.len()))
+                                .label(text::CHAT_SUBMIT.format(&[("n", &picks.len().to_string())]))
                                 .small()
                                 .primary()
                                 .disabled(answered || picks.is_empty())
@@ -446,7 +447,7 @@ impl Shell {
                             .gap_2()
                             .child(
                                 Button::new(SharedString::from(format!("chat-perm-yes-{idx}")))
-                                    .label("Approve (y)")
+                                    .label(text::CHAT_APPROVE.get())
                                     .small()
                                     .primary()
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -455,7 +456,7 @@ impl Shell {
                             )
                             .child(
                                 Button::new(SharedString::from(format!("chat-perm-no-{idx}")))
-                                    .label("Deny (n)")
+                                    .label(text::CHAT_DENY.get())
                                     .small()
                                     .ghost()
                                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -498,7 +499,7 @@ impl Shell {
                     .gap_1p5()
                     .child(
                         Button::new("desktop-chat-refresh")
-                            .label("Refresh")
+                            .label(text::CHAT_REFRESH.get())
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
@@ -507,7 +508,7 @@ impl Shell {
                     )
                     .child(
                         Button::new("desktop-chat-switch-term")
-                            .label("Term →")
+                            .label(text::CHAT_TERM.get())
                             .ghost()
                             .xsmall()
                             .on_click(cx.listener(|this, _, _, cx| {
