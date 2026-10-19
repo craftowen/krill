@@ -1408,6 +1408,8 @@ mod tests {
 
     struct OrcaFixture {
         root: PathBuf,
+        /// 이관 저장소·워크트리·폴더가 실제로 있는 디렉터리(사이드바는 디스크에 있는 이관 워크트리만 보인다).
+        work: PathBuf,
         home: PathBuf,
         state_dir: PathBuf,
         orca_dir: PathBuf,
@@ -1462,6 +1464,12 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&state_dir).unwrap();
         fs::create_dir_all(&orca_dir).unwrap();
+        let work = fs::canonicalize(&root).unwrap().join("work");
+        for d in ["krill", "krill-wt-1", "notes"] {
+            fs::create_dir_all(work.join(d)).unwrap();
+        }
+        let work_str = work.to_string_lossy().into_owned();
+        let at_work = |text: &str| text.replace("/Users/test", &work_str);
 
         // Active profile "work"
         fs::write(
@@ -1500,7 +1508,7 @@ mod tests {
         fs::create_dir_all(&profile_dir).unwrap();
         fs::write(
             profile_dir.join("orca-data.json"),
-            r#"{
+            at_work(r#"{
               "folderWorkspaces": [
                 {
                   "id": "fw-1",
@@ -1517,7 +1525,7 @@ mod tests {
                   ]
                 }
               ]
-            }"#,
+            }"#),
         )
         .unwrap();
 
@@ -1648,15 +1656,16 @@ mod tests {
             &[
                 ("settings", &settings_payload),
                 ("sshTargets", &ssh_payload),
-                ("repos", &repos_payload),
-                ("worktreeMeta", &wt_meta_payload),
-                ("worktreeLineageById", &lineage_payload),
+                ("repos", &at_work(&repos_payload)),
+                ("worktreeMeta", &at_work(&wt_meta_payload)),
+                ("worktreeLineageById", &at_work(&lineage_payload)),
                 ("automations", &automations_payload),
             ],
         );
 
         OrcaFixture {
             root,
+            work,
             home,
             state_dir,
             orca_dir,
@@ -1883,9 +1892,9 @@ mod tests {
 
             // Verify immediate live reflection in Sidebar project & worktree tree
             let sb = sidebar.read(cx);
-            let repo_path = PathBuf::from("/Users/test/krill");
-            let wt_path = PathBuf::from("/Users/test/krill-wt-1");
-            let notes_path = PathBuf::from("/Users/test/notes");
+            let repo_path = fx.work.join("krill");
+            let wt_path = fx.work.join("krill-wt-1");
+            let notes_path = fx.work.join("notes");
             assert!(
                 sb.trees()
                     .get(&repo_path)

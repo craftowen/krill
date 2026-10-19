@@ -22,7 +22,9 @@ pub(crate) struct Teardown {
     stage: usize,
     /// 지금까지 본 후손(리더 포함)과 시작 시각. 리더가 먼저 죽으면 고아는 launchd 밑으로 옮겨 가
     /// 트리로 다시 찾을 수 없으므로 미리 적어 두고 단계마다 따라간다. 시작 시각은 pid 재사용을 가린다.
-    procs: Vec<(Pid, u64)>,
+    /// 시작 시각 `None`은 리더뿐이다: setuid root(`top` 등)는 macOS `proc_pidinfo`가 EPERM이라 읽을 수 없다(OWE-954).
+    /// 리더는 holder가 거두기 전까지 pid가 재사용되지 않으므로, 거둘 때 [`Teardown::exited`]로 뺀다.
+    procs: Vec<(Pid, Option<u64>)>,
 }
 
 impl Teardown {
@@ -32,10 +34,7 @@ impl Teardown {
             leader,
             started: Instant::now(),
             stage: 0,
-            procs: sys::start_time(leader)
-                .map(|st| (leader, st))
-                .into_iter()
-                .collect(),
+            procs: vec![(leader, sys::start_time(leader))],
         };
         t.step();
         t
@@ -73,19 +72,53 @@ impl Teardown {
         }
     }
 
+    /// holder가 `pid`를 거뒀다(또는 Adopt 세션이 끝났다). 시작 시각 없이 따라가던 리더를 더는 신호하지 않는다.
+    pub fn exited(&mut self, pid: Pid) {
+        self.procs.retain(|(p, _)| *p != pid);
+    }
+
     /// 죽은 것(시작 시각이 달라진 것 포함)을 빼고, 남은 것들의 자식을 끝까지 더한다.
     fn refresh(&mut self) {
-        self.procs.retain(|&(p, st)| sys::start_time(p) == Some(st));
+        self.procs
+            .retain(|&(p, st)| st.is_none() || sys::start_time(p) == st);
         let mut i = 0;
         while let Some(&(p, _)) = self.procs.get(i) {
             for c in sys::children(p) {
                 if self.procs.iter().all(|(q, _)| *q != c)
                     && let Some(st) = sys::start_time(c)
                 {
-                    self.procs.push((c, st));
+                    self.procs.push((c, Some(st)));
                 }
             }
             i += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn leader_without_start_time_still_gets_signals() {
+        // OWE-954: setuid 리더는 시작 시각을 못 읽는다. 그래도 단계 신호를 받아야 한다.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
+        let mut t = Teardown {
+            leader: pid,
+            started: Instant::now(),
+            stage: 0,
+            procs: vec![(pid, None)],
+        };
+        t.step();
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGHUP));
+        assert!(t.due().is_some());
+        t.exited(pid);
+        t.step();
+        assert_eq!(t.due(), None);
     }
 }

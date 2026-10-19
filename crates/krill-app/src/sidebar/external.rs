@@ -813,6 +813,10 @@ pub fn include_imported_projects(
             continue;
         }
         let wt_path = normalize_imported_path(Path::new(wt_key.trim()));
+        // Orca 이관 목록은 지운 워크트리도 남긴다. 디스크에 없는 것은 보이지 않는다(사용자 실측: 92개 중 54개가 없는 폴더).
+        if !wt_path.is_dir() {
+            continue;
+        }
         let repo = resolve_repo_for_worktree(&file.projects, wt.repo_id.as_deref(), &wt_path);
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
@@ -829,6 +833,9 @@ pub fn include_imported_projects(
             continue;
         }
         let wt_path = normalize_imported_path(Path::new(wt_str));
+        if !wt_path.is_dir() {
+            continue;
+        }
         let repo = resolve_repo_for_worktree(&file.projects, lin.repo_id.as_deref(), &wt_path);
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
@@ -1587,6 +1594,41 @@ fn owe803_symlink_alias_imports_merge_into_single_repo() {
     assert!(prefs.contains_key(&canon));
 
     fs::remove_dir_all(root).unwrap();
+}
+
+/// 지운 워크트리가 Orca 이관 목록(`[worktrees]`·`[lineage]`)에 남아 사이드바 수가 부풀던 문제.
+#[cfg(test)]
+#[test]
+fn imported_worktrees_missing_on_disk_are_skipped() {
+    let root = std::env::temp_dir().join(format!("mk-imported-gone-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(root.join("repo")).unwrap();
+    fs::create_dir_all(root.join("live")).unwrap();
+    let root = fs::canonicalize(&root).unwrap();
+    let (repo, live) = (root.join("repo"), root.join("live"));
+    let gone = root.join("gone");
+    fs::write(
+        root.join(PROJECTS_FILE),
+        format!(
+            "[[projects]]\nid = \"r1\"\npath = \"{repo}\"\n\n\
+             [worktrees.\"{live}\"]\nrepo_id = \"r1\"\n\n\
+             [worktrees.\"{gone}\"]\nrepo_id = \"r1\"\n\n\
+             [lineage.\"{gone}\"]\nrepo_id = \"r1\"\nworktree_path = \"{gone}\"\n",
+            repo = repo.display(),
+            live = live.display(),
+            gone = gone.display(),
+        ),
+    )
+    .unwrap();
+    let mut trees: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
+    let mut meta: super::Meta = BTreeMap::new();
+    include_imported_projects(&root, &mut trees, &mut meta);
+    fs::remove_dir_all(&root).ok();
+    assert_eq!(
+        trees.get(&repo),
+        Some(&vec![repo.clone(), live]),
+        "{trees:?}"
+    );
 }
 
 /// 설 실기(v0.1.8): ⌘N으로 만든 linked 워크트리가 독립 프로젝트로 등록돼 "저장소 wt1" 그룹이 하나 더 생겼다.
