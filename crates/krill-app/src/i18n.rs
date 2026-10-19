@@ -463,9 +463,6 @@ catalog! {
     security {
         APP_MENU => ("Krill", "Krill"),
         SECURE_KEYBOARD_MENU => ("보안 키보드 입력 (Secure Keyboard Entry)", "Secure Keyboard Entry"),
-        SECURE_KEYBOARD_OFF => ("보안 키보드 입력", "Secure keyboard input"),
-        SECURE_KEYBOARD_ON => ("🔒 보안 키보드 입력 켜짐", "🔒 Secure keyboard input on"),
-        SECURE_KEYBOARD_TOOLTIP => ("비밀번호 입력 시 다른 앱이 키 입력을 가로채지 못하게 합니다 (EnableSecureEventInput).", "Prevent other apps from intercepting password keystrokes (EnableSecureEventInput)."),
         LINK_HINT => (platform_text!("⌘+클릭하여 열기", "Ctrl+클릭하여 열기"), platform_text!("⌘+click to open", "Ctrl+click to open")),
         PASTE_CONFIRM => ("붙여넣기", "Paste"),
         PASTE_CANCEL => ("취소", "Cancel"),
@@ -2299,7 +2296,6 @@ pub mod link_ui {
         ROUTE_DIRECT => ("직접 연결", "Direct"),
         ROUTE_RELAY => ("중계 연결", "Relay"),
         RTT => ("응답 {ms}ms", "RTT {ms}ms"),
-        ADD_MAC => ("+ 다른 Mac 추가", "+ Add another Mac"),
         ERR_INVALID_LINK => ("올바른 초대 링크 형식이 아닙니다. 상대 Mac에서 복사한 초대 링크(krill://pair?...)를 붙여넣어 주세요.", "Not a valid invite link. Paste the krill://pair?... link copied from the other Mac."),
         NEARBY_TITLE => ("근처 Mac (같은 Wi-Fi)", "Nearby Macs (Same Wi-Fi)"),
         NEARBY_REFRESH => ("다시 찾기", "Refresh"),

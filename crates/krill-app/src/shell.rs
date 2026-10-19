@@ -3685,16 +3685,6 @@ impl Shell {
                         krill_app::i18n::catalog::settings::SC_NAV_FORWARD.get(),
                     )),
             )
-            .child(krill_app::ui::button_with_tooltip(
-                Button::new("sidebar-add-mac")
-                    .icon(IconName::Plus)
-                    .ghost()
-                    .xsmall()
-                    .debug_selector(|| "sidebar-add-mac".into())
-                    .on_click(|_, _, cx| krill_app::link_ui::open_pairing(cx)),
-                "sidebar-add-mac",
-                krill_app::i18n::link_ui::ADD_MAC.get(),
-            ))
     }
 
     fn render_tree(
@@ -4996,7 +4986,7 @@ impl Render for Shell {
                                 .child(self.render_agents(cx))
                                 .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
                                 .child(self.detached.clone())
-                                .child(self.render_security_controls(cx)),
+                                .child(Self::render_sidebar_footer(cx)),
                         )
                         .child(divider(
                             "divider-sidebar".into(),
