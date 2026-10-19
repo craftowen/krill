@@ -347,7 +347,7 @@ pub(super) fn discard_worktree_file(
         return krill_proto::usage::profiles::move_path_to_trash(home, repo, &target).map(|_| ());
     }
     let mut child = super::Reap(
-        Command::new("git")
+        crate::platform::background_command("git")
             .current_dir(repo)
             .env("GIT_OPTIONAL_LOCKS", "0")
             .env("GIT_TERMINAL_PROMPT", "0")
@@ -678,7 +678,7 @@ pub fn apply_git_patch(
     cached: bool,
     reverse: bool,
 ) -> io::Result<()> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::platform::background_command("git");
     cmd.current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

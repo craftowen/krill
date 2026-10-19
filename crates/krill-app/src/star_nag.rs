@@ -6,7 +6,6 @@
 //! 이미 별을 준 사용자 = 영구 완료.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use gpui::{AnyElement, App, Global, div, prelude::*, px};
@@ -246,7 +245,7 @@ fn gh(args: &[&str]) -> bool {
     }
     let exe =
         crate::pull_request::find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(exe);
+    let mut cmd = crate::platform::background_command(exe);
     cmd.args(args)
         .env("GH_PROMPT_DISABLED", "1")
         .env("GIT_TERMINAL_PROMPT", "0");

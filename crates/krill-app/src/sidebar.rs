@@ -79,6 +79,10 @@ const ROW_HEIGHT: f32 = 32.;
 /// 가상 리스트로 전환하는 행 수. 이 이상이면 `uniform_list`(고정 높이)라
 /// 워크트리 카드는 고정 높이 컴팩트 변형으로 렌더한다(OWE-900).
 const VIRTUALIZED_ROWS: usize = 100;
+/// 프로젝트(저장소·폴더·그룹) 아래 워크트리·세션 행의 들여쓰기(px). 호스트 > 프로젝트 > 워크트리 단계가 보이게 한다.
+const CHILD_INDENT: f32 = 20.;
+/// 호스트 머리줄이 있을 때(원격 호스트 등록) 그 아래 프로젝트 행의 들여쓰기(px).
+const HOST_CHILD_INDENT: f32 = 12.;
 /// 세션 없는 워크트리가 이 수를 넘으면 프로젝트를 접힌 상태로 시작한다(OWE-900).
 /// 코디네이터 결정: 기본값 `hide_sleeping = false` 유지, 대신 다량 유휴 프로젝트 자동 접힘.
 const AUTO_COLLAPSE_IDLE_WORKTREES: usize = 10;
@@ -1595,6 +1599,15 @@ impl Sidebar {
             self.shown_external.insert(repo.to_path_buf());
         }
         self.persist(cx);
+    }
+
+    /// 호스트 머리줄을 그리면(원격 호스트가 있으면) 그 아래 행 전체를 한 단계 민다.
+    fn host_indent(&self) -> f32 {
+        if self.remote_hosts.is_empty() {
+            0.
+        } else {
+            HOST_CHILD_INDENT
+        }
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {

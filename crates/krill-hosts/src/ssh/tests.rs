@@ -158,6 +158,7 @@ fn ssh_options_validation_rejects_option_injection() {
 #[test]
 fn remote_socket_for_home_computes_remote_user_path() {
     let sock = remote_socket_for_home("/Users/remoteuser\n").expect("valid home");
+    assert!(!sock.to_str().unwrap().contains('\\'));
     assert_eq!(
         sock,
         PathBuf::from(

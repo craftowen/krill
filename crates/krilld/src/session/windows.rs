@@ -1,5 +1,6 @@
-//! Blocking `ConPTY` reads feed the common engine loop through one bounded slot.
+//! Blocking `ConPTY` reads feed the engine through a bounded queue of reusable buffers.
 //! The engine can wait on DEC 2026 deadlines without polling a Windows pipe.
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Read as _};
 use std::os::windows::io::{AsHandle as _, OwnedHandle};
@@ -26,8 +27,14 @@ impl Stop {
     }
 }
 
+type ReadMessage = io::Result<(Vec<u8>, usize)>;
+// Bound read-ahead while allowing the pipe worker and engine to run independently.
+const QUEUED_READS: usize = 8;
+
 pub(super) struct Reader {
-    rx: Option<mpsc::Receiver<io::Result<Vec<u8>>>>,
+    rx: Option<mpsc::Receiver<ReadMessage>>,
+    recycle: mpsc::SyncSender<Vec<u8>>,
+    pending: Cell<Option<ReadMessage>>,
     worker: Option<JoinHandle<()>>,
     stop: Arc<Stop>,
 }
@@ -35,7 +42,8 @@ pub(super) struct Reader {
 impl Reader {
     pub(super) fn start(master: &Master) -> io::Result<Self> {
         let mut pipe = File::from(master.output.try_clone()?);
-        let (tx, rx) = mpsc::sync_channel(1);
+        let (tx, rx) = mpsc::sync_channel(QUEUED_READS);
+        let (recycle, recycled) = mpsc::sync_channel::<Vec<u8>>(QUEUED_READS + 2);
         // Gate startup until cancellation is registered, including concurrent halt().
         let (ready, gate) = mpsc::sync_channel::<Arc<Stop>>(0);
         let worker = thread::Builder::new()
@@ -43,13 +51,10 @@ impl Reader {
             .spawn(move || {
                 let Ok(stop) = gate.recv() else { return };
                 while !stop.stopped.load(Ordering::SeqCst) {
-                    let mut bytes = vec![0; BATCH];
+                    let mut bytes = recycled.try_recv().unwrap_or_else(|_| vec![0; BATCH]);
                     let result = match pipe.read(&mut bytes) {
                         Ok(0) => break,
-                        Ok(n) => {
-                            bytes.truncate(n);
-                            Ok(bytes)
-                        }
+                        Ok(n) => Ok((bytes, n)),
                         Err(e) if matches!(e.raw_os_error(), Some(109 | 232 | 995)) => break,
                         Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                         Err(e) => Err(e),
@@ -76,6 +81,8 @@ impl Reader {
             .map_err(|_| io::ErrorKind::BrokenPipe)?;
         Ok(Self {
             rx: Some(rx),
+            recycle,
+            pending: Cell::new(None),
             worker: Some(worker),
             stop,
         })
@@ -87,22 +94,50 @@ impl Reader {
         timeout: Option<Duration>,
     ) -> io::Result<Option<usize>> {
         let rx = self.rx.as_ref().ok_or(io::ErrorKind::BrokenPipe)?;
-        let bytes = match timeout {
-            Some(t) => match rx.recv_timeout(t) {
-                Ok(r) => r?,
-                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Some(0)),
-                Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
-            },
-            None => match rx.recv() {
-                Ok(r) => r?,
-                Err(_) => return Ok(None),
+        let mut message = match self.pending.take() {
+            Some(message) => message,
+            None => match timeout {
+                Some(t) => match rx.recv_timeout(t) {
+                    Ok(r) => r,
+                    Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Some(0)),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(None),
+                },
+                None => match rx.recv() {
+                    Ok(r) => r,
+                    Err(_) => return Ok(None),
+                },
             },
         };
-        let dest = buf
-            .get_mut(..bytes.len())
-            .ok_or(io::ErrorKind::InvalidData)?;
-        dest.copy_from_slice(&bytes);
-        Ok(Some(bytes.len()))
+        let mut used = 0;
+        loop {
+            match message {
+                Ok((bytes, n)) => {
+                    let Some(dest) = buf.get_mut(used..).and_then(|rest| rest.get_mut(..n)) else {
+                        if used == 0 {
+                            return Err(io::ErrorKind::InvalidData.into());
+                        }
+                        self.pending.set(Some(Ok((bytes, n))));
+                        return Ok(Some(used));
+                    };
+                    dest.copy_from_slice(bytes.get(..n).ok_or(io::ErrorKind::InvalidData)?);
+                    self.recycle.try_send(bytes).ok();
+                    used += n;
+                }
+                Err(e) if used == 0 => return Err(e),
+                Err(e) => {
+                    self.pending.set(Some(Err(e)));
+                    return Ok(Some(used));
+                }
+            }
+            if used == buf.len() {
+                return Ok(Some(used));
+            }
+            // Drain only already queued reads: no timer or sleep on interactive output.
+            message = match rx.try_recv() {
+                Ok(r) => r,
+                Err(_) => return Ok(Some(used)),
+            };
+        }
     }
 }
 
@@ -170,6 +205,7 @@ mod tests {
             signal,
             reference: None,
             process: None,
+            recovery: Vec::new(),
         };
         (master, input, output)
     }
@@ -188,6 +224,30 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(buf.get(..n), Some(b"after cancellation".as_slice()));
+    }
+
+    #[test]
+    fn queued_reads_preserve_bytes_through_eof() {
+        let (master, _input, mut output) = pipes();
+        let reader = Reader::start(&master).unwrap();
+        let expected: Vec<_> = (0u8..=255)
+            .cycle()
+            .take(BATCH * (QUEUED_READS + 3) + 37)
+            .collect();
+        let bytes = expected.clone();
+        let writer = thread::spawn(move || {
+            for chunk in bytes.chunks(997) {
+                output.write_all(chunk).unwrap();
+            }
+        });
+        let mut actual = Vec::new();
+        let mut buf = vec![0; BATCH];
+        while let Some(n) = reader.read(&mut buf, Some(Duration::from_secs(5))).unwrap() {
+            assert_ne!(n, 0, "reader stalled before EOF");
+            actual.extend_from_slice(buf.get(..n).unwrap());
+        }
+        writer.join().unwrap();
+        assert_eq!(actual, expected);
     }
 
     #[test]

@@ -97,8 +97,20 @@ impl Message {
     }
 }
 
+// Keep catalog results static and allocation-free on every platform. Windows/Linux hints
+// follow keys::windows_keys, including Shift/Alt needed to preserve terminal controls.
+macro_rules! platform_text {
+    ($mac:literal, $other:literal) => {
+        if cfg!(target_os = "macos") {
+            $mac
+        } else {
+            $other
+        }
+    };
+}
+
 macro_rules! catalog {
-    ($($group:ident { $($key:ident $( [$id:literal] )? => ($ko:literal, $en:literal)),* $(,)? })*) => {
+    ($($group:ident { $($key:ident $( [$id:literal] )? => ($ko:expr, $en:expr)),* $(,)? })*) => {
         pub mod catalog {
             $(pub mod $group {
                 $(pub const $key: super::super::Message = super::super::Message {
@@ -170,8 +182,8 @@ catalog! {
     }
     jump {
         PLACEHOLDER => ("채팅, 터미널, 워크스페이스, 작업, 설정 및 동작 검색...", "Search chats, terminals, workspaces, tasks, settings, and actions..."),
-        PLACEHOLDER_COMMANDS => ("명령어 검색 (⇧⌘P)", "Search commands (⇧⌘P)"),
-        PLACEHOLDER_FILES => ("파일 열기 (⌘P)", "Open file (⌘P)"),
+        PLACEHOLDER_COMMANDS => (platform_text!("명령어 검색 (⇧⌘P)", "명령어 검색 (Ctrl+Alt+Shift+P)"), platform_text!("Search commands (⇧⌘P)", "Search commands (Ctrl+Alt+Shift+P)")),
+        PLACEHOLDER_FILES => (platform_text!("파일 열기 (⌘P)", "파일 열기 (Ctrl+Shift+P)"), platform_text!("Open file (⌘P)", "Open file (Ctrl+Shift+P)")),
         EMPTY => ("일치하는 세션 없음", "No matching sessions"),
         EMPTY_FILES => ("일치하는 파일 없음", "No matching files"),
         EMPTY_SUBTITLE => ("다른 검색어나 필터를 시도해 보세요.", "Try a different search term or filter."),
@@ -349,13 +361,13 @@ catalog! {
     shell {
         APP_TITLE => ("Krill", "Krill"),
         PANE => ("터미널", "Terminal"),
-        NEW_TAB => ("새 탭 (⌘T)", "New tab (⌘T)"),
-        SPLIT_RIGHT => ("좌우 분할 (⌘D)", "Split right (⌘D)"),
-        SPLIT_DOWN => ("상하 분할 (⇧⌘D)", "Split down (⇧⌘D)"),
-        CLOSE_TAB => ("탭 닫기 (⇧⌘W)", "Close tab (⇧⌘W)"),
-        TOGGLE_SIDEBAR => ("사이드바 토글 (⌘B)", "Toggle sidebar (⌘B)"),
-        TOGGLE_PANEL => ("오른쪽 패널 토글 (⌥⌘B)", "Toggle right panel (⌥⌘B)"),
-        JUMP_TOOLTIP => ("세션으로 이동 (⌘J)", "Jump to session (⌘J)"),
+        NEW_TAB => (platform_text!("새 탭 (⌘T)", "새 탭 (Ctrl+Shift+T)"), platform_text!("New tab (⌘T)", "New tab (Ctrl+Shift+T)")),
+        SPLIT_RIGHT => (platform_text!("좌우 분할 (⌘D)", "좌우 분할 (Ctrl+Shift+D)"), platform_text!("Split right (⌘D)", "Split right (Ctrl+Shift+D)")),
+        SPLIT_DOWN => (platform_text!("상하 분할 (⇧⌘D)", "상하 분할 (Ctrl+Alt+Shift+D)"), platform_text!("Split down (⇧⌘D)", "Split down (Ctrl+Alt+Shift+D)")),
+        CLOSE_TAB => (platform_text!("탭 닫기 (⇧⌘W)", "탭 닫기 (Ctrl+Alt+Shift+W)"), platform_text!("Close tab (⇧⌘W)", "Close tab (Ctrl+Alt+Shift+W)")),
+        TOGGLE_SIDEBAR => (platform_text!("사이드바 토글 (⌘B)", "사이드바 토글 (Ctrl+Shift+B)"), platform_text!("Toggle sidebar (⌘B)", "Toggle sidebar (Ctrl+Shift+B)")),
+        TOGGLE_PANEL => (platform_text!("오른쪽 패널 토글 (⌥⌘B)", "오른쪽 패널 토글 (Ctrl+Alt+B)"), platform_text!("Toggle right panel (⌥⌘B)", "Toggle right panel (Ctrl+Alt+B)")),
+        JUMP_TOOLTIP => (platform_text!("세션으로 이동 (⌘J)", "세션으로 이동 (Ctrl+Shift+J)"), platform_text!("Jump to session (⌘J)", "Jump to session (Ctrl+Shift+J)")),
         OPEN_FOLDER => ("폴더 열기…", "Open folder…"),
         CONNECTING => ("세션에 연결하는 중…", "Connecting to session…"),
         AGENTS => ("에이전트 새 세션", "New agent session"),
@@ -425,9 +437,9 @@ catalog! {
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
         EMPTY_NEW_AGENT => ("새 에이전트", "New agent"),
         EMPTY_OPEN_FILE => ("파일 열기", "Open file"),
-        SHORTCUT_NEW_TAB => ("⌘T", "⌘T"),
-        SHORTCUT_NEW_AGENT_TAB => ("⌘⌥T", "⌘⌥T"),
-        SHORTCUT_QUICK_OPEN => ("⌘P", "⌘P"),
+        SHORTCUT_NEW_TAB => (platform_text!("⌘T", "Ctrl+Shift+T"), platform_text!("⌘T", "Ctrl+Shift+T")),
+        SHORTCUT_NEW_AGENT_TAB => (platform_text!("⌘⌥T", "Ctrl+Alt+T"), platform_text!("⌘⌥T", "Ctrl+Alt+T")),
+        SHORTCUT_QUICK_OPEN => (platform_text!("⌘P", "Ctrl+Shift+P"), platform_text!("⌘P", "Ctrl+Shift+P")),
         SIDEBAR_NO_WINDOW => ("창을 사용할 수 없어 작업을 건너뜁니다", "Window unavailable; action skipped"),
         PANE_SELECT_ALL => ("전체 선택", "Select all"),
         PANE_CLEAR => ("화면 지우기", "Clear screen"),
@@ -454,7 +466,7 @@ catalog! {
         SECURE_KEYBOARD_OFF => ("보안 키보드 입력", "Secure keyboard input"),
         SECURE_KEYBOARD_ON => ("🔒 보안 키보드 입력 켜짐", "🔒 Secure keyboard input on"),
         SECURE_KEYBOARD_TOOLTIP => ("비밀번호 입력 시 다른 앱이 키 입력을 가로채지 못하게 합니다 (EnableSecureEventInput).", "Prevent other apps from intercepting password keystrokes (EnableSecureEventInput)."),
-        LINK_HINT => ("⌘+클릭하여 열기", "⌘+click to open"),
+        LINK_HINT => (platform_text!("⌘+클릭하여 열기", "Ctrl+클릭하여 열기"), platform_text!("⌘+click to open", "Ctrl+click to open")),
         PASTE_CONFIRM => ("붙여넣기", "Paste"),
         PASTE_CANCEL => ("취소", "Cancel"),
         PASTE_WARNING => ("⚠ 여러 줄 붙여넣기 경고 ({lines}줄): 이 프로그램은 bracketed paste를 쓰지 않아 줄바꿈이 바로 실행될 수 있습니다 — {preview}", "⚠ Multiline paste warning ({lines} lines): this program does not use bracketed paste, so newlines may execute immediately — {preview}"),
@@ -707,10 +719,10 @@ catalog! {
     diff {
         TITLE => ("변경 사항", "Changes"),
         FILES => ("파일", "Files"),
-        FILES_TOOLTIP => ("파일 탐색기 (⇧⌘E)", "File Explorer (⇧⌘E)"),
-        CHANGES_TOOLTIP => ("변경 사항 (⇧⌘G)", "Changes (⇧⌘G)"),
+        FILES_TOOLTIP => (platform_text!("파일 탐색기 (⇧⌘E)", "파일 탐색기 (Ctrl+Alt+Shift+E)"), platform_text!("File Explorer (⇧⌘E)", "File Explorer (Ctrl+Alt+Shift+E)")),
+        CHANGES_TOOLTIP => (platform_text!("변경 사항 (⇧⌘G)", "변경 사항 (Ctrl+Alt+Shift+G)"), platform_text!("Changes (⇧⌘G)", "Changes (Ctrl+Alt+Shift+G)")),
         REFRESH => ("변경 파일 새로고침", "Refresh changed files"),
-        COLLAPSE => ("오른쪽 패널 접기 (⌥⌘B)", "Collapse right panel (⌥⌘B)"),
+        COLLAPSE => (platform_text!("오른쪽 패널 접기 (⌥⌘B)", "오른쪽 패널 접기 (Ctrl+Alt+B)"), platform_text!("Collapse right panel (⌥⌘B)", "Collapse right panel (Ctrl+Alt+B)")),
         WORKTREE => ("작업 트리", "Working tree"),
         INDEX => ("스테이징", "Staged"),
         LOADING => ("변경 사항을 읽는 중…", "Loading changes…"),
@@ -749,7 +761,7 @@ catalog! {
         EXPLORER_FILTER_EMPTY => ("일치하는 파일이 없습니다", "No matching files"),
         EXPLORER_LOADING => ("파일 목록을 읽는 중…", "Loading files…"),
         SEARCH => ("검색", "Search"),
-        SEARCH_TOOLTIP => ("워크스페이스 검색 (⇧⌘F)", "Search in Workspace (⇧⌘F)"),
+        SEARCH_TOOLTIP => (platform_text!("워크스페이스 검색 (⇧⌘F)", "워크스페이스 검색 (Ctrl+Alt+Shift+F)"), platform_text!("Search in Workspace (⇧⌘F)", "Search in Workspace (Ctrl+Alt+Shift+F)")),
         SEARCH_PLACEHOLDER => ("파일에서 검색…", "Search in files…"),
         SEARCH_CASE_SENSITIVE => ("대소문자 구분", "Match Case"),
         SEARCH_WHOLE_WORD => ("단어 단위 일치", "Match Whole Word"),
@@ -774,7 +786,7 @@ catalog! {
         VIEW_SPLIT => ("Split", "Split"),
     }
     editor {
-        QUICK_OPEN => ("파일 열기 (⌘P)", "Open file (⌘P)"),
+        QUICK_OPEN => (platform_text!("파일 열기 (⌘P)", "파일 열기 (Ctrl+Shift+P)"), platform_text!("Open file (⌘P)", "Open file (Ctrl+Shift+P)")),
         CHANGED_ON_DISK => ("디스크에서 파일이 바뀌었습니다. 편집 중인 내용은 그대로 있습니다.", "The file changed on disk. Your edits are kept."),
         RELOAD => ("디스크 내용으로 다시 읽기", "Reload from disk"),
         KEEP => ("내 편집 유지", "Keep my edits"),
@@ -801,7 +813,7 @@ catalog! {
         IMAGE => ("이미지", "Image"),
     }
     search {
-        PLACEHOLDER => ("터미널 검색 (⌘F)", "Search terminal (⌘F)"),
+        PLACEHOLDER => (platform_text!("터미널 검색 (⌘F)", "터미널 검색 (Ctrl+Shift+F)"), platform_text!("Search terminal (⌘F)", "Search terminal (Ctrl+Shift+F)")),
         PREV => ("이전 일치 (↑)", "Previous match (↑)"),
         NEXT => ("다음 일치 (↓)", "Next match (↓)"),
         CLOSE => ("검색 닫기 (Esc)", "Close search (Esc)"),
@@ -1060,7 +1072,7 @@ catalog! {
         FONT_SIZE => ("글꼴 크기", "Font size"),
         FONT_RESET => ("13pt", "13pt"),
         EDITOR_FONT_SIZE => ("에디터 글꼴 크기", "Editor font size"),
-        EDITOR_FONT_SIZE_DESC => ("코드 에디터 글자 크기입니다(에디터 포커스 시 ⌘= / ⌘- / ⌘0).", "Code editor text size (⌘= / ⌘- / ⌘0 when an editor is focused)."),
+        EDITOR_FONT_SIZE_DESC => (platform_text!("코드 에디터 글자 크기입니다(에디터 포커스 시 ⌘= / ⌘- / ⌘0).", "코드 에디터 글자 크기입니다(에디터 포커스 시 Ctrl+= / Ctrl+- / Ctrl+0)."), platform_text!("Code editor text size (⌘= / ⌘- / ⌘0 when an editor is focused).", "Code editor text size (Ctrl+= / Ctrl+- / Ctrl+0 when an editor is focused).")),
         EDITOR_FONT_RESET => ("12pt", "12pt"),
         OPACITY => ("배경 투명도", "Opacity"),
         ALERT_SOUND => ("알림 사운드", "Alert sound"),
@@ -1099,7 +1111,7 @@ catalog! {
         DOCTOR_MISSING_BINS => ("바이너리 없음", "Missing binaries"),
         DOCTOR_WARN => ("경고 {n}건", "{n} warning(s)"),
         DOCTOR_CRASHES => ("{n}건", "{n}"),
-        SEARCH_HINT_CMD_F => ("⌘F", "⌘F"),
+        SEARCH_HINT_CMD_F => (platform_text!("⌘F", "Ctrl+Shift+F"), platform_text!("⌘F", "Ctrl+Shift+F")),
         ORCH_TITLE => ("멀티 에이전트 오케스트레이션 (Runs · Tasks DAG · Gates)", "Multi-Agent Orchestration (Runs · Tasks DAG · Gates)"),
         ORCH_TASK_STATUS_PENDING => ("대기", "Pending"),
         ORCH_TASK_STATUS_READY => ("준비", "Ready"),
@@ -1114,8 +1126,8 @@ catalog! {
         CONFIRM_AGAIN => ("다시 눌러 확인", "Click again to confirm"),
         LANGUAGE_DESC => ("앱 화면과 메뉴에 쓸 언어입니다.", "Language for app screens and menus."),
         THEME_DESC => ("앱과 터미널의 라이트·다크 모양입니다. 시스템은 macOS 설정을 따릅니다.", "Light or dark look for the app and terminals. System follows macOS."),
-        ZOOM_DESC => ("앱 UI 전체 배율입니다. 터미널·에디터 글자 크기는 ⌘= / ⌘- / ⌘0으로 조절합니다.", "Overall app UI scale. Use ⌘= / ⌘- / ⌘0 to adjust terminal or editor font size."),
-        FONT_SIZE_DESC => ("터미널 글자 크기입니다(터미널 포커스 시 ⌘= / ⌘- / ⌘0).", "Terminal text size (⌘= / ⌘- / ⌘0 when terminal is focused)."),
+        ZOOM_DESC => (platform_text!("앱 UI 전체 배율입니다. 터미널·에디터 글자 크기는 ⌘= / ⌘- / ⌘0으로 조절합니다.", "앱 UI 전체 배율입니다. 터미널·에디터 글자 크기는 Ctrl+= / Ctrl+- / Ctrl+0으로 조절합니다."), platform_text!("Overall app UI scale. Use ⌘= / ⌘- / ⌘0 to adjust terminal or editor font size.", "Overall app UI scale. Use Ctrl+= / Ctrl+- / Ctrl+0 to adjust terminal or editor font size.")),
+        FONT_SIZE_DESC => (platform_text!("터미널 글자 크기입니다(터미널 포커스 시 ⌘= / ⌘- / ⌘0).", "터미널 글자 크기입니다(터미널 포커스 시 Ctrl+= / Ctrl+- / Ctrl+0)."), platform_text!("Terminal text size (⌘= / ⌘- / ⌘0 when terminal is focused).", "Terminal text size (Ctrl+= / Ctrl+- / Ctrl+0 when terminal is focused).")),
         OPACITY_DESC => ("터미널 배경의 불투명도입니다.", "Opacity of the terminal background."),
         TERMINAL_FONT => ("글꼴", "Font family"),
         TERMINAL_FONT_DESC => ("터미널 글꼴입니다. 목록에는 고정폭 글꼴만 나옵니다.", "Terminal font. Only monospace fonts are listed."),
@@ -1220,7 +1232,7 @@ catalog! {
         SC_CONFLICT_SAVE => ("그래도 저장", "Save anyway"),
         SC_CANCEL => ("취소", "Cancel"),
         SC_WRITE_FAILED => ("keys.toml 저장 실패: {error}", "Failed to save keys.toml: {error}"),
-        SC_NEEDS_MODIFIER => ("일반 키는 ⌘·⌃·⌥ 중 하나 이상과 함께 눌러야 단축키가 됩니다. 키를 지우려면 옆 ×를 누르세요.", "Plain keys need ⌘, Ctrl or ⌥ held to become a shortcut. To remove a key, press its × button."),
+        SC_NEEDS_MODIFIER => (platform_text!("일반 키는 ⌘·⌃·⌥ 중 하나 이상과 함께 눌러야 단축키가 됩니다. 키를 지우려면 옆 ×를 누르세요.", "일반 키는 Ctrl·Alt·OS 키 중 하나 이상과 함께 눌러야 단축키가 됩니다. 키를 지우려면 옆 ×를 누르세요."), platform_text!("Plain keys need ⌘, Ctrl or ⌥ held to become a shortcut. To remove a key, press its × button.", "Plain keys need Ctrl, Alt or the OS key held to become a shortcut. To remove a key, press its × button.")),
         SC_DELETE_KEY => ("키 삭제", "Delete key"),
         SC_DISABLE => ("사용 안 함", "Disable"),
         SC_DISABLED_HINT => ("사용 안 함 — 초기화로 기본 키를 되돌릴 수 있습니다", "Disabled — Reset restores the default keys"),
@@ -1432,7 +1444,7 @@ catalog! {
         THANKS => ("별 고맙습니다!", "Thanks for the star!"),
     }
     general {
-        JUMP_SHORTCUT => ("⌘J", "⌘J"),
+        JUMP_SHORTCUT => (platform_text!("⌘J", "Ctrl+Shift+J"), platform_text!("⌘J", "Ctrl+Shift+J")),
         HASH => ("SHA-256 {hash}", "SHA-256 {hash}"),
         SETTINGS_MENU => ("설정…", "Settings…"),
         QUIT => ("Krill 종료", "Quit Krill"),
@@ -1465,7 +1477,7 @@ catalog! {
         HIDE_APP => ("Krill 가리기", "Hide Krill"),
         HIDE_OTHERS => ("다른 앱 가리기", "Hide Others"),
         SHOW_ALL => ("모두 보기", "Show All"),
-        SETTINGS_HINT => ("설정 (⌘,)", "Settings (⌘,)"),
+        SETTINGS_HINT => (platform_text!("설정 (⌘,)", "설정 (Ctrl+,)"), platform_text!("Settings (⌘,)", "Settings (Ctrl+,)")),
         DEFAULT => ("기본", "Default"),
         SEARCH => ("검색…", "Search…"),
         AGENT_CHOICE => ("에이전트 선택", "Choose agent"),
@@ -1574,7 +1586,7 @@ catalog! {
         DISCARD => ("변경 취소", "Discard Changes"),
         CONFIRM_DISCARD => ("\"{path}\"의 작업 트리 변경 사항을 취소할까요? 이 작업은 되돌릴 수 없습니다.", "Discard working tree changes in \"{path}\"? This cannot be undone."),
         CONFIRM_DISCARD_UNTRACKED => ("\"{path}\" 미추적 파일을 휴지통으로 이동할까요?", "Move untracked file \"{path}\" to Trash?"),
-        MESSAGE => ("커밋 메시지 (⌘Enter로 커밋)", "Commit message (⌘Enter to commit)"),
+        MESSAGE => (platform_text!("커밋 메시지 (⌘Enter로 커밋)", "커밋 메시지 (Ctrl+Enter로 커밋)"), platform_text!("Commit message (⌘Enter to commit)", "Commit message (Ctrl+Enter to commit)")),
         COMMIT => ("커밋", "Commit"),
         COMMIT_AND_PUSH => ("커밋 및 푸시", "Commit & Push"),
         CANCEL => ("취소", "Cancel"),
@@ -1605,9 +1617,9 @@ catalog! {
     }
     popout {
         FLOAT_BUTTON => ("↗ 터미널", "↗ Terminal"),
-        FLOAT_LABEL => ("플로팅 터미널 (⌥⌘A)", "Floating terminal (⌥⌘A)"),
+        FLOAT_LABEL => (platform_text!("플로팅 터미널 (⌥⌘A)", "플로팅 터미널 (Ctrl+Alt+A)"), platform_text!("Floating terminal (⌥⌘A)", "Floating terminal (Ctrl+Alt+A)")),
         DASHBOARD => ("에이전트 대시보드", "Agent Dashboard"),
-        DASHBOARD_LABEL => ("에이전트 대시보드 (⇧⌥⌘A)", "Agent Dashboard (⇧⌥⌘A)"),
+        DASHBOARD_LABEL => (platform_text!("에이전트 대시보드 (⇧⌥⌘A)", "에이전트 대시보드 (Ctrl+Alt+Shift+A)"), platform_text!("Agent Dashboard (⇧⌥⌘A)", "Agent Dashboard (Ctrl+Alt+Shift+A)")),
         FLOAT_MENU => ("플로팅 터미널", "Floating terminal"),
         STATUS_OPEN_SETTINGS => ("설정 열기", "Open settings"),
         DAEMON_UP => ("데몬 연결됨", "Daemon connected"),
@@ -2213,7 +2225,7 @@ pub mod link_ui {
     use super::Message;
 
     macro_rules! link_ui_catalog {
-        ($($key:ident => ($ko:literal, $en:literal)),* $(,)?) => {
+        ($($key:ident => ($ko:expr, $en:expr)),* $(,)?) => {
             $(pub const $key: Message = Message {
                 id: concat!("link_ui.", stringify!($key)),
                 ko: $ko,
@@ -2297,5 +2309,41 @@ pub mod link_ui {
         DEMO_DEVICE_STUDIO => ("작업실 Mac Studio", "Studio Mac Studio"),
         DEMO_NEARBY_HOME => ("집 맥미니", "Home Mac mini"),
         DEMO_NEARBY_IMAC => ("거실 iMac", "Living Room iMac"),
+    }
+}
+
+#[cfg(test)]
+mod platform_shortcut_tests {
+    use super::*;
+
+    #[test]
+    fn catalog_shortcut_hints_match_platform_bindings() {
+        use catalog::{security, settings, shell};
+        if cfg!(target_os = "macos") {
+            assert_eq!(shell::SHORTCUT_NEW_TAB.in_language(Language::En), "⌘T");
+            assert_eq!(settings::SEARCH_HINT_CMD_F.in_language(Language::En), "⌘F");
+        } else {
+            for message in ALL {
+                for language in [Language::Ko, Language::En] {
+                    assert!(
+                        !message.in_language(language).contains(['⌘', '⌥', '⇧', '⌃']),
+                        "{}",
+                        message.id
+                    );
+                }
+            }
+            assert_eq!(
+                shell::SHORTCUT_NEW_TAB.in_language(Language::En),
+                "Ctrl+Shift+T"
+            );
+            assert_eq!(
+                settings::SEARCH_HINT_CMD_F.in_language(Language::En),
+                "Ctrl+Shift+F"
+            );
+            assert_eq!(
+                security::LINK_HINT.in_language(Language::En),
+                "Ctrl+click to open"
+            );
+        }
     }
 }

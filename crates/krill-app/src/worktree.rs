@@ -190,7 +190,7 @@ pub fn branch_suggestions(
 /// 실패·타임아웃 시 빈 목록으로 조용히 넘어간다. 호출자는 백그라운드에서 부른다.
 pub fn list_git_refs(repo: &Path) -> Vec<String> {
     use std::time::{Duration, Instant};
-    let child = std::process::Command::new("git")
+    let child = crate::platform::background_command("git")
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

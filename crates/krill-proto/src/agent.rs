@@ -329,6 +329,11 @@ fn executable(p: PathBuf) -> Option<PathBuf> {
 /// `<exe> --version` 출력의 첫 줄. 실패하거나 [`VERSION_TIMEOUT`] 안에 끝나지 않으면 `None`.
 pub fn version(exe: &Path) -> Option<String> {
     let mut cmd = Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
     cmd.arg("--version");
     capture(cmd, VERSION_TIMEOUT)?
         .lines()

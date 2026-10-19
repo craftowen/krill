@@ -5,7 +5,7 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitCode, Stdio};
+use std::process::{Child, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -477,7 +477,7 @@ fn spawn_bundle_app(
     state_dir: &Path,
     ready_file: Option<&Path>,
 ) -> io::Result<Child> {
-    let mut cmd = Command::new(app_bundle.join(APP_EXE));
+    let mut cmd = crate::platform::background_command(app_bundle.join(APP_EXE));
     cmd.env("KRILL_STATE_DIR", state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -525,7 +525,7 @@ fn wait_process_exit(raw_pid: u32, timeout: Duration) -> io::Result<()> {
         .checked_add(timeout)
         .unwrap_or_else(Instant::now);
     loop {
-        let out = Command::new("tasklist")
+        let out = crate::platform::background_command("tasklist")
             .args(["/FI", &filter, "/NH", "/FO", "CSV"])
             .creation_flags(CREATE_NO_WINDOW)
             .stdin(Stdio::null())
@@ -566,7 +566,7 @@ pub fn spawn_detached_relauncher(
     #[cfg(unix)]
     fs::set_permissions(&bin, fs::Permissions::from_mode(0o700))?;
 
-    let mut cmd = Command::new(&bin);
+    let mut cmd = crate::platform::background_command(&bin);
     // Windows: 앱 콘솔·프로세스 그룹과 분리한다(앱이 끝나도 relauncher는 남아야 한다, OWE-829).
     #[cfg(windows)]
     {
@@ -718,6 +718,7 @@ pub fn offer_rollback(state_dir: PathBuf, window: &mut Window, cx: &mut App) {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use std::process::Command;
 
     #[test]
     fn regression_config_parse_error_aborts_relauncher() {

@@ -3,6 +3,8 @@
 //! panic은 크래시 로그로 남기고, 다음 실행이 진단 대화상자를 띄운다(MK-067). `--crash-test`는 그 경로를 검증하려고
 //! 시작 직후 일부러 panic한다. 첫 실행이면 온보딩 대화상자를 띄운다(MK-073).
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod shell;
 
 use gpui::{
@@ -223,7 +225,8 @@ fn init(cx: &mut App) {
     shell::bind_keys(cx);
     krill_app::link_ui::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
-    // macOS는 마지막 창을 닫아도 메뉴바·Dock에 남는다. 메뉴바 항목이 없는 Windows는 마지막 창을 닫으면 끝낸다(트레이는 후속).
+    // macOS stays in the menu bar/Dock. Windows starts with last-window quit;
+    // menu_bar::init switches to explicit quit only after its tray icon succeeds.
     cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
         let services = krill_app::hosts::link::begin_shutdown();

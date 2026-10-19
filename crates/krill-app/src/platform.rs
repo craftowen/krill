@@ -34,3 +34,30 @@ pub fn has_exec_bits(meta: &std::fs::Metadata) -> bool {
 pub use macos::*;
 #[cfg(not(target_os = "macos"))]
 pub use windows::*;
+
+/// Background CLI work must never allocate a Windows console. Piped stdout/stderr
+/// remain available, so discovery and diagnostics keep their existing contracts.
+pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let command = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        let mut command = command;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        command
+    }
+    #[cfg(not(windows))]
+    command
+}
+
+/// Refresh existing windows after a theme or attention-count change.
+#[cfg(windows)]
+pub fn sync_windows(cx: &mut gpui::App) {
+    use gpui_component::ActiveTheme as _;
+    let dark = cx.theme().mode == gpui_component::ThemeMode::Dark;
+    for handle in cx.windows() {
+        handle
+            .update(cx, |_, window, _| sync_window(window, dark))
+            .ok();
+    }
+}

@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -22,12 +22,16 @@ const MAX_PENDING: usize = 4;
 const MAX_CONNECTIONS: usize = 12;
 const STACK: usize = 128 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(5);
+/// 수락 스레드가 일이 없어도 깨어 reconcile(터널 감시·백오프)하는 최대 간격.
+const RECONCILE: Duration = Duration::from_secs(1);
 /// Cloudflare는 양방향 무전송 WS를 끊는다(Quick Tunnel 실측 약 125초). 이 주기로 ping하고,
 /// 응답 없는 주기가 `IDLE_PINGS`번 이어지면(LTE 전환 등으로 죽은 연결) 닫는다.
 const PING: Duration = Duration::from_secs(30);
 const IDLE_PINGS: u8 = 3;
-/// 페어링 요청이 터널 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기 타임아웃(20초)보다 짧다.
-const MINT_WAIT: Duration = Duration::from_secs(15);
+/// 페어링 요청이 터널 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기 타임아웃(60초)보다 짧다.
+/// 새 퀵 터널은 띄운 뒤 2.6~5.0초에 URL이 찍히고(2026-10-19 11회 실측) 그 뒤 `READY_SETTLE`(33초)
+/// 이후에 준비되므로 약 36~42초(추정)가 걸린다.
+const MINT_WAIT: Duration = Duration::from_secs(45);
 /// 사용자가 고른 연결 모드. 데몬을 재시작해도 Tunnel 기기가 다시 붙을 수 있게 남긴다.
 const INTENT_FILE: &str = "mobile-gateway.json";
 const MOBILE_ORIGIN: &str = "https://krill-mobile.pages.dev";
@@ -47,6 +51,89 @@ pub struct Gateway {
 struct Shared {
     state: Mutex<State>,
     changed: Condvar,
+    waker: Arc<Waker>,
+}
+impl Shared {
+    /// 상태 변경을 알린다. QR 대기(condvar)와 락 밖에서 poll 중인 수락 스레드를 함께 깨운다.
+    fn wake(&self) {
+        self.changed.notify_all();
+        self.waker.ring();
+    }
+}
+/// 수락 스레드는 상태 락을 푼 채 리스너 복제 fd와 깨우기 소켓을 poll한다. 리스너를 닫는 쪽은
+/// [`Waker::quiesce`]로 수락 스레드가 복제 fd를 놓을 때까지 기다려, 닫은 포트가 복제 fd로 계속
+/// 열려 있지 않게 한다(Lazy Exposure). Windows는 condvar 50ms 대기를 유지한다.
+#[derive(Debug)]
+struct Waker {
+    #[cfg(unix)]
+    tx: std::os::unix::net::UnixStream,
+    #[cfg(unix)]
+    rx: std::os::unix::net::UnixStream,
+    /// 수락 스레드가 리스너 복제 fd를 들고 poll 중이다.
+    #[cfg(unix)]
+    polling: Mutex<bool>,
+    #[cfg(unix)]
+    idle: Condvar,
+}
+impl Waker {
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unnecessary_wraps,
+            reason = "Windows는 깨우기 소켓 없이 condvar만 쓴다"
+        )
+    )]
+    fn new() -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            let (tx, rx) = std::os::unix::net::UnixStream::pair()?;
+            tx.set_nonblocking(true)?;
+            rx.set_nonblocking(true)?;
+            Ok(Self {
+                tx,
+                rx,
+                polling: Mutex::new(false),
+                idle: Condvar::new(),
+            })
+        }
+        #[cfg(not(unix))]
+        Ok(Self {})
+    }
+    /// 버퍼가 차 있으면(WouldBlock) 이미 깨울 바이트가 남아 있으므로 버린다.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Windows는 깨우기 소켓 없이 condvar만 쓴다"
+        )
+    )]
+    fn ring(&self) {
+        #[cfg(unix)]
+        (&self.tx).write_all(&[1]).ok();
+    }
+    /// 상태 락을 쥔 채 리스너를 닫은 뒤 부른다. 수락 스레드는 poll을 끝낼 때 상태 락이 필요 없다.
+    #[cfg_attr(
+        not(unix),
+        expect(
+            clippy::unused_self,
+            reason = "Windows는 깨우기 소켓 없이 condvar만 쓴다"
+        )
+    )]
+    fn quiesce(&self) {
+        #[cfg(unix)]
+        {
+            let mut polling = lock(&self.polling);
+            if *polling {
+                self.ring();
+            }
+            while *polling {
+                polling = self
+                    .idle
+                    .wait(polling)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        }
+    }
 }
 #[derive(Debug)]
 struct State {
@@ -68,6 +155,7 @@ struct State {
     tunnel_error: Option<io::Error>,
     dir: Option<PathBuf>,
     ping: Duration,
+    waker: Arc<Waker>,
 }
 #[derive(Deserialize, Serialize)]
 struct Intent {
@@ -160,6 +248,7 @@ impl Gateway {
             rid: intent.rid,
             key: intent.key,
         };
+        let waker = Arc::new(Waker::new()?);
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 devices: Devices::open(dir)?,
@@ -180,8 +269,10 @@ impl Gateway {
                 tunnel_error: None,
                 dir: dir.map(Path::to_path_buf),
                 ping: PING,
+                waker: Arc::clone(&waker),
             }),
             changed: Condvar::new(),
+            waker,
         });
         let backend = super::pwa_rpc::Backend::new(registry.clone(), dir, hello.clone());
         let worker = Arc::clone(&shared);
@@ -222,7 +313,7 @@ impl Gateway {
             Ok(reply) => reply,
             Err(e) => MobileReply::Failed(e.to_string()),
         };
-        self.shared.changed.notify_all();
+        self.shared.wake();
         reply
     }
     fn handle(&self, request: MobileRequest) -> io::Result<MobileReply> {
@@ -242,7 +333,7 @@ impl Gateway {
                 if mode == ConnectMode::Tunnel {
                     // 설치·터널 준비·고정 출처 판정을 모두 락 밖에서 기다린다.
                     drop(state);
-                    self.shared.changed.notify_all();
+                    self.shared.wake();
                     let deadline = Instant::now() + MINT_WAIT;
                     loop {
                         let state = lock(&self.shared.state);
@@ -266,8 +357,13 @@ impl Gateway {
                         {
                             return Err(tunnel_unavailable(&state));
                         }
-                        drop(state);
-                        thread::sleep(Duration::from_millis(200));
+                        // 상태 변경은 바로, 백그라운드 프로브의 준비 표시는 50ms 안에 본다.
+                        drop(
+                            self.shared
+                                .changed
+                                .wait_timeout(state, Duration::from_millis(50))
+                                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                        );
                     }
                 } else {
                     pairing_offer(&state, now)?
@@ -307,7 +403,7 @@ impl Gateway {
                 MobileReply::Revoked { count }
             }
         };
-        self.shared.changed.notify_all();
+        self.shared.wake();
         Ok(reply)
     }
 }
@@ -316,7 +412,7 @@ impl Drop for Gateway {
         let mut state = lock(&self.shared.state);
         state.stopped = true;
         close(&mut state);
-        self.shared.changed.notify_all();
+        self.shared.wake();
     }
 }
 fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64) -> io::Result<()> {
@@ -438,6 +534,7 @@ fn close(s: &mut State) {
     s.tunnel_failures = 0;
     s.tunnel_retry_at = None;
     s.listeners.clear();
+    s.waker.quiesce();
     for c in s.connections.values() {
         c.socket.shutdown(Shutdown::Both).ok();
     }
@@ -535,9 +632,17 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
             return;
         }
         reconcile(&mut state, now_ms()).ok();
+        let now = Instant::now();
+        let mut deadline: Option<Instant> = None;
         for connection in state.connections.values() {
-            if connection.device.is_none() && connection.accepted.elapsed() >= TIMEOUT {
+            if connection.device.is_some() {
+                continue;
+            }
+            let due = connection.accepted + TIMEOUT;
+            if now >= due {
                 connection.socket.shutdown(Shutdown::Both).ok();
+            } else {
+                deadline = Some(deadline.map_or(due, |d| d.min(due)));
             }
         }
         let pending = state
@@ -545,69 +650,115 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
             .values()
             .filter(|c| c.device.is_none())
             .count();
-        let incoming = if pending < MAX_PENDING && state.connections.len() < MAX_CONNECTIONS {
-            state
-                .listeners
-                .iter()
-                .find_map(|l| l.accept().ok().map(|(s, _)| s))
+        let room = pending < MAX_PENDING && state.connections.len() < MAX_CONNECTIONS;
+        let mut failed = false;
+        let incoming = if room {
+            state.listeners.iter().find_map(|l| match l.accept() {
+                Ok((s, _)) => Some(s),
+                Err(e) => {
+                    failed |= e.kind() != io::ErrorKind::WouldBlock;
+                    None
+                }
+            })
         } else {
             None
         };
-        if let Some(socket) = incoming {
-            let Some(id) = state.next.checked_add(1) else {
-                return;
+        let Some(socket) = incoming else {
+            let idle = state.listeners.is_empty()
+                && state.devices.active_count() == 0
+                && state.devices.ticket(now_ms()).is_none();
+            // 수락 오류(EMFILE 등)는 리스너가 계속 읽기 가능이라 50ms 뒤 다시 시도한다.
+            let timeout = if idle {
+                None
+            } else if failed {
+                Some(Duration::from_millis(50))
+            } else {
+                Some(deadline.map_or(RECONCILE, |d| {
+                    d.saturating_duration_since(now).min(RECONCILE)
+                }))
             };
-            state.next = id;
-            let Ok(kept) = socket.try_clone() else {
-                continue;
-            };
-            state.connections.insert(
-                id,
-                Connection {
-                    accepted: Instant::now(),
-                    device: None,
-                    socket: kept,
-                },
-            );
-            drop(state);
-            let (s, r, h) = (Arc::clone(shared), registry.clone(), hello.clone());
-            if thread::Builder::new()
-                .name("mobile-ws".into())
-                .stack_size(STACK)
-                .spawn(move || {
-                    crate::alloc::mobile_thread().ok();
-                    let guard = Connected {
-                        shared: Arc::clone(&s),
-                        id,
-                    };
-                    if let Err(error) = serve(socket, &s, id, &r, &h) {
-                        tracing::debug!(kind=?error.kind(), "mobile connection ended");
-                    }
-                    drop(guard);
-                })
-                .is_err()
-            {
-                lock(&shared.state).connections.remove(&id);
-            }
-        } else if state.listeners.is_empty()
-            && state.devices.active_count() == 0
-            && state.devices.ticket(now_ms()).is_none()
+            wait(shared, state, room && !failed, timeout);
+            continue;
+        };
+        let Some(id) = state.next.checked_add(1) else {
+            return;
+        };
+        state.next = id;
+        let Ok(kept) = socket.try_clone() else {
+            continue;
+        };
+        state.connections.insert(
+            id,
+            Connection {
+                accepted: Instant::now(),
+                device: None,
+                socket: kept,
+            },
+        );
+        drop(state);
+        let (s, r, h) = (Arc::clone(shared), registry.clone(), hello.clone());
+        if thread::Builder::new()
+            .name("mobile-ws".into())
+            .stack_size(STACK)
+            .spawn(move || {
+                crate::alloc::mobile_thread().ok();
+                let guard = Connected {
+                    shared: Arc::clone(&s),
+                    id,
+                };
+                if let Err(error) = serve(socket, &s, id, &r, &h) {
+                    tracing::debug!(kind=?error.kind(), "mobile connection ended");
+                }
+                drop(guard);
+            })
+            .is_err()
         {
-            drop(
-                shared
-                    .changed
-                    .wait(state)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
-        } else {
-            drop(
-                shared
-                    .changed
-                    .wait_timeout(state, Duration::from_millis(50))
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            );
+            lock(&shared.state).connections.remove(&id);
         }
     }
+}
+/// 상태 락을 풀고 새 연결(`listen`이면)·깨우기·`timeout`(`None`이면 깨우기까지) 중 먼저 오는 것을 기다린다.
+#[cfg(unix)]
+fn wait(shared: &Shared, state: MutexGuard<'_, State>, listen: bool, timeout: Option<Duration>) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let fds: Vec<TcpListener> = if listen {
+        state
+            .listeners
+            .iter()
+            .filter_map(|l| l.try_clone().ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // 상태 락 안에서 표시해야 리스너를 닫는 쪽(quiesce)이 놓치지 않는다.
+    *lock(&shared.waker.polling) = !fds.is_empty();
+    drop(state);
+    let mut polls: Vec<PollFd<'_>> = fds.iter().map(|l| PollFd::new(l, PollFlags::IN)).collect();
+    polls.push(PollFd::new(&shared.waker.rx, PollFlags::IN));
+    let timeout = timeout.and_then(|t| Timespec::try_from(t).ok());
+    poll(&mut polls, timeout.as_ref()).ok();
+    drop(polls);
+    drop(fds);
+    *lock(&shared.waker.polling) = false;
+    shared.waker.idle.notify_all();
+    let mut drain = [0; 64];
+    while io::Read::read(&mut &shared.waker.rx, &mut drain).is_ok_and(|n| n > 0) {}
+}
+#[cfg(not(unix))]
+fn wait(shared: &Shared, state: MutexGuard<'_, State>, _listen: bool, timeout: Option<Duration>) {
+    drop(match timeout {
+        None => shared
+            .changed
+            .wait(state)
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+        Some(_) => {
+            shared
+                .changed
+                .wait_timeout(state, Duration::from_millis(50))
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .0
+        }
+    });
 }
 struct Connected {
     shared: Arc<Shared>,
@@ -620,7 +771,7 @@ impl Drop for Connected {
             c.socket.shutdown(Shutdown::Both).ok();
         }
         reconcile(&mut s, now_ms()).ok();
-        self.shared.changed.notify_all();
+        self.shared.wake();
     }
 }
 fn serve(
@@ -653,13 +804,19 @@ fn serve(
                 socket
                     .set_read_timeout(Some(Duration::from_millis(50)))
                     .ok();
+                // 클라이언트가 인증 뒤 프레임을 미리 보내므로(파이프라이닝) 닫기 전에 EOF까지 비운다.
+                // 남은 바이트가 있으면 close가 RST가 되어 클라이언트가 1008 대신 1006을 본다.
                 let mut drain = [0; 512];
-                io::Read::read(&mut socket, &mut drain).ok();
+                let until = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < until
+                    && io::Read::read(&mut socket, &mut drain).is_ok_and(|n| n > 0)
+                {
+                }
             }
             return Err(error);
         }
     };
-    shared.changed.notify_all();
+    shared.wake();
     let registry = registry.upgrade().ok_or_else(invalid)?;
     let ping = lock(&shared.state).ping;
     socket.set_read_timeout(Some(ping))?;
@@ -764,7 +921,14 @@ fn bridge(
         .stack_size(STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
-            registry.serve_mobile(server, &hello)
+            // server_stop 복제가 fd를 붙잡고 있어 serve가 끝나도 local 쪽에 EOF가 오지 않는다.
+            // 레지스트리가 먼저 끝내면(첫 요청 기한 초과·세션 종료) 여기서 닫아 WS도 닫히게 한다.
+            let done = server.try_clone();
+            let result = registry.serve_mobile(server, &hello);
+            if let Ok(done) = done {
+                done.shutdown(Shutdown::Both).ok();
+            }
+            result
         });
     let result = if worker.is_ok() {
         (|| -> io::Result<()> {
@@ -821,5 +985,4 @@ fn bridge(
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 mod tests;

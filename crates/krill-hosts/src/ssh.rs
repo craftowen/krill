@@ -7,9 +7,9 @@
 use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 #[cfg(unix)]
-use std::process::Child;
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -303,7 +303,8 @@ pub fn remote_socket_for_home(remote_home: &str) -> io::Result<PathBuf> {
         .iter()
         .find(|d| Some(d.as_str()) == found)
         .unwrap_or(default);
-    Ok(PathBuf::from(home).join(dir).join("run/krilld.sock"))
+    // 원격 경로는 로컬 OS가 Windows여도 POSIX 구분자를 보존한다.
+    Ok(PathBuf::from(format!("{home}/{dir}/run/krilld.sock")))
 }
 
 /// `ssh <opts> <host> <remote_query>`를 실행해 원격 맥의 `$HOME`과 소켓이 있는 번들 id를 조회한다.
@@ -316,10 +317,14 @@ fn query_remote_home_with_program(
     ssh_bin: &std::ffi::OsStr,
 ) -> io::Result<String> {
     opts.validate()?;
-    if cfg!(windows) {
-        // 파이프 stdout을 잡은 ssh.exe는 핸드셰이크에서 멈춘다(OWE-840 실측) — 막히기 전에 끊는다.
-        return Err(windows_unsupported());
-    }
+    #[cfg(windows)]
+    let out = windows::stdio::output(
+        ssh_bin,
+        &opts.remote_home_args(),
+        None,
+        Duration::from_secs(30),
+    )?;
+    #[cfg(unix)]
     let out = Command::new(ssh_bin)
         .args(opts.remote_home_args())
         .stdin(Stdio::null())
@@ -342,14 +347,6 @@ fn query_remote_home_with_program(
         }));
     }
     String::from_utf8(out.stdout).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// Windows SSH 원격 호스트 미지원 오류(`ssh/windows.rs` 참고).
-fn windows_unsupported() -> io::Error {
-    io::Error::new(
-        io::ErrorKind::Unsupported,
-        "ssh remote hosts are not supported on Windows yet",
-    )
 }
 
 /// 원격 krilld 소켓 경로 결정:
@@ -772,6 +769,8 @@ fn proxy(down: UnixStream, up: UnixStream) {
 mod windows;
 #[cfg(windows)]
 pub use windows::Tunnel;
+#[cfg(windows)]
+pub(crate) use windows::stdio::output as windows_output;
 
 #[cfg(test)]
 mod tests;

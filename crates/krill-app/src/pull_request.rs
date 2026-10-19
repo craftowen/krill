@@ -384,7 +384,7 @@ fn status_error(error: &io::Error) -> Status {
 }
 
 pub fn has_github_remote(folder: &Path) -> bool {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::platform::background_command("git");
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -489,7 +489,7 @@ pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
 fn command(folder: &Path, branch: &str, action: Action) -> Command {
     // Finder's PATH may omit Homebrew. Still prefer the user's PATH installation.
     let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
-    let mut cmd = Command::new(executable);
+    let mut cmd = crate::platform::background_command(executable);
     cmd.current_dir(folder)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -665,7 +665,7 @@ pub(crate) fn git_output(folder: &Path, args: &[&str]) -> io::Result<String> {
             "/usr/bin/git",
         ],
     );
-    let mut cmd = Command::new(exe);
+    let mut cmd = crate::platform::background_command(exe);
     cmd.current_dir(folder)
         .args(["-c", "core.quotePath=false"])
         .args(args)
@@ -698,7 +698,7 @@ pub(crate) fn run_local_agent_prompt(folder: &Path, prompt: &str) -> io::Result<
     if let Some(custom) = std::env::var_os("KRILL_AI_CLI")
         && !custom.is_empty()
     {
-        let mut cmd = Command::new(custom);
+        let mut cmd = crate::platform::background_command(custom);
         cmd.current_dir(folder).arg(prompt);
         let bytes = execute(&mut cmd, AI_TIMEOUT)?;
         let out = String::from_utf8_lossy(&bytes).trim().to_owned();
@@ -732,7 +732,7 @@ pub(crate) fn run_local_agent_prompt(folder: &Path, prompt: &str) -> io::Result<
         if !executable(&exe) {
             continue;
         }
-        let mut cmd = Command::new(exe);
+        let mut cmd = crate::platform::background_command(exe);
         cmd.current_dir(folder)
             .env("CI", "1")
             .env("GIT_TERMINAL_PROMPT", "0");

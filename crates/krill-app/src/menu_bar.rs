@@ -91,6 +91,12 @@ pub fn init(
         }
     });
     let item = StatusItem::new(text::OPEN.get(), text::QUIT.get(), cx);
+    #[cfg(windows)]
+    cx.set_quit_mode(if item.is_some() {
+        gpui::QuitMode::Explicit
+    } else {
+        gpui::QuitMode::LastWindowClosed
+    });
     if let Some(item) = &item {
         item.set_title(text::DISCONNECTED.get());
     } else if cfg!(target_os = "macos") && !cx.is_test() {
@@ -101,7 +107,11 @@ pub fn init(
         loop {
             let source = source.clone();
             let snapshot = bg.spawn(async move { source.fetch() }).await;
-            cx.update(|cx| apply(snapshot.as_ref().ok(), cx));
+            cx.update(|cx| {
+                apply(snapshot.as_ref().ok(), cx);
+                #[cfg(windows)]
+                crate::platform::sync_windows(cx);
+            });
             bg.timer(Duration::from_millis(500)).await;
         }
     });
@@ -115,6 +125,7 @@ pub fn init(
                 cx.update(|cx| match StatusItem::take_command() {
                     Some(Command::Open) => open(None, cx),
                     // 셸의 종료 경로가 미저장 파일을 묻는다(OWE-663). 셸 없는 앱(테스트)은 바로 끝낸다.
+                    Some(Command::Quit) if cx.windows().is_empty() => cx.quit(),
                     Some(Command::Quit) => match cx.build_action("shell::Quit", None) {
                         Ok(quit) => cx.dispatch_action(quit.as_ref()),
                         Err(_) => cx.quit(),

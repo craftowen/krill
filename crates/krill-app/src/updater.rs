@@ -25,7 +25,6 @@ use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::time::Duration;
 
 use krill_proto::control::is_newer;
@@ -308,7 +307,7 @@ fn read_bundle_info_plist_json(app_bundle: &Path) -> Option<serde_json::Value> {
     if cfg!(windows) {
         return serde_json::from_slice(&fs::read(plist_path).ok()?).ok();
     }
-    let out = Command::new("/usr/bin/plutil")
+    let out = crate::platform::background_command("/usr/bin/plutil")
         .args(["-convert", "json", "-o", "-"])
         .arg(&plist_path)
         .output()
@@ -660,7 +659,7 @@ impl CodeVerifier for CodesignVerifier {
         }
         run_codesign(&["--verify", "--strict", "--verbose=2"], app_bundle)?;
 
-        let info = Command::new("/usr/bin/codesign")
+        let info = crate::platform::background_command("/usr/bin/codesign")
             .args(["-dv", "--verbose=4"])
             .arg(app_bundle)
             .output()?;
@@ -684,7 +683,7 @@ impl CodeVerifier for CodesignVerifier {
 }
 
 fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
-    let out = Command::new("/usr/bin/codesign")
+    let out = crate::platform::background_command("/usr/bin/codesign")
         .args(args)
         .arg(target)
         .output()?;
@@ -700,7 +699,7 @@ fn run_codesign(args: &[&str], target: &Path) -> Result<(), Error> {
 pub fn fetch_bytes(url: &str, max_bytes: usize) -> Result<Vec<u8>, Error> {
     validate_url(url)?;
     let max_str = max_bytes.to_string();
-    let out = Command::new(system_tool("curl"))
+    let out = crate::platform::background_command(system_tool("curl"))
         .args([
             "--fail",
             "--silent",
@@ -810,7 +809,7 @@ fn fetch_github_release_asset_with_bin(
     asset: &str,
     max_bytes: usize,
 ) -> Result<Vec<u8>, Error> {
-    let mut cmd = Command::new(gh);
+    let mut cmd = crate::platform::background_command(gh);
     cmd.args(["release", "download"]);
     if let Some(t) = tag {
         cmd.arg(t);
@@ -1233,7 +1232,7 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
     if !cfg!(windows)
         && let Some(gui_pid) = find_running_gui_pid(&app_bundle)
     {
-        Command::new("/bin/kill")
+        crate::platform::background_command("/bin/kill")
             .args(["-TERM", &gui_pid.to_string()])
             .status()
             .ok();
@@ -1311,7 +1310,7 @@ fn find_running_gui_pid(app_bundle: &Path) -> Option<u32> {
     let target_canon = fs::canonicalize(&target_exe).unwrap_or(target_exe);
     let target_str = target_canon.to_string_lossy();
     let self_pid = std::process::id();
-    let out = Command::new("/bin/ps")
+    let out = crate::platform::background_command("/bin/ps")
         .args(["-axo", "pid=,command="])
         .output()
         .ok()?;
@@ -1371,11 +1370,11 @@ fn system_tool(name: &str) -> PathBuf {
 fn unpack_with_ditto(zip_path: &Path, unpack_tmp: &Path, staging: &Path) -> Result<(), Error> {
     fs::create_dir_all(unpack_tmp)?;
     let mut cmd = if cfg!(windows) {
-        let mut c = Command::new(system_tool("tar"));
+        let mut c = crate::platform::background_command(system_tool("tar"));
         c.arg("-xf").arg(zip_path).arg("-C").arg(unpack_tmp);
         c
     } else {
-        let mut c = Command::new(system_tool("ditto"));
+        let mut c = crate::platform::background_command(system_tool("ditto"));
         c.args(["-x", "-k"]).arg(zip_path).arg(unpack_tmp);
         c
     };

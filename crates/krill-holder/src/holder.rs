@@ -358,6 +358,7 @@ impl Holder {
                 s.status = Some(status);
                 let id = s.id;
                 self.send(&FromHolder::Exited { id, status });
+                self.teardowns.iter_mut().for_each(|t| t.exited(pid));
             }
         }
         duplicate
@@ -394,6 +395,7 @@ impl Holder {
                 id,
                 status: STATUS_UNKNOWN,
             });
+            self.teardowns.iter_mut().for_each(|t| t.exited(pid));
         }
     }
 
