@@ -118,8 +118,8 @@ pub const SWITCH_WIDTH: Pixels = px(36.);
 pub const SWITCH_HEIGHT: Pixels = px(20.);
 /// 토글 스위치 원형 썸 지름(Orca `Switch` 썸 `size-3.5` = 14px, OWE-793).
 pub const SWITCH_THUMB: Pixels = px(14.);
-/// 상단 Jump/커맨드 팔레트 기본 너비(520px).
-pub const COMMAND_PALETTE_WIDTH: Pixels = px(520.);
+/// 상단 Jump/커맨드 팔레트 기본 너비(Orca `WorktreeJumpPalette` `w-[900px]` 대응).
+pub const COMMAND_PALETTE_WIDTH: Pixels = px(900.);
 
 /// MK-098 팝아웃 기본 크기. 두 번째 창의 drawable 예산을 제한한다.
 pub const FLOATING_SIZE: gpui::Size<Pixels> = gpui::Size {
@@ -127,8 +127,8 @@ pub const FLOATING_SIZE: gpui::Size<Pixels> = gpui::Size {
     height: px(400.),
 };
 pub const DASHBOARD_SIZE: gpui::Size<Pixels> = gpui::Size {
-    width: px(760.),
-    height: px(480.),
+    width: px(960.),
+    height: px(600.),
 };
 
 /// 왼쪽 사이드바 기본 폭(pt).

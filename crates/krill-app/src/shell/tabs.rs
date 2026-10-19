@@ -157,13 +157,14 @@ impl Shell {
                     Some(Program::Agent { id }) => launch_agent_id(id),
                     _ => "",
                 };
-                let agent = session.map_or(launch_agent, |s| {
+                let raw_agent = session.map_or(launch_agent, |s| {
                     if s.status.agent.is_empty() {
                         launch_agent
                     } else {
                         &s.status.agent
                     }
                 });
+                let agent = ui::status::infer_agent_from_title(raw_agent, &label);
                 let state = session.map_or(AgentState::Unknown, |s| s.status.state);
                 let unread = host.is_local()
                     && self

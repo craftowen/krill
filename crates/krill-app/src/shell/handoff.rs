@@ -335,6 +335,7 @@ impl Shell {
         let Some(sid) = self.layout.session(pane) else {
             return;
         };
+        self.close_dashboard(None, cx);
         let default_agent = self.pane_agent_id(pane, cx);
         let agents = self
             .agents

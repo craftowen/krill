@@ -1,33 +1,56 @@
 //! MK-057 Jump 팔레트(Cmd+J) + MK-181 AI Vault 통합 검색:
-//! 열린 세션 퍼지 검색(`List`·`States`·`Sidebar`)과 AI Vault 대화 기록(워크스페이스/프로젝트/전체 범위 필터,
-//! 에이전트 종류 필터, 스니펫 하이라이트, 원클릭 Resume)을 함께 제공한다.
+//! Orca `WorktreeJumpPalette` 패리티 레이아웃(배경 스크림, 상단 검색창 + 필터 버튼/칩,
+//! `최근 채팅 및 터미널` 섹션, `최근 작업 공간` 섹션, 빠른 액션/명령 섹션, 하단 단축키 푸터)으로
+//! 열린 세션·워크트리·AI Vault 대화 기록·명령을 한 화면에서 탐색·실행한다.
 //!
 //! 검색어는 조합 중인 한글(IME preedit)까지 포함해 즉시 거른다: gpui-component `Input`은 조합 중에 `Change`를 내지
 //! 않으므로 입력 상태를 직접 관찰한다.
 
 use std::cmp::Reverse;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
-    Context, Entity, EventEmitter, ScrollHandle, Subscription, UniformListScrollHandle, Window,
-    deferred, div, prelude::*, px, uniform_list,
+    Context, Entity, EventEmitter, FontWeight, Hsla, KeyDownEvent, ScrollHandle, Subscription,
+    UniformListScrollHandle, Window, deferred, div, prelude::*, px,
 };
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
+use gpui_component::{Icon, Sizable as _};
+use gpui_kit_assets::IconName;
 use krill_proto::SessionId;
 use krill_proto::agent_history::{VaultAgent, VaultHit, VaultScope};
+use krill_proto::control::AgentState;
 
 use crate::i18n::catalog::agent_history as vault_text;
 use crate::i18n::catalog::jump as text;
+use crate::layout::TabColor;
 
+const EMPTY_QUERY_RECENT_TAB_CAP: usize = 6;
+const EMPTY_QUERY_WORKTREE_CAP: usize = 5;
+const VISIBLE_ROWS: usize = 8;
 const ROW_HEIGHT: f32 = 28.;
-const VISIBLE_ROWS: usize = 12;
 
-/// 팔레트 한 줄. `label`의 소문자 글자를 미리 펼쳐 둬 키 입력마다 할당하지 않는다.
+/// 팔레트 한 줄(열린 세션 또는 빠른 열기 파일). `label`의 소문자 글자를 미리 펼쳐 둬 키 입력마다 할당하지 않는다.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "UI row model carries independent display flags (needs_you, unread, current tab/worktree, file)"
+)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Item {
     pub id: SessionId,
     pub label: String,
     pub needs_you: bool,
+    pub title: String,
     pub agent: String,
+    pub state: Option<AgentState>,
+    pub unread: bool,
+    pub age: String,
+    pub is_current_tab: bool,
+    pub is_current_worktree: bool,
+    pub host_label: String,
+    pub repo_name: String,
+    pub worktree_name: String,
+    pub is_file: bool,
     chars: Vec<char>,
 }
 
@@ -54,9 +77,19 @@ impl Item {
         let chars = label.chars().flat_map(char::to_lowercase).collect();
         Self {
             id,
+            title: label.clone(),
             label,
             needs_you,
             agent,
+            state: None,
+            unread: false,
+            age: String::new(),
+            is_current_tab: false,
+            is_current_worktree: false,
+            host_label: String::new(),
+            repo_name: String::new(),
+            worktree_name: String::new(),
+            is_file: false,
             chars,
         }
     }
@@ -65,6 +98,197 @@ impl Item {
     pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
         self.agent = agent.into();
         self
+    }
+
+    pub fn rebuild_search_chars(&mut self) {
+        let combined = format!(
+            "{} {} {} {} {} {}",
+            self.label, self.title, self.agent, self.repo_name, self.worktree_name, self.id.0
+        );
+        self.chars = combined.chars().flat_map(char::to_lowercase).collect();
+    }
+}
+
+/// 최근 작업 공간(워크트리·폴더) 한 줄.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeItem {
+    pub path: PathBuf,
+    pub session_id: Option<SessionId>,
+    pub name: String,
+    pub branch: String,
+    pub repo_name: String,
+    pub host_label: String,
+    pub age: String,
+    pub state: Option<AgentState>,
+    pub unread: bool,
+    pub is_main: bool,
+    pub is_current: bool,
+    chars: Vec<char>,
+}
+
+impl WorktreeItem {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "WorktreeItem constructor initializes all display fields directly"
+    )]
+    #[must_use]
+    pub fn new(
+        path: PathBuf,
+        session_id: Option<SessionId>,
+        name: String,
+        branch: String,
+        repo_name: String,
+        host_label: String,
+        age: String,
+        state: Option<AgentState>,
+        unread: bool,
+        is_main: bool,
+        is_current: bool,
+    ) -> Self {
+        let combined = format!("{name} {branch} {repo_name} {}", path.display());
+        let chars = combined.chars().flat_map(char::to_lowercase).collect();
+        Self {
+            path,
+            session_id,
+            name,
+            branch,
+            repo_name,
+            host_label,
+            age,
+            state,
+            unread,
+            is_main,
+            is_current,
+            chars,
+        }
+    }
+}
+
+/// Jump 팔레트의 워크트리 한 줄(OWE-865): 세션이 열린 워크트리(열기)와
+/// 아직 세션이 없는 워크트리·폴더(새 세션 만들기)를 함께 검색한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorktreeEntry {
+    pub path: PathBuf,
+    pub label: String,
+    pub detail: Option<String>,
+    pub session: Option<SessionId>,
+    chars: Vec<char>,
+}
+
+impl WorktreeEntry {
+    pub fn new(
+        path: PathBuf,
+        label: String,
+        detail: Option<String>,
+        session: Option<SessionId>,
+    ) -> Self {
+        let chars = lower_chars(&format!("{label} {}", path.display()));
+        Self {
+            path,
+            label,
+            detail,
+            session,
+            chars,
+        }
+    }
+}
+
+impl From<WorktreeEntry> for WorktreeItem {
+    fn from(entry: WorktreeEntry) -> Self {
+        Self::new(
+            entry.path,
+            entry.session,
+            entry.label,
+            String::new(),
+            entry.detail.unwrap_or_default(),
+            String::new(),
+            String::new(),
+            None,
+            false,
+            false,
+            false,
+        )
+    }
+}
+
+/// 나노초 타임스탬프 차이를 Orca `formatPaletteSessionAge` 규칙(`1분 미만`, `14분`, `1시간`, `2일`)으로 포맷한다.
+#[must_use]
+pub fn format_age_ns(since_unix_ns: u64, now_unix_ns: u64) -> String {
+    if since_unix_ns == 0 || now_unix_ns == 0 {
+        return String::new();
+    }
+    format_elapsed_secs(now_unix_ns.saturating_sub(since_unix_ns) / 1_000_000_000)
+}
+
+/// 초 단위 수정 시각을 상대 시간 문자열로 포맷한다.
+#[must_use]
+pub fn format_age_secs(modified_secs: u64, now_secs: u64) -> String {
+    if modified_secs == 0 || now_secs == 0 {
+        return String::new();
+    }
+    format_elapsed_secs(now_secs.saturating_sub(modified_secs))
+}
+
+fn format_elapsed_secs(secs: u64) -> String {
+    if secs < 60 {
+        text::AGE_UNDER_MIN.get().to_owned()
+    } else if secs < 3600 {
+        text::AGE_MIN.format(&[("n", &(secs / 60).to_string())])
+    } else if secs < 48 * 3600 {
+        text::AGE_HOUR.format(&[("n", &(secs / 3600).to_string())])
+    } else {
+        text::AGE_DAY.format(&[("n", &(secs / 86_400).to_string())])
+    }
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn repo_badge_color(repo_name: &str) -> Hsla {
+    const COLORS: [TabColor; 8] = [
+        TabColor::Teal,
+        TabColor::Blue,
+        TabColor::Red,
+        TabColor::Purple,
+        TabColor::Green,
+        TabColor::Orange,
+        TabColor::Pink,
+        TabColor::Yellow,
+    ];
+    let hash = repo_name.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(usize::from(b))
+    });
+    crate::ui::tab_tag_color(COLORS[hash % COLORS.len()])
+}
+
+fn cwd_repo_and_worktree(cwd: &str) -> (String, String) {
+    let trimmed = cwd.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return (String::new(), String::new());
+    }
+    let path = Path::new(trimmed);
+    let leaf = path
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let parent = path
+        .parent()
+        .and_then(|p| p.file_name())
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|p| {
+            !p.is_empty()
+                && !matches!(
+                    p.as_str(),
+                    "Users" | "home" | "tmp" | "var" | "private" | "Documents" | "wProject"
+                )
+        });
+    if let Some(repo) = parent {
+        (repo, leaf)
+    } else {
+        (leaf, String::new())
     }
 }
 
@@ -154,39 +378,30 @@ fn lower_chars(text: &str) -> Vec<char> {
     text.chars().flat_map(char::to_lowercase).collect()
 }
 
-/// Jump 팔레트의 워크트리 한 줄(OWE-865): 세션이 열린 워크트리(열기)와
-/// 아직 세션이 없는 워크트리·폴더(새 세션 만들기)를 함께 검색한다.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorktreeEntry {
-    pub path: std::path::PathBuf,
-    pub label: String,
-    pub detail: Option<String>,
-    pub session: Option<SessionId>,
-    chars: Vec<char>,
-}
-
-impl WorktreeEntry {
-    pub fn new(
-        path: std::path::PathBuf,
-        label: String,
-        detail: Option<String>,
-        session: Option<SessionId>,
-    ) -> Self {
-        let chars = lower_chars(&format!("{label} {}", path.display()));
-        Self {
-            path,
-            label,
-            detail,
-            session,
-            chars,
-        }
-    }
-}
-
 /// 워크트리 목록에서 `query`와 일치하는 인덱스(점수 높은 순, 원래 순서는 유지).
 pub fn worktree_search(entries: &[WorktreeEntry], query: &str) -> Vec<usize> {
     let all: Vec<&[char]> = entries.iter().map(|entry| entry.chars.as_slice()).collect();
     rank(&all, &vec![false; entries.len()], query)
+}
+
+fn search_worktrees(
+    items: &[WorktreeItem],
+    query: &str,
+    project_filter: Option<&str>,
+) -> Vec<usize> {
+    let query: Vec<char> = query
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    let mut hits: Vec<_> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, wt)| project_filter.is_none_or(|p| wt.repo_name == p))
+        .filter_map(|(i, wt)| score(&query, &wt.chars).map(|s| (Reverse(s), !wt.is_current, i)))
+        .collect();
+    hits.sort_unstable();
+    hits.into_iter().map(|(_, _, i)| i).collect()
 }
 
 /// 팔레트에서 바로 실행하는 빠른 액션(OWE-865). `QuickCommand`는 설정의
@@ -240,10 +455,10 @@ pub enum Mode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Section {
     Sessions,
+    Vault,
     Worktrees,
     Actions,
     QuickCommands,
-    Vault,
 }
 
 impl Mode {
@@ -251,17 +466,17 @@ impl Mode {
         match self {
             Mode::Jump | Mode::Files => [
                 Section::Sessions,
+                Section::Vault,
                 Section::Worktrees,
                 Section::Actions,
                 Section::QuickCommands,
-                Section::Vault,
             ],
             Mode::Commands => [
                 Section::Actions,
                 Section::QuickCommands,
                 Section::Sessions,
-                Section::Worktrees,
                 Section::Vault,
+                Section::Worktrees,
             ],
         }
     }
@@ -305,6 +520,7 @@ fn filter_vault(
     query: &str,
     scope: VaultScope,
     agent_filter: Option<VaultAgent>,
+    project_filter: Option<&str>,
     workspace_path: Option<&str>,
     project_paths: &[String],
 ) -> Vec<usize> {
@@ -332,6 +548,12 @@ fn filter_vault(
     hits.iter()
         .enumerate()
         .filter(|(_, hit)| agent_filter.is_none_or(|a| hit.agent == a))
+        .filter(|(_, hit)| {
+            project_filter.is_none_or(|proj| {
+                let (repo, wt) = cwd_repo_and_worktree(&hit.cwd);
+                repo == proj || wt == proj
+            })
+        })
         .filter(|(_, hit)| {
             if active_paths.is_empty() {
                 return true;
@@ -382,7 +604,7 @@ pub struct Palette {
     placeholder_mode: Mode,
     items: Vec<Item>,
     matches: Vec<usize>,
-    worktrees: Vec<WorktreeEntry>,
+    worktrees: Vec<WorktreeItem>,
     worktree_matches: Vec<usize>,
     actions: Vec<ActionEntry>,
     action_matches: Vec<usize>,
@@ -390,10 +612,15 @@ pub struct Palette {
     quick_matches: Vec<usize>,
     vault_hits: Vec<VaultHit>,
     vault_matches: Vec<usize>,
+    projects: Vec<String>,
     scope: VaultScope,
     agent_filter: Option<VaultAgent>,
+    project_filter: Option<String>,
     workspace_path: Option<String>,
     project_paths: Vec<String>,
+    expanded_chats: bool,
+    expanded_worktrees: bool,
+    filter_open: bool,
     selected: usize,
     query: String,
     input: Entity<InputState>,
@@ -414,6 +641,7 @@ impl std::fmt::Debug for Palette {
             .field("items", &self.items.len())
             .field("matches", &self.matches.len())
             .field("vault_hits", &self.vault_hits.len())
+            .field("worktrees", &self.worktrees.len())
             .field("selected", &self.selected)
             .finish_non_exhaustive()
     }
@@ -427,9 +655,7 @@ impl Palette {
             let value = input.read(cx).value();
             if *value != p.query {
                 p.query = value.to_string();
-                p.matches = search(&p.items, &p.query);
-                p.recompute_entry_matches();
-                p.recompute_vault_matches();
+                p.recompute_all_matches();
                 p.selected = 0;
                 p.scroll_to_top();
                 if let Some(history) = p.history.clone() {
@@ -444,7 +670,7 @@ impl Palette {
                 cx.notify();
             }
         });
-        Self {
+        let mut this = Self {
             language: crate::i18n::language(),
             mode: Mode::Jump,
             placeholder_mode: Mode::Jump,
@@ -458,10 +684,15 @@ impl Palette {
             items,
             vault_hits: Vec::new(),
             vault_matches: Vec::new(),
+            projects: Vec::new(),
             scope: VaultScope::All,
             agent_filter: None,
+            project_filter: None,
             workspace_path: None,
             project_paths: Vec::new(),
+            expanded_chats: false,
+            expanded_worktrees: false,
+            filter_open: false,
             selected: 0,
             query: String::new(),
             input,
@@ -472,7 +703,9 @@ impl Palette {
             history: None,
             history_sub: None,
             _observe: observe,
-        }
+        };
+        this.rebuild_projects();
+        this
     }
 
     pub fn connect_history(
@@ -483,7 +716,8 @@ impl Palette {
         let initial_hits = history.read(cx).loaded_hits();
         if !initial_hits.is_empty() {
             self.vault_hits = initial_hits;
-            self.recompute_vault_matches();
+            self.rebuild_projects();
+            self.recompute_all_matches();
         }
         let sub = cx.observe(history, |this, history, cx| {
             let (has_loaded, hits) =
@@ -523,9 +757,40 @@ impl Palette {
             .filter_map(|&i| self.vault_hits.get(i))
     }
 
+    /// 지금 필터에 일치하는 작업 공간 항목.
+    pub fn worktree_matches(&self) -> impl Iterator<Item = &WorktreeItem> {
+        self.worktree_matches
+            .iter()
+            .filter_map(|&i| self.worktrees.get(i))
+    }
+
     #[must_use]
     pub fn vault_hit(&self, index: usize) -> Option<&VaultHit> {
         self.vault_hits.get(index)
+    }
+
+    #[must_use]
+    pub fn worktree(&self, index: usize) -> Option<&WorktreeItem> {
+        self.worktrees.get(index)
+    }
+
+    #[must_use]
+    pub fn worktree_entry(&self, index: usize) -> Option<&WorktreeItem> {
+        self.worktrees.get(index)
+    }
+
+    /// 지금 필터에 일치하는 빠른 액션.
+    pub fn action_matches(&self) -> impl Iterator<Item = &ActionEntry> {
+        self.action_matches
+            .iter()
+            .filter_map(|&i| self.actions.get(i))
+    }
+
+    /// 지금 필터에 일치하는 빠른 명령.
+    pub fn quick_matches(&self) -> impl Iterator<Item = &crate::commands::QuickCommand> {
+        self.quick_matches
+            .iter()
+            .filter_map(|&i| self.quick_commands.get(i))
     }
 
     #[must_use]
@@ -545,14 +810,42 @@ impl Palette {
 
     pub fn set_vault_hits(&mut self, hits: Vec<VaultHit>, cx: &mut Context<Self>) {
         self.vault_hits = hits;
-        self.recompute_vault_matches();
+        self.rebuild_projects();
+        self.recompute_all_matches();
+        cx.notify();
+    }
+
+    pub fn set_worktrees<I, T>(&mut self, worktrees: I, cx: &mut Context<Self>)
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<WorktreeItem>,
+    {
+        self.worktrees = worktrees.into_iter().map(Into::into).collect();
+        self.rebuild_projects();
+        self.recompute_all_matches();
+        cx.notify();
+    }
+
+    pub fn set_actions(&mut self, actions: Vec<ActionEntry>, cx: &mut Context<Self>) {
+        self.actions = actions;
+        self.recompute_all_matches();
+        cx.notify();
+    }
+
+    pub fn set_quick_commands(
+        &mut self,
+        quick_commands: Vec<crate::commands::QuickCommand>,
+        cx: &mut Context<Self>,
+    ) {
+        self.quick_commands = quick_commands;
+        self.recompute_all_matches();
         cx.notify();
     }
 
     pub fn set_scope(&mut self, scope: VaultScope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
-            self.recompute_vault_matches();
+            self.recompute_all_matches();
             if let Some(history) = self.history.clone() {
                 history.update(cx, |h, cx| {
                     h.set_scope(scope, cx);
@@ -568,7 +861,7 @@ impl Palette {
     pub fn set_agent_filter(&mut self, agent: Option<VaultAgent>, cx: &mut Context<Self>) {
         if self.agent_filter != agent {
             self.agent_filter = agent;
-            self.recompute_vault_matches();
+            self.recompute_all_matches();
             if let Some(history) = self.history.clone() {
                 history.update(cx, |h, cx| {
                     h.set_agent_filter(agent, cx);
@@ -579,6 +872,22 @@ impl Palette {
             }
             cx.notify();
         }
+    }
+
+    pub fn set_project_filter(&mut self, project: Option<String>, cx: &mut Context<Self>) {
+        if self.project_filter != project {
+            self.project_filter = project;
+            self.recompute_all_matches();
+            cx.notify();
+        }
+    }
+
+    pub fn clear_all_filters(&mut self, cx: &mut Context<Self>) {
+        self.project_filter = None;
+        self.set_scope(VaultScope::All, cx);
+        self.set_agent_filter(None, cx);
+        self.recompute_all_matches();
+        cx.notify();
     }
 
     pub fn set_scope_paths(
@@ -594,7 +903,7 @@ impl Palette {
         }
         self.workspace_path = workspace;
         self.project_paths = project;
-        self.recompute_vault_matches();
+        self.recompute_all_matches();
         cx.notify();
     }
 
@@ -604,15 +913,46 @@ impl Palette {
         }
     }
 
-    fn recompute_vault_matches(&mut self) {
-        self.vault_matches = filter_vault(
-            &self.vault_hits,
-            &self.query,
-            self.scope,
-            self.agent_filter,
-            self.workspace_path.as_deref(),
-            &self.project_paths,
-        );
+    fn recompute_all_matches(&mut self) {
+        let proj = self.project_filter.as_deref();
+        let hits = search(&self.items, &self.query);
+        self.matches = if let Some(p) = proj {
+            hits.into_iter()
+                .filter(|&i| {
+                    self.items
+                        .get(i)
+                        .is_some_and(|item| item.repo_name == p || item.worktree_name == p)
+                })
+                .collect()
+        } else {
+            hits
+        };
+        if self.vault_hits.is_empty() {
+            self.vault_matches.clear();
+        } else {
+            self.vault_matches = filter_vault(
+                &self.vault_hits,
+                &self.query,
+                self.scope,
+                self.agent_filter,
+                proj,
+                self.workspace_path.as_deref(),
+                &self.project_paths,
+            );
+        }
+        if self.worktrees.is_empty() {
+            self.worktree_matches.clear();
+        } else {
+            self.worktree_matches = search_worktrees(&self.worktrees, &self.query, proj);
+        }
+        self.action_matches = action_search(&self.actions, &self.query);
+        let all: Vec<Vec<char>> = self
+            .quick_commands
+            .iter()
+            .map(|c| lower_chars(&format!("{} {}", c.name, c.text)))
+            .collect();
+        let refs: Vec<&[char]> = all.iter().map(Vec::as_slice).collect();
+        self.quick_matches = rank(&refs, &vec![false; all.len()], &self.query);
         self.clamp_selected();
     }
 
@@ -625,20 +965,6 @@ impl Palette {
         }
     }
 
-    /// 검색어가 바뀌면 워크트리·액션·빠른 명령 일치 목록도 다시 고른다.
-    fn recompute_entry_matches(&mut self) {
-        self.worktree_matches = worktree_search(&self.worktrees, &self.query);
-        self.action_matches = action_search(&self.actions, &self.query);
-        let all: Vec<Vec<char>> = self
-            .quick_commands
-            .iter()
-            .map(|c| lower_chars(&format!("{} {}", c.name, c.text)))
-            .collect();
-        let refs: Vec<&[char]> = all.iter().map(Vec::as_slice).collect();
-        self.quick_matches = rank(&refs, &vec![false; all.len()], &self.query);
-        self.clamp_selected();
-    }
-
     pub fn set_items(&mut self, items: Vec<Item>, cx: &mut Context<Self>) {
         // 절대 행 번호에서 세션 위치만 살린다(Commands 모드에서는 세션이 뒤에 있다).
         let selected = self
@@ -648,7 +974,8 @@ impl Palette {
             .and_then(|&i| self.items.get(i))
             .map(|item| item.id);
         self.items = items;
-        self.matches = search(&self.items, &self.query);
+        self.rebuild_projects();
+        self.recompute_all_matches();
         let selected_index = self
             .matches()
             .position(|item| Some(item.id) == selected)
@@ -688,61 +1015,13 @@ impl Palette {
         self.vault_scroll.scroll_to_item(0);
     }
 
-    pub fn set_worktrees(&mut self, worktrees: Vec<WorktreeEntry>, cx: &mut Context<Self>) {
-        self.worktrees = worktrees;
-        self.recompute_entry_matches();
-        cx.notify();
-    }
-
-    pub fn set_actions(&mut self, actions: Vec<ActionEntry>, cx: &mut Context<Self>) {
-        self.actions = actions;
-        self.recompute_entry_matches();
-        cx.notify();
-    }
-
-    pub fn set_quick_commands(
-        &mut self,
-        quick_commands: Vec<crate::commands::QuickCommand>,
-        cx: &mut Context<Self>,
-    ) {
-        self.quick_commands = quick_commands;
-        self.recompute_entry_matches();
-        cx.notify();
-    }
-
-    /// 지금 필터에 일치하는 워크트리 항목.
-    pub fn worktree_matches(&self) -> impl Iterator<Item = &WorktreeEntry> {
-        self.worktree_matches
-            .iter()
-            .filter_map(|&i| self.worktrees.get(i))
-    }
-
-    #[must_use]
-    pub fn worktree_entry(&self, index: usize) -> Option<&WorktreeEntry> {
-        self.worktrees.get(index)
-    }
-
-    /// 지금 필터에 일치하는 빠른 액션.
-    pub fn action_matches(&self) -> impl Iterator<Item = &ActionEntry> {
-        self.action_matches
-            .iter()
-            .filter_map(|&i| self.actions.get(i))
-    }
-
-    /// 지금 필터에 일치하는 빠른 명령.
-    pub fn quick_matches(&self) -> impl Iterator<Item = &crate::commands::QuickCommand> {
-        self.quick_matches
-            .iter()
-            .filter_map(|&i| self.quick_commands.get(i))
-    }
-
     fn section_len(&self, section: Section) -> usize {
         match section {
             Section::Sessions => self.matches.len(),
+            Section::Vault => self.vault_matches.len(),
             Section::Worktrees => self.worktree_matches.len(),
             Section::Actions => self.action_matches.len(),
             Section::QuickCommands => self.quick_matches.len(),
-            Section::Vault => self.vault_matches.len(),
         }
     }
 
@@ -818,12 +1097,16 @@ impl Palette {
                     cx.emit(Event::Confirm(item.id));
                 }
             }
+            Some((Section::Vault, pos)) => {
+                if let Some(&vault_idx) = self.vault_matches.get(pos) {
+                    cx.emit(Event::ResumeVault(vault_idx));
+                }
+            }
             Some((Section::Worktrees, pos)) => {
                 if let Some(&index) = self.worktree_matches.get(pos)
                     && let Some(entry) = self.worktrees.get(index)
                 {
-                    // 세션이 이미 있으면 세션 행과 똑같이 열기만 한다.
-                    if let Some(id) = entry.session {
+                    if let Some(id) = entry.session_id {
                         cx.emit(Event::Confirm(id));
                     } else {
                         cx.emit(Event::OpenWorktree(index));
@@ -845,11 +1128,6 @@ impl Palette {
                     cx.emit(Event::Action(ActionKind::QuickCommand(index)));
                 }
             }
-            Some((Section::Vault, pos)) => {
-                if let Some(&vault_idx) = self.vault_matches.get(pos) {
-                    cx.emit(Event::ResumeVault(vault_idx));
-                }
-            }
             None => {}
         }
     }
@@ -864,10 +1142,31 @@ impl Palette {
         self.confirm(cx);
         true
     }
+
+    fn rebuild_projects(&mut self) {
+        let mut names = Vec::new();
+        for wt in &self.worktrees {
+            if !wt.repo_name.is_empty() && !names.contains(&wt.repo_name) {
+                names.push(wt.repo_name.clone());
+            }
+        }
+        for item in &self.items {
+            if !item.repo_name.is_empty() && !names.contains(&item.repo_name) {
+                names.push(item.repo_name.clone());
+            }
+        }
+        for hit in &self.vault_hits {
+            let (repo, _) = cwd_repo_and_worktree(&hit.cwd);
+            if !repo.is_empty() && !names.contains(&repo) {
+                names.push(repo);
+            }
+        }
+        self.projects = names;
+    }
 }
 
 fn render_vault_highlight(text_str: &str, query: &str, p: &crate::ui::Palette) -> gpui::Div {
-    let mut row = div().flex().flex_wrap().items_center();
+    let mut row = div().flex().items_center().overflow_hidden();
     for (seg, is_hit) in crate::agent_history::highlight_spans(text_str, query) {
         if is_hit {
             row = row.child(
@@ -876,17 +1175,169 @@ fn render_vault_highlight(text_str: &str, query: &str, p: &crate::ui::Palette) -
                     .rounded(crate::ui::RADIUS_XS)
                     .bg(p.accent)
                     .text_color(p.accent_foreground)
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(FontWeight::SEMIBOLD)
                     .child(seg),
             );
         } else {
-            row = row.child(div().child(seg));
+            row = row.child(div().truncate().child(seg));
         }
     }
     row
 }
 
+fn render_host_badge(label: &str, pal: &crate::ui::Palette) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .py(px(1.))
+        .rounded(crate::ui::RADIUS_XS)
+        .border_1()
+        .border_color(pal.border)
+        .bg(pal.background)
+        .text_size(crate::ui::TEXT_2XS)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(pal.muted_foreground)
+        .child(label.to_owned())
+}
+
+fn render_context_badge(label: &str, pal: &crate::ui::Palette) -> gpui::Div {
+    div()
+        .flex_none()
+        .px_1p5()
+        .py(px(1.))
+        .rounded(crate::ui::RADIUS_XS)
+        .border_1()
+        .border_color(pal.border)
+        .bg(pal.background.opacity(0.5))
+        .text_size(crate::ui::TEXT_2XS)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(pal.muted_foreground)
+        .child(label.to_owned())
+}
+
+fn render_location_chip(
+    repo_name: &str,
+    worktree_name: &str,
+    pal: &crate::ui::Palette,
+) -> Option<gpui::Div> {
+    let show_repo = !repo_name.trim().is_empty();
+    let show_worktree = !worktree_name.trim().is_empty();
+    if !show_repo && !show_worktree {
+        return None;
+    }
+    let mark_color = repo_badge_color(if show_repo { repo_name } else { worktree_name });
+    Some(
+        div()
+            .flex_none()
+            .max_w(px(260.))
+            .px_2()
+            .py_1()
+            .rounded(crate::ui::RADIUS_SM)
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.muted)
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .overflow_hidden()
+            .text_size(crate::ui::TEXT_XS)
+            .when(show_repo, |d| {
+                d.child(
+                    div()
+                        .size(px(6.))
+                        .rounded(px(1.))
+                        .flex_none()
+                        .bg(mark_color),
+                )
+                .child(
+                    div()
+                        .truncate()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(pal.popover_foreground)
+                        .child(repo_name.to_owned()),
+                )
+            })
+            .when(show_repo && show_worktree, |d| {
+                d.child(
+                    div()
+                        .flex_none()
+                        .text_color(pal.muted_foreground.opacity(0.5))
+                        .child("·"),
+                )
+            })
+            .when(show_worktree, |d| {
+                d.child(
+                    div()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(pal.muted_foreground)
+                        .child(worktree_name.to_owned()),
+                )
+            }),
+    )
+}
+
+fn render_shortcut_combo(index: usize, pal: &crate::ui::Palette) -> gpui::Div {
+    let cap = |k: String| {
+        div()
+            .px_1()
+            .py(px(1.))
+            .rounded(crate::ui::RADIUS_XS)
+            .border_1()
+            .border_color(pal.border)
+            .bg(pal.background.opacity(0.45))
+            .font_family(crate::ui::FONT_MONO)
+            .text_size(crate::ui::TEXT_2XS)
+            .text_color(pal.muted_foreground)
+            .child(k)
+    };
+    div()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_0p5()
+        .child(cap("⌘".to_owned()))
+        .child(cap((index + 1).to_string()))
+}
+
+fn render_sliders_glyph(color: Hsla) -> gpui::Div {
+    div()
+        .flex_none()
+        .text_size(crate::ui::TEXT_XS)
+        .text_color(color)
+        .child("≚")
+}
+
+fn render_footer_key(label: &'static str, pal: &crate::ui::Palette) -> gpui::Div {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded_full()
+        .border_1()
+        .border_color(pal.border)
+        .bg(pal.muted.opacity(0.45))
+        .text_size(crate::ui::TEXT_2XS)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(pal.popover_foreground.opacity(0.85))
+        .child(label)
+}
+
+fn render_section_header(label: &str, pal: &crate::ui::Palette) -> gpui::Div {
+    div()
+        .px_3()
+        .pt_2()
+        .pb_1()
+        .text_size(crate::ui::TEXT_XS)
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(pal.muted_foreground.opacity(0.8))
+        .child(label.to_owned())
+}
+
 impl Render for Palette {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "Orca WorktreeJumpPalette 패리티 레이아웃(검색창·필터 칩·최근 채팅 및 터미널·최근 작업 공간·빠른 액션/명령·푸터)을 한 뷰에 조립한다"
+    )]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.language != crate::i18n::language() || self.placeholder_mode != self.mode {
             self.language = crate::i18n::language();
@@ -897,233 +1348,178 @@ impl Render for Palette {
             });
         }
         let pal = crate::ui::palette(cx);
-        let (bg, fg, border, accent, accent_fg, warning, muted) = (
+        let (bg, fg, border, accent, accent_fg, muted) = (
             pal.popover,
             pal.popover_foreground,
             pal.border,
             pal.accent,
             pal.accent_foreground,
-            pal.agent_question,
             pal.muted_foreground,
         );
-        let rows = self.matches.len();
-        // Commands 모드에서는 세션 섹션이 뒤에 오므로 하이라이트·클릭에 절대 행 번호를 쓴다.
-        let session_base = self.section_base(Section::Sessions);
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "VISIBLE_ROWS 이하라 정확히 표현된다"
-        )]
-        let height = rows.min(VISIBLE_ROWS) as f32 * ROW_HEIGHT;
-        let list = uniform_list(
-            "jump-list",
-            rows,
-            cx.processor(move |p, range: std::ops::Range<usize>, _, cx| {
-                range
-                    .filter_map(|i| {
-                        let item = p.items.get(*p.matches.get(i)?)?;
-                        Some(
-                            div()
-                                .id(i)
-                                .h(px(ROW_HEIGHT))
-                                .px_2()
-                                .rounded(crate::ui::RADIUS_XS)
-                                .flex()
-                                .items_center()
-                                .gap_1p5()
-                                .overflow_hidden()
-                                .cursor_pointer()
-                                .text_size(crate::ui::TEXT_SM)
-                                .text_color(fg)
-                                .when(session_base + i == p.selected, |d| {
-                                    d.bg(accent).text_color(accent_fg)
-                                })
-                                .child(
-                                    div()
-                                        .size(crate::ui::STATE_DOT)
-                                        .rounded_full()
-                                        .bg(warning)
-                                        .when(!item.needs_you, Styled::invisible),
-                                )
-                                .children((!item.agent.is_empty()).then(|| {
-                                    crate::ui::icons::agent_brand_icon(
-                                        &item.agent,
-                                        crate::ui::ICON_SM,
-                                        fg,
-                                    )
-                                }))
-                                .child(div().flex_1().truncate().child(item.label.clone()))
-                                .on_click(cx.listener(move |p, _, _, cx| {
-                                    p.selected = session_base + i;
-                                    p.confirm(cx);
-                                })),
-                        )
-                    })
-                    .collect()
-            }),
-        )
-        .track_scroll(&self.scroll)
-        .h(px(height));
+        let has_query = !self.query.trim().is_empty();
+        let now_secs = now_unix_secs();
 
-        // OWE-865: 세션 밖 워크트리·빠른 액션·빠른 명령 섹션. 세션 목록과 같은
-        // 28px 행에 선택 강조·클릭 실행을 맞추고, 길어지면 볼트처럼 안에서 스크롤한다.
-        let header = |label: &str| {
-            div()
-                .px_2()
-                .pt_1()
-                .text_size(crate::ui::TEXT_XS)
-                .text_color(muted)
-                .child(label.to_owned())
+        let projects = &self.projects;
+        let active_filter_count = usize::from(self.scope != VaultScope::All)
+            + usize::from(self.agent_filter.is_some())
+            + usize::from(self.project_filter.is_some());
+        let badge_count = if active_filter_count > 0 {
+            active_filter_count
+        } else {
+            projects.len()
         };
-        let worktree_base = self.section_base(Section::Worktrees);
-        let worktree_rows: Vec<gpui::Stateful<gpui::Div>> = self
-            .worktree_matches
-            .iter()
-            .enumerate()
-            .filter_map(|(pos, &index)| {
-                let entry = self.worktrees.get(index)?;
-                let row_index = worktree_base + pos;
-                let is_selected = self.selected == row_index;
-                let mut row = div()
-                    .id(("jump-worktree", index))
-                    .debug_selector(move || format!("jump-worktree-{index}"))
-                    .h(px(ROW_HEIGHT))
-                    .px_2()
-                    .rounded(crate::ui::RADIUS_XS)
+
+        // 1. 상단 검색 입력창 + 우측 필터 버튼 (Orca CommandInput 패리티)
+        let filter_btn = div()
+            .id("jump-filter-button")
+            .debug_selector(|| "jump-filter-button".into())
+            .flex_none()
+            .px_2()
+            .py_1()
+            .rounded(crate::ui::RADIUS_SM)
+            .border_1()
+            .border_color(border)
+            .bg(if active_filter_count > 0 || self.filter_open {
+                pal.secondary
+            } else {
+                pal.background.opacity(0.6)
+            })
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .cursor_pointer()
+            .text_size(crate::ui::TEXT_XS)
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(fg)
+            .hover(|d| d.bg(accent))
+            .child(format!("≚ {}", text::FILTER.get()))
+            .when(badge_count > 0, |d| {
+                d.child(
+                    div()
+                        .px_1p5()
+                        .rounded_full()
+                        .bg(pal.primary)
+                        .text_size(crate::ui::TEXT_2XS)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(pal.primary_foreground)
+                        .child(badge_count.to_string()),
+                )
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.filter_open = !this.filter_open;
+                cx.notify();
+            }));
+
+        let search_bar = div()
+            .mx_3()
+            .mt_3()
+            .h(px(38.))
+            .px_3()
+            .rounded(crate::ui::RADIUS_MD)
+            .border_1()
+            .border_color(border)
+            .bg(pal.muted.opacity(0.35))
+            .flex()
+            .items_center()
+            .gap_2()
+            .text_size(crate::ui::TEXT_SM)
+            .text_color(muted)
+            .child("⌕")
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&self.input).appearance(false)),
+            )
+            .child(filter_btn);
+
+        // 2. 검색창 바로 아래 필터 칩 바 (Orca PaletteFilterChips 패리티)
+        let show_vault_filters = !self.vault_hits.is_empty()
+            || self.scope != VaultScope::All
+            || self.agent_filter.is_some()
+            || self.filter_open;
+        let show_project_chips = !projects.is_empty() || self.project_filter.is_some();
+
+        let filter_section = (show_project_chips || show_vault_filters).then(|| {
+            let mut container = div()
+                .mx_3()
+                .mt_2()
+                .px_2()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(muted);
+
+            if show_project_chips {
+                let mut proj_strip = div()
                     .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .flex_wrap()
                     .items_center()
-                    .gap_1p5()
-                    .overflow_hidden()
-                    .cursor_pointer()
-                    .text_size(crate::ui::TEXT_SM)
-                    .text_color(fg)
-                    .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
-                    .child(div().flex_1().truncate().child(entry.label.clone()));
-                if entry.session.is_none() {
-                    row = row.child(
+                    .gap_1()
+                    .child(render_sliders_glyph(muted));
+                for (idx, proj) in projects.iter().take(8).enumerate() {
+                    if idx > 0 {
+                        proj_strip =
+                            proj_strip.child(div().text_color(muted.opacity(0.5)).child("·"));
+                    }
+                    let is_active = self.project_filter.as_deref() == Some(proj.as_str());
+                    let proj_name = proj.clone();
+                    proj_strip = proj_strip.child(
                         div()
-                            .flex_none()
-                            .text_size(crate::ui::TEXT_2XS)
-                            .text_color(muted)
-                            .child(text::WORKTREE_NEW.get()),
+                            .id(("jump-project-chip", idx))
+                            .debug_selector(move || format!("jump-project-chip-{idx}"))
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(crate::ui::RADIUS_XS)
+                            .cursor_pointer()
+                            .when(is_active, |d| d.bg(accent).text_color(fg))
+                            .hover(|d| d.text_color(fg))
+                            .child(proj.clone())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let next =
+                                    if this.project_filter.as_deref() == Some(proj_name.as_str()) {
+                                        None
+                                    } else {
+                                        Some(proj_name.clone())
+                                    };
+                                this.set_project_filter(next, cx);
+                            })),
                     );
                 }
-                Some(row.on_click(cx.listener(move |p, _, _, cx| {
-                    p.selected = row_index;
-                    p.confirm(cx);
-                })))
-            })
-            .collect();
-        let worktree_section = (!self.worktree_matches.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .child(header(text::SECTION_WORKTREES.get()))
-                .child(
+                container = container.child(
                     div()
-                        .id("jump-worktree-list")
-                        .flex()
-                        .flex_col()
-                        .max_h(px(ROW_HEIGHT * 6.))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.worktree_scroll)
-                        .children(worktree_rows),
-                )
-        });
-        let action_base = self.section_base(Section::Actions);
-        let action_rows: Vec<gpui::Stateful<gpui::Div>> = self
-            .action_matches
-            .iter()
-            .enumerate()
-            .filter_map(|(pos, &index)| {
-                let action = self.actions.get(index)?;
-                let row_index = action_base + pos;
-                let is_selected = self.selected == row_index;
-                Some(
-                    div()
-                        .id(("jump-action", index))
-                        .debug_selector(move || format!("jump-action-{index}"))
-                        .h(px(ROW_HEIGHT))
-                        .px_2()
-                        .rounded(crate::ui::RADIUS_XS)
                         .flex()
                         .items_center()
-                        .gap_1p5()
-                        .overflow_hidden()
-                        .cursor_pointer()
-                        .text_size(crate::ui::TEXT_SM)
-                        .text_color(fg)
-                        .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
-                        .child(div().flex_1().truncate().child(action.label.clone()))
-                        .on_click(cx.listener(move |p, _, _, cx| {
-                            p.selected = row_index;
-                            p.confirm(cx);
-                        })),
-                )
-            })
-            .collect();
-        let action_section = (!self.action_matches.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .child(header(text::SECTION_ACTIONS.get()))
-                .children(action_rows)
-        });
-        let quick_base = self.section_base(Section::QuickCommands);
-        let quick_rows: Vec<gpui::Stateful<gpui::Div>> = self
-            .quick_matches
-            .iter()
-            .enumerate()
-            .filter_map(|(pos, &index)| {
-                let command = self.quick_commands.get(index)?;
-                let row_index = quick_base + pos;
-                let is_selected = self.selected == row_index;
-                Some(
-                    div()
-                        .id(("jump-quick-command", index))
-                        .debug_selector(move || format!("jump-quick-command-{index}"))
-                        .h(px(ROW_HEIGHT))
-                        .px_2()
-                        .rounded(crate::ui::RADIUS_XS)
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .overflow_hidden()
-                        .cursor_pointer()
-                        .text_size(crate::ui::TEXT_SM)
-                        .text_color(fg)
-                        .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
-                        .child(div().flex_1().truncate().child(command.name.clone()))
-                        .on_click(cx.listener(move |p, _, _, cx| {
-                            p.selected = row_index;
-                            p.confirm(cx);
-                        })),
-                )
-            })
-            .collect();
-        let quick_section = (!self.quick_matches.is_empty()).then(|| {
-            div()
-                .flex()
-                .flex_col()
-                .child(header(text::SECTION_QUICK_COMMANDS.get()))
-                .child(
-                    div()
-                        .id("jump-quick-command-list")
-                        .flex()
-                        .flex_col()
-                        .max_h(px(ROW_HEIGHT * 6.))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.quick_scroll)
-                        .children(quick_rows),
-                )
-        });
+                        .justify_between()
+                        .gap_2()
+                        .child(proj_strip)
+                        .child(
+                            div()
+                                .id("jump-filter-clear")
+                                .debug_selector(|| "jump-filter-clear".into())
+                                .flex_none()
+                                .px_1p5()
+                                .py_0p5()
+                                .rounded(crate::ui::RADIUS_XS)
+                                .cursor_pointer()
+                                .hover(|d| d.bg(accent).text_color(fg))
+                                .child(text::CLEAR_ALL.get())
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.clear_all_filters(cx);
+                                })),
+                        ),
+                );
+            }
 
-        let show_vault = !self.vault_hits.is_empty()
-            || self.scope != VaultScope::All
-            || self.agent_filter.is_some();
-        let vault_section = show_vault.then(|| {
-            let scope_control = crate::ui::segmented_control(
-                pal,
-                [
+            if show_vault_filters {
+                let mut filter_bar = div().flex().flex_wrap().items_center().gap_1();
+                if !show_project_chips {
+                    filter_bar = filter_bar.child(render_sliders_glyph(muted));
+                }
+                for (id, scope, label) in [
                     (
                         "jump-scope-all",
                         VaultScope::All,
@@ -1139,20 +1535,29 @@ impl Render for Palette {
                         VaultScope::Workspace,
                         vault_text::SCOPE_WORKSPACE.get(),
                     ),
-                ]
-                .into_iter()
-                .map(|(id, scope, label)| {
+                ] {
                     let active = self.scope == scope;
-                    crate::ui::segment(id, label, active)
-                        .debug_selector(move || id.into())
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_scope(scope, cx);
-                        }))
-                }),
-            );
-            let agent_control = crate::ui::segmented_control(
-                pal,
-                [
+                    filter_bar = filter_bar.child(
+                        div()
+                            .id(id)
+                            .debug_selector(move || id.into())
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(crate::ui::RADIUS_XS)
+                            .cursor_pointer()
+                            .bg(if active { pal.accent } else { pal.secondary })
+                            .text_color(if active {
+                                pal.accent_foreground
+                            } else {
+                                pal.secondary_foreground
+                            })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_scope(scope, cx);
+                            })),
+                    );
+                }
+                for (id, agent, label) in [
                     ("jump-agent-all", None, vault_text::AGENT_ALL.get()),
                     ("jump-agent-claude", Some(VaultAgent::Claude), "Claude"),
                     ("jump-agent-codex", Some(VaultAgent::Codex), "Codex"),
@@ -1162,152 +1567,808 @@ impl Render for Palette {
                         Some(VaultAgent::OpenCode),
                         "OpenCode",
                     ),
-                ]
-                .into_iter()
-                .map(|(id, agent, label)| {
+                ] {
                     let active = self.agent_filter == agent;
-                    let btn =
-                        crate::ui::segment(id, label, active).debug_selector(move || id.into());
-                    let btn = match agent {
-                        Some(ag) => btn.icon(crate::ui::icons::agent_menu_icon(ag.profile())),
-                        None => btn,
-                    };
-                    btn.on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_agent_filter(agent, cx);
-                    }))
-                }),
-            );
-            let filter_bar = div()
-                .flex()
-                .flex_wrap()
-                .items_center()
-                .gap_1()
-                .pt_1()
-                .border_t_1()
-                .border_color(border)
-                .text_size(crate::ui::TEXT_XS)
-                .child(scope_control)
-                .child(agent_control);
+                    filter_bar = filter_bar.child(
+                        div()
+                            .id(id)
+                            .debug_selector(move || id.into())
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(crate::ui::RADIUS_XS)
+                            .cursor_pointer()
+                            .bg(if active { pal.accent } else { pal.secondary })
+                            .text_color(if active {
+                                pal.accent_foreground
+                            } else {
+                                pal.secondary_foreground
+                            })
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_agent_filter(agent, cx);
+                            })),
+                    );
+                }
+                if !show_project_chips && active_filter_count > 0 {
+                    filter_bar = filter_bar.child(
+                        div()
+                            .id("jump-filter-clear-vault")
+                            .ml_auto()
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded(crate::ui::RADIUS_XS)
+                            .cursor_pointer()
+                            .hover(|d| d.bg(accent).text_color(fg))
+                            .child(text::CLEAR_ALL.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.clear_all_filters(cx);
+                            })),
+                    );
+                }
+                container = container.child(filter_bar);
+            }
 
-            let mut rows_div = div()
-                .id("jump-vault-list")
+            container
+        });
+
+        let action_base = self.section_base(Section::Actions);
+        let action_rows: Vec<gpui::Stateful<gpui::Div>> = self
+            .action_matches
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &index)| {
+                let action = self.actions.get(index)?;
+                let row_index = action_base + pos;
+                let is_selected = self.selected == row_index;
+                Some(
+                    div()
+                        .id(("jump-action", index))
+                        .debug_selector(move || format!("jump-action-{index}"))
+                        .h(px(ROW_HEIGHT))
+                        .px_3()
+                        .rounded(crate::ui::RADIUS_XS)
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .text_size(crate::ui::TEXT_SM)
+                        .text_color(fg)
+                        .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
+                        .hover(|d| d.bg(accent.opacity(0.6)))
+                        .child(div().flex_1().truncate().child(action.label.clone()))
+                        .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selected = row_index;
+                            p.confirm(cx);
+                        })),
+                )
+            })
+            .collect();
+        let mut action_section = (!self.action_matches.is_empty()).then(|| {
+            div()
                 .flex()
                 .flex_col()
-                .gap_1()
-                .max_h(px(ROW_HEIGHT * 6.))
-                .overflow_y_scroll()
-                .track_scroll(&self.vault_scroll)
-                .text_size(crate::ui::TEXT_XS);
-            // 볼트 행의 절대 번호(워크트리·액션·빠른 명령이 앞에 올 수 있다).
-            let vault_base = self.section_base(Section::Vault);
-            for (vault_pos, &hit_idx) in self.vault_matches.iter().enumerate() {
-                if let Some(hit) = self.vault_hits.get(hit_idx) {
-                    let row_index = vault_base + vault_pos;
-                    let is_selected = self.selected == row_index;
-                    let title = if hit.title.is_empty() {
-                        format!("{} · {}", hit.agent.profile(), hit.id)
-                    } else {
-                        format!("{} · {}", hit.agent.profile(), hit.title)
-                    };
-                    let mut col = div().flex_1().flex().flex_col().overflow_hidden().child(
+                .child(render_section_header(text::SECTION_ACTIONS.get(), pal))
+                .children(action_rows)
+        });
+
+        let quick_base = self.section_base(Section::QuickCommands);
+        let quick_rows: Vec<gpui::Stateful<gpui::Div>> = self
+            .quick_matches
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, &index)| {
+                let command = self.quick_commands.get(index)?;
+                let row_index = quick_base + pos;
+                let is_selected = self.selected == row_index;
+                Some(
+                    div()
+                        .id(("jump-quick-command", index))
+                        .debug_selector(move || format!("jump-quick-command-{index}"))
+                        .h(px(ROW_HEIGHT))
+                        .px_3()
+                        .rounded(crate::ui::RADIUS_XS)
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .overflow_hidden()
+                        .cursor_pointer()
+                        .text_size(crate::ui::TEXT_SM)
+                        .text_color(fg)
+                        .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
+                        .hover(|d| d.bg(accent.opacity(0.6)))
+                        .child(div().flex_1().truncate().child(command.name.clone()))
+                        .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selected = row_index;
+                            p.confirm(cx);
+                        })),
+                )
+            })
+            .collect();
+        let mut quick_section = (!self.quick_matches.is_empty()).then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .child(render_section_header(
+                    text::SECTION_QUICK_COMMANDS.get(),
+                    pal,
+                ))
+                .child(
+                    div()
+                        .id("jump-quick-command-list")
+                        .flex()
+                        .flex_col()
+                        .max_h(px(ROW_HEIGHT * 6.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.quick_scroll)
+                        .children(quick_rows),
+                )
+        });
+
+        // 3. `최근 채팅 및 터미널` (열린 세션 + AI Vault 대화 기록 통합 섹션)
+        let session_base = self.section_base(Section::Sessions);
+        let sessions_len = self.matches.len();
+        let vault_len = self.vault_matches.len();
+        let chat_total = sessions_len + vault_len;
+        let rel_chat_sel = self
+            .selected
+            .saturating_sub(session_base)
+            .min(chat_total.saturating_sub(1));
+
+        let (chat_start, chat_end) =
+            if !has_query && !self.expanded_chats && rel_chat_sel < EMPTY_QUERY_RECENT_TAB_CAP {
+                (0, chat_total.min(EMPTY_QUERY_RECENT_TAB_CAP))
+            } else if chat_total <= VISIBLE_ROWS {
+                (0, chat_total)
+            } else {
+                let half = VISIBLE_ROWS / 2;
+                let start = rel_chat_sel
+                    .saturating_sub(half)
+                    .min(chat_total - VISIBLE_ROWS);
+                (start, start + VISIBLE_ROWS)
+            };
+        let chat_overflow = chat_total.saturating_sub(chat_end);
+
+        let mut list_body = div()
+            .id("jump-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .px_2p5()
+            .pt_1p5()
+            .pb_2()
+            .flex()
+            .flex_col()
+            .gap_0p5();
+
+        if self.row_count() == 0 {
+            list_body = list_body.child(
+                div()
+                    .id("jump-empty")
+                    .debug_selector(|| "jump-empty".into())
+                    .px_5()
+                    .py_8()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_1()
+                    .child(
                         div()
+                            .text_size(crate::ui::TEXT_LG)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(fg)
+                            .child(self.mode.empty_text()),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_SM)
+                            .text_color(muted)
+                            .child(text::EMPTY_SUBTITLE.get()),
+                    ),
+            );
+        }
+
+        if self.mode == Mode::Commands {
+            if let Some(sec) = action_section.take() {
+                list_body = list_body.child(sec);
+            }
+            if let Some(sec) = quick_section.take() {
+                list_body = list_body.child(sec);
+            }
+        }
+
+        if chat_total > 0 {
+            list_body = list_body.child(render_section_header(
+                if has_query {
+                    text::OPEN_TABS.get()
+                } else {
+                    text::RECENT_CHATS_TERMINALS.get()
+                },
+                pal,
+            ));
+
+            for pos in chat_start..chat_end {
+                let abs_row = session_base + pos;
+                if pos < sessions_len {
+                    let match_idx = pos;
+                    let Some(&item_idx) = self.matches.get(match_idx) else {
+                        continue;
+                    };
+                    let Some(item) = self.items.get(item_idx) else {
+                        continue;
+                    };
+                    let is_selected = self.selected == abs_row;
+                    let icon_slot = if item.is_file {
+                        div()
+                            .size(px(18.))
+                            .flex_none()
                             .flex()
                             .items_center()
-                            .gap_1p5()
-                            .child(crate::ui::icons::agent_brand_icon(
-                                hit.agent.profile(),
-                                crate::ui::ICON_SM,
-                                fg,
-                            ))
-                            .child(render_vault_highlight(&title, &self.query, pal)),
-                    );
-                    if !hit.snippet.is_empty() {
-                        col = col.child(div().text_color(muted).child(render_vault_highlight(
-                            &hit.snippet,
-                            &self.query,
-                            pal,
-                        )));
-                    }
-                    rows_div = rows_div.child(
+                            .justify_center()
+                            .child(
+                                Icon::new(IconName::File)
+                                    .with_size(px(14.))
+                                    .text_color(muted),
+                            )
+                    } else if let Some(pip_state) = item.state {
+                        let show_pip = item.unread
+                            || item.needs_you
+                            || !matches!(pip_state, AgentState::Exited | AgentState::Unknown);
                         div()
-                            .id(("jump-vault-row", hit_idx))
-                            .debug_selector(move || format!("jump-vault-row-{hit_idx}"))
-                            .px_2()
-                            .py_1()
-                            .rounded(crate::ui::RADIUS_XS)
+                            .relative()
+                            .size(px(18.))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::ui::status::agent_icon(
+                                &item.agent,
+                                crate::ui::ICON_SM,
+                                muted,
+                            ))
+                            .when(show_pip, |d| {
+                                d.child(
+                                    div()
+                                        .absolute()
+                                        .right(px(-3.))
+                                        .bottom(px(-2.))
+                                        .rounded_full()
+                                        .bg(bg)
+                                        .child(crate::ui::status::status_glyph(
+                                            pip_state,
+                                            item.unread,
+                                            crate::ui::status::Size::Sm,
+                                            cx,
+                                        )),
+                                )
+                            })
+                    } else {
+                        div()
+                            .size(crate::ui::STATE_DOT)
+                            .flex_none()
+                            .rounded_full()
+                            .bg(pal.agent_question)
+                            .when(!item.needs_you, Styled::invisible)
+                    };
+
+                    let title_el = div()
+                        .truncate()
+                        .text_size(crate::ui::TEXT_LG)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(item.title.clone());
+                    let primary_line = if item.age.is_empty()
+                        && !item.is_current_tab
+                        && !item.is_current_worktree
+                    {
+                        title_el.flex_1().min_w_0()
+                    } else {
+                        let mut line = div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
                             .items_center()
                             .gap_2()
+                            .overflow_hidden()
+                            .child(title_el);
+                        if !item.age.is_empty() {
+                            line = line.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(muted.opacity(0.75))
+                                    .child(item.age.clone()),
+                            );
+                        }
+                        if item.is_current_tab {
+                            line = line.child(render_context_badge(text::CURRENT_TAB.get(), pal));
+                        } else if item.is_current_worktree {
+                            line =
+                                line.child(render_context_badge(text::CURRENT_WORKTREE.get(), pal));
+                        }
+                        line
+                    };
+
+                    let mut row = div()
+                        .id(("jump-session-row", match_idx))
+                        .debug_selector(move || format!("jump-session-row-{match_idx}"))
+                        .px_3()
+                        .py_2()
+                        .rounded(crate::ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(if is_selected {
+                            border
+                        } else {
+                            border.opacity(0.)
+                        })
+                        .when(is_selected, |d| d.bg(accent))
+                        .hover(|d| d.bg(accent.opacity(0.6)))
+                        .flex()
+                        .items_center()
+                        .gap_2p5()
+                        .cursor_pointer()
+                        .child(icon_slot)
+                        .child(primary_line);
+
+                    if !item.host_label.is_empty() {
+                        row = row.child(render_host_badge(&item.host_label, pal));
+                    }
+                    if let Some(chip) =
+                        render_location_chip(&item.repo_name, &item.worktree_name, pal)
+                    {
+                        row = row.child(chip);
+                    }
+                    if !has_query && abs_row < EMPTY_QUERY_RECENT_TAB_CAP && !item.is_file {
+                        row = row.child(render_shortcut_combo(abs_row, pal));
+                    }
+
+                    list_body = list_body.child(row.on_click(cx.listener(move |p, _, _, cx| {
+                        p.selected = abs_row;
+                        p.confirm(cx);
+                    })));
+                } else {
+                    let vault_pos = pos - sessions_len;
+                    let Some(&hit_idx) = self.vault_matches.get(vault_pos) else {
+                        continue;
+                    };
+                    let Some(hit) = self.vault_hits.get(hit_idx) else {
+                        continue;
+                    };
+                    let is_selected = self.selected == abs_row;
+                    let title = if hit.title.is_empty() {
+                        hit.id.clone()
+                    } else {
+                        hit.title.clone()
+                    };
+                    let age = format_age_secs(hit.modified, now_secs);
+                    let (repo_name, worktree_name) = cwd_repo_and_worktree(&hit.cwd);
+
+                    let icon_slot = div()
+                        .size(px(18.))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(crate::ui::icons::agent_brand_icon(
+                            hit.agent.profile(),
+                            crate::ui::ICON_SM,
+                            muted,
+                        ));
+
+                    let mut title_line = div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .text_size(crate::ui::TEXT_LG)
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg)
+                        .child(render_vault_highlight(&title, &self.query, pal));
+                    if !age.is_empty() {
+                        title_line = title_line.child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::ui::TEXT_XS)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted.opacity(0.75))
+                                .child(age),
+                        );
+                    }
+
+                    let mut col = div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(title_line);
+                    if !hit.snippet.is_empty() && has_query {
+                        col = col.child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(muted)
+                                .child(render_vault_highlight(&hit.snippet, &self.query, pal)),
+                        );
+                    }
+
+                    let mut right_meta = div()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(render_host_badge(text::LOCAL_MAC.get(), pal));
+                    if let Some(chip) = render_location_chip(&repo_name, &worktree_name, pal) {
+                        right_meta = right_meta.child(chip);
+                    }
+                    right_meta = right_meta.child(
+                        div()
+                            .id(("jump-vault-resume", hit_idx))
+                            .debug_selector(move || format!("jump-vault-resume-{hit_idx}"))
+                            .px_2()
+                            .py_0p5()
+                            .rounded(crate::ui::RADIUS_XS)
+                            .border_1()
+                            .border_color(border)
+                            .bg(pal.secondary)
+                            .text_size(crate::ui::TEXT_2XS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(pal.secondary_foreground)
                             .cursor_pointer()
-                            .when(is_selected, |d| d.bg(accent).text_color(accent_fg))
+                            .child(vault_text::RESUME.get())
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected = row_index;
+                                this.selected = abs_row;
                                 this.resume_vault_at(hit_idx, cx);
-                            }))
-                            .child(col)
+                            })),
+                    );
+                    if !has_query && abs_row < EMPTY_QUERY_RECENT_TAB_CAP {
+                        right_meta = right_meta.child(render_shortcut_combo(abs_row, pal));
+                    }
+
+                    list_body = list_body.child(
+                        div()
+                            .id(("jump-vault-row", hit_idx))
+                            .debug_selector(move || format!("jump-vault-row-{hit_idx}"))
+                            .px_3()
+                            .py_2()
+                            .rounded(crate::ui::RADIUS_MD)
+                            .border_1()
+                            .border_color(if is_selected {
+                                border
+                            } else {
+                                border.opacity(0.)
+                            })
+                            .when(is_selected, |d| d.bg(accent))
+                            .hover(|d| d.bg(accent.opacity(0.6)))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .cursor_pointer()
                             .child(
-                                crate::ui::secondary(
-                                    ("jump-vault-resume", hit_idx),
-                                    vault_text::RESUME.get(),
-                                )
-                                .debug_selector(move || format!("jump-vault-resume-{hit_idx}"))
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.selected = row_index;
-                                        this.resume_vault_at(hit_idx, cx);
-                                    },
-                                )),
-                            ),
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2p5()
+                                    .overflow_hidden()
+                                    .child(icon_slot)
+                                    .child(col),
+                            )
+                            .child(right_meta)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.selected = abs_row;
+                                this.resume_vault_at(hit_idx, cx);
+                            })),
                     );
                 }
             }
-            div()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .child(filter_bar)
-                .child(rows_div)
-        });
 
-        // OWE-862: 콘텐츠 높이에 맞춘 상단 플로팅 모달. 전체 높이는 max-h로 묶고,
-        // 하단 힌트(↑↓ 이동·Enter 열기·Esc 닫기)를 고정한다.
-        let hint_item = |keys: &str, label: &str| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1()
-                .child(crate::ui::keycap(pal, keys))
-                .child(div().child(label.to_owned()))
-        };
-        let hint = div()
+            if chat_overflow > 0 {
+                let more_label = text::MORE_COUNT.format(&[("n", &chat_overflow.to_string())]);
+                list_body = list_body.child(
+                    div()
+                        .id("jump-chats-see-more")
+                        .debug_selector(|| "jump-chats-see-more".into())
+                        .px_3()
+                        .py_1p5()
+                        .rounded(crate::ui::RADIUS_MD)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_size(crate::ui::TEXT_SM)
+                        .text_color(muted)
+                        .hover(|d| d.bg(accent.opacity(0.5)))
+                        .child(more_label)
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(crate::ui::RADIUS_SM)
+                                .border_1()
+                                .border_color(pal.input)
+                                .bg(pal.background)
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child(text::SEE_MORE.get()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.expanded_chats = true;
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        // 4. `최근 작업 공간` 섹션 (Orca WorktreeJumpPaletteWorktreeRow 패리티)
+        let worktree_base = self.section_base(Section::Worktrees);
+        let wt_total = self.worktree_matches.len();
+        if wt_total > 0 {
+            list_body = list_body.child(render_section_header(
+                if has_query {
+                    text::WORKSPACES.get()
+                } else {
+                    text::RECENT_WORKSPACES.get()
+                },
+                pal,
+            ));
+
+            let wt_cap = if !has_query && !self.expanded_worktrees {
+                EMPTY_QUERY_WORKTREE_CAP
+            } else {
+                VISIBLE_ROWS
+            };
+            let wt_end = wt_total.min(wt_cap);
+            let wt_overflow = wt_total.saturating_sub(wt_end);
+
+            for (wt_pos, &wt_idx) in self.worktree_matches.iter().enumerate().take(wt_end) {
+                let Some(wt) = self.worktrees.get(wt_idx) else {
+                    continue;
+                };
+                let row_index = worktree_base + wt_pos;
+                let is_selected = self.selected == row_index;
+
+                let status_slot = div()
+                    .size(px(18.))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        if wt.unread
+                            || matches!(
+                                wt.state,
+                                Some(
+                                    AgentState::Working | AgentState::Waiting | AgentState::Blocked
+                                )
+                            )
+                        {
+                            crate::ui::status::status_glyph(
+                                wt.state.unwrap_or(AgentState::Unknown),
+                                wt.unread,
+                                crate::ui::status::Size::Sm,
+                                cx,
+                            )
+                            .into_any_element()
+                        } else if wt.state.is_some() {
+                            div()
+                                .size(crate::ui::STATE_DOT)
+                                .rounded_full()
+                                .bg(pal.success)
+                                .into_any_element()
+                        } else {
+                            div().size(crate::ui::STATE_DOT).into_any_element()
+                        },
+                    );
+
+                let mut left_line = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(crate::ui::TEXT_LG)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(wt.name.clone()),
+                    );
+                if !wt.age.is_empty() {
+                    left_line = left_line.child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::ui::TEXT_XS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted.opacity(0.75))
+                            .child(wt.age.clone()),
+                    );
+                }
+                if wt.is_current {
+                    left_line =
+                        left_line.child(render_context_badge(text::CURRENT_BADGE.get(), pal));
+                }
+                if wt.is_main {
+                    left_line = left_line.child(
+                        div()
+                            .flex_none()
+                            .px_1p5()
+                            .py(px(1.))
+                            .rounded(crate::ui::RADIUS_XS)
+                            .border_1()
+                            .border_color(muted.opacity(0.3))
+                            .bg(pal.muted.opacity(0.3))
+                            .text_size(crate::ui::TEXT_2XS)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(muted)
+                            .child(text::PRIMARY_BADGE.get()),
+                    );
+                }
+                if !wt.branch.is_empty() {
+                    left_line = left_line
+                        .child(div().flex_none().text_color(muted.opacity(0.45)).child("·"))
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(muted)
+                                .child(wt.branch.clone()),
+                        );
+                }
+
+                let mut right_meta = div().flex_none().flex().items_center().gap_1p5();
+                if !wt.host_label.is_empty() {
+                    right_meta = right_meta.child(render_host_badge(&wt.host_label, pal));
+                }
+                if let Some(chip) = render_location_chip(&wt.repo_name, "", pal) {
+                    right_meta = right_meta.child(chip);
+                }
+                if wt.session_id.is_none() {
+                    right_meta = right_meta.child(
+                        div()
+                            .flex_none()
+                            .text_size(crate::ui::TEXT_2XS)
+                            .text_color(muted)
+                            .child(text::WORKTREE_NEW.get()),
+                    );
+                }
+
+                list_body = list_body.child(
+                    div()
+                        .id(("jump-worktree-row", wt_idx))
+                        .debug_selector(move || format!("jump-worktree-row-{wt_idx}"))
+                        .px_3()
+                        .py_2()
+                        .rounded(crate::ui::RADIUS_MD)
+                        .border_1()
+                        .border_color(if is_selected {
+                            border
+                        } else {
+                            border.opacity(0.)
+                        })
+                        .when(is_selected, |d| d.bg(accent))
+                        .hover(|d| d.bg(accent.opacity(0.6)))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .cursor_pointer()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .items_center()
+                                .gap_2p5()
+                                .overflow_hidden()
+                                .child(status_slot)
+                                .child(left_line),
+                        )
+                        .child(right_meta)
+                        .on_click(cx.listener(move |p, _, _, cx| {
+                            p.selected = row_index;
+                            p.confirm(cx);
+                        })),
+                );
+            }
+
+            if wt_overflow > 0 {
+                let more_label = text::MORE_COUNT.format(&[("n", &wt_overflow.to_string())]);
+                list_body = list_body.child(
+                    div()
+                        .id("jump-worktrees-see-more")
+                        .debug_selector(|| "jump-worktrees-see-more".into())
+                        .px_3()
+                        .py_1p5()
+                        .rounded(crate::ui::RADIUS_MD)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .cursor_pointer()
+                        .text_size(crate::ui::TEXT_SM)
+                        .text_color(muted)
+                        .hover(|d| d.bg(accent.opacity(0.5)))
+                        .child(more_label)
+                        .child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(crate::ui::RADIUS_SM)
+                                .border_1()
+                                .border_color(pal.input)
+                                .bg(pal.background)
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(fg)
+                                .child(text::SEE_MORE.get()),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.expanded_worktrees = true;
+                            cx.notify();
+                        })),
+                );
+            }
+        }
+
+        if self.mode != Mode::Commands {
+            if let Some(sec) = action_section {
+                list_body = list_body.child(sec);
+            }
+            if let Some(sec) = quick_section {
+                list_body = list_body.child(sec);
+            }
+        }
+
+        // 5. 하단 단축키 안내 푸터 (Orca FooterKey 패리티: Enter 열기 / Esc 닫기 / ↑↓ 이동 / Tab 필터)
+        let footer = div()
             .id("jump-hint")
             .debug_selector(|| "jump-hint".into())
-            .flex()
-            .items_center()
-            .gap_3()
-            .pt_1p5()
+            .px_3p5()
+            .py_2()
             .border_t_1()
             .border_color(border)
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap_2()
             .text_size(crate::ui::TEXT_XS)
             .text_color(muted)
-            .child(hint_item("↑↓", text::HINT_MOVE.get()))
-            .child(hint_item("Enter", text::HINT_OPEN.get()))
-            .child(hint_item("Esc", text::HINT_CLOSE.get()));
-        // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc 처리를 대신한다.
-        let mut palette = div()
+            .child(render_footer_key("Enter", pal))
+            .child(text::FOOTER_OPEN.get())
+            .child(render_footer_key("Esc", pal))
+            .child(text::FOOTER_CLOSE.get())
+            .child(render_footer_key("↑↓", pal))
+            .child(text::FOOTER_MOVE.get())
+            .child(render_footer_key("Tab", pal))
+            .child(text::FOOTER_FILTER.get());
+
+        let viewport = window.viewport_size();
+        let max_w = (viewport.width - crate::ui::SPACE_4 * 2.).max(px(320.));
+        let max_h = (viewport.height - px(96.)).max(px(320.));
+        let entity = cx.entity();
+
+        // 키는 입력칸보다 먼저(capture) 잡아 단일 행 입력의 위·아래·Enter·Esc·Tab 처리를 대신한다.
+        let palette = div()
+            .id("jump-palette")
+            .debug_selector(|| "jump-palette".into())
             .w(crate::ui::COMMAND_PALETTE_WIDTH)
-            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
-            .p_2()
+            .max_w(max_w)
+            .max_h(max_h)
             .flex()
             .flex_col()
-            .gap_1p5()
+            .overflow_hidden()
             .bg(bg)
             .text_color(fg)
             .border_1()
             .border_color(border)
-            .rounded(crate::ui::RADIUS_LG)
+            .rounded(crate::ui::RADIUS_XL)
             .shadow_lg()
-            .max_h(px(480.))
             .capture_action(cx.listener(|p, _: &MoveUp, _, cx| {
                 cx.stop_propagation();
                 p.step(-1, cx);
@@ -1324,49 +2385,46 @@ impl Render for Palette {
                 cx.stop_propagation();
                 cx.emit(Event::Dismiss);
             }))
+            .on_key_down(move |e: &KeyDownEvent, _, cx| {
+                if e.keystroke.key == "tab" && !e.keystroke.modifiers.modified() {
+                    cx.stop_propagation();
+                    entity.update(cx, |p, cx| {
+                        p.filter_open = !p.filter_open;
+                        cx.notify();
+                    });
+                } else if e.keystroke.modifiers.platform
+                    && !e.keystroke.modifiers.alt
+                    && !e.keystroke.modifiers.control
+                    && !e.keystroke.modifiers.shift
+                    && let Ok(digit) = e.keystroke.key.parse::<usize>()
+                    && (1..=9).contains(&digit)
+                {
+                    let idx = digit - 1;
+                    entity.update(cx, |p, cx| {
+                        if p.jump_to_row(idx, cx) {
+                            cx.stop_propagation();
+                        }
+                    });
+                }
+            })
             .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Dismiss)))
-            .child(Input::new(&self.input));
-        if self.row_count() == 0 {
-            palette = palette.child(
-                div()
-                    .id("jump-empty")
-                    .debug_selector(|| "jump-empty".into())
-                    .p_2()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(muted)
-                    .child(self.mode.empty_text()),
-            );
-        }
-        // OWE-865: ⇧⌘P 명령 팔레트에서는 액션부터, ⌘J·⌘P에서는 세션부터 보여준다.
-        match self.mode {
-            Mode::Commands => {
-                palette = palette
-                    .children(action_section)
-                    .children(quick_section)
-                    .child(list)
-                    .children(worktree_section)
-                    .children(vault_section);
-            }
-            Mode::Jump | Mode::Files => {
-                palette = palette
-                    .child(list)
-                    .children(worktree_section)
-                    .children(action_section)
-                    .children(quick_section)
-                    .children(vault_section);
-            }
-        }
-        palette = palette.child(hint);
+            .child(search_bar)
+            .children(filter_section)
+            .child(list_body)
+            .child(footer);
+
         deferred(
             div()
+                .id("jump-backdrop")
                 .absolute()
                 .top_0()
                 .left_0()
                 .size_full()
-                .flex()
-                .justify_center()
-                .pt(px(80.))
                 .bg(crate::ui::MODAL_BACKDROP)
+                .flex()
+                .items_start()
+                .justify_center()
+                .pt(px(64.))
                 .child(palette),
         )
     }

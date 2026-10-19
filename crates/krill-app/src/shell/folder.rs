@@ -120,6 +120,7 @@ impl Shell {
     }
 
     pub(super) fn open_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dashboard(None, cx);
         let dialog = cx.new(|cx| add_project::Dialog::new(window, cx));
         let events = cx.subscribe_in(
             &dialog,
