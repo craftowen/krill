@@ -784,6 +784,7 @@ catalog! {
         DISCARD_LINE => ("줄 버리기", "Discard Line"),
         VIEW_UNIFIED => ("Unified", "Unified"),
         VIEW_SPLIT => ("Split", "Split"),
+        VIEWED => ("확인됨", "Viewed"),
     }
     editor {
         QUICK_OPEN => (platform_text!("파일 열기 (⌘P)", "파일 열기 (Ctrl+Shift+P)"), platform_text!("Open file (⌘P)", "Open file (Ctrl+Shift+P)")),
@@ -1398,6 +1399,7 @@ catalog! {
         QUEUED => ("주석을 세션 입력으로 보냈습니다", "Comments sent to session input"),
         FAILED => ("입력을 전달하지 못했습니다. 연결 상태를 확인하세요", "Could not deliver input. Check the connection."),
         PROMPT => ("다음 diff 검토 주석을 반영해 주세요. 경로와 줄 번호는 주석 작성 당시 비교 기준입니다.", "Please address these diff review comments. Paths and line numbers refer to the comparison when the comments were written."),
+        CLEAR_ALL => ("전체 삭제", "Clear all"),
     }
     updater_relaunch {
         ROLLBACK_DONE_TITLE => ("업데이트 실패로 이전 버전으로 롤백했습니다", "Update failed; restored the previous version"),
