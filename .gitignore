@@ -5,3 +5,5 @@ target/
 .wrangler/
 node_modules/
 cloud/
+docs/reports/
+docs/boost-*.md

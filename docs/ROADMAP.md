@@ -216,4 +216,4 @@
 | MK-221 | 원격·부가: krill-link·모바일 게이트웨이·krill-hosts SSH 포워딩 Windows화 | M11 | P3 | tokio Unix 대체, Windows OpenSSH 로컬 Unix 소켓 `-L` 지원 확인(안 되면 루프백 TCP + 토큰) | MK-205 | boost Phase 5 | OWE-840 |
 | MK-222 | (보류) WSL2 백엔드 | M11 | P3 | 보류 — 네이티브 스파이크 실패 시 재검토 | — | boost 전략 B | OWE-841 |
 
-M11의 `WCHK(X)`는 [docs/boost-2026-10-18-windows-port.md](boost-2026-10-18-windows-port.md) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
+M11의 `WCHK(X)`는 Windows 포팅 boost 보고서(비공개) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
