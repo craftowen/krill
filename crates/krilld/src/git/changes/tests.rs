@@ -2,6 +2,7 @@ use super::*;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::process::Command;
+use std::thread;
 
 pub(crate) struct Dir(pub PathBuf);
 impl Dir {

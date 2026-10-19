@@ -10,13 +10,12 @@ use std::process::{Child, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use krill_proto::control::Reply;
 use krill_proto::git::{ChangedFile, Changes, MAX_FILES, MAX_PATH_BYTES, Numstat};
 
-use crate::child::nonblocking;
+use crate::child::{AsFd, nonblocking};
 
 use super::GitQueue;
 
@@ -297,9 +296,11 @@ fn stream(
     let mut errors = Vec::new();
     let mut buf = [0u8; 8192];
     let mut eof = false;
+    let mut stderr_eof = false;
     loop {
         interrupted(cancel, deadline)?;
         match stderr.read(&mut buf) {
+            Ok(0) => stderr_eof = true,
             Ok(n) => errors.extend(
                 buf.iter()
                     .take(n)
@@ -362,7 +363,14 @@ fn stream(
             }
             return Ok(());
         }
-        thread::sleep(Duration::from_millis(10));
+        // 10ms 상한은 취소·제한시간 확인 주기다(이전 sleep 폴링과 같다).
+        crate::child::wait_readable(
+            &[
+                (!eof).then_some(&stdout as &dyn AsFd),
+                (!stderr_eof).then_some(&stderr as &dyn AsFd),
+            ],
+            Duration::from_millis(10),
+        );
     }
 }
 
