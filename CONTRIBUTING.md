@@ -5,14 +5,15 @@ Krill은 순수 Rust macOS 앱이다. 처음이라면 [README.md](README.md), [�
 ## 작업 흐름
 
 1. GitHub 이슈를 먼저 확인하고, 없으면 만든다. 한 이슈 = 하나의 완료 조건, 범위를 넓히지 않는다.
-2. 브랜치는 `main`에서 따고, 커밋 첫 줄은 `<이슈번호>: <무엇을>` (예: `123: 세션 목록 페이징`). 한 커밋 = 한 논리 변경.
+2. 브랜치는 `main`에서 딴다. 커밋 첫 줄은 이슈가 있으면 `<이슈 ID>: <무엇을>` (예: `OWE-873: ⌘K 스크롤백 지우기 시 기준선 갱신`), 없으면 `<영역>: <무엇을>` (예: `krilld: …`, `scripts: …`). 한 커밋 = 한 논리 변경.
 3. Push 전 필수 (`scripts/check.sh`가 0으로 끝나야 병합된다):
    ```sh
    cargo fmt --all
-   perl -e 'alarm shift; exec @ARGV' 300 scripts/check.sh
+   scripts/check.sh
    ```
-   검사는 fmt · clippy(`-D warnings`) · nextest · doctest · `cargo deny --locked`다. 무거운 cargo는 `perl -e 'alarm shift; exec @ARGV' 300`으로 감싼다.
-4. PR은 템플릿을 채운다. 작은 PR을 선호한다.
+   검사는 fmt · clippy(`-D warnings`) · nextest · doctest · `cargo deny --locked` · `THIRD_PARTY_NOTICES.md` 최신 여부 · 공개 표면(`scripts/public-surface.sh`)이다. 타임아웃 래퍼(`perl -e 'alarm shift; exec @ARGV' <초> scripts/check.sh`)는 선택이다 — 시간 초과·Ctrl-C로 끝나도 check.sh가 자기가 띄운 cargo를 정리한다.
+4. Push 정책: `main` 브랜치와 `v*` 태그에는 직접 push하지 않는다(메인테이너가 사유를 남기고 직접 하는 경우만). 클론마다 `scripts/install-hooks.sh`로 pre-push 훅을 켜면 이를 막고 공개 표면도 점검한다. 외부 기여는 fork 브랜치에서 PR로 보낸다.
+5. PR은 템플릿을 채운다. 작은 PR을 선호한다.
 
 ## 코드 규칙 요약 (상세는 CONVENTIONS.md)
 
