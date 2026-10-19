@@ -27,7 +27,7 @@
 | 크레이트 | 역할 | 메모리 목표 |
 |---|---|---|
 | `krill-proto` | 와이어 포맷(프레임·메시지·키프레임 포맷). 엔진 무관 | — |
-| `krill-holder` | spawn·waitpid·fd 보관·SCM_RIGHTS·exec 핸드오프. macOS 빌드 1,250줄 이하 + Linux 전용 `sys/linux.rs` 300줄 이하(결정 12-2, 2026-10-18 개정: Linux 원격 호스트용 epoll·pidfd 구현 추가. 개정 시점 실측 1,218줄·292줄) | 수 MB(추정) |
+| `krill-holder` | spawn·waitpid·fd 보관·SCM_RIGHTS·exec 핸드오프. macOS 빌드 1,300줄 이하 + Linux 전용 `sys/linux.rs` 300줄 이하 + Windows 빌드 2,000줄 이하(2026-10-19 개정: macOS 1,250→1,300. 결정 12-2, 2026-10-18 개정: Linux 원격 호스트용 epoll·pidfd 구현 추가. 개정 시점 실측 1,218줄·292줄) | 수 MB(추정) |
 | `krilld` | 에뮬레이터·IPC·디스크·상태·hook·git 큐·전원 | ≤ 60MB @10세션 |
 | `krill-term` | 프레임워크 중립 터미널 그리드 렌더 모델 + IME 상태기계 | — |
 | `krill-app` | gpui UI(사이드바·탭·분할·터미널 위젯·diff) | ≤ 120MB |

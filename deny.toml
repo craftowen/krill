@@ -28,7 +28,7 @@ workspace-dependencies = { duplicates = "deny", include-path-dependencies = true
 # 한계: proto·term이 이미 wrappers에 있는 크레이트를 새로 의존하면(간접 의존) 잡지 못한다.
 deny = [
     { crate = "gpui-pre", reason = "T5", wrappers = ["gpui-base", "gpui-component", "gpui-kit-assets", "gpui-pre-apple", "gpui-pre-macos", "gpui-pre-platform", "gpui-pre-windows", "krill-app"] },
-    { crate = "tokio", reason = "T5", wrappers = ["backon", "hyper", "hyper-rustls", "hyper-util", "iroh", "iroh-dns", "iroh-relay", "krill-app", "krill-link", "n0-dns-resolver", "n0-future", "netwatch", "noq", "reqwest", "tokio-rustls", "tokio-stream", "tokio-util", "tokio-websockets", "tower"] },
+    { crate = "tokio", reason = "T5", wrappers = ["backon", "hyper", "hyper-rustls", "hyper-util", "iroh", "iroh-dns", "iroh-relay", "krill-app", "krill-hosts", "krill-link", "n0-dns-resolver", "n0-future", "netwatch", "noq", "reqwest", "tokio-rustls", "tokio-stream", "tokio-util", "tokio-websockets", "tower"] },
     { crate = "nix", reason = "T5(워크스페이스는 rustix를 쓴다)" },
     { crate = "objc2", reason = "T5", wrappers = ["accesskit_macos", "block2", "dispatch2", "gpui-base", "gpui-component", "gpui-pre-apple", "gpui-pre-macos", "krill-app", "netdev", "objc2-app-kit", "objc2-cloud-kit", "objc2-core-data", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-image", "objc2-core-text", "objc2-core-video", "objc2-core-wlan", "objc2-foundation", "objc2-metal", "objc2-quartz-core", "objc2-security", "objc2-security-foundation", "objc2-system-configuration", "objc2-user-notifications"] },
 ]

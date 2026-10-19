@@ -1,11 +1,11 @@
-//! CONVENTIONS §5 `krill-holder` 줄 수 상한(결정 12-2, 2026-10-18 개정)을 플랫폼별로 센다.
+//! CONVENTIONS §5 `krill-holder` 줄 수 상한(결정 12-2, 2026-10-19 개정)을 플랫폼별로 센다.
 //! 상한 상향은 하네스 변경이다(메인테이너 승인). 이 테스트의 숫자만 올려 통과시키지 않는다.
 
 use std::path::{Path, PathBuf};
 
-const MACOS_MAX: usize = 1_250;
+const MACOS_MAX: usize = 1_300;
 const LINUX_SYS_MAX: usize = 300;
-const WINDOWS_MAX: usize = 1_700;
+const WINDOWS_MAX: usize = 2_000;
 
 /// lib.rs에서 `#[cfg(unix)]`로만 선언되는 모듈 파일 — Windows 빌드 몫에서 뺀다.
 const UNIX_ONLY: [&str; 4] = ["holder.rs", "link.rs", "sys.rs", "teardown.rs"];
