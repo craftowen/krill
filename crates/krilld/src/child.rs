@@ -2,11 +2,11 @@
 
 use std::io;
 #[cfg(unix)]
-use std::os::fd::AsFd;
+pub(crate) use std::os::fd::AsFd;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
 #[cfg(windows)]
-use std::os::windows::io::AsHandle as AsFd;
+pub(crate) use std::os::windows::io::AsHandle as AsFd;
 use std::process::{Child, Command};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +30,35 @@ pub(crate) fn nonblocking(pipe: &impl AsFd) -> io::Result<()> {
 #[cfg(windows)]
 pub(crate) fn nonblocking(_pipe: &impl AsFd) -> io::Result<()> {
     Err(io::ErrorKind::Unsupported.into())
+}
+
+/// 열린 파이프 중 하나가 읽을 거리·EOF를 가질 때까지 최대 `timeout` 기다린다(sleep 폴링 대신 poll(2)).
+/// 열린 파이프가 없으면(둘 다 EOF, 자식 종료 대기) 1ms만 쉬어 바쁜 루프를 막는다. poll 오류·EINTR은 바로
+/// 돌아가 호출자가 다시 읽고 판단한다.
+#[cfg(unix)]
+pub(crate) fn wait_readable(pipes: &[Option<&dyn AsFd>], timeout: Duration) {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let mut fds: Vec<PollFd<'_>> = pipes
+        .iter()
+        .flatten()
+        .map(|pipe| PollFd::from_borrowed_fd(pipe.as_fd(), PollFlags::IN))
+        .collect();
+    if fds.is_empty() {
+        thread::sleep(Duration::from_millis(1));
+        return;
+    }
+    // 변환 실패를 무한 대기(None)로 넘기면 취소 확인이 멈춘다.
+    let Ok(limit) = Timespec::try_from(timeout) else {
+        thread::sleep(timeout);
+        return;
+    };
+    poll(&mut fds, Some(&limit)).ok();
+}
+
+/// Windows 익명 파이프는 poll할 수 없다(Phase 3 리더 스레드 전까지 기존 sleep 폴링).
+#[cfg(windows)]
+pub(crate) fn wait_readable(_pipes: &[Option<&dyn AsFd>], timeout: Duration) {
+    thread::sleep(timeout);
 }
 
 pub(crate) fn kill_and_reap(child: &mut Child) {
