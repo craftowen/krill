@@ -1712,11 +1712,18 @@ fn resolve_codex_profile_dir(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(|s| expand_tilde(home, s));
+    let short_orca_home = home
+        .join(".orca")
+        .join("codex-homes")
+        .join(krill_proto::usage::profiles::codex_short_key(raw_id));
     let codex_accounts_home = orca_dir.join("codex-accounts").join(raw_id).join("home");
     if let Some(ref exp) = explicit
         && exp.is_dir()
     {
         return exp.clone();
+    }
+    if short_orca_home.is_dir() {
+        return short_orca_home;
     }
     if codex_accounts_home.is_dir() {
         return codex_accounts_home;
