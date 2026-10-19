@@ -137,9 +137,11 @@ globalThis.MkTerminalCodec=(()=>{
    const {socket,credentials}=result||{};if(this.disposed||generation!==this.generation){socket?.close();return;}if(!socket||!credentials){this.error(Error('Invalid terminal connection factory'));return;}
    this.socket=socket;this.connectionTimer=setTimeout(()=>{if(generation===this.generation)this.disconnect('disconnected','Terminal connection timed out');},15000);socket.binaryType='arraybuffer';let phase=0,channel;
    this.listen(socket,'message',e=>{if(generation!==this.generation||this.disposed)return;try{
-    if(phase===0){const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');channel=new C.Channel(C.sha256(C.unhex(credentials.credential)),C.concat(C.unhex(challenge.challenge),nonce));this.channel=channel;socket.send(JSON.stringify({device_id:credentials.device_id,token:null,client_nonce:C.hex(nonce)}));socket.send(channel.seal(C.enc.encode('{"label":"Live terminal"}')));phase=1;return;}
+    if(phase===0){const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');channel=new C.Channel(C.sha256(C.unhex(credentials.credential)),C.concat(C.unhex(challenge.challenge),nonce));this.channel=channel;socket.send(JSON.stringify({device_id:credentials.device_id,token:null,client_nonce:C.hex(nonce)}));socket.send(channel.seal(C.enc.encode('{"label":"Live terminal"}')));
+     // 게이트웨이는 proof만 읽고 나머지를 IPC로 넘긴다(협상은 교집합). ServerHello를 기다리지 않고 Hello·role·attach를 함께 보낸다.
+     this.send(2,C.concat(T.v(1),T.v(1),T.v((1n<<56n)|1n|4n|4096n),T.v(0),T.text('minikrill-mobile-grid')));this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));phase=1;return;}
     const bytes=channel.open(e.data);if(phase===1){JSON.parse(new TextDecoder().decode(bytes));phase=2;return;}
-    if(phase===2){const r=T.reader(bytes.slice(5));r.u();r.u();const offered=r.u(),features=offered&((1n<<56n)|1n|4n|4096n);this.send(2,C.concat(T.v(1),T.v(1),T.v(features),T.v(0),T.text('minikrill-mobile-grid')));this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));phase=3;return;}
+    if(phase===2){if(bytes[4]!==1)throw Error('Unexpected terminal handshake');phase=3;return;}
     if(bytes.length<5||new DataView(bytes.buffer,bytes.byteOffset).getUint32(0,true)!==bytes.length-4)throw Error('Invalid screen frame');const body=bytes.slice(5),r=T.reader(body);
     switch(bytes[4]){
      case 0x20:this.attached={seq:r.u(),revision:r.u()};break;
