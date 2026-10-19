@@ -225,7 +225,8 @@ fn init(cx: &mut App) {
     shell::bind_keys(cx);
     krill_app::link_ui::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
-    // macOS는 마지막 창을 닫아도 메뉴바·Dock에 남는다. 메뉴바 항목이 없는 Windows는 마지막 창을 닫으면 끝낸다(트레이는 후속).
+    // macOS stays in the menu bar/Dock. Windows starts with last-window quit;
+    // menu_bar::init switches to explicit quit only after its tray icon succeeds.
     cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
         let services = krill_app::hosts::link::begin_shutdown();
