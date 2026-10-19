@@ -3,7 +3,7 @@ use ring::digest;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 13] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 14] = [
     (
         "index.html",
         "text/html; charset=utf-8",
@@ -45,6 +45,12 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 13] = [
         "text/javascript; charset=utf-8",
         include_bytes!("assets/screens/workspaces.js"),
         include_bytes!("assets/screens/workspaces.js.gz"),
+    ),
+    (
+        "screens/chat.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/screens/chat.js"),
+        include_bytes!("assets/screens/chat.js.gz"),
     ),
     (
         "screens/session.js",

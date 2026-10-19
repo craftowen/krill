@@ -337,3 +337,149 @@ fn launch_account_persists_and_old_records_still_read() {
     assert_eq!(old.account, None);
     fs::remove_dir_all(dir).unwrap();
 }
+
+/// OWE-929 / MK-233: 서브에이전트·보조(`claude -p`) 외래 훅은 부모 `session_id`를 덮어쓰지 않고
+/// 외래 훅으로 판정하되, `/clear`·`resume`·`compact` 회전은 허용한다(#30067, #29429, #28966).
+#[test]
+fn subagent_and_foreign_hooks_do_not_clobber_parent_session_id() {
+    let dir = std::env::temp_dir().join(format!("owe929-subagent-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let c = Control::new(Some(&dir));
+    let launch = AgentLaunch {
+        profile: "claude".into(),
+        permission: Permission::Manual,
+    };
+    let id = SessionId(29);
+    c.remember_session(id, &launch, None, vec![], None).unwrap();
+
+    // 최초 부모 SessionStart는 session_id를 바인딩하고 외래 훅이 아니다.
+    let parent_start =
+        br#"{"hook_event_name":"SessionStart","source":"startup","session_id":"parent-sid-1"}"#;
+    assert!(!c.is_subagent_or_foreign_hook(id, parent_start));
+    assert!(!c.record_hook_session(id, parent_start));
+    assert_eq!(
+        c.stored(id).unwrap().unwrap().session_id.as_deref(),
+        Some("parent-sid-1")
+    );
+
+    // 명시적 subagent/teammate 페이로드는 같은 session_id여도 외래(서브에이전트)로 판정한다.
+    for sub in [
+        br#"{"hook_event_name":"UserPromptSubmit","session_id":"parent-sid-1","agent_id":"sub-1","prompt":"sub task"}"#.as_slice(),
+        br#"{"hook_event_name":"Stop","session_id":"parent-sid-1","subagent_id":"sub-1"}"#,
+        br#"{"hook_event_name":"Stop","session_id":"child-sid","parent_session_id":"parent-sid-1"}"#,
+        br#"{"hook_event_name":"UserPromptSubmit","session_id":"child-sid","is_subagent":true}"#,
+    ] {
+        assert!(c.is_subagent_or_foreign_hook(id, sub));
+        assert!(c.record_hook_session(id, sub));
+        assert_eq!(
+            c.stored(id).unwrap().unwrap().session_id.as_deref(),
+            Some("parent-sid-1")
+        );
+    }
+
+    // 같은 터미널 안에서 실행된 보조 `claude -p` (다른 session_id, startup/Stop/UserPromptSubmit)도 부모를 덮어쓰지 않는다.
+    for aux in [
+        br#"{"hook_event_name":"SessionStart","source":"startup","session_id":"aux-sid-99"}"#.as_slice(),
+        br#"{"hook_event_name":"UserPromptSubmit","session_id":"aux-sid-99","prompt":"commit msg"}"#,
+        br#"{"hook_event_name":"Stop","session_id":"aux-sid-99"}"#,
+    ] {
+        assert!(c.is_subagent_or_foreign_hook(id, aux));
+        assert!(c.record_hook_session(id, aux));
+        assert_eq!(
+            c.stored(id).unwrap().unwrap().session_id.as_deref(),
+            Some("parent-sid-1")
+        );
+    }
+
+    // 반면 `/clear`·`compact`·`resume`으로 인한 부모 세션 ID 회전은 정상 반영한다.
+    let clear_rotate =
+        br#"{"hook_event_name":"SessionStart","source":"clear","session_id":"parent-sid-2"}"#;
+    assert!(!c.is_subagent_or_foreign_hook(id, clear_rotate));
+    assert!(!c.record_hook_session(id, clear_rotate));
+    assert_eq!(
+        c.stored(id).unwrap().unwrap().session_id.as_deref(),
+        Some("parent-sid-2")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+/// OWE-944 / MK-241: 훅 payload의 `transcript_path`를 기록하고, 로그인 셸에서 직접 실행된 에이전트도
+/// 첫 훅 수신 시 `StoredLaunch`에 자동 바인딩하되 외래/서브에이전트 훅은 부모 경로를 덮어쓰지 않는다.
+#[test]
+fn hook_transcript_path_and_login_shell_auto_binding_work() {
+    let dir = std::env::temp_dir().join(format!("owe944-bind-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let c = Control::new(Some(&dir));
+
+    // 1) 비정상(malformed) 페이로드가 바인딩 전 로그인 셸에 오더라도 StoredLaunch를 만들지 않는다.
+    let login_id = SessionId(77);
+    assert!(!c.has(login_id));
+    c.record_hook_session_with_context(login_id, b"malformed", Some("claude"), None);
+    assert!(!c.has(login_id));
+
+    // 2) 로그인 셸(StoredLaunch 없음)에서 수동 실행된 claude가 첫 훅을 보내면 자동 바인딩된다.
+    let payload = br#"{"hook_event_name":"SessionStart","session_id":"login-sid-1","transcript_path":"/Users/test/.claude/projects/demo/login-sid-1.jsonl","cwd":"/Users/test/demo"}"#;
+    assert!(!c.record_hook_session_with_context(
+        login_id,
+        payload,
+        Some("claude-code"),
+        Some(b"/Users/test/fallback")
+    ));
+    let stored = c.stored(login_id).unwrap().unwrap();
+    assert_eq!(stored.profile, "claude");
+    assert_eq!(stored.session_id.as_deref(), Some("login-sid-1"));
+    assert_eq!(
+        stored.transcript_path.as_deref(),
+        Some("/Users/test/.claude/projects/demo/login-sid-1.jsonl")
+    );
+    assert_eq!(stored.cwd, b"/Users/test/demo");
+    assert!(stored.hibernation_blocked);
+    assert!(c.hibernation_blocked(login_id));
+
+    // 3) 외래 보조 훅이나 상대 경로·비허용 확장자·부모 디렉터리(`..`) 탈출 경로는 부모의 transcript_path를 덮어쓰지 않는다.
+    let foreign = br#"{"hook_event_name":"UserPromptSubmit","session_id":"aux-sid-2","transcript_path":"/Users/test/.claude/projects/demo/aux.jsonl"}"#;
+    assert!(c.record_hook_session_with_context(login_id, foreign, Some("claude"), None));
+    assert_eq!(
+        c.stored(login_id)
+            .unwrap()
+            .unwrap()
+            .transcript_path
+            .as_deref(),
+        Some("/Users/test/.claude/projects/demo/login-sid-1.jsonl")
+    );
+    for bad_path in [
+        "relative/path.jsonl",
+        "/etc/passwd",
+        "/Users/test/.claude/../escape.jsonl",
+        "/Users/test/.claude/note.txt",
+    ] {
+        let bad = serde_json::to_vec(&serde_json::json!({
+            "hook_event_name": "UserPromptSubmit",
+            "session_id": "login-sid-1",
+            "transcript_path": bad_path,
+        }))
+        .unwrap();
+        c.record_hook_session_with_context(login_id, &bad, Some("claude"), None);
+        assert_eq!(
+            c.stored(login_id)
+                .unwrap()
+                .unwrap()
+                .transcript_path
+                .as_deref(),
+            Some("/Users/test/.claude/projects/demo/login-sid-1.jsonl"),
+            "{bad_path}"
+        );
+    }
+
+    // 4) `/clear` 등으로 session_id가 합법 회전될 때 새 transcript_path가 없으면 이전 파일 경로를 비운다.
+    let rotated =
+        br#"{"hook_event_name":"SessionStart","source":"clear","session_id":"login-sid-2"}"#;
+    assert!(!c.record_hook_session_with_context(login_id, rotated, Some("claude"), None));
+    let after_rotate = c.stored(login_id).unwrap().unwrap();
+    assert_eq!(after_rotate.session_id.as_deref(), Some("login-sid-2"));
+    assert_eq!(after_rotate.transcript_path, None);
+
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -50,6 +50,8 @@ enum Action {
     Snapshot,
     CreateTerminal {
         cwd_session: u64,
+        #[serde(default)]
+        agent: Option<String>,
     },
     CloseTerminal {
         session: u64,
@@ -66,6 +68,24 @@ enum Action {
         session: u64,
         mime: String,
         data: String,
+        #[serde(default)]
+        prompt: Option<String>,
+    },
+    ChatPoll {
+        session: u64,
+        #[serde(default)]
+        offset: u64,
+    },
+    AnswerQuestion {
+        session: u64,
+        #[serde(default)]
+        selected: Vec<usize>,
+        #[serde(default)]
+        option_count: usize,
+        #[serde(default)]
+        multi_select: bool,
+        #[serde(default)]
+        custom_text: Option<String>,
     },
     Accounts,
     SwitchAccount {
@@ -120,10 +140,17 @@ impl Backend {
     fn handle(&self, action: Action) -> io::Result<Value> {
         match action {
             Action::Snapshot => self.snapshot(),
-            Action::CreateTerminal { cwd_session } => {
+            Action::CreateTerminal { cwd_session, agent } => {
+                let program = match agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    None => Program::Login,
+                    Some(id) if crate::agent::control::valid_session_id(id) => {
+                        Program::Agent { id: id.to_owned() }
+                    }
+                    Some(_) => return Err(invalid()),
+                };
                 let cwd = self.cwd(cwd_session)?;
                 match self.control(&Request::Create(Create {
-                    program: Program::Login,
+                    program,
                     cwd: cwd.into_os_string().into_vec(),
                     cols: 80,
                     rows: 24,
@@ -147,7 +174,25 @@ impl Backend {
                 if text.len() >= krill_proto::input::MAX_INPUT {
                     return Err(invalid());
                 }
-                self.input(session, format!("{text}\r").into_bytes())?;
+                if text.is_empty() {
+                    self.input(session, b"\r".to_vec())?;
+                } else {
+                    let bracketed =
+                        self.session_bracketed_paste(session) || text.contains(['\n', '\r']);
+                    let payload = if bracketed {
+                        format_bracketed_paste(&text)
+                    } else {
+                        sanitize_plain_input(&text)
+                    };
+                    if payload.len() > krill_proto::input::MAX_INPUT {
+                        return Err(invalid());
+                    }
+                    self.input_paced(
+                        session,
+                        &[payload, b"\r".to_vec()],
+                        Duration::from_millis(60),
+                    )?;
+                }
                 Ok(json!({"sent":true}))
             }
             Action::Approve { session, value } => {
@@ -161,14 +206,70 @@ impl Backend {
                 session,
                 mime,
                 data,
+                prompt,
             } => {
                 let path = save_photo(&mime, &data)?;
                 let quoted = krill_proto::agent::hooks::shell_quote(&path.to_string_lossy());
-                if let Err(error) = self.input(session, format!("{quoted} ").into_bytes()) {
+                let trimmed_prompt = prompt.as_deref().map(str::trim).filter(|s| !s.is_empty());
+                let combined = match trimmed_prompt {
+                    Some(p) => {
+                        if p.len() >= krill_proto::input::MAX_INPUT {
+                            fs::remove_file(&path).ok();
+                            return Err(invalid());
+                        }
+                        format!("{quoted} {p}")
+                    }
+                    None => format!("{quoted} "),
+                };
+                let bracketed =
+                    self.session_bracketed_paste(session) || combined.contains(['\n', '\r']);
+                let payload = if bracketed {
+                    format_bracketed_paste(&combined)
+                } else {
+                    sanitize_plain_input(&combined)
+                };
+                if payload.len() > krill_proto::input::MAX_INPUT {
+                    fs::remove_file(&path).ok();
+                    return Err(invalid());
+                }
+                let send_result = if trimmed_prompt.is_some() {
+                    self.input_paced(
+                        session,
+                        &[payload, b"\r".to_vec()],
+                        Duration::from_millis(60),
+                    )
+                } else {
+                    self.input(session, payload)
+                };
+                if let Err(error) = send_result {
                     fs::remove_file(&path).ok();
                     return Err(error);
                 }
                 Ok(json!({"attached":true,"path":path.to_string_lossy()}))
+            }
+            Action::ChatPoll { session, offset } => {
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                to_value(registry.chat_poll(SessionId(session), offset))
+            }
+            Action::AnswerQuestion {
+                session,
+                selected,
+                option_count,
+                multi_select,
+                custom_text,
+            } => {
+                let (screen_text, bracketed) = self.session_screen_and_bracketed_paste(session);
+                let initial_cursor = detect_question_cursor_index(&screen_text, option_count);
+                let steps = plan_question_keystrokes_from(
+                    &selected,
+                    option_count,
+                    multi_select,
+                    custom_text.as_deref(),
+                    bracketed,
+                    initial_cursor,
+                )?;
+                self.input_paced(session, &steps, Duration::from_millis(60))?;
+                Ok(json!({"sent":true,"steps":steps.len()}))
             }
             Action::Accounts => to_value(self.accounts(&UsageRequest::ListAccounts)?),
             Action::SwitchAccount {
@@ -234,6 +335,18 @@ impl Backend {
             Action::Git { session, path } => self.git(session, path.as_deref()),
         }
     }
+    fn session_bracketed_paste(&self, session: u64) -> bool {
+        self.registry
+            .upgrade()
+            .is_some_and(|reg| reg.session_bracketed_paste(SessionId(session)))
+    }
+    fn session_screen_and_bracketed_paste(&self, session: u64) -> (String, bool) {
+        self.registry
+            .upgrade()
+            .map_or((String::new(), false), |reg| {
+                reg.session_screen_and_bracketed_paste(SessionId(session))
+            })
+    }
     fn wire(&self) -> io::Result<Wire> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
         let hello = self.hello.clone();
@@ -277,6 +390,12 @@ impl Backend {
         }
     }
     fn input(&self, session: u64, bytes: Vec<u8>) -> io::Result<()> {
+        self.input_paced(session, &[bytes], Duration::ZERO)
+    }
+    fn input_paced(&self, session: u64, chunks: &[Vec<u8>], delay: Duration) -> io::Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
         let mut wire = self.wire()?;
         wire.socket.write_all(
             &Attach {
@@ -297,23 +416,30 @@ impl Backend {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
         }
-        wire.socket.write_all(
-            &Input {
-                id: InputId(1),
-                bytes,
+        for (idx, bytes) in chunks.iter().enumerate() {
+            if idx > 0 && !delay.is_zero() {
+                thread::sleep(delay);
             }
-            .encode()?,
-        )?;
-        loop {
-            let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
-            if kind == krill_proto::input::kind::INPUT_ACK {
-                return if InputAck::decode(kind, &body)?.result == InputResult::Applied {
-                    Ok(())
-                } else {
-                    Err(io::Error::other("input rejected"))
-                };
+            let input_id = u64::try_from(idx).unwrap_or(0).saturating_add(1);
+            wire.socket.write_all(
+                &Input {
+                    id: InputId(input_id),
+                    bytes: bytes.clone(),
+                }
+                .encode()?,
+            )?;
+            loop {
+                let (kind, body) = ipc::read_frame(&mut wire.socket)?.ok_or_else(invalid)?;
+                if kind == krill_proto::input::kind::INPUT_ACK {
+                    let ack = InputAck::decode(kind, &body)?;
+                    if ack.result != InputResult::Applied {
+                        return Err(io::Error::other("input rejected"));
+                    }
+                    break;
+                }
             }
         }
+        Ok(())
     }
     fn cwd(&self, session: u64) -> io::Result<PathBuf> {
         let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
@@ -368,6 +494,16 @@ impl Backend {
                 .iter()
                 .find(|s| s.session == info.session)
                 .map_or(control::AgentStatus::UNKNOWN, |s| s.status.clone());
+            let agent = if state.agent.is_empty() {
+                match self.control(&Request::AgentLaunch {
+                    session: info.session,
+                }) {
+                    Ok(Reply::AgentLaunch(Some(launch))) => launch.profile,
+                    _ => String::new(),
+                }
+            } else {
+                state.agent.clone()
+            };
             let cwd = String::from_utf8_lossy(cwd_bytes);
             let text = match self.control(&Request::Capture {
                 session: info.session,
@@ -387,7 +523,7 @@ impl Backend {
             let git = git_cwd(cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":state.state,"agent":state.agent,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":state.state,"agent":agent,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "repo_key":group.repo_key,"worktree_key":group.worktree_key,
                 "group_label":group.label,"group_path":group.path,
                 "state_source":state.source,"state_confidence":state.confidence,
@@ -396,7 +532,7 @@ impl Backend {
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":repositories_json(&sidebar.repositories),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true},
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"hybrid_chat":true},
             "host":self.host}),
         )
     }
@@ -758,9 +894,225 @@ fn bounded_command(command: &mut Command, timeout: Duration, limit: usize) -> io
     result
 }
 
+/// Bracketed Paste(`\x1b[200~...\x1b[201~`)로 감싸고 내부 ESC(`0x1b`)·ETX(`0x03`) 등 제어 바이트를 제거한다(OWE-944 / MK-241).
+fn format_bracketed_paste(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len().saturating_add(12));
+    out.extend_from_slice(b"\x1b[200~");
+    for &b in text.as_bytes() {
+        if matches!(b, b'\n' | b'\r' | b'\t') || (b >= 0x20 && b != 0x7f) {
+            out.push(b);
+        }
+    }
+    out.extend_from_slice(b"\x1b[201~");
+    out
+}
+
+fn sanitize_plain_input(text: &str) -> Vec<u8> {
+    text.as_bytes()
+        .iter()
+        .copied()
+        .filter(|&b| b == b'\t' || (b >= 0x20 && b != 0x7f))
+        .collect()
+}
+
+/// 터미널 화면 텍스트에서 현재 선택 포인터(`❯`·`›`·`▸`·`>`)가 위치한 질문 옵션 인덱스(0-based)를 추정한다.
+/// 감지할 수 없으면 기본값 `0`을 반환한다.
+fn detect_question_cursor_index(screen_text: &str, option_count: usize) -> usize {
+    let max_idx = option_count.max(16);
+    let tail: Vec<&str> = screen_text
+        .lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(40)
+        .collect();
+    for line in &tail {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed
+            .strip_prefix('❯')
+            .or_else(|| trimmed.strip_prefix('›'))
+            .or_else(|| trimmed.strip_prefix('▸'))
+            .or_else(|| trimmed.strip_prefix('>'))
+        else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix("[ ]")
+            .or_else(|| rest.strip_prefix("[x]"))
+            .or_else(|| rest.strip_prefix("[X]"))
+            .or_else(|| rest.strip_prefix("[✓]"))
+            .or_else(|| rest.strip_prefix("( )"))
+            .or_else(|| rest.strip_prefix("(*)"))
+            .unwrap_or(rest)
+            .trim_start();
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty()
+            && let Some(after) = rest.strip_prefix(&digits)
+            && (after.starts_with('.') || after.starts_with(')'))
+            && let Ok(num) = digits.parse::<usize>()
+            && num >= 1
+            && num <= max_idx.saturating_add(1)
+        {
+            return num - 1;
+        }
+    }
+    0
+}
+
+fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
+    while *cursor < target {
+        steps.push(b"\x1b[B".to_vec());
+        *cursor += 1;
+    }
+    while *cursor > target {
+        steps.push(b"\x1b[A".to_vec());
+        *cursor -= 1;
+    }
+}
+
+#[cfg(test)]
+fn plan_question_keystrokes(
+    selected: &[usize],
+    option_count: usize,
+    multi_select: bool,
+    custom_text: Option<&str>,
+    bracketed: bool,
+) -> io::Result<Vec<Vec<u8>>> {
+    plan_question_keystrokes_from(
+        selected,
+        option_count,
+        multi_select,
+        custom_text,
+        bracketed,
+        0,
+    )
+}
+
+/// 인터랙티브 질문 카드(`AskUserQuestion` 등)의 응답을 현재 TUI 커서 위치(`initial_cursor`) 기준
+/// 60ms 간격 키스트로크 시퀀스로 계획한다(OWE-946 / MK-243).
+fn plan_question_keystrokes_from(
+    selected: &[usize],
+    option_count: usize,
+    multi_select: bool,
+    custom_text: Option<&str>,
+    bracketed: bool,
+    initial_cursor: usize,
+) -> io::Result<Vec<Vec<u8>>> {
+    let capped_options = option_count.min(16);
+    let custom = custom_text.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(t) = custom
+        && t.len() > 4096
+    {
+        return Err(invalid());
+    }
+    let mut steps: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = initial_cursor.min(capped_options.max(16));
+
+    if multi_select {
+        let mut sorted: Vec<usize> = selected
+            .iter()
+            .copied()
+            .filter(|&idx| idx < capped_options.max(16))
+            .collect();
+        sorted.sort_unstable();
+        sorted.dedup();
+        if sorted.is_empty() && custom.is_none() {
+            return Err(invalid());
+        }
+        for target in sorted {
+            step_cursor(&mut steps, &mut cursor, target);
+            steps.push(b" ".to_vec());
+        }
+        if let Some(text) = custom {
+            step_cursor(&mut steps, &mut cursor, capped_options);
+            steps.push(b" ".to_vec());
+            let payload = if bracketed || text.contains(['\n', '\r']) {
+                format_bracketed_paste(text)
+            } else {
+                sanitize_plain_input(text)
+            };
+            steps.push(payload);
+            steps.push(b"\r".to_vec());
+        } else {
+            steps.push(b"\r".to_vec());
+        }
+        return Ok(steps);
+    }
+
+    if let Some(text) = custom {
+        step_cursor(&mut steps, &mut cursor, capped_options);
+        if capped_options > 0 {
+            steps.push(b"\r".to_vec());
+        }
+        let payload = if bracketed || text.contains(['\n', '\r']) {
+            format_bracketed_paste(text)
+        } else {
+            sanitize_plain_input(text)
+        };
+        steps.push(payload);
+        steps.push(b"\r".to_vec());
+        return Ok(steps);
+    }
+
+    let Some(&choice) = selected.first() else {
+        return Err(invalid());
+    };
+    if choice >= 16 || (capped_options > 0 && choice >= capped_options) {
+        return Err(invalid());
+    }
+    step_cursor(&mut steps, &mut cursor, choice);
+    steps.push(b"\r".to_vec());
+    Ok(steps)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bracketed_paste_and_question_keystroke_planner_work() {
+        assert_eq!(
+            format_bracketed_paste("hi\x1b[201~\nthere"),
+            b"\x1b[200~hi[201~\nthere\x1b[201~"
+        );
+        // 단일 선택 2번째(인덱스 1): Down 1번 + Enter
+        let single = plan_question_keystrokes(&[1], 3, false, None, true).unwrap();
+        assert_eq!(single, vec![b"\x1b[B".to_vec(), b"\r".to_vec()]);
+
+        // TUI에서 이미 2번째(인덱스 1)로 커서가 내려간 상태에서 1번째(인덱스 0)를 고르면 Up 1번 + Enter
+        let screen = "Which option?\n  1. First\n❯ 2. Second\n  3. Third\n";
+        let detected = detect_question_cursor_index(screen, 3);
+        assert_eq!(detected, 1);
+        let relative_up =
+            plan_question_keystrokes_from(&[0], 3, false, None, true, detected).unwrap();
+        assert_eq!(relative_up, vec![b"\x1b[A".to_vec(), b"\r".to_vec()]);
+
+        // 다중 선택 [0, 2]: Space, Down, Down, Space, Enter
+        let multi = plan_question_keystrokes(&[2, 0], 3, true, None, true).unwrap();
+        assert_eq!(
+            multi,
+            vec![
+                b" ".to_vec(),
+                b"\x1b[B".to_vec(),
+                b"\x1b[B".to_vec(),
+                b" ".to_vec(),
+                b"\r".to_vec()
+            ]
+        );
+
+        // 커스텀 텍스트 입력(옵션 2개 뒤 Other): Down, Down, Enter, Paste, Enter
+        let custom = plan_question_keystrokes(&[], 2, false, Some("직접 입력"), true).unwrap();
+        assert_eq!(
+            custom,
+            vec![
+                b"\x1b[B".to_vec(),
+                b"\x1b[B".to_vec(),
+                b"\r".to_vec(),
+                b"\x1b[200~\xec\xa7\x81\xec\xa0\x91 \xec\x9e\x85\xeb\xa0\xa5\x1b[201~".to_vec(),
+                b"\r".to_vec(),
+            ]
+        );
+    }
 
     #[test]
     fn snapshot_groups_use_deepest_path_components_and_keep_empty_repositories() {

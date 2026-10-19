@@ -223,6 +223,10 @@
 | MK-227 | 오케스트레이션 `ask --question-id` 멱등 재대기·`worker start --preamble` 3모드·스킬 공유 `--include- untracked` | M12 | P1 | `question_id` 중복 생성 방지·재대기, `preamble` 모드별 시스템 지시문 제어, untracked 스킬 동기화 테스트 통과 | MK-114, MK-115 | Orca 감사 | OWE-922 |
 | MK-228 | AI History Vault 대용량 JSONL(≤ 64 MiB) Head+Tail 분할 스캔·증분 mtime 캐시·최신순 정렬 | M12 | P1 | 8 MiB 초과 JSONL Head+Tail 파싱 및 `(path, mtime_ns, size)` 증분 캐시 재사용 테스트 통과 | MK-181 | Orca 감사 | OWE-923 |
 | MK-229 | 멀티 에이전트 Fan-Out 워크트리 생성 & 초기 프롬프트·Git Hunk/Line 스테이징·Unified/Split Diff·인앱 PR 머지 | M12 | P1 | 다중 에이전트 동시 워크트리 스폰·초기 프롬프트 주입, Hunk/Line stage/unstage/discard, PR Squash/Rebase/Merge 및 Draft 전환 테스트 통과 | MK-042, MK-054, MK-085, MK-185 | Orca 감사 | OWE-924 |
+| MK-240 | [Epic] Krill 하이브리드 채팅 UI (`krill-holder` PTY 영속 + Zero-State 트랜스크립트 투영 + `[Chat \| Term]` 1-탭 전환) | M12 | P1 | 하위 MK-241~243 전부 완료, `scripts/check.sh` 0 | MK-125, MK-184 | M12 Hybrid Chat | OWE-943 |
+| MK-241 | [Phase 1] 하이브리드 채팅 기반: 세션 바인딩(`transcript_path`·로그인 셸 자동 귀속) & 안전 입력 파이프라인(`Bracketed Paste` + 60ms 분리 `\r`) | M12 | P1 | `StoredLaunch::transcript_path` 기록, 로그인 셸 수동 실행 에이전트 첫 훅 자동 귀속, `Action::Prompt`/`Action::Photo` Bracketed Paste + 60ms 분리 `\r`, `Action::CreateTerminal { cwd_session, agent }` 단위 테스트 통과 | MK-125 | M12 Phase 1 | OWE-944 |
+| MK-242 | [Phase 2] Zero-State 증분 `ChatItem` 리더(`Action::ChatPoll`) & 모바일 PWA 채팅 뷰(`screens/chat.js` + `[Chat \| Term]` 토글 + 인라인 Diff 모달) | M12 | P1 | 4대 에이전트(`claude`·`codex`·`agy`·`opencode`) 오프셋 기반 증분 `ChatItem` 정규화, 모바일 `[Chat \| Term]` 1-탭 토글, Live Activity Strip, `Action::Git` 인라인 Diff 모달 테스트 통과 | MK-241 | M12 Phase 2 | OWE-945 |
+| MK-243 | [Phase 3] 인터랙티브 질문 카드(`Action::AnswerQuestion` + 60ms Paced Keystroke Injector) & 데스크톱 `[Chat \| Term]` 하이브리드 뷰 확장 | M12 | P1 | `AskUserQuestion` 선택지 버튼 1-탭 응답(`Down`×N + `Enter`) 및 자유 입력 주입, 데스크톱 `krill-app` 탭 헤더 `[Chat \| Term]` 토글 오버레이(`shell/chat.rs`) 테스트 통과 | MK-241, MK-242 | M12 Phase 3 | OWE-946 |
 
 M11의 `WCHK(X)`는 [docs/boost-2026-10-18-windows-port.md](boost-2026-10-18-windows-port.md) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
 

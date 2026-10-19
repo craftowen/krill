@@ -20,6 +20,11 @@ impl Registry {
                     crate::agent_history::vault::search(self.state_dir().as_deref(), &query),
                 )));
             }
+            Action::ChatPoll { session, offset } => {
+                return Ok(Reply::AgentHistory(Response::ChatPolled(
+                    self.chat_poll(session, offset),
+                )));
+            }
             Action::Resume(entry) => {
                 if !crate::agent_history::valid(&entry) || !Path::new(&entry.cwd).is_dir() {
                     return Err(Failure::BadRequest);
@@ -147,6 +152,10 @@ mod tests {
                 Action::Search(SearchQuery::default()),
                 Action::Resume(entry()),
                 Action::ResumeVault(VaultTarget::from(&entry())),
+                Action::ChatPoll {
+                    session: SessionId(1),
+                    offset: 0,
+                },
             ] {
                 assert_eq!(reg.agent_history(&peer, action), Err(Failure::Denied));
             }
@@ -156,6 +165,12 @@ mod tests {
         )));
         assert!(super::super::read_only(&Request::AgentHistory(
             Action::Search(SearchQuery::default())
+        )));
+        assert!(super::super::read_only(&Request::AgentHistory(
+            Action::ChatPoll {
+                session: SessionId(1),
+                offset: 0,
+            }
         )));
         assert!(!super::super::read_only(&Request::AgentHistory(
             Action::Resume(entry())

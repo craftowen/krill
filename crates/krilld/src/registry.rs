@@ -1666,9 +1666,16 @@ impl Registry {
     }
 
     fn apply_agent_hook(&self, st: &State, id: SessionId, e: &HookEvent) -> io::Result<()> {
-        self.agents.record_hook_session(id, &e.payload);
+        use krill_proto::os::ffi::OsStrExt as _;
+        let cwd_hint = st
+            .sessions
+            .get(&id)
+            .map(|entry| entry.cwd.as_os_str().as_bytes());
+        let is_subagent_or_foreign =
+            self.agents
+                .record_hook_session_with_context(id, &e.payload, Some(&e.agent), cwd_hint);
         self.observe_webhook(id);
-        if self.status.hook(&[(id, e)])? > 0 {
+        if !is_subagent_or_foreign && self.status.hook(&[(id, e)])? > 0 {
             self.observe_webhook(id);
             let status = self.status.get(id);
             if status.state == control::AgentState::Done
@@ -1958,6 +1965,57 @@ impl Registry {
             .filter(|a| !a.dir.is_empty())
             .map(|a| PathBuf::from(a.dir))
             .collect()
+    }
+
+    /// 활성 세션 터미널이 현재 Bracketed Paste 모드(`?2004h`)를 켰는지 확인한다(OWE-944 / MK-241).
+    pub(crate) fn session_bracketed_paste(&self, id: SessionId) -> bool {
+        self.session_screen_and_bracketed_paste(id).1
+    }
+
+    /// 활성 세션의 현재 평문 화면과 Bracketed Paste 모드 여부를 함께 반환한다(OWE-944·OWE-946).
+    pub(crate) fn session_screen_and_bracketed_paste(&self, id: SessionId) -> (String, bool) {
+        let st = lock(&self.state);
+        st.sessions
+            .get(&id)
+            .map_or((String::new(), false), |entry| {
+                let (text, modes) = entry.session.tap().screen_text_and_modes();
+                (
+                    text,
+                    modes.contains(krill_proto::term_modes::Modes::BRACKETED_PASTE),
+                )
+            })
+    }
+
+    /// 세션의 에이전트 트랜스크립트를 `offset` 바이트부터 증분 정규화해 읽는다(OWE-945 / MK-242).
+    pub(crate) fn chat_poll(
+        &self,
+        id: SessionId,
+        offset: u64,
+    ) -> krill_proto::agent_history::ChatPollSnapshot {
+        use krill_proto::os::ffi::OsStrExt as _;
+        let cwd = self
+            .session_cwd(id)
+            .map(|p| p.as_os_str().as_bytes().to_vec())
+            .unwrap_or_default();
+        let stored = self.agents.stored(id).ok().flatten().or_else(|| {
+            let status_agent = self.status.get(id).agent;
+            let agent = krill_proto::agent_history::VaultAgent::parse(&status_agent)?;
+            Some(crate::agent::control::StoredLaunch {
+                profile: agent.profile().to_owned(),
+                permission: krill_proto::agent::Permission::Manual,
+                session_id: None,
+                transcript_path: None,
+                cwd: cwd.clone(),
+                hibernation_blocked: true,
+                account: None,
+            })
+        });
+        crate::agent_history::chat::poll_session(
+            self.state_dir().as_deref(),
+            stored.as_ref(),
+            &cwd,
+            offset,
+        )
     }
 
     pub(crate) fn deliver_input_to_tap(tap: &Tap, bytes: &[u8], submit: bool) -> io::Result<()> {
@@ -2312,6 +2370,7 @@ fn read_only(req: &Request) -> bool {
             | Request::AgentHistory(
                 krill_proto::agent_history::Action::Scan
                     | krill_proto::agent_history::Action::Search(_)
+                    | krill_proto::agent_history::Action::ChatPoll { .. }
             )
             | Request::Orchestration(
                 krill_proto::orchestration::OrchAction::Snapshot

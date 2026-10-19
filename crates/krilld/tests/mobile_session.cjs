@@ -4,8 +4,10 @@ const assert=require('node:assert/strict'),{getEventListeners}=require('node:eve
 class Element extends EventTarget {
  constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.scrollLeft=0;}
  append(...nodes){for(const n of nodes){n.parentElement=this;this.children.push(n);}}
+ prepend(...nodes){for(const n of nodes)n.parentElement=this;this.children.unshift(...nodes);}
  replaceChildren(...nodes){this.children=[];this.append(...nodes);}
  setAttribute(k,v){this.attrs[k]=v;}
+ getAttribute(k){return this.attrs[k];}
  querySelector(selector){return this.children.flatMap(n=>[n,...n.descendants()]).find(n=>selector==='h1'?n.tag==='h1':selector==='[aria-selected=true]'&&n.attrs['aria-selected']==='true');}
  descendants(){return this.children.flatMap(n=>[n,...n.descendants()]);}
  scrollIntoView(){}
@@ -52,6 +54,54 @@ async function main(){
  f.mounts[0].options.onStatus({phase:'disconnected',typing:true});f.advance(1000);assert.equal(f.mounts.length,2);assert.equal(f.mounts[1].focused,0);f.mounts[1].options.onStatus({phase:'ready'});assert.equal(f.mounts[1].focused,1);f.mounts[1].options.onStatus({phase:'ready'});assert.equal(f.mounts[1].focused,1);f.view.cleanup();
  console.log('PASS OSC title labels agentless tabs, input refocus after reconnect only when typing');
  console.log('PASS tab provider mark/name, state dot, duplicate numbering and tab-strip scroll kept across updates');
+ await testHybridChatToggleAndQuestionCards();
+ console.log('PASS Hybrid Chat [Chat | Term] toggle, chat_poll cards, question answer_question, and diff modal');
+}
+async function testHybridChatToggleAndQuestionCards(){
+ const timers=new Map(),mounts=[],unmounts=[],buttons=[],sheets=[],calls=[],abort=new AbortController();let clock=0,id=0;
+ const sandbox={AbortController,abort,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,unmount(){unmounts.push(options.sessionId);}};mounts.push(h);options.onStatus({phase:'ready'});return h;}}}};
+ vm.createContext(sandbox);
+ vm.runInContext(longPressCode,sandbox);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/chat.js'),'utf8'),sandbox);
+ vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
+ const session={id:7,state:'Working',agent:'claude',branch:'main',lines:['● Editing src/lib.rs']},shellSession={id:8,state:'Idle',agent:'',branch:'main',lines:['$']},group={key:'g',label:'Workspace',sessions:[session,shellSession]},state={groups:new Map([['g',group]]),sessions:new Map([[7,session],[8,shellSession]]),connection:{phase:'ready'},preferences:{},drafts:new Map()};
+ const el=(...args)=>new Element(...args);
+ const ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(){},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>sheets.push({title,entries,render}),act:fn=>fn(),rpc:async req=>{calls.push(req);if(req.action==='chat_poll')return {agent:'claude',bound:true,next_offset:128,reset:false,items:[{kind:'user',text:'Fix bug'},{kind:'tool_call',tool_name:'Edit',title:'Update lib',file_path:'src/lib.rs',text:'src/lib.rs'},{kind:'question',title:'Mode',text:'Pick one',multi_select:false,options:[{label:'Fast',description:'Quick'},{label:'Safe',description:'Thorough'}]}]};if(req.action==='git')return {patch:'+added line'};return {sent:true};},refresh:async()=>{}};
+ const root=el('main');
+ const view=sandbox.KrillMobile.screens.session(root,ctx);
+ assert.equal(mounts.length,1);
+ const flush=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
+ const toggleBtn=buttons.find(b=>b.className?.includes('mode-toggle'));
+ // 에이전트 세션(claude)은 기본값이 Chat 뷰이므로 토글 버튼 텍스트는 'Term'이다.
+ assert.equal(toggleBtn.textContent,'Term');
+ await flush();
+ assert(calls.some(c=>c.action==='chat_poll'&&c.session===7));
+ const fastOpt=buttons.find(b=>b.textContent?.startsWith('Fast'));
+ assert(fastOpt);
+ fastOpt.action();await flush();
+ assert(calls.some(c=>c.action==='answer_question'&&c.session===7&&c.selected[0]===0));
+ const diffBtn=buttons.find(b=>b.textContent==='Diff');
+ assert(diffBtn);
+ diffBtn.action();await flush();
+ assert(calls.some(c=>c.action==='git'&&c.path==='src/lib.rs'));
+ const rawBtn=buttons.find(b=>b.className?.includes('chat-raw-btn'));
+ rawBtn.action();
+ assert.equal(toggleBtn.textContent,'Chat');
+ // [Chat | Term] 전환 시 TerminalAdapter를 언마운트하지 않고 그대로 유지해야 한다(0ms 전환).
+ assert.equal(mounts.length,1);
+ assert.equal(unmounts.length,0);
+ toggleBtn.action();
+ assert.equal(toggleBtn.textContent,'Term');
+ assert.equal(mounts.length,1);
+ assert.equal(unmounts.length,0);
+ view.cleanup();
+ assert.equal(unmounts.length,1);
+ // 일반 셸 세션(agent === '')은 기본값이 Term 뷰다.
+ buttons.length=0;
+ const shellView=sandbox.KrillMobile.screens.session(el('main'),{...ctx,route:{groupKey:'g',sessionId:8}});
+ const shellToggle=buttons.find(b=>b.className?.includes('mode-toggle'));
+ assert.equal(shellToggle.textContent,'Chat');
+ shellView.cleanup();
 }
 async function testTransportAuthRetries(){
  let now=1000,nextId=0;const timers=new Map(),sockets=[],statuses=[],errors=[];
