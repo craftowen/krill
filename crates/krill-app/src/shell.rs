@@ -623,7 +623,23 @@ impl Shell {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
                 .unwrap_or(krill_app::hosts::HostId::Local);
+            let initial_prompt = sidebar.update(cx, |s, _| s.take_initial_prompt(&e.cwd));
             this.new_folder_tab_on(host, &e.cwd, e.program.clone(), cx);
+            if let Some(prompt) = initial_prompt
+                && let Some(pane) = this.layout.focused()
+            {
+                let agent_id = match &e.program {
+                    krill_proto::control::Program::Agent { id } => id.clone(),
+                    _ => "shell".to_owned(),
+                };
+                this.start_handoff_delivery(
+                    pane,
+                    agent_id,
+                    prompt.into_bytes(),
+                    handoff::BOOT_TIMEOUT,
+                    cx,
+                );
+            }
             if let Some(win) = this.window {
                 let focus = this.focus.clone();
                 win.update(cx, |_, window, cx| window.focus(&focus, cx))

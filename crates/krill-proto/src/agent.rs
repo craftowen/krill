@@ -52,12 +52,78 @@ yolo_args = ["--dangerously-skip-permissions"]
 install = "agy install"
 "#;
 
-/// 에이전트 ID 별칭을 기본 ID로 정규화한다(`"antigravity"` -> `"agy"`).
+/// 추가 에이전트 생태계 프리셋(MK-229). `Agents::load(None)`의 기본 5종([`BUILTIN`])은 그대로 두고,
+/// `Agents::resolve(id)` 및 `krill agent list`에서 별도 설정 없이 바로 해석·실행할 수 있게 한다.
+pub const PRESETS: &str = r#"
+[agent.aider]
+name = "Aider"
+launch = ["aider"]
+yolo_args = ["--yes-always"]
+install = "pipx install aider-chat"
+
+[agent.goose]
+name = "Goose"
+launch = ["goose"]
+install = "curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash"
+
+[agent.copilot]
+name = "GitHub Copilot CLI"
+launch = ["github-copilot-cli"]
+install = "npm install -g @githubnext/github-copilot-cli"
+
+[agent.amp]
+name = "Amp"
+launch = ["amp"]
+install = "npm install -g @sourcegraph/amp"
+
+[agent.pi]
+name = "Pi"
+launch = ["pi"]
+install = "npm install -g @mariozechner/pi-coding-agent"
+
+[agent.qwen]
+name = "Qwen Code"
+launch = ["qwen"]
+yolo_args = ["--yolo"]
+install = "npm install -g @qwen-code/qwen-code"
+
+[agent.kimi]
+name = "Kimi CLI"
+launch = ["kimi"]
+yolo_args = ["--yolo"]
+install = "uv tool install kimi-cli"
+"#;
+
+/// 내장 외 확장 프리셋 프로필 목록.
+#[must_use]
+pub fn preset_profiles() -> &'static BTreeMap<String, Profile> {
+    static PARSED: std::sync::LazyLock<BTreeMap<String, Profile>> =
+        std::sync::LazyLock::new(|| {
+            toml::from_str::<Agents>(PRESETS)
+                .map(|a| a.profiles)
+                .unwrap_or_default()
+        });
+    &PARSED
+}
+
+/// 에이전트 ID 별칭을 기본 ID로 정규화한다(`"antigravity"` -> `"agy"` 등).
 #[must_use]
 pub fn canonical_id(id: &str) -> &str {
     let trimmed = id.trim();
     if trimmed.eq_ignore_ascii_case("antigravity") {
         "agy"
+    } else if trimmed.eq_ignore_ascii_case("cursor-agent") {
+        "cursor"
+    } else if trimmed.eq_ignore_ascii_case("github-copilot-cli")
+        || trimmed.eq_ignore_ascii_case("gh-copilot")
+    {
+        "copilot"
+    } else if trimmed.eq_ignore_ascii_case("aider-chat") {
+        "aider"
+    } else if trimmed.eq_ignore_ascii_case("qwen-code") {
+        "qwen"
+    } else if trimmed.eq_ignore_ascii_case("kimi-cli") {
+        "kimi"
     } else {
         trimmed
     }
@@ -193,15 +259,31 @@ impl Agents {
     }
 
     /// `id` 또는 정규화한 기본 ID(`"antigravity"` -> `"agy"`)로 프로필과 실제 키를 찾는다.
+    /// `self.profiles`에 없으면 [`preset_profiles`]에서 찾는다(MK-229).
     #[must_use]
     pub fn resolve<'a>(&'a self, id: &str) -> Option<(&'a str, &'a Profile)> {
         if let Some((k, p)) = self.profiles.get_key_value(id) {
             return Some((k.as_str(), p));
         }
         let canon = canonical_id(id);
-        self.profiles
-            .get_key_value(canon)
-            .map(|(k, p)| (k.as_str(), p))
+        if let Some((k, p)) = self.profiles.get_key_value(canon) {
+            return Some((k.as_str(), p));
+        }
+        let presets = preset_profiles();
+        if let Some((k, p)) = presets.get_key_value(id) {
+            return Some((k.as_str(), p));
+        }
+        presets.get_key_value(canon).map(|(k, p)| (k.as_str(), p))
+    }
+
+    /// 내장·사용자 프로필과 [`preset_profiles`]를 합친 전체 프로필 맵(사용자·내장 우선).
+    #[must_use]
+    pub fn all_profiles_with_presets(&self) -> BTreeMap<String, Profile> {
+        let mut all = preset_profiles().clone();
+        for (k, v) in &self.profiles {
+            all.insert(k.clone(), v.clone());
+        }
+        all
     }
 }
 

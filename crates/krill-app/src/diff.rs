@@ -26,6 +26,7 @@ use gpui::{
     div, prelude::*, px, uniform_list,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
+pub use gpui_component::diff::DiffMode;
 use gpui_component::diff::{Diff, DiffFile, DiffState};
 use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{Icon, IconName, Sizable as _};
@@ -53,6 +54,9 @@ pub use search::{
 /// Retained patch bound, independent of the number of visible rows.
 pub const MAX_PATCH_BYTES: usize = 4 * 1024 * 1024;
 mod edit;
+pub use edit::{
+    apply_git_patch, build_hunk_patch, build_line_patch, extract_patch_header_and_hunks,
+};
 const TIMEOUT: Duration = Duration::from_secs(5);
 const WATCH_POLL: Duration = Duration::from_millis(100);
 const WATCH_POLL_INACTIVE: Duration = Duration::from_millis(500);
@@ -266,7 +270,7 @@ impl Drop for Reap {
 
 /// Bounded read, timeout and kill+wait on every exit. Never runs external diff/textconv.
 /// The path comes from MK-053 and is passed literally, including non-UTF-8 names.
-pub fn patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io::Result<Vec<DiffFile>> {
+pub fn raw_patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io::Result<String> {
     let path = Path::new(OsStr::from_bytes(&file.path));
     if path.as_os_str().is_empty()
         || path
@@ -279,7 +283,7 @@ pub fn patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io::Res
         ));
     }
     if comparison == Comparison::Index && file.status == *b"??" {
-        return Ok(Vec::new());
+        return Ok(String::new());
     }
     let mut cmd = Command::new("git");
     cmd.current_dir(repo)
@@ -354,7 +358,14 @@ pub fn patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io::Res
     // AS-06: UTF-8이 아닌 텍스트(EUC-KR·CP949)도 통째로 거부하지 않는다. 패치 헤더는
     // ASCII라 구조 파싱이 되고, 디코드 실패 바이트만 U+FFFD로 보인다(손실 변환).
     // Binary 패치는 git이 메타데이터만 내보내(`Binary files ... differ`) 그대로 표시된다.
-    let source = String::from_utf8_lossy(&bytes);
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+pub fn patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io::Result<Vec<DiffFile>> {
+    let source = raw_patch(repo, file, comparison)?;
+    if source.is_empty() {
+        return Ok(Vec::new());
+    }
     DiffFile::parse(&source).map_err(io::Error::other)
 }
 
@@ -523,6 +534,8 @@ pub struct Panel {
     selected: Option<usize>,
     comparison: Comparison,
     state: Entity<DiffState>,
+    raw_patch: String,
+    active_hunk: usize,
     scroll: UniformListScrollHandle,
     message: String,
     repo_error: Option<String>,
@@ -599,6 +612,8 @@ impl Panel {
             selected: None,
             comparison: Comparison::default(),
             state,
+            raw_patch: String::new(),
+            active_hunk: 0,
             scroll: UniformListScrollHandle::new(),
             message: text::EMPTY.get().into(),
             repo_error: None,
@@ -1001,20 +1016,32 @@ impl Panel {
         self.patch_gen = self.patch_gen.wrapping_add(1);
         let generation = self.patch_gen;
         self.selected = Some(index);
+        self.raw_patch.clear();
+        self.active_hunk = 0;
         self.message = text::LOADING.get().into();
         self.state.update(cx, |s, cx| s.set_files([], cx));
         let (repo, comparison) = (self.repo.clone(), self.comparison);
         self.patch_task = Some(cx.spawn(async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move { patch(&repo, &file, comparison) })
+                .spawn(async move {
+                    let raw = raw_patch(&repo, &file, comparison)?;
+                    let files = if raw.is_empty() {
+                        Vec::new()
+                    } else {
+                        DiffFile::parse(&raw).map_err(io::Error::other)?
+                    };
+                    Ok::<_, io::Error>((raw, files))
+                })
                 .await;
             this.update(cx, |this, cx| {
                 if this.patch_gen != generation {
                     return;
                 }
                 match result {
-                    Ok(files) => {
+                    Ok((raw, files)) => {
+                        this.raw_patch = raw;
+                        this.active_hunk = 0;
                         this.message = if files.is_empty() {
                             text::NO_PATCH.get().into()
                         } else {
@@ -1022,13 +1049,46 @@ impl Panel {
                         };
                         this.state.update(cx, |s, cx| s.set_files(files, cx));
                     }
-                    Err(e) => this.message = patch_error_message(&e),
+                    Err(e) => {
+                        this.raw_patch.clear();
+                        this.message = patch_error_message(&e);
+                    }
                 }
                 cx.notify();
             })
             .ok();
         }));
         cx.notify();
+    }
+
+    #[must_use]
+    pub fn diff_mode(&self, cx: &gpui::App) -> DiffMode {
+        self.state.read(cx).mode()
+    }
+
+    pub fn set_diff_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, cx| s.set_mode(mode, cx));
+        cx.notify();
+    }
+
+    #[must_use]
+    pub fn hunk_count(&self) -> usize {
+        edit::extract_patch_header_and_hunks(&self.raw_patch)
+            .1
+            .len()
+    }
+
+    #[must_use]
+    pub fn active_hunk(&self) -> usize {
+        self.active_hunk
+    }
+
+    pub fn set_active_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
+        let count = self.hunk_count();
+        if count > 0 {
+            self.active_hunk = hunk.min(count - 1);
+            cx.notify();
+        }
     }
 
     pub(crate) fn matches_comparison(file: &ChangedFile, comparison: Comparison) -> bool {
@@ -1717,6 +1777,11 @@ impl Render for Panel {
                 let code = status_code(file.status, self.comparison);
                 let color = crate::ui::git_status_color(file.status, cx);
                 let full_path = String::from_utf8_lossy(&file.path).into_owned();
+                let mode = self.diff_mode(cx);
+                let hunk_count = self.hunk_count();
+                let active_hunk = self.active_hunk.min(hunk_count.saturating_sub(1));
+                let has_selected_lines = self.state.read(cx).selected_lines().is_some();
+                let can_patch = file.status != *b"??" && hunk_count > 0 && !self.editing.busy;
                 let header = div()
                     .h(px(26.))
                     .px_2p5()
@@ -1744,6 +1809,114 @@ impl Render for Panel {
                             .text_size(crate::ui::TEXT_XS)
                             .text_color(p.sidebar_foreground)
                             .child(full_path),
+                    )
+                    .when(can_patch && self.comparison == Comparison::Worktree, |d| {
+                        d.child(
+                            Button::new("diff-stage-hunk")
+                                .debug_selector(|| "diff-stage-hunk".into())
+                                .xsmall()
+                                .ghost()
+                                .label(text::STAGE_HUNK.get())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.stage_hunk(active_hunk, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("diff-discard-hunk")
+                                .debug_selector(|| "diff-discard-hunk".into())
+                                .xsmall()
+                                .ghost()
+                                .label(text::DISCARD_HUNK.get())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.discard_hunk(active_hunk, cx);
+                                })),
+                        )
+                        .when(has_selected_lines, |d| {
+                            d.child(
+                                Button::new("diff-stage-line")
+                                    .debug_selector(|| "diff-stage-line".into())
+                                    .xsmall()
+                                    .ghost()
+                                    .label(text::STAGE_LINE.get())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.stage_selected_lines(cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("diff-discard-line")
+                                    .debug_selector(|| "diff-discard-line".into())
+                                    .xsmall()
+                                    .ghost()
+                                    .label(text::DISCARD_LINE.get())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.discard_selected_lines(cx);
+                                    })),
+                            )
+                        })
+                    })
+                    .when(can_patch && self.comparison == Comparison::Index, |d| {
+                        d.child(
+                            Button::new("diff-unstage-hunk")
+                                .debug_selector(|| "diff-unstage-hunk".into())
+                                .xsmall()
+                                .ghost()
+                                .label(text::UNSTAGE_HUNK.get())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.unstage_hunk(active_hunk, cx);
+                                })),
+                        )
+                        .when(has_selected_lines, |d| {
+                            d.child(
+                                Button::new("diff-unstage-line")
+                                    .debug_selector(|| "diff-unstage-line".into())
+                                    .xsmall()
+                                    .ghost()
+                                    .label(text::UNSTAGE_LINE.get())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.unstage_selected_lines(cx);
+                                    })),
+                            )
+                        })
+                    })
+                    .child(
+                        div()
+                            .id("diff-view-mode")
+                            .debug_selector(|| "diff-view-mode".into())
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(
+                                Button::new("diff-view-unified")
+                                    .debug_selector(|| "diff-view-unified".into())
+                                    .xsmall()
+                                    .label(text::VIEW_UNIFIED.get())
+                                    .map(|b| {
+                                        if mode == DiffMode::Unified {
+                                            b.primary()
+                                        } else {
+                                            b.ghost()
+                                        }
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_diff_mode(DiffMode::Unified, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("diff-view-split")
+                                    .debug_selector(|| "diff-view-split".into())
+                                    .xsmall()
+                                    .label(text::VIEW_SPLIT.get())
+                                    .map(|b| {
+                                        if mode == DiffMode::Split {
+                                            b.primary()
+                                        } else {
+                                            b.ghost()
+                                        }
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_diff_mode(DiffMode::Split, cx);
+                                    })),
+                            ),
                     );
                 let content = if self.message.is_empty() {
                     div()

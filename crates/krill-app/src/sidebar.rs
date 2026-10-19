@@ -568,6 +568,8 @@ pub struct Sidebar {
     edit_subscription: Option<Subscription>,
     orca_import_subscription: Option<Subscription>,
     pub(crate) creating: Option<(Entity<worktree::Dialog>, Subscription)>,
+    /// OWE-924: 워크트리 생성 시 예약된 초기 프롬프트(워크트리 경로 → 프롬프트).
+    pending_prompts: BTreeMap<PathBuf, String>,
     /// OWE-854: 셸 탭에서 사용자가 직접 지정한 세션별 제목. 세션 행 라벨의 최우선 후보.
     custom_titles: BTreeMap<SessionId, String>,
     /// 셸이 아는 세션별 터미널 제목(보이는 칸만). 세션 이름의 첫 후보.
@@ -712,6 +714,7 @@ impl Sidebar {
             edit_subscription: None,
             orca_import_subscription: None,
             creating: None,
+            pending_prompts: BTreeMap::new(),
             custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
             auto_titles,
