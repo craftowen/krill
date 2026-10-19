@@ -492,6 +492,8 @@ pub(super) struct WorktreeContext<'a> {
     pub collapsed_lineage: Option<&'a BTreeSet<PathBuf>>,
     pub sleeping_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
+    /// 사용자가 끌어다 놓아 정한 프로젝트 순서. 없는 프로젝트는 그 뒤에 이름순으로 온다.
+    pub project_order: Option<&'a [PathBuf]>,
 }
 
 pub(super) fn is_default_branch_worktree(
@@ -682,6 +684,18 @@ fn push_worktree_and_sessions(
     }
 }
 
+/// 저장소를 사용자가 정한 순서(`order`)대로, 순서에 없는 것은 그 뒤에 원래(경로) 순서대로 돌려준다.
+fn ordered_projects<'a>(
+    snapshot: &'a Snapshot,
+    order: Option<&[PathBuf]>,
+) -> Vec<(&'a PathBuf, &'a Vec<PathBuf>)> {
+    let mut repos: Vec<_> = snapshot.trees.iter().collect();
+    if let Some(order) = order.filter(|o| !o.is_empty()) {
+        repos.sort_by_key(|(repo, _)| order.iter().position(|o| o == *repo).unwrap_or(usize::MAX));
+    }
+    repos
+}
+
 pub(super) fn rows_with_options<'a>(
     snapshot: &'a Snapshot,
     prefs: &Preferences,
@@ -716,7 +730,7 @@ pub(super) fn rows_with_options<'a>(
 
     match options.group_by {
         GroupBy::Repo => {
-            for (repo, trees) in &snapshot.trees {
+            for (repo, trees) in ordered_projects(snapshot, ctx.project_order) {
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
@@ -932,6 +946,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
+            project_order: Some(&self.project_order),
         };
         rows_with_options(
             &self.snapshot,
@@ -958,6 +973,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
+            project_order: Some(&self.project_order),
             ..WorktreeContext::default()
         };
         rows_with_options(

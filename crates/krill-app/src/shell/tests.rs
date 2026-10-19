@@ -4172,7 +4172,13 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         );
     });
 
-    // 사이드바에 '내 Mac'과 'Mac Studio' 호스트 섹션 헤더가 동시에 표시된다.
+    // 사이드바에 '내 Mac'과 'Mac Studio' 호스트 섹션 헤더가 동시에 표시된다. 아직 연결 전이고 세션이 없는
+    // 'Mac Studio'는 '연결 안 된 호스트' 묶음 안에 있으므로 펼쳐서 본다.
+    cx.update(|_, cx| {
+        let sidebar = view.read(cx).sidebar.clone();
+        sidebar.update(cx, |s, cx| s.toggle_offline_hosts(Some(true), cx));
+    });
+    cx.run_until_parked();
     assert!(cx.debug_bounds("host-header-local").is_some());
     assert!(cx.debug_bounds("host-header-studio-mac").is_some());
 

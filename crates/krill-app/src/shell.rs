@@ -33,8 +33,8 @@ mod tabs;
 
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::net::Shutdown;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -536,6 +536,11 @@ pub struct Shell {
     pub(super) accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     pub(super) ssh_hosts: Vec<krill_app::ssh_hosts::SshHost>,
     pub(super) host_manager: krill_app::hosts::HostManager,
+    /// 같은 기기를 가리키는 중복 등록 id → 대표 id(`ssh -G` 기준, 백그라운드에서 구한다).
+    host_aliases: BTreeMap<String, String>,
+    /// `host_aliases`를 구한 호스트 목록. 같으면 `ssh -G`를 다시 돌리지 않는다.
+    host_aliases_for: Option<Vec<krill_app::ssh_hosts::SshHost>>,
+    host_dedupe: Option<Task<()>>,
     link_hosts: Option<Arc<krill_app::hosts::link::LinkHosts>>,
     link_poll: Option<Task<()>>,
     pub(super) launch_host: krill_app::hosts::HostId,
@@ -924,6 +929,9 @@ impl Shell {
             accounts_poll: None,
             update_poll: None,
             ssh_hosts,
+            host_aliases: BTreeMap::new(),
+            host_aliases_for: None,
+            host_dedupe: None,
             host_manager,
             link_hosts: None,
             link_poll: None,
@@ -1716,12 +1724,42 @@ impl Shell {
     }
 
     pub(crate) fn sync_hosts(&mut self, cx: &mut Context<Self>) {
-        let specs = krill_app::hosts::specs_from_ssh_hosts(&self.ssh_hosts);
+        let mut specs = krill_app::hosts::specs_from_ssh_hosts(&self.ssh_hosts);
+        specs.retain(|s| !self.host_aliases.contains_key(&s.id));
+        self.host_manager.set_aliases(self.host_aliases.clone());
         self.host_manager.sync_specs(&specs);
+        if let krill_app::hosts::HostId::Remote(id) = &self.launch_host
+            && let Some(canonical) = self.host_aliases.get(id)
+        {
+            self.launch_host = krill_app::hosts::HostId::Remote(canonical.clone());
+        }
         if let krill_app::hosts::HostId::Remote(id) = &self.launch_host
             && !self.host_manager.specs().iter().any(|s| &s.id == id)
         {
             self.launch_host = krill_app::hosts::HostId::Local;
+        }
+        // 별칭·IP로 따로 등록한 같은 기기는 사이드바에 한 번만 보이고 터널도 하나만 연다. `ssh -G`가 필요해
+        // 백그라운드에서 구하고, 바뀌었을 때만 다시 동기화한다.
+        if self.host_aliases_for.as_ref() != Some(&self.ssh_hosts) {
+            let hosts = self.ssh_hosts.clone();
+            self.host_aliases_for = Some(hosts.clone());
+            self.host_dedupe = Some(cx.spawn(async move |this, cx| {
+                let aliases: BTreeMap<String, String> = cx
+                    .background_executor()
+                    .spawn(async move {
+                        krill_app::ssh_hosts::duplicate_hosts(&hosts)
+                            .into_iter()
+                            .collect()
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.host_aliases != aliases {
+                        this.host_aliases = aliases;
+                        this.sync_hosts(cx);
+                    }
+                })
+                .ok();
+            }));
         }
         if self.paths.is_some() {
             let hm = self.host_manager.clone();
@@ -1916,7 +1954,8 @@ impl Shell {
     }
 
     fn poll_updates(state_dir: PathBuf, cx: &mut Context<Self>) -> Task<()> {
-        const UPDATE_POLL_INTERVAL: Duration = Duration::from_hours(4);
+        // 4시간이면 앱을 켠 뒤 낸 릴리스가 반나절 가까이 안 보였다(사용자 지적). 매니페스트 한 번 받는 일이라 30분마다 본다.
+        const UPDATE_POLL_INTERVAL: Duration = Duration::from_mins(30);
         cx.spawn(async move |this, cx| {
             loop {
                 let dir = state_dir.clone();
