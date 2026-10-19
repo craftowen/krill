@@ -7,7 +7,8 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    # dev가 통합 브랜치다(main은 공개 릴리스 이력). release/**는 릴리스 준비 브랜치.
+    branches: [main, dev, 'release/**']
   pull_request:
 
 permissions:
