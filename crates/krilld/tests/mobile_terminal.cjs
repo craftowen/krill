@@ -11,7 +11,7 @@ class Element extends EventTarget {
  remove(){if(this.parent)this.parent.children=this.parent.children.filter(n=>n!==this);}
  focus(){this.dispatchEvent(new Event('focus'));}
  blur(){this.dispatchEvent(new Event('blur'));}
- getContext(){return new Proxy({},{get:()=>()=>{},set:()=>true});}
+ getContext(){const calls=this.calls={fillText:0,font:0,draws:0};return new Proxy({},{get:(_,k)=>k==='fillText'?()=>{calls.fillText++;}:k==='setTransform'?()=>{calls.draws++;}:()=>{},set:(_,k)=>{if(k==='font')calls.font++;return true;}});}
  setPointerCapture(){}
 }
 function fixture(){
@@ -57,6 +57,17 @@ async function main(){
  count=socket.sent.filter(a=>a[4]===0x17).length;handle.setFontScale(1.4);assert.equal(socket.sent.filter(a=>a[4]===0x17).length,count);assert.equal(find(root,'terminal-history').style.fontSize,'20px');console.log('PASS Fit ownership ACK, failure rollback and local font sizing');
  handle.loadHistory();sent=socket.sent.at(-1);r=T.reader(sent.slice(5));const req=r.n();assert.equal(r.n(),0);assert.equal(r.n(),0);assert.equal(r.n(),100);const rows=Array.from({length:100},()=>[{ch:'x',zero:'',flags:0}]);const row=C.concat(T.v(1),T.text('x'),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0));socket.frame(0x26,T.v(req),T.v(100),T.v(2),T.v(0),T.v(100),...Array(100).fill(row));handle.loadHistory();r=T.reader(socket.sent.at(-1).slice(5));r.n();assert.equal(r.n(),1);assert.equal(r.n(),1);let historyReq;for(let page=0;page<9;page++){r=T.reader(socket.sent.at(-1).slice(5));historyReq=r.n();socket.frame(0x26,T.v(historyReq),T.v(10000),T.v(2),T.v(page*100),T.v(100),...Array(100).fill(row));handle.loadHistory();}assert.equal(find(root,'terminal-history').textContent.split('\n').length,1001);assert.equal(find(root,'load-history').disabled,true);const before=socket.sent.length;handle.loadHistory();assert.equal(socket.sent.length,before);console.log('PASS 100-row hot-to-cold history and 1000-row cap');
  handle.unmount();let lastStatus;({root,handle,socket}=await mount(99,{onStatus:s=>{lastStatus=s;}}));const uncertain=handle.sendKey('ctrlC');socket.close();await assert.rejects(uncertain,/Input delivery is uncertain; input will not be resent\./);assert.match(lastStatus.message,/will not be resent/);assert.equal(inputs(socket).length,1);handle.unmount();console.log('PASS disconnect uncertainty, no retry and listener cleanup');
+ ({root,handle,socket}=await mount());const canvas=find(root,'terminal-grid'),calls=canvas.calls;await advance(16);
+ const line=(n,text)=>C.concat(T.v(2),T.v(n),T.v([...text].length),...[...text].map(ch=>C.concat(T.text(ch),T.v(0),T.v(0),T.v(0),T.v(0),T.v(0)))),cursor=(line,column)=>C.concat(T.v(3),T.v(line),T.v(column),T.v(1));
+ const update=(...ops)=>socket.frame(0x21,T.v(2),T.v(2),T.v(1),T.v(ops.length),...ops),drawn=async()=>{const before={...calls};await advance(16);return {text:calls.fillText-before.fillText,font:calls.font-before.font,draws:calls.draws-before.draws};};
+ update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(1,'def'),line(2,'ghi'),cursor(1,2));assert.deepEqual(await drawn(),{text:9,font:0,draws:1});
+ update(line(1,'xy'));assert.deepEqual(await drawn(),{text:2,font:0,draws:1});
+ update(cursor(2,0));assert.equal((await drawn()).text,5);
+ update(line(0,'a'));update(line(2,'g'));assert.deepEqual(await drawn(),{text:2,font:0,draws:1});
+ update(C.concat(T.v(0),T.v(80),T.v(24)),line(0,'abc'),line(3,'jk'));assert.equal((await drawn()).text,5);
+ handle.setFontScale(1.25);assert.deepEqual(await drawn(),{text:5,font:1,draws:1});assert.equal(canvas.width,Math.round(80*8*16/13));
+ await advance(500);assert.match(canvas.getAttribute('aria-label'),/^abc\n\n\njk/);handle.unmount();
+ console.log('PASS dirty-row canvas redraw: one changed row only, cursor rows, one frame per batch, Reset/font full');
  console.log('All terminal adapter regression checks passed.');
 }
 if(process.argv.includes('--harness')){
