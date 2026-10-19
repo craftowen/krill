@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -920,7 +920,7 @@ pub(crate) fn search_with_rg_limits(
     let include_globs = parse_glob_patterns(&options.include_pattern);
     let exclude_globs = parse_glob_patterns(&options.exclude_pattern);
 
-    let mut cmd = Command::new(rg_bin);
+    let mut cmd = crate::platform::background_command(rg_bin);
     cmd.current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1332,7 +1332,7 @@ pub(crate) fn query_git_ignored_set_with_limits(
     if relative_paths.is_empty() || !repo.join(".git").exists() {
         return BTreeSet::new();
     }
-    let Ok(spawned) = Command::new("git")
+    let Ok(spawned) = crate::platform::background_command("git")
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")

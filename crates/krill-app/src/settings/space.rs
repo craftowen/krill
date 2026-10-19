@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 
 use gpui::{Context, FontWeight, SharedString, Window, div, prelude::*, px};
@@ -55,7 +55,7 @@ impl CliRunner {
     /// 스테이징된 `krill` 바이너리를 하위 프로세스로 실행한다.
     fn process(bin: PathBuf, state_dir: Option<PathBuf>) -> Self {
         Self::new(move |args| {
-            let mut cmd = Command::new(&bin);
+            let mut cmd = crate::platform::background_command(&bin);
             cmd.args(args)
                 // CLI는 `--repo`가 없으면 cwd 저장소를 먼저 고르므로, 저장소가 아닌 `/`에서 실행해 전체 탐색을 강제한다.
                 .current_dir("/")

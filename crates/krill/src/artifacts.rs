@@ -8,7 +8,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Read as _, Write as _};
+#[cfg(not(windows))]
+use std::io::Read as _;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 
@@ -381,7 +383,7 @@ fn read_artifact(file: &str, title: Option<&str>) -> Result<(String, String), Er
     Ok((key, body.to_string()))
 }
 
-/// 상태 디렉터리의 영구 소유자 토큰. 없으면 /dev/urandom 32바이트로 만든다(0600).
+/// 상태 디렉터리의 영구 소유자 토큰. 없으면 OS CSPRNG 32바이트로 만든다(0600).
 fn owner_token(dir: &Path) -> Result<String, Error> {
     let path = dir.join(TOKEN_FILE);
     match fs::read_to_string(&path) {
@@ -391,7 +393,15 @@ fn owner_token(dir: &Path) -> Result<String, Error> {
         Err(e) => return Err(e.into()),
     }
     let mut bytes = [0u8; 32];
+    #[cfg(not(windows))]
     fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    #[cfg(windows)]
+    {
+        use ring::rand::SecureRandom as _;
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("OS random source unavailable"))?;
+    }
     let token = bytes.iter().fold(String::new(), |mut t, b| {
         write!(t, "{b:02x}").ok();
         t
@@ -820,5 +830,19 @@ esac
                 .unwrap()
                 .contains("krill artifacts share")
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_random_tests {
+    #[test]
+    fn artifact_owner_token_uses_os_random_and_is_reused() {
+        let dir = std::env::temp_dir().join(format!("owe917-token-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = super::owner_token(&dir).unwrap();
+        assert_eq!(token.len(), 64);
+        assert!(token.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_eq!(super::owner_token(&dir).unwrap(), token);
+        std::fs::remove_dir_all(dir).ok();
     }
 }

@@ -48,8 +48,11 @@ use gpui::{
     SharedString, Subscription, Task, UTF16Selection, Window, actions, canvas, div, point,
     prelude::*, px, relative,
 };
+#[cfg(windows)]
+use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::ContextMenuExt as _;
+
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_app::detached;
 use krill_app::echo::EchoDraw;
@@ -4154,7 +4157,7 @@ impl Shell {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
-                    if e.modifiers.platform {
+                    if keys::link_modifier(e.modifiers) {
                         let mut file = None;
                         let mut url = None;
                         if let Some(l) = this.live.get(&id) {
@@ -4261,7 +4264,7 @@ impl Shell {
             )
             .on_mouse_move(cx.listener(move |this, e: &gpui::MouseMoveEvent, _, cx| {
                 this.update_hover_link(id, e.position, cx);
-                this.update_path_hover(id, e.position, e.modifiers.platform, cx);
+                this.update_path_hover(id, e.position, keys::link_modifier(e.modifiers), cx);
                 if e.pressed_button == Some(MouseButton::Left)
                     && this.live.get(&id).is_some_and(|l| l.selecting)
                 {
@@ -4407,6 +4410,11 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(windows)]
+        krill_app::platform::sync_window(
+            window,
+            cx.theme().mode == gpui_component::ThemeMode::Dark,
+        );
         self.window = Some(window.window_handle());
         // OWE-903: 라이브러리에서 들어온 온보딩·짝짓기 모달 요청을 엔티티로 만든다.
         self.open_pending_overlays(window, cx);

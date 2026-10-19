@@ -285,6 +285,8 @@ impl Paths {
 
     fn from_exe(exe: &Path, state: &Path, apps: &[PathBuf]) -> io::Result<Self> {
         let exe = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+        #[cfg(windows)]
+        let exe = executable_path(&exe);
         let bin = exe.parent().ok_or(io::ErrorKind::NotFound)?;
         Ok(Self {
             socket: state.join("run/krilld.sock"),
@@ -292,6 +294,34 @@ impl Paths {
             krilld: find_exe(bin, apps, "krilld"),
         })
     }
+}
+
+/// Canonicalization adds Win32 verbatim prefixes. Pass ordinary DOS/UNC paths to
+/// launchers and shell integrations, without a lossy Unicode round trip. Other
+/// device namespaces stay verbatim (stripping them would change their meaning).
+#[cfg(windows)]
+fn executable_path(path: &Path) -> PathBuf {
+    use std::path::{Component, Prefix};
+    let mut components = path.components();
+    let base = match components.next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:\\", char::from(drive))),
+            Prefix::VerbatimUNC(server, share) => {
+                let mut base = PathBuf::from(r"\\");
+                base.push(server);
+                base.push(share);
+                base
+            }
+            _ => return path.to_owned(),
+        },
+        _ => return path.to_owned(),
+    };
+    components
+        .filter(|c| !matches!(c, Component::RootDir))
+        .fold(base, |mut base, part| {
+            base.push(part.as_os_str());
+            base
+        })
 }
 
 fn is_temp_home(home: &Path) -> bool {
@@ -367,6 +397,15 @@ fn find_exe(bin: &Path, apps: &[PathBuf], name: &str) -> PathBuf {
     let direct = bin.join(name);
     if direct.is_file() {
         return direct;
+    }
+    // Exact-version side-by-side holder only: never choose a random old holder
+    // left behind by an update. The flat zip layout remains the first choice.
+    #[cfg(windows)]
+    if name == "krill-holder.exe" {
+        let versioned = bin.join(format!("krill-holder-{}.exe", env!("CARGO_PKG_VERSION")));
+        if versioned.is_file() {
+            return versioned;
+        }
     }
     if let Some(contents) = bin
         .ancestors()
@@ -528,7 +567,13 @@ pub fn preflight(path: &Path) -> io::Result<()> {
     if !valid_magic {
         return Err(io::Error::from_raw_os_error(8)); // ENOEXEC
     }
-    let status = Command::new(path)
+    let mut command = Command::new(path);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let status = command
         .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::null())

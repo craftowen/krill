@@ -1,6 +1,7 @@
 use std::io::Read as _;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
+use std::process::Command;
 use std::thread;
 
 use gpui::{TestAppContext, VisualTestContext};

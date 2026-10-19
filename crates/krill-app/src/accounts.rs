@@ -433,7 +433,7 @@ pub fn parse_claude_identity(json: &str) -> Option<Identity> {
 /// `CLAUDE_CONFIG_DIR=<dir> claude auth status --json`(1회 0.29초 실측, 보고서 C5). `dir`이 `None`이면 호스트 기본
 /// 로그인을 묻는다. 실패·시간 초과·미로그인은 `None`(호출자는 무시한다). 백그라운드에서만 부른다.
 pub fn claude_identity(exe: &Path, dir: Option<&Path>) -> Option<Identity> {
-    let mut cmd = std::process::Command::new(exe);
+    let mut cmd = crate::platform::background_command(exe);
     cmd.args(["auth", "status", "--json"]);
     match dir {
         Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
@@ -580,7 +580,7 @@ fn run_browser_login(
         fail(LoginFailReason::SpawnFailed);
         return;
     }
-    let Ok(mut child) = std::process::Command::new(std::ffi::OsStr::from_bytes(program))
+    let Ok(mut child) = crate::platform::background_command(std::ffi::OsStr::from_bytes(program))
         .args(args.iter().map(|arg| std::ffi::OsStr::from_bytes(arg)))
         .env("BROWSER", &browser)
         .env(
@@ -616,7 +616,7 @@ fn run_browser_login(
             && let Some(url) = authorize_url(account.provider, &raw)
         {
             opened = if cfg!(target_os = "macos") {
-                std::process::Command::new("open")
+                crate::platform::background_command("open")
                     .arg(url)
                     .status()
                     .is_ok_and(|status| status.success())

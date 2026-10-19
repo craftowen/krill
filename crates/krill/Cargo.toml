@@ -16,6 +16,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+sysinfo = { workspace = true }
+ring = { workspace = true }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true }
 

@@ -292,7 +292,7 @@ pub fn reveal_command(path: &Path) -> Command {
 
 #[cfg(windows)]
 fn explorer() -> Command {
-    let mut cmd = Command::new("explorer.exe");
+    let mut cmd = crate::platform::background_command("explorer.exe");
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -301,7 +301,7 @@ fn explorer() -> Command {
 
 #[cfg(not(windows))]
 fn open_command(flags: &[&str], path: &Path) -> Command {
-    let mut cmd = Command::new("/usr/bin/open");
+    let mut cmd = crate::platform::background_command("/usr/bin/open");
     cmd.args(flags).arg("--").arg(path);
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())

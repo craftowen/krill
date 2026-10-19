@@ -4,6 +4,7 @@ use krill_proto::git::Numstat;
 use std::fmt::Write as _;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::net::UnixListener;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
