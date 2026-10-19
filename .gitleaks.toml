@@ -1,0 +1,46 @@
+# gitleaks 설정 — 공개 저장소 유출 차단(하네스 레드팀 P0-4). scripts/public-surface.sh가 쓴다.
+# gitleaks 기본 규칙(API 키·토큰·PEM 등)에 이 저장소에서 실제로 새어 나간 종류의 규칙을 더한다.
+# 경로 정규식은 스캔 루트가 달라도(저장소·git archive 풀린 디렉터리) 맞도록 앞을 고정하지 않는다.
+
+title = "krill"
+
+[extend]
+useDefault = true
+
+# 개인 메일 주소. 2026-10-19 기준 현재 트리에서 docs/ARTIFACTS.md의 Cloudflare 계정 메일이 실제로 노출됐다.
+# 메인테이너 주소를 하나하나 적으면 이 파일이 곧 유출이 되므로, 개인 메일 도메인 전체를 막고
+# 서드파티 저작권 표기(THIRD_PARTY_NOTICES.md·docs/licensing·vendor)만 허용한다.
+[[rules]]
+id = "krill-personal-email"
+description = "개인 메일 주소(공개 저장소에 두지 않는다)"
+regex = '''[A-Za-z0-9._%+-]+@(?:gmail|googlemail|naver|hanmail|daum|kakao|icloud|me|outlook|hotmail|live|proton|protonmail)\.(?:com|net|me)'''
+keywords = ["@gmail", "@googlemail", "@naver", "@hanmail", "@daum", "@kakao", "@icloud", "@me.", "@outlook", "@hotmail", "@live", "@proton"]
+[rules.allowlist]
+paths = ['''THIRD_PARTY_NOTICES\.md$''', '''docs/licensing/''', '''vendor/''']
+
+# Cloudflare 계정·Zone ID(32자리 소문자 hex). 해시와 구분하려고 앞쪽 문맥을 요구한다.
+[[rules]]
+id = "krill-cloudflare-id"
+description = "Cloudflare 계정/Zone ID"
+regex = '''(?i)(?:cloudflare|account[_ -]?id|zone[_ -]?id|zone\*{0,2})[^\n]{0,80}?[^0-9a-f]([0-9a-f]{32})(?:[^0-9a-f]|$)'''
+secretGroup = 1
+keywords = ["cloudflare", "account", "zone"]
+
+# Cloudflare D1 데이터베이스 ID(UUID). wrangler 설정·문서 표의 "D1 ... (uuid)" 형태.
+[[rules]]
+id = "krill-cloudflare-d1-id"
+description = "Cloudflare D1 데이터베이스 ID"
+regex = '''(?i)(?:d1|database[_ -]?id)[^\n]{0,80}?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})'''
+secretGroup = 1
+keywords = ["d1", "database"]
+
+# 리댁션 테스트 fixture의 가짜 토큰·PEM. 지우면 리댁션 회귀를 못 잡는다.
+[allowlist]
+description = "리댁션 테스트 fixture(가짜 토큰)"
+paths = [
+  '''crates/krill-proto/src/diag/tests\.rs$''',
+  '''crates/krill/tests/doctor\.rs$''',
+  '''crates/krill-app/src/crash/tests\.rs$''',
+  '''crates/krilld/src/agent/tests\.rs$''',
+  '''vendor/gpui-pre-reqwest/src/tls\.rs$''',
+]
