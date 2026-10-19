@@ -133,7 +133,7 @@ fn linked_account_refresh_keeps_daemon_snapshot_on_ipc_failure(cx: &mut TestAppC
     assert!(notice.is_some(), "명시적 새로고침 실패를 알린다");
 }
 
-/// OWE-652: 상태바 '세션 대시보드' 버튼은 대시보드 창을 열고, 두 번 눌러도 창은 하나다.
+/// OWE-652: 상태바·사이드바 '에이전트 대시보드' 버튼은 인앱 모달을 열고, 새 OS 창을 띄우지 않는다.
 #[gpui::test]
 fn status_dashboard_button_opens_singleton_window(cx: &mut TestAppContext) {
     let (_main, main_window) = open(cx);
@@ -144,8 +144,9 @@ fn status_dashboard_button_opens_singleton_window(cx: &mut TestAppContext) {
         .expect("dashboard button");
     visual.simulate_click(bounds.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 2, "dashboard click opens a window");
-    cx.read(|cx| assert!(existing::<Dashboard>(cx).is_some()));
+    assert_eq!(cx.windows().len(), 1, "dashboard opens as an in-app modal");
+    assert!(visual.debug_bounds("dashboard-modal").is_some());
+    cx.read(|cx| assert!(existing_dashboard(cx).is_some()));
     let bounds = visual
         .debug_bounds("dashboard-popout")
         .expect("dashboard button");
@@ -153,9 +154,10 @@ fn status_dashboard_button_opens_singleton_window(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         cx.windows().len(),
-        2,
-        "second click focuses, not duplicates"
+        1,
+        "second click keeps in-app modal without opening a window"
     );
+    cx.read(|cx| assert!(existing_dashboard(cx).is_some()));
 }
 
 /// OWE-652: 상태바 '세션 히스토리' 토글은 팝오버를 열고, 바깥 클릭은 닫는다.
@@ -409,15 +411,15 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     let (main, main_window) = open(cx);
     cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
     cx.run_until_parked();
-    let dashboard = cx.read(|cx| existing::<Dashboard>(cx).unwrap());
-    dashboard
-        .update(cx, |d, _, cx| {
+    let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
+    cx.update(|cx| {
+        dashboard.update(cx, |d, cx| {
             d.sidebar
                 .update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx));
-        })
-        .unwrap();
+        });
+    });
     cx.run_until_parked();
-    let mut visual = VisualTestContext::from_window(dashboard.into(), cx);
+    let mut visual = VisualTestContext::from_window(main_window, cx);
     for selector in [
         "dashboard-session-0",
         "dashboard-session-1",
@@ -430,33 +432,71 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
     }
     assert_eq!(
         [
-            lane(AgentState::Working),
             lane(AgentState::Waiting),
             lane(AgentState::Blocked),
+            lane(AgentState::Working),
             lane(AgentState::Done),
             lane(AgentState::Exited),
             lane(AgentState::Unknown)
         ],
-        [0, 1, 1, 2, 2, 3]
+        [0, 0, 1, 2, 2, 3]
+    );
+    assert_eq!(
+        LANES.map(|m| m.in_language(krill_app::i18n::Language::Ko)),
+        ["확인 필요", "작업 중", "완료", "알 수 없음"]
+    );
+    assert_eq!(
+        LANES.map(|m| m.in_language(krill_app::i18n::Language::En)),
+        ["Needs You", "Working", "Done", "Unknown"]
     );
     cx.update(|cx| main.update(cx, super::super::Shell::dashboard));
     cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 2);
+    assert_eq!(cx.windows().len(), 1);
     let card = visual.debug_bounds("dashboard-session-2").unwrap();
     visual.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    // OWE-851: 카드 클릭은 별도 플로팅 창 대신 메인 창 해당 세션으로 포커스한다.
-    assert_eq!(cx.windows().len(), 2);
-    assert!(cx.read(|cx| existing::<Floating>(cx).is_none()));
-    let focused = main.read_with(cx, |s, _| {
-        s.layout.focused().and_then(|p| s.layout.session(p))
-    });
-    assert_eq!(focused, Some(SessionId(2)));
-    // 새 세션 선택은 같은 플로팅 창을 재사용한다.
+    assert!(
+        cx.read(|cx| existing_dashboard(cx).is_none()),
+        "카드 클릭 시 대시보드 모달이 닫힌다"
+    );
+    assert_eq!(
+        main.read_with(cx, |s, _| s.layout.session(s.layout.active_tab().focused)),
+        Some(SessionId(2)),
+        "카드 클릭 시 메인 창이 해당 세션 화면으로 이동한다"
+    );
+
+    // 사이드바 '에이전트 대시보드' 항목을 눌러 다시 열고 cmd-w·Escape·닫기 버튼으로 닫을 수 있다.
+    let nav = visual.debug_bounds("nav-agent-dashboard").unwrap();
+    visual.simulate_click(nav.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.read(|cx| existing_dashboard(cx).is_some()));
+    cx.simulate_keystrokes(main_window, "cmd-w");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| existing_dashboard(cx).is_none()));
+
+    let nav = visual.debug_bounds("nav-agent-dashboard").unwrap();
+    visual.simulate_click(nav.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.read(|cx| existing_dashboard(cx).is_some()));
+    cx.simulate_keystrokes(main_window, "escape");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| existing_dashboard(cx).is_none()));
+
+    let nav = visual.debug_bounds("nav-agent-dashboard").unwrap();
+    visual.simulate_click(nav.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let close_btn = visual.debug_bounds("dashboard-close").unwrap();
+    visual.simulate_click(close_btn.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.read(|cx| existing_dashboard(cx).is_none()));
+
+    // 플로팅 터미널은 같은 플로팅 창을 재사용한다.
+    cx.update(|cx| main.update(cx, |s, cx| s.float_terminal(SessionId(2), cx)));
+    cx.run_until_parked();
+    let floating = cx.read(|cx| existing::<Floating>(cx).unwrap());
     cx.update(|cx| main.update(cx, |s, cx| s.float_terminal(SessionId(5), cx)));
     cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 3);
-    let floating = cx.read(|cx| existing::<Floating>(cx).unwrap());
+    assert_eq!(cx.windows().len(), 2);
     floating
         .update(cx, |f, _, cx| {
             let s = f.shell.read(cx);
@@ -466,12 +506,25 @@ fn dashboard_lanes_live_updates_click_and_singleton(cx: &mut TestAppContext) {
             );
         })
         .unwrap();
-    cx.simulate_keystrokes(dashboard.into(), "cmd-w");
+
+    // 플로팅 창에서 에이전트 대시보드를 호출하면 메인 창에 인앱 모달을 띄운다.
+    cx.simulate_keystrokes(floating.into(), "alt-cmd-shift-a");
     cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 2);
+    assert!(
+        cx.read(|cx| existing_dashboard(cx).is_some()),
+        "플로팅 창 단축키는 메인 창의 대시보드 모달을 연다"
+    );
+    floating
+        .update(cx, |f, _, cx| {
+            assert!(
+                f.shell.read(cx).dashboard.is_none(),
+                "플로팅 창 자체에는 빈 대시보드를 띄우지 않는다"
+            );
+        })
+        .unwrap();
 }
 
-/// OWE-861: 대시보드 팝아웃은 Esc로 닫히고, 실시간 미리보기가 있는 카드에는
+/// OWE-861: 대시보드는 Esc로 닫히고, 실시간 미리보기가 있는 카드에는
 /// '미리보기 없음'이 중복 출력되지 않는다.
 #[gpui::test]
 fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
@@ -487,15 +540,15 @@ fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
     });
     cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
     cx.run_until_parked();
-    let dashboard = cx.read(|cx| existing::<Dashboard>(cx).unwrap());
-    dashboard
-        .update(cx, |d, _, cx| {
+    let dashboard = cx.read(|cx| existing_dashboard(cx).unwrap());
+    cx.update(|cx| {
+        dashboard.update(cx, |d, cx| {
             d.sidebar
                 .update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx));
-        })
-        .unwrap();
+        });
+    });
     cx.run_until_parked();
-    let mut visual = VisualTestContext::from_window(dashboard.into(), cx);
+    let mut visual = VisualTestContext::from_window(main_window, cx);
     // 미리보기가 있는 세션 2번 카드: PREVIEW만 있고 NO_PREVIEW는 없다.
     assert!(visual.debug_bounds("dashboard-preview-2").is_some());
     assert!(
@@ -508,7 +561,10 @@ fn dashboard_esc_closes_and_preview_hides_no_preview(cx: &mut TestAppContext) {
     // Esc로 닫힌다.
     visual.simulate_keystrokes("escape");
     visual.run_until_parked();
-    assert_eq!(cx.windows().len(), 1, "escape closes dashboard");
+    assert!(
+        cx.read(|cx| existing_dashboard(cx).is_none()),
+        "escape closes dashboard"
+    );
 }
 
 /// OWE-861: 플로팅 창에서 터미널 단축키(⌘F 찾기)가 Shell 키 문맥으로 동작한다.
@@ -556,11 +612,11 @@ fn dashboard_escape_closes_window(cx: &mut TestAppContext) {
     let (_main, main_window) = open(cx);
     cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
     cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 2);
-    let dashboard = cx.read(|cx| existing::<Dashboard>(cx).unwrap());
-    cx.simulate_keystrokes(dashboard.into(), "escape");
-    cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
+    assert!(cx.read(|cx| existing_dashboard(cx).is_some()));
+    cx.simulate_keystrokes(main_window, "escape");
+    cx.run_until_parked();
+    assert!(cx.read(|cx| existing_dashboard(cx).is_none()));
 }
 
 #[gpui::test]
@@ -574,14 +630,13 @@ fn dashboard_stable_poll_does_not_notify_and_changed_snapshot_refreshes(cx: &mut
     let (main, main_window) = open(cx);
     cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
     cx.run_until_parked();
-    let dashboard = cx.read(|cx| existing::<Dashboard>(cx).unwrap());
-    let entity = dashboard
-        .update(cx, |d, _, cx| {
+    let entity = cx.read(|cx| existing_dashboard(cx).unwrap());
+    cx.update(|cx| {
+        entity.update(cx, |d, cx| {
             d.sidebar
                 .update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx));
-            cx.entity()
-        })
-        .unwrap();
+        });
+    });
     cx.run_until_parked();
     let notifications = std::rc::Rc::new(std::cell::Cell::new(0));
     let count = notifications.clone();
@@ -595,17 +650,202 @@ fn dashboard_stable_poll_does_not_notify_and_changed_snapshot_refreshes(cx: &mut
         0,
         "변화 없는 폴링은 redraw를 요청하지 않는다"
     );
-    dashboard
-        .update(cx, |d, _, cx| {
+    cx.update(|cx| {
+        entity.update(cx, |d, cx| {
             d.sidebar
                 .update(cx, |s, cx| s.connect_source(Arc::new(Empty), cx));
-        })
-        .unwrap();
+        });
+    });
     cx.executor().advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
     assert!(notifications.get() > 0);
     assert!(entity.read_with(cx, |d, cx| d.sidebar.read(cx).jump_items().is_empty()));
     drop(main);
+}
+
+#[gpui::test]
+fn dashboard_card_click_closes_settings_unzooms_pane_and_routes_remote_host(
+    cx: &mut TestAppContext,
+) {
+    #[derive(Clone)]
+    struct DynamicLocal(Arc<std::sync::Mutex<sidebar::Snapshot>>);
+    impl sidebar::Source for DynamicLocal {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.lock().unwrap().clone())
+        }
+    }
+
+    struct RemoteOne;
+    impl sidebar::Source for RemoteOne {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: SessionId(1),
+                    status: AgentStatus {
+                        state: AgentState::Waiting,
+                        ..AgentStatus::UNKNOWN
+                    },
+                    worktree: None,
+                    cwd: None,
+                    account: None,
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    let local_source = DynamicLocal(Arc::new(std::sync::Mutex::new(sidebar::Snapshot {
+        sessions: vec![
+            sidebar::Session {
+                id: SessionId(1),
+                status: AgentStatus {
+                    state: AgentState::Working,
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: None,
+                cwd: None,
+                account: None,
+            },
+            sidebar::Session {
+                id: SessionId(2),
+                status: AgentStatus {
+                    state: AgentState::Working,
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: None,
+                cwd: None,
+                account: None,
+            },
+        ],
+        ..Default::default()
+    })));
+
+    let (main, main_window) = open(cx);
+    // Split tab into two panes (Session 1 and Session 2), zoom pane 1, collapse sidebar, and open Settings.
+    cx.update(|cx| {
+        main.update(cx, |shell, cx| {
+            let pane_a = shell.layout.active_tab().focused;
+            shell.layout.set_session(pane_a, SessionId(1));
+            shell.layout.split(krill_app::layout::Axis::Horizontal);
+            let pane_b = shell.layout.active_tab().focused;
+            shell.layout.set_session(pane_b, SessionId(2));
+            shell.layout.focus(pane_a);
+            shell.zoomed_pane = Some(pane_a);
+            shell.toggle_sidebar(cx);
+            assert!(!shell.sidebar.read(cx).is_visible());
+            shell.sidebar.update(cx, |s, cx| {
+                s.connect_source(Arc::new(local_source.clone()), cx);
+                s.set_remote_host_source(
+                    "remote-box",
+                    "Remote Box",
+                    krill_app::hosts::HostStatus::Connected,
+                    Arc::new(RemoteOne),
+                    cx,
+                );
+            });
+            shell.open_settings(krill_app::settings::AdminTab::General, None, cx);
+        });
+    });
+    cx.run_until_parked();
+    // Pressing Shift+Option+Cmd+A while SettingsView is open opens the Dashboard modal.
+    cx.simulate_keystrokes(main_window, "alt-cmd-shift-a");
+    cx.run_until_parked();
+    main.read_with(cx, |shell, cx| {
+        assert!(shell.dashboard.is_some());
+        assert!(
+            shell.sidebar.read(cx).is_visible(),
+            "사이드바가 접혀 있어도 대시보드가 열리면 폴링을 켠다"
+        );
+    });
+
+    let mut visual = VisualTestContext::from_window(main_window, cx);
+    // Local Session 1, Local Session 2, and Remote Session 1 all render simultaneously.
+    assert!(visual.debug_bounds("dashboard-session-1").is_some());
+    assert!(visual.debug_bounds("dashboard-session-2").is_some());
+    assert!(
+        visual
+            .debug_bounds("dashboard-session-remote-box-1")
+            .is_some()
+    );
+
+    // Click Session 2 card while Settings is open and Pane A is zoomed.
+    let card_2 = visual.debug_bounds("dashboard-session-2").unwrap();
+    visual.simulate_click(card_2.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    main.read_with(cx, |shell, cx| {
+        assert!(shell.dashboard.is_none());
+        assert!(shell.settings.is_none(), "설정 화면이 닫힌다");
+        assert!(
+            shell.zoomed_pane.is_none(),
+            "다른 칸이 확대되어 있었으면 확대를 풀어 선택한 세션을 보이게 한다"
+        );
+        assert!(
+            !shell.sidebar.read(cx).is_visible(),
+            "대시보드가 닫히면 접힌 사이드바 가시성으로 복원한다"
+        );
+        let focused = shell.layout.active_tab().focused;
+        assert_eq!(shell.layout.session(focused), Some(SessionId(2)));
+        assert_eq!(shell.layout.host(focused), &krill_app::hosts::HostId::Local);
+    });
+
+    // Session 2 is now the active tab's focused pane. Open Dashboard; while Dashboard covers the
+    // terminal, terminal pane shortcuts (cmd-d, cmd-f, cmd-k, cmd-v) must not leak to the hidden
+    // pane, and when Session 2 completes (`Working -> Done`) and becomes unread, clicking
+    // Session 2's card closes Dashboard and marks Session 2 as focused/read on sidebar.
+    cx.update(|cx| main.update(cx, super::super::Shell::dashboard));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(main_window, "cmd-d cmd-f cmd-k");
+    cx.run_until_parked();
+    main.read_with(cx, |shell, _| {
+        assert_eq!(
+            shell.layout.visible().len(),
+            2,
+            "대시보드 모달이 열린 동안 cmd-d가 뒤쪽 터미널 칸을 분할하지 않는다"
+        );
+        assert!(
+            shell.search.is_none(),
+            "대시보드 모달이 열린 동안 cmd-f가 터미널 검색 바를 열지 않는다"
+        );
+    });
+    local_source.0.lock().unwrap().sessions[1].status.state = AgentState::Done;
+    cx.executor().advance_clock(Duration::from_millis(501));
+    cx.run_until_parked();
+    assert!(
+        main.read_with(cx, |shell, cx| shell
+            .sidebar
+            .read(cx)
+            .is_unread(SessionId(2))),
+        "대시보드가 열려 있는 동안 완료된 세션은 미확인 상태가 된다"
+    );
+    let card_2 = visual.debug_bounds("dashboard-session-2").unwrap();
+    visual.simulate_click(card_2.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(
+        !main.read_with(cx, |shell, cx| shell
+            .sidebar
+            .read(cx)
+            .is_unread(SessionId(2))),
+        "이미 포커스였던 칸의 세션을 대시보드에서 눌러도 미확인 표시가 해제된다"
+    );
+
+    // Reopen dashboard and click the remote session that shares SessionId(1) with Local.
+    cx.update(|cx| main.update(cx, super::super::Shell::dashboard));
+    cx.run_until_parked();
+    let remote_card = visual
+        .debug_bounds("dashboard-session-remote-box-1")
+        .unwrap();
+    visual.simulate_click(remote_card.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    main.read_with(cx, |shell, _| {
+        assert!(shell.dashboard.is_none());
+        let focused = shell.layout.active_tab().focused;
+        assert_eq!(shell.layout.session(focused), Some(SessionId(1)));
+        assert_eq!(
+            shell.layout.host(focused),
+            &krill_app::hosts::HostId::Remote("remote-box".into()),
+            "같은 숫자 SessionId라도 원격 호스트 카드는 원격 세션으로 이동한다"
+        );
+    });
 }
 
 #[test]

@@ -86,7 +86,11 @@ pub fn items(files: &[PathBuf]) -> Vec<Item> {
     files
         .iter()
         .zip(0u64..)
-        .map(|(p, i)| Item::new(SessionId(i), p.display().to_string(), false))
+        .map(|(p, i)| {
+            let mut item = Item::new(SessionId(i), p.display().to_string(), false);
+            item.is_file = true;
+            item
+        })
         .collect()
 }
 
