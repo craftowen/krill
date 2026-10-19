@@ -1962,6 +1962,43 @@ fn active_tab_stays_visible_after_keyboard_switch(cx: &mut TestAppContext) {
     assert!(ok, "first tab must scroll back into view");
 }
 
+/// 설 실화면 QA(v0.1.17): 탭 최소 폭이 생긴 뒤 1200px 창에서 사이드바로 연 넷째 탭이 줄 밖에 숨었다.
+/// 애니메이션을 켠 채(실사용 기본값) 새 마지막 탭이 보이는지 확인한다.
+#[gpui::test]
+fn new_last_tab_is_revealed_with_motion_in_narrow_window(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-reveal-motion"));
+    cx.simulate_resize(gpui::size(px(1200.), px(761.)));
+    for n in 0..4 {
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+        for _ in 0..60 {
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(16));
+            cx.update(gpui::Window::simulate_next_frame);
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        let active = layout_of(&view, cx).active();
+        let tab = cx
+            .debug_bounds(Box::leak(format!("session-tab-{active}").into_boxed_str()))
+            .unwrap();
+        let limit = cx.debug_bounds("quick-commands").unwrap();
+        let all: Vec<_> = (0..=active)
+            .map(|i| {
+                cx.debug_bounds(Box::leak(format!("session-tab-{i}").into_boxed_str()))
+                    .map(|b| (b.left(), b.right()))
+            })
+            .collect();
+        let drag = cx
+            .debug_bounds("titlebar-drag")
+            .map(|b| (b.left(), b.right()));
+        assert!(
+            tab.right() <= limit.left(),
+            "tab {n}: active {active} {tab:?} hidden behind {limit:?}; all={all:?} drag={drag:?}"
+        );
+    }
+}
+
 #[gpui::test]
 fn tabs_middle_close_and_drag_keep_session_identity(cx: &mut TestAppContext) {
     let path = state_path("tab-pointer");
