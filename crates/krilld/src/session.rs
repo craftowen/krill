@@ -564,6 +564,12 @@ impl Tap {
         )
     }
 
+    /// 현재 평문 화면과 입력 모드를 `Screen` 셀 복제 없이 한 잠금 안에서 읽는다(OWE-944·OWE-946).
+    pub(crate) fn screen_text_and_modes(&self) -> (String, krill_proto::term_modes::Modes) {
+        let live = lock(&self.0.live);
+        (live.engine.screen_text(), live.engine.input_modes())
+    }
+
     /// 보조 상태 감지용 제목·평문·revision. `seen`과 revision이 같으면 문자열화 없이 `None`이다.
     /// 제목·화면이 바뀌면 revision도 오르므로(출력·리사이즈) 캐시 무효화에 revision 하나로 충분하다.
     pub(crate) fn evidence_since(&self, seen: Option<u64>) -> Option<(String, String, u64)> {

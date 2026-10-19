@@ -524,6 +524,21 @@ impl Shell {
                         text::JUMP_TOOLTIP.get(),
                     ))
                     .child(ui::button_with_tooltip(
+                        Button::new("toggle-chat-view")
+                            .label(if self.is_active_chat_view() {
+                                "Term"
+                            } else {
+                                "Chat"
+                            })
+                            .ghost()
+                            .xsmall()
+                            .toggled(self.is_active_chat_view())
+                            .debug_selector(|| "toggle-chat-view".into())
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_chat_view(cx))),
+                        "toggle-chat-view",
+                        "Toggle Chat / Terminal view",
+                    ))
+                    .child(ui::button_with_tooltip(
                         Button::new("toggle-panel")
                             .icon(IconName::PanelRight)
                             .ghost()

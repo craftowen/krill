@@ -16,6 +16,7 @@
 //! ⌘V·파일 드롭은 `krill_term::paste`로 bracketed paste·셸 이스케이프를 거쳐 입력으로 간다. 우클릭 메뉴(복사·붙여넣기)는
 //! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
 
+mod chat;
 mod commands;
 mod diff;
 pub(crate) mod files;
@@ -555,6 +556,8 @@ pub struct Shell {
     tab_rename: Option<tabs::TabRename>,
     /// 워크트리·탭·설정 뷰 탐색 히스토리(MK-176 / OWE-730).
     pub(super) nav_history: NavHistory,
+    /// OWE-946 / MK-243: 데스크톱 Hybrid Chat `[Chat | Term]` 오버레이 상태.
+    pub(super) chat: chat::ChatState,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -903,6 +906,7 @@ impl Shell {
             pending_running_close: None,
             tab_rename: None,
             nav_history: NavHistory::default(),
+            chat: chat::ChatState::default(),
         };
         shell.sync_sidebar_custom_titles(cx);
         shell.record_workspace_nav(cx);
@@ -2611,6 +2615,7 @@ impl Shell {
                     l.clear_selection();
                 }
             }
+            self.maybe_poll_active_chat(cx);
             cx.notify();
         }
         if ev.closed {
@@ -3152,6 +3157,7 @@ impl Shell {
             self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
         }
         self.sync(cx);
+        self.poll_active_chat(cx);
         if save && self.layout != before {
             self.close_settings(None, cx);
             self.record_workspace_nav(cx);
@@ -4976,6 +4982,7 @@ impl Render for Shell {
                                         krill_app::settings::terminal_opacity_pct(cx),
                                     ))
                                     .children(tree)
+                                    .children(self.render_chat_overlay(cx))
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
                                     // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
                                     // 너비·접힘과 무관하게 항상 터미널 우측에 붙는다.
