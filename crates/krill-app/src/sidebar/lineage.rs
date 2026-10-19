@@ -563,18 +563,35 @@ impl Sidebar {
         });
         let events = cx.subscribe(
             &dialog,
-            move |s, _, event: &worktree::Event, cx| match event {
+            move |s, dialog_entity, event: &worktree::Event, cx| match event {
                 worktree::Event::Created(w) => {
-                    // OWE-853: 생성 완료 즉시 모달을 닫고 새 워크트리로 전환한다.
-                    // Done 화면에 머물지 않는다. 계보·새로고침 뒤 setup 세션이 있으면
-                    // 그 세션으로, 없으면 새 워크트리 경로에 로그인 탭을 연다.
+                    // OWE-853 / OWE-924: 생성 완료 즉시 새 워크트리로 전환한다.
+                    // 멀티 에이전트 Fan-Out 중이면 모든 워크트리가 만들어질 때까지 모달을 유지한다.
                     let created_path = PathBuf::from(std::ffi::OsStr::from_bytes(&w.path));
+                    let (agent, prompt, has_more) = {
+                        let d = dialog_entity.read(cx);
+                        (
+                            d.last_created_agent().map(str::to_owned),
+                            d.last_created_prompt().map(str::to_owned),
+                            d.has_pending_fan_out(),
+                        )
+                    };
                     if let Some(parent_path) = &parent_for_event {
                         s.set_worktree_parent(created_path.clone(), parent_path.clone(), cx);
                     }
-                    s.creating = None;
+                    if let Some(prompt_text) = &prompt {
+                        s.queue_initial_prompt(created_path.clone(), prompt_text);
+                    }
+                    if !has_more {
+                        s.creating = None;
+                    }
                     s.refresh(cx);
-                    if let Some(id) = w.setup {
+                    if let Some(agent_id) = agent {
+                        cx.emit(NewSession {
+                            cwd: created_path,
+                            program: Program::Agent { id: agent_id },
+                        });
+                    } else if let Some(id) = w.setup {
                         cx.emit(Selected(id));
                     } else {
                         cx.emit(NewSession {
@@ -592,6 +609,17 @@ impl Sidebar {
         );
         self.creating = Some((dialog, events));
         cx.notify();
+    }
+
+    pub fn queue_initial_prompt(&mut self, cwd: PathBuf, prompt: &str) {
+        let trimmed = prompt.trim();
+        if !trimmed.is_empty() {
+            self.pending_prompts.insert(cwd, trimmed.to_owned());
+        }
+    }
+
+    pub fn take_initial_prompt(&mut self, cwd: &Path) -> Option<String> {
+        self.pending_prompts.remove(cwd)
     }
 
     /// 워크트리가 수동 수면 상태인지.

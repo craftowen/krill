@@ -423,3 +423,98 @@ fn owe853_created_closes_dialog_and_opens_new_worktree(cx: &mut TestAppContext) 
         Some(std::path::PathBuf::from("/repo/wt-new"))
     );
 }
+
+#[gpui::test]
+fn owe924_multi_agent_fanout_and_initial_prompt(cx: &mut TestAppContext) {
+    use crate::sidebar::NewSession;
+    use krill_proto::control::Program;
+    let fake = Arc::new(Fake::default());
+    fake.replies.lock().unwrap().extend([
+        Reply::WorktreeCreated(Worktree {
+            path: "/repo/wt-fan-claude".as_bytes().to_vec(),
+            branch: "wt-fan-claude".into(),
+            base: "main".into(),
+            copied: Vec::new(),
+            warnings: Vec::new(),
+            setup: None,
+        }),
+        Reply::WorktreeCreated(Worktree {
+            path: "/repo/wt-fan-codex".as_bytes().to_vec(),
+            branch: "wt-fan-codex".into(),
+            base: "main".into(),
+            copied: Vec::new(),
+            warnings: Vec::new(),
+            setup: None,
+        }),
+    ]);
+    cx.update(gpui_component::init);
+    let (sidebar, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let opened: Rc<std::cell::RefCell<Vec<NewSession>>> =
+        Rc::new(std::cell::RefCell::new(Vec::new()));
+    let got = opened.clone();
+    cx.update(|_, cx| {
+        cx.subscribe(&sidebar, move |_, e: &NewSession, _| {
+            got.borrow_mut().push(e.clone());
+        })
+        .detach();
+    });
+    let source: Arc<dyn Source> = fake.clone();
+    cx.update(|window, cx| {
+        sidebar.update(cx, |s, cx| {
+            s.connect_source(source, cx);
+            s.new_worktree("/repo".into(), window, cx);
+        });
+    });
+    cx.run_until_parked();
+    let dialog = cx.update(|_, cx| sidebar.read(cx).creating.as_ref().unwrap().0.clone());
+    cx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.name.update(cx, |input, cx| {
+                input.set_value("wt-fan", window, cx);
+            });
+            d.toggle_agent("claude", cx);
+            d.toggle_agent("codex", cx);
+            d.set_initial_prompt("Fix the flaky test", window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| dialog.update(cx, |d, cx| d.submit(Setup::Ask, cx)));
+    cx.run_until_parked();
+    cx.run_until_parked();
+    assert!(
+        cx.update(|_, cx| sidebar.read(cx).creating.is_none()),
+        "dialog must auto-close after all fan-out worktrees finish"
+    );
+    let requests = fake.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].name, "wt-fan-claude");
+    assert_eq!(requests[1].name, "wt-fan-codex");
+    let sessions = opened.borrow().clone();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(
+        sessions[0],
+        NewSession {
+            cwd: std::path::PathBuf::from("/repo/wt-fan-claude"),
+            program: Program::Agent {
+                id: "claude".into()
+            },
+        }
+    );
+    assert_eq!(
+        sessions[1],
+        NewSession {
+            cwd: std::path::PathBuf::from("/repo/wt-fan-codex"),
+            program: Program::Agent { id: "codex".into() },
+        }
+    );
+    let (p1, p2) = cx.update(|_, cx| {
+        sidebar.update(cx, |s, _| {
+            (
+                s.take_initial_prompt(std::path::Path::new("/repo/wt-fan-claude")),
+                s.take_initial_prompt(std::path::Path::new("/repo/wt-fan-codex")),
+            )
+        })
+    });
+    assert_eq!(p1.as_deref(), Some("Fix the flaky test"));
+    assert_eq!(p2.as_deref(), Some("Fix the flaky test"));
+}

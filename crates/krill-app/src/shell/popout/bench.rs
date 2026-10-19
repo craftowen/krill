@@ -140,8 +140,8 @@ pub(crate) fn run(mode: String) -> ExitCode {
                     if let Some(f) = existing::<Floating>(cx) {
                         f.update(cx, |f, _, cx| f.shell.update(cx, screen)).ok();
                     }
-                    if let Some(d) = existing::<Dashboard>(cx) {
-                        d.update(cx, |d, _, cx| d.sidebar.update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx))).ok();
+                    if let Some(d) = existing_dashboard(cx) {
+                        d.update(cx, |d, cx| d.sidebar.update(cx, |s, cx| s.connect_source(Arc::new(Fixed), cx)));
                     }
                 });
                 bg.timer(Duration::from_secs(1)).await;

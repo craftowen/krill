@@ -437,6 +437,10 @@ impl Shell {
                     icons::LAYOUT_DASHBOARD_SVG,
                     sb_text::NAV_AGENT_DASHBOARD.get(),
                 )
+                .when(self.dashboard.is_some(), |d| {
+                    d.bg(p.sidebar_accent)
+                        .text_color(p.sidebar_accent_foreground)
+                })
                 .when(working_count > 0 || done_count > 0, |d| {
                     d.child(
                         div()

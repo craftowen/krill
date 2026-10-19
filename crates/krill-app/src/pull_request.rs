@@ -88,6 +88,25 @@ pub enum Action {
     Create,
 }
 
+/// OWE-924(MK-229): PR 병합 방식(`gh pr merge --squash | --rebase | --merge`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrMergeMethod {
+    Squash,
+    Rebase,
+    Merge,
+}
+
+impl PrMergeMethod {
+    #[must_use]
+    pub const fn flag(self) -> &'static str {
+        match self {
+            Self::Squash => "--squash",
+            Self::Rebase => "--rebase",
+            Self::Merge => "--merge",
+        }
+    }
+}
+
 /// OWE-738(MK-184): AI 생성 또는 사용자 입력 PR 초안(제목 + 마크다운 본문).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Draft {
@@ -116,6 +135,16 @@ pub trait Runner: Send + Sync {
     fn inspect_pr(&self, folder: &Path, branch: &str) -> io::Result<PrInspection> {
         let _ = (folder, branch);
         Ok(PrInspection::default())
+    }
+
+    fn merge_pr(&self, folder: &Path, branch: &str, method: PrMergeMethod) -> io::Result<()> {
+        let _ = (folder, branch, method);
+        Ok(())
+    }
+
+    fn set_pr_draft(&self, folder: &Path, branch: &str, to_draft: bool) -> io::Result<()> {
+        let _ = (folder, branch, to_draft);
+        Ok(())
     }
 }
 
@@ -310,6 +339,40 @@ impl Service {
             }
         })
     }
+
+    pub fn merge(
+        &self,
+        folder: &Path,
+        branch: &str,
+        method: PrMergeMethod,
+    ) -> Result<(), &'static str> {
+        let _slot = self.reserve_slot(Instant::now())?;
+        self.runner.merge_pr(folder, branch, method).map_err(|e| {
+            if e.kind() == io::ErrorKind::NotFound {
+                MISSING.get()
+            } else {
+                FAILED.get()
+            }
+        })
+    }
+
+    pub fn set_draft(
+        &self,
+        folder: &Path,
+        branch: &str,
+        to_draft: bool,
+    ) -> Result<(), &'static str> {
+        let _slot = self.reserve_slot(Instant::now())?;
+        self.runner
+            .set_pr_draft(folder, branch, to_draft)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    MISSING.get()
+                } else {
+                    FAILED.get()
+                }
+            })
+    }
 }
 
 fn status_error(error: &io::Error) -> Status {
@@ -397,6 +460,18 @@ impl Runner for Gh {
     fn inspect_pr(&self, folder: &Path, branch: &str) -> io::Result<PrInspection> {
         checks::inspect_with_gh(folder, branch)
     }
+
+    fn merge_pr(&self, folder: &Path, branch: &str, method: PrMergeMethod) -> io::Result<()> {
+        let mut cmd = merge_command(folder, branch, method);
+        execute(&mut cmd, TIMEOUT)?;
+        Ok(())
+    }
+
+    fn set_pr_draft(&self, folder: &Path, branch: &str, to_draft: bool) -> io::Result<()> {
+        let mut cmd = ready_command(folder, branch, to_draft);
+        execute(&mut cmd, TIMEOUT)?;
+        Ok(())
+    }
 }
 
 pub(super) fn find_executable(name: &str, fallbacks: &[&str]) -> PathBuf {
@@ -453,6 +528,43 @@ fn create_command(folder: &Path, branch: &str, title: &str, body: &str) -> Comma
     let body = body.trim();
     if !body.is_empty() {
         cmd.args(["--body", body]);
+    }
+    cmd
+}
+
+pub fn merge_command(folder: &Path, branch: &str, method: PrMergeMethod) -> Command {
+    let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
+    let mut cmd = Command::new(executable);
+    cmd.current_dir(folder)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GH_REPO")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["pr", "merge", branch, method.flag()]);
+    cmd
+}
+
+pub fn ready_command(folder: &Path, branch: &str, to_draft: bool) -> Command {
+    let executable = find_executable("gh", &["/opt/homebrew/bin/gh", "/usr/local/bin/gh"]);
+    let mut cmd = Command::new(executable);
+    cmd.current_dir(folder)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env_remove("GH_REPO")
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .args(["pr", "ready", branch]);
+    if to_draft {
+        cmd.arg("--undo");
     }
     cmd
 }
