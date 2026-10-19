@@ -16,7 +16,6 @@
 //! ⌘V·파일 드롭은 `krill_term::paste`로 bracketed paste·셸 이스케이프를 거쳐 입력으로 간다. 우클릭 메뉴(복사·붙여넣기)는
 //! 마우스 보고가 꺼져 있을 때만. 프로그램의 OSC 52 쓰기는 krilld가 알려 오면 시스템 클립보드에 쓴다(읽기는 krilld가 막는다).
 
-mod away;
 mod commands;
 mod diff;
 pub(crate) mod files;
@@ -30,6 +29,9 @@ pub(crate) mod popout;
 mod release;
 pub(crate) mod security;
 mod tabs;
+
+// 앱이 꺼져 있던 동안의 변화 요약.
+mod away;
 
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;

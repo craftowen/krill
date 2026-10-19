@@ -1893,6 +1893,33 @@ impl Sidebar {
         self.rebuild(cx);
     }
 
+    /// 로컬 데몬 감시 연결이 끊겨 다시 붙는 중인지. 재연결 중에서 풀리면 다음 로컬 목록 도착을
+    /// [`Relisted`]로 한 번 알린다(재연결 확인은 목록이 실제로 온 뒤에만).
+    pub fn set_local_reconnecting(&mut self, reconnecting: bool, cx: &mut Context<Self>) {
+        let next = match (reconnecting, self.relink) {
+            (true, _) => Relink::Reconnecting,
+            (false, Relink::Reconnecting) => Relink::AwaitingList,
+            (false, other) => other,
+        };
+        if next != self.relink {
+            self.relink = next;
+            cx.notify();
+        }
+    }
+
+    fn local_reconnecting(&self) -> bool {
+        self.relink == Relink::Reconnecting
+    }
+
+    /// 로컬 세션들의 에이전트 상태(상태바 떼 미터).
+    pub fn session_states(&self) -> Vec<krill_proto::control::AgentState> {
+        self.snapshot
+            .sessions
+            .iter()
+            .map(|s| s.status.state)
+            .collect()
+    }
+
     pub fn row_count(&self) -> usize {
         self.rows.len()
     }
@@ -2212,33 +2239,6 @@ impl Sidebar {
             return tree;
         }
         format!("{} {}", text::SESSION.get(), session.id.0)
-    }
-
-    /// 로컬 데몬 감시 연결이 끊겨 다시 붙는 중인지. 재연결 중에서 풀리면 다음 로컬 목록 도착을
-    /// [`Relisted`]로 한 번 알린다(재연결 확인은 목록이 실제로 온 뒤에만).
-    pub fn set_local_reconnecting(&mut self, reconnecting: bool, cx: &mut Context<Self>) {
-        let next = match (reconnecting, self.relink) {
-            (true, _) => Relink::Reconnecting,
-            (false, Relink::Reconnecting) => Relink::AwaitingList,
-            (false, other) => other,
-        };
-        if next != self.relink {
-            self.relink = next;
-            cx.notify();
-        }
-    }
-
-    fn local_reconnecting(&self) -> bool {
-        self.relink == Relink::Reconnecting
-    }
-
-    /// 로컬 세션들의 에이전트 상태(상태바 떼 미터).
-    pub fn session_states(&self) -> Vec<krill_proto::control::AgentState> {
-        self.snapshot
-            .sessions
-            .iter()
-            .map(|s| s.status.state)
-            .collect()
     }
 
     pub fn jump_items(&self) -> Vec<Item> {
