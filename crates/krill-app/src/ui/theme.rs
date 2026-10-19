@@ -534,6 +534,8 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         theme.colors.list_active = p.sidebar_accent;
         theme.colors.list_active_border = p.sidebar_border;
     });
+    #[cfg(windows)]
+    crate::platform::sync_windows(cx);
 }
 
 /// 현재 `cx.theme().mode`를 유지한 채 Orca 토큰을 [`Theme`]에 동기화한다.

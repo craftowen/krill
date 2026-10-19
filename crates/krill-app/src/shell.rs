@@ -48,8 +48,11 @@ use gpui::{
     SharedString, Subscription, Task, UTF16Selection, Window, actions, canvas, div, point,
     prelude::*, px, relative,
 };
+#[cfg(windows)]
+use gpui_component::ActiveTheme as _;
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::menu::ContextMenuExt as _;
+
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_app::detached;
 use krill_app::echo::EchoDraw;
@@ -4405,6 +4408,11 @@ impl Shell {
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(windows)]
+        krill_app::platform::sync_window(
+            window,
+            cx.theme().mode == gpui_component::ThemeMode::Dark,
+        );
         self.window = Some(window.window_handle());
         // OWE-903: 라이브러리에서 들어온 온보딩·짝짓기 모달 요청을 엔티티로 만든다.
         self.open_pending_overlays(window, cx);

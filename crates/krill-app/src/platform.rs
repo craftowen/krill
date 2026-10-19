@@ -50,3 +50,14 @@ pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process:
     command
 }
 
+/// Refresh existing windows after a theme or attention-count change.
+#[cfg(windows)]
+pub fn sync_windows(cx: &mut gpui::App) {
+    use gpui_component::ActiveTheme as _;
+    let dark = cx.theme().mode == gpui_component::ThemeMode::Dark;
+    for handle in cx.windows() {
+        handle
+            .update(cx, |_, window, _| sync_window(window, dark))
+            .ok();
+    }
+}
