@@ -152,6 +152,36 @@ mod tests {
     }
 
     #[test]
+    fn ascii_chunks_preserve_pending_escape_strings_and_utf8() {
+        for prefix in [
+            b"".as_slice(),
+            b"\x1b",
+            b"\x1b[31",
+            b"\x1b]2;title",
+            b"\x1bPpayload",
+            b"\xe9\x9f",
+        ] {
+            let mut chunked = Boundary::default();
+            let mut bytewise = Boundary::default();
+            chunked.advance(prefix);
+            bytewise.advance(prefix);
+            for chunk in [b"plain ascii\r\n".as_slice(), b"m\x07\x1b\\", b"after"] {
+                chunked.advance(chunk);
+                for byte in chunk {
+                    bytewise.advance(std::slice::from_ref(byte));
+                }
+                assert_eq!(chunked.pending, bytewise.pending, "prefix={prefix:?}");
+                assert_eq!(chunked.escaped, bytewise.escaped, "prefix={prefix:?}");
+                assert_eq!(
+                    std::mem::discriminant(&chunked.state),
+                    std::mem::discriminant(&bytewise.state),
+                    "prefix={prefix:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn capture_continues_pending_sequences_sync_and_active_sgr() {
         let size = WinSize { cols: 80, rows: 24 };
         let look = Appearance::load(std::path::PathBuf::new());
@@ -203,6 +233,12 @@ enum BoundaryState {
 }
 impl Boundary {
     pub fn advance(&mut self, bytes: &[u8]) {
+        // ASCII without ESC cannot leave ground or start a partial UTF-8 sequence.
+        // Keep pending control strings and codepoints on the bytewise path.
+        if matches!(self.state, BoundaryState::Ground) && bytes.is_ascii() && !bytes.contains(&0x1b)
+        {
+            return;
+        }
         for &byte in bytes {
             self.pending = self.pending.saturating_add(1);
             match self.state {
