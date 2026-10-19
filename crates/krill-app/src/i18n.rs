@@ -976,6 +976,7 @@ catalog! {
         SSH_KEYGEN_CANCEL => ("취소", "Cancel"),
         SSH_REGISTER_STARTED => ("{label}: 새 터미널 탭에서 ssh-copy-id를 실행했습니다. 상대 맥 비밀번호를 1회 입력해 주세요.", "{label}: Launched ssh-copy-id in a new terminal tab. Enter the remote Mac password once."),
         SSH_AUTH_FAILED_GUIDE => ("{label}: SSH 키가 아직 등록되지 않았습니다 ({error}). '이 기기 등록하기'를 눌러 비밀번호 1회 입력으로 등록하세요.", "{label}: SSH key is not registered yet ({error}). Click 'Register this device' to set it up with a one-time password."),
+        SSH_AUTH_USER_HINT => (" 주소에 사용자를 안 적어 이 PC 계정 '{user}'로 접속했습니다. 상대 Mac 계정이 다르면 '편집'에서 주소를 '계정@{address}'로 바꾸세요(상대 Mac 터미널에서 whoami로 확인).", " No user in the address, so this PC's account '{user}' was used. If the remote Mac account differs, use 'Edit' to change the address to 'account@{address}' (check with whoami on the remote Mac)."),
         SSH_CONN_REFUSED_GUIDE => ("{label}: 원격 로그인이 꺼져 있습니다. 상대 맥에서 시스템 설정 > 일반 > 공유 > 원격 로그인 켜기를 확인해 주세요.", "{label}: Remote Login is off. On the remote Mac, enable System Settings > General > Sharing > Remote Login."),
         SSH_REMOTE_PROBE => ("원격 정보 확인", "Check remote"),
         SSH_REMOTE_REFRESH => ("새로고침", "Refresh"),

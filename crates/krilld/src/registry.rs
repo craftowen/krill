@@ -860,7 +860,12 @@ impl Registry {
                     })
                     .collect();
                 drop(st);
-                lock(&self.sidebar).snapshot(&entries).map(Reply::Sidebar)
+                lock(&self.sidebar).snapshot(&entries).map(|mut data| {
+                    if peer.scope == Scope::Full {
+                        sidebar::include_projects(&mut data);
+                    }
+                    Reply::Sidebar(data)
+                })
             }
             Request::PrepareWorktree(w) => {
                 if self.authorize_cwd(peer, "worktree-prepare", &w.repo) {
