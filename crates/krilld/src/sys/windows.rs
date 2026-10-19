@@ -17,10 +17,16 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    FILETIME, HANDLE, INVALID_HANDLE_VALUE, LocalFree, WAIT_OBJECT_0,
+    ERROR_BUFFER_OVERFLOW, ERROR_NO_DATA, ERROR_SUCCESS, FILETIME, HANDLE, INVALID_HANDLE_VALUE,
+    LocalFree, WAIT_OBJECT_0,
 };
+use windows_sys::Win32::NetworkManagement::IpHelper::{
+    GAA_FLAG_INCLUDE_GATEWAYS, GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_DNS_SERVER,
+    GAA_FLAG_SKIP_MULTICAST, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+};
+use windows_sys::Win32::NetworkManagement::Ndis::IfOperStatusUp;
 use windows_sys::Win32::Networking::WinSock::{
-    SIO_AF_UNIX_GETPEERPID, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl,
+    AF_INET, SIO_AF_UNIX_GETPEERPID, SOCKADDR_IN, SOCKET, SOCKET_ERROR, WSAGetLastError, WSAIoctl,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
@@ -32,6 +38,7 @@ use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS_EX};
+use windows_sys::Win32::System::SystemInformation::{ComputerNameDnsHostname, GetComputerNameExW};
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessIoCounters, GetProcessTimes, IO_COUNTERS, OpenProcess,
     OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject,
@@ -340,8 +347,110 @@ pub fn user() -> io::Result<User> {
     })
 }
 
-pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr)>> {
-    unsupported()
+/// IPv4 주소·한글을 포함한 표시 이름·기본 게이트웨이 유무를 같은 네이티브 스냅샷에서 읽는다.
+pub(crate) fn ipv4_interfaces() -> io::Result<Vec<(String, std::net::Ipv4Addr, bool)>> {
+    let mut size = 15_000_u32;
+    let flags = GAA_FLAG_INCLUDE_GATEWAYS
+        | GAA_FLAG_SKIP_ANYCAST
+        | GAA_FLAG_SKIP_MULTICAST
+        | GAA_FLAG_SKIP_DNS_SERVER;
+    for _ in 0..3 {
+        let bytes = usize::try_from(size).map_err(io::Error::other)?;
+        // IP_ADAPTER_ADDRESSES의 u64 정렬을 보장한다. Windows가 크기를 바꾸면 새 버퍼로 다시 조회한다.
+        let mut buffer = vec![0_u64; bytes.div_ceil(size_of::<u64>())];
+        let head = buffer.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        // SAFETY: head는 size 바이트 이상·u64 정렬의 쓰기 가능한 버퍼이며 size도 쓰기 가능하다. Reserved는 null이다.
+        let code = unsafe {
+            GetAdaptersAddresses(u32::from(AF_INET), flags, ptr::null(), head, &raw mut size)
+        };
+        if code == ERROR_BUFFER_OVERFLOW {
+            continue;
+        }
+        if code == ERROR_NO_DATA {
+            return Ok(Vec::new());
+        }
+        if code != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(
+                i32::try_from(code).unwrap_or(i32::MAX),
+            ));
+        }
+        let mut interfaces = Vec::new();
+        let mut current = head;
+        while !current.is_null() {
+            // SAFETY: 성공한 API가 이 버퍼 안에 초기화한 연결 목록이다. buffer는 순회 내내 살아 있고 변경하지 않는다.
+            let adapter = unsafe { &*current };
+            current = adapter.Next;
+            if adapter.OperStatus != IfOperStatusUp || adapter.FriendlyName.is_null() {
+                continue;
+            }
+            let offset = adapter
+                .FriendlyName
+                .addr()
+                .checked_sub(buffer.as_ptr().addr())
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "adapter name outside buffer")
+                })?;
+            let available = size_of_val(buffer.as_slice())
+                .checked_sub(offset)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "adapter name outside buffer")
+                })?
+                / size_of::<u16>();
+            // SAFETY: FriendlyName은 API가 버퍼 안에 쓴 UTF-16 포인터다. available은 할당 끝까지만 세며 u16은 모든 비트 패턴이 유효하다.
+            let wide = unsafe { std::slice::from_raw_parts(adapter.FriendlyName, available) };
+            let name = interface_name(wide);
+            let default_route = !adapter.FirstGatewayAddress.is_null();
+            let mut address = adapter.FirstUnicastAddress;
+            while !address.is_null() {
+                // SAFETY: FirstUnicastAddress·Next도 같은 성공한 API가 버퍼 안에 초기화한 목록이다.
+                let unicast = unsafe { &*address };
+                address = unicast.Next;
+                let socket = &unicast.Address;
+                if socket.lpSockaddr.is_null()
+                    || usize::try_from(socket.iSockaddrLength).unwrap_or(0)
+                        < size_of::<SOCKADDR_IN>()
+                {
+                    continue;
+                }
+                // SAFETY: API의 AF_INET 조회 결과이고 위에서 null·구조체 크기를 검사했다. 구조체를 복사해 더 강한 정렬을 요구하지 않는다.
+                let ipv4: SOCKADDR_IN = unsafe { ptr::read_unaligned(socket.lpSockaddr.cast()) };
+                if ipv4.sin_family != AF_INET {
+                    continue;
+                }
+                // SAFETY: AF_INET 주소의 S_addr는 초기화된 IPv4 네트워크 바이트다.
+                let raw = unsafe { ipv4.sin_addr.S_un.S_addr };
+                interfaces.push((
+                    name.clone(),
+                    std::net::Ipv4Addr::from(raw.to_ne_bytes()),
+                    default_route,
+                ));
+            }
+        }
+        return Ok(interfaces);
+    }
+    Err(io::Error::other("network adapters changed during query"))
+}
+
+fn interface_name(wide: &[u16]) -> String {
+    let end = wide.iter().position(|&c| c == 0).unwrap_or(wide.len());
+    String::from_utf16_lossy(wide.get(..end).unwrap_or_default())
+}
+
+/// 모바일 snapshot마다 자식 프로세스를 띄우지 않고 실제 DNS 호스트 이름을 읽는다.
+pub(crate) fn hostname() -> io::Result<String> {
+    let mut size = 0;
+    // SAFETY: null·크기 0으로 필요한 UTF-16 버퍼 길이만 묻는다. size는 쓰기 가능하다.
+    unsafe { GetComputerNameExW(ComputerNameDnsHostname, ptr::null_mut(), &raw mut size) };
+    if size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = vec![0_u16; usize::try_from(size).map_err(io::Error::other)?];
+    // SAFETY: name은 직전 API가 요구한 size개 요소의 쓰기 가능한 UTF-16 버퍼다.
+    if unsafe { GetComputerNameExW(ComputerNameDnsHostname, name.as_mut_ptr(), &raw mut size) } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(interface_name(&name))
 }
 
 /// DPAPI로 봉인한다(현재 사용자 범위, UI 없음). 같은 사용자 로그온에서만 풀 수 있다.
@@ -513,6 +622,25 @@ pub(crate) fn thread_finished(thread: BorrowedHandle<'_>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "OWE-915 VM network query measurement"]
+    fn measure_ipv4_interfaces() {
+        for _ in 0..10 {
+            let start = Instant::now();
+            let interfaces = ipv4_interfaces().unwrap();
+            eprintln!(
+                "detect_us={} interfaces={interfaces:?}",
+                start.elapsed().as_micros()
+            );
+        }
+    }
+
+    #[test]
+    fn adapter_name_preserves_korean_and_stops_at_nul() {
+        let wide = "이더넷 OWE-915\0discard".encode_utf16().collect::<Vec<_>>();
+        assert_eq!(interface_name(&wide), "이더넷 OWE-915");
+    }
 
     #[test]
     fn process_queries_describe_this_process() {
