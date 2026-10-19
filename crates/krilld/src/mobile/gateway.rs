@@ -783,8 +783,14 @@ fn serve(
                 socket
                     .set_read_timeout(Some(Duration::from_millis(50)))
                     .ok();
+                // 클라이언트가 인증 뒤 프레임을 미리 보내므로(파이프라이닝) 닫기 전에 EOF까지 비운다.
+                // 남은 바이트가 있으면 close가 RST가 되어 클라이언트가 1008 대신 1006을 본다.
                 let mut drain = [0; 512];
-                io::Read::read(&mut socket, &mut drain).ok();
+                let until = Instant::now() + Duration::from_millis(250);
+                while Instant::now() < until
+                    && io::Read::read(&mut socket, &mut drain).is_ok_and(|n| n > 0)
+                {
+                }
             }
             return Err(error);
         }
@@ -894,7 +900,14 @@ fn bridge(
         .stack_size(STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
-            registry.serve_mobile(server, &hello)
+            // server_stop 복제가 fd를 붙잡고 있어 serve가 끝나도 local 쪽에 EOF가 오지 않는다.
+            // 레지스트리가 먼저 끝내면(첫 요청 기한 초과·세션 종료) 여기서 닫아 WS도 닫히게 한다.
+            let done = server.try_clone();
+            let result = registry.serve_mobile(server, &hello);
+            if let Ok(done) = done {
+                done.shutdown(Shutdown::Both).ok();
+            }
+            result
         });
     let result = if worker.is_ok() {
         (|| -> io::Result<()> {
