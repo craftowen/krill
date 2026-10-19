@@ -19,6 +19,10 @@ use crate::{HostId, HostStatus, HostTarget, RemoteConnector};
 
 const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
+/// 이만큼 잇달아 실패하면(약 30초) 꺼져 있는 기기로 보고 [`OFFLINE_BACKOFF`] 간격으로만 다시 시도한다.
+const OFFLINE_AFTER_FAILURES: u32 = 10;
+/// 꺼진 기기 재시도 간격. 사이드바 '다시 연결'([`HostManager::reconnect_now`])은 이 대기를 바로 푼다.
+const OFFLINE_BACKOFF: Duration = Duration::from_secs(60);
 
 /// 백그라운드에서 수집한 전송 상태. UI에서는 이 스냅샷만 읽는다.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -139,6 +143,8 @@ pub struct HostManager {
     external: Arc<Mutex<BTreeMap<String, ExternalHost>>>,
     slots: Arc<Mutex<BTreeMap<String, Arc<Mutex<RemoteSlot>>>>>,
     order: Arc<Mutex<Vec<String>>>,
+    /// 같은 기기를 가리키는 중복 등록 id → 대표 id. 중복 id로 저장된 칸도 대표 슬롯의 터널을 쓴다.
+    aliases: Arc<Mutex<BTreeMap<String, String>>>,
     local_dir: Option<PathBuf>,
     ssh_bin: Option<std::ffi::OsString>,
 }
@@ -175,7 +181,11 @@ impl HostManager {
     }
 
     /// 연속 실패 횟수에 따른 지수 백오프 지연(200ms → 400ms → 800ms → 1.6s → 3.2s → 최대 5s).
+    /// [`OFFLINE_AFTER_FAILURES`]번을 넘기면 [`OFFLINE_BACKOFF`]로 늘려, 꺼진 기기에 ssh를 5초마다 띄우지 않는다.
     pub fn backoff_delay(failures: u32) -> Duration {
+        if failures > OFFLINE_AFTER_FAILURES {
+            return OFFLINE_BACKOFF;
+        }
         let shift = failures.saturating_sub(1).min(5);
         let factor = 1u32.checked_shl(shift).unwrap_or(32);
         INITIAL_BACKOFF.saturating_mul(factor).min(MAX_BACKOFF)
@@ -356,8 +366,21 @@ impl HostManager {
         }
     }
 
+    /// 같은 기기 중복 등록(`id` → 대표 id)을 알린다. [`Self::sync_specs`]에는 대표 명세만 넘긴다.
+    pub fn set_aliases(&self, aliases: BTreeMap<String, String>) {
+        if let Ok(mut map) = self.aliases.lock() {
+            *map = aliases;
+        }
+    }
+
     fn slot(&self, id: &str) -> Option<Arc<Mutex<RemoteSlot>>> {
-        self.slots.lock().ok()?.get(id).cloned()
+        let id = self
+            .aliases
+            .lock()
+            .ok()
+            .and_then(|a| a.get(id).cloned())
+            .unwrap_or_else(|| id.to_owned());
+        self.slots.lock().ok()?.get(&id).cloned()
     }
 
     fn ensure_tunnel_socket(&self, id: &str) -> io::Result<PathBuf> {
