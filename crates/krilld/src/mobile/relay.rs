@@ -507,11 +507,9 @@ fn handle_mux_frame(
     };
     sessions.retain(|_, s| s.tx.send((0, Vec::new())).is_ok());
     match kind {
+        // 챌린지는 데몬이 만든다(serve_mux_client). DO가 정하면 같은 챌린지로 녹화한 세션을 재생할 수 있다.
+        // MUX_OPEN payload는 비어 있어야 하지만 내용을 쓰지 않으므로 검사하지 않는다.
         MUX_OPEN => {
-            let Ok(challenge) = <[u8; 32]>::try_from(payload) else {
-                outbox.send_close(conn_id, 1002);
-                return;
-            };
             let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
             let Ok((local, server)) = UnixStream::pair() else {
                 outbox.send_close(conn_id, 1011);
@@ -571,7 +569,7 @@ fn handle_mux_frame(
                 .spawn(move || {
                     crate::alloc::mobile_thread().ok();
                     let code = match serve_mux_client(
-                        conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
+                        conn_id, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
                     ) {
                         Err(err) if err.kind() == io::ErrorKind::InvalidData => 1008,
                         _ => 1000,
@@ -647,7 +645,6 @@ fn recv_open_frame(rx: &mpsc::Receiver<(u8, Vec<u8>)>) -> io::Result<(u8, Vec<u8
 )]
 fn serve_mux_client(
     conn_id: u32,
-    challenge: [u8; 32],
     rx: &mpsc::Receiver<(u8, Vec<u8>)>,
     close_tx: &mpsc::Sender<(u8, Vec<u8>)>,
     mut local: UnixStream,
@@ -659,6 +656,14 @@ fn serve_mux_client(
     hello: &ServerHello,
 ) -> io::Result<()> {
     lock(&shared.state).devices.attempt(now_ms())?;
+    // 직접 연결 경로(gateway::authenticate)와 같은 생성기·형식. 릴레이는 챌린지를 모른 채 텍스트로만 넘긴다.
+    let challenge = random()?;
+    outbox.send_mux(
+        MUX_TEXT,
+        conn_id,
+        &serde_json::to_vec(&serde_json::json!({"version":2,"challenge":hex(&challenge)}))
+            .map_err(io::Error::other)?,
+    )?;
     let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
     if opcode != ws::TEXT || body.len() > 4096 {
         return Err(invalid());
