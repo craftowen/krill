@@ -1899,6 +1899,22 @@ impl Sidebar {
             }))
     }
 
+    fn fill_lineage(&self, meta: &mut TreeMenuMeta, host: &HostId) {
+        if !host.is_local() {
+            return;
+        }
+        meta.current_parent = self.worktree_parent(&meta.path);
+        meta.parent_candidates = self
+            .eligible_parent_worktrees(&meta.path)
+            .into_iter()
+            .map(|cand| {
+                let label = self.name(&cand);
+                (cand, label)
+            })
+            .collect();
+        meta.descendant_count = self.lineage_descendants(&meta.path).len();
+    }
+
     /// 행 + 우클릭 메뉴(세션 행은 열기·이어하기·종료 + 여기서 새 터미널·에이전트·Open in, 워크트리·폴더는 핀·이름 변경·계보 작업).
     /// 저장소·폴더 헤더는 접기 대상 경로를 `header`로 넘겨 '프로젝트 제거' 메뉴를 붙인다(OWE-845).
     fn render_row_with_menu(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
@@ -1908,26 +1924,6 @@ impl Sidebar {
             Row::Worktree(path) => {
                 let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
                 let is_primary = self.snapshot_for(&host).trees.contains_key(path);
-                let current_parent = host
-                    .is_local()
-                    .then(|| self.worktree_parent(path))
-                    .flatten();
-                let parent_candidates = if host.is_local() {
-                    self.eligible_parent_worktrees(path)
-                        .into_iter()
-                        .map(|cand| {
-                            let label = self.name(&cand);
-                            (cand, label)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let descendant_count = if host.is_local() {
-                    self.lineage_descendants(path).len()
-                } else {
-                    0
-                };
                 let sleeping = host.is_local() && self.is_worktree_sleeping(path);
                 (
                     Some(path.clone()),
@@ -1936,9 +1932,9 @@ impl Sidebar {
                         path: path.clone(),
                         pinned,
                         is_primary,
-                        current_parent,
-                        parent_candidates,
-                        descendant_count,
+                        current_parent: None,
+                        parent_candidates: Vec::new(),
+                        descendant_count: 0,
                         sleeping,
                     }),
                     None,
@@ -1969,6 +1965,14 @@ impl Sidebar {
             .cloned();
         element
             .context_menu(move |menu, window, cx| {
+                // 계보 정보는 메뉴를 열 때만 계산한다. 보이는 행마다 계산하면 후보마다 계보 저장소를 다시 읽어
+                // 프레임이 O(행×워크트리²)가 된다(MK-046 500행 테스트가 CI에서 180초 시간 초과, 2026-10-18).
+                let tree = tree.clone().map(|mut meta| {
+                    if let Some(sidebar) = this.upgrade() {
+                        sidebar.read(cx).fill_lineage(&mut meta, &host);
+                    }
+                    meta
+                });
                 row_menu(
                     menu,
                     &this,
