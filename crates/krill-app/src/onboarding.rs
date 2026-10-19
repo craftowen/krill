@@ -12,7 +12,7 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -130,7 +130,7 @@ impl Drop for ReaderGuard {
 /// `shell -l -i -c`로 로그인·대화형 셸의 PATH를 얻는다. 실패하거나 [`SHELL_TIMEOUT`]을 넘기면 `None`.
 pub fn login_path(shell: &OsStr) -> Option<OsString> {
     let script = format!("printf '\\n{PATH_MARK}%s\\n' \"$PATH\"");
-    let mut child = Command::new(shell)
+    let mut child = crate::platform::background_command(shell)
         .args(["-l", "-i", "-c", &script])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -303,7 +303,7 @@ fn mk_hook(krill: &Path, path: &OsStr, agent: Agent, flag: &str) -> Result<Strin
             .get()
             .replace("{path}", &krill.display().to_string()));
     }
-    let out = Command::new(krill)
+    let out = crate::platform::background_command(krill)
         .args(["hook", "install", agent.id(), flag])
         .env("PATH", path)
         .stdin(Stdio::null())
@@ -643,7 +643,7 @@ fn quick_helpers(env: &Env) -> Check {
 }
 
 fn command_version(binary: &Path) -> Option<String> {
-    let out = Command::new(binary)
+    let out = crate::platform::background_command(binary)
         .arg("--version")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -945,7 +945,7 @@ pub(super) fn run_doctor_settled(staged_krill: &Path, wait: Duration) -> Vec<Che
 /// 읽는다(OWE-714: fail 1건이 보고서 전체를 "점검 실행 실패"로 덮던 결함). 보고서를 못 읽을
 /// 때만 원인(실행 불가·종료 코드·stderr 첫 줄·형식 불일치)을 담은 `bin.helpers` fail 1건이다.
 pub(super) fn run_doctor_checks(staged_krill: &Path) -> Vec<Check> {
-    let output = Command::new(staged_krill)
+    let output = crate::platform::background_command(staged_krill)
         .args(["doctor", "--json", "--no-start"])
         .stdin(Stdio::null())
         .stderr(Stdio::piped())

@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
@@ -685,7 +685,7 @@ pub fn run_krill_import_with_timeout(
             text::ERR_CLI_MISSING.get(),
         ));
     }
-    let mut cmd = Command::new(krill_bin);
+    let mut cmd = crate::platform::background_command(krill_bin);
     cmd.arg("import").arg("orca");
     if dry_run {
         cmd.arg("--dry-run");
@@ -1435,7 +1435,7 @@ mod tests {
             )
             .unwrap();
         }
-        let status = Command::new("/usr/bin/sqlite3")
+        let status = crate::platform::background_command("/usr/bin/sqlite3")
             .arg(db_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())

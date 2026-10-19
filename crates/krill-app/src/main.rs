@@ -3,6 +3,8 @@
 //! panic은 크래시 로그로 남기고, 다음 실행이 진단 대화상자를 띄운다(MK-067). `--crash-test`는 그 경로를 검증하려고
 //! 시작 직후 일부러 panic한다. 첫 실행이면 온보딩 대화상자를 띄운다(MK-073).
 
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod shell;
 
 use gpui::{

@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -678,7 +678,7 @@ pub fn discover_tailscale_peers() -> Vec<TailscalePeer> {
         "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
     ));
     for bin in candidates {
-        let Ok(out) = Command::new(&bin)
+        let Ok(out) = crate::platform::background_command(&bin)
             .args(["status", "--json"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -754,7 +754,7 @@ pub fn generate_default_ssh_key(home: Option<&Path>) -> io::Result<PathBuf> {
     }
     let keygen_bin = std::env::var_os("KRILL_SSH_KEYGEN_BIN")
         .map_or_else(|| PathBuf::from("ssh-keygen"), PathBuf::from);
-    let out = Command::new(keygen_bin)
+    let out = crate::platform::background_command(keygen_bin)
         .args(["-t", "ed25519", "-N", "", "-f"])
         .arg(&key_path)
         .stdin(Stdio::null())
@@ -803,7 +803,7 @@ pub fn test_connection(host: &SshHost) -> Result<String, String> {
     let start = Instant::now();
     let ssh_bin =
         std::env::var_os("KRILL_SSH_BIN").map_or_else(|| PathBuf::from("ssh"), PathBuf::from);
-    let mut cmd = Command::new(ssh_bin);
+    let mut cmd = crate::platform::background_command(ssh_bin);
     cmd.args(host.test_args())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

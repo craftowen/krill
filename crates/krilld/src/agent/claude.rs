@@ -322,7 +322,13 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
     profile.launch = vec![profile.program()?.to_owned(), "--version".into()];
     let launch = wrap(&profile, Permission::Manual, login.clone());
     let (program, args) = launch.argv.split_first()?;
-    let mut child = Command::new(OsStr::from_bytes(program))
+    let mut command = Command::new(OsStr::from_bytes(program));
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .args(args.iter().map(|a| OsStr::from_bytes(a)))
         .env_clear()
         .envs(
