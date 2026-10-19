@@ -718,7 +718,19 @@ impl Shell {
         let detached_open = cx.subscribe(&detached, |this, _, &detached::Open(s), cx| {
             this.open_session(s, cx);
         });
+        // 바이너리 단위 테스트는 라이브러리를 cfg(test) 없이 링크하므로, 기본 Panel이면 이 Mac의 실제 krilld에 붙어
+        // 사용자 기록 볼트 결과가 팔레트에 섞인다. 테스트에서는 데몬 호출을 끊는다.
+        #[cfg(not(test))]
         let history = cx.new(|_| krill_app::agent_history::Panel::default());
+        #[cfg(test)]
+        let history = cx.new(|_| {
+            krill_app::agent_history::Panel::new(std::sync::Arc::new(|_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "daemon disabled in unit tests",
+                ))
+            }))
+        });
         let history_open = cx.subscribe(
             &history,
             |this, _, &krill_app::agent_history::Open(s), cx| {
