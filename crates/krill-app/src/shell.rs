@@ -56,7 +56,7 @@ use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_app::detached;
 use krill_app::echo::EchoDraw;
-use krill_app::link::{Link, notice_text};
+use krill_app::link::{BannerTone, Link, notice_text};
 use krill_app::pane::{self, Pane};
 use krill_app::terminal::{
     Painted, Preedit, TerminalElement, cell_at, cell_size, file_link_target, link_target,
@@ -82,6 +82,8 @@ const KEY_CONTEXT: &str = "Shell";
 const CURSOR_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 /// 분할선의 잡는 폭(pt). 보이는 선은 1pt.
 const DIVIDER_GRAB: Pixels = krill_app::ui::DIVIDER_HIT_PX;
+/// 재연결 확인 배너가 보이는 시간.
+const RECONNECTED_FOR: Duration = Duration::from_millis(2500);
 
 /// 사용자에게 보이는 ko/en 문자열 키(MK-094).
 use krill_app::i18n::catalog::shell as text;
@@ -453,6 +455,7 @@ pub struct Shell {
     _sidebar_close_session: Subscription,
     _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
+    _sidebar_relisted: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
     sidebar_collapsed: bool,
@@ -478,6 +481,9 @@ pub struct Shell {
     agent_client: Arc<dyn pane::AgentClient>,
     /// 마지막 입력 알림(누르면 닫힘).
     notice: Option<String>,
+    /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
+    reconnected: Option<String>,
+    reconnected_task: Option<Task<()>>,
     window: Option<AnyWindowHandle>,
     activation: Option<Subscription>,
     bounds_observer: Option<Subscription>,
@@ -640,6 +646,9 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
+        let sidebar_relisted = cx.subscribe(&sidebar, |this, _, e: &sidebar::Relisted, cx| {
+            this.show_reconnected(e.0, cx);
+        });
         let close_session =
             cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::CloseSession, cx| {
                 let host = sidebar
@@ -840,6 +849,7 @@ impl Shell {
             _sidebar_close_session: close_session,
             _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
+            _sidebar_relisted: sidebar_relisted,
             _sidebar_tabs: sidebar_tabs,
             layout,
             sidebar_collapsed,
@@ -860,6 +870,8 @@ impl Shell {
             agent_task: None,
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
+            reconnected: None,
+            reconnected_task: None,
             window: None,
             activation: None,
             bounds_observer: None,
@@ -1822,7 +1834,13 @@ impl Shell {
         if link != Link::Up {
             krill_app::alert::disconnected(cx);
             self.appearance = None;
+            self.reconnected = None;
+            self.reconnected_task = None;
         }
+        // 재연결 확인은 다시 붙은 뒤 실제 세션 목록이 도착해야 보인다(결과 동사 규칙, STYLEGUIDE §7.1.1).
+        let reconnecting = link == Link::Down;
+        self.sidebar
+            .update(cx, |s, cx| s.set_local_reconnecting(reconnecting, cx));
         self.link = link;
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
@@ -1839,6 +1857,24 @@ impl Shell {
             self.sync(cx);
             self.refresh_detached(cx);
         }
+        cx.notify();
+    }
+
+    fn show_reconnected(&mut self, sessions: usize, cx: &mut Context<Self>) {
+        if self.link != Link::Up {
+            return;
+        }
+        self.reconnected = Some(
+            krill_app::i18n::catalog::link::RECONNECTED.format(&[("n", &sessions.to_string())]),
+        );
+        self.reconnected_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RECONNECTED_FOR).await;
+            this.update(cx, |this, cx| {
+                this.reconnected = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -3537,11 +3573,17 @@ impl Shell {
                     // K1 OWE-843: 좁은 사이드바·큰 UI 배율에서도 앱 이름을 찌그러뜨리지 않는다.
                     .flex_none()
                     .px_1()
-                    .truncate()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .text_size(krill_app::ui::TEXT_SM)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(p.sidebar_foreground)
-                    .child(text::APP_TITLE.get()),
+                    .child(
+                        krill_app::ui::icons::krill_brand_icon(krill_app::ui::ICON_MD, p)
+                            .debug_selector(|| "titlebar-brand-mark".into()),
+                    )
+                    .child(div().truncate().child(text::APP_TITLE.get())),
             )
             .child(krill_app::ui::button_with_tooltip(
                 Button::new("toggle-sidebar")
@@ -4339,6 +4381,33 @@ impl Shell {
     }
 }
 
+/// 보존 톤 배너(STYLEGUIDE §3.3): `preserve` 12% 바탕·30% 테두리, 앞에 모노 크릴 마크 12px.
+fn preserve_banner(
+    id: &'static str,
+    msg: impl Into<SharedString>,
+    p: &krill_app::ui::Palette,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .px_3()
+        .py_1p5()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .bg(p.preserve.opacity(0.12))
+        .border_b_1()
+        .border_color(p.preserve.opacity(0.3))
+        .text_color(p.foreground)
+        .text_size(krill_app::ui::TEXT_XS)
+        .child(krill_app::ui::icons::svg_box(
+            krill_app::ui::icons::KRILL_SVG,
+            krill_app::ui::ICON_XS,
+            p.preserve,
+        ))
+        .child(div().min_w_0().child(msg.into()))
+}
+
 /// 분할선: 1pt 선 + 잡는 폭 5pt. 드래그 값은 `Drag`, 실제 크기 계산은 부모의 `on_drag_move`가 한다.
 /// OWE-871: 기본 선 색은 `p.split_divider`(STYLEGUIDE §3.1)이며, 분할 트리의 선(`reset` 있음)을
 /// 더블클릭하면 50:50(`ratio = 0.5`)으로 되돌린다.
@@ -4932,14 +5001,24 @@ impl Render for Shell {
                             .bg(bg)
                             .child(self.render_tab_bar(window, cx))
                             .children(self.link.banner().map(|msg| {
-                                div()
-                                    .px_3()
-                                    .py_1p5()
-                                    .bg(warning)
-                                    .text_color(warning_fg)
-                                    .text_size(krill_app::ui::TEXT_XS)
-                                    .child(krill_app::i18n::cached_notice(&msg))
+                                let msg = krill_app::i18n::cached_notice(&msg);
+                                match self.link.banner_tone() {
+                                    BannerTone::Preserve => preserve_banner("link-banner", msg, p),
+                                    BannerTone::Warning => div()
+                                        .id("link-banner")
+                                        .px_3()
+                                        .py_1p5()
+                                        .bg(warning)
+                                        .text_color(warning_fg)
+                                        .text_size(krill_app::ui::TEXT_XS)
+                                        .child(msg),
+                                }
                             }))
+                            .children(
+                                self.reconnected
+                                    .clone()
+                                    .map(|msg| preserve_banner("reconnected-banner", msg, p)),
+                            )
                             .children(self.notice.clone().map(|msg| {
                                 div()
                                     .id("notice")
@@ -5074,6 +5153,32 @@ impl Shell {
             .flex_col()
             .items_center()
             .justify_center()
+            .gap_6()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        krill_app::ui::icons::brand_mark_tile(48.)
+                            .debug_selector(|| "empty-brand-tile".into()),
+                    )
+                    .child(
+                        div()
+                            .text_size(krill_app::ui::TEXT_LG)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(text::APP_TITLE.get()),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "empty-tagline".into())
+                            .text_size(krill_app::ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .child(text::EMPTY_TAGLINE.get()),
+                    ),
+            )
             .child(
                 div()
                     .w(px(240.))

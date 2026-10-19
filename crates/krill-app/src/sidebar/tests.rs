@@ -4288,3 +4288,67 @@ fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
         assert!(s.collapsed.contains(&wt_gone));
     });
 }
+
+/// 재연결 확인: 재연결 중에서 풀린 뒤 처음 도착한 목록만 세션 수와 함께 한 번 알린다.
+#[gpui::test]
+fn fresh_list_after_reconnect_emits_relisted_once(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let got = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let sink = got.clone();
+    let _sub = cx
+        .update(|_, cx| cx.subscribe(&view, move |_, e: &Relisted, _| sink.borrow_mut().push(e.0)));
+    let apply = |cx: &mut gpui::VisualTestContext, ok: bool| {
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                let result = if ok {
+                    Ok((
+                        Snapshot {
+                            sessions: vec![
+                                session(1, AgentState::Working, None),
+                                session(2, AgentState::Done, None),
+                            ],
+                            trees: BTreeMap::new(),
+                        },
+                        Meta::new(),
+                    ))
+                } else {
+                    Err(io::Error::other("daemon down"))
+                };
+                s.apply(result, BTreeMap::new(), cx);
+            });
+        });
+    };
+    let reconnecting = |cx: &mut gpui::VisualTestContext, on: bool| {
+        cx.update(|_, cx| view.update(cx, |s, cx| s.set_local_reconnecting(on, cx)));
+    };
+    apply(cx, true);
+    reconnecting(cx, false);
+    apply(cx, true);
+    assert!(got.borrow().is_empty(), "재연결이 없었으면 알리지 않는다");
+    reconnecting(cx, true);
+    apply(cx, false);
+    apply(cx, true);
+    assert!(
+        got.borrow().is_empty(),
+        "셸이 다시 붙기 전 목록은 알리지 않는다"
+    );
+    reconnecting(cx, false);
+    apply(cx, false);
+    assert!(got.borrow().is_empty(), "실패한 폴링은 목록 도착이 아니다");
+    apply(cx, true);
+    apply(cx, true);
+    assert_eq!(*got.borrow(), vec![2]);
+}
+
+/// 로컬 데몬 재연결 중의 '내 Mac' 끊김만 보존 톤이고, 원격·실패는 destructive 그대로다.
+#[test]
+fn local_reconnecting_host_is_preserve() {
+    let p = &crate::ui::DARK;
+    let (c, label) = view::host_status_tone(HostStatus::Disconnected, true, p);
+    assert_eq!((c, label), (p.preserve, text::HOST_RECONNECTING.get()));
+    let (c, _) = view::host_status_tone(HostStatus::Disconnected, false, p);
+    assert_eq!(c, p.destructive);
+    let (c, _) = view::host_status_tone(HostStatus::Connected, true, p);
+    assert_eq!(c, p.success);
+}

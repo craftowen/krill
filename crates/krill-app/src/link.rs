@@ -36,6 +36,24 @@ impl Link {
     }
 }
 
+/// 배너 색조(STYLEGUIDE §3.3). 세션이 안전한 재연결은 `preserve`, 사용자가 알아야 할 실패는 `warning`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BannerTone {
+    Preserve,
+    Warning,
+}
+
+impl Link {
+    /// [`Link::banner`]의 색조. 붙어 있다가 끊긴 `Down`만 보존 톤이다(PTY는 krill-holder가 쥐고 있다).
+    #[must_use]
+    pub const fn banner_tone(&self) -> BannerTone {
+        match self {
+            Self::Down => BannerTone::Preserve,
+            Self::Connecting | Self::Up | Self::Failed(_) => BannerTone::Warning,
+        }
+    }
+}
+
 /// 멈춘 칸 배너(OWE-586). 보이는 칸 중 보낸 입력의 ack가 PROBE 넘게 오지 않은 칸이 있으면 보인다.
 /// ack·재연결이 오면 다음 그리기에서 사라진다.
 pub fn stalled_banner(stalled: bool) -> Option<String> {
@@ -84,6 +102,12 @@ mod tests {
             f.contains("socket path too long") && f.contains(text::RETRYING.get()),
             "{f}"
         );
+    }
+
+    #[test]
+    fn reconnect_is_preserve_and_failure_is_warning() {
+        assert_eq!(Link::Down.banner_tone(), BannerTone::Preserve);
+        assert_eq!(Link::Failed("x".into()).banner_tone(), BannerTone::Warning);
     }
 
     #[test]
