@@ -18,10 +18,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// 미인증 연결 상한. 인증된 연결은 기기당 WS 2개(메인+터미널)라 별도 상한을 둔다.
-const MAX_PENDING: usize = 4;
-const MAX_CONNECTIONS: usize = 12;
+pub(super) const MAX_PENDING: usize = 4;
+pub(super) const MAX_CONNECTIONS: usize = 12;
 const STACK: usize = 128 * 1024;
-const TIMEOUT: Duration = Duration::from_secs(5);
+pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 /// 수락 스레드가 일이 없어도 깨어 reconcile(터널 감시·백오프)하는 최대 간격.
 const RECONCILE: Duration = Duration::from_secs(1);
 /// Cloudflare는 양방향 무전송 WS를 끊는다(Quick Tunnel 실측 약 125초). 이 주기로 ping하고,
@@ -48,16 +48,26 @@ pub struct Gateway {
     backend: super::pwa_rpc::Backend,
 }
 #[derive(Debug)]
-struct Shared {
-    state: Mutex<State>,
+pub(super) struct Shared {
+    pub(super) state: Mutex<State>,
     changed: Condvar,
     waker: Arc<Waker>,
 }
 impl Shared {
     /// 상태 변경을 알린다. QR 대기(condvar)와 락 밖에서 poll 중인 수락 스레드를 함께 깨운다.
-    fn wake(&self) {
+    pub(super) fn wake(&self) {
         self.changed.notify_all();
         self.waker.ring();
+    }
+}
+struct RelayContext {
+    shared: Weak<Shared>,
+    registry: Weak<Registry>,
+    hello: ServerHello,
+}
+impl std::fmt::Debug for RelayContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayContext").finish_non_exhaustive()
     }
 }
 /// 수락 스레드는 상태 락을 푼 채 리스너 복제 fd와 깨우기 소켓을 poll한다. 리스너를 닫는 쪽은
@@ -136,25 +146,33 @@ impl Waker {
     }
 }
 #[derive(Debug)]
-struct State {
-    devices: Devices,
+pub(super) struct State {
+    pub(super) devices: Devices,
     mode: ConnectMode,
     custom: Option<String>,
     interfaces: Vec<NetworkInterface>,
     selected: Option<SocketAddrV4>,
     listeners: Vec<TcpListener>,
-    connections: HashMap<u64, Connection>,
-    next: u64,
-    stopped: bool,
-    tunnel: Option<super::tunnel::Tunnel>,
+    pub(super) connections: HashMap<u64, Connection>,
+    pub(super) next: u64,
+    pub(super) stopped: bool,
+    pub(super) tunnel: Option<super::tunnel::Tunnel>,
     tunnel_start: Option<fn(u16) -> io::Result<super::tunnel::Tunnel>>,
+    relay: Option<super::relay::RelayClient>,
+    relay_enabled: bool,
+    relay_ctx: Option<RelayContext>,
+    saved_port: Option<u16>,
+    saved_tunnel_pid: Option<u32>,
+    saved_tunnel_url: Option<String>,
+    tunnel_token: Option<String>,
+    tunnel_hostname: Option<String>,
     resolver: super::cloudflared::Resolver,
     publication: super::tunnel::Publication,
     tunnel_failures: u32,
     tunnel_retry_at: Option<Instant>,
     tunnel_error: Option<io::Error>,
     dir: Option<PathBuf>,
-    ping: Duration,
+    pub(super) ping: Duration,
     waker: Arc<Waker>,
 }
 #[derive(Deserialize, Serialize)]
@@ -165,6 +183,16 @@ struct Intent {
     rid: String,
     #[serde(default)]
     key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tunnel_hostname: Option<String>,
 }
 impl Intent {
     fn load(dir: Option<&Path>) -> io::Result<Self> {
@@ -180,6 +208,11 @@ impl Intent {
                 custom: None,
                 rid: String::new(),
                 key: String::new(),
+                port: None,
+                tunnel_pid: None,
+                tunnel_url: None,
+                tunnel_token: None,
+                tunnel_hostname: None,
             });
         if decode_hex::<16>(&intent.rid).is_err() || decode_hex::<32>(&intent.key).is_err() {
             intent.rid = hex(&random()?.into_iter().take(16).collect::<Vec<_>>());
@@ -197,11 +230,69 @@ impl Intent {
         )
     }
 }
+fn save_intent(s: &State) -> io::Result<()> {
+    let Some(dir) = &s.dir else {
+        return Ok(());
+    };
+    let intent = Intent {
+        mode: s.mode,
+        custom: s.custom.clone(),
+        rid: s.publication.rid.clone(),
+        key: s.publication.key.clone(),
+        port: s.saved_port,
+        tunnel_pid: s.saved_tunnel_pid,
+        tunnel_url: s.saved_tunnel_url.clone(),
+        tunnel_token: s.tunnel_token.clone(),
+        tunnel_hostname: s.tunnel_hostname.clone(),
+    };
+    intent.save(dir)
+}
+fn sync_tunnel_intent(s: &mut State) {
+    if s.dir.is_none() || s.mode != ConnectMode::Tunnel {
+        return;
+    }
+    let Some(port) = s.selected.map(|a| a.port()) else {
+        return;
+    };
+    let Some(tunnel) = s.tunnel.as_ref() else {
+        return;
+    };
+    let cur_pid = tunnel.pid();
+    let cur_url = tunnel.url().map(str::to_owned);
+    if cur_url.is_some()
+        && (s.saved_port != Some(port)
+            || s.saved_tunnel_pid != cur_pid
+            || s.saved_tunnel_url != cur_url)
+    {
+        tunnel.set_persist(true);
+        s.saved_port = Some(port);
+        s.saved_tunnel_pid = cur_pid;
+        s.saved_tunnel_url = cur_url;
+        save_intent(s).ok();
+    }
+}
 #[derive(Debug)]
-struct Connection {
-    accepted: Instant,
-    device: Option<String>,
-    socket: TcpStream,
+pub(super) enum ShutdownHandle {
+    Tcp(TcpStream),
+    Unix(UnixStream),
+}
+impl ShutdownHandle {
+    pub(super) fn shutdown(&self) {
+        match self {
+            Self::Tcp(s) => {
+                s.shutdown(Shutdown::Both).ok();
+            }
+            Self::Unix(s) => {
+                s.shutdown(Shutdown::Both).ok();
+            }
+        }
+    }
+}
+#[derive(Debug)]
+pub(super) struct Connection {
+    pub(super) accepted: Instant,
+    pub(super) device: Option<String>,
+    pub(super) socket: ShutdownHandle,
 }
 
 /// 공개 JSON 핸드셰이크. 비밀 대신 server challenge와 client nonce로 키를 유도한다.
@@ -262,6 +353,14 @@ impl Gateway {
                 stopped: false,
                 tunnel: None,
                 tunnel_start: None,
+                relay: None,
+                relay_enabled: false,
+                relay_ctx: None,
+                saved_port: intent.port,
+                saved_tunnel_pid: intent.tunnel_pid,
+                saved_tunnel_url: intent.tunnel_url,
+                tunnel_token: intent.tunnel_token,
+                tunnel_hostname: intent.tunnel_hostname,
                 resolver: super::cloudflared::Resolver::default(),
                 publication,
                 tunnel_failures: 0,
@@ -273,6 +372,11 @@ impl Gateway {
             }),
             changed: Condvar::new(),
             waker,
+        });
+        lock(&shared.state).relay_ctx = Some(RelayContext {
+            shared: Arc::downgrade(&shared),
+            registry: registry.clone(),
+            hello: hello.clone(),
         });
         let backend = super::pwa_rpc::Backend::new(registry.clone(), dir, hello.clone());
         let worker = Arc::clone(&shared);
@@ -293,12 +397,22 @@ impl Gateway {
         }
         let address = state.selected?;
         let base = if state.mode == ConnectMode::Tunnel {
-            let tunnel = state.tunnel.as_ref()?;
-            let url = tunnel.ready_url()?;
-            if tunnel.fixed() {
+            if let Some(tunnel) = state.tunnel.as_ref()
+                && let Some(url) = tunnel.ready_url()
+            {
+                if tunnel.fixed() {
+                    fixed_base(&state)
+                } else {
+                    url.to_owned()
+                }
+            } else if state
+                .relay
+                .as_ref()
+                .is_some_and(super::relay::RelayClient::connected)
+            {
                 fixed_base(&state)
             } else {
-                url.to_owned()
+                return None;
             }
         } else {
             format!("http://{address}")
@@ -336,7 +450,7 @@ impl Gateway {
                     self.shared.wake();
                     let deadline = Instant::now() + MINT_WAIT;
                     loop {
-                        let state = lock(&self.shared.state);
+                        let mut state = lock(&self.shared.state);
                         if state.stopped || state.mode != mode {
                             return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
                         }
@@ -345,16 +459,28 @@ impl Gateway {
                         if state.tunnel.as_ref().is_some_and(|t| {
                             t.ready_url().is_some() || (timed_out && t.url().is_some())
                         }) {
+                            sync_tunnel_intent(&mut state);
                             return pairing_offer(&state, now_ms());
                         }
-                        if timed_out
-                            || (state.tunnel.is_none()
-                                && !state.resolver.downloading()
-                                && state
-                                    .tunnel_error
-                                    .as_ref()
-                                    .is_some_and(|e| e.kind() != io::ErrorKind::WouldBlock))
+                        let fatal_tunnel_err = state.tunnel.is_none()
+                            && !state.resolver.downloading()
+                            && state
+                                .tunnel_error
+                                .as_ref()
+                                .is_some_and(|e| e.kind() != io::ErrorKind::WouldBlock);
+                        if (timed_out || fatal_tunnel_err)
+                            && state
+                                .relay
+                                .as_ref()
+                                .is_some_and(super::relay::RelayClient::connected)
                         {
+                            return pairing_offer(&state, now_ms());
+                        }
+                        let relay_failed = state
+                            .relay
+                            .as_ref()
+                            .is_none_or(|r| r.settled() && !r.connected());
+                        if timed_out || (fatal_tunnel_err && relay_failed) {
                             return Err(tunnel_unavailable(&state));
                         }
                         // 상태 변경은 바로, 백그라운드 프로브의 준비 표시는 50ms 안에 본다.
@@ -396,7 +522,7 @@ impl Gateway {
                 let count = state.devices.revoke(device_id.as_deref(), all, now)?;
                 for c in state.connections.values() {
                     if all || c.device.as_deref() == device_id.as_deref() {
-                        c.socket.shutdown(Shutdown::Both).ok();
+                        c.socket.shutdown();
                     }
                 }
                 reconcile(&mut state, now)?;
@@ -411,20 +537,69 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         let mut state = lock(&self.shared.state);
         state.stopped = true;
-        close(&mut state);
+        let now = now_ms();
+        let keep_tunnel = state.dir.is_some()
+            && state.mode == ConnectMode::Tunnel
+            && (state.devices.active_count() > 0 || state.devices.ticket(now).is_some());
+        if keep_tunnel {
+            sync_tunnel_intent(&mut state);
+            if let Some(tunnel) = state.tunnel.as_ref() {
+                tunnel.set_persist(true);
+            }
+            state.tunnel = None;
+            state.relay = None;
+            state.listeners.clear();
+            state.waker.quiesce();
+            for c in state.connections.values() {
+                c.socket.shutdown();
+            }
+        } else {
+            close(&mut state);
+        }
         self.shared.wake();
     }
 }
 fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64) -> io::Result<()> {
+    let mut next_custom = custom;
+    let mut named_changed = false;
+    if mode == ConnectMode::Tunnel
+        && let Some(raw) = next_custom.as_deref()
+    {
+        if raw.trim().is_empty() {
+            if s.tunnel_token.is_some() || s.tunnel_hostname.is_some() {
+                s.tunnel_token = None;
+                s.tunnel_hostname = None;
+                named_changed = true;
+            }
+            next_custom = None;
+        } else if let Some((token, hostname)) = raw.split_once('@') {
+            let token = token.trim();
+            let hostname = hostname.trim();
+            if token.is_empty() || super::tunnel::normalize_named_url(hostname).is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "유효하지 않은 Named Tunnel 설정(token@hostname)",
+                ));
+            }
+            let next_token = Some(token.to_owned());
+            let next_host = Some(hostname.to_owned());
+            if s.tunnel_token != next_token || s.tunnel_hostname != next_host {
+                s.tunnel_token = next_token;
+                s.tunnel_hostname = next_host;
+                named_changed = true;
+            }
+            next_custom = None;
+        }
+    }
     let reissue = s.devices.ticket(now).is_some();
-    let intent_changed = s.mode != mode || s.custom != custom;
+    let intent_changed = s.mode != mode || s.custom != next_custom || named_changed;
     if intent_changed {
         s.devices.clear_ticket();
         close(s);
         s.selected = None;
     }
     let interfaces = net::detect()?;
-    let selected = net::select(&interfaces, mode, custom.as_deref())?;
+    let selected = net::select(&interfaces, mode, next_custom.as_deref())?;
     if intent_changed || s.selected.is_some_and(|a| a.ip() != selected.ip()) {
         s.devices.clear_ticket();
         close(s);
@@ -433,20 +608,14 @@ fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64)
             s.devices.mint(now, true)?;
         }
     }
-    if intent_changed && let Some(dir) = &s.dir {
-        let intent = Intent {
-            mode,
-            custom: custom.clone(),
-            rid: s.publication.rid.clone(),
-            key: s.publication.key.clone(),
-        };
-        intent.save(dir)?;
-    }
     s.mode = mode;
-    s.custom = custom;
+    s.custom = next_custom;
     s.interfaces = interfaces;
     if s.selected.is_none() {
         s.selected = Some(selected);
+    }
+    if intent_changed {
+        save_intent(s)?;
     }
     Ok(())
 }
@@ -455,19 +624,33 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let address = state.selected.ok_or_else(invalid)?;
     let host = address.ip().to_string();
     let port = address.port();
-    let base = if state.mode == ConnectMode::Tunnel {
-        let tunnel = state
+    let relay_only = state.mode == ConnectMode::Tunnel
+        && state
             .tunnel
             .as_ref()
-            .ok_or_else(|| tunnel_unavailable(state))?;
-        let url = tunnel
-            .ready_url()
-            .or_else(|| tunnel.url())
-            .ok_or_else(|| tunnel_unavailable(state))?;
-        if tunnel.fixed() {
+            .and_then(|t| t.ready_url().or_else(|| t.url()))
+            .is_none()
+        && state
+            .relay
+            .as_ref()
+            .is_some_and(super::relay::RelayClient::connected);
+    let base = if state.mode == ConnectMode::Tunnel {
+        if relay_only {
             fixed_base(state)
         } else {
-            url.to_owned()
+            let tunnel = state
+                .tunnel
+                .as_ref()
+                .ok_or_else(|| tunnel_unavailable(state))?;
+            let url = tunnel
+                .ready_url()
+                .or_else(|| tunnel.url())
+                .ok_or_else(|| tunnel_unavailable(state))?;
+            if tunnel.fixed() {
+                fixed_base(state)
+            } else {
+                url.to_owned()
+            }
         }
     } else {
         format!("http://{host}:{port}")
@@ -477,14 +660,16 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
         hex(&ticket.token),
         ws::base64(&ticket.secret, true)
     );
-    if let Some(tunnel) = state.tunnel.as_ref().filter(|t| t.fixed())
-        && state.mode == ConnectMode::Tunnel
-    {
-        let host = tunnel
-            .ready_url()
-            .and_then(|url| url.strip_prefix("https://"))
-            .ok_or_else(invalid)?;
-        write!(url, "&t={host}&r={}", state.publication.rid).map_err(io::Error::other)?;
+    if state.mode == ConnectMode::Tunnel {
+        if let Some(tunnel) = state.tunnel.as_ref().filter(|t| t.fixed()) {
+            let host = tunnel
+                .ready_url()
+                .and_then(|url| url.strip_prefix("https://"))
+                .ok_or_else(invalid)?;
+            write!(url, "&t={host}&r={}", state.publication.rid).map_err(io::Error::other)?;
+        } else if relay_only {
+            write!(url, "&r={}", state.publication.rid).map_err(io::Error::other)?;
+        }
     }
     Ok(MobileReply::PairingOffer {
         url,
@@ -530,17 +715,34 @@ fn status(s: &State, now: u64) -> MobileReply {
     }
 }
 fn close(s: &mut State) {
-    s.tunnel = None;
+    if let Some(mut tunnel) = s.tunnel.take() {
+        tunnel.terminate();
+    } else if let Some(pid) = s.saved_tunnel_pid.take() {
+        super::tunnel::kill_pid(pid);
+    }
+    s.relay = None;
     s.tunnel_failures = 0;
     s.tunnel_retry_at = None;
+    if s.saved_port.is_some() || s.saved_tunnel_pid.is_some() || s.saved_tunnel_url.is_some() {
+        s.saved_port = None;
+        s.saved_tunnel_pid = None;
+        s.saved_tunnel_url = None;
+        save_intent(s).ok();
+    }
     s.listeners.clear();
     s.waker.quiesce();
     for c in s.connections.values() {
-        c.socket.shutdown(Shutdown::Both).ok();
+        c.socket.shutdown();
     }
 }
 fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
-    if s.stopped || (s.devices.active_count() == 0 && s.devices.ticket(now).is_none()) {
+    if s.devices.ticket(now).is_none() {
+        s.devices.clear_ticket();
+    }
+    if s.stopped {
+        return Ok(());
+    }
+    if s.devices.active_count() == 0 && s.devices.ticket(now).is_none() {
         close(s);
         s.selected = None;
         return Ok(());
@@ -553,7 +755,24 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
         Some(a) => a,
         None => net::select(&s.interfaces, s.mode, s.custom.as_deref())?,
     };
-    let loopback = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, selected.port()))?;
+    let loopback = if s.mode == ConnectMode::Tunnel
+        && selected.port() == 0
+        && let Some(saved_port) = s.saved_port.filter(|p| *p > 0)
+    {
+        if let Ok(l) = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, saved_port)) {
+            l
+        } else {
+            if let Some(pid) = s.saved_tunnel_pid.take() {
+                super::tunnel::kill_pid(pid);
+            }
+            s.saved_port = None;
+            s.saved_tunnel_url = None;
+            save_intent(s).ok();
+            TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?
+        }
+    } else {
+        TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, selected.port()))?
+    };
     let port = loopback.local_addr()?.port();
     loopback.set_nonblocking(true)?;
     let mut listeners = vec![loopback];
@@ -567,12 +786,57 @@ fn reconcile(s: &mut State, now: u64) -> io::Result<()> {
     supervise_tunnel(s);
     Ok(())
 }
+fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
+    if let (Some(token), Some(hostname)) = (&s.tunnel_token, &s.tunnel_hostname)
+        && !token.is_empty()
+        && !hostname.is_empty()
+    {
+        return Some(super::tunnel::NamedTunnel {
+            token: token.clone(),
+            url: hostname.clone(),
+        });
+    }
+    if let Some((token, hostname)) = s.custom.as_deref().and_then(|c| c.split_once('@'))
+        && !token.trim().is_empty()
+        && !hostname.trim().is_empty()
+    {
+        return Some(super::tunnel::NamedTunnel {
+            token: token.trim().to_owned(),
+            url: hostname.trim().to_owned(),
+        });
+    }
+    let token = std::env::var("KRILL_MOBILE_TUNNEL_TOKEN").ok()?;
+    let hostname = std::env::var("KRILL_MOBILE_TUNNEL_HOSTNAME").ok()?;
+    if token.trim().is_empty() || hostname.trim().is_empty() {
+        return None;
+    }
+    Some(super::tunnel::NamedTunnel {
+        token: token.trim().to_owned(),
+        url: hostname.trim().to_owned(),
+    })
+}
 /// 리스너가 열려 있는 Tunnel 모드에서는 cloudflared가 항상 떠 있게 한다.
 /// 죽었거나 준비 기한을 넘기면 지수 백오프(2초~1분)로 다시 띄운다. 고정 출처 기기는 랑데부에서 새 URL을 찾는다.
 fn supervise_tunnel(s: &mut State) {
     if s.mode != ConnectMode::Tunnel {
-        s.tunnel = None;
+        if let Some(mut tunnel) = s.tunnel.take() {
+            tunnel.terminate();
+        }
+        s.relay = None;
         return;
+    }
+    if (s.tunnel_start.is_none() || s.relay_enabled)
+        && s.relay.is_none()
+        && let Some(ctx) = s.relay_ctx.as_ref()
+        && let Some(shared) = ctx.shared.upgrade()
+    {
+        s.relay = super::relay::RelayClient::start(
+            s.publication.clone(),
+            &shared,
+            &ctx.registry,
+            &ctx.hello,
+        )
+        .ok();
     }
     let Some(port) = s.selected.map(|a| a.port()) else {
         return;
@@ -582,27 +846,55 @@ fn supervise_tunnel(s: &mut State) {
             s.tunnel_failures = 0;
         }
         if tunnel.healthy() {
+            sync_tunnel_intent(s);
             return;
         }
         tracing::warn!("mobile tunnel exited or never became reachable; restarting");
-        s.tunnel = None;
+        if let Some(mut old) = s.tunnel.take() {
+            old.terminate();
+        }
+        s.saved_tunnel_pid = None;
+        s.saved_tunnel_url = None;
+        save_intent(s).ok();
         backoff(s);
+    }
+    if s.saved_port == Some(port)
+        && let (Some(pid), Some(url)) = (s.saved_tunnel_pid, s.saved_tunnel_url.clone())
+    {
+        if let Some(tunnel) = super::tunnel::Tunnel::adopt(pid, url, Some(s.publication.clone())) {
+            if s.dir.is_some() {
+                tunnel.set_persist(true);
+            }
+            s.tunnel = Some(tunnel);
+            s.tunnel_failures = 0;
+            s.tunnel_retry_at = None;
+            s.tunnel_error = None;
+            return;
+        }
+        s.saved_tunnel_pid = None;
+        s.saved_tunnel_url = None;
+        save_intent(s).ok();
     }
     if s.tunnel_retry_at.is_some_and(|at| Instant::now() < at) {
         return;
     }
+    let named = named_tunnel(s);
     let result = if let Some(start) = s.tunnel_start {
         start(port)
     } else {
         s.resolver.resolve(s.dir.as_deref()).and_then(|binary| {
-            super::tunnel::Tunnel::start(binary.as_os_str(), port, s.publication.clone())
+            super::tunnel::Tunnel::start(binary.as_os_str(), port, s.publication.clone(), named)
         })
     };
     match result {
         Ok(tunnel) => {
+            if s.dir.is_some() {
+                tunnel.set_persist(true);
+            }
             s.tunnel = Some(tunnel);
             s.tunnel_retry_at = None;
             s.tunnel_error = None;
+            sync_tunnel_intent(s);
         }
         Err(error) => {
             tracing::warn!(kind=?error.kind(), "mobile tunnel start failed");
@@ -640,7 +932,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
             }
             let due = connection.accepted + TIMEOUT;
             if now >= due {
-                connection.socket.shutdown(Shutdown::Both).ok();
+                connection.socket.shutdown();
             } else {
                 deadline = Some(deadline.map_or(due, |d| d.min(due)));
             }
@@ -692,7 +984,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
             Connection {
                 accepted: Instant::now(),
                 device: None,
-                socket: kept,
+                socket: ShutdownHandle::Tcp(kept),
             },
         );
         drop(state);
@@ -768,7 +1060,7 @@ impl Drop for Connected {
     fn drop(&mut self) {
         let mut s = lock(&self.shared.state);
         if let Some(c) = s.connections.remove(&self.id) {
-            c.socket.shutdown(Shutdown::Both).ok();
+            c.socket.shutdown();
         }
         reconcile(&mut s, now_ms()).ok();
         self.shared.wake();
@@ -985,4 +1277,5 @@ fn bridge(
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests;

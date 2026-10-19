@@ -6,5 +6,6 @@ pub mod gateway;
 pub mod net;
 pub mod pwa;
 mod pwa_rpc;
+pub mod relay;
 pub mod tunnel;
 mod ws;

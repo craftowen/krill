@@ -955,3 +955,389 @@ fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
     let (port, t) = offer(&g);
     Client::pair(port, &t).ipc();
 }
+
+#[test]
+fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_isolation() {
+    use super::super::relay::{MUX_BINARY, MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
+    fn tunnel_down(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        Err(io::Error::other("cloudflared unavailable"))
+    }
+
+    let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let relay_port = relay_listener.local_addr().unwrap().port();
+    let (_r, g) = start();
+    let (rid, rkey) = {
+        let mut s = lock(&g.shared.state);
+        s.publication.origin = format!("http://127.0.0.1:{relay_port}");
+        s.relay_enabled = true;
+        // cloudflared가 실패해도 DO Relay가 연결되면 순수 릴레이 QR을 즉시 발급한다.
+        s.tunnel_start = Some(tunnel_down);
+        (s.publication.rid.clone(), s.publication.key.clone())
+    };
+
+    let rid_srv = rid.clone();
+    let server_handle = thread::spawn(move || {
+        let (mut host_ws, _) = relay_listener.accept().unwrap();
+        host_ws
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        host_ws
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut req = Vec::new();
+        while !req.ends_with(b"\r\n\r\n") {
+            let mut b = [0_u8; 1];
+            host_ws.read_exact(&mut b).unwrap();
+            req.extend_from_slice(&b);
+        }
+        let headers = String::from_utf8(req).unwrap();
+        assert!(headers.starts_with(&format!(
+            "GET /r/{rid_srv}?hash={}",
+            super::super::pwa::asset_hash()
+        )));
+        assert!(headers.contains(&format!("Authorization: Bearer {rkey}\r\n")));
+        let ws_key = headers
+            .lines()
+            .find_map(|l| l.strip_prefix("Sec-WebSocket-Key: "))
+            .unwrap()
+            .trim();
+        let mut accept_in = Vec::from(ws_key.as_bytes());
+        accept_in.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+        let accept = ws::base64(
+            digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &accept_in).as_ref(),
+            false,
+        );
+        write!(
+            host_ws,
+            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+        )
+        .unwrap();
+        host_ws
+    });
+
+    let reply = g.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    });
+    let MobileReply::PairingOffer { url, .. } = reply else {
+        panic!("expected pure DO relay offer, got {reply:?}");
+    };
+    let mut host_ws = server_handle.join().unwrap();
+    let ticket = lock(&g.shared.state)
+        .devices
+        .ticket(now_ms())
+        .unwrap()
+        .clone();
+    assert_eq!(
+        url,
+        format!(
+            "http://127.0.0.1:{relay_port}/m/{}/#pair={}&key={}&r={rid}",
+            super::super::pwa::asset_hash(),
+            hex(&ticket.token),
+            ws::base64(&ticket.secret, true)
+        )
+    );
+
+    let read_mux_for = |host_ws: &mut TcpStream, target_conn: u32| -> (u8, Vec<u8>) {
+        loop {
+            let (op, body) = ws::read(host_ws).unwrap();
+            assert_eq!(op, ws::BINARY);
+            let (kind, cid, payload) = decode_mux(&body).unwrap();
+            if cid == target_conn {
+                return (kind, payload.to_vec());
+            }
+        }
+    };
+
+    // 1. conn_id = 1: 1-RTT 파이프라인 페어링 (MUX_OPEN + MUX_TEXT + MUX_BINARY 연속 전송)
+    let challenge_1 = [0x11_u8; 32];
+    let nonce_1 = [0x22_u8; 32];
+    let mut salt_1 = [0_u8; 64];
+    salt_1[..32].copy_from_slice(&challenge_1);
+    salt_1[32..].copy_from_slice(&nonce_1);
+    let mut chan_1 = Channel::new(&ticket.secret, &salt_1, Endpoint::Client).unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_OPEN, 1, &challenge_1),
+    )
+    .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(
+            MUX_TEXT,
+            1,
+            &serde_json::to_vec(&AuthHello {
+                token: Some(hex(&ticket.token)),
+                device_id: None,
+                client_nonce: hex(&nonce_1),
+            })
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(
+            MUX_BINARY,
+            1,
+            &chan_1
+                .seal(
+                    &serde_json::to_vec(&AuthProof {
+                        label: "relay-phone".into(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+
+    let (kind, auth_sealed) = read_mux_for(&mut host_ws, 1);
+    assert_eq!(kind, MUX_BINARY);
+    let auth_1: Authenticated =
+        serde_json::from_slice(&chan_1.open(&auth_sealed).unwrap()).unwrap();
+    let cred_1 = decode_hex::<32>(auth_1.credential.as_deref().unwrap()).unwrap();
+
+    // ServerHello 수신 후 ClientHello + List 전송
+    let (kind, sh_sealed) = read_mux_for(&mut host_ws, 1);
+    assert_eq!(kind, MUX_BINARY);
+    let sh_plain = chan_1.open(&sh_sealed).unwrap();
+    let (k, b) = ipc::read_frame(&mut sh_plain.as_slice()).unwrap().unwrap();
+    ServerHello::decode(k, &b).unwrap();
+    let ch_sealed = chan_1
+        .seal(
+            &client_hello(ClientRole::App, "relay-phone-1")
+                .encode()
+                .unwrap(),
+        )
+        .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_BINARY, 1, &ch_sealed),
+    )
+    .unwrap();
+
+    // 2. conn_id = 2: 동일 호스트 WS 위에서 두 번째 소켓(터미널 프리워밍 등) 동시 재인증
+    let challenge_2 = [0x33_u8; 32];
+    let nonce_2 = [0x44_u8; 32];
+    let mut salt_2 = [0_u8; 64];
+    salt_2[..32].copy_from_slice(&challenge_2);
+    salt_2[32..].copy_from_slice(&nonce_2);
+    let cred_hash: [u8; 32] = digest::digest(&digest::SHA256, &cred_1)
+        .as_ref()
+        .try_into()
+        .unwrap();
+    let mut chan_2 = Channel::new(&cred_hash, &salt_2, Endpoint::Client).unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_OPEN, 2, &challenge_2),
+    )
+    .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(
+            MUX_TEXT,
+            2,
+            &serde_json::to_vec(&AuthHello {
+                token: None,
+                device_id: Some(auth_1.device_id.clone()),
+                client_nonce: hex(&nonce_2),
+            })
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(
+            MUX_BINARY,
+            2,
+            &chan_2
+                .seal(
+                    &serde_json::to_vec(&AuthProof {
+                        label: "relay-phone".into(),
+                    })
+                    .unwrap(),
+                )
+                .unwrap(),
+        ),
+    )
+    .unwrap();
+    let (kind, auth2_sealed) = read_mux_for(&mut host_ws, 2);
+    assert_eq!(kind, MUX_BINARY);
+    let auth_2: Authenticated =
+        serde_json::from_slice(&chan_2.open(&auth2_sealed).unwrap()).unwrap();
+    assert_eq!(auth_2.device_id, auth_1.device_id);
+    assert!(auth_2.credential.is_none());
+    let (kind, sh2_sealed) = read_mux_for(&mut host_ws, 2);
+    assert_eq!(kind, MUX_BINARY);
+    let _ = chan_2.open(&sh2_sealed).unwrap();
+    // 인증 완료 후 변조된 암호문 프레임 전송 시 1000이 아니라 1008로 즉시 닫혀야 한다.
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_BINARY, 2, &[0xde, 0xad, 0xbe, 0xef]),
+    )
+    .unwrap();
+    let (kind, close2_payload) = read_mux_for(&mut host_ws, 2);
+    assert_eq!(kind, MUX_CLOSE);
+    assert_eq!(close2_payload, 1008_u16.to_be_bytes());
+
+    // 3. conn_id = 3: 잘못된 키로 위조 증명 전송 -> conn_id=3만 1008로 닫히고 conn_id=1은 정상 동작
+    let challenge_3 = [0x55_u8; 32];
+    let nonce_3 = [0x66_u8; 32];
+    let mut salt_3 = [0_u8; 64];
+    salt_3[..32].copy_from_slice(&challenge_3);
+    salt_3[32..].copy_from_slice(&nonce_3);
+    let mut bad_chan = Channel::new(&[0x99_u8; 32], &salt_3, Endpoint::Client).unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_OPEN, 3, &challenge_3),
+    )
+    .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(
+            MUX_TEXT,
+            3,
+            &serde_json::to_vec(&AuthHello {
+                token: None,
+                device_id: Some(auth_1.device_id.clone()),
+                client_nonce: hex(&nonce_3),
+            })
+            .unwrap(),
+        ),
+    )
+    .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(
+            MUX_BINARY,
+            3,
+            &bad_chan.seal(b"{\"label\":\"attacker\"}").unwrap(),
+        ),
+    )
+    .unwrap();
+    let (kind, close_payload) = read_mux_for(&mut host_ws, 3);
+    assert_eq!(kind, MUX_CLOSE);
+    assert_eq!(close_payload, 1008_u16.to_be_bytes());
+
+    // conn_id = 1은 여전히 살아 있어 RPC(List) 응답을 정상 수신한다.
+    let list_sealed = chan_1
+        .seal(&control::Request::List.encode().unwrap())
+        .unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_BINARY, 1, &list_sealed),
+    )
+    .unwrap();
+    let (kind, reply_sealed) = read_mux_for(&mut host_ws, 1);
+    assert_eq!(kind, MUX_BINARY);
+    let reply_plain = chan_1.open(&reply_sealed).unwrap();
+    let (k, b) = ipc::read_frame(&mut reply_plain.as_slice())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        control::Reply::decode(k, &b).unwrap(),
+        control::Reply::Sessions(Vec::new())
+    );
+}
+
+#[test]
+fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
+    fn must_not_spawn(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        Err(io::Error::other("must re-adopt existing cloudflared PID"))
+    }
+    let dir = std::env::temp_dir().join(format!("mk-mobile-readopt-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let r = Arc::new(Registry::new(None, None));
+    let g = Gateway::start(Arc::downgrade(&r), Some(&dir), hello()).unwrap();
+    lock(&g.shared.state).tunnel_start = Some(super::super::tunnel::Tunnel::persistent_fixture);
+    g.request(MobileRequest::SetConnectMode {
+        mode: ConnectMode::Tunnel,
+        custom_address: Some("eyJ-named-token@krill.example.com".into()),
+    });
+
+    let MobileReply::PairingOffer { port, url, .. } = g.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    }) else {
+        panic!("expected tunnel offer");
+    };
+    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
+    let (ticket, pid) = {
+        let s = lock(&g.shared.state);
+        assert_eq!(s.tunnel_token.as_deref(), Some("eyJ-named-token"));
+        assert_eq!(s.tunnel_hostname.as_deref(), Some("krill.example.com"));
+        (
+            s.devices.ticket(now_ms()).unwrap().clone(),
+            s.tunnel.as_ref().unwrap().pid().unwrap(),
+        )
+    };
+    let mut phone = Client::pair(port, &ticket);
+    phone.ipc();
+    let (device, credential) = (phone.device.clone(), phone.credential);
+    drop(phone);
+
+    // 1. 데몬 종료(Gateway::drop): 기기가 등록되어 있으므로 cloudflared PID는 죽지 않고 살아남는다.
+    drop(g);
+    assert!(
+        super::super::tunnel::pid_alive(pid),
+        "cloudflared process must survive Gateway::drop when a device is enrolled"
+    );
+    let saved = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(saved.port, Some(port));
+    assert_eq!(saved.tunnel_pid, Some(pid));
+    assert_eq!(
+        saved.tunnel_url.as_deref(),
+        Some("https://fixture-mobile.trycloudflare.com")
+    );
+    assert_eq!(saved.tunnel_token.as_deref(), Some("eyJ-named-token"));
+    assert_eq!(saved.tunnel_hostname.as_deref(), Some("krill.example.com"));
+
+    // 2. 데몬 재시작(Gateway::start): 새 cloudflared를 띄우지 않고 기존 port와 PID를 0초 만에 재입양한다.
+    let g2 = Gateway::start(Arc::downgrade(&r), Some(&dir), hello()).unwrap();
+    lock(&g2.shared.state).tunnel_start = Some(must_not_spawn);
+    until(|| {
+        let s = lock(&g2.shared.state);
+        !s.listeners.is_empty() && s.tunnel.as_ref().is_some_and(|t| t.ready_url().is_some())
+    });
+    {
+        let s = lock(&g2.shared.state);
+        assert_eq!(s.selected.unwrap().port(), port);
+        assert_eq!(s.tunnel.as_ref().unwrap().pid(), Some(pid));
+        assert_eq!(
+            s.tunnel.as_ref().unwrap().ready_url(),
+            Some("https://fixture-mobile.trycloudflare.com")
+        );
+    }
+    let mut reconnected = Client::reconnect(port, &device, &credential);
+    reconnected.ipc();
+    drop(reconnected);
+
+    // 3. 모든 기기 해제 시 입양된 cloudflared 프로세스까지 즉시 종료하고 Intent의 터널 정보를 비운다.
+    g2.request(MobileRequest::RevokeDevice {
+        device_id: None,
+        all: true,
+    });
+    until(|| !super::super::tunnel::pid_alive(pid));
+    let cleared = Intent::load(Some(&dir)).unwrap();
+    assert!(cleared.port.is_none());
+    assert!(cleared.tunnel_pid.is_none());
+    assert!(cleared.tunnel_url.is_none());
+    drop(g2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
