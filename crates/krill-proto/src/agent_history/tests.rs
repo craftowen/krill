@@ -143,6 +143,40 @@ fn vault_search_and_resume_roundtrip_and_agent_parsing() {
     let bytes = reply.encode().unwrap();
     let (kind, body) = crate::ipc::read_frame(&mut &bytes[..]).unwrap().unwrap();
     assert_eq!(Reply::decode(kind, &body).unwrap(), reply);
+
+    let poll_req = Request::AgentHistory(Action::ChatPoll {
+        session: crate::SessionId(42),
+        offset: 1024,
+    });
+    let bytes = poll_req.encode().unwrap();
+    let (kind, body) = crate::ipc::read_frame(&mut &bytes[..]).unwrap().unwrap();
+    assert_eq!(Request::decode(kind, &body).unwrap(), poll_req);
+
+    let poll_resp = Reply::AgentHistory(Response::ChatPolled(ChatPollSnapshot {
+        agent: "claude".into(),
+        session_id: "sid-42".into(),
+        transcript_path: "/tmp/sid-42.jsonl".into(),
+        next_offset: 2048,
+        reset: false,
+        bound: true,
+        items: vec![ChatItem {
+            kind: ChatItemKind::Question,
+            text: "Choose mode".into(),
+            title: "Mode".into(),
+            tool_name: "AskUserQuestion".into(),
+            tool_id: "toolu_1".into(),
+            file_path: String::new(),
+            is_error: false,
+            multi_select: false,
+            options: vec![ChatQuestionOption {
+                label: "Fast".into(),
+                description: "Low latency".into(),
+            }],
+        }],
+    }));
+    let bytes = poll_resp.encode().unwrap();
+    let (kind, body) = crate::ipc::read_frame(&mut &bytes[..]).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), poll_resp);
 }
 
 proptest::proptest! {

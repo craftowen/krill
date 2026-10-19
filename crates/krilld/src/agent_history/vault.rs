@@ -47,6 +47,11 @@ pub(crate) fn valid_target(target: &VaultTarget) -> bool {
 }
 
 pub(crate) fn search(state_dir: Option<&Path>, query: &SearchQuery) -> SearchSnapshot {
+    let roots = collect_roots(state_dir);
+    search_in(&roots, query)
+}
+
+pub(super) fn collect_roots(state_dir: Option<&Path>) -> VaultRoots {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let env_or_home = |var: &str, default_rel: &str| {
         std::env::var_os(var)
@@ -94,7 +99,7 @@ pub(crate) fn search(state_dir: Option<&Path>, query: &SearchQuery) -> SearchSna
         state_dir,
     );
     add_account_roots(&mut roots, &accounts, state_dir);
-    search_in(&roots, query)
+    roots
 }
 
 fn add_account_roots(
@@ -220,7 +225,7 @@ pub(crate) fn profile_dir_for_vault_target_in(
     None
 }
 
-fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
+pub(super) fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
     let mut dirs = vec![
         dir.to_path_buf(),
         dir.join(".gemini/antigravity-cli"),
@@ -238,7 +243,7 @@ fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
     dirs
 }
 
-fn opencode_candidate_bases(dir: &Path) -> Vec<PathBuf> {
+pub(super) fn opencode_candidate_bases(dir: &Path) -> Vec<PathBuf> {
     let mut bases = Vec::new();
     for sub in [
         "storage/session",
@@ -1757,7 +1762,7 @@ fn extract_content_messages(role: &str, record: &Value, out: &mut Vec<(String, S
     }
 }
 
-fn extract_agy_user_request(content: &str) -> String {
+pub(super) fn extract_agy_user_request(content: &str) -> String {
     let opener = "<USER_REQUEST>";
     let closer = "</USER_REQUEST>";
     if let Some(start) = content.find(opener) {
