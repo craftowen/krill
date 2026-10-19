@@ -11,6 +11,9 @@ krill-proto = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+tokio = { workspace = true }
+
 [dev-dependencies]
 postcard = { workspace = true }
 
