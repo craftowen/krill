@@ -2672,7 +2672,9 @@ impl Shell {
                     l.clear_selection();
                 }
             }
-            self.maybe_poll_active_chat(cx);
+            if self.layout.focused() == Some(pane) {
+                self.maybe_poll_active_chat(cx);
+            }
             cx.notify();
         }
         if ev.closed {
@@ -2954,6 +2956,11 @@ impl Shell {
             reason = "휠 한 번은 수백 행 안이고 abs 뒤에만 usize로 바꾼다"
         )]
         if lines != 0. {
+            if e.modifiers.platform || (cfg!(target_os = "windows") && e.modifiers.control) {
+                krill_app::settings::step_terminal_font_size(if lines > 0. { 1 } else { -1 }, cx);
+                cx.stop_propagation();
+                return;
+            }
             if let Some((column, line)) = cell_at(&l.painted, l.pane.screen(), e.position)
                 && let Some(bytes) = keys::tui::mouse(
                     l.pane.modes(),
@@ -3209,7 +3216,9 @@ impl Shell {
             self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
         }
         self.sync(cx);
-        self.poll_active_chat(cx);
+        if now_focused != focused {
+            self.poll_active_chat(cx);
+        }
         if save && self.layout != before {
             self.close_dashboard(None, cx);
             self.close_settings(None, cx);
