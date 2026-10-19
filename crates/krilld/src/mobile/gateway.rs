@@ -28,8 +28,10 @@ const RECONCILE: Duration = Duration::from_secs(1);
 /// 응답 없는 주기가 `IDLE_PINGS`번 이어지면(LTE 전환 등으로 죽은 연결) 닫는다.
 const PING: Duration = Duration::from_secs(30);
 const IDLE_PINGS: u8 = 3;
-/// 페어링 요청이 터널 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기 타임아웃(20초)보다 짧다.
-const MINT_WAIT: Duration = Duration::from_secs(15);
+/// 페어링 요청이 터널 준비를 기다리는 최대 시간. 모바일 IPC 클라이언트 읽기 타임아웃(60초)보다 짧다.
+/// 새 퀵 터널은 띄운 뒤 2.6~5.0초에 URL이 찍히고(2026-10-19 11회 실측) 그 뒤 `READY_SETTLE`(33초)
+/// 이후에 준비되므로 약 36~42초(추정)가 걸린다.
+const MINT_WAIT: Duration = Duration::from_secs(45);
 /// 사용자가 고른 연결 모드. 데몬을 재시작해도 Tunnel 기기가 다시 붙을 수 있게 남긴다.
 const INTENT_FILE: &str = "mobile-gateway.json";
 const MOBILE_ORIGIN: &str = "https://krill-mobile.pages.dev";

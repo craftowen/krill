@@ -1088,7 +1088,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     let script = d.dir.join("cloudflared-test");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 30\n",
+        "#!/bin/sh\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 120\n",
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1101,7 +1101,7 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
         .unwrap()
         .as_str()
         .unwrap();
-    // 가짜 터널은 HTTP 준비 확인을 통과하지 못하므로 15초 뒤 터널 출처 URL로 강등된다.
+    // 가짜 터널은 HTTP 준비 확인을 통과하지 못하므로 MINT_WAIT(45초) 뒤 터널 출처 URL로 강등된다.
     assert!(url.starts_with("https://cli-mobile.trycloudflare.com/#pair="));
     assert!(url.contains("&key="));
     let status = d.ok(&["mobile", "serve"]);
