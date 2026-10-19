@@ -2,6 +2,8 @@
 use crate::session::lock;
 use std::ffi::OsStr;
 use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt as _;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -72,7 +74,10 @@ impl Tunnel {
         probe: Probe,
         publication: Option<Publication>,
     ) -> io::Result<Self> {
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000);
+        let mut child = command
             .args([
                 "tunnel",
                 "--no-autoupdate",
@@ -178,7 +183,6 @@ impl Tunnel {
         alive && (self.ready.load(Ordering::Acquire) || self.started.elapsed() < READY_DEADLINE)
     }
     #[cfg(test)]
-    #[cfg(unix)]
     pub(super) fn fixture(port: u16) -> io::Result<Self> {
         if port == 0 {
             return Err(io::ErrorKind::InvalidInput.into());
@@ -196,7 +200,6 @@ impl Tunnel {
     }
 }
 #[cfg(test)]
-#[cfg(unix)]
 impl Tunnel {
     pub(super) fn fixed_fixture(port: u16) -> io::Result<Self> {
         let tunnel = Self::fixture(port)?;
@@ -258,11 +261,14 @@ fn prepare(
     }
 }
 fn http_status(url: &str) -> Option<u16> {
-    let out = Command::new("curl")
+    let mut command = Command::new("curl");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let out = command
         .args([
             "-sS",
             "-o",
-            "/dev/null",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
             "-w",
             "%{http_code}",
             "--max-time",
@@ -281,11 +287,14 @@ fn http_status(url: &str) -> Option<u16> {
 fn publish(p: &Publication, url: &str) -> bool {
     // 헤더 파일을 stdin으로 전달해 ps에 랑데부 키가 남지 않게 한다.
     let body = serde_json::json!({"url":url, "hash":super::pwa::asset_hash()}).to_string();
-    let Ok(mut child) = Command::new("curl")
+    let mut command = Command::new("curl");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    let Ok(mut child) = command
         .args([
             "-sS",
             "-o",
-            "/dev/null",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
             "-w",
             "%{http_code}",
             "--max-time",
@@ -324,11 +333,14 @@ fn probe(url: &str) -> bool {
     let Some(host) = url.strip_prefix("https://") else {
         return false;
     };
-    match Command::new("curl")
+    let mut command = Command::new("curl");
+    #[cfg(windows)]
+    command.creation_flags(0x0800_0000);
+    match command
         .args([
             "-sS",
             "-o",
-            "/dev/null",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
             "-w",
             "%{http_code}",
             "--max-time",

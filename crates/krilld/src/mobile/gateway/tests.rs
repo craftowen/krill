@@ -444,6 +444,7 @@ fn unnegotiated_mobile_feature_is_rejected() {
     worker.join().unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
     use crate::holder::{Holder, Kept};
@@ -592,6 +593,7 @@ fn ws_attach_input_and_resize_preserve_real_desktop_pty() {
     worker.join().unwrap();
 }
 
+#[cfg(unix)]
 fn desktop_frame(s: &mut UnixStream, kind: u8) -> Vec<u8> {
     loop {
         let (k, b) = ipc::read_frame(s).unwrap().unwrap();
@@ -601,6 +603,7 @@ fn desktop_frame(s: &mut UnixStream, kind: u8) -> Vec<u8> {
     }
 }
 
+#[cfg(unix)]
 fn phone_frame(c: &mut Client, kind: u8) -> Vec<u8> {
     loop {
         let (k, b) = c.read().unwrap();

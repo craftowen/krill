@@ -821,5 +821,4 @@ fn bridge(
 }
 
 #[cfg(test)]
-#[cfg(unix)]
 mod tests;
