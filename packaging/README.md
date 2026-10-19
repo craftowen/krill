@@ -1,3 +1,35 @@
+# 공개 릴리스 (`publish-github.sh`)
+
+GitHub Releases 게시의 **공식 경로**는 로컬 맥에서 메인테이너가 돌리는 `packaging/publish-github.sh`다.
+`.github/workflows/release.yml`은 수동 예비·Windows 자산 추가용이며 같은 규칙(main 끝 또는 태그 커밋에서만,
+기존 자산 덮어쓰기 없음)을 따른다. `git push`·릴리스 생성은 사람이 한다(AGENTS.md 규칙 9).
+
+```sh
+bash packaging/publish-github.sh --preflight      # 가드만 확인(빌드·업로드 없음, 실패 시 1)
+bash packaging/publish-github.sh --bump patch     # 가드 통과 후 버전·Cargo.lock·THIRD_PARTY_NOTICES.md를 한 커밋으로 만들고 멈춤
+#   → 메인테이너가 그 커밋을 main에 올리고 CI가 녹색이 될 때까지 기다린다
+bash packaging/publish-github.sh --dry-run        # 조립만(가드 실패는 경고). --bin-dir은 여기서만 허용
+bash packaging/publish-github.sh                  # 가드 → 빌드 → 재확인 → 태그 푸시 → gh release create
+```
+
+빌드 전에 모든 가드를 보고, 하나라도 실패하면 아무것도 빌드·업로드하지 않는다(v0.1.6 덮어쓰기 사고 대응).
+
+| 가드 | 실패 시 | 탈출구 |
+|---|---|---|
+| `/tmp/krill-publish.lock` `lockf` — 이 맥에서 동시에 한 번만(dry-run·preflight 포함) | 즉시 종료(75) | 없음 |
+| `git fetch origin` 후 HEAD == `origin/main` | 중단 | `KRILL_PUBLISH_FORCE` |
+| HEAD의 GitHub check-runs가 모두 `success`(또는 `skipped`), 0개면 실패 | 중단 | `KRILL_PUBLISH_FORCE` |
+| `THIRD_PARTY_NOTICES.md`가 최신(`generate_notices.py --check`) | 중단 | `KRILL_PUBLISH_FORCE` |
+| 원격 태그(`git ls-remote --tags`)·GitHub 릴리스가 이미 있음 — 빌드 뒤 태그 직전에 한 번 더 확인 | 중단 | 없음(버전을 올린다) |
+| 로컬 태그가 있으면 HEAD를 가리켜야 함 | 중단 | 없음 |
+| 소스 tarball과 같은 `HEAD` 트리에 `docs/boost-*`·`docs/reports/`·`.night/` 없음, `scripts/public-surface.sh`가 있으면 `git archive HEAD`를 푼 경로로 실행 | 중단 | 없음 |
+
+- 기존 릴리스에 자산을 올리는 경로(`gh release upload --clobber`)는 없다. 태그만 푸시하고 `gh release create --verify-tag`로 만든다.
+- 게시 빌드는 전용 `CARGO_TARGET_DIR`(설정된 절대 경로의 형제 `krill-publish`, 없으면 `target/krill-publish`)을 써서
+  다른 워크트리 빌드가 게시 바이너리를 덮어쓰지 못하게 한다. 락이 단독 사용을 보장한다.
+- `KRILL_PUBLISH_FORCE=<사유>`는 사람 전용이다. 대화형 터미널에서 태그를 직접 입력해 확인해야 하고 사유를 출력한다.
+- 회귀 테스트: `python3 packaging/test_publish.py`(임시 git 저장소·로컬 bare origin·가짜 `gh`, 네트워크·빌드 없음).
+
 # 로컬 릴리스와 개인 Homebrew tap (MK-072)
 
 Apple Developer 미가입 상태에서의 **ad-hoc 서명 DMG와 소스 빌드 formula·개인 cask 준비** 안내다.
@@ -102,6 +134,7 @@ cask의 앱·CLI 연결은 Homebrew가 제거하고, zap은 다음 기본 데이
 
 ```sh
 python3 packaging/homebrew/test_release.py
+python3 packaging/test_publish.py   # 게시 가드
 ```
 
 표준 라이브러리 테스트가 URL·Ruby 보간 주입·체크섬·덮어쓰기 거부를 확인한다.
@@ -168,7 +201,7 @@ ad-hoc 서명에는 TeamIdentifier가 없다. 같은 팀의 Developer ID 서명�
 ## CI
 
 `.github/workflows/package-macos.yml`은 `workflow_dispatch`로만 실행한다.
-Rust 1.98.1을 선택하고 회귀 검사 후 같은 로컬 진입점으로 빌드한다.
+Rust 1.98.1을 선택하고 회귀 검사(`test_pipeline.py`·`homebrew/test_release.py`·`test_publish.py`) 후 같은 로컬 진입점으로 빌드한다.
 프로필은 `release`(기본) 또는 `dev`를 선택한다. ZIP과 체크섬만 Actions artifact로 보관하며 릴리스를 발행하지 않는다.
 이 작업에서는 워크플로를 원격 실행하지 않았다.
 액션 설정 근거: [checkout 공식 문서](https://github.com/actions/checkout),
