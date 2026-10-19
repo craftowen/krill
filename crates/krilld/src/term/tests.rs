@@ -12,6 +12,59 @@ mod unicode_fuzz;
 
 const SIZE: WinSize = WinSize { cols: 80, rows: 40 };
 
+#[test]
+fn ascii_scan_bypass_finishes_pending_mode_sequences() {
+    let look = fresh();
+    let mut engine = Engine::new(SIZE);
+    engine.feed(b"\x1b[?20", Feed::Live, &look);
+    engine.feed(b"31h", Feed::Live, &look);
+    engine.feed(b"plain text\r\n", Feed::Live, &look);
+    assert_eq!(
+        engine.feed(b"\x1b[?2031$p", Feed::Live, &look),
+        "\x1b[?2031;1$y"
+    );
+    engine.feed(b"\x1b[?2031", Feed::Live, &look);
+    engine.feed(b"l", Feed::Live, &look);
+    assert_eq!(
+        engine.feed(b"\x1b[?2031$p", Feed::Live, &look),
+        "\x1b[?2031;2$y"
+    );
+}
+
+#[test]
+fn ascii_scan_bypass_matches_raw_parser_across_chunks() {
+    let look = fresh();
+    let mut engine = Engine::new(SIZE);
+    let mut parser = Parser::new();
+    let mut scan = RawScan::default();
+    for chunk in [
+        b"plain\r\n".as_slice(),
+        b"\x1b[?2031",
+        b"h",
+        b"\x1b[?2031$p",
+        b"\x1b]7;file://localhost/",
+        b"tmp\x07",
+        b"\xe9\x9f",
+        b"ascii after incomplete utf8",
+        b"\x1bPpayload",
+        b"more payload",
+        b"\x1b\\",
+        b"\x1b",
+        b"c",
+        b"\x00\x07\x18\x1a\x7f",
+    ] {
+        parser.advance(&mut scan, chunk);
+        engine.feed(chunk, Feed::Live, &look);
+        assert_eq!(engine.scheme.on, scan.on, "chunk={chunk:?}");
+        assert_eq!(engine.scheme.cwd, scan.cwd, "chunk={chunk:?}");
+        assert_eq!(
+            engine.scan.mk_is_ground(),
+            parser.mk_is_ground(),
+            "chunk={chunk:?}"
+        );
+    }
+}
+
 /// 디스크에 아무것도 없는 상태(테마를 한 번도 받지 않음). 테스트는 `set_theme`을 부르지 않는다.
 fn fresh() -> Appearance {
     Appearance::load(PathBuf::from("/nonexistent/mk020/theme"))
