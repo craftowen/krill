@@ -4930,7 +4930,7 @@ fn owe880_mobile_enter_revoke_confirm_and_copy_feedback(cx: &mut TestAppContext)
                     _ => MobileReply::GatewayStatus {
                         listening: true,
                         bind_addrs: Vec::new(),
-                        mode: ConnectMode::Lan,
+                        mode: ConnectMode::Tunnel,
                         tunnel_url: None,
                         active_offer: false,
                         devices: vec![phone.clone()],
@@ -4945,6 +4945,7 @@ fn owe880_mobile_enter_revoke_confirm_and_copy_feedback(cx: &mut TestAppContext)
     vcx.run_until_parked();
     vcx.update(|_, cx| {
         assert!(!view.read(cx).mobile.pending);
+        assert_eq!(view.read(cx).mobile.mode, ConnectMode::Tunnel);
         assert_eq!(view.read(cx).mobile.devices.len(), 1);
         assert!(
             view.read(cx).mobile.offer.is_none(),
@@ -7115,6 +7116,10 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
             "radio row {sel} ({opt:?}) overflowed mobile-mode-card ({mode_card:?})"
         );
     }
+    assert!(
+        bounds(vcx, "mobile-tunnel").top() < bounds(vcx, "mobile-tailscale").top(),
+        "Tunnel must be prioritized above Tailscale in mobile mode card"
+    );
     for sel in [
         "admin-mobile-pair-section",
         "admin-mobile-devices-section",
