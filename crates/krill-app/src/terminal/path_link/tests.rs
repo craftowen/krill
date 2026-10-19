@@ -26,11 +26,11 @@ impl Drop for TempDir {
     }
 }
 
-/// 한 행. 2칸 글자(한글)는 WIDE + SPACER 두 칸이다.
+/// 한 행. 2칸 글자(한글·전각)는 WIDE + SPACER 두 칸이다.
 fn row(text: &str) -> Vec<Cell> {
     let mut out = Vec::new();
     for ch in text.chars() {
-        let wide = ('가'..='힣').contains(&ch);
+        let wide = is_cjk_or_hangul(ch) || is_fullwidth_punct(ch);
         out.push(Cell {
             ch,
             flags: if wide { Flags::WIDE } else { Flags::default() },
@@ -78,6 +78,15 @@ fn parses_compiler_grep_and_git_formats() {
     assert_eq!((l.column, l.cols), (10, 11));
     let l = at("see src/main.rs.", 5, &dir.0).unwrap();
     assert_eq!((l.column, l.cols, l.line), (4, 11, None));
+    // 전각 괄호·한글 조사가 바로 이어져도 파일 경로만 정확히 잡는다(#30093).
+    let l = at("（src/main.rs:12）", 4, &dir.0).unwrap();
+    assert_eq!(
+        (l.column, l.cols, &l.path, l.line),
+        (2, 14, &file, Some(12))
+    );
+    let l = at("src/main.rs에서 오류", 2, &dir.0).unwrap();
+    assert_eq!((l.column, l.cols, &l.path, l.line), (0, 11, &file, None));
+    assert_eq!(at("src/main.rs에서 오류", 12, &dir.0), None);
 }
 
 #[test]
@@ -187,6 +196,36 @@ fn url_at_parses_plaintext_http_https_and_trims_punctuation() {
             column: 6,
             cols: 26,
             uri: "http://localhost:3000/문서".into(),
+        })
+    );
+
+    // CJK·한글 조사 및 전각 괄호에서 URL을 끊는다(#30213, #30037).
+    let local_kr = row("서버 http://localhost:3000에서 열림");
+    assert_eq!(
+        url_at(&local_kr, 8),
+        Some(UrlLink {
+            column: 5,
+            cols: 21,
+            uri: "http://localhost:3000".into(),
+        })
+    );
+    assert_eq!(url_at(&local_kr, 26), None);
+    let path_kr = row("PR https://github.com/org/repo/pull/42를 확인");
+    assert_eq!(
+        url_at(&path_kr, 5),
+        Some(UrlLink {
+            column: 3,
+            cols: 35,
+            uri: "https://github.com/org/repo/pull/42".into(),
+        })
+    );
+    let fw = row("（https://example.com/docs）");
+    assert_eq!(
+        url_at(&fw, 4),
+        Some(UrlLink {
+            column: 2,
+            cols: 24,
+            uri: "https://example.com/docs".into(),
         })
     );
 
