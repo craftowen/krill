@@ -3,7 +3,7 @@ use ring::digest;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 14] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 15] = [
     (
         "index.html",
         "text/html; charset=utf-8",
@@ -87,6 +87,12 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 14] = [
         "image/svg+xml",
         include_bytes!("assets/icon.svg"),
         include_bytes!("assets/icon.svg.gz"),
+    ),
+    (
+        "icon.png",
+        "image/png",
+        include_bytes!("assets/icon.png"),
+        include_bytes!("assets/icon.png.gz"),
     ),
 ];
 /// C1: 파일명·길이·원본 바이트로 식별하는 고정 출처 버전.
