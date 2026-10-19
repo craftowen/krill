@@ -501,15 +501,21 @@ fn repositories_json(repositories: &[control::RepositoryTrees]) -> Vec<Value> {
     })).collect()
 }
 fn host_metadata() -> Value {
-    let mut command = Command::new("/bin/hostname");
-    let display_name = bounded_command(&mut command, Duration::from_secs(1), 1024)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .map(|name| name.trim().to_owned())
-        .filter(|name| !name.is_empty());
+    #[cfg(windows)]
+    let display_name = crate::sys::hostname().ok();
+    #[cfg(unix)]
+    let display_name = {
+        let mut command = Command::new("/bin/hostname");
+        bounded_command(&mut command, Duration::from_secs(1), 1024)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+    };
     let platform = match std::env::consts::OS {
         "macos" => Some("macos"),
         "linux" => Some("linux"),
+        "windows" => Some("windows"),
         _ => None,
     };
     json!({"display_name":display_name,"platform":platform})
@@ -727,7 +733,13 @@ mod tests {
     #[test]
     fn host_metadata_reports_only_actual_hostname_and_platform() {
         let host = host_metadata();
-        let expected = Command::new("/bin/hostname").output().unwrap();
+        let expected = Command::new(if cfg!(windows) {
+            "hostname.exe"
+        } else {
+            "/bin/hostname"
+        })
+        .output()
+        .unwrap();
         assert_eq!(
             host["display_name"],
             String::from_utf8(expected.stdout).unwrap().trim()
