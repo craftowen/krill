@@ -36,6 +36,11 @@ impl Fixture {
     }
 
     pub(super) fn git(&self, args: &[&str]) -> String {
+        self.git_in(&self.repo, args)
+    }
+
+    #[expect(clippy::unused_self, reason = "test fixture method ergonomics")]
+    pub(super) fn git_in(&self, cwd: &Path, args: &[&str]) -> String {
         let out = Command::new("git")
             .args([
                 "-c",
@@ -46,7 +51,7 @@ impl Fixture {
                 "core.quotePath=false",
             ])
             .args(args)
-            .current_dir(&self.repo)
+            .current_dir(cwd)
             .output()
             .unwrap();
         assert!(out.status.success(), "git {args:?}: {out:?}");
@@ -746,4 +751,50 @@ fn rename_branch_from_prompt_renames_default_and_handles_collisions_and_guards()
         rename_branch_from_prompt(&f.queue, &wt_up_path, "Should skip tracked branch").unwrap(),
         None
     );
+}
+
+#[test]
+fn clean_worktree_with_initialized_submodule_removes_without_force() {
+    let f = Fixture::new("submodule-rm", "");
+    let sub_src = f.dir.join("sub-src");
+    fs::create_dir_all(&sub_src).unwrap();
+    f.git_in(&sub_src, &["init", "-b", "main"]);
+    f.git_in(&sub_src, &["config", "user.email", "t@example.com"]);
+    f.git_in(&sub_src, &["config", "user.name", "t"]);
+    fs::write(sub_src.join("lib.txt"), "v1\n").unwrap();
+    f.git_in(&sub_src, &["add", "lib.txt"]);
+    f.git_in(&sub_src, &["commit", "-m", "init sub"]);
+
+    let sub_src_str = sub_src.to_str().unwrap();
+    f.git(&[
+        "-c",
+        "protocol.file.allow=always",
+        "submodule",
+        "add",
+        sub_src_str,
+        "vendor/sub",
+    ]);
+    f.git(&["commit", "-m", "add submodule"]);
+
+    let (wt, _) = f.created("with-sub", Setup::Skip);
+    let wt_path = path(&wt);
+    f.git_in(
+        &wt_path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+        ],
+    );
+    assert!(wt_path.join("vendor/sub/lib.txt").is_file());
+
+    // Without dirty files, removing the worktree with force=false must succeed even though
+    // the submodule is initialized.
+    let removed = f
+        .remove(&wt, false)
+        .expect("clean submodule worktree must remove");
+    assert!(removed.branch_deleted);
+    assert!(!wt_path.exists());
 }
