@@ -1987,6 +1987,55 @@ fn tabs_middle_close_and_drag_keep_session_identity(cx: &mut TestAppContext) {
     assert_eq!(Layout::load(&path).unwrap(), closed);
 }
 
+/// v0.1.17: 상단 탭은 안쪽 여백·최소 폭·탭 사이 구분선이 있어 탭 경계가 보인다(STYLEGUIDE §5.3 탭 규칙).
+/// 1200px 창에 탭 6개여도 타이틀바 오른쪽 버튼은 탭 줄 밖에 남는다(넘치는 탭은 스크롤).
+#[gpui::test]
+fn tabs_have_padding_min_width_and_separators(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("tab-metrics"));
+    cx.simulate_resize(gpui::size(px(1200.), px(800.)));
+    for _ in 0..5 {
+        cx.simulate_keystrokes("cmd-t");
+        cx.run_until_parked();
+    }
+    cx.simulate_keystrokes("cmd-1");
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(layout_of(&view, cx).tabs().len(), 6);
+    assert_eq!(layout_of(&view, cx).active(), 0);
+    let tab = cx.debug_bounds("session-tab-1").expect("tab 1");
+    let prefix = cx.debug_bounds("tab-prefix-1").expect("tab 1 prefix");
+    // 비활성 탭의 닫기 버튼은 호버 때만 그려지므로 늘 보이는 활성 탭(0)에서 잰다.
+    let active_tab = cx.debug_bounds("session-tab-0").expect("tab 0");
+    let close = cx.debug_bounds("close-tab-0").expect("tab 0 close");
+    assert!(
+        prefix.left() - tab.left() >= krill_app::ui::SPACE_3,
+        "left padding tab={tab:?} prefix={prefix:?}"
+    );
+    assert!(
+        tab.size.width >= krill_app::ui::TAB_MIN_WIDTH
+            && tab.size.width <= krill_app::ui::TAB_MAX_WIDTH,
+        "tab width {:?}",
+        tab.size.width
+    );
+    assert!(
+        active_tab.right() - close.right() <= px(8.),
+        "close button sits at the right edge tab={active_tab:?} close={close:?}"
+    );
+    // 비활성 탭 1의 오른쪽 구분선은 탭 오른쪽 끝에 붙는다. 활성 탭(0)이 그 경계를 맡는 탭 0 쪽은 같은 자리를 지킨다.
+    let sep = cx.debug_bounds("tab-separator-1").expect("separator 1");
+    assert!(
+        tab.right() - sep.right() <= px(2.),
+        "separator {sep:?} tab {tab:?}"
+    );
+    let next = cx.debug_bounds("session-tab-2").expect("tab 2");
+    assert!(next.left() >= tab.right(), "tabs must not overlap");
+    // 타이틀바 오른쪽 명령 버튼은 탭 줄과 겹치지 않는다.
+    let tabs_right = active_tab.right();
+    let commands = cx.debug_bounds("quick-commands").expect("quick-commands");
+    let titlebar = cx.debug_bounds("titlebar").expect("titlebar");
+    assert!(tabs_right <= commands.left() && commands.right() <= titlebar.right());
+}
+
 /// OWE-590: 렌더 팔레트·설정 변경·시스템 외관·재연결의 재전송을 같은 인메모리 IPC로 확인한다.
 #[gpui::test]
 fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {

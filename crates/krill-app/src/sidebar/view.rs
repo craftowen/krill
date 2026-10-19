@@ -26,6 +26,14 @@ use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 use crate::ui::status::{self, Size};
 
+/// 카드 아래 세션 행의 왼쪽 안쪽 여백(px) = 카드 여백 + 이 값. 상태 글리프가 카드 제목 글자 아래에 오게 한다(Orca 중첩).
+/// 카드 왼쪽 끝 → 제목 글자 32(테두리 2(계보 자식 `border_l_2`) + `px_2p5` 10 + 상태 칸 14 + `gap_1p5` 6)에서
+/// 세션 행 자체의 `mx_1` 4를 뺀다.
+const CARD_TITLE_INSET: f32 = 28.;
+/// 폴더 아래 세션 행의 왼쪽 안쪽 여백(px, 호스트 들여쓰기 제외). 폴더 이름 글자 아래에 글리프가 온다:
+/// 머리줄 `ml` 4 + `px_2` 8 + 접기 버튼 20 + `gap_1p5` 6 + 폴더 아이콘 14 + `gap_1p5` 6 − 세션 행 `mx_1` 4.
+const FOLDER_TITLE_INSET: f32 = 54.;
+
 #[derive(Clone)]
 struct TreeMenuMeta {
     path: PathBuf,
@@ -834,7 +842,14 @@ impl Sidebar {
                             .with_size(px(14.))
                             .text_color(p.muted_foreground),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(basename(path)))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("folder-title-{index}"))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(basename(path)),
+                    )
                     .child(
                         div()
                             .invisible()
@@ -921,19 +936,31 @@ impl Sidebar {
                             String::new()
                         }
                     ))
-                    .when(*nested, |d| d.pl(px(33. + host_indent)).pr_2())
+                    .when(*nested, |d| {
+                        // 하위 세션은 소속 카드(워크트리·폴더)의 제목 글자 아래에서 시작해 한 단계 깊어 보이게 한다.
+                        let pl = match &session.worktree {
+                            Some(tree) => {
+                                let depth = if row_host.is_local() {
+                                    self.lineage_depth(tree)
+                                } else {
+                                    0
+                                };
+                                self.worktree_margin(depth) + CARD_TITLE_INSET
+                            }
+                            None => host_indent + FOLDER_TITLE_INSET,
+                        };
+                        d.pl(px(pl)).pr_2()
+                    })
                     .cursor_pointer()
                     .text_color(p.sidebar_foreground)
                     .hover(|d| {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
-                    .child(status::status_glyph(
-                        session.status.state,
-                        unread,
-                        Size::Sm,
-                        cx,
-                    ))
+                    .child(
+                        status::status_glyph(session.status.state, unread, Size::Sm, cx)
+                            .debug_selector(move || format!("session-state-{index}")),
+                    )
                     .child(status::agent_icon(
                         status::infer_agent_from_title(&session.status.agent, &name),
                         ui::ICON_XS,
@@ -1043,12 +1070,19 @@ impl Sidebar {
                 .into_any_element();
         }
         div()
+            .debug_selector(move || format!("worktree-title-{index}"))
             .min_w_0()
             .truncate()
             .text_size(title_size)
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .child(card_title)
             .into_any_element()
+    }
+
+    /// 워크트리 카드 왼쪽 여백(px): 프로젝트 > 워크트리 들여쓰기 + 호스트 들여쓰기 + 계보 깊이(단계당 14px).
+    fn worktree_margin(&self, lineage_depth: usize) -> f32 {
+        let depth = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
+        6. + CHILD_INDENT + self.host_indent() + depth * 14.
     }
 
     fn render_worktree(
@@ -1431,8 +1465,7 @@ impl Sidebar {
             0
         };
         let lineage_collapsed = row_host.is_local() && self.is_lineage_collapsed(path);
-        let depth_px = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
-        let left_margin = px(6. + CHILD_INDENT + self.host_indent() + depth_px * 14.);
+        let left_margin = px(self.worktree_margin(lineage_depth));
         let lineage_toggle_btn = (lineage_child_count > 0).then(|| {
             let fold_path = path.to_path_buf();
             let count_str = lineage_child_count.to_string();
