@@ -957,7 +957,7 @@ fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
 }
 
 #[test]
-fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_isolation() {
+fn do_relay_daemon_challenge_pair_reconnect_concurrent_sessions_replay_and_1008_isolation() {
     use super::super::relay::{MUX_BINARY, MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
     fn tunnel_down(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
         Err(io::Error::other("cloudflared unavailable"))
@@ -1049,20 +1049,23 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
             }
         }
     };
+    // DO는 빈 MUX_OPEN만 보내고, 챌린지는 데몬이 만들어 MUX_TEXT로 클라이언트에게 내려보낸다.
+    let open_conn = |host_ws: &mut TcpStream, cid: u32| -> [u8; 32] {
+        ws::write(host_ws, ws::BINARY, &encode_mux(MUX_OPEN, cid, &[])).unwrap();
+        let (kind, text) = read_mux_for(host_ws, cid);
+        assert_eq!(kind, MUX_TEXT);
+        let hello: serde_json::Value = serde_json::from_slice(&text).unwrap();
+        assert_eq!(hello["version"], 2);
+        decode_hex::<32>(hello["challenge"].as_str().unwrap()).unwrap()
+    };
 
-    // 1. conn_id = 1: 1-RTT 파이프라인 페어링 (MUX_OPEN + MUX_TEXT + MUX_BINARY 연속 전송)
-    let challenge_1 = [0x11_u8; 32];
+    // 1. conn_id = 1: 데몬 챌린지를 받은 뒤 AuthHello(MUX_TEXT) + AuthProof(MUX_BINARY) 파이프라인 페어링
+    let challenge_1 = open_conn(&mut host_ws, 1);
     let nonce_1 = [0x22_u8; 32];
     let mut salt_1 = [0_u8; 64];
     salt_1[..32].copy_from_slice(&challenge_1);
     salt_1[32..].copy_from_slice(&nonce_1);
     let mut chan_1 = Channel::new(&ticket.secret, &salt_1, Endpoint::Client).unwrap();
-    ws::write(
-        &mut host_ws,
-        ws::BINARY,
-        &encode_mux(MUX_OPEN, 1, &challenge_1),
-    )
-    .unwrap();
     ws::write(
         &mut host_ws,
         ws::BINARY,
@@ -1123,7 +1126,7 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
     .unwrap();
 
     // 2. conn_id = 2: 동일 호스트 WS 위에서 두 번째 소켓(터미널 프리워밍 등) 동시 재인증
-    let challenge_2 = [0x33_u8; 32];
+    let challenge_2 = open_conn(&mut host_ws, 2);
     let nonce_2 = [0x44_u8; 32];
     let mut salt_2 = [0_u8; 64];
     salt_2[..32].copy_from_slice(&challenge_2);
@@ -1133,42 +1136,26 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
         .try_into()
         .unwrap();
     let mut chan_2 = Channel::new(&cred_hash, &salt_2, Endpoint::Client).unwrap();
-    ws::write(
-        &mut host_ws,
-        ws::BINARY,
-        &encode_mux(MUX_OPEN, 2, &challenge_2),
-    )
+    // 재생 공격 검증용으로 conn 2의 클라이언트 프레임을 그대로 녹화해 둔다.
+    let hello_2 = serde_json::to_vec(&AuthHello {
+        token: None,
+        device_id: Some(auth_1.device_id.clone()),
+        client_nonce: hex(&nonce_2),
+    })
     .unwrap();
-    ws::write(
-        &mut host_ws,
-        ws::BINARY,
-        &encode_mux(
-            MUX_TEXT,
-            2,
-            &serde_json::to_vec(&AuthHello {
-                token: None,
-                device_id: Some(auth_1.device_id.clone()),
-                client_nonce: hex(&nonce_2),
+    let proof_2 = chan_2
+        .seal(
+            &serde_json::to_vec(&AuthProof {
+                label: "relay-phone".into(),
             })
             .unwrap(),
-        ),
-    )
-    .unwrap();
+        )
+        .unwrap();
+    ws::write(&mut host_ws, ws::BINARY, &encode_mux(MUX_TEXT, 2, &hello_2)).unwrap();
     ws::write(
         &mut host_ws,
         ws::BINARY,
-        &encode_mux(
-            MUX_BINARY,
-            2,
-            &chan_2
-                .seal(
-                    &serde_json::to_vec(&AuthProof {
-                        label: "relay-phone".into(),
-                    })
-                    .unwrap(),
-                )
-                .unwrap(),
-        ),
+        &encode_mux(MUX_BINARY, 2, &proof_2),
     )
     .unwrap();
     let (kind, auth2_sealed) = read_mux_for(&mut host_ws, 2);
@@ -1192,18 +1179,12 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
     assert_eq!(close2_payload, 1008_u16.to_be_bytes());
 
     // 3. conn_id = 3: 잘못된 키로 위조 증명 전송 -> conn_id=3만 1008로 닫히고 conn_id=1은 정상 동작
-    let challenge_3 = [0x55_u8; 32];
+    let challenge_3 = open_conn(&mut host_ws, 3);
     let nonce_3 = [0x66_u8; 32];
     let mut salt_3 = [0_u8; 64];
     salt_3[..32].copy_from_slice(&challenge_3);
     salt_3[32..].copy_from_slice(&nonce_3);
     let mut bad_chan = Channel::new(&[0x99_u8; 32], &salt_3, Endpoint::Client).unwrap();
-    ws::write(
-        &mut host_ws,
-        ws::BINARY,
-        &encode_mux(MUX_OPEN, 3, &challenge_3),
-    )
-    .unwrap();
     ws::write(
         &mut host_ws,
         ws::BINARY,
@@ -1232,6 +1213,21 @@ fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_is
     let (kind, close_payload) = read_mux_for(&mut host_ws, 3);
     assert_eq!(kind, MUX_CLOSE);
     assert_eq!(close_payload, 1008_u16.to_be_bytes());
+
+    // 4. 재생 공격: 릴레이가 conn 2에서 녹화한 AuthHello·AuthProof를 새 연결에 그대로 다시 보낸다.
+    // 챌린지는 데몬이 연결마다 새로 만들므로(릴레이는 모른다) 키가 달라져 증명이 풀리지 않고 1008로 닫힌다.
+    let challenge_4 = open_conn(&mut host_ws, 4);
+    assert_ne!(challenge_4, challenge_2);
+    ws::write(&mut host_ws, ws::BINARY, &encode_mux(MUX_TEXT, 4, &hello_2)).unwrap();
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_BINARY, 4, &proof_2),
+    )
+    .unwrap();
+    let (kind, close4_payload) = read_mux_for(&mut host_ws, 4);
+    assert_eq!(kind, MUX_CLOSE);
+    assert_eq!(close4_payload, 1008_u16.to_be_bytes());
 
     // conn_id = 1은 여전히 살아 있어 RPC(List) 응답을 정상 수신한다.
     let list_sealed = chan_1
