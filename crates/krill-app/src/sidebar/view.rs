@@ -1063,7 +1063,8 @@ impl Sidebar {
         let p = ui::palette(cx);
         let selected = self.cursor == Some(index);
         let row_host = self.row_host(index).clone();
-        let is_default_tree = self.snapshot_for(&row_host).trees.contains_key(path);
+        let is_default_tree =
+            super::options::is_primary_worktree(self.snapshot_for(&row_host), path);
         let is_first_default = self
             .snapshot_for(&row_host)
             .trees
@@ -1970,7 +1971,8 @@ impl Sidebar {
         let (folder, session, tree, header) = match row {
             Row::Worktree(path) => {
                 let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
-                let is_primary = self.snapshot_for(&host).trees.contains_key(path);
+                let is_primary =
+                    super::options::is_primary_worktree(self.snapshot_for(&host), path);
                 let current_parent = host
                     .is_local()
                     .then(|| self.worktree_parent(path))

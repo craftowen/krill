@@ -3709,7 +3709,7 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     );
 
     // Compact 모드에서도 핀 고정된 카드의 우측 배지가 `★` 버튼과 겹치지 않고 `main` 중복 브랜치가 없어야 한다.
-    // 두 카드 모두 핀 고정되면 스마트 정렬이 브랜치명순으로 재정렬해 순서가 바뀔 수 있어 인덱스에 의존하지 않는다.
+    // 두 카드 모두 핀 고정돼도 [기본] 워크트리(repo)는 항상 맨 위(행 1)다.
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.toggle_pin(wt_feature.clone(), cx);
@@ -3718,11 +3718,7 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
-    let repo_idx: usize = if vcx.debug_bounds("worktree-default-badge-1").is_some() {
-        1
-    } else {
-        2
-    };
+    let repo_idx: usize = 1;
     let feature_idx: usize = if repo_idx == 1 { 2 } else { 1 };
     let repo_branch: &'static str = if repo_idx == 1 {
         "worktree-branch-1"
@@ -4036,8 +4032,8 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     assert!(
-        vcx.debug_bounds("rename-inline-1").is_some(),
-        "이름 변경 입력창은 워크트리 카드 제목 자리(행 1)에 있어야 한다"
+        vcx.debug_bounds("rename-inline-2").is_some(),
+        "이름 변경 입력창은 워크트리 카드 제목 자리(행 2, [기본] /repo 다음)에 있어야 한다"
     );
     // Esc: 저장하지 않고 닫는다.
     vcx.simulate_keystrokes("escape");
@@ -4051,7 +4047,7 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
             );
         });
     });
-    assert!(vcx.debug_bounds("rename-inline-1").is_none());
+    assert!(vcx.debug_bounds("rename-inline-2").is_none());
     // Enter: 저장한다.
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
@@ -4407,4 +4403,63 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
         ]
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+/// [기본] 워크트리(저장소 본 체크아웃)는 정렬 기준·활동·이름·핀과 무관하게 프로젝트 맨 위에 오고,
+/// 계보 자식은 여전히 부모 바로 아래에 붙는다.
+#[test]
+fn primary_worktree_is_always_first_in_project() {
+    let repo = PathBuf::from("/r/minikrill");
+    let brand = PathBuf::from("/r/brand-identity");
+    let ci = PathBuf::from("/r/harness-ci");
+    let child = PathBuf::from("/r/harness-ci-child");
+    let snapshot = Snapshot {
+        sessions: vec![session(1, AgentState::Waiting, brand.to_str())],
+        trees: BTreeMap::from([(
+            repo.clone(),
+            vec![repo.clone(), brand.clone(), ci.clone(), child.clone()],
+        )]),
+    };
+    let mut prefs = Preferences::new();
+    prefs.insert(
+        ci.clone(),
+        Preference {
+            pinned: true,
+            name: String::new(),
+        },
+    );
+    let updated_at = BTreeMap::from([(brand.clone(), 900), (ci.clone(), 800), (repo.clone(), 1)]);
+    let parents = BTreeMap::from([(child.clone(), ci.clone())]);
+    let ctx = options::WorktreeContext {
+        updated_at: Some(&updated_at),
+        parents: Some(&parents),
+        ..options::WorktreeContext::default()
+    };
+    for sort_by in [SortBy::Smart, SortBy::Recent, SortBy::Name] {
+        let opts = WorkspaceOptions {
+            sort_by,
+            ..WorkspaceOptions::default()
+        };
+        let order: Vec<PathBuf> = options::rows_with_options(
+            &snapshot,
+            &prefs,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &opts,
+            &ctx,
+        )
+        .into_iter()
+        .filter_map(|r| match r {
+            Row::Worktree(p) => Some(p),
+            _ => None,
+        })
+        .collect();
+        // 기본 → 핀(harness-ci) → 그 자식 → 나머지(대기 중·최근·이름이 앞서는 brand-identity).
+        assert_eq!(
+            order,
+            vec![repo.clone(), ci.clone(), child.clone(), brand.clone()],
+            "{sort_by:?}"
+        );
+    }
 }
