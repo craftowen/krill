@@ -191,28 +191,11 @@ impl Shell {
         )
     }
 
-    /// 사이드바 하단 푸터(설정·보안/도움말 + 활성 워크트리 이동·보드 대시보드).
-    pub(super) fn render_security_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// 사이드바 하단 푸터(설정 + 활성 워크트리 이동·보드 대시보드). Secure Keyboard Entry는 앱 메뉴 토글만 둔다.
+    pub(super) fn render_sidebar_footer(cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_component::{Icon, IconName, Sizable as _};
         use krill_app::ui::icons;
         let p = krill_app::ui::palette(cx);
-        let on = self.security.is_secure_keyboard_enabled();
-        // OWE-886: 상태(켜기/끄기)는 접근성 라벨에 유지하고, 툴팁은 공용 헬퍼로 통일한다.
-        let sec_label = if on {
-            sec_text::SECURE_KEYBOARD_ON.get()
-        } else {
-            sec_text::SECURE_KEYBOARD_OFF.get()
-        };
-        let btn = krill_app::ui::button_with_tooltip(
-            Button::new("secure-keyboard-entry")
-                .icon(Icon::default().data(icons::SHIELD_SVG))
-                .xsmall()
-                .debug_selector(|| "secure-keyboard-entry".into())
-                .on_click(cx.listener(|this, _, _, cx| this.toggle_secure_keyboard(cx))),
-            "secure-keyboard-entry",
-            sec_text::SECURE_KEYBOARD_TOOLTIP.get(),
-        )
-        .accessibility_label(sec_label);
         div()
             .h(krill_app::ui::SIDEBAR_HEADER_HEIGHT)
             .px_2()
@@ -242,8 +225,7 @@ impl Shell {
                             })),
                         "sidebar-settings",
                         krill_app::i18n::catalog::general::SETTINGS_HINT.get(),
-                    ))
-                    .child(if on { btn.primary() } else { btn.ghost() }),
+                    )),
             )
             .child(
                 div()

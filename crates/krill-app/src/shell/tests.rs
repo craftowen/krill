@@ -4070,12 +4070,9 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
             window.draw(cx).clear(cx);
         });
         cx.run_until_parked();
-        let add_mac = cx.debug_bounds("sidebar-add-mac").expect("sidebar-add-mac");
-        let sidebar = cx.debug_bounds("sidebar-column").expect("sidebar-column");
-        let tabbar = cx.debug_bounds("titlebar").expect("titlebar");
         assert!(
-            add_mac.right() <= sidebar.right() && add_mac.right() <= tabbar.left(),
-            "sidebar-add-mac ({add_mac:?}) must stay inside sidebar ({sidebar:?}) and before tab bar ({tabbar:?}) in {lang:?}"
+            cx.debug_bounds("sidebar-add-mac").is_none(),
+            "Mac pairing lives in the admin SSH tab, not the titlebar ({lang:?})"
         );
     }
     cx.update(|window, cx| {
