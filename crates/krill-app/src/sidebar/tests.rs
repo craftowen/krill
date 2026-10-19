@@ -1682,6 +1682,20 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
         host_x + gpui::px(HOST_CHILD_INDENT) <= repo_x && repo_x + gpui::px(CHILD_INDENT) <= tree_x,
         "indent host={host_x:?} repo={repo_x:?} worktree={tree_x:?}"
     );
+    // 촘촘한(Compact) 카드도 같은 단계로 들여 쓴다.
+    cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(CardLayout::Compact, cx)));
+    cx.run_until_parked();
+    let compact_x = cx
+        .debug_bounds(tree_sel)
+        .expect("compact worktree")
+        .origin
+        .x;
+    assert!(
+        repo_x + gpui::px(CHILD_INDENT) <= compact_x,
+        "compact indent repo={repo_x:?} worktree={compact_x:?}"
+    );
+    cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(CardLayout::Detailed, cx)));
+    cx.run_until_parked();
 
     // 3. 끊긴 호스트('mini') 아래의 행들은 흐리게(dimmed) 표시되고, 연결된 호스트('local', 'studio') 행들은 흐리지 않다.
     cx.update(|_, cx| {
