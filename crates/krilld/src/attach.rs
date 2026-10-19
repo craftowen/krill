@@ -53,7 +53,9 @@ mod search_worker;
 
 /// 계속 출력 중일 때 화면 프레임 사이 최소 간격(약 120Hz). 쉬다가 처음 바뀐 화면은 바로 보낸다(입력 에코).
 // ponytail: 고정값. 앱 vsync 합치기(MK-027)와 맞춰 볼 필요가 생기면 클라이언트가 Attach에 싣는다.
-const FRAME_MIN: Duration = Duration::from_millis(8);
+pub(crate) const FRAME_MIN: Duration = Duration::from_millis(8);
+/// 모바일 연결의 최소 간격(약 30Hz). 터널·LTE 왕복이 수십 ms라 120Hz는 대역폭·배터리만 쓴다.
+pub(crate) const MOBILE_FRAME_MIN: Duration = Duration::from_millis(33);
 /// 클라이언트가 이만큼 읽지 않으면 끊는다(재접속하면 스냅샷부터).
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hello 뒤 첫 요청([`Attach`] 등)을 기다리는 최대 시간.
@@ -113,6 +115,7 @@ pub fn serve(
         negotiated.features,
         tap,
         role,
+        FRAME_MIN,
     )
 }
 
@@ -144,7 +147,15 @@ pub fn run(
     features: u64,
     tap: Option<Tap>,
 ) -> io::Result<()> {
-    run_as(stream, attach, instance, features, tap, Role::Interactive)
+    run_as(
+        stream,
+        attach,
+        instance,
+        features,
+        tap,
+        Role::Interactive,
+        FRAME_MIN,
+    )
 }
 
 pub(crate) fn run_as(
@@ -154,6 +165,7 @@ pub(crate) fn run_as(
     features: u64,
     tap: Option<Tap>,
     role: Role,
+    frame_min: Duration,
 ) -> io::Result<()> {
     stream.set_read_timeout(None)?;
     stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
@@ -187,7 +199,7 @@ pub(crate) fn run_as(
                     Stream::Screen { known } => {
                         // 화면 구독 동안 핫 스크롤백을 쌓는다(MK-035). 놓으면 유예 뒤 강등.
                         let _viewer = tap.watch();
-                        screen_loop(&tap, &conn, known, instance, features)
+                        screen_loop(&tap, &conn, known, instance, features, frame_min)
                     }
                     Stream::Raw { from } => raw_loop(&tap, &conn, from),
                 };
@@ -304,6 +316,7 @@ fn screen_loop(
     known: Option<Known>,
     instance: u64,
     features: u64,
+    frame_min: Duration,
 ) -> io::Result<()> {
     let meta = features & FEAT_SCREEN_META != 0;
     let modes_enabled = features & krill_proto::term_modes::FEAT_TERM_MODES != 0;
@@ -339,7 +352,7 @@ fn screen_loop(
         }
         let resync = conn.resync.swap(false, Ordering::SeqCst);
         if let Some(wait) = last
-            .map(|t: Instant| (t + FRAME_MIN).saturating_duration_since(Instant::now()))
+            .map(|t: Instant| (t + frame_min).saturating_duration_since(Instant::now()))
             .filter(|w| !resync && !w.is_zero())
         {
             thread::sleep(wait);
