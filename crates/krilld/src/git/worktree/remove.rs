@@ -112,13 +112,29 @@ pub fn remove_with_state(
         }
     }
     unlink_symlinks(&path, &config.worktree.symlinks);
+    let path_os = path.into_os_string();
     let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
     if req.force {
         args.push("--force".into());
     }
     args.push("--".into());
-    args.push(path.into_os_string());
-    text(git(q, repo, args)?, "git worktree remove failed")?;
+    args.push(path_os.clone());
+    if let Err(first_err) = text(git(q, repo, args)?, "git worktree remove failed") {
+        // !target.locked 및 !dirty 검증을 이미 통과한 클린 워크트리라도 서브모듈이 초기화되어 있으면
+        // git worktree remove가 단일 --force 없이는 거부한다(#28164). 단일 --force로 1회 재시도한다.
+        if req.force {
+            return Err(first_err);
+        }
+        let retry_args: Vec<OsString> = [
+            OsString::from("worktree"),
+            OsString::from("remove"),
+            OsString::from("--force"),
+            OsString::from("--"),
+            path_os,
+        ]
+        .into();
+        text(git(q, repo, retry_args)?, &first_err)?;
+    }
 
     let mut result = RemovedWorktree {
         branch: target.branch.clone(),

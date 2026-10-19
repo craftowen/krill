@@ -25,6 +25,9 @@ sha2 = { workspace = true }
 serde-saphyr = { workspace = true }
 notify = { workspace = true }
 ring = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+webpki-roots = { workspace = true }
 zeroize = { workspace = true }
 
 # Windows는 jemalloc-sys가 빌드되지 않는다(시스템 할당기, OWE-819).

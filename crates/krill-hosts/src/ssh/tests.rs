@@ -402,3 +402,15 @@ fn sweep_removes_only_dead_forward_sockets() {
     );
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn machine_key_reads_user_host_port_from_ssh_g() {
+    let cfg = "user owen\nhostname 100.65.102.14\nport 22\nidentityfile ~/.ssh/id\n";
+    assert_eq!(
+        machine_key_from_config(cfg).as_deref(),
+        Some("owen@100.65.102.14:22")
+    );
+    assert_eq!(machine_key_from_config("user owen\n"), None);
+    // 플래그처럼 보이는 대상은 ssh에 넘기지 않고 그대로 쓴다.
+    assert_eq!(machine_key("-oProxyCommand=x", None), "-oproxycommand=x");
+}

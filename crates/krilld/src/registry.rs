@@ -1635,6 +1635,9 @@ impl Registry {
     /// 현재 디렉터리가 기본 이름(`worktree-1`, `claude-1` 등)의 git 브랜치이면 슬러그로 개명한다.
     pub(crate) fn maybe_rename_from_hook(&self, id: SessionId, payload: &[u8]) {
         use krill_proto::os::ffi::OsStrExt as _;
+        if self.agents.is_subagent_or_foreign_hook(id, payload) {
+            return;
+        }
         let state_dir = self.state_dir();
         if !krill_proto::git::is_auto_rename_enabled(state_dir.as_deref()) {
             return;

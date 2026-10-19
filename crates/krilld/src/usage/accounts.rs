@@ -923,7 +923,14 @@ fn refresh_accounts_authenticated(
         let Some(provider) = ProviderKind::parse(&stored.provider) else {
             continue;
         };
-        let dir = PathBuf::from(&stored.profile_dir);
+        let raw_dir = PathBuf::from(&stored.profile_dir);
+        let dir = if provider == ProviderKind::Codex {
+            let slug = stored.id.strip_prefix("codex-").unwrap_or(&stored.id);
+            krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(home, slug, &raw_dir)
+        } else {
+            raw_dir
+        };
+        let resolved_profile_dir = dir.display().to_string();
         let pu = read_profile_usage(
             home,
             provider,
@@ -971,7 +978,7 @@ fn refresh_accounts_authenticated(
             }
             existing.label.clone_from(&stored.label);
             existing.email.clone_from(&stored.email);
-            existing.profile_dir.clone_from(&stored.profile_dir);
+            existing.profile_dir.clone_from(&resolved_profile_dir);
             if !pu.usage.is_empty() {
                 existing.usage = pu.usage.to_proto();
                 existing.stale = pu.stale;
@@ -984,7 +991,7 @@ fn refresh_accounts_authenticated(
                 provider,
                 label: stored.label.clone(),
                 email: stored.email.clone(),
-                profile_dir: stored.profile_dir.clone(),
+                profile_dir: resolved_profile_dir,
                 active: false,
                 host_default: false,
                 stale,
@@ -1454,14 +1461,17 @@ pub fn add_account(
         let mut file = file;
         let resolved_dir = if profile_dir.trim().is_empty() {
             file.accounts.iter().find(|a| a.id == id).map_or_else(
-                || {
-                    home.join(".config")
-                        .join("minikrill")
-                        .join("profiles")
-                        .join(provider.as_str())
-                        .join(&slug)
+                || krill_proto::usage::profiles::default_profile_dir(home, provider, &slug),
+                |existing| {
+                    let current = PathBuf::from(&existing.profile_dir);
+                    if provider == ProviderKind::Codex {
+                        krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(
+                            home, &slug, &current,
+                        )
+                    } else {
+                        current
+                    }
                 },
-                |existing| PathBuf::from(&existing.profile_dir),
             )
         } else if let Some(stripped) = profile_dir.trim().strip_prefix("~/") {
             home.join(stripped)

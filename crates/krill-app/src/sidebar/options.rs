@@ -492,6 +492,8 @@ pub(super) struct WorktreeContext<'a> {
     pub collapsed_lineage: Option<&'a BTreeSet<PathBuf>>,
     pub sleeping_worktrees: Option<&'a BTreeSet<PathBuf>>,
     pub removed_projects: Option<&'a BTreeSet<PathBuf>>,
+    /// 사용자가 끌어다 놓아 정한 프로젝트 순서. 없는 프로젝트는 그 뒤에 이름순으로 온다.
+    pub project_order: Option<&'a [PathBuf]>,
 }
 
 pub(super) fn is_default_branch_worktree(
@@ -636,6 +638,12 @@ fn worktree_sort_name(path: &Path, prefs: &Preferences, meta: Option<&Meta>) -> 
         .unwrap_or_else(|| basename(path))
 }
 
+/// 카드에 [기본] 배지가 붙는 워크트리(저장소 본 체크아웃)인지. 배지와 정렬이 이 함수 하나로 판정한다.
+pub(super) fn is_primary_worktree(snapshot: &Snapshot, path: &Path) -> bool {
+    snapshot.trees.contains_key(path)
+}
+
+/// 정렬 기준과 무관하게 [기본] 워크트리 → 핀 고정 → 나머지(정렬 기준) 순서로 정렬한다.
 pub(super) fn sort_worktrees(
     trees: &mut [&PathBuf],
     snapshot: &Snapshot,
@@ -644,6 +652,11 @@ pub(super) fn sort_worktrees(
     ctx: &WorktreeContext<'_>,
 ) {
     trees.sort_by(|a, b| {
+        let primary_a = !is_primary_worktree(snapshot, a);
+        let primary_b = !is_primary_worktree(snapshot, b);
+        if primary_a != primary_b {
+            return primary_a.cmp(&primary_b);
+        }
         let pin_a = !prefs.get(*a).is_some_and(|v| v.pinned);
         let pin_b = !prefs.get(*b).is_some_and(|v| v.pinned);
         let name_a = worktree_sort_name(a, prefs, ctx.meta);
@@ -682,6 +695,18 @@ fn push_worktree_and_sessions(
     }
 }
 
+/// 저장소를 사용자가 정한 순서(`order`)대로, 순서에 없는 것은 그 뒤에 원래(경로) 순서대로 돌려준다.
+fn ordered_projects<'a>(
+    snapshot: &'a Snapshot,
+    order: Option<&[PathBuf]>,
+) -> Vec<(&'a PathBuf, &'a Vec<PathBuf>)> {
+    let mut repos: Vec<_> = snapshot.trees.iter().collect();
+    if let Some(order) = order.filter(|o| !o.is_empty()) {
+        repos.sort_by_key(|(repo, _)| order.iter().position(|o| o == *repo).unwrap_or(usize::MAX));
+    }
+    repos
+}
+
 pub(super) fn rows_with_options<'a>(
     snapshot: &'a Snapshot,
     prefs: &Preferences,
@@ -716,7 +741,7 @@ pub(super) fn rows_with_options<'a>(
 
     match options.group_by {
         GroupBy::Repo => {
-            for (repo, trees) in &snapshot.trees {
+            for (repo, trees) in ordered_projects(snapshot, ctx.project_order) {
                 if is_removed(repo) || !options.filters.contains_repo(repo) {
                     continue;
                 }
@@ -932,6 +957,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
+            project_order: Some(&self.project_order),
         };
         rows_with_options(
             &self.snapshot,
@@ -958,6 +984,7 @@ impl Sidebar {
             collapsed_lineage: Some(&self.collapsed_lineage),
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
+            project_order: Some(&self.project_order),
             ..WorktreeContext::default()
         };
         rows_with_options(

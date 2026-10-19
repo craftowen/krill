@@ -211,6 +211,8 @@ enum Row {
     Folder(PathBuf),
     /// 작업 디렉터리를 모르는 세션.
     Loose,
+    /// 연결되지 않았고 세션도 없는 원격 호스트 묶음(개수). 누르면 그 호스트들을 펼친다.
+    OfflineHosts(usize),
 }
 
 /// 사이드바에 표시되는 원격 호스트 섹션 상태.
@@ -222,6 +224,8 @@ pub struct RemoteHost {
     pub snapshot: Snapshot,
     pub meta: Meta,
     pub source: Option<Arc<dyn Source>>,
+    /// 마지막 연결 실패 메시지. 끊긴 이유(꺼짐·인증 거부·Krill 없음)를 보여 주는 데 쓴다.
+    pub error: Option<String>,
 }
 
 impl std::fmt::Debug for RemoteHost {
@@ -365,18 +369,21 @@ impl UiExpansionState {
     }
 }
 
+/// 마지막 `Vec<PathBuf>`는 사용자가 끌어다 놓아 정한 프로젝트 순서(5번째 구간). postcard는 구조체 끝 필드 추가를
+/// 옛 파일에서 못 읽으므로 구간을 따로 덧붙인다. 옛 앱은 남는 바이트를 무시한다.
 type PersistedSidebarState = (
     Preferences,
     WorkspaceOptions,
     lineage::LineageState,
     UiExpansionState,
+    Vec<PathBuf>,
 );
 
 /// 저장 파일을 읽는다. 손상·미지원 버전은 덮어쓰지 않도록 `.corrupt`로 보존한 뒤 오류를 돌려준다.
 #[cfg(test)]
 #[cfg(unix)]
 fn load(path: &Path) -> io::Result<Preferences> {
-    load_state(path).map(|(prefs, _, _, _)| prefs)
+    load_state(path).map(|(prefs, ..)| prefs)
 }
 
 fn load_state(path: &Path) -> io::Result<PersistedSidebarState> {
@@ -413,6 +420,7 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
             WorkspaceOptions::default(),
             lineage::LineageState::default(),
             UiExpansionState::default(),
+            Vec::new(),
         ));
     }
     let (opts, rest) =
@@ -423,16 +431,22 @@ fn decode_state(bytes: &[u8]) -> io::Result<PersistedSidebarState> {
             opts,
             lineage::LineageState::default(),
             UiExpansionState::default(),
+            Vec::new(),
         ));
     }
     let (lin, rest) = postcard::take_from_bytes::<lineage::LineageState>(rest)
         .map_err(|e| invalid(&e.to_string()))?;
-    let ui = if rest.is_empty() {
-        UiExpansionState::default()
+    if rest.is_empty() {
+        return Ok((prefs, opts, lin, UiExpansionState::default(), Vec::new()));
+    }
+    let (ui, rest) =
+        postcard::take_from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?;
+    let order = if rest.is_empty() {
+        Vec::new()
     } else {
-        postcard::from_bytes::<UiExpansionState>(rest).map_err(|e| invalid(&e.to_string()))?
+        postcard::from_bytes::<Vec<PathBuf>>(rest).map_err(|e| invalid(&e.to_string()))?
     };
-    Ok((prefs, opts, lin, ui))
+    Ok((prefs, opts, lin, ui, order))
 }
 
 #[cfg(test)]
@@ -444,6 +458,7 @@ fn save(path: &Path, prefs: &Preferences) -> io::Result<()> {
         &WorkspaceOptions::default(),
         &lineage::LineageState::default(),
         &UiExpansionState::default(),
+        &[],
     )
 }
 
@@ -453,14 +468,20 @@ fn save_state(
     opts: &WorkspaceOptions,
     lin: &lineage::LineageState,
     ui: &UiExpansionState,
+    order: &[PathBuf],
 ) -> io::Result<()> {
     let mut bytes = postcard::to_stdvec(prefs).map_err(io::Error::other)?;
-    if opts.is_customized() || !lin.is_empty() || !ui.is_empty() {
+    let need_ui = !ui.is_empty() || !order.is_empty();
+    let need_lin = !lin.is_empty() || need_ui;
+    if opts.is_customized() || need_lin {
         bytes.extend(postcard::to_stdvec(opts).map_err(io::Error::other)?);
-        if !lin.is_empty() || !ui.is_empty() {
+        if need_lin {
             bytes.extend(postcard::to_stdvec(lin).map_err(io::Error::other)?);
-            if !ui.is_empty() {
+            if need_ui {
                 bytes.extend(postcard::to_stdvec(ui).map_err(io::Error::other)?);
+                if !order.is_empty() {
+                    bytes.extend(postcard::to_stdvec(order).map_err(io::Error::other)?);
+                }
             }
         }
     }
@@ -533,6 +554,10 @@ enum Relink {
     AwaitingList,
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "서로 무관한 화면 상태 플래그(표시·폴링·펼침)라 상태 기계로 합칠 수 없다"
+)]
 pub struct Sidebar {
     snapshot: Snapshot,
     meta: Meta,
@@ -543,6 +568,10 @@ pub struct Sidebar {
     remote_manager: Option<HostManager>,
     remote_info: BTreeMap<String, krill_hosts::HostConnectionInfo>,
     collapsed_hosts: BTreeSet<HostId>,
+    /// '연결 안 된 호스트' 묶음을 펼쳤는지(앱을 다시 켜면 접힌다).
+    show_offline_hosts: bool,
+    /// 사용자가 끌어다 놓아 정한 프로젝트(저장소) 순서(`sidebar.bin` 5번째 구간).
+    project_order: Vec<PathBuf>,
     row_hosts: Vec<HostId>,
     action_host: Option<HostId>,
     prs: BTreeMap<PathBuf, crate::pull_request::Status>,
@@ -664,7 +693,7 @@ impl Sidebar {
     pub fn new(path: Option<PathBuf>) -> Self {
         let mut error = None;
         let mut writable = true;
-        let (prefs, options, lin, ui) = match path.as_deref().map(load_state) {
+        let (prefs, options, lin, ui, project_order) = match path.as_deref().map(load_state) {
             Some(Ok(state)) => state,
             Some(Err(err)) if err.kind() != io::ErrorKind::NotFound => {
                 writable = path
@@ -676,6 +705,7 @@ impl Sidebar {
                     WorkspaceOptions::default(),
                     lineage::LineageState::default(),
                     UiExpansionState::default(),
+                    Vec::new(),
                 )
             }
             _ => (
@@ -683,6 +713,7 @@ impl Sidebar {
                 WorkspaceOptions::default(),
                 lineage::LineageState::default(),
                 UiExpansionState::default(),
+                Vec::new(),
             ),
         };
         let comments = external::load_comments_from_sidebar_path(path.as_deref());
@@ -697,6 +728,8 @@ impl Sidebar {
             remote_manager: None,
             remote_info: BTreeMap::new(),
             collapsed_hosts: ui.collapsed_hosts,
+            show_offline_hosts: false,
+            project_order,
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -1149,6 +1182,7 @@ impl Sidebar {
                     snapshot: Snapshot::default(),
                     meta: Meta::new(),
                     source,
+                    error: None,
                 });
             }
         }
@@ -1182,6 +1216,7 @@ impl Sidebar {
                 snapshot: Snapshot::default(),
                 meta: Meta::new(),
                 source: Some(source),
+                error: None,
             });
         }
         self.rebuild(cx);
@@ -1271,23 +1306,29 @@ impl Sidebar {
                         let Some(entry) = s.remote_hosts.iter_mut().find(|r| r.id == id) else {
                             continue;
                         };
-                        if let Ok((snap, meta)) = res {
-                            if entry.status != HostStatus::Connected
-                                || entry.snapshot != snap
-                                || entry.meta != meta
-                            {
-                                entry.status = HostStatus::Connected;
-                                entry.snapshot = snap;
-                                entry.meta = meta;
-                                changed = true;
+                        match res {
+                            Ok((snap, meta)) => {
+                                if entry.status != HostStatus::Connected
+                                    || entry.snapshot != snap
+                                    || entry.meta != meta
+                                {
+                                    entry.status = HostStatus::Connected;
+                                    entry.snapshot = snap;
+                                    entry.meta = meta;
+                                    changed = true;
+                                }
+                                entry.error = None;
                             }
-                        } else {
-                            let status = transport
-                                .as_ref()
-                                .map_or(HostStatus::Disconnected, |t| t.status);
-                            if entry.status != status {
-                                entry.status = status;
-                                changed = true;
+                            Err(err) => {
+                                let status = transport
+                                    .as_ref()
+                                    .map_or(HostStatus::Disconnected, |t| t.status);
+                                let error = Some(err.to_string());
+                                if entry.status != status || entry.error != error {
+                                    entry.status = status;
+                                    entry.error = error;
+                                    changed = true;
+                                }
                             }
                         }
                     }
@@ -1658,10 +1699,29 @@ impl Sidebar {
                     rows.extend(local_rows);
                 }
             }
-            for remote in &self.remote_hosts {
+            // Orca처럼 쓰는 호스트만 펼쳐 두고, 연결 안 됐고 세션도 없는 호스트는 맨 아래 한 줄로 묶는다.
+            let (idle_hosts, live_hosts): (Vec<&RemoteHost>, Vec<&RemoteHost>) = self
+                .remote_hosts
+                .iter()
+                .filter(|r| {
+                    self.options
+                        .filters
+                        .contains_host(&HostId::Remote(r.id.clone()))
+                })
+                // 짝지은 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 짝짓기 등)와 함께 그대로 보인다.
+                .partition(|r| {
+                    r.status != HostStatus::Connected
+                        && r.snapshot.sessions.is_empty()
+                        && !self.remote_info.contains_key(&r.id)
+                });
+            for (i, remote) in live_hosts.iter().chain(&idle_hosts).enumerate() {
                 let host = HostId::Remote(remote.id.clone());
-                if !self.options.filters.contains_host(&host) {
-                    continue;
+                if i == live_hosts.len() {
+                    rows.push(Row::OfflineHosts(idle_hosts.len()));
+                    row_hosts.push(HostId::Local);
+                    if !self.show_offline_hosts {
+                        break;
+                    }
                 }
                 rows.push(Row::HostHeader {
                     host: host.clone(),
@@ -1885,7 +1945,14 @@ impl Sidebar {
                 shown_external: self.shown_external.clone(),
                 removed_projects: self.removed_projects.clone(),
             };
-            if let Err(e) = save_state(path, &self.prefs, &self.options, &lin, &ui) {
+            if let Err(e) = save_state(
+                path,
+                &self.prefs,
+                &self.options,
+                &lin,
+                &ui,
+                &self.project_order,
+            ) {
                 self.error = Some(e.to_string());
             }
         }
@@ -2153,8 +2220,47 @@ impl Sidebar {
                 self.new_session_on(host, path, Program::Login, Some(window), cx);
             }
             Some(Row::HiddenWorktrees(repo, _, _)) => self.toggle_external(&repo, cx),
+            Some(Row::OfflineHosts(_)) => self.toggle_offline_hosts(None, cx),
             _ => {}
         }
+    }
+
+    /// 프로젝트(저장소) `from`을 `to` 자리로 옮긴다(Orca처럼 끌어다 놓기). 지금 보이는 순서를 통째로 저장한다.
+    pub fn move_project(&mut self, from: &Path, to: &Path, cx: &mut Context<Self>) {
+        let mut order: Vec<PathBuf> = self
+            .rows
+            .iter()
+            .zip(&self.row_hosts)
+            .filter_map(|(row, host)| match row {
+                Row::Repository(p) if host.is_local() => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        let (Some(i), Some(j)) = (
+            order.iter().position(|p| p == from),
+            order.iter().position(|p| p == to),
+        ) else {
+            return;
+        };
+        if i == j {
+            return;
+        }
+        let moved = order.remove(i);
+        order.insert(j, moved);
+        // 지금 안 보이는(필터·접힌 호스트) 프로젝트의 예전 자리도 뒤에 남겨 둔다.
+        for p in &self.project_order {
+            if !order.contains(p) {
+                order.push(p.clone());
+            }
+        }
+        self.project_order = order;
+        self.persist(cx);
+    }
+
+    /// '연결 안 된 호스트' 묶음을 펼치거나 접는다(`None`이면 뒤집는다).
+    pub fn toggle_offline_hosts(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
+        self.show_offline_hosts = open.unwrap_or(!self.show_offline_hosts);
+        self.rebuild(cx);
     }
 
     /// `open`: `None`이면 뒤집고, `Some(true)`면 펼치고, `Some(false)`면 접는다.
@@ -2175,6 +2281,7 @@ impl Sidebar {
         match self.cursor_row().cloned() {
             Some(Row::HostHeader { host, .. }) => self.fold_host(&host, Some(open), cx),
             Some(Row::GroupHeader { key, .. }) => self.fold_group(key, Some(open), cx),
+            Some(Row::OfflineHosts(_)) => self.toggle_offline_hosts(Some(open), cx),
             Some(Row::Worktree(path) | Row::Folder(path) | Row::Repository(path)) => {
                 self.fold(&path, Some(open), cx);
             }

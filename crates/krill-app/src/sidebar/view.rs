@@ -26,6 +26,14 @@ use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 use crate::ui::status::{self, Size};
 
+/// 카드 아래 세션 행의 왼쪽 안쪽 여백(px) = 카드 여백 + 이 값. 상태 글리프가 카드 제목 글자 아래에 오게 한다(Orca 중첩).
+/// 카드 왼쪽 끝 → 제목 글자 32(테두리 2(계보 자식 `border_l_2`) + `px_2p5` 10 + 상태 칸 14 + `gap_1p5` 6)에서
+/// 세션 행 자체의 `mx_1` 4를 뺀다.
+const CARD_TITLE_INSET: f32 = 28.;
+/// 폴더 아래 세션 행의 왼쪽 안쪽 여백(px, 호스트 들여쓰기 제외). 폴더 이름 글자 아래에 글리프가 온다:
+/// 머리줄 `ml` 4 + `px_2` 8 + 접기 버튼 20 + `gap_1p5` 6 + 폴더 아이콘 14 + `gap_1p5` 6 − 세션 행 `mx_1` 4.
+const FOLDER_TITLE_INSET: f32 = 54.;
+
 #[derive(Clone)]
 struct TreeMenuMeta {
     path: PathBuf,
@@ -56,6 +64,7 @@ struct HeaderMenuMeta {
 pub(super) fn host_status_tone(
     status: HostStatus,
     local_reconnecting: bool,
+    reason: Option<&'static str>,
     p: &ui::Palette,
 ) -> (gpui::Hsla, &'static str) {
     match status {
@@ -64,7 +73,10 @@ pub(super) fn host_status_tone(
         HostStatus::Disconnected if local_reconnecting => {
             (p.preserve, text::HOST_RECONNECTING.get())
         }
-        HostStatus::Disconnected => (p.destructive, text::HOST_DISCONNECTED.get()),
+        HostStatus::Disconnected => (
+            p.destructive,
+            reason.unwrap_or_else(|| text::HOST_DISCONNECTED.get()),
+        ),
     }
 }
 
@@ -456,8 +468,17 @@ impl Sidebar {
                 let detail = info.and_then(|i| i.detail.clone());
                 let error = info.and_then(|i| i.error.clone());
                 let closed = self.collapsed_hosts.contains(host);
-                let (dot_color, status_label) =
-                    host_status_tone(*status, !host.is_remote() && self.local_reconnecting(), p);
+                let reason = host
+                    .remote_id()
+                    .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+                    .and_then(|r| r.error.as_deref())
+                    .map(disconnect_reason);
+                let (dot_color, status_label) = host_status_tone(
+                    *status,
+                    !host.is_remote() && self.local_reconnecting(),
+                    reason,
+                    p,
+                );
                 let fold_host = host.clone();
                 let header_key = host.as_key().to_owned();
                 let status_key = header_key.clone();
@@ -657,6 +678,35 @@ impl Sidebar {
                 .aria_label(text::SESSIONS.get())
                 .child(Icon::new(IconName::SquareTerminal).xsmall())
                 .child(text::SESSIONS.get()),
+            Row::OfflineHosts(n) => {
+                let label = text::HOST_OFFLINE_GROUP.format(&[("n", &n.to_string())]);
+                let open = self.show_offline_hosts;
+                heading(base)
+                    .debug_selector(|| "host-offline-group".into())
+                    .aria_label(label.clone())
+                    .aria_expanded(open)
+                    .cursor_pointer()
+                    .pl_1()
+                    .pr_1p5()
+                    .text_color(p.muted_foreground)
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall(),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.cursor = Some(index);
+                        s.toggle_offline_hosts(None, cx);
+                    }))
+            }
             Row::Repository(path) => {
                 let repo = path.clone();
                 let fold_btn = path.clone();
@@ -750,6 +800,27 @@ impl Sidebar {
                         s.cursor = Some(index);
                         s.fold(&fold_row, None, cx);
                     }))
+                    // Orca처럼 프로젝트 머리줄을 끌어다 다른 프로젝트 위에 놓아 순서를 바꾼다(내 Mac 프로젝트만).
+                    .when(row_host.is_local(), |d| {
+                        let drop_to = path.clone();
+                        let ring = p.ring;
+                        d.on_drag(
+                            ProjectDrag {
+                                path: path.clone(),
+                                name: basename(path).into(),
+                            },
+                            |drag, _, _, cx| cx.new(|_| drag.clone()),
+                        )
+                        .drag_over::<ProjectDrag>(move |d, _, _, _| {
+                            d.border_t_2().border_color(ring)
+                        })
+                        .on_drop(cx.listener(
+                            move |s, drag: &ProjectDrag, _, cx| {
+                                cx.stop_propagation();
+                                s.move_project(&drag.path, &drop_to, cx);
+                            },
+                        ))
+                    })
             }
             Row::Folder(path) => {
                 let (fold_btn, fold_row, fresh, fresh_host) =
@@ -790,7 +861,14 @@ impl Sidebar {
                             .with_size(px(14.))
                             .text_color(p.muted_foreground),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(basename(path)))
+                    .child(
+                        div()
+                            .debug_selector(move || format!("folder-title-{index}"))
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(basename(path)),
+                    )
                     .child(
                         div()
                             .invisible()
@@ -877,19 +955,31 @@ impl Sidebar {
                             String::new()
                         }
                     ))
-                    .when(*nested, |d| d.pl(px(33. + host_indent)).pr_2())
+                    .when(*nested, |d| {
+                        // 하위 세션은 소속 카드(워크트리·폴더)의 제목 글자 아래에서 시작해 한 단계 깊어 보이게 한다.
+                        let pl = match &session.worktree {
+                            Some(tree) => {
+                                let depth = if row_host.is_local() {
+                                    self.lineage_depth(tree)
+                                } else {
+                                    0
+                                };
+                                self.worktree_margin(depth) + CARD_TITLE_INSET
+                            }
+                            None => host_indent + FOLDER_TITLE_INSET,
+                        };
+                        d.pl(px(pl)).pr_2()
+                    })
                     .cursor_pointer()
                     .text_color(p.sidebar_foreground)
                     .hover(|d| {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
-                    .child(status::status_glyph(
-                        session.status.state,
-                        unread,
-                        Size::Sm,
-                        cx,
-                    ))
+                    .child(
+                        status::status_glyph(session.status.state, unread, Size::Sm, cx)
+                            .debug_selector(move || format!("session-state-{index}")),
+                    )
                     .child(status::agent_icon(
                         status::infer_agent_from_title(&session.status.agent, &name),
                         ui::ICON_XS,
@@ -999,12 +1089,19 @@ impl Sidebar {
                 .into_any_element();
         }
         div()
+            .debug_selector(move || format!("worktree-title-{index}"))
             .min_w_0()
             .truncate()
             .text_size(title_size)
             .font_weight(gpui::FontWeight::SEMIBOLD)
             .child(card_title)
             .into_any_element()
+    }
+
+    /// 워크트리 카드 왼쪽 여백(px): 프로젝트 > 워크트리 들여쓰기 + 호스트 들여쓰기 + 계보 깊이(단계당 14px).
+    fn worktree_margin(&self, lineage_depth: usize) -> f32 {
+        let depth = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
+        6. + CHILD_INDENT + self.host_indent() + depth * 14.
     }
 
     fn render_worktree(
@@ -1019,7 +1116,8 @@ impl Sidebar {
         let p = ui::palette(cx);
         let selected = self.cursor == Some(index);
         let row_host = self.row_host(index).clone();
-        let is_default_tree = self.snapshot_for(&row_host).trees.contains_key(path);
+        let is_default_tree =
+            super::options::is_primary_worktree(self.snapshot_for(&row_host), path);
         let is_first_default = self
             .snapshot_for(&row_host)
             .trees
@@ -1386,8 +1484,7 @@ impl Sidebar {
             0
         };
         let lineage_collapsed = row_host.is_local() && self.is_lineage_collapsed(path);
-        let depth_px = f32::from(u16::try_from(lineage_depth).unwrap_or(0));
-        let left_margin = px(6. + CHILD_INDENT + self.host_indent() + depth_px * 14.);
+        let left_margin = px(self.worktree_margin(lineage_depth));
         let lineage_toggle_btn = (lineage_child_count > 0).then(|| {
             let fold_path = path.to_path_buf();
             let count_str = lineage_child_count.to_string();
@@ -1926,7 +2023,8 @@ impl Sidebar {
         let (folder, session, tree, header) = match row {
             Row::Worktree(path) => {
                 let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
-                let is_primary = self.snapshot_for(&host).trees.contains_key(path);
+                let is_primary =
+                    super::options::is_primary_worktree(self.snapshot_for(&host), path);
                 let current_parent = host
                     .is_local()
                     .then(|| self.worktree_parent(path))
@@ -2631,5 +2729,71 @@ impl Render for Sidebar {
                 )
             })
             .child(list)
+    }
+}
+
+/// 원격 연결 실패 메시지(ssh 표준 오류·터널 오류)를 사이드바에 보일 짧은 이유로 줄인다.
+pub(super) fn disconnect_reason(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    match crate::ssh_hosts::classify_ssh_error(&lower) {
+        crate::ssh_hosts::SshTestFailureKind::AuthFailed => text::HOST_REASON_AUTH.get(),
+        crate::ssh_hosts::SshTestFailureKind::ConnectionRefused => text::HOST_REASON_REFUSED.get(),
+        crate::ssh_hosts::SshTestFailureKind::Other => {
+            if [
+                "timed out",
+                "no route to host",
+                "host is down",
+                "network is unreachable",
+                "could not resolve",
+            ]
+            .iter()
+            .any(|m| lower.contains(m))
+            {
+                text::HOST_REASON_OFFLINE.get()
+            } else if [
+                "krill is not installed",
+                "failed to start krill",
+                "unexpected eof",
+                "early eof",
+                "connection reset",
+                "broken pipe",
+            ]
+            .iter()
+            .any(|m| lower.contains(m))
+            {
+                text::HOST_REASON_NO_KRILL.get()
+            } else {
+                text::HOST_DISCONNECTED.get()
+            }
+        }
+    }
+}
+
+/// 끌고 있는 프로젝트 머리줄(놓을 자리 표시와 드래그 미리보기).
+#[derive(Clone)]
+struct ProjectDrag {
+    path: PathBuf,
+    name: gpui::SharedString,
+}
+
+impl Render for ProjectDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
+        div()
+            .px(ui::SPACE_3)
+            .py(ui::SPACE_2)
+            .rounded(ui::RADIUS_SM)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .flex()
+            .items_center()
+            .gap(ui::SPACE_1)
+            .child(Icon::new(IconName::Folder).xsmall())
+            .child(self.name.clone())
     }
 }
