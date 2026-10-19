@@ -12,3 +12,5 @@
 .diff-added{background:var(--diff-added-bg);color:var(--chat-diff-added)}.diff-deleted{background:var(--diff-deleted-bg);color:var(--chat-diff-removed)}.diff-hunk{color:var(--syntax-keyword)}.diff-line{display:block;min-width:max-content}
 
 .host-status>span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* screens: home, workspaces, accounts, settings, connection log, pairing, toast. Overrides earlier rules; keep additions here. */
+#notice{pointer-events:auto;cursor:pointer}
