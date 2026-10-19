@@ -204,3 +204,23 @@ exec /usr/bin/perl -MIO::Socket::UNIX -e '$s = IO::Socket::UNIX->new(Local => $A
     drop(manager);
     fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn duplicate_host_id_alias_shares_the_canonical_slot() {
+    let manager = HostManager::new();
+    manager.sync_specs(&[spec(None)]);
+    assert!(
+        manager
+            .target_for(&HostId::Remote("studio-alias".into()), None)
+            .is_none()
+    );
+    manager.set_aliases(BTreeMap::from([("studio-alias".into(), "studio".into())]));
+    assert!(
+        manager
+            .target_for(&HostId::Remote("studio-alias".into()), None)
+            .is_some()
+    );
+    manager.kill_tunnel("studio-alias");
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+    assert_eq!(manager.statuses().len(), 1);
+}

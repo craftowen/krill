@@ -1531,6 +1531,74 @@ fn unread_clears_when_session_is_focused(cx: &mut TestAppContext) {
     });
 }
 
+/// 연결 안 됐고 세션도 없는 원격 호스트는 Orca처럼 맨 아래 한 줄('연결 안 된 호스트 N개')로 묶이고,
+/// 누르면 펼쳐지며, 끊긴 이유(꺼짐·인증 거부·Krill 없음)가 상태 자리에 보인다.
+#[gpui::test]
+fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let remote = |id: &str, status, sessions: Vec<Session>, error: Option<&str>| RemoteHost {
+        id: id.into(),
+        label: id.into(),
+        status,
+        snapshot: Snapshot {
+            sessions,
+            trees: BTreeMap::new(),
+        },
+        meta: Meta::new(),
+        source: None,
+        error: error.map(str::to_owned),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.remote_hosts = vec![
+                remote("mbp", HostStatus::Disconnected, vec![], Some("ssh remote HOME query to mbp failed: ssh: connect to host 100.65.102.14 port 22: Operation timed out")),
+                remote("oci", HostStatus::Connected, vec![], None),
+                remote("seol", HostStatus::Disconnected, vec![], Some("ssh: Permission denied (publickey,password).")),
+                remote("kak", HostStatus::Disconnected, vec![session(3, AgentState::Done, Some("/r/wt"))], Some("unexpected EOF")),
+            ];
+            s.rebuild(cx);
+        });
+    });
+    let headers = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_, cx| {
+            view.read(cx)
+                .rows
+                .iter()
+                .filter_map(|r| match r {
+                    Row::HostHeader { host, .. } => Some(host.as_key().to_owned()),
+                    Row::OfflineHosts(n) => Some(format!("offline:{n}")),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘만 묶인다.
+    assert_eq!(headers(cx), ["local", "oci", "kak", "offline:2"]);
+    cx.update(|_, cx| view.update(cx, |s, cx| s.toggle_offline_hosts(None, cx)));
+    assert_eq!(
+        headers(cx),
+        ["local", "oci", "kak", "offline:2", "mbp", "seol"]
+    );
+
+    assert_eq!(
+        super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
+        text::HOST_REASON_OFFLINE.get()
+    );
+    assert_eq!(
+        super::view::disconnect_reason("Permission denied (publickey)"),
+        text::HOST_REASON_AUTH.get()
+    );
+    assert_eq!(
+        super::view::disconnect_reason("krill is not installed on the remote host"),
+        text::HOST_REASON_NO_KRILL.get()
+    );
+    assert_eq!(
+        super::view::disconnect_reason("weird"),
+        text::HOST_DISCONNECTED.get()
+    );
+}
+
 /// MK-131(OWE-667): 원격 호스트가 설정되면 최상단 `'내 Mac'` 섹션과 원격 호스트 섹션으로 묶이고,
 /// 각 호스트 헤더에 연결 상태 점(`연결됨` / `연결 중` / `끊김`)과 세션 수 배지·접기/펼치기가 동작하며,
 /// 끊긴 호스트는 마지막으로 알려진 세션 목록을 흐리게(`is_row_dimmed`) 유지하고 `'다시 연결'` 버튼을 제공한다.
@@ -1595,6 +1663,7 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
                     },
                     meta: Meta::new(),
                     source: None,
+                    error: None,
                 },
                 RemoteHost {
                     id: "mini".into(),
@@ -1609,6 +1678,7 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
                     },
                     meta: Meta::new(),
                     source: None,
+                    error: None,
                 },
             ];
             s.rebuild(cx);
@@ -2732,6 +2802,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
                 },
                 meta: Meta::new(),
                 source: None,
+                error: None,
             }];
             s.rebuild(cx);
         });
@@ -3085,6 +3156,7 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
                 snapshot: Snapshot::default(),
                 meta: Meta::new(),
                 source: None,
+                error: None,
             }];
             s.rebuild(cx);
         });
@@ -4287,4 +4359,52 @@ fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
         assert!(s.ports.contains_key(&wt_live));
         assert!(s.collapsed.contains(&wt_gone));
     });
+}
+
+/// Orca처럼 프로젝트 머리줄을 끌어다 놓으면 순서가 바뀌고, `sidebar.bin`에 남아 다시 열어도 유지된다.
+#[gpui::test]
+fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("mk-project-order-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("sidebar.bin");
+    let snapshot = Snapshot {
+        sessions: vec![],
+        trees: BTreeMap::from([
+            (PathBuf::from("/p/a"), vec![PathBuf::from("/p/a")]),
+            (PathBuf::from("/p/b"), vec![PathBuf::from("/p/b")]),
+            (PathBuf::from("/p/c"), vec![PathBuf::from("/p/c")]),
+        ]),
+    };
+    let repos = |s: &Sidebar| {
+        s.rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Repository(p) => Some(p.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let path = file.clone();
+    let (view, cx) = cx.add_window_view(move |_, _| Sidebar::new(Some(path)));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = snapshot.clone();
+            s.rebuild(cx);
+            assert_eq!(repos(s), ["/p/a", "/p/b", "/p/c"]);
+            s.move_project(Path::new("/p/c"), Path::new("/p/a"), cx);
+            assert_eq!(repos(s), ["/p/c", "/p/a", "/p/b"]);
+        });
+    });
+    let (_, _, _, _, order) = load_state(&file).unwrap();
+    assert_eq!(
+        order,
+        [
+            PathBuf::from("/p/c"),
+            PathBuf::from("/p/a"),
+            PathBuf::from("/p/b")
+        ]
+    );
+    fs::remove_dir_all(&dir).ok();
 }
