@@ -466,9 +466,19 @@ impl RenderOnce for TabBar {
             // (완료한 선택, 현재 선택 재시도 횟수, 지난 프레임 탭 크기·넘침 폭). 위치를 끝내 못 얻어도 다시 그리기를
             // 무한히 요청하지 않게 30프레임까지만.
             let shown = window.use_keyed_state(format!("{}-revealed", self.id), cx, |_, _| {
-                (None::<usize>, 0u8, None::<(gpui::Size<Pixels>, Pixels)>)
+                (None::<usize>, 0u8, None::<(gpui::Size<Pixels>, Pixels)>, None::<Pixels>)
             });
-            let (done, tries, last_size) = *shown.read(cx);
+            let (mut done, tries, last_size, done_at) = *shown.read(cx);
+            // 완료 뒤에 탭 제목이 늦게 와(복원 직후 데몬 연결) 탭들이 자라면 활성 탭이 다시 밀려난다. 사용자가
+            // 스크롤하지 않았고(완료 때 위치 그대로) 활성 탭이 가려졌으면 다시 보이게 한다.
+            if done == Some(sel)
+                && done_at == Some(scroll_handle.offset().x)
+                && reveal.target.read(cx).is_none()
+                && scroll_handle.bounds_for_item(sel).is_some()
+                && !reveal.visible_at(sel, scroll_handle.offset().x)
+            {
+                done = None;
+            }
             // 탭이 막 추가된 프레임은 최대 스크롤 폭이 옛 값이라 한 번에 못 닿는다. 새 탭은 들어오는 애니메이션
             // 동안 폭이 자라므로(첫 프레임 12×0) 크기가 멈추고, 그 크기로 실제로 보일 때만 완료로 표시한다.
             // 그 뒤의 수동 스크롤은 건드리지 않는다(Krill v0.1.17 실화면 QA: 넘치기 시작한 새 탭이 줄 밖에 남음).
@@ -485,14 +495,17 @@ impl RenderOnce for TabBar {
                             && reveal.target.read(cx).is_none()
                             && reveal.visible_at(sel, to) =>
                     {
-                        shown.update(cx, |s, _| *s = (Some(sel), 0, None));
+                        shown.update(cx, |s, _| *s = (Some(sel), 0, None, Some(to)));
                     }
-                    _ if tries >= 30 => shown.update(cx, |s, _| *s = (Some(sel), 0, None)),
+                    _ if tries >= 30 => {
+                        let at = scroll_handle.offset().x;
+                        shown.update(cx, |s, _| *s = (Some(sel), 0, None, Some(at)));
+                    }
                     found => {
                         if found.is_some() {
                             reveal.reveal(sel, cx);
                         }
-                        shown.update(cx, |s, _| *s = (s.0, tries + 1, size));
+                        shown.update(cx, |s, _| *s = (done, tries + 1, size, None));
                         cx.notify(window.current_view());
                     }
                 }
