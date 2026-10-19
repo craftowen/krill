@@ -1386,6 +1386,13 @@ static AGY_GUARD_CACHE: std::sync::Mutex<std::collections::BTreeMap<AgyGuardKey,
     std::sync::Mutex::new(std::collections::BTreeMap::new());
 /// 가드 결과 기억 상한. 키가 바뀌면(업그레이드) 그 전에 다시 본다.
 const AGY_GUARD_TTL: Duration = Duration::from_hours(1);
+/// 가드 프로브(`agy --gemini_dir=… mcp list`) 대기 상한. 테스트는 전체 검사의 병렬 부하에서 갓 만든 가짜 스크립트
+/// 실행이 5초를 넘겨(2026-10-20 실측 5.1·9.6초) 지원 안 함으로 잘못 판정해 30초로 둔다.
+const AGY_GUARD_PROBE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(30)
+} else {
+    Duration::from_secs(5)
+};
 
 fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
     use krill_proto::os::fs::DirBuilderExt as _;
@@ -1415,7 +1422,7 @@ fn agy_gemini_dir_supported_with(exe: &Path, root: &Path) -> bool {
         std::fs::remove_dir_all(root).ok();
         return false;
     };
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + AGY_GUARD_PROBE_TIMEOUT;
     let supported = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
