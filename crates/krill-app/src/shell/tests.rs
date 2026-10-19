@@ -1992,9 +1992,13 @@ fn new_last_tab_is_revealed_with_motion_in_narrow_window(cx: &mut TestAppContext
         let drag = cx
             .debug_bounds("titlebar-drag")
             .map(|b| (b.left(), b.right()));
+        // 넘침 메뉴(⌄) 버튼에 가려도 안 된다(설 실화면: 닫기 ×가 ⌄ 밑에 숨음).
+        let menu = cx
+            .debug_bounds("tab-overflow-menu")
+            .map_or(limit.left(), |b| b.left());
         assert!(
-            tab.right() <= limit.left(),
-            "tab {n}: active {active} {tab:?} hidden behind {limit:?}; all={all:?} drag={drag:?}"
+            tab.right() <= limit.left() && tab.right() <= menu,
+            "tab {n}: active {active} {tab:?} hidden behind {limit:?} menu={menu:?}; all={all:?} drag={drag:?}"
         );
     }
 }
