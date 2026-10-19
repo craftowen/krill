@@ -122,10 +122,17 @@ impl Plan {
                 let exe_str = exe
                     .to_str()
                     .ok_or_else(|| error("krill executable path is not UTF-8"))?;
-                format!(
-                    "if [ -n \"${{MK_PANE_ID:-}}\" ]; then exec {} hook claude; else printf '{{}}\\n'; fi",
-                    hooks::shell_quote(exe_str)
-                )
+                #[cfg(windows)]
+                {
+                    exe_str.to_owned()
+                }
+                #[cfg(not(windows))]
+                {
+                    format!(
+                        "if [ -n \"${{MK_PANE_ID:-}}\" ]; then exec {} hook claude; else printf '{{}}\\n'; fi",
+                        hooks::shell_quote(exe_str)
+                    )
+                }
             }
             TargetAgent::Other(a) => {
                 hooks::command(exe, a).ok_or_else(|| error("krill executable path is not UTF-8"))?

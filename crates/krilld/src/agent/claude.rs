@@ -64,18 +64,25 @@ impl Settings {
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let state = state.canonicalize()?;
         let krill = krill.canonicalize()?;
+        #[cfg(not(windows))]
         let command = format!(
             "env KRILL_STATE_DIR={} {} hook claude",
             quote(&state)?,
             quote(&krill)?
         );
+        #[cfg(windows)]
+        let command = krill
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "hook path is not utf-8"))?
+            .to_owned();
+        let handler = krill_proto::agent::hooks::claude_hook(&command);
         let hooks: serde_json::Map<String, serde_json::Value> = claude::events(version)
             .into_iter()
             .map(|event| {
                 (
                     event.to_owned(),
                     serde_json::json!([{
-                        "matcher": "*", "hooks": [{"type": "command", "command": command}]
+                        "matcher": "*", "hooks": [handler]
                     }]),
                 )
             })
@@ -284,6 +291,7 @@ fn owner(name: &OsStr) -> Option<SessionId> {
     sid.parse().ok().map(SessionId)
 }
 
+#[cfg(not(windows))]
 fn quote(path: &Path) -> io::Result<String> {
     let text = path
         .to_str()
@@ -377,3 +385,26 @@ pub(crate) fn probe(profile: &Profile, login: &Launch) -> Option<String> {
 #[cfg(test)]
 #[cfg(unix)]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    #[test]
+    fn session_settings_use_native_exec_hook_and_os_random_uuid() {
+        let state = std::env::temp_dir().join(format!("owe917-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&state).unwrap();
+        let exe = state.join("krill 한글 '$`.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+        let settings =
+            super::Settings::create(&state, &exe, krill_proto::SessionId(17), None).unwrap();
+        assert!(super::is_uuid(&settings.id));
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&settings.path).unwrap()).unwrap();
+        let handler = &value["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert_eq!(
+            std::path::Path::new(handler["command"].as_str().unwrap()),
+            exe.canonicalize().unwrap()
+        );
+        assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
+        std::fs::remove_dir_all(state).ok();
+    }
+}

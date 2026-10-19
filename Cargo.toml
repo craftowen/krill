@@ -82,6 +82,8 @@ tokio = { version = "1.44.1", default-features = false, features = ["fs", "io-ut
 # M11 Windows 포팅(OWE-812). 둘 다 이미 Cargo.lock에 있는 버전(gpui·tokio 묶음 전이 의존성)이라 새 크레이트가 아니다. 기능은 쓰는 크레이트가 켠다.
 windows-sys = "0.61.2"
 uds_windows = "1.2.1"
+# OWE-917: locked, cached safe Windows parent-PID lookup; refresh only the hook PID.
+sysinfo = { version = "=0.31.4", default-features = false, features = ["system"] }
 
 # gpui 묶음 vendor 사본(원본 그대로, 패치는 MK-103).
 [patch.crates-io]
