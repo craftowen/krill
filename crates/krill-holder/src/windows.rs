@@ -12,7 +12,7 @@ use krill_proto::{
 };
 use std::ffi::OsString;
 use std::io::{self, Write};
-use std::os::windows::io::{AsHandle, AsSocket, OwnedHandle, OwnedSocket};
+use std::os::windows::io::{AsHandle, AsSocket, BorrowedHandle, OwnedHandle, OwnedSocket};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -23,6 +23,51 @@ struct Session {
     job: Job,
     status: Option<i32>,
     deadline: Option<Instant>,
+}
+impl Session {
+    fn handles(&self) -> Vec<BorrowedHandle<'_>> {
+        let mut handles = self.console.pty.handles();
+        handles.extend([
+            self.process.handle.as_handle(),
+            self.job.handle.as_handle(),
+            self.job.port.as_handle(),
+        ]);
+        handles
+    }
+    fn restore(
+        api: Api,
+        id: SessionId,
+        pid: u32,
+        status: Option<i32>,
+        mut handles: Vec<OwnedHandle>,
+    ) -> io::Result<Self> {
+        if handles.len() != 8 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        let mut pop = || {
+            handles
+                .pop()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidData))
+        };
+        let port = pop()?;
+        let handle = pop()?;
+        let process = Process {
+            handle: pop()?,
+            pid,
+        };
+        let mut console = Console::pack(api, crate::link::Pty::from_handles(handles)?)?;
+        if status.is_some() {
+            console.close();
+        }
+        Ok(Self {
+            id,
+            process,
+            console,
+            job: Job { handle, port },
+            status,
+            deadline: None,
+        })
+    }
 }
 struct Daemon {
     process: Process,
@@ -103,7 +148,7 @@ impl Holder {
                         pid: s.process.pid,
                         status: s.status,
                     },
-                    &s.console.pty.handles(),
+                    &s.handles(),
                     target.as_handle(),
                 )?;
             }
@@ -131,7 +176,7 @@ impl Holder {
             .ok_or(io::ErrorKind::NotConnected)?
             .send_message(
                 m,
-                &session.map_or_else(Vec::new, |s| s.console.pty.handles()),
+                &session.map_or_else(Vec::new, Session::handles),
                 d.target.as_handle(),
             )
     }
@@ -252,9 +297,8 @@ impl Holder {
                 }
             }
         }
-        drop(packet);
         let result = match decoded {
-            Ok(m) => self.handle(m),
+            Ok(m) => self.handle(m, packet.fds),
             Err(_) => Err(io::Error::from_raw_os_error(38)),
         };
         match result {
@@ -275,7 +319,7 @@ impl Holder {
         }
         false
     }
-    fn handle(&mut self, m: ToHolder) -> io::Result<Option<FromHolder>> {
+    fn handle(&mut self, m: ToHolder, handles: Vec<OwnedHandle>) -> io::Result<Option<FromHolder>> {
         let req = m.req();
         match m {
             ToHolder::Spawn {
@@ -372,7 +416,13 @@ impl Holder {
             ToHolder::HoldListener { info, .. } => {
                 self.listener = Some(sys::restore_socket(&info)?);
             }
-            ToHolder::Adopt { .. } | ToHolder::UpgradeHolder { .. } => {
+            ToHolder::Adopt { id, pid, .. } => {
+                if !self.sessions.iter().any(|s| s.id == id) {
+                    self.sessions
+                        .push(Session::restore(self.api, id, pid, None, handles)?);
+                }
+            }
+            ToHolder::UpgradeHolder { .. } => {
                 return Err(io::Error::from_raw_os_error(38));
             }
         }
@@ -458,28 +508,13 @@ impl Holder {
             } else {
                 Some(number(Some(status))?)
             };
-            let process = Process {
-                handle: next()?,
-                pid,
-            };
-            let pty =
-                crate::link::Pty::from_handles((0..5).map(|_| next()).collect::<io::Result<_>>()?)?;
-            let mut console = Console::pack(self.api, pty)?;
-            if status.is_some() {
-                console.close();
-            }
-            let job = Job {
-                handle: next()?,
-                port: next()?,
-            };
-            self.sessions.push(Session {
-                id,
-                process,
-                console,
-                job,
-                status,
-                deadline: None,
-            });
+            let mut session = (0..8).map(|_| next()).collect::<io::Result<Vec<_>>>()?;
+            session
+                .get_mut(..6)
+                .ok_or(io::ErrorKind::InvalidData)?
+                .rotate_left(1);
+            self.sessions
+                .push(Session::restore(self.api, id, pid, status, session)?);
         }
         if handles.next().is_some() {
             return Err(io::ErrorKind::InvalidData.into());
