@@ -4358,7 +4358,7 @@ fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn owe731_grouped_sorted_500_rows_60fps_budget(cx: &mut TestAppContext) {
+fn owe731_grouped_sorted_500_rows_60fps_within_budget(cx: &mut TestAppContext) {
     struct Memory(Snapshot);
     impl Source for Memory {
         fn fetch(&self) -> io::Result<Snapshot> {
