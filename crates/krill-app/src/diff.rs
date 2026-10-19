@@ -196,13 +196,11 @@ impl Source for Socket {
             .conn
             .lock()
             .map_err(|_| io::Error::other("diff socket mutex poisoned"))?;
-        if guard.is_none() {
-            *guard = Some(self.connect()?);
-        }
-        let result = match guard.as_mut() {
-            Some(conn) => Self::exchange(conn, req),
-            None => unreachable!(),
+        let conn = match guard.take() {
+            Some(conn) => conn,
+            None => self.connect()?,
         };
+        let result = Self::exchange(guard.insert(conn), req);
         match &result {
             Ok(_) => self.target.record_outcome(true, None),
             Err(e) => {
