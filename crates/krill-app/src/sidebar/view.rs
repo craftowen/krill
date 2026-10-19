@@ -891,7 +891,7 @@ impl Sidebar {
                         cx,
                     ))
                     .child(status::agent_icon(
-                        &session.status.agent,
+                        status::infer_agent_from_title(&session.status.agent, &name),
                         ui::ICON_XS,
                         p.muted_foreground,
                     ))

@@ -470,3 +470,109 @@ fn files_mode_uses_file_empty_text(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds("jump-empty").is_some());
     assert!(cx.debug_bounds("jump-hint").is_some());
 }
+
+#[gpui::test]
+fn jump_palette_worktrees_project_filters_and_cmd_digits(cx: &mut TestAppContext) {
+    let mut s1 = item(1, "* Claude Code · minikrill · main · 작업 중", false);
+    s1.title = "* Claude Code".into();
+    s1.agent = "claude".into();
+    s1.state = Some(AgentState::Working);
+    s1.is_current_tab = true;
+    s1.host_label = "Local Mac".into();
+    s1.repo_name = "minikrill".into();
+    s1.worktree_name = "main".into();
+
+    let mut s2 = item(2, "zsh · orca · feat-jump · 완료", false);
+    s2.title = "zsh".into();
+    s2.state = Some(AgentState::Done);
+    s2.is_current_worktree = true;
+    s2.host_label = "Local Mac".into();
+    s2.repo_name = "orca".into();
+    s2.worktree_name = "feat-jump".into();
+
+    let (view, events, cx) = open(cx, vec![s1, s2]);
+    let worktrees = vec![
+        WorktreeItem::new(
+            "/tmp/minikrill".into(),
+            Some(SessionId(1)),
+            "minikrill".into(),
+            "main".into(),
+            "minikrill".into(),
+            "Local Mac".into(),
+            "1분 미만".into(),
+            Some(AgentState::Working),
+            false,
+            true,
+            true,
+        ),
+        WorktreeItem::new(
+            "/tmp/orca-wt".into(),
+            None,
+            "feat-jump".into(),
+            "feat/jump".into(),
+            "orca".into(),
+            "Local Mac".into(),
+            "5분".into(),
+            None,
+            false,
+            false,
+            false,
+        ),
+    ];
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_worktrees(worktrees, cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).worktree_matches().count()),
+        2
+    );
+
+    // 프로젝트 필터("orca") 적용 시 세션·작업 공간 모두 해당 프로젝트만 남는다.
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_project_filter(Some("orca".into()), cx));
+    });
+    cx.run_until_parked();
+    assert_eq!(shown(&view, cx), [2]);
+    assert_eq!(
+        cx.update(|_, cx| {
+            view.read(cx)
+                .worktree_matches()
+                .map(|w| w.name.clone())
+                .collect::<Vec<_>>()
+        }),
+        ["feat-jump"]
+    );
+
+    // 모두 지우기로 필터 해제.
+    cx.update(|_, cx| {
+        view.update(cx, super::Palette::clear_all_filters);
+    });
+    cx.run_until_parked();
+    assert_eq!(shown(&view, cx), [1, 2]);
+    assert_eq!(
+        cx.update(|_, cx| view.read(cx).worktree_matches().count()),
+        2
+    );
+
+    // Cmd+2 단축키로 2번째 최근 세션 즉시 열기.
+    cx.simulate_keystrokes("cmd-2");
+    assert_eq!(events.borrow().as_slice(), &[Event::Confirm(SessionId(2))]);
+
+    // 아래 방향키로 `최근 작업 공간` 섹션의 2번째 워크트리(세션 미보유)까지 내려가 Enter → OpenWorktree(1).
+    events.borrow_mut().clear();
+    cx.simulate_keystrokes("down down enter");
+    assert_eq!(events.borrow().as_slice(), &[Event::OpenWorktree(1)]);
+}
+
+#[test]
+fn infer_agent_from_title_detects_brands_when_status_agent_is_empty() {
+    use crate::ui::status::infer_agent_from_title;
+    assert_eq!(infer_agent_from_title("", "* Claude Code"), "claude");
+    assert_eq!(infer_agent_from_title("zsh", "✳ Claude Code"), "claude");
+    assert_eq!(infer_agent_from_title("", "Codex CLI"), "codex");
+    assert_eq!(infer_agent_from_title("", "Antigravity Agent"), "agy");
+    assert_eq!(infer_agent_from_title("", "OpenCode"), "opencode");
+    assert_eq!(infer_agent_from_title("claude", "zsh"), "claude");
+    assert_eq!(infer_agent_from_title("", "zsh"), "");
+}

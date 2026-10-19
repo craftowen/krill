@@ -84,6 +84,8 @@ impl TaskStatus {
     }
 }
 
+pub const DEFAULT_MAX_WORKER_DEPTH: u32 = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchStatus {
@@ -92,6 +94,7 @@ pub enum DispatchStatus {
     Failed,
     Stopped,
     Released,
+    Abandoned,
 }
 
 impl DispatchStatus {
@@ -102,6 +105,7 @@ impl DispatchStatus {
             Self::Failed => "failed",
             Self::Stopped => "stopped",
             Self::Released => "released",
+            Self::Abandoned => "abandoned",
         }
     }
 }
@@ -207,6 +211,8 @@ pub struct Dispatch {
     pub agent: String,
     #[serde(default)]
     pub session_id: Option<u64>,
+    #[serde(default)]
+    pub depth: u32,
     pub cwd: String,
     pub prompt: String,
     pub status: DispatchStatus,
@@ -269,6 +275,8 @@ pub struct DecisionGate {
 pub struct OrchestrationStore {
     #[serde(default)]
     pub next_seq: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_run_id: Option<String>,
     #[serde(default)]
     pub runs: Vec<Run>,
     #[serde(default)]
@@ -281,7 +289,7 @@ pub struct OrchestrationStore {
     pub gates: Vec<DecisionGate>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SendParams {
     pub from: String,
     pub to: String,
@@ -293,6 +301,126 @@ pub struct SendParams {
     pub dispatch_id: Option<String>,
     pub outcome: Option<String>,
     pub reply_to: Option<String>,
+}
+
+/// `krill orchestration worker-start --spec <json>` 입력 명세(MK-227).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerStartSpec {
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub worker: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<u64>,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub depth: Option<u32>,
+    #[serde(default)]
+    pub max_depth: Option<u32>,
+    #[serde(default)]
+    pub no_spawn: bool,
+}
+
+/// `krilld` IPC 기반 멀티에이전트 오케스트레이션 요청(MK-227).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrchAction {
+    Snapshot,
+    CreateRun {
+        title: String,
+        coordinator_session_id: Option<u64>,
+    },
+    SetCurrentRun {
+        run_id: Option<String>,
+    },
+    CreateTask {
+        run_id: String,
+        title: String,
+        description: String,
+        deps: Vec<String>,
+    },
+    UpdateTask {
+        task_id: String,
+        status: TaskStatus,
+        summary: Option<String>,
+    },
+    StartWorker {
+        run_id: String,
+        task_id: Option<String>,
+        worker_name: String,
+        agent: String,
+        session_id: Option<u64>,
+        cwd: String,
+        prompt: String,
+        depth: u32,
+        max_depth: u32,
+    },
+    SendMessage(SendParams),
+    CheckMessages {
+        recipient: Option<String>,
+        types: Vec<MessageType>,
+        unread_only: bool,
+        ack: bool,
+        wait_ms: u64,
+    },
+    WaitAnswer {
+        question_id: String,
+        wait_ms: u64,
+    },
+    ReplyMessage {
+        question_id: String,
+        from: String,
+        body: String,
+    },
+    CreateGate {
+        from: String,
+        question: String,
+        options: Vec<String>,
+        run_id: Option<String>,
+        task_id: Option<String>,
+    },
+    ResolveGate {
+        gate_id: String,
+        decision: String,
+        rationale: Option<String>,
+        resolved_by: String,
+    },
+    StopOrReleaseWorker {
+        worker_or_dispatch: String,
+        release: bool,
+        #[serde(default)]
+        archived_output: Option<String>,
+    },
+    AbandonWorker {
+        worker_or_dispatch: String,
+    },
+    Reset {
+        run_id: Option<String>,
+    },
+}
+
+/// `krilld` IPC 기반 멀티에이전트 오케스트레이션 응답(MK-227).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OrchResponse {
+    Snapshot(OrchestrationStore),
+    Run(Run),
+    CurrentRun(Option<String>),
+    Task(Task),
+    Dispatch(Dispatch),
+    Messages(Vec<OrchMessage>),
+    Message(OrchMessage),
+    Answer(Option<OrchMessage>),
+    Gate(DecisionGate),
+    Reset,
+    Error(String),
 }
 
 impl OrchestrationStore {
@@ -388,15 +516,54 @@ impl OrchestrationStore {
         let id = self.alloc_id("run");
         let now = now_ms();
         let run = Run {
-            id,
+            id: id.clone(),
             title: trimmed.to_owned(),
             coordinator_session_id,
             status: RunStatus::Active,
             created_at_ms: now,
             updated_at_ms: now,
         };
+        self.current_run_id = Some(id);
         self.runs.push(run.clone());
         Ok(run)
+    }
+
+    pub fn set_current_run(&mut self, run_id: Option<&str>) -> io::Result<Option<String>> {
+        match run_id.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(rid) => {
+                if !self.runs.iter().any(|r| r.id == rid) {
+                    return Err(not_found(format!("run not found: {rid}")));
+                }
+                self.current_run_id = Some(rid.to_owned());
+            }
+            None => {
+                self.current_run_id = None;
+            }
+        }
+        Ok(self.current_run_id.clone())
+    }
+
+    pub fn resolve_run_id(&self, given: Option<&str>) -> io::Result<String> {
+        if let Some(rid) = given.map(str::trim).filter(|s| !s.is_empty()) {
+            return Ok(rid.to_owned());
+        }
+        if let Some(ref current) = self.current_run_id
+            && self.runs.iter().any(|r| &r.id == current)
+        {
+            return Ok(current.clone());
+        }
+        if let Some(active) = self
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.status == RunStatus::Active)
+        {
+            return Ok(active.id.clone());
+        }
+        if let Some(last) = self.runs.last() {
+            return Ok(last.id.clone());
+        }
+        Err(invalid("missing --run (and no active run in store)"))
     }
 
     pub fn create_task(
@@ -549,6 +716,28 @@ impl OrchestrationStore {
         task_id: Option<&str>,
         worker_name: &str,
     ) -> io::Result<()> {
+        self.validate_worker_start_with_depth(
+            run_id,
+            task_id,
+            worker_name,
+            0,
+            DEFAULT_MAX_WORKER_DEPTH,
+        )
+    }
+
+    pub fn validate_worker_start_with_depth(
+        &self,
+        run_id: &str,
+        task_id: Option<&str>,
+        worker_name: &str,
+        depth: u32,
+        max_depth: u32,
+    ) -> io::Result<()> {
+        if depth > max_depth {
+            return Err(invalid(format!(
+                "nested worker depth {depth} exceeds max_depth {max_depth}"
+            )));
+        }
         if !self.runs.iter().any(|r| r.id == run_id) {
             return Err(not_found(format!("run not found: {run_id}")));
         }
@@ -573,6 +762,16 @@ impl OrchestrationStore {
         Ok(())
     }
 
+    #[must_use]
+    pub fn inferred_child_depth(&self, parent_session_id: Option<u64>) -> Option<u32> {
+        let sid = parent_session_id?;
+        self.dispatches
+            .iter()
+            .rev()
+            .find(|d| d.session_id == Some(sid))
+            .map(|d| d.depth.saturating_add(1))
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "worker dispatch captures full task/session binding"
@@ -587,7 +786,36 @@ impl OrchestrationStore {
         cwd: &str,
         prompt: &str,
     ) -> io::Result<Dispatch> {
-        self.validate_worker_start(run_id, task_id, worker_name)?;
+        self.start_worker_with_depth(
+            run_id,
+            task_id,
+            worker_name,
+            agent,
+            session_id,
+            cwd,
+            prompt,
+            0,
+            DEFAULT_MAX_WORKER_DEPTH,
+        )
+    }
+
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "worker dispatch captures full task/session binding and depth guard"
+    )]
+    pub fn start_worker_with_depth(
+        &mut self,
+        run_id: &str,
+        task_id: Option<&str>,
+        worker_name: &str,
+        agent: &str,
+        session_id: Option<u64>,
+        cwd: &str,
+        prompt: &str,
+        depth: u32,
+        max_depth: u32,
+    ) -> io::Result<Dispatch> {
+        self.validate_worker_start_with_depth(run_id, task_id, worker_name, depth, max_depth)?;
         let worker_trimmed = worker_name.trim();
 
         let disp_id = self.alloc_id("disp");
@@ -599,6 +827,7 @@ impl OrchestrationStore {
             worker_name: worker_trimmed.to_owned(),
             agent: crate::agent::canonical_id(agent).to_owned(),
             session_id,
+            depth,
             cwd: cwd.trim().to_owned(),
             prompt: prompt.trim().to_owned(),
             status: DispatchStatus::Active,
@@ -1061,8 +1290,51 @@ impl OrchestrationStore {
             .ok_or_else(|| not_found("dispatch missing"))
     }
 
+    /// Fences a dead/unresponsive worker dispatch without waiting on its PTY session,
+    /// returning the bound task to `Ready` so another worker can be dispatched while
+    /// rejecting any late `worker_done` from the abandoned dispatch (MK-227).
+    pub fn abandon_worker(&mut self, worker_or_dispatch: &str) -> io::Result<Dispatch> {
+        let now = now_ms();
+        let Some(idx) = self
+            .dispatches
+            .iter()
+            .rposition(|d| d.id == worker_or_dispatch || d.worker_name == worker_or_dispatch)
+        else {
+            return Err(not_found(format!(
+                "worker or dispatch not found: {worker_or_dispatch}"
+            )));
+        };
+        let (disp_id, task_id) = {
+            let Some(disp) = self.dispatches.get_mut(idx) else {
+                return Err(not_found("dispatch missing"));
+            };
+            disp.status = DispatchStatus::Abandoned;
+            disp.ended_at_ms = Some(now);
+            (disp.id.clone(), disp.task_id.clone())
+        };
+        if let Some(tid) = task_id
+            && let Some(task) = self.tasks.iter_mut().find(|t| t.id == tid)
+            && task.active_dispatch_id.as_deref() == Some(disp_id.as_str())
+        {
+            task.active_dispatch_id = None;
+            task.assigned_worker = None;
+            if task.status == TaskStatus::Dispatched {
+                task.status = TaskStatus::Ready;
+            }
+            task.updated_at_ms = now;
+        }
+        self.reconverge_dag();
+        self.dispatches
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| not_found("dispatch missing"))
+    }
+
     pub fn reset(&mut self, run_id: Option<&str>) {
         if let Some(rid) = run_id {
+            if self.current_run_id.as_deref() == Some(rid) {
+                self.current_run_id = None;
+            }
             self.runs.retain(|r| r.id != rid);
             self.tasks.retain(|t| t.run_id != rid);
             self.dispatches.retain(|d| d.run_id != rid);

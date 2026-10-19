@@ -346,3 +346,97 @@ fn vault_search_indexes_claude_codex_agy_opencode_titles_summaries_and_bodies() 
 
     fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn vault_large_jsonl_head_tail_and_incremental_cache() {
+    use krill_proto::agent_history::{SearchQuery, VaultAgent};
+    use vault::{VaultRoots, search_in, vault_cache_hits_for_test};
+
+    let root = std::env::temp_dir().join(format!(
+        "mk228-vault-head-tail-cache-{}",
+        std::process::id()
+    ));
+    fs::remove_dir_all(&root).ok();
+    let claude_root = root.join("claude");
+    let claude_proj = claude_root.join("projects/-tmp-repo-large");
+    fs::create_dir_all(&claude_proj).unwrap();
+
+    let sess_id = "55555555-2222-4333-8444-555555555555";
+    let jsonl_path = claude_proj.join(format!("{sess_id}.jsonl"));
+
+    // Build a >700KiB JSONL file:
+    // - Head has sessionId, cwd, and initial user prompt ("HeadTokenAlpha")
+    // - Middle has >600KiB of filler lines
+    // - Tail has latest assistant message ("TailTokenOmega") and customTitle ("Final Tail Title")
+    let mut content = String::with_capacity(750 * 1024);
+    content.push_str(
+        "{\"type\":\"user\",\"sessionId\":\"55555555-2222-4333-8444-555555555555\",\"cwd\":\"/tmp/repo-large\",\"message\":{\"role\":\"user\",\"content\":\"Initialize HeadTokenAlpha session\"}}\n"
+    );
+    let filler_line = format!(
+        "{{\"type\":\"assistant\",\"sessionId\":\"{sess_id}\",\"message\":{{\"role\":\"assistant\",\"content\":\"{}\"}}}}\n",
+        "x".repeat(1024)
+    );
+    while content.len() < 640 * 1024 {
+        content.push_str(&filler_line);
+    }
+    content.push_str(
+        "{\"type\":\"assistant\",\"sessionId\":\"55555555-2222-4333-8444-555555555555\",\"message\":{\"role\":\"assistant\",\"content\":\"Completed TailTokenOmega verification at the end of long session\"}}\n"
+    );
+    content.push_str(
+        "{\"type\":\"custom-title\",\"sessionId\":\"55555555-2222-4333-8444-555555555555\",\"customTitle\":\"Final Tail Title\",\"summary\":\"Tail summary record\"}\n"
+    );
+    fs::write(&jsonl_path, &content).unwrap();
+
+    let roots = VaultRoots {
+        claude: vec![claude_root],
+        ..VaultRoots::default()
+    };
+
+    // 1. Both Head token and Tail token/customTitle should be indexed via Head+Tail split reading.
+    let hits_before = vault_cache_hits_for_test();
+    let snap_tail = search_in(
+        &roots,
+        &SearchQuery {
+            query: "HeadTokenAlpha TailTokenOmega".into(),
+            ..SearchQuery::default()
+        },
+    );
+    assert_eq!(snap_tail.hits.len(), 1);
+    assert_eq!(snap_tail.hits[0].agent, VaultAgent::Claude);
+    assert_eq!(snap_tail.hits[0].id, sess_id);
+    assert_eq!(snap_tail.hits[0].title, "Final Tail Title");
+    assert_eq!(snap_tail.hits[0].summary, "Tail summary record");
+
+    // 2. Repeated search on unchanged file should hit the incremental cache.
+    let hits_after_first = vault_cache_hits_for_test();
+    let snap_cached = search_in(
+        &roots,
+        &SearchQuery {
+            query: "TailTokenOmega".into(),
+            ..SearchQuery::default()
+        },
+    );
+    assert_eq!(snap_cached.hits.len(), 1);
+    assert!(
+        vault_cache_hits_for_test() > hits_after_first,
+        "expected incremental vault cache hit on unchanged file (before={hits_before}, after_first={hits_after_first})"
+    );
+
+    // 3. Modifying the file (size/mtime change) invalidates the cache and indexes new content.
+    content.push_str(
+        "{\"type\":\"user\",\"sessionId\":\"55555555-2222-4333-8444-555555555555\",\"message\":{\"role\":\"user\",\"content\":\"Appended PostCacheInvalidationToken\"}}\n"
+    );
+    fs::write(&jsonl_path, &content).unwrap();
+
+    let snap_updated = search_in(
+        &roots,
+        &SearchQuery {
+            query: "PostCacheInvalidationToken".into(),
+            ..SearchQuery::default()
+        },
+    );
+    assert_eq!(snap_updated.hits.len(), 1);
+    assert_eq!(snap_updated.hits[0].id, sess_id);
+
+    fs::remove_dir_all(&root).ok();
+}

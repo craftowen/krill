@@ -361,19 +361,46 @@ impl Registry {
             let Some(program) = command.next() else {
                 continue;
             };
-            let args = command
-                .chain((!entry.prompt.is_empty()).then_some(entry.prompt))
-                .map(String::into_bytes)
-                .collect();
-            let create = Create {
-                account: None,
-                program: Program::Custom {
-                    program: program.into_bytes(),
-                    args,
-                },
-                cwd: run_cwd.as_os_str().as_bytes().to_vec(),
-                cols: 80,
-                rows: 24,
+            let extra_args: Vec<String> = command.collect();
+            let resolved_agent = self
+                .agents
+                .agents()
+                .ok()
+                .and_then(|a| a.resolve(&program).map(|(c, p)| (c.to_owned(), p.clone())));
+            let cwd_bytes = run_cwd.as_os_str().as_bytes().to_vec();
+            let is_agent_launch = extra_args.is_empty() && resolved_agent.is_some();
+            let prompt = entry.prompt;
+            let create = if let Some((canonical, _)) = &resolved_agent
+                && is_agent_launch
+            {
+                Create {
+                    account: None,
+                    program: Program::Agent {
+                        id: canonical.clone(),
+                    },
+                    cwd: cwd_bytes,
+                    cols: 80,
+                    rows: 24,
+                }
+            } else {
+                if let Some((_, profile)) = &resolved_agent {
+                    crate::agent::pre_trust_workspace(profile, &cwd_bytes, None);
+                }
+                let args = extra_args
+                    .into_iter()
+                    .chain((!prompt.is_empty()).then(|| prompt.clone()))
+                    .map(String::into_bytes)
+                    .collect();
+                Create {
+                    account: None,
+                    program: Program::Custom {
+                        program: program.into_bytes(),
+                        args,
+                    },
+                    cwd: cwd_bytes,
+                    cols: 80,
+                    rows: 24,
+                }
             };
             let peer = Peer {
                 pid: None,
@@ -382,6 +409,28 @@ impl Registry {
             if let Ok(Reply::Created { session, .. }) = self.create(&peer, create) {
                 run.phase = "spawned".into();
                 run.session = Some(session.0);
+                if is_agent_launch
+                    && !prompt.is_empty()
+                    && let Some(tap) = self.tap(&peer, session)
+                {
+                    let prompt_bytes = prompt.into_bytes();
+                    std::thread::Builder::new()
+                        .name(format!("sched-prompt-{}", session.0))
+                        .spawn(move || {
+                            let deadline = Instant::now() + Duration::from_secs(15);
+                            while Instant::now() < deadline {
+                                let p = tap.pulse();
+                                if p.closed || (p.end > 0 && tap.quiet_ms() >= 150) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(50));
+                            }
+                            if !tap.pulse().closed {
+                                drop(Registry::deliver_input_to_tap(&tap, &prompt_bytes, true));
+                            }
+                        })
+                        .ok();
+                }
             } else {
                 run.phase = "failed".into();
                 run.error = Some("session creation failed".into());

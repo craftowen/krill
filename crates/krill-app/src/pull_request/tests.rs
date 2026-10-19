@@ -827,3 +827,48 @@ fn parse_repo_owner_and_name_supports_ghe_hosts_and_graphql_uses_raw_fields_for_
         );
     }
 }
+
+#[test]
+fn owe924_merge_and_draft_toggle_commands_and_service_updates_cache() {
+    struct ActionRunner;
+    impl Runner for ActionRunner {
+        fn run(&self, _: &Path, _: &str, _: Action) -> io::Result<Status> {
+            Ok(Status::Open)
+        }
+        fn merge_pr(&self, _: &Path, _: &str, _: PrMergeMethod) -> io::Result<()> {
+            Ok(())
+        }
+        fn set_pr_draft(&self, _: &Path, _: &str, _: bool) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let folder = Path::new("/tmp/repo");
+    for (method, expected_flag) in [
+        (PrMergeMethod::Squash, "--squash"),
+        (PrMergeMethod::Rebase, "--rebase"),
+        (PrMergeMethod::Merge, "--merge"),
+    ] {
+        assert_eq!(method.flag(), expected_flag);
+        let cmd = merge_command(folder, "feat/owe-924", method);
+        let args: Vec<_> = cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+        assert_eq!(args, ["pr", "merge", "feat/owe-924", expected_flag]);
+    }
+
+    let ready_cmd = ready_command(folder, "feat/owe-924", false);
+    let ready_args: Vec<_> = ready_cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+    assert_eq!(ready_args, ["pr", "ready", "feat/owe-924"]);
+
+    let draft_cmd = ready_command(folder, "feat/owe-924", true);
+    let draft_args: Vec<_> = draft_cmd.get_args().map(|s| s.to_str().unwrap()).collect();
+    assert_eq!(draft_args, ["pr", "ready", "feat/owe-924", "--undo"]);
+
+    let service = Service::new(Arc::new(ActionRunner));
+    let repo = PathBuf::from("/repo");
+    assert_eq!(service.set_draft(&repo, "feat/owe-924", true), Ok(()));
+    assert_eq!(service.set_draft(&repo, "feat/owe-924", false), Ok(()));
+    assert_eq!(
+        service.merge(&repo, "feat/owe-924", PrMergeMethod::Squash),
+        Ok(())
+    );
+}
