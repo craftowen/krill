@@ -28,7 +28,7 @@ use krill_proto::screen::{self, Attach, Attached, Msg, Seq, Stream};
 
 use crate::remote::Target;
 
-const USAGE: &str = "usage: krill [--host <user@host>] ls [--json] | krill new [--cwd <path>] [--worktree <name>] [--agent <profile> | -- <program> <args>...] [--cols N --rows N]\n       krill fork [<id>] [--from <id>] [--cwd <path>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill send <id> [--enter] [--text <text>] [--stdin | -- <text>...]\n       krill read <id> [--lines N] | krill wait <id> [--for idle|waiting|blocked|pattern|quiet|exited|working|done|unknown] [--pattern <regex>] [--quiet-ms|--idle-ms N] [--timeout <seconds>]\n       krill kill <id> | krill attach <id> (Ctrl-] detaches; stdin EOF detaches)\n       remote (--host): SSH Unix-socket forwarding to the remote krilld; --cwd must be absolute on the remote host, --worktree is local only";
+const USAGE: &str = "usage: krill [--host <user@host>] ls [--worktree <path>] [--json] | krill new [--cwd <path>] [--worktree <name>] [--agent <profile> | -- <program> <args>...] [--account <id>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill fork [<id>] [--from <id>] [--cwd <path>] [--prompt <text>] [--cols N --rows N] [--json]\n       krill send <id> [--enter] [--wait-submit] [--text <text>] [--stdin | -- <text>...]\n       krill read <id> [--lines N] | krill wait <id> [--for idle|waiting|blocked|pattern|quiet|exited|working|done|unknown] [--pattern <regex>] [--quiet-ms|--idle-ms N] [--timeout <seconds>]\n       krill kill <id> | krill attach <id> (Ctrl-] detaches; stdin EOF detaches)\n       remote (--host): SSH Unix-socket forwarding to the remote krilld; --cwd must be absolute on the remote host";
 /// capture→attach 사이 세션 종료와 권한 거부를 구분할 수 없어 둘 다 이 문구로 나온다.
 /// "방금 kill한 세션에 send" 같은 레이스에서 권한 문제로 오인하지 않게 닫힘 가능성을 먼저 적는다(C5).
 const RAW_REFUSED_MSG: &str =
@@ -80,17 +80,21 @@ pub fn run(args: &[OsString]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    run_with_target(&target, &rest)
+}
+
+pub(crate) fn run_with_target(target: &Target, rest: &[OsString]) -> ExitCode {
     let result = match rest.split_first() {
-        Some((cmd, rest)) if cmd == "ls" => list(&target, rest),
-        Some((cmd, rest)) if cmd == "new" => create(&target, rest),
-        Some((cmd, rest)) if cmd == "fork" => fork(&target, rest),
-        Some((cmd, rest)) if cmd == "send" => send(&target, rest),
-        Some((cmd, rest)) if cmd == "read" => read(&target, rest),
-        Some((cmd, rest)) if cmd == "wait" => wait::run(rest, &target),
+        Some((cmd, rest)) if cmd == "ls" => list(target, rest),
+        Some((cmd, rest)) if cmd == "new" => create(target, rest),
+        Some((cmd, rest)) if cmd == "fork" => fork(target, rest),
+        Some((cmd, rest)) if cmd == "send" => send(target, rest),
+        Some((cmd, rest)) if cmd == "read" => read(target, rest),
+        Some((cmd, rest)) if cmd == "wait" => wait::run(rest, target),
         Some((cmd, rest)) if cmd == "attach" && rest.len() == 1 => {
-            id(&rest[0]).and_then(|session| terminal::attach(&target, session))
+            id(&rest[0]).and_then(|session| terminal::attach(target, session))
         }
-        Some((cmd, rest)) if cmd == "kill" || cmd == "close" => kill(&target, rest),
+        Some((cmd, rest)) if cmd == "kill" || cmd == "close" => kill(target, rest),
         _ => Err(usage()),
     };
     match result {
@@ -160,12 +164,40 @@ fn probe_holder_orphan(target: &Target) -> bool {
 }
 
 fn list(target: &Target, args: &[OsString]) -> Result<()> {
+    struct EnrichedSession {
+        id: u64,
+        pid: u32,
+        process: &'static str,
+        state: &'static str,
+        agent: Option<String>,
+        account: Option<String>,
+        cwd: String,
+        worktree: String,
+        title: String,
+    }
+
     let mut json = false;
-    for arg in args {
-        if arg == "--json" {
-            json = true;
-        } else {
-            return Err(usage());
+    let mut worktree_filter: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.to_str() {
+            Some("--json") => json = true,
+            Some("--worktree" | "--cwd") if worktree_filter.is_none() => {
+                let raw = it
+                    .next()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(usage)?;
+                let resolved = if target.is_remote() {
+                    raw.to_owned()
+                } else {
+                    crate::set::resolve_worktree(std::path::Path::new(raw))
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                worktree_filter = Some(resolved);
+            }
+            _ => return Err(usage()),
         }
     }
     // holder 상실은 연결(치유) 전에 관측한다. 목록은 그대로 보여주고 경고만 남긴다.
@@ -177,19 +209,111 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
     let Reply::States(states) = request(&mut c.stream, &Request::States)? else {
         return Err(fail("unexpected state list reply"));
     };
+    let sidebar = if c.negotiated.features & FEAT_SIDEBAR != 0 {
+        match request(&mut c.stream, &Request::Sidebar) {
+            Ok(Reply::Sidebar(sb)) => Some(sb),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let accounts = if c.negotiated.features & krill_proto::control::FEAT_SESSION_ACCOUNT != 0 {
+        match request(&mut c.stream, &Request::SessionAccounts) {
+            Ok(Reply::SessionAccounts(list)) => list,
+            _ => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
+    let mut enriched = Vec::new();
+    for s in sessions {
+        let state_entry = states.iter().find(|v| v.session == s.session);
+        let state = state_entry.map_or(AgentState::Unknown, |v| v.status.state);
+        let sb_entry = sidebar
+            .as_ref()
+            .and_then(|sb| sb.sessions.iter().find(|e| e.session == s.session));
+        let cwd = sb_entry
+            .map(|e| String::from_utf8_lossy(&e.cwd).into_owned())
+            .unwrap_or_default();
+        let mut worktree = sidebar
+            .as_ref()
+            .and_then(|sb| {
+                sb.repositories
+                    .iter()
+                    .flat_map(|r| r.worktrees.iter())
+                    .map(|w| String::from_utf8_lossy(w).into_owned())
+                    .filter(|w| {
+                        cwd == *w
+                            || cwd
+                                .strip_prefix(w.as_str())
+                                .is_some_and(|rest| rest.starts_with('/'))
+                    })
+                    .max_by_key(String::len)
+            })
+            .unwrap_or_default();
+        if worktree.is_empty() && !cwd.is_empty() && !target.is_remote() {
+            worktree = crate::set::resolve_worktree(std::path::Path::new(&cwd))
+                .to_string_lossy()
+                .into_owned();
+        }
+        if let Some(filter) = &worktree_filter {
+            let matches_wt = worktree == *filter
+                || cwd == *filter
+                || cwd
+                    .strip_prefix(filter.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'));
+            if !matches_wt {
+                continue;
+            }
+        }
+        let acc = accounts.iter().find(|a| a.session == s.session);
+        let agent = state_entry
+            .map(|v| v.status.agent.clone())
+            .filter(|v| !v.is_empty());
+        let account = acc
+            .map(|a| {
+                if a.account_id.is_empty() {
+                    a.label.clone()
+                } else {
+                    a.account_id.clone()
+                }
+            })
+            .filter(|v| !v.is_empty());
+        let title = state_entry
+            .and_then(|v| v.status.foreground.clone())
+            .unwrap_or_default();
+        enriched.push(EnrichedSession {
+            id: s.session.0,
+            pid: s.pid,
+            process: if s.status.is_some() {
+                "exited"
+            } else {
+                "running"
+            },
+            state: state_name(state),
+            agent,
+            account,
+            cwd,
+            worktree,
+            title,
+        });
+    }
+
     if json {
-        let rows: Vec<_> = sessions
+        let rows: Vec<_> = enriched
             .into_iter()
             .map(|s| {
-                let state = states
-                    .iter()
-                    .find(|v| v.session == s.session)
-                    .map_or(AgentState::Unknown, |v| v.status.state);
                 serde_json::json!({
-                    "id": s.session.0,
+                    "id": s.id,
                     "pid": s.pid,
-                    "process": if s.status.is_some() { "exited" } else { "running" },
-                    "state": state_name(state),
+                    "process": s.process,
+                    "state": s.state,
+                    "agent": s.agent,
+                    "account": s.account,
+                    "cwd": s.cwd,
+                    "worktree": s.worktree,
+                    "title": s.title,
                 })
             })
             .collect();
@@ -200,22 +324,22 @@ fn list(target: &Target, args: &[OsString]) -> Result<()> {
         }
         return Ok(());
     }
-    println!("ID\tPID\tPROCESS\tSTATE");
-    for s in sessions {
-        let state = states
-            .iter()
-            .find(|v| v.session == s.session)
-            .map_or(AgentState::Unknown, |v| v.status.state);
+    println!("ID\tPID\tPROCESS\tSTATE\tAGENT\tACCOUNT\tWORKTREE\tCWD");
+    for s in enriched {
         println!(
-            "{}\t{}\t{}\t{}",
-            s.session.0,
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            s.id,
             s.pid,
-            if s.status.is_some() {
-                "exited"
+            s.process,
+            s.state,
+            s.agent.as_deref().unwrap_or("-"),
+            s.account.as_deref().unwrap_or("-"),
+            if s.worktree.is_empty() {
+                "-"
             } else {
-                "running"
+                &s.worktree
             },
-            state_name(state)
+            if s.cwd.is_empty() { "-" } else { &s.cwd },
         );
     }
     if let Some(warning) = holder_loss_warning(orphan) {
@@ -234,6 +358,8 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
         rows: size.1,
     };
     let mut worktree = None;
+    let mut prompt: Option<String> = None;
+    let mut json = false;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.to_str() {
@@ -267,6 +393,24 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
             }
             Some("--cols") => c.cols = number(args.next())?,
             Some("--rows") => c.rows = number(args.next())?,
+            Some("--account") if c.account.is_none() => {
+                c.account = Some(
+                    args.next()
+                        .and_then(|s| s.to_str())
+                        .filter(|s| !s.is_empty())
+                        .ok_or_else(usage)?
+                        .to_owned(),
+                );
+            }
+            Some("--prompt") if prompt.is_none() => {
+                prompt = Some(
+                    args.next()
+                        .and_then(|s| s.to_str())
+                        .ok_or_else(usage)?
+                        .to_owned(),
+                );
+            }
+            Some("--json") => json = true,
             Some("--agent") if c.program == Program::Login => {
                 c.program = Program::Agent {
                     id: args
@@ -292,36 +436,34 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
         return Err(usage());
     }
     if target.is_remote() {
-        if worktree.is_some() {
-            return Err(remote_usage(
-                "remote worktree creation is not supported in this version",
-            ));
-        }
         if c.cwd.is_empty() {
             return Err(remote_usage(
                 "remote new requires --cwd <absolute path on the remote host>",
             ));
         }
-    } else {
-        if c.cwd.is_empty() {
-            c.cwd = std::env::current_dir()
-                .map_err(fail)?
-                .as_os_str()
-                .as_bytes()
-                .to_vec();
-        }
-        if let Some(name) = worktree {
-            // --cwd selects the repository; the daemon returns the actual path after name collision handling.
-            c.cwd = crate::worktree::create(NewWorktree {
+    } else if c.cwd.is_empty() {
+        c.cwd = std::env::current_dir()
+            .map_err(fail)?
+            .as_os_str()
+            .as_bytes()
+            .to_vec();
+    }
+    if let Some(name) = worktree {
+        // --cwd selects the repository; the daemon returns the actual path after name collision handling.
+        c.cwd = crate::worktree::create_on_target(
+            target,
+            NewWorktree {
                 repo: c.cwd,
                 name,
                 base: None,
                 setup: Setup::Ask,
-            })
-            .map_err(fail)?
-            .path;
-        }
+            },
+        )
+        .map_err(fail)?
+        .path;
     }
+    let cwd_str = String::from_utf8_lossy(&c.cwd).into_owned();
+    let is_agent = matches!(c.program, Program::Agent { .. });
     let mut conn = connect(target, FEAT_CONTROL)?;
     // 데몬 spawn 실패(ENOENT 등)가 프로그램명 없이 그대로 나오면 무엇이 없는지 알 수 없다(C3).
     let program_label = match &c.program {
@@ -330,9 +472,26 @@ fn create(target: &Target, args: &[OsString]) -> Result<()> {
     };
     let reply = request(&mut conn.stream, &Request::Create(c))
         .map_err(|e| prefix_create_error(program_label.as_deref(), e))?;
+    drop(conn);
     match reply {
-        Reply::Created { session, .. } => {
-            println!("{}", session.0);
+        Reply::Created { session, pid } => {
+            if let Some(prompt_text) = prompt.filter(|s| !s.is_empty()) {
+                if is_agent {
+                    wait_for_spawned_agent_ready(target, session.0, BOOT_TIMEOUT).map_err(fail)?;
+                }
+                send_session_line(target, session.0, &prompt_text).map_err(fail)?;
+            }
+            if json {
+                let out = serde_json::to_string_pretty(&serde_json::json!({
+                    "session": session.0,
+                    "pid": pid,
+                    "cwd": cwd_str,
+                }))
+                .map_err(fail)?;
+                println!("{out}");
+            } else {
+                println!("{}", session.0);
+            }
             Ok(())
         }
         _ => Err(fail("unexpected create reply")),
@@ -580,6 +739,7 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
     let (session, args) = args.split_first().ok_or_else(usage)?;
     let session = id(session)?;
     let mut enter = false;
+    let mut wait_submit = false;
     let mut stdin = false;
     let mut text = Vec::new();
     let mut literal = false;
@@ -587,6 +747,8 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
     while let Some(arg) = it.next() {
         if !literal && arg == "--enter" {
             enter = true;
+        } else if !literal && arg == "--wait-submit" {
+            wait_submit = true;
         } else if !literal && arg == "--stdin" {
             stdin = true;
         } else if !literal && arg == "--text" {
@@ -616,13 +778,28 @@ fn send(target: &Target, args: &[OsString]) -> Result<()> {
             .read_to_end(&mut text)
             .map_err(fail)?;
     }
-    if enter {
-        text.push(b'\r');
-    }
-    if text.is_empty() || text.len() > MAX_INPUT {
+    let total_bytes = text.len().saturating_add(usize::from(enter));
+    if total_bytes == 0 || total_bytes > MAX_INPUT {
         return Err(fail("send requires 1..=65536 bytes (including --enter)"));
     }
     let mut ctrl = connect(target, FEAT_CONTROL | FEAT_CLI)?;
+    match request(
+        &mut ctrl.stream,
+        &Request::SendInput {
+            session,
+            bytes: text.clone(),
+            submit: enter,
+            wait_submit,
+        },
+    ) {
+        Ok(Reply::InputSent) => return Ok(()),
+        Ok(_) => return Err(fail("unexpected send reply")),
+        Err(e) if e.text == "bad request" => {}
+        Err(e) => return Err(e),
+    }
+    if enter {
+        text.push(b'\r');
+    }
     let (seq, _) = capture(&mut ctrl.stream, session, CaptureFormat::Plain)?;
     drop(ctrl);
     let mut c = raw(target, session, seq)?;
@@ -666,7 +843,11 @@ fn state_name(s: AgentState) -> &'static str {
 
 pub(crate) fn list_session_ids() -> std::result::Result<Vec<u64>, String> {
     let target = Target::establish(None).map_err(|e| e.to_string())?;
-    let mut c = connect(&target, FEAT_CONTROL).map_err(|e| e.text)?;
+    list_session_ids_on_target(&target)
+}
+
+pub(crate) fn list_session_ids_on_target(target: &Target) -> std::result::Result<Vec<u64>, String> {
+    let mut c = connect(target, FEAT_CONTROL).map_err(|e| e.text)?;
     let Reply::Sessions(sessions) = request(&mut c.stream, &Request::List).map_err(|e| e.text)?
     else {
         return Err("unexpected session list reply".to_owned());
@@ -676,7 +857,14 @@ pub(crate) fn list_session_ids() -> std::result::Result<Vec<u64>, String> {
 
 pub(crate) fn capture_session_text(session_id: u64) -> std::result::Result<String, String> {
     let target = Target::establish(None).map_err(|e| e.to_string())?;
-    let mut c = connect(&target, FEAT_CONTROL | FEAT_CLI).map_err(|e| e.text)?;
+    capture_session_text_on_target(&target, session_id)
+}
+
+pub(crate) fn capture_session_text_on_target(
+    target: &Target,
+    session_id: u64,
+) -> std::result::Result<String, String> {
+    let mut c = connect(target, FEAT_CONTROL | FEAT_CLI).map_err(|e| e.text)?;
     let (_, bytes) =
         capture(&mut c.stream, SessionId(session_id), CaptureFormat::Plain).map_err(|e| e.text)?;
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -687,7 +875,16 @@ pub(crate) fn spawn_agent_session(
     cwd: &std::path::Path,
 ) -> std::result::Result<u64, String> {
     let target = Target::establish(None).map_err(|e| e.to_string())?;
-    let mut conn = connect(&target, FEAT_CONTROL).map_err(|e| e.text)?;
+    spawn_agent_session_on_target(&target, agent, None, cwd)
+}
+
+pub(crate) fn spawn_agent_session_on_target(
+    target: &Target,
+    agent: &str,
+    account: Option<String>,
+    cwd: &std::path::Path,
+) -> std::result::Result<u64, String> {
+    let mut conn = connect(target, FEAT_CONTROL).map_err(|e| e.text)?;
     let program = if agent.is_empty()
         || agent.eq_ignore_ascii_case("shell")
         || agent.eq_ignore_ascii_case("login")
@@ -699,7 +896,7 @@ pub(crate) fn spawn_agent_session(
         }
     };
     let req = Request::Create(Create {
-        account: None,
+        account,
         program,
         cwd: cwd.as_os_str().as_bytes().to_vec(),
         cols: 120,
@@ -780,25 +977,32 @@ pub(crate) fn send_session_line(
     session_id: u64,
     line: &str,
 ) -> std::result::Result<(), String> {
-    if !line.is_empty() {
-        let text_args = [
+    if line.is_empty() {
+        let enter_args = [
             OsString::from(session_id.to_string()),
-            OsString::from("--"),
-            OsString::from(line),
+            OsString::from("--enter"),
         ];
-        send(target, &text_args).map_err(|e| e.text)?;
-        std::thread::sleep(Duration::from_millis(50));
+        return send(target, &enter_args).map_err(|e| e.text);
     }
-    let enter_args = [
+    let args = [
         OsString::from(session_id.to_string()),
         OsString::from("--enter"),
+        OsString::from("--"),
+        OsString::from(line),
     ];
-    send(target, &enter_args).map_err(|e| e.text)
+    send(target, &args).map_err(|e| e.text)
 }
 
 pub(crate) fn close_session(session_id: u64) -> std::result::Result<(), String> {
     let target = Target::establish(None).map_err(|e| e.to_string())?;
-    close_and_wait(&target, SessionId(session_id)).map_err(|e| e.text)
+    close_session_on_target(&target, session_id)
+}
+
+pub(crate) fn close_session_on_target(
+    target: &Target,
+    session_id: u64,
+) -> std::result::Result<(), String> {
+    close_and_wait(target, SessionId(session_id)).map_err(|e| e.text)
 }
 
 fn kill(target: &Target, args: &[OsString]) -> Result<()> {
