@@ -683,6 +683,14 @@ fn install_remote_with_program(
             remote.platform.describe(),
         ));
     }
+    // 관리형 설치는 로컬 바이너리를 그대로 보낸다. Windows PE로 원격 Mac의 실행 파일을 덮어쓰지 않는다.
+    if cfg!(windows) {
+        return Err(InstallError::new(
+            InstallFailureKind::Other,
+            "check-platform",
+            "local Windows binaries cannot be installed on macOS; install Krill on the remote host first",
+        ));
+    }
     if !remote.platform.accepts_local_arch(local_arch) {
         return Err(InstallError::new(
             InstallFailureKind::ArchMismatch,
@@ -772,3 +780,28 @@ fn install_remote_with_program(
 #[cfg(unix)]
 mod tests;
 
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn local_windows_binaries_are_rejected_before_remote_install() {
+        let remote = parse_probe(
+            "krill-os=Darwin\nkrill-arch=arm64\nkrill-home=/Users/test\nkrill-version=missing\n",
+        )
+        .unwrap();
+        let spec = InstallSpec::new(&remote.home, "0.1.10").unwrap();
+        let error = install_remote(
+            &SshOptions::new("owner@test"),
+            &spec,
+            "x86_64",
+            &[],
+            "",
+            &remote,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind, InstallFailureKind::Other);
+        assert_eq!(error.step, "check-platform");
+        assert!(error.detail.contains("Windows binaries"));
+    }
+}
