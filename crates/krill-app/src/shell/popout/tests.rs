@@ -876,6 +876,7 @@ fn unreleased_workers_includes_completed_runs_and_hides_released() {
             worker_name: format!("worker-{id}"),
             agent: "claude".to_owned(),
             session_id: Some(7),
+            depth: 0,
             cwd: "/tmp".to_owned(),
             prompt: "do it".to_owned(),
             status,

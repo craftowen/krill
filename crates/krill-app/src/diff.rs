@@ -1083,6 +1083,18 @@ impl Panel {
         self.active_hunk
     }
 
+    #[must_use]
+    pub fn resolved_hunk_index(&self, cx: &gpui::App) -> usize {
+        let count = self.hunk_count();
+        if let Some(range) = self.state.read(cx).selected_lines() {
+            let use_new = matches!(range.side(), gpui_component::diff::DiffSide::Modified);
+            if let Some(idx) = edit::hunk_index_for_line(&self.raw_patch, range.start(), use_new) {
+                return idx.min(count.saturating_sub(1));
+            }
+        }
+        self.active_hunk.min(count.saturating_sub(1))
+    }
+
     pub fn set_active_hunk(&mut self, hunk: usize, cx: &mut Context<Self>) {
         let count = self.hunk_count();
         if count > 0 {
@@ -1779,7 +1791,7 @@ impl Render for Panel {
                 let full_path = String::from_utf8_lossy(&file.path).into_owned();
                 let mode = self.diff_mode(cx);
                 let hunk_count = self.hunk_count();
-                let active_hunk = self.active_hunk.min(hunk_count.saturating_sub(1));
+                let active_hunk = self.resolved_hunk_index(cx);
                 let has_selected_lines = self.state.read(cx).selected_lines().is_some();
                 let can_patch = file.status != *b"??" && hunk_count > 0 && !self.editing.busy;
                 let header = div()

@@ -663,6 +663,8 @@ fn hunk_and_line_stage_unstage_discard_on_real_repo() {
     let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
     let (_, hunks) = extract_patch_header_and_hunks(&wt_patch);
     assert_eq!(hunks.len(), 2);
+    assert_eq!(hunk_index_for_line(&wt_patch, 2, true), Some(0));
+    assert_eq!(hunk_index_for_line(&wt_patch, 12, true), Some(1));
 
     // 1. Stage only line 2 from hunk 0.
     let stage_line2 = build_line_patch(&wt_patch, false, 2, 2, true).unwrap();
@@ -689,6 +691,67 @@ fn hunk_and_line_stage_unstage_discard_on_real_repo() {
     assert!(disk_after.contains("line1_mod\nline2_mod\n"));
     assert!(disk_after.contains("line12\n"));
     assert!(!disk_after.contains("line12_mod"));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn line_patch_handles_no_newline_at_end_of_file_on_real_repo() {
+    let dir = std::env::temp_dir().join(format!(
+        "krill-no-nl-test-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    for args in [
+        &["init", "-q"][..],
+        &["config", "user.email", "test@example.com"],
+        &["config", "user.name", "Test"],
+    ] {
+        Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .status()
+            .unwrap();
+    }
+    // Initial file WITHOUT trailing newline
+    std::fs::write(dir.join("no_nl.txt"), "first\nmiddle\nlast").unwrap();
+    Command::new("git")
+        .args(["add", "no_nl.txt"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["commit", "-q", "-m", "init"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+
+    // Modify line 1 and line 3 (still no trailing newline)
+    std::fs::write(dir.join("no_nl.txt"), "first_mod\nmiddle\nlast_mod").unwrap();
+    let file = ChangedFile {
+        path: b"no_nl.txt".to_vec(),
+        old_path: None,
+        status: *b".M",
+        staged: None,
+        unstaged: None,
+    };
+    let wt_patch = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    assert!(wt_patch.contains("\\ No newline at end of file"));
+
+    // Stage only line 1 (leaving the no-newline line 3 unstaged)
+    let stage_line1 = build_line_patch(&wt_patch, false, 1, 1, true).unwrap();
+    apply_git_patch(&dir, &stage_line1, true, false).unwrap();
+
+    // Now stage line 3 (which has \ No newline at end of file on both old and new)
+    let wt_patch2 = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    let stage_line3 = build_line_patch(&wt_patch2, false, 3, 3, true).unwrap();
+    apply_git_patch(&dir, &stage_line3, true, false).unwrap();
+
+    let remaining = super::super::raw_patch(&dir, &file, Comparison::Worktree).unwrap();
+    assert!(remaining.trim().is_empty());
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -641,18 +641,15 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         .or(spec.agent)
         .unwrap_or_else(|| "claude".to_owned());
     let agent = krill_proto::agent::canonical_id(&raw_agent).to_owned();
-    let depth = explicit_depth
-        .or(spec.depth)
-        .or_else(|| {
-            std::env::var("MK_WORKER_DEPTH")
-                .ok()
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0);
+    let env_depth = std::env::var("KRILL_ORCH_DEPTH")
+        .or_else(|_| std::env::var("MK_WORKER_DEPTH"))
+        .ok()
+        .and_then(|v| v.parse().ok());
     let max_depth = explicit_max_depth
         .or(spec.max_depth)
         .or_else(|| {
-            std::env::var("MK_MAX_WORKER_DEPTH")
+            std::env::var("KRILL_ORCH_MAX_DEPTH")
+                .or_else(|_| std::env::var("MK_MAX_WORKER_DEPTH"))
                 .ok()
                 .and_then(|v| v.parse().ok())
         })
@@ -671,6 +668,14 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
 
     // 스폰 전에 run/task 유효성과 상태를 먼저 검증해 잘못된 요청이 고아 PTY 세션을 남기지 않게 한다.
     let store = ctx.load_store()?;
+    let current_pane = std::env::var("MK_PANE_ID")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok());
+    let depth = explicit_depth
+        .or(spec.depth)
+        .or(env_depth)
+        .or_else(|| store.inferred_child_depth(current_pane))
+        .unwrap_or(0);
     let run_id = match spec.run_id {
         Some(id) => id,
         None => store
@@ -721,14 +726,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     ) {
         Ok(Some(OrchResponse::Dispatch(d))) => Ok(d),
         Ok(_) => OrchestrationStore::mutate(ctx.state_dir, |s| {
-            s.validate_worker_start_with_depth(
-                &run_id,
-                spec.task_id.as_deref(),
-                &worker_name,
-                depth,
-                max_depth,
-            )?;
-            s.start_worker(
+            s.start_worker_with_depth(
                 &run_id,
                 spec.task_id.as_deref(),
                 &worker_name,
@@ -736,6 +734,8 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 session_id,
                 &cwd_str,
                 &prompt,
+                depth,
+                max_depth,
             )
         }),
         Err(e) => Err(e),
@@ -2066,12 +2066,10 @@ mod tests {
         })
         .to_string();
         cmd_worker_start_ctx(&ctx, &args(&["--spec", &spec_json, "--json"]))?;
-        let d1 = OrchestrationStore::load(&dir)?
-            .dispatches
-            .first()
-            .unwrap()
-            .clone();
+        let store_after_d1 = OrchestrationStore::load(&dir)?;
+        let d1 = store_after_d1.dispatches.first().unwrap().clone();
         assert_eq!(d1.worker_name, "spec-w1");
+        assert_eq!(d1.depth, 1);
         assert_eq!(d1.status, DispatchStatus::Active);
 
         // Exceeding max_depth is rejected

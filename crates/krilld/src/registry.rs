@@ -2013,7 +2013,19 @@ impl Registry {
             return Err(Failure::BadRequest);
         }
         let tap = self.tap(peer, session).ok_or(Failure::NoSession)?;
+        if wait_submit {
+            let idle_deadline = Instant::now() + Duration::from_millis(2500);
+            while Instant::now() < idle_deadline {
+                if tap.pulse().closed
+                    || self.status.get(session).state != control::AgentState::Working
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         let before_end = tap.pulse().end;
+        let was_working = self.status.get(session).state == control::AgentState::Working;
         Self::deliver_input_to_tap(&tap, bytes, submit).map_err(|e| os(&e))?;
         if submit && wait_submit {
             let deadline = Instant::now() + Duration::from_millis(500);
@@ -2021,7 +2033,8 @@ impl Registry {
                 let p = tap.pulse();
                 if p.closed
                     || p.end > before_end
-                    || self.status.get(session).state == control::AgentState::Working
+                    || (!was_working
+                        && self.status.get(session).state == control::AgentState::Working)
                 {
                     break;
                 }
@@ -2098,14 +2111,7 @@ impl Registry {
                 depth,
                 max_depth,
             } => OrchestrationStore::mutate(&dir, |s| {
-                s.validate_worker_start_with_depth(
-                    &run_id,
-                    task_id.as_deref(),
-                    &worker_name,
-                    depth,
-                    max_depth,
-                )?;
-                s.start_worker(
+                s.start_worker_with_depth(
                     &run_id,
                     task_id.as_deref(),
                     &worker_name,
@@ -2113,6 +2119,8 @@ impl Registry {
                     session_id,
                     &cwd,
                     &prompt,
+                    depth,
+                    max_depth,
                 )
             })
             .map(|d| {
