@@ -2,6 +2,7 @@
 use krill_proto::mobile::{ConnectMode, NetworkInterface};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
+#[cfg(unix)]
 use std::process::Command;
 
 pub fn excluded(name: &str) -> bool {
@@ -13,6 +14,7 @@ pub fn tailscale(ip: Ipv4Addr) -> bool {
     (u32::from(ip) & 0xffc0_0000) == 0x6440_0000
 }
 
+#[cfg(unix)]
 pub fn detect() -> io::Result<Vec<NetworkInterface>> {
     let default = Command::new("/sbin/route")
         .args(["-n", "get", "default"])
@@ -33,6 +35,19 @@ pub fn detect() -> io::Result<Vec<NetworkInterface>> {
             default_route: default.as_ref() == Some(&name),
             name,
             address: ip.to_string(),
+        })
+        .collect())
+}
+
+#[cfg(windows)]
+pub fn detect() -> io::Result<Vec<NetworkInterface>> {
+    Ok(crate::sys::ipv4_interfaces()?
+        .into_iter()
+        .filter(|(name, ip, _)| !excluded(name) && (tailscale(*ip) || ip.is_private()))
+        .map(|(name, address, default_route)| NetworkInterface {
+            name,
+            address: address.to_string(),
+            default_route,
         })
         .collect())
 }
