@@ -12,7 +12,7 @@ Krill은 순수 Rust macOS 앱이다. 처음이라면 [README.md](README.md), [�
    scripts/check.sh
    ```
    검사는 fmt · clippy(`-D warnings`) · nextest · doctest · `cargo deny --locked` · `THIRD_PARTY_NOTICES.md` 최신 여부 · 공개 표면(`scripts/public-surface.sh`)이다. 타임아웃 래퍼(`perl -e 'alarm shift; exec @ARGV' <초> scripts/check.sh`)는 선택이다 — 시간 초과·Ctrl-C로 끝나도 check.sh가 자기가 띄운 cargo를 정리한다.
-4. Push 정책: `main` 브랜치와 `v*` 태그에는 직접 push하지 않는다(메인테이너가 사유를 남기고 직접 하는 경우만). 클론마다 `scripts/install-hooks.sh`로 pre-push 훅을 켜면 이를 막고 공개 표면도 점검한다. 외부 기여는 fork 브랜치에서 PR로 보낸다.
+4. Push 정책: `main` 브랜치와 `v*` 태그에는 직접 push하지 않는다(메인테이너가 사유를 남기고 직접 하는 경우만). 외부 기여는 fork 브랜치에서 PR로 보낸다.
 5. PR은 템플릿을 채운다. 작은 PR을 선호한다.
 
 ## 코드 규칙 요약 (상세는 CONVENTIONS.md)
