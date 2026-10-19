@@ -1632,7 +1632,7 @@ catalog! {
         NO_PREVIEW => ("눌러서 세션으로 이동", "Click to go to session"),
         LANE_WORKING => ("작업 중", "Working"),
         LANE_NEEDS_YOU => ("확인 필요", "Needs You"),
-        LANE_DONE => ("완료 · 종료", "Done · Exited"),
+        LANE_DONE => ("완료", "Done"),
         LANE_UNKNOWN => ("알 수 없음", "Unknown"),
         COUNTS => ("세션 {sessions} · 확인 필요 {needs_you}", "Sessions {sessions} · Needs You {needs_you}"),
         ACCOUNT_BTN => ("계정: {label} ({pct}%)", "Account: {label} ({pct}%)"),
