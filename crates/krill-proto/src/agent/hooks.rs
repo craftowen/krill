@@ -173,6 +173,20 @@ pub fn encode_hook_json(value: &serde_json::Value) -> io::Result<String> {
         .map_err(io::Error::other)
 }
 
+/// Claude command handler. Windows uses the documented exec form so executable
+/// paths with spaces, quotes or shell metacharacters never pass through a shell.
+/// Its CLI checks `MK_PANE_ID` before collecting or delivering an event.
+pub fn claude_hook(command: &str) -> serde_json::Value {
+    #[cfg(windows)]
+    {
+        json!({"type": "command", "command": command, "args": ["hook", "claude"]})
+    }
+    #[cfg(not(windows))]
+    {
+        json!({"type": "command", "command": command})
+    }
+}
+
 /// Claude `settings.json` 머지. 항목 모양은 `{"hooks": [{"type": "command",
 /// "name": "minikrill", "command": ...}]}`이며 이미 있으면 건드리지 않는다.
 pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<String> {
@@ -191,9 +205,12 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .ok_or_else(|| merge_error(format!("hooks.{event} must be an array")))?;
-        let entry = json!({
-            "hooks": [{"type": "command", "name": "minikrill", "command": command}]
-        });
+        let mut handler = claude_hook(command);
+        handler
+            .as_object_mut()
+            .ok_or_else(|| merge_error("Claude hook handler must be an object"))?
+            .insert("name".into(), json!("minikrill"));
+        let entry = json!({"hooks": [handler]});
         if !entries.contains(&entry) {
             entries.push(entry);
         }
@@ -277,6 +294,22 @@ mod tests {
             let parsed: toml::Value = toml::from_str(text).unwrap();
             assert!(parsed.get("hooks").is_some());
             assert!(!text.contains("auth.json"));
+        }
+    }
+}
+
+#[cfg(test)]
+mod claude_platform_tests {
+    #[test]
+    fn windows_claude_exec_form_keeps_executable_metacharacters_literal() {
+        let command = r"C:\한글 '$` & dir\krill.exe";
+        let handler = super::claude_hook(command);
+        assert_eq!(handler["command"], command);
+        if cfg!(windows) {
+            assert_eq!(handler["args"], serde_json::json!(["hook", "claude"]));
+            assert!(handler.get("shell").is_none());
+        } else {
+            assert!(handler.get("args").is_none());
         }
     }
 }
