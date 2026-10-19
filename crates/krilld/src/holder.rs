@@ -8,7 +8,7 @@
 //! - 요청은 아무 스레드에서나 [`Holder::request`]로 보내고 같은 `req`의 답을 기다린다. 답과 `Exited`는
 //!   [`Holder::run`]을 도는 리더 스레드 하나가 받아 나눠 준다.
 //! - 링크가 끊기면(holder 크래시) 기다리던 요청과 새 요청은 모두 `NotConnected`다. krilld는 끝나지 않고 들고 있는
-//!   세션을 계속 서빙한다(docs/spikes/MK-018.md '재결합 절차' 2). 그 뒤의 고아 운영과 재결합은 [`crate::rejoin`].
+//!   세션을 계속 서빙한다(비공개 MK-018 스파이크 기록 '재결합 절차' 2). 그 뒤의 고아 운영과 재결합은 [`crate::rejoin`].
 
 use std::collections::HashMap;
 use std::io;

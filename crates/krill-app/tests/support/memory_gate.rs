@@ -1,7 +1,7 @@
 //! MK-066: 메모리 회귀 게이트. 실제 release 앱 + krilld + holder에 터미널 10개를 붙여 출력을 흘린 뒤
 //! `phys_footprint` 합이 200MiB(ARCHITECTURE §출시 차단선)를 넘으면 실패한다. 세션 프로세스(에이전트 대역)는 예산 밖이다.
 //! 병렬 부하에서 값이 흔들리므로 `scripts/memory-gate.sh`로만 돈다. gpui 잠정 결정 의존은 MK-031처럼 이 모듈에만 있다.
-//! 재현·측정값은 docs/testing/MK-066.md.
+//! 재현·측정값은 비공개 MK-066 테스트 기록.
 
 use std::fmt::Write as _;
 use std::fs;

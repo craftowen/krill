@@ -8,11 +8,11 @@ Krill의 공식 소개·문서 사이트(`https://krill.page`)와 HTML·Markdown
 
 | 구분 | 값 | 비고 |
 |---|---|---|
-| **Cloudflare 계정** | `tnlvof@gmail.com` (`f0fe98b1edd6d8cc19273314869c1e05`) | Cloudflare Registrar 원가 등록 (US$10.20/년, 자동 갱신) |
-| **Zone** | `krill.page` (`ff7d21e8509e003e7e3640972a627fd6`) | `rachel.ns.cloudflare.com`, `viddy.ns.cloudflare.com` |
-| **소개·문서 사이트** | `https://krill.page`, `https://www.krill.page` | Worker: `krill-site` ([`cloud/site/`](../cloud/site/)) |
-| **아티팩트 공유 서버** | `https://share.krill.page` | Worker: `krill-share` ([`cloud/share/`](../cloud/share/)) |
-| **D1 데이터베이스** | `krill-artifacts` (`1a4feae2-e3de-420e-aaa2-2eaa01b07a97`) | 메타데이터·소유/수정 토큰 해시·만료 시각 저장 ([`schema.sql`](../cloud/share/schema.sql)) |
+| **Cloudflare 계정** | 메인테이너 계정(계정 이메일·ID는 비공개) | 도메인은 Cloudflare Registrar로 등록 |
+| **Zone** | `krill.page` | `rachel.ns.cloudflare.com`, `viddy.ns.cloudflare.com` |
+| **소개·문서 사이트** | `https://krill.page`, `https://www.krill.page` | Worker: `krill-site`, 소스 `cloud/site/`(저장소 밖, 비공개) |
+| **아티팩트 공유 서버** | `https://share.krill.page` | Worker: `krill-share`, 소스 `cloud/share/`(저장소 밖, 비공개) |
+| **D1 데이터베이스** | `krill-artifacts` | 메타데이터·소유/수정 토큰 해시·만료 시각 저장, 소스 `cloud/share/schema.sql`(저장소 밖, 비공개) |
 | **R2 버킷** | `krill-artifacts` | 아티팩트 원본 본문 저장 (`artifacts/<slug>`) |
 
 ---
@@ -53,7 +53,7 @@ krill artifacts rm <slug> [--json]
 
 ## 3. 아티팩트 서버 (`share.krill.page`) API 및 보안 모델
 
-구현 위치: [`cloud/share/src/index.ts`](../cloud/share/src/index.ts)
+구현 위치: `cloud/share/src/index.ts`(저장소 밖, 비공개)
 
 ### 3.1 REST API (`/v1/artifacts`)
 
@@ -88,9 +88,9 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 
 ## 4. 공식 소개·문서 사이트 (`krill.page`)
 
-구현 위치: [`cloud/site/`](../cloud/site/)
+구현 위치: `cloud/site/`(저장소 밖, 비공개)
 
-- **런타임 의존성 0**: HTML·셸 스크립트를 Wrangler Text 모듈로 번들하여 Cold Start 1~2ms 내외로 응답한다.
+- **런타임 의존성 0**: HTML·셸 스크립트를 Wrangler Text 모듈로 번들하여 콜드 스타트를 줄인다(응답 시간 추정, 미측정).
 - **제공 경로**:
   - `GET /`: 제품 소개 랜딩 페이지 (한/영 토글, 인터랙티브 앱 프리뷰 및 `⌘K` Jump Palette 체험, 3계층 데몬 생존 아키텍처, 오케스트레이션 DAG, 아티팩트 공유 안내, CLI 레퍼런스)
   - `GET /docs` (`/docs/*`): 빠른 시작·설치·아키텍처·CLI 전체 레퍼런스 문서
@@ -99,6 +99,8 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 ---
 
 ## 5. 배포 및 검증 명령
+
+`cloud/`는 공개 저장소에 없다(gitignore). 1~3은 메인테이너의 비공개 작업 트리에서만 실행한다.
 
 ```sh
 # 1. 소개 사이트 배포 (krill.page, www.krill.page)

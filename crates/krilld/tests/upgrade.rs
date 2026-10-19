@@ -436,7 +436,7 @@ fn upgrade_keeps_sessions_lossless_and_one_generation() {
         gaps[(gaps.len() * 95).div_ceil(100) - 1],
         gaps[gaps.len() - 1]
     );
-    // 기본 실행은 병렬 부하에서도 깨지지 않을 상한만 본다. 300ms 기준은 docs/spikes/MK-062.md의 측정으로 판정한다.
+    // 기본 실행은 병렬 부하에서도 깨지지 않을 상한만 본다. 300ms 기준은 비공개 MK-062 스파이크 기록의 측정으로 판정한다.
     assert!(gaps[gaps.len() - 1] < Duration::from_secs(3));
 
     assert_eq!(request(&mut c, &Request::Close { session }), Reply::Closed);

@@ -29,7 +29,7 @@
 //! - `UpgradeHolder`를 보낸 krilld는 답이 올 때까지 아무것도 보내지 않는다. 성공하면 새 holder 이미지가
 //!   `Hello`(새 버전) → `Done{req}`를 보낸다(세션 목록은 다시 보내지 않는다).
 //!
-//! # v2 추가 (OWE-478, holder만 크래시한 뒤 재결합 — docs/spikes/MK-018.md '재결합 절차')
+//! # v2 추가 (OWE-478, holder만 크래시한 뒤 재결합 — 비공개 MK-018 스파이크 기록 '재결합 절차')
 //!
 //! - 요청 `Adopt`(kind `0x07`, +fd): 다른 holder가 띄운 세션(master fd)을 맡긴다. holder의 자식이 아니라
 //!   `waitpid`로 거둘 수 없으므로 holder는 `EVFILT_PROC NOTE_EXIT`로 종료만 감지하고, 그 세션의
