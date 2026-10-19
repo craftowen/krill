@@ -1875,6 +1875,17 @@ fn import_ssh_domain(
             if !valid_ssh_destination(&host) {
                 continue;
             }
+            // Orca 원격 환경 주소에는 SSH 사용자가 없다. 이미 SSH 대상으로 등록된 기기면 사용자 없는 중복을 만들지 않는다.
+            let env_host = host.to_ascii_lowercase();
+            if file.hosts.iter().any(|h| {
+                !h.id.starts_with("orca-env-")
+                    && krill_hosts::ssh::machine_key(&h.destination, h.port)
+                        .split_once('@')
+                        .and_then(|(_, rest)| rest.rsplit_once(':'))
+                        .is_some_and(|(name, _)| name == env_host)
+            }) {
+                continue;
+            }
             let id = format!(
                 "orca-env-{}",
                 slugify(if env.id.trim().is_empty() {

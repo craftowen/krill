@@ -439,10 +439,18 @@ impl Sidebar {
                 let detail = info.and_then(|i| i.detail.clone());
                 let error = info.and_then(|i| i.error.clone());
                 let closed = self.collapsed_hosts.contains(host);
+                let reason = host
+                    .remote_id()
+                    .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+                    .and_then(|r| r.error.as_deref())
+                    .map(disconnect_reason);
                 let (dot_color, status_label) = match status {
                     HostStatus::Connected => (p.success, text::HOST_CONNECTED.get()),
                     HostStatus::Connecting => (p.warning, text::HOST_CONNECTING.get()),
-                    HostStatus::Disconnected => (p.destructive, text::HOST_DISCONNECTED.get()),
+                    HostStatus::Disconnected => (
+                        p.destructive,
+                        reason.unwrap_or_else(|| text::HOST_DISCONNECTED.get()),
+                    ),
                 };
                 let fold_host = host.clone();
                 let header_key = host.as_key().to_owned();
@@ -643,6 +651,35 @@ impl Sidebar {
                 .aria_label(text::SESSIONS.get())
                 .child(Icon::new(IconName::SquareTerminal).xsmall())
                 .child(text::SESSIONS.get()),
+            Row::OfflineHosts(n) => {
+                let label = text::HOST_OFFLINE_GROUP.format(&[("n", &n.to_string())]);
+                let open = self.show_offline_hosts;
+                heading(base)
+                    .debug_selector(|| "host-offline-group".into())
+                    .aria_label(label.clone())
+                    .aria_expanded(open)
+                    .cursor_pointer()
+                    .pl_1()
+                    .pr_1p5()
+                    .text_color(p.muted_foreground)
+                    .hover(|d| {
+                        d.bg(p.sidebar_accent)
+                            .text_color(p.sidebar_accent_foreground)
+                    })
+                    .child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .xsmall(),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                    .on_click(cx.listener(move |s, _, _, cx| {
+                        s.cursor = Some(index);
+                        s.toggle_offline_hosts(None, cx);
+                    }))
+            }
             Row::Repository(path) => {
                 let repo = path.clone();
                 let fold_btn = path.clone();
@@ -736,6 +773,27 @@ impl Sidebar {
                         s.cursor = Some(index);
                         s.fold(&fold_row, None, cx);
                     }))
+                    // Orca처럼 프로젝트 머리줄을 끌어다 다른 프로젝트 위에 놓아 순서를 바꾼다(내 Mac 프로젝트만).
+                    .when(row_host.is_local(), |d| {
+                        let drop_to = path.clone();
+                        let ring = p.ring;
+                        d.on_drag(
+                            ProjectDrag {
+                                path: path.clone(),
+                                name: basename(path).into(),
+                            },
+                            |drag, _, _, cx| cx.new(|_| drag.clone()),
+                        )
+                        .drag_over::<ProjectDrag>(move |d, _, _, _| {
+                            d.border_t_2().border_color(ring)
+                        })
+                        .on_drop(cx.listener(
+                            move |s, drag: &ProjectDrag, _, cx| {
+                                cx.stop_propagation();
+                                s.move_project(&drag.path, &drop_to, cx);
+                            },
+                        ))
+                    })
             }
             Row::Folder(path) => {
                 let (fold_btn, fold_row, fresh, fresh_host) =
@@ -2617,5 +2675,71 @@ impl Render for Sidebar {
                 )
             })
             .child(list)
+    }
+}
+
+/// 원격 연결 실패 메시지(ssh 표준 오류·터널 오류)를 사이드바에 보일 짧은 이유로 줄인다.
+pub(super) fn disconnect_reason(error: &str) -> &'static str {
+    let lower = error.to_ascii_lowercase();
+    match crate::ssh_hosts::classify_ssh_error(&lower) {
+        crate::ssh_hosts::SshTestFailureKind::AuthFailed => text::HOST_REASON_AUTH.get(),
+        crate::ssh_hosts::SshTestFailureKind::ConnectionRefused => text::HOST_REASON_REFUSED.get(),
+        crate::ssh_hosts::SshTestFailureKind::Other => {
+            if [
+                "timed out",
+                "no route to host",
+                "host is down",
+                "network is unreachable",
+                "could not resolve",
+            ]
+            .iter()
+            .any(|m| lower.contains(m))
+            {
+                text::HOST_REASON_OFFLINE.get()
+            } else if [
+                "krill is not installed",
+                "failed to start krill",
+                "unexpected eof",
+                "early eof",
+                "connection reset",
+                "broken pipe",
+            ]
+            .iter()
+            .any(|m| lower.contains(m))
+            {
+                text::HOST_REASON_NO_KRILL.get()
+            } else {
+                text::HOST_DISCONNECTED.get()
+            }
+        }
+    }
+}
+
+/// 끌고 있는 프로젝트 머리줄(놓을 자리 표시와 드래그 미리보기).
+#[derive(Clone)]
+struct ProjectDrag {
+    path: PathBuf,
+    name: gpui::SharedString,
+}
+
+impl Render for ProjectDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let p = ui::palette(cx);
+        div()
+            .px(ui::SPACE_3)
+            .py(ui::SPACE_2)
+            .rounded(ui::RADIUS_SM)
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .border_1()
+            .border_color(p.border)
+            .shadow_lg()
+            .font_family(ui::FONT_UI)
+            .text_size(ui::TEXT_SM)
+            .flex()
+            .items_center()
+            .gap(ui::SPACE_1)
+            .child(Icon::new(IconName::Folder).xsmall())
+            .child(self.name.clone())
     }
 }

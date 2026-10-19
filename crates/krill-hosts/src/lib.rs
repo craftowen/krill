@@ -362,13 +362,16 @@ mod tests {
     }
 
     #[test]
-    fn exponential_backoff_doubles_and_caps_at_five_seconds() {
+    fn exponential_backoff_doubles_caps_at_five_seconds_then_slows_for_offline_hosts() {
         assert_eq!(HostManager::backoff_delay(1), Duration::from_millis(200));
         assert_eq!(HostManager::backoff_delay(2), Duration::from_millis(400));
         assert_eq!(HostManager::backoff_delay(3), Duration::from_millis(800));
         assert_eq!(HostManager::backoff_delay(4), Duration::from_millis(1_600));
         assert_eq!(HostManager::backoff_delay(5), Duration::from_millis(3_200));
         assert_eq!(HostManager::backoff_delay(6), Duration::from_secs(5));
-        assert_eq!(HostManager::backoff_delay(99), Duration::from_secs(5));
+        assert_eq!(HostManager::backoff_delay(10), Duration::from_secs(5));
+        // 30초가량 계속 실패한 기기(꺼짐)는 1분 간격으로만 다시 시도한다.
+        assert_eq!(HostManager::backoff_delay(11), Duration::from_secs(60));
+        assert_eq!(HostManager::backoff_delay(99), Duration::from_secs(60));
     }
 }
