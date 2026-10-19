@@ -7,7 +7,9 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 use std::ffi::OsStr;
 use std::fmt::Write as _;
-use std::fs::{DirBuilder, File, OpenOptions};
+#[cfg(not(windows))]
+use std::fs::File;
+use std::fs::{DirBuilder, OpenOptions};
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -301,7 +303,15 @@ fn statusline_command(krill: &Path) -> io::Result<String> {
 
 fn uuid() -> io::Result<String> {
     let mut bytes = [0_u8; 16];
+    #[cfg(not(windows))]
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    #[cfg(windows)]
+    {
+        use ring::rand::SecureRandom as _;
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| io::Error::other("OS random source unavailable"))?;
+    }
     let version = bytes.get_mut(6).ok_or(io::ErrorKind::InvalidData)?;
     *version = (*version & 0x0f) | 0x40;
     let variant = bytes.get_mut(8).ok_or(io::ErrorKind::InvalidData)?;

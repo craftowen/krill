@@ -3788,6 +3788,7 @@ dependencies = [
  "krill-proto",
  "proptest",
  "regex",
+ "ring",
  "rustix",
  "rustix-openpty",
  "serde",
