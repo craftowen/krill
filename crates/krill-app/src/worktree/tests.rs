@@ -75,7 +75,7 @@ fn script_controls_are_visible() {
         visible("echo 1\n\techo\x1b[2J\r"),
         "echo 1\n\techo\u{fffd}[2J\u{fffd}"
     );
-    assert_eq!(hex(&[0, 0xab, 0xff]), "00abff");
+    assert_eq!(hex_string(&[0, 0xab, 0xff]), "00abff");
 }
 
 #[gpui::test]
