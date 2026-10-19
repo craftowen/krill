@@ -140,6 +140,11 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
         assert_eq!(card["state_confidence"], "Low");
         assert_eq!(card["state_since_unix_ns"], "0");
         assert!(card["worktree_key"].is_string());
+        // 저장소 밖 cwd는 git을 부르지 않고 요약을 비운다.
+        assert_eq!(card["repo_key"], Value::Null);
+        for field in ["branch", "added", "deleted"] {
+            assert_eq!(card[field], Value::Null, "{field}");
+        }
         assert!(card.get("state_source").is_some());
         assert!(card.get("state_confidence").is_some());
         let source_cwd = card["cwd"].clone();
@@ -217,6 +222,23 @@ fn session_screen_regressions() {
         .arg(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/mobile_session.cjs"
+        ))
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
+fn terminal_adapter_regressions() {
+    let result = std::process::Command::new("node")
+        .arg(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/mobile_terminal.cjs"
         ))
         .output()
         .unwrap();

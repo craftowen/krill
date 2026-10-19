@@ -179,19 +179,22 @@ pub fn read_limited(stream: &mut impl Read, limit: usize) -> io::Result<(u8, Vec
     }
     Ok((opcode, body))
 }
+/// 헤더와 본문을 한 버퍼로 모아 한 번에 쓴다(`TCP_NODELAY`라 나눠 쓰면 세그먼트가 갈린다).
 pub fn write(stream: &mut impl Write, opcode: u8, body: &[u8]) -> io::Result<()> {
-    stream.write_all(&[0x80 | opcode])?;
     let n = body.len();
+    let mut frame = Vec::with_capacity(n.saturating_add(10));
+    frame.push(0x80 | opcode);
     if n < 126 {
-        stream.write_all(&[u8::try_from(n).map_err(|_| invalid())?])?;
+        frame.push(u8::try_from(n).map_err(|_| invalid())?);
     } else if n <= 65_535 {
-        stream.write_all(&[126])?;
-        stream.write_all(&u16::try_from(n).map_err(|_| invalid())?.to_be_bytes())?;
+        frame.push(126);
+        frame.extend(u16::try_from(n).map_err(|_| invalid())?.to_be_bytes());
     } else {
-        stream.write_all(&[127])?;
-        stream.write_all(&u64::try_from(n).map_err(|_| invalid())?.to_be_bytes())?;
+        frame.push(127);
+        frame.extend(u64::try_from(n).map_err(|_| invalid())?.to_be_bytes());
     }
-    stream.write_all(body)
+    frame.extend_from_slice(body);
+    stream.write_all(&frame)
 }
 
 #[cfg(test)]
