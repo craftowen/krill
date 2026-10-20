@@ -17,6 +17,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub type Call = Arc<dyn Fn(MobileRequest) -> Result<MobileReply, String> + Send + Sync>;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairingState {
+    Idle,
+    Connecting,
+    Waiting,
+}
+
 pub struct Panel {
     pub mode: ConnectMode,
     pub address: Option<String>,
@@ -26,6 +33,8 @@ pub struct Panel {
     pub interfaces: Vec<NetworkInterface>,
     pub connected: BTreeSet<String>,
     pub pending: bool,
+    /// 연결 준비만 별도로 추적해 다른 경로 선택·기기 관리·앱 이동을 막지 않는다.
+    pairing: PairingState,
     pub error: Option<String>,
     /// 페어링 링크 복사 피드백(버튼 라벨 '복사됨'). 새 오퍼가 오면 풀린다(OWE-880).
     pub copied: bool,
@@ -63,12 +72,28 @@ impl Panel {
             interfaces: Vec::new(),
             connected: BTreeSet::new(),
             pending: false,
+            pairing: PairingState::Idle,
             error: None,
             copied: false,
             call,
             timer: None,
             generation: 0,
         }
+    }
+    pub fn pairing_pending(&self) -> bool {
+        self.pairing != PairingState::Idle
+    }
+    fn complete(&mut self, generation: u64, reply: Result<MobileReply, String>) -> bool {
+        if self.generation != generation {
+            return false;
+        }
+        self.pending = false;
+        self.pairing = PairingState::Idle;
+        match reply {
+            Ok(reply) => self.accept(reply),
+            Err(error) => self.error = Some(error),
+        }
+        true
     }
     fn accept(&mut self, reply: MobileReply) {
         match reply {
@@ -82,6 +107,13 @@ impl Panel {
                 self.mode = mode;
                 if self.copied_url.as_deref() != Some(url.as_str()) {
                     self.copied_url = None;
+                }
+                if self.offer.as_ref().is_some_and(|(old, _, _)| old == &url) {
+                    if let Some((_, expires, _)) = &mut self.offer {
+                        *expires = expires_at_ms;
+                    }
+                    self.interfaces = interfaces;
+                    return;
                 }
                 match Qr::encode(&url) {
                     Ok(q) => {
@@ -121,7 +153,26 @@ impl SettingsView {
             self.mobile.copied = false;
         }
         self.mobile.generation = self.mobile.generation.wrapping_add(1);
-        self.mobile.pending = true;
+        let generation = self.mobile.generation;
+        self.mobile.pairing = if matches!(request, MobileRequest::MintPairingTicket { .. }) {
+            PairingState::Connecting
+        } else {
+            PairingState::Idle
+        };
+        self.mobile.pending = !self.mobile.pairing_pending();
+        if self.mobile.pairing_pending() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                this.update(cx, |this, cx| {
+                    if this.mobile.generation == generation && this.mobile.pairing_pending() {
+                        this.mobile.pairing = PairingState::Waiting;
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
         self.mobile.error = None;
         let call = Arc::clone(&self.mobile.call);
         cx.spawn(async move |this, cx| {
@@ -130,10 +181,8 @@ impl SettingsView {
                 .spawn(async move { call(request) })
                 .await;
             this.update(cx, |this, cx| {
-                this.mobile.pending = false;
-                match got {
-                    Ok(reply) => this.mobile.accept(reply),
-                    Err(e) => this.mobile.error = Some(e),
+                if !this.mobile.complete(generation, got) {
+                    return;
                 }
                 this.mobile_poll(cx);
                 cx.notify();
@@ -146,7 +195,7 @@ impl SettingsView {
     /// 탭 진입 시 기기 목록·활성 오퍼를 자동 조회한다(Orca 마운트 조회 대응, OWE-880).
     /// 진행 중인 요청이 있으면 그 결과가 오면 폴링이 시작되므로 중복 호출하지 않는다.
     pub(super) fn mobile_enter(&mut self, cx: &mut Context<Self>) {
-        if self.mobile.pending {
+        if self.mobile.pending || self.mobile.pairing_pending() {
             return;
         }
         self.mobile.generation = self.mobile.generation.wrapping_add(1);
@@ -210,7 +259,10 @@ impl SettingsView {
                     .await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.mobile.pending || this.mobile.generation != generation {
+                        if this.mobile.pending
+                            || this.mobile.pairing_pending()
+                            || this.mobile.generation != generation
+                        {
                             return;
                         }
                         if let Ok(reply) = data.0 {
@@ -249,7 +301,11 @@ impl SettingsView {
         address: Option<String>,
         cx: &mut Context<Self>,
     ) {
-        if self.mobile.pending {
+        if self.mobile.pending
+            || (self.mobile.pairing_pending()
+                && self.mobile.mode == mode
+                && self.mobile.address == address)
+        {
             return;
         }
         self.mobile.mode = mode;
@@ -385,20 +441,38 @@ impl SettingsView {
             root = root.child(interfaces);
         }
 
+        let show_progress = self.mobile.pairing == PairingState::Waiting;
+        // 두 문구의 공간을 함께 예약해 준비 상태가 나타나도 기기 목록이 밀리지 않는다.
+        let pair_label = div()
+            .flex_1()
+            .min_w_0()
+            .min_w(px(200.))
+            .grid()
+            .child(
+                layout::label(p, text::PAIR_TITLE.get(), Some(text::PAIR_DESC.get()))
+                    .row_start(1)
+                    .col_start(1)
+                    .when(show_progress, Styled::invisible),
+            )
+            .child(
+                layout::label(p, text::PREPARING.get(), Some(text::PREPARING_DESC.get()))
+                    .id("mobile-pairing-progress")
+                    .debug_selector(|| "mobile-pairing-progress".into())
+                    .row_start(1)
+                    .col_start(1)
+                    .when(!show_progress, Styled::invisible),
+            );
         let pair_actions = layout::row(p)
             .id("mobile-pair-actions-row")
             .debug_selector(|| "mobile-pair-actions-row".into())
             .flex_wrap()
-            .child(
-                layout::label(p, text::PAIR_TITLE.get(), Some(text::PAIR_DESC.get()))
-                    .min_w(px(200.)),
-            )
+            .child(pair_label)
             .child(
                 layout::controls()
                     .flex_wrap()
                     .child(
                         layout::primary("mobile-new-qr", text::NEW_QR.get())
-                            .disabled(self.mobile.pending)
+                            .disabled(self.mobile.pending || self.mobile.pairing_pending())
                             .debug_selector(|| "mobile-new-qr".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.mobile_pair(this.mobile.mode, this.mobile.address.clone(), cx);
@@ -407,7 +481,7 @@ impl SettingsView {
                     .child(
                         layout::secondary("mobile-refresh", text::REFRESH.get())
                             .icon(IconName::RefreshCw)
-                            .disabled(self.mobile.pending)
+                            .disabled(self.mobile.pending || self.mobile.pairing_pending())
                             .debug_selector(|| "mobile-refresh".into())
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.mobile_action(MobileRequest::Status, cx);
@@ -698,64 +772,4 @@ fn ago(now: u64, then: u64) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn device(created_at_ms: u64, last_seen_ms: u64) -> PairedMobileDevice {
-        PairedMobileDevice {
-            device_id: "dev-1".into(),
-            label: "아이폰".into(),
-            key_fingerprint: String::new(),
-            shared_secret_hash: String::new(),
-            created_at_ms,
-            last_seen_ms,
-            revoked_at_ms: None,
-        }
-    }
-
-    #[test]
-    fn ago_scales_from_just_now_to_days() {
-        let now = 10_000_000_000;
-        assert_eq!(ago(now, now), text::JUST_NOW.get());
-        assert_eq!(ago(now, now + 5_000), text::JUST_NOW.get());
-        assert!(
-            ago(now, now - 90_000).starts_with("1 "),
-            "got {}",
-            ago(now, now - 90_000)
-        );
-        assert!(
-            ago(now, now - 3 * 3_600_000).starts_with("3 "),
-            "got {}",
-            ago(now, now - 3 * 3_600_000)
-        );
-        assert!(
-            ago(now, now - 2 * 86_400_000).starts_with("2 "),
-            "got {}",
-            ago(now, now - 2 * 86_400_000)
-        );
-    }
-
-    #[test]
-    fn device_line_avoids_paired_duplication_and_handles_never_seen() {
-        let now = 10_000_000_000;
-        // 오프라인·접속 기록 없음: 상태는 OFFLINE 1회, 마지막 활동은 NEVER.
-        let line = device_line(&device(now - 90_000, 0), false, now);
-        assert!(line.starts_with("○ "), "got {line}");
-        assert!(line.contains(text::OFFLINE.get()), "got {line}");
-        assert!(line.contains(text::NEVER.get()), "got {line}");
-        assert_eq!(
-            line.matches(text::PAIRED.get()).count(),
-            1,
-            "PAIRED must appear exactly once (paired-at label): {line}"
-        );
-        // 온라인 기기: CONNECTED 1회 + 경과 시간 표기.
-        let line = device_line(
-            &device(now - 2 * 86_400_000, now - 3 * 3_600_000),
-            true,
-            now,
-        );
-        assert!(line.starts_with("● "), "got {line}");
-        assert!(line.contains(text::CONNECTED.get()), "got {line}");
-        assert!(!line.contains(text::OFFLINE.get()), "got {line}");
-    }
-}
+mod tests;
