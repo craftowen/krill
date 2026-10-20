@@ -20,6 +20,7 @@ use krill_app::ui;
 use krill_proto::SessionId;
 use krill_proto::agent_history::{Action, ChatItem, ChatItemKind, ChatPollSnapshot, Response};
 use krill_proto::control::{Reply, Request};
+use krill_proto::screen::Cell;
 use krill_term::ime::Output;
 
 use super::Shell;
@@ -29,6 +30,9 @@ pub(crate) struct SessionChatLog {
     pub agent: String,
     pub offset: u64,
     pub bound: bool,
+    /// `items` 앞에서 잘려 나간 항목 수. 답변 키를 절대 위치로 유지해 250개 상한으로
+    /// 앞부분이 잘려도 이미 답한 질문 카드가 다시 열리지 않게 한다.
+    pub base_index: usize,
     pub items: Vec<ChatItem>,
     pub answered: BTreeSet<String>,
     pub multi_selected: BTreeMap<String, BTreeSet<usize>>,
@@ -41,6 +45,44 @@ pub(crate) struct ChatState {
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
     pub keystroke_task: Option<Task<()>>,
+}
+
+/// TUI 화면에서 질문 선택지 목록의 현재 커서 줄(`❯`·`>`·`›`·`●`·`*`·`→`로 시작)을 찾아
+/// 그 줄이 가리키는 선택지 인덱스를 돌려준다. 한 줄에 여러 라벨이 겹치면 가장 긴 라벨을 고른다
+/// (`Yes`와 `Yes, and don't ask again`). 못 찾으면 `None`.
+pub(crate) fn detect_question_cursor_index(
+    rows: &[Vec<Cell>],
+    options: &[String],
+) -> Option<usize> {
+    for row in rows.iter().rev() {
+        let line: String = row.iter().map(|c| c.ch).collect();
+        let trimmed = line.trim();
+        if !trimmed.starts_with(['❯', '>', '›', '●', '*', '→']) {
+            continue;
+        }
+        let hit = options
+            .iter()
+            .enumerate()
+            .filter(|(_, opt)| !opt.is_empty() && trimmed.contains(opt.as_str()))
+            .max_by_key(|(_, opt)| opt.len())
+            .map(|(idx, _)| idx);
+        if hit.is_some() {
+            return hit;
+        }
+    }
+    None
+}
+
+/// 커서를 `target`까지 ↑/↓ 키로 옮기는 시퀀스를 덧붙인다.
+fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
+    while *cursor < target {
+        steps.push(b"\x1b[B".to_vec());
+        *cursor += 1;
+    }
+    while *cursor > target {
+        steps.push(b"\x1b[A".to_vec());
+        *cursor -= 1;
+    }
 }
 
 impl Shell {
@@ -125,12 +167,16 @@ impl Shell {
         log.bound = snap.bound;
         if snap.reset {
             log.items.clear();
+            log.base_index = 0;
+            log.answered.clear();
+            log.multi_selected.clear();
         }
         if !snap.items.is_empty() {
             log.items.extend(snap.items);
             if log.items.len() > 250 {
                 let excess = log.items.len() - 250;
                 log.items.drain(0..excess);
+                log.base_index = log.base_index.saturating_add(excess);
             }
         }
         log.offset = snap.next_offset;
@@ -185,11 +231,23 @@ impl Shell {
         cx.notify();
     }
 
+    /// 세션 칸 화면에서 질문 선택지의 현재 커서 위치를 읽는다(못 읽으면 첫 선택지로 본다).
+    fn current_question_cursor(&self, session: SessionId, options: &[String]) -> usize {
+        self.layout
+            .visible()
+            .into_iter()
+            .find(|&p| self.layout.file(p).is_none() && self.layout.session(p) == Some(session))
+            .and_then(|p| self.live.get(&p))
+            .and_then(|l| detect_question_cursor_index(&l.pane.screen().rows, options))
+            .unwrap_or(0)
+    }
+
     /// 인터랙티브 질문 카드 선택지를 60ms 간격 키스트로크 시퀀스로 해당 세션 PTY에 주입한다(OWE-946).
     pub(super) fn answer_chat_question(
         &mut self,
         session: SessionId,
         answer_key: String,
+        option_labels: &[String],
         selected: Vec<usize>,
         multi_select: bool,
         cx: &mut Context<Self>,
@@ -197,24 +255,20 @@ impl Shell {
         if let Some(log) = self.chat.logs.get_mut(&session) {
             log.answered.insert(answer_key);
         }
+        // 에이전트 TUI가 커서를 기본값 등 첫 줄이 아닌 곳에 둘 수 있어 화면에서 현재 위치를 읽는다.
+        let mut cursor = self.current_question_cursor(session, option_labels);
         let mut steps: Vec<Vec<u8>> = Vec::new();
         if multi_select {
             let mut sorted: Vec<usize> = selected.into_iter().filter(|&idx| idx < 16).collect();
             sorted.sort_unstable();
             sorted.dedup();
-            let mut cursor = 0usize;
             for target in sorted {
-                while cursor < target {
-                    steps.push(b"\x1b[B".to_vec());
-                    cursor += 1;
-                }
+                step_cursor(&mut steps, &mut cursor, target);
                 steps.push(b" ".to_vec());
             }
             steps.push(b"\r".to_vec());
         } else if let Some(&choice_idx) = selected.first() {
-            for _ in 0..choice_idx.min(16) {
-                steps.push(b"\x1b[B".to_vec());
-            }
+            step_cursor(&mut steps, &mut cursor, choice_idx.min(16));
             steps.push(b"\r".to_vec());
         } else {
             return;
@@ -285,6 +339,11 @@ impl Shell {
             .unwrap_or("agent");
         let bound = log.is_some_and(|l| l.bound);
         let items = log.map_or(&[][..], |l| l.items.as_slice());
+        let base_index = log.map_or(0, |l| l.base_index);
+        let cwd = self
+            .layout
+            .focused()
+            .and_then(|pane| self.pane_cwd(pane, cx));
 
         let mut feed = div()
             .id("desktop-chat-feed")
@@ -314,7 +373,8 @@ impl Shell {
                     .child(empty_msg),
             );
         } else {
-            for (idx, item) in items.iter().enumerate() {
+            for (rel, item) in items.iter().enumerate() {
+                let idx = base_index + rel;
                 let role_label = match item.kind {
                     ChatItemKind::User => "YOU",
                     ChatItemKind::Assistant => "AGENT",
@@ -353,7 +413,12 @@ impl Shell {
                                 },
                             ))
                             .children((!item.file_path.is_empty()).then(|| {
-                                let path = std::path::PathBuf::from(&item.file_path);
+                                // agy 등은 작업 폴더 기준 상대 경로를 남기므로 칸의 cwd에 붙인다.
+                                let raw = std::path::PathBuf::from(&item.file_path);
+                                let path = match &cwd {
+                                    Some(cwd) if raw.is_relative() => cwd.join(&raw),
+                                    _ => raw,
+                                };
                                 Button::new(SharedString::from(format!("chat-open-file-{idx}")))
                                     .label(item.file_path.clone())
                                     .ghost()
@@ -378,9 +443,12 @@ impl Shell {
                         .and_then(|l| l.multi_selected.get(&answer_key))
                         .cloned()
                         .unwrap_or_default();
+                    let labels: std::rc::Rc<[String]> =
+                        item.options.iter().map(|o| o.label.clone()).collect();
                     let mut opts_row = div().flex().flex_wrap().gap_1p5();
                     for (opt_idx, opt) in item.options.iter().enumerate() {
                         let key_clone = answer_key.clone();
+                        let labels = labels.clone();
                         let is_checked = selected_set.contains(&opt_idx);
                         let prefix = if multi_select {
                             if is_checked { "[✓] " } else { "[ ] " }
@@ -410,6 +478,7 @@ impl Shell {
                                         this.answer_chat_question(
                                             session,
                                             key_clone.clone(),
+                                            &labels,
                                             vec![opt_idx],
                                             false,
                                             cx,
@@ -431,6 +500,7 @@ impl Shell {
                                     this.answer_chat_question(
                                         session,
                                         key_submit.clone(),
+                                        &labels,
                                         picks.clone(),
                                         true,
                                         cx,
@@ -597,5 +667,76 @@ mod tests {
         });
         cx.run_until_parked();
         assert!(cx.debug_bounds("desktop-chat-overlay").is_none());
+    }
+
+    #[test]
+    fn detect_question_cursor_prefers_marked_row_and_longest_label() {
+        let row = |s: &str| -> Vec<Cell> {
+            s.chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Cell::default()
+                })
+                .collect()
+        };
+        let options = vec![
+            "Yes".to_owned(),
+            "Yes, and don't ask again".to_owned(),
+            "No".to_owned(),
+        ];
+        let rows = vec![
+            row("  1. Yes"),
+            row("❯ 2. Yes, and don't ask again"),
+            row("  3. No"),
+        ];
+        assert_eq!(detect_question_cursor_index(&rows, &options), Some(1));
+        let unmarked = vec![row("  Yes"), row("  No")];
+        assert_eq!(detect_question_cursor_index(&unmarked, &options), None);
+
+        let mut cursor = 1;
+        let mut steps = Vec::new();
+        step_cursor(&mut steps, &mut cursor, 0);
+        step_cursor(&mut steps, &mut cursor, 2);
+        assert_eq!(cursor, 2);
+        assert_eq!(
+            steps,
+            vec![b"\x1b[A".to_vec(), b"\x1b[B".to_vec(), b"\x1b[B".to_vec()]
+        );
+    }
+
+    #[gpui::test]
+    fn apply_chat_poll_keeps_absolute_index_after_trim(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
+        shell.update(cx, |this, _| {
+            let batch = |from: usize, n: usize, reset: bool| ChatPollSnapshot {
+                reset,
+                bound: true,
+                items: (from..from + n)
+                    .map(|i| ChatItem {
+                        tool_id: format!("t{i}"),
+                        ..ChatItem::default()
+                    })
+                    .collect(),
+                ..ChatPollSnapshot::default()
+            };
+            this.apply_chat_poll(SessionId(3), batch(0, 200, false));
+            this.chat
+                .logs
+                .entry(SessionId(3))
+                .or_default()
+                .answered
+                .insert("t5:5".into());
+            this.apply_chat_poll(SessionId(3), batch(200, 60, false));
+            let log = &this.chat.logs[&SessionId(3)];
+            assert_eq!(log.items.len(), 250);
+            assert_eq!(log.base_index, 10);
+            assert_eq!(log.items[190].tool_id, "t200");
+            // 트랜스크립트가 다시 시작되면 답변 기록도 함께 비운다.
+            this.apply_chat_poll(SessionId(3), batch(0, 1, true));
+            let log = &this.chat.logs[&SessionId(3)];
+            assert_eq!((log.items.len(), log.base_index), (1, 0));
+            assert!(log.answered.is_empty());
+        });
     }
 }
