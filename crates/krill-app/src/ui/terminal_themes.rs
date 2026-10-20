@@ -1388,9 +1388,7 @@ pub fn warp_theme_directories() -> Vec<PathBuf> {
     }
     #[cfg(target_os = "windows")]
     {
-        let app_data = std::env::var_os("APPDATA")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.clone());
+        let app_data = std::env::var_os("APPDATA").map_or_else(|| home.clone(), PathBuf::from);
         for ch in ["Warp", "WarpPreview", "WarpOss", "WarpDev"] {
             dirs.push(app_data.join("warp").join(ch).join("data").join("themes"));
         }
