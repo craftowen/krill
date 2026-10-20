@@ -404,7 +404,9 @@ fn preflight_validates_executable() {
             offset += usize::try_from(size).unwrap();
         }
         let entry = usize::try_from(entry.expect("native test binary has LC_MAIN")).unwrap();
-        bytes[entry] ^= 0xff;
+        // 서명 강제가 없는 환경에서도 BRK로 즉시 종료한다. 임의 한 바이트만 바꾸면
+        // 테스트 실행기가 다시 시작돼 이 검사까지 재귀 실행할 수 있다.
+        bytes[entry..entry + 4].copy_from_slice(&0xd420_0000_u32.to_le_bytes());
         std::fs::write(&corrupt, &bytes).unwrap();
         std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(preflight(&corrupt).unwrap_err().raw_os_error(), Some(EPERM));
