@@ -23,7 +23,7 @@ async function browser(){
   // Each isolated context has its own storage, like Safari vs an iOS Home Screen app. Installability needs the default (non-incognito) one.
   const {browserContextId}=isolated?await send('Target.createBrowserContext'):{},{targetId}=await send('Target.createTarget',{url:'about:blank',browserContextId}),{sessionId}=await send('Target.attachToTarget',{targetId,flatten:true});
   const call=(method,params)=>send(method,params,sessionId);await call('Network.enable');await call('Page.enable');await call('Runtime.enable');
-  if(iphone)await call('Emulation.setUserAgentOverride',{userAgent:IPHONE,platform:'iPhone'});
+  if(iphone)await call('Emulation.setUserAgentOverride',{userAgent:IPHONE,platform:'iPhone',acceptLanguage:'en-US,en'});
   // A Home Screen launch: standalone display and its own (fresh) storage.
   if(homeScreen)await call('Page.addScriptToEvaluateOnNewDocument',{source:"Object.defineProperty(Navigator.prototype,'standalone',{get:()=>true})"});
   const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.exception?.description||r.exceptionDetails.text);return r.result.value;};
@@ -57,10 +57,10 @@ exports.main=async function main({base,fragment}){
   const safari=await chrome.page({iphone:true});await safari.open(`${base}/#${fragment}`);
   assert.equal(await safari.evaluate('location.hash'),'#/pair-confirm');
   assert.equal(await safari.evaluate("document.querySelector('link[rel=manifest]')"),null,'iOS must keep the current URL, not a manifest start_url');
-  assert(await safari.click('Pair'));const browserDevice=await until(safari.stored,'Safari pairing');await until(safari.ready,'Safari ready');
-  assert.equal(await until(()=>safari.evaluate("document.getElementById('action-sheet').open&&document.querySelector('#sheet-content h2').textContent"),'post-pairing offer'),'Add Krill to your Home Screen?');
+  assert(await safari.click('Pair'),await safari.evaluate("JSON.stringify({lang:document.documentElement.lang,buttons:[...document.querySelectorAll('button')].map(b=>b.getAttribute('aria-label'))})"));const browserDevice=await until(safari.stored,'Safari pairing');await until(safari.ready,'Safari ready');
+  assert.equal(await until(()=>safari.evaluate("document.getElementById('action-sheet').open&&document.querySelector('#sheet-content h2').textContent"),'post-pairing offer'),'Add Krill to your Home Screen');
   assert(await safari.click('Cancel'));await safari.evaluate("location.hash='#/settings'");
-  assert(await until(()=>safari.click('Add to Home Screen'),'settings row'));
+  assert(await until(()=>safari.click('Install Krill'),'settings row'));
   const handoff=await until(()=>safari.evaluate("location.hash.includes('&install=1')&&location.href"),'handoff fragment');
   assert.match(new URL(handoff).hash,/^#pair=[0-9a-f]{64}&key=[\w-]{43}&install=1$/);assert.equal(new URL(handoff).search,'');
   assert.match(await safari.evaluate("document.querySelector('#sheet-content').textContent"),/Share.*Add to Home Screen.*Within 5 minutes/);
@@ -73,10 +73,13 @@ exports.main=async function main({base,fragment}){
   assert.doesNotMatch(await home.evaluate('location.href'),/pair=|key=|install/);assert.equal(await home.evaluate("document.getElementById('action-sheet').open"),false);
   // Later launches reopen the same start URL: the spent link is ignored and the saved device reconnects.
   await home.open(handoff);await until(home.ready,'Home Screen relaunch');
-  assert.deepEqual(await home.stored(),homeDevice);assert.doesNotMatch(await home.evaluate('location.href'),/pair=|key=|install/);
+  const resumed=await home.stored();
+  // Snapshot metadata may fill in the desktop name/platform after the first auth response.
+  for(const field of ['device_id','credential','id','origin','fixed','rid','url','hash'])assert.equal(resumed[field],homeDevice[field],field+' changed on relaunch');
+  assert.doesNotMatch(await home.evaluate('location.href'),/pair=|key=|install/);
   // The spent ticket cannot pair anyone else.
   const thief=await chrome.page({iphone:true});await thief.open(handoff);assert(await thief.click('Pair'));
-  await until(()=>thief.evaluate("/rejected/.test(KrillMobile.store.connection.message)"),'spent ticket rejected');assert.equal(await thief.stored(),null);
+  await until(()=>thief.evaluate("/expired|already used|rejected/.test(KrillMobile.store.connection.message)"),'spent ticket rejected');assert.equal(await thief.stored(),null);
 
   // No credential, pairing key or ticket ever left the page in a URL, header, body or the manifest; WS frames never carry a credential or key.
   const fields=new URLSearchParams(new URL(handoff).hash.slice(1)),start=new URLSearchParams(fragment);

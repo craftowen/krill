@@ -42,13 +42,13 @@ for(const name of ['screens/details.js','screens/home.js','screens/settings.js']
  T.toast('Photo attached',3000);notice.dispatchEvent(new Event('click'));assert.equal(notice.hidden,true);
  assert.equal(T.pairingLink('#pair=abc&key=def'),true);assert.equal(T.pairingLink('#t=x.trycloudflare.com&r=rid'),true);assert.equal(T.pairingLink('#/host/local/group/x/s/1'),false);assert.equal(T.pairingLink('#/pair-confirm'),false);assert.equal(T.pairingLink(''),false);}
 console.log('PASS mobile screens: account usage/reset/status, Needs You, connection log, toast auto-hide and same-tab pairing link detection');
-for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','client.js','terminal.js','qr.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
+for(const name of ['index.html','app.js','app.css','i18n.js','manifest.json','icon.svg','icon-192.png','icon-512.png','icon-maskable-512.png','apple-touch-icon.png','crypto.js','client.js','terminal.js','qr.js','sw.js','screens/chat.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js'])assert.deepEqual(zlib.gunzipSync(fs.readFileSync(path.join(assets,name+'.gz'))),fs.readFileSync(path.join(assets,name)));
 const html=fs.readFileSync(path.join(assets,'index.html'),'utf8');let scriptAt=-1;for(const name of ['crypto.js','i18n.js','client.js','terminal.js','screens/home.js','screens/workspaces.js','screens/session.js','screens/details.js','screens/settings.js','app.js']){const at=html.indexOf('src="'+name+'" defer');assert(at>scriptAt,name);scriptAt=at;assert(!fs.readFileSync(path.join(assets,name),'utf8').includes('innerHTML'));}
 // Fixed-origin bootstrap and transport, with real crypto and deterministic sockets.
 async function fixedOriginTests(){
  const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,url:'https://saved.trycloudflare.com',hash};
  const source=fs.readFileSync(path.join(assets,'client.js'),'utf8');
- function fixture(href,credential=saved,found={url:'https://fresh.trycloudflare.com',hash}){
+ function fixture(href,credential=saved,found={url:'https://fresh.trycloudflare.com',hash},{serviceWorker=true}={}){
   const location=new URL(href),values=new Map(credential?[['minikrill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0;
   location.replace=href=>redirects.push(href);
   class Socket extends EventTarget{
@@ -57,7 +57,7 @@ async function fixedOriginTests(){
    emit(type,data){const e=new Event(type);if(type==='message')e.data=data;if(type==='close')e.code=data;this.dispatchEvent(e);}
    close(){if(this.closed)return;this.closed=true;this.emit('close',1006);}
   }
-  const context={AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,URL,URLSearchParams,location,history:{replaceState(a,b,url){location.href=new URL(url,location).href;}},navigator:{serviceWorker:{register:url=>{registrations.push(url);return Promise.resolve();}}},localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)},fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>found};},setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),crypto:{getRandomValues:bytes=>bytes.fill(1)},WebSocket:Socket,MkCrypto:C};
+  const context={AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,URL,URLSearchParams,location,history:{replaceState(a,b,url){location.href=new URL(url,location).href;}},navigator:serviceWorker?{serviceWorker:{register:url=>{registrations.push(url);return Promise.resolve();}}}:{},localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)},fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>found};},setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),crypto:{getRandomValues:bytes=>bytes.fill(1)},WebSocket:Socket,MkCrypto:C};
   vm.createContext(context);vm.runInContext(source,context);const endpoint=context.KrillMobile.transport.bootstrap();
   return {context,endpoint,location,values,requests,registrations,sockets,timers,redirects,stored:()=>JSON.parse(values.get('minikrill-mobile-v2'))};
  }
@@ -69,7 +69,9 @@ async function fixedOriginTests(){
   f=fixture(fixed+fragment);assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);await f.endpoint.locate();assert.equal(f.requests[0].url,'/r/'+rid);
  }
  f=fixture(fixed+'?pair=query&key=query&t=evil.trycloudflare.com&r=forged');assert.equal(f.endpoint.pair,null);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.equal(f.location.search,'');
- f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,[]);
+ // Browsers expose service workers on HTTP loopback, but not ordinary insecure LAN origins.
+ f=fixture('http://127.0.0.1:1234/#pair=ticket&key=secret');assert.equal(f.endpoint.socketUrl(),'ws://127.0.0.1:1234/ws');assert.deepEqual(f.registrations,['/sw.js']);
+ f=fixture('http://192.0.2.1:1234/#pair=ticket&key=secret',null,undefined,{serviceWorker:false});assert.equal(f.endpoint.socketUrl(),'ws://192.0.2.1:1234/ws');assert.deepEqual(f.registrations,[]);
  // Home Screen install link: pairs an empty store once; relaunches with the same start URL keep the saved device.
  f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`,null);assert.equal(f.endpoint.pair.ticket,'ticket');assert.equal(f.location.href,fixed+'#/pair-confirm');
  f=fixture(fixed+`#pair=ticket&key=secret&t=paired.trycloudflare.com&r=${rid}&install=1`);assert.equal(f.endpoint.pair,null);assert.deepEqual({...f.endpoint.credentials},saved);assert.equal(f.location.href,fixed);
@@ -77,10 +79,11 @@ async function fixedOriginTests(){
  for(const found of [{url:'https://evil.test',hash},{url:'https://ok.trycloudflare.com.evil.test',hash},{url:'https://ok.trycloudflare.com',hash:'../evil'},{url:'https://ok.trycloudflare.com',hash:'ABCDEF0123456789'},{url:'https://ok.trycloudflare.com',hash:1234567890123456}]){
   f=fixture(fixed,saved,found);assert.equal(await f.endpoint.locate(),false);assert.deepEqual(f.stored(),saved);assert.equal(f.endpoint.socketUrl(),`wss://saved.trycloudflare.com/ws?v=${hash}`);assert.deepEqual(f.redirects,[]);
  }
- // A pre-open failure (including an HTTP 409 handshake) locates, then uses normal backoff.
+ // A pre-open failure locates and tries a changed endpoint immediately; unchanged endpoints back off.
  f=fixture(fixed);let t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});
  t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.requests.length,1);assert.equal(f.requests[0].options.cache,'no-store');assert.equal(f.stored().url,'https://fresh.trycloudflare.com');assert.equal(f.timers.size,1);
- const retry=[...f.timers.values()][0];assert.equal(retry.ms,1000);retry.fn();await flush();assert.equal(f.sockets[1].url,`wss://fresh.trycloudflare.com/ws?v=${hash}`);t.close();
+ const retry=[...f.timers.values()][0];assert.equal(retry.ms,0);retry.fn();await flush();assert.equal(f.sockets[1].url,`wss://fresh.trycloudflare.com/ws?v=${hash}`);t.close();
+ f=fixture(fixed,{...saved,rid:undefined});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.requests.length,0);assert.equal([...f.timers.values()][0].ms,1000);t.close();
  f=fixture(fixed+'?session=7#/host/local',saved,{url:'https://fresh.trycloudflare.com',hash:'fedcba9876543210'});t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.deepEqual(f.redirects,['/m/fedcba9876543210/?session=7#/host/local']);assert.equal(f.timers.size,0);t.close();
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('open');f.sockets[0].emit('close',1008);await flush();assert.equal(f.requests.length,0);assert.equal(f.timers.size,0);assert.equal(t.blocked,true);t.close();
  // Returning to the app (visibilitychange/pageshow/online → resume) reconnects at once instead of waiting out the backoff.
@@ -168,7 +171,7 @@ async function connect(url,credential){
   const question=jsonCli(['orchestration','ask','--from','mobile-worker','--to','coordinator','--question','Proceed with fixture?']);
   const gate=jsonCli(['orchestration','gate-create','--from','test-worker','--question','Deploy fixture?','--options','Approve,Deny','--run',runId]);const gateId=gate.id||gate.gate_id;assert(gateId,JSON.stringify(gate));
   const offer=jsonCli(['mobile','pair','--address',keep?(process.env.M9_BROWSER_ADDRESS||'127.0.0.1:0'):'127.0.0.1:0']);const url=offer.PairingOffer.url,base=new URL(url).origin;
-  for(const name of ['/','/app.js','/app.css','/crypto.js','/client.js','/terminal.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg','/icon-192.png','/icon-512.png','/icon-maskable-512.png','/apple-touch-icon.png']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert.deepEqual(Buffer.from(await response.arrayBuffer()),fs.readFileSync(path.join(assets,name==='/'?'index.html':name.slice(1))));}
+  for(const name of ['/','/app.js','/app.css','/i18n.js','/qr.js','/sw.js','/crypto.js','/client.js','/terminal.js','/screens/home.js','/screens/workspaces.js','/screens/chat.js','/screens/session.js','/screens/details.js','/screens/settings.js','/manifest.json','/icon.svg','/icon-192.png','/icon-512.png','/icon-maskable-512.png','/apple-touch-icon.png']){const response=await fetch(base+name);assert.equal(response.status,200);assert.equal(response.headers.get('content-encoding'),'gzip');assert.deepEqual(Buffer.from(await response.arrayBuffer()),fs.readFileSync(path.join(assets,name==='/'?'index.html':name.slice(1))));}
   if(keep){let terminalSession=null;const extraSessions=[];if(process.env.M9_UI_QA){
     const worktree=path.join(dir,'feature-worktree'),second=path.join(dir,'api'),outside=path.join(dir,'notes');
     git(['worktree','add','-b','feature/mobile',worktree]);fs.mkdirSync(second);fs.mkdirSync(outside);
