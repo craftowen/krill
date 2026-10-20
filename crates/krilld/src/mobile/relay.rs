@@ -335,18 +335,33 @@ fn supervise_loop(
 ) {
     let wake_writer = Arc::new(Mutex::new(wake_tx));
     let mut delay = Duration::from_millis(200);
+    let mut assets_ready = false;
     while !stop.cancelled() {
-        let res = run_once(
-            publication,
-            &wake_writer,
-            &mut wake_rx,
-            connected,
-            settled,
-            stop,
-            shared,
-            registry,
-            hello,
-        );
+        // 고정 출처에 이 앱 버전이 없으면 QR은 404가 된다. 확인도 릴레이 스레드에서 한다.
+        if !assets_ready {
+            assets_ready = super::tunnel::publication_available(publication);
+        }
+        if stop.cancelled() {
+            return;
+        }
+        let res = if assets_ready {
+            run_once(
+                publication,
+                &wake_writer,
+                &mut wake_rx,
+                connected,
+                settled,
+                stop,
+                shared,
+                registry,
+                hello,
+            )
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "mobile PWA version is not deployed",
+            ))
+        };
         let first_settle = !settled.swap(true, Ordering::AcqRel);
         let was_connected = connected.swap(false, Ordering::AcqRel);
         if was_connected || first_settle {
@@ -508,8 +523,12 @@ fn handle_mux_frame(
     sessions.retain(|_, s| s.tx.send((0, Vec::new())).is_ok());
     match kind {
         // 챌린지는 데몬이 만든다(serve_mux_client). DO가 정하면 같은 챌린지로 녹화한 세션을 재생할 수 있다.
-        // MUX_OPEN payload는 비어 있어야 하지만 내용을 쓰지 않으므로 검사하지 않는다.
+        // DO는 빈 OPEN만 보낸다. 내용이 있거나(서버 지정 챌린지) 이미 열린 conn_id면 거부한다.
         MUX_OPEN => {
+            if !payload.is_empty() || sessions.contains_key(&conn_id) {
+                outbox.send_close(conn_id, 1002);
+                return;
+            }
             let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
             let Ok((local, server)) = UnixStream::pair() else {
                 outbox.send_close(conn_id, 1011);

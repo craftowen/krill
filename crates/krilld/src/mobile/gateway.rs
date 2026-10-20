@@ -259,15 +259,19 @@ fn sync_tunnel_intent(s: &mut State) {
     };
     let cur_pid = tunnel.pid();
     let cur_url = tunnel.url().map(str::to_owned);
-    if cur_url.is_some()
-        && (s.saved_port != Some(port)
-            || s.saved_tunnel_pid != cur_pid
-            || s.saved_tunnel_url != cur_url)
-    {
+    if cur_url.is_some() {
         tunnel.set_persist(true);
+    }
+    let next_url = cur_url.or_else(|| {
+        (s.saved_tunnel_pid == cur_pid)
+            .then(|| s.saved_tunnel_url.clone())
+            .flatten()
+    });
+    if s.saved_port != Some(port) || s.saved_tunnel_pid != cur_pid || s.saved_tunnel_url != next_url
+    {
         s.saved_port = Some(port);
         s.saved_tunnel_pid = cur_pid;
-        s.saved_tunnel_url = cur_url;
+        s.saved_tunnel_url = next_url;
         save_intent(s).ok();
     }
 }
@@ -397,7 +401,9 @@ impl Gateway {
         }
         let address = state.selected?;
         let base = if state.mode == ConnectMode::Tunnel {
-            if let Some(tunnel) = state.tunnel.as_ref()
+            if relay_connected(&state) {
+                fixed_base(&state)
+            } else if let Some(tunnel) = state.tunnel.as_ref()
                 && let Some(url) = tunnel.ready_url()
             {
                 if tunnel.fixed() {
@@ -405,12 +411,6 @@ impl Gateway {
                 } else {
                     url.to_owned()
                 }
-            } else if state
-                .relay
-                .as_ref()
-                .is_some_and(super::relay::RelayClient::connected)
-            {
-                fixed_base(&state)
             } else {
                 return None;
             }
@@ -478,6 +478,15 @@ impl Gateway {
                         if state.stopped || state.mode != mode {
                             return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
                         }
+                        if state.devices.ticket(now_ms()).is_none() {
+                            return Err(io::Error::other(
+                                "페어링 요청이 취소되었거나 만료되었습니다",
+                            ));
+                        }
+                        // 릴레이가 연결되면 퀵 터널의 DNS/엣지 정착을 기다리지 않는다.
+                        if relay_connected(&state) {
+                            return pairing_offer(&state, now_ms());
+                        }
                         // 기한이 지나도 준비되지 않으면 찍힌 URL로 낸다(터널 출처). 몇 초 뒤 새로고침하면 열린다.
                         let timed_out = Instant::now() >= deadline;
                         if state.tunnel.as_ref().is_some_and(|t| {
@@ -492,14 +501,6 @@ impl Gateway {
                                 .tunnel_error
                                 .as_ref()
                                 .is_some_and(|e| e.kind() != io::ErrorKind::WouldBlock);
-                        if (timed_out || fatal_tunnel_err)
-                            && state
-                                .relay
-                                .as_ref()
-                                .is_some_and(super::relay::RelayClient::connected)
-                        {
-                            return pairing_offer(&state, now_ms());
-                        }
                         let relay_failed = state
                             .relay
                             .as_ref()
@@ -648,16 +649,7 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let address = state.selected.ok_or_else(invalid)?;
     let host = address.ip().to_string();
     let port = address.port();
-    let relay_only = state.mode == ConnectMode::Tunnel
-        && state
-            .tunnel
-            .as_ref()
-            .and_then(|t| t.ready_url().or_else(|| t.url()))
-            .is_none()
-        && state
-            .relay
-            .as_ref()
-            .is_some_and(super::relay::RelayClient::connected);
+    let relay_only = state.mode == ConnectMode::Tunnel && relay_connected(state);
     let base = if state.mode == ConnectMode::Tunnel {
         if relay_only {
             fixed_base(state)
@@ -685,14 +677,14 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
         ws::base64(&ticket.secret, true)
     );
     if state.mode == ConnectMode::Tunnel {
-        if let Some(tunnel) = state.tunnel.as_ref().filter(|t| t.fixed()) {
+        if relay_only {
+            write!(url, "&r={}", state.publication.rid).map_err(io::Error::other)?;
+        } else if let Some(tunnel) = state.tunnel.as_ref().filter(|t| t.fixed()) {
             let host = tunnel
                 .ready_url()
                 .and_then(|url| url.strip_prefix("https://"))
                 .ok_or_else(invalid)?;
             write!(url, "&t={host}&r={}", state.publication.rid).map_err(io::Error::other)?;
-        } else if relay_only {
-            write!(url, "&r={}", state.publication.rid).map_err(io::Error::other)?;
         }
     }
     Ok(MobileReply::PairingOffer {
@@ -703,6 +695,13 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
         mode: state.mode,
         interfaces: state.interfaces.clone(),
     })
+}
+
+fn relay_connected(state: &State) -> bool {
+    state
+        .relay
+        .as_ref()
+        .is_some_and(super::relay::RelayClient::connected)
 }
 
 fn fixed_base(state: &State) -> String {
@@ -839,8 +838,8 @@ fn named_tunnel(s: &State) -> Option<super::tunnel::NamedTunnel> {
         url: hostname.trim().to_owned(),
     })
 }
-/// 리스너가 열려 있는 Tunnel 모드에서는 cloudflared가 항상 떠 있게 한다.
-/// 죽었거나 준비 기한을 넘기면 지수 백오프(2초~1분)로 다시 띄운다. 고정 출처 기기는 랑데부에서 새 URL을 찾는다.
+/// 외부 접속은 릴레이를 먼저 연결한다. 릴레이 첫 시도가 실패할 때만 퀵 터널을 준비한다.
+/// 기존 터널·명시적 Named Tunnel은 유지하며, 터널 실패는 지수 백오프로 재시도한다.
 fn supervise_tunnel(s: &mut State) {
     if s.mode != ConnectMode::Tunnel {
         if let Some(mut tunnel) = s.tunnel.take() {
@@ -849,7 +848,9 @@ fn supervise_tunnel(s: &mut State) {
         s.relay = None;
         return;
     }
-    if (s.tunnel_start.is_none() || s.relay_enabled)
+    let named = named_tunnel(s);
+    if named.is_none()
+        && (s.tunnel_start.is_none() || s.relay_enabled)
         && s.relay.is_none()
         && let Some(ctx) = s.relay_ctx.as_ref()
         && let Some(shared) = ctx.shared.upgrade()
@@ -882,10 +883,12 @@ fn supervise_tunnel(s: &mut State) {
         save_intent(s).ok();
         backoff(s);
     }
-    if s.saved_port == Some(port)
-        && let (Some(pid), Some(url)) = (s.saved_tunnel_pid, s.saved_tunnel_url.clone())
-    {
-        if let Some(tunnel) = super::tunnel::Tunnel::adopt(pid, url, Some(s.publication.clone())) {
+    if let Some(pid) = s.saved_tunnel_pid {
+        if s.saved_port == Some(port)
+            && let Some(url) = s.saved_tunnel_url.clone()
+            && let Some(tunnel) =
+                super::tunnel::Tunnel::adopt(pid, url, Some(s.publication.clone()))
+        {
             if s.dir.is_some() {
                 tunnel.set_persist(true);
             }
@@ -895,6 +898,7 @@ fn supervise_tunnel(s: &mut State) {
             s.tunnel_error = None;
             return;
         }
+        super::tunnel::kill_pid(pid);
         s.saved_tunnel_pid = None;
         s.saved_tunnel_url = None;
         save_intent(s).ok();
@@ -902,7 +906,13 @@ fn supervise_tunnel(s: &mut State) {
     if s.tunnel_retry_at.is_some_and(|at| Instant::now() < at) {
         return;
     }
-    let named = named_tunnel(s);
+    if named.is_none()
+        && s.relay
+            .as_ref()
+            .is_some_and(|r| !r.settled() || r.connected())
+    {
+        return;
+    }
     let result = if let Some(start) = s.tunnel_start {
         start(port)
     } else {
@@ -912,9 +922,6 @@ fn supervise_tunnel(s: &mut State) {
     };
     match result {
         Ok(tunnel) => {
-            if s.dir.is_some() {
-                tunnel.set_persist(true);
-            }
             s.tunnel = Some(tunnel);
             s.tunnel_retry_at = None;
             s.tunnel_error = None;

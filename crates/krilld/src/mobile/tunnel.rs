@@ -611,6 +611,11 @@ fn stable(
     }
     false
 }
+/// 현재 에셋 해시가 고정 출처에 배포돼 있는지. 네트워크 IO는 상태 락 밖에서 수행한다.
+pub(super) fn publication_available(publication: &Publication) -> bool {
+    fixed_available(Some(publication), |url| http_status(url) == Some(200))
+}
+
 /// 현재 에셋 해시가 고정 출처에 배포돼 있는지.
 fn fixed_available(
     publication: Option<&Publication>,

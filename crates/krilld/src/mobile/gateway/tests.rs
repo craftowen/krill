@@ -957,10 +957,10 @@ fn closing_listener_waits_for_polling_accept_thread_to_release_its_fd() {
 }
 
 #[test]
-fn do_relay_daemon_challenge_pair_reconnect_concurrent_sessions_replay_and_1008_isolation() {
+fn do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_isolation() {
     use super::super::relay::{MUX_BINARY, MUX_CLOSE, MUX_OPEN, MUX_TEXT, decode_mux, encode_mux};
-    fn tunnel_down(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
-        Err(io::Error::other("cloudflared unavailable"))
+    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        panic!("a healthy relay must not start cloudflared")
     }
 
     let relay_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -970,13 +970,31 @@ fn do_relay_daemon_challenge_pair_reconnect_concurrent_sessions_replay_and_1008_
         let mut s = lock(&g.shared.state);
         s.publication.origin = format!("http://127.0.0.1:{relay_port}");
         s.relay_enabled = true;
-        // cloudflared가 실패해도 DO Relay가 연결되면 순수 릴레이 QR을 즉시 발급한다.
-        s.tunnel_start = Some(tunnel_down);
+        s.tunnel_start = Some(must_not_start_tunnel);
         (s.publication.rid.clone(), s.publication.key.clone())
     };
 
     let rid_srv = rid.clone();
     let server_handle = thread::spawn(move || {
+        // 실제 고정 출처와 같이 배포된 PWA manifest 확인 뒤 WebSocket을 받는다.
+        let (mut manifest, _) = relay_listener.accept().unwrap();
+        manifest
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            manifest.read_exact(&mut byte).unwrap();
+            header.extend(byte);
+        }
+        assert!(String::from_utf8(header).unwrap().starts_with(&format!(
+            "GET /m/{}/manifest.json ",
+            super::super::pwa::asset_hash()
+        )));
+        manifest
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+            .unwrap();
+        drop(manifest);
         let (mut host_ws, _) = relay_listener.accept().unwrap();
         host_ws
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -1037,6 +1055,23 @@ fn do_relay_daemon_challenge_pair_reconnect_concurrent_sessions_replay_and_1008_
             hex(&ticket.token),
             ws::base64(&ticket.secret, true)
         )
+    );
+
+    {
+        let mut state = lock(&g.shared.state);
+        let port = state.selected.unwrap().port();
+        state.tunnel = Some(super::super::tunnel::Tunnel::fixture(port).unwrap());
+        let MobileReply::PairingOffer { url: restored, .. } =
+            pairing_offer(&state, now_ms()).unwrap()
+        else {
+            panic!("missing offer")
+        };
+        assert_eq!(restored, url, "relay must win over an existing tunnel URL");
+    }
+    assert!(
+        g.deep_link(krill_proto::SessionId(42))
+            .unwrap()
+            .starts_with(&format!("http://127.0.0.1:{relay_port}/m/"))
     );
 
     let read_mux_for = |host_ws: &mut TcpStream, target_conn: u32| -> (u8, Vec<u8>) {
@@ -1229,6 +1264,17 @@ fn do_relay_daemon_challenge_pair_reconnect_concurrent_sessions_replay_and_1008_
     assert_eq!(kind, MUX_CLOSE);
     assert_eq!(close4_payload, 1008_u16.to_be_bytes());
 
+    // 5. 중계 서버가 챌린지를 지정한 OPEN은 거부한다. 챌린지는 데몬만 고른다.
+    ws::write(
+        &mut host_ws,
+        ws::BINARY,
+        &encode_mux(MUX_OPEN, 5, &[0x77; 32]),
+    )
+    .unwrap();
+    let (kind, close5_payload) = read_mux_for(&mut host_ws, 5);
+    assert_eq!(kind, MUX_CLOSE);
+    assert_eq!(close5_payload, 1002_u16.to_be_bytes());
+
     // conn_id = 1은 여전히 살아 있어 RPC(List) 응답을 정상 수신한다.
     let list_sealed = chan_1
         .seal(&control::Request::List.encode().unwrap())
@@ -1249,6 +1295,12 @@ fn do_relay_daemon_challenge_pair_reconnect_concurrent_sessions_replay_and_1008_
         control::Reply::decode(k, &b).unwrap(),
         control::Reply::Sessions(Vec::new())
     );
+
+    // 6. 이미 열린 conn_id로 다시 온 OPEN은 거부한다(새 챌린지를 내지 않는다).
+    ws::write(&mut host_ws, ws::BINARY, &encode_mux(MUX_OPEN, 1, &[])).unwrap();
+    let (kind, dup_payload) = read_mux_for(&mut host_ws, 1);
+    assert_eq!(kind, MUX_CLOSE);
+    assert_eq!(dup_payload, 1002_u16.to_be_bytes());
 }
 
 #[test]
@@ -1336,4 +1388,76 @@ fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
     assert!(cleared.tunnel_url.is_none());
     drop(g2);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn missing_relay_pwa_falls_back_without_issuing_a_dead_fixed_origin_qr() {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (_registry, gateway) = start();
+    {
+        let mut state = lock(&gateway.shared.state);
+        state.publication.origin = format!("http://{}", listener.local_addr().unwrap());
+        state.relay_enabled = true;
+    }
+    let server = thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            header.extend(byte);
+        }
+        socket
+            .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .unwrap();
+    });
+    let MobileReply::PairingOffer { url, .. } = gateway.request(MobileRequest::MintPairingTicket {
+        mode: ConnectMode::Tunnel,
+        custom_address: None,
+        rotate: true,
+    }) else {
+        panic!("expected fallback offer")
+    };
+    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
+    assert!(!url.contains("&r="));
+    server.join().unwrap();
+}
+
+#[test]
+fn revoking_all_devices_cancels_a_pending_pairing_wait() {
+    fn pending(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        Err(io::Error::new(io::ErrorKind::WouldBlock, "still preparing"))
+    }
+    let (_registry, gateway) = start();
+    lock(&gateway.shared.state).tunnel_start = Some(pending);
+    let worker_gateway = Arc::clone(&gateway);
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = thread::spawn(move || {
+        send.send(worker_gateway.request(MobileRequest::MintPairingTicket {
+            mode: ConnectMode::Tunnel,
+            custom_address: None,
+            rotate: true,
+        }))
+        .unwrap();
+    });
+    until(|| {
+        lock(&gateway.shared.state)
+            .devices
+            .ticket(now_ms())
+            .is_some()
+    });
+    assert!(matches!(
+        gateway.request(MobileRequest::RevokeDevice {
+            device_id: None,
+            all: true,
+        }),
+        MobileReply::Revoked { .. }
+    ));
+    let reply = receive.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(reply, MobileReply::Failed(_)));
+    assert!(lock(&gateway.shared.state).listeners.is_empty());
+    worker.join().unwrap();
 }
