@@ -765,7 +765,7 @@ fn ws_closes_when_registry_ends_before_first_request() {
     let (port, t) = offer(&g);
     let mut phone = Client::pair(port, &t);
     phone.ipc();
-    // 첫 요청 없이 ATTACH_TIMEOUT이 지나면 레지스트리가 끝낸다. WS도 닫혀야 하며 응답 없이 멈추면 안 된다.
+    // 첫 요청 없이 MOBILE_ATTACH_TIMEOUT(테스트 2초)이 지나면 레지스트리가 끝낸다. WS도 닫혀야 하며 응답 없이 멈추면 안 된다.
     phone
         .socket
         .set_read_timeout(Some(Duration::from_secs(10)))

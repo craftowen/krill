@@ -130,6 +130,11 @@ async function main(){
  const authWarmHandle=api.mount(authWarmRoot,{sessionId:43,connect:()=>({socket:authWarmSocket,credentials:{device_id:'fixture',credential:''},channel:new C.Channel(),messages:[C.enc.encode('{}'),T.frame(1,C.concat(T.v(1),T.v(1),T.v((1n<<56n)|4096n|5n)))]})});
  await flush();assert.equal(authWarmSocket.sent.length,2);assert.equal(authWarmSocket.sent[0][4],0x17);assert.equal(authWarmSocket.sent[1][4],0x10);authWarmSocket.frame(0x2c,T.v(0));authWarmSocket.screen();await flush();assert.equal(find(authWarmRoot,'terminal-status').textContent,'80 × 24');authWarmHandle.unmount();
  console.log('PASS prewarmed terminal WebSocket replays buffered challenge or pre-authenticated channel immediately on mount');
+ {// 자동 Fit: 크기 요청이 첫 화면을 기다리지 않고 attach와 함께 나가고, 첫 화면 뒤 fitToPhone은 같은 응답을 기다린다(중복 요청 없음).
+  const root=new Element('div'),handle=context.mountFixture(root,11,{preferences:{fitToPhone:true}});await flush();const socket=context.sockets.at(-1);find(root,'terminal-scroll').clientHeight=600;socket.handshake();await flush();
+  const resizes=()=>socket.sent.filter(a=>a[4]===0x17&&a[5]===1).map(a=>[...a.slice(5)]);assert.equal(JSON.stringify(resizes()),"[[1,48,33]]");
+  socket.screen();await flush();assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'false');socket.frame(0x2c,T.v(0));await flush();
+  assert.equal(find(root,'display-mode').getAttribute('aria-pressed'),'true');assert.equal(resizes().length,1);handle.unmount();console.log('PASS auto-fit resize pipelined with attach, no duplicate after first frame');}
  console.log('All terminal adapter regression checks passed.');
 }
 if(process.argv.includes('--harness')){
