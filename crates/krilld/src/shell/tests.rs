@@ -142,20 +142,13 @@ fn system_lang_falls_back_when_unreadable() {
 
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: AppleLocale(defaults)")]
-fn real_system_lang_matches_this_mac() {
-    // 이 맥 실측: AppleLocale=ko_KR. 다른 맥에서는 그 맥의 값과 같아야 한다.
+fn real_system_lang_matches_system_locale() {
+    // 개발 맥·CI 러너 각각의 AppleLocale을 따른다. 변환 규칙은 위 표로 따로 검증한다.
     let got = system_lang();
     let locale = system_locale();
     match locale.as_deref().map(lang_from_locale) {
         Some(Some(want)) => assert_eq!(got, Some(want)),
         _ => assert_eq!(got, None),
-    }
-    if std::env::var_os("AppleLocale").is_none() {
-        assert_eq!(
-            got,
-            Some(b"ko_KR.UTF-8".to_vec()),
-            "AppleLocale env가 없을 때 defaults read 값이 이 맥 실측(ko_KR.UTF-8)과 같아야 한다"
-        );
     }
 }
 
