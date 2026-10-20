@@ -43,6 +43,9 @@ async function main(){
  const run=tools.find('chat-tool-run');assert(run);assert(!run.open);assert(!tools.find('chat-tool-call').open);assert(!tools.find('chat-tool-result').open);assert.equal(tools.find('chat-feed').children.length,3);assert(run.children[0].textContent.includes('Read'));
  run.open=true;tools.find('chat-tool-call').open=true;await tools.poll({generation:'g1',bound:true,next_offset:2,items:[{id:'more',kind:'assistant',text:'More context'}]});assert.equal(tools.find('chat-tool-run'),run);assert(run.open);assert(tools.find('chat-tool-call').open);tools.dispose();
  console.log('PASS message-first chat groups adjacent tools, defaults closed and preserves disclosure on deltas');
+ const failedTools=fixture();await flush();await failedTools.poll({generation:'g1',bound:true,next_offset:1,items:[{id:'failed-call',kind:'tool_call',tool_name:'Read',text:'Read the file'},{id:'failed-result',kind:'tool_result',is_error:true,text:'Permission denied'}]});
+ const failedRun=failedTools.find('chat-tool-run');assert(failedRun);assert(!failedRun.open);assert(failedRun.children[0].textContent.includes('Tool error'),'a collapsed tool group must expose failures without opening it');assert(failedRun.children[0].textContent.includes('Read'));failedTools.dispose();
+ console.log('PASS collapsed tool group exposes tool failure in its summary');
  let f=fixture();await flush();const pending=deferred();f.handler=async req=>req.action==='prompt'?pending.promise:{generation:'g1',items:[],next_offset:req.offset,bound:true};
  f.input('first');f.submit();await flush();f.input('second');f.submit();await flush();assert.equal(f.calls.filter(c=>c.action==='prompt').length,1);
  pending.resolve({sent:true});await flush();assert.equal(f.find('chat-input').value,'second');assert.equal(f.state.drafts.get(7),'second');
