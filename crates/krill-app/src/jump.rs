@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use gpui::{
     Context, Entity, EventEmitter, FontWeight, Hsla, KeyDownEvent, ScrollHandle, Subscription,
-    UniformListScrollHandle, Window, deferred, div, prelude::*, px,
+    Window, deferred, div, prelude::*, px,
 };
 use gpui_component::input::{Enter, Escape, Input, InputState, MoveDown, MoveUp};
 use gpui_component::{Icon, Sizable as _};
@@ -624,10 +624,8 @@ pub struct Palette {
     selected: usize,
     query: String,
     input: Entity<InputState>,
-    scroll: UniformListScrollHandle,
-    worktree_scroll: ScrollHandle,
+    scroll: ScrollHandle,
     quick_scroll: ScrollHandle,
-    vault_scroll: ScrollHandle,
     history: Option<Entity<crate::agent_history::Panel>>,
     history_sub: Option<Subscription>,
     _observe: Subscription,
@@ -696,10 +694,8 @@ impl Palette {
             selected: 0,
             query: String::new(),
             input,
-            scroll: UniformListScrollHandle::new(),
-            worktree_scroll: ScrollHandle::new(),
+            scroll: ScrollHandle::new(),
             quick_scroll: ScrollHandle::new(),
-            vault_scroll: ScrollHandle::new(),
             history: None,
             history_sub: None,
             _observe: observe,
@@ -1009,10 +1005,110 @@ impl Palette {
     }
 
     fn scroll_to_top(&self) {
-        self.scroll.scroll_to_item(0, gpui::ScrollStrategy::Top);
-        self.worktree_scroll.scroll_to_item(0);
+        self.scroll.scroll_to_item(0);
         self.quick_scroll.scroll_to_item(0);
-        self.vault_scroll.scroll_to_item(0);
+    }
+
+    fn chat_window(&self) -> (usize, usize, usize) {
+        let has_query = !self.query.trim().is_empty();
+        let session_base = self.section_base(Section::Sessions);
+        let chat_total = self.matches.len() + self.vault_matches.len();
+        let in_chat = self.selected >= session_base && self.selected < session_base + chat_total;
+        let rel_sel = if in_chat {
+            self.selected - session_base
+        } else {
+            0
+        };
+        let (start, end) =
+            if !has_query && !self.expanded_chats && rel_sel < EMPTY_QUERY_RECENT_TAB_CAP {
+                (0, chat_total.min(EMPTY_QUERY_RECENT_TAB_CAP))
+            } else if chat_total <= VISIBLE_ROWS {
+                (0, chat_total)
+            } else {
+                let half = VISIBLE_ROWS / 2;
+                let s = rel_sel.saturating_sub(half).min(chat_total - VISIBLE_ROWS);
+                (s, s + VISIBLE_ROWS)
+            };
+        (start, end, chat_total.saturating_sub(end))
+    }
+
+    fn worktree_window(&self) -> (usize, usize, usize) {
+        let has_query = !self.query.trim().is_empty();
+        let wt_base = self.section_base(Section::Worktrees);
+        let wt_total = self.worktree_matches.len();
+        let in_wt = self.selected >= wt_base && self.selected < wt_base + wt_total;
+        let rel_sel = if in_wt { self.selected - wt_base } else { 0 };
+        let (start, end) =
+            if !has_query && !self.expanded_worktrees && rel_sel < EMPTY_QUERY_WORKTREE_CAP {
+                (0, wt_total.min(EMPTY_QUERY_WORKTREE_CAP))
+            } else if wt_total <= VISIBLE_ROWS {
+                (0, wt_total)
+            } else {
+                let half = VISIBLE_ROWS / 2;
+                let s = rel_sel.saturating_sub(half).min(wt_total - VISIBLE_ROWS);
+                (s, s + VISIBLE_ROWS)
+            };
+        (start, end, wt_total.saturating_sub(end))
+    }
+
+    fn selected_list_child_index(&self) -> Option<usize> {
+        let (section, pos) = self.row_at(self.selected)?;
+        let mut idx = 0usize;
+        if self.mode == Mode::Commands {
+            if !self.action_matches.is_empty() {
+                if section == Section::Actions {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+            if !self.quick_matches.is_empty() {
+                if section == Section::QuickCommands {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+        }
+        let chat_total = self.matches.len() + self.vault_matches.len();
+        if chat_total > 0 {
+            let (chat_start, chat_end, chat_overflow) = self.chat_window();
+            idx += 1; // section header
+            if matches!(section, Section::Sessions | Section::Vault) {
+                let chat_pos = self
+                    .selected
+                    .saturating_sub(self.section_base(Section::Sessions));
+                let offset = chat_pos.saturating_sub(chat_start);
+                return Some(idx + offset);
+            }
+            idx += chat_end.saturating_sub(chat_start);
+            if chat_overflow > 0 {
+                idx += 1;
+            }
+        }
+        let wt_total = self.worktree_matches.len();
+        if wt_total > 0 {
+            let (wt_start, wt_end, wt_overflow) = self.worktree_window();
+            idx += 1; // section header
+            if section == Section::Worktrees {
+                let offset = pos.saturating_sub(wt_start);
+                return Some(idx + offset);
+            }
+            idx += wt_end.saturating_sub(wt_start);
+            if wt_overflow > 0 {
+                idx += 1;
+            }
+        }
+        if self.mode != Mode::Commands {
+            if !self.action_matches.is_empty() {
+                if section == Section::Actions {
+                    return Some(idx);
+                }
+                idx += 1;
+            }
+            if !self.quick_matches.is_empty() && section == Section::QuickCommands {
+                return Some(idx);
+            }
+        }
+        None
     }
 
     fn section_len(&self, section: Section) -> usize {
@@ -1071,21 +1167,11 @@ impl Palette {
         let current = isize::try_from(self.selected).unwrap_or(0);
         let wrapped = current.saturating_add(delta).rem_euclid(total_isize);
         self.selected = usize::try_from(wrapped).unwrap_or(0);
-        match self.row_at(self.selected) {
-            Some((Section::Sessions, pos)) => {
-                self.scroll
-                    .scroll_to_item(pos, gpui::ScrollStrategy::Center);
-            }
-            Some((Section::Worktrees, pos)) => {
-                self.worktree_scroll.scroll_to_item(pos);
-            }
-            Some((Section::QuickCommands, pos)) => {
-                self.quick_scroll.scroll_to_item(pos);
-            }
-            Some((Section::Vault, pos)) => {
-                self.vault_scroll.scroll_to_item(pos);
-            }
-            Some((Section::Actions, _)) | None => {}
+        if let Some(child_idx) = self.selected_list_child_index() {
+            self.scroll.scroll_to_item(child_idx);
+        }
+        if let Some((Section::QuickCommands, pos)) = self.row_at(self.selected) {
+            self.quick_scroll.scroll_to_item(pos);
         }
         cx.notify();
     }
@@ -1710,30 +1796,14 @@ impl Render for Palette {
         let sessions_len = self.matches.len();
         let vault_len = self.vault_matches.len();
         let chat_total = sessions_len + vault_len;
-        let rel_chat_sel = self
-            .selected
-            .saturating_sub(session_base)
-            .min(chat_total.saturating_sub(1));
-
-        let (chat_start, chat_end) =
-            if !has_query && !self.expanded_chats && rel_chat_sel < EMPTY_QUERY_RECENT_TAB_CAP {
-                (0, chat_total.min(EMPTY_QUERY_RECENT_TAB_CAP))
-            } else if chat_total <= VISIBLE_ROWS {
-                (0, chat_total)
-            } else {
-                let half = VISIBLE_ROWS / 2;
-                let start = rel_chat_sel
-                    .saturating_sub(half)
-                    .min(chat_total - VISIBLE_ROWS);
-                (start, start + VISIBLE_ROWS)
-            };
-        let chat_overflow = chat_total.saturating_sub(chat_end);
+        let (chat_start, chat_end, chat_overflow) = self.chat_window();
 
         let mut list_body = div()
             .id("jump-list")
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .track_scroll(&self.scroll)
             .px_2p5()
             .pt_1p5()
             .pb_2()
@@ -2116,15 +2186,12 @@ impl Render for Palette {
                 pal,
             ));
 
-            let wt_cap = if !has_query && !self.expanded_worktrees {
-                EMPTY_QUERY_WORKTREE_CAP
-            } else {
-                VISIBLE_ROWS
-            };
-            let wt_end = wt_total.min(wt_cap);
-            let wt_overflow = wt_total.saturating_sub(wt_end);
+            let (wt_start, wt_end, wt_overflow) = self.worktree_window();
 
-            for (wt_pos, &wt_idx) in self.worktree_matches.iter().enumerate().take(wt_end) {
+            for wt_pos in wt_start..wt_end {
+                let Some(&wt_idx) = self.worktree_matches.get(wt_pos) else {
+                    continue;
+                };
                 let Some(wt) = self.worktrees.get(wt_idx) else {
                     continue;
                 };
