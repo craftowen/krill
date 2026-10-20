@@ -60,6 +60,13 @@ pub(crate) const MOBILE_FRAME_MIN: Duration = Duration::from_millis(33);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hello 뒤 첫 요청([`Attach`] 등)을 기다리는 최대 시간.
 pub(crate) const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
+/// 모바일(인증된 E2EE 채널)은 터미널 소켓을 미리 열어 두고 세션을 고를 때 첫 요청을 보낸다(client.js warmTerminal).
+/// 5초면 목록을 보다 들어갈 때 이미 닫혀 매번 새 WS 핸드셰이크를 다시 한다.
+/// 죽은 연결은 게이트웨이 ping(`IDLE_PINGS`)이 따로 닫는다.
+#[cfg(not(test))]
+pub(crate) const MOBILE_ATTACH_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
+pub(crate) const MOBILE_ATTACH_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// 연결 하나의 쓰기 쪽과 요청 스레드가 쓰기 스레드에 거는 신호.
 struct Conn {

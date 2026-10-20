@@ -172,8 +172,8 @@ async function testPipelinedHandshakeAndPolling(){
  t.connect();await flush();const socket=sockets[0];socket.message(JSON.stringify({version:2,challenge:'bb'.repeat(32)}));await flush();
  // 인증 응답 전에 auth hello·proof·ClientHello·snapshot 요청이 모두 나가야 한다.
  assert.equal(socket.sent.length,4);assert.equal(socket.sent[2][4],2);assert.equal(socket.sent[3][4],0x45);
- const reply=()=>socket.message(frame(0x65,concat(Uint8Array.of(6),text(JSON.stringify({ok:true,data:{sessions:[]}})))));
- socket.message(enc.encode('{"device_id":"dev1"}'));socket.message(frame(1,Uint8Array.of(1,1,0,0,1)));reply();await flush();
+ const reply=(data={sessions:[]})=>socket.message(frame(0x65,concat(Uint8Array.of(6),text(JSON.stringify({ok:true,data})))));
+ socket.message(enc.encode('{"device_id":"dev1"}'));socket.message(frame(1,Uint8Array.of(1,1,0,0,1)));reply({sessions:[],etag:'e1'});await flush();
  assert.equal(snapshots.length,1);assert.equal(statuses.at(-1),'ready');assert.equal(socket.sent.length,4);
  // 컨트롤 소켓 ready 직후 백그라운드 터미널 WebSocket 1개가 프리워밍되며 challenge 수신 시 즉시 인증·ClientHello까지 마친다.
  assert.equal(sockets.length,2);
@@ -181,13 +181,16 @@ async function testPipelinedHandshakeAndPolling(){
  assert.equal(warmSocket.sent.length,3);assert.equal(warmSocket.sent[2][4],2);
  warmSocket.message(enc.encode('{"device_id":"dev1"}'));warmSocket.message(frame(1,Uint8Array.of(1,1,0,0,1)));
  const claimed=t.terminalConnect();assert.equal(claimed.socket,warmSocket);assert(claimed.channel);assert.equal(claimed.messages.length,2);
- const fresh=t.terminalConnect();assert.notEqual(fresh.socket,warmSocket);assert.equal(sockets.length,3);
+ // 꺼내 쓰면 바로 하나를 다시 채워 다음 탭 전환도 미리 인증된 소켓을 쓴다.
+ assert.equal(sockets.length,3);const fresh=t.terminalConnect();assert.equal(fresh.socket,sockets[2]);assert.notEqual(fresh.socket,warmSocket);assert.equal(sockets.length,4);
  const [[,poll]]=[...timers];assert.equal(poll.at,2500);
  document.hidden=true;now=2500;timers.clear();poll.fn();await flush();assert.equal(socket.sent.length,4);
- sandbox.KrillMobile.activeTerminal={};document.hidden=false;const [[,next]]=[...timers];timers.clear();next.fn();await flush();assert.equal(socket.sent.length,5);reply();await flush();assert.equal(snapshots.length,2);
+ sandbox.KrillMobile.activeTerminal={};document.hidden=false;const [[,next]]=[...timers];timers.clear();next.fn();await flush();assert.equal(socket.sent.length,5);
+ // 폴링은 직전 etag를 since로 보내고, unchanged 응답이면 화면을 다시 그리지 않는다.
+ assert.deepEqual(JSON.parse(new TextDecoder().decode(socket.sent[4].slice(7))),{action:'snapshot',since:'e1'});reply({unchanged:true,etag:'e1'});await flush();assert.equal(snapshots.length,1);
  const [[,slow]]=[...timers];assert.equal(slow.at-now,10000);
- // resume() 시 소진된 터미널 프리워밍 소켓을 다시 채우고, 정상 응답이 1.5초 안에 오면 재연결하지 않는다.
- t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);reply();await flush();assert.equal(snapshots.length,3);
+ // resume() 시 살아 있는 프리워밍 소켓은 그대로 두고, 정상 응답이 1.5초 안에 오면 재연결하지 않는다.
+ t.resume();await flush();assert.equal(sockets.length,4);assert.equal(socket.sent.length,6);reply();await flush();assert.equal(snapshots.length,2);
  for(const [id,tm] of [...timers])if(tm.at<=now+1500){timers.delete(id);tm.fn();}await flush();assert.equal(sockets.length,4);
  // 1.5초 동안 응답이 없으면 좀비 소켓으로 판정해 즉시 reconnect()하며, 끊긴 refresh의 오류를 onError로 흘리지 않는다.
  t.resume();await flush();assert.equal(socket.sent.length,7);
