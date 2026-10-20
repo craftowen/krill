@@ -787,6 +787,7 @@ catalog! {
         VIEW_UNIFIED => ("Unified", "Unified"),
         VIEW_SPLIT => ("Split", "Split"),
         VIEWED => ("확인됨", "Viewed"),
+        CLOSE_DIFF => ("Diff 닫기 (Esc)", "Close Diff (Esc)"),
     }
     editor {
         QUICK_OPEN => (platform_text!("파일 열기 (⌘P)", "파일 열기 (Ctrl+Shift+P)"), platform_text!("Open file (⌘P)", "Open file (Ctrl+Shift+P)")),
