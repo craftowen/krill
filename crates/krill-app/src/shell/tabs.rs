@@ -631,7 +631,7 @@ impl Shell {
     }
 
     /// OWE-872: 탭을 닫기 전에 실행 중인지 본다. 실행 중이면 확인 대화상자를 띄우고,
-    /// 아니면 바로 닫는다. 일괄 닫기(다른·오른쪽·왼쪽 탭)는 닫은 기록이 남아 ⌘⇧T로 되돌릴 수 있어 묻지 않는다.
+    /// 아니면 바로 닫는다. 일괄 닫기(다른·오른쪽·왼쪽 탭)는 메뉴에서 고른 명시적 동작이라 묻지 않는다.
     pub(super) fn maybe_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index < self.layout.tabs().len()
             && self.tab_has_running(index, cx)
@@ -644,12 +644,12 @@ impl Shell {
         self.do_close_tab(index, cx);
     }
 
-    /// OWE-872: 탭을 실제로 닫는다(닫은 세션 기록 포함).
+    /// OWE-872: 탭을 실제로 닫는다(탭 세션 데몬 종료 포함).
     pub(super) fn do_close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         if index >= self.layout.tabs().len() {
             return;
         }
-        self.record_closed_tab(index);
+        self.record_closed_tab(index, cx);
         self.change(true, cx, |l| l.close_tab(index));
     }
 
@@ -786,7 +786,7 @@ impl Shell {
             .filter_map(|(i, tab)| (i != keep_index && !tab.pinned).then_some(i))
             .collect();
         for i in closing {
-            self.record_closed_tab(i);
+            self.record_closed_tab(i, cx);
         }
         self.change(true, cx, |l| l.close_other_tabs(keep_index));
     }
@@ -802,7 +802,7 @@ impl Shell {
             .filter_map(|(i, tab)| (!tab.pinned).then_some(i))
             .collect();
         for i in closing {
-            self.record_closed_tab(i);
+            self.record_closed_tab(i, cx);
         }
         self.change(true, cx, |l| l.close_tabs_to_right(index));
     }
@@ -818,7 +818,7 @@ impl Shell {
             .filter_map(|(i, tab)| (!tab.pinned).then_some(i))
             .collect();
         for i in closing {
-            self.record_closed_tab(i);
+            self.record_closed_tab(i, cx);
         }
         self.change(true, cx, |l| l.close_tabs_to_left(index));
     }

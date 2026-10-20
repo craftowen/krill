@@ -410,7 +410,7 @@ impl Shell {
     }
 
     /// 세션의 현재 폴더(krilld가 알린 값), 모르면 칸을 연 폴더. 터미널 상대 경로 링크의 기준이다.
-    fn pane_cwd(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
+    pub(super) fn pane_cwd(&self, pane: PaneId, cx: &App) -> Option<PathBuf> {
         use krill_proto::os::ffi::OsStringExt as _;
         let live = self
             .layout
