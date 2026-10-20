@@ -3,7 +3,7 @@ use ring::digest;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 15] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 18] = [
     (
         "index.html",
         "text/html; charset=utf-8",
@@ -89,10 +89,28 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 15] = [
         include_bytes!("assets/icon.svg.gz"),
     ),
     (
-        "icon.png",
+        "icon-192.png",
         "image/png",
-        include_bytes!("assets/icon.png"),
-        include_bytes!("assets/icon.png.gz"),
+        include_bytes!("assets/icon-192.png"),
+        include_bytes!("assets/icon-192.png.gz"),
+    ),
+    (
+        "icon-512.png",
+        "image/png",
+        include_bytes!("assets/icon-512.png"),
+        include_bytes!("assets/icon-512.png.gz"),
+    ),
+    (
+        "icon-maskable-512.png",
+        "image/png",
+        include_bytes!("assets/icon-maskable-512.png"),
+        include_bytes!("assets/icon-maskable-512.png.gz"),
+    ),
+    (
+        "apple-touch-icon.png",
+        "image/png",
+        include_bytes!("assets/apple-touch-icon.png"),
+        include_bytes!("assets/apple-touch-icon.png.gz"),
     ),
 ];
 /// C1: 파일명·길이·원본 바이트로 식별하는 고정 출처 버전.

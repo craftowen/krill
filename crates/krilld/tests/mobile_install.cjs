@@ -45,7 +45,7 @@ exports.main=async function main({base,fragment}){
   const manifest=await until(async()=>{const m=await android.call('Page.getAppManifest');return m.url&&m;},'manifest');
   assert.deepEqual(manifest.errors,[]);const parsed=JSON.parse(manifest.data);assert.equal(parsed.display,'standalone');assert.equal(parsed.start_url,'/');
   const {installabilityErrors}=await android.call('Page.getInstallabilityErrors');assert.deepEqual(installabilityErrors,[],JSON.stringify(installabilityErrors));
-  assert.equal(await android.evaluate("document.querySelector('link[rel=apple-touch-icon]').href.endsWith('/icon.png')"),true);
+  assert.equal(await android.evaluate("document.querySelector('link[rel=apple-touch-icon]').href.endsWith('/apple-touch-icon.png')"),true);
 
   // Safari: pair, then Settings → Add to Home Screen puts a one-time pairing link into the URL fragment only.
   const safari=await chrome.page({iphone:true});await safari.open(`${base}/#${fragment}`);
