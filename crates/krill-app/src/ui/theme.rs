@@ -399,13 +399,6 @@ pub const TERMINAL_LIGHT: TerminalTheme = TerminalTheme {
     ],
 };
 
-/// 내장 터미널 테마 목록(이름, 값). 첫 항목이 다크 기본, 마지막이 라이트 기본이다.
-pub const TERMINAL_THEMES: [(&str, TerminalTheme); 3] = [
-    ("Krill Deep", TERMINAL_DARK),
-    ("Ghostty Default Style Dark", TERMINAL_GHOSTTY_DARK),
-    ("Builtin Tango Light", TERMINAL_LIGHT),
-];
-
 /// 터미널 칸 여백도 셀과 같은 테마 배경을 쓴다.
 pub const fn terminal_surface(theme: TerminalTheme) -> Hsla {
     rgba_bytes(
@@ -799,12 +792,6 @@ mod tests {
         assert_eq!(TERMINAL_DARK.foreground, TERMINAL_GHOSTTY_DARK.foreground);
         assert_eq!(TERMINAL_DARK.background, term_rgb(0x10, 0x13, 0x1b));
         assert_eq!(TERMINAL_DARK.cursor, term_rgb(0xff, 0x52, 0x38));
-        assert_eq!(TERMINAL_THEMES[0], ("Krill Deep", TERMINAL_DARK));
-        assert!(
-            TERMINAL_THEMES
-                .iter()
-                .any(|(_, t)| *t == TERMINAL_GHOSTTY_DARK)
-        );
         assert!(terminal_surface(TERMINAL_DARK).l < 0.10);
     }
 

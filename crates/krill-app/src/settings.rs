@@ -161,7 +161,7 @@ pub struct Settings {
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub workspace_trust_preset_enabled: bool,
-    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Ghostty Default Style Dark"`, OWE-956).
+    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Krill Deep"`, OWE-956).
     #[serde(default = "default_terminal_theme_dark")]
     pub terminal_theme_dark: String,
     /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Builtin Tango Light"`, OWE-956).
@@ -4611,7 +4611,7 @@ impl SettingsView {
         const PREVIEW_FN: &str = "apply_theme";
         const PREVIEW_ARGS: &str = "(mode: ThemeMode) -> ";
         const PREVIEW_RET: &str = "TerminalTheme ";
-        const PREVIEW_COMMENT: &str = "// 30 built-in + custom themes";
+        const PREVIEW_COMMENT: &str = "// 31 built-in + custom themes";
         const PREVIEW_CURSOR_CHAR: &str = " ";
 
         let preview = crate::ui::terminal_theme_for_mode(target_mode, s);
