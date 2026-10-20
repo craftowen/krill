@@ -3199,6 +3199,8 @@ fn import_settings_domain(
         }
     }
 
+    import_orca_terminal_themes(settings, &mut settings_table);
+
     if settings_table != before_settings {
         summary.settings_updated = true;
         if !opts.dry_run {
@@ -3214,6 +3216,204 @@ fn import_settings_domain(
     summary.schedules_merged = import_automations(opts, domains, settings, warnings)?;
 
     Ok(summary)
+}
+
+fn import_orca_terminal_themes(settings: &Json, settings_table: &mut toml::Table) {
+    const ANSI_KEYS: [&str; 16] = [
+        "black",
+        "red",
+        "green",
+        "yellow",
+        "blue",
+        "magenta",
+        "cyan",
+        "white",
+        "brightBlack",
+        "brightRed",
+        "brightGreen",
+        "brightYellow",
+        "brightBlue",
+        "brightMagenta",
+        "brightCyan",
+        "brightWhite",
+    ];
+
+    if let Some(dark) = settings
+        .get("terminalThemeDark")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        settings_table.insert(
+            "terminal_theme_dark".to_owned(),
+            toml::Value::String(dark.to_owned()),
+        );
+    }
+
+    if let Some(light) = settings
+        .get("terminalThemeLight")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        settings_table.insert(
+            "terminal_theme_light".to_owned(),
+            toml::Value::String(light.to_owned()),
+        );
+    }
+
+    if let Some(use_sep) = settings
+        .get("terminalUseSeparateLightTheme")
+        .and_then(Json::as_bool)
+    {
+        settings_table.insert(
+            "terminal_use_separate_light_theme".to_owned(),
+            toml::Value::Boolean(use_sep),
+        );
+    }
+
+    let Some(arr) = settings
+        .get("terminalCustomThemes")
+        .and_then(Json::as_array)
+    else {
+        return;
+    };
+
+    let mut existing: Vec<toml::Table> = settings_table
+        .get("terminal_custom_themes")
+        .and_then(toml::Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+
+    for entry in arr {
+        let Some(id) = entry
+            .get("id")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(name) = entry
+            .get("name")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let source = entry
+            .get("source")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("custom");
+        let mode = entry
+            .get("mode")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| matches!(*s, "dark" | "light"));
+        let source_label = entry
+            .get("sourceLabel")
+            .or_else(|| entry.get("source_label"))
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+
+        let colors = entry.get("colors").unwrap_or(entry);
+        let Some(bg) = colors
+            .get("background")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let Some(fg) = colors
+            .get("foreground")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let cursor = colors
+            .get("cursor")
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(fg);
+
+        let ansi_vals: Vec<toml::Value> = if let Some(ansi_arr) = entry
+            .get("ansi")
+            .and_then(Json::as_array)
+            .filter(|a| a.len() == 16)
+        {
+            let mapped: Vec<toml::Value> = ansi_arr
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| toml::Value::String(s.to_owned()))
+                .collect();
+            if mapped.len() != 16 {
+                continue;
+            }
+            mapped
+        } else {
+            let mapped: Vec<toml::Value> = ANSI_KEYS
+                .iter()
+                .filter_map(|k| colors.get(*k).and_then(Json::as_str))
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| toml::Value::String(s.to_owned()))
+                .collect();
+            if mapped.len() != 16 {
+                continue;
+            }
+            mapped
+        };
+
+        let mut table = toml::Table::new();
+        table.insert("id".to_owned(), toml::Value::String(id.to_owned()));
+        table.insert("name".to_owned(), toml::Value::String(name.to_owned()));
+        table.insert("source".to_owned(), toml::Value::String(source.to_owned()));
+        if let Some(m) = mode {
+            table.insert("mode".to_owned(), toml::Value::String(m.to_owned()));
+        }
+        if let Some(lbl) = source_label {
+            table.insert(
+                "source_label".to_owned(),
+                toml::Value::String(lbl.to_owned()),
+            );
+        }
+        table.insert("foreground".to_owned(), toml::Value::String(fg.to_owned()));
+        table.insert("background".to_owned(), toml::Value::String(bg.to_owned()));
+        table.insert("cursor".to_owned(), toml::Value::String(cursor.to_owned()));
+        table.insert("ansi".to_owned(), toml::Value::Array(ansi_vals));
+
+        if let Some(slot) = existing
+            .iter_mut()
+            .find(|t| t.get("id").and_then(toml::Value::as_str) == Some(id))
+        {
+            *slot = table;
+        } else {
+            existing.push(table);
+        }
+    }
+
+    if !existing.is_empty() {
+        settings_table.insert(
+            "terminal_custom_themes".to_owned(),
+            toml::Value::Array(existing.into_iter().map(toml::Value::Table).collect()),
+        );
+    }
 }
 
 fn map_orca_agent_id(raw: &str) -> Option<&'static str> {
@@ -5038,6 +5238,116 @@ mod tests {
             !raw.contains("base64"),
             "data URL을 projects.toml에 넣지 않는다"
         );
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn imports_orca_terminal_themes_and_custom_themes() {
+        let root = std::env::temp_dir().join(format!("owe956-orca-themes-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let orca_dir = root.join("orca");
+        let state_dir = root.join("state");
+        fs::create_dir_all(orca_dir.join("profiles").join("default")).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+
+        let doc = serde_json::json!({
+            "settings": {
+                "terminalThemeDark": "custom:ghostty:catppuccin-mocha",
+                "terminalThemeLight": "Catppuccin Latte",
+                "terminalUseSeparateLightTheme": true,
+                "terminalCustomThemes": [
+                    {
+                        "id": "ghostty:catppuccin-mocha",
+                        "name": "Catppuccin Mocha",
+                        "source": "ghostty",
+                        "mode": "dark",
+                        "sourceLabel": "ghostty",
+                        "colors": {
+                            "background": "#1e1e2e",
+                            "foreground": "#cdd6f4",
+                            "cursor": "#f5e0dc",
+                            "black": "#45475a",
+                            "red": "#f38ba8",
+                            "green": "#a6e3a1",
+                            "yellow": "#f9e2af",
+                            "blue": "#89b4fa",
+                            "magenta": "#f5c2e7",
+                            "cyan": "#94e2d5",
+                            "white": "#bac2de",
+                            "brightBlack": "#585b70",
+                            "brightRed": "#f38ba8",
+                            "brightGreen": "#a6e3a1",
+                            "brightYellow": "#f9e2af",
+                            "brightBlue": "#89b4fa",
+                            "brightMagenta": "#f5c2e7",
+                            "brightCyan": "#94e2d5",
+                            "brightWhite": "#a6adc8"
+                        }
+                    }
+                ]
+            }
+        });
+        fs::write(
+            orca_dir
+                .join("profiles")
+                .join("default")
+                .join("orca-data.json"),
+            doc.to_string(),
+        )
+        .unwrap();
+
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Settings],
+            dry_run: false,
+        };
+        let report = run_import(&opts).unwrap();
+        assert!(report.settings.settings_updated);
+
+        let body = fs::read_to_string(state_dir.join("settings.toml")).unwrap();
+        let table: toml::Table = toml::from_str(&body).unwrap();
+        assert_eq!(
+            table
+                .get("terminal_theme_dark")
+                .and_then(toml::Value::as_str),
+            Some("custom:ghostty:catppuccin-mocha")
+        );
+        assert_eq!(
+            table
+                .get("terminal_theme_light")
+                .and_then(toml::Value::as_str),
+            Some("Catppuccin Latte")
+        );
+        assert_eq!(
+            table
+                .get("terminal_use_separate_light_theme")
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        let customs = table
+            .get("terminal_custom_themes")
+            .and_then(toml::Value::as_array)
+            .unwrap();
+        assert_eq!(customs.len(), 1);
+        let first = customs[0].as_table().unwrap();
+        assert_eq!(
+            first.get("id").and_then(toml::Value::as_str),
+            Some("ghostty:catppuccin-mocha")
+        );
+        assert_eq!(
+            first.get("background").and_then(toml::Value::as_str),
+            Some("#1e1e2e")
+        );
+        assert_eq!(
+            first
+                .get("ansi")
+                .and_then(toml::Value::as_array)
+                .map(Vec::len),
+            Some(16)
+        );
+
         fs::remove_dir_all(&root).ok();
     }
 }
