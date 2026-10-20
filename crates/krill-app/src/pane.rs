@@ -1309,7 +1309,8 @@ impl History {
     }
 
     fn scroll(&mut self, lines: isize) {
-        let next = self.offset.saturating_add_signed(lines);
+        // 비동기 요청량이 받은 히스토리보다 커도 이동 기준은 실제 보이는 위치다.
+        let next = self.visible().saturating_add_signed(lines);
         // 다 받았으면 더 올라가지 않는다. 받는 중이면 원하는 만큼 두고, 행이 오면 그만큼 보인다.
         let cap = if self.phase == Phase::Done {
             self.total_len()

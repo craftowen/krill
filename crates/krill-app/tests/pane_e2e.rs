@@ -136,13 +136,6 @@ impl App {
     fn type_text(&mut self, s: &str) {
         assert_eq!(self.pane.input(s.as_bytes(), Now::get()), None);
     }
-
-    /// 프레임이 `quiet` 동안 오지 않을 때까지 적용한다.
-    fn settle(&mut self, quiet: Duration) {
-        while let Ok((k, b)) = self.frames.recv_timeout(quiet) {
-            self.pane.frame(k, &b).unwrap();
-        }
-    }
 }
 
 fn say(line: &str) {
@@ -205,19 +198,9 @@ fn child() {
     // 지연 히스토리: 핫 1,000행을 넘는 출력 뒤 끝까지 올라가며 모은다.
     app.type_text(&format!("printf 'L%d\\n' $(seq 1 {LINES})\r"));
     app.has_row(&format!("L{LINES}"));
-    app.settle(Duration::from_millis(300));
-    let mut tops = Vec::new();
-    loop {
-        let before = texts(&app.pane);
-        app.pane.scroll(1_000);
-        app.settle(Duration::from_millis(500));
-        let now = texts(&app.pane);
-        if now == before {
-            break;
-        }
-        tops.push(now);
-        assert!(tops.len() < 100, "scroll never ends");
-    }
+    // 응답 없는 500ms가 히스토리의 끝은 아니다. 모든 페이지를 요청해 가장 오래된 행을 기다린다.
+    app.pane.scroll(10_000);
+    app.has_row("L1");
     // 한 행씩 내려오며 새로 드러난 마지막 행만 모은다(받아 둔 행이라 요청 없음).
     // 한 화면씩 이동하면 바닥에서 이동량이 줄어 마지막 화면의 일부를 두 번 세게 된다.
     let mut all = texts(&app.pane);
