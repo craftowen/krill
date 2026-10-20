@@ -9279,10 +9279,9 @@ impl SettingsView {
         ]);
         let reset = self.confirm_button("admin-orch-reset", text::ORCH_RESET.get(), cx, |_, cx| {
             if let Some(dir) = state_dir(cx) {
-                krill_proto::orchestration::OrchestrationStore::mutate(&dir, |store| {
-                    store.reset(None);
-                    Ok(())
-                })
+                krill_proto::orchestration::OrchestrationStore::reset_via_daemon_or_disk(
+                    &dir, None,
+                )
                 .ok();
                 cx.defer(notify_external_change);
             }

@@ -1047,9 +1047,12 @@ impl Shell {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    krill_proto::orchestration::OrchestrationStore::mutate(&dir, |st| {
-                        st.reply_message(&question_id, "coordinator", answer)
-                    })
+                    krill_proto::orchestration::OrchestrationStore::reply_via_daemon_or_disk(
+                        &dir,
+                        &question_id,
+                        "coordinator",
+                        answer,
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -1084,9 +1087,13 @@ impl Shell {
             let outcome = cx
                 .background_executor()
                 .spawn(async move {
-                    krill_proto::orchestration::OrchestrationStore::mutate(&dir, move |s| {
-                        s.resolve_gate(&gate_id, decision, Some(note.to_owned()), "coordinator")
-                    })
+                    krill_proto::orchestration::OrchestrationStore::resolve_gate_via_daemon_or_disk(
+                        &dir,
+                        &gate_id,
+                        decision,
+                        Some(note.to_owned()),
+                        "coordinator",
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {

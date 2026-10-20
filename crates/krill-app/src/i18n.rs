@@ -1716,7 +1716,7 @@ catalog! {
         WORKER_RELEASE_FAILED => ("워커 해제 실패: {reason}", "Worker release failed: {reason}"),
         QUESTION_ANSWER_FAILED => ("질문 응답 실패: {reason}", "Failed to answer question: {reason}"),
         GATE_RESOLVE_FAILED => ("승인 처리 실패: {reason}", "Failed to resolve gate: {reason}"),
-        ORCH_EMPTY => ("아직 Run이 없습니다 · `krill orchestration run-create`로 만들거나 에이전트에게 /orchestration을 요청하세요", "No runs yet · Create one with `krill orchestration run-create` or ask an agent for /orchestration"),
+        ORCH_EMPTY => ("아직 Run이 없습니다 · `krill orchestration run-create`로 만들거나 에이전트에게 /krill-orchestration을 요청하세요", "No runs yet · Create one with `krill orchestration run-create` or ask an agent for /krill-orchestration"),
     }
     file_format {
         KIND_MEDIA => ("오디오·비디오 파일", "Audio or video file"),

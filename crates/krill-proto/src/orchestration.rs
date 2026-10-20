@@ -95,6 +95,7 @@ pub enum DispatchStatus {
     Stopped,
     Released,
     Abandoned,
+    Retained,
 }
 
 impl DispatchStatus {
@@ -106,6 +107,7 @@ impl DispatchStatus {
             Self::Stopped => "stopped",
             Self::Released => "released",
             Self::Abandoned => "abandoned",
+            Self::Retained => "retained",
         }
     }
 }
@@ -405,6 +407,9 @@ pub enum OrchAction {
     Reset {
         run_id: Option<String>,
     },
+    RetainWorker {
+        worker_or_dispatch: String,
+    },
 }
 
 /// `krilld` IPC 기반 멀티에이전트 오케스트레이션 응답(MK-227).
@@ -497,6 +502,116 @@ impl OrchestrationStore {
         let out = f(&mut store)?;
         store.save(state_dir)?;
         Ok(out)
+    }
+
+    /// Sends an [`OrchAction`] to the local `krilld` socket in `state_dir` if running so that
+    /// `krilld`'s `orch_signal` Condvar wakes up waiting `check --wait` / `ask --wait` callers
+    /// immediately. Returns `Ok(None)` when no local daemon socket is listening.
+    pub fn try_local_daemon_orch(
+        state_dir: &Path,
+        action: &OrchAction,
+        timeout: Duration,
+    ) -> io::Result<Option<OrchResponse>> {
+        use crate::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
+        use crate::ipc::ClientRole;
+        use crate::screen::Msg as _;
+
+        let socket = state_dir.join("run/krilld.sock");
+        let hello = crate::daemon::client_hello(ClientRole::Cli, "krill-orch");
+        let Ok(mut conn) = crate::daemon::handshake(&socket, &hello, Duration::from_secs(2)) else {
+            return Ok(None);
+        };
+        let required = FEAT_CONTROL | FEAT_CLI;
+        if conn.negotiated.features & required != required {
+            return Ok(None);
+        }
+        let io_wait = timeout.saturating_add(Duration::from_secs(5));
+        conn.stream.set_read_timeout(Some(io_wait))?;
+        conn.stream
+            .set_write_timeout(Some(Duration::from_secs(5)))?;
+        let encoded = Request::Orchestration(action.clone())
+            .encode()
+            .map_err(|e| invalid(e.to_string()))?;
+        if conn.stream.write_all(&encoded).is_err() {
+            return Ok(None);
+        }
+        let Ok(Some((kind, body))) = crate::ipc::read_frame(&mut conn.stream) else {
+            return Ok(None);
+        };
+        let reply = Reply::decode(kind, &body).map_err(|e| invalid(e.to_string()))?;
+        match reply {
+            Reply::Orchestration(OrchResponse::Error(msg)) => {
+                if msg.contains("not found") || msg.contains("no active run") {
+                    Err(not_found(msg))
+                } else {
+                    Err(invalid(msg))
+                }
+            }
+            Reply::Orchestration(resp) => Ok(Some(resp)),
+            Reply::Failed(Failure::BadRequest) => Ok(None),
+            Reply::Failed(f) => Err(io::Error::other(f.to_string())),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn reply_via_daemon_or_disk(
+        state_dir: &Path,
+        question_id: &str,
+        from: &str,
+        body: &str,
+    ) -> io::Result<OrchMessage> {
+        if let Some(OrchResponse::Message(m)) = Self::try_local_daemon_orch(
+            state_dir,
+            &OrchAction::ReplyMessage {
+                question_id: question_id.to_owned(),
+                from: from.to_owned(),
+                body: body.to_owned(),
+            },
+            Duration::from_secs(2),
+        )? {
+            return Ok(m);
+        }
+        Self::mutate(state_dir, |s| s.reply_message(question_id, from, body))
+    }
+
+    pub fn resolve_gate_via_daemon_or_disk(
+        state_dir: &Path,
+        gate_id: &str,
+        decision: &str,
+        rationale: Option<String>,
+        resolved_by: &str,
+    ) -> io::Result<DecisionGate> {
+        if let Some(OrchResponse::Gate(g)) = Self::try_local_daemon_orch(
+            state_dir,
+            &OrchAction::ResolveGate {
+                gate_id: gate_id.to_owned(),
+                decision: decision.to_owned(),
+                rationale: rationale.clone(),
+                resolved_by: resolved_by.to_owned(),
+            },
+            Duration::from_secs(2),
+        )? {
+            return Ok(g);
+        }
+        Self::mutate(state_dir, |s| {
+            s.resolve_gate(gate_id, decision, rationale, resolved_by)
+        })
+    }
+
+    pub fn reset_via_daemon_or_disk(state_dir: &Path, run_id: Option<&str>) -> io::Result<()> {
+        if let Some(OrchResponse::Reset) = Self::try_local_daemon_orch(
+            state_dir,
+            &OrchAction::Reset {
+                run_id: run_id.map(str::to_owned),
+            },
+            Duration::from_secs(2),
+        )? {
+            return Ok(());
+        }
+        Self::mutate(state_dir, |s| {
+            s.reset(run_id);
+            Ok(())
+        })
     }
 
     fn alloc_id(&mut self, prefix: &str) -> String {
@@ -1218,8 +1333,22 @@ impl OrchestrationStore {
             if gate.status == GateStatus::Resolved {
                 return Err(invalid(format!("gate '{gate_id}' is already resolved")));
             }
+            let matched_option = if gate.options.is_empty() {
+                dec.to_owned()
+            } else if let Some(opt) = gate
+                .options
+                .iter()
+                .find(|opt| opt.eq_ignore_ascii_case(dec))
+            {
+                opt.clone()
+            } else {
+                return Err(invalid(format!(
+                    "decision '{dec}' is not in gate options ({})",
+                    gate.options.join(", ")
+                )));
+            };
             gate.status = GateStatus::Resolved;
-            gate.decision = Some(dec.to_owned());
+            gate.decision = Some(matched_option);
             gate.rationale.clone_from(&rationale);
             gate.resolved_by = Some(resolved_by.trim().to_owned());
             gate.resolved_at_ms = Some(now);
@@ -1271,6 +1400,46 @@ impl OrchestrationStore {
                 disp.status = DispatchStatus::Stopped;
             }
             disp.ended_at_ms = Some(now);
+            (disp.id.clone(), disp.task_id.clone())
+        };
+        if let Some(tid) = task_id
+            && let Some(task) = self.tasks.iter_mut().find(|t| t.id == tid)
+            && task.active_dispatch_id.as_deref() == Some(disp_id.as_str())
+        {
+            task.active_dispatch_id = None;
+            if task.status == TaskStatus::Dispatched {
+                task.status = TaskStatus::Ready;
+            }
+            task.updated_at_ms = now;
+        }
+        self.reconverge_dag();
+        self.dispatches
+            .get(idx)
+            .cloned()
+            .ok_or_else(|| not_found("dispatch missing"))
+    }
+
+    /// Marks a worker dispatch as `Retained` so its live terminal session is kept open for
+    /// inspection/debugging while clearing any active task dispatch lock.
+    pub fn retain_worker(&mut self, worker_or_dispatch: &str) -> io::Result<Dispatch> {
+        let now = now_ms();
+        let Some(idx) = self
+            .dispatches
+            .iter()
+            .rposition(|d| d.id == worker_or_dispatch || d.worker_name == worker_or_dispatch)
+        else {
+            return Err(not_found(format!(
+                "worker or dispatch not found: {worker_or_dispatch}"
+            )));
+        };
+        let (disp_id, task_id) = {
+            let Some(disp) = self.dispatches.get_mut(idx) else {
+                return Err(not_found("dispatch missing"));
+            };
+            disp.status = DispatchStatus::Retained;
+            if disp.ended_at_ms.is_none() {
+                disp.ended_at_ms = Some(now);
+            }
             (disp.id.clone(), disp.task_id.clone())
         };
         if let Some(tid) = task_id
@@ -1362,9 +1531,9 @@ pub fn worker_preamble(dispatch: &Dispatch) -> String {
          Task Prompt: {prompt}\n\
          IMPORTANT: Always use the `krill orchestration` CLI via your shell/command tool to report status or ask questions; do NOT use built-in subagent tools (like `send_message`, `Task`, or `spawn_agent`).\n\
          When finished, report completion with:\n  \
-         krill orchestration send --from {worker} --to coordinator --type worker_done --run {run}{task_flag} --dispatch {disp} --summary \"<result>\"\n\
-         If blocked or need clarification:\n  \
-         krill orchestration ask --from {worker} --to coordinator --summary \"<question>\"",
+         krill orchestration send --from {worker} --to coordinator --type worker_done --run {run}{task_flag} --dispatch {disp} --outcome succeeded --summary \"<result>\"\n\
+         If blocked or need clarification (blocks until answered):\n  \
+         krill orchestration ask --from {worker} --to coordinator --run {run} --wait --summary \"<question>\"",
         run = dispatch.run_id,
         disp = dispatch.id,
         worker = dispatch.worker_name,
@@ -2145,7 +2314,7 @@ pub const BUILTIN_SKILLS: &[SkillEntry] = &[
     SkillEntry {
         name: "orchestration",
         description: "Coordinate multi-agent runs, task DAGs, worker dispatches, threaded messages, blocking ask/reply, and decision gates via `krill orchestration`.",
-        content: "---\nname: orchestration\ndescription: Coordinate multi-agent runs, task DAGs, worker dispatches, messages, ask/reply, and decision gates via krill orchestration.\n---\n\n# Krill Multi-Agent Orchestration (`krill orchestration`)\n\n> **IMPORTANT**: Always run `krill orchestration` CLI commands via your shell/command tool to dispatch workers, send/check messages, or report completion. Do NOT use built-in subagent tools (such as `send_message`, `Task`, or `spawn_agent`) for Krill orchestration.\n\n- Create a run & task DAG:\n  - `krill orchestration run-create --title \"Feature X\" --json`\n  - `krill orchestration task-create --run <run-id> --title \"Implement API\" --json`\n  - `krill orchestration task-create --run <run-id> --title \"Verify UI\" --deps <task-1> --json`\n- Dispatch a worker (`claude`, `codex`, `agy`, `cursor`, `opencode`):\n  - `krill orchestration worker-start --run <run-id> --task <task-id> --worker backend --agent claude --prompt \"Implement API\"`\n- Report completion (settles dispatch & auto-promotes dependent tasks to `ready`):\n  - `krill orchestration send --from backend --to coordinator --type worker_done --task <task-id> --summary \"API complete\"`\n- Check/wait for messages & decision gates:\n  - `krill orchestration check --to coordinator --wait --timeout-ms 5000 --ack`\n  - `krill orchestration gate-create --from backend --question \"Ship migration?\" --options \"yes,no\"`\n  - `krill orchestration gate-resolve <gate-id> --decision yes --rationale \"Reviewed\"`\n",
+        content: "---\nname: orchestration\ndescription: Coordinate multi-agent runs, task DAGs, worker dispatches, messages, ask/reply, and decision gates via krill orchestration.\n---\n\n# Krill Multi-Agent Orchestration (`krill orchestration`)\n\n> **IMPORTANT**: Always run `krill orchestration` CLI commands via your shell/command tool to dispatch workers, send/check messages, or report completion. Do NOT use built-in subagent tools (such as `send_message`, `Task`, or `spawn_agent`) for Krill orchestration.\n\n## Role Classification\n\nDetermine your role before acting:\n- **Worker**: Your startup prompt includes `[MK ORCHESTRATION PREAMBLE]` or a `Run:` / `Dispatch:` / `Worker:` header. Execute the assigned task, send progress/questions via `krill orchestration`, and finish with `worker_done`.\n- **Coordinator**: The user asked you to decompose work, supervise workers, or manage a multi-agent DAG.\n\n## Safety Floor\n\n1. Never kill, stop, or abandon sessions outside your active `run-id`.\n2. Every active dispatch must reach a terminal state (`succeeded`, `failed`, `stopped`, `retained`, `released`, or `abandoned`).\n3. Respect recursion depth limits (`--depth` / `--max-depth`, default max 3).\n\n## Canonical Coordinator Loop\n\n1. **Create & select a Run**:\n   - `krill orchestration run-create --title \"Feature X\" --json` (alias: `--objective`)\n   - `krill orchestration run-use <run-id>` / `krill orchestration run-current --json`\n   - `krill orchestration run-show [<run-id>] --json` / `krill orchestration run-list --json`\n2. **Define the Task DAG**:\n   - `krill orchestration task-create --run <run-id> --title \"Implement API\" --desc \"...\" --json` (aliases: `--spec`, `--task-title`)\n   - `krill orchestration task-create --run <run-id> --title \"Verify UI\" --deps <task-1> --json`\n   - `krill orchestration task-list --run <run-id> --json`\n   - `krill orchestration task-update <task-id> --status <ready|completed|failed|blocked> --summary \"...\" --json`\n3. **Dispatch Workers (`claude`, `codex`, `agy`, `cursor`, `opencode`)**:\n   - `krill orchestration worker-start --run <run-id> --task <task-id> --worker backend --agent claude --cwd <dir> --prompt \"Implement API\" --json`\n   - Or pass a JSON/text spec: `krill orchestration worker-start --spec '{\"worker\":\"backend\",\"agent\":\"codex\",\"prompt\":\"...\"}' --json` (or `--spec \"<prompt text>\"`), plus `--account <id>`, `--depth <N>`, `--max-depth <N>`, `--preamble <full|minimal|none>`.\n4. **Supervise, Answer Questions & Resolve Gates**:\n   - Wait for worker events (Condvar-backed in `krilld`): `krill orchestration check --to coordinator --wait --timeout-ms 5000 --ack --json`\n   - Inspect unread inbox: `krill orchestration inbox --to coordinator --json`\n   - Reply to a worker question: `krill orchestration reply <msg-id> --body \"Proceed with approach A\" --json` (or `--id <msg-id>`)\n   - Decision gates:\n     - `krill orchestration gate-create --from backend --question \"Ship migration?\" --options \"yes,no\"`\n     - `krill orchestration gate-list --pending --json`\n     - `krill orchestration gate-resolve <gate-id> --decision yes --rationale \"Reviewed\"`\n5. **Inspect & Settle Workers**:\n   - `krill orchestration worker-list --run <run-id> --json`\n   - `krill orchestration worker-show <worker-or-dispatch> --json`\n   - `krill orchestration worker-read <worker-or-dispatch> --lines 60 --json`\n   - Keep terminal open after completion: `krill orchestration worker-retain <worker-or-dispatch> --json`\n   - Archive output & close worker session: `krill orchestration worker-release <worker-or-dispatch> --json` or `krill orchestration worker-stop <worker-or-dispatch> --json`\n   - Fence dead/unresponsive worker and return task to `ready`: `krill orchestration worker-abandon <worker-or-dispatch> --json`\n\n## Worker Contract\n\n- **Ask a blocking question** (waits for coordinator's `reply`):\n  - `krill orchestration ask --from <worker> --to coordinator --run <run-id> --wait --summary \"<question>\"`\n  - If timed out, resume waiting without creating a duplicate question:\n    `krill orchestration ask --question-id <msg-id> --wait --timeout-ms 30000`\n- **Report completion** (settles dispatch & auto-promotes dependent tasks to `ready`):\n  - `krill orchestration send --from backend --to coordinator --type worker_done --run <run-id> --task <task-id> --dispatch <dispatch-id> --outcome succeeded --summary \"API complete\"`\n  - On failure, pass `--outcome failed`.\n\n## Modular Reference Docs\n\nRun `krill skills get orchestration --references` to list detailed reference guides, or `krill skills get orchestration --reference references/<name>.md` to read one.\n",
     },
     SkillEntry {
         name: "worktree-checkpoints",
@@ -2161,6 +2330,37 @@ pub const BUILTIN_SKILLS: &[SkillEntry] = &[
 
 pub fn builtin_skills() -> &'static [SkillEntry] {
     BUILTIN_SKILLS
+}
+
+pub const ORCHESTRATION_REFERENCES: &[(&str, &str)] = &[
+    (
+        "references/coordinator-loop.md",
+        "# Coordinator Loop Reference\n\n1. Create a run (`run-create --title <title>`) or select an existing run (`run-use <run-id>`).\n2. Create tasks (`task-create`) with `--deps <t1,t2>` to form a DAG. Tasks with satisfied dependencies start in `ready`.\n3. Dispatch ready tasks with `worker-start`. Use `--preamble full|minimal|none` to control injected worker instructions.\n4. Block on `check --to coordinator --wait --timeout-ms 10000 --ack` to process `worker_done`, `question`, `escalation`, and `decision_gate` messages.\n5. Inspect terminal output with `worker-read <worker-or-dispatch> --lines 60`, keep live sessions with `worker-retain`, or clean up finished workers with `worker-release`.\n",
+    ),
+    (
+        "references/worker-contract.md",
+        "# Worker Contract Reference\n\n1. Stay within the scope of your assigned task and `cwd`.\n2. Send periodic progress updates or heartbeats on long tasks: `krill orchestration send --from <worker> --to coordinator --type heartbeat --summary \"...\"`.\n3. When blocked, ask the coordinator and wait for a reply:\n   `krill orchestration ask --from <worker> --to coordinator --run <run-id> --wait --summary \"<question>\"`\n   If the wait times out, re-wait on the same question ID without creating a duplicate:\n   `krill orchestration ask --question-id <msg-id> --wait --timeout-ms 30000`\n4. When finished, always settle your dispatch with `worker_done`:\n   `krill orchestration send --from <worker> --to coordinator --type worker_done --run <run-id> --task <task-id> --dispatch <dispatch-id> --outcome succeeded --summary \"<concise 1-3 sentence summary>\"`\n",
+    ),
+    (
+        "references/messaging-and-gates.md",
+        "# Messaging, Group Addressing & Decision Gates\n\n- **Group Addressing**: `--to @all`, `@active`, `@idle`, `@claude`, `@codex`, `@agy`, `@cursor`, `@opencode`.\n- **Blocking Check**: `krill orchestration check --to <recipient> --wait --timeout-ms <ms> [--unread] [--ack]`.\n- **Inbox**: `krill orchestration inbox [--to <recipient>] [--json]` lists unacknowledged messages.\n- **Decision Gates**: Create with `gate-create --from <worker> --question \"...\" --options \"approve,reject\"`. Resolve with `gate-resolve <gate-id> --decision approve --rationale \"...\"` (decision must match one of the gate's configured options).\n",
+    ),
+    (
+        "references/recovery-and-cleanup.md",
+        "# Recovery, Fencing & Cleanup\n\n- **Dead / Unresponsive Worker**: Run `krill orchestration worker-abandon <worker-or-dispatch>` to fence the stale dispatch (`abandoned`), close its session if still present, and return the bound task to `ready` so a replacement worker can be started. Late `worker_done` messages from abandoned dispatches are rejected.\n- **Retaining vs Releasing**: Use `worker-retain <worker-or-dispatch>` to keep a worker's terminal open for debugging, or `worker-release <worker-or-dispatch>` to archive its terminal output and close the session.\n",
+    ),
+    (
+        "references/placement-and-remote.md",
+        "# Worktree Placement & Remote Host Orchestration\n\n- **Worktree Isolation**: Create isolated worktrees via `krill worktree new <name> --parent <base-path>` and pass `--cwd <worktree-path>` to `worker-start`.\n- **Remote Orchestration**: Prefix commands with `krill --host <user@host> orchestration ...`. Remote `worker-start` requires an explicit `--cwd <remote-abs-path>`.\n",
+    ),
+];
+
+#[must_use]
+pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
+    match name.trim().trim_start_matches("krill-") {
+        "orchestration" => ORCHESTRATION_REFERENCES,
+        _ => &[],
+    }
 }
 
 /// Orca도 같은 이름으로 설치하는 스킬. 맨 이름 자리에 Krill 사본이 있으면 Orca가
@@ -3378,6 +3578,71 @@ mod tests {
         store.remove_worktree_lineage("/repo/c");
         assert_eq!(store.checkpoint("/repo/a").parent, None);
         assert_eq!(store.checkpoint("/repo/c").parent, None);
+        Ok(())
+    }
+
+    #[test]
+    fn gate_options_retain_worker_preamble_and_skill_references_work() -> io::Result<()> {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("Gate & Retain", None)?;
+        let task = store.create_task(&run.id, "Step", "", Vec::new())?;
+        let disp = store.start_worker(
+            &run.id,
+            Some(&task.id),
+            "w-ret",
+            "codex",
+            Some(42),
+            "/tmp",
+            "Check preamble",
+        )?;
+        let preamble = worker_preamble(&disp);
+        assert!(preamble.contains("--wait"), "{preamble}");
+        assert!(preamble.contains("--outcome succeeded"), "{preamble}");
+
+        let retained = store.retain_worker(&disp.id)?;
+        assert_eq!(retained.status, DispatchStatus::Retained);
+        let updated_task = store
+            .tasks
+            .iter()
+            .find(|t| t.id == task.id)
+            .ok_or_else(|| not_found("task"))?;
+        assert_eq!(updated_task.active_dispatch_id, None);
+        assert_eq!(updated_task.status, TaskStatus::Ready);
+
+        let gate = store.create_gate(
+            "w-ret",
+            "Deploy?",
+            vec!["approve".to_owned(), "reject".to_owned()],
+            Some(run.id),
+            Some(task.id),
+        )?;
+        let bad = store
+            .resolve_gate(&gate.id, "maybe", None, "coordinator")
+            .err()
+            .ok_or_else(|| invalid("expected invalid gate option error"))?;
+        assert!(bad.to_string().contains("not in gate options"), "{bad}");
+        let ok = store.resolve_gate(&gate.id, "APPROVE", None, "coordinator")?;
+        assert_eq!(ok.decision.as_deref(), Some("approve"));
+
+        let refs = skill_references("orchestration");
+        assert!(!refs.is_empty());
+        assert_eq!(skill_references("krill-orchestration").len(), refs.len());
+        let orch_skill = BUILTIN_SKILLS
+            .iter()
+            .find(|s| s.name == "orchestration")
+            .ok_or_else(|| not_found("orchestration skill"))?;
+        for term in [
+            "run-use",
+            "run-current",
+            "worker-retain",
+            "worker-release",
+            "worker-abandon",
+            "--question-id",
+            "--wait",
+            "--outcome succeeded",
+        ] {
+            assert!(orch_skill.content.contains(term), "missing {term}");
+        }
         Ok(())
     }
 }
