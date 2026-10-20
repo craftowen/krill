@@ -7311,9 +7311,8 @@ fn file_tab_context_menu_copies_paths(cx: &mut TestAppContext) {
     std::fs::write(&file, "hi\n").unwrap();
 
     let (view, cx) = open(cx, state_path("file-tab-menu"));
-    view.update(cx, |s, cx| s.open_file(file.clone(), cx));
-    cx.run_until_parked();
-    // 작업 폴더를 파일이 있는 폴더로 두면 상대 경로는 파일 이름이 된다.
+    // 파일을 열기 전에 작업 폴더를 정해 두 탭이 같은 워크스페이스에 속하게 한다.
+    // 상대 경로는 파일 이름이 되고 메뉴를 다시 열 때도 탭 위치가 유지된다.
     view.update(cx, |s, _| {
         let pane = s.layout.active_tab().focused;
         s.layout.set_launch(
@@ -7327,6 +7326,9 @@ fn file_tab_context_menu_copies_paths(cx: &mut TestAppContext) {
             },
         );
     });
+    view.update(cx, |s, cx| s.open_file(file.clone(), cx));
+    cx.run_until_parked();
+    view.update(cx, |s, cx| assert_eq!(s.workspace_tabs(cx), vec![0, 1]));
     let l = layout_of(&view, cx);
     assert_eq!(l.tabs().len(), 2);
     let idx = l
