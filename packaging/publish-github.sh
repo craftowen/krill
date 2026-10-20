@@ -366,9 +366,17 @@ if [[ -n "${KRILL_WIN_VM_DIR:-}" ]]; then
     --output "$OUT_DIR/latest-windows.json"
   cp packaging/windows/install.ps1 "$OUT_DIR/install.ps1"
 fi
-WINDOWS_ASSETS=("$OUT_DIR"/Krill-"${VERSION}"-windows-x64.zip "$OUT_DIR"/Krill-"${VERSION}"-windows-x64.zip.sha256)
-if [[ "${#WINDOWS_ASSETS[@]}" -gt 0 ]]; then
-  WINDOWS_ASSETS+=("$OUT_DIR/latest-windows.json" "$OUT_DIR/install.ps1")
+WINDOWS_ASSETS=()
+if [[ -f "$OUT_DIR/Krill-${VERSION}-windows-x64.zip" ]]; then
+  WINDOWS_ASSETS=(
+    "$OUT_DIR/Krill-${VERSION}-windows-x64.zip"
+    "$OUT_DIR/Krill-${VERSION}-windows-x64.zip.sha256"
+    "$OUT_DIR/latest-windows.json"
+    "$OUT_DIR/install.ps1"
+  )
+  for asset in "${WINDOWS_ASSETS[@]}"; do
+    [[ -f "$asset" ]] || { echo "missing Windows release asset: $asset" >&2; exit 1; }
+  done
 else
   echo "warning: no Windows zip (set KRILL_WIN_VM_DIR to build it)" >&2
 fi
