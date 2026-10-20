@@ -36,6 +36,7 @@ mod ipc;
 pub mod lineage;
 pub mod options;
 mod pr;
+mod project_icon;
 mod view;
 
 pub use lineage::{MAX_LINEAGE_DEPTH, can_assign_parent};
@@ -586,6 +587,8 @@ pub struct Sidebar {
     selected_worktree: Option<PathBuf>,
     /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
     removed_projects: BTreeSet<PathBuf>,
+    /// 로컬 프로젝트 헤더 아이콘·배지 색(Orca `RepoIcon`). `projects.toml`을 다시 읽을 때 갱신한다.
+    project_visuals: BTreeMap<PathBuf, project_icon::ProjectVisual>,
     /// 워크트리 삭제 확인 모달 상태(OWE-847). `Some`일 때 모달을 띄운다.
     delete_confirm: Option<DeleteConfirm>,
     path: Option<PathBuf>,
@@ -739,6 +742,7 @@ impl Sidebar {
             expanded_cards: ui.expanded_cards,
             selected_worktree: ui.selected_worktree,
             removed_projects: ui.removed_projects,
+            project_visuals: BTreeMap::new(),
             delete_confirm: None,
             path: path.filter(|_| writable),
             error,
@@ -907,10 +911,44 @@ impl Sidebar {
             &mut self.issues,
             &mut self.worktree_statuses,
         );
+        self.sync_project_visuals(&dir);
         (
             self.snapshot.trees != prev_trees || !self.snapshot.trees.is_empty(),
             auto_changed,
         )
+    }
+
+    /// 저장소(트리 키)와 워크트리 밖 세션 폴더의 헤더 아이콘·배지 색을 다시 계산한다.
+    fn sync_project_visuals(&mut self, state_dir: &Path) {
+        let repos: Vec<PathBuf> = self.snapshot.trees.keys().cloned().collect();
+        let mut folders: Vec<PathBuf> = Vec::new();
+        for s in &self.snapshot.sessions {
+            if s.worktree.is_none()
+                && let Some(cwd) = &s.cwd
+                && !self.snapshot.trees.contains_key(cwd)
+                && !folders.contains(cwd)
+            {
+                folders.push(cwd.clone());
+            }
+        }
+        self.project_visuals = project_icon::resolve(state_dir, &repos, &folders);
+    }
+
+    /// 로컬 프로젝트 헤더 아이콘. 원격 호스트 행은 항상 `None`(기본 폴더 아이콘).
+    pub(super) fn project_icon(
+        &self,
+        host: &HostId,
+        path: &Path,
+    ) -> Option<&crate::ui::icons::ProjectIcon> {
+        host.is_local()
+            .then(|| self.project_visuals.get(path)?.icon.as_ref())
+            .flatten()
+    }
+
+    pub(super) fn project_badge_color(&self, host: &HostId, path: &Path) -> Option<&str> {
+        host.is_local()
+            .then(|| self.project_visuals.get(path)?.badge_color.as_deref())
+            .flatten()
     }
 
     /// OWE-898: 라이브 워크트리 집합에 없는 파생 상태(상태·갱신시각·이슈·포트·호스트 라벨·자동/CLI 표시)를
@@ -1804,11 +1842,16 @@ impl Sidebar {
                         self.rebuild(cx);
                     }
                 } else {
+                    // 백그라운드로 받은 원격 프로젝트 아이콘이 캐시에 들어오면 헤더를 다시 그린다.
+                    let icons_fetched = project_icon::take_fetched();
+                    if icons_fetched {
+                        self.sync_imported_projects_from_disk();
+                    }
                     let now_ns = self.now_unix_ns();
                     let next_tick = self
                         .has_active_cache_timer(now_ns, cx)
                         .then_some(now_ns / 1_000_000_000);
-                    if self.last_cache_tick_sec != next_tick {
+                    if icons_fetched || self.last_cache_tick_sec != next_tick {
                         self.last_cache_tick_sec = next_tick;
                         cx.notify();
                     }
