@@ -29,6 +29,21 @@ use std::sync::{Arc, Mutex, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+/// `create_terminal`이 받는 에이전트 프로필(`registry` create와 같은 출처) id·이름, 표준 순서. 설정을 못 읽으면 빈 목록.
+/// 미설치 CLI도 싣는다 — 띄우면 로그인 셸 preflight가 설치 안내를 보여 준다.
+fn agents_json(dir: Option<&Path>) -> Value {
+    let mut agents: Vec<_> = crate::agent::control::Control::new(dir)
+        .agents()
+        .map(|a| a.profiles.into_iter().collect())
+        .unwrap_or_default();
+    agents.sort_by(|(a, _), (b, _)| {
+        (krill_proto::agent::profile_rank(a), a).cmp(&(krill_proto::agent::profile_rank(b), b))
+    });
+    agents
+        .into_iter()
+        .map(|(id, p)| json!({"id":id,"name":p.name}))
+        .collect()
+}
 pub(super) struct Backend {
     registry: Weak<Registry>,
     dir: Option<PathBuf>,
@@ -533,7 +548,7 @@ impl Backend {
             json!({"sessions":cards,"orchestration":self.orchestration()?,
             "repositories":repositories_json(&sidebar.repositories),"truncated":truncated,
             "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"hybrid_chat":true},
-            "host":self.host}),
+            "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
     }
     fn orchestration(&self) -> io::Result<Value> {
@@ -1155,6 +1170,39 @@ mod tests {
         assert!(first.repo_key.is_none());
         assert!(first.path.is_none());
         assert!(first.label.is_none());
+    }
+
+    #[test]
+    fn snapshot_agents_follow_registry_profiles_in_standard_order() {
+        let ids = |v: Value| -> Vec<String> {
+            v.as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|a| a["id"].as_str().map(str::to_owned))
+                .collect()
+        };
+        let builtin = agents_json(None);
+        assert_eq!(builtin[0], json!({"id":"claude","name":"Claude Code"}));
+        assert_eq!(
+            ids(builtin),
+            ["claude", "codex", "agy", "cursor", "opencode"]
+        );
+        let dir = std::env::temp_dir().join(format!("mk-pwa-agents-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join(krill_proto::agent::FILE_NAME),
+            "[agent.my-bot]\nname = \"My Bot\"\nlaunch = [\"my-bot\"]\n",
+        )
+        .unwrap();
+        let user = agents_json(Some(&dir));
+        assert_eq!(
+            user.as_array().unwrap().last(),
+            Some(&json!({"id":"my-bot","name":"My Bot"}))
+        );
+        fs::write(dir.join(krill_proto::agent::FILE_NAME), "not toml [").unwrap();
+        assert_eq!(agents_json(Some(&dir)), json!([]));
+        fs::remove_dir_all(&dir).ok();
     }
 
     fn test_backend() -> Backend {

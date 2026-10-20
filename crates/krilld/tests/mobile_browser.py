@@ -109,6 +109,7 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 assert len(uploads)==1 and stat.S_IMODE(uploads[0].stat().st_mode)==0o600
                 original_route=evaluate('location.hash.slice(1)')
                 browser('find','role','button','click','--name','Create Tab','--exact')
+                browser('find','role','button','click','--name','Terminal','--exact')
                 wait('KrillMobile.store.sessions.size===6')
                 wait(f'location.hash!=="#{original_route}"')
                 created=evaluate('Number(location.hash.split("/").at(-1))')
