@@ -1561,7 +1561,7 @@ impl Indexer {
                 .unwrap_or("");
 
             if cwd.is_empty()
-                && let Some(extracted_cwd) = extract_agy_workspace_from_text(content)
+                && let Some(extracted_cwd) = extract_agy_workspace_from_record(&v)
             {
                 cwd = extracted_cwd;
             }
@@ -2045,6 +2045,44 @@ fn extract_agy_workspace_from_text(content: &str) -> Option<String> {
             let p = rest.trim();
             if p.starts_with('/') {
                 return Some(p.to_owned());
+            }
+        }
+    }
+    None
+}
+
+pub(super) fn extract_agy_workspace_from_record(v: &Value) -> Option<String> {
+    if let Some(c) = v
+        .get("cwd")
+        .or_else(|| v.get("workspace"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().trim_matches('"'))
+        && c.starts_with('/')
+    {
+        return Some(c.to_owned());
+    }
+    let content = v
+        .get("content")
+        .or_else(|| v.get("text"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if let Some(cwd) = extract_agy_workspace_from_text(content) {
+        return Some(cwd);
+    }
+    if let Some(calls) = v.get("tool_calls").and_then(Value::as_array) {
+        for call in calls {
+            let Some(args) = call.get("args").or_else(|| call.get("arguments")) else {
+                continue;
+            };
+            for key in ["Cwd", "cwd", "SearchDirectory", "DirectoryPath"] {
+                if let Some(val) = args
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .map(|s| s.trim().trim_matches('"'))
+                    && val.starts_with('/')
+                {
+                    return Some(val.to_owned());
+                }
             }
         }
     }
