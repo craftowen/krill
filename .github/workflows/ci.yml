@@ -32,6 +32,12 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: PTY 테스트 의존성 (zsh)
+        # 로그인 rc·에이전트 실행·전경 프로세스 테스트가 /bin/zsh를 실제로 띄운다.
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y zsh
+
       - name: Rust 1.98 + clippy
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
