@@ -80,8 +80,10 @@ impl Shell {
         prefer: usize,
         cx: &mut Context<Self>,
     ) {
+        let tabs = self.workspace_tabs(cx);
         let remaining = std::iter::once(prefer)
-            .chain(self.workspace_tabs(cx))
+            .chain(tabs.iter().copied().filter(|&i| i > prefer))
+            .chain(tabs.iter().rev().copied().filter(|&i| i < prefer))
             .find(|i| !closing.contains(i))
             .and_then(|i| self.layout.tabs().get(i))
             .map(|t| t.focused);
