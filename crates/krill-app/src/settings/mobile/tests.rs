@@ -62,7 +62,7 @@ fn device_line_avoids_paired_duplication_and_handles_never_seen() {
 fn obsolete_pairing_result_cannot_replace_selection_or_finish_current_job() {
     let mut panel = Panel {
         generation: 2,
-        mode: ConnectMode::Lan,
+        mode: ConnectMode::Tailscale,
         pairing: PairingState::Connecting,
         ..Panel::default()
     };
@@ -74,7 +74,7 @@ fn obsolete_pairing_result_cannot_replace_selection_or_finish_current_job() {
         host: "127.0.0.1".into(),
         port: 1234,
         expires_at_ms: u64::MAX,
-        mode: ConnectMode::Lan,
+        mode: ConnectMode::Tailscale,
         interfaces: Vec::new(),
     };
     assert!(panel.complete(2, Ok(reply.clone())));
@@ -94,6 +94,6 @@ fn obsolete_pairing_result_cannot_replace_selection_or_finish_current_job() {
         devices: Vec::new(),
     };
     assert!(!panel.complete(1, Ok(old)));
-    assert_eq!(panel.mode, ConnectMode::Lan);
+    assert_eq!(panel.mode, ConnectMode::Tailscale);
     assert!(panel.offer.is_some());
 }

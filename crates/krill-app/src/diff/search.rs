@@ -12,7 +12,6 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
-use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -979,13 +978,9 @@ pub(crate) fn search_with_rg_limits(
     let cap = u64::try_from(max_stdout_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.take(cap).read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
-
     let deadline = Instant::now() + timeout;
+    let reader = crate::process_io::read(stdout, cap, deadline)
+        .map_err(|error| RgError::Execution(error.to_string()))?;
     let mut exit_code = None;
     let mut timed_out = false;
     loop {
@@ -1007,10 +1002,11 @@ pub(crate) fn search_with_rg_limits(
     child.0.kill().ok();
     child.0.wait().ok();
 
-    let mut output = reader
-        .join()
-        .map_err(|_| RgError::Execution("rg reader thread panicked".to_owned()))?
-        .map_err(|e| RgError::Execution(e.to_string()))?;
+    let captured = reader
+        .finish(deadline + Duration::from_millis(50))
+        .map_err(|error| RgError::Execution(error.to_string()))?;
+    timed_out |= captured.timed_out;
+    let mut output = captured.bytes;
 
     if exit_code == Some(2) && output.is_empty() && !timed_out {
         return Err(RgError::Execution("invalid search pattern".to_owned()));
@@ -1348,26 +1344,21 @@ pub(crate) fn query_git_ignored_set_with_limits(
     let Some(stdout) = child.0.stdout.take() else {
         return BTreeSet::new();
     };
-    let writer = child.0.stdin.take().map(|mut stdin| {
+    let deadline = Instant::now() + timeout;
+    let writer = child.0.stdin.take().and_then(|stdin| {
         let mut payload = Vec::new();
         for rel in relative_paths {
             payload.extend_from_slice(rel.as_bytes());
             payload.push(0);
         }
-        std::thread::spawn(move || {
-            stdin.write_all(&payload).ok();
-        })
+        crate::process_io::write(stdin, payload, deadline).ok()
     });
     let cap = u64::try_from(max_stdout_bytes)
         .unwrap_or(u64::MAX)
         .saturating_add(1);
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout.take(cap).read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
-
-    let deadline = Instant::now() + timeout;
+    let Ok(reader) = crate::process_io::read(stdout, cap, deadline) else {
+        return BTreeSet::new();
+    };
     loop {
         match child.0.try_wait() {
             Ok(Some(_)) => break,
@@ -1382,11 +1373,12 @@ pub(crate) fn query_git_ignored_set_with_limits(
     child.0.kill().ok();
     child.0.wait().ok();
     if let Some(w) = writer {
-        w.join().ok();
+        w.finish(deadline + Duration::from_millis(50)).ok();
     }
-    let Ok(Ok(mut stdout_bytes)) = reader.join() else {
+    let Ok(captured) = reader.finish(deadline + Duration::from_millis(50)) else {
         return BTreeSet::new();
     };
+    let mut stdout_bytes = captured.bytes;
     if stdout_bytes.len() > max_stdout_bytes {
         stdout_bytes.truncate(max_stdout_bytes);
         let valid_len = stdout_bytes

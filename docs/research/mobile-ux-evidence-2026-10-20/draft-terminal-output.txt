@@ -1,0 +1,4 @@
+READY
+got:모바일 확인
+got:first verify
+got:first message

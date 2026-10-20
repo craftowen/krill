@@ -1,8 +1,8 @@
 //! macOS 구현: `AppKit`·`IOKit`·`Carbon` 직접 호출(CONVENTIONS U1: mk-app의 objc2·FFI 구역).
 
+use std::cell::RefCell;
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr::{self, NonNull};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui::{AnyWindowHandle, App, AppContext as _, Window};
@@ -14,7 +14,9 @@ const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
 const K_IOPM_ASSERTION_LEVEL_ON: u32 = 255;
 const PREVENT_USER_IDLE_SYSTEM_SLEEP: &str = "PreventUserIdleSystemSleep";
 
-static DOCK_BADGE: Mutex<Option<String>> = Mutex::new(None);
+thread_local! {
+    static DOCK_BADGE: RefCell<Option<String>> = const { RefCell::new(None) };
+}
 
 /// 이 프로세스가 `EnableSecureEventInput`을 켠 상태인지 기록한다(MK-076).
 /// Carbon 내부 카운터가 중첩되므로 상태가 바뀔 때만 FFI를 부른다.
@@ -107,11 +109,15 @@ fn play_bundled_sound(name: &str) -> bool {
 /// 빈 문자열이나 `None`이면 배지를 지운다. 같은 값이면 `AppKit` 호출을 생략한다.
 pub fn set_dock_badge(label: Option<&str>) {
     let next = label.filter(|s| !s.is_empty()).map(str::to_owned);
-    if let Ok(mut guard) = DOCK_BADGE.lock() {
-        if *guard == next {
-            return;
+    let changed = DOCK_BADGE.with_borrow_mut(|badge| {
+        if *badge == next {
+            return false;
         }
-        guard.clone_from(&next);
+        badge.clone_from(&next);
+        true
+    });
+    if !changed {
+        return;
     }
     // SAFETY: `NSApp`은 AppKit이 내보내는 전역 포인터다. 앱이 초기화된 경우에만 `dockTile`을 갱신한다.
     let app = unsafe { NSApp };
@@ -122,7 +128,7 @@ pub fn set_dock_badge(label: Option<&str>) {
 
 /// 마지막으로 설정한 Dock 배지 문자열(테스트·상태 확인용).
 pub fn dock_badge() -> Option<String> {
-    DOCK_BADGE.lock().ok().and_then(|g| g.clone())
+    DOCK_BADGE.with_borrow(Clone::clone)
 }
 
 /// `NSApplication`의 `NSDockTile`에 배지를 직접 설정하고 `badgeLabel`을 다시 읽어 돌려준다.

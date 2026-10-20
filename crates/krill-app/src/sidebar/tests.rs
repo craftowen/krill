@@ -40,7 +40,7 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
         )
     };
     manager.sync_external_hosts(vec![registration(false)]);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     view.update(vcx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
@@ -140,7 +140,7 @@ fn virtualized_500_rows_scroll_and_idle(cx: &mut TestAppContext) {
         }
     }
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let fixture = fixture();
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
@@ -194,7 +194,7 @@ fn rename_pins_persist_and_selection_emits(cx: &mut TestAppContext) {
     let path = std::env::temp_dir().join(format!("mk-sidebar-{}-prefs.bin", std::process::id()));
     fs::remove_file(&path).ok();
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path.clone())));
     cx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.prefs.entry("/repo/a".into()).or_default().pinned = true;
@@ -206,7 +206,7 @@ fn rename_pins_persist_and_selection_emits(cx: &mut TestAppContext) {
     cx.simulate_input("한글 🦐");
     cx.simulate_keystrokes("enter");
     cx.run_until_parked();
-    let restored = Sidebar::new(Some(path.clone()));
+    let restored = Sidebar::new_loaded(Some(path.clone()));
     assert_eq!(restored.name(Path::new("/repo/a")), "한글 🦐");
     assert!(restored.prefs[Path::new("/repo/a")].pinned);
     let selected = Rc::new(Cell::new(None));
@@ -230,7 +230,7 @@ fn a11y(element: &impl gpui::Element) -> (Option<gpui::Role>, gpui::accesskit::N
 fn rows_expose_voiceover_names_roles_and_press(cx: &mut TestAppContext) {
     use gpui::accesskit::Action;
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let mut waiting = session(2, AgentState::Waiting, Some("/repo/a"));
     waiting.status.agent = "claude".into();
     let snapshot = Snapshot {
@@ -281,7 +281,7 @@ fn rows_expose_voiceover_names_roles_and_press(cx: &mut TestAppContext) {
 #[gpui::test]
 fn session_list_is_a_named_list(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let (role, node) = cx.update(|_, cx| view.update(cx, |s, cx| a11y(&s.render_list(cx))));
     assert_eq!(role, Some(gpui::Role::List));
     assert_eq!(node.label(), Some(text::PROJECTS.get()));
@@ -295,7 +295,7 @@ fn worktree_comments_display_and_expose_voiceover(cx: &mut TestAppContext) {
         .expect("save worktree comment");
     let sidebar_file = dir.join("sidebar.bin");
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_file)));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_file)));
     let snapshot = Snapshot {
         sessions: Vec::new(),
         trees: BTreeMap::from([(PathBuf::from("/repo"), vec![PathBuf::from("/repo/a")])]),
@@ -378,7 +378,7 @@ fn claude_worktrees_hidden_card_and_toggle(cx: &mut TestAppContext) {
     let claude_wt2 = std::fs::canonicalize(&claude_wt2).unwrap_or(claude_wt2);
 
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let mut snapshot = Snapshot {
         sessions: Vec::new(),
         trees: BTreeMap::from([(repo.clone(), vec![repo.clone()])]),
@@ -485,7 +485,7 @@ fn branch_follows_git_dir_and_worktree_links() {
 #[gpui::test]
 fn worktree_rows_summarize_sessions_and_branch(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let mut a = session(1, AgentState::Working, Some("/repo/a"));
@@ -534,7 +534,7 @@ fn keyboard_navigation_selects_folds_and_returns_focus(cx: &mut TestAppContext) 
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let back = cx.update(|_, cx| cx.focus_handle());
     let selected = Rc::new(Cell::new(None));
     let got = selected.clone();
@@ -619,7 +619,7 @@ fn worktree_enter_and_keyboard_actions_launch_session_pin_rename_and_open_in(
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let back = cx.update(|_, cx| cx.focus_handle());
     let launched: Rc<RefCell<Vec<NewSession>>> = Rc::new(RefCell::new(Vec::new()));
     let got = launched.clone();
@@ -717,7 +717,7 @@ fn worktree_hover_plus_button_launches_login_session(cx: &mut TestAppContext) {
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let launched: Rc<RefCell<Vec<NewSession>>> = Rc::new(RefCell::new(Vec::new()));
     let got = launched.clone();
     let _sub = cx.update(|_, cx| {
@@ -841,7 +841,7 @@ fn sidebar_stops_polling_and_hides_git_watch_when_hidden_or_inactive(cx: &mut Te
             trees: BTreeMap::from([(PathBuf::from("/repo"), vec![PathBuf::from("/repo/wt")])]),
         }),
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.connect_source(source.clone(), cx);
@@ -972,7 +972,7 @@ fn corrupt_and_unreadable_sidebar_prefs_preserve_original_and_prevent_overwrite(
     // 2. 손상 파일(버전 바이트 없음/깨진 바이트)과 미래 버전 파일은 `.corrupt`로 보존한다.
     fs::write(&path, b"broken-without-version").unwrap();
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path.clone())));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             assert!(s.error.is_some(), "corrupt sidebar.bin must surface error");
@@ -985,6 +985,7 @@ fn corrupt_and_unreadable_sidebar_prefs_preserve_original_and_prevent_overwrite(
             s.toggle_pin("/repo/a".into(), cx);
         });
     });
+    cx.run_until_parked();
     assert_eq!(
         fs::read(path.with_extension("corrupt")).unwrap(),
         b"broken-without-version"
@@ -1008,7 +1009,7 @@ fn corrupt_and_unreadable_sidebar_prefs_preserve_original_and_prevent_overwrite(
     fs::create_dir_all(&unreadable).unwrap();
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
-            *s = Sidebar::new(Some(unreadable.clone()));
+            *s = Sidebar::new_loaded(Some(unreadable.clone()));
             assert!(s.error.is_some());
             assert!(
                 s.path.is_none(),
@@ -1026,7 +1027,7 @@ fn corrupt_and_unreadable_sidebar_prefs_preserve_original_and_prevent_overwrite(
 #[test]
 fn jump_items_fall_back_to_worktree_and_session_names() {
     use krill_proto::control::{AgentState, AgentStatus};
-    let mut sidebar = Sidebar::new(None);
+    let mut sidebar = Sidebar::new_loaded(None);
     let session = |id: u64, agent: &str, state: AgentState, worktree: Option<&str>| Session {
         id: SessionId(id),
         status: AgentStatus {
@@ -1075,7 +1076,7 @@ fn pr_badge_renders_and_missing_cli_hides_it_without_external_io(cx: &mut TestAp
     use crate::pull_request::Status;
     use gpui::{Modifiers, MouseButton};
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let path = PathBuf::from("/repo/feature");
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
@@ -1248,7 +1249,7 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
 #[gpui::test]
 fn failed_snapshot_releases_agent_sleep_assertion_and_badge(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let sidebar = cx.new(|_| Sidebar::new(None));
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
     sidebar.update(cx, |sidebar, cx| {
         sidebar.apply(
             Ok((
@@ -1294,7 +1295,7 @@ fn header_empty_and_dirty_badge_match_orca(cx: &mut TestAppContext) {
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.run_until_parked();
 
     let header = cx.debug_bounds("sidebar-header").expect("sidebar header");
@@ -1418,7 +1419,7 @@ fn empty_state_offers_open_folder_button(cx: &mut TestAppContext) {
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let opened = Rc::new(Cell::new(0));
     let got = opened.clone();
     let _sub =
@@ -1490,7 +1491,7 @@ fn unread_turns_on_for_unfocused_transitions() {
 #[gpui::test]
 fn unread_clears_when_session_is_focused(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let snap = |state| Snapshot {
         sessions: vec![session(1, state, Some("/repo/a"))],
         ..Snapshot::default()
@@ -1614,7 +1615,7 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let activated: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
     let reconnected: Rc<RefCell<Vec<HostId>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -1841,9 +1842,137 @@ fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_r
 }
 
 #[gpui::test]
+fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppContext) {
+    use gpui::Modifiers;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![
+                    session(1, AgentState::Working, Some("/repo/a")),
+                    session(2, AgentState::Done, Some("/repo/a")),
+                ],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
+            };
+            s.rebuild(cx);
+        });
+    });
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    let out = selected.clone();
+    let _sub = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &Selected, _| {
+            out.borrow_mut().push(event.0);
+        })
+    });
+
+    for layout in [CardLayout::Detailed, CardLayout::Compact] {
+        cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(layout, cx)));
+        cx.run_until_parked();
+        let collapsed = cx.debug_bounds("worktree-card-1").unwrap();
+        assert!(cx.debug_bounds("sidebar-session-2").is_none());
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| s.toggle_card_sessions(Path::new("/repo/a"), cx));
+        });
+        cx.run_until_parked();
+        let card = cx.debug_bounds("worktree-card-1").unwrap();
+        assert!(card.size.height > collapsed.size.height);
+        for selector in ["sidebar-session-2", "sidebar-session-3"] {
+            let row = cx.debug_bounds(selector).expect("expanded session renders");
+            assert!(
+                card.contains(&row.origin) && card.contains(&row.bottom_right()),
+                "{layout:?}: {selector} must be enclosed by the worktree card: {card:?}, {row:?}"
+            );
+        }
+        let second = cx.debug_bounds("sidebar-session-3").unwrap();
+        selected.borrow_mut().clear();
+        cx.simulate_click(second.center(), Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            selected.borrow().as_slice(),
+            &[SessionId(2)],
+            "nested click must select exactly that session without activating the parent card"
+        );
+        assert_eq!(cx.update(|_, cx| view.read(cx).cursor), Some(3));
+        selected.borrow_mut().clear();
+        let press = gpui::point(second.origin.x + gpui::px(16.), second.center().y);
+        cx.simulate_mouse_down(press, gpui::MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(press, gpui::MouseButton::Right, Modifiers::default());
+        cx.run_until_parked();
+        let first_item = gpui::point(press.x + gpui::px(30.), press.y + gpui::px(17.));
+        cx.simulate_mouse_move(first_item, None, Modifiers::default());
+        cx.simulate_click(first_item, Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            selected.borrow().as_slice(),
+            &[SessionId(2)],
+            "right-click must open the nested session menu and its first action must open that session"
+        );
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| s.toggle_card_sessions(Path::new("/repo/a"), cx));
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("sidebar-session-2").is_none());
+        assert!(cx.debug_bounds("sidebar-session-3").is_none());
+        assert_eq!(
+            cx.debug_bounds("worktree-card-1").unwrap().size.height,
+            collapsed.size.height
+        );
+    }
+}
+
+#[gpui::test]
+fn virtualized_worktree_sessions_share_card_edges(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let first = session(1, AgentState::Working, Some("/repo/a"));
+            let second = session(2, AgentState::Done, Some("/repo/a"));
+            s.snapshot = Snapshot {
+                sessions: vec![first.clone(), second.clone()],
+                trees: BTreeMap::from([(PathBuf::from("/repo"), vec!["/repo/a".into()])]),
+            };
+            s.rows = vec![
+                Row::Worktree("/repo/a".into()),
+                Row::Session(first, true),
+                Row::Session(second, true),
+            ];
+            s.rows.extend(
+                (0..VIRTUALIZED_ROWS).map(|i| Row::Repository(format!("/extra/{i}").into())),
+            );
+            s.expanded_cards.insert("/repo/a".into());
+            s.cursor = Some(0);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let header = cx.debug_bounds("worktree-card-0").unwrap();
+    let first = cx.debug_bounds("sidebar-session-1").unwrap();
+    let second = cx.debug_bounds("sidebar-session-2").unwrap();
+    for segment in [first, second] {
+        assert_eq!(segment.origin.x, header.origin.x);
+        assert_eq!(segment.size.width, header.size.width);
+    }
+    assert_eq!(
+        header.bottom_left().y,
+        first.origin.y,
+        "header border must continue into the session list without a gap"
+    );
+    assert_eq!(
+        first.bottom_left().y,
+        second.origin.y,
+        "session borders must continue without a gap"
+    );
+}
+
+#[gpui::test]
 fn orca_card_expansion_agent_counts_and_reveal_focused(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let mut s1 = session(1, AgentState::Working, Some("/repo/a"));
@@ -1952,7 +2081,7 @@ fn apply_never_discovers_worktrees_on_ui_thread(cx: &mut TestAppContext) {
         trees: BTreeMap::from([(repo.clone(), vec![repo])]),
         ..Snapshot::default()
     };
-    let sidebar = cx.new(|_| Sidebar::new(None));
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
     sidebar.update(cx, |s, cx| {
         s.apply(Ok((snapshot.clone(), Meta::new())), BTreeMap::new(), cx);
         assert_eq!(
@@ -1968,11 +2097,14 @@ fn apply_never_discovers_worktrees_on_ui_thread(cx: &mut TestAppContext) {
 fn snapshot_poll_preserves_preference_failure(cx: &mut TestAppContext) {
     let dir = std::env::temp_dir().join(format!("mk-cross-{}-save", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let sidebar = cx.new(|_| Sidebar::new(None));
+    let sidebar = cx.new(|_| Sidebar::new_loaded(None));
     sidebar.update(cx, |s, cx| {
         // 파일 자리에 디렉터리를 두면 root 권한에서도 저장이 실패한다.
         s.path = Some(dir.clone());
         s.toggle_pin("/repo/a".into(), cx);
+    });
+    cx.run_until_parked();
+    sidebar.update(cx, |s, cx| {
         let saved_error = s.error.clone();
         assert!(saved_error.is_some());
         s.apply(Ok((Snapshot::default(), Meta::new())), BTreeMap::new(), cx);
@@ -2011,7 +2143,7 @@ fn owe737_cache_timer_and_auto_titles_render_on_session_and_worktree_rows(cx: &m
     let sidebar_file = dir.join("sidebar.bin");
 
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_file)));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_file)));
     let base_ns = 10_000_000_000_000_u64;
     let now_ns = base_ns + 120 * 1_000_000_000; // 120초 경과 → 5분(300초) 중 3:00 남음
 
@@ -2081,7 +2213,7 @@ fn workspace_grouping_and_sorting_modes_order_rows_and_fold_groups(cx: &mut Test
     use krill_proto::orchestration::WorkspaceStatus;
 
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
 
     let wt_wait = PathBuf::from("/repo/wt-wait");
     let wt_unread = PathBuf::from("/repo/wt-unread");
@@ -2256,7 +2388,7 @@ fn workspace_filters_card_properties_compact_layout_and_persistence(cx: &mut Tes
     let sidebar_bin = dir.join("sidebar.bin");
 
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
 
     let repo_a = PathBuf::from("/repo-a");
     let repo_b = PathBuf::from("/repo-b");
@@ -2458,7 +2590,7 @@ fn workspace_filters_card_properties_compact_layout_and_persistence(cx: &mut Tes
         "compact card must be shorter than detailed card ({compact_h} vs {detailed_h})"
     );
 
-    let restored = Sidebar::new(Some(sidebar_bin));
+    let restored = Sidebar::new_loaded(Some(sidebar_bin));
     assert_eq!(restored.options().group_by, GroupBy::PrStatus);
     assert_eq!(restored.options().sort_by, SortBy::Recent);
     assert_eq!(restored.options().card_layout, CardLayout::Compact);
@@ -2479,7 +2611,7 @@ fn setup_script_prompt_card_enables_and_dismisses_in_sidebar(cx: &mut TestAppCon
     let sidebar_bin = dir.join("sidebar.bin");
 
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin)));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin)));
     vcx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
@@ -2492,14 +2624,51 @@ fn setup_script_prompt_card_enables_and_dismisses_in_sidebar(cx: &mut TestAppCon
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("setup-script-prompt-card").is_some());
     let enable = vcx.debug_bounds("setup-prompt-enable").unwrap();
     vcx.simulate_click(enable.center(), gpui::Modifiers::default());
     vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("setup-script-prompt-card").is_none());
     let summary = krill_proto::orchestration::inspect_repo_hooks(&repo, Some(&dir));
     assert_eq!(summary.store_setup.as_deref(), Some("pnpm install"));
 
+    fs::remove_dir_all(dir).ok();
+}
+
+#[gpui::test]
+fn setup_prompt_render_uses_last_completed_scan(cx: &mut TestAppContext) {
+    let dir = std::env::temp_dir().join(format!("krill-prompt-render-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    let repo = dir.join("repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    let config = repo.join("orca.yaml");
+    fs::write(&config, "scripts:\n  setup: pnpm install\n").unwrap();
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(dir.join("sidebar.bin"))));
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot.trees.insert(repo.clone(), vec![repo.clone()]);
+            s.rebuild(cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("setup-script-prompt-card").is_some());
+
+    // 디스크 내용이 바뀌어도 draw는 IO 없이 마지막 스캔 결과만 사용한다.
+    fs::write(config, "scripts: {}\n").unwrap();
+    vcx.update(|window, cx| {
+        view.update(cx, |_, cx| cx.notify());
+        window.draw(cx).clear(cx);
+    });
+    assert!(vcx.debug_bounds("setup-script-prompt-card").is_some());
+    vcx.executor().advance_clock(Duration::from_secs(2));
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("setup-script-prompt-card").is_none());
     fs::remove_dir_all(dir).ok();
 }
 
@@ -2553,7 +2722,7 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     };
 
     let sb_path = sidebar_bin.clone();
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sb_path)));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sb_path)));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.set_group_by(GroupBy::None, cx);
@@ -2692,7 +2861,7 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     });
 
     // `worktree-comments.toml` 및 `sidebar.bin`에 계보·수면 상태가 영속화되는지 검증한다.
-    let restored = Sidebar::new(Some(sidebar_bin));
+    let restored = Sidebar::new_loaded(Some(sidebar_bin));
     assert_eq!(
         restored.worktree_parent(&child_a).as_deref(),
         Some(parent.as_path())
@@ -2746,7 +2915,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
 
     let selected: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
@@ -2965,7 +3134,7 @@ fn delete_worktree_failure_preserves_lineage_and_ssot_respects_cli_changes(
     };
 
     let sb_path = sidebar_bin.clone();
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sb_path)));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sb_path)));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.set_group_by(GroupBy::None, cx);
@@ -3088,6 +3257,9 @@ fn delete_worktree_failure_preserves_lineage_and_ssot_respects_cli_changes(
     .unwrap();
     cx.update(|_, cx| {
         view.update(cx, Sidebar::reload_external);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
         let s = view.read(cx);
         assert_eq!(
             s.worktree_parent(&grandchild).as_deref(),
@@ -3101,11 +3273,14 @@ fn delete_worktree_failure_preserves_lineage_and_ssot_respects_cli_changes(
     .unwrap();
     cx.update(|_, cx| {
         view.update(cx, Sidebar::reload_external);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
         let s = view.read(cx);
         assert_eq!(s.worktree_parent(&grandchild), None);
     });
 
-    let reloaded = Sidebar::new(Some(sidebar_bin));
+    let reloaded = Sidebar::new_loaded(Some(sidebar_bin));
     assert_eq!(reloaded.worktree_parent(&grandchild), None);
 
     fs::remove_dir_all(dir).ok();
@@ -3132,7 +3307,7 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     let sidebar_bin = dir.join("sidebar.bin");
 
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
     vcx.simulate_resize(gpui::size(gpui::px(420.), gpui::px(900.)));
 
     let repo_a = PathBuf::from("/repo-alpha");
@@ -3338,7 +3513,7 @@ fn orca_workspace_options_menu_segments_submenus_switches_badge_and_persistence(
     });
 
     // `sidebar.bin` 영속화 확인 후 필터 초기화 클릭
-    let persisted = Sidebar::new(Some(sidebar_bin.clone()));
+    let persisted = Sidebar::new_loaded(Some(sidebar_bin.clone()));
     assert_eq!(persisted.options().group_by, GroupBy::WorkspaceStatus);
     assert_eq!(persisted.options().sort_by, SortBy::Recent);
     assert_eq!(persisted.options().card_layout, CardLayout::Compact);
@@ -3372,7 +3547,7 @@ fn owe900_imported_idle_worktrees_render_as_cards_and_all_projects_visible(
     cx: &mut TestAppContext,
 ) {
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
 
     // 실측 이관 결과(프로젝트 16·워크트리 122)를 본뜬 세션 없는 스냅샷.
@@ -3455,7 +3630,7 @@ fn owe900_idle_heavy_repo_auto_collapses_and_expand_persists(cx: &mut TestAppCon
     fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sidebar.bin");
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path.clone())));
 
     let big: Vec<PathBuf> = (0..12)
         .map(|i| PathBuf::from(format!("/repo-big/wt-{i:02}")))
@@ -3539,7 +3714,7 @@ fn owe900_idle_heavy_repo_auto_collapses_and_expand_persists(cx: &mut TestAppCon
         });
     });
     cx.run_until_parked();
-    let mut restored = Sidebar::new(Some(path.clone()));
+    let mut restored = Sidebar::new_loaded(Some(path.clone()));
     assert!(
         !restored.collapsed.contains(Path::new("/repo-big")),
         "user-expanded repo must stay expanded after restart"
@@ -3618,7 +3793,7 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
         gpui_component::init(cx);
         bind_keys(cx);
     });
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
     vcx.simulate_resize(size(px(240.), px(720.)));
 
     let selected_events: Rc<RefCell<Vec<SessionId>>> = Rc::new(RefCell::new(Vec::new()));
@@ -3840,7 +4015,7 @@ fn owe_842_sidebar_persists_expansion_state_and_selected_worktree(cx: &mut TestA
     let group = options::GroupKey::PrStatus(options::PrGroup::Open);
     let remote = crate::hosts::HostId::Remote("remote-dev".into());
 
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(Some(sidebar_bin.clone())));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(sidebar_bin.clone())));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.snapshot = Snapshot {
@@ -3860,7 +4035,7 @@ fn owe_842_sidebar_persists_expansion_state_and_selected_worktree(cx: &mut TestA
     });
     cx.run_until_parked();
 
-    let reloaded = Sidebar::new(Some(sidebar_bin.clone()));
+    let reloaded = Sidebar::new_loaded(Some(sidebar_bin.clone()));
     assert!(reloaded.is_collapsed(&wt_a));
     assert!(!reloaded.is_collapsed(&wt_b));
     assert!(reloaded.is_group_collapsed(group));
@@ -3903,7 +4078,7 @@ fn repo_header_fold_hides_children_and_persists(cx: &mut TestAppContext) {
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sidebar.bin");
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path.clone())));
     vcx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.snapshot.trees.insert(
@@ -3935,7 +4110,7 @@ fn repo_header_fold_hides_children_and_persists(cx: &mut TestAppContext) {
         window.draw(cx).clear(cx);
     });
     assert!(vcx.debug_bounds("repo-header-0").is_some());
-    let restored = Sidebar::new(Some(path.clone()));
+    let restored = Sidebar::new_loaded(Some(path.clone()));
     assert!(
         restored.collapsed.contains(Path::new("/repo")),
         "저장소 접힘은 재시작 후에도 유지되어야 한다"
@@ -3951,7 +4126,7 @@ fn ui_fold_state_round_trips_through_sidebar_bin(cx: &mut TestAppContext) {
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sidebar.bin");
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path.clone())));
     vcx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.collapsed.insert(PathBuf::from("/repo/a"));
@@ -3964,7 +4139,7 @@ fn ui_fold_state_round_trips_through_sidebar_bin(cx: &mut TestAppContext) {
         });
     });
     vcx.run_until_parked();
-    let restored = Sidebar::new(Some(path.clone()));
+    let restored = Sidebar::new_loaded(Some(path.clone()));
     assert!(restored.collapsed.contains(Path::new("/repo/a")));
     assert!(
         restored
@@ -3986,7 +4161,7 @@ fn removed_project_hides_repo_and_survives_restart(cx: &mut TestAppContext) {
     fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sidebar.bin");
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(Some(path.clone())));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(Some(path.clone())));
     vcx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.snapshot.trees.insert(
@@ -4007,7 +4182,7 @@ fn removed_project_hides_repo_and_survives_restart(cx: &mut TestAppContext) {
         });
     });
     vcx.run_until_parked();
-    let restored = Sidebar::new(Some(path.clone()));
+    let restored = Sidebar::new_loaded(Some(path.clone()));
     assert!(restored.removed_projects.contains(Path::new("/repo")));
     fs::remove_dir_all(dir).ok();
 }
@@ -4083,7 +4258,7 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
     use std::cell::RefCell;
     use std::rc::Rc;
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let launched: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
     let launched_out = launched.clone();
     let _sub = vcx.update(|_, cx| {
@@ -4228,7 +4403,7 @@ fn delete_confirm_modal_requires_explicit_confirm_with_force(cx: &mut TestAppCon
         }
     }
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let events = Arc::new(RecordingSource {
         removed: std::sync::Mutex::new(Vec::new()),
         snapshot: Snapshot {
@@ -4305,7 +4480,7 @@ fn session_row_actions_emit_session_events(cx: &mut TestAppContext) {
     use std::cell::RefCell;
     use std::rc::Rc;
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let mut s1 = session(1, AgentState::Working, Some("/repo/a"));
@@ -4379,7 +4554,7 @@ fn single_session_card_line_selects_session(cx: &mut TestAppContext) {
     use std::cell::RefCell;
     use std::rc::Rc;
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let mut s1 = session(1, AgentState::Working, Some("/repo/a"));
@@ -4425,7 +4600,7 @@ fn single_session_card_line_selects_session(cx: &mut TestAppContext) {
 fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
     use krill_proto::orchestration::WorkspaceStatus;
     cx.update(gpui_component::init);
-    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     let wt_live = PathBuf::from("/repo/wt");
     let wt_gone = PathBuf::from("/repo/gone");
     cx.update(|_, cx| {
@@ -4577,7 +4752,7 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
             .collect::<Vec<_>>()
     };
     let path = file.clone();
-    let (view, cx) = cx.add_window_view(move |_, _| Sidebar::new(Some(path)));
+    let (view, cx) = cx.add_window_view(move |_, _| Sidebar::new_loaded(Some(path)));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             s.snapshot = snapshot.clone();
@@ -4587,6 +4762,7 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
             assert_eq!(repos(s), ["/p/c", "/p/a", "/p/b"]);
         });
     });
+    cx.run_until_parked();
     let (_, _, _, _, order) = load_state(&file).unwrap();
     assert_eq!(
         order,
@@ -4738,7 +4914,7 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
 #[gpui::test]
 fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     vcx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let mut bg = session(21, AgentState::Working, Some("/repo"));

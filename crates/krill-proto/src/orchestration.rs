@@ -86,6 +86,9 @@ impl TaskStatus {
 
 pub const DEFAULT_MAX_WORKER_DEPTH: u32 = 3;
 
+/// Retain action/status extension; older peers receive the preserved-session stopped state.
+pub const FEAT_ORCH_RETAIN: u64 = 1 << 19;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DispatchStatus {
@@ -105,9 +108,9 @@ impl DispatchStatus {
             Self::Succeeded => "succeeded",
             Self::Failed => "failed",
             Self::Stopped => "stopped",
+            Self::Retained => "retained",
             Self::Released => "released",
             Self::Abandoned => "abandoned",
-            Self::Retained => "retained",
         }
     }
 }
@@ -428,6 +431,26 @@ pub enum OrchResponse {
     Error(String),
 }
 
+impl OrchResponse {
+    /// Keep the appended Retained variant off the wire for N-1 peers.
+    #[must_use]
+    pub fn for_features(mut self, features: u64) -> Self {
+        if features & FEAT_ORCH_RETAIN == 0 {
+            let downgrade = |dispatch: &mut Dispatch| {
+                if dispatch.status == DispatchStatus::Retained {
+                    dispatch.status = DispatchStatus::Stopped;
+                }
+            };
+            match &mut self {
+                Self::Snapshot(store) => store.dispatches.iter_mut().for_each(downgrade),
+                Self::Dispatch(dispatch) => downgrade(dispatch),
+                _ => {}
+            }
+        }
+        self
+    }
+}
+
 impl OrchestrationStore {
     pub fn load_cached(state_dir: &Path) -> Self {
         type CacheEntry = (
@@ -525,6 +548,14 @@ impl OrchestrationStore {
         if conn.negotiated.features & required != required {
             return Ok(None);
         }
+        if matches!(action, OrchAction::RetainWorker { .. })
+            && conn.negotiated.features & FEAT_ORCH_RETAIN == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "update krilld to retain workers",
+            ));
+        }
         let io_wait = timeout.saturating_add(Duration::from_secs(5));
         conn.stream.set_read_timeout(Some(io_wait))?;
         conn.stream
@@ -532,12 +563,10 @@ impl OrchestrationStore {
         let encoded = Request::Orchestration(action.clone())
             .encode()
             .map_err(|e| invalid(e.to_string()))?;
-        if conn.stream.write_all(&encoded).is_err() {
-            return Ok(None);
-        }
-        let Ok(Some((kind, body))) = crate::ipc::read_frame(&mut conn.stream) else {
-            return Ok(None);
-        };
+        // Once sending begins, failure is ambiguous: never replay a mutation on disk.
+        conn.stream.write_all(&encoded)?;
+        let (kind, body) =
+            crate::ipc::read_frame(&mut conn.stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
         let reply = Reply::decode(kind, &body).map_err(|e| invalid(e.to_string()))?;
         match reply {
             Reply::Orchestration(OrchResponse::Error(msg)) => {
@@ -550,7 +579,7 @@ impl OrchestrationStore {
             Reply::Orchestration(resp) => Ok(Some(resp)),
             Reply::Failed(Failure::BadRequest) => Ok(None),
             Reply::Failed(f) => Err(io::Error::other(f.to_string())),
-            _ => Ok(None),
+            _ => Err(invalid("unexpected orchestration response")),
         }
     }
 
@@ -560,7 +589,7 @@ impl OrchestrationStore {
         from: &str,
         body: &str,
     ) -> io::Result<OrchMessage> {
-        if let Some(OrchResponse::Message(m)) = Self::try_local_daemon_orch(
+        if let Some(response) = Self::try_local_daemon_orch(
             state_dir,
             &OrchAction::ReplyMessage {
                 question_id: question_id.to_owned(),
@@ -569,7 +598,10 @@ impl OrchestrationStore {
             },
             Duration::from_secs(2),
         )? {
-            return Ok(m);
+            return match response {
+                OrchResponse::Message(m) => Ok(m),
+                _ => Err(invalid("unexpected orchestration response")),
+            };
         }
         Self::mutate(state_dir, |s| s.reply_message(question_id, from, body))
     }
@@ -581,7 +613,7 @@ impl OrchestrationStore {
         rationale: Option<String>,
         resolved_by: &str,
     ) -> io::Result<DecisionGate> {
-        if let Some(OrchResponse::Gate(g)) = Self::try_local_daemon_orch(
+        if let Some(response) = Self::try_local_daemon_orch(
             state_dir,
             &OrchAction::ResolveGate {
                 gate_id: gate_id.to_owned(),
@@ -591,7 +623,10 @@ impl OrchestrationStore {
             },
             Duration::from_secs(2),
         )? {
-            return Ok(g);
+            return match response {
+                OrchResponse::Gate(g) => Ok(g),
+                _ => Err(invalid("unexpected orchestration response")),
+            };
         }
         Self::mutate(state_dir, |s| {
             s.resolve_gate(gate_id, decision, rationale, resolved_by)
@@ -599,14 +634,17 @@ impl OrchestrationStore {
     }
 
     pub fn reset_via_daemon_or_disk(state_dir: &Path, run_id: Option<&str>) -> io::Result<()> {
-        if let Some(OrchResponse::Reset) = Self::try_local_daemon_orch(
+        if let Some(response) = Self::try_local_daemon_orch(
             state_dir,
             &OrchAction::Reset {
                 run_id: run_id.map(str::to_owned),
             },
             Duration::from_secs(2),
         )? {
-            return Ok(());
+            return match response {
+                OrchResponse::Reset => Ok(()),
+                _ => Err(invalid("unexpected orchestration response")),
+            };
         }
         Self::mutate(state_dir, |s| {
             s.reset(run_id);
@@ -3644,5 +3682,130 @@ mod tests {
             assert!(orch_skill.content.contains(term), "missing {term}");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod extension_wire_tests {
+    use super::*;
+
+    #[test]
+    fn retain_extension_preserves_n_minus_one_postcard_ordinals() {
+        for (status, bytes) in [
+            (DispatchStatus::Active, vec![0]),
+            (DispatchStatus::Succeeded, vec![1]),
+            (DispatchStatus::Failed, vec![2]),
+            (DispatchStatus::Stopped, vec![3]),
+            (DispatchStatus::Released, vec![4]),
+            (DispatchStatus::Abandoned, vec![5]),
+            (DispatchStatus::Retained, vec![6]),
+        ] {
+            assert_eq!(postcard::to_stdvec(&status).unwrap(), bytes);
+            assert_eq!(
+                postcard::from_bytes::<DispatchStatus>(&bytes).unwrap(),
+                status
+            );
+        }
+        for (action, bytes) in [
+            (
+                OrchAction::StopOrReleaseWorker {
+                    worker_or_dispatch: "x".into(),
+                    release: false,
+                    archived_output: None,
+                },
+                vec![12, 1, b'x', 0, 0],
+            ),
+            (
+                OrchAction::AbandonWorker {
+                    worker_or_dispatch: "x".into(),
+                },
+                vec![13, 1, b'x'],
+            ),
+            (OrchAction::Reset { run_id: None }, vec![14, 0]),
+            (
+                OrchAction::RetainWorker {
+                    worker_or_dispatch: "x".into(),
+                },
+                vec![15, 1, b'x'],
+            ),
+        ] {
+            assert_eq!(postcard::to_stdvec(&action).unwrap(), bytes);
+            assert_eq!(postcard::from_bytes::<OrchAction>(&bytes).unwrap(), action);
+        }
+    }
+
+    #[test]
+    fn retained_responses_are_negotiated_for_n_minus_one_peers() {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("compat", None).unwrap();
+        let dispatch = store
+            .start_worker(&run.id, None, "w", "codex", Some(42), "/tmp", "p")
+            .unwrap();
+        let retained = store.retain_worker(&dispatch.id).unwrap();
+        let current = OrchResponse::Dispatch(retained.clone());
+        assert_eq!(current.clone().for_features(FEAT_ORCH_RETAIN), current);
+        let OrchResponse::Dispatch(legacy) = current.for_features(0) else {
+            panic!("dispatch response")
+        };
+        assert_eq!(legacy.status, DispatchStatus::Stopped);
+        assert_eq!(postcard::to_stdvec(&legacy.status).unwrap(), [3]);
+        let OrchResponse::Snapshot(legacy) = OrchResponse::Snapshot(store.clone()).for_features(0)
+        else {
+            panic!("snapshot response")
+        };
+        assert_eq!(legacy.dispatches[0].status, DispatchStatus::Stopped);
+        assert_eq!(store.dispatches[0].status, DispatchStatus::Retained);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn daemon_response_loss_never_replays_reset_on_disk() {
+        use crate::control::Request;
+        use crate::screen::Msg as _;
+        use std::os::unix::net::UnixListener;
+        let dir = std::env::temp_dir().join(format!("ko-loss-{}", std::process::id()));
+        fs::create_dir_all(dir.join("run")).unwrap();
+        let mut store = OrchestrationStore::default();
+        let run = store
+            .create_run("keep after ambiguous delivery", None)
+            .unwrap();
+        store.save(&dir).unwrap();
+        let listener = UnixListener::bind(dir.join("run/krilld.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .write_all(
+                    &crate::ipc::ServerHello {
+                        proto_min: crate::ipc::PROTO_MIN,
+                        proto_max: crate::ipc::PROTO_MAX,
+                        features: crate::ipc::FEATURES,
+                        build: "response-loss-fixture".into(),
+                        instance_id: 1,
+                    }
+                    .encode()
+                    .unwrap(),
+                )
+                .unwrap();
+            crate::ipc::read_frame(&mut socket).unwrap().unwrap();
+            let (kind, body) = crate::ipc::read_frame(&mut socket).unwrap().unwrap();
+            assert_eq!(
+                Request::decode(kind, &body).unwrap(),
+                Request::Orchestration(OrchAction::Reset { run_id: None })
+            );
+            // The daemon accepted the complete request, then its response was lost.
+        });
+        assert!(OrchestrationStore::reset_via_daemon_or_disk(&dir, None).is_err());
+        server.join().unwrap();
+        assert!(
+            OrchestrationStore::load(&dir)
+                .unwrap()
+                .runs
+                .iter()
+                .any(|r| r.id == run.id)
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }

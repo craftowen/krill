@@ -1,6 +1,6 @@
 //! 사용량·레이트리밋 조회 및 프로바이더 다계정·자동전환 제어(MK-084·MK-107·MK-108, T1#32).
 //! Hello에서 [`FEAT_USAGE`]를 협상한 뒤 전용 연결에서 요청 하나·응답 하나.
-//! 값은 krilld가 Claude·Codex·OpenCode 로컬 프로필 파일에서 읽은 5시간·주간 사용률이다.
+//! 기본 창은 N-1 호환용 5시간·주간 요약이다. 선택 꼬리는 프로바이더가 보고한 모든 사용량 항목을 담는다.
 
 use serde::{Deserialize, Serialize};
 
@@ -9,6 +9,10 @@ use crate::screen::Msg;
 
 /// 이 모듈의 kind를 쓸 수 있다는 feature 비트(ARCHITECTURE §4.3 등록표).
 pub const FEAT_USAGE: u64 = 1 << 17;
+/// Provider-specific meters and running-session account handoff results.
+pub const FEAT_PROVIDER_DETAILS: u64 = 1 << 15;
+mod details;
+pub use details::{AccountMeters, ProviderDetails, SessionHandoff, UsageMeter};
 /// Create 계정 선택·고급 정책·이력·모델별 창(OWE-712 지휘자 배정).
 pub const FEAT_ACCOUNT_POLICY: u64 = 1 << 61;
 /// OWE-719: 연결 상태·읽기 전용 직접 사용량 설정 꼬리.
@@ -135,6 +139,34 @@ impl ProviderKind {
         }
     }
 
+    /// Environment overrides that would bypass the chosen account's credential authority.
+    pub const fn credential_overrides(self) -> &'static [&'static str] {
+        match self {
+            Self::Claude => &[
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "ANTHROPIC_BASE_URL",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDECODE",
+                "CLAUDE_CODE_ENTRYPOINT",
+            ],
+            Self::Codex => &["OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL"],
+            Self::OpenCode => &[
+                "OPENCODE_AUTH_CONTENT",
+                "OPENCODE_DB",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_API_KEY",
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "GOOGLE_API_KEY",
+                "GEMINI_API_KEY",
+            ],
+            Self::Antigravity | Self::Gemini => &[],
+        }
+    }
+
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude-code" | "claudecode" => Some(Self::Claude),
@@ -163,9 +195,26 @@ impl ProviderKind {
 /// 5시간(`5h`)·주간(`weekly`) 중 가장 제약이 큰 버킷으로 [`Snapshot`]을 만든다.
 #[must_use]
 pub fn parse_antigravity_usage(s: &str) -> Snapshot {
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+    let v = serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .or_else(|| {
+            s.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|v| {
+                    v.pointer("/command/name")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("usage")
+                })
+        });
+    let Some(v) = v else {
         return Snapshot::default();
     };
+    if v.get("status")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|s| s != "SUCCESS")
+    {
+        return Snapshot::default();
+    }
     if let Some(cmd) = v.get("command")
         && let Some(name) = cmd.get("name").and_then(serde_json::Value::as_str)
         && name != "usage"
@@ -471,6 +520,7 @@ pub struct AutoSwitchRule {
 /// 사용률 임계치·레이트리밋 기반 자동전환 정책(MK-108).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AutoSwitchPolicy {
+    /// 기본 꺼짐. 사용자가 명시적으로 켜야 전역 자동전환을 시작한다.
     pub enabled: bool,
     /// 5h 또는 7d 사용률이 이 값(1~100) 이상이면 가용 최저 사용률 계정으로 전환.
     pub threshold_percent: u8,
@@ -483,7 +533,7 @@ pub struct AutoSwitchPolicy {
 impl Default for AutoSwitchPolicy {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             threshold_percent: DEFAULT_AUTO_SWITCH_PERCENT,
             switch_on_rate_limit: true,
             rules: Vec::new(),
@@ -552,9 +602,18 @@ pub struct AccountsSnapshot {
     pub advanced: AccountPolicyState,
     #[serde(default)]
     pub connections: Box<ConnectionsSnapshot>,
+    #[serde(default)]
+    pub details: Box<ProviderDetails>,
 }
 
 impl AccountsSnapshot {
+    pub fn meters_for(&self, account_id: &str) -> Option<&AccountMeters> {
+        self.details
+            .accounts
+            .iter()
+            .find(|a| a.account_id == account_id)
+    }
+
     pub fn connection_for(&self, account_id: &str) -> ConnectionStatus {
         self.connections
             .accounts
@@ -622,6 +681,12 @@ pub enum UsageRequest {
     SetProvisioning(bool),
     /// 프로비저닝 설정 조회 → [`UsageReply::Provisioning`].
     GetProvisioning,
+    /// Read Orca's native Antigravity account vault on this execution host.
+    /// Credentials are materialized by the daemon and never returned over IPC.
+    ImportOrcaAntigravity {
+        source_dir: String,
+        dry_run: bool,
+    },
 }
 
 impl UsageRequest {
@@ -648,13 +713,21 @@ impl UsageRequest {
     pub fn is_read(&self) -> bool {
         matches!(
             self,
-            Self::Get | Self::ListAccounts | Self::ListOrphanProfiles | Self::GetProvisioning
+            Self::Get
+                | Self::ListAccounts
+                | Self::ListOrphanProfiles
+                | Self::GetProvisioning
+                | Self::ImportOrcaAntigravity { dry_run: true, .. }
         )
     }
 
     pub fn required_features(&self) -> u64 {
         let mut features = FEAT_USAGE;
         let provider = match self {
+            Self::ImportOrcaAntigravity { .. } => {
+                features |= FEAT_PROVIDER_DETAILS;
+                Some(ProviderKind::Antigravity)
+            }
             Self::SetDirectUsage(_) => {
                 features |= FEAT_ACCOUNT_CONNECTION;
                 None
@@ -726,6 +799,9 @@ impl UsageReply {
     #[must_use]
     pub fn for_features(mut self, features: u64) -> Self {
         if let Self::Accounts(snapshot) = &mut self {
+            if features & FEAT_PROVIDER_DETAILS == 0 {
+                *snapshot.details = ProviderDetails::default();
+            }
             snapshot
                 .accounts
                 .retain(|account| account.provider != ProviderKind::Gemini);
@@ -835,13 +911,19 @@ impl Msg for UsageReply {
             append_tails(&mut body, &policy.rules, &snapshot.statuses)?;
             if snapshot.advanced != AccountPolicyState::default()
                 || *snapshot.connections != ConnectionsSnapshot::default()
+                || *snapshot.details != ProviderDetails::default()
             {
                 if policy.rules.is_empty() && snapshot.statuses.is_empty() {
                     body.extend([0, 0]); // 빈 rules·statuses 목록 두 개
                 }
                 body.extend(postcard::to_stdvec(&snapshot.advanced).map_err(Error::Codec)?);
-                if *snapshot.connections != ConnectionsSnapshot::default() {
+                if *snapshot.connections != ConnectionsSnapshot::default()
+                    || *snapshot.details != ProviderDetails::default()
+                {
                     body.extend(postcard::to_stdvec(&snapshot.connections).map_err(Error::Codec)?);
+                }
+                if *snapshot.details != ProviderDetails::default() {
+                    body.extend(postcard::to_stdvec(&snapshot.details).map_err(Error::Codec)?);
                 }
             }
             ipc::encode_frame(Self::KIND, &body)
@@ -866,10 +948,15 @@ impl Msg for UsageReply {
             } else {
                 postcard::take_from_bytes::<AccountPolicyState>(rest).map_err(Error::Codec)?
             };
-            let connections = if rest.is_empty() {
-                ConnectionsSnapshot::default()
+            let (connections, rest) = if rest.is_empty() {
+                (ConnectionsSnapshot::default(), rest)
             } else {
-                postcard::take_from_bytes::<ConnectionsSnapshot>(rest)
+                postcard::take_from_bytes::<ConnectionsSnapshot>(rest).map_err(Error::Codec)?
+            };
+            let details = if rest.is_empty() {
+                ProviderDetails::default()
+            } else {
+                postcard::take_from_bytes::<ProviderDetails>(rest)
                     .map_err(Error::Codec)?
                     .0
             };
@@ -885,6 +972,7 @@ impl Msg for UsageReply {
                 statuses,
                 advanced,
                 connections: Box::new(connections),
+                details: Box::new(details),
             }))
         } else {
             ipc::decode(Self::KIND, kind, body)

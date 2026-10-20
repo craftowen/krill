@@ -143,6 +143,15 @@ mod tests {
     #[test]
     fn direct_usage_is_evaluated_even_when_disk_fingerprint_is_unchanged() {
         let (home, state) = (dir("direct-home"), dir("direct-state"));
+        accounts::set_auto_switch(
+            &home,
+            Some(&state),
+            &AutoSwitchPolicy {
+                enabled: true,
+                ..AutoSwitchPolicy::default()
+            },
+        )
+        .unwrap();
         accounts::add_account(&home, Some(&state), ProviderKind::Claude, "Quota", None, "")
             .unwrap();
         let mut seen = None;
@@ -158,6 +167,15 @@ mod tests {
     #[test]
     fn evaluates_only_when_cache_files_change_and_skips_when_disabled() {
         let (home, state) = (dir("home"), dir("state"));
+        accounts::set_auto_switch(
+            &home,
+            Some(&state),
+            &AutoSwitchPolicy {
+                enabled: true,
+                ..AutoSwitchPolicy::default()
+            },
+        )
+        .unwrap();
         let backup = home.join("claude-backup");
         accounts::add_account(
             &home,

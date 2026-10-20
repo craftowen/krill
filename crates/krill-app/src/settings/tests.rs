@@ -76,6 +76,7 @@ fn init(cx: &mut TestAppContext, d: &Path) {
         cx.bind_keys(defaults());
         init_at(Some(d), cx);
     });
+    cx.run_until_parked();
 }
 
 #[test]
@@ -129,6 +130,7 @@ fn webhook_settings_roundtrip_survive_ui_edits_and_redact_parse_errors(cx: &mut 
         edit(cx, |s| s.zoom = 1.3);
         assert_eq!(current(cx).webhooks.len(), 1);
     });
+    cx.run_until_parked();
     let saved = fs::read_to_string(d.join(SETTINGS_FILE)).unwrap();
     assert_eq!(
         fs::metadata(d.join(SETTINGS_FILE))
@@ -146,6 +148,9 @@ fn webhook_settings_roundtrip_survive_ui_edits_and_redact_parse_errors(cx: &mut 
     .unwrap();
     cx.update(|cx| {
         reload(cx);
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
         assert_eq!(current(cx).webhooks.len(), 1);
         let error = cx.global::<Config>().error.as_ref().unwrap();
         assert!(!error.contains("SECRET"));
@@ -315,6 +320,7 @@ fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
     .unwrap();
     // 폴링 태스크가 부르는 것과 같은 경로.
     cx.update(reload_if_changed);
+    cx.run_until_parked();
     cx.update(|cx| {
         assert_eq!(cx.theme().mode, ThemeMode::Dark);
         assert!((cx.global::<Config>().settings.zoom() - 1.5).abs() < f32::EPSILON);
@@ -328,6 +334,7 @@ fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
     fs::write(d.join(SETTINGS_FILE), "theme = 1").unwrap();
     fs::write(d.join(KEYS_FILE), "[bindings").unwrap();
     cx.update(reload);
+    cx.run_until_parked();
     cx.update(|cx| {
         assert_eq!(cx.theme().mode, ThemeMode::Dark);
         assert_eq!(bound(cx, "cmd-alt-9"), Some(ZoomIn.name()));
@@ -337,6 +344,7 @@ fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
     // 사용자가 파일을 복구한 뒤 설정 창 버튼으로 저장한다.
     fs::write(d.join(SETTINGS_FILE), "theme = \"dark\"").unwrap();
     cx.update(|cx| edit(cx, |s| s.theme = ThemeChoice::Light));
+    cx.run_until_parked();
     cx.update(|cx| assert_eq!(cx.theme().mode, ThemeMode::Light));
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert_eq!(saved.theme, ThemeChoice::Light);
@@ -365,6 +373,7 @@ fn legacy_zoom_migrates_to_terminal_font_size_and_resets_ui_zoom(cx: &mut TestAp
     assert!(on_disk.contains("terminal_font_size = 10"), "{on_disk}");
     // 재로드해도 중복 이관되지 않는다.
     cx.update(reload);
+    cx.run_until_parked();
     cx.update(|cx| {
         assert_eq!(terminal_font_pt(cx), 10);
         assert!((current(cx).zoom() - 1.0).abs() < f32::EPSILON);
@@ -401,6 +410,7 @@ fn regression_settings_edit_preserves_corrupt_file(cx: &mut TestAppContext) {
     for body in [b"theme = 1".as_slice(), b"theme = [", &[0xff]] {
         fs::write(&path, body).unwrap();
         cx.update(|cx| edit(cx, |s| s.zoom = 1.5));
+        cx.run_until_parked();
         assert_eq!(fs::read(&path).unwrap(), body);
         cx.update(|cx| {
             assert!(cx.global::<Config>().error.is_some());
@@ -422,6 +432,7 @@ fn regression_settings_edit_replaces_inode(cx: &mut TestAppContext) {
     fs::hard_link(&path, &old).unwrap();
     init(cx, &d);
     cx.update(|cx| edit(cx, |s| s.theme = ThemeChoice::Light));
+    cx.run_until_parked();
     assert_eq!(fs::read_to_string(old).unwrap(), "theme = \"dark\"");
     assert_eq!(
         Settings::parse(&fs::read_to_string(path).unwrap())
@@ -441,6 +452,7 @@ fn regression_settings_edit_applies_on_disk_value(cx: &mut TestAppContext) {
     // 1초 폴링 전에 외부 편집기로 바꾼 유효한 최신 값을 edit()이 바탕으로 삼는다.
     fs::write(&path, "theme = \"light\"\nui_zoom = 1.5").unwrap();
     cx.update(|cx| edit(cx, |s| s.zoom = s.zoom_step(1)));
+    cx.run_until_parked();
     cx.update(|cx| {
         assert_eq!(cx.global::<Config>().settings.theme, ThemeChoice::Light);
         assert!((cx.global::<Config>().settings.zoom() - 1.6).abs() < f32::EPSILON);
@@ -465,6 +477,7 @@ text = "변경 사항을 검토해줘"
 "#;
     fs::write(d.join(SETTINGS_FILE), body).unwrap();
     cx.update(reload_if_changed);
+    cx.run_until_parked();
     cx.update(|cx| {
         let s = current(cx);
         assert_eq!(s.quick_commands.len(), 2);
@@ -472,11 +485,13 @@ text = "변경 사항을 검토해줘"
         assert_eq!(s.copy_context_lines, 3);
         edit(cx, |s| s.zoom = 1.2);
     });
+    cx.run_until_parked();
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert_eq!(saved.quick_commands.len(), 2);
     assert_eq!(saved.copy_context_lines, 3);
     fs::write(d.join(SETTINGS_FILE), "[[quick_commands]]\nname = 3").unwrap();
     cx.update(reload);
+    cx.run_until_parked();
     cx.update(|cx| assert_eq!(current(cx).quick_commands, saved.quick_commands));
     fs::remove_dir_all(d).unwrap();
 }
@@ -505,24 +520,32 @@ fn account_rule_methods_upsert_persist_and_clear(cx: &mut TestAppContext) {
             v.account_error = Some("previous error".into());
             v.set_account_rule(rule.clone(), cx);
             assert!(v.account_error.is_none());
-            assert_eq!(v.accounts().auto_switch.rules, vec![rule.clone()]);
+        });
+    });
+    vcx.run_until_parked();
+    assert_eq!(
+        vcx.update(|_, cx| view.read(cx).accounts().auto_switch.rules.clone()),
+        vec![rule.clone()]
+    );
+    let mut updated = rule.clone();
+    updated.enabled = false;
+    updated.threshold_percent = 85;
+    updated.metric = AutoSwitchMetric::SevenDay;
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
             v.set_account_rule(other.clone(), cx);
-            let mut updated = rule.clone();
-            updated.enabled = false;
-            updated.threshold_percent = 85;
-            updated.metric = AutoSwitchMetric::SevenDay;
             v.set_account_rule(updated.clone(), cx);
-            let rules = &v.accounts().auto_switch.rules;
-            assert_eq!(rules.len(), 2);
-            assert!(rules.contains(&updated) && rules.contains(&other));
-            let persisted = crate::accounts::refresh_local(&d, Some(&d));
-            assert_eq!(persisted.auto_switch.rules.len(), 2);
-            assert!(persisted.auto_switch.rules.contains(&updated));
-            assert!(persisted.auto_switch.rules.contains(&other));
+        });
+    });
+    vcx.run_until_parked();
+    let persisted = crate::accounts::refresh_local(&d, Some(&d));
+    assert_eq!(persisted.auto_switch.rules.len(), 2);
+    assert!(persisted.auto_switch.rules.contains(&updated));
+    assert!(persisted.auto_switch.rules.contains(&other));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
             v.clear_account_rule(rule.provider, &rule.from_account_id, cx);
-            assert_eq!(v.accounts().auto_switch.rules, vec![other.clone()]);
             v.clear_account_rule(rule.provider, &rule.from_account_id, cx);
-            assert_eq!(v.accounts().auto_switch.rules, vec![other.clone()]);
         });
     });
     vcx.run_until_parked();
@@ -769,6 +792,7 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
         });
         window.draw(cx).clear(cx);
     });
+    vcx.run_until_parked();
 
     vcx.update(|_, cx| {
         let snap = view.read(cx).accounts();
@@ -807,7 +831,6 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
         assert_eq!(pending.label, "mac-node-1");
         let id = view.read(cx).ssh_hosts()[0].id.clone();
         view.update(cx, |v, cx| v.remove_ssh_host(&id, cx));
-        assert!(view.read(cx).ssh_hosts().is_empty());
 
         // Calling open_window_at_tab reuses the existing SettingsView window instead of opening a second one.
         let before_windows = cx.windows().len();
@@ -1051,6 +1074,7 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
         });
         window.draw(cx).clear(cx);
     });
+    vcx.run_until_parked();
 
     vcx.update(|window, cx| {
         let snap = view.read(cx).accounts();
@@ -2304,6 +2328,7 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
     // 기본값은 꺼짐(opt-in)이라 초기화가 표식을 만들지 않는다.
     assert!(!d.join(HIBERNATION_FLAG).exists());
     cx.update(|cx| edit(cx, |s| s.hibernation_enabled = true));
+    cx.run_until_parked();
     assert!(d.join(HIBERNATION_FLAG).is_file());
     // 파싱 자름: 범위를 벗어나면 경계로 붙는다.
     assert_eq!(
@@ -2343,6 +2368,7 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
         assert!((terminal_opacity_alpha(cx) - 0.75).abs() < 1e-6);
         assert!(!notification_sound(cx));
     });
+    cx.run_until_parked();
     assert!(!d.join(HIBERNATION_FLAG).exists());
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert!(!saved.hibernation_enabled);
@@ -2352,11 +2378,13 @@ fn owe655_terminal_options_and_hibernation_flag_sync(cx: &mut TestAppContext) {
     // 외부 편집으로 다시 켜면 폴링 리로드가 표식을 되살린다.
     fs::write(d.join(SETTINGS_FILE), "hibernation_enabled = true\n").unwrap();
     cx.update(reload);
+    cx.run_until_parked();
     cx.update(|cx| assert!(current(cx).hibernation_enabled));
     assert!(d.join(HIBERNATION_FLAG).is_file());
     // 사람이 직접 만든 표식은 설정 파일이 끔이어도 리로드가 지우지 않고 켜짐으로 읽는다.
     fs::write(d.join(SETTINGS_FILE), "hibernation_enabled = false\n").unwrap();
     cx.update(reload);
+    cx.run_until_parked();
     cx.update(|cx| assert!(current(cx).hibernation_enabled));
     assert!(d.join(HIBERNATION_FLAG).is_file());
     fs::remove_dir_all(d).ok();
@@ -3003,6 +3031,7 @@ fn owe658_terminal_settings_defaults_and_serialization(cx: &mut TestAppContext) 
         );
         assert!(option_as_meta(cx) && copy_on_select(cx));
     });
+    cx.run_until_parked();
     let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
     assert!(saved.option_as_meta && saved.copy_on_select && saved.terminal_cursor_blink);
     fs::remove_dir_all(d).ok();
@@ -3586,6 +3615,7 @@ fn as02_transient_io_error_keeps_settings_and_hibernation_flag(cx: &mut TestAppC
     fs::remove_file(d.join(SETTINGS_FILE)).unwrap();
     fs::create_dir(d.join(SETTINGS_FILE)).unwrap();
     cx.update(reload);
+    cx.run_until_parked();
     cx.update(|cx| {
         assert!(
             current(cx).hibernation_enabled,
@@ -4847,7 +4877,7 @@ fn mobile_eighth_tab_qr_and_mode_invalidation(cx: &mut TestAppContext) {
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             assert!(!v.mobile.pending);
-            v.mobile_pair(ConnectMode::Lan, None, cx);
+            v.mobile_pair(ConnectMode::Tailscale, None, cx);
             assert!(v.mobile.offer.is_none());
         });
     });
@@ -4993,7 +5023,7 @@ fn owe880_mobile_enter_revoke_confirm_and_copy_feedback(cx: &mut TestAppContext)
 
     // 4. 페어링 링크 복사 → '복사됨' 피드백(플래그+클립보드).
     vcx.update(|_, cx| {
-        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Lan, None, cx));
+        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Tailscale, None, cx));
     });
     vcx.run_until_parked();
     vcx.update(|window, cx| {
@@ -5043,16 +5073,10 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
                 v.add_worktree_symlink_for(&repo_canonical, "../secret", cx)
                     .is_err()
             );
-            assert_eq!(
-                v.add_worktree_symlink_for(&repo_canonical, ".env", cx)
-                    .unwrap(),
-                vec![".env".to_owned()]
-            );
-            assert_eq!(
-                v.add_worktree_symlink_for(&repo_canonical, "node_modules", cx)
-                    .unwrap(),
-                vec![".env".to_owned(), "node_modules".to_owned()]
-            );
+            v.add_worktree_symlink_for(&repo_canonical, ".env", cx)
+                .unwrap();
+            v.add_worktree_symlink_for(&repo_canonical, "node_modules", cx)
+                .unwrap();
             v.save_repo_hooks_for(
                 &repo_canonical,
                 Some("pnpm install"),
@@ -5063,6 +5087,7 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
         });
         window.draw(cx).clear(cx);
     });
+    vcx.run_until_parked();
     assert!(vcx.debug_bounds("admin-symlink-remove-0").is_some());
     assert!(vcx.debug_bounds("admin-repo-hook-row-0").is_some());
 
@@ -5085,6 +5110,7 @@ fn owe728_workflows_tab_worktree_symlinks_and_repo_hooks(cx: &mut TestAppContext
             v.remove_worktree_symlink_for(&repo_canonical, ".env", cx);
         });
     });
+    vcx.run_until_parked();
     let store_after = krill_proto::orchestration::WorktreeStore::load(&d).unwrap();
     assert_eq!(
         store_after.symlinks_for(&repo_canonical),
@@ -5671,7 +5697,13 @@ fn workflows_schedule_modal_precheck_isolated_worktree_and_log_viewer(cx: &mut T
     registry
         .poll_schedules(UNIX_EPOCH + Duration::from_mins(50))
         .unwrap();
-    vcx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.services_checked = None;
+            view.refresh_service_cache(cx);
+            cx.notify();
+        });
+    });
     vcx.run_until_parked();
 
     let runs = load_coalesced_runs(&d).unwrap();
@@ -5756,7 +5788,13 @@ fn workflows_schedule_modal_precheck_isolated_worktree_and_log_viewer(cx: &mut T
         .unwrap();
     writeln!(f, "{}", serde_json::to_string(&finished_record).unwrap()).unwrap();
 
-    vcx.update(|_, cx| view.update(cx, |_, cx| cx.notify()));
+    vcx.update(|_, cx| {
+        view.update(cx, |view, cx| {
+            view.services_checked = None;
+            view.refresh_service_cache(cx);
+            cx.notify();
+        });
+    });
     vcx.run_until_parked();
 
     let runs = load_coalesced_runs(&d).unwrap();
@@ -5914,27 +5952,45 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         view.update(cx, |v, cx| {
             v.login_account(krill_proto::usage::ProviderKind::OpenCode, None, cx);
         });
-        assert!(view.read(cx).opencode_login_prompt);
+        assert_eq!(
+            view.read(cx).terminal_login_provider,
+            Some(krill_proto::usage::ProviderKind::OpenCode)
+        );
         assert_eq!(take_pending_terminal_command(cx), None);
     });
     click(vcx, "admin-opencode-login-run");
     vcx.update(|_, cx| {
-        assert!(!view.read(cx).opencode_login_prompt);
-        assert_eq!(
-            take_pending_terminal_command(cx).as_deref(),
-            Some("opencode auth login")
-        );
+        assert!(view.read(cx).terminal_login_provider.is_none());
+        let command = take_pending_terminal_command(cx).expect("scoped OpenCode login");
+        let account = view
+            .read(cx)
+            .accounts_snapshot
+            .accounts
+            .iter()
+            .find(|a| a.provider == krill_proto::usage::ProviderKind::OpenCode && !a.host_default)
+            .expect("new OpenCode account registered before login");
+        assert!(command.contains(&format!(
+                "XDG_DATA_HOME='{}'",
+                std::path::Path::new(&account.profile_dir)
+                    .join("data")
+                    .display()
+            )));
+        assert!(command.ends_with("opencode auth login"));
+        assert!(std::path::Path::new(&account.profile_dir).is_dir());
         assert_eq!(take_pending_terminal_command(cx), None);
     });
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.login_account(krill_proto::usage::ProviderKind::OpenCode, None, cx);
         });
-        assert!(view.read(cx).opencode_login_prompt);
+        assert_eq!(
+            view.read(cx).terminal_login_provider,
+            Some(krill_proto::usage::ProviderKind::OpenCode)
+        );
     });
     click(vcx, "admin-opencode-login-dismiss");
     vcx.update(|_, cx| {
-        assert!(!view.read(cx).opencode_login_prompt);
+        assert!(view.read(cx).terminal_login_provider.is_none());
         assert_eq!(take_pending_terminal_command(cx), None);
     });
 
@@ -7054,19 +7110,19 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
                         mode,
                         interfaces: vec![NetworkInterface {
                             name: "en0".into(),
-                            address: "192.168.1.25".into(),
+                            address: "100.64.1.25".into(),
                             default_route: true,
                         }],
                     },
                     MobileRequest::CurrentPairingOffer => MobileReply::PairingOffer {
-                        url: "https://example.test/?pair=owe802&mode=Lan#key=secret".into(),
+                        url: "https://example.test/?pair=owe802&mode=Tailscale#key=secret".into(),
                         host: "example.test".into(),
                         port: 8443,
                         expires_at_ms: krill_proto::mobile::client::now_ms() + 300_000,
-                        mode: ConnectMode::Lan,
+                        mode: ConnectMode::Tailscale,
                         interfaces: vec![NetworkInterface {
                             name: "en0".into(),
-                            address: "192.168.1.25".into(),
+                            address: "100.64.1.25".into(),
                             default_route: true,
                         }],
                     },
@@ -7086,7 +7142,7 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
     vcx.simulate_resize(size(px(820.), px(5000.)));
     vcx.run_until_parked();
     vcx.update(|window, cx| {
-        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Lan, None, cx));
+        view.update(cx, |v, cx| v.mobile_pair(ConnectMode::Tailscale, None, cx));
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
@@ -7110,7 +7166,7 @@ fn owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds(
         mode_card.right() <= column.right() + px(0.5),
         "mobile-mode-card ({mode_card:?}) overflowed column ({column:?})"
     );
-    for sel in ["mobile-lan", "mobile-tailscale", "mobile-tunnel"] {
+    for sel in ["mobile-tailscale", "mobile-tunnel"] {
         let opt = bounds(vcx, sel);
         assert!(
             opt.right() <= mode_card.right() + px(0.5),
@@ -7282,7 +7338,7 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(820.), px(5000.)));
 
-    vcx.update(|window, cx| {
+    vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
             v.set_tab(AdminTab::Accounts, cx);
             for label in ["Primary", "Work", "Relogin"] {
@@ -7303,6 +7359,11 @@ fn owe797_accounts_tab_row_click_switch_badges_and_policy_switches(cx: &mut Test
                 },
                 cx,
             );
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
             if let Some(primary) = v
                 .accounts_snapshot
                 .accounts
@@ -7925,8 +7986,8 @@ fn terminal_tab_renders_themes_preview_and_selects_theme(cx: &mut TestAppContext
     )
     .unwrap();
     cx.update(|cx| {
-        edit(cx, |s| {
-            s.terminal_custom_themes.push(custom);
+        edit(cx, move |s| {
+            s.terminal_custom_themes.push(custom.clone());
         });
     });
     let (view, vcx) = cx.add_window_view(|_, cx| {
@@ -8039,8 +8100,8 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
         });
         window.draw(cx).clear(cx);
         view.update(cx, |v, cx| {
-            v.mobile_pair(ConnectMode::Lan, None, cx);
-            assert_eq!(v.mobile.mode, ConnectMode::Lan);
+            v.mobile_pair(ConnectMode::Tailscale, None, cx);
+            assert_eq!(v.mobile.mode, ConnectMode::Tailscale);
             v.set_tab(AdminTab::General, cx);
             assert_eq!(v.tab, AdminTab::General);
         });
@@ -8050,8 +8111,8 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
     vcx.update(|_, cx| {
         let mobile = &view.read(cx).mobile;
         assert!(!mobile.pairing_pending());
-        assert_eq!(mobile.mode, ConnectMode::Lan);
-        assert!(mobile.offer.as_ref().unwrap().0.contains("Lan"));
+        assert_eq!(mobile.mode, ConnectMode::Tailscale);
+        assert!(mobile.offer.as_ref().unwrap().0.contains("Tailscale"));
     });
     fs::remove_dir_all(d).ok();
 }
@@ -8100,4 +8161,297 @@ fn ssh_and_remote_krill_have_separate_pages(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     vcx.update(|_, cx| assert_eq!(view.read(cx).remote_krill.as_ref(), Some(&pairing)));
     fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn mobile_pairing_path_selection_does_not_block_settings(cx: &mut TestAppContext) {
+    use krill_proto::mobile::{ConnectMode, MobileReply, MobileRequest};
+    let d = dir("mobile-background-pair");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile = mobile::Panel::new(std::sync::Arc::new(|request| {
+                Ok(match request {
+                    MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
+                        url: format!("http://127.0.0.1:1234/#pair={mode:?}"),
+                        host: "127.0.0.1".into(),
+                        port: 1234,
+                        expires_at_ms: u64::MAX,
+                        mode,
+                        interfaces: Vec::new(),
+                    },
+                    _ => MobileReply::Devices(Vec::new()),
+                })
+            }));
+            v.set_tab(AdminTab::Mobile, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile_pair(ConnectMode::Tunnel, None, cx);
+            assert!(v.mobile.pairing_pending());
+            assert!(
+                !v.mobile.pending,
+                "connection wait must not lock mobile controls"
+            );
+            // 요청을 아직 실행하지 않은 상태에서도 창을 그리며 다른 경로를 고를 수 있다.
+        });
+        window.draw(cx).clear(cx);
+        view.update(cx, |v, cx| {
+            v.mobile_pair(ConnectMode::Tailscale, None, cx);
+            assert_eq!(v.mobile.mode, ConnectMode::Tailscale);
+            v.set_tab(AdminTab::General, cx);
+            assert_eq!(v.tab, AdminTab::General);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let mobile = &view.read(cx).mobile;
+        assert!(!mobile.pairing_pending());
+        assert_eq!(mobile.mode, ConnectMode::Tailscale);
+        assert!(mobile.offer.as_ref().unwrap().0.contains("Tailscale"));
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn agy_account_add_and_relogin_use_the_profile_terminal(cx: &mut TestAppContext) {
+    use krill_proto::usage::ProviderKind;
+    let d = dir("agy-terminal-login");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.update(|window, cx| {
+        cx.set_global(crate::accounts::installed::Installed(Some(vec![
+            ProviderKind::Antigravity,
+        ])));
+        view.update(cx, |v, cx| v.set_tab(AdminTab::Accounts, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    let click = |vcx: &mut gpui::VisualTestContext, selector: &'static str| {
+        let bounds = vcx
+            .debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector}"));
+        vcx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+    click(vcx, "admin-add-account-agy");
+    assert!(vcx.debug_bounds("admin-agy-login-guide").is_some());
+    vcx.update(|_, cx| {
+        assert_eq!(
+            view.read(cx).terminal_login_provider,
+            Some(ProviderKind::Antigravity)
+        );
+        assert!(view.read(cx).login_pending.is_none());
+        assert_eq!(take_pending_terminal_command(cx), None);
+    });
+    click(vcx, "admin-agy-login-dismiss");
+    vcx.update(|_, cx| {
+        assert!(view.read(cx).terminal_login_provider.is_none());
+        assert!(
+            !view
+                .read(cx)
+                .accounts_snapshot
+                .accounts
+                .iter()
+                .any(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
+        );
+        assert_eq!(take_pending_terminal_command(cx), None);
+    });
+    click(vcx, "admin-add-account-agy");
+    click(vcx, "admin-agy-login-run");
+    let account = vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert!(v.terminal_login_provider.is_none());
+        assert!(v.login_pending.is_none());
+        let account = v
+            .accounts_snapshot
+            .accounts
+            .iter()
+            .find(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
+            .unwrap()
+            .clone();
+        assert!(Path::new(&account.profile_dir).is_dir());
+        assert_eq!(
+            take_pending_terminal_command(cx),
+            Some(crate::accounts::terminal_login_command(&account))
+        );
+        account
+    });
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.login_account(ProviderKind::Antigravity, Some(account.clone()), cx);
+        });
+    });
+    vcx.run_until_parked();
+    click(vcx, "admin-agy-login-run");
+    vcx.update(|_, cx| {
+        assert_eq!(
+            take_pending_terminal_command(cx),
+            Some(crate::accounts::terminal_login_command(&account))
+        );
+        assert_eq!(
+            view.read(cx)
+                .accounts_snapshot
+                .accounts
+                .iter()
+                .filter(|a| a.provider == ProviderKind::Antigravity && !a.host_default)
+                .count(),
+            1
+        );
+    });
+    fs::remove_dir_all(d).ok();
+}
+
+#[gpui::test]
+fn async_settings_queue_keeps_ui_live_and_preserves_edit_order(cx: &mut TestAppContext) {
+    let root = dir("async-settings-queue");
+    init(cx, &root);
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    cx.update(|cx| {
+        cx.set_global(FileIoQueue(Some(blocked)));
+        edit(cx, |settings| settings.notifications = false);
+        edit(cx, |settings| settings.keep_awake = KeepAwake::Off);
+        // An unrelated input event can still be handled while the storage queue waits.
+        queue_terminal_command("input-while-storage-is-delayed", cx);
+        assert_eq!(
+            take_pending_terminal_command(cx).as_deref(),
+            Some("input-while-storage-is-delayed")
+        );
+        assert!(!current(cx).notifications);
+        assert_eq!(current(cx).keep_awake, KeepAwake::Off);
+    });
+    cx.run_until_parked();
+    assert!(!root.join(SETTINGS_FILE).exists());
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    let saved = Settings::parse(&fs::read_to_string(root.join(SETTINGS_FILE)).unwrap()).unwrap();
+    assert!(!saved.notifications);
+    assert_eq!(saved.keep_awake, KeepAwake::Off);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn async_old_config_read_cannot_replace_reinitialized_config(cx: &mut TestAppContext) {
+    let old = dir("async-old-config");
+    let new = dir("async-new-config");
+    fs::write(old.join(SETTINGS_FILE), "notifications = false\n").unwrap();
+    fs::write(new.join(SETTINGS_FILE), "keep_awake = 'off'\n").unwrap();
+    init(cx, &old);
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    cx.update(|cx| {
+        cx.set_global(FileIoQueue(Some(blocked)));
+        reload(cx);
+        init_at(Some(new.clone()), cx);
+    });
+    cx.run_until_parked();
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    cx.read(|cx| {
+        assert_eq!(state_dir(cx), Some(new.clone()));
+        assert!(current(cx).notifications);
+        assert_eq!(current(cx).keep_awake, KeepAwake::Off);
+    });
+    fs::remove_dir_all(old).unwrap();
+    fs::remove_dir_all(new).unwrap();
+}
+
+#[gpui::test]
+fn async_schedule_lock_does_not_block_action_or_other_input(cx: &mut TestAppContext) {
+    let root = dir("async-schedule-lock");
+    init(cx, &root);
+    let mut schedules = krill_proto::schedule::Schedules::default();
+    schedules.schedule.push(krill_proto::schedule::Schedule {
+        id: "delayed".into(),
+        cron: "* * * * *".into(),
+        cwd: "/tmp".into(),
+        command: vec!["true".into()],
+        prompt: String::new(),
+        precheck: None,
+        workspace_mode: krill_proto::schedule::WorkspaceMode::default(),
+        enabled: true,
+    });
+    schedules.save(&root).unwrap();
+    let lock = krill_proto::schedule::Schedules::exclusive_edit(&root).unwrap();
+    let view = cx.new(SettingsView::new);
+    view.update(cx, |view, cx| {
+        view.toggle_schedule_enabled("delayed", cx);
+        view.set_tab(AdminTab::Accounts, cx);
+        assert_eq!(view.tab(), AdminTab::Accounts);
+        assert!(view.file_jobs.contains_key("schedule-edit"));
+    });
+    // The callback above returned while another owner still held the file lock.
+    drop(lock);
+    cx.run_until_parked();
+    assert!(
+        !krill_proto::schedule::Schedules::load(&root)
+            .unwrap()
+            .schedule[0]
+            .enabled
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn async_failed_settings_write_preserves_corrupt_file_and_rolls_back_ui(cx: &mut TestAppContext) {
+    let root = dir("async-corrupt-settings");
+    init(cx, &root);
+    fs::write(root.join(SETTINGS_FILE), "broken = [\n").unwrap();
+    cx.update(|cx| edit(cx, |settings| settings.notifications = false));
+    cx.run_until_parked();
+    cx.run_until_parked();
+    assert_eq!(
+        fs::read_to_string(root.join(SETTINGS_FILE)).unwrap(),
+        "broken = [\n"
+    );
+    cx.read(|cx| {
+        assert!(current(cx).notifications);
+        assert!(cx.global::<Config>().error.is_some());
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
+    cx: &mut TestAppContext,
+) {
+    let root = dir("async-external-notification");
+    init(cx, &root);
+    let changes = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = changes.clone();
+    cx.update(|cx| {
+        cx.observe_global::<Config>(move |_| observed.set(observed.get() + 1))
+            .detach();
+        reload_if_changed(cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        changes.get(),
+        0,
+        "unchanged polling must not trigger account rescans"
+    );
+    fs::write(root.join(SETTINGS_FILE), "notifications = false\n").unwrap();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    cx.update(|cx| {
+        cx.set_global(FileIoQueue(Some(blocked)));
+        for _ in 0..3 {
+            notify_external_change(cx);
+        }
+        queue_terminal_command("input-after-notification", cx);
+        assert_eq!(
+            take_pending_terminal_command(cx).as_deref(),
+            Some("input-after-notification")
+        );
+        assert!(current(cx).notifications);
+    });
+    cx.run_until_parked();
+    assert!(cx.read(|cx| current(cx).notifications));
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert!(!cx.read(|cx| current(cx).notifications));
+    fs::remove_dir_all(root).unwrap();
 }

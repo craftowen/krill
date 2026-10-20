@@ -29,11 +29,17 @@ actions!(
     ]
 );
 
+struct StartupBounds(Option<krill_app::layout::SavedWindowBounds>);
+impl gpui::Global for StartupBounds {}
+
+#[derive(Default)]
+struct OpeningWindow {
+    pending: bool,
+    session: Option<krill_proto::SessionId>,
+}
+impl gpui::Global for OpeningWindow {}
+
 fn main() -> std::process::ExitCode {
-    // MK-170: 경로를 정하기 전에 옛 번들 id 데이터를 옮긴다(옛 holder가 살아 있으면 그대로 둔다).
-    let migrated = krill_proto::daemon::migrate::run();
-    krill_log::init(krill_log::Component::App).ok();
-    tracing::info!(?migrated, "app starting");
     krill_proto::diag::install_panic_hook("krill-app");
     if std::env::args().any(|a| a == "--crash-test") {
         crash_test();
@@ -56,46 +62,70 @@ fn main() -> std::process::ExitCode {
     }
     // OWE-576: gpui-component 아이콘 자산은 재열기·새 창에서도 같은 소스를 쓴다.
     let application = gpui_platform::application().with_assets(gpui_kit_assets::Assets);
-    application.on_reopen(|cx| {
-        reopen(cx, |cx| {
-            let _ = new_window(cx);
-        });
-    });
+    application.on_reopen(|cx| request_open_from_menu(None, cx));
     application.run(|cx: &mut App| {
         init(cx);
-        krill_app::settings::init(cx);
-        let Some(window) = new_window(cx) else {
-            cx.quit();
-            return;
-        };
-        if let Ok(paths) = krill_proto::daemon::Paths::dev() {
-            krill_app::menu_bar::init(
-                krill_app::sidebar::status_source(paths),
-                |session, cx| {
-                    open_from_menu(session, cx, |cx| {
-                        let _ = new_window(cx);
-                    });
-                },
-                cx,
-            );
-        }
-        if let Some(state) = krill_proto::daemon::state_dir() {
-            window
-                .update(cx, |shell, window, cx| {
-                    shell.arm_update_ready(state.clone());
-                    krill_app::star_nag::init(state.clone(), cx);
-                    krill_app::updater::on_startup(state.clone(), window, cx);
-                    krill_app::crash::offer_report(state, |p, cx| cx.reveal_path(p), window, cx);
-                    if let Some(env) = krill_app::onboarding::Env::current() {
-                        krill_app::onboarding::offer(env.clone(), cx);
-                        // 시작 시 빠른 점검(bin/state/위치만, 백그라운드). UI 스레드를 막지 않는다.
-                        krill_app::onboarding::spawn_quick_check(&env, cx);
-                        // OWE-706: 설치된 프로바이더만 계정 화면·상태바에 보인다.
-                        krill_app::accounts::installed::spawn_detect(env.shell.clone(), cx);
-                    }
-                })
-                .ok();
-        }
+        cx.set_global(OpeningWindow {
+            pending: true,
+            session: None,
+        });
+        // Resolve startup files and helper paths while the application event loop stays responsive.
+        let startup = cx.background_spawn(async {
+            let migrated = krill_proto::daemon::migrate::run();
+            krill_log::init(krill_log::Component::App).ok();
+            tracing::info!(?migrated, "app starting");
+            let bounds = krill_app::layout::default_path()
+                .as_deref()
+                .and_then(krill_app::layout::Layout::peek_window_bounds);
+            let paths = krill_proto::daemon::Paths::dev().ok();
+            let env = krill_app::onboarding::Env::discover_current();
+            (bounds, paths, env)
+        });
+        cx.spawn(async move |cx| {
+            let (bounds, paths, env) = startup.await;
+            cx.update(|cx| {
+                cx.set_global(StartupBounds(bounds));
+                krill_app::settings::init(cx);
+                let Some(window) = new_window(cx) else {
+                    cx.quit();
+                    return;
+                };
+                if let Some(paths) = paths {
+                    krill_app::menu_bar::init(
+                        krill_app::sidebar::status_source(paths),
+                        request_open_from_menu,
+                        cx,
+                    );
+                }
+                if let Some(state) = krill_proto::daemon::state_dir() {
+                    window
+                        .update(cx, |shell, window, cx| {
+                            shell.arm_update_ready(state.clone());
+                            krill_app::star_nag::init(state.clone(), cx);
+                            krill_app::updater::on_startup(state.clone(), window, cx);
+                            krill_app::crash::offer_report(
+                                state,
+                                |p, cx| cx.reveal_path(p),
+                                window,
+                                cx,
+                            );
+                            if let Some(env) = env {
+                                krill_app::onboarding::offer(env.clone(), cx);
+                                krill_app::onboarding::spawn_quick_check(&env, cx);
+                                krill_app::accounts::installed::spawn_detect(env.shell, cx);
+                            }
+                        })
+                        .ok();
+                }
+                let opening = cx.global_mut::<OpeningWindow>();
+                opening.pending = false;
+                let session = opening.session.take();
+                if session.is_some() {
+                    open_from_menu(session, cx, |_| {});
+                }
+            });
+        })
+        .detach();
     });
     std::process::ExitCode::SUCCESS
 }
@@ -137,6 +167,47 @@ fn open_from_menu(
     }
 }
 
+/// Reopening after the last window closes loads its latest bounds without blocking menus.
+fn request_open_from_menu(session: Option<krill_proto::SessionId>, cx: &mut App) {
+    if cx
+        .windows()
+        .iter()
+        .any(|window| window.downcast::<shell::Shell>().is_some())
+    {
+        open_from_menu(session, cx, |_| {});
+        return;
+    }
+    if !cx.has_global::<OpeningWindow>() {
+        cx.set_global(OpeningWindow::default());
+    }
+    let opening = cx.global_mut::<OpeningWindow>();
+    if session.is_some() {
+        opening.session = session;
+    }
+    if opening.pending {
+        return;
+    }
+    opening.pending = true;
+    let work = cx.background_spawn(async {
+        krill_app::layout::default_path()
+            .as_deref()
+            .and_then(krill_app::layout::Layout::peek_window_bounds)
+    });
+    cx.spawn(async move |cx| {
+        let bounds = work.await;
+        cx.update(|cx| {
+            cx.set_global(StartupBounds(bounds));
+            let opening = cx.global_mut::<OpeningWindow>();
+            opening.pending = false;
+            let session = opening.session.take();
+            open_from_menu(session, cx, |cx| {
+                let _ = new_window(cx);
+            });
+        });
+    })
+    .detach();
+}
+
 fn new_window(cx: &mut App) -> Option<WindowHandle<shell::Shell>> {
     // 단일 메인 창 정책: 이미 열린 Shell 창이 있으면 활성화하고, 모든 창이 닫혔을 때만
     // 기본 레이아웃 저장 경로로 메인 창을 다시 열어 탭·분할 변경이 유실되지 않게 한다(OWE-859).
@@ -161,9 +232,9 @@ fn new_window(cx: &mut App) -> Option<WindowHandle<shell::Shell>> {
 
 /// 창 구성과 외부 IO를 분리하여 gpui 테스트가 데몬을 띄우지 않게 한다.
 fn open_shell(cx: &mut App, path: Option<PathBuf>) -> Option<WindowHandle<shell::Shell>> {
-    let window_bounds = path
-        .as_deref()
-        .and_then(krill_app::layout::Layout::peek_window_bounds)
+    let window_bounds = cx
+        .try_global::<StartupBounds>()
+        .and_then(|startup| startup.0)
         .map_or_else(
             || WindowBounds::Windowed(Bounds::centered(None, size(px(1200.), px(760.)), cx)),
             |saved| on_screen(shell::gpui_window_bounds_from_saved(saved), cx),
@@ -228,9 +299,8 @@ fn init(cx: &mut App) {
     // menu_bar::init switches to explicit quit only after its tray icon succeeds.
     cx.set_quit_mode(QuitMode::Default);
     cx.on_app_quit(|cx| {
-        let services = krill_app::hosts::link::begin_shutdown();
         cx.background_executor().spawn(async move {
-            for service in services {
+            for service in krill_app::hosts::link::begin_shutdown() {
                 service.shutdown();
             }
         })
@@ -246,9 +316,7 @@ fn init(cx: &mut App) {
         krill_app::keys::bind("cmd-m", MinimizeWindow, None),
         krill_app::keys::bind("ctrl-cmd-f", ToggleFullscreen, None),
     ]);
-    cx.on_action(|_: &NewWindow, cx| {
-        let _ = new_window(cx);
-    });
+    cx.on_action(|_: &NewWindow, cx| request_open_from_menu(None, cx));
     cx.on_action(|_: &HideApp, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -282,12 +350,13 @@ fn init(cx: &mut App) {
         krill_app::settings::open_window_at_tab(krill_app::settings::AdminTab::Shortcuts, cx);
     });
     cx.on_action(|_: &CloseWindow, cx| {
-        if let Some(window) = cx.active_window() {
+        if let Some(window) = cx
+            .active_window()
+            .and_then(|window| window.downcast::<shell::Shell>())
+        {
             // 액션 전달 중에는 현재 창이 빌려져 있으므로 전달이 끝난 뒤 닫는다.
             cx.defer(move |cx| {
-                window
-                    .update(cx, |_, window, _| window.remove_window())
-                    .ok();
+                window.update(cx, shell::Shell::request_close).ok();
             });
         }
     });

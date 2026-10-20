@@ -2,7 +2,7 @@
 //! No remote writes happen on refresh; creation opens gh's browser form only on user action.
 
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{self, Read as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -588,49 +588,51 @@ pub(super) fn execute(cmd: &mut Command, timeout: Duration) -> io::Result<Vec<u8
             .stderr(Stdio::null())
             .spawn()?,
     );
-    let mut stdout = child
+    let stdout = child
         .0
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("missing gh stdout"))?;
-    // Nonblocking pipe reads avoid pipe backpressure and reader threads surviving a timeout.
-    // ponytail: Windows 파이프는 블로킹이라 `gh`가 멈추면 타임아웃이 늦다. 실구현은 OWE-834.
-    #[cfg(unix)]
-    rustix::fs::fcntl_setfl(&stdout, rustix::fs::OFlags::NONBLOCK)?;
     let deadline = Instant::now() + timeout;
-    let mut bytes = Vec::new();
-    loop {
-        let mut buf = [0; 4096];
-        loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    bytes.extend_from_slice(&buf[..n]);
-                    if bytes.len() as u64 > MAX_OUTPUT {
-                        return Err(io::Error::other("gh output too large"));
-                    }
-                }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                Err(e) => return Err(e),
+    let reader = crate::process_io::read(stdout, MAX_OUTPUT + 1, deadline)?;
+    let mut output = None;
+    let status = loop {
+        if output.is_none()
+            && let Some(captured) = reader.try_finish()
+        {
+            let captured = captured?;
+            if captured.bytes.len() as u64 > MAX_OUTPUT {
+                return Err(io::Error::other("gh output too large"));
             }
+            if captured.timed_out {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "gh pipe timed out"));
+            }
+            output = Some(captured.bytes);
         }
         if let Some(status) = child.0.try_wait()? {
-            if !status.success() {
-                return Err(io::Error::other("gh failed"));
-            }
-            // The direct child exited; a retained descendant pipe must never block the caller.
-            stdout.take(MAX_OUTPUT + 1).read_to_end(&mut bytes)?;
-            return if bytes.len() as u64 <= MAX_OUTPUT {
-                Ok(bytes)
-            } else {
-                Err(io::Error::other("gh output too large"))
-            };
+            break status;
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "gh timed out"));
         }
         std::thread::sleep(Duration::from_millis(5));
+    };
+    let bytes = if let Some(output) = output {
+        output
+    } else {
+        let captured = reader.finish(deadline + Duration::from_millis(50))?;
+        if captured.timed_out {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "gh pipe timed out"));
+        }
+        if captured.bytes.len() as u64 > MAX_OUTPUT {
+            return Err(io::Error::other("gh output too large"));
+        }
+        captured.bytes
+    };
+    if !status.success() {
+        return Err(io::Error::other("gh failed"));
     }
+    Ok(bytes)
 }
 
 #[derive(Deserialize)]

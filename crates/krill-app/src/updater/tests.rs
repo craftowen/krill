@@ -415,6 +415,7 @@ fn open_window<'a>(cx: &'a mut TestAppContext, state: &Path) -> &'a mut VisualTe
     let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
     let state = state.to_path_buf();
     cx.update(|window, cx| offer_rollback(state, window, cx));
+    cx.run_until_parked();
     cx
 }
 
@@ -441,6 +442,7 @@ fn gpui_rollback_dialogs_confirm_and_restore(cx: &mut TestAppContext) {
     };
     j2.save(&state).unwrap();
     let vcx = open_window(cx, &state);
+    vcx.run_until_parked();
     let (title, _) = vcx.pending_prompt().expect("rollback notice prompt");
     assert_eq!(title, text::ROLLBACK_DONE_TITLE.get());
     vcx.simulate_prompt_answer(text::OK_BUTTON.get());

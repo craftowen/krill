@@ -704,6 +704,21 @@ impl Layout {
         }
     }
 
+    /// Rebind every pane on this host, including panes in background tabs.
+    pub fn rebind_session(&mut self, host: &HostId, from: SessionId, to: SessionId) -> Vec<PaneId> {
+        let panes: Vec<_> = self
+            .sessions
+            .iter()
+            .filter_map(|(&pane, &session)| {
+                (session == from && self.host(pane) == host).then_some(pane)
+            })
+            .collect();
+        for &pane in &panes {
+            self.sessions.insert(pane, to);
+        }
+        panes
+    }
+
     /// 폴더·실행 프로그램. 기존 세션에 재접속할 때도 Open in의 폴더를 유지한다.
     pub fn launch(&self, pane: PaneId) -> Option<&Create> {
         self.launches.get(&pane)

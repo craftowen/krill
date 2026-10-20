@@ -30,6 +30,7 @@ static CACHE: Mutex<BTreeMap<CacheKey, Cached>> = Mutex::new(BTreeMap::new());
 /// 캐시된 로그인 상태만 돌려준다. CLI 조회(프로필마다 최대 5초)는 백그라운드 스레드가 하므로
 /// 실행·재개·hook(레지스트리 잠금 안)·자동전환 경로가 CLI를 기다리지 않는다. 조회 중이면 "모름"(항목 없음)이다.
 pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
+    let agents = crate::agent::control::Control::new(state).agents().ok();
     let mut profiles: Vec<_> = load_file(home, state)
         .accounts
         .into_iter()
@@ -47,7 +48,7 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
     let mut found = BTreeMap::new();
     for (provider, dir, host) in profiles {
         let key = (provider, dir.clone());
-        let Some(exe) = executable(provider) else {
+        let Some(exe) = executable(provider, agents.as_ref()) else {
             lock(&STATES).insert(key, ConnectionStatus::NotInstalled);
             continue;
         };
@@ -56,13 +57,14 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
             lock(&STATES).insert(key, ConnectionStatus::CheckFailed);
             continue;
         }
-        let stamp: Stamp = [
+        let mut stamp: Stamp = [
             "",
             ".claude.json",
             "auth.json",
             ".credentials.json",
             ".krill-login-completed",
             ".gemini/antigravity-cli/antigravity-oauth-token",
+            "data/opencode/auth.json",
         ]
         .iter()
         .map(|name| {
@@ -71,6 +73,12 @@ pub(super) fn statuses(home: &Path, state: Option<&Path>) -> Statuses {
                 .ok()
         })
         .collect();
+        stamp.push(std::fs::metadata(&exe).and_then(|m| m.modified()).ok());
+        stamp.push(state.and_then(|s| {
+            std::fs::metadata(s.join(krill_proto::agent::FILE_NAME))
+                .and_then(|m| m.modified())
+                .ok()
+        }));
         let cached = lock(&CACHE).get(&key).cloned();
         let status = match cached {
             Some((at, prior, status)) if prior == stamp => {
@@ -111,13 +119,18 @@ fn spawn_probe(exe: PathBuf, key: &CacheKey, stamp: Stamp, host: bool, home: Pat
                     return super::super::direct::antigravity_auth(dir, host);
                 }
                 let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
-                probe_with_environment(
+                let mut status = probe_with_environment(
                     &exe,
                     *provider,
                     (!host).then_some(dir.as_path()),
                     Some(&home),
                     Some(path),
-                )
+                )?;
+                if status.logged_in && *provider == ProviderKind::Codex {
+                    status.identity = super::super::direct::read_file(&dir.join("auth.json"))
+                        .and_then(|raw| super::identity::from_credentials(*provider, &raw));
+                }
+                Some(status)
             })
             .ok()
             .flatten();
@@ -145,18 +158,25 @@ fn spawn_probe(exe: PathBuf, key: &CacheKey, stamp: Stamp, host: bool, home: Pat
 }
 
 #[cfg(not(test))]
-fn executable(provider: ProviderKind) -> Option<PathBuf> {
+fn executable(
+    provider: ProviderKind,
+    agents: Option<&krill_proto::agent::Agents>,
+) -> Option<PathBuf> {
     if cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some() {
         return None;
     }
     let path = std::ffi::OsStr::from_bytes(crate::shell::login_path());
-    krill_proto::agent::which(provider.as_str(), path)
+    let program = agents
+        .and_then(|a| a.resolve(provider.as_str()))
+        .and_then(|(_, profile)| profile.program())
+        .unwrap_or(provider.as_str());
+    krill_proto::agent::which(program, path)
 }
 
 // 단위 테스트에서는 실제 CLI/네트워크/사용자 자격증명을 조회하지 않는다.
 // fake CLI의 명령·환경·응답 검증은 krill_proto::account_login::tests에서 수행한다.
 #[cfg(test)]
-fn executable(_: ProviderKind) -> Option<PathBuf> {
+fn executable(_: ProviderKind, _: Option<&krill_proto::agent::Agents>) -> Option<PathBuf> {
     FAKE_EXE.with(|exe| exe.borrow().clone())
 }
 

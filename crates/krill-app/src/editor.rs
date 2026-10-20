@@ -243,11 +243,11 @@ pub enum Poll {
 }
 
 /// 열린 텍스트 파일 하나의 상태.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Doc {
     path: PathBuf,
     /// dirty 비교 기준: 마지막으로 읽거나 저장한 내용.
-    saved: String,
+    saved: std::sync::Arc<str>,
     stamp: Option<Stamp>,
     dirty: bool,
     disk: Disk,
@@ -257,7 +257,7 @@ impl Doc {
     pub fn new(path: PathBuf, text: String, stamp: Stamp) -> Self {
         Self {
             path,
-            saved: text,
+            saved: text.into(),
             stamp: Some(stamp),
             dirty: false,
             disk: Disk::Same,
@@ -272,6 +272,10 @@ impl Doc {
         &self.saved
     }
 
+    pub fn saved_snapshot(&self) -> std::sync::Arc<str> {
+        self.saved.clone()
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -282,7 +286,7 @@ impl Doc {
 
     /// 에디터가 처음 받은 내용을 기준으로 삼는다(에디터가 내용을 정규화해도 열자마자 dirty가 되지 않게).
     pub fn rebase(&mut self, text: String) {
-        self.saved = text;
+        self.saved = text.into();
         self.dirty = false;
     }
 
@@ -306,7 +310,7 @@ impl Doc {
 
     /// 저장 성공. 저장한 내용이 새 기준이 되고, 디스크 표시는 지운다.
     pub fn saved_as(&mut self, text: String, stamp: Stamp) {
-        self.saved = text;
+        self.saved = text.into();
         self.stamp = Some(stamp);
         self.dirty = false;
         self.disk = Disk::Same;

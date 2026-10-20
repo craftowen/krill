@@ -9,7 +9,7 @@ use std::process::{Child, ExitCode, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use gpui::{App, PromptLevel, Window};
+use gpui::{App, AppContext as _, PromptLevel, Window};
 use krill_proto::os::fs::DirBuilderExt as _;
 #[cfg(unix)]
 use rustix::process::{Pid, test_kill_process};
@@ -677,41 +677,63 @@ pub fn mark_ready(state_dir: &Path, current_version: &str) {
 
 /// 시작 시 중간 크래시 저널을 복구하고 롤백 대화상자를 띄운다. ready는 첫 Attached 뒤에 보낸다.
 pub fn on_startup(state_dir: PathBuf, window: &mut Window, cx: &mut App) {
-    recover_journal(&state_dir).ok();
-    offer_rollback(state_dir, window, cx);
+    load_rollback(state_dir, true, window, cx);
 }
 
-/// 저널이 `Stage::RolledBack`이면 롤백 안내 대화상자를 띄운다.
-///
-/// `Stage::RollbackNeeded`(수동 확인 대기)는 프로덕션에서 생성하는 곳이 없는
-/// 죽은 경로라 제거했다(AS-10). relauncher는 분리 프로세스라 묻지 않고 자동
-/// 롤백한다(ARCHITECTURE §7).
+/// Load the journal without waiting on disk on the event loop.
 pub fn offer_rollback(state_dir: PathBuf, window: &mut Window, cx: &mut App) {
-    let Ok(Some(journal)) = Journal::load(&state_dir) else {
-        return;
-    };
-    if let Stage::RolledBack { reason } = journal.stage.clone() {
-        let detail = text::ROLLBACK_DONE_DETAIL
-            .get()
-            .replace("{to}", &journal.to_version)
-            .replace("{from}", &journal.from_version)
-            .replace("{reason}", &localize_reason(&reason));
-        let answer = window.prompt(
-            PromptLevel::Warning,
-            text::ROLLBACK_DONE_TITLE.get(),
-            Some(&detail),
-            &[text::OK_BUTTON.get()],
-            cx,
-        );
-        cx.spawn(async move |_| {
-            answer.await.ok();
-            if let Ok(Some(mut j)) = Journal::load(&state_dir) {
-                j.stage = Stage::Acknowledged;
-                j.save(&state_dir).ok();
-            }
-        })
-        .detach();
-    }
+    load_rollback(state_dir, false, window, cx);
+}
+
+fn load_rollback(state_dir: PathBuf, recover: bool, window: &Window, cx: &mut App) {
+    let handle = window.window_handle();
+    let work_dir = state_dir.clone();
+    let work = cx.background_spawn(async move {
+        if recover {
+            recover_journal(&work_dir).ok();
+        }
+        Journal::load(&work_dir).ok().flatten()
+    });
+    cx.spawn(async move |cx| {
+        let Some(journal) = work.await else {
+            return;
+        };
+        let Stage::RolledBack { reason } = &journal.stage else {
+            return;
+        };
+        let answer = handle.update(cx, |_, window, cx| {
+            let detail = text::ROLLBACK_DONE_DETAIL
+                .get()
+                .replace("{to}", &journal.to_version)
+                .replace("{from}", &journal.from_version)
+                .replace("{reason}", &localize_reason(reason));
+            window.prompt(
+                PromptLevel::Warning,
+                text::ROLLBACK_DONE_TITLE.get(),
+                Some(&detail),
+                &[text::OK_BUTTON.get()],
+                cx,
+            )
+        });
+        let Ok(answer) = answer else {
+            return;
+        };
+        if answer.await.is_err() {
+            return;
+        }
+        cx.background_executor()
+            .spawn(async move {
+                // A newer update journal must not be acknowledged by an old dialog.
+                if let Ok(Some(mut current)) = Journal::load(&state_dir)
+                    && current == journal
+                {
+                    current.stage = Stage::Acknowledged;
+                    current.save(&state_dir).ok();
+                }
+            })
+            .await;
+    })
+    .detach();
 }
 
 #[cfg(test)]

@@ -1,0 +1,11 @@
+   Compiling krill-proto v0.1.13 (/path/to/krill/crates/krill-proto)
+    Checking krill-holder v0.1.13 (/path/to/krill/crates/krill-holder)
+    Checking krill-hosts v0.1.13 (/path/to/krill/crates/krill-hosts)
+    Checking krill-link v0.1.13 (/path/to/krill/crates/krill-link)
+    Checking krill-term v0.1.13 (/path/to/krill/crates/krill-term)
+    Checking krilld v0.1.13 (/path/to/krill/crates/krilld)
+    Checking krill v0.1.13 (/path/to/krill/crates/krill)
+    Checking krill-app v0.1.13 (/path/to/krill/crates/krill-app)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 7.01s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`

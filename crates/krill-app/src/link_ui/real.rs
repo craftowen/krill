@@ -14,16 +14,15 @@ use crate::i18n::link_ui as text;
 pub struct RealLinkBackend {
     state_dir: PathBuf,
     executable: PathBuf,
-    hosts: std::sync::Arc<crate::hosts::link::LinkHosts>,
+    hosts: std::sync::OnceLock<std::sync::Arc<crate::hosts::link::LinkHosts>>,
 }
 
 impl RealLinkBackend {
     pub fn new(state_dir: PathBuf, executable: PathBuf) -> Self {
-        let hosts = crate::hosts::link::LinkHosts::shared(state_dir.clone(), executable.clone());
         Self {
             state_dir,
             executable,
-            hosts,
+            hosts: std::sync::OnceLock::new(),
         }
     }
 
@@ -109,7 +108,14 @@ impl LinkBackend for RealLinkBackend {
             device_name,
         )) {
             Ok(host) => {
-                self.hosts.paired(&host.id);
+                self.hosts
+                    .get_or_init(|| {
+                        crate::hosts::link::LinkHosts::shared(
+                            self.state_dir.clone(),
+                            self.executable.clone(),
+                        )
+                    })
+                    .paired(&host.id);
                 PairOutcome::Paired(PairedDevice {
                     id: host.id,
                     name: host.name,

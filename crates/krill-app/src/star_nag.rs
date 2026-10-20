@@ -103,16 +103,62 @@ pub struct StarNag {
     dir: PathBuf,
     pub state: State,
     pub card: Card,
+    initialized: bool,
+    pending_save: Option<gpui::Task<()>>,
+    startup: tokio::sync::watch::Receiver<bool>,
 }
 
 impl Global for StarNag {}
 
-impl StarNag {
-    fn save(&self) {
-        if let Err(error) = save(&self.dir, &self.state) {
+fn persist(cx: &mut App) {
+    let (dir, state, previous) = {
+        let nag = cx.global_mut::<StarNag>();
+        if !nag.initialized {
+            return;
+        }
+        (nag.dir.clone(), nag.state.clone(), nag.pending_save.take())
+    };
+    let task = cx.background_executor().spawn(async move {
+        if let Some(previous) = previous {
+            previous.await;
+        }
+        if let Err(error) = save(&dir, &state) {
             tracing::warn!(kind = ?error.kind(), "star-nag save failed");
         }
+    });
+    cx.global_mut::<StarNag>().pending_save = Some(task);
+}
+
+/// 정상 종료 전에 호출하는 비동기 저장 배리어. 이후 저장도 이 순서 뒤에 이어진다.
+pub fn flush(cx: &mut App) -> gpui::Task<()> {
+    if !cx.has_global::<StarNag>() {
+        return gpui::Task::ready(());
     }
+    let mut startup = cx.global::<StarNag>().startup.clone();
+    cx.spawn(async move |cx| {
+        while !*startup.borrow() {
+            if startup.changed().await.is_err() {
+                break;
+            }
+        }
+        let pending = cx.update(flush_writes);
+        pending.await;
+    })
+}
+
+fn flush_writes(cx: &mut App) -> gpui::Task<()> {
+    let previous = cx.global_mut::<StarNag>().pending_save.take();
+    let (done, wait) = tokio::sync::oneshot::channel();
+    let task = cx.background_executor().spawn(async move {
+        if let Some(previous) = previous {
+            previous.await;
+        }
+        done.send(()).ok();
+    });
+    cx.global_mut::<StarNag>().pending_save = Some(task);
+    cx.background_executor().spawn(async move {
+        wait.await.ok();
+    })
 }
 
 fn now() -> u64 {
@@ -123,18 +169,48 @@ fn now() -> u64 {
 
 /// 앱 시작 때 한 번(메인 앱만). 테스트·`KRILL_TEST_OFFLINE`에서는 부르는 쪽이 임시 디렉터리를 준다.
 pub fn init(dir: PathBuf, cx: &mut App) {
-    let mut state = load(&dir);
-    let nag_version = env!("CARGO_PKG_VERSION");
-    let changed = state.ensure_version(nag_version);
-    let nag = StarNag {
-        dir,
-        state,
+    let (loaded, startup) = tokio::sync::watch::channel(false);
+    cx.set_global(StarNag {
+        dir: dir.clone(),
+        state: State::default(),
         card: Card::Hidden,
-    };
-    if changed {
-        nag.save();
-    }
-    cx.set_global(nag);
+        initialized: false,
+        pending_save: None,
+        startup,
+    });
+    cx.spawn(async move |cx| {
+        let load_dir = dir.clone();
+        let mut state = cx
+            .background_executor()
+            .spawn(async move { load(&load_dir) })
+            .await;
+        let version_changed = state.ensure_version(env!("CARGO_PKG_VERSION"));
+        cx.update(|cx| {
+            let nag = cx.global_mut::<StarNag>();
+            if nag.dir != dir || nag.initialized {
+                return;
+            }
+            let starts = nag.state.total;
+            state.total = state.total.saturating_add(starts);
+            nag.state = state;
+            nag.initialized = true;
+            if version_changed || starts > 0 {
+                persist(cx);
+            }
+            check_due(cx);
+        });
+        loaded.send(true).ok();
+    })
+    .detach();
+    cx.on_app_quit(|cx| {
+        let pending = cx.global_mut::<StarNag>().pending_save.take();
+        cx.background_executor().spawn(async move {
+            if let Some(pending) = pending {
+                pending.await;
+            }
+        })
+    })
+    .detach();
 }
 
 /// 앱에서 에이전트 세션을 하나 시작했다. 문턱을 넘으면 이미 별을 줬는지 확인한 뒤 카드를 띄운다.
@@ -144,8 +220,13 @@ pub fn record_agent_start(cx: &mut App) {
     }
     let nag = cx.global_mut::<StarNag>();
     nag.state.total = nag.state.total.saturating_add(1);
-    nag.save();
-    if nag.card != Card::Hidden || !nag.state.due(now()) {
+    persist(cx);
+    check_due(cx);
+}
+
+fn check_due(cx: &mut App) {
+    let nag = cx.global_mut::<StarNag>();
+    if !nag.initialized || nag.card != Card::Hidden || !nag.state.due(now()) {
         return;
     }
     nag.card = Card::Checking;
@@ -161,11 +242,11 @@ pub fn record_agent_start(cx: &mut App) {
             }
             if starred || nag.state.completed {
                 nag.state.complete();
-                nag.save();
                 nag.card = Card::Hidden;
             } else {
                 nag.card = Card::Shown;
             }
+            persist(cx);
             cx.refresh_windows();
         });
     })
@@ -176,7 +257,12 @@ fn update(cx: &mut App, f: impl FnOnce(&mut StarNag)) {
     if !cx.has_global::<StarNag>() {
         return;
     }
-    f(cx.global_mut::<StarNag>());
+    let nag = cx.global_mut::<StarNag>();
+    let before = nag.state.clone();
+    f(nag);
+    if nag.state != before {
+        persist(cx);
+    }
     cx.refresh_windows();
 }
 
@@ -184,7 +270,6 @@ fn update(cx: &mut App, f: impl FnOnce(&mut StarNag)) {
 pub fn later(cx: &mut App) {
     update(cx, |nag| {
         nag.state.defer(now());
-        nag.save();
         nag.card = Card::Hidden;
     });
 }
@@ -193,7 +278,6 @@ pub fn later(cx: &mut App) {
 pub fn never(cx: &mut App) {
     update(cx, |nag| {
         nag.state.complete();
-        nag.save();
         nag.card = Card::Hidden;
     });
 }
@@ -216,7 +300,6 @@ pub fn star(cx: &mut App) {
             if ok {
                 update(cx, |nag| {
                     nag.state.complete();
-                    nag.save();
                     nag.card = Card::Thanks;
                 });
             } else {

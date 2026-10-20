@@ -18,6 +18,28 @@ pub(super) fn bind_keys(cx: &mut App) {
     crate::set_menus(&krill_app::security::State::default(), cx);
 }
 
+/// Bound clipboard-owner stalls, image conversion and filesystem preparation together.
+const PASTE_PREPARATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[derive(Default)]
+pub(super) struct PasteQueue {
+    next: u64,
+    entries: std::collections::VecDeque<QueuedInput>,
+}
+struct QueuedInput {
+    pane: PaneId,
+    session: krill_proto::SessionId,
+    kind: QueuedKind,
+}
+enum PreparedPaste {
+    Pending,
+    Ready(Option<Vec<u8>>),
+}
+enum QueuedKind {
+    Paste(u64, PreparedPaste),
+    Bytes(Vec<u8>),
+}
+
 impl Shell {
     pub(crate) fn on_toggle_secure_input(
         &mut self,
@@ -35,22 +57,229 @@ impl Shell {
     }
 
     pub(super) fn on_window_active_changed(&mut self, active: bool, cx: &mut Context<Self>) {
+        if !active && let Some(pane) = self.layout.focused() {
+            self.cancel_pending_paste_for(pane, cx);
+        }
         self.security.set_window_active(active);
         krill_app::alert::set_active(active, cx);
         self.sidebar.update(cx, |s, cx| s.set_active(active, cx));
         self.diff.update(cx, |d, cx| d.set_active(active, cx));
     }
 
-    /// 클립보드 항목(텍스트·Finder 복사 파일 경로·스크린샷/복사 이미지)을 터미널 주입 바이트로 변환한다(MK-033·MK-111).
+    fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {
+        let pane = self.layout.focused()?;
+        let session = self.live.get(&pane)?.pane.session()?;
+        // Existing composition precedes the paste; later keystrokes enter slots
+        // behind it, so a slow image or clipboard owner cannot reorder input.
+        self.commit_ime(pane, Some(window), cx);
+        self.paste_queue.next = self.paste_queue.next.wrapping_add(1);
+        let id = self.paste_queue.next;
+        self.paste_queue.entries.push_back(QueuedInput {
+            pane,
+            session,
+            kind: QueuedKind::Paste(id, PreparedPaste::Pending),
+        });
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(PASTE_PREPARATION_TIMEOUT)
+                .await;
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.complete_clipboard_paste(id, None, window, cx);
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+        Some(id)
+    }
+
+    pub(super) fn paste_clipboard(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(id) = self.begin_clipboard_paste(window, cx) else {
+            return;
+        };
+        let read = cx.read_from_clipboard_async();
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let item = read.await.ok().flatten();
+            let payload = cx
+                .background_executor()
+                .spawn(async move { item.as_ref().and_then(clipboard_paste_payload) })
+                .await;
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.complete_clipboard_paste(id, payload, window, cx);
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    #[cfg(all(test, unix))]
     pub(super) fn paste_clipboard_item(
         &mut self,
         item: &gpui::ClipboardItem,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(bytes) = clipboard_paste_payload(item) {
-            self.paste_bytes(&bytes, window, cx);
+        let Some(id) = self.begin_clipboard_paste(window, cx) else {
+            return;
+        };
+        let item = item.clone();
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let payload = cx
+                .background_executor()
+                .spawn(async move { clipboard_paste_payload(&item) })
+                .await;
+            handle
+                .update(cx, |_, window, cx| {
+                    this.update(cx, |this, cx| {
+                        this.complete_clipboard_paste(id, payload, window, cx);
+                    })
+                    .ok();
+                })
+                .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn queue_input_behind_paste(&mut self, pane: PaneId, bytes: &[u8]) -> bool {
+        if !self
+            .paste_queue
+            .entries
+            .iter()
+            .any(|entry| entry.pane == pane)
+        {
+            return false;
         }
+        let Some(session) = self.live.get(&pane).and_then(|l| l.pane.session()) else {
+            return false;
+        };
+        self.paste_queue.entries.push_back(QueuedInput {
+            pane,
+            session,
+            kind: QueuedKind::Bytes(bytes.to_vec()),
+        });
+        true
+    }
+
+    pub(super) fn cancel_pending_paste_for(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let pending = std::mem::take(&mut self.paste_queue.entries);
+        for entry in pending {
+            if entry.pane != pane {
+                self.paste_queue.entries.push_back(entry);
+                continue;
+            }
+            // A focus change cancels clipboard navigation intent. Keystrokes
+            // already submitted to the still-existing session keep their order.
+            if self.layout.pane_exists(pane)
+                && let QueuedKind::Bytes(bytes) = entry.kind
+                && let Some(live) = self
+                    .live
+                    .get_mut(&pane)
+                    .filter(|live| live.pane.session() == Some(entry.session))
+            {
+                let notice = live.pane.input(&bytes, Now::get());
+                self.show(notice.as_ref(), cx);
+            }
+        }
+    }
+
+    pub(super) fn cancel_closed_pastes(&mut self, cx: &mut Context<Self>) {
+        let closed = self
+            .paste_queue
+            .entries
+            .iter()
+            .filter(|entry| !self.layout.pane_exists(entry.pane))
+            .map(|entry| entry.pane)
+            .collect::<std::collections::BTreeSet<_>>();
+        for pane in closed {
+            self.cancel_pending_paste_for(pane, cx);
+        }
+    }
+
+    fn complete_clipboard_paste(
+        &mut self,
+        id: u64,
+        payload: Option<Vec<u8>>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut found = false;
+        for entry in &mut self.paste_queue.entries {
+            if let QueuedKind::Paste(request, ready) = &mut entry.kind
+                && *request == id
+            {
+                *ready = PreparedPaste::Ready(payload);
+                found = true;
+                break;
+            }
+        }
+        // Expired/cancelled requests cannot reinsert payloads into the stream.
+        if !found {
+            return;
+        }
+        let pending = std::mem::take(&mut self.paste_queue.entries);
+        let mut blocked = std::collections::BTreeSet::new();
+        for entry in pending {
+            if !self.layout.pane_exists(entry.pane)
+                || self
+                    .live
+                    .get(&entry.pane)
+                    .is_none_or(|live| live.pane.session() != Some(entry.session))
+            {
+                continue;
+            }
+            if blocked.contains(&entry.pane)
+                || matches!(entry.kind, QueuedKind::Paste(_, PreparedPaste::Pending))
+            {
+                blocked.insert(entry.pane);
+                self.paste_queue.entries.push_back(entry);
+                continue;
+            }
+            if self.settings.is_some()
+                || self.dashboard.is_some()
+                || self.layout.focused() != Some(entry.pane)
+            {
+                continue;
+            }
+            let Some(live) = self
+                .live
+                .get_mut(&entry.pane)
+                .filter(|live| live.pane.session() == Some(entry.session))
+            else {
+                continue;
+            };
+            let bytes = match entry.kind {
+                QueuedKind::Bytes(bytes) => bytes,
+                QueuedKind::Paste(_, PreparedPaste::Ready(Some(bytes))) => {
+                    match plan_paste(entry.pane, &bytes, live.pane.modes()) {
+                        PastePlan::Immediate(bytes) => bytes,
+                        PastePlan::Warn(pending) => {
+                            self.security.set_pending_paste(Some(pending));
+                            cx.notify();
+                            continue;
+                        }
+                    }
+                }
+                QueuedKind::Paste(_, PreparedPaste::Pending | PreparedPaste::Ready(None)) => {
+                    continue;
+                }
+            };
+            live.clear_selection();
+            live.echo.key_sent(std::time::Instant::now());
+            let notice = live.pane.input(&bytes, Now::get());
+            self.show(notice.as_ref(), cx);
+            cx.notify();
+        }
+        let _ = window;
     }
 
     /// 포커스 칸에 텍스트를 붙여넣는다(MK-033·MK-076).
@@ -262,6 +491,28 @@ impl Shell {
     }
 }
 
+const MAX_CLIPBOARD_PREPARATIONS: usize = 2;
+static CLIPBOARD_PREPARATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+struct PreparationPermit<'a>(&'a std::sync::atomic::AtomicUsize);
+impl<'a> PreparationPermit<'a> {
+    fn acquire(count: &'a std::sync::atomic::AtomicUsize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < MAX_CLIPBOARD_PREPARATIONS).then_some(active + 1)
+            })
+            .ok()?;
+        Some(Self(count))
+    }
+}
+impl Drop for PreparationPermit<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 /// 클립보드 이미지 최대 허용 크기(64 MiB). 비정상 대용량 버퍼로 인한 UI 지연을 막는다.
 const MAX_CLIPBOARD_IMAGE_BYTES: usize = 64 * 1024 * 1024;
 
@@ -300,6 +551,9 @@ pub(crate) fn sniff_clipboard_image_extension(
 ///   셸 이스케이프된 파일 경로를 반환한다.
 pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
     use krill_proto::os::ffi::OsStrExt as _;
+    // Admission is held until native conversion/filesystem work really returns,
+    // independently of a UI deadline or the originating window's lifetime.
+    let _permit = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS)?;
 
     let has_valid_image = item.entries().iter().any(|entry| {
         matches!(
@@ -410,3 +664,6 @@ pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::pa
     file.sync_all()?;
     Ok(path)
 }
+
+#[cfg(all(test, unix))]
+mod tests;

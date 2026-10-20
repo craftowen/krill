@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 pub const FEAT_AGENT_HISTORY: u64 = 1 << 50;
 /// AI Vault 전문 검색·재개(`Action::Search`·`Action::ResumeVault`/`Response::Searched`, MK-181·OWE-735 지휘자 배정).
 pub const FEAT_AI_VAULT: u64 = 1 << 32;
+/// 하이브리드 채팅 오버레이 폴링(`Action::ChatPoll`/`Response::ChatSnapshot`).
+pub const FEAT_CHAT_POLL: u64 = 1 << 63;
 /// 한 응답은 프레임 상한(1MiB)보다 작다. 목록이 넘치면 `truncated`로 알린다.
 pub const MAX_ENTRIES: usize = 100;
 pub const MAX_TEXT: usize = 4096;

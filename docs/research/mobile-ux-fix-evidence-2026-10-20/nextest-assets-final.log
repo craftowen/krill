@@ -1,0 +1,35 @@
+   Compiling krill-holder v0.1.13 (/path/to/krill/crates/krill-holder)
+   Compiling krilld v0.1.13 (/path/to/krill/crates/krilld)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.08s
+────────────
+ Nextest run ID cc84edfa-1301-48de-9370-bff8a9c3d0e6 with nextest profile: default
+    Starting 27 tests across 19 binaries (569 tests skipped)
+        PASS [   0.020s] ( 1/27) krilld agent_history::chat::tests::agy_brain_transcript_binds_by_cwd_and_normalizes_generic_tool_results
+        PASS [   0.012s] ( 2/27) krilld agent_history::chat::tests::bounded_history_pages_can_be_replayed_and_generation_survives_append
+        PASS [   0.009s] ( 3/27) krilld mobile::pwa_rpc::tests::bracketed_paste_and_question_keystroke_planner_work
+        PASS [   0.010s] ( 4/27) krilld agent_history::chat::tests::mobile_replay_stops_at_observed_end_even_inside_a_record
+        PASS [   0.012s] ( 5/27) krilld agent_history::chat::tests::codex_agy_and_opencode_normalize_into_unified_chat_items
+        PASS [   0.012s] ( 6/27) krilld mobile::pwa::hash_tests::disk_hash_and_source_file_inventory_match
+        PASS [   0.012s] ( 7/27) krilld agent_history::chat::tests::claude_incremental_poll_and_truncation_reset_work
+        PASS [   0.013s] ( 8/27) krilld mobile::pwa::tests::embedded_routes_and_gzip_budget
+        PASS [   0.008s] ( 9/27) krilld mobile::pwa_rpc::tests::mobile_chat_page_identity_is_additive_and_replays_without_changing_legacy_snapshot
+        PASS [   0.016s] (10/27) krilld mobile::pwa_rpc::tests::historical_approval_and_question_requests_fail_closed_before_input
+        PASS [   0.014s] (11/27) krilld mobile::pwa_rpc::tests::photo_decoder_bounds_and_malformed_data
+        PASS [   0.016s] (12/27) krilld mobile::pwa_rpc::tests::host_metadata_reports_only_actual_hostname_and_platform
+        PASS [   0.007s] (13/27) krilld mobile::pwa_rpc::tests::snapshot_group_keys_preserve_non_utf8_bytes_and_unknown_sessions
+        PASS [   0.008s] (14/27) krilld mobile::pwa_rpc::tests::snapshot_agents_follow_registry_profiles_in_standard_order
+        PASS [   0.012s] (15/27) krilld mobile::pwa_rpc::tests::prompt_accepts_one_prepared_photo_and_rejects_bad_preparation_before_input
+        PASS [   0.007s] (16/27) krilld mobile::pwa_rpc::tests::snapshot_groups_use_deepest_path_components_and_keep_empty_repositories
+        PASS [   0.006s] (17/27) krilld mobile::pwa_rpc::tests::terminal_actions_reject_phone_supplied_paths_and_programs
+        PASS [   0.014s] (18/27) krilld mobile::pwa_rpc::tests::workflow_errors_are_bounded_and_json
+        PASS [   0.036s] (19/27) krilld mobile::pwa_rpc::tests::subprocess_output_and_time_are_bounded
+        PASS [   0.110s] (20/27) krilld mobile::pwa_rpc::tests::mobile_chat_small_append_pages_replay_with_original_display_ids
+        PASS [   0.141s] (21/27) krilld mobile::pwa_rpc::tests::card_git_skips_non_repositories_dedups_cwds_and_expires_cache
+        PASS [   0.137s] (22/27) krilld mobile::pwa_rpc::tests::photo_decoder_never_panics
+        PASS [   0.091s] (23/27) krilld::mobile_pwa session_screen_regressions
+        PASS [   0.114s] (24/27) krilld::mobile_pwa terminal_adapter_regressions
+        PASS [   0.783s] (25/27) krilld::mobile_pwa mobile_frontend_regressions
+        PASS [   0.783s] (26/27) krilld::mobile_pwa workflow_terminal_lifecycle_and_snapshot_metadata
+        PASS [   3.751s] (27/27) krilld::mobile_pwa non_secure_pwa_crypto_and_workflows
+────────────
+     Summary [   3.840s] 27 tests run: 27 passed, 569 skipped

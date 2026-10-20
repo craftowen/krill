@@ -10,7 +10,7 @@ use gpui::{Context, Div, FontWeight, SharedString, Stateful, Window, div, prelud
 use gpui_component::Sizable as _;
 use gpui_component::input::{Input, InputState};
 use krill_proto::schedule::{
-    FILE, Schedule, ScheduleRun, Schedules, WorkspaceMode, load_coalesced_runs, request_run_now,
+    FILE, Schedule, ScheduleRun, Schedules, WorkspaceMode, request_run_now,
 };
 
 use super::{SettingsView, layout, open_file, state_dir, text};
@@ -279,6 +279,7 @@ impl SettingsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.schedule_form_generation = self.schedule_form_generation.wrapping_add(1);
         let editing_id = existing.map(|s| s.id.clone());
         let init_id = existing.map_or("", |s| s.id.as_str()).to_owned();
         let init_cron = existing.map_or("0 9 * * *", |s| s.cron.as_str()).to_owned();
@@ -354,6 +355,7 @@ impl SettingsView {
     }
 
     pub fn close_schedule_modal(&mut self, cx: &mut Context<Self>) {
+        self.schedule_form_generation = self.schedule_form_generation.wrapping_add(1);
         if self.schedule_modal.is_some() {
             self.schedule_modal = None;
             cx.notify();
@@ -516,28 +518,40 @@ impl SettingsView {
             );
             return;
         };
-        let res: std::io::Result<()> = (|| {
-            let _guard = Schedules::exclusive_edit(&dir)?;
-            let mut schedules = Schedules::load(&dir)?;
-            if let Some(old_id) = editing_id.as_deref() {
-                schedules.schedule.retain(|s| s.id != old_id);
-            }
-            schedules.schedule.retain(|s| s.id != entry.id);
-            schedules.schedule.push(entry);
-            schedules.save(&dir)
-        })();
-        match res {
-            Ok(()) => {
-                self.schedule_modal = None;
-                self.schedule_error = None;
-                cx.notify();
-            }
-            Err(err) => {
-                if let Some(m) = &mut self.schedule_modal {
-                    fail(m, &mut self.schedule_error, err.to_string(), cx);
+        let generation = self.schedule_form_generation;
+        self.file_job(
+            "schedule-edit",
+            move || {
+                let _guard = Schedules::exclusive_edit(&dir)?;
+                let mut schedules = Schedules::load(&dir)?;
+                if let Some(old_id) = editing_id.as_deref() {
+                    schedules.schedule.retain(|s| s.id != old_id);
                 }
-            }
-        }
+                schedules.schedule.retain(|s| s.id != entry.id);
+                schedules.schedule.push(entry);
+                schedules.save(&dir)
+            },
+            move |this, result: std::io::Result<()>, cx| {
+                if this.schedule_form_generation != generation {
+                    this.refresh_service_cache(cx);
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        this.schedule_modal = None;
+                        this.schedule_error = None;
+                    }
+                    Err(error) => {
+                        this.schedule_error = Some(error.to_string().into());
+                        if let Some(modal) = &mut this.schedule_modal {
+                            modal.error.clone_from(&this.schedule_error);
+                        }
+                    }
+                }
+                this.refresh_service_cache(cx);
+            },
+            cx,
+        );
     }
 
     /// 지정한 스케줄의 활성/일시정지 상태(`enabled`)를 토글해 `schedules.toml`에 저장한다.
@@ -545,43 +559,53 @@ impl SettingsView {
         let Some(dir) = state_dir(cx) else {
             return;
         };
-        let res: std::io::Result<()> = (|| {
-            let _guard = Schedules::exclusive_edit(&dir)?;
-            let mut schedules = Schedules::load(&dir)?;
-            if let Some(sched) = schedules.schedule.iter_mut().find(|s| s.id == id) {
-                sched.enabled = !sched.enabled;
-                schedules.save(&dir)?;
-            }
-            Ok(())
-        })();
-        match res {
-            Ok(()) => {
-                self.schedule_error = None;
-                cx.notify();
-            }
-            Err(err) => {
-                self.schedule_error = Some(err.to_string().into());
-                cx.notify();
-            }
-        }
+        let id = id.to_owned();
+        self.file_job(
+            "schedule-edit",
+            move || {
+                let _guard = Schedules::exclusive_edit(&dir)?;
+                let mut schedules = Schedules::load(&dir)?;
+                if let Some(sched) = schedules.schedule.iter_mut().find(|s| s.id == id) {
+                    sched.enabled = !sched.enabled;
+                    schedules.save(&dir)?;
+                }
+                Ok(())
+            },
+            |this, result: std::io::Result<()>, cx| {
+                this.schedule_error = result.err().map(|error| error.to_string().into());
+                this.refresh_service_cache(cx);
+            },
+            cx,
+        );
     }
 
     pub fn remove_schedule(&mut self, id: &str, cx: &mut Context<Self>) {
         let Some(dir) = state_dir(cx) else {
             return;
         };
-        let res: std::io::Result<()> = (|| {
-            let _guard = Schedules::exclusive_edit(&dir)?;
-            let mut schedules = Schedules::load(&dir)?;
-            schedules.schedule.retain(|s| s.id != id);
-            schedules.save(&dir)
-        })();
-        if res.is_ok() {
-            if self.schedule_log.as_ref().is_some_and(|lv| lv.id == id) {
-                self.schedule_log = None;
-            }
-            cx.notify();
-        }
+        let id = id.to_owned();
+        let bg_id = id.clone();
+        self.file_job(
+            "schedule-edit",
+            move || {
+                let _guard = Schedules::exclusive_edit(&dir)?;
+                let mut schedules = Schedules::load(&dir)?;
+                schedules.schedule.retain(|s| s.id != bg_id);
+                schedules.save(&dir)
+            },
+            move |this, result, cx| {
+                match result {
+                    Ok(()) => {
+                        if this.schedule_log.as_ref().is_some_and(|log| log.id == id) {
+                            this.schedule_log = None;
+                        }
+                    }
+                    Err(error) => this.schedule_error = Some(error.to_string().into()),
+                }
+                this.refresh_service_cache(cx);
+            },
+            cx,
+        );
     }
 
     /// 스케줄을 즉시 실행(`Run Now`)한다. 데몬 소켓이 살아 있을 때만 `request_run_now`로
@@ -592,52 +616,79 @@ impl SettingsView {
             cx.notify();
             return;
         };
-        let sock = dir.join("run/krilld.sock");
-        let daemon_live = sock.exists() && krill_proto::os::net::UnixStream::connect(&sock).is_ok();
-        if !daemon_live {
-            self.schedule_error = Some(text::ACCOUNTS_DAEMON_REQUIRED.get().into());
-            cx.notify();
-            return;
-        }
-        match request_run_now(&dir, id) {
-            Ok(()) => {
-                self.schedule_error = None;
-            }
-            Err(err) => {
-                self.schedule_error = Some(err.to_string().into());
-            }
-        }
-        cx.notify();
+        let id = id.to_owned();
+        self.file_job(
+            "schedule-run",
+            move || {
+                let socket = dir.join("run/krilld.sock");
+                if !socket.exists() || krill_proto::os::net::UnixStream::connect(&socket).is_err() {
+                    return Err(std::io::Error::other(text::ACCOUNTS_DAEMON_REQUIRED.get()));
+                }
+                request_run_now(&dir, &id)
+            },
+            |this, result, _| {
+                this.schedule_error = result.err().map(|error| error.to_string().into());
+            },
+            cx,
+        );
     }
 
     /// 실행 기록 항목의 터미널 출력 로그 뷰어를 연다.
     pub fn open_schedule_run_log(&mut self, run: &ScheduleRun, cx: &mut Context<Self>) {
-        let output = if let Some(out) = run.output.as_deref().filter(|s| !s.trim().is_empty()) {
-            out.to_owned()
-        } else if let Some(sid) = run.session
-            && let Some(dir) = state_dir(cx)
-            && let Some(captured) = capture_session_output(&dir, krill_proto::SessionId(sid))
-        {
-            captured
-        } else if let Some(err) = run.error.as_deref().filter(|s| !s.trim().is_empty()) {
-            err.to_owned()
-        } else if let Some(st) = run.status {
-            format!("exit status {st}")
-        } else {
-            text::SCHEDULE_LOG_EMPTY.get().to_owned()
-        };
-
+        self.schedule_log_generation = self.schedule_log_generation.wrapping_add(1);
+        let generation = self.schedule_log_generation;
+        let run = run.clone();
+        let dir = state_dir(cx);
+        // Selecting another log or closing it fences this completion by the full run key.
         self.schedule_log = Some(ScheduleLogView {
             id: run.id.clone(),
             minute: run.minute,
             phase: run.phase.clone(),
             cwd: run.cwd.clone(),
-            output,
+            output: run.output.clone().unwrap_or_default(),
         });
+        cx.spawn(async move |this, cx| {
+            let key = (run.id.clone(), run.minute, run.phase.clone());
+            let output = cx
+                .background_executor()
+                .spawn(async move {
+                    if let Some(out) = run.output.as_deref().filter(|s| !s.trim().is_empty()) {
+                        out.to_owned()
+                    } else if let Some(sid) = run.session
+                        && let Some(dir) = dir
+                        && let Some(captured) =
+                            capture_session_output(&dir, krill_proto::SessionId(sid))
+                    {
+                        captured
+                    } else if let Some(err) = run.error.as_deref().filter(|s| !s.trim().is_empty())
+                    {
+                        err.to_owned()
+                    } else if let Some(st) = run.status {
+                        format!("exit status {st}")
+                    } else {
+                        text::SCHEDULE_LOG_EMPTY.get().to_owned()
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.schedule_log_generation != generation {
+                    return;
+                }
+                if let Some(log) = &mut this.schedule_log
+                    && (log.id.clone(), log.minute, log.phase.clone()) == key
+                {
+                    log.output = output;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
     pub fn close_schedule_run_log(&mut self, cx: &mut Context<Self>) {
+        self.schedule_log_generation = self.schedule_log_generation.wrapping_add(1);
         if self.schedule_log.is_some() {
             self.schedule_log = None;
             cx.notify();
@@ -651,16 +702,8 @@ impl SettingsView {
 
     pub(super) fn render_schedules_section(&self, cx: &mut Context<Self>) -> Stateful<Div> {
         let p = crate::ui::palette(cx);
-        let dir = state_dir(cx);
-        let schedules = dir
-            .as_deref()
-            .and_then(|d| Schedules::load(d).ok())
-            .map(|s| s.schedule)
-            .unwrap_or_default();
-        let runs = dir
-            .as_deref()
-            .and_then(|d| load_coalesced_runs(d).ok())
-            .unwrap_or_default();
+        let schedules = self.services.schedules.clone();
+        let runs = self.services.runs.clone();
 
         let add_btn = layout::primary("admin-schedule-add", text::SCHEDULE_ADD_BTN.get())
             .debug_selector(|| "admin-schedule-add".into())

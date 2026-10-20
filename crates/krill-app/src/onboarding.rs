@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(unix))]
 use self::access_shim::{Access, access};
-use gpui::{App, actions};
+use gpui::{App, AppContext as _, actions};
 use krill_proto::agent::hooks::Agent;
 use krill_proto::agent::{self, Agents};
 use krill_proto::doctor::{Check, Fix, FixKind, Level, Status};
@@ -58,9 +58,20 @@ pub struct Env {
     pub state_overridden: bool,
 }
 
+static CURRENT_ENV: std::sync::OnceLock<Option<Env>> = std::sync::OnceLock::new();
+
 impl Env {
     /// 이 프로세스의 환경. HOME이나 실행 파일 경로를 모르면 `None`(온보딩을 띄우지 않는다).
     pub fn current() -> Option<Self> {
+        CURRENT_ENV.get().cloned().flatten()
+    }
+
+    /// Resolve executable paths on the background executor before UI callbacks use `current`.
+    pub fn discover_current() -> Option<Self> {
+        CURRENT_ENV.get_or_init(Self::read_current).clone()
+    }
+
+    fn read_current() -> Option<Self> {
         Some(Self {
             shell: std::env::var_os("SHELL")
                 .filter(|s| !s.is_empty())
@@ -427,12 +438,16 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
 /// 첫 실행 진입. 모달 없이 완료를 남기고, 격리 상태가 아니면 비번들 스테이징 바이너리
 /// 갱신·자동 준비를 백그라운드로 돌린다(OWE-904). 준비 중 필요한 조치는 조치 배너가 알린다.
 pub fn offer(env: Env, cx: &mut App) {
-    let stored = state::load(&env.state);
-    if !stored.completed
-        && let Err(e) = state::save(&env.state, &stored.completed())
-    {
-        tracing::warn!(%e, "onboarding completion save failed");
-    }
+    let dir = env.state.clone();
+    crate::settings::background_file_io(cx, move || {
+        let stored = state::load(&dir);
+        if !stored.completed
+            && let Err(error) = state::save(&dir, &stored.completed())
+        {
+            tracing::warn!(%error, "onboarding completion save failed");
+        }
+    })
+    .detach();
     if !env.is_isolated_state() {
         actions::auto_prepare(env, cx).detach();
     }
@@ -451,9 +466,13 @@ pub fn init_actions(cx: &mut App) {
 
 /// 현재 환경으로 점검 창을 연다. 메뉴·설정·상태바 진입점이 함께 쓴다.
 pub fn open_checks_current(cx: &mut App) {
-    if let Some(env) = Env::current() {
-        open_checks(&env, cx);
-    }
+    let work = cx.background_spawn(async { Env::discover_current() });
+    cx.spawn(async move |cx| {
+        if let Some(env) = work.await {
+            cx.update(|cx| open_checks(&env, cx));
+        }
+    })
+    .detach();
 }
 
 /// 점검 모달을 연다. 이미 열려 있으면 앞으로 가져온다.

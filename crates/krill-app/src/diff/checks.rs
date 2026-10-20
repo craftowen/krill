@@ -31,10 +31,17 @@ pub enum PanelTab {
     Files,
     Search,
     Checks,
+    History,
 }
 
 impl PanelTab {
-    pub const ALL: [Self; 4] = [Self::Changes, Self::Files, Self::Search, Self::Checks];
+    pub const ALL: [Self; 5] = [
+        Self::Changes,
+        Self::Files,
+        Self::Search,
+        Self::Checks,
+        Self::History,
+    ];
 
     #[must_use]
     pub fn label(self) -> &'static str {
@@ -43,6 +50,7 @@ impl PanelTab {
             Self::Files => crate::i18n::catalog::diff::FILES.get(),
             Self::Search => crate::i18n::catalog::diff::SEARCH.get(),
             Self::Checks => text::CHECKS_TAB.get(),
+            Self::History => crate::i18n::catalog::agent_history::TITLE.get(),
         }
     }
 
@@ -53,6 +61,7 @@ impl PanelTab {
             Self::Files => crate::i18n::catalog::diff::FILES_TOOLTIP.get(),
             Self::Search => crate::i18n::catalog::diff::SEARCH_TOOLTIP.get(),
             Self::Checks => text::CHECKS_TAB.get(),
+            Self::History => crate::i18n::catalog::agent_history::TITLE.get(),
         }
     }
 
@@ -63,6 +72,7 @@ impl PanelTab {
             Self::Files => "diff-tab-files",
             Self::Search => "diff-tab-search",
             Self::Checks => "diff-tab-checks",
+            Self::History => "diff-tab-history",
         }
     }
 
@@ -73,6 +83,7 @@ impl PanelTab {
             Self::Files => "diff-tab-files-active",
             Self::Search => "diff-tab-search-active",
             Self::Checks => "diff-tab-checks-active",
+            Self::History => "diff-tab-history-active",
         }
     }
 
@@ -83,16 +94,18 @@ impl PanelTab {
             Self::Files => "diff-tab-files-tooltip",
             Self::Search => "diff-tab-search-tooltip",
             Self::Checks => "diff-tab-checks-tooltip",
+            Self::History => "diff-tab-history-tooltip",
         }
     }
 
     #[must_use]
-    pub const fn icon(self) -> IconName {
+    pub fn icon(self) -> Icon {
         match self {
-            Self::Changes => IconName::FileText,
-            Self::Files => IconName::Folder,
-            Self::Search => IconName::Search,
-            Self::Checks => IconName::CircleCheck,
+            Self::Changes => Icon::new(IconName::FileText),
+            Self::Files => Icon::new(IconName::Folder),
+            Self::Search => Icon::new(IconName::Search),
+            Self::Checks => Icon::new(IconName::CircleCheck),
+            Self::History => Icon::default().data(crate::ui::icons::HISTORY_SVG),
         }
     }
 }
@@ -151,6 +164,7 @@ impl Panel {
             return;
         }
         self.tab = tab;
+        self.sync_history(cx);
         if tab == PanelTab::Files {
             self.ensure_explorer_loaded_async(cx);
         }

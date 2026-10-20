@@ -895,7 +895,7 @@ impl Palette {
         if let Some(history) = self.history.clone() {
             let ws = workspace.clone();
             let prj = project.clone();
-            history.update(cx, |h, _| h.set_scope_paths(ws, prj));
+            history.update(cx, |h, cx| h.update_scope_paths(ws, prj, cx));
         }
         self.workspace_path = workspace;
         self.project_paths = project;

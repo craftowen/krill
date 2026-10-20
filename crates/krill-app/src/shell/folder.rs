@@ -86,8 +86,10 @@ impl Shell {
         });
         // OWE-852: 로컬 폴더를 열면 projects.toml에 영속 등록해 탭을 닫아도 사이드바에 남긴다.
         // 원격 호스트 경로는 로컬 projects.toml에 넣지 않는다. 실패해도 탭 열기는 막지 않는다.
-        if !is_remote && let Some(dir) = self.state_dir(cx) {
-            krill_app::sidebar::external::register_project(&dir, folder).ok();
+        if !is_remote {
+            self.sidebar.update(cx, |sidebar, cx| {
+                sidebar.register_project(folder.to_owned(), cx);
+            });
         }
     }
 
@@ -180,13 +182,9 @@ impl Shell {
                 this.update(cx, |this, cx| {
                     this.new_folder_tab(&parent, program, cx);
                     // OWE-852: 복제될 실제 저장소 루트(parent/dir)를 영속 등록한다.
-                    if let Some(dir_state) = this.state_dir(cx) {
-                        krill_app::sidebar::external::register_project(
-                            &dir_state,
-                            &parent.join(&dir),
-                        )
-                        .ok();
-                    }
+                    this.sidebar.update(cx, |sidebar, cx| {
+                        sidebar.register_project(parent.join(&dir), cx);
+                    });
                 })
                 .ok();
             }
@@ -207,9 +205,8 @@ impl Shell {
                 this.update(cx, |this, cx| {
                     this.new_folder_tab(parent, program, cx);
                     // OWE-852: 새로 만들 프로젝트 루트 자체를 영속 등록한다.
-                    if let Some(dir_state) = this.state_dir(cx) {
-                        krill_app::sidebar::external::register_project(&dir_state, &path).ok();
-                    }
+                    this.sidebar
+                        .update(cx, |sidebar, cx| sidebar.register_project(path.clone(), cx));
                 })
                 .ok();
             }

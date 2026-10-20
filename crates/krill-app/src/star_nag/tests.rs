@@ -70,6 +70,29 @@ fn load_save_roundtrip_and_garbage_starts_fresh() {
     assert_eq!(load(&dir), State::default());
 }
 
+#[gpui::test]
+fn explicit_flush_waits_for_startup_and_early_session_count(cx: &mut gpui::TestAppContext) {
+    let dir = temp_dir("startup-flush");
+    let mut previous = fresh(env!("CARGO_PKG_VERSION"));
+    previous.total = 9;
+    save(&dir, &previous).unwrap();
+    cx.update(|cx| {
+        init(dir.clone(), cx);
+        record_agent_start(cx);
+    });
+    let barrier = cx.update(flush);
+    cx.spawn(async move |_| {
+        barrier.await;
+        assert_eq!(
+            load(&dir).total,
+            10,
+            "flush must include the startup completion's save"
+        );
+    })
+    .detach();
+    cx.run_until_parked();
+}
+
 struct Host;
 impl Render for Host {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

@@ -1,6 +1,8 @@
 #![cfg(target_os = "windows")]
 
 mod clipboard;
+// Krill modification (Apache-2.0 §4(b)): asynchronous native clipboard IO.
+mod clipboard_worker;
 mod destination_list;
 mod dialog;
 mod direct_manipulation;

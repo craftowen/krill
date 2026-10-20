@@ -1,0 +1,124 @@
+   Compiling krill-proto v0.1.13 (/path/to/krill/crates/krill-proto)
+   Compiling krill-holder v0.1.13 (/path/to/krill/crates/krill-holder)
+   Compiling krill-hosts v0.1.13 (/path/to/krill/crates/krill-hosts)
+   Compiling krilld v0.1.13 (/path/to/krill/crates/krilld)
+   Compiling krill-link v0.1.13 (/path/to/krill/crates/krill-link)
+   Compiling krill-term v0.1.13 (/path/to/krill/crates/krill-term)
+   Compiling krill v0.1.13 (/path/to/krill/crates/krill)
+   Compiling krill-app v0.1.13 (/path/to/krill/crates/krill-app)
+warning: linker stderr: ld: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in compact unwind table, performance of exception handling might be affected
+  |
+  = note: `#[warn(linker_messages)]` on by default
+
+warning: `krill-app` (bin "krill-app" test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.72s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+────────────
+ Nextest run ID b748649e-42f8-44e0-9ca7-2d0f7120d488 with nextest profile: default
+    Starting 103 tests across 46 binaries (1907 tests skipped)
+        PASS [   0.012s] (  1/103) krill::bin/krill mobile::tests::command_validation
+        PASS [   0.019s] (  2/103) krill-app settings::mobile::tests::ago_scales_from_just_now_to_days
+        PASS [   0.019s] (  3/103) krill-app settings::mobile::tests::device_line_avoids_paired_duplication_and_handles_never_seen
+        PASS [   0.021s] (  4/103) krill-app settings::mobile::tests::obsolete_pairing_result_cannot_replace_selection_or_finish_current_job
+        PASS [   0.078s] (  5/103) krill-app webhook::tests::provider_transitions_include_only_state_id_and_mobile_link
+        PASS [   0.008s] (  6/103) krill-proto mobile::qr::tests::independently_decoded_fixture
+        PASS [   0.006s] (  7/103) krill-proto mobile::qr::tests::qr_capacity_quiet_zone_and_finder_patterns
+        PASS [   0.103s] (  8/103) krill-app settings::tests::mobile_pairing_keeps_path_selection_and_other_tabs_available
+        PASS [   0.005s] (  9/103) krill-proto mobile::tests::fixtures_and_roundtrips
+        PASS [   0.011s] ( 10/103) krill-proto mobile::tests::malformed_never_panics
+        PASS [   0.009s] ( 11/103) krilld agent_history::chat::tests::agy_brain_transcript_binds_by_cwd_and_normalizes_generic_tool_results
+        PASS [   0.150s] ( 12/103) krill-app settings::tests::mobile_eighth_tab_qr_and_mode_invalidation
+        PASS [   0.176s] ( 13/103) krill-app settings::tests::owe880_mobile_enter_revoke_confirm_and_copy_feedback
+        PASS [   1.038s] ( 14/103) krill-app settings::tests::owe802_mobile_radio_cards_ticket_copy_and_resources_space_header_bounds
+        PASS [  46.263s] ( 15/103) krill::cli mobile_cli_pair_list_revoke_and_tunnel_contract
+        PASS [   0.024s] ( 16/103) krilld agent_history::chat::tests::bounded_history_pages_can_be_replayed_and_generation_survives_append
+        PASS [   0.014s] ( 17/103) krilld agent_history::chat::tests::codex_agy_and_opencode_normalize_into_unified_chat_items
+        PASS [   0.014s] ( 18/103) krilld agent_history::chat::tests::mobile_replay_stops_at_observed_end_even_inside_a_record
+        PASS [   0.014s] ( 19/103) krilld mobile::cloudflared::tests::digest_mismatch_is_deleted_and_release_table_is_complete
+        PASS [   0.015s] ( 20/103) krilld agent_history::chat::tests::claude_incremental_poll_and_truncation_reset_work
+        PASS [   0.016s] ( 21/103) krilld alloc::mobile_tests::mobile_arena_policy_is_thread_local
+        PASS [   0.010s] ( 22/103) krilld mobile::cloudflared::tests::standard_locations_precede_cached_binary
+        PASS [   0.010s] ( 23/103) krilld mobile::devices::tests::capacity_is_distinct_from_invalid_ticket_and_frees_after_revoke
+        PASS [   0.013s] ( 24/103) krilld mobile::cloudflared::tests::resolution_order_and_executable_check
+        PASS [   0.009s] ( 25/103) krilld mobile::devices::tests::expiry_rotation_one_time_and_rate_limit
+        PASS [   0.010s] ( 26/103) krilld mobile::devices::tests::failed_save_does_not_enroll_or_consume_ticket
+        PASS [   0.019s] ( 27/103) krilld mobile::devices::tests::existing_user_owned_readable_state_directory_keeps_registry_private
+        PASS [   0.025s] ( 28/103) krilld mobile::cloudflared::tests::fake_download_installs_archive_and_raw_binary_atomically
+        PASS [   0.009s] ( 29/103) krilld mobile::e2ee::tests::bidirectional_replay_and_tamper_rejection
+        PASS [   0.007s] ( 30/103) krilld mobile::e2ee::tests::new_challenge_and_direction_separate_keys
+        PASS [   0.007s] ( 31/103) krilld mobile::e2ee::tests::sequence_exhaustion_never_wraps
+        PASS [   0.006s] ( 32/103) krilld mobile::gateway::tests::auth_close_codes_distinguish_capacity_cooldown_and_rejection
+        PASS [   0.033s] ( 33/103) krilld mobile::devices::tests::registry_atomic_permissions_reopen_and_revoke
+        PASS [   0.033s] ( 34/103) krilld mobile::e2ee::tests::arbitrary_frames_never_panic
+        PASS [   0.016s] ( 35/103) krilld mobile::gateway::tests::cancel_qr_preserves_paired_device_and_authenticated_connection
+        PASS [   0.039s] ( 36/103) krilld mobile::devices::tests::seen_within_flush_window_stays_in_memory_until_next_save
+        PASS [   0.024s] ( 37/103) krilld mobile::gateway::tests::authenticated_ws_pair_bridge_reconnect_replay_and_revoke
+        PASS [   0.016s] ( 38/103) krilld mobile::gateway::tests::cancel_qr_with_zero_devices_closes_exposure_without_revoking_devices
+        PASS [   0.023s] ( 39/103) krilld mobile::gateway::tests::closing_listener_waits_for_polling_accept_thread_to_release_its_fd
+        PASS [   0.126s] ( 40/103) krilld mobile::cloudflared::tests::downloading_is_nonblocking_and_single_flight
+        PASS [   0.053s] ( 41/103) krilld mobile::gateway::tests::connect_mode_survives_daemon_restart
+        PASS [   0.105s] ( 42/103) krilld mobile::gateway::tests::daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms
+        PASS [   0.017s] ( 43/103) krilld mobile::gateway::tests::local_control_feature_and_observer_gates
+        PASS [   0.018s] ( 44/103) krilld mobile::gateway::tests::fixed_offer_deep_link_and_fallback_follow_shared_contract
+        PASS [   0.021s] ( 45/103) krilld mobile::gateway::tests::individual_revocation_preserves_other_device_and_listener
+        PASS [   0.021s] ( 46/103) krilld mobile::gateway::tests::lazy_binding_expiry_and_mode_rotation
+        PASS [   0.023s] ( 47/103) krilld mobile::gateway::tests::do_relay_multiplexes_pipelined_pair_reconnect_concurrent_sessions_and_1008_isolation
+        PASS [   0.329s] ( 48/103) krilld mobile::gateway::tests::idle_authenticated_socket_is_pinged_then_closed_without_pong
+        PASS [   0.086s] ( 49/103) krilld mobile::gateway::tests::manual_loopback_bind_survives_restart_with_multiple_interfaces
+        PASS [   0.026s] ( 50/103) krilld mobile::gateway::tests::notification_deep_link_exists_only_while_gateway_is_exposed_and_has_no_secret
+        PASS [   0.040s] ( 51/103) krilld mobile::gateway::tests::mint_waits_for_pending_download_without_holding_state_lock
+        PASS [   0.093s] ( 52/103) krilld mobile::gateway::tests::missing_relay_pwa_falls_back_without_issuing_a_dead_fixed_origin_qr
+        PASS [   0.057s] ( 53/103) krilld mobile::gateway::tests::rendezvous_credentials_migrate_old_intent_and_survive_mode_changes
+        PASS [   0.022s] ( 54/103) krilld mobile::gateway::tests::unnegotiated_mobile_feature_is_rejected
+        PASS [   0.023s] ( 55/103) krilld mobile::gateway::tests::revoke_all_closes_pending_unauthenticated_connections
+        PASS [   0.024s] ( 56/103) krilld mobile::gateway::tests::supervisor_replaces_unreachable_tunnel_with_backoff
+        PASS [   0.027s] ( 57/103) krilld mobile::gateway::tests::wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited
+        PASS [   0.031s] ( 58/103) krilld mobile::gateway::tests::revoking_all_devices_cancels_a_pending_pairing_wait
+        PASS [   0.007s] ( 59/103) krilld mobile::net::tests::only_tailscale_or_explicit_loopback_can_select_direct_address
+        PASS [   0.007s] ( 60/103) krilld mobile::pwa::hash_tests::disk_hash_and_source_file_inventory_match
+        PASS [   0.007s] ( 61/103) krilld mobile::pwa_rpc::tests::bracketed_paste_and_question_keystroke_planner_work
+        PASS [   0.008s] ( 62/103) krilld mobile::pwa::tests::embedded_routes_and_gzip_budget
+        PASS [   0.044s] ( 63/103) krilld mobile::gateway::tests::retired_lan_intent_migrates_without_changing_device_credentials
+        PASS [   0.026s] ( 64/103) krilld mobile::gateway::tests::ws_attach_input_and_resize_preserve_real_desktop_pty
+        PASS [   0.007s] ( 65/103) krilld mobile::pwa_rpc::tests::mobile_chat_page_identity_is_additive_and_replays_without_changing_legacy_snapshot
+        PASS [   0.015s] ( 66/103) krilld mobile::pwa_rpc::tests::historical_approval_and_question_requests_fail_closed_before_input
+        PASS [   0.016s] ( 67/103) krilld mobile::pwa_rpc::tests::host_metadata_reports_only_actual_hostname_and_platform
+        PASS [   0.013s] ( 68/103) krilld mobile::pwa_rpc::tests::photo_decoder_bounds_and_malformed_data
+        PASS [   0.015s] ( 69/103) krilld mobile::pwa_rpc::tests::prompt_accepts_one_prepared_photo_and_rejects_bad_preparation_before_input
+        PASS [   0.009s] ( 70/103) krilld mobile::pwa_rpc::tests::snapshot_agents_follow_registry_profiles_in_standard_order
+        PASS [   0.008s] ( 71/103) krilld mobile::pwa_rpc::tests::snapshot_group_keys_preserve_non_utf8_bytes_and_unknown_sessions
+        PASS [   0.008s] ( 72/103) krilld mobile::pwa_rpc::tests::snapshot_groups_use_deepest_path_components_and_keep_empty_repositories
+        PASS [   0.006s] ( 73/103) krilld mobile::pwa_rpc::tests::terminal_actions_reject_phone_supplied_paths_and_programs
+        PASS [   0.012s] ( 74/103) krilld mobile::pwa_rpc::tests::workflow_errors_are_bounded_and_json
+        PASS [   0.009s] ( 75/103) krilld mobile::relay::tests::mux_frame_roundtrip_and_tls_config_init
+        PASS [   0.038s] ( 76/103) krilld mobile::pwa_rpc::tests::subprocess_output_and_time_are_bounded
+        PASS [   0.134s] ( 77/103) krilld mobile::pwa_rpc::tests::photo_decoder_never_panics
+        PASS [   0.147s] ( 78/103) krilld mobile::pwa_rpc::tests::mobile_chat_small_append_pages_replay_with_original_display_ids
+        PASS [   0.009s] ( 79/103) krilld mobile::tunnel::tests::availability_is_decided_before_ready_and_failure_falls_back
+        PASS [   0.183s] ( 80/103) krilld mobile::pwa_rpc::tests::card_git_skips_non_repositories_dedups_cwds_and_expires_cache
+        PASS [   0.230s] ( 81/103) krilld mobile::tunnel::tests::named_tunnel_sets_token_env_and_skips_33s_settle
+        PASS [   0.020s] ( 82/103) krilld mobile::tunnel::tests::publication_request_keeps_key_in_stdin_and_requires_204
+        PASS [   0.007s] ( 83/103) krilld mobile::tunnel::tests::strict_url_parser
+        PASS [   0.474s] ( 84/103) krilld mobile::tunnel::tests::alternating_probe_is_never_stable_until_consecutive_streak
+        PASS [   0.010s] ( 85/103) krilld mobile::tunnel::tests::unrelated_process_is_not_adopted_or_killed_after_pid_recycle
+        PASS [   0.026s] ( 86/103) krilld mobile::ws::tests::arbitrary_wire_never_panics
+        PASS [   0.011s] ( 87/103) krilld mobile::ws::tests::different_asset_version_returns_empty_409
+        PASS [   0.008s] ( 88/103) krilld mobile::ws::tests::fixed_origin_is_opt_in_and_same_origin_is_preserved
+        PASS [   0.007s] ( 89/103) krilld mobile::ws::tests::masked_encode_and_unmasked_sans_io_decode_roundtrip
+        PASS [   0.008s] ( 90/103) krilld mobile::ws::tests::rejects_unmasked_fragmented_and_oversized_frames
+        PASS [   0.008s] ( 91/103) krilld mobile::ws::tests::rfc_accept_and_base64_vectors
+        PASS [   0.258s] ( 92/103) krilld mobile::tunnel::tests::unready_url_is_published_but_not_ready
+        PASS [   0.251s] ( 93/103) krilld session::tests::mobile_attach_paces_continuous_updates
+        PASS [   0.784s] ( 94/103) krilld::mobile_pwa mobile_frontend_regressions
+        PASS [   0.102s] ( 95/103) krilld::mobile_pwa session_screen_regressions
+        PASS [   0.121s] ( 96/103) krilld::mobile_pwa terminal_adapter_regressions
+        PASS [   0.192s] ( 97/103) krilld::mobile_pwa workflow_terminal_lifecycle_and_snapshot_metadata
+        PASS [   0.030s] ( 98/103) krilld::roles mobile_input_preserves_desktop_size_until_explicit_resize
+        PASS [   2.020s] ( 99/103) krilld mobile::gateway::tests::ws_closes_when_registry_ends_before_first_request
+        PASS [   2.010s] (100/103) krilld mobile::tunnel::tests::failed_publication_retries_and_drop_cancels_backoff
+        PASS [   3.157s] (101/103) krilld mobile::tunnel::tests::adopt_reuses_live_pid_and_terminate_kills_adopted_process
+        PASS [   3.118s] (102/103) krilld mobile::tunnel::tests::process_url_and_drop_cleanup
+        PASS [   3.818s] (103/103) krilld::mobile_pwa non_secure_pwa_crypto_and_workflows
+────────────
+     Summary [  51.879s] 103 tests run: 103 passed, 1907 skipped

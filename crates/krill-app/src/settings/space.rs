@@ -153,6 +153,7 @@ fn run_cleanup(
 /// `SettingsView`가 소유하는 디스크 용량 분석(`Space`) 및 워크트리 클린업(`Cleanup`) 상태.
 #[derive(Debug, Default)]
 pub struct Panel {
+    generation: u64,
     /// 지정 저장소 오버라이드(`--repo`로 전달). `None`이면 CLI가 상태 디렉터리·데몬에서 자동 탐색한다.
     pub repos_override: Option<Vec<PathBuf>>,
     /// 테스트용 CLI 실행기 오버라이드. `None`이면 스테이징된 `krill` 바이너리를 실행한다.
@@ -202,6 +203,8 @@ impl SettingsView {
         runner: Option<CliRunner>,
         cx: &mut Context<Self>,
     ) {
+        self.space.generation = self.space.generation.wrapping_add(1);
+        self.space.scanning = false;
         self.space.repos_override = Some(repos);
         self.space.runner_override = runner;
         self.scan_workspace_space(cx);
@@ -238,6 +241,7 @@ impl SettingsView {
         };
         self.space.scanning = true;
         let repos = self.space.repos_override.clone();
+        let generation = self.space.generation;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -246,6 +250,9 @@ impl SettingsView {
                 .spawn(async move { fetch_space(&run, repos.as_deref()) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.space.generation != generation {
+                    return;
+                }
                 this.space.scanning = false;
                 this.apply_space_result(res);
                 cx.notify();
@@ -360,6 +367,7 @@ impl SettingsView {
         self.space.cleaning = true;
         let filter = self.space.filter.clone();
         let repos = self.space.repos_override.clone();
+        let generation = self.space.generation;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -372,6 +380,9 @@ impl SettingsView {
                 .await;
             this.update(cx, |this, cx| {
                 this.space.cleaning = false;
+                if this.space.generation != generation {
+                    return;
+                }
                 match summary {
                     Ok(summary) => this.space.last_summary = Some(summary),
                     Err(e) => {

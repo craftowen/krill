@@ -75,6 +75,49 @@ pub(crate) fn poll_transcript_file(
     path: &Path,
     offset: u64,
 ) -> ChatPollSnapshot {
+    poll_transcript_file_until(agent, session_id, path, offset, None)
+}
+
+/// Replays an observed mobile page without reading records appended beyond its end.
+/// The registry has already resolved the transcript; client offsets cannot select a path.
+pub(crate) fn replay_page(
+    snapshot: ChatPollSnapshot,
+    offset: u64,
+    end_offset: u64,
+) -> std::io::Result<ChatPollSnapshot> {
+    if end_offset <= offset {
+        return Err(std::io::Error::other("invalid chat page boundary"));
+    }
+    if snapshot.reset || !snapshot.bound {
+        return Ok(snapshot);
+    }
+    let agent = VaultAgent::parse(&snapshot.agent)
+        .ok_or_else(|| std::io::Error::other("unknown chat transcript agent"))?;
+    let path = Path::new(&snapshot.transcript_path);
+    if agent == VaultAgent::OpenCode && path.extension().is_some_and(|e| e == "json") {
+        // OpenCode's JSON offset is synthetic, not a JSONL byte boundary.
+        return if snapshot.next_offset == end_offset {
+            Ok(snapshot)
+        } else {
+            Err(std::io::Error::other("chat page changed; return to latest"))
+        };
+    }
+    Ok(poll_transcript_file_until(
+        agent,
+        &snapshot.session_id,
+        path,
+        offset,
+        Some(end_offset),
+    ))
+}
+
+fn poll_transcript_file_until(
+    agent: VaultAgent,
+    session_id: &str,
+    path: &Path,
+    offset: u64,
+    end_offset: Option<u64>,
+) -> ChatPollSnapshot {
     let path_str = bounded(&path.to_string_lossy(), MAX_TEXT);
     let agent_str = bounded(agent.profile(), MAX_TEXT);
     let sid_str = bounded(session_id, MAX_TEXT);
@@ -112,11 +155,15 @@ pub(crate) fn poll_transcript_file(
         };
     }
 
-    let mut reader = BufReader::with_capacity(8192, file);
+    // Limit the underlying reader itself so even read-ahead and oversized-line scanning
+    // cannot cross a historical page's observed end. Ordinary polling keeps its byte cap.
+    let readable = end_offset.map_or(u64::MAX, |end| end.saturating_sub(start_offset));
+    let mut reader = BufReader::with_capacity(8192, file.take(readable));
     let mut line = Vec::new();
     let mut consumed = start_offset;
     let mut batch_bytes = 0_u64;
     let mut items = Vec::new();
+    let mut previous_codex_record = None;
     let max_line = usize::try_from(MAX_POLL_BYTES).unwrap_or(512 * 1024);
 
     while items.len() < MAX_CHAT_ITEMS && batch_bytes < MAX_POLL_BYTES {
@@ -172,7 +219,36 @@ pub(crate) fn poll_transcript_file(
         let Ok(val) = serde_json::from_slice::<Value>(trimmed) else {
             continue;
         };
+        let codex_record = if agent == VaultAgent::Codex {
+            match val.get("type").and_then(Value::as_str) {
+                Some("response_item") => Some(false),
+                Some("event_msg") => Some(true),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let before = items.len();
         parse_line_into_items(agent, &val, &mut items);
+        // Only Codex's two representations of the same adjacent event may merge.
+        // Separate records with the same text must remain separate messages.
+        if previous_codex_record
+            .zip(codex_record)
+            .is_some_and(|(a, b)| a != b)
+            && let Some(previous) = before.checked_sub(1).and_then(|i| items.get(i))
+            && let Some(current) = items.get(before)
+            && matches!(
+                current.kind,
+                ChatItemKind::User | ChatItemKind::Assistant | ChatItemKind::Reasoning
+            )
+            && previous.kind == current.kind
+            && previous.text == current.text
+        {
+            items.remove(before);
+            previous_codex_record = None;
+        } else {
+            previous_codex_record = codex_record;
+        }
     }
 
     if items.len() > MAX_CHAT_ITEMS {
@@ -274,6 +350,19 @@ fn poll_opencode_json_file(
         bound: true,
         items,
     }
+}
+
+/// Appends do not change identity; replacement/rebinding changes the generation.
+pub(crate) fn generation(snapshot: &ChatPollSnapshot) -> String {
+    let created = fs::metadata(&snapshot.transcript_path)
+        .and_then(|meta| meta.created())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos());
+    format!(
+        "{}:{}:{created}",
+        snapshot.session_id, snapshot.transcript_path
+    )
 }
 
 fn resolve_transcript(
@@ -1557,16 +1646,6 @@ fn push_item(out: &mut Vec<ChatItem>, item: ChatItem) {
     if item.text.is_empty() && item.options.is_empty() && item.tool_name.is_empty() {
         return;
     }
-    // Codex처럼 response_item과 event_msg가 연속으로 동일 텍스트를 기록하는 경우 중복 카드를 방지한다.
-    if matches!(
-        item.kind,
-        ChatItemKind::User | ChatItemKind::Assistant | ChatItemKind::Reasoning
-    ) && out
-        .last()
-        .is_some_and(|prev| prev.kind == item.kind && prev.text == item.text)
-    {
-        return;
-    }
     if out.len() < MAX_CHAT_ITEMS {
         out.push(item);
     }
@@ -1602,7 +1681,69 @@ fn bounded(s: &str, max_bytes: usize) -> String {
 #[cfg(unix)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
     use std::io::Write as _;
+
+    #[test]
+    fn mobile_replay_stops_at_observed_end_even_inside_a_record() {
+        let dir = std::env::temp_dir().join(format!("chat-replay-end-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let line =
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"same text\"}}\n";
+        fs::write(&path, line).unwrap();
+        let observed = poll_transcript_file(VaultAgent::Claude, "sid", &path, 0);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+        let current = poll_transcript_file(VaultAgent::Claude, "sid", &path, 0);
+        assert_eq!(current.items.len(), 2);
+        assert_eq!(current.items[0].text, current.items[1].text);
+        let replay = replay_page(current.clone(), 0, observed.next_offset).unwrap();
+        assert_eq!(replay, observed);
+        let partial = replay_page(current.clone(), 0, observed.next_offset - 1).unwrap();
+        assert_eq!(partial.next_offset, 0);
+        assert!(partial.items.is_empty());
+        assert!(replay_page(current.clone(), 0, 0).is_err());
+        assert!(replay_page(current, observed.next_offset, observed.next_offset).is_err());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn bounded_history_pages_can_be_replayed_and_generation_survives_append() {
+        let dir = std::env::temp_dir().join(format!("chat-pages-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let mut lines = String::new();
+        for index in 0..300 {
+            writeln!(lines, "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"message {index}\"}}}}").unwrap();
+        }
+        fs::write(&path, lines).unwrap();
+        let first = poll_transcript_file(VaultAgent::Claude, "sid", &path, 0);
+        assert_eq!(first.items.len(), MAX_CHAT_ITEMS);
+        let second = poll_transcript_file(VaultAgent::Claude, "sid", &path, first.next_offset);
+        let third = poll_transcript_file(VaultAgent::Claude, "sid", &path, second.next_offset);
+        assert_eq!(
+            first.items.len() + second.items.len() + third.items.len(),
+            300
+        );
+        assert_eq!(
+            first,
+            poll_transcript_file(VaultAgent::Claude, "sid", &path, 0)
+        );
+        assert_eq!(
+            second,
+            poll_transcript_file(VaultAgent::Claude, "sid", &path, first.next_offset)
+        );
+        let identity = generation(&first);
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        writeln!(
+            file,
+            "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"new\"}}}}"
+        )
+        .unwrap();
+        assert_eq!(generation(&first), identity);
+        fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn claude_incremental_poll_and_truncation_reset_work() {
@@ -1706,6 +1847,14 @@ mod tests {
         assert_eq!(codex_snap.items[2].file_path, "crates/krilld/src/lib.rs");
         assert_eq!(codex_snap.items[3].kind, ChatItemKind::ToolResult);
         assert_eq!(codex_snap.items[4].kind, ChatItemKind::Permission);
+        fs::write(
+            &codex_path,
+            format!("{0}\n{1}\n{0}\n{1}\n", codex_lines[0], codex_lines[1]),
+        )
+        .unwrap();
+        let repeated = poll_transcript_file(VaultAgent::Codex, "codex-1", &codex_path, 0);
+        assert_eq!(repeated.items.len(), 2);
+        assert_eq!(repeated.items[0].text, repeated.items[1].text);
 
         // Agy JSONL
         let agy_path = dir.join("agy.jsonl");

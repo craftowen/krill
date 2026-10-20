@@ -1,0 +1,48 @@
+m/460764b1c54d8a40/  HEAD worktree
+✔ C1 해시: `<file>\n<len>\n<bytes>` 연결의 SHA-256 앞 16 hex (0.421417ms)
+✔ pwa.rs에서 .gz 아닌 include_bytes!만 바이트 순으로 뽑는다 (0.301125ms)
+✔ 작업 트리 해시는 디스크 파일과 일치한다 (2.070125ms)
+✔ 작업 트리가 HEAD와 같아도(깨끗해도) 루트에 manifest·아이콘을 쓴다 (68.937167ms)
+✔ 붙여넣은 링크는 같은 출처 /m/<16hex>/만 허용 (0.397209ms)
+✔ 저장된 해시가 있을 때만 /m/<hash>/로 보낸다 (0.089833ms)
+✔ 저장소가 비면 빌드가 넣은 최신 PWA 해시로 보낸다(Scan QR로 바로 페어링) (0.049542ms)
+✔ PUT 후 GET 왕복, no-store (11.820875ms)
+✔ TOFU: 첫 키만 갱신 가능, 다른 키는 403 (1.39675ms)
+✔ 형식 위반은 400, 잘못된 rid GET은 404, 다른 메서드 405 (0.42425ms)
+✔ DO는 키 원문이 아니라 sha256(key)를 저장한다 (0.311667ms)
+✔ WS 릴레이: TOFU 호스트 인증, 빈 MUX_OPEN(챌린지는 krilld), 다중 클라이언트 5B 멀티플렉싱, Hibernation 복구 (2.393167ms)
+✔ WS 릴레이: 키 원문은 DO로 안 가고, 큰 바이너리는 클라이언트만 1009로 닫고, 호스트 재연결은 옛 터널 주소를 지운다 (0.645291ms)
+✔ WS relay preserves capacity and cooldown close codes for client recovery (0.479791ms)
+✔ cloud: auth manifest/navigation preserve original query and are never cached (1.116916ms)
+✔ direct: auth manifest/navigation preserve original query and are never cached (0.331667ms)
+✔ direct: installed offline shell works without caching credentials or API routes (0.476917ms)
+✔ cloud: normal immutable asset requests still use stable path cache (0.271125ms)
+✔ total connect deadline covers stalled open (2.027666ms)
+✔ total connect deadline covers stalled challenge (0.535042ms)
+✔ total connect deadline covers stalled authentication (1.001792ms)
+✔ total connect deadline covers stalled server hello (0.539541ms)
+✔ total connect deadline covers stalled snapshot (0.518917ms)
+✔ RPC total deadline breaks serial queue and never resends a mutation (0.842917ms)
+✔ replacement cancellation restores saved destination and credential together (0.509291ms)
+✔ device capacity is blocked with cleanup guidance rather than expired QR diagnosis (0.411084ms)
+✔ cooldown exposes retryAt and explicit reconnect preserves server backoff (0.366625ms)
+✔ fresh pairing can recover a blocked transport (0.33475ms)
+✔ warm terminal negotiates TERM_MODES with the daemon (0.725584ms)
+✔ retry during authentication cancels old generation and starts a new attempt (0.346166ms)
+✔ late open from expired connection cannot consume or send on the next attempt (0.312791ms)
+✔ replacement cancellation returns to saved app version when QR was for another build (0.523292ms)
+✔ late locate(false) cannot disconnect or stop a connecting replacement connection (0.666083ms)
+✔ late locate(false) cannot disconnect or stop a ready replacement connection (0.912792ms)
+✔ late locate(true) cannot disconnect or stop a connecting replacement connection (0.677ms)
+✔ late locate(true) cannot disconnect or stop a ready replacement connection (0.636334ms)
+✔ stale discovery fetch success cannot change routing, credentials or location (0.820375ms)
+✔ stale discovery json success cannot change routing, credentials or location (0.916208ms)
+✔ closing a connection cancels pending discovery before a late JSON redirect (0.3485ms)
+ℹ tests 39
+ℹ suites 0
+ℹ pass 39
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 155.6525

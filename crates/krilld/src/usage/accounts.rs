@@ -1,6 +1,10 @@
 //! 프로바이더 다계정 레지스트리(`accounts.toml`)·계정별 5h/7d 사용량 측정·원클릭 전환·자동전환 엔진(MK-107·MK-108).
 
+pub(crate) mod codex_home;
+mod identity;
+pub(super) use identity::from_credentials as identity_from_credentials;
 mod login;
+pub(crate) mod orca_vault;
 mod policy;
 
 use std::collections::BTreeMap;
@@ -328,7 +332,7 @@ fn save_inner(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io:
     Ok(())
 }
 
-fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
+pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let Some(parent) = path.parent() else {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "no parent dir"));
     };
@@ -798,7 +802,7 @@ fn refresh_accounts_inner(
     trigger: RefreshTrigger,
 ) -> AccountsSnapshot {
     // CLI 프로세스를 기다리는 동안 계정 저장 잠금을 잡지 않는다.
-    super::direct::refresh(home, state_dir);
+    super::direct::refresh_on_request(home, state_dir);
     let auth = login::statuses(home, state_dir);
     refresh_accounts_authenticated(home, state_dir, trigger, &auth)
 }
@@ -1000,6 +1004,16 @@ fn refresh_accounts_authenticated(
         }
     }
 
+    // 로그인 프로브의 현재 신원은 등록 이름이나 오래된 사용량 캐시보다 우선한다.
+    for account in &mut all {
+        if let Some(identity) = auth
+            .get(&(account.provider, PathBuf::from(&account.profile_dir)))
+            .filter(|status| status.logged_in)
+            .and_then(|status| status.identity.as_ref())
+        {
+            account.email = Some(identity.email.clone());
+        }
+    }
     let now = now_epoch();
     let now_secs = u64::try_from(now).unwrap_or_default();
     let mut rate_limits = Vec::new();
@@ -1034,6 +1048,17 @@ fn refresh_accounts_authenticated(
     // 4. 프로바이더별 현재 활성 계정 표시 및 자동전환(Auto-Switch) 평가.
     let mut switched = Vec::new();
     let mut dirty = false;
+    let readings: BTreeMap<_, _> = all
+        .iter()
+        .map(|a| (a.id.clone(), super::meters::read(home, a)))
+        .collect();
+    let effective = |a: &AccountInfo, metric: AutoSwitchMetric, now: i64| {
+        if metric == AutoSwitchMetric::Max {
+            readings.get(&a.id).and_then(|m| m.effective_max(now))
+        } else {
+            metric.effective_percent(&a.usage, now)
+        }
+    };
 
     for provider in ProviderKind::ALL {
         let key = provider.as_str().to_owned();
@@ -1091,7 +1116,7 @@ fn refresh_accounts_authenticated(
             );
             // K-10·K-11: 사용량을 모르면(`None`) 전환을 걸지도 후보로 고르지도 않는다.
             // 지난 창의 수치(`resets_at` 경과)는 버리고 유효 창만 본다.
-            // 판정 함수는 `krill_proto::usage::AutoSwitchMetric::effective_percent` 하나로 둔다(OWE-703).
+            // Max는 제공자가 보고한 모든 풀을 본다. 5h/7d 명시 규칙은 해당 창만 본다.
             // OWE-703 2단계 지시: 한도 기록이 있는 활성 계정은 캐시와 무관하게 100%로 보고
             // 기존 트리거(임계치·`switch_on_rate_limit`·비활성 규칙)를 그대로 탄다.
             let now = now_epoch();
@@ -1099,7 +1124,7 @@ fn refresh_accounts_authenticated(
             let active_pct = if limited_active {
                 Some(100)
             } else {
-                metric.effective_percent(&active_acc.usage, now)
+                effective(active_acc, metric, now)
             };
             let predicted = file.advanced_policy.predict_exhaustion
                 && policy::predictive_trigger(&forecasts, &current_id, metric, now_secs);
@@ -1118,19 +1143,16 @@ fn refresh_accounts_authenticated(
                         || auth
                             .get(&(a.provider, PathBuf::from(&a.profile_dir)))
                             .is_some_and(|status| !status.logged_in)
-                        || a.usage.is_empty()
+                        || effective(a, AutoSwitchMetric::Max, now).is_none()
                         || !runnable(a)
                         || rate_limited_at(&limited, provider, &a.id).is_some()
                     {
                         return None;
                     }
-                    if AutoSwitchMetric::Max
-                        .effective_percent(&a.usage, now)
-                        .is_none_or(|max| max >= 100)
-                    {
+                    if effective(a, AutoSwitchMetric::Max, now).is_none_or(|max| max >= 100) {
                         return None;
                     }
-                    let v = metric.effective_percent(&a.usage, now)?;
+                    let v = effective(a, metric, now)?;
                     (v.saturating_add(AUTO_SWITCH_HYSTERESIS) <= pct).then_some(v)
                 };
                 let preferred = target
@@ -1217,6 +1239,11 @@ fn refresh_accounts_authenticated(
     );
     // OWE-703 1단계: 계정별 상태 꼬리를 채운다. 판정에는 쓰지 않는다(표시·N-1용).
     // OWE-703 2단계 지시: 한도 기록은 감지 시각을 갱신 시각에 넣는다.
+    let details = krill_proto::usage::ProviderDetails {
+        supported: true,
+        accounts: readings.into_values().collect(),
+        handoffs: Vec::new(),
+    };
     let statuses = all
         .iter()
         .map(|a| {
@@ -1239,7 +1266,12 @@ fn refresh_accounts_authenticated(
             {
                 (AccountStatus::NeedsLogin, None)
             } else {
-                classify_account(error.as_deref(), a.stale, a.usage.is_empty(), detected)
+                let empty = details
+                    .accounts
+                    .iter()
+                    .find(|m| m.account_id == a.id)
+                    .is_none_or(|m| m.meters.is_empty());
+                classify_account(error.as_deref(), a.stale, empty, detected)
             };
             AccountStatusInfo {
                 status,
@@ -1268,6 +1300,7 @@ fn refresh_accounts_authenticated(
         statuses,
         advanced,
         connections: Box::new(connections),
+        details: Box::new(details),
     }
 }
 
@@ -1403,6 +1436,9 @@ pub fn switch_account(
     provider: ProviderKind,
     account_id: &str,
 ) -> io::Result<AccountsSnapshot> {
+    if provider == ProviderKind::Codex {
+        codex_home::migrate(home, state_dir)?;
+    }
     // K-12: 존재 확인·최종 새로고침 모두 자동전환 없이 한다. 저장 직후 자동전환이
     // 사용자 선택을 덮어쓰고 응답만 고른 계정으로 위장하던 결함을 막는다.
     let snap = refresh_accounts_with(home, state_dir, false);
@@ -1480,6 +1516,11 @@ pub fn add_account(
         };
 
         std::fs::create_dir_all(&resolved_dir)?;
+        let resolved_dir = if provider == ProviderKind::Codex {
+            codex_home::prepare(home, &resolved_dir)?
+        } else {
+            resolved_dir
+        };
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;

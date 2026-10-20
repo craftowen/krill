@@ -1,4 +1,4 @@
-//! Claude·Codex 로그인 명령과 비밀값 없는 로그인 상태 조회(OWE-700).
+//! 프로바이더 로그인 명령과 비밀값 없는 로그인 상태 조회.
 
 use std::io::Read as _;
 use std::path::Path;
@@ -28,16 +28,31 @@ pub fn login_program(provider: ProviderKind, dir: Option<&Path>) -> Option<Progr
     let tail: &[&str] = match provider {
         ProviderKind::Claude => &["claude", "auth", "login", "--claudeai"],
         ProviderKind::Codex => &["codex", "login"],
-        ProviderKind::Antigravity => &["login"],
-        _ => return None,
+        // agy starts authentication in its interactive TUI; there is no `login` subcommand.
+        ProviderKind::Antigravity => &[],
+        ProviderKind::OpenCode => &["opencode", "auth", "login"],
+        ProviderKind::Gemini => return None,
     };
     let mut args = if provider == ProviderKind::Antigravity {
         let mut args = vec![b"agy".to_vec()];
-        if let Some(dir) = dir.filter(|dir| !dir.as_os_str().is_empty()) {
+        if let Some(dir) = dir {
+            if dir.as_os_str().is_empty() {
+                return None;
+            }
             args.insert(0, b"SSH_CONNECTION=krill".to_vec());
             args.push(format!("--gemini_dir={}", dir.join(".gemini").to_str()?).into_bytes());
         }
         args
+    } else if provider == ProviderKind::OpenCode {
+        match dir {
+            Some(dir) if dir.as_os_str().is_empty() => return None,
+            Some(dir) => vec![
+                format!("XDG_DATA_HOME={}", dir.join("data").to_str()?).into_bytes(),
+                format!("XDG_STATE_HOME={}", dir.join("state").to_str()?).into_bytes(),
+                b"OPENCODE_DB=opencode.db".to_vec(),
+            ],
+            None => Vec::new(),
+        }
     } else {
         match dir {
             Some(dir) if dir.as_os_str().is_empty() => return None,
@@ -45,6 +60,12 @@ pub fn login_program(provider: ProviderKind, dir: Option<&Path>) -> Option<Progr
             None => vec![b"-u".to_vec(), provider.env_var().as_bytes().to_vec()],
         }
     };
+    let mut clean = Vec::new();
+    for key in provider.credential_overrides() {
+        clean.extend([b"-u".to_vec(), key.as_bytes().to_vec()]);
+    }
+    clean.extend(args);
+    args = clean;
     args.extend(tail.iter().map(|s| s.as_bytes().to_vec()));
     Some(Program::Custom {
         program: b"/usr/bin/env".to_vec(),
@@ -120,10 +141,14 @@ pub fn probe_with_environment(
     if let Some(path) = path {
         cmd.env("PATH", path);
     }
+    for key in provider.credential_overrides() {
+        cmd.env_remove(key);
+    }
     match dir {
         Some(dir) if provider == ProviderKind::OpenCode => {
             cmd.env("XDG_DATA_HOME", dir.join("data"));
             cmd.env("XDG_STATE_HOME", dir.join("state"));
+            cmd.env("OPENCODE_DB", "opencode.db");
             cmd.env_remove("OPENCODE_CONFIG_DIR");
         }
         Some(dir) => {
@@ -195,10 +220,10 @@ pub fn probe_with_environment(
             .collect::<Vec<_>>()
             .windows(2)
             .find_map(|pair| {
-                pair.first()?
-                    .parse::<u64>()
-                    .ok()
-                    .filter(|_| pair.get(1).is_some_and(|s| s.starts_with("credential")))
+                pair.first()?.parse::<u64>().ok().filter(|_| {
+                    pair.get(1)
+                        .is_some_and(|s| s.starts_with("credential") || s.starts_with("provider"))
+                })
             })?;
         count > 0
     } else if lower.contains("not logged in") {
@@ -273,14 +298,16 @@ mod tests {
                 vec!["CODEX_HOME=/tmp/a b;$x", "codex", "login"],
             ),
         ] {
+            let mut expected_args = Vec::new();
+            for key in provider.credential_overrides() {
+                expected_args.extend([b"-u".to_vec(), key.as_bytes().to_vec()]);
+            }
+            expected_args.extend(expected.into_iter().map(|s| s.as_bytes().to_vec()));
             assert_eq!(
                 login_program(provider, Some(Path::new("/tmp/a b;$x"))),
                 Some(Program::Custom {
                     program: b"/usr/bin/env".to_vec(),
-                    args: expected
-                        .into_iter()
-                        .map(|s| s.as_bytes().to_vec())
-                        .collect(),
+                    args: expected_args,
                 })
             );
         }
@@ -289,9 +316,26 @@ mod tests {
             None
         );
         assert_eq!(
-            login_program(ProviderKind::OpenCode, Some(Path::new("/tmp/a"))),
+            login_program(ProviderKind::Antigravity, Some(Path::new(""))),
             None
         );
+        assert_eq!(
+            login_program(ProviderKind::Antigravity, None),
+            Some(Program::Custom {
+                program: b"/usr/bin/env".to_vec(),
+                args: vec![b"agy".to_vec()],
+            })
+        );
+        let Some(Program::Custom { program, args }) =
+            login_program(ProviderKind::OpenCode, Some(Path::new("/tmp/a")))
+        else {
+            panic!("OpenCode must support scoped account login");
+        };
+        assert_eq!(program, b"/usr/bin/env");
+        assert!(args.contains(&b"XDG_DATA_HOME=/tmp/a/data".to_vec()));
+        assert!(args.contains(&b"XDG_STATE_HOME=/tmp/a/state".to_vec()));
+        assert!(args.contains(&b"OPENCODE_DB=opencode.db".to_vec()));
+        assert!(args.ends_with(&[b"opencode".to_vec(), b"auth".to_vec(), b"login".to_vec()]));
         assert_eq!(
             login_program(ProviderKind::Antigravity, Some(Path::new("/tmp/a"))),
             Some(Program::Custom {
@@ -303,7 +347,6 @@ mod tests {
                         "--gemini_dir={}",
                         Path::new("/tmp/a").join(".gemini").to_string_lossy()
                     ),
-                    "login"
                 ]
                 .into_iter()
                 .map(|s| s.as_bytes().to_vec())
@@ -318,21 +361,27 @@ mod tests {
     #[cfg(unix)] // 가짜 CLI가 /bin/sh 스크립트다.
     fn host_account_login_and_probe_drop_config_env() {
         use std::os::unix::fs::PermissionsExt as _;
+        let mut clean = Vec::new();
+        for key in ProviderKind::Claude.credential_overrides() {
+            clean.extend([b"-u".to_vec(), key.as_bytes().to_vec()]);
+        }
+        clean.extend(
+            [
+                "-u",
+                "CLAUDE_CONFIG_DIR",
+                "claude",
+                "auth",
+                "login",
+                "--claudeai",
+            ]
+            .into_iter()
+            .map(|s| s.as_bytes().to_vec()),
+        );
         assert_eq!(
             login_program(ProviderKind::Claude, None),
             Some(Program::Custom {
                 program: b"/usr/bin/env".to_vec(),
-                args: [
-                    "-u",
-                    "CLAUDE_CONFIG_DIR",
-                    "claude",
-                    "auth",
-                    "login",
-                    "--claudeai"
-                ]
-                .into_iter()
-                .map(|s| s.as_bytes().to_vec())
-                .collect(),
+                args: clean,
             })
         );
         let root = std::env::temp_dir().join(format!("owe700-host-{}", std::process::id()));
@@ -435,7 +484,7 @@ mod tests {
         std::fs::write(
             &exe,
             format!(
-                "#!/bin/sh\ntest \"$1 $2\" = 'auth list' && test \"$XDG_DATA_HOME\" = '{}/data' && test \"$XDG_STATE_HOME\" = '{}/state' && test -z \"${{OPENCODE_CONFIG_DIR+x}}\" || exit 9\nprintf '1 credential\\n'\n",
+                "#!/bin/sh\ntest \"$1 $2\" = 'auth list' && test \"$XDG_DATA_HOME\" = '{}/data' && test \"$XDG_STATE_HOME\" = '{}/state' && test \"$OPENCODE_DB\" = opencode.db && test -z \"${{OPENCODE_CONFIG_DIR+x}}\" || exit 9\nprintf '1 credential\\n'\n",
                 profile.display(), profile.display()
             ),
         )

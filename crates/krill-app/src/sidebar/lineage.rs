@@ -162,57 +162,6 @@ pub(super) fn order_lineage_worktrees<'a>(
     out
 }
 
-type ParentsCacheEntry = (
-    PathBuf,
-    Option<std::time::SystemTime>,
-    u64,
-    BTreeMap<PathBuf, PathBuf>,
-);
-
-static PARENTS_CACHE: std::sync::LazyLock<std::sync::Mutex<Option<ParentsCacheEntry>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-
-pub(super) fn invalidate_parents_cache() {
-    if let Ok(mut guard) = PARENTS_CACHE.lock() {
-        *guard = None;
-    }
-}
-
-fn load_store_parents(dir: &Path) -> BTreeMap<PathBuf, PathBuf> {
-    let file = dir.join(super::external::COMMENTS_FILE);
-    let Ok(meta) = std::fs::metadata(&file) else {
-        if let Ok(mut guard) = PARENTS_CACHE.lock()
-            && guard.as_ref().is_some_and(|(d, _, _, _)| d == dir)
-        {
-            *guard = None;
-        }
-        return BTreeMap::new();
-    };
-    let mtime = meta.modified().ok();
-    let len = meta.len();
-    if let Ok(guard) = PARENTS_CACHE.lock()
-        && let Some((cached_dir, cached_mtime, cached_len, cached_map)) = guard.as_ref()
-        && cached_dir == dir
-        && *cached_mtime == mtime
-        && *cached_len == len
-    {
-        return cached_map.clone();
-    }
-    let store = krill_proto::orchestration::WorktreeStore::load(dir).unwrap_or_default();
-    let mut map = BTreeMap::new();
-    for (child, parent) in &store.parents {
-        let c = PathBuf::from(child);
-        let p = PathBuf::from(parent);
-        if can_assign_parent(&map, &c, &p) {
-            map.insert(c, p);
-        }
-    }
-    if let Ok(mut guard) = PARENTS_CACHE.lock() {
-        *guard = Some((dir.to_path_buf(), mtime, len, map.clone()));
-    }
-    map
-}
-
 fn splice_lineage_in_map<K: Ord + Clone>(map: &mut BTreeMap<K, K>, target: &K) {
     let direct_children: Vec<K> = map
         .iter()
@@ -239,25 +188,15 @@ impl Sidebar {
             .filter(|p| !p.as_os_str().is_empty())
     }
 
-    /// 디스크(`WorktreeStore`)를 단일 진실 공급원(SSOT)으로 삼아 부모 맵을 돌려준다.
-    /// 상태 디렉터리가 없는 인메모리 인스턴스(`path == None`)에서만 `self.parents`를 사용한다.
+    /// 백그라운드에서 갱신한 디스크 계보의 메모리 스냅샷을 검증해 돌려준다.
     pub(super) fn merged_parents(&self) -> BTreeMap<PathBuf, PathBuf> {
-        if let Some(dir) = self.state_dir() {
-            return load_store_parents(dir);
-        }
-        let mut map = BTreeMap::new();
-        for (child, parent) in &self.parents {
-            if can_assign_parent(&map, child, parent) {
-                map.insert(child.clone(), parent.clone());
-            }
-        }
-        map
+        self.parents.clone()
     }
 
     /// 지정한 워크트리의 부모 경로를 돌려준다.
     #[must_use]
     pub fn worktree_parent(&self, path: &Path) -> Option<PathBuf> {
-        self.merged_parents().remove(path)
+        self.parents.get(path).cloned()
     }
 
     /// `path`의 부모를 `parent`로 설정할 수 있는지(자기 참조·사이클·다른 저장소 방지).
@@ -289,48 +228,45 @@ impl Sidebar {
         if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let child_str = path.to_string_lossy().into_owned();
             let parent_str = parent.to_string_lossy().into_owned();
-            if krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-                store.set_parent(&child_str, Some(&parent_str))?;
-                if store.parents.get(&child_str) != Some(&parent_str) {
-                    store.parents.insert(child_str, parent_str);
-                }
-                Ok(())
-            })
-            .is_err()
-            {
-                return false;
-            }
-            invalidate_parents_cache();
-            self.parents = self.merged_parents();
-        } else {
-            self.parents.insert(path, parent);
+            self.enqueue_disk_write(
+                move || {
+                    krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                        store.set_parent(&child_str, Some(&parent_str))?;
+                        store.parents.insert(child_str, parent_str);
+                        Ok(())
+                    })
+                },
+                cx,
+            );
         }
+        self.parents.insert(path, parent);
         self.persist(cx);
         true
     }
 
     /// 워크트리의 부모 연결을 해제한다.
     pub fn clear_worktree_parent(&mut self, path: &Path, cx: &mut Context<Self>) -> bool {
-        let had_parent = self.worktree_parent(path).is_some();
-        let removed_mem = self.parents.remove(path).is_some();
-        let mut removed_disk = false;
+        if !self.disk.initialized {
+            self.disk.startup.parents.insert(path.to_path_buf());
+        }
+        if self.parents.remove(path).is_none() && self.disk.initialized {
+            return false;
+        }
         if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let child_str = path.to_string_lossy().into_owned();
-            removed_disk = krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-                let removed_raw = store.parents.remove(&child_str).is_some();
-                store.set_parent(&child_str, None)?;
-                Ok(removed_raw || had_parent)
-            })
-            .unwrap_or(false);
-            invalidate_parents_cache();
-            self.parents = self.merged_parents();
+            self.enqueue_disk_write(
+                move || {
+                    krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                        store.parents.remove(&child_str);
+                        store.set_parent(&child_str, None)?;
+                        Ok(())
+                    })
+                },
+                cx,
+            );
         }
-        if removed_mem || removed_disk {
-            self.persist(cx);
-            true
-        } else {
-            false
-        }
+        self.persist(cx);
+        true
     }
 
     /// 스냅샷에 저장소·워크트리 목록이 하나라도 있는지.
@@ -378,7 +314,9 @@ impl Sidebar {
         let Some(trees) = self.snapshot.trees.get(&repo) else {
             return Vec::new();
         };
-        let mut parents = self.merged_parents();
+        // Every candidate is already in the same repository. Validate ancestry
+        // against one shared map instead of re-scanning every repo per candidate.
+        let mut parents = self.parents.clone();
         parents.remove(path);
         trees
             .iter()
@@ -390,10 +328,7 @@ impl Sidebar {
     /// `path`의 직계 자식 워크트리 목록(현재 스냅샷에 존재하는 워크트리만).
     #[must_use]
     pub fn lineage_children(&self, path: &Path) -> Vec<PathBuf> {
-        let parents = self.merged_parents();
-        if parents.is_empty() {
-            return Vec::new();
-        }
+        let parents = &self.parents;
         let known: BTreeSet<&Path> = self
             .snapshot
             .trees
@@ -404,7 +339,7 @@ impl Sidebar {
         known
             .iter()
             .filter(|&&cand| {
-                effective_parent(cand, &parents, &known).is_some_and(|p| p.as_path() == path)
+                effective_parent(cand, parents, &known).is_some_and(|p| p.as_path() == path)
             })
             .map(|&p| p.to_path_buf())
             .collect()
@@ -413,10 +348,7 @@ impl Sidebar {
     /// `path`의 모든 자손 워크트리 목록(부모 → 자식 BFS/DFS 순서, 사이클 안전).
     #[must_use]
     pub fn lineage_descendants(&self, path: &Path) -> Vec<PathBuf> {
-        let parents = self.merged_parents();
-        if parents.is_empty() {
-            return Vec::new();
-        }
+        let parents = &self.parents;
         let known: BTreeSet<&Path> = self
             .snapshot
             .trees
@@ -426,7 +358,7 @@ impl Sidebar {
             .collect();
         let mut children_map: BTreeMap<&Path, Vec<&Path>> = BTreeMap::new();
         for &cand in &known {
-            if let Some(p) = effective_parent(cand, &parents, &known) {
+            if let Some(p) = effective_parent(cand, parents, &known) {
                 children_map.entry(p.as_path()).or_default().push(cand);
             }
         }
@@ -454,7 +386,7 @@ impl Sidebar {
     /// 현재 표시 기준에서 `path`의 계보 들여쓰기 깊이(`0..=MAX_LINEAGE_DEPTH`).
     #[must_use]
     pub fn lineage_depth(&self, path: &Path) -> usize {
-        let parents = self.merged_parents();
+        let parents = &self.parents;
         if parents.is_empty() {
             return 0;
         }
@@ -476,7 +408,7 @@ impl Sidebar {
         let mut visited = BTreeSet::new();
         visited.insert(path);
         let mut cur = path;
-        while let Some(parent) = effective_parent(cur, &parents, &scope) {
+        while let Some(parent) = effective_parent(cur, parents, &scope) {
             if !visited.insert(parent.as_path()) {
                 break;
             }
@@ -505,7 +437,7 @@ impl Sidebar {
 
     /// `path`의 조상 중 접혀 있는 계보가 있으면 모두 펼쳐 `path`가 사이드바에 드러나게 한다.
     pub(super) fn expand_lineage_ancestors(&mut self, path: &Path) -> bool {
-        let parents = self.merged_parents();
+        let parents = &self.parents;
         let mut changed = false;
         let mut visited = BTreeSet::new();
         let mut cur = Some(path);
@@ -555,7 +487,8 @@ impl Sidebar {
             .and_then(|p| self.meta.get(p).and_then(|t| t.branch.clone()));
         let repo_branch = self.meta.get(&repo).and_then(|t| t.branch.clone());
         // OWE-853: 로컬 git refs를 읽어 후보를 풍부하게 한다(새 IPC 없이, 실패 시 폴백만).
-        let git_refs = worktree::list_git_refs(&repo);
+        let git_refs = Vec::new();
+        let refs_repo = repo.clone();
         let (default_base, initial_candidates) = worktree::branch_suggestions(
             parent_branch.as_deref(),
             repo_branch.as_deref(),
@@ -569,6 +502,25 @@ impl Sidebar {
             }
             dialog
         });
+        let weak_dialog = dialog.downgrade();
+        cx.spawn_in(window, async move |_, cx| {
+            let refs = cx
+                .background_executor()
+                .spawn(async move { worktree::list_git_refs(&refs_repo) })
+                .await;
+            let (base, candidates) = worktree::branch_suggestions(
+                parent_branch.as_deref(),
+                repo_branch.as_deref(),
+                &refs,
+            );
+            weak_dialog
+                .update_in(cx, |dialog, window, cx| {
+                    dialog.set_branch_candidates(candidates, cx);
+                    dialog.set_base_default(base, window, cx);
+                })
+                .ok();
+        })
+        .detach();
         let events = cx.subscribe(
             &dialog,
             move |s, dialog_entity, event: &worktree::Event, cx| match event {
@@ -638,6 +590,9 @@ impl Sidebar {
 
     /// 워크트리를 수면 상태로 전환한다.
     pub fn sleep_worktree(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.disk.initialized {
+            self.disk.startup.ui.expanded_cards.insert(path.clone());
+        }
         self.expanded_cards.remove(&path);
         self.collapsed.insert(path.clone());
         self.sleeping_worktrees.insert(path);
@@ -646,7 +601,10 @@ impl Sidebar {
 
     /// 수면 상태인 워크트리를 깨운다.
     pub fn wake_worktree(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if self.sleeping_worktrees.remove(path) {
+        if !self.disk.initialized {
+            self.disk.startup.sleeping.insert(path.to_path_buf());
+        }
+        if self.sleeping_worktrees.remove(path) || !self.disk.initialized {
             self.persist(cx);
         }
     }
@@ -655,6 +613,9 @@ impl Sidebar {
     pub fn sleep_with_descendants(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let descendants = self.lineage_descendants(&path);
         for target in std::iter::once(path).chain(descendants) {
+            if !self.disk.initialized {
+                self.disk.startup.ui.expanded_cards.insert(target.clone());
+            }
             self.expanded_cards.remove(&target);
             self.collapsed.insert(target.clone());
             self.sleeping_worktrees.insert(target);
@@ -662,24 +623,35 @@ impl Sidebar {
         self.persist(cx);
     }
 
-    fn remove_worktree_lineage_local(&mut self, target: &Path) {
+    fn remove_worktree_lineage_local(&mut self, target: &Path, cx: &mut Context<Self>) {
+        if !self.disk.initialized {
+            self.disk.startup.parents.insert(target.to_path_buf());
+            self.disk
+                .startup
+                .collapsed_lineage
+                .insert(target.to_path_buf());
+            self.disk.startup.sleeping.insert(target.to_path_buf());
+        }
         splice_lineage_in_map(&mut self.parents, &target.to_path_buf());
         self.collapsed_lineage.remove(target);
         self.sleeping_worktrees.remove(target);
         if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
             let target_str = target.to_string_lossy().into_owned();
-            let norm_key = krill_proto::orchestration::worktree_key(target);
-            krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-                splice_lineage_in_map(&mut store.parents, &target_str);
-                if norm_key != target_str {
-                    splice_lineage_in_map(&mut store.parents, &norm_key);
-                }
-                store.remove_worktree_lineage(&target_str);
-                Ok(())
-            })
-            .ok();
-            invalidate_parents_cache();
-            self.parents = self.merged_parents();
+            let target_path = target.to_path_buf();
+            self.enqueue_disk_write(
+                move || {
+                    let norm_key = krill_proto::orchestration::worktree_key(&target_path);
+                    krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                        splice_lineage_in_map(&mut store.parents, &target_str);
+                        if norm_key != target_str {
+                            splice_lineage_in_map(&mut store.parents, &norm_key);
+                        }
+                        store.remove_worktree_lineage(&target_str);
+                        Ok(())
+                    })
+                },
+                cx,
+            );
         }
     }
 
@@ -705,7 +677,7 @@ impl Sidebar {
         let Some(source) = self.source.clone() else {
             return;
         };
-        let parents = self.merged_parents();
+        let parents = self.parents.clone();
         let mut ipc_targets = Vec::new();
         for target in targets {
             if self.snapshot.trees.contains_key(&target) {
@@ -769,7 +741,7 @@ impl Sidebar {
                     cx.notify();
                 } else {
                     for removed in &removed_paths {
-                        s.remove_worktree_lineage_local(removed);
+                        s.remove_worktree_lineage_local(removed, cx);
                         for list in s.snapshot.trees.values_mut() {
                             list.retain(|t| t != removed);
                         }

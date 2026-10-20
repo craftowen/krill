@@ -51,6 +51,42 @@ pub fn summary(usage: &Snapshot, now: u64) -> String {
     )
 }
 
+pub fn meters_summary(meters: &krill_proto::usage::AccountMeters, now: u64) -> String {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    meters
+        .meters
+        .iter()
+        .map(|meter| {
+            let value = meter
+                .value
+                .clone()
+                .unwrap_or_else(|| window(meter.window.as_ref(), now).text);
+            format!("{} {value}", meter_label(meter))
+        })
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+pub fn meter_label(meter: &krill_proto::usage::UsageMeter) -> String {
+    let label = match meter.label.as_str() {
+        "5h" => text::WINDOW_5H.get(),
+        "7d" => text::WINDOW_7D.get(),
+        "30d" => text::WINDOW_MONTHLY.get(),
+        "Extra usage" => text::METER_EXTRA_USAGE.get(),
+        "Credits" => text::METER_CREDITS.get(),
+        "Reset credits" => text::METER_RESET_CREDITS.get(),
+        "Code review" => text::METER_CODE_REVIEW.get(),
+        other => other,
+    };
+    if let Some(group) = label.strip_suffix(" · 7d") {
+        format!("{group} · {}", text::WINDOW_7D.get())
+    } else if let Some(group) = label.strip_suffix(" · 5h") {
+        format!("{group} · {}", text::WINDOW_5H.get())
+    } else {
+        label.to_owned()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountDisplay {
     pub status: AccountStatus,

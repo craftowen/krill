@@ -1,0 +1,7 @@
+AUDIT rejected a then type ab -> wire ["a","b"]
+AUDIT paste -> wire ["echo one\necho two"]
+AUDIT no ACK after 120s -> {"disabled":true,"phase":"ready","value":"echo hang"}
+AUDIT delta replaces custom field true value=  selection= ghost small chat-opt
+AUDIT historical approval while Working -> [{"action":"approve","session":7,"value":"y"}]
+AUDIT edit pending send -> {"value":""}
+AUDIT empty reset cache/render {"cache":0,"rendered":3,"before":3}

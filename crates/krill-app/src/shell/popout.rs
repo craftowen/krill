@@ -417,7 +417,7 @@ fn append_rule_menu(
 }
 
 fn render_popover_usage_row(
-    window_label: &'static str,
+    window_label: &str,
     selector: String,
     win: Option<&krill_proto::usage::Window>,
     brand_color: gpui::Hsla,
@@ -455,7 +455,7 @@ fn render_popover_usage_row(
                         .text_size(ui::TEXT_2XS)
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(p.muted_foreground)
-                        .child(window_label),
+                        .child(window_label.to_owned()),
                 )
                 .child(
                     div()
@@ -495,6 +495,46 @@ fn render_popover_usage_row(
         )
 }
 
+fn expanded_usage_fits(width: gpui::Pixels, rem_size: gpui::Pixels, providers: usize) -> bool {
+    let scale = f32::from(rem_size) / 16.;
+    width
+        >= (ui::theme::STATUS_USAGE_CONTROLS_WIDTH
+            + ui::theme::STATUS_USAGE_PROVIDER_WIDTH
+                * f32::from(u8::try_from(providers).unwrap_or(u8::MAX)))
+            * scale
+}
+
+fn status_window_label(label: &str, win: Option<&krill_proto::usage::Window>, now: u64) -> String {
+    let display = krill_app::accounts::display::window(win, i64::try_from(now).unwrap_or(i64::MAX));
+    let reset = display
+        .percent
+        .and_then(|_| krill_app::settings::window_reset_suffix(win));
+    format!(
+        "{label} {}{}",
+        display.text,
+        reset.map_or_else(String::new, |r| format!(" {r}"))
+    )
+}
+
+fn expanded_account_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> String {
+    use krill_app::i18n::catalog::settings as labels;
+    format!(
+        "{} · {}",
+        status_window_label(labels::WINDOW_5H.get(), usage.five_hour.as_ref(), now),
+        status_window_label(labels::WINDOW_7D.get(), usage.seven_day.as_ref(), now),
+    )
+}
+
+fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) -> bool {
+    snap.accounts.iter().any(|a| {
+        a.provider == provider
+            && (provider != ProviderKind::OpenCode
+                || !a.host_default
+                || !a.usage.is_empty()
+                || snap.meters_for(&a.id).is_some_and(|m| !m.meters.is_empty()))
+    }) && krill_app::accounts::installed::is_installed(cx, provider)
+}
+
 fn compact_account_usage(usage: &krill_proto::usage::Snapshot) -> String {
     krill_app::accounts::display::summary(usage, krill_app::accounts::display::now())
 }
@@ -522,6 +562,69 @@ fn provider_usage_menu(
 
     menu = menu.min_w(px(300.)).max_w(px(340.));
     let active_card = active.clone();
+    let active_meters = active
+        .as_ref()
+        .and_then(|a| snap.meters_for(&a.id))
+        .cloned();
+    let mut advanced_notes = Vec::new();
+    if snap.advanced.supported {
+        use krill_app::i18n::catalog::shell as policy_text;
+        let now = krill_app::accounts::display::now();
+        if let Some(active) = &active {
+            for model in snap
+                .advanced
+                .model_windows
+                .iter()
+                .filter(|m| m.account_id == active.id)
+            {
+                // 모름 "—"·리셋 지남은 카드와 같은 공유 헬퍼로 현지화한다(OWE-703).
+                let pct = krill_app::accounts::display::window(
+                    Some(&model.seven_day),
+                    i64::try_from(now).unwrap_or(i64::MAX),
+                )
+                .text;
+                let window = krill_app::i18n::catalog::settings::WINDOW_7D.get();
+                advanced_notes.push(format!("{} · {window} {pct}", model.model));
+            }
+            for f in snap
+                .advanced
+                .forecasts
+                .iter()
+                .filter(|f| f.account_id == active.id)
+            {
+                advanced_notes.push(policy_text::ACCOUNT_FORECAST.format(&[
+                    ("window", &f.window),
+                    (
+                        "minutes",
+                        &f.exhausts_at.saturating_sub(now).div_ceil(60).to_string(),
+                    ),
+                    ("rate", &f.percent_per_hour.to_string()),
+                ]));
+            }
+            if let Some(limit) = snap
+                .advanced
+                .rate_limits
+                .iter()
+                .find(|l| l.account_id == active.id)
+            {
+                advanced_notes.push(
+                    policy_text::ACCOUNT_LIMIT_CLEARS
+                        .format(&[("seconds", &limit.clears_at.saturating_sub(now).to_string())]),
+                );
+            }
+        }
+        if let Some(cd) = snap
+            .advanced
+            .cooldowns
+            .iter()
+            .find(|c| c.provider == provider && c.cooldown_until > now)
+        {
+            advanced_notes.push(policy_text::ACCOUNT_COOLDOWN_LEFT.format(&[(
+                "seconds",
+                &cd.cooldown_until.saturating_sub(now).to_string(),
+            )]));
+        }
+    }
     menu = menu.item(
         PopupMenuItem::element(move |_, cx| {
             let p = ui::palette(cx);
@@ -538,7 +641,7 @@ fn provider_usage_menu(
             let card_id = format!("status-provider-card-{}", provider.as_str());
             let debug_id = card_id.clone();
 
-            div()
+            let card = div()
                 .id(gpui::SharedString::from(card_id))
                 .debug_selector(move || debug_id.clone())
                 .w(px(284.))
@@ -559,10 +662,10 @@ fn provider_usage_menu(
                                 .flex()
                                 .items_center()
                                 .gap_1p5()
-                                .child(ui::icons::provider_icon(provider, ui::ICON_MD, brand_color))
+                                .child(ui::icons::provider_icon(provider, ui::ICON_SM, brand_color))
                                 .child(
                                     div()
-                                        .text_size(ui::TEXT_XS)
+                                        .text_size(ui::TEXT_SM)
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .text_color(p.foreground)
                                         .child(provider.display_name()),
@@ -580,8 +683,43 @@ fn provider_usage_menu(
                                 .text_color(p.muted_foreground)
                                 .child(name)
                         })),
-                )
-                .child(render_popover_usage_row(
+                );
+            let card = if let Some(meters) = &active_meters {
+                let mut card = card;
+                for meter in &meters.meters {
+                    let label = krill_app::accounts::display::meter_label(meter);
+                    card = card.child(if let Some(value) = &meter.value {
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_between()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(label)
+                            .child(value.clone())
+                            .into_any_element()
+                    } else {
+                        render_popover_usage_row(
+                            &label,
+                            format!("status-provider-bar-{}-{}", provider.as_str(), meter.key),
+                            meter.window.as_ref(),
+                            brand_color,
+                            p,
+                        )
+                        .into_any_element()
+                    });
+                }
+                if meters.meters.is_empty() {
+                    card = card.child(
+                        div()
+                            .text_size(ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child("—"),
+                    );
+                }
+                card
+            } else {
+                card.child(render_popover_usage_row(
                     krill_app::i18n::catalog::settings::WINDOW_5H.get(),
                     format!("status-provider-bar-{}-5h", provider.as_str()),
                     five_win,
@@ -595,6 +733,14 @@ fn provider_usage_menu(
                     brand_color,
                     p,
                 ))
+            };
+            card.children(advanced_notes.iter().cloned().map(|note| {
+                div()
+                    .w_full()
+                    .text_size(ui::TEXT_2XS)
+                    .text_color(p.muted_foreground)
+                    .child(note)
+            }))
         })
         .disabled(true),
     );
@@ -604,7 +750,12 @@ fn provider_usage_menu(
         .label(provider_text::PROVIDER_ACCOUNTS_HEADER.get());
     for account in &accounts {
         let (title, _) = krill_app::settings::account_heading(account);
-        let usage_summary = compact_account_usage(&account.usage);
+        let usage_summary = snap.meters_for(&account.id).map_or_else(
+            || compact_account_usage(&account.usage),
+            |m| {
+                krill_app::accounts::display::meters_summary(m, krill_app::accounts::display::now())
+            },
+        );
         let status = krill_app::accounts::display::account(
             account,
             snap.statuses.iter().find(|s| s.account_id == account.id),
@@ -639,9 +790,12 @@ fn provider_usage_menu(
                     .id(gpui::SharedString::from(row_id.clone()))
                     .debug_selector(move || debug_id.clone())
                     .w(px(264.))
+                    .py_0p5()
                     .flex()
                     .flex_col()
-                    .gap_1()
+                    .items_start()
+                    .justify_between()
+                    .gap_0p5()
                     .child(
                         div()
                             .w_full()
@@ -653,7 +807,7 @@ fn provider_usage_menu(
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .text_size(ui::TEXT_XS)
+                                    .text_size(ui::TEXT_SM)
                                     .font_weight(if is_active {
                                         gpui::FontWeight::SEMIBOLD
                                     } else {
@@ -708,63 +862,36 @@ fn provider_usage_menu(
         );
     }
 
+    menu = menu.separator();
+    let policy = snap.auto_switch.clone();
+    let weak_toggle = weak.clone();
+    menu = menu.item(
+        PopupMenuItem::new(provider_text::PROVIDER_GLOBAL_AUTO_SWITCH.get())
+            .checked(policy.enabled)
+            .on_click(move |_, _, cx| {
+                let mut next = policy.clone();
+                next.enabled = !next.enabled;
+                weak_toggle
+                    .update(cx, |shell, cx| {
+                        shell.refresh_accounts(UsageRequest::SetAutoSwitch(next.clone()), cx);
+                    })
+                    .ok();
+            }),
+    );
+    if let Some(active) = active {
+        let snap_rule = snap.clone();
+        let weak_rule = weak.clone();
+        menu = menu.submenu(
+            provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
+            window,
+            cx,
+            move |menu, window, cx| {
+                append_rule_menu(menu, &snap_rule, &active, weak_rule.clone(), window, cx)
+            },
+        );
+    }
     if snap.advanced.supported {
         use krill_app::i18n::catalog::shell as policy_text;
-        let now = krill_app::accounts::display::now();
-        if let Some(active) = &active {
-            for model in snap
-                .advanced
-                .model_windows
-                .iter()
-                .filter(|m| m.account_id == active.id)
-            {
-                // 모름 "—"·리셋 지남은 카드와 같은 공유 헬퍼로 현지화한다(OWE-703).
-                let pct = krill_app::accounts::display::window(
-                    Some(&model.seven_day),
-                    i64::try_from(now).unwrap_or(i64::MAX),
-                )
-                .text;
-                let window = krill_app::i18n::catalog::settings::WINDOW_7D.get();
-                menu = menu.label(format!("{} · {window} {pct}", model.model));
-            }
-            for f in snap
-                .advanced
-                .forecasts
-                .iter()
-                .filter(|f| f.account_id == active.id)
-            {
-                menu = menu.label(policy_text::ACCOUNT_FORECAST.format(&[
-                    ("window", &f.window),
-                    (
-                        "minutes",
-                        &f.exhausts_at.saturating_sub(now).div_ceil(60).to_string(),
-                    ),
-                    ("rate", &f.percent_per_hour.to_string()),
-                ]));
-            }
-            if let Some(limit) = snap
-                .advanced
-                .rate_limits
-                .iter()
-                .find(|l| l.account_id == active.id)
-            {
-                menu = menu.label(
-                    policy_text::ACCOUNT_LIMIT_CLEARS
-                        .format(&[("seconds", &limit.clears_at.saturating_sub(now).to_string())]),
-                );
-            }
-        }
-        if let Some(cd) = snap
-            .advanced
-            .cooldowns
-            .iter()
-            .find(|c| c.provider == provider && c.cooldown_until > now)
-        {
-            menu = menu.label(policy_text::ACCOUNT_COOLDOWN_LEFT.format(&[(
-                "seconds",
-                &cd.cooldown_until.saturating_sub(now).to_string(),
-            )]));
-        }
         let policy = snap.advanced.policy.clone();
         let weak = weak.clone();
         menu = menu.submenu(
@@ -829,34 +956,6 @@ fn provider_usage_menu(
             },
         );
     }
-    menu = menu.separator();
-    let policy = snap.auto_switch.clone();
-    let weak_toggle = weak.clone();
-    menu = menu.item(
-        PopupMenuItem::new(provider_text::PROVIDER_GLOBAL_AUTO_SWITCH.get())
-            .checked(policy.enabled)
-            .on_click(move |_, _, cx| {
-                let mut next = policy.clone();
-                next.enabled = !next.enabled;
-                weak_toggle
-                    .update(cx, |shell, cx| {
-                        shell.refresh_accounts(UsageRequest::SetAutoSwitch(next.clone()), cx);
-                    })
-                    .ok();
-            }),
-    );
-    if let Some(active) = active {
-        let snap_rule = snap.clone();
-        let weak_rule = weak.clone();
-        menu = menu.submenu(
-            provider_text::PROVIDER_AUTO_SWITCH_HEADER.get(),
-            window,
-            cx,
-            move |menu, window, cx| {
-                append_rule_menu(menu, &snap_rule, &active, weak_rule.clone(), window, cx)
-            },
-        );
-    }
     let refresh_weak = weak.clone();
     let open_weak = weak;
     menu.separator()
@@ -865,7 +964,7 @@ fn provider_usage_menu(
                 move |_, _, cx| {
                     refresh_weak
                         .update(cx, |shell, cx| {
-                            shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+                            shell.refresh_usage_manually(cx);
                         })
                         .ok();
                 },
@@ -877,7 +976,7 @@ fn provider_usage_menu(
                 div()
                     .id("status-provider-open-accounts")
                     .debug_selector(|| "status-provider-open-accounts".into())
-                    .text_size(ui::TEXT_XS)
+                    .text_size(ui::TEXT_SM)
                     .text_color(p.foreground)
                     .child(provider_text::PROVIDER_OPEN_SETTINGS.get())
             })
@@ -1026,6 +1125,28 @@ impl Shell {
         cx.notify();
     }
 
+    /// OWE-851: 대시보드 카드·리소스 행 클릭 → 메인 창 해당 세션으로 포커스하고 메인 창을 앞으로.
+    #[expect(dead_code, reason = "dashboard window navigation helper")]
+    pub(super) fn focus_session_window(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        self.open_session(session, cx);
+        if let Some(win) = self.window {
+            let focus = self.focus.clone();
+            win.update(cx, |_, window, cx| {
+                window.activate_window();
+                window.focus(&focus, cx);
+            })
+            .ok();
+        }
+        let owner = cx.weak_entity();
+        let sidebar = self.sidebar.clone();
+        let previews = Dashboard::collect_previews(self);
+        let dashboard = cx.new(|cx| Dashboard::new(owner, sidebar, previews, cx));
+        self.dashboard = Some(dashboard);
+        self.sync_sidebar_visibility(cx);
+        self.sync_focused_session(cx);
+        cx.notify();
+    }
+
     pub(crate) fn upsert_account_rule(&mut self, rule: AutoSwitchRule, cx: &mut Context<Self>) {
         self.refresh_accounts(UsageRequest::UpsertAutoSwitchRule(rule), cx);
     }
@@ -1123,7 +1244,11 @@ impl Shell {
         );
     }
 
-    pub(super) fn render_status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(super) fn render_status_bar(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let p = ui::palette(cx);
         let (color, daemon_tooltip) = match &self.link {
             Link::Up => (p.success, text::DAEMON_UP.get().to_owned()),
@@ -1152,6 +1277,15 @@ impl Shell {
             ProviderKind::Antigravity,
             ProviderKind::OpenCode,
         ];
+        let status_providers: Vec<_> = status_providers
+            .into_iter()
+            .filter(|provider| has_provider_pill(&snap, *provider, cx))
+            .collect();
+        let expanded = expanded_usage_fits(
+            window.viewport_size().width,
+            window.rem_size(),
+            status_providers.len(),
+        );
         let mut provider_pills = div()
             .id("status-provider-usage")
             .debug_selector(|| "status-provider-usage".into())
@@ -1161,12 +1295,6 @@ impl Shell {
         // OWE-652: 계정이 하나도 없는 제공자는 알약을 그리지 않는다(Orca처럼 간결하게).
         // 활성 계정의 모름·만료를 다른 계정 수치로 덮지 않는다(OWE-703).
         for provider in status_providers {
-            // OWE-706: 설치 감지에서 빠진 프로바이더도 그리지 않는다(감지 전에는 모두 그린다).
-            if !snap.accounts.iter().any(|a| a.provider == provider)
-                || !krill_app::accounts::installed::is_installed(cx, provider)
-            {
-                continue;
-            }
             let active = snap
                 .accounts
                 .iter()
@@ -1174,8 +1302,11 @@ impl Shell {
                 .or_else(|| snap.accounts.iter().find(|a| a.provider == provider));
             let now = krill_app::accounts::display::now();
             let percent = active.and_then(|a| {
-                AutoSwitchMetric::Max
-                    .effective_percent(&a.usage, i64::try_from(now).unwrap_or(i64::MAX))
+                let now = i64::try_from(now).unwrap_or(i64::MAX);
+                snap.meters_for(&a.id).map_or_else(
+                    || AutoSwitchMetric::Max.effective_percent(&a.usage, now),
+                    |m| m.effective_max(now),
+                )
             });
             let status = active.map(|a| {
                 krill_app::accounts::display::account(
@@ -1184,7 +1315,15 @@ impl Shell {
                     now,
                 )
             });
-            let label = percent.map_or_else(|| "—".to_owned(), |pct| format!("{pct}%"));
+            let compact_label = percent.map_or_else(|| "—".to_owned(), |pct| format!("{pct}%"));
+            let expanded_label = active
+                .map(|a| expanded_account_usage(&a.usage, now))
+                .unwrap_or_default();
+            let label = if expanded {
+                expanded_label.clone()
+            } else {
+                compact_label
+            };
             let color = match percent {
                 _ if status.as_ref().is_some_and(|s| {
                     s.status == krill_proto::usage::AccountStatus::RateLimited
@@ -1201,42 +1340,64 @@ impl Shell {
             let weak = cx.weak_entity();
             let description = status.map_or_else(
                 || provider.display_name().to_owned(),
-                |s| format!("{} · {} · {}", provider.display_name(), s.label, s.updated),
+                |s| {
+                    format!(
+                        "{} · {} · {} · {}",
+                        provider.display_name(),
+                        expanded_label,
+                        s.label,
+                        s.updated
+                    )
+                },
             );
-            provider_pills = provider_pills.child(
-                ui::button_with_tooltip_when(
-                    tooltips_on,
-                    Button::new(gpui::SharedString::from(selector.clone()))
-                        .label(label)
-                        .font_family(ui::FONT_MONO)
-                        .icon(ui::icons::provider_menu_icon(provider))
-                        .text_color(color)
-                        .ghost()
-                        .xsmall()
-                        .debug_selector(move || debug_selector.clone()),
-                    selector,
-                    description,
-                )
-                .dropdown_menu(move |menu, window, cx| {
-                    provider_usage_menu(menu, &provider_snap, provider, weak.clone(), window, cx)
+            let pill_btn = Button::new(gpui::SharedString::from(selector.clone()))
+                .font_family(ui::FONT_MONO)
+                .text_color(color)
+                .ghost()
+                .xsmall()
+                .debug_selector(move || debug_selector.clone());
+            let detail_selector = format!(
+                "status-provider-{}-{}",
+                if expanded { "expanded" } else { "compact" },
+                provider.as_str()
+            );
+            let pill_btn = pill_btn
+                .accessibility_label(description.clone())
+                .child(ui::icons::provider_icon(provider, ui::ICON_SM, color))
+                .when(expanded && percent.is_some(), |button| {
+                    button.child(
+                        div()
+                            .w(ui::SPACE_4 * 2.)
+                            .h(ui::SPACE_1)
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(p.muted)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(f32::from(percent.unwrap_or(0)) / 100.))
+                                    .bg(color),
+                            ),
+                    )
                 })
-                .on_open_change({
-                    let track = track_menu_open(cx.weak_entity());
-                    let shell = cx.weak_entity();
-                    // 열 때마다 데몬의 활성 계정·사용량을 다시 받는다(다른 곳에서 바꾼 전환이 늦게 보이지 않게).
-                    move |open: &bool, window: &mut Window, cx: &mut App| {
-                        track(open, window, cx);
-                        if *open {
-                            shell
-                                .update(cx, |s, cx| {
-                                    if s.link == Link::Up {
-                                        s.refresh_accounts(UsageRequest::ListAccounts, cx);
-                                    }
-                                })
-                                .ok();
-                        }
-                    }
-                }),
+                .child(
+                    div()
+                        .debug_selector(move || detail_selector.clone())
+                        .child(label),
+                );
+            provider_pills = provider_pills.child(
+                ui::button_with_tooltip_when(tooltips_on, pill_btn, selector, description)
+                    .dropdown_menu(move |menu, window, cx| {
+                        provider_usage_menu(
+                            menu,
+                            &provider_snap,
+                            provider,
+                            weak.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                    .on_open_change(track_menu_open(cx.weak_entity())),
             );
         }
         let weak = cx.weak_entity();
@@ -1244,6 +1405,7 @@ impl Shell {
             tooltips_on,
             Button::new("status-usage-refresh")
                 .icon(gpui_component::IconName::RefreshCw)
+                .loading(self.usage_refresh.is_some())
                 .ghost()
                 .xsmall()
                 .debug_selector(|| "status-usage-refresh".into()),
@@ -1251,7 +1413,7 @@ impl Shell {
             provider_text::PROVIDER_REFRESH_USAGE.get(),
         )
         .on_click(cx.listener(|shell, _, _, cx| {
-            shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+            shell.refresh_usage_manually(cx);
         }));
         // 같은 기기 중복 등록은 사이드바처럼 한 번만 보인다(대표 항목만).
         let ssh_hosts: Vec<_> = self
@@ -1305,10 +1467,7 @@ impl Shell {
         })
         .on_open_change(track_menu_open(cx.weak_entity()));
         let state_dir = self.state_dir(cx);
-        let orch_store = state_dir
-            .as_deref()
-            .map(krill_proto::orchestration::OrchestrationStore::load_cached)
-            .unwrap_or_default();
+        let orch_store = self.orch_snapshot.clone();
         let orch_compact_label = format!("{}·{}", orch_store.runs.len(), orch_store.tasks.len());
         let orch_full_label = text::ORCH_MENU_BTN.format(&[
             ("runs", &orch_store.runs.len().to_string()),
@@ -1373,7 +1532,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().text_size(ui::TEXT_XS).child(summary.clone()));
+                                    .child(div().flex_1().text_size(ui::TEXT_SM).child(summary.clone()));
                                 for (answer, label) in [
                                     ("yes", text::QUESTION_YES.get()),
                                     ("no", text::QUESTION_NO.get()),
@@ -1427,7 +1586,7 @@ impl Shell {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .child(div().flex_1().text_size(ui::TEXT_XS).child(label.clone()))
+                                    .child(div().flex_1().text_size(ui::TEXT_SM).child(label.clone()))
                                     .child(
                                         Button::new(gpui::ElementId::Name(button_id.clone().into()))
                                             .label(text::WORKER_RELEASE.get())
@@ -1562,42 +1721,23 @@ impl Shell {
             })
             .on_open_change(track_menu_open(cx.weak_entity()));
         let mut detected_ports = Vec::new();
-        for live in self.live.values() {
-            if let Some(sid) = live.pane.session() {
-                let text_lines = screen_plain_text(&live.pane.shown());
-                // AS-24: 화면 텍스트가 그대로면 정규식을 다시 돌리지 않는다.
-                let hit = self
-                    .ports_cache
-                    .borrow()
-                    .get(&sid.0)
-                    .filter(|(text, _)| *text == text_lines)
-                    .map(|(_, entries)| entries.clone());
-                let entries = if let Some(entries) = hit {
-                    entries
-                } else {
-                    let entries =
-                        krill_proto::orchestration::extract_local_urls(sid.0, &text_lines, false);
-                    self.ports_cache
-                        .borrow_mut()
-                        .insert(sid.0, (text_lines, entries.clone()));
-                    entries
-                };
-                for entry in entries {
-                    if !detected_ports
-                        .iter()
-                        .any(|e: &krill_proto::orchestration::PortEntry| e.url == entry.url)
-                    {
-                        detected_ports.push(entry);
-                    }
+        for (sid, (_, entries)) in self.ports_cache.borrow().iter() {
+            if !self
+                .live
+                .values()
+                .any(|live| live.pane.session().is_some_and(|session| session.0 == *sid))
+            {
+                continue;
+            }
+            for entry in entries {
+                if !detected_ports
+                    .iter()
+                    .any(|e: &krill_proto::orchestration::PortEntry| e.url == entry.url)
+                {
+                    detected_ports.push(entry.clone());
                 }
             }
         }
-        // 사라진 세션의 메모를 비운다.
-        self.ports_cache.borrow_mut().retain(|id, _| {
-            self.live
-                .values()
-                .any(|live| live.pane.session().is_some_and(|sid| sid.0 == *id))
-        });
         let ports_count_label = detected_ports.len().to_string();
         let ports_full_label = text::PORTS_MENU_BTN.format(&[("count", &ports_count_label)]);
         let ports_tooltip = format!("{} — {ports_full_label}", text::PORTS_MENU_TITLE.get());
@@ -1795,7 +1935,7 @@ impl Shell {
                         )
                         .on_click(cx.listener(|this, _, _, cx| this.dashboard(cx)))
                     })
-                    .child(self.history.clone())
+                    .child(self.history.update(cx, |h, cx| h.render_toggle(cx)))
                     .child(self.resources.clone()),
             )
             // 하-4: 상태바 우클릭 메뉴. 상태바에 이미 있는 동작과 설정 열기만 담는다.
@@ -1810,7 +1950,7 @@ impl Shell {
                         })
                         .on_click(move |_, _, cx| {
                             weak.update(cx, |shell, cx| {
-                                shell.refresh_accounts(UsageRequest::ListAccounts, cx);
+                                shell.refresh_usage_manually(cx);
                             })
                             .ok();
                         }),

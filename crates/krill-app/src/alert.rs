@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::mpsc;
 
 use gpui::{App, Global, SharedString, SystemNotification, WeakEntity};
 use krill_proto::SessionId;
@@ -23,6 +24,44 @@ use crate::sidebar::{Selected, Session, Sidebar, Snapshot};
 
 const PANE_TAG_PREFIX: &str = "pane:";
 const SLEEP_REASON: &str = "Krill agent working";
+
+enum AwakeCommand {
+    Set(bool),
+    #[cfg(test)]
+    Barrier(mpsc::Sender<()>),
+}
+
+/// Windows 실행 상태는 스레드에 귀속되므로 취득·해제를 같은 전용 스레드에서 수행한다.
+struct AwakeWorker {
+    send: mpsc::Sender<AwakeCommand>,
+    task: std::thread::JoinHandle<()>,
+}
+
+impl AwakeWorker {
+    fn spawn() -> std::io::Result<Self> {
+        let (send, recv) = mpsc::channel();
+        let task = std::thread::Builder::new()
+            .name("sleep-assertion".into())
+            .spawn(move || {
+                let mut assertion = None;
+                while let Ok(command) = recv.recv() {
+                    match command {
+                        AwakeCommand::Set(true) if assertion.is_none() => {
+                            assertion = SleepAssertion::acquire(SLEEP_REASON);
+                        }
+                        AwakeCommand::Set(false) => assertion = None,
+                        AwakeCommand::Set(true) => {}
+                        #[cfg(test)]
+                        AwakeCommand::Barrier(done) => {
+                            done.send(()).ok();
+                        }
+                    }
+                }
+                drop(assertion);
+            })?;
+        Ok(Self { send, task })
+    }
+}
 
 use crate::i18n::catalog::alert as text;
 
@@ -108,6 +147,12 @@ struct AlertState {
     notified: HashMap<SessionId, (AgentState, u64)>,
     /// 현재 알림 센터에 게시돼 있는 세션 집합.
     active_tags: HashSet<SessionId>,
+    /// 세션별 알림 음소거 집합(#28312, #28289).
+    muted_sessions: HashSet<SessionId>,
+    /// 워크트리(폴더)별 알림 음소거 집합(#28312, #28289).
+    muted_worktrees: HashSet<std::path::PathBuf>,
+    /// 오케스트레이션 워커로 실행 중인 세션 집합(#30058: 일반 작업 완료 알림 억제).
+    orchestration_workers: HashSet<SessionId>,
     /// 마지막 스냅샷의 `Needs You`(`Waiting` | `Blocked`) 세션 수.
     needs_you_count: usize,
     /// 마지막 스냅샷의 `Working` 세션 수.
@@ -116,18 +161,98 @@ struct AlertState {
     badge_count: usize,
     /// 알림음을 낸 횟수(테스트·상태 확인용, 실제 발음은 `cfg(test)`가 아닐 때만).
     beep_count: u64,
-    /// 활성 `IOPMAssertion` 핸들.
-    sleep_assertion: Option<SleepAssertion>,
+    /// 메인 스레드는 요청 상태만 보관하고 OS 핸들은 전용 작업자가 소유한다.
+    awake_requested: bool,
+    awake: Option<AwakeWorker>,
     account_switch_sequence: Option<u64>,
 }
 
 impl Global for AlertState {}
 
+// Saved notification/power preferences must be loaded before producing side
+// effects. Early snapshots still establish a baseline for session transitions.
+fn effective_settings(cx: &App) -> settings::Settings {
+    let mut cfg = settings::current(cx);
+    if !settings::is_loaded(cx) {
+        cfg.notifications = false;
+        cfg.keep_awake = settings::KeepAwake::Off;
+    }
+    cfg
+}
+
+fn is_session_or_worktree_muted(state: &AlertState, session: &Session) -> bool {
+    state.muted_sessions.contains(&session.id)
+        || session
+            .worktree
+            .as_deref()
+            .or(session.cwd.as_deref())
+            .is_some_and(|p| state.muted_worktrees.contains(p))
+}
+
 fn ensure_state(cx: &mut App) {
     if cx.try_global::<AlertState>().is_none() {
         cx.set_app_identity(krill_proto::daemon::BUNDLE_ID, "Krill");
         cx.set_global(AlertState::default());
+        cx.on_app_quit(|cx| {
+            let worker = cx.global_mut::<AlertState>().awake.take();
+            cx.background_executor().spawn(async move {
+                if let Some(AwakeWorker { send, task }) = worker {
+                    drop(send);
+                    task.join().ok();
+                }
+            })
+        })
+        .detach();
     }
+}
+
+/// 특정 세션의 알림·배지 음소거 상태를 설정한다(#28312, #28289).
+pub fn set_session_muted(id: SessionId, muted: bool, cx: &mut App) {
+    ensure_state(cx);
+    let state = cx.global_mut::<AlertState>();
+    if muted {
+        state.muted_sessions.insert(id);
+    } else {
+        state.muted_sessions.remove(&id);
+    }
+    if muted {
+        dismiss(id, cx);
+    }
+}
+
+/// 특정 세션이 음소거 상태인지 확인한다(#28312).
+#[must_use]
+pub fn is_session_muted(id: SessionId, cx: &App) -> bool {
+    cx.try_global::<AlertState>()
+        .is_some_and(|state| state.muted_sessions.contains(&id))
+}
+
+/// 특정 워크트리(폴더)의 알림·배지 음소거 상태를 설정한다(#28312, #28289).
+pub fn set_worktree_muted(worktree: impl Into<std::path::PathBuf>, muted: bool, cx: &mut App) {
+    ensure_state(cx);
+    let path = worktree.into();
+    let state = cx.global_mut::<AlertState>();
+    if muted {
+        state.muted_worktrees.insert(path);
+    } else {
+        state.muted_worktrees.remove(&path);
+    }
+}
+
+/// 특정 워크트리(폴더)가 음소거 상태인지 확인한다(#28312).
+#[must_use]
+pub fn is_worktree_muted(worktree: &Path, cx: &App) -> bool {
+    cx.try_global::<AlertState>()
+        .is_some_and(|state| state.muted_worktrees.contains(worktree))
+}
+
+/// 오케스트레이션 워커 세션 목록을 갱신한다(#30058: 워커 세션의 일반 `Done` 알림을 억제한다).
+pub fn set_orchestration_worker_sessions(
+    sessions: impl IntoIterator<Item = SessionId>,
+    cx: &mut App,
+) {
+    ensure_state(cx);
+    cx.global_mut::<AlertState>().orchestration_workers = sessions.into_iter().collect();
 }
 
 /// 알림 클릭 시 해당 세션의 pane으로 포커스를 옮기도록 `Sidebar`에 리스너를 등록한다.
@@ -152,7 +277,7 @@ pub fn listen(sidebar: &WeakEntity<Sidebar>, cx: &mut App) {
 /// 활성 창의 포커스 칸만 알림을 생략한다. 창이 없거나 비활성이면 알림을 보낸다(메뉴바 상주).
 pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
     ensure_state(cx);
-    let cfg = settings::current(cx);
+    let cfg = effective_settings(cx);
     // 창이 닫힌 뒤에도 `window_active`·`focused`가 stale하게 남을 수 있어 메뉴바 상주 알림까지
     // 막는다. 억제는 창이 있을 때만 적용한다.
     let has_window = !cx.windows().is_empty();
@@ -169,6 +294,7 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
         for session in &snapshot.sessions {
             present.insert(session.id);
             let prev = state.seen.insert(session.id, session.status.state);
+            let muted = is_session_or_worktree_muted(state, session);
             match session.status.state {
                 AgentState::Working => {
                     working += 1;
@@ -178,11 +304,14 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                     }
                 }
                 AgentState::Waiting | AgentState::Blocked => {
-                    needs_you += 1;
+                    if !muted {
+                        needs_you += 1;
+                    }
                     let key = (session.status.state, session.status.since_unix_ns);
                     if state.notified.get(&session.id) != Some(&key) {
                         state.notified.insert(session.id, key);
-                        if should_notify(&cfg, AlertEvent::InputWait)
+                        if !muted
+                            && should_notify(&cfg, AlertEvent::InputWait)
                             && initialized
                             && !suppress_notification(
                                 cfg.notify_only_inactive,
@@ -197,13 +326,16 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                 }
                 AgentState::Done => {
                     let key = (session.status.state, session.status.since_unix_ns);
+                    let is_worker = state.orchestration_workers.contains(&session.id);
                     // Working→Done뿐 아니라 Waiting·Blocked→Done(폴링 사이 전이)도 알린다.
                     // 같은 Done 스냅샷 반복은 notified 기록으로 걸러진다.
                     if prev.is_some_and(|old| old != AgentState::Done)
                         && state.notified.get(&session.id) != Some(&key)
                     {
                         state.notified.insert(session.id, key);
-                        if should_notify(&cfg, AlertEvent::Done)
+                        if !muted
+                            && !is_worker
+                            && should_notify(&cfg, AlertEvent::Done)
                             && initialized
                             && !suppress_notification(
                                 cfg.notify_only_inactive,
@@ -273,7 +405,7 @@ pub fn disconnected(cx: &mut App) {
     for id in tags {
         crate::onboarding::actions::dismiss_notification(&pane_tag(id), cx);
     }
-    apply_outputs(&settings::current(cx), cx);
+    apply_outputs(&effective_settings(cx), cx);
 }
 
 /// 재접속 뒤 같은 스냅샷이어도 작업 수·배지를 다시 반영해야 한다.
@@ -304,7 +436,7 @@ pub fn set_active(active: bool, cx: &mut App) {
 /// `settings.toml` 변경(`notifications`, `keep_awake`)을 즉시 배지·알림·`IOPMAssertion`에 반영한다.
 pub fn sync_settings(cx: &mut App) {
     ensure_state(cx);
-    let cfg = settings::current(cx);
+    let cfg = effective_settings(cx);
     apply_outputs(&cfg, cx);
 }
 
@@ -342,7 +474,7 @@ fn play_notification_sound(cx: &mut App) {
 /// 알림이 있거나 보고 있는 칸의 벨이면 생략한다.
 pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
     ensure_state(cx);
-    let cfg = settings::current(cx);
+    let cfg = effective_settings(cx);
     if !should_notify(&cfg, AlertEvent::Bell) {
         return;
     }
@@ -350,6 +482,7 @@ pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
     let suppressed = {
         let state = cx.global::<AlertState>();
         state.active_tags.contains(&id)
+            || state.muted_sessions.contains(&id)
             || suppress_notification(
                 cfg.notify_only_inactive,
                 state.focused == Some(id),
@@ -381,7 +514,7 @@ pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
 /// `"pane:"` 접두를 쓰지 않아 클릭해도 세션으로 이동하지 않는다.
 pub fn send_test_notification(cx: &mut App) {
     ensure_state(cx);
-    if !settings::current(cx).notifications {
+    if !effective_settings(cx).notifications {
         return;
     }
     crate::onboarding::actions::show_notification(
@@ -395,11 +528,10 @@ pub fn send_test_notification(cx: &mut App) {
     );
 }
 
-/// 현재 `IOPMAssertion`으로 유휴 잠자기를 막고 있는지 돌려준다.
+/// 유휴 잠자기 방지를 요청 중인지 돌려준다. OS 적용·해제는 전용 작업자가 순서대로 처리한다.
 pub fn is_preventing_sleep(cx: &App) -> bool {
     cx.try_global::<AlertState>()
-        .and_then(|s| s.sleep_assertion.as_ref())
-        .is_some()
+        .is_some_and(|s| s.awake_requested)
 }
 
 fn apply_outputs(cfg: &settings::Settings, cx: &mut App) {
@@ -417,14 +549,16 @@ fn apply_outputs(cfg: &settings::Settings, cx: &mut App) {
         state.badge_count = next_badge;
 
         let want_awake = should_keep_awake(cfg.keep_awake, state.working_count);
-        match (want_awake, state.sleep_assertion.is_some()) {
-            (true, false) => {
-                state.sleep_assertion = SleepAssertion::acquire(SLEEP_REASON);
+        if want_awake && state.awake.is_none() {
+            match AwakeWorker::spawn() {
+                Ok(worker) => state.awake = Some(worker),
+                Err(error) => tracing::warn!(kind = ?error.kind(), "sleep assertion worker failed"),
             }
-            (false, true) => {
-                state.sleep_assertion = None;
-            }
-            _ => {}
+        }
+        if want_awake != state.awake_requested {
+            state.awake_requested = state.awake.as_ref().is_some_and(|worker| {
+                worker.send.send(AwakeCommand::Set(want_awake)).is_ok() && want_awake
+            });
         }
 
         (next_badge > 0).then(|| next_badge.to_string())
@@ -499,7 +633,7 @@ pub fn sync_account_switches(advanced: &krill_proto::usage::AccountPolicyState, 
         .account_switch_sequence
         .replace(latest);
     let Some(previous) = previous else { return };
-    let cfg = settings::current(cx);
+    let cfg = effective_settings(cx);
     if !cfg.notifications {
         return;
     }

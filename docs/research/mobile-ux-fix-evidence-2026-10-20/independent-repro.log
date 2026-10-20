@@ -1,0 +1,23 @@
+remount unchanged => ""
+remount different => "new draft"
+remount edit-back => "send once"
+remount failure => "send once"
+PASS remount
+history: 300 incremental unit pages, 50 exact earlier reads, cap/latest preserved
+PASS history
+byteHistory: mixed short byte pages, clipped page, duplicate texts and chronology preserved
+PASS byteHistory
+historyRace first/last: Message 49 Message 298
+PASS historyRace
+locate false connecting preserved
+locate false ready preserved
+locate true connecting preserved
+locate true ready preserved
+PASS locate
+discovery fetch reconnect side effects suppressed
+discovery fetch setPair side effects suppressed
+discovery fetch close side effects suppressed
+discovery json reconnect side effects suppressed
+discovery json setPair side effects suppressed
+discovery json close side effects suppressed
+PASS discoverySideEffects

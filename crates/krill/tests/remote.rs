@@ -489,23 +489,22 @@ fn remote_new_rejects_relative_cwd_and_worktree() {
         .code(),
         Some(2)
     );
-    // OWE-920부터 원격 --worktree는 원격 데몬에 워크트리 생성을 요청한다. 저장소가 아닌 --cwd면
-    // 사용법 오류(2)가 아니라 실행 실패(1)이고, 세션을 만들지 않는다.
+    let output = r.run(&[
+        "--host",
+        HOST,
+        "new",
+        "--cwd",
+        r.daemon_dir.to_str().unwrap(),
+        "--worktree",
+        "wt",
+        "--",
+        "/bin/sh",
+    ]);
     assert_eq!(
-        r.run(&[
-            "--host",
-            HOST,
-            "new",
-            "--cwd",
-            r.daemon_dir.to_str().unwrap(),
-            "--worktree",
-            "wt",
-            "--",
-            "/bin/sh"
-        ])
-        .status
-        .code(),
-        Some(1)
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(r.remote_sessions(), 0);
 }

@@ -15,6 +15,35 @@ use crate::sidebar::Source;
 static SERIAL: Mutex<()> = Mutex::new(());
 
 #[gpui::test]
+fn initial_config_read_cannot_enable_notifications_or_power_from_defaults(cx: &mut TestAppContext) {
+    let dir = temp_dir("config-loading");
+    fs::write(
+        dir.join("settings.toml"),
+        "notifications = false\nkeep_awake = \"off\"\n",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        settings::init_at(Some(dir.clone()), cx);
+        assert!(!settings::is_loaded(cx));
+        sync_snapshot(
+            &snapshot(vec![session(1, AgentState::Working, 1, "/repo")]),
+            cx,
+        );
+        assert!(!is_preventing_sleep(cx));
+        sync_snapshot(
+            &snapshot(vec![session(1, AgentState::Done, 2, "/repo")]),
+            cx,
+        );
+    });
+    assert!(cx.shown_system_notifications().is_empty());
+    cx.run_until_parked();
+    assert!(cx.shown_system_notifications().is_empty());
+    cx.read(|cx| assert!(!is_preventing_sleep(cx)));
+    fs::remove_dir_all(dir).ok();
+}
+
+#[gpui::test]
 fn daemon_owned_webhooks_are_not_duplicated_by_app_snapshots(cx: &mut TestAppContext) {
     let _guard = SERIAL
         .lock()
@@ -25,10 +54,7 @@ fn daemon_owned_webhooks_are_not_duplicated_by_app_snapshots(cx: &mut TestAppCon
         "notifications = false\nkeep_awake = \"off\"\n[[webhooks]]\nprovider = \"ntfy\"\nurl = \"{url}\"\n"
     );
     fs::write(dir.join("settings.toml"), &settings).unwrap();
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
-    });
+    init_settings(cx, &dir);
     let sync = |state, since, cx: &mut App| {
         let mut s = session(51, state, since, "/private/TERMINAL_SECRET");
         s.status.agent = "AGENT_SECRET".into();
@@ -57,15 +83,17 @@ fn daemon_owned_webhooks_are_not_duplicated_by_app_snapshots(cx: &mut TestAppCon
 
     // opt-in 제거는 즉시 반영하고 다시 켜도 과거 완료를 재전송하지 않는다.
     fs::write(dir.join("settings.toml"), "keep_awake = \"off\"\n").unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         assert!(settings::current(cx).webhooks.is_empty());
         sync(AgentState::Working, 12, cx);
         sync(AgentState::Done, 13, cx);
     });
     fs::write(dir.join("settings.toml"), settings).unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         sync(AgentState::Done, 13, cx);
     });
     cx.run_until_parked();
@@ -122,6 +150,12 @@ fn snapshot(sessions: Vec<Session>) -> Snapshot {
     }
 }
 
+fn init_settings(cx: &mut TestAppContext, dir: &Path) {
+    cx.update(gpui_component::init);
+    cx.update(|cx| settings::init_at(Some(dir.to_path_buf()), cx));
+    cx.run_until_parked();
+}
+
 fn temp_dir(name: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("mk-alert-{}-{name}", std::process::id()));
     fs::remove_dir_all(&d).ok();
@@ -129,7 +163,18 @@ fn temp_dir(name: &str) -> PathBuf {
     d
 }
 
-fn pmset_assertions_output() -> String {
+fn pmset_assertions_output(cx: &TestAppContext) -> String {
+    // 이 실제 OS 통합 검사에서만 적용 완료 배리어를 기다린다.
+    let (done, applied) = mpsc::channel();
+    let queued = cx.read(|cx| {
+        cx.global::<AlertState>()
+            .awake
+            .as_ref()
+            .is_some_and(|worker| worker.send.send(AwakeCommand::Barrier(done)).is_ok())
+    });
+    if queued {
+        applied.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
     let out = Command::new("/usr/bin/pmset")
         .args(["-g", "assertions"])
         .output()
@@ -169,10 +214,7 @@ fn waiting_blocked_done_notifications_badge_and_click(cx: &mut TestAppContext) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = temp_dir("flow");
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
-    });
+    init_settings(cx, &dir);
 
     // 초기 스냅샷: 세션 1은 Working, 세션 2는 이미 Done(시작 시점의 기존 Done은 알림을 띄우지 않는다).
     let source = SharedSource::new(snapshot(vec![
@@ -280,10 +322,7 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = temp_dir("pmset");
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
-    });
+    init_settings(cx, &dir);
 
     // 기본값: notifications = true, keep_awake = "agent". Working 세션이 있으면 pmset에 표시된다.
     cx.update(|cx| {
@@ -293,7 +332,7 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
         );
         assert!(is_preventing_sleep(cx));
     });
-    let pmset_working = pmset_assertions_output();
+    let pmset_working = pmset_assertions_output(cx);
     assert!(
         has_our_sleep_assertion(&pmset_working),
         "expected PreventUserIdleSystemSleep for pid {} in pmset output:\n{pmset_working}",
@@ -310,7 +349,7 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
         assert_eq!(dock_badge(cx).as_deref(), Some("1"));
     });
     assert_eq!(cx.delivered_system_notifications().len(), 1);
-    let pmset_waiting = pmset_assertions_output();
+    let pmset_waiting = pmset_assertions_output(cx);
     assert!(
         !has_our_sleep_assertion(&pmset_waiting),
         "expected sleep assertion to be released when no session is Working:\n{pmset_waiting}"
@@ -330,7 +369,7 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
         assert_eq!(dock_badge(cx), None);
     });
     assert!(cx.delivered_system_notifications().is_empty());
-    let pmset_on = pmset_assertions_output();
+    let pmset_on = pmset_assertions_output(cx);
     assert!(
         has_our_sleep_assertion(&pmset_on),
         "expected PreventUserIdleSystemSleep under keep_awake = \"on\":\n{pmset_on}"
@@ -342,15 +381,16 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
         "notifications = false\nkeep_awake = \"off\"\n",
     )
     .unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         sync_snapshot(
             &snapshot(vec![session(7, AgentState::Working, 3, "/repo/wt-work")]),
             cx,
         );
         assert!(!is_preventing_sleep(cx));
     });
-    let pmset_off = pmset_assertions_output();
+    let pmset_off = pmset_assertions_output(cx);
     assert!(
         !has_our_sleep_assertion(&pmset_off),
         "expected no sleep assertion under keep_awake = \"off\":\n{pmset_off}"
@@ -367,9 +407,8 @@ fn settings_toggle_and_pmset_iopm_assertion(cx: &mut TestAppContext) {
 fn startup_and_reconnect_are_baselines_and_active_focus_is_silent(cx: &mut TestAppContext) {
     let dir = temp_dir("baseline");
     // 포커스 억제는 창이 있을 때만 적용된다(메뉴바 상주). 억제 구간은 창을 열어 둔다.
+    init_settings(cx, &dir);
     let window = cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
         cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| gpui::Empty))
             .unwrap()
     });
@@ -430,9 +469,8 @@ fn startup_and_reconnect_are_baselines_and_active_focus_is_silent(cx: &mut TestA
 #[gpui::test]
 fn closed_window_does_not_suppress_focused_session(cx: &mut TestAppContext) {
     let dir = temp_dir("closed-window");
+    init_settings(cx, &dir);
     let window = cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
         cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| gpui::Empty))
             .unwrap()
     });
@@ -499,9 +537,8 @@ fn inactive_only_mode_suppresses_while_a_window_is_active(cx: &mut TestAppContex
         "notifications = true\nkeep_awake = \"off\"\nnotify_only_inactive = true\n",
     )
     .unwrap();
+    init_settings(cx, &dir);
     cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
         cx.open_window(WindowOptions::default(), |_, cx| cx.new(|_| gpui::Empty))
             .unwrap();
     });
@@ -535,8 +572,9 @@ fn inactive_only_mode_suppresses_while_a_window_is_active(cx: &mut TestAppContex
         "notifications = true\nkeep_awake = \"off\"\nnotify_only_inactive = false\n",
     )
     .unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         set_active(true, cx);
         sync_snapshot(
             &snapshot(vec![session(7, AgentState::Waiting, 4, "/repo/a")]),
@@ -613,10 +651,7 @@ fn event_toggles_gate_snapshot_and_bell(cx: &mut TestAppContext) {
         "notifications = true\nnotify_on_input = false\nnotify_on_done = false\nnotify_on_bell = false\nkeep_awake = \"off\"\n",
     )
     .unwrap();
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
-    });
+    init_settings(cx, &dir);
     cx.update(|cx| {
         sync_snapshot(
             &snapshot(vec![session(21, AgentState::Working, 1, "/repo/a")]),
@@ -651,8 +686,9 @@ fn event_toggles_gate_snapshot_and_bell(cx: &mut TestAppContext) {
         "notifications = true\nnotify_on_input = true\nnotify_on_done = true\nnotify_on_bell = true\nkeep_awake = \"off\"\n",
     )
     .unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         sync_snapshot(
             &snapshot(vec![session(21, AgentState::Working, 5, "/repo/a")]),
             cx,
@@ -680,8 +716,9 @@ fn event_toggles_gate_snapshot_and_bell(cx: &mut TestAppContext) {
         "notifications = false\nkeep_awake = \"off\"\n",
     )
     .unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         send_test_notification(cx);
         notify_bell(SessionId(23), "wt-c", cx);
     });
@@ -701,9 +738,8 @@ fn done_notifies_from_waiting_and_blocked(cx: &mut TestAppContext) {
         "notifications = true\nnotify_on_input = false\nnotify_on_done = true\nnotify_on_bell = false\nkeep_awake = \"off\"\n",
     )
     .unwrap();
+    init_settings(cx, &dir);
     cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
         sync_snapshot(
             &snapshot(vec![session(31, AgentState::Waiting, 1, "/repo/a")]),
             cx,
@@ -766,10 +802,7 @@ fn notification_sound_truth_table() {
 #[gpui::test]
 fn notification_sound_gates_beep_count(cx: &mut TestAppContext) {
     let dir = temp_dir("sound");
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
-    });
+    init_settings(cx, &dir);
     cx.update(|cx| {
         sync_snapshot(
             &snapshot(vec![session(9, AgentState::Working, 1, "/repo/a")]),
@@ -797,8 +830,9 @@ fn notification_sound_gates_beep_count(cx: &mut TestAppContext) {
         "notifications = true\nnotification_sound = false\n",
     )
     .unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         sync_snapshot(
             &snapshot(vec![session(9, AgentState::Blocked, 3, "/repo/a")]),
             cx,
@@ -815,10 +849,7 @@ fn account_switch_history_notifies_once_after_initial_snapshot(cx: &mut TestAppC
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = temp_dir("account-switch");
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        settings::init_at(Some(dir.clone()), cx);
-    });
+    init_settings(cx, &dir);
     let record = |sequence| krill_proto::usage::SwitchRecord {
         sequence,
         at: 1000,
@@ -848,10 +879,53 @@ fn account_switch_history_notifies_once_after_initial_snapshot(cx: &mut TestAppC
     });
     assert_eq!(cx.delivered_system_notifications().len(), 1);
     fs::write(dir.join("settings.toml"), "notifications = false\n").unwrap();
+    cx.update(settings::reload);
+    cx.run_until_parked();
     cx.update(|cx| {
-        settings::reload(cx);
         sync_account_switches(&state(vec![record(2), record(3)]), cx);
     });
     assert_eq!(cx.delivered_system_notifications().len(), 1);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[gpui::test]
+fn muted_sessions_worktrees_and_orchestration_workers_suppress_notifications(
+    cx: &mut TestAppContext,
+) {
+    let _guard = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = temp_dir("mute-workers");
+    init_settings(cx, &dir);
+    cx.update(|cx| {
+        set_session_muted(SessionId(1), true, cx);
+        set_worktree_muted("/repo/wt-muted", true, cx);
+        set_orchestration_worker_sessions([SessionId(3)], cx);
+        assert!(is_session_muted(SessionId(1), cx));
+        assert!(is_worktree_muted(Path::new("/repo/wt-muted"), cx));
+        sync_snapshot(
+            &snapshot(vec![
+                session(1, AgentState::Working, 1, "/repo/wt-a"),
+                session(2, AgentState::Working, 1, "/repo/wt-muted"),
+                session(3, AgentState::Working, 1, "/repo/wt-worker"),
+                session(4, AgentState::Working, 1, "/repo/wt-normal"),
+            ]),
+            cx,
+        );
+        // 음소거된 세션(1)·워크트리(2)의 Waiting과 오케스트레이션 워커(3)의 Done은 억제되고, 일반 세션(4)의 Done만 발송된다.
+        sync_snapshot(
+            &snapshot(vec![
+                session(1, AgentState::Waiting, 2, "/repo/wt-a"),
+                session(2, AgentState::Blocked, 2, "/repo/wt-muted"),
+                session(3, AgentState::Done, 2, "/repo/wt-worker"),
+                session(4, AgentState::Done, 2, "/repo/wt-normal"),
+            ]),
+            cx,
+        );
+    });
+    let delivered = cx.delivered_system_notifications();
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].tag.as_ref(), "pane:4");
+    assert_eq!(cx.read(dock_badge), None);
     fs::remove_dir_all(dir).ok();
 }

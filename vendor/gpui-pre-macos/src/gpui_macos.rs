@@ -4,6 +4,9 @@
 //! macOS screens have a y axis that goes up from the bottom of the screen and
 //! an origin at the bottom left of the main display.
 
+// Krill modification (Apache-2.0 §4(b)): background pasteboard IO owner.
+mod clipboard_worker;
+
 mod display;
 mod display_link;
 mod events;

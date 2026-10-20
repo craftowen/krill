@@ -10,8 +10,8 @@ use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::agent_history::{
-    Action, Entry, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, Response, SearchQuery, SearchSnapshot,
-    Snapshot, VaultAgent, VaultHit, VaultScope, VaultTarget,
+    Action, Entry, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, FEAT_CHAT_POLL, Response, SearchQuery,
+    SearchSnapshot, Snapshot, VaultAgent, VaultHit, VaultScope, VaultTarget,
 };
 use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
@@ -56,8 +56,11 @@ fn exchange(features: u64, sock: &mut (impl Read + Write), req: &Request) -> io:
         req,
         Request::AgentHistory(Action::Search(_) | Action::ResumeVault(_))
     );
+    let chat_poll = matches!(req, Request::AgentHistory(Action::ChatPoll { .. }));
     let need = if vault {
         FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_AI_VAULT
+    } else if chat_poll {
+        FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_CHAT_POLL
     } else {
         FEAT_CONTROL | FEAT_AGENT_HISTORY
     };
@@ -158,13 +161,19 @@ fn path_matches_scope(cwd: &str, filter_paths: &[String]) -> bool {
 #[derive(Debug, Clone, Copy)]
 pub struct Open(pub SessionId);
 
+/// 상태바에서 우측 세션 기록 탭을 열거나 접는다.
+#[derive(Debug, Clone, Copy)]
+pub struct Toggle;
+
 #[expect(
     clippy::struct_excessive_bools,
-    reason = "팝오버 열림·처리 중·재검색 대기·열림 포커스 예약의 독립 UI 상태"
+    reason = "패널 열림·처리 중·재검색 대기·열림 포커스 예약의 독립 UI 상태"
 )]
 pub struct Panel {
     call: Call,
+    generation: u64,
     open: bool,
+    active: bool,
     busy: bool,
     pending_search: bool,
     data: Option<Snapshot>,
@@ -180,8 +189,6 @@ pub struct Panel {
     language: crate::i18n::Language,
     error: Option<String>,
     task: Option<Task<()>>,
-    /// OWE-652: 바깥 클릭으로 닫힌 시각. 같은 제스처의 헤더 클릭이 다시 열지 않게 한다.
-    dismissed_at: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for Panel {
@@ -196,6 +203,7 @@ impl std::fmt::Debug for Panel {
     }
 }
 impl EventEmitter<Open> for Panel {}
+impl EventEmitter<Toggle> for Panel {}
 impl Default for Panel {
     fn default() -> Self {
         Self::new(daemon_call())
@@ -206,7 +214,9 @@ impl Panel {
     pub fn new(call: Call) -> Self {
         Self {
             call,
+            generation: 0,
             open: false,
+            active: false,
             busy: false,
             pending_search: false,
             data: None,
@@ -222,11 +232,16 @@ impl Panel {
             language: crate::i18n::language(),
             error: None,
             task: None,
-            dismissed_at: None,
         }
     }
 
     pub fn set_call(&mut self, call: Call) {
+        self.generation = self.generation.wrapping_add(1);
+        self.task = None;
+        self.busy = false;
+        self.pending_search = false;
+        self.data = None;
+        self.vault = None;
         self.call = call;
     }
 
@@ -242,6 +257,7 @@ impl Panel {
     }
 
     pub fn scan(&mut self, cx: &mut Context<Self>) {
+        self.active = true;
         if self.has_vault_filters() {
             self.search_vault(cx);
         } else {
@@ -249,9 +265,11 @@ impl Panel {
         }
     }
 
-    /// OWE-652: 바깥 클릭·다른 팝오버가 열릴 때 닫는다.
+    /// 패널을 접거나 다른 탭으로 전환하면 적재한 기록과 진행 중인 요청을 해제한다.
     pub fn close(&mut self, cx: &mut Context<Self>) {
-        if self.open {
+        if self.open || self.active {
+            self.active = false;
+            self.generation = self.generation.wrapping_add(1);
             self.open = false;
             self.busy = false;
             self.pending_search = false;
@@ -265,8 +283,32 @@ impl Panel {
 
     /// 현재 워크스페이스·프로젝트 범위 경로를 설정한다.
     pub fn set_scope_paths(&mut self, workspace: Option<String>, project: Vec<String>) {
+        if self.workspace_path != workspace || self.project_paths != project {
+            self.generation = self.generation.wrapping_add(1);
+            self.task = None;
+            self.busy = false;
+            self.data = None;
+            self.vault = None;
+        }
         self.workspace_path = workspace;
         self.project_paths = project;
+    }
+
+    /// Update an active consumer's paths and refresh its search, including a hidden palette consumer.
+    pub fn update_scope_paths(
+        &mut self,
+        workspace: Option<String>,
+        project: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_path == workspace && self.project_paths == project {
+            return;
+        }
+        self.set_scope_paths(workspace, project);
+        if self.active {
+            self.scan(cx);
+        }
+        cx.notify();
     }
 
     #[must_use]
@@ -287,7 +329,7 @@ impl Panel {
     pub fn set_scope(&mut self, scope: VaultScope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
-            if self.open {
+            if self.active {
                 self.search_vault(cx);
             } else {
                 cx.notify();
@@ -298,7 +340,7 @@ impl Panel {
     pub fn set_agent_filter(&mut self, agent: Option<VaultAgent>, cx: &mut Context<Self>) {
         if self.agent_filter != agent {
             self.agent_filter = agent;
-            if self.open {
+            if self.active {
                 self.search_vault(cx);
             } else {
                 cx.notify();
@@ -310,7 +352,7 @@ impl Panel {
         let next = query.into();
         if self.query != next {
             self.query = next;
-            if self.open {
+            if self.active {
                 self.search_vault(cx);
             } else {
                 cx.notify();
@@ -319,6 +361,7 @@ impl Panel {
     }
 
     pub fn search_vault(&mut self, cx: &mut Context<Self>) {
+        self.active = true;
         if self.busy {
             self.pending_search = true;
             cx.notify();
@@ -413,7 +456,7 @@ impl Panel {
     }
 
     /// 상태바 토글 버튼(OWE-856: 버튼 역할·이름 노출).
-    fn render_toggle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+    pub fn render_toggle(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let p = crate::ui::palette(cx);
         let tooltip_text = match (&self.vault, &self.data) {
             (Some(v), _) => format!("{} ({})", text::TITLE.get(), v.hits.len()),
@@ -447,30 +490,10 @@ impl Panel {
             .tooltip(move |window, cx| {
                 crate::ui::tooltip_view("agent-history-toggle", tooltip_text.clone(), window, cx)
             })
-            .on_click(cx.listener(|this, _, window, cx| this.on_toggle_click(window, cx)))
+            .on_click(cx.listener(|_, _, _, cx| cx.emit(Toggle)))
     }
 
-    /// OWE-652: 팝오버 밖 마우스 눌림에 닫는다. 같은 제스처의 헤더 클릭이
-    /// 다시 열지 않게 시각을 남긴다(클릭은 마우스 뗌 뒤에 온다).
-    fn on_outside_down(&mut self, cx: &mut Context<Self>) {
-        self.close(cx);
-        self.dismissed_at = Some(std::time::Instant::now());
-    }
-
-    /// OWE-652: 헤더 클릭. 바깥 닫기와 같은 제스처(약 150ms 안)면 닫힌 채로 둔다.
-    fn on_toggle_click(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let same_gesture = self
-            .dismissed_at
-            .take()
-            .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(150));
-        if !same_gesture {
-            self.toggle(cx);
-            // OWE-857: 열릴 때 검색창에 자동 포커스한다.
-            self.focus_search(window, cx);
-        }
-    }
-
-    /// OWE-857: 열린 팝오버의 검색창에 포커스를 둔다. 입력 엔티티가 아직
+    /// OWE-857: 열린 패널의 검색창에 포커스를 둔다. 입력 엔티티가 아직
     /// 없으면 다음 렌더의 `focus_on_open` 소비가 대신 수행한다.
     pub fn focus_search(&self, window: &mut Window, cx: &mut App) {
         if self.open
@@ -490,16 +513,25 @@ impl Panel {
         if self.busy {
             return;
         }
+        self.active = true;
         self.busy = true;
         self.error = None;
         let call = Arc::clone(&self.call);
+        let generation = self.generation;
         self.task = Some(cx.spawn(async move |this, cx| {
             let got = cx
                 .background_executor()
                 .spawn(async move { call(&Request::AgentHistory(action)) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.busy = false;
+                if this.pending_search {
+                    this.search_vault(cx);
+                    return;
+                }
                 match got {
                     Ok(Reply::AgentHistory(Response::Scanned(data))) => {
                         this.data = Some(data);
@@ -597,9 +629,7 @@ impl Render for Panel {
                 input.update(cx, |s, cx| s.focus(window, cx));
             }
         }
-        let header = self.render_toggle(cx);
-
-        let popover = self.open.then(|| {
+        let panel = self.open.then(|| {
             let search_bar = if let Some(input) = &self.input {
                 div().id("vault-search-box").py_1().child(Input::new(input))
             } else {
@@ -648,8 +678,7 @@ impl Render for Panel {
                 }),
             ));
 
-            let agent_bar = div().pb_1().child(crate::ui::segmented_control(
-                p,
+            let agent_bar = div().flex().flex_wrap().gap_1().pb_1().children(
                 [
                     ("vault-agent-all", None, text::AGENT_ALL.get()),
                     ("vault-agent-claude", Some(VaultAgent::Claude), "Claude"),
@@ -674,14 +703,17 @@ impl Render for Panel {
                         this.set_agent_filter(agent, cx);
                     }))
                 }),
-            ));
+            );
 
             let mut content = div()
                 .id("agent-history-list")
+                .debug_selector(|| "agent-history-list".into())
+                .flex_1()
+                .min_h_0()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_2()
-                .max_h(crate::ui::AGENT_HISTORY_MAX_HEIGHT)
                 .overflow_y_scroll();
 
             let hits = self.visible_hits();
@@ -711,18 +743,24 @@ impl Render for Panel {
                 } else {
                     format!("{} · {} ({})", hit.agent.profile(), hit.title, hit.id)
                 };
-                let mut detail = div().flex_1().flex().flex_col().overflow_hidden().child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(crate::ui::icons::agent_brand_icon(
-                            hit.agent.profile(),
-                            crate::ui::ICON_SM,
-                            p.foreground,
-                        ))
-                        .child(render_highlighted(&header_line, &self.query, p)),
-                );
+                let mut detail = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(crate::ui::icons::agent_brand_icon(
+                                hit.agent.profile(),
+                                crate::ui::ICON_SM,
+                                p.foreground,
+                            ))
+                            .child(render_highlighted(&header_line, &self.query, p)),
+                    );
                 if !hit.snippet.is_empty() {
                     detail = detail.child(
                         div()
@@ -737,7 +775,16 @@ impl Render for Panel {
                         .text_color(p.muted_foreground)
                         .child(hit.cwd.clone()),
                 );
-                let row = div().flex().items_center().gap_2().child(detail);
+                let row = div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .items_start()
+                    .gap_1()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(p.border)
+                    .child(detail.w_full());
                 let busy = self.busy;
                 let target = hit.target();
                 content = content.child(
@@ -774,22 +821,23 @@ impl Render for Panel {
             }
 
             div()
-                .id("agent-history-popover")
-                .debug_selector(|| "agent-history-popover".into())
-                .absolute()
-                .bottom(crate::ui::STATUS_BAR_HEIGHT + crate::ui::SPACE_1)
-                .right_0()
-                .w(crate::ui::AGENT_HISTORY_WIDTH)
-                .p_3()
-                .rounded(crate::ui::RADIUS_MD)
-                .bg(p.popover)
-                .text_color(p.popover_foreground)
-                .border_1()
-                .border_color(p.border)
-                .shadow_lg()
+                .id("agent-history-panel")
+                .debug_selector(|| "agent-history-panel".into())
+                .capture_key_down(cx.listener(|_, e: &gpui::KeyDownEvent, _, cx| {
+                    if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                        cx.stop_propagation();
+                        cx.emit(Toggle);
+                    }
+                }))
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .p_2()
+                .bg(p.sidebar)
+                .text_color(p.sidebar_foreground)
                 .text_size(crate::ui::TEXT_XS)
-                // OWE-652: 바깥 클릭·다른 팝오버가 열리면 닫는다.
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| this.on_outside_down(cx)))
                 .child(
                     div()
                         .id("agent-history-header")
@@ -834,7 +882,7 @@ impl Render for Panel {
                 .child(content)
                 .children(self.error.as_deref().map(crate::i18n::cached_notice))
         });
-        div().relative().child(header).children(popover)
+        div().size_full().min_h_0().children(panel)
     }
 }
 

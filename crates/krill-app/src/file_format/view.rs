@@ -62,6 +62,15 @@ impl ImageView {
         }
     }
 
+    /// Install bytes whose image identity was prepared on the background executor.
+    pub fn new_svg_image(image: Arc<Image>) -> Self {
+        Self {
+            source: ImageSource::SvgBytes(image),
+            dims: None,
+            zoom: Zoom::Fit,
+        }
+    }
+
     /// 메모리 SVG 바이트(경로 기반이면 `None`). 미리보기가 버퍼 기준인지 확인할 때 쓴다.
     pub fn svg_bytes(&self) -> Option<Vec<u8>> {
         match &self.source {
@@ -355,22 +364,65 @@ impl Render for CsvView {
     }
 }
 
-/// ipynb 셀 목록(읽기 전용). 마크다운 셀은 미리보기, 코드·raw 셀은 고정폭, 출력은 텍스트만.
-/// ponytail: 셀을 모두 그린다 — 크기는 [`super::MAX_TEXT_BYTES`]로 묶여 있다. 셀 수천 개가 느리면 gpui `list` 가상화로.
-pub fn notebook(id: impl Into<ElementId>, nb: &Notebook, cx: &App) -> AnyElement {
+/// Prepared off-thread; both tiny cells and many outputs have one virtual row each.
+#[derive(Debug)]
+pub struct NotebookPreview {
+    notebook: Notebook,
+    rows: Vec<(usize, Option<usize>)>,
+}
+impl NotebookPreview {
+    pub fn new(notebook: Notebook) -> Self {
+        let rows = notebook
+            .cells
+            .iter()
+            .enumerate()
+            .flat_map(|(cell, value)| {
+                std::iter::once((cell, None))
+                    .chain((0..value.outputs.len()).map(move |output| (cell, Some(output))))
+            })
+            .collect();
+        Self { notebook, rows }
+    }
+}
+struct NotebookList {
+    source: Arc<NotebookPreview>,
+    state: gpui::ListState,
+}
+
+fn notebook_row(preview: &NotebookPreview, index: usize, cx: &App) -> AnyElement {
     let pal = crate::ui::palette(cx);
-    let id = id.into();
-    let mono = |s: String| {
+    let Some(&(cell_index, output_index)) = preview.rows.get(index) else {
+        return div().into_any_element();
+    };
+    let Some(cell) = preview.notebook.cells.get(cell_index) else {
+        return div().into_any_element();
+    };
+    let mono = |value: String| {
         div()
             .font_family(crate::ui::FONT_MONO)
             .text_size(crate::ui::TEXT_SM)
             .whitespace_normal()
-            .child(s)
+            .child(value)
     };
-    let cells = nb.cells.iter().enumerate().map(|(i, cell)| {
+    let body = if let Some(index) = output_index {
+        match cell.outputs.get(index) {
+            Some(Output::Stream { text, .. } | Output::Text(text)) => {
+                mono(text.clone()).into_any_element()
+            }
+            Some(Output::Error { name, message }) => mono(format!("{name}: {message}"))
+                .text_color(pal.destructive)
+                .into_any_element(),
+            Some(Output::Omitted(mime)) => div()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(pal.muted_foreground)
+                .child(text::IPYNB_OUTPUT_OMITTED.format(&[("mime", mime)]))
+                .into_any_element(),
+            None => div().into_any_element(),
+        }
+    } else {
         let source = match cell.kind {
             CellKind::Markdown => div()
-                .child(TextView::markdown(i, cell.source.clone()))
+                .child(TextView::markdown(cell_index, cell.source.clone()))
                 .into_any_element(),
             CellKind::Code | CellKind::Raw => mono(cell.source.clone())
                 .p_2()
@@ -383,41 +435,66 @@ pub fn notebook(id: impl Into<ElementId>, nb: &Notebook, cx: &App) -> AnyElement
                 .font_family(crate::ui::FONT_MONO)
                 .text_size(crate::ui::TEXT_XS)
                 .text_color(pal.muted_foreground)
-                .child(match cell.execution_count {
-                    Some(n) => format!("[{n}]"),
-                    None => "[ ]".to_owned(),
-                })
-        });
-        let outputs = cell.outputs.iter().map(|out| match out {
-            Output::Stream { text, .. } | Output::Text(text) => mono(text.clone()),
-            Output::Error { name, message } => {
-                mono(format!("{name}: {message}")).text_color(pal.destructive)
-            }
-            Output::Omitted(mime) => div()
-                .text_size(crate::ui::TEXT_XS)
-                .text_color(pal.muted_foreground)
-                .child(text::IPYNB_OUTPUT_OMITTED.format(&[("mime", mime)])),
+                .child(
+                    cell.execution_count
+                        .map_or_else(|| "[ ]".to_owned(), |count| format!("[{count}]")),
+                )
         });
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .pb_3()
             .children(prompt)
             .child(source)
-            .children(outputs)
+            .into_any_element()
+    };
+    div()
+        .id(("notebook-row", index))
+        .debug_selector(move || format!("notebook-row-{index}"))
+        .w_full()
+        .px(crate::ui::SPACE_4)
+        .pb_3()
+        .child(body)
+        .into_any_element()
+}
+
+/// Variable-height virtualization creates only rows intersecting the viewport.
+pub fn notebook(
+    id: impl Into<ElementId>,
+    preview: Arc<NotebookPreview>,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    let pal = crate::ui::palette(cx);
+    let id = id.into();
+    let count = preview.rows.len();
+    let state = window.use_keyed_state(id.clone(), cx, |_, _| NotebookList {
+        source: preview.clone(),
+        state: gpui::ListState::new(count, gpui::ListAlignment::Top, px(200.)),
+    });
+    let list_state = state.update(cx, |state, _| {
+        if !Arc::ptr_eq(&state.source, &preview) {
+            state.state.reset(count);
+            state.source = preview.clone();
+        }
+        state.state.clone()
     });
     div()
-        .id(id.clone())
+        .id(id)
         .size_full()
-        .overflow_y_scroll()
-        .p(crate::ui::SPACE_4)
         .bg(pal.editor_surface)
-        .when(nb.cells.is_empty(), |d| {
-            d.text_color(pal.muted_foreground)
+        .when(count == 0, |view| {
+            view.text_color(pal.muted_foreground)
                 .child(text::IPYNB_EMPTY.get())
         })
-        .children(cells)
+        .when(count != 0, |view| {
+            view.child(
+                gpui::list(list_state, move |index, _, cx| {
+                    notebook_row(&preview, index, cx)
+                })
+                .size_full(),
+            )
+        })
         .into_any_element()
 }
 
@@ -439,7 +516,7 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
         let path = path.to_path_buf();
         crate::ui::primary("file-open-default", text::OPEN_DEFAULT.get())
             .debug_selector(|| "file-open-default".into())
-            .on_click(move |_, _, cx| spawn_open(super::open_default_command(&path), cx))
+            .on_click(move |_, _, cx| spawn_open(path.clone(), super::open_default_command, cx))
     };
     let reveal_action = {
         let path = path.to_path_buf();
@@ -450,7 +527,7 @@ pub fn placeholder(path: &Path, kind: Kind, len: u64, cx: &App) -> AnyElement {
                 .get(),
         )
         .debug_selector(|| "file-reveal".into())
-        .on_click(move |_, _, cx| spawn_open(super::reveal_command(&path), cx))
+        .on_click(move |_, _, cx| spawn_open(path.clone(), super::reveal_command, cx))
     };
     div()
         .size_full()
@@ -489,9 +566,10 @@ pub(crate) fn size_label(len: u64) -> String {
 }
 
 /// `open`은 Launch Services 응답을 기다리므로 UI 스레드 밖에서 실행한다. 로그에 경로는 남기지 않는다(A8).
-fn spawn_open(mut cmd: Command, cx: &App) {
+fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
     cx.background_spawn(async move {
-        match cmd.status() {
+        // Building an Open command can stat the target to avoid executing binaries.
+        match command(&path).status() {
             // explorer.exe는 열기에 성공해도 1로 끝난다.
             Ok(status) if status.success() || cfg!(windows) => {}
             Ok(status) => tracing::warn!(?status, "open failed"),

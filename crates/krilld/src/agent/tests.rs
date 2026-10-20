@@ -138,6 +138,60 @@ fn installed_agent_is_execed_with_args() {
     );
 }
 
+#[test]
+fn selected_credentials_win_over_login_rc_and_custom_profile_environment() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = std::env::temp_dir().join(format!("krill-account-rc-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::create_dir_all(&root).unwrap();
+    let exe = root.join("codex");
+    std::fs::write(&exe, "#!/bin/sh\nprintf '%s\\n' \"$CODEX_HOME\" \"${OPENAI_API_KEY-unset}\" \"${KRILL_ACCOUNT_DIR-unset}\"\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        root.join(".zshrc"),
+        "export CODEX_HOME=/wrong/from-rc OPENAI_API_KEY=wrong-from-rc\n",
+    )
+    .unwrap();
+    let mut profile = profile(&[exe.to_str().unwrap()]);
+    profile
+        .env
+        .insert("CODEX_HOME".into(), "/wrong/from-profile".into());
+    profile
+        .env
+        .insert("OPENAI_API_KEY".into(), "wrong-from-profile".into());
+    for dir in [root.join("selected").display().to_string(), String::new()] {
+        let pinned = LaunchAccount {
+            id: "codex-selected".into(),
+            env_key: "CODEX_HOME".into(),
+            dir,
+        };
+        let mut login = Shell::Login.launch_with(Some(&user()), polluted());
+        login
+            .env
+            .push((b"ZDOTDIR".to_vec(), root.as_os_str().as_bytes().to_vec()));
+        let applied = apply_account_env(&mut login, &profile, Some(&root), Some(&pinned));
+        let launch = wrap_account(&profile, Permission::Manual, login, applied.as_ref());
+        let (program, args) = launch.argv.split_first().unwrap();
+        let out = Command::new(OsStr::from_bytes(program))
+            .args(args.iter().map(|a| OsStr::from_bytes(a)))
+            .env_clear()
+            .envs(
+                launch
+                    .env
+                    .iter()
+                    .map(|(k, v)| (OsStr::from_bytes(k), OsStr::from_bytes(v))),
+            )
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("{}\nunset\nunset\n", pinned.dir)
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// OWE-503: 설치가 끝난 receipt의 고정 명령만 `-c` hook으로, 프로그램 바로 뒤에 붙인다.
 #[test]
 fn codex_hooks_follow_complete_receipt_only() {
@@ -463,7 +517,7 @@ fn codex_and_agy_resume_use_selected_profile() {
             assert!(env.is_empty());
         }
     }
-    // 명시적으로 적은 사용자 env는 기존 우선순위를 유지한다.
+    // Explicit account selection wins over stale profile and inherited credentials.
     let mut p = profile(&["codex"]);
     p.env
         .insert("CODEX_HOME".into(), "/fixture/override".into());
@@ -485,7 +539,7 @@ fn codex_and_agy_resume_use_selected_profile() {
             .iter()
             .filter(|(k, _)| k == b"CODEX_HOME")
             .collect::<Vec<_>>(),
-        [&kv("CODEX_HOME", "/fixture/override")]
+        [&kv("CODEX_HOME", "/fixture/account-b")]
     );
     std::fs::remove_dir_all(state).unwrap();
 }
@@ -513,6 +567,7 @@ fn opencode_account_uses_xdg_data_and_state_profile_directories() {
             .env
             .contains(&kv("XDG_STATE_HOME", "/fixture/opencode-one/state"))
     );
+    assert!(login.env.contains(&kv("OPENCODE_DB", "opencode.db")));
     assert!(
         !login
             .env

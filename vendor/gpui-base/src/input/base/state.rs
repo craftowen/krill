@@ -2794,13 +2794,10 @@ impl<M: InputModeKind> InputBaseState<M> {
         if !self.is_editable() {
             return;
         }
-        if let Some(clipboard) = cx.read_from_clipboard() {
-            self.insert_clipboard(clipboard, window, cx);
-            return;
-        }
-        // The synchronous read is empty on platforms whose clipboard is
-        // asynchronous and permission-gated (the web), so fall back to the
-        // real read. It has to start here, still inside the user activation
+        // Krill modification (Apache-2.0 §4(b)): always request a fresh async
+        // read. Native pasteboard providers may block; cached sync reads can
+        // also contain clipboard data superseded by another application.
+        // It has to start here, still inside the user activation
         // that dispatched `Paste`, or the browser refuses the read.
         let read = cx.read_from_clipboard_async();
         let target = self.paste_target();

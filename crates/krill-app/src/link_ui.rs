@@ -60,6 +60,7 @@ pub struct ServerPanel {
     confirm_revoke: Option<PairedDevice>,
     error: Option<SharedString>,
     busy: bool,
+    generation: u64,
     now_secs: u64,
     refresh_task: Option<Task<()>>,
     clock_task: Option<Task<()>>,
@@ -96,6 +97,7 @@ impl ServerPanel {
             confirm_revoke: None,
             error: None,
             busy: false,
+            generation: 0,
             now_secs: current_epoch_secs(),
             refresh_task: None,
             clock_task: None,
@@ -115,20 +117,20 @@ impl ServerPanel {
                 let Ok(backend) = this.update(cx, |panel, cx| {
                     panel.now_secs = current_epoch_secs();
                     cx.notify();
-                    (!panel.busy).then(|| panel.backend.clone())
+                    (!panel.busy).then(|| (panel.backend.clone(), panel.generation))
                 }) else {
                     return;
                 };
                 tick = (tick + 1) % 3;
                 if tick == 0
-                    && let Some(backend) = backend
+                    && let Some((backend, generation)) = backend
                 {
                     let snapshot = bg
                         .spawn(async move { (backend.server_status(), backend.devices()) })
                         .await;
                     if this
                         .update(cx, |panel, cx| {
-                            if !panel.busy {
+                            if !panel.busy && panel.generation == generation {
                                 if let Ok(status) = snapshot.0 {
                                     panel.status = status;
                                 }
@@ -204,8 +206,13 @@ impl ServerPanel {
 
     /// 백그라운드 실행기에서 서버 상태와 짝지은 기기 목록을 새로 고친다.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
         let backend = self.backend.clone();
         self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         cx.notify();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let (status_res, devices_res) = cx
@@ -213,6 +220,9 @@ impl ServerPanel {
                 .spawn(async move { (backend.server_status(), backend.devices()) })
                 .await;
             this.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
                 panel.busy = false;
                 match status_res {
                     Ok(status) => panel.status = status,
@@ -235,6 +245,8 @@ impl ServerPanel {
         }
         let backend = self.backend.clone();
         self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         self.error = None;
         cx.notify();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -249,6 +261,9 @@ impl ServerPanel {
                 })
                 .await;
             this.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
                 panel.busy = false;
                 match res {
                     Ok(status) => {
@@ -281,6 +296,8 @@ impl ServerPanel {
         let backend = self.backend.clone();
         let qr_source = self.qr_source.clone();
         self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         self.error = None;
         self.copied = false;
         cx.notify();
@@ -298,6 +315,9 @@ impl ServerPanel {
                 })
                 .await;
             this.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
                 panel.busy = false;
                 match res {
                     Ok((status, invite, matrix)) => {
@@ -346,6 +366,8 @@ impl ServerPanel {
         let backend = self.backend.clone();
         let target_id = target.id.clone();
         self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         self.error = None;
         cx.notify();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -355,6 +377,9 @@ impl ServerPanel {
                 .spawn(async move { backend.revoke(&id_for_call) })
                 .await;
             this.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
                 panel.busy = false;
                 match res {
                     Ok(devices) => {
@@ -739,6 +764,9 @@ pub enum ClientPhase {
 
 /// "다른 Mac 추가" 클라이언트 대화상자.
 pub struct ClientDialog {
+    generation: u64,
+    nearby_generation: u64,
+    clipboard_generation: u64,
     language: crate::i18n::Language,
     backend: Arc<dyn LinkBackend>,
     link_input: Entity<InputState>,
@@ -792,13 +820,13 @@ impl ClientDialog {
                 this.submit_pair(cx);
             }
         });
-        let clipboard_suggestion = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .and_then(|s| extract_clipboard_invite(&s));
+        let clipboard_suggestion = None;
 
         let mut dialog = Self {
             language: crate::i18n::language(),
+            generation: 0,
+            nearby_generation: 0,
+            clipboard_generation: 0,
             backend,
             link_input,
             device_name_input,
@@ -810,6 +838,7 @@ impl ClientDialog {
             _subscriptions: [enter_link, enter_name],
         };
         dialog.refresh_nearby(cx);
+        dialog.refresh_clipboard_suggestion(cx);
         dialog
     }
 
@@ -868,11 +897,26 @@ impl ClientDialog {
 
     /// 시스템 클립보드를 다시 확인해 `krill://pair` 링크가 있으면 자동 채움 제안을 갱신한다.
     pub fn refresh_clipboard_suggestion(&mut self, cx: &mut Context<Self>) {
-        self.clipboard_suggestion = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .and_then(|s| extract_clipboard_invite(&s));
-        cx.notify();
+        self.clipboard_generation = self.clipboard_generation.wrapping_add(1);
+        let generation = self.clipboard_generation;
+        let read = cx.read_from_clipboard_async();
+        cx.spawn(async move |this, cx| {
+            let suggestion = read
+                .await
+                .ok()
+                .flatten()
+                .and_then(|item| item.text())
+                .and_then(|text| extract_clipboard_invite(&text));
+            this.update(cx, |this, cx| {
+                if this.clipboard_generation != generation {
+                    return;
+                }
+                this.clipboard_suggestion = suggestion;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 클립보드 자동 채움 제안의 초대 링크를 입력칸에 채운다.
@@ -885,18 +929,36 @@ impl ClientDialog {
     /// 클립보드 텍스트를 초대 링크 입력칸에 채운다. 기기 이름을 확인·수정할 수 있게
     /// 바로 연결하지 않고 사용자가 [연결](또는 Enter)으로 제출한다(OWE-878).
     pub fn paste_from_clipboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-            let trimmed = text.trim().to_owned();
-            if let Some(valid) = extract_clipboard_invite(&trimmed) {
-                self.clipboard_suggestion = Some(valid);
+        self.clipboard_generation = self.clipboard_generation.wrapping_add(1);
+        let generation = self.clipboard_generation;
+        let initial = self.link_input.read(cx).value();
+        let read = cx.read_from_clipboard_async();
+        cx.spawn_in(window, async move |this, cx| {
+            let text = read.await.ok().flatten().and_then(|item| item.text());
+            if let Some(text) = text {
+                this.update_in(cx, |this, window, cx| {
+                    if this.clipboard_generation != generation
+                        || this.link_input.read(cx).value() != initial
+                    {
+                        return;
+                    }
+                    let trimmed = text.trim().to_owned();
+                    if let Some(valid) = extract_clipboard_invite(&trimmed) {
+                        this.clipboard_suggestion = Some(valid);
+                    }
+                    this.set_link_value(trimmed, window, cx);
+                })
+                .ok();
             }
-            self.set_link_value(trimmed, window, cx);
-        }
+        })
+        .detach();
     }
 
     /// 클라이언트 카드 입력 초기화. 통합 짝짓기 창 안에 있으므로 OS 창을 닫지 않고
     /// 입력칸·진행 상태만 되돌린다(OWE-878). 이 기기 이름은 유지한다.
     pub fn reset_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.generation = self.generation.wrapping_add(1);
+        self.clipboard_generation = self.clipboard_generation.wrapping_add(1);
         self.task = None;
         self.phase = ClientPhase::Idle;
         self.set_link_value("", window, cx);
@@ -905,6 +967,8 @@ impl ClientDialog {
 
     /// 같은 Wi-Fi의 근처 Mac 목록(`nearby`)을 백그라운드 실행기에서 조회한다.
     pub fn refresh_nearby(&mut self, cx: &mut Context<Self>) {
+        self.nearby_generation = self.nearby_generation.wrapping_add(1);
+        let generation = self.nearby_generation;
         let backend = self.backend.clone();
         self.nearby_task = Some(cx.spawn(async move |this, cx| {
             let res = cx
@@ -913,6 +977,9 @@ impl ClientDialog {
                 .await;
             if let Ok(list) = res {
                 this.update(cx, |dialog, cx| {
+                    if dialog.nearby_generation != generation {
+                        return;
+                    }
                     dialog.nearby = list;
                     cx.notify();
                 })
@@ -943,6 +1010,8 @@ impl ClientDialog {
         }
         let link = self.link_input.read(cx).value().trim().to_owned();
         let device_name = sanitize_device_name(&self.device_name_input.read(cx).value());
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         self.phase = ClientPhase::Connecting;
         cx.notify();
         let backend = self.backend.clone();
@@ -952,6 +1021,9 @@ impl ClientDialog {
                 .spawn(async move { backend.pair(&link, &device_name) })
                 .await;
             this.update(cx, |dialog, cx| {
+                if dialog.generation != generation {
+                    return;
+                }
                 match outcome {
                     PairOutcome::Paired(dev) => {
                         dialog.phase = ClientPhase::Paired(dev.clone());
@@ -1115,12 +1187,6 @@ impl Render for ClientDialog {
             self.device_name_input.update(cx, |input, cx| {
                 input.set_placeholder(text::DEVICE_NAME_PLACEHOLDER.get(), window, cx);
             });
-        }
-        if self.clipboard_suggestion.is_none() {
-            self.clipboard_suggestion = cx
-                .read_from_clipboard()
-                .and_then(|item| item.text())
-                .and_then(|s| extract_clipboard_invite(&s));
         }
 
         let p = crate::ui::palette(cx);

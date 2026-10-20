@@ -89,7 +89,12 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
         } = control(Request::Create(Create {
             program: Program::Custom {
                 program: b"/bin/sh".to_vec(),
-                args: vec![b"-c".to_vec(), b"exec sleep 60".to_vec()],
+                args: vec![
+                    b"-c".to_vec(),
+                    "printf '\\033]0;모바일 세션 제목\\007'; exec sleep 60"
+                        .as_bytes()
+                        .to_vec(),
+                ],
             },
             cwd: dir.as_os_str().as_encoded_bytes().to_vec(),
             cols: 80,
@@ -99,6 +104,7 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
         else {
             return Err("source creation failed".into());
         };
+        krill_proto::git::record_session_auto_title(&dir, source, "fallback-task-title")?;
         let mut connection = UnixStream::connect(&socket)?;
         connection.set_read_timeout(Some(Duration::from_secs(20)))?;
         ipc::read_frame(&mut connection)?.ok_or("missing workflow hello")?;
@@ -119,6 +125,7 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
                     cards.iter().any(|card| {
                         card["id"] == source.0
                             && card["cwd"].as_str().is_some_and(|cwd| !cwd.is_empty())
+                            && card["title"] == "모바일 세션 제목"
                     })
                 })
             {
@@ -139,6 +146,8 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
         assert_eq!(card["state_source"], Value::Null);
         assert_eq!(card["state_confidence"], "Low");
         assert_eq!(card["state_since_unix_ns"], "0");
+        assert_eq!(card["title"], "모바일 세션 제목");
+        assert!(card.get("foreground").is_some());
         assert!(card["worktree_key"].is_string());
         // 저장소 밖 cwd는 git을 부르지 않고 요약을 비운다.
         assert_eq!(card["repo_key"], Value::Null);
@@ -148,20 +157,92 @@ fn workflow_terminal_lifecycle_and_snapshot_metadata() -> Result<(), Box<dyn std
         assert!(card.get("state_source").is_some());
         assert!(card.get("state_confidence").is_some());
         let source_cwd = card["cwd"].clone();
-        let created = rpc(json!({"action":"create_terminal","cwd_session":source.0}))?;
-        assert_eq!(created["ok"], true, "{created}");
-        let session = created["data"]["session"]
+        // 등록 목록은 세션 유무와 독립적이며 데스크톱에서 바꾼 이름을 매 폴링에 반영한다.
+        let empty = dir.join("empty-workspace");
+        std::fs::create_dir_all(&empty)?;
+        std::fs::write(
+            dir.join("projects.toml"),
+            format!(
+                "[[projects]]\nid = \"empty\"\npath = {:?}\ndisplay_name = \"이관된 이름\"\npinned = true\n",
+                empty.to_string_lossy()
+            ),
+        )?;
+        let mut prefs = std::collections::BTreeMap::new();
+        prefs.insert(
+            std::fs::canonicalize(&empty)?,
+            (false, "PC에서 바꾼 이름".to_owned()),
+        );
+        let mut sidebar = vec![1];
+        sidebar.extend(postcard::to_allocvec(&prefs)?);
+        std::fs::write(dir.join("sidebar.bin"), sidebar)?;
+        let snapshot = rpc(json!({"action":"snapshot"}))?;
+        let workspace = snapshot["data"]["workspaces"]
+            .as_array()
+            .ok_or("missing workspaces")?
+            .iter()
+            .find(|w| w["label"] == "PC에서 바꾼 이름")
+            .ok_or("empty workspace omitted")?;
+        assert_eq!(workspace["pinned"], false);
+        let key = workspace["key"].as_str().ok_or("missing workspace key")?;
+        assert_eq!(rpc(json!({"action":"create_terminal"}))?["ok"], false);
+        assert_eq!(
+            rpc(json!({"action":"create_terminal","workspace":"not-registered"}))?["ok"],
+            false
+        );
+        assert_eq!(
+            rpc(json!({"action":"create_terminal","workspace":key,"cwd_session":source.0}))?["ok"],
+            false
+        );
+        assert_eq!(
+            rpc(json!({"action":"create_terminal","workspace":key,"cwd":"/"}))?["ok"],
+            false
+        );
+        let created_empty = rpc(json!({"action":"create_terminal","workspace":key}))?;
+        assert_eq!(created_empty["ok"], true, "{created_empty}");
+        let empty_session = created_empty["data"]["session"]
             .as_u64()
-            .ok_or("missing new session")?;
-        assert_ne!(session, source.0);
-        let snapshot = loop {
+            .ok_or("missing empty workspace session")?;
+        loop {
             let snapshot = rpc(json!({"action":"snapshot"}))?;
             if snapshot["data"]["sessions"]
                 .as_array()
                 .is_some_and(|cards| {
                     cards
                         .iter()
-                        .any(|card| card["id"] == session && card["cwd"] == source_cwd)
+                        .any(|c| c["id"] == empty_session && c["worktree_key"] == key)
+                })
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "workspace session cwd differs");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(
+            rpc(json!({"action":"close_terminal","session":empty_session}))?["ok"],
+            true
+        );
+
+        let created = rpc(json!({"action":"create_terminal","cwd_session":source.0}))?;
+        assert_eq!(created["ok"], true, "{created}");
+        let session = created["data"]["session"]
+            .as_u64()
+            .ok_or("missing new session")?;
+        assert_ne!(session, source.0);
+        krill_proto::git::record_session_auto_title(
+            &dir,
+            krill_proto::SessionId(session),
+            "new-shell-task",
+        )?;
+        let snapshot = loop {
+            let snapshot = rpc(json!({"action":"snapshot"}))?;
+            if snapshot["data"]["sessions"]
+                .as_array()
+                .is_some_and(|cards| {
+                    cards.iter().any(|card| {
+                        card["id"] == session
+                            && card["cwd"] == source_cwd
+                            && card["title"] == "new-shell-task"
+                    })
                 })
             {
                 break snapshot;
@@ -248,4 +329,29 @@ fn terminal_adapter_regressions() {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+}
+
+/// 모바일 화면·채팅·전송 실패 경로를 표준 Cargo 검사에도 포함한다.
+#[test]
+fn mobile_frontend_regressions() {
+    for name in [
+        "mobile_screens.cjs",
+        "mobile_chat.cjs",
+        "mobile_transport.cjs",
+    ] {
+        let result = std::process::Command::new("node")
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests")
+                    .join(name),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{name}: {}\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
 }

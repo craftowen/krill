@@ -10,6 +10,12 @@ fn dir(tag: &str) -> std::path::PathBuf {
     d
 }
 
+fn enable_auto_switch(home: &std::path::Path, state: &std::path::Path) {
+    let mut file = accounts::load_file(home, Some(state));
+    file.auto_switch.enabled = true;
+    accounts::save_file(home, Some(state), &file).unwrap();
+}
+
 /// Claude local file measured format.
 #[test]
 fn claude_files_parse_five_hour_and_seven_day() {
@@ -151,9 +157,23 @@ fn multi_account_registry_manual_switch_and_auto_switch_engine() {
     )
     .unwrap();
 
-    // 3. 호스트 계정(92%)이 기본 활성 상태였으나 Auto-Switch(임계치 90%)가 동작해
+    // 기본 설정에서는 임계치를 넘어도 호스트 계정을 유지한다.
+    let initial = accounts::refresh_accounts(&home, Some(&state));
+    assert!(!initial.auto_switch.enabled);
+    assert!(initial.switched.is_empty());
+    assert!(initial.accounts.iter().any(|a| a.host_default && a.active));
+
+    // 3. 사용자가 Auto-Switch(임계치 90%)를 켜면 호스트 계정(92%)에서
     // 가장 여유 있는 Backup Pro(15%)로 자동 전환되어야 한다.
-    let snap = accounts::refresh_accounts(&home, Some(&state));
+    let snap = accounts::set_auto_switch(
+        &home,
+        Some(&state),
+        &AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        },
+    )
+    .unwrap();
     assert_eq!(snap.switched.len(), 1);
     assert_eq!(snap.switched[0].from_id, "claude-host");
     assert_eq!(snap.switched[0].to_id, "claude-backup-pro");
@@ -330,6 +350,7 @@ fn legacy_accounts_toml_defaults_rules_to_empty() {
         "[auto_switch]\nenabled = true\nthreshold_percent = 90\nswitch_on_rate_limit = true\n",
     )
     .unwrap();
+    assert!(file.auto_switch.enabled);
     assert!(file.auto_switch.rules.is_empty());
 }
 
@@ -383,7 +404,7 @@ fn corrupt_accounts_toml_is_preserved_and_writes_refused() {
 /// K-03: `[auto_switch]` 일부 필드 누락(부분 쓰기·구버전 파일) 때도 파싱이 깨지지 않는다.
 #[test]
 fn partial_auto_switch_table_parses_with_defaults() {
-    let file: accounts::AccountsFile = toml::from_str("[auto_switch]\nenabled = false\n").unwrap();
+    let file: accounts::AccountsFile = toml::from_str("[auto_switch]\n").unwrap();
     assert!(!file.auto_switch.enabled);
     assert_eq!(file.auto_switch.threshold_percent, 90);
     assert!(file.auto_switch.switch_on_rate_limit);
@@ -507,6 +528,7 @@ fn unknown_usage_is_never_auto_switch_target() {
 
     let home = dir("k10-home");
     let state = dir("k10-state");
+    enable_auto_switch(&home, &state);
     // 사용량 파일 없는 후보(미로그인 프로필).
     let fresh = home.join("claude-fresh");
     accounts::add_account(
@@ -547,6 +569,7 @@ fn expired_window_is_ignored_for_auto_switch() {
 
     let home = dir("k11-home");
     let state = dir("k11-state");
+    enable_auto_switch(&home, &state);
     let backup = home.join("claude-backup");
     accounts::add_account(
         &home,
@@ -648,7 +671,7 @@ fn stale_preferred_target_is_skipped_for_fresh_fallback() {
         .unwrap();
     }
     let mut file = accounts::load_file(&home, Some(&state));
-    // 등록 중 기본 정책이 이미 전환했을 수 있다. 호스트에서 다시 시작한다.
+    // 호스트에서 시작해 계정별 규칙의 후보 선택을 확인한다.
     file.active.clear();
     file.auto_switch.enabled = false;
     file.auto_switch.rules.push(AutoSwitchRule {
@@ -674,6 +697,7 @@ fn manual_switch_is_not_overridden_by_auto_switch() {
 
     let home = dir("k12-home");
     let state = dir("k12-state");
+    enable_auto_switch(&home, &state);
     let high_profile = home.join("claude-High");
     for (label, five) in [("High", 95), ("Low", 10)] {
         let profile = home.join(format!("claude-{label}"));
@@ -785,6 +809,7 @@ fn failed_auto_switch_save_keeps_persisted_selection() {
 
     let home = dir("audit-save-home");
     let state = dir("audit-save-state");
+    enable_auto_switch(&home, &state);
     let backup = home.join("backup");
     accounts::add_account(
         &home,
@@ -1206,6 +1231,7 @@ fn unknown_status_is_never_auto_switch_target() {
 
     let home = dir("status-k10-home");
     let state = dir("status-k10-state");
+    enable_auto_switch(&home, &state);
     let fresh = home.join("claude-fresh");
     accounts::add_account(
         &home,
@@ -1253,6 +1279,7 @@ fn rate_limited_is_excluded_and_triggers_switch() {
 
     let home = dir("ratelim-home");
     let state = dir("ratelim-state");
+    enable_auto_switch(&home, &state);
     // id 충돌 방지: 이 테스트 전용 라벨(프로세스 전역 한도 기록과 겹치지 않게).
     for (label, five) in [("RateLim", 10), ("RateBak", 15)] {
         let profile = home.join(format!("claude-{label}"));
@@ -1352,6 +1379,7 @@ fn rate_limited_candidate_is_skipped_for_fresh_fallback() {
 
     let home = dir("ratelim-cand-home");
     let state = dir("ratelim-cand-state");
+    enable_auto_switch(&home, &state);
     for (label, five) in [("RateLim", 5), ("RateBak", 30)] {
         let profile = home.join(format!("claude-{label}"));
         accounts::add_account(

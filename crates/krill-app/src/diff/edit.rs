@@ -379,12 +379,8 @@ pub(super) fn discard_worktree_file(
         .stderr
         .take()
         .ok_or_else(|| io::Error::other("missing git stderr"))?;
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr.take(64 * 1024).read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
     let deadline = Instant::now() + TIMEOUT;
+    let reader = crate::process_io::read(stderr, 64 * 1024, deadline)?;
     let status = loop {
         match child.0.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -400,9 +396,14 @@ pub(super) fn discard_worktree_file(
     };
     child.0.kill().ok();
     child.0.wait().ok();
-    let err_bytes = reader
-        .join()
-        .map_err(|_| io::Error::other("git reader failed"))??;
+    let captured = reader.finish(deadline + Duration::from_millis(50))?;
+    if captured.timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "git checkout pipe timed out",
+        ));
+    }
+    let err_bytes = captured.bytes;
     let status = status?;
     if status.success() {
         Ok(())

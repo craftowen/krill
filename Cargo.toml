@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.22"
+version = "0.1.23"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -51,6 +51,9 @@ unicode-width = "0.2.2"
 sha2 = "0.10.9"
 # MK-063: 자체 업데이터 latest.json Ed25519 서명 검증(T4-D14). gpui 묶음이 이미 쓰는 버전(Cargo.lock)이라 새 크레이트가 아니다.
 ring = "0.17.14"
+# Orca macOS safeStorage account-vault import (Chromium v10 AES-CBC).
+aes = { version = "0.8.4", features = ["zeroize"] }
+cbc = "0.1.2"
 # MK-097: 키체인 키와 임시 키 버퍼 소거. 기존 gpui 의존성 버전을 재사용한다.
 security-framework = "3.7.0"
 zeroize = "1.9.1"

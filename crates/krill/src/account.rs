@@ -214,9 +214,32 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
         return Err("login failed or was cancelled".to_owned());
     }
     let exe = provider.as_str();
-    let auth = krill_proto::account_login::probe(std::path::Path::new(exe), provider, dir)
-        .filter(|s| s.logged_in)
-        .ok_or("login could not be verified")?;
+    let auth = if provider == ProviderKind::Antigravity && account.host_default {
+        std::fs::write(
+            std::path::Path::new(&account.profile_dir).join(".krill-login-completed"),
+            b"",
+        )
+        .ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            if request(&UsageRequest::ListAccounts).is_ok_and(|s| {
+                s.connection_for(&account.id) == krill_proto::usage::ConnectionStatus::Connected
+            }) {
+                break Some(krill_proto::account_login::AuthStatus {
+                    logged_in: true,
+                    identity: None,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    } else {
+        krill_proto::account_login::probe(std::path::Path::new(exe), provider, dir)
+    }
+    .filter(|s| s.logged_in)
+    .ok_or("login could not be verified")?;
     if let Some(dir) = dir {
         std::fs::write(dir.join(".krill-login-completed"), b"").ok();
     }
@@ -252,7 +275,7 @@ fn login_command(
     let Some(krill_proto::control::Program::Custom { program, args }) =
         krill_proto::account_login::login_program(provider, dir)
     else {
-        return Err("login supports Claude and Codex profiles only".to_owned());
+        return Err("provider does not support interactive account login".to_owned());
     };
     let mut command = std::process::Command::new(OsString::from_vec(program));
     command.args(args.into_iter().map(OsString::from_vec));
@@ -436,6 +459,7 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
     let paths = Paths::dev().map_err(|e| e.to_string())?;
     let mut hello = daemon::client_hello(ClientRole::Cli, "krill account");
     hello.features = FEAT_USAGE
+        | krill_proto::usage::FEAT_PROVIDER_DETAILS
         | krill_proto::usage::FEAT_USAGE_AGY
         | krill_proto::usage::FEAT_USAGE_RULES
         | krill_proto::usage::FEAT_USAGE_STATUS
@@ -456,7 +480,12 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("krilld does not support FEAT_USAGE; restart daemon".to_owned());
     }
-    let required = req.required_features();
+    let required = req.required_features()
+        | if matches!(req, UsageRequest::SwitchAccount { .. }) {
+            krill_proto::usage::FEAT_PROVIDER_DETAILS
+        } else {
+            0
+        };
     if conn.negotiated.features & required != required {
         return Err("daemon does not support this account extension; restart daemon".to_owned());
     }

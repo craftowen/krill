@@ -181,6 +181,11 @@ pub fn ensure_session_in(
         {
             return Ok(Found::Live(id, false));
         }
+        if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
+            && let Some(replacement) = account_handoff(&target, id)?
+        {
+            return Ok(Found::Live(replacement, false));
+        }
         if features & FEAT_COLD != 0
             && let Reply::Cold(cold) = call(&Request::Cold { session: id })?
         {
@@ -207,6 +212,38 @@ pub fn ensure_session_in(
         Reply::Failed(f) => Err(io::Error::other(f.to_string())),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
+}
+
+/// Resolve a durable handoff before a missing old terminal can create a fresh conversation.
+fn account_handoff(target: &HostTarget, old: SessionId) -> io::Result<Option<SessionId>> {
+    use krill_proto::usage::{UsageReply, UsageRequest};
+    let mut connection = target.connect(&hello()).map_err(connect_error)?;
+    connection.stream.set_read_timeout(Some(REPLY_TIMEOUT))?;
+    connection.stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
+    connection
+        .stream
+        .write_all(&UsageRequest::ListAccounts.encode()?)?;
+    let (kind, body) = read(&mut connection.stream)?;
+    let UsageReply::Accounts(snapshot) = UsageReply::decode(kind, &body)? else {
+        return Err(io::ErrorKind::InvalidData.into());
+    };
+    let mut current = old;
+    for _ in 0..snapshot.details.handoffs.len().min(128) {
+        let Some(next) = snapshot
+            .details
+            .handoffs
+            .iter()
+            .find(|h| h.from == current)
+            .and_then(|h| h.to)
+        else {
+            break;
+        };
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    Ok((current != old).then_some(current))
 }
 
 /// 종료·콜드 세션 `session`을 다시 시작한다(MK-052). krilld가 [`FEAT_RESUME`]을 협상했으면
@@ -554,6 +591,14 @@ impl SearchState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountInput {
+    Normal,
+    Switching,
+    Failed,
+    Delivering,
+}
+
 /// 칸 하나의 연결 상태: 화면 스트림·입력 장부·지연 히스토리. IO는 `out`(붙어 있을 때의 쓰기 쪽)에만 한다.
 #[derive(Debug)]
 pub struct Pane<W> {
@@ -578,6 +623,7 @@ pub struct Pane<W> {
     sent: Option<(u16, u16)>,
     /// 이 연결이 `FEAT_ROLES`를 협상했다.
     roles: bool,
+    account_input: AccountInput,
 }
 
 impl<W> Default for Pane<W> {
@@ -599,6 +645,7 @@ impl<W> Default for Pane<W> {
             grid: None,
             sent: None,
             roles: false,
+            account_input: AccountInput::Normal,
         }
     }
 }
@@ -754,7 +801,12 @@ impl<W: Write> Pane<W> {
         } else {
             Vec::new()
         };
-        let (frames, relink_notices) = self.journal.relink(same, now);
+        let (frames, relink_notices) = if self.account_switching() {
+            self.journal.pause();
+            (Vec::new(), Vec::new())
+        } else {
+            self.journal.relink(same, now)
+        };
         notices.extend(relink_notices);
         for f in frames {
             if let Some(n) = self.send(&f).err().and_then(|()| self.unlink()) {
@@ -779,9 +831,78 @@ impl<W: Write> Pane<W> {
         self.journal.unlink()
     }
 
+    /// Keep typing in the bounded journal instead of sending new prompts to the old account.
+    pub fn pause_account_input(&mut self) {
+        self.account_input = AccountInput::Switching;
+        self.journal.pause();
+    }
+
+    pub fn account_switching(&self) -> bool {
+        matches!(
+            self.account_input,
+            AccountInput::Switching | AccountInput::Failed
+        )
+    }
+
+    /// Keep a hidden pane alive until its held prompts have reached the replacement PTY.
+    pub fn keep_account_input(&self) -> bool {
+        self.account_switching()
+            || self.account_input == AccountInput::Delivering && self.journal.has_pending_input()
+    }
+
+    /// A cancelled switch may continue on the original account. Failed switches keep all held
+    /// bytes for retry, so prompts intended for the new account cannot reach the original one.
+    pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
+        if failed {
+            self.account_input = AccountInput::Failed;
+            self.journal.pause();
+            return Vec::new();
+        }
+        if !self.account_switching() {
+            return Vec::new();
+        }
+        self.account_input = if self.journal.has_pending_input() {
+            AccountInput::Delivering
+        } else {
+            AccountInput::Normal
+        };
+        let mut notices = Vec::new();
+        if self.out.is_some() {
+            let (frames, relink_notices) = self.journal.relink(input::Incarnation::Same, now);
+            notices.extend(relink_notices);
+            for frame in frames {
+                if let Some(notice) = self.send(&frame).err().and_then(|()| self.unlink()) {
+                    notices.push(notice);
+                }
+            }
+        }
+        notices
+    }
+
+    /// An explicit account handoff keeps only unsent input. In-flight bytes remain uncertain
+    /// and are never replayed to another PTY.
+    pub fn handoff_account(&mut self, session: SessionId) -> Option<Notice> {
+        let notice = self.unlink();
+        let journal = std::mem::take(&mut self.journal);
+        let grid = self.grid;
+        let account_input = if journal.has_pending_input() {
+            AccountInput::Delivering
+        } else {
+            AccountInput::Normal
+        };
+        *self = Self {
+            session: Some(session),
+            journal,
+            grid,
+            account_input,
+            ..Self::default()
+        };
+        notice
+    }
+
     /// 사용자 입력. 스크롤 중이면 바닥으로 돌아간다. 보류 한도를 넘으면 알림.
     pub fn input(&mut self, bytes: &[u8], now: Now) -> Option<Notice> {
-        if self.state != State::Live {
+        if self.state != State::Live && !self.account_switching() {
             return None;
         }
         let had_mark = self.search.highlight.take().is_some();
@@ -941,7 +1062,14 @@ impl<W: Write> Pane<W> {
                     self.refresh();
                 }
             }
-            input::kind::INPUT_ACK => ev.notice = self.journal.ack(&InputAck::decode(k, body)?),
+            input::kind::INPUT_ACK => {
+                ev.notice = self.journal.ack(&InputAck::decode(k, body)?);
+                if self.account_input == AccountInput::Delivering
+                    && !self.journal.has_pending_input()
+                {
+                    self.account_input = AccountInput::Normal;
+                }
+            }
             kind::CLOSED => {
                 krill_proto::screen::Closed::decode(k, body)?;
                 self.state = State::Closed;

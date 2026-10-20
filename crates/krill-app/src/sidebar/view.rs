@@ -186,7 +186,7 @@ fn row_menu(
                     }),
             );
         }
-        if host.is_local() {
+        if host.is_local() && session.is_none() {
             menu = menu.separator();
             for target in Target::ALL {
                 let (this, folder) = (this.clone(), folder.clone());
@@ -398,6 +398,120 @@ fn row_menu(
 }
 
 impl Sidebar {
+    /// 워크트리 바로 뒤의 세션만 카드 안에 넣는다. 주의 필요/폴더 행은 독립적으로 유지한다.
+    fn card_session_indices(&self, index: usize) -> std::ops::Range<usize> {
+        let start = index + 1;
+        let Some(Row::Worktree(path)) = self.rows.get(index) else {
+            return start..start;
+        };
+        let host = self.row_host(index);
+        let cursor_inside = self.cursor.is_some_and(|cursor| {
+            self.row_host(cursor) == host
+                && matches!(self.rows.get(cursor), Some(Row::Session(s, true)) if s.worktree.as_ref() == Some(path))
+        });
+        if !self.expanded_cards.contains(path) && !cursor_inside {
+            return start..start;
+        }
+        let count = self
+            .rows
+            .iter()
+            .skip(start)
+            .take_while(
+                |row| matches!(row, Row::Session(s, true) if s.worktree.as_ref() == Some(path)),
+            )
+            .count();
+        start..start + count
+    }
+
+    fn session_card_index(&self, index: usize) -> Option<usize> {
+        let Row::Session(session, true) = self.rows.get(index)? else {
+            return None;
+        };
+        let parent = (0..index)
+            .rev()
+            .find(|i| !matches!(self.rows.get(*i), Some(Row::Session(_, true))))?;
+        matches!(self.rows.get(parent), Some(Row::Worktree(path)) if session.worktree.as_ref() == Some(path))
+            .then_some(parent)
+    }
+
+    fn worktree_card_active(&self, index: usize, path: &std::path::Path) -> bool {
+        let host = self.row_host(index);
+        let snapshot = self.snapshot_for(host);
+        let focused_wt = self
+            .focused
+            .and_then(|id| self.folder_on(host, id))
+            .filter(|wt| {
+                snapshot
+                    .trees
+                    .values()
+                    .any(|list| list.iter().any(|t| t == wt))
+            });
+        self.cursor == Some(index)
+            || focused_wt == Some(path)
+            || (focused_wt.is_none()
+                && self.cursor.is_none()
+                && self.selected_worktree.as_deref().map_or_else(
+                    || {
+                        snapshot
+                            .trees
+                            .keys()
+                            .next()
+                            .is_some_and(|first| first == path)
+                    },
+                    |sel| sel == path,
+                ))
+    }
+
+    /// 고정 높이 가상 목록에서는 행별 테두리를 이어 같은 워크트리 카드로 보이게 한다.
+    fn virtual_card_segment(
+        &self,
+        index: usize,
+        row: &Row,
+        element: gpui::Stateful<gpui::Div>,
+        cx: &Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        if self.rows.len() < VIRTUALIZED_ROWS {
+            return element;
+        }
+        if matches!(row, Row::Worktree(_)) {
+            return element.when(self.session_card_index(index + 1) == Some(index), |d| {
+                d.h(px(30.)).mb_0().border_b_0().rounded_b_none()
+            });
+        }
+        let Some(parent) = self.session_card_index(index) else {
+            return element;
+        };
+        let Some(Row::Worktree(path)) = self.rows.get(parent) else {
+            return element;
+        };
+        let last = self.session_card_index(index + 1) != Some(parent);
+        let depth = if self.row_host(parent).is_local() {
+            self.lineage_depth(path)
+        } else {
+            0
+        };
+        let p = ui::palette(cx);
+        element
+            .h(px(if last { 30. } else { ROW_HEIGHT }))
+            .mx_0()
+            .ml(px(self.worktree_margin(depth)))
+            .mr_1p5()
+            .pl(px(30.))
+            .pr_2p5()
+            .rounded_none()
+            .border_l_1()
+            .border_r_1()
+            .border_color(ui::TRANSPARENT)
+            .when(last, |d| d.mb_0p5().border_b_1().rounded_b(ui::RADIUS_MD))
+            .when(self.worktree_card_active(parent, path), |d| {
+                d.bg(p.worktree_sidebar)
+                    .border_color(p.sidebar_ring.opacity(0.65))
+            })
+            .when(depth > 0 && !self.worktree_card_active(parent, path), |d| {
+                d.border_l_2().border_color(p.worktree_sidebar_border)
+            })
+    }
+
     /// MK-078: 행마다 스크린 리더 역할(목록 항목)·이름·"n개 중 m번째"를 붙인다. 가상 리스트라 위치는 직접 알린다.
     pub(super) fn render_row(
         &self,
@@ -457,7 +571,7 @@ impl Sidebar {
                         .text_color(p.sidebar_accent_foreground)
                 })
         };
-        match row {
+        let element = match row {
             Row::HostHeader {
                 host,
                 label,
@@ -761,13 +875,29 @@ impl Sidebar {
                         div()
                             .debug_selector(move || format!("repo-icon-{index}"))
                             .child(ui::icons::project_header_icon(
-                                self.project_icon(&row_host, path),
-                                self.project_badge_color(&row_host, path),
+                                row_host
+                                    .is_local()
+                                    .then(|| self.project_icon(path))
+                                    .flatten(),
+                                row_host
+                                    .is_local()
+                                    .then(|| self.project_badge_color(path))
+                                    .flatten(),
                                 ui::ICON_MD,
                                 p.muted_foreground,
                             )),
                     )
-                    .child(div().flex_1().min_w_0().truncate().child(basename(path)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(if row_host.is_local() {
+                                self.project_header_name(path)
+                            } else {
+                                basename(path)
+                            }),
+                    )
                     .when(wt_count > 0, |d| {
                         d.child(
                             div()
@@ -862,8 +992,14 @@ impl Sidebar {
                             })),
                     )
                     .child(ui::icons::project_header_icon(
-                        self.project_icon(&row_host, path),
-                        self.project_badge_color(&row_host, path),
+                        row_host
+                            .is_local()
+                            .then(|| self.project_icon(path))
+                            .flatten(),
+                        row_host
+                            .is_local()
+                            .then(|| self.project_badge_color(path))
+                            .flatten(),
                         ui::ICON_MD,
                         p.muted_foreground,
                     ))
@@ -873,7 +1009,11 @@ impl Sidebar {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .child(basename(path)),
+                            .child(if row_host.is_local() {
+                                self.project_header_name(path)
+                            } else {
+                                basename(path)
+                            }),
                     )
                     .child(
                         div()
@@ -913,10 +1053,14 @@ impl Sidebar {
                 let unread = row_host.is_local() && self.is_unread(id);
                 let state = state_text(session.status.state);
                 let (name, detail) = self.session_label(session);
-                let badge = session
+                let inferred = session
                     .status
                     .badge()
-                    .map(|_| crate::i18n::catalog::general::INFERRED.get());
+                    .map(|_| text::INFERRED_STATUS_TOOLTIP.get());
+                let state_tip = inferred.map_or_else(
+                    || state.to_owned(),
+                    |explanation| format!("{state} · {explanation}"),
+                );
                 // OWE-707: 실행 당시 계정 배지(라벨 축약 2자, 툴팁 전체 이름).
                 // OWE-662 상태 글리프·에이전트 아이콘 옆이 아니라 행 끝 배지들과 함께 둬
                 // 좁은 행에서도 이름이 밀리지 않게 한다. 이어가기 칩은 OWE-699까지 숨긴다.
@@ -938,7 +1082,9 @@ impl Sidebar {
                         )
                     })
                     .flatten();
+                let inside_card = self.session_card_index(index).is_some();
                 single_line(base)
+                    .debug_selector(move || format!("sidebar-session-{index}"))
                     .h(px(if *nested { 26. } else { ROW_HEIGHT }))
                     .aria_label(format!(
                         "{name}{}, {state}{}{}{}",
@@ -954,7 +1100,7 @@ impl Sidebar {
                             })
                             .map(|b| format!(", {b}"))
                             .unwrap_or_default(),
-                        badge.map(|b| format!(", {b}")).unwrap_or_default(),
+                        inferred.map(|b| format!(", {b}")).unwrap_or_default(),
                         if unread {
                             format!(", {}", text::UNREAD.get())
                         } else {
@@ -979,15 +1125,25 @@ impl Sidebar {
                     .cursor_pointer()
                     .text_color(p.sidebar_foreground)
                     .hover(|d| {
-                        d.bg(p.sidebar_accent)
-                            .text_color(p.sidebar_accent_foreground)
+                        d.bg(if inside_card {
+                            p.worktree_sidebar_accent
+                        } else {
+                            p.sidebar_accent
+                        })
+                        .text_color(p.sidebar_accent_foreground)
                     })
                     .child(
                         status::status_glyph(session.status.state, unread, Size::Sm, cx)
-                            .debug_selector(move || format!("session-state-{index}")),
+                            .debug_selector(move || format!("session-state-{index}"))
+                            .id(("session-status", index))
+                            .aria_label(state_tip.clone())
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(state_tip.clone())
+                                    .build(window, cx)
+                            }),
                     )
                     .child(status::agent_icon(
-                        status::infer_agent_from_title(&session.status.agent, &name),
+                        status::infer_agent_from_status(&session.status, &name),
                         ui::ICON_XS,
                         p.muted_foreground,
                     ))
@@ -999,20 +1155,14 @@ impl Sidebar {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(name),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(ui::TEXT_XS)
-                            .text_color(p.muted_foreground)
-                            .child(detail),
-                    )
                     .children(
                         row_host
                             .is_local()
                             .then(|| {
-                                super::external::session_orch_parts(self.path.as_deref(), id.0)
+                                super::external::orch_parts_from_store(
+                                    &self.disk.orchestration,
+                                    id.0,
+                                )
                             })
                             .flatten()
                             .map(|ob| super::external::session_orch_element(&ob, p)),
@@ -1052,21 +1202,13 @@ impl Sidebar {
                                 gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
                             })
                     }))
-                    .children(badge.map(|b| {
-                        div()
-                            .flex_none()
-                            .px_1p5()
-                            .rounded(ui::RADIUS_XS)
-                            .bg(p.muted)
-                            .text_size(ui::TEXT_2XS)
-                            .text_color(p.muted_foreground)
-                            .child(b)
-                    }))
                     .on_click(cx.listener(move |s, _, _, cx| {
+                        cx.stop_propagation();
                         s.select_session(index, id, cx);
                     }))
             }
-        }
+        };
+        self.virtual_card_segment(index, row, element, cx)
     }
 
     /// 워크트리 카드 제목 자리(OWE-847): 이름 변경 중이면 인라인 입력창 + 저장(✓)·취소(✕) 버튼
@@ -1159,33 +1301,9 @@ impl Sidebar {
         use krill_proto::control::AgentState;
 
         let p = ui::palette(cx);
-        let selected = self.cursor == Some(index);
         let row_host = self.row_host(index).clone();
-        let is_default_tree =
-            super::options::is_primary_worktree(self.snapshot_for(&row_host), path);
-        let is_first_default = self
-            .snapshot_for(&row_host)
-            .trees
-            .keys()
-            .next()
-            .is_some_and(|first| first == path);
-        let focused_wt = self
-            .focused
-            .and_then(|id| self.folder_on(&row_host, id))
-            .filter(|wt| {
-                self.snapshot_for(&row_host)
-                    .trees
-                    .values()
-                    .any(|list| list.iter().any(|t| t == wt))
-            });
-        let is_active_worktree = selected
-            || focused_wt == Some(path)
-            || (focused_wt.is_none()
-                && self.cursor.is_none()
-                && self
-                    .selected_worktree
-                    .as_deref()
-                    .map_or(is_first_default, |sel| sel == path));
+        let is_default_tree = self.snapshot_for(&row_host).trees.contains_key(path);
+        let is_active_worktree = self.worktree_card_active(index, path);
         let (fold, pin, edit, fresh, card_path, fresh_host) = (
             path.to_path_buf(),
             path.to_path_buf(),
@@ -1266,7 +1384,10 @@ impl Sidebar {
         let comment = row_host.is_local().then(|| self.comment(path)).flatten();
         let checkpoint_badge = row_host
             .is_local()
-            .then(|| super::external::checkpoint_badge_for(self.path.as_deref(), path))
+            .then(|| {
+                super::external::checkpoint_parts_from_store(&self.disk.store, path)
+                    .and_then(|p| p.label(false))
+            })
             .flatten();
         let mut label = super::external::worktree_a11y_label(text::TITLE.get(), &name, comment);
         for part in [
@@ -1476,7 +1597,7 @@ impl Sidebar {
         });
         let card_checkpoint_parts = row_host
             .is_local()
-            .then(|| super::external::checkpoint_badge_parts(self.path.as_deref(), path))
+            .then(|| super::external::checkpoint_parts_from_store(&self.disk.store, path))
             .flatten();
 
         let ports_list = if props.ports {
@@ -1591,6 +1712,13 @@ impl Sidebar {
         // 렌더한다. 상태 점·브랜치·코멘트·배지·들여쓰기를 유지해 세션 없는 이관 워크트리도
         // 일반 카드와 같이 보인다.
         let compact_fallback = self.rows.len() >= VIRTUALIZED_ROWS;
+        let session_rows: Vec<_> = if compact_fallback {
+            Vec::new()
+        } else {
+            self.card_session_indices(index)
+                .map(|i| self.render_row_with_menu(i, &self.rows[i], cx))
+                .collect()
+        };
         if self.options.card_layout == super::CardLayout::Compact || compact_fallback {
             let compact_path = card_path.clone();
             let compact_fold = fold.clone();
@@ -1599,7 +1727,7 @@ impl Sidebar {
                 .debug_selector(move || format!("worktree-card-{index}"))
                 .aria_label(label)
                 .aria_expanded(!closed)
-                .h(px(28.))
+                .min_h(px(28.))
                 .mr_1p5()
                 .ml(left_margin)
                 .my_0p5()
@@ -1622,102 +1750,124 @@ impl Sidebar {
                 })
                 .text_color(p.worktree_sidebar_foreground)
                 .cursor_pointer()
-                .relative()
                 .flex()
-                .items_center()
-                .gap_1p5()
+                .flex_col()
                 .child(
-                    div()
-                        .w(px(14.))
-                        .h(px(14.))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(left_status),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
-                        .when(!is_editing_this, |d| {
-                            d.children(lineage_toggle_btn)
-                                .when(show_branch_subtitle, |d| {
-                                    d.child(
-                                        div()
-                                            .debug_selector(move || {
-                                                format!("worktree-branch-{index}")
-                                            })
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(ui::TEXT_2XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(branch_subtitle),
-                                    )
-                                })
-                                .when_some(visible_comment, |d, cm| {
-                                    d.child(
-                                        div()
-                                            .debug_selector(move || {
-                                                format!("worktree-comment-{index}")
-                                            })
-                                            .min_w_0()
-                                            .truncate()
-                                            .text_size(ui::TEXT_2XS)
-                                            .text_color(p.muted_foreground)
-                                            .child(cm.to_owned()),
-                                    )
-                                })
-                        }),
-                )
-                .when(!is_editing_this, |d| {
-                    d.child(
+                    self.with_row_menu(
+                        index,
+                        &Row::Worktree(path.to_path_buf()),
                         div()
+                            .id(("worktree-header", index))
+                            .relative()
+                            .w_full()
+                            .h(px(26.))
                             .flex_none()
                             .flex()
                             .items_center()
-                            .gap_1()
-                            .children(host_badge)
-                            .children(issue_badge)
-                            .children(ports_badge)
-                            .children(dirty_badge)
-                            .children(pr_badge)
-                            .when(has_agent_pill, |d| {
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .w(px(14.))
+                                    .h(px(14.))
+                                    .flex_none()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(left_status),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(self.card_title_el(
+                                        path,
+                                        card_title,
+                                        ui::TEXT_SM,
+                                        index,
+                                        cx,
+                                    ))
+                                    .when(!is_editing_this, |d| {
+                                        d.children(lineage_toggle_btn)
+                                            .when(show_branch_subtitle, |d| {
+                                                d.child(
+                                                    div()
+                                                        .debug_selector(move || {
+                                                            format!("worktree-branch-{index}")
+                                                        })
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(ui::TEXT_2XS)
+                                                        .text_color(p.muted_foreground)
+                                                        .child(branch_subtitle),
+                                                )
+                                            })
+                                            .when_some(visible_comment, |d, cm| {
+                                                d.child(
+                                                    div()
+                                                        .debug_selector(move || {
+                                                            format!("worktree-comment-{index}")
+                                                        })
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_size(ui::TEXT_2XS)
+                                                        .text_color(p.muted_foreground)
+                                                        .child(cm.to_owned()),
+                                                )
+                                            })
+                                    }),
+                            )
+                            .when(!is_editing_this, |d| {
                                 d.child(
                                     div()
-                                        .id(("fold", index))
-                                        .cursor_pointer()
-                                        .child(
-                                            Icon::new(if card_expanded {
-                                                IconName::ChevronDown
-                                            } else {
-                                                IconName::ChevronRight
-                                            })
-                                            .with_size(ui::ICON_XS)
-                                            .text_color(p.muted_foreground),
-                                        )
-                                        .on_click(cx.listener(move |s, _, _, cx| {
-                                            cx.stop_propagation();
-                                            s.toggle_card_sessions(&compact_fold, cx);
-                                        })),
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .children(host_badge)
+                                        .children(issue_badge)
+                                        .children(ports_badge)
+                                        .children(dirty_badge)
+                                        .children(pr_badge)
+                                        .when(has_agent_pill, |d| {
+                                            d.child(
+                                                div()
+                                                    .id(("fold", index))
+                                                    .cursor_pointer()
+                                                    .child(
+                                                        Icon::new(if card_expanded {
+                                                            IconName::ChevronDown
+                                                        } else {
+                                                            IconName::ChevronRight
+                                                        })
+                                                        .with_size(ui::ICON_XS)
+                                                        .text_color(p.muted_foreground),
+                                                    )
+                                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                                        cx.stop_propagation();
+                                                        s.toggle_card_sessions(&compact_fold, cx);
+                                                    })),
+                                            )
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .flex()
+                                        .items_center()
+                                        .gap_0p5()
+                                        .child(new_session_btn)
+                                        .child(rename_btn)
+                                        .child(pin_btn),
                                 )
                             }),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .child(new_session_btn)
-                            .child(rename_btn)
-                            .child(pin_btn),
-                    )
-                })
+                        cx,
+                    ),
+                )
+                .when(!session_rows.is_empty(), gpui::Styled::pb_1)
+                .children(session_rows)
                 .on_click(cx.listener(move |s, _, window, cx| {
                     s.activate_worktree_card(
                         index,
@@ -1753,32 +1903,9 @@ impl Sidebar {
                 .child(super::external::checkpoint_badge_element(parts, p))
         });
 
-        base.debug_selector(move || format!("worktree-card-{index}"))
-            .aria_label(label)
-            .aria_expanded(!closed)
-            .mr_1p5()
-            .ml(left_margin)
-            .my_0p5()
-            .px_2p5()
-            .py_1p5()
-            .rounded(ui::RADIUS_MD)
-            .border_1()
-            .when(is_active_worktree, |d| {
-                d.bg(p.worktree_sidebar)
-                    .border_color(p.sidebar_ring.opacity(0.65))
-            })
-            .when(!is_active_worktree, |d| {
-                let d = d
-                    .border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
-                if lineage_depth > 0 {
-                    d.border_l_2().border_color(p.worktree_sidebar_border)
-                } else {
-                    d
-                }
-            })
-            .text_color(p.worktree_sidebar_foreground)
-            .cursor_pointer()
+        let header = div()
+            .id(("worktree-header", index))
+            .w_full()
             .flex()
             .flex_col()
             .gap_0p5()
@@ -1966,7 +2093,7 @@ impl Sidebar {
                                             cx,
                                         ))
                                         .child(status::agent_icon(
-                                            &sess.status.agent,
+                                            status::infer_agent_from_status(&sess.status, &sess_name),
                                             ui::ICON_SM,
                                             p.muted_foreground,
                                         ))
@@ -2070,7 +2197,39 @@ impl Sidebar {
                             }
                         }),
                 )
+            });
+
+        base.debug_selector(move || format!("worktree-card-{index}"))
+            .aria_label(label)
+            .aria_expanded(!closed)
+            .mr_1p5()
+            .ml(left_margin)
+            .my_0p5()
+            .px_2p5()
+            .py_1p5()
+            .rounded(ui::RADIUS_MD)
+            .border_1()
+            .when(is_active_worktree, |d| {
+                d.bg(p.worktree_sidebar)
+                    .border_color(p.sidebar_ring.opacity(0.65))
             })
+            .when(!is_active_worktree, |d| {
+                let d = d
+                    .border_color(ui::TRANSPARENT)
+                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
+                if lineage_depth > 0 {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                } else {
+                    d
+                }
+            })
+            .text_color(p.worktree_sidebar_foreground)
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .child(self.with_row_menu(index, &Row::Worktree(path.to_path_buf()), header, cx))
+            .children(session_rows)
             .on_click(cx.listener(move |s, _, window, cx| {
                 s.activate_worktree_card(
                     index,
@@ -2086,17 +2245,27 @@ impl Sidebar {
     /// 저장소·폴더 헤더는 접기 대상 경로를 `header`로 넘겨 '프로젝트 제거' 메뉴를 붙인다(OWE-845).
     fn render_row_with_menu(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let element = self.render_row(index, row, cx);
-        if !matches!(
-            row,
-            Row::Worktree(_) | Row::Session(_, _) | Row::Repository(_) | Row::Folder(_)
-        ) {
+        if matches!(row, Row::Worktree(_)) {
             return element.into_any_element();
         }
+        self.with_row_menu(index, row, element, cx)
+    }
+
+    /// 워크트리 메뉴는 헤더에만 붙여 하위 세션 메뉴와 겹치지 않게 한다.
+    fn with_row_menu(
+        &self,
+        index: usize,
+        row: &Row,
+        element: gpui::Stateful<gpui::Div>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let host = self.row_host(index).clone();
         let row = row.clone();
         let this = cx.weak_entity();
         element
             .context_menu(move |menu, window, cx| {
+                // Build menu-only lineage and labels when the menu opens, not
+                // once for every visible row on every scrolling frame.
                 let Ok((folder, session, tree, header, agents, pr)) = this.read_with(cx, |s, _| {
                     let (folder, session, tree, header) = match &row {
                         Row::Worktree(path) => {
@@ -2137,9 +2306,9 @@ impl Sidebar {
                                 None,
                             )
                         }
-                        Row::Session(sess, _) => (
-                            sess.worktree.clone().or_else(|| sess.cwd.clone()),
-                            Some(SessionMenuMeta { index, id: sess.id }),
+                        Row::Session(s, _) => (
+                            s.worktree.clone().or_else(|| s.cwd.clone()),
+                            Some(SessionMenuMeta { index, id: s.id }),
                             None,
                             None,
                         ),
@@ -2154,11 +2323,12 @@ impl Sidebar {
                         ),
                         _ => (None, None, None, None),
                     };
+                    let agents = s.agents.clone();
                     let pr = tree
                         .as_ref()
                         .and_then(|meta| s.prs.get(&meta.path))
                         .cloned();
-                    (folder, session, tree, header, s.agents.clone(), pr)
+                    (folder, session, tree, header, agents, pr)
                 }) else {
                     return menu;
                 };
@@ -2193,7 +2363,14 @@ impl Sidebar {
                     range
                         .filter_map(|i| {
                             let row = s.rows.get(i)?.clone();
-                            Some(s.render_row_with_menu(i, &row, cx))
+                            Some(
+                                div()
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .child(s.render_row_with_menu(i, &row, cx))
+                                    .into_any_element(),
+                            )
                         })
                         .collect()
                 }),
@@ -2202,33 +2379,21 @@ impl Sidebar {
             .size_full()
             .into_any_element()
         } else {
-            let cursor_in_wt: Option<PathBuf> =
-                self.cursor.and_then(|c| match self.rows.get(c)? {
-                    Row::Session(s, true) => s.worktree.clone(),
-                    _ => None,
-                });
+            #[cfg(test)]
+            let nested_rows: std::collections::BTreeSet<_> = (0..self.rows.len())
+                .flat_map(|i| self.card_session_indices(i))
+                .collect();
             let items: Vec<AnyElement> = self
                 .rows
                 .clone()
                 .into_iter()
                 .enumerate()
-                .filter(|(_, row)| match row {
-                    Row::Session(s, true) => {
-                        if let Some(wt) = &s.worktree
-                            && self.snapshot.trees.values().any(|list| list.contains(wt))
-                        {
-                            self.expanded_cards.contains(wt) || cursor_in_wt.as_ref() == Some(wt)
-                        } else {
-                            true
-                        }
-                    }
-                    _ => true,
-                })
+                .filter(|(i, _)| self.session_card_index(*i).is_none())
                 .map(|(i, row)| self.render_row_with_menu(i, &row, cx))
                 .collect();
             #[cfg(test)]
             {
-                self.rendered_rows += items.len();
+                self.rendered_rows += items.len() + nested_rows.len();
             }
             div()
                 .id("worktree-list")
@@ -2409,19 +2574,8 @@ impl Sidebar {
         &self,
         cx: &mut Context<Self>,
     ) -> Option<gpui::Stateful<gpui::Div>> {
-        let state_dir = self
-            .path
-            .as_deref()
-            .and_then(std::path::Path::parent)
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(PathBuf::from)
-            .or_else(|| crate::settings::state_dir(cx))?;
-        let summary = self
-            .snapshot
-            .trees
-            .keys()
-            .map(|repo| krill_proto::orchestration::inspect_repo_hooks(repo, Some(&state_dir)))
-            .find(krill_proto::orchestration::RepoHookSummary::should_show_setup_prompt)?;
+        let state_dir = self.setup_prompt_dir(cx)?;
+        let summary = self.setup_prompt.summary.as_ref()?;
         let script = summary.suggested_setup.clone()?;
         let source = summary
             .suggested_source
@@ -2488,18 +2642,13 @@ impl Sidebar {
                                 .xsmall()
                                 .label(crate::i18n::catalog::worktree::PROMPT_ENABLE.get())
                                 .debug_selector(|| "setup-prompt-enable".into())
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    let key = enable_key.clone();
-                                    let script = enable_script.clone();
-                                    krill_proto::orchestration::WorktreeStore::mutate(
-                                        &enable_dir,
-                                        |store| {
-                                            store.set_setup_script(&key, &script)?;
-                                            Ok(())
-                                        },
-                                    )
-                                    .ok();
-                                    cx.notify();
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    s.save_setup_prompt(
+                                        enable_dir.clone(),
+                                        enable_key.clone(),
+                                        Some(enable_script.clone()),
+                                        cx,
+                                    );
                                 })),
                         )
                         .child(
@@ -2521,17 +2670,13 @@ impl Sidebar {
                                 .xsmall()
                                 .label(crate::i18n::catalog::worktree::PROMPT_DISMISS.get())
                                 .debug_selector(|| "setup-prompt-dismiss".into())
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    let key = dismiss_key.clone();
-                                    krill_proto::orchestration::WorktreeStore::mutate(
-                                        &dismiss_dir,
-                                        |store| {
-                                            store.set_setup_prompt_dismissed(&key, true);
-                                            Ok(())
-                                        },
-                                    )
-                                    .ok();
-                                    cx.notify();
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    s.save_setup_prompt(
+                                        dismiss_dir.clone(),
+                                        dismiss_key.clone(),
+                                        None,
+                                        cx,
+                                    );
                                 })),
                         ),
                 ),
@@ -2541,6 +2686,8 @@ impl Sidebar {
 
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.ensure_external_polling(cx);
+        self.ensure_setup_prompt_polling(cx);
         if self.orca_import_subscription.is_none() {
             self.orca_import_subscription = Some(
                 cx.observe_global::<crate::orca_import::OrcaImportState>(|this, cx| {
