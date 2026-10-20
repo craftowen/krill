@@ -549,6 +549,8 @@ pub struct Panel {
     _observe: Subscription,
     review: comments::Review,
     viewed: std::collections::HashSet<Vec<u8>>,
+    /// 셸 메인 창 모드: 선택한 파일의 diff 본문을 패널 대신 화면 가운데에 그린다.
+    split_center: bool,
     editing: edit::State,
     checks: checks::State,
     #[cfg(test)]
@@ -632,6 +634,7 @@ impl Panel {
             _observe: observe,
             review: comments::Review::default(),
             viewed: std::collections::HashSet::new(),
+            split_center: false,
             editing,
             checks: checks::State::default(),
             #[cfg(test)]
@@ -639,6 +642,34 @@ impl Panel {
             #[cfg(test)]
             renders: 0,
         }
+    }
+
+    /// `true`면 우측 패널에는 변경 파일 목록·커밋 상자만 두고, 선택한 파일의 diff 본문은
+    /// 화면 가운데([`Self::render_center_diff`])에 그린다.
+    pub fn set_split_center(&mut self, split_center: bool) {
+        self.split_center = split_center;
+    }
+
+    /// 가운데에 그릴 선택된 변경 파일이 있는지.
+    #[must_use]
+    pub fn has_center_diff(&self) -> bool {
+        self.split_center
+            && self
+                .selected
+                .is_some_and(|idx| self.changes.files.get(idx).is_some())
+    }
+
+    /// 선택된 변경 파일과 패치 상태를 비워 가운데 diff 뷰를 닫는다.
+    pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        if self.selected.take().is_none() {
+            return;
+        }
+        self.pending_diff_path = None;
+        self.patch_gen = self.patch_gen.wrapping_add(1);
+        self.patch_task = None;
+        self.message = text::EMPTY.get().into();
+        self.state.update(cx, |s, cx| s.set_files([], cx));
+        cx.notify();
     }
 
     /// 파일별 diff 검토 완료(`Viewed`) 상태를 조회한다(#29269).
@@ -983,7 +1014,8 @@ impl Panel {
         path.display().to_string()
     }
 
-    /// 지정된 워크트리 내 상대 경로 파일의 Diff 뷰를 우측 패널(`Changes` 탭)에 연다(`krill file diff`).
+    /// 지정된 워크트리 내 상대 경로 파일의 Diff 뷰를 연다(`krill file diff`). `Changes` 탭을 선택하고,
+    /// 가운데 diff 모드([`Self::set_split_center`])면 본문은 화면 가운데에 그린다.
     pub fn open_diff_file(
         &mut self,
         repo: PathBuf,
@@ -1533,6 +1565,9 @@ impl Panel {
             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                 if e.click_count() >= 2 {
                     this.open_file_preview = false;
+                    if this.split_center {
+                        this.clear_selection(cx);
+                    }
                     cx.emit(OpenFile(open.clone()));
                 } else {
                     this.select(i, cx);
@@ -1562,6 +1597,9 @@ impl Panel {
                     move |_, _, cx| {
                         weak.update(cx, |this, cx| {
                             this.open_file_preview = false;
+                            if this.split_center {
+                                this.clear_selection(cx);
+                            }
                             cx.emit(OpenFile(full.clone()));
                         })
                         .ok();
@@ -1653,6 +1691,293 @@ impl Panel {
                 )
             })
     }
+    /// 선택된 변경 파일의 헤더·diff 본문. `center`면 화면 가운데용 헤더(에디터로 열기·닫기)를 붙인다.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "diff 헤더의 hunk·줄 단위 스테이징, 보기 모드, 확인됨·닫기 버튼을 한 곳에서 그린다"
+    )]
+    fn render_selected_diff_body(
+        &mut self,
+        file: &ChangedFile,
+        center: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let p = crate::ui::palette(cx);
+        let code = status_code(file.status, self.comparison);
+        let color = crate::ui::git_status_color(file.status, cx);
+        let path_bytes = file.path.clone();
+        let viewed_label = if self.is_file_viewed(&path_bytes) {
+            format!("✓ {}", text::VIEWED.get())
+        } else {
+            text::VIEWED.get().to_owned()
+        };
+        let full_path = String::from_utf8_lossy(&file.path).into_owned();
+        let open_path = self.repo.join(OsStr::from_bytes(&file.path));
+        let mode = self.diff_mode(cx);
+        let hunk_count = self.hunk_count();
+        let active_hunk = self.resolved_hunk_index(cx);
+        let has_selected_lines = self.state.read(cx).selected_lines().is_some();
+        let can_patch = file.status != *b"??" && hunk_count > 0 && !self.editing.busy;
+        let header = div()
+            .h(if center {
+                crate::ui::TAB_BAR_HEIGHT
+            } else {
+                px(26.)
+            })
+            .px_2p5()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .bg(p.sidebar)
+            .border_b_1()
+            .border_color(if center { p.border } else { p.sidebar_border })
+            .child(
+                div()
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_2XS)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(color)
+                    .child(code),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(crate::ui::FONT_MONO)
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(if center {
+                        p.foreground
+                    } else {
+                        p.sidebar_foreground
+                    })
+                    .child(full_path),
+            )
+            .when(can_patch && self.comparison == Comparison::Worktree, |d| {
+                d.child(
+                    Button::new("diff-stage-hunk")
+                        .debug_selector(|| "diff-stage-hunk".into())
+                        .xsmall()
+                        .ghost()
+                        .label(text::STAGE_HUNK.get())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.stage_hunk(active_hunk, cx);
+                        })),
+                )
+                .child(
+                    Button::new("diff-discard-hunk")
+                        .debug_selector(|| "diff-discard-hunk".into())
+                        .xsmall()
+                        .ghost()
+                        .label(text::DISCARD_HUNK.get())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.discard_hunk(active_hunk, cx);
+                        })),
+                )
+                .when(has_selected_lines, |d| {
+                    d.child(
+                        Button::new("diff-stage-line")
+                            .debug_selector(|| "diff-stage-line".into())
+                            .xsmall()
+                            .ghost()
+                            .label(text::STAGE_LINE.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.stage_selected_lines(cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("diff-discard-line")
+                            .debug_selector(|| "diff-discard-line".into())
+                            .xsmall()
+                            .ghost()
+                            .label(text::DISCARD_LINE.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discard_selected_lines(cx);
+                            })),
+                    )
+                })
+            })
+            .when(can_patch && self.comparison == Comparison::Index, |d| {
+                d.child(
+                    Button::new("diff-unstage-hunk")
+                        .debug_selector(|| "diff-unstage-hunk".into())
+                        .xsmall()
+                        .ghost()
+                        .label(text::UNSTAGE_HUNK.get())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.unstage_hunk(active_hunk, cx);
+                        })),
+                )
+                .when(has_selected_lines, |d| {
+                    d.child(
+                        Button::new("diff-unstage-line")
+                            .debug_selector(|| "diff-unstage-line".into())
+                            .xsmall()
+                            .ghost()
+                            .label(text::UNSTAGE_LINE.get())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.unstage_selected_lines(cx);
+                            })),
+                    )
+                })
+            })
+            .child(
+                div()
+                    .id("diff-view-mode")
+                    .debug_selector(|| "diff-view-mode".into())
+                    .flex()
+                    .items_center()
+                    .gap_0p5()
+                    .child(
+                        Button::new("diff-view-unified")
+                            .debug_selector(|| "diff-view-unified".into())
+                            .xsmall()
+                            .label(text::VIEW_UNIFIED.get())
+                            .map(|b| {
+                                if mode == DiffMode::Unified {
+                                    b.primary()
+                                } else {
+                                    b.ghost()
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_diff_mode(DiffMode::Unified, cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("diff-view-split")
+                            .debug_selector(|| "diff-view-split".into())
+                            .xsmall()
+                            .label(text::VIEW_SPLIT.get())
+                            .map(|b| {
+                                if mode == DiffMode::Split {
+                                    b.primary()
+                                } else {
+                                    b.ghost()
+                                }
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_diff_mode(DiffMode::Split, cx);
+                            })),
+                    ),
+            )
+            .child(
+                Button::new("diff-file-viewed")
+                    .debug_selector(|| "diff-file-viewed".into())
+                    .label(viewed_label)
+                    .xsmall()
+                    .ghost()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_file_viewed(&path_bytes, cx);
+                    })),
+            )
+            .when(center, |d| {
+                d.child(
+                    Button::new("diff-open-editor")
+                        .debug_selector(|| "diff-open-editor".into())
+                        .label(text::OPEN_IN_EDITOR.get())
+                        .xsmall()
+                        .ghost()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_file_preview = false;
+                            this.clear_selection(cx);
+                            cx.emit(OpenFile(open_path.clone()));
+                        })),
+                )
+                .child(
+                    Button::new("diff-close")
+                        .debug_selector(|| "diff-close".into())
+                        .icon(IconName::Close)
+                        .xsmall()
+                        .ghost()
+                        .tooltip(text::CLOSE_DIFF.get())
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.clear_selection(cx);
+                        })),
+                )
+            });
+        let weak = cx.entity().downgrade();
+        let content = if self.message.is_empty() {
+            div()
+                .id("diff-viewer")
+                .debug_selector(|| "diff-viewer".into())
+                .flex_1()
+                .min_h_0()
+                .child(Diff::new(&self.state).size_full().on_add_annotation(
+                    move |range, window, cx| {
+                        weak.update(cx, |this, cx| {
+                            this.begin_comment(range.clone(), window, cx);
+                        })
+                        .ok();
+                    },
+                ))
+                .into_any_element()
+        } else {
+            Self::render_empty_state(
+                "diff-empty-patch",
+                IconName::File,
+                &crate::i18n::cached_notice(&self.message),
+                "",
+                cx,
+            )
+            .into_any_element()
+        };
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .when(!center, |d| d.border_t_1().border_color(p.sidebar_border))
+            .child(header)
+            .child(content)
+            .when(center, |d| d.child(self.render_comments(window, cx)))
+            .into_any_element()
+    }
+
+    /// 선택된 변경 파일의 diff를 화면 가운데 작업 공간에 그린다(셸 메인 창, [`Self::set_split_center`]).
+    pub fn render_center_diff(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        if !self.has_center_diff() {
+            return None;
+        }
+        let file = self
+            .selected
+            .and_then(|idx| self.changes.files.get(idx).cloned())?;
+        let p = crate::ui::palette(cx);
+        let body = self.render_selected_diff_body(&file, true, window, cx);
+        Some(
+            div()
+                .id("center-diff-view")
+                .debug_selector(|| "center-diff-view".into())
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .occlude()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .min_h_0()
+                .font_family(crate::ui::FONT_UI)
+                .bg(p.background)
+                .text_color(p.foreground)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// 패널 안에 리뷰 코멘트 상자를 그릴지. 가운데 diff가 열려 있으면 코멘트는 가운데에 그린다.
+    fn panel_comments_visible(&self) -> bool {
+        if self.has_center_diff() {
+            return false;
+        }
+        (!self.split_center && self.selected.is_some()) || self.review.has_active_ui()
+    }
 }
 
 impl Render for Panel {
@@ -1737,10 +2062,9 @@ impl Render for Panel {
                 .text_color(p.sidebar_foreground)
                 .child(top_bar)
                 .child(body)
-                .when(
-                    self.selected.is_some() || self.review.has_active_ui(),
-                    |d| d.child(self.render_comments(window, cx)),
-                );
+                .when(self.panel_comments_visible(), |d| {
+                    d.child(self.render_comments(window, cx))
+                });
         }
 
         let comparison_bar = self.render_comparison_bar(cx);
@@ -1766,10 +2090,9 @@ impl Render for Panel {
                 .child(comparison_bar)
                 .child(editor)
                 .child(empty_clean)
-                .when(
-                    self.selected.is_some() || self.review.has_active_ui(),
-                    |d| d.child(self.render_comments(window, cx)),
-                );
+                .when(self.panel_comments_visible(), |d| {
+                    d.child(self.render_comments(window, cx))
+                });
         }
 
         let selected_file = self
@@ -1799,217 +2122,39 @@ impl Render for Panel {
             }),
         )
         .track_scroll(&self.scroll)
-        .h(px(176.))
         .py_1()
-        .flex_none();
-
-        let weak = cx.entity().downgrade();
-        let bottom = match selected_file {
-            None => Self::render_empty_state(
-                "diff-empty-unselected",
-                IconName::FileText,
-                text::EMPTY.get(),
-                "",
-                cx,
-            )
-            .into_any_element(),
-            Some(file) => {
-                let code = status_code(file.status, self.comparison);
-                let color = crate::ui::git_status_color(file.status, cx);
-                let path_bytes = file.path.clone();
-                let viewed_label = if self.is_file_viewed(&path_bytes) {
-                    format!("✓ {}", text::VIEWED.get())
-                } else {
-                    text::VIEWED.get().to_owned()
-                };
-                let full_path = String::from_utf8_lossy(&file.path).into_owned();
-                let mode = self.diff_mode(cx);
-                let hunk_count = self.hunk_count();
-                let active_hunk = self.resolved_hunk_index(cx);
-                let has_selected_lines = self.state.read(cx).selected_lines().is_some();
-                let can_patch = file.status != *b"??" && hunk_count > 0 && !self.editing.busy;
-                let header = div()
-                    .h(px(26.))
-                    .px_2p5()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .bg(p.sidebar)
-                    .border_b_1()
-                    .border_color(p.sidebar_border)
-                    .child(
-                        div()
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_2XS)
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(color)
-                            .child(code),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .font_family(crate::ui::FONT_MONO)
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(p.sidebar_foreground)
-                            .child(full_path),
-                    )
-                    .when(can_patch && self.comparison == Comparison::Worktree, |d| {
-                        d.child(
-                            Button::new("diff-stage-hunk")
-                                .debug_selector(|| "diff-stage-hunk".into())
-                                .xsmall()
-                                .ghost()
-                                .label(text::STAGE_HUNK.get())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.stage_hunk(active_hunk, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("diff-discard-hunk")
-                                .debug_selector(|| "diff-discard-hunk".into())
-                                .xsmall()
-                                .ghost()
-                                .label(text::DISCARD_HUNK.get())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.discard_hunk(active_hunk, cx);
-                                })),
-                        )
-                        .when(has_selected_lines, |d| {
-                            d.child(
-                                Button::new("diff-stage-line")
-                                    .debug_selector(|| "diff-stage-line".into())
-                                    .xsmall()
-                                    .ghost()
-                                    .label(text::STAGE_LINE.get())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.stage_selected_lines(cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("diff-discard-line")
-                                    .debug_selector(|| "diff-discard-line".into())
-                                    .xsmall()
-                                    .ghost()
-                                    .label(text::DISCARD_LINE.get())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.discard_selected_lines(cx);
-                                    })),
-                            )
-                        })
-                    })
-                    .when(can_patch && self.comparison == Comparison::Index, |d| {
-                        d.child(
-                            Button::new("diff-unstage-hunk")
-                                .debug_selector(|| "diff-unstage-hunk".into())
-                                .xsmall()
-                                .ghost()
-                                .label(text::UNSTAGE_HUNK.get())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.unstage_hunk(active_hunk, cx);
-                                })),
-                        )
-                        .when(has_selected_lines, |d| {
-                            d.child(
-                                Button::new("diff-unstage-line")
-                                    .debug_selector(|| "diff-unstage-line".into())
-                                    .xsmall()
-                                    .ghost()
-                                    .label(text::UNSTAGE_LINE.get())
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.unstage_selected_lines(cx);
-                                    })),
-                            )
-                        })
-                    })
-                    .child(
-                        div()
-                            .id("diff-view-mode")
-                            .debug_selector(|| "diff-view-mode".into())
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .child(
-                                Button::new("diff-view-unified")
-                                    .debug_selector(|| "diff-view-unified".into())
-                                    .xsmall()
-                                    .label(text::VIEW_UNIFIED.get())
-                                    .map(|b| {
-                                        if mode == DiffMode::Unified {
-                                            b.primary()
-                                        } else {
-                                            b.ghost()
-                                        }
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_diff_mode(DiffMode::Unified, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("diff-view-split")
-                                    .debug_selector(|| "diff-view-split".into())
-                                    .xsmall()
-                                    .label(text::VIEW_SPLIT.get())
-                                    .map(|b| {
-                                        if mode == DiffMode::Split {
-                                            b.primary()
-                                        } else {
-                                            b.ghost()
-                                        }
-                                    })
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.set_diff_mode(DiffMode::Split, cx);
-                                    })),
-                            ),
-                    )
-                    .child(
-                        Button::new("diff-file-viewed")
-                            .debug_selector(|| "diff-file-viewed".into())
-                            .label(viewed_label)
-                            .xsmall()
-                            .ghost()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.toggle_file_viewed(&path_bytes, cx);
-                            })),
-                    );
-                let content = if self.message.is_empty() {
-                    div()
-                        .id("diff-viewer")
-                        .debug_selector(|| "diff-viewer".into())
-                        .flex_1()
-                        .min_h_0()
-                        .child(Diff::new(&self.state).size_full().on_add_annotation(
-                            move |range, window, cx| {
-                                weak.update(cx, |this, cx| {
-                                    this.begin_comment(range.clone(), window, cx);
-                                })
-                                .ok();
-                            },
-                        ))
-                        .into_any_element()
-                } else {
-                    Self::render_empty_state(
-                        "diff-empty-patch",
-                        IconName::File,
-                        &crate::i18n::cached_notice(&self.message),
-                        "",
-                        cx,
-                    )
-                    .into_any_element()
-                };
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .flex()
-                    .flex_col()
-                    .border_t_1()
-                    .border_color(p.sidebar_border)
-                    .child(header)
-                    .child(content)
-                    .into_any_element()
+        .map(|l| {
+            // 가운데 diff 모드면 본문이 패널에 없으므로 파일 목록이 남는 높이를 채운다.
+            if self.split_center {
+                l.flex_1().min_h_0()
+            } else {
+                l.h(px(176.)).flex_none()
             }
+        });
+
+        let bottom = if self.split_center {
+            (!has_visible_files).then(|| {
+                Self::render_empty_state(
+                    "diff-empty-unselected",
+                    IconName::FileText,
+                    text::NO_PATCH.get(),
+                    "",
+                    cx,
+                )
+                .into_any_element()
+            })
+        } else {
+            Some(match selected_file {
+                None => Self::render_empty_state(
+                    "diff-empty-unselected",
+                    IconName::FileText,
+                    text::EMPTY.get(),
+                    "",
+                    cx,
+                )
+                .into_any_element(),
+                Some(file) => self.render_selected_diff_body(&file, false, window, cx),
+            })
         };
 
         div()
@@ -2036,11 +2181,10 @@ impl Render for Panel {
                         .child(text::LIMITED.get()),
                 )
             })
-            .child(bottom)
-            .when(
-                self.selected.is_some() || self.review.has_active_ui(),
-                |d| d.child(self.render_comments(window, cx)),
-            )
+            .children(bottom)
+            .when(self.panel_comments_visible(), |d| {
+                d.child(self.render_comments(window, cx))
+            })
     }
 }
 
