@@ -1,3 +1,4 @@
+// Orca mobile conversation/tool disclosure reference: MIT, Copyright (c) 2026 Lovecast Inc.
 (()=>{const M=globalThis.KrillMobile||={};M.screens||={};
 function renderRichText(el,text){
  const wrap=el('div',undefined,'chat-md');
@@ -112,8 +113,8 @@ function mountChat(root,opts){
    let card=cards.get(key);
    if(!card){card=renderCard(item);card.dataset.chatId=key;cards.set(key,card);}
    if(item.kind==='tool_call'||item.kind==='tool_result'){
-    if(!run){let group=toolRuns.get(key);if(!group){const details=el('details',undefined,'chat-tool-run'),summary=el('summary',undefined,'chat-tool-summary'),body=el('div',undefined,'chat-tool-items');details.append(summary,body);group={details,summary,body};toolRuns.set(key,group);}run={...group,key,nodes:[],names:new Set(),count:0};wantedRuns.add(key);nodes.push(run.details);}
-    run.nodes.push(card);if(item.kind==='tool_call'){run.count++;if(item.tool_name)run.names.add(item.tool_name);}run.summary.textContent=`${t('Tool activity')} · ${run.count||run.nodes.length}${run.names.size?' · '+[...run.names].join(', '):''}`;
+    if(!run){let group=toolRuns.get(key);if(!group){const details=el('details',undefined,'chat-tool-run'),summary=el('summary',undefined,'chat-tool-summary'),body=el('div',undefined,'chat-tool-items');details.append(summary,body);group={details,summary,body};toolRuns.set(key,group);}run={...group,key,nodes:[],names:new Set(),count:0,errors:0};wantedRuns.add(key);nodes.push(run.details);}
+    run.nodes.push(card);if(item.is_error)run.errors++;if(item.kind==='tool_call'){run.count++;if(item.tool_name)run.names.add(item.tool_name);}run.summary.textContent=`${t(run.errors?'Tool error':'Tool activity')} · ${run.count||run.nodes.length}${run.names.size?' · '+[...run.names].join(', '):''}`;
     const at=run.body.children?.[run.nodes.length-1];if(at!==card)run.body.insertBefore(card,at||null);
    }else{run=null;nodes.push(card);}
   }
