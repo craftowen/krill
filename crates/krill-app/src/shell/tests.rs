@@ -4172,7 +4172,7 @@ fn handoff_delivery_times_out_without_session(cx: &mut TestAppContext) {
 #[gpui::test]
 fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) {
     use krill_proto::SessionId;
-    use krill_proto::control::{AgentState, AgentStatus};
+    use krill_proto::control::{AgentState, AgentStatus, Create};
     use std::sync::Arc;
 
     struct Memory(sidebar::Snapshot);
@@ -4203,6 +4203,19 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
             let panes: Vec<_> = s.layout.tabs().iter().map(|t| t.focused).collect();
+            // 제목·상태 점을 함께 비교할 탭들은 같은 워크스페이스에 둔다.
+            for pane in &panes {
+                s.layout.set_launch(
+                    *pane,
+                    Create {
+                        account: None,
+                        program: Program::Login,
+                        cwd: b"/Users/alice/project".to_vec(),
+                        cols: 80,
+                        rows: 24,
+                    },
+                );
+            }
             for (pane, id) in panes.iter().skip(1).zip(1..=3) {
                 s.layout.set_session(*pane, SessionId(id));
             }
@@ -4214,6 +4227,7 @@ fn tab_titles_share_sidebar_rule_and_number_duplicates(cx: &mut TestAppContext) 
     cx.run_until_parked();
     let labels = cx.update(|_, cx| {
         let s = view.read(cx);
+        assert_eq!(s.workspace_tabs(cx), vec![0, 1, 2, 3]);
         s.layout
             .tabs()
             .iter()
