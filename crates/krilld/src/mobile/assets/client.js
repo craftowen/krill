@@ -10,13 +10,16 @@
  // Pairing input is consumed once, before UI routing or networking.
  function bootstrap(){
   const match=/^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname),fixed=!!match,hash=match?.[1];
-  const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1)),ticket=fragment.get('pair'),secret=fragment.get('key'),pair=ticket&&secret?{ticket,secret}:null;
-  const auth=parameters.get('auth'),sensitive=['pair','key','t','r'],consumed=sensitive.some(key=>fragment.has(key));for(const key of [...sensitive,'auth'])parameters.delete(key);
-  history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?(pair?'#/pair-confirm':''):location.hash));
+  const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1)),ticket=fragment.get('pair'),secret=fragment.get('key');
   const STORE='minikrill-mobile-v2',HOSTS='krill-mobile-hosts-v1';
   let saved,book;try{saved=JSON.parse(localStorage.getItem(STORE)||'null');}catch{saved=null;}
   try{book=JSON.parse(localStorage.getItem(HOSTS)||'null');}catch{}const hosts=Array.isArray(book?.hosts)?book.hosts.filter(h=>typeof h?.id==='string'&&typeof h.device_id==='string'&&typeof h.credential==='string'):[];
-  let active=hosts.find(h=>h.id===book?.active)||null;if(active)saved=active;let credentials=pair?null:saved,directOrigin=location.origin,destinationFixed=fixed;
+  let active=hosts.find(h=>h.id===book?.active)||null;if(active)saved=active;
+  // Home Screen relaunches reuse the saved device, even though the start URL contains a spent ticket.
+  const pair=ticket&&secret&&!(fragment.has('install')&&saved?.credential)?{ticket,secret}:null;
+  const auth=parameters.get('auth'),sensitive=['pair','key','t','r','install'],consumed=sensitive.some(key=>fragment.has(key));for(const key of [...sensitive,'auth'])parameters.delete(key);
+  history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?(pair?'#/pair-confirm':''):location.hash));
+  let credentials=pair?null:saved,directOrigin=location.origin,destinationFixed=fixed;
   const hostId=c=>c.rid?'relay:'+c.rid:c.url?'tunnel:'+c.url:'direct:'+(c.origin||location.origin);
   let storageFailed=false;const persist=()=>{try{localStorage.setItem(HOSTS,JSON.stringify({active:active?.id||null,hosts}));storageFailed=false;}catch{storageFailed=true;}};
   // Preserve the legacy credential during migration.
