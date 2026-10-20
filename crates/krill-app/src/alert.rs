@@ -108,12 +108,6 @@ struct AlertState {
     notified: HashMap<SessionId, (AgentState, u64)>,
     /// 현재 알림 센터에 게시돼 있는 세션 집합.
     active_tags: HashSet<SessionId>,
-    /// 세션별 알림 음소거 집합(#28312, #28289).
-    muted_sessions: HashSet<SessionId>,
-    /// 워크트리(폴더)별 알림 음소거 집합(#28312, #28289).
-    muted_worktrees: HashSet<std::path::PathBuf>,
-    /// 오케스트레이션 워커로 실행 중인 세션 집합(#30058: 일반 작업 완료 알림 억제).
-    orchestration_workers: HashSet<SessionId>,
     /// 마지막 스냅샷의 `Needs You`(`Waiting` | `Blocked`) 세션 수.
     needs_you_count: usize,
     /// 마지막 스냅샷의 `Working` 세션 수.
@@ -129,69 +123,11 @@ struct AlertState {
 
 impl Global for AlertState {}
 
-fn is_session_or_worktree_muted(state: &AlertState, session: &Session) -> bool {
-    state.muted_sessions.contains(&session.id)
-        || session
-            .worktree
-            .as_deref()
-            .or(session.cwd.as_deref())
-            .is_some_and(|p| state.muted_worktrees.contains(p))
-}
-
 fn ensure_state(cx: &mut App) {
     if cx.try_global::<AlertState>().is_none() {
         cx.set_app_identity(krill_proto::daemon::BUNDLE_ID, "Krill");
         cx.set_global(AlertState::default());
     }
-}
-
-/// 특정 세션의 알림·배지 음소거 상태를 설정한다(#28312, #28289).
-pub fn set_session_muted(id: SessionId, muted: bool, cx: &mut App) {
-    ensure_state(cx);
-    let state = cx.global_mut::<AlertState>();
-    if muted {
-        state.muted_sessions.insert(id);
-    } else {
-        state.muted_sessions.remove(&id);
-    }
-    if muted {
-        dismiss(id, cx);
-    }
-}
-
-/// 특정 세션이 음소거 상태인지 확인한다(#28312).
-#[must_use]
-pub fn is_session_muted(id: SessionId, cx: &App) -> bool {
-    cx.try_global::<AlertState>()
-        .is_some_and(|state| state.muted_sessions.contains(&id))
-}
-
-/// 특정 워크트리(폴더)의 알림·배지 음소거 상태를 설정한다(#28312, #28289).
-pub fn set_worktree_muted(worktree: impl Into<std::path::PathBuf>, muted: bool, cx: &mut App) {
-    ensure_state(cx);
-    let path = worktree.into();
-    let state = cx.global_mut::<AlertState>();
-    if muted {
-        state.muted_worktrees.insert(path);
-    } else {
-        state.muted_worktrees.remove(&path);
-    }
-}
-
-/// 특정 워크트리(폴더)가 음소거 상태인지 확인한다(#28312).
-#[must_use]
-pub fn is_worktree_muted(worktree: &Path, cx: &App) -> bool {
-    cx.try_global::<AlertState>()
-        .is_some_and(|state| state.muted_worktrees.contains(worktree))
-}
-
-/// 오케스트레이션 워커 세션 목록을 갱신한다(#30058: 워커 세션의 일반 `Done` 알림을 억제한다).
-pub fn set_orchestration_worker_sessions(
-    sessions: impl IntoIterator<Item = SessionId>,
-    cx: &mut App,
-) {
-    ensure_state(cx);
-    cx.global_mut::<AlertState>().orchestration_workers = sessions.into_iter().collect();
 }
 
 /// 알림 클릭 시 해당 세션의 pane으로 포커스를 옮기도록 `Sidebar`에 리스너를 등록한다.
@@ -233,7 +169,6 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
         for session in &snapshot.sessions {
             present.insert(session.id);
             let prev = state.seen.insert(session.id, session.status.state);
-            let muted = is_session_or_worktree_muted(state, session);
             match session.status.state {
                 AgentState::Working => {
                     working += 1;
@@ -243,14 +178,11 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                     }
                 }
                 AgentState::Waiting | AgentState::Blocked => {
-                    if !muted {
-                        needs_you += 1;
-                    }
+                    needs_you += 1;
                     let key = (session.status.state, session.status.since_unix_ns);
                     if state.notified.get(&session.id) != Some(&key) {
                         state.notified.insert(session.id, key);
-                        if !muted
-                            && should_notify(&cfg, AlertEvent::InputWait)
+                        if should_notify(&cfg, AlertEvent::InputWait)
                             && initialized
                             && !suppress_notification(
                                 cfg.notify_only_inactive,
@@ -265,16 +197,13 @@ pub fn sync_snapshot(snapshot: &Snapshot, cx: &mut App) {
                 }
                 AgentState::Done => {
                     let key = (session.status.state, session.status.since_unix_ns);
-                    let is_worker = state.orchestration_workers.contains(&session.id);
                     // Working→Done뿐 아니라 Waiting·Blocked→Done(폴링 사이 전이)도 알린다.
                     // 같은 Done 스냅샷 반복은 notified 기록으로 걸러진다.
                     if prev.is_some_and(|old| old != AgentState::Done)
                         && state.notified.get(&session.id) != Some(&key)
                     {
                         state.notified.insert(session.id, key);
-                        if !muted
-                            && !is_worker
-                            && should_notify(&cfg, AlertEvent::Done)
+                        if should_notify(&cfg, AlertEvent::Done)
                             && initialized
                             && !suppress_notification(
                                 cfg.notify_only_inactive,
@@ -421,7 +350,6 @@ pub fn notify_bell(id: SessionId, label: &str, cx: &mut App) {
     let suppressed = {
         let state = cx.global::<AlertState>();
         state.active_tags.contains(&id)
-            || state.muted_sessions.contains(&id)
             || suppress_notification(
                 cfg.notify_only_inactive,
                 state.focused == Some(id),
