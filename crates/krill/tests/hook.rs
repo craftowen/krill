@@ -68,32 +68,28 @@ struct Run {
 
 const PIPE_PREFILL: usize = 16 * 1024;
 
-/// `input`을 파이프에 미리 채워 두고(작은 입력은 EOF까지 닫은 채) `krill hook`을 띄운다(`None`이면 끝날 때까지 열어 둔다).
+/// 입력을 준비한 뒤 `krill hook`을 띄운다(`None`이면 파이프를 끝날 때까지 열어 둔다).
 fn hook(state: &Path, input: Option<&[u8]>) -> Run {
     let (rx, mut tx) = std::io::pipe().unwrap();
-    // 과대 입력은 앞 청크를 커널 파이프 버퍼에 먼저 채우고 쓰기 스레드가 깨어난 뒤에 자식 프로세스를 띄운다(OWE-533).
-    // `None`이면 끝날 때까지 쥐고 있는다(map 클로저로 옮기면 None일 때 바로 닫힌다).
-    let (writer, _open) = match input {
+    let (stdin, _open) = match input {
         Some(b) if b.len() <= PIPE_PREFILL => {
             tx.write_all(b).unwrap();
             drop(tx);
-            (None, None)
+            (Stdio::from(rx), None)
         }
         Some(b) => {
-            tx.write_all(&b[..PIPE_PREFILL]).unwrap();
-            let rest = b[PIPE_PREFILL..].to_vec();
-            let (ready_tx, ready_rx) = mpsc::sync_channel(0);
-            let w = thread::spawn(move || {
-                ready_tx.send(()).unwrap();
-                tx.write_all(&rest).ok();
-            });
-            ready_rx.recv().unwrap();
-            (Some(w), None)
+            // 넘침 검증용 입력 전체를 먼저 준비한다. 쓰기 스레드가 10ms 안에 스케줄되지 않으면
+            // 파이프 입력은 정상적으로 TimedOut이 되어 크기 제한 검증과 혼동된다.
+            let path = state.join("stdin-fixture");
+            fs::write(&path, b).unwrap();
+            let input = fs::File::open(&path).unwrap();
+            fs::remove_file(path).unwrap();
+            (Stdio::from(input), None)
         }
-        None => (None, Some(tx)),
+        None => (Stdio::from(rx), Some(tx)),
     };
     let start = Instant::now();
-    let mut child = spawn(state, Stdio::from(rx));
+    let mut child = spawn(state, stdin);
     let mut out = child.stdout.take().unwrap();
     let mut first = [0u8; 1];
     out.read_exact(&mut first).unwrap();
@@ -102,9 +98,6 @@ fn hook(state: &Path, input: Option<&[u8]>) -> Run {
     out.read_to_end(&mut stdout).unwrap();
     let status = child.wait().unwrap();
     let elapsed = start.elapsed();
-    if let Some(w) = writer {
-        w.join().unwrap();
-    }
     Run {
         stdout,
         ok: status.success(),
