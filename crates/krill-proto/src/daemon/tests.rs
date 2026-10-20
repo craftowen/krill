@@ -383,9 +383,28 @@ fn preflight_validates_executable() {
         const EPERM: i32 = 1;
         let corrupt = d.join("corrupt");
         let mut bytes = std::fs::read(std::env::current_exe().unwrap()).unwrap();
-        for b in bytes.iter_mut().skip(8192).step_by(16384) {
-            *b ^= 0xff;
+        // 임의 간격의 바이트는 최적화 빌드에서 실행하지 않는 페이지에 놓일 수 있다.
+        // Mach-O 64의 LC_MAIN entryoff를 찾아 반드시 실행되는 코드 페이지 해시를 깨뜨린다.
+        assert_eq!(
+            u32::from_le_bytes(bytes[..4].try_into().unwrap()),
+            0xfeed_facf
+        );
+        let ncmds = u32::from_le_bytes(bytes[16..20].try_into().unwrap());
+        let mut offset = 32;
+        let mut entry = None;
+        for _ in 0..ncmds {
+            let command = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+            let size = u32::from_le_bytes(bytes[offset + 4..offset + 8].try_into().unwrap());
+            if command == 0x8000_0028 {
+                entry = Some(u64::from_le_bytes(
+                    bytes[offset + 8..offset + 16].try_into().unwrap(),
+                ));
+                break;
+            }
+            offset += usize::try_from(size).unwrap();
         }
+        let entry = usize::try_from(entry.expect("native test binary has LC_MAIN")).unwrap();
+        bytes[entry] ^= 0xff;
         std::fs::write(&corrupt, &bytes).unwrap();
         std::fs::set_permissions(&corrupt, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(preflight(&corrupt).unwrap_err().raw_os_error(), Some(EPERM));
