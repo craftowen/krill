@@ -1640,6 +1640,7 @@ pub enum AdminTab {
     Accounts,
     Agents,
     Ssh,
+    RemoteKrill,
     Workflows,
     Shortcuts,
     Resources,
@@ -1647,15 +1648,16 @@ pub enum AdminTab {
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
-gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone]);
+gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor]);
 
 impl AdminTab {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::General,
         Self::Terminal,
         Self::Accounts,
         Self::Agents,
         Self::Ssh,
+        Self::RemoteKrill,
         Self::Workflows,
         Self::Shortcuts,
         Self::Mobile,
@@ -1669,6 +1671,7 @@ impl AdminTab {
             Self::Accounts => "admin-tab-accounts",
             Self::Agents => "admin-tab-agents",
             Self::Ssh => "admin-tab-ssh",
+            Self::RemoteKrill => "admin-tab-remote-krill",
             Self::Workflows => "admin-tab-workflows",
             Self::Shortcuts => "admin-tab-shortcuts",
             Self::Resources => "admin-tab-resources",
@@ -1683,6 +1686,7 @@ impl AdminTab {
             Self::Accounts => text::TAB_ACCOUNTS.get(),
             Self::Agents => text::TAB_AGENTS.get(),
             Self::Ssh => text::TAB_SSH.get(),
+            Self::RemoteKrill => text::TAB_REMOTE_KRILL.get(),
             Self::Workflows => text::TAB_WORKFLOWS.get(),
             Self::Shortcuts => text::TAB_SHORTCUTS.get(),
             Self::Resources => text::TAB_RESOURCES.get(),
@@ -1697,6 +1701,7 @@ impl AdminTab {
             Self::Accounts => text::TAB_ACCOUNTS_DESC,
             Self::Agents => text::AGENTS_DESC,
             Self::Ssh => text::TAB_SSH_DESC,
+            Self::RemoteKrill => text::TAB_REMOTE_KRILL_DESC,
             Self::Workflows => text::TAB_WORKFLOWS_DESC,
             Self::Shortcuts => text::SHORTCUTS_DESC,
             Self::Resources => text::TAB_RESOURCES_DESC,
@@ -1717,6 +1722,7 @@ impl AdminTab {
             Self::Accounts => IconName::User,
             Self::Agents => IconName::Bot,
             Self::Ssh => IconName::Server,
+            Self::RemoteKrill => IconName::Monitor,
             Self::Workflows => IconName::Cpu,
             Self::Shortcuts => IconName::Keyboard,
             Self::Resources => IconName::CircleCheck,
@@ -1724,7 +1730,7 @@ impl AdminTab {
         }
     }
 
-    /// 그릴 탭 아이콘. `Keyboard`·`Server`·`Smartphone`은 기본 번들(`gpui_kit_assets::Assets`)에 없어 경로로 그리면
+    /// 그릴 탭 아이콘. `Keyboard`·`Server`·`Smartphone`·`Monitor`는 기본 번들(`gpui_kit_assets::Assets`)에 없어 경로로 그리면
     /// 빈 칸이 된다(OWE-704 실화면 QA) → 그것만 [`TabIcons`]에서 SVG를 직접 싣는다.
     pub fn icon_element(self) -> gpui_component::Icon {
         use gpui::AssetSource as _;
@@ -2275,6 +2281,7 @@ pub struct SettingsView {
     _observe: Subscription,
     tab: AdminTab,
     mobile: mobile::Panel,
+    remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
     accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     account_error: Option<SharedString>,
     /// 마지막 계정 갱신 때 데몬에 닿지 못했다. 로컬 파일을 읽기 전용으로 보이고 변경은 막는다(OWE-697).
@@ -2537,6 +2544,7 @@ impl SettingsView {
             }),
             tab: AdminTab::General,
             mobile: mobile::Panel::default(),
+            remote_krill: None,
             accounts_snapshot: krill_proto::usage::AccountsSnapshot::default(),
             account_error: None,
             accounts_offline: false,
@@ -8043,6 +8051,27 @@ impl SettingsView {
         skills_card
     }
 
+    fn render_remote_krill_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let Some(dir) = state_dir(cx) else {
+            return div().child(crate::ui::error_banner(
+                crate::ui::palette(cx),
+                crate::i18n::link_ui::ERR_UNAVAILABLE.get(),
+            ));
+        };
+        let view = self.remote_krill.get_or_insert_with(|| {
+            let executable = krill_proto::daemon::sibling_exe("krill-link")
+                .unwrap_or_else(|_| PathBuf::from("krill-link"));
+            let backend =
+                std::sync::Arc::new(crate::link_ui::real::RealLinkBackend::new(dir, executable));
+            cx.new(|cx| crate::link_ui::PairingView::new(backend, window, cx))
+        });
+        div().child(view.clone())
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "SSH 탭은 Tailscale 발견 기기·호스트 추가/편집 2열 폼·첫 연결 키 등록 도우미·호스트 목록 카드를 한 화면에 그린다"
@@ -8061,14 +8090,6 @@ impl SettingsView {
                 .child(layout::label(p, text::SSH_TITLE.get(), None))
                 .child(
                     layout::controls()
-                        .child(
-                            layout::secondary(
-                                "admin-link-pairing",
-                                crate::i18n::link_ui::CLIENT_TITLE.get(),
-                            )
-                            .debug_selector(|| "admin-link-pairing".into())
-                            .on_click(|_, _, cx| crate::link_ui::open_pairing(cx)),
-                        )
                         .child(
                             layout::secondary("admin-ssh-import", text::SSH_IMPORT.get())
                                 .debug_selector(|| "admin-ssh-import".into())
@@ -10393,6 +10414,7 @@ impl Render for SettingsView {
                     AdminTab::Terminal,
                     AdminTab::Shortcuts,
                     AdminTab::Ssh,
+                    AdminTab::RemoteKrill,
                 ],
             ),
             (
@@ -10657,6 +10679,7 @@ impl Render for SettingsView {
                 AdminTab::Accounts => self.render_accounts_tab(cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
                 AdminTab::Ssh => self.render_ssh_tab(window, cx),
+                AdminTab::RemoteKrill => self.render_remote_krill_tab(window, cx),
                 AdminTab::Workflows => self.render_workflows_tab(&s, window, cx),
                 // OWE-799: 단축키 탭은 카테고리 그룹·로컬 검색·인라인 기록을 위해 window를 받는다.
                 AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),

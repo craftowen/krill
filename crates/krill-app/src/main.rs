@@ -223,7 +223,6 @@ fn init(cx: &mut App) {
     gpui_component::init(cx);
     krill_app::ui::apply(gpui_component::ThemeMode::Dark, cx);
     shell::bind_keys(cx);
-    krill_app::link_ui::bind_keys(cx);
     krill_app::onboarding::init_actions(cx);
     // macOS stays in the menu bar/Dock. Windows starts with last-window quit;
     // menu_bar::init switches to explicit quit only after its tray icon succeeds.

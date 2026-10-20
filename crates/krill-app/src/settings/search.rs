@@ -35,6 +35,7 @@ fn tab_title(tab: AdminTab) -> Message {
         AdminTab::Accounts => text::TAB_ACCOUNTS,
         AdminTab::Agents => text::TAB_AGENTS,
         AdminTab::Ssh => text::TAB_SSH,
+        AdminTab::RemoteKrill => text::TAB_REMOTE_KRILL,
         AdminTab::Workflows => text::TAB_WORKFLOWS,
         AdminTab::Shortcuts => text::TAB_SHORTCUTS,
         AdminTab::Resources => text::TAB_RESOURCES,
@@ -56,6 +57,16 @@ mod tests {
             assert!(search_tabs(q).contains(&AdminTab::Terminal), "{q}");
         }
         assert_eq!(search_tabs("ssh"), [AdminTab::Ssh]);
+        for q in [
+            "원격 Krill",
+            "remote krill",
+            "초대",
+            "invite",
+            "짝짓기",
+            "p2p",
+        ] {
+            assert_eq!(search_tabs(q), [AdminTab::RemoteKrill], "{q}");
+        }
         assert_eq!(search_tabs("동면"), [AdminTab::Agents]);
         assert!(search_tabs("webhook").contains(&AdminTab::Workflows));
         // 알림 이벤트별 토글·테스트 알림(OWE-659)은 일반 탭에서 찾는다.
@@ -75,7 +86,7 @@ mod tests {
         // 탭 이름·부제(한·영 모두)도 맞는다(OWE-795).
         assert!(search_tabs("shortcuts").contains(&AdminTab::Shortcuts));
         assert_eq!(search_tabs("스마트폰"), [AdminTab::Mobile]);
-        assert_eq!(search_tabs("qr"), [AdminTab::Mobile]);
+        assert_eq!(search_tabs("qr"), [AdminTab::RemoteKrill, AdminTab::Mobile]);
         assert!(search_tabs("zzz-no-such-setting").is_empty());
     }
 

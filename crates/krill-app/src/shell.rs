@@ -517,7 +517,6 @@ pub struct Shell {
     /// OWE-903 온보딩 모달(메인 창 안 `ui::modal_backdrop`).
     onboarding: Option<overlays::OnboardingModal>,
     /// OWE-903 짝짓기 모달(메인 창 안 `ui::modal_backdrop`).
-    pairing: Option<overlays::PairingModal>,
     /// OWE-903 렌더에서 지연 생성할 모달 요청.
     pending: overlays::PendingOverlays,
     /// 인앱 에이전트 대시보드 모달.
@@ -943,7 +942,6 @@ impl Shell {
             add_project: None,
             continue_session: None,
             onboarding: None,
-            pairing: None,
             pending: overlays::PendingOverlays::default(),
             dashboard: None,
             search: None,
@@ -5397,7 +5395,6 @@ impl Render for Shell {
             )
             // OWE-903: 온보딩·짝짓기는 메인 창 안 모달로 그린다(별도 OS 창 없음).
             .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
-            .children(self.pairing.as_ref().map(|modal| modal.view.clone()))
             .children(self.dashboard.clone())
             .children(self.quick_open_palette())
             .children(self.render_tab_context_menu(window, cx))

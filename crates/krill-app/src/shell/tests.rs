@@ -4342,7 +4342,7 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         cx.run_until_parked();
         assert!(
             cx.debug_bounds("sidebar-add-mac").is_none(),
-            "Mac pairing lives in the admin SSH tab, not the titlebar ({lang:?})"
+            "Mac pairing lives in the Remote Krill settings page ({lang:?})"
         );
     }
     cx.update(|window, cx| {
@@ -7235,26 +7235,39 @@ fn file_tab_context_menu_copies_paths(cx: &mut TestAppContext) {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// OWE-903: 짝짓기는 별도 OS 창 대신 메인 창 안 모달로 뜨고, Esc로 닫힌다(창은 유지).
+/// 앱 메뉴의 연결 진입점은 원격 Krill 설정으로 이동하며 터미널 칸을 보존한다.
 #[gpui::test]
-fn owe903_pairing_opens_as_in_window_modal(cx: &mut TestAppContext) {
-    let (_view, cx) = open(cx, state_path("owe903-pairing"));
+fn pairing_opens_remote_krill_settings_page(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("remote-krill-settings"));
+    let panes = layout_of(&view, cx).visible();
     cx.run_until_parked();
-    cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));
-    cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 1, "no separate pairing window");
-    assert!(cx.debug_bounds("link-pairing-modal").is_some());
-    assert!(cx.debug_bounds("link-pairing-view").is_some());
-    assert!(cx.debug_bounds("link-server-panel").is_some());
-    // 두 번 열어도 모달은 하나다.
     cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));
     cx.run_until_parked();
     assert_eq!(cx.windows().len(), 1);
-    assert!(cx.debug_bounds("link-pairing-modal").is_some());
-    // Esc = 모달만 닫고 메인 창은 남는다.
+    assert!(cx.debug_bounds("admin-center").is_some());
+    assert!(cx.debug_bounds("link-pairing-modal").is_none());
+    assert!(cx.debug_bounds("link-server-panel").is_some());
+    cx.update(|_, cx| {
+        let settings = view.read(cx).settings.as_ref().unwrap();
+        assert_eq!(
+            settings.read(cx).tab(),
+            krill_app::settings::AdminTab::RemoteKrill
+        );
+    });
+    cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));
+    cx.run_until_parked();
+    assert_eq!(cx.windows().len(), 1);
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
-    assert!(cx.debug_bounds("link-pairing-modal").is_none());
+    assert!(cx.debug_bounds("admin-center").is_none());
+    assert_eq!(layout_of(&view, cx).visible(), panes);
+    // ⌘W도 설정만 닫고 기존 터미널 칸을 남긴다.
+    cx.update(|_, cx| krill_app::link_ui::open_pairing(cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("admin-center").is_none());
+    assert_eq!(layout_of(&view, cx).visible(), panes);
     assert_eq!(cx.windows().len(), 1);
 }
 

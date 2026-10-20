@@ -1,20 +1,12 @@
-//! OWE-903: 점검(온보딩)·기기 연결(짝짓기) 인앱 모달 호스팅.
+//! 점검(온보딩) 인앱 모달과 원격 Krill 설정 페이지 진입점.
 //!
 //! 별도 OS 창(`cx.open_window`) 대신 메인 창 안 `ui::modal_backdrop` 모달로 연다.
-//! 라이브러리(`link_ui`·`onboarding`)가 호스트 요청을 디스패치하면 메인 `Shell`이
+//! `onboarding`이 호스트 요청을 디스패치하면 메인 `Shell`이
 //! 모달 엔티티를 들고 렌더에서 함께 그린다. `dispatch`는 `&mut App`만 받아 창이
 //! 없어도 되므로, 실제 엔티티 생성은 렌더(`window`·`Context`가 있는 곳)에서 지연한다.
 
-use std::sync::Arc;
-
 use gpui::{AppContext as _, Context, Entity, Subscription, Window};
 use krill_app::{link_ui, onboarding};
-
-/// 짝짓기 모달 슬롯.
-pub(super) struct PairingModal {
-    pub(super) view: Entity<link_ui::PairingView>,
-    _close: Subscription,
-}
 
 /// 점검 모달 슬롯.
 pub(super) struct OnboardingModal {
@@ -26,12 +18,11 @@ pub(super) struct OnboardingModal {
 /// `InputState` 생성에 필요한 `&mut Window`가 없으므로 일단 적어 둔다.
 #[derive(Default)]
 pub(super) struct PendingOverlays {
-    pub(super) pairing: bool,
     pub(super) onboarding: Option<onboarding::Env>,
 }
 
 impl super::Shell {
-    /// 짝짓기·온보딩 모달 호스트를 등록한다. `Shell::new`에서 설정 호스트 옆에 둔다.
+    /// 원격 Krill 설정·온보딩 모달 호스트를 등록한다. `Shell::new`에서 설정 호스트 옆에 둔다.
     pub(super) fn register_overlay_hosts(cx: &mut Context<Self>) {
         let weak = cx.weak_entity();
         link_ui::register_host(cx, move |cmd, cx| {
@@ -43,7 +34,8 @@ impl super::Shell {
                 link_ui::HostCommand::Open => {}
             }
             Some(entity.update(cx, |this, cx| {
-                this.request_pairing(cx);
+                this.open_settings(krill_app::settings::AdminTab::RemoteKrill, None, cx);
+                this.activate_host_window(cx);
                 true
             }))
         });
@@ -62,23 +54,9 @@ impl super::Shell {
 
     /// 렌더 시작 때 밀린 모달 요청을 실제 엔티티로 만든다.
     pub(super) fn open_pending_overlays(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pending.pairing {
-            self.pending.pairing = false;
-            self.open_pairing_modal(window, cx);
-        }
         if let Some(env) = self.pending.onboarding.take() {
             self.open_onboarding_modal(env, window, cx);
         }
-    }
-
-    /// 짝짓기 모달 요청. 열려 있으면 앞으로 가져오고, 닫혀 있으면 렌더에서 연다.
-    pub(super) fn request_pairing(&mut self, cx: &mut Context<Self>) {
-        if self.pairing.is_some() {
-            self.activate_host_window(cx);
-            return;
-        }
-        self.pending.pairing = true;
-        cx.notify();
     }
 
     /// 점검 모달 요청. 열려 있으면 앞으로 가져오고, 닫혀 있으면 렌더에서 연다.
@@ -104,33 +82,6 @@ impl super::Shell {
                     .ok();
             });
         }
-    }
-
-    /// 짝짓기 모달 엔티티를 만들고 닫기 이벤트를 구독한다.
-    pub(super) fn open_pairing_modal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.pairing.is_some() {
-            return;
-        }
-        let Some(state_dir) = krill_app::settings::state_dir(cx) else {
-            return;
-        };
-        let executable = krill_proto::daemon::sibling_exe("krill-link")
-            .unwrap_or_else(|_| std::path::PathBuf::from("krill-link"));
-        let backend: Arc<dyn link_ui::LinkBackend> =
-            Arc::new(link_ui::real::RealLinkBackend::new(state_dir, executable));
-        let view = cx.new(|cx| link_ui::PairingView::new(backend, window, cx));
-        let close = cx.subscribe_in(&view, window, |this, _, ev: &link_ui::Event, window, cx| {
-            if *ev == link_ui::Event::Close {
-                this.pairing = None;
-                window.focus(&this.focus, cx);
-                cx.notify();
-            }
-        });
-        self.pairing = Some(PairingModal {
-            view,
-            _close: close,
-        });
-        cx.notify();
     }
 
     /// 점검 모달 엔티티를 만들고 수집 시작·재포커스 재검사·닫기를 연결한다.
