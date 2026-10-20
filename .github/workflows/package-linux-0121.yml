@@ -1,8 +1,8 @@
-name: Package Linux v0.1.21 (native)
+name: Package Linux v0.1.22 (native)
 
 on:
   push:
-    branches: [automation/linux-package-0.1.21]
+    branches: [automation/linux-package-0.1.22]
   workflow_dispatch:
 
 permissions:
@@ -24,11 +24,11 @@ jobs:
     env:
       CARGO_BUILD_JOBS: 4
       CARGO_INCREMENTAL: 0
-      CARGO_TARGET_DIR: /Volumes/krill-build/targets/linux-0121-${{ matrix.arch }}
+      CARGO_TARGET_DIR: /Volumes/krill-build/targets/linux-0122-${{ matrix.arch }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: 0eaeba4af9fec25e12038dae4bc4d611c37a2f9e
+          ref: f0ca1b3c881981b8ee90fa077542908cd1b18b3f
           persist-credentials: false
 
       - name: Verify source and native Ubuntu 22.04 runner
@@ -36,7 +36,7 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          [[ "$(git rev-parse HEAD)" == 0eaeba4af9fec25e12038dae4bc4d611c37a2f9e ]]
+          [[ "$(git rev-parse HEAD)" == f0ca1b3c881981b8ee90fa077542908cd1b18b3f ]]
           [[ "$(uname -m)" == "$EXPECTED_ARCH" ]]
           source /etc/os-release
           [[ "$ID" == ubuntu && "$VERSION_ID" == 22.04 ]]
@@ -54,23 +54,23 @@ jobs:
           toolchain: 1.98.1
 
       - name: Build native Linux archive
-        run: bash packaging/linux/build.sh 0.1.21 packaging/dist
+        run: bash packaging/linux/build.sh 0.1.22 packaging/dist
 
       - name: Install and verify daemon SIGKILL survival
         env:
           EXPECTED_ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          bash packaging/linux/smoke.sh "packaging/dist/krill-0.1.21-linux-$EXPECTED_ARCH.tar.gz"
+          bash packaging/linux/smoke.sh "packaging/dist/krill-0.1.22-linux-$EXPECTED_ARCH.tar.gz"
           git rev-parse HEAD > "packaging/dist/source-commit-$EXPECTED_ARCH.txt"
 
       - name: Upload verified Linux archive
         uses: actions/upload-artifact@v4
         with:
-          name: krill-linux-0.1.21-${{ matrix.arch }}
+          name: krill-linux-0.1.22-${{ matrix.arch }}
           path: |
-            packaging/dist/krill-0.1.21-linux-${{ matrix.arch }}.tar.gz
-            packaging/dist/krill-0.1.21-linux-${{ matrix.arch }}.tar.gz.sha256
+            packaging/dist/krill-0.1.22-linux-${{ matrix.arch }}.tar.gz
+            packaging/dist/krill-0.1.22-linux-${{ matrix.arch }}.tar.gz.sha256
             packaging/dist/source-commit-${{ matrix.arch }}.txt
           if-no-files-found: error
           retention-days: 7
