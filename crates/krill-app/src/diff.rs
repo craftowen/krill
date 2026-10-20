@@ -196,13 +196,11 @@ impl Source for Socket {
             .conn
             .lock()
             .map_err(|_| io::Error::other("diff socket mutex poisoned"))?;
-        if guard.is_none() {
-            *guard = Some(self.connect()?);
-        }
-        let result = match guard.as_mut() {
-            Some(conn) => Self::exchange(conn, req),
-            None => unreachable!(),
+        let conn = match guard.take() {
+            Some(conn) => conn,
+            None => self.connect()?,
         };
+        let result = Self::exchange(guard.insert(conn), req);
         match &result {
             Ok(_) => self.target.record_outcome(true, None),
             Err(e) => {
@@ -602,6 +600,10 @@ impl Panel {
         let observe = cx.observe(&state, |_, _, cx| cx.notify());
         let explorer = Explorer::new(repo.clone());
         let search = WorkspaceSearch::new(repo.clone());
+        let mut editing = edit::State::default();
+        if repo.exists() {
+            editing.has_remote = edit::repo_has_remote(&repo);
+        }
         Self {
             repo,
             tab: PanelTab::default(),
@@ -630,7 +632,7 @@ impl Panel {
             _observe: observe,
             review: comments::Review::default(),
             viewed: std::collections::HashSet::new(),
-            editing: edit::State::default(),
+            editing,
             checks: checks::State::default(),
             #[cfg(test)]
             rendered_rows: 0,
@@ -691,6 +693,9 @@ impl Panel {
         self.review = comments::Review::default();
         self.viewed.clear();
         self.editing.reset_repo();
+        if repo.exists() {
+            self.editing.has_remote = edit::repo_has_remote(&repo);
+        }
         self.explorer.set_repo(repo.clone(), false);
         if self.tab == PanelTab::Files {
             self.ensure_explorer_loaded_async(cx);
@@ -729,6 +734,7 @@ impl Panel {
         self.message = text::EMPTY.get().into();
         self.state.update(cx, |s, cx| s.set_files([], cx));
         if self.visible {
+            self.refresh_branch_sync(cx);
             self.start_watch(cx);
             if self.tab == PanelTab::Checks {
                 self.refresh_checks(cx);
@@ -747,6 +753,7 @@ impl Panel {
         self.visible = visible;
         if visible {
             self.watch_gen = 0;
+            self.refresh_branch_sync(cx);
             self.start_watch(cx);
         } else {
             self.watch_task = None;

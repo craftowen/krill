@@ -378,9 +378,11 @@ impl Sidebar {
         let Some(trees) = self.snapshot.trees.get(&repo) else {
             return Vec::new();
         };
+        let mut parents = self.merged_parents();
+        parents.remove(path);
         trees
             .iter()
-            .filter(|cand| cand.as_path() != path && self.can_set_worktree_parent(path, cand))
+            .filter(|cand| cand.as_path() != path && can_assign_parent(&parents, path, cand))
             .cloned()
             .collect()
     }
@@ -389,6 +391,9 @@ impl Sidebar {
     #[must_use]
     pub fn lineage_children(&self, path: &Path) -> Vec<PathBuf> {
         let parents = self.merged_parents();
+        if parents.is_empty() {
+            return Vec::new();
+        }
         let known: BTreeSet<&Path> = self
             .snapshot
             .trees
@@ -409,6 +414,9 @@ impl Sidebar {
     #[must_use]
     pub fn lineage_descendants(&self, path: &Path) -> Vec<PathBuf> {
         let parents = self.merged_parents();
+        if parents.is_empty() {
+            return Vec::new();
+        }
         let known: BTreeSet<&Path> = self
             .snapshot
             .trees

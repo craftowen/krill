@@ -247,7 +247,7 @@ impl Pool {
             &repo,
             ["config", "--get-regexp", "^filter\\..*\\.(smudge|process)$"],
         )?;
-        if !filters.stdout.is_empty() {
+        if !filters.stdout.is_empty() && uses_filters(&self.q, &repo, &commit)? {
             return Ok(None);
         }
         let tree = git(&self.q, &repo, ["ls-tree", "-r", "-l", "-z", &commit])?;
@@ -470,6 +470,47 @@ impl Pool {
         )?;
         Ok(true)
     }
+}
+
+/// A configured filter runs only for paths whose attributes name it. `git lfs install` configures
+/// `filter.lfs.*` globally, so skip only when an attributes source of `commit` mentions `filter=`
+/// (macros included). Git without `git var GIT_ATTR_*` (before 2.42) is treated as filtered.
+fn uses_filters(q: &GitQueue, repo: &Path, commit: &str) -> Result<bool, String> {
+    let tree = git(
+        q,
+        repo,
+        [
+            "grep",
+            "-q",
+            "-I",
+            "-F",
+            "-e",
+            "filter=",
+            commit,
+            "--",
+            ".gitattributes",
+            "*/.gitattributes",
+        ],
+    )?;
+    match tree.status.code() {
+        Some(1) => {}
+        Some(0) => return Ok(true),
+        _ => return Err("cannot inspect attributes".to_owned()),
+    }
+    let mut files = vec![repo.join(output_path(
+        git(q, repo, ["rev-parse", "--git-path", "info/attributes"])?,
+        "cannot locate attributes",
+    )?)];
+    for var in ["GIT_ATTR_GLOBAL", "GIT_ATTR_SYSTEM"] {
+        let out = git(q, repo, ["var", var])?;
+        if !out.status.success() {
+            return Ok(true);
+        }
+        files.push(output_path(out, "cannot locate attributes")?);
+    }
+    Ok(files
+        .iter()
+        .any(|file| fs::read(file).is_ok_and(|bytes| bytes.windows(7).any(|w| w == b"filter="))))
 }
 
 /// Conservative preflight: rounded blobs, unique directories, index entries, and metadata reserve.

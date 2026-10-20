@@ -96,7 +96,7 @@ pub fn remove_with_state(
         if !super::is_setup_trusted(state_dir, repo, script)? {
             let hash = super::hex(&super::digest(repo, script));
             let msg = format!(
-                "archive hook is not trusted (SHA-256: {hash}); approve it in setup-trust or use --force to remove without running it"
+                "archive hook is not trusted (SHA-256: {hash}); approve it in setup-trust (or pass --trust-archive {hash}) or use --force to remove without running it"
             );
             if req.force {
                 warnings.push(msg);

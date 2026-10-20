@@ -1,6 +1,6 @@
 //! 알림·Dock 배지·잠자기 방지(MK-044).
 //!
-//! MK-016 스파이크 잠정 결정(`docs/spikes/MK-016.md`)에 따라 Developer ID 없이 ad-hoc 서명된
+//! MK-016 스파이크 잠정 결정(비공개 MK-016 스파이크 기록)에 따라 Developer ID 없이 ad-hoc 서명된
 //! `krill-app` 본 앱을 단일 발신자로 삼아:
 //! - `gpui::App`의 `UNUserNotificationCenter` 경로(`show_system_notification`,
 //!   `dismiss_system_notification`, `on_system_notification_response`)로 `"pane:<id>"` 식별자 알림을

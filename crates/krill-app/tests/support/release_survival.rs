@@ -1,6 +1,6 @@
 //! MK-031: 실제 release GUI 프로세스의 SIGKILL·재실행과 원본 seq 재생을 검사한다.
 //! gpui 잠정 결정 의존은 이 테스트 모듈에만 둔다. 기본 검사에서는 명시적으로 제외한다.
-//! 재현 명령과 검증 범위는 docs/testing/MK-031.md에 기록한다.
+//! 재현 명령과 검증 범위는 비공개 MK-031 테스트 기록에 기록한다.
 
 use std::collections::HashMap;
 use std::fs;

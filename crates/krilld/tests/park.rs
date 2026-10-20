@@ -3,7 +3,7 @@
 //!   핫 스크롤백을 쥔다. 이 프로세스의 `phys_footprint`로 돌려준 메모리를 잰다(krilld와 같은 jemalloc + decay 0).
 //! - 숨긴 세션으로 전환(화면 구독 → 스냅샷 수신 완료)은 100ms 안이고, 화면은 강등 전과 같다.
 //!
-//! 재현: `cargo test --release -p krilld --test park -- --nocapture`. 측정값은 docs/spikes/MK-035.md.
+//! 재현: `cargo test --release -p krilld --test park -- --nocapture`. 측정값은 비공개 MK-035 스파이크 기록.
 
 #![cfg(unix)]
 #![expect(
@@ -218,7 +218,7 @@ fn only_shown_terminals_keep_hot_rows_and_switch_rebuilds_fast() {
         "전환(구독 → 스냅샷 완료) {}회: p95 {p95:.2}ms, 최대 {max:.2}ms",
         took.len()
     );
-    // 완료 조건 100ms는 release 기준이다(docs/spikes/MK-035.md). 디버그 빌드(check.sh)는 부하에 따라 수백 ms가 나와
+    // 완료 조건 100ms는 release 기준이다(비공개 MK-035 스파이크 기록). 디버그 빌드(check.sh)는 부하에 따라 수백 ms가 나와
     // (load avg 105에서 209ms 실측) 콜드 재생 같은 구조 회귀만 잡는 상한을 둔다.
     let limit = if cfg!(debug_assertions) {
         1_000.0

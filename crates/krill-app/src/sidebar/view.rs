@@ -1194,13 +1194,23 @@ impl Sidebar {
             .get(path)
             .and_then(|m| m.dirty)
             .filter(|n| *n > 0);
-        let (summary, unread) = self.tree_summary_on(&row_host, path);
         let tree_sessions: Vec<_> = self
             .snapshot_for(&row_host)
             .sessions
             .iter()
             .filter(|s| s.worktree.as_deref() == Some(path))
             .collect();
+        let unread =
+            row_host.is_local() && tree_sessions.iter().any(|s| self.unread.contains(&s.id));
+        let summary_pairs: Vec<_> = tree_sessions
+            .iter()
+            .filter(|s| {
+                !s.status.agent.is_empty()
+                    || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
+            })
+            .map(|s| (s.status.state, s.status.agent.as_str()))
+            .collect();
+        let summary = status::summarize(&summary_pairs);
         let tree_session_count = tree_sessions.len();
         let states = summary
             .groups
@@ -2019,73 +2029,82 @@ impl Sidebar {
     /// 저장소·폴더 헤더는 접기 대상 경로를 `header`로 넘겨 '프로젝트 제거' 메뉴를 붙인다(OWE-845).
     fn render_row_with_menu(&self, index: usize, row: &Row, cx: &mut Context<Self>) -> AnyElement {
         let element = self.render_row(index, row, cx);
+        if !matches!(
+            row,
+            Row::Worktree(_) | Row::Session(_, _) | Row::Repository(_) | Row::Folder(_)
+        ) {
+            return element.into_any_element();
+        }
         let host = self.row_host(index).clone();
-        let (folder, session, tree, header) = match row {
-            Row::Worktree(path) => {
-                let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
-                let is_primary =
-                    super::options::is_primary_worktree(self.snapshot_for(&host), path);
-                let current_parent = host
-                    .is_local()
-                    .then(|| self.worktree_parent(path))
-                    .flatten();
-                let parent_candidates = if host.is_local() {
-                    self.eligible_parent_worktrees(path)
-                        .into_iter()
-                        .map(|cand| {
-                            let label = self.name(&cand);
-                            (cand, label)
-                        })
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let descendant_count = if host.is_local() {
-                    self.lineage_descendants(path).len()
-                } else {
-                    0
-                };
-                let sleeping = host.is_local() && self.is_worktree_sleeping(path);
-                (
-                    Some(path.clone()),
-                    None,
-                    Some(TreeMenuMeta {
-                        path: path.clone(),
-                        pinned,
-                        is_primary,
-                        current_parent,
-                        parent_candidates,
-                        descendant_count,
-                        sleeping,
-                    }),
-                    None,
-                )
-            }
-            Row::Session(s, _) => (
-                s.worktree.clone().or_else(|| s.cwd.clone()),
-                Some(SessionMenuMeta { index, id: s.id }),
-                None,
-                None,
-            ),
-            Row::Repository(path) | Row::Folder(path) => (
-                Some(path.clone()),
-                None,
-                None,
-                Some(HeaderMenuMeta {
-                    path: path.clone(),
-                    repo: matches!(row, Row::Repository(_)) && host.is_local(),
-                }),
-            ),
-            _ => return element.into_any_element(),
-        };
+        let row = row.clone();
         let this = cx.weak_entity();
-        let agents = self.agents.clone();
-        let pr = tree
-            .as_ref()
-            .and_then(|meta| self.prs.get(&meta.path))
-            .cloned();
         element
             .context_menu(move |menu, window, cx| {
+                let Ok((folder, session, tree, header, agents, pr)) = this.read_with(cx, |s, _| {
+                    let (folder, session, tree, header) = match &row {
+                        Row::Worktree(path) => {
+                            let pinned = s.prefs.get(path).is_some_and(|p| p.pinned);
+                            let is_primary =
+                                super::options::is_primary_worktree(s.snapshot_for(&host), path);
+                            let current_parent =
+                                host.is_local().then(|| s.worktree_parent(path)).flatten();
+                            let parent_candidates = if host.is_local() {
+                                s.eligible_parent_worktrees(path)
+                                    .into_iter()
+                                    .map(|cand| {
+                                        let label = s.name(&cand);
+                                        (cand, label)
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+                            let descendant_count = if host.is_local() {
+                                s.lineage_descendants(path).len()
+                            } else {
+                                0
+                            };
+                            let sleeping = host.is_local() && s.is_worktree_sleeping(path);
+                            (
+                                Some(path.clone()),
+                                None,
+                                Some(TreeMenuMeta {
+                                    path: path.clone(),
+                                    pinned,
+                                    is_primary,
+                                    current_parent,
+                                    parent_candidates,
+                                    descendant_count,
+                                    sleeping,
+                                }),
+                                None,
+                            )
+                        }
+                        Row::Session(sess, _) => (
+                            sess.worktree.clone().or_else(|| sess.cwd.clone()),
+                            Some(SessionMenuMeta { index, id: sess.id }),
+                            None,
+                            None,
+                        ),
+                        Row::Repository(path) | Row::Folder(path) => (
+                            Some(path.clone()),
+                            None,
+                            None,
+                            Some(HeaderMenuMeta {
+                                path: path.clone(),
+                                repo: matches!(row, Row::Repository(_)) && host.is_local(),
+                            }),
+                        ),
+                        _ => (None, None, None, None),
+                    };
+                    let pr = tree
+                        .as_ref()
+                        .and_then(|meta| s.prs.get(&meta.path))
+                        .cloned();
+                    (folder, session, tree, header, s.agents.clone(), pr)
+                }) else {
+                    return menu;
+                };
                 row_menu(
                     menu,
                     &this,

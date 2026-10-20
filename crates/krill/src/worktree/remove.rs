@@ -13,18 +13,33 @@ use krill_proto::screen::Msg;
 
 use crate::remote::Target;
 
-const USAGE: &str =
-    "usage: krill [--host <user@host>] worktree rm <path> [--repo <path>] [--force]";
+const USAGE: &str = "usage: krill [--host <user@host>] worktree rm <path> [--repo <path>] [--force] [--trust-archive <hash>]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedRemove {
+    req: RemoveWorktree,
+    trust_archive: Option<String>,
+}
 
 pub fn run(target: &Target, args: &[OsString]) -> ExitCode {
-    let req = match parse(args, target.is_remote()) {
-        Ok(req) => req,
+    let parsed = match parse(args, target.is_remote()) {
+        Ok(parsed) => parsed,
         Err(e) => {
             eprintln!("{e}\n{USAGE}");
             return ExitCode::from(2);
         }
     };
-    match remove(target, req) {
+    if let Some(ref hash) = parsed.trust_archive {
+        let Some(state) = daemon::state_dir() else {
+            eprintln!("worktree: HOME is not set");
+            return ExitCode::FAILURE;
+        };
+        if let Err(e) = super::record_setup_trust(&state, hash) {
+            eprintln!("worktree: {e}");
+            return ExitCode::from(2);
+        }
+    }
+    match remove(target, parsed.req) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("worktree: {e}");
@@ -33,16 +48,32 @@ pub fn run(target: &Target, args: &[OsString]) -> ExitCode {
     }
 }
 
-fn parse(args: &[OsString], remote: bool) -> Result<RemoveWorktree, String> {
+fn parse(args: &[OsString], remote: bool) -> Result<ParsedRemove, String> {
     let mut args = args.iter();
     let mut repo = None;
     let mut path = None;
     let mut force = false;
+    let mut trust_archive = None;
     while let Some(arg) = args.next() {
+        if let Some(s) = arg.to_str()
+            && let Some(val) = s.strip_prefix("--trust-archive=")
+        {
+            validate_sha256_hex(val)?;
+            trust_archive = Some(val.to_ascii_lowercase());
+            continue;
+        }
         if arg == "--repo" {
             repo = Some(PathBuf::from(args.next().ok_or("missing --repo value")?));
         } else if arg == "--force" {
             force = true;
+        } else if arg == "--trust-archive" {
+            let val = args
+                .next()
+                .ok_or("missing --trust-archive value")?
+                .to_str()
+                .ok_or("--trust-archive must be UTF-8")?;
+            validate_sha256_hex(val)?;
+            trust_archive = Some(val.to_ascii_lowercase());
         } else if arg == "--" {
             if path.is_some() {
                 return Err("unexpected arguments after path".to_owned());
@@ -59,6 +90,10 @@ fn parse(args: &[OsString], remote: bool) -> Result<RemoveWorktree, String> {
     }
     let path = path.ok_or("missing worktree path")?;
     if remote {
+        // 신뢰 기록은 이 Mac의 상태 디렉터리에 남으므로 원격 데몬의 archive 훅에는 닿지 않는다.
+        if trust_archive.is_some() {
+            return Err("--trust-archive is not supported with --host".to_owned());
+        }
         let Some(repo) = repo else {
             return Err(
                 "remote worktree rm requires --repo <absolute path on the remote host>".to_owned(),
@@ -72,10 +107,13 @@ fn parse(args: &[OsString], remote: bool) -> Result<RemoveWorktree, String> {
                 "remote worktree path must be an absolute path on the remote host".to_owned(),
             );
         }
-        return Ok(RemoveWorktree {
-            repo: repo.as_os_str().as_bytes().to_vec(),
-            path: path.as_os_str().as_bytes().to_vec(),
-            force,
+        return Ok(ParsedRemove {
+            req: RemoveWorktree {
+                repo: repo.as_os_str().as_bytes().to_vec(),
+                path: path.as_os_str().as_bytes().to_vec(),
+                force,
+            },
+            trust_archive,
         });
     }
     let repo = repo
@@ -84,11 +122,21 @@ fn parse(args: &[OsString], remote: bool) -> Result<RemoveWorktree, String> {
     let repo =
         std::fs::canonicalize(repo).map_err(|e| format!("cannot resolve repository: {e}"))?;
     let path = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve worktree: {e}"))?;
-    Ok(RemoveWorktree {
-        repo: repo.as_os_str().as_bytes().to_vec(),
-        path: path.as_os_str().as_bytes().to_vec(),
-        force,
+    Ok(ParsedRemove {
+        req: RemoveWorktree {
+            repo: repo.as_os_str().as_bytes().to_vec(),
+            path: path.as_os_str().as_bytes().to_vec(),
+            force,
+        },
+        trust_archive,
     })
+}
+
+fn validate_sha256_hex(hash: &str) -> Result<(), String> {
+    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("--trust-archive requires a 64-digit SHA-256 hash".to_owned());
+    }
+    Ok(())
 }
 
 fn remove(target: &Target, req: RemoveWorktree) -> Result<(), String> {
@@ -140,5 +188,43 @@ fn remove(target: &Target, req: RemoveWorktree) -> Result<(), String> {
         Reply::WorktreeFailed(e) => Err(e),
         Reply::Failed(e) => Err(e.to_string()),
         _ => Err("unexpected daemon reply".to_owned()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_remove_with_trust_archive_and_force() {
+        let dir = std::env::temp_dir().join(format!("mk-wt-rm-parse-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let hash = "0123456789abcdef".repeat(4);
+        let parsed = parse(
+            &[
+                dir.as_os_str().to_owned(),
+                OsString::from("--repo"),
+                dir.as_os_str().to_owned(),
+                OsString::from("--trust-archive"),
+                OsString::from(&hash),
+                OsString::from("--force"),
+            ],
+            false,
+        )
+        .unwrap();
+        assert!(parsed.req.force);
+        assert_eq!(parsed.trust_archive.as_deref(), Some(hash.as_str()));
+        assert!(
+            parse(
+                &[
+                    dir.as_os_str().to_owned(),
+                    OsString::from("--trust-archive=bad"),
+                ],
+                false,
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

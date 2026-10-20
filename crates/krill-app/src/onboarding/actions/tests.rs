@@ -58,7 +58,9 @@ fn managed_cli_preserves_existing_regular_file() {
     std::fs::create_dir_all(env.home.join(".local/bin")).unwrap();
     let link = env.home.join(".local/bin/krill");
     std::fs::write(&link, "user-owned").unwrap();
-    assert!(install_managed_cli(&env).is_err());
+    // 호스트 PATH(install_managed_cli)를 쓰면 쓰기 가능한 /opt/homebrew/bin(CI 러너)에 실제로 설치돼
+    // 첫 시도는 통과(Ok)하고 재시도는 그 잔재와 충돌해 FLAKY가 됐다(2026-10-18 macos-14·15-intel).
+    assert!(install_managed_cli_at(&env, env.home.join(".local/bin").as_os_str()).is_err());
     assert_eq!(std::fs::read_to_string(link).unwrap(), "user-owned");
     std::fs::remove_dir_all(root).unwrap();
 }

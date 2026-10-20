@@ -854,6 +854,34 @@ mod tests {
         false
     }
 
+    /// `Hsla { .. }`·`gpui::Rgba { .. }` 구조체 리터럴(생 색상 우회). `-> Hsla {` 반환형·`for Hsla {` impl은 제외한다.
+    fn has_struct_literal(line: &str, ty: &str) -> bool {
+        let mut start = 0;
+        while let Some(pos) = line.get(start..).and_then(|rest| rest.find(ty)) {
+            let idx = start + pos;
+            let end = idx + ty.len();
+            start = end;
+            let opens_brace = line
+                .get(end..)
+                .is_some_and(|rest| rest.trim_start().starts_with('{'));
+            let prefix = line.get(..idx).unwrap_or_default();
+            let ident_start = prefix
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+            let before_path = prefix
+                .trim_end_matches(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+                .trim_end();
+            let is_type_position = ["->", "for", "impl"]
+                .iter()
+                .any(|kw| before_path.ends_with(kw));
+            if opens_brace && ident_start && !is_type_position {
+                return true;
+            }
+        }
+        false
+    }
+
     fn scan_design_system_violations(rel: &str, src: &str) -> Vec<String> {
         let stripped = strip_comments_and_strings(src);
         let forbidden = [
@@ -886,7 +914,7 @@ mod tests {
             ".text_size(rems(",
             ".text_size(gpui::rems(",
         ];
-        let unqualified = ["rgb", "rgba", "hsla", "black", "white"];
+        let unqualified = ["rgb", "rgba", "hsla", "black", "white", "hex", "hexa"];
 
         let mut violations = Vec::new();
         for (line_no, line) in stripped.lines().enumerate() {
@@ -906,13 +934,21 @@ mod tests {
                     ));
                 }
             }
+            for ty in ["Hsla", "Rgba"] {
+                if has_struct_literal(line, ty) {
+                    violations.push(format!(
+                        "src/{rel}:{}: forbidden `{ty} {{ .. }}` literal (use `crate::ui` tokens per docs/STYLEGUIDE.md)",
+                        line_no + 1
+                    ));
+                }
+            }
         }
         violations
     }
 
     /// 디자인 시스템 게이트(Orca `lint:design-system` 대응): `src/ui/`와 터미널 격자(`terminal.rs`) 밖에서
     /// 생 색상(`gpui::rgb`/`rgba`/`hsla`/`black`/`white`/`transparent_black`/`red`/`green`/`blue`/`yellow`,
-    /// 비수식 `rgb(` 등, `ui::hex`/`hexa`, 임포트 우회 `hex(0x...)`)이나
+    /// 비수식 `rgb(`·`hex(` 등, `ui::hex`/`hexa`, `Hsla { .. }`·`Rgba { .. }` 구조체 리터럴)이나
     /// 비허용 그림자 단계(`.shadow_xs/sm/md/xl/2xl`, `.shadow_lg()`만 허용)나
     /// 임의 글자 크기(`.text_size(px(..))`, `.text_size(rems(..))`)를 직접 쓰면 실패한다(`docs/STYLEGUIDE.md` §2·§4·§5.4·§9).
     #[test]
@@ -953,8 +989,11 @@ mod tests {
                /* nested rgb(0x000000) */
             */
             let s = "gpui::rgb(0x123456) .text_size(px(12.)) rgb(0)";
-            let r = r#"hsla(0., 0., 0., 1.) black()"#;
+            let r = r#"hsla(0., 0., 0., 1.) black() Hsla { h: 0. }"#;
             div().bg(p.background).text_size(ui::TEXT_SM)
+            fn tint(p: &Palette) -> gpui::Hsla {
+            impl From<Rgb> for Hsla {
+            let digest = worktree::hex(hash);
         "##;
         assert!(scan_design_system_violations("clean.rs", clean).is_empty());
 
@@ -968,6 +1007,12 @@ mod tests {
             "div().bg(ui::hex(0x112233))",
             "div().bg(hex(0x112233))",
             "div().bg(hexa(0x112233, 0.5))",
+            "div().bg(hex(BRAND))",
+            "div().bg(hexa(BRAND, 0.5))",
+            "div().bg(Hsla { h: 0., s: 0., l: 0., a: 1. })",
+            "div().bg(gpui::Hsla { h: 0., s: 0., l: 0., a: 1. })",
+            "div().bg(Rgba{ r: 0., g: 0., b: 0., a: 1. })",
+            "let c = gpui::Rgba {",
             "div().border_color(gpui::transparent_black())",
             "div().text_color(gpui::red())",
             "div().text_color(gpui::green())",

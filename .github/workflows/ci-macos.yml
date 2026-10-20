@@ -1,35 +1,17 @@
 # Krill CI — macOS 전체 게이트 (OWE-382, MK-017).
 # clippy · nextest(PTY e2e 포함) · doctest를 전체 워크스페이스에 실행한다.
-# macOS 분 절약을 위해 Rust·빌드 관련 경로가 바뀔 때만 실행하고,
-# 그 외(문서 등) PR에서는 건너뛴다. 필요하면 Actions에서 수동 실행한다.
-# Linux 고속 게이트(krill-proto·krill-term + deny)는 ci.yml이 모든 PR에서 실행한다.
-# 로컬 재현은 scripts/check.sh.
+# macOS 분 절약을 위해 테스트 입력이 바뀔 때만 macOS 잡을 돌린다. `paths` 필터를 쓰면
+# 문서만 바뀐 PR에서 워크플로 자체가 안 떠 required check가 영원히 대기하므로,
+# 항상 뜨는 `changes` 잡(ubuntu)이 git diff로 판단하고 고정 이름 `ci-macos` 잡이 결과를 모은다.
+# branch protection의 required check에는 `ci-macos`만 건다(matrix 잡 이름은 skip 시 펼쳐지지 않는다).
+# Linux 고속 게이트는 ci.yml이 모든 PR에서 실행한다. 로컬 재현은 scripts/check.sh.
 name: ci-macos
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - 'clippy.toml'
-      - 'rustfmt.toml'
-      - 'vendor/**'
-      - '.github/workflows/**'
-      - 'scripts/check.sh'
+    # dev가 통합 브랜치다(main은 공개 릴리스 이력). release/**는 릴리스 준비 브랜치.
+    branches: [main, dev, 'release/**']
   pull_request:
-    paths:
-      - 'crates/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'deny.toml'
-      - 'clippy.toml'
-      - 'rustfmt.toml'
-      - 'vendor/**'
-      - '.github/workflows/**'
-      - 'scripts/check.sh'
   workflow_dispatch:
 
 permissions:
@@ -43,8 +25,57 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.diff.outputs.rust }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          # pull_request는 병합 커밋을 체크아웃하므로 HEAD^1이 base 끝이다.
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: 테스트 입력 변경 감지
+        id: diff
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -uo pipefail
+          # 빌드·테스트가 읽는 저장소 파일 전체. 근거(2026-10-19 전수 확인):
+          #   rg -n 'include_str!|include_bytes!|read_to_string|CARGO_MANIFEST_DIR|\.\./\.\.' crates
+          #   - docs/ARCHITECTURE.md: krill-proto ipc/tests.rs include_str!
+          #   - docs/STYLEGUIDE.md·AGENTS.md·docs/CONVENTIONS.md·CONTRIBUTING.md·README.md: krill-app ui/theme.rs 문서 동기화 테스트
+          #   - packaging/macos/ed25519_manifest.py: krill-app updater/tests.rs·shell/popout/tests.rs가 실행
+          #   - vendor/**: krill-app tests/i18n.rs include_str!, krill-proto build.rs 해시, [patch] 소스
+          #   - .config/**(nextest 프로필)·.cargo/**(빌드 설정)·루트 Cargo/lint 설정·scripts/check.sh
+          re='^(crates/|vendor/|\.config/|\.cargo/|\.github/workflows/|Cargo\.(toml|lock)$|(deny|clippy|rustfmt)\.toml$|scripts/check\.sh$|AGENTS\.md$|CONTRIBUTING\.md$|README\.md$|docs/(ARCHITECTURE|CONVENTIONS|STYLEGUIDE)\.md$|packaging/macos/ed25519_manifest\.py$)'
+          case "$EVENT" in
+            pull_request) base=HEAD^1 ;;
+            push) base=$BEFORE; git fetch -q --depth=1 origin "$BEFORE" || base= ;;
+            *) base= ;;
+          esac
+          # 수동 실행·새 브랜치(before=000…)·강제 푸시 등 diff를 못 구하면 항상 검사한다.
+          if [ -z "$base" ] || ! files=$(git diff --name-only "$base" HEAD); then
+            echo "base 없음 → 검사"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if hits=$(grep -E "$re" <<<"$files"); then
+            printf '테스트 입력 변경:\n%s\n' "$hits"
+            echo "rust=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "테스트 입력 변경 없음 → macOS 잡 건너뜀"
+            echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+
   check:
     name: clippy · nextest · doctest (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -52,16 +83,18 @@ jobs:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Rust 1.98 + clippy
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.98"
           components: rustfmt, clippy
 
       - name: nextest
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest
 
@@ -71,7 +104,7 @@ jobs:
 
       - name: nextest
         # PTY e2e(krill-holder survive, krill CLI 실PTY 테스트, krilld 통합) 포함.
-        run: cargo nextest run --workspace --locked --no-tests=pass
+        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass
         timeout-minutes: 60
 
       - name: doctest
@@ -79,3 +112,19 @@ jobs:
         timeout-minutes: 30
 
       # cargo deny는 Linux 잡(ci.yml)이 담당하므로 여기서 중복 실행하지 않는다.
+
+  # required check용 고정 이름 잡. check가 건너뛰어졌으면 성공, 실패·취소면 실패.
+  ci-macos:
+    name: ci-macos
+    needs: [changes, check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: 결과 집계
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          CHECK: ${{ needs.check.result }}
+        run: |
+          echo "changes=$CHANGES check=$CHECK"
+          [ "$CHANGES" = success ] && { [ "$CHECK" = success ] || [ "$CHECK" = skipped ]; }

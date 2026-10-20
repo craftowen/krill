@@ -1,0 +1,13 @@
+# 하네스 파일(AGENTS.md 규칙 8)은 메인테이너 리뷰가 필요하다.
+# 효력은 main ruleset에서 "Require review from Code Owners"를 켜야 생긴다(원격 설정은 사람이 한다).
+/AGENTS.md               @craftowen
+/CLAUDE.md               @craftowen
+/docs/CONVENTIONS.md     @craftowen
+/scripts/                @craftowen
+/Cargo.toml              @craftowen
+/clippy.toml             @craftowen
+/rustfmt.toml            @craftowen
+/deny.toml               @craftowen
+/.config/nextest.toml    @craftowen
+/.github/                @craftowen
+/.claude/                @craftowen
