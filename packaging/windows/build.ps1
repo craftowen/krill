@@ -50,5 +50,6 @@ $a = @{ Version = $Version; TargetDir = $targetDir; ConptyDir = $conptyDir; OutD
 if ($PublicKey) { $a.PublicKey = $PublicKey }
 if ($UpdateUrl) { $a.UpdateUrl = $UpdateUrl }
 $line = & (Join-Path $PSScriptRoot 'bundle.ps1') @a
-Set-Content -Encoding ascii (Join-Path $OutDir "Krill-$Version-windows-x64.zip.sha256") $line
+# LF로 쓴다(맥·리눅스 `shasum -c`가 CR을 파일 이름으로 읽는다).
+[IO.File]::WriteAllText((Join-Path (Resolve-Path $OutDir) "Krill-$Version-windows-x64.zip.sha256"), "$line`n")
 $line
