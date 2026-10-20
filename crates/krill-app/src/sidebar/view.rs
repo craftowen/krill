@@ -758,9 +758,14 @@ impl Sidebar {
                             })),
                     )
                     .child(
-                        Icon::new(IconName::Folder)
-                            .with_size(ui::ICON_MD)
-                            .text_color(p.muted_foreground),
+                        div()
+                            .debug_selector(move || format!("repo-icon-{index}"))
+                            .child(ui::icons::project_header_icon(
+                                self.project_icon(&row_host, path),
+                                self.project_badge_color(&row_host, path),
+                                ui::ICON_MD,
+                                p.muted_foreground,
+                            )),
                     )
                     .child(div().flex_1().min_w_0().truncate().child(basename(path)))
                     .when(wt_count > 0, |d| {
@@ -856,11 +861,12 @@ impl Sidebar {
                                 s.fold(&fold_btn, None, cx);
                             })),
                     )
-                    .child(
-                        Icon::new(IconName::Folder)
-                            .with_size(ui::ICON_MD)
-                            .text_color(p.muted_foreground),
-                    )
+                    .child(ui::icons::project_header_icon(
+                        self.project_icon(&row_host, path),
+                        self.project_badge_color(&row_host, path),
+                        ui::ICON_MD,
+                        p.muted_foreground,
+                    ))
                     .child(
                         div()
                             .debug_selector(move || format!("folder-title-{index}"))

@@ -667,6 +667,12 @@ struct ImportedProject {
     #[serde(default)]
     display_name: String,
     #[serde(default)]
+    badge_color: Option<String>,
+    #[serde(default)]
+    repo_icon: Option<ImportedRepoIcon>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
     host_id: Option<String>,
     #[serde(default)]
     pinned: bool,
@@ -716,6 +722,51 @@ pub(super) fn imported_repo_paths(state_dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
+/// `projects.toml`의 프로젝트 아이콘(CLI `StoredRepoIcon`): `lucide`·`emoji`·`image`(https URL 또는 로컬 경로).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub(super) struct ImportedRepoIcon {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub value: String,
+}
+
+/// 이관 프로젝트의 헤더 표시 메타(배지 색·아이콘·git 여부).
+#[derive(Debug, Clone)]
+pub(super) struct ImportedVisual {
+    pub badge_color: Option<String>,
+    pub repo_icon: Option<ImportedRepoIcon>,
+    pub is_git: bool,
+}
+
+/// 로컬 이관 프로젝트의 표시 메타를 정규 경로(와 linked 워크트리면 주 워크트리 경로) 키로 모은다.
+pub(super) fn imported_visuals(state_dir: &Path) -> BTreeMap<PathBuf, ImportedVisual> {
+    let mut out = BTreeMap::new();
+    let Some(file) = load_imported_projects(state_dir) else {
+        return out;
+    };
+    for proj in file.projects {
+        let raw = proj.path.trim();
+        if proj.archived || proj.host_id.is_some() || raw.is_empty() {
+            continue;
+        }
+        let visual = ImportedVisual {
+            badge_color: proj
+                .badge_color
+                .map(|c| c.trim().to_owned())
+                .filter(|c| !c.is_empty()),
+            repo_icon: proj.repo_icon,
+            is_git: proj.kind.as_deref() != Some("folder"),
+        };
+        let norm = normalize_imported_path(Path::new(raw));
+        if let Some(main) = main_worktree(&norm) {
+            out.insert(normalize_imported_path(&main), visual.clone());
+        }
+        out.insert(norm, visual);
+    }
+    out
+}
+
 fn load_imported_projects(state_dir: &Path) -> Option<ImportedProjectsFile> {
     let mut bytes = Vec::new();
     let file = fs::File::open(state_dir.join(PROJECTS_FILE)).ok()?;
@@ -763,7 +814,7 @@ fn resolve_repo_for_worktree(
 /// 과거 이관분(`[[projects]]` 원본 경로 vs `[worktrees]` 정규 경로)이 섞인 파일도
 /// 사이드바에서 하나의 저장소로 합쳐지도록 읽는 쪽에서도 정규화한다.
 /// 별칭 후보가 아니면 시스템 콜 없이 그대로 둔다(스냅샷 폴링 부하 방지).
-fn normalize_imported_path(path: &Path) -> PathBuf {
+pub(super) fn normalize_imported_path(path: &Path) -> PathBuf {
     if !["/tmp", "/var", "/etc", "/private"]
         .iter()
         .any(|prefix| path.starts_with(prefix))

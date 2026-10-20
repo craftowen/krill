@@ -23,6 +23,8 @@ use super::{
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 
+type ProjectVisuals = BTreeMap<PathBuf, super::project_icon::ProjectVisual>;
+
 /// 사이드바 워크트리 목록 그룹화 기준.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum GroupBy {
@@ -1427,8 +1429,15 @@ fn render_options_menu_panel(
     cx: &gpui::App,
 ) -> gpui::Stateful<gpui::Div> {
     let p = ui::palette(cx);
-    let (options, repos, hosts) = sidebar_weak.upgrade().map_or_else(
-        || (WorkspaceOptions::default(), Vec::new(), Vec::new()),
+    let (options, repos, hosts, visuals) = sidebar_weak.upgrade().map_or_else(
+        || {
+            (
+                WorkspaceOptions::default(),
+                Vec::new(),
+                Vec::new(),
+                BTreeMap::new(),
+            )
+        },
         |entity| {
             let s = entity.read(cx);
             let repos: Vec<PathBuf> = s.snapshot.trees.keys().cloned().collect();
@@ -1450,7 +1459,7 @@ fn render_options_menu_panel(
                 }))
                 .collect()
             };
-            (s.options.clone(), repos, hosts)
+            (s.options.clone(), repos, hosts, s.project_visuals.clone())
         },
     );
     let open_submenu = *submenu_state.read(cx);
@@ -1482,7 +1491,7 @@ fn render_options_menu_panel(
                 submenu_state,
                 open_submenu,
                 &options,
-                &repos,
+                (&repos, &visuals),
                 &hosts,
                 p,
             ))
@@ -1517,7 +1526,7 @@ fn render_show_section(
     submenu_state: &Entity<Option<OptionsSubmenu>>,
     open_submenu: Option<OptionsSubmenu>,
     options: &WorkspaceOptions,
-    repos: &[PathBuf],
+    (repos, visuals): (&[PathBuf], &ProjectVisuals),
     hosts: &[HostMenuEntry],
     p: &'static ui::Palette,
 ) -> gpui::Div {
@@ -1574,6 +1583,7 @@ fn render_show_section(
                     menu_weak,
                     &options.filters,
                     repos,
+                    visuals,
                     p,
                 ))
             })
@@ -1690,6 +1700,7 @@ fn render_projects_panel(
     menu_weak: &gpui::WeakEntity<PopupMenu>,
     filters: &WorkspaceFilters,
     repos: &[PathBuf],
+    visuals: &ProjectVisuals,
     p: &'static ui::Palette,
 ) -> gpui::Stateful<gpui::Div> {
     let has_selection = !filters.repos.is_empty();
@@ -1761,6 +1772,12 @@ fn render_projects_panel(
                     mn.update(cx, |_, cx| cx.notify()).ok();
                 })
                 .child(check_slot(checked, p))
+                .child(ui::icons::project_header_icon(
+                    visuals.get(repo).and_then(|v| v.icon.as_ref()),
+                    visuals.get(repo).and_then(|v| v.badge_color.as_deref()),
+                    ui::ICON_XS,
+                    p.muted_foreground,
+                ))
                 .child(
                     div()
                         .min_w_0()
