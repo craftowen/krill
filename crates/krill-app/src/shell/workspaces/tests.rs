@@ -120,6 +120,41 @@ fn workspace_tabs_close_active_selects_another_tab_in_same_workspace(cx: &mut Te
 }
 
 #[gpui::test]
+fn workspace_tabs_close_active_prefers_adjacent_tabs_in_same_workspace(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("workspace-close-adjacent"));
+    let panes = view.update(cx, fixture);
+    let right = view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            l.new_tab_after(l.tabs().len() - 1);
+            let pane = l.active_tab().focused;
+            l.set_launch(
+                pane,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: b"/workspace/a".to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            l.set_session(pane, SessionId(104));
+            l.activate(2);
+        });
+        s.layout.tabs()[4].focused
+    });
+    view.update(cx, |s, cx| {
+        s.do_close_tab(2, cx);
+        assert_eq!(s.layout.focused(), Some(right));
+        s.do_close_tab(s.layout.active(), cx);
+        assert_eq!(s.layout.focused(), Some(panes[0]));
+        assert_eq!(s.closed_sessions, vec![SessionId(102), SessionId(104)]);
+        for (pane, session) in [(panes[1], SessionId(101)), (panes[3], SessionId(103))] {
+            assert_eq!(s.layout.session(pane), Some(session));
+        }
+    });
+}
+
+#[gpui::test]
 fn workspace_tabs_close_single_pane_stays_in_workspace(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("workspace-close-pane"));
     let panes = view.update(cx, fixture);
