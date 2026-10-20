@@ -72,8 +72,10 @@ async function testHybridChatToggleAndQuestionCards(){
  assert.equal(mounts.length,1);
  const flush=async()=>{for(let i=0;i<10;i++)await Promise.resolve();};
  const toggleBtn=buttons.find(b=>b.className?.includes('mode-toggle'));
- // 에이전트 세션(claude)은 기본값이 Chat 뷰이므로 토글 버튼 텍스트는 'Term'이다.
- assert.equal(toggleBtn.textContent,'Term');
+ // 기본 보기는 에이전트 세션(claude)도 터미널이다. Chat은 사용자가 고르면 열리고 세션별로 저장된다.
+ assert.equal(toggleBtn.textContent,'Chat');
+ await flush();assert(!calls.some(c=>c.action==='chat_poll'));
+ toggleBtn.action();assert.equal(toggleBtn.textContent,'Term');assert.equal(state.preferences.sessionViewModes[7],'chat');
  await flush();
  assert(calls.some(c=>c.action==='chat_poll'&&c.session===7));
  const fastOpt=buttons.find(b=>b.textContent?.startsWith('Fast'));
@@ -96,6 +98,7 @@ async function testHybridChatToggleAndQuestionCards(){
  assert.equal(unmounts.length,0);
  view.cleanup();
  assert.equal(unmounts.length,1);
+ buttons.length=0;const savedView=sandbox.KrillMobile.screens.session(el('main'),ctx);assert.equal(buttons.find(b=>b.className?.includes('mode-toggle')).textContent,'Term');savedView.cleanup();
  // 일반 셸 세션(agent === '')은 기본값이 Term 뷰다.
  buttons.length=0;
  const shellView=sandbox.KrillMobile.screens.session(el('main'),{...ctx,route:{groupKey:'g',sessionId:8}});
