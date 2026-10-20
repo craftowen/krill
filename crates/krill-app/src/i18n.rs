@@ -436,6 +436,13 @@ catalog! {
         PINNED_CLOSE_CANCEL => ("취소", "Cancel"),
         RECENT_TABS_TITLE => ("최근 탭 (Ctrl+Tab)", "Recent Tabs (Ctrl+Tab)"),
         EMPTY_NEW_AGENT => ("새 에이전트", "New agent"),
+        AWAY_SUMMARY => ("Krill을 닫아 둔 {duration} 동안 {counts}", "While Krill was closed ({duration}): {counts}"),
+        AWAY_DONE => ("{n}개 완료", "{n} done"),
+        AWAY_NEEDS_YOU => ("{n}개 확인 필요", "{n} need you"),
+        AWAY_MINUTES => ("{n}분", "{n} min"),
+        AWAY_HOURS => ("{n}시간", "{n} h"),
+        AWAY_DAYS => ("{n}일", "{n} d"),
+        EMPTY_TAGLINE => ("앱을 닫거나 업데이트해도 세션은 계속 실행됩니다", "Sessions keep running when you close or update the app"),
         EMPTY_OPEN_FILE => ("파일 열기", "Open file"),
         SHORTCUT_NEW_TAB => (platform_text!("⌘T", "Ctrl+Shift+T"), platform_text!("⌘T", "Ctrl+Shift+T")),
         SHORTCUT_NEW_AGENT_TAB => (platform_text!("⌘⌥T", "Ctrl+Alt+T"), platform_text!("⌘⌥T", "Ctrl+Alt+T")),
@@ -455,6 +462,7 @@ catalog! {
     }
     detached {
         TITLE => ("분리된 세션", "Detached sessions"),
+        SUBTITLE => ("탭 밖에서 계속 실행 중", "Running outside tabs"),
         EXITED => ("종료됨", "Exited"),
         CLOSE => ("닫기", "Close"),
         SESSION_EXITED => ("세션 {id} · {state}", "Session {id} · {state}"),
@@ -512,6 +520,7 @@ catalog! {
         HOST_CONNECTED => ("연결됨", "Connected"),
         HOST_CONNECTING => ("연결 중", "Connecting"),
         HOST_DISCONNECTED => ("끊김", "Disconnected"),
+        HOST_RECONNECTING => ("다시 연결하는 중", "Reconnecting"),
         HOST_RECONNECT => ("다시 연결", "Reconnect"),
         HOST_OFFLINE_GROUP => ("연결 안 된 호스트 {n}개", "{n} unconnected hosts"),
         HOST_REASON_OFFLINE => ("꺼져 있음", "Offline"),
@@ -604,7 +613,8 @@ catalog! {
         REMOVE_PROJECT => ("프로젝트 제거", "Remove Project"),
     }
     link {
-        RECONNECTING => ("세션 데몬에 다시 연결하는 중… 세션은 그대로 살아 있습니다", "Reconnecting to the session daemon… Sessions are still running"),
+        RECONNECTING => ("세션 데몬에 다시 연결하는 중… 세션은 krill-holder가 보관하고 있습니다", "Reconnecting to the session daemon… krill-holder is keeping your sessions"),
+        RECONNECTED => ("세션 {n}개에 다시 연결했습니다", "Reconnected to {n} sessions"),
         FAILED => ("세션 데몬에 연결하지 못했습니다", "Could not connect to the session daemon"),
         RETRYING => ("다시 시도하는 중", "Retrying"),
         UNCERTAIN => ("전달됐는지 알 수 없는 입력(다시 보내지 않음)", "Input delivery uncertain (not resent)"),

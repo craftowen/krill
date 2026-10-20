@@ -141,6 +141,7 @@ impl Render for Panel {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let p = crate::ui::palette(cx);
         let expanded = self.expanded;
+        let any_running = self.items.iter().any(|i| i.status.is_none());
         div().flex().flex_col().when(!self.items.is_empty(), |d| {
             d.border_t_1()
                 .border_color(p.sidebar_border)
@@ -157,9 +158,12 @@ impl Render for Panel {
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(p.muted_foreground.opacity(0.75))
                         .hover(|d| d.text_color(p.sidebar_foreground))
+                        .gap_2()
                         .child(
                             div()
                                 .flex()
+                                .flex_1()
+                                .min_w_0()
                                 .items_center()
                                 .gap_1p5()
                                 .child(
@@ -171,10 +175,21 @@ impl Render for Panel {
                                     .with_size(gpui::px(12.))
                                     .text_color(p.muted_foreground.opacity(0.65)),
                                 )
-                                .child(text::TITLE.get()),
+                                .child(div().flex_none().child(text::TITLE.get()))
+                                // 탭 밖 세션도 krill-holder가 PTY를 쥐고 있다. 종료된 것만 남으면 붙이지 않는다.
+                                .when(any_running, |d| {
+                                    d.child(
+                                        div()
+                                            .min_w_0()
+                                            .truncate()
+                                            .font_weight(gpui::FontWeight::NORMAL)
+                                            .child(text::SUBTITLE.get()),
+                                    )
+                                }),
                         )
                         .child(
                             div()
+                                .flex_none()
                                 .px_1()
                                 .rounded(crate::ui::RADIUS_XS)
                                 .bg(p.muted)
@@ -197,6 +212,12 @@ impl Render for Panel {
                             .flex_col()
                             .children(self.items.iter().map(|i| {
                                 let id = i.session;
+                                // 실행 중이면 보존 톤 점, 종료됐으면 흐린 점(같은 폭이라 라벨이 줄 맞춤된다).
+                                let dot = if i.status.is_none() {
+                                    p.preserve
+                                } else {
+                                    p.muted_foreground.opacity(0.5)
+                                };
                                 let label = match i.status {
                                     Some(_) => text::SESSION_EXITED.format(&[
                                         ("id", &id.0.to_string()),
@@ -210,6 +231,7 @@ impl Render for Panel {
                                 div()
                                     .flex()
                                     .items_center()
+                                    .gap_1p5()
                                     .mx_1()
                                     .px_2()
                                     .py_1()
@@ -220,6 +242,13 @@ impl Render for Panel {
                                         d.bg(p.sidebar_accent)
                                             .text_color(p.sidebar_accent_foreground)
                                     })
+                                    .child(
+                                        div()
+                                            .size(crate::ui::STATE_DOT)
+                                            .flex_none()
+                                            .rounded_full()
+                                            .bg(dot),
+                                    )
                                     .child(
                                         div()
                                             .id(("detached-open", id.0))

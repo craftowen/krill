@@ -72,6 +72,36 @@ pub fn beep() {
     unsafe { NSBeep() }
 }
 
+/// Krill 알림음(`Contents/Resources/krill-chime.caf`, `packaging/macos/make_chime.py`). 번들 밖 실행처럼 리소스가 없거나
+/// 재생을 시작하지 못하면 `NSBeep`으로 대신한다.
+pub fn play_notification_chime() {
+    if !play_bundled_sound("krill-chime") {
+        beep();
+    }
+}
+
+/// 이름으로 찾은 `NSSound`(번들 Resources → 시스템 사운드 순)를 재생한다. 재생을 시작했으면 `true`.
+fn play_bundled_sound(name: &str) -> bool {
+    let Some(cls) = AnyClass::get(c"NSSound") else {
+        return false;
+    };
+    let Some(cf) = cf_string(name) else {
+        return false;
+    };
+    // SAFETY: `soundNamed:`는 NSSound 클래스 메서드다. 인자는 NSString과 toll-free bridge되는 CFString이고, 반환은
+    // autorelease된 캐시 인스턴스나 nil이다. 메인 스레드(gpui 업데이트)에서 부른다.
+    let sound: *mut AnyObject = unsafe { msg_send![cls, soundNamed: cf.cast::<AnyObject>()] };
+    cf_release(cf);
+    if sound.is_null() {
+        return false;
+    }
+    // 같은 캐시 인스턴스가 아직 울리는 중이면 `play`가 NO를 돌려주므로 먼저 멈추고 처음부터 다시 낸다.
+    // SAFETY: sound는 널이 아닌 NSSound, `stop`·`play`는 BOOL을 돌려주는 인스턴스 메서드다.
+    let _: bool = unsafe { msg_send![sound, stop] };
+    // SAFETY: 위와 같다.
+    unsafe { msg_send![sound, play] }
+}
+
 /// Dock 아이콘 배지(`[[NSApplication sharedApplication] dockTile] setBadgeLabel:`, MK-044).
 ///
 /// 빈 문자열이나 `None`이면 배지를 지운다. 같은 값이면 `AppKit` 호출을 생략한다.

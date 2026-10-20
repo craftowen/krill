@@ -540,6 +540,20 @@ pub struct RenameSession(pub SessionId);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectHost(pub HostId);
 
+/// 로컬 데몬 재연결 뒤 처음 받은 로컬 세션 목록의 세션 수.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Relisted(pub usize);
+
+/// 셸이 알려 주는 로컬 데몬 감시 연결의 재연결 단계.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relink {
+    Steady,
+    /// 끊겨 다시 붙는 중. '내 Mac' 끊김을 보존 톤으로 그린다.
+    Reconnecting,
+    /// 다시 붙었고, 다음 로컬 목록 도착 때 [`Relisted`]를 한 번 내보낸다.
+    AwaitingList,
+}
+
 #[expect(
     clippy::struct_excessive_bools,
     reason = "서로 무관한 화면 상태 플래그(표시·폴링·펼침)라 상태 기계로 합칠 수 없다"
@@ -548,6 +562,7 @@ pub struct Sidebar {
     snapshot: Snapshot,
     meta: Meta,
     local_status: HostStatus,
+    relink: Relink,
     remote_hosts: Vec<RemoteHost>,
     remote_task: Option<Task<()>>,
     remote_manager: Option<HostManager>,
@@ -643,6 +658,7 @@ impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
+impl EventEmitter<Relisted> for Sidebar {}
 
 impl std::fmt::Debug for Sidebar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -706,6 +722,7 @@ impl Sidebar {
             snapshot: Snapshot::default(),
             meta: Meta::new(),
             local_status: HostStatus::Connected,
+            relink: Relink::Steady,
             remote_hosts: Vec::new(),
             remote_task: None,
             remote_manager: None,
@@ -1758,6 +1775,10 @@ impl Sidebar {
     ) {
         match result {
             Ok((snapshot, meta)) => {
+                if self.relink == Relink::AwaitingList {
+                    self.relink = Relink::Steady;
+                    cx.emit(Relisted(snapshot.sessions.len()));
+                }
                 // 워크트리 발견·메타 IO는 connect_source의 백그라운드 단계에서 끝낸다.
                 let status_changed = self.local_status != HostStatus::Connected;
                 self.local_status = HostStatus::Connected;
@@ -1940,6 +1961,33 @@ impl Sidebar {
     fn persist(&mut self, cx: &mut Context<Self>) {
         self.write_state();
         self.rebuild(cx);
+    }
+
+    /// 로컬 데몬 감시 연결이 끊겨 다시 붙는 중인지. 재연결 중에서 풀리면 다음 로컬 목록 도착을
+    /// [`Relisted`]로 한 번 알린다(재연결 확인은 목록이 실제로 온 뒤에만).
+    pub fn set_local_reconnecting(&mut self, reconnecting: bool, cx: &mut Context<Self>) {
+        let next = match (reconnecting, self.relink) {
+            (true, _) => Relink::Reconnecting,
+            (false, Relink::Reconnecting) => Relink::AwaitingList,
+            (false, other) => other,
+        };
+        if next != self.relink {
+            self.relink = next;
+            cx.notify();
+        }
+    }
+
+    fn local_reconnecting(&self) -> bool {
+        self.relink == Relink::Reconnecting
+    }
+
+    /// 로컬 세션들의 에이전트 상태(상태바 떼 미터).
+    pub fn session_states(&self) -> Vec<krill_proto::control::AgentState> {
+        self.snapshot
+            .sessions
+            .iter()
+            .map(|s| s.status.state)
+            .collect()
     }
 
     pub fn row_count(&self) -> usize {

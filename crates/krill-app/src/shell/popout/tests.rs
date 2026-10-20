@@ -5,8 +5,8 @@ use krill_proto::{control::AgentStatus, input::Input, ipc, screen::Msg as _};
 
 use super::*;
 
-#[test]
-fn status_indicators_expose_status_role_and_label() {
+#[gpui::test]
+fn status_indicators_expose_status_role_and_label(cx: &mut TestAppContext) {
     let p = &krill_app::ui::DARK;
     let el = daemon_status_dot("daemon up".to_owned(), p.success);
     let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
@@ -14,7 +14,8 @@ fn status_indicators_expose_status_role_and_label() {
     assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Status));
     assert_eq!(node.label(), Some("daemon up"));
 
-    let el = usage_status(p, 3, 1);
+    // 떼 미터를 붙여도 세션 수·알림 수 라벨은 그대로다.
+    let el = cx.update(|cx| usage_status(p, &[AgentState::Working; 3], 1, cx));
     let mut node = gpui::accesskit::Node::new(gpui::Role::Unknown);
     gpui::Element::write_a11y_info(&el, &mut node);
     assert_eq!(gpui::Element::a11y_role(&el), Some(gpui::Role::Status));

@@ -39,6 +39,11 @@ pub fn beep() {
     win::beep();
 }
 
+/// 알림음. Windows는 지금처럼 시스템 경고음을 쓴다.
+pub fn play_notification_chime() {
+    beep();
+}
+
 /// Windows uses a taskbar attention overlay; the full unread count stays in the app.
 pub fn set_dock_badge(label: Option<&str>) {
     #[cfg(windows)]

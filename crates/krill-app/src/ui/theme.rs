@@ -208,7 +208,7 @@ pub(super) const fn term_rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
 }
 
-/// Orca `.ref/orca/src/renderer/src/assets/main.css`의 시맨틱 색 토큰.
+/// 시맨틱 색 토큰. 이름·역할은 Orca `.ref/orca/src/renderer/src/assets/main.css`를 따르고, 무채색 크롬 값과 `preserve`는 Krill 고유다.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Palette {
     pub background: Hsla,
@@ -247,11 +247,12 @@ pub struct Palette {
     pub warning: Hsla,
     pub warning_foreground: Hsla,
     pub agent_question: Hsla,
+    pub preserve: Hsla,
     pub split_divider: Hsla,
     pub split_divider_strong: Hsla,
 }
 
-/// Orca 라이트 모드(`:root`) 팔레트.
+/// 라이트 팔레트. Orca 라이트 모드(`:root`) 기반, 무채색 크롬은 Krill 심해 틴트(Orca 값에서 변경). 상태색은 Orca 값 그대로다.
 pub const LIGHT: Palette = Palette {
     background: hex(0x00ff_ffff),
     editor_surface: hex(0x00ff_ffff),
@@ -262,81 +263,94 @@ pub const LIGHT: Palette = Palette {
     popover_foreground: hex(0x000a_0a0a),
     primary: hex(0x0017_1717),
     primary_foreground: hex(0x00fa_fafa),
-    secondary: hex(0x00f5_f5f5),
+    // Krill 심해 틴트(Orca 값에서 변경): secondary·muted·accent·border·input·ring.
+    secondary: hex(0x00f3_f4f7),
     secondary_foreground: hex(0x0017_1717),
-    muted: hex(0x00f5_f5f5),
-    muted_foreground: hex(0x0073_7373),
-    accent: hex(0x00f5_f5f5),
+    muted: hex(0x00f3_f4f7),
+    // `#666D7A`는 sidebar_accent 위 4.40:1이라 한 단계 더 어둡게 잡았다(대비 테스트가 고정).
+    muted_foreground: hex(0x0064_6b78),
+    accent: hex(0x00ee_f0f4),
     accent_foreground: hex(0x0017_1717),
     destructive: hex(0x00e4_0014),
     destructive_foreground: hex(0x00fc_f3f3),
-    border: hex(0x00e5_e5e5),
-    input: hex(0x00e5_e5e5),
-    ring: hex(0x00a1_a1a1),
-    sidebar: hex(0x00fa_fafa),
+    border: hex(0x00e4_e7ec),
+    input: hex(0x00e4_e7ec),
+    ring: hex(0x009a_a3b5),
+    // Krill 심해 틴트(Orca 값에서 변경): sidebar·worktree_sidebar 계열.
+    sidebar: hex(0x00f6_f7f9),
     sidebar_foreground: hex(0x000a_0a0a),
     sidebar_primary: hex(0x0017_1717),
     sidebar_primary_foreground: hex(0x00fa_fafa),
-    sidebar_accent: hex(0x00f0_f0f0),
+    sidebar_accent: hex(0x00e9_ecf1),
     sidebar_accent_foreground: hex(0x0017_1717),
-    sidebar_border: hex(0x00e5_e5e5),
-    sidebar_ring: hex(0x00a1_a1a1),
-    worktree_sidebar: hex(0x00f5_f5f5),
+    sidebar_border: hex(0x00e4_e7ec),
+    sidebar_ring: hex(0x009a_a3b5),
+    worktree_sidebar: hex(0x00f1_f3f6),
     worktree_sidebar_foreground: hex(0x000a_0a0a),
-    worktree_sidebar_accent: hex(0x00ea_eaea),
-    worktree_sidebar_border: hex(0x00e5_e5e5),
+    worktree_sidebar_accent: hex(0x00e6_e9ef),
+    worktree_sidebar_border: hex(0x00e4_e7ec),
     success: hex(0x0015_803d),
     warning: hex(0x00ca_8a04),
     warning_foreground: hex(0x00fa_fafa),
     agent_question: hex(0x00ea_580c),
+    // Krill 고유: 세션 보존·이어짐(데몬 재연결 중, 탭 밖 분리 세션). 상태색과 섞지 않는다.
+    preserve: hex(0x0003_69a1),
     split_divider: hex(0x0086_8690),
     split_divider_strong: hex(0x0071_717a),
 };
 
-/// Orca 다크 모드(`.dark`) 팔레트.
+/// 다크 팔레트. Orca 다크 모드(`.dark`) 기반, 무채색 크롬은 Krill 심해 틴트(Orca 값에서 변경). 상태색은 Orca 값 그대로다.
 pub const DARK: Palette = Palette {
-    background: hex(0x000a_0a0a),
+    // Krill 심해 틴트(Orca 값에서 변경): background·card·popover·secondary·muted·accent·ring.
+    background: hex(0x000b_0d13),
     editor_surface: hex(0x001e_1e1e),
     foreground: hex(0x00fa_fafa),
-    card: hex(0x0017_1717),
+    card: hex(0x0016_1a24),
     card_foreground: hex(0x00fa_fafa),
-    popover: hex(0x0017_1717),
+    popover: hex(0x0016_1a24),
     popover_foreground: hex(0x00fa_fafa),
     primary: hex(0x00e5_e5e5),
     primary_foreground: hex(0x0017_1717),
-    secondary: hex(0x0026_2626),
+    secondary: hex(0x001f_2430),
     secondary_foreground: hex(0x00fa_fafa),
-    muted: hex(0x0026_2626),
-    muted_foreground: hex(0x00a1_a1a1),
-    accent: hex(0x0030_3030),
+    muted: hex(0x001f_2430),
+    muted_foreground: hex(0x009a_a3b5),
+    accent: hex(0x002a_3040),
     accent_foreground: hex(0x00fa_fafa),
     destructive: hex(0x00ff_6568),
     destructive_foreground: hex(0x00fa_fafa),
     border: hexa(0x00ff_ffff, 0.08),
     input: hexa(0x00ff_ffff, 0.15),
-    ring: hex(0x0073_7373),
-    sidebar: hex(0x0017_1717),
+    ring: hex(0x005b_6478),
+    // Krill 심해 틴트(Orca 값에서 변경): sidebar·worktree_sidebar 계열.
+    sidebar: hex(0x0012_151d),
     sidebar_foreground: hex(0x00fa_fafa),
     sidebar_primary: hex(0x0014_47e6),
     sidebar_primary_foreground: hex(0x00fa_fafa),
-    sidebar_accent: hex(0x0026_2626),
+    sidebar_accent: hex(0x0022_2836),
     sidebar_accent_foreground: hex(0x00fa_fafa),
     sidebar_border: hexa(0x00ff_ffff, 0.07),
-    sidebar_ring: hex(0x0052_5252),
-    worktree_sidebar: hex(0x002a_2a2a),
+    sidebar_ring: hex(0x004b_5366),
+    worktree_sidebar: hex(0x0023_2836),
     worktree_sidebar_foreground: hex(0x00fa_fafa),
-    worktree_sidebar_accent: hex(0x0035_3535),
+    worktree_sidebar_accent: hex(0x002e_3445),
     worktree_sidebar_border: hexa(0x00ff_ffff, 0.07),
     success: hex(0x0086_efac),
     warning: hex(0x00ea_b308),
     warning_foreground: hex(0x0017_1717),
     agent_question: hex(0x00f9_7316),
+    // Krill 고유: 세션 보존·이어짐(데몬 재연결 중, 탭 밖 분리 세션). 상태색과 섞지 않는다.
+    preserve: hex(0x007d_d3fc),
     split_divider: hex(0x0071_717a),
     split_divider_strong: hex(0x00a1_a1aa),
 };
 
+/// Krill 다크 터미널 기본 테마 `Krill Deep`. 데몬이 테마를 받기 전에 답하는 [`krill_proto::theme::DEFAULT`]와 같은 값이다.
+pub const TERMINAL_DARK: TerminalTheme = krill_proto::theme::DEFAULT;
+
 /// Orca 다크 터미널 팔레트(`Ghostty Default Style Dark`, `.ref/orca/src/shared/terminal-themes/defaults.ts`).
-pub const TERMINAL_DARK: TerminalTheme = TerminalTheme {
+/// `Krill Deep`과 글자·ANSI 색은 같고 배경·커서만 다르다.
+pub const TERMINAL_GHOSTTY_DARK: TerminalTheme = TerminalTheme {
     foreground: term_rgb(0xff, 0xff, 0xff),
     background: term_rgb(0x28, 0x2c, 0x34),
     cursor: term_rgb(0xff, 0xff, 0xff),
@@ -627,6 +641,69 @@ mod tests {
         assert_eq!(STATUS_GROUP_OVERLAP, px(-3.));
         assert!((TRANSPARENT.a - 0.0).abs() < f32::EPSILON);
         assert_eq!(transparent(), TRANSPARENT);
+    }
+
+    /// WCAG 2.x 상대휘도.
+    fn relative_luminance(c: Hsla) -> f32 {
+        let rgba = c.to_rgb();
+        let lin = |v: f32| {
+            if v <= 0.040_45 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * lin(rgba.r) + 0.7152 * lin(rgba.g) + 0.0722 * lin(rgba.b)
+    }
+
+    fn contrast(a: Hsla, b: Hsla) -> f32 {
+        let (la, lb) = (relative_luminance(a), relative_luminance(b));
+        (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+    }
+
+    /// 심해 틴트 대비 회귀: 본문·보조 글자가 모든 크롬 표면 위에서 WCAG AA(4.5:1) 이상, `preserve`도 바탕 위 AA.
+    #[test]
+    fn text_tokens_meet_wcag_aa_on_every_surface() {
+        for (name, p) in [("LIGHT", &LIGHT), ("DARK", &DARK)] {
+            let surfaces = [
+                ("background", p.background),
+                ("sidebar", p.sidebar),
+                ("card", p.card),
+                ("popover", p.popover),
+                ("muted", p.muted),
+                ("accent", p.accent),
+                ("sidebar_accent", p.sidebar_accent),
+                ("worktree_sidebar", p.worktree_sidebar),
+            ];
+            for (fg_name, fg) in [
+                ("foreground", p.foreground),
+                ("muted_foreground", p.muted_foreground),
+            ] {
+                for (bg_name, bg) in surfaces {
+                    let ratio = contrast(fg, bg);
+                    assert!(
+                        ratio >= 4.5,
+                        "{name}: {fg_name} on {bg_name} = {ratio:.2}:1 < 4.5:1"
+                    );
+                }
+            }
+            let ratio = contrast(p.preserve, p.background);
+            assert!(
+                ratio >= 4.5,
+                "{name}: preserve on background = {ratio:.2}:1"
+            );
+        }
+    }
+
+    /// Krill Deep은 데몬 기본 테마와 같고, 글자·ANSI는 Ghostty Default Style Dark 그대로, 배경은 어둡다.
+    #[test]
+    fn krill_deep_terminal_matches_daemon_default() {
+        assert_eq!(TERMINAL_DARK, krill_proto::theme::DEFAULT);
+        assert_eq!(TERMINAL_DARK.ansi, TERMINAL_GHOSTTY_DARK.ansi);
+        assert_eq!(TERMINAL_DARK.foreground, TERMINAL_GHOSTTY_DARK.foreground);
+        assert_eq!(TERMINAL_DARK.background, term_rgb(0x10, 0x13, 0x1b));
+        assert_eq!(TERMINAL_DARK.cursor, term_rgb(0xff, 0x52, 0x38));
+        assert!(terminal_surface(TERMINAL_DARK).l < 0.10);
     }
 
     /// OWE-655: 터미널 배경 불투명도는 50..=100으로 자르고 그 외 색은 그대로 둔다.
@@ -983,7 +1060,7 @@ mod tests {
             }
         }
         assert_eq!(
-            field_count, 38,
+            field_count, 39,
             "unexpected Palette field count: {field_count}"
         );
 

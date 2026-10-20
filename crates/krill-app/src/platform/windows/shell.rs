@@ -163,8 +163,18 @@ fn notify(hwnd: HWND, title: &str, operation: u32) -> bool {
         uCallbackMessage: CALLBACK,
         ..Default::default()
     };
-    // SAFETY: loads a shared system icon, requiring no DestroyIcon.
-    data.hIcon = unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) };
+    // Krill 아이콘은 exe 리소스 ID 1(packaging/windows/krill.rc). 없으면 시스템 기본 아이콘.
+    // SAFETY: a null name returns this exe's module handle without taking a reference.
+    let module = unsafe { GetModuleHandleW(ptr::null()) };
+    // SAFETY: LoadIconW with an integer resource id (MAKEINTRESOURCE(1)) returns a shared icon
+    // needing no DestroyIcon, or null when the resource is missing.
+    let krill = unsafe { LoadIconW(module, ptr::without_provenance(1)) };
+    data.hIcon = if krill.is_null() {
+        // SAFETY: loads a shared system icon, requiring no DestroyIcon.
+        unsafe { LoadIconW(ptr::null_mut(), IDI_APPLICATION) }
+    } else {
+        krill
+    };
     let mut length = 0;
     for character in title.chars() {
         if length + character.len_utf16() >= data.szTip.len() {

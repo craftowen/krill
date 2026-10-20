@@ -476,6 +476,103 @@ fn daemon_link_shows_banner(cx: &mut TestAppContext) {
     assert_eq!(banner(cx), None);
 }
 
+/// 데몬 재연결: 끊긴 동안 보존 톤 배너, 다시 붙어도 실제 세션 목록이 오기 전에는 확인 문구가 없고,
+/// 목록이 오면 "세션 n개에 다시 연결했습니다"를 잠깐 보인 뒤 지운다. 처음 붙을 때는 보이지 않는다.
+#[gpui::test]
+fn reconnect_confirmation_waits_for_session_list(cx: &mut TestAppContext) {
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("reconnected"));
+    let session = |id| sidebar::Session {
+        id: krill_proto::SessionId(id),
+        status: krill_proto::control::AgentStatus::UNKNOWN,
+        worktree: None,
+        cwd: None,
+        account: None,
+    };
+    let snapshot = sidebar::Snapshot {
+        sessions: vec![session(1), session(2)],
+        trees: std::collections::BTreeMap::new(),
+    };
+    let shown = |cx: &mut VisualTestContext| cx.update(|_, cx| view.read(cx).reconnected.clone());
+    let set = |cx: &mut VisualTestContext, link: Link| {
+        cx.update(|_, cx| view.update(cx, |s, cx| s.set_link(link, cx)));
+        cx.run_until_parked();
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_link(Link::Up, cx);
+            s.sidebar
+                .update(cx, |b, cx| b.connect_source(Arc::new(Memory(snapshot)), cx));
+        });
+    });
+    cx.run_until_parked();
+    assert_eq!(shown(cx), None, "처음 붙을 때는 재연결 확인이 없다");
+
+    set(cx, Link::Down);
+    assert!(cx.debug_bounds("link-banner").is_some());
+    set(cx, Link::Up);
+    assert_eq!(
+        shown(cx),
+        None,
+        "목록 도착 전에는 다시 연결했다고 말하지 않는다"
+    );
+    assert!(cx.debug_bounds("reconnected-banner").is_none());
+
+    cx.executor().advance_clock(Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(
+        shown(cx).as_deref(),
+        Some(
+            krill_app::i18n::catalog::link::RECONNECTED
+                .format(&[("n", "2")])
+                .as_str()
+        )
+    );
+    assert!(cx.debug_bounds("reconnected-banner").is_some());
+
+    cx.executor().advance_clock(RECONNECTED_FOR);
+    cx.run_until_parked();
+    assert_eq!(shown(cx), None);
+}
+
+/// 자리 비운 사이 요약은 보존 톤 한 줄로 보이고 누르면 닫힌다.
+#[gpui::test]
+fn away_summary_banner_dismisses_on_click(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("away-summary"));
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.away = Some("Krill을 닫아 둔 2시간 동안 3개 완료".into());
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("away-summary").is_some());
+    click(cx, "away-summary");
+    assert_eq!(cx.update(|_, cx| view.read(cx).away.clone()), None);
+    assert!(cx.debug_bounds("away-summary").is_none());
+}
+
+/// 빈 작업 공간: 브랜드 타일·세션 생존 문구가 단축키 행 위에 보인다.
+#[gpui::test]
+fn empty_workspace_shows_brand_and_survival_line(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("empty-brand"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(layout_of(&view, cx).tabs().is_empty());
+    let tile = cx.debug_bounds("empty-brand-tile").expect("brand tile");
+    let tagline = cx.debug_bounds("empty-tagline").expect("tagline");
+    let row = cx.debug_bounds("empty-new-terminal").expect("shortcut row");
+    assert_eq!(tile.size.width, px(48.));
+    assert!(tile.bottom() <= tagline.top() && tagline.bottom() <= row.top());
+    assert!(cx.debug_bounds("titlebar-brand-mark").is_some());
+}
+
 /// OWE-490: 특수 키·IME 확정 텍스트가 포커스 칸 세션의 INPUT으로 가고, 화면 프레임의 제목이 탭 이름이 된다.
 #[gpui::test]
 fn keys_ime_and_frames_reach_the_focused_pane(cx: &mut TestAppContext) {

@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="660" height="400" viewBox="0 0 660 400">
+  <defs>
+    <linearGradient id="krill-dmg-shell" gradientUnits="userSpaceOnUse" x1="150" y1="90" x2="380" y2="420">
+      <stop offset="0" stop-color="#FFC4A8"/>
+      <stop offset="0.45" stop-color="#FF5238"/>
+      <stop offset="1" stop-color="#D63A24"/>
+    </linearGradient>
+  </defs>
+  <rect width="660" height="400" fill="#08090E"/>
+  <g transform="translate(275.2 14.2) scale(0.22)">
+    <path d="M352 140C300 82 200 72 112 126" fill="none" stroke="#FFC4A8" stroke-width="22" stroke-linecap="round"/>
+    <g fill="none" stroke="url(#krill-dmg-shell)">
+      <path d="M216 188.8A88 88 0 0 0 178.4 232" stroke-width="50"/>
+      <path d="M173.3 249.7A88 88 0 0 0 179.6 300.8" stroke-width="42"/>
+      <path d="M190.4 315.6A86 86 0 0 0 233.4 346.8" stroke-width="34"/>
+    </g>
+    <path fill="url(#krill-dmg-shell)" d="M242 340Q300 318 368 330Q336 356 262 362ZM262 366Q330 368 362 404Q296 404 242 368Z"/>
+    <path fill="url(#krill-dmg-shell)" fill-rule="evenodd" d="M392 148C360 126 300 112 252 128C236 134 226 142 219.6 154.1L240.2 210.5C280 214 330 198 360 176C372 167 382 158 392 148ZM302 154a16 16 0 1 0 32 0a16 16 0 1 0-32 0Z"/>
+  </g>
+  <path d="M262 200H392M372 184l20 16-20 16" fill="none" stroke="#5B6478" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Apple SD Gothic Neo', sans-serif" text-anchor="middle">
+    <text x="330" y="330" font-size="17" font-weight="600" fill="#FAFAFA">Krill을 Applications로 끌어다 놓기</text>
+    <text x="330" y="356" font-size="13" fill="#9AA3B5">Drag Krill to Applications</text>
+  </g>
+</svg>

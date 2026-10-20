@@ -53,28 +53,30 @@ const fn rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
 }
 
-/// 내장 기본 테마(어두움). MK-008 하네스가 세 에이전트와 실측한 값과 같다.
+/// 내장 기본 테마 `Krill Deep`(어두움). 앱 다크 터미널 기본값(`krill_app::ui::TERMINAL_DARK`)과 같다.
+/// 글자·ANSI 16색은 Orca `Ghostty Default Style Dark`, 배경은 Krill 심해 남색, 커서는 Krill 코랄이다.
+/// 배경이 어두워 OSC 11 응답을 받은 에이전트는 계속 다크로 판정한다(MK-008).
 pub const DEFAULT: Theme = Theme {
-    foreground: rgb(0xd0, 0xd0, 0xd0),
-    background: rgb(0x1c, 0x1c, 0x1c),
-    cursor: rgb(0xd0, 0xd0, 0xd0),
+    foreground: rgb(0xff, 0xff, 0xff),
+    background: rgb(0x10, 0x13, 0x1b),
+    cursor: rgb(0xff, 0x52, 0x38),
     ansi: [
-        rgb(0, 0, 0),
-        rgb(205, 49, 49),
-        rgb(13, 188, 121),
-        rgb(229, 229, 16),
-        rgb(36, 114, 200),
-        rgb(188, 63, 188),
-        rgb(17, 168, 205),
-        rgb(229, 229, 229),
-        rgb(102, 102, 102),
-        rgb(241, 76, 76),
-        rgb(35, 209, 139),
-        rgb(245, 245, 67),
-        rgb(59, 142, 234),
-        rgb(214, 112, 214),
-        rgb(41, 184, 219),
-        rgb(255, 255, 255),
+        rgb(0x1d, 0x1f, 0x21),
+        rgb(0xcc, 0x66, 0x66),
+        rgb(0xb5, 0xbd, 0x68),
+        rgb(0xf0, 0xc6, 0x74),
+        rgb(0x81, 0xa2, 0xbe),
+        rgb(0xb2, 0x94, 0xbb),
+        rgb(0x8a, 0xbe, 0xb7),
+        rgb(0xc5, 0xc8, 0xc6),
+        rgb(0x66, 0x66, 0x66),
+        rgb(0xd5, 0x4e, 0x53),
+        rgb(0xb9, 0xca, 0x4a),
+        rgb(0xe7, 0xc5, 0x47),
+        rgb(0x7a, 0xa6, 0xda),
+        rgb(0xc3, 0x97, 0xd8),
+        rgb(0x70, 0xc0, 0xb1),
+        rgb(0xea, 0xea, 0xea),
     ],
 };
 

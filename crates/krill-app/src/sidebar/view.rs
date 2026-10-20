@@ -59,6 +59,27 @@ struct HeaderMenuMeta {
     repo: bool,
 }
 
+/// 호스트 헤더 상태점 색·라벨. 로컬 데몬에 다시 붙는 중의 '내 Mac' 끊김은 세션이 krill-holder에 남아 있어
+/// 경고가 아니라 `preserve` 톤이다(STYLEGUIDE §7.1.1). 원격 호스트 끊김·처음부터 실패는 그대로 `destructive`.
+pub(super) fn host_status_tone(
+    status: HostStatus,
+    local_reconnecting: bool,
+    reason: Option<&'static str>,
+    p: &ui::Palette,
+) -> (gpui::Hsla, &'static str) {
+    match status {
+        HostStatus::Connected => (p.success, text::HOST_CONNECTED.get()),
+        HostStatus::Connecting => (p.warning, text::HOST_CONNECTING.get()),
+        HostStatus::Disconnected if local_reconnecting => {
+            (p.preserve, text::HOST_RECONNECTING.get())
+        }
+        HostStatus::Disconnected => (
+            p.destructive,
+            reason.unwrap_or_else(|| text::HOST_DISCONNECTED.get()),
+        ),
+    }
+}
+
 /// 행 컨텍스트 메뉴: 세션 행이면 세션 제어(열기·이어하기·종료)를 먼저 두고,
 /// 여기서 새 터미널·에이전트(N4), Open in(폴더가 있을 때), 워크트리면 핀·이름 변경·계보 작업(MK-176).
 #[expect(
@@ -452,14 +473,12 @@ impl Sidebar {
                     .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
                     .and_then(|r| r.error.as_deref())
                     .map(disconnect_reason);
-                let (dot_color, status_label) = match status {
-                    HostStatus::Connected => (p.success, text::HOST_CONNECTED.get()),
-                    HostStatus::Connecting => (p.warning, text::HOST_CONNECTING.get()),
-                    HostStatus::Disconnected => (
-                        p.destructive,
-                        reason.unwrap_or_else(|| text::HOST_DISCONNECTED.get()),
-                    ),
-                };
+                let (dot_color, status_label) = host_status_tone(
+                    *status,
+                    !host.is_remote() && self.local_reconnecting(),
+                    reason,
+                    p,
+                );
                 let fold_host = host.clone();
                 let header_key = host.as_key().to_owned();
                 let status_key = header_key.clone();

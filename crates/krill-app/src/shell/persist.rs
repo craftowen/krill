@@ -10,7 +10,6 @@ const DELAY: Duration = Duration::from_millis(150);
 
 enum Message {
     Save(Box<Layout>),
-    #[cfg(test)]
     Flush(mpsc::Sender<()>),
 }
 
@@ -37,7 +36,7 @@ impl Saver {
                 .spawn(move || run(&path, &recv))
             {
                 Ok(task) => *worker = Some(Worker { send, task }),
-                Err(err) => eprintln!("레이아웃 저장 작업자 시작 실패: {err}"),
+                Err(err) => eprintln!("layout save worker failed to start: {err}"),
             }
         }
         if let Some(worker) = worker.as_ref() {
@@ -48,12 +47,16 @@ impl Saver {
         }
     }
 
-    #[cfg(test)]
+    /// 디바운스 대기분을 지금 쓰고 끝날 때까지(최대 5초) 기다린다. 앱 종료 직전 저장용.
     pub(super) fn flush(&self) {
         let (send, recv) = mpsc::channel();
-        if let Some(worker) = self.worker.lock().unwrap().as_ref() {
-            worker.send.send(Message::Flush(send)).unwrap();
-            recv.recv_timeout(Duration::from_secs(5)).unwrap();
+        let sent = self.worker.lock().is_ok_and(|worker| {
+            worker
+                .as_ref()
+                .is_some_and(|w| w.send.send(Message::Flush(send)).is_ok())
+        });
+        if sent {
+            recv.recv_timeout(Duration::from_secs(5)).ok();
         }
     }
 }
@@ -69,7 +72,7 @@ impl Drop for Saver {
             // 정상 창 종료에서는 마지막 디바운스 대기분도 저장하고 끝낸다.
             drop(send);
             if task.join().is_err() {
-                eprintln!("레이아웃 저장 작업자 종료 실패");
+                eprintln!("layout save worker failed to stop");
             }
         }
     }
@@ -86,7 +89,6 @@ fn run(path: &Path, recv: &mpsc::Receiver<Message>) {
         };
         match message {
             Ok(Message::Save(layout)) => pending = Some(layout),
-            #[cfg(test)]
             Ok(Message::Flush(done)) => {
                 write(path, &mut pending);
                 done.send(()).ok();
@@ -105,7 +107,7 @@ fn write(path: &std::path::Path, pending: &mut Option<Box<Layout>>) {
     if let Some(layout) = pending.take()
         && let Err(err) = layout.save(path)
     {
-        eprintln!("레이아웃 저장 실패: {err}");
+        eprintln!("layout save failed: {err}");
     }
 }
 

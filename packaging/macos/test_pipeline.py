@@ -85,6 +85,7 @@ class PipelineTests(unittest.TestCase):
             r'^identifier "dev\.krill\.app" and certificate root = H"[0-9a-f]{40}"$',
         )
         self.assertTrue((self.app / "Contents/Resources/AppIcon.icns").is_file())
+        self.assertTrue((self.app / "Contents/Resources/krill-chime.caf").is_file())
         self.assertIn("NSDocumentsFolderUsageDescription", plist)
         archive, = self.output.glob("*.zip")
         self.assertIn("-adhoc.zip", archive.name)

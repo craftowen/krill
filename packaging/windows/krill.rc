@@ -1,0 +1,2 @@
+// krill-app.exe 아이콘. gpui-pre-windows가 리소스 ID 1을 창 클래스 아이콘(제목 표시줄·작업 표시줄·Alt+Tab)으로 읽는다.
+1 ICON "krill.ico"

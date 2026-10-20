@@ -1066,3 +1066,30 @@ fn focus_direction_moves_geometrically() {
     assert_eq!(l.focused(), Some(PaneId(2)));
     assert!(l.is_valid());
 }
+
+/// 마지막 앱 생존 시각은 꼬리 끝 필드로 저장·복원되고, 그 필드가 없는 6-필드 꼬리(이전 버전)는
+/// 나머지 꼬리를 그대로 읽되 시각은 `None`이다.
+#[test]
+fn last_seen_round_trips_and_old_tail_has_none() {
+    let mut l = Layout::default();
+    let pane = l.active_tab().focused;
+    assert!(l.set_respawn_cwd(pane, b"/repo/sub".to_vec()));
+    assert_eq!(l.last_seen_unix_ns(), None);
+    l.set_last_seen_unix_ns(1_760_000_000_000_000_000);
+    let path = temp_path("last-seen");
+    l.save(&path).unwrap();
+    let loaded = Layout::load(&path).unwrap();
+    assert_eq!(loaded.last_seen_unix_ns(), Some(1_760_000_000_000_000_000));
+    assert_eq!(loaded, l);
+
+    // 시각 0은 varint 한 바이트(0x00)라 마지막 바이트를 떼면 이전 버전의 6-필드 꼬리가 된다.
+    l.set_last_seen_unix_ns(0);
+    l.save(&path).unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes.pop(), Some(0));
+    std::fs::write(&path, &bytes).unwrap();
+    let old = Layout::load(&path).unwrap();
+    assert_eq!(old.last_seen_unix_ns(), None);
+    assert_eq!(old.respawn_cwd(pane), Some(&b"/repo/sub"[..]));
+    std::fs::remove_file(&path).ok();
+}

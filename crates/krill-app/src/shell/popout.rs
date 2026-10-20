@@ -54,8 +54,17 @@ fn daemon_status_dot(tip: String, color: gpui::Hsla) -> gpui::Stateful<gpui::Div
         .tooltip(move |window, cx| ui::tooltip_view("status-daemon", tip.clone(), window, cx))
 }
 
-/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출).
-fn usage_status(p: &ui::Palette, sessions: usize, needs_you: usize) -> gpui::Stateful<gpui::Div> {
+/// 상태바 떼 미터 점 칸 수. 폭은 세션 수와 무관하게 이만큼 예약한다.
+const STATUS_SWARM_DOTS: usize = 8;
+
+/// OWE-856: 세션 수·알림 수(상태 역할·이름 노출). 세션 수 옆에 세션별 상태 떼 미터.
+fn usage_status(
+    p: &ui::Palette,
+    states: &[AgentState],
+    needs_you: usize,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let sessions = states.len();
     let usage_tip = counts(sessions, needs_you);
     let sessions_count = sessions.to_string();
     let needs_you_count = needs_you.to_string();
@@ -88,7 +97,11 @@ fn usage_status(p: &ui::Palette, sessions: usize, needs_you: usize) -> gpui::Sta
                         .data(ui::icons::TERMINAL_SVG)
                         .with_size(gpui_component::Size::XSmall),
                 )
-                .child(sessions_count),
+                .child(sessions_count)
+                .child(
+                    ui::status::swarm_meter(states, STATUS_SWARM_DOTS, cx)
+                        .debug_selector(|| "status-swarm".into()),
+                ),
         )
         .child(
             div()
@@ -1107,7 +1120,9 @@ impl Shell {
         let p = ui::palette(cx);
         let (color, daemon_tooltip) = match &self.link {
             Link::Up => (p.success, text::DAEMON_UP.get().to_owned()),
-            Link::Connecting | Link::Down => (p.warning, text::DAEMON_CONNECTING.get().to_owned()),
+            Link::Connecting => (p.warning, text::DAEMON_CONNECTING.get().to_owned()),
+            // 세션은 krill-holder가 쥐고 있어 끊김이 아니라 보존 중이다(STYLEGUIDE §3.3).
+            Link::Down => (p.preserve, text::DAEMON_CONNECTING.get().to_owned()),
             Link::Failed(err) => (
                 p.destructive,
                 if err.is_empty() {
@@ -1119,6 +1134,7 @@ impl Shell {
         };
         let items = self.sidebar.read(cx).jump_items();
         let needs_you = items.iter().filter(|i| i.needs_you).count();
+        let states = self.sidebar.read(cx).session_states();
         // OWE-851: 메뉴가 열려 있는 동안은 상태바 호버 툴팁을 숨긴다.
         let tooltips_on = self.status_menus_open == 0;
         let session = self.layout.focused().and_then(|p| self.layout.session(p));
@@ -1723,7 +1739,7 @@ impl Shell {
                             }),
                     )
                     .child(daemon_status_dot(daemon_tooltip, color))
-                    .child(usage_status(p, items.len(), needs_you))
+                    .child(usage_status(p, &states, needs_you, cx))
                     .child(orch_menu)
                     .child(ports_menu)
                     .child(ssh_menu)

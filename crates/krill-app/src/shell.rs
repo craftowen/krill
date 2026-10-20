@@ -31,6 +31,9 @@ mod release;
 pub(crate) mod security;
 mod tabs;
 
+// 앱이 꺼져 있던 동안의 변화 요약.
+mod away;
+
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
 use std::collections::hash_map::Entry;
@@ -57,7 +60,7 @@ use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_app::detached;
 use krill_app::echo::EchoDraw;
-use krill_app::link::{Link, notice_text};
+use krill_app::link::{BannerTone, Link, notice_text};
 use krill_app::pane::{self, Pane};
 use krill_app::terminal::{
     Painted, Preedit, TerminalElement, cell_at, cell_size, file_link_target, link_target,
@@ -83,6 +86,8 @@ const KEY_CONTEXT: &str = "Shell";
 const CURSOR_BLINK: std::time::Duration = std::time::Duration::from_millis(530);
 /// 분할선의 잡는 폭(pt). 보이는 선은 1pt.
 const DIVIDER_GRAB: Pixels = krill_app::ui::DIVIDER_HIT_PX;
+/// 재연결 확인 배너가 보이는 시간.
+const RECONNECTED_FOR: Duration = Duration::from_millis(2500);
 
 /// 사용자에게 보이는 ko/en 문자열 키(MK-094).
 use krill_app::i18n::catalog::shell as text;
@@ -454,6 +459,7 @@ pub struct Shell {
     _sidebar_close_session: Subscription,
     _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
+    _sidebar_relisted: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
     sidebar_collapsed: bool,
@@ -479,6 +485,17 @@ pub struct Shell {
     agent_client: Arc<dyn pane::AgentClient>,
     /// 마지막 입력 알림(누르면 닫힘).
     notice: Option<String>,
+    /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
+    reconnected: Option<String>,
+    reconnected_task: Option<Task<()>>,
+    /// 자리 비운 사이 요약의 기준 시각. 이 프로세스의 첫 메인 창이 데몬에 처음 붙을 때 한 번 쓴다.
+    away_since: Option<u64>,
+    /// 자리 비운 사이 요약 한 줄(누르면 닫힘).
+    away: Option<String>,
+    away_task: Option<Task<()>>,
+    /// 마지막 생존 시각 주기 저장([`away::HEARTBEAT`]).
+    heartbeat: Option<Task<()>>,
+    app_quit: Option<Subscription>,
     window: Option<AnyWindowHandle>,
     activation: Option<Subscription>,
     bounds_observer: Option<Subscription>,
@@ -666,6 +683,9 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
+        let sidebar_relisted = cx.subscribe(&sidebar, |this, _, e: &sidebar::Relisted, cx| {
+            this.show_reconnected(e.0, cx);
+        });
         let close_session =
             cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::CloseSession, cx| {
                 let host = sidebar
@@ -879,6 +899,7 @@ impl Shell {
             _sidebar_close_session: close_session,
             _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
+            _sidebar_relisted: sidebar_relisted,
             _sidebar_tabs: sidebar_tabs,
             layout,
             sidebar_collapsed,
@@ -899,6 +920,13 @@ impl Shell {
             agent_task: None,
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
+            reconnected: None,
+            reconnected_task: None,
+            away_since: None,
+            away: None,
+            away_task: None,
+            heartbeat: None,
+            app_quit: None,
             window: None,
             activation: None,
             bounds_observer: None,
@@ -1618,6 +1646,7 @@ impl Shell {
         };
         let target = krill_app::hosts::HostTarget::local(paths.clone());
         self.paths = Some(paths);
+        self.start_away_tracking(cx);
         self.sidebar
             .update(cx, |s, cx| s.connect(target.clone(), cx));
         self.diff.update(cx, |d, cx| d.connect(target.clone(), cx));
@@ -1934,11 +1963,20 @@ impl Shell {
         if link != Link::Up {
             krill_app::alert::disconnected(cx);
             self.appearance = None;
+            self.reconnected = None;
+            self.reconnected_task = None;
         }
+        // 재연결 확인은 다시 붙은 뒤 실제 세션 목록이 도착해야 보인다(결과 동사 규칙, STYLEGUIDE §7.1.1).
+        let reconnecting = link == Link::Down;
+        self.sidebar
+            .update(cx, |s, cx| s.set_local_reconnecting(reconnecting, cx));
         self.link = link;
         krill_app::orca_import::set_daemon_link_up(self.link == Link::Up, cx);
         self.accounts_poll = (self.link == Link::Up).then(|| Self::poll_accounts(cx));
         if self.link == Link::Up {
+            if let Some(since) = self.away_since.take() {
+                self.load_away_summary(since, cx);
+            }
             self.load_agents(None, cx);
             self.refresh_accounts(krill_proto::usage::UsageRequest::ListAccounts, cx);
             self.refresh_ssh_hosts(cx);
@@ -1951,6 +1989,81 @@ impl Shell {
             self.sync(cx);
             self.refresh_detached(cx);
         }
+        cx.notify();
+    }
+
+    /// 메인 창이면 지난번 마지막 생존 시각을 요약 기준으로 잡고, 이후 주기·종료 때 생존 시각을 레이아웃에 쓴다.
+    /// 창을 닫았다 다시 연 같은 프로세스에서는 요약하지 않는다(앱은 계속 돌고 있었다).
+    fn start_away_tracking(&mut self, cx: &mut Context<Self>) {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if self.path.is_none() || self.role != WindowRole::Main || self.heartbeat.is_some() {
+            return;
+        }
+        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.away_since = self.layout.last_seen_unix_ns();
+        }
+        self.heartbeat = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(away::HEARTBEAT).await;
+                if this.update(cx, |this, _| this.touch_last_seen()).is_err() {
+                    return;
+                }
+            }
+        }));
+        // 정상 종료·업데이트 재시작(`cx.quit`)은 종료 직전 시각을 디스크까지 쓴다. kill -9는 마지막 주기 저장값이 남는다.
+        self.app_quit = Some(cx.on_app_quit(|this, _| {
+            this.touch_last_seen();
+            this.saver.flush();
+            async {}
+        }));
+    }
+
+    fn touch_last_seen(&mut self) {
+        self.layout.set_last_seen_unix_ns(away::now_ns());
+        self.save();
+    }
+
+    /// 실제 상태 목록을 받은 뒤에만 요약을 세운다. 읽지 못하면 아무것도 보이지 않는다.
+    fn load_away_summary(&mut self, since: u64, cx: &mut Context<Self>) {
+        let Some(paths) = self.paths.clone() else {
+            return;
+        };
+        let target = krill_app::hosts::HostTarget::local(paths);
+        self.away_task = Some(cx.spawn(async move |this, cx| {
+            let statuses = cx
+                .background_executor()
+                .spawn(async move { away::fetch_statuses(&target) })
+                .await;
+            let Ok(statuses) = statuses else {
+                return;
+            };
+            this.update(cx, |this, cx| {
+                if let Some((away_for, counts)) =
+                    away::count(&statuses, Some(since), away::now_ns())
+                {
+                    this.away = Some(away::summary(away_for, counts));
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn show_reconnected(&mut self, sessions: usize, cx: &mut Context<Self>) {
+        if self.link != Link::Up {
+            return;
+        }
+        self.reconnected = Some(
+            krill_app::i18n::catalog::link::RECONNECTED.format(&[("n", &sessions.to_string())]),
+        );
+        self.reconnected_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(RECONNECTED_FOR).await;
+            this.update(cx, |this, cx| {
+                this.reconnected = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         cx.notify();
     }
 
@@ -3691,11 +3804,17 @@ impl Shell {
                     // K1 OWE-843: 좁은 사이드바·큰 UI 배율에서도 앱 이름을 찌그러뜨리지 않는다.
                     .flex_none()
                     .px_1()
-                    .truncate()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
                     .text_size(krill_app::ui::TEXT_SM)
                     .font_weight(gpui::FontWeight::BOLD)
                     .text_color(p.sidebar_foreground)
-                    .child(text::APP_TITLE.get()),
+                    .child(
+                        krill_app::ui::icons::krill_brand_icon(krill_app::ui::ICON_MD, p)
+                            .debug_selector(|| "titlebar-brand-mark".into()),
+                    )
+                    .child(div().truncate().child(text::APP_TITLE.get())),
             )
             .child(krill_app::ui::button_with_tooltip(
                 Button::new("toggle-sidebar")
@@ -4483,6 +4602,33 @@ impl Shell {
     }
 }
 
+/// 보존 톤 배너(STYLEGUIDE §3.3): `preserve` 12% 바탕·30% 테두리, 앞에 모노 크릴 마크 12px.
+fn preserve_banner(
+    id: &'static str,
+    msg: impl Into<SharedString>,
+    p: &krill_app::ui::Palette,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .debug_selector(move || id.into())
+        .px_3()
+        .py_1p5()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .bg(p.preserve.opacity(0.12))
+        .border_b_1()
+        .border_color(p.preserve.opacity(0.3))
+        .text_color(p.foreground)
+        .text_size(krill_app::ui::TEXT_XS)
+        .child(krill_app::ui::icons::svg_box(
+            krill_app::ui::icons::KRILL_SVG,
+            krill_app::ui::ICON_XS,
+            p.preserve,
+        ))
+        .child(div().min_w_0().child(msg.into()))
+}
+
 /// 분할선: 1pt 선 + 잡는 폭 5pt. 드래그 값은 `Drag`, 실제 크기 계산은 부모의 `on_drag_move`가 한다.
 /// OWE-871: 기본 선 색은 `p.split_divider`(STYLEGUIDE §3.1)이며, 분할 트리의 선(`reset` 있음)을
 /// 더블클릭하면 50:50(`ratio = 0.5`)으로 되돌린다.
@@ -5088,13 +5234,31 @@ impl Render for Shell {
                             .bg(bg)
                             .child(self.render_tab_bar(window, cx))
                             .children(self.link.banner().map(|msg| {
-                                div()
-                                    .px_3()
-                                    .py_1p5()
-                                    .bg(warning)
-                                    .text_color(warning_fg)
-                                    .text_size(krill_app::ui::TEXT_XS)
-                                    .child(krill_app::i18n::cached_notice(&msg))
+                                let msg = krill_app::i18n::cached_notice(&msg);
+                                match self.link.banner_tone() {
+                                    BannerTone::Preserve => preserve_banner("link-banner", msg, p),
+                                    BannerTone::Warning => div()
+                                        .id("link-banner")
+                                        .px_3()
+                                        .py_1p5()
+                                        .bg(warning)
+                                        .text_color(warning_fg)
+                                        .text_size(krill_app::ui::TEXT_XS)
+                                        .child(msg),
+                                }
+                            }))
+                            .children(
+                                self.reconnected
+                                    .clone()
+                                    .map(|msg| preserve_banner("reconnected-banner", msg, p)),
+                            )
+                            .children(self.away.clone().map(|msg| {
+                                preserve_banner("away-summary", msg, p)
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.away = None;
+                                        cx.notify();
+                                    }))
                             }))
                             .children(self.notice.clone().map(|msg| {
                                 div()
@@ -5233,6 +5397,32 @@ impl Shell {
             .flex_col()
             .items_center()
             .justify_center()
+            .gap_6()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        krill_app::ui::icons::brand_mark_tile(48.)
+                            .debug_selector(|| "empty-brand-tile".into()),
+                    )
+                    .child(
+                        div()
+                            .text_size(krill_app::ui::TEXT_LG)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.foreground)
+                            .child(text::APP_TITLE.get()),
+                    )
+                    .child(
+                        div()
+                            .debug_selector(|| "empty-tagline".into())
+                            .text_size(krill_app::ui::TEXT_SM)
+                            .text_color(p.muted_foreground)
+                            .child(text::EMPTY_TAGLINE.get()),
+                    ),
+            )
             .child(
                 div()
                     .w(px(240.))
