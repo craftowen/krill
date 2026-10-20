@@ -164,3 +164,47 @@ button.account-row:disabled{opacity:1}
 
 /* Home quick actions use the same quiet panels and touch targets as settings. */
 .quick-actions-section{margin-bottom:20px}.quick-actions-section>.eyebrow{margin:0 4px 8px}.quick-actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.quick-action{display:flex;align-items:center;justify-content:center;gap:8px;min-height:var(--touch-target);padding:14px 12px;border:1px solid var(--border);border-radius:var(--radius-card);background:var(--surface-panel);font-size:var(--font-meta);font-weight:600}.quick-action>svg{width:16px;height:16px;flex:none;color:var(--muted-foreground)}.quick-action:disabled{opacity:.45}.saved-host{margin-top:12px}.home-empty>.quick-actions-section{margin:0 24px 24px}.quick-action:active:not(:disabled){background:var(--surface-raised)}
+
+/* Keep terminal content ahead of chrome; the accessory row is one compact scrollable strip. */
+.session.screen>.page-header .icon-button{width:32px;min-width:32px;height:32px;min-height:32px}
+.session .mode-toggle,.session-tabs,.session-tab,.tab-add{min-height:32px}.session-tab{padding-top:6px;padding-bottom:6px}.session .mode-toggle{padding:4px 8px}
+.keybar{align-items:center;padding:4px;gap:4px}
+.accessory-key,.dismiss-keyboard,.keybar>.photo-attach{min-width:32px;min-height:32px;height:32px;padding:4px 8px;border-radius:var(--radius-row);font-size:var(--font-meta)}
+.dismiss-keyboard{margin:4px 0 4px 4px;display:grid;place-items:center}
+.keybar>.photo-attach{width:32px;background:var(--surface-raised);color:var(--muted-foreground)}
+.edit-keys{font:600 var(--font-body) var(--font-mono);border:1px solid var(--border)}
+.input-row{padding:4px 8px;min-height:42px}.buffered-command{align-items:flex-end}
+.buffered-command>.command-input{height:34px;min-height:34px;max-height:108px;line-height:22px;padding:6px 10px;resize:none;overflow-y:auto;font-family:var(--font-mono)}
+.command-send{width:32px;height:32px;min-width:32px;min-height:32px;border-radius:var(--radius-row)}
+.terminal-mount[data-keyboard-open=true] .command-dock{padding-bottom:0}
+
+/* Orca Home order: desktops, resume, work requiring attention, quick actions, accounts. */
+.home-list{width:100%;max-width:720px;align-self:center}
+.home-host{margin-bottom:12px}.home-list>.saved-host{margin:0 0 12px}
+.recent-session{margin-top:12px}.home-links{margin:0 0 24px}
+.quick-actions{gap:8px}.quick-action{justify-content:flex-start;padding:10px 12px}
+.quick-action>svg{width:28px;height:28px;padding:6px;border-radius:var(--radius-row);background:var(--surface-raised)}
+.home-accounts>.eyebrow{margin:4px 4px 8px}
+.home-accounts .host-logins{border:1px solid var(--border);border-radius:var(--radius-card);overflow:hidden;background:var(--surface-panel)}
+.home-accounts>.setting-link{margin-top:8px;border:1px solid var(--border);border-radius:var(--radius-card)}
+
+.workspace-filters{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.workspace-filters>select{flex:1;min-width:0;width:calc(50% - 4px);padding:6px 8px;min-height:36px}
+.workspace-filters>.text-button{flex:none;min-height:32px;margin:0;padding:4px 8px}
+
+/* Conversation text leads; tool runs and their individual payloads are closed disclosures. */
+.chat-feed{gap:12px;padding:12px 16px}
+.chat-assistant{background:transparent;border:0;border-radius:0;padding:4px 0}
+.chat-user{align-self:flex-end;width:fit-content;max-width:95%;border-color:var(--border)}
+.chat-role{font-size:var(--font-meta);text-transform:none;color:var(--muted-foreground)}
+.chat-md{font-size:var(--font-body);line-height:1.6;gap:8px}
+.chat-tool-run{border:1px solid var(--border);border-radius:var(--radius-row);color:var(--muted-foreground);background:var(--surface-panel)}
+.chat-tool-summary{padding:8px 10px;font-size:var(--font-meta);cursor:pointer;overflow-wrap:anywhere}
+.chat-tool-items{padding:0 8px 8px}
+.chat-tool-items>.chat-card{border:0;border-top:1px solid var(--border);border-radius:0;padding:8px 2px;background:transparent}
+.chat-tool-call>summary,.chat-tool-result>summary,.chat-reasoning>summary{cursor:pointer;min-height:28px;font-size:var(--font-meta);align-items:center}
+.chat-tool-call>summary{display:list-item}.chat-tool-head>.badge{margin-right:8px}.chat-tool-title{overflow-wrap:anywhere;white-space:normal}
+.chat-tool-call[open]>*+*,.chat-tool-result[open]>*+*{margin-top:8px}
+.chat-live-strip{font-size:var(--font-meta);padding:4px 8px}.chat-live-strip .small,.chat-composer button{min-height:32px}
+.chat-composer{padding:6px 8px calc(6px + env(safe-area-inset-bottom));gap:6px}.chat-input{min-height:44px;max-height:140px;resize:none;padding:8px 10px}
+.chat-composer-bar{justify-content:space-between}.chat-composer-bar .small{padding:6px 12px}

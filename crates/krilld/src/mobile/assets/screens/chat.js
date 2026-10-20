@@ -25,7 +25,7 @@ function renderRichText(el,text){
 }
 function mountChat(root,opts){
  const {ctx,sessionId,onSwitchTerm}=opts;
- const {el,button,state}=ctx,t=ctx.t||((s)=>s);
+ const {el,button,state}=ctx,t=ctx.t||((s)=>s),itemLimit=1000;
  const cacheMap=state.chatCache||(state.chatCache=new Map());
  const entry=cacheMap.get(sessionId)||{offset:0,items:[],agent:'',bound:false};
  entry.pages||=[];entry.photoVersion||=0;
@@ -46,7 +46,7 @@ function mountChat(root,opts){
  const input=el('textarea',undefined,'chat-input');input.rows=2;input.placeholder=t('Message agent (Bracketed Paste)…');input.setAttribute('aria-label',t('Chat prompt'));
  input.value=state.drafts?.get(sessionId)||'';
  let composing=false,disposed=false,pollTimer=null,inFlight=false,failures=0,lastSuccess=entry.lastSuccess||0,earlierPending=false;
- const cards=new Map();
+ const cards=new Map(),toolRuns=new Map();
  input.addEventListener('input',()=>{entry.draftVersion=(entry.draftVersion||0)+1;state.drafts?.set(sessionId,input.value);});
  input.addEventListener('compositionstart',()=>composing=true);
  input.addEventListener('compositionend',()=>composing=false);
@@ -105,15 +105,20 @@ function mountChat(root,opts){
  function itemKey(item,idx){return `${entry.generation||''}:${item.id||`${item._pageStart||0}:${idx}:${item.tool_id||''}:${item.text}`}`;}
  function renderItems(){
   const stick=!feed.scrollHeight||(feed.scrollHeight-(feed.scrollTop||0)-(feed.clientHeight||0)<60);
-  const wanted=new Set();
+  const wanted=new Set(),wantedRuns=new Set(),nodes=[];let run=null;
   // Retain the actual question/details nodes so selection, write-in, focus and expansion survive deltas.
   for(const [idx,item] of entry.items.entries()){
    const key=itemKey(item,idx);wanted.add(key);
    let card=cards.get(key);
    if(!card){card=renderCard(item);card.dataset.chatId=key;cards.set(key,card);}
-   const at=Array.from(feed.children||[])[idx];
-   if(at!==card){if(feed.insertBefore)feed.insertBefore(card,at||null);else feed.append(card);}
+   if(item.kind==='tool_call'||item.kind==='tool_result'){
+    if(!run){let group=toolRuns.get(key);if(!group){const details=el('details',undefined,'chat-tool-run'),summary=el('summary',undefined,'chat-tool-summary'),body=el('div',undefined,'chat-tool-items');details.append(summary,body);group={details,summary,body};toolRuns.set(key,group);}run={...group,key,nodes:[],names:new Set(),count:0};wantedRuns.add(key);nodes.push(run.details);}
+    run.nodes.push(card);if(item.kind==='tool_call'){run.count++;if(item.tool_name)run.names.add(item.tool_name);}run.summary.textContent=`${t('Tool activity')} · ${run.count||run.nodes.length}${run.names.size?' · '+[...run.names].join(', '):''}`;
+    const at=run.body.children?.[run.nodes.length-1];if(at!==card)run.body.insertBefore(card,at||null);
+   }else{run=null;nodes.push(card);}
   }
+  for(const [idx,node] of nodes.entries()){const at=feed.children?.[idx];if(at!==node)feed.insertBefore(node,at||null);}
+  for(const [key,group] of toolRuns)if(!wantedRuns.has(key)){group.details.remove();toolRuns.delete(key);}
   for(const [key,card] of cards)if(!wanted.has(key)){card.remove();cards.delete(key);}
   for(const child of Array.from(feed.children||[]))if(child.className==='chat-empty')child.remove();
   if(!entry.items.length){
@@ -126,7 +131,8 @@ function mountChat(root,opts){
   earlierBtn.hidden=!entry.pages.some(page=>page.start<start)&&!first?._clipped;
   earlierBtn.disabled=earlierPending;
   latestBtn.hidden=!entry.live;
-  historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 250 messages. Earlier messages remain in the transcript.');
+  historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
+  history.hidden=earlierBtn.hidden&&latestBtn.hidden;
   if(stick&&!entry.live)feed.scrollTop=feed.scrollHeight||0;
  }
  function renderCard(item){
@@ -136,9 +142,9 @@ function mountChat(root,opts){
    const details=el('details',undefined,kind==='reasoning'?'chat-reasoning':'chat-tool-result');
    details.append(el('summary',t(kind==='reasoning'?'Reasoning':item.is_error?'Tool error':'Tool output')),kind==='reasoning'?renderRichText(el,item.text):el('pre',item.text,'chat-code'));card.append(details);
   }else if(kind==='tool_call'){
-   const head=el('div',undefined,'chat-tool-head');head.append(el('span',item.tool_name||'tool','badge'),el('span',item.title||item.file_path||item.text||t('Tool call'),'chat-tool-title'));
-   if(item.file_path)head.append(button(t('Current diff'),()=>openDiff(item.file_path),'ghost small'));
-   card.append(head);if(item.text&&item.text!==item.file_path)card.append(el('pre',item.text,'chat-tool-body'));
+   const details=el('details',undefined,'chat-tool-call'),head=el('summary',undefined,'chat-tool-head');head.append(el('span',item.tool_name||'tool','badge'),el('span',item.title||item.file_path||t('Tool call'),'chat-tool-title'));details.append(head);
+   if(item.file_path)details.append(button(t('Current diff'),()=>openDiff(item.file_path),'ghost small'));
+   if(item.text&&item.text!==item.file_path)details.append(el('pre',item.text,'chat-tool-body'));card.append(details);
   }else if(kind==='question')renderQuestionCard(card,item);
   else if(kind==='permission'){
    card.append(el('header',`${t('Permission')} • ${item.title||item.tool_name||t('Approval')}`,'chat-role'),el('p',item.text,'chat-p'),el('p',t('Historical request. Confirm the current request in Term.'),'muted'),button(t('Confirm in Term'),()=>onSwitchTerm?.(),'ghost small'));
@@ -175,16 +181,16 @@ function mountChat(root,opts){
   stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${entry.agent||'agent'} ${t('bound')}`:t('PTY live'));
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start}));}
- function clearTranscript(){entry.items=[];entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();feed.replaceChildren();}
+ function clearTranscript(){entry.items=[];entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();}
  function rememberPage(start,next){if(next>start&&!entry.pages.some(p=>p.start===start)){entry.pages.push({start,next});entry.pages.sort((a,b)=>a.start-b.start);}}
  function trimItems(fromStart){
-  if(entry.items.length<=250)return;
+  if(entry.items.length<=itemLimit)return;
   if(fromStart){
-   const removed=entry.items.splice(0,entry.items.length-250),first=entry.items[0];
+   const removed=entry.items.splice(0,entry.items.length-itemLimit),first=entry.items[0];
    // Re-read this page only when it actually contained an item that was clipped.
    if(first&&removed.at(-1)?._pageStart===first._pageStart)first._clipped=true;
   }
-  else entry.items.length=250;
+  else entry.items.length=itemLimit;
  }
  function showPollError(error){
   failures++;pollStatus.hidden=false;
