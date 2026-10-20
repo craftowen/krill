@@ -288,8 +288,8 @@ mod tests {
     fn help_returns_zero() {
         assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
         assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
-        // 베어 `help`는 검색어다. 빈 저장소에서는 결과가 없어도 SUCCESS다.
-        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+        // 베어 `help`는 검색어다. 실제 데몬 실행은 CLI 통합 테스트에서 검증한다.
+        assert_eq!(parse_args(&vec_str(&["help"])).unwrap().query.query, "help");
     }
 
     #[test]
