@@ -233,8 +233,12 @@ impl Shell {
                             .when(!selected, |d| d.opacity(ui::TAB_INACTIVE_OPACITY))
                             .when(tab.pinned, |d| {
                                 d.child(
-                                    ui::icons::svg_box(ui::icons::PIN_SVG, 11., p.muted_foreground)
-                                        .debug_selector(move || format!("tab-pin-{i}")),
+                                    ui::icons::svg_box(
+                                        ui::icons::PIN_SVG,
+                                        ui::ICON_XS,
+                                        p.muted_foreground,
+                                    )
+                                    .debug_selector(move || format!("tab-pin-{i}")),
                                 )
                             })
                             .children(tab.color.map(|color| {

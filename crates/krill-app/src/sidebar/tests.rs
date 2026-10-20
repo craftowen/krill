@@ -4076,11 +4076,21 @@ fn local_reconnecting_host_is_preserve() {
     assert_eq!(c, p.success);
 }
 
-/// OWE-847: 이름 변경은 카드 제목 자리에서 인라인으로 편집하고 Enter 저장·Esc 취소한다.
+/// OWE-847: 이름 변경은 카드 제목 자리에서 인라인으로 편집하고 Enter/저장 버튼(✓)으로 저장·Esc/취소 버튼(✕)으로 취소한다.
 #[gpui::test]
 fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
+    use gpui::Modifiers;
+    use std::cell::RefCell;
+    use std::rc::Rc;
     cx.update(gpui_component::init);
     let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let launched: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+    let launched_out = launched.clone();
+    let _sub = vcx.update(|_, cx| {
+        cx.subscribe(&view, move |_, _: &NewSession, _| {
+            *launched_out.borrow_mut() += 1;
+        })
+    });
     vcx.update(|window, cx| {
         view.update(cx, |s, cx| {
             s.snapshot.trees.insert(
@@ -4098,6 +4108,20 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
     assert!(
         vcx.debug_bounds("rename-inline-2").is_some(),
         "이름 변경 입력창은 워크트리 카드 제목 자리(행 2, [기본] /repo 다음)에 있어야 한다"
+    );
+    assert!(
+        vcx.debug_bounds("rename-inline-save-2").is_some()
+            && vcx.debug_bounds("rename-inline-cancel-2").is_some(),
+        "인라인 이름 변경 행에는 저장(✓)·취소(✕) 버튼이 표시되어야 한다"
+    );
+    // 입력창 영역을 클릭해도 워크트리 카드 활성화(세션 실행/포커스 탈취)가 일어나면 안 된다.
+    let inline_center = vcx.debug_bounds("rename-inline-2").unwrap().center();
+    vcx.simulate_click(inline_center, Modifiers::default());
+    vcx.run_until_parked();
+    assert_eq!(
+        *launched.borrow(),
+        0,
+        "인라인 입력창 클릭이 카드 활성화로 전파되면 안 된다"
     );
     // Esc: 저장하지 않고 닫는다.
     vcx.simulate_keystrokes("escape");
@@ -4131,6 +4155,38 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
                 "새 이름",
                 "Enter는 입력한 이름을 저장해야 한다"
             );
+        });
+    });
+    // 저장(✓)·취소(✕) 버튼 클릭으로도 각각 저장·취소할 수 있어야 한다.
+    vcx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.rename(PathBuf::from("/repo/a"), window, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.simulate_keystrokes("cmd-a");
+    vcx.simulate_input("버튼 저장");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+    // Saving the first name may reorder the cards; follow the edited path.
+    let index = vcx.update(|_, cx| {
+        view.read(cx)
+            .rows
+            .iter()
+            .position(|row| matches!(row, Row::Worktree(path) if path == Path::new("/repo/a")))
+            .unwrap()
+    });
+    let save_at = vcx
+        .debug_bounds(&format!("rename-inline-save-{index}"))
+        .unwrap()
+        .center();
+    vcx.simulate_click(save_at, Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            assert!(s.editing.is_none(), "저장 버튼 클릭은 편집을 마쳐야 한다");
+            assert_eq!(s.prefs[Path::new("/repo/a")].name, "버튼 저장");
         });
     });
 }

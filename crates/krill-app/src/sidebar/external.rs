@@ -144,7 +144,7 @@ pub fn checkpoint_badge_element(parts: &CheckpointParts, p: &crate::ui::Palette)
                 .gap_0p5()
                 .child(
                     Icon::new(gpui_kit_assets::IconName::Link)
-                        .with_size(px(10.))
+                        .with_size(crate::ui::ICON_2XS)
                         .text_color(p.muted_foreground),
                 )
                 .child(parts.refs_len.to_string()),
@@ -1271,7 +1271,7 @@ pub fn render_hidden_row(
             } else {
                 IconName::ChevronRight
             })
-            .with_size(px(12.))
+            .with_size(crate::ui::ICON_XS)
             .text_color(p.muted_foreground.opacity(0.65)),
         )
         .child(div().flex_1().min_w_0().truncate().child(display_text))

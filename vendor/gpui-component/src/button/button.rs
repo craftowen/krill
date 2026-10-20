@@ -658,10 +658,8 @@ impl RenderOnce for Button {
             .items_center()
             .justify_center()
             .cursor_default()
-            .when(
-                interactive && (self.variant.is_link() || self.variant.is_text()),
-                |this| this.cursor_pointer(),
-            )
+            .when(interactive, |this| this.cursor_pointer())
+            .when(disabled, |this| this.cursor_not_allowed())
             .when(
                 !disabled && cx.theme().shadow && normal_style.shadow,
                 |this| this.shadow_xs(),
@@ -714,6 +712,7 @@ impl RenderOnce for Button {
                     .when(self.border_edges.bottom, |this| this.border_b_1())
             })
             .when(!self.disabled && !selected, |this| {
+                let instance_fg = instance_style.text.color;
                 this.border_color(normal_style.border)
                     .bg(normal_style.bg)
                     .text_color(normal_style.fg)
@@ -725,13 +724,13 @@ impl RenderOnce for Button {
                             let hover_style = style.hovered(self.outline, cx);
                             this.bg(hover_style.bg)
                                 .border_color(hover_style.border)
-                                .text_color(hover_style.fg)
+                                .text_color(instance_fg.unwrap_or(hover_style.fg))
                         })
                         .active(|this| {
                             let active_style = style.active(self.outline, cx);
                             this.bg(active_style.bg)
                                 .border_color(active_style.border)
-                                .text_color(active_style.fg)
+                                .text_color(instance_fg.unwrap_or(active_style.fg))
                         })
                         .when_some(hover_group, |this, group| {
                             let idle_bg = style.hovered(self.outline, cx).bg.opacity(0.5);
@@ -917,16 +916,8 @@ impl ButtonVariant {
     fn outline_background(&self, state: ButtonStyleState, cx: &mut App) -> Background {
         match (self, state) {
             (Self::Default, ButtonStyleState::Normal) => cx.theme().input_background().into(),
-            (Self::Default, ButtonStyleState::Hovered) => cx
-                .theme()
-                .input
-                .mix_oklab(cx.theme().transparent, 0.5)
-                .into(),
-            (Self::Default, ButtonStyleState::Active) => cx
-                .theme()
-                .input
-                .mix_oklab(cx.theme().transparent, 0.7)
-                .into(),
+            (Self::Default, ButtonStyleState::Hovered) => cx.theme().tokens.button_hover.into(),
+            (Self::Default, ButtonStyleState::Active) => cx.theme().tokens.button_active.into(),
             (Self::Primary, ButtonStyleState::Normal) => {
                 cx.theme().tokens.primary.background.opacity(0.1)
             }
@@ -1182,14 +1173,7 @@ impl ButtonVariant {
                 }
             }
             Self::Custom(colors) => colors.hover.into(),
-            Self::Ghost => {
-                let accent: Background = cx.theme().tokens.accent.into();
-                if cx.theme().mode.is_dark() {
-                    accent.opacity(0.5)
-                } else {
-                    accent
-                }
-            }
+            Self::Ghost => cx.theme().tokens.button_hover.into(),
             Self::Link => cx.theme().transparent.into(),
             Self::Text => cx.theme().transparent.into(),
         };

@@ -2136,7 +2136,7 @@ fn render_filter_section(
                     })
                     .child(ui::icons::svg_box(
                         ui::icons::ROTATE_CCW_SVG,
-                        13.,
+                        ui::ICON_SM,
                         p.muted_foreground,
                     ))
                     .child(text::FILTER_RESET.get()),
@@ -2179,7 +2179,11 @@ fn render_filter_toggle_row(
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(ui::icons::svg_box(icon_bytes, 14., p.muted_foreground))
+                .child(ui::icons::svg_box(
+                    icon_bytes,
+                    ui::ICON_SM,
+                    p.muted_foreground,
+                ))
                 .child(
                     div()
                         .min_w_0()
@@ -2263,7 +2267,7 @@ fn render_submenu_trigger(
                 )
                 .child(
                     Icon::new(chevron)
-                        .with_size(px(12.))
+                        .with_size(ui::ICON_XS)
                         .text_color(p.muted_foreground),
                 ),
         )
@@ -2307,7 +2311,7 @@ fn check_slot(checked: bool, p: &'static ui::Palette) -> gpui::Div {
         .when(checked, |d| {
             d.child(
                 Icon::new(IconName::Check)
-                    .with_size(px(11.))
+                    .with_size(ui::ICON_XS)
                     .text_color(p.primary),
             )
         })

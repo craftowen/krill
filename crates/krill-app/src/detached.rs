@@ -172,7 +172,7 @@ impl Render for Panel {
                                     } else {
                                         IconName::ChevronRight
                                     })
-                                    .with_size(gpui::px(12.))
+                                    .with_size(crate::ui::ICON_XS)
                                     .text_color(p.muted_foreground.opacity(0.65)),
                                 )
                                 .child(div().flex_none().child(text::TITLE.get()))

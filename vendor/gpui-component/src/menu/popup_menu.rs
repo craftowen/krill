@@ -7,7 +7,7 @@ use crate::{ActiveTheme, ElementExt, Icon, IconName, Sizable as _, h_flex, v_fle
 use crate::{Side, Size, kbd::Kbd};
 use gpui::{
     Action, Anchor, AnyElement, App, AppContext, Bounds, Context, DismissEvent, Edges, Entity,
-    EventEmitter, FocusHandle, Focusable, InteractiveElement, IntoElement, KeyBinding,
+    EventEmitter, FocusHandle, Focusable, FontWeight, InteractiveElement, IntoElement, KeyBinding,
     ParentElement, Pixels, Render, Role, ScrollHandle, SharedString, StatefulInteractiveElement,
     Styled, WeakEntity, Window, anchored, deferred, div, prelude::FluentBuilder, px, rems,
 };
@@ -1234,7 +1234,7 @@ impl PopupMenu {
 
         let this = MenuItemElement::new(ix)
             .relative()
-            .text_sm()
+            .text_xs()
             .py_0()
             .px(INNER_PADDING)
             .rounded(radius)
@@ -1272,17 +1272,22 @@ impl PopupMenu {
                 .p_0()
                 .my_0p5()
                 .mx_neg_1()
-                .border_b(px(2.))
+                .border_b_1()
                 .border_color(cx.theme().border)
                 .disabled(true),
-            PopupMenuItem::Label(label) => this.disabled(true).cursor_default().child(
-                h_flex()
-                    .cursor_default()
-                    .items_center()
-                    .gap_x_1()
-                    .children(Self::render_icon(has_left_icon, false, None, window, cx))
-                    .child(div().flex_1().child(label.clone())),
-            ),
+            PopupMenuItem::Label(label) => this
+                .disabled(true)
+                .cursor_default()
+                .text_size(rems(11. / 16.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(cx.theme().muted_foreground)
+                .child(
+                    h_flex()
+                        .cursor_default()
+                        .items_center()
+                        .gap_x_1()
+                        .child(div().flex_1().child(label.clone())),
+                ),
             PopupMenuItem::ElementItem {
                 render,
                 icon,
@@ -1301,13 +1306,15 @@ impl PopupMenu {
                         .min_h(item_height)
                         .items_center()
                         .gap_x_1()
-                        .children(Self::render_icon(
-                            has_left_icon,
-                            is_left_check,
-                            icon.clone(),
-                            window,
-                            cx,
-                        ))
+                        .when(!(*disabled && !is_left_check && icon.is_none()), |this| {
+                            this.children(Self::render_icon(
+                                has_left_icon,
+                                is_left_check,
+                                icon.clone(),
+                                window,
+                                cx,
+                            ))
+                        })
                         .child((render)(window, cx))
                         .children(right_check_icon.map(|icon| icon.ml_3())),
                 ),

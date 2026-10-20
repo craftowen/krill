@@ -1069,8 +1069,8 @@ impl Sidebar {
         }
     }
 
-    /// 워크트리 카드 제목 자리(OWE-847): 이름 변경 중이면 인라인 입력창(Enter 저장·Esc 취소),
-    /// 아니면 기존 제목 텍스트를 돌려준다.
+    /// 워크트리 카드 제목 자리(OWE-847): 이름 변경 중이면 인라인 입력창 + 저장(✓)·취소(✕) 버튼
+    /// (Enter 저장·Esc 취소), 아니면 기존 제목 텍스트를 돌려준다.
     fn card_title_el(
         &self,
         path: &std::path::Path,
@@ -1082,10 +1082,49 @@ impl Sidebar {
         if let Some((_, input)) = self.editing.as_ref().filter(|(p, _)| p == path) {
             let input = input.clone();
             return div()
+                .id(("rename-inline", index))
                 .debug_selector(move || format!("rename-inline-{index}"))
                 .flex_1()
                 .min_w_0()
-                .child(Input::new(&input).small())
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .on_click(|_, _, cx| cx.stop_propagation())
+                .child(div().flex_1().min_w_0().child(Input::new(&input).small()))
+                .child(
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("rename-inline-save-{index}"))
+                        .child(
+                            Button::new(("rename-inline-save", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Check)
+                                .accessibility_label(text::SAVE.get())
+                                .tooltip(text::SAVE.get())
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    cx.stop_propagation();
+                                    s.finish_rename(Some(window), cx);
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .debug_selector(move || format!("rename-inline-cancel-{index}"))
+                        .child(
+                            Button::new(("rename-inline-cancel", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .accessibility_label(text::CANCEL.get())
+                                .tooltip(text::CANCEL.get())
+                                .on_click(cx.listener(|s, _, window, cx| {
+                                    cx.stop_propagation();
+                                    s.cancel_rename(Some(window), cx);
+                                })),
+                        ),
+                )
                 .capture_key_down(cx.listener(|s, e: &gpui::KeyDownEvent, window, cx| {
                     if e.keystroke.key == "escape" {
                         cx.stop_propagation();
@@ -1521,7 +1560,8 @@ impl Sidebar {
                 .py(px(1.))
                 .rounded(ui::RADIUS_XS)
                 .bg(p.worktree_sidebar_accent)
-                .hover(|d| d.bg(p.worktree_sidebar_accent))
+                .hover(|d| d.bg(p.accent).text_color(p.foreground))
+                .active(|d| d.bg(p.sidebar_accent))
                 .text_size(ui::TEXT_2XS)
                 .font_family(ui::FONT_MONO)
                 .text_color(p.muted_foreground)
@@ -1532,7 +1572,7 @@ impl Sidebar {
                     } else {
                         IconName::ChevronDown
                     })
-                    .with_size(px(10.))
+                    .with_size(ui::ICON_XS)
                     .text_color(p.muted_foreground),
                 )
                 .child(count_str)
@@ -1545,6 +1585,7 @@ impl Sidebar {
                 }))
         });
 
+        let is_editing_this = self.editing.as_ref().is_some_and(|(p, _)| p == path);
         // OWE-900: 가상화 구간(`rows >= VIRTUALIZED_ROWS`)에서는 `uniform_list` 고정 높이
         // 제약으로 가변 높이 상세 카드를 그릴 수 없어, 평문 행 대신 고정 높이 컴팩트 카드를
         // 렌더한다. 상태 점·브랜치·코멘트·배지·들여쓰기를 유지해 세션 없는 이관 워크트리도
@@ -1603,72 +1644,80 @@ impl Sidebar {
                         .items_center()
                         .gap_1p5()
                         .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
-                        .children(lineage_toggle_btn)
-                        .when(show_branch_subtitle, |d| {
-                            d.child(
-                                div()
-                                    .debug_selector(move || format!("worktree-branch-{index}"))
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(branch_subtitle),
-                            )
-                        })
-                        .when_some(visible_comment, |d, cm| {
-                            d.child(
-                                div()
-                                    .debug_selector(move || format!("worktree-comment-{index}"))
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(cm.to_owned()),
-                            )
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_1()
-                        .children(host_badge)
-                        .children(issue_badge)
-                        .children(ports_badge)
-                        .children(dirty_badge)
-                        .children(pr_badge)
-                        .when(has_agent_pill, |d| {
-                            d.child(
-                                div()
-                                    .id(("fold", index))
-                                    .cursor_pointer()
-                                    .child(
-                                        Icon::new(if card_expanded {
-                                            IconName::ChevronDown
-                                        } else {
-                                            IconName::ChevronRight
-                                        })
-                                        .with_size(px(12.))
-                                        .text_color(p.muted_foreground),
+                        .when(!is_editing_this, |d| {
+                            d.children(lineage_toggle_btn)
+                                .when(show_branch_subtitle, |d| {
+                                    d.child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("worktree-branch-{index}")
+                                            })
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::TEXT_2XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(branch_subtitle),
                                     )
-                                    .on_click(cx.listener(move |s, _, _, cx| {
-                                        cx.stop_propagation();
-                                        s.toggle_card_sessions(&compact_fold, cx);
-                                    })),
-                            )
+                                })
+                                .when_some(visible_comment, |d, cm| {
+                                    d.child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("worktree-comment-{index}")
+                                            })
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::TEXT_2XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(cm.to_owned()),
+                                    )
+                                })
                         }),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .gap_0p5()
-                        .child(new_session_btn)
-                        .child(rename_btn)
-                        .child(pin_btn),
-                )
+                .when(!is_editing_this, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .children(host_badge)
+                            .children(issue_badge)
+                            .children(ports_badge)
+                            .children(dirty_badge)
+                            .children(pr_badge)
+                            .when(has_agent_pill, |d| {
+                                d.child(
+                                    div()
+                                        .id(("fold", index))
+                                        .cursor_pointer()
+                                        .child(
+                                            Icon::new(if card_expanded {
+                                                IconName::ChevronDown
+                                            } else {
+                                                IconName::ChevronRight
+                                            })
+                                            .with_size(ui::ICON_XS)
+                                            .text_color(p.muted_foreground),
+                                        )
+                                        .on_click(cx.listener(move |s, _, _, cx| {
+                                            cx.stop_propagation();
+                                            s.toggle_card_sessions(&compact_fold, cx);
+                                        })),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .child(new_session_btn)
+                            .child(rename_btn)
+                            .child(pin_btn),
+                    )
+                })
                 .on_click(cx.listener(move |s, _, window, cx| {
                     s.activate_worktree_card(
                         index,
@@ -1760,7 +1809,7 @@ impl Sidebar {
                             .items_center()
                             .gap_1p5()
                             .child(self.card_title_el(path, card_title, ui::TEXT_MD, index, cx))
-                            .when(is_default_tree, |d| {
+                            .when(is_default_tree && !is_editing_this, |d| {
                                 d.child(
                                     div()
                                         .debug_selector(move || {
@@ -1777,18 +1826,20 @@ impl Sidebar {
                                         .child(crate::i18n::catalog::general::DEFAULT.get()),
                                 )
                             })
-                            .children(lineage_toggle_btn),
+                            .when(!is_editing_this, |d| d.children(lineage_toggle_btn)),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_0p5()
-                            .child(new_session_btn)
-                            .child(rename_btn)
-                            .child(pin_btn),
-                    ),
+                    .when(!is_editing_this, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap_0p5()
+                                .child(new_session_btn)
+                                .child(rename_btn)
+                                .child(pin_btn),
+                        )
+                    }),
             )
             // 2행: 들여쓴 브랜치 이름 + 체크포인트·캐시 타이머·호스트·이슈·포트·미커밋·PR 배지
             .when(has_line2, |d| {
@@ -2008,7 +2059,7 @@ impl Sidebar {
                                             } else {
                                                 IconName::ChevronRight
                                             })
-                                            .with_size(px(12.))
+                                            .with_size(ui::ICON_XS)
                                             .text_color(p.muted_foreground),
                                         )
                                         .on_click(cx.listener(move |s, _, _, cx| {
@@ -2662,6 +2713,8 @@ impl Render for Sidebar {
                             .justify_between()
                             .gap_1p5()
                             .cursor_pointer()
+                            .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
+                            .active(|d| d.bg(p.accent))
                             .text_size(ui::TEXT_XS)
                             .text_color(p.muted_foreground)
                             .on_click(cx.listener(|s, _, _, cx| {

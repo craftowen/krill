@@ -2301,7 +2301,7 @@ impl Render for Dashboard {
                                                             gpui_component::Icon::new(
                                                                 gpui_component::IconName::Folder,
                                                             )
-                                                            .with_size(px(11.))
+                                                            .with_size(ui::ICON_XS)
                                                             .text_color(p.muted_foreground),
                                                         )
                                                         .child(

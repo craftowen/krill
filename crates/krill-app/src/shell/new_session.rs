@@ -106,7 +106,7 @@ impl Shell {
                     .min_w_0()
                     .child(
                         gpui_component::Icon::new(IconName::Search)
-                            .with_size(gpui::px(14.))
+                            .with_size(krill_app::ui::ICON_MD)
                             .text_color(p.sidebar_foreground.opacity(0.38)),
                     )
                     .child(div().truncate().child(sb_text::SEARCH_SHORT.get())),
@@ -191,7 +191,7 @@ impl Shell {
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(nav_text_color)
             .hover(|d| d.bg(nav_hover_bg).text_color(p.sidebar_foreground))
-            .child(icons::svg_icon(svg, 15., nav_icon_color))
+            .child(icons::svg_icon(svg, krill_app::ui::ICON_SM, nav_icon_color))
             .child(div().flex_1().min_w_0().truncate().child(label))
     }
     pub(super) fn new_agent_with_account(

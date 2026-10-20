@@ -100,7 +100,7 @@ impl RenderOnce for MenuItemElement {
             .gap_x_1()
             .py_1()
             .px_2()
-            .text_base()
+            .text_xs()
             .text_color(cx.theme().foreground)
             .relative()
             .items_center()

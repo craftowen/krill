@@ -126,6 +126,8 @@ pub const KRILL_SVG: &[u8] = br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox
 
 // ---- 프로바이더·에이전트 아이콘 크기 토큰 (OWE-875) ----
 
+/// 초소형 아이콘(10px): 사이드바 인라인 배지·트리 화살표 보조 표시.
+pub const ICON_2XS: f32 = 10.0;
 /// 소형 아이콘(12px): 사이드바 개별 세션 행, 에이전트 그룹 헤더, 필터 칩(AI Vault·Jump).
 pub const ICON_XS: f32 = 12.0;
 /// 기본 소형 아이콘(13px): 워크트리 카드 에이전트 요약, 탭 바 탭, 상태바 알약, 이어하기 모달 칩.
