@@ -1,6 +1,6 @@
 //! 화면·원본 전송 서버(MK-023). 와이어 포맷·흐름·두 번호(원본 seq, 화면 revision)의 정의는 [`krill_proto::screen`].
 //!
-//! - 연결마다 요청·쓰기 스레드. 첫 검색 때 별도 검색 스레드를 쓴다(대기 요청은 최신 하나).
+//! - 연결마다 요청·쓰기 스레드. 검색과 이력 재생은 별도 작업자로 보내 입력 요청을 막지 않는다.
 //!   [`serve`]를 부른 스레드가 요청(RESYNC·HISTORY)을 읽고, 쓰기 스레드가 화면 델타나 원본을 보낸다.
 //! - 쓰기 스레드는 세션 [`Tap`]을 기다렸다가 지금 화면을 떠서 "클라이언트가 가진 화면"과의 차이만 보낸다(당김 방식,
 //!   연결별 큐 = 프레임 하나). 원본 스트림은 세션 링 → 디스크 → Gap 순서로 이어 준다. PTY 리더는 아무도 기다리지 않는다.
@@ -48,6 +48,7 @@ use crate::session::lock;
 pub use crate::session::{Pulse, Read, Tap};
 use crate::store::Piece;
 
+mod history_worker;
 pub(crate) mod roles;
 mod search_worker;
 
@@ -238,6 +239,7 @@ fn requests(
     client: &roles::Client,
 ) -> io::Result<()> {
     let mut search: Option<search_worker::Worker> = None;
+    let mut history: Option<history_worker::Worker> = None;
     while let Some((k, body)) = ipc::read_frame(s)? {
         match (k, stream) {
             (role_proto::kind::ROLE, _) if features & FEAT_ROLES != 0 => {
@@ -268,7 +270,15 @@ fn requests(
             }
             (kind::HISTORY, Stream::Screen { .. }) => {
                 let req = HistoryRequest::decode(k, &body)?;
-                conn.send(&history(tap, &req).encode()?)?;
+                if history.is_none() {
+                    history = Some(history_worker::Worker::start(
+                        tap.clone(),
+                        Arc::clone(conn),
+                    )?);
+                }
+                if let Some(worker) = &history {
+                    worker.submit(req)?;
+                }
             }
             (krill_proto::control::kind::REQUEST, Stream::Screen { .. })
                 if features & krill_proto::control::FEAT_CLEAR_SCROLLBACK != 0 =>
@@ -277,6 +287,9 @@ fn requests(
                 match Request::decode(k, &body)? {
                     Request::ClearScrollback { session } if session == tap.id() => {
                         let reply = if client.can_modify() {
+                            if let Some(worker) = &history {
+                                worker.invalidate();
+                            }
                             tap.clear_scrollback();
                             Reply::ScrollbackCleared
                         } else {
@@ -316,6 +329,27 @@ fn history(tap: &Tap, req: &HistoryRequest) -> HistoryRows {
     reply
 }
 
+/// 화면을 계산한 시각과 전송 완료 시각 양쪽을 기준으로 폭주를 합친다.
+#[derive(Default)]
+struct CaptureClock {
+    last: Option<Instant>,
+}
+
+impl CaptureClock {
+    fn delay(&self, now: Instant, minimum: Duration, resync: bool) -> Duration {
+        if resync {
+            return Duration::ZERO;
+        }
+        self.last.map_or(Duration::ZERO, |at| {
+            (at + minimum).saturating_duration_since(now)
+        })
+    }
+
+    fn mark(&mut self, now: Instant) {
+        self.last = Some(now);
+    }
+}
+
 /// `meta`: 클라이언트가 [`FEAT_SCREEN_META`]를 협상했다(아니면 그 연산을 걸러 낸다).
 fn screen_loop(
     tap: &Tap,
@@ -341,7 +375,8 @@ fn screen_loop(
         conn.send(&modes.encode()?)?;
     }
     let mut seen = rev.0;
-    let mut last = None;
+    let mut clock = CaptureClock::default();
+    clock.mark(Instant::now());
     if known
         != Some(Known {
             instance,
@@ -349,7 +384,7 @@ fn screen_loop(
         })
     {
         conn.update(rev, seq, keep(snapshot(&sent)))?;
-        last = Some(Instant::now());
+        clock.mark(Instant::now());
     }
     let mut closed_sent = false;
     loop {
@@ -358,13 +393,14 @@ fn screen_loop(
             return Ok(());
         }
         let resync = conn.resync.swap(false, Ordering::SeqCst);
-        if let Some(wait) = last
-            .map(|t: Instant| (t + frame_min).saturating_duration_since(Instant::now()))
-            .filter(|w| !resync && !w.is_zero())
-        {
+        let wait = clock.delay(Instant::now(), frame_min, resync);
+        if !wait.is_zero() {
             thread::sleep(wait);
         }
         let (next, rev, seq, next_modes) = tap.capture_with_modes();
+        // 전송할 변경이 없어도 계산 시도는 제한한다. sync/제어열만 이어질 때
+        // 마지막 전송 시각만 쓰면 매 PTY batch마다 전체 화면을 비교하게 된다.
+        clock.mark(Instant::now());
         if modes_enabled && (resync || modes != next_modes) {
             conn.send(&next_modes.encode()?)?;
         }
@@ -383,7 +419,7 @@ fn screen_loop(
         });
         if !ops.is_empty() {
             conn.update(rev, seq, ops)?;
-            last = Some(Instant::now());
+            clock.mark(Instant::now());
         }
         sent = next;
         seen = rev.0;
@@ -500,7 +536,12 @@ fn diff(prev: &Screen, next: &Screen) -> Vec<Op> {
     if prev.cursor_style != next.cursor_style {
         ops.push(Op::CursorStyle(next.cursor_style));
     }
-    let n = best_shift(&prev.rows, &next.rows);
+    // 커서·제목·링크만 바뀌었으면 전행 해시와 O(행²) 스크롤 탐색이 필요 없다.
+    let n = if prev.rows == next.rows {
+        0
+    } else {
+        best_shift(&prev.rows, &next.rows)
+    };
     let mut links = prev.links.clone();
     links.resize(prev.rows.len(), Vec::new());
     let shifted;

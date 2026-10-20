@@ -108,6 +108,47 @@ fn big_paste_is_split() {
     assert_eq!(concat(&f), paste);
 }
 
+#[test]
+fn linked_input_budget_rejects_whole_paste_and_ack_restores_capacity() {
+    let now = Now::get();
+    let mut j = Journal::new();
+    j.relink(Incarnation::Same, now);
+    let accepted = j.input(&vec![b'x'; IN_FLIGHT_MAX], now).unwrap();
+    let last = accepted.last().unwrap().id;
+    let rejected = j.input(b"too much", now).unwrap_err();
+    assert_eq!(
+        rejected,
+        Notice {
+            fate: Fate::Full,
+            bytes: b"too much".to_vec()
+        }
+    );
+    assert_eq!(j.sent.len(), accepted.len());
+    assert_eq!(j.last, last.0, "rejection must not consume input IDs");
+    j.ack(&InputAck {
+        id: last,
+        result: InputResult::Applied,
+    });
+    assert!(j.input(&vec![b'x'; IN_FLIGHT_MAX], now).is_ok());
+}
+
+#[test]
+fn tiny_inputs_are_bounded_in_both_connection_states() {
+    let now = Now::get();
+    let mut j = Journal::new();
+    j.relink(Incarnation::Same, now);
+    for _ in 0..MAX_PENDING_FRAMES {
+        j.input(b"x", now).unwrap();
+    }
+    assert_eq!(j.input(b"y", now).unwrap_err().fate, Fate::Full);
+    assert_eq!(j.sent.len(), MAX_PENDING_FRAMES);
+    j.unlink();
+    for _ in 0..MAX_PENDING_FRAMES {
+        j.input(b"x", now).unwrap();
+    }
+    assert_eq!(j.input(b"y", now).unwrap_err().fate, Fate::Full);
+}
+
 /// 보냈지만 ack 전에 끊긴 입력은 다시 보내지 않고 "불확실"로 알린다(중복 실행 0).
 /// 끊긴 동안 친 입력은 같은 세션에 다시 붙으면 한 번 보낸다(유실 0).
 #[test]

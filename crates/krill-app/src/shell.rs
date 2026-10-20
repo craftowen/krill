@@ -167,6 +167,8 @@ struct Live {
     echo: EchoDraw,
     /// 마지막으로 그린 자리와 칸 크기(IME 후보창).
     painted: Painted,
+    /// Live와 함께 해제하는 행 계획(계정 입력 보존 중인 숨은 Live는 예외).
+    row_cache: krill_app::terminal::RowPlanCache,
     /// 한 행이 안 되는 스크롤 양(px).
     scroll_rem: f32,
     /// 붙지 못한 이유(연결 전까지 칸에 보인다).
@@ -193,6 +195,7 @@ impl Live {
             ime: Ime::default(),
             echo: EchoDraw::default(),
             painted: Rc::default(),
+            row_cache: krill_app::terminal::RowPlanCache::default(),
             scroll_rem: 0.,
             error: None,
             launch: None,
@@ -613,8 +616,7 @@ pub struct Shell {
     pub(super) launch_host: krill_app::hosts::HostId,
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
-    pub(super) ports_cache:
-        std::cell::RefCell<HashMap<u64, (String, Vec<krill_proto::orchestration::PortEntry>)>>,
+    ports_cache: std::cell::RefCell<HashMap<u64, popout::PortCache>>,
     /// 인앱 설정 페이지(`SettingsView`, Orca `activeView === 'settings'` 패리티).
     pub(super) settings: Option<gpui::Entity<krill_app::settings::SettingsView>>,
     /// 플로팅 자식 터미널 창 여부(설정 호스트에서 제외).
@@ -1126,13 +1128,25 @@ impl Shell {
     fn poll_orchestration(cx: &mut Context<Self>) -> Task<()> {
         cx.spawn(async move |this, cx| {
             loop {
-                let Ok((dir, screens)) = this.read_with(cx, |this, cx| {
+                let Ok((dir, screens, mut previous)) = this.read_with(cx, |this, cx| {
+                    let mut cache = this.ports_cache.borrow_mut();
+                    let mut previous = HashMap::new();
                     let screens = this
                         .live
                         .values()
-                        .filter_map(|live| Some((live.pane.session()?.0, live.pane.shown())))
+                        .filter_map(|live| {
+                            let id = live.pane.session()?.0;
+                            let screen = live.pane.shown();
+                            if cache.get(&id).is_some_and(|entry| entry.matches(&screen)) {
+                                return None;
+                            }
+                            if let Some(old) = cache.remove(&id) {
+                                previous.insert(id, old.into_data());
+                            }
+                            Some((id, screen))
+                        })
                         .collect::<Vec<_>>();
-                    (this.state_dir(cx), screens)
+                    (this.state_dir(cx), screens, previous)
                 }) else {
                     return;
                 };
@@ -1151,11 +1165,7 @@ impl Shell {
                         let ports = copies
                             .into_iter()
                             .map(|(id, screen)| {
-                                let text = popout::screen_plain_text(&screen);
-                                let entries = krill_proto::orchestration::extract_local_urls(
-                                    id, &text, false,
-                                );
-                                (id, (text, entries))
+                                (id, popout::detect_ports(id, &screen, previous.remove(&id)))
                             })
                             .collect::<HashMap<_, _>>();
                         (snapshot, ports)
@@ -1166,18 +1176,25 @@ impl Shell {
                         if let Some(snapshot) = snapshot {
                             this.orch_snapshot = snapshot;
                         }
-                        *this.ports_cache.borrow_mut() = ports
-                            .into_iter()
-                            .filter(|(id, _)| {
-                                let source = screens.iter().find(|(sid, _)| sid == id);
-                                this.live.values().any(|live| {
-                                    live.pane.session().is_some_and(|sid| sid.0 == *id)
-                                        && source.is_some_and(|(_, screen)| {
-                                            Rc::ptr_eq(screen, &live.pane.shown())
-                                        })
+                        let mut cache = this.ports_cache.borrow_mut();
+                        cache.retain(|id, _| {
+                            this.live
+                                .values()
+                                .any(|live| live.pane.session().is_some_and(|sid| sid.0 == *id))
+                        });
+                        cache.extend(ports.into_iter().filter_map(|(id, (text, entries))| {
+                            let (_, screen) = screens.iter().find(|(sid, _)| *sid == id)?;
+                            this.live
+                                .values()
+                                .any(|live| {
+                                    live.pane.session().is_some_and(|sid| sid.0 == id)
+                                        && Rc::ptr_eq(screen, &live.pane.shown())
                                 })
-                            })
-                            .collect();
+                                .then(|| {
+                                    (id, popout::PortCache::from_result(screen, text, entries))
+                                })
+                        }));
+                        drop(cache);
                         cx.notify();
                     })
                     .is_err()
@@ -3876,15 +3893,22 @@ impl Shell {
 
     /// 포커스 칸 커서가 깜박여야 하면(프로그램 지정 또는 설정 기본값, OWE-658) 타이머로 숨김을 뒤집는다.
     /// 깜박일 커서가 없으면 타이머를 버린다.
-    fn sync_cursor_blink(&mut self, cx: &mut Context<Self>) {
+    fn sync_cursor_blink(&mut self, active: bool, cx: &mut Context<Self>) {
         let default = krill_app::settings::terminal_cursor(cx);
-        let blink = self
-            .layout
-            .focused()
-            .and_then(|pane| self.live.get(&pane))
-            .is_some_and(|l| {
-                krill_app::terminal::effective_cursor(l.pane.shown().cursor_style, default).blink
-            });
+        let blink = active
+            && self.settings.is_none()
+            && self.dashboard.is_none()
+            && !self.is_active_chat_view()
+            && self
+                .layout
+                .focused()
+                .filter(|pane| self.layout.file(*pane).is_none())
+                .and_then(|pane| self.live.get(&pane))
+                .is_some_and(|l| {
+                    let screen = l.pane.shown();
+                    screen.cursor.visible
+                        && krill_app::terminal::effective_cursor(screen.cursor_style, default).blink
+                });
         if !blink {
             self.cursor_blink = None;
         } else if self.cursor_blink.is_none() {
@@ -4917,7 +4941,8 @@ impl Shell {
             );
         let body = match self.live.get(&id) {
             Some(l) if l.pane.session().is_some() => {
-                let mut el = TerminalElement::new(l.pane.shown(), self.terminal_theme);
+                let mut el = TerminalElement::new(l.pane.shown(), self.terminal_theme)
+                    .with_row_cache(l.row_cache.clone());
                 el.opacity = krill_app::settings::terminal_opacity_alpha(cx);
                 el.cursor = krill_app::terminal::effective_cursor(
                     el.screen.cursor_style,
@@ -5415,7 +5440,8 @@ impl Render for Shell {
                 }
             }
         }
-        self.sync_cursor_blink(cx);
+        // 첫 렌더도 실제 창의 활성 상태로 커서 타이머를 결정한다.
+        self.sync_cursor_blink(window.is_window_active(), cx);
         if self.settings.is_none() {
             self.sync_files(window, cx);
         }

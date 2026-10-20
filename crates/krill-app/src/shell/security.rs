@@ -61,9 +61,12 @@ impl Shell {
             self.cancel_pending_paste_for(pane, cx);
         }
         self.security.set_window_active(active);
+        // 비활성화 뒤 다음 렌더를 기다리지 않고 커서 타이머를 끊는다.
+        self.sync_cursor_blink(active, cx);
         krill_app::alert::set_active(active, cx);
         self.sidebar.update(cx, |s, cx| s.set_active(active, cx));
         self.diff.update(cx, |d, cx| d.set_active(active, cx));
+        cx.notify();
     }
 
     fn begin_clipboard_paste(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<u64> {

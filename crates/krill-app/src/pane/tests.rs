@@ -637,6 +637,99 @@ fn large_paste_does_not_block_the_caller() {
     assert_eq!(got, paste);
 }
 
+#[test]
+fn writer_rejects_pressure_without_blocking_and_releases_budget_after_drain() {
+    use std::io::Read as _;
+
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut writer = Writer::spawn(ours).unwrap();
+    let chunk = vec![b'x'; 64 << 10];
+    let mut accepted = 0;
+    let start = std::time::Instant::now();
+    let mut rejected = false;
+    for _ in 0..256 {
+        match writer.write(&chunk) {
+            Ok(n) => accepted += n,
+            Err(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+                rejected = true;
+                break;
+            }
+        }
+        assert!(writer.bytes.load(Ordering::Relaxed) <= WRITE_QUEUE_BYTES);
+    }
+    assert!(
+        rejected,
+        "a peer that never reads must encounter a bounded queue"
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "queue admission must not wait for socket writes"
+    );
+    let drain = std::thread::spawn(move || {
+        let mut bytes = vec![0; accepted];
+        theirs.read_exact(&mut bytes).unwrap();
+        assert!(bytes.iter().all(|&b| b == b'x'));
+    });
+    drain.join().unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while writer.bytes.load(Ordering::Relaxed) != 0 && std::time::Instant::now() < deadline {
+        std::thread::yield_now();
+    }
+    assert_eq!(writer.bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn oversized_paste_is_rejected_before_any_frame_is_queued() {
+    let (ours, mut theirs) = UnixStream::pair().unwrap();
+    let mut pane = Pane::default();
+    pane.link(
+        SessionId(1),
+        9,
+        Writer::spawn(ours).unwrap(),
+        input::FEAT_INPUT,
+        Now::get(),
+    );
+    let paste = vec![b'x'; input::IN_FLIGHT_MAX + 1];
+    let notice = pane.input(&paste, Now::get()).unwrap();
+    assert_eq!(notice.fate, input::Fate::Full);
+    assert_eq!(notice.bytes, paste);
+    assert!(pane.input(b"ok", Now::get()).is_none());
+    theirs
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let (kind, body) = ipc::read_frame(&mut theirs).unwrap().unwrap();
+    let actual = Input::decode(kind, &body).unwrap();
+    assert_eq!(actual.bytes, b"ok");
+    assert_eq!(actual.id, input::InputId(1));
+}
+
+#[test]
+fn writer_budget_is_returned_when_enqueue_or_connection_fails() {
+    let (send, recv) = mpsc::sync_channel(1);
+    let bytes = Arc::new(AtomicUsize::new(0));
+    let mut writer = Writer {
+        send,
+        bytes: Arc::clone(&bytes),
+    };
+    writer.write_all(b"x").unwrap();
+    assert_eq!(
+        writer.write(b"rejected").unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    assert_eq!(bytes.load(Ordering::Relaxed), 1);
+    drop(recv);
+    assert_eq!(bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        writer.write(b"disconnected").unwrap_err().kind(),
+        io::ErrorKind::BrokenPipe
+    );
+    assert_eq!(bytes.load(Ordering::Relaxed), 0);
+}
+
 /// OWE-583: CLOSED 뒤 마지막 화면을 남기고 입력 소켓을 닫는다.
 #[test]
 fn closed_session_keeps_screen_and_drops_input() {
