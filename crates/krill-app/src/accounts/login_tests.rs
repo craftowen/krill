@@ -1,4 +1,4 @@
-use super::{authorize_url, cleanup_failed_login};
+use super::{LoginFailReason, LoginOutcome, authorize_url, run_browser_login, take_login_outcome};
 use krill_proto::usage::ProviderKind;
 use std::path::Path;
 
@@ -117,7 +117,18 @@ fn failed_new_login_deletes_account_through_daemon_and_trashes_managed_profile()
         let reply = UsageReply::Accounts(snap).for_features(features);
         stream.write_all(&reply.encode().unwrap()).unwrap();
     });
-    cleanup_failed_login(&paths, &account, true);
+    run_browser_login(
+        &paths,
+        &account,
+        true,
+        b"/krill-test-missing-login-cli",
+        &[],
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert_eq!(
+        take_login_outcome(&account.id),
+        Some(LoginOutcome::Failed(LoginFailReason::SpawnFailed))
+    );
     server.join().unwrap();
     assert!(!Path::new(&account.profile_dir).exists());
     assert!(
@@ -159,7 +170,30 @@ fn failed_relogin_preserves_existing_profile_without_ipc() {
         "existing",
     )
     .unwrap();
-    cleanup_failed_login(&paths, &account, false);
+    run_browser_login(
+        &paths,
+        &account,
+        false,
+        b"/bin/sleep",
+        &[b"30".to_vec()],
+        &std::sync::atomic::AtomicBool::new(true),
+    );
+    assert_eq!(
+        take_login_outcome(&account.id),
+        Some(LoginOutcome::Cancelled)
+    );
+    run_browser_login(
+        &paths,
+        &account,
+        false,
+        b"/krill-test-missing-login-cli",
+        &[],
+        &std::sync::atomic::AtomicBool::new(false),
+    );
+    assert_eq!(
+        take_login_outcome(&account.id),
+        Some(LoginOutcome::Failed(LoginFailReason::SpawnFailed))
+    );
     assert!(
         Path::new(&account.profile_dir)
             .join(".claude.json")
