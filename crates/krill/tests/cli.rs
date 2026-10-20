@@ -51,6 +51,8 @@ impl Daemon {
             .arg(bin.join("krilld"))
             .arg(&socket)
             .env("KRILL_CLOUDFLARED_BIN", dir.join("cloudflared-test"))
+            // 가짜 터널의 폴백 계약은 공개 PWA 배포 여부·실제 릴레이에 의존하지 않는다.
+            .env("KRILL_MOBILE_ORIGIN", "http://127.0.0.1:0")
             .env("KRILL_STATE_DIR", &dir)
             .env_remove("KRILL_SESSION_ID")
             .env_remove("MK_SESSION_ID")
