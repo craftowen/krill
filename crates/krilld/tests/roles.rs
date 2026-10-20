@@ -681,6 +681,9 @@ fn creator_session_can_wait_read_and_send_to_created_child_while_unrelated_sessi
         .unwrap();
     send_conn.frame(screen::kind::ATTACHED);
     send_conn.applied(1, b"from-parent-a\n");
+    // ACK 뒤에도 raw 출력이 남을 수 있다. 쓰기만 닫고 서버의 전송·종료를 끝까지 읽는다.
+    send_conn.socket.shutdown(Shutdown::Write).unwrap();
+    while ipc::read_frame(&mut send_conn.socket).unwrap().is_some() {}
     drop(send_conn);
 
     until(|| {
