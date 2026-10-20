@@ -1,9 +1,9 @@
 name: Release macOS
 
 # 공식 게시 경로는 로컬 맥의 packaging/publish-github.sh다(가드·락·Linux 자산 포함, packaging/README.md).
-# 이 워크플로는 수동 예비 경로이고 주 용도는 이미 게시된 릴리스에 Windows 자산을 더하는 것이다.
+# 이 워크플로는 수동 예비 경로이고 주 용도는 이미 게시된 릴리스에 Windows·Linux 네이티브 자산을 더하는 것이다.
 # publish-github.sh와 같은 규칙: main 끝(또는 이미 있는 태그 커밋)에서만, 기존 자산은 절대 덮어쓰지 않는다.
-# Linux tar.gz는 GCP 빌드(유료)라 여기서 만들지 않는다.
+# Linux tar.gz(x86_64·aarch64)도 무료 네이티브 러너(ubuntu-22.04, ubuntu-22.04-arm)에서 빌드·스모크 검증 후 업로드한다.
 on:
   workflow_dispatch:
     inputs:
@@ -326,6 +326,160 @@ jobs:
               echo "Release ${TAG} already has ${ZIP_NAME}; skipping (assets are never overwritten)."
             else
               gh release upload "${TAG}" "${ASSETS[@]}"
+            fi
+          else
+            gh release create "${TAG}" "${ASSETS[@]}" \
+              --target "${GITHUB_SHA}" \
+              --title "Krill ${TAG}" \
+              --generate-notes
+          fi
+
+  build-linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+          - runner: ubuntu-22.04-arm
+            arch: aarch64
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify release source and native Ubuntu 22.04 runner
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          CARGO_VER=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          if [[ -n "${INPUT_TAG}" ]]; then
+            TAG="${INPUT_TAG}"
+          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${CARGO_VER}"
+          fi
+          VERSION="${TAG#v}"
+          if [[ "${VERSION}" != "${CARGO_VER}" ]]; then
+            echo "tag version (${VERSION}) does not match Cargo.toml (${CARGO_VER})" >&2
+            exit 1
+          fi
+          if TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+            [[ "${TAG_SHA}" == "${GITHUB_SHA}" ]] || { echo "tag ${TAG} points at ${TAG_SHA}, not ${GITHUB_SHA}" >&2; exit 1; }
+          else
+            MAIN_SHA=$(git rev-parse origin/main)
+            [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
+          fi
+          [[ "$(uname -m)" == "${EXPECTED_ARCH}" ]]
+          source /etc/os-release
+          [[ "${ID}" == ubuntu && "${VERSION_ID}" == 22.04 ]]
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential pkg-config
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: "1.98.1"
+
+      - name: Build native Linux archive
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: bash packaging/linux/build.sh "${VERSION}" packaging/dist
+
+      - name: Install and verify daemon SIGKILL survival
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          bash packaging/linux/smoke.sh "packaging/dist/krill-${VERSION}-linux-${EXPECTED_ARCH}.tar.gz"
+          git rev-parse HEAD > "packaging/dist/source-commit-${EXPECTED_ARCH}.txt"
+
+      - name: Upload verified Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: krill-linux-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+          path: |
+            packaging/dist/krill-${{ steps.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
+            packaging/dist/krill-${{ steps.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
+            packaging/dist/source-commit-${{ matrix.arch }}.txt
+          if-no-files-found: error
+          retention-days: 30
+
+  publish-linux:
+    needs: [release, build-linux]
+    if: ${{ !cancelled() && needs.build-linux.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Resolve release version
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          CARGO_VER=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
+          TAG="${INPUT_TAG:-v${CARGO_VER}}"
+          VERSION="${TAG#v}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: krill-linux-${{ steps.meta.outputs.version }}-*
+          merge-multiple: true
+          path: dist
+
+      - name: Publish Linux assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          for arch in x86_64 aarch64; do
+            [[ "$(cat "dist/source-commit-${arch}.txt")" == "${GITHUB_SHA}" ]]
+          done
+          ASSETS=(
+            "dist/krill-${VERSION}-linux-x86_64.tar.gz"
+            "dist/krill-${VERSION}-linux-x86_64.tar.gz.sha256"
+            "dist/krill-${VERSION}-linux-aarch64.tar.gz"
+            "dist/krill-${VERSION}-linux-aarch64.tar.gz.sha256"
+          )
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            EXISTING=$(gh release view "${TAG}" --json assets --jq '.assets[].name')
+            TO_UPLOAD=()
+            for a in "${ASSETS[@]}"; do
+              if ! grep -qxF "$(basename "$a")" <<<"${EXISTING}"; then
+                TO_UPLOAD+=("$a")
+              fi
+            done
+            if [[ "${#TO_UPLOAD[@]}" -gt 0 ]]; then
+              gh release upload "${TAG}" "${TO_UPLOAD[@]}"
+            else
+              echo "Release ${TAG} already has all Linux assets; skipping."
             fi
           else
             gh release create "${TAG}" "${ASSETS[@]}" \
