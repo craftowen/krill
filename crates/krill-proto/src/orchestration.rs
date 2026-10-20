@@ -275,7 +275,7 @@ pub struct DecisionGate {
 pub struct OrchestrationStore {
     #[serde(default)]
     pub next_seq: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub current_run_id: Option<String>,
     #[serde(default)]
     pub runs: Vec<Run>,
