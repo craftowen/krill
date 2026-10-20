@@ -13,11 +13,12 @@ Krill = 어떤 AI 코딩 에이전트든 끊기지 않게 병렬로 돌리는 �
 ## 명령
 
 ```bash
-scripts/check.sh            # 릴리스 후보의 전체 통합 검사: fmt · clippy · nextest · doctest · cargo deny
+scripts/check.sh            # 릴리스 후보의 전체 통합 검사: fmt · clippy · nextest · doctest · cargo deny · NOTICES --check · 공개 표면
 cargo fmt --all             # 포맷 적용
 cargo nextest run -p <크레이트>   # 한 크레이트 테스트
 cargo build --workspace --bins && cargo run -p krill-app   # 앱 실행(보조 바이너리 krill·krill-holder·krilld를 먼저 빌드해야 한다)
 scripts/check-windows.sh [-p <크레이트>] [--clippy]   # Mac에서 Windows 타깃 cargo check(저장소 밖 격리 툴체인, OWE-811). Windows 코드를 건드리면 0이어야 한다
+scripts/install-hooks.sh    # 클론마다 1회: git pre-push 훅(main·v* 태그 push 차단 + 공개 표면 점검) 켜기
 ```
 
 - 반복 수정 중에는 변경한 크레이트의 `cargo check -p <크레이트> --locked`와 변경 동작에 관련된 테스트만 실행한다. 작은 수정마다 워크스페이스 전체를 빌드·검사하지 않는다.
@@ -58,7 +59,8 @@ packaging/            # macOS 번들·DMG·Ed25519 매니페스트·설치 스�
 6. **데몬 panic 격리**: krilld는 세션 작업 단위 `catch_unwind`(panic=unwind, CONVENTIONS P4), krill-holder는 panic 금지. 비테스트 코드 `unwrap`/`expect`/`panic!` 금지(clippy가 막음, 불변식은 `#[expect(..., reason)]`). C·objc2 콜백 밖으로 panic이 나가지 않게.
 7. 측정하지 않은 수치는 문서·커밋·이슈에 쓰지 않는다. 추정이면 "추정".
 8. 하네스 파일(`AGENTS.md`, `docs/CONVENTIONS.md`, `scripts/`, lint·deny·fmt 설정)은 메인테이너 승인 없이 바꾸지 않는다.
-9. `git push`, 원격 생성, 유료 작업 금지(사람이 한다).
+   기계 강제: `.claude` 훅(`.claude/hooks/guard.sh`, Claude Code 전용)·`.github/CODEOWNERS`·git `pre-push`(`scripts/hooks/`).
+9. 에이전트는 `main`·`v*` 태그에 push하지 않는다. 그 외 브랜치 push·게시(`publish-github.sh`)·원격 설정 변경·유료 작업은 사용자가 그 작업을 명시적으로 지시했을 때만 한다.
 10. **UI/UX는 [docs/STYLEGUIDE.md](docs/STYLEGUIDE.md)와 `krill_app::ui` 토큰·프리미티브만 쓴다.** 미구현 기능을 UI에 미리 표기하지 않는다.
 
 ## 이슈·작업 흐름
