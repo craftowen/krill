@@ -23,6 +23,7 @@ scripts/check-windows.sh [-p <크레이트>] [--clippy]   # Mac에서 Windows �
 - 반복 수정 중 중간 검증은 `cargo check -p <크레이트>`와 `cargo nextest run -p <크레이트> <필터>`만 실행한다.
 - 전체 `scripts/check.sh`는 작업 완료(커밋) 직전 1회만 실행한다.
 - 중간 검증은 최종 검증을 대체하지 않는다. `scripts/check.sh`가 0으로 끝나야 완료를 주장·커밋할 수 있다.
+- 예외(위험도 낮음): 바뀐 파일이 전부 (a) Markdown 문서(`*.md`, `docs/**`)이거나 (b) `Cargo.toml`의 `[profile.*]` 디버그 정보 설정(`debug`·`split-debuginfo`)뿐이면 `check.sh`를 생략하고 `git diff --check`만 확인한다. `.rs` 파일(주석·doc 주석 포함)·스크립트·lint·deny 설정이 하나라도 섞이면 예외가 아니다. 생략했으면 커밋 메시지에 `check.sh 생략(<사유>)`를 적는다.
 
 툴체인: Homebrew `rustc 1.98.1`(rustup 없음 → `rust-toolchain.toml` 대신 `Cargo.toml`의 `rust-version = "1.98"`로 MSRV 고정). 최신 stable 1.99 전용 기능(패키지 레벨 default-features 덮어쓰기 등)에 기대지 않는다. Xcode 없음(CommandLineTools만) — gpui는 `font-kit` + `runtime_shaders` 기능으로 빌드. Apple Developer 인증서 없음(MK-104).
 
