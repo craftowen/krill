@@ -2614,6 +2614,10 @@ impl Shell {
                         handoff.from,
                         to,
                     );
+                    if !panes.is_empty() && self.chat.active_sessions.remove(&handoff.from) {
+                        self.chat.active_sessions.insert(to);
+                        self.chat.logs.remove(&handoff.from);
+                    }
                     changed |= !panes.is_empty();
                     for pane in panes {
                         if let Some(live) = self.live.get_mut(&pane) {

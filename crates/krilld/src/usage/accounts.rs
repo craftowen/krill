@@ -367,6 +367,11 @@ pub(crate) fn write_atomic_0600(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write
 }
 
+pub(crate) fn resolve_codex_dir(home: &Path, id: &str, raw_dir: &Path) -> PathBuf {
+    let slug = id.strip_prefix("codex-").unwrap_or(id);
+    krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(home, slug, raw_dir)
+}
+
 fn write_active_env(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) -> io::Result<()> {
     use std::fmt::Write as _;
     let mut lines = String::new();
@@ -381,7 +386,16 @@ fn write_active_env(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) 
                 .find(|a| a.id == *active_id && a.config_dir().is_dir())
                 .map_or_else(
                     || host_default_dir(home, provider).display().to_string(),
-                    |a| a.profile_dir.clone(),
+                    |a| {
+                        let raw_dir = a.config_dir();
+                        if provider == ProviderKind::Codex {
+                            resolve_codex_dir(home, &a.id, raw_dir)
+                                .display()
+                                .to_string()
+                        } else {
+                            a.profile_dir.clone()
+                        }
+                    },
                 );
             // K-28: `{:?}`(Rust Debug)는 `$`·백틱을 이스케이프하지 않아 source 시 실행·확장된다.
             // 작은따옴표로 감싸고 안의 따옴표만 `'\''`로 끊어 셸에 안전하게 넘긴다.
@@ -929,8 +943,7 @@ fn refresh_accounts_authenticated(
         };
         let raw_dir = PathBuf::from(&stored.profile_dir);
         let dir = if provider == ProviderKind::Codex {
-            let slug = stored.id.strip_prefix("codex-").unwrap_or(&stored.id);
-            krill_proto::usage::profiles::migrate_long_codex_profile_if_needed(home, slug, &raw_dir)
+            resolve_codex_dir(home, &stored.id, &raw_dir)
         } else {
             raw_dir
         };
@@ -1776,6 +1789,16 @@ pub fn active_profile_env(
     state_dir: Option<&Path>,
     program: &str,
 ) -> Option<(&'static str, String)> {
+    let (provider, active) = active_account_info(home, state_dir, program)?;
+    Some((provider.env_var(), active.profile_dir))
+}
+
+/// 에이전트 실행 시 비-기본 활성 계정의 `(ProviderKind, AccountInfo)`를 돌려준다.
+pub fn active_account_info(
+    home: &Path,
+    state_dir: Option<&Path>,
+    program: &str,
+) -> Option<(ProviderKind, AccountInfo)> {
     let name = Path::new(program).file_name()?.to_str()?;
     let provider = ProviderKind::parse(name)?;
     let path = config_path(home, state_dir);
@@ -1787,7 +1810,7 @@ pub fn active_profile_env(
         .accounts
         .into_iter()
         .find(|a| a.provider == provider && a.active && !a.host_default && runnable(a))?;
-    Some((provider.env_var(), active.profile_dir))
+    Some((provider, active))
 }
 
 #[cfg(test)]
