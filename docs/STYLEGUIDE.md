@@ -93,10 +93,12 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
 - **키보드 선택 / 현재 활성 행(Selected / Active)**: `p.accent` 또는 `p.sidebar_accent`를 사용한다. 임의의 `#ededed`나 `#333333` 같은 생 색상을 발명하지 않는다.
 - **색상 틴트(Color Mixing)**: 강조 배경이나 옅은 테두리가 필요할 때는 새 hex를 만들지 않고 시맨틱 토큰에 `.opacity(...)`를 입힌다(예: 오류 배너 배경 `p.destructive.opacity(0.1)`, 테두리 `p.destructive.opacity(0.3)`).
 
-### 3.4 터미널 팔레트 (`TERMINAL_DARK` / `TERMINAL_LIGHT`)
+### 3.4 터미널 팔레트와 테마 카탈로그 (`TERMINAL_DARK` / `TERMINAL_LIGHT` / `BUILTIN_TERMINAL_THEMES`)
 
-- 다크 모드: `TERMINAL_DARK` (Orca `Ghostty Default Style Dark`, 배경 `#282c34`, 전경 `#ffffff`).
-- 라이트 모드: `TERMINAL_LIGHT` (Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
+- 기본 다크 터미널 테마: `TERMINAL_DARK` (`DEFAULT_TERMINAL_THEME_DARK` = Orca `Ghostty Default Style Dark`, 배경 `#282c34`, 전경 `#ffffff`).
+- 기본 라이트 터미널 테마: `TERMINAL_LIGHT` (`DEFAULT_TERMINAL_THEME_LIGHT` = Orca `Builtin Tango Light`, 배경 `#ffffff`, 전경 `#000000`).
+- 내장 30종 카탈로그(`ui::BUILTIN_TERMINAL_THEMES`, [`ui/terminal_themes.rs`](../crates/krill-app/src/ui/terminal_themes.rs))와 사용자가 가져온 Ghostty·Warp 테마(`CustomTerminalTheme`)는 `ui::terminal_theme(cx)` / `ui::terminal_theme_for_mode(mode, settings)`로만 해석한다. 라이트 모드는 `terminal_use_separate_light_theme`(기본 켜짐)가 꺼져 있으면 다크 테마를 그대로 쓴다.
+- 설정 화면의 테마 스와치·미리보기처럼 터미널 `Rgb` 색을 UI 요소에 입힐 때는 생 색상 대신 `ui::terminal_rgb_hsla(rgb)`를 쓴다.
 - 터미널 칸 여백은 셀 배경과 일치하도록 `ui::terminal_surface(theme)` 또는 투명도 설정(`50..=100%`)이 반영된 `ui::terminal_surface_alpha(theme, opacity_pct)`를 쓴다.
 
 ---
