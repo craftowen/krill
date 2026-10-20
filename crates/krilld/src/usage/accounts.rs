@@ -1610,7 +1610,7 @@ pub fn delete_account(
             ));
         };
         let dir = PathBuf::from(&file.accounts.remove(idx).profile_dir);
-        if in_use.iter().any(|d| d == &dir) {
+        if profile_in_use(&dir, in_use) {
             return Err(io::Error::from_raw_os_error(libc::EBUSY));
         }
         if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
@@ -1625,6 +1625,17 @@ pub fn delete_account(
         tracing::warn!(error = %e, "account profile left as orphan");
     }
     Ok(refresh_accounts(home, state_dir))
+}
+
+// 세션이 같은 폴더를 symlink·정규화된 경로로 기록했어도 보호한다.
+fn profile_in_use(dir: &Path, in_use: &[PathBuf]) -> bool {
+    let resolved = dir.canonicalize().ok();
+    in_use.iter().any(|other| {
+        other == dir
+            || resolved
+                .as_ref()
+                .is_some_and(|path| other.canonicalize().is_ok_and(|other| other == *path))
+    })
 }
 
 /// 등록되지 않은 Krill 관리 프로필 폴더(OWE-704). `in_use` 폴더는 빼지 않는다(목록에는 보이되 정리에서 건너뜀).
@@ -1652,6 +1663,9 @@ pub fn purge_orphan_profiles(
         .collect();
     let keep: Vec<PathBuf> = registered.iter().chain(in_use).cloned().collect();
     for orphan in krill_proto::usage::profiles::orphans(home, &keep) {
+        if profile_in_use(Path::new(&orphan.dir), in_use) {
+            continue;
+        }
         if let Err(e) = krill_proto::usage::profiles::move_to_trash(home, Path::new(&orphan.dir)) {
             tracing::warn!(error = %e, "orphan profile not moved");
         }
@@ -1975,4 +1989,56 @@ pub fn set_provisioning(home: &Path, state_dir: Option<&Path>, enabled: bool) ->
 pub fn provisioning(home: &Path, state_dir: Option<&Path>) -> io::Result<bool> {
     let _guard = lock(&SAVE_LOCK);
     Ok(load_writable(home, state_dir)?.provisioning)
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod removal_alias_tests {
+    use super::*;
+
+    #[test]
+    fn removal_and_orphan_cleanup_preserve_in_use_profile_alias() {
+        let home = std::env::temp_dir().join(format!("owe704-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let state = home.join("state");
+        let snap =
+            add_account(&home, Some(&state), ProviderKind::Claude, "Work", None, "").unwrap();
+        let account = snap.accounts.iter().find(|a| a.label == "Work").unwrap();
+        let profile = PathBuf::from(&account.profile_dir);
+        std::fs::write(profile.join("partial-login"), b"fake data").unwrap();
+        let alias = home.join("running-profile");
+        std::os::unix::fs::symlink(&profile, &alias).unwrap();
+        let before = std::fs::read(config_path(&home, Some(&state))).unwrap();
+
+        let result = delete_account(
+            &home,
+            Some(&state),
+            ProviderKind::Claude,
+            &account.id,
+            std::slice::from_ref(&alias),
+        );
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EBUSY));
+        assert_eq!(
+            std::fs::read(config_path(&home, Some(&state))).unwrap(),
+            before
+        );
+        assert!(profile.join("partial-login").is_file());
+
+        remove_account(&home, Some(&state), ProviderKind::Claude, &account.id).unwrap();
+        let left =
+            purge_orphan_profiles(&home, Some(&state), std::slice::from_ref(&alias)).unwrap();
+        assert_eq!(left.len(), 1);
+        assert!(alias.join("partial-login").is_file());
+        assert!(!home.join(".Trash").exists());
+        assert!(
+            purge_orphan_profiles(&home, Some(&state), &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            home.join(".Trash/krill-claude-work/partial-login")
+                .is_file()
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
 }
