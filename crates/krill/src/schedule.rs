@@ -40,6 +40,13 @@ fn execute(raw: &[OsString]) -> io::Result<()> {
 }
 
 fn execute_in(dir: &std::path::Path, args: &[&str], connect_daemon: bool) -> io::Result<()> {
+    // `--` 뒤 `<executable> [args...]`의 `--help`는 검색어가 아니라 해당 명령의 도움말 요청이 아니라
+    // 스케줄 실행 대상의 인자이므로 도움말로 삼키지 않는다. 첫 토큰(서브커맨드 자리)만 본다.
+    let head = args.split(|a| *a == "--").next().unwrap_or(&[]);
+    if head.len() <= 2 && head.iter().any(|a| matches!(*a, "-h" | "--help" | "help")) {
+        println!("{USAGE}");
+        return Ok(());
+    }
     match args {
         ["list"] => {
             let schedules = Schedules::load(dir)?;
@@ -382,6 +389,16 @@ fn usage_error(e: impl std::fmt::Display) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_returns_usage_without_daemon() {
+        let dir = std::env::temp_dir().join(format!("krill-sched-help-{}", std::process::id()));
+        drop(fs::remove_dir_all(&dir));
+        fs::create_dir_all(&dir).unwrap();
+        assert!(execute_in(&dir, &["--help"], false).is_ok());
+        assert!(execute_in(&dir, &["-h"], false).is_ok());
+        drop(fs::remove_dir_all(&dir));
+    }
 
     #[test]
     fn schedule_add_edit_show_enable_disable_run_and_rm_preserve_fields() {

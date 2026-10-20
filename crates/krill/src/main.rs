@@ -224,7 +224,17 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         ["doctor", "--json", "--no-start"] | ["doctor", "--no-start", "--json"] => {
             doctor::run_json(true)
         }
+        ["doctor", "-h" | "--help" | "help"]
+        | ["doctor", _, "-h" | "--help" | "help"]
+        | ["doctor", _, _, "-h" | "--help" | "help"] => {
+            println!("usage: krill doctor [--bundle|--json [--no-start]]");
+            ExitCode::SUCCESS
+        }
         ["agent", "list"] => agent_list(),
+        ["agent", "-h" | "--help" | "help"] | ["agent", _, "-h" | "--help" | "help"] => {
+            println!("usage: krill agent list");
+            ExitCode::SUCCESS
+        }
         ["hook", action @ ("install" | "uninstall"), ref rest @ ..] => {
             hook_install::run(action, rest)
         }
@@ -311,6 +321,45 @@ mod tests {
             assert_eq!(run(vec![OsString::from(flag)]), ExitCode::SUCCESS, "{flag}");
         }
         assert_eq!(run(Vec::new()), ExitCode::from(2));
+    }
+
+    #[test]
+    fn subcommand_help_delegates_to_modules() {
+        for argv in [
+            vec!["doctor", "--help"],
+            vec!["agent", "list", "--help"],
+            vec!["history", "--help"],
+            vec!["update", "--help"],
+            vec!["search", "--help"],
+            vec!["mobile", "pair", "--help"],
+            #[cfg(target_os = "macos")]
+            vec!["computer", "--help"],
+            vec!["ls", "--help"],
+            vec!["new", "--help"],
+            vec!["send", "--help"],
+            vec!["read", "--help"],
+            vec!["wait", "--help"],
+            vec!["kill", "--help"],
+            vec!["orchestration", "--help"],
+            vec!["statusline", "--help"],
+            vec!["telemetry", "--help"],
+            vec!["account", "--help"],
+            vec!["artifacts", "--help"],
+            vec!["schedule", "--help"],
+            vec!["changes", "--help"],
+            vec!["file", "--help"],
+            vec!["worktree", "--help"],
+            vec!["set", "--help"],
+            vec!["import", "--help"],
+            vec!["skills", "--help"],
+            vec!["handoff", "--help"],
+            vec!["reference", "--help"],
+            vec!["ports", "--help"],
+        ] {
+            let raw = argv.into_iter().map(OsString::from).collect::<Vec<_>>();
+            assert_eq!(run(raw.clone()), ExitCode::SUCCESS, "{raw:?}");
+        }
+        // send -- --help는 리터럴이므로 도움말이 아니다(세션 모듈 단위 테스트에서 보장).
     }
 
     #[test]

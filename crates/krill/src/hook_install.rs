@@ -14,6 +14,10 @@ const USAGE: &str =
 const CONSENT: &str = "Apply the changes shown above? [y/N] ";
 
 pub fn run(action: &str, args: &[&str]) -> ExitCode {
+    if args.iter().any(|s| matches!(*s, "-h" | "--help" | "help")) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     match execute(action, args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
@@ -166,4 +170,16 @@ fn config_path(agent: TargetAgent, home: &Path) -> io::Result<PathBuf> {
         }
         TargetAgent::Other(Agent::Codex) => return Err(io::Error::other("Codex uses RPC trust")),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run("install", &["--help"]), ExitCode::SUCCESS);
+        assert_eq!(run("uninstall", &["-h"]), ExitCode::SUCCESS);
+        // 도움말 플래그는 설치 경로와 겹치지 않는다.
+        assert_eq!(run("install", &["--dry-run", "--help"]), ExitCode::SUCCESS);
+    }
 }

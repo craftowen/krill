@@ -284,3 +284,10 @@ fn uninstall_preserves_user_taken_slot() {
     assert!(paths.receipt.exists());
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn help_flag_returns_zero() {
+    use std::ffi::OsString;
+    assert_eq!(super::run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+    assert_eq!(super::run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+}

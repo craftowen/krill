@@ -32,6 +32,15 @@ const CHAIN_WAIT: Duration = Duration::from_secs(10);
 const PROBE_WAIT: Duration = Duration::from_secs(10);
 
 pub fn run(args: &[OsString]) -> ExitCode {
+    // `--chain <command>` 값 자리는 사용자 명령이므로 첫 두 토큰만 본다.
+    let head: Vec<_> = args.iter().take(2).collect();
+    if head
+        .iter()
+        .any(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
+    {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     match args.first().and_then(|s| s.to_str()) {
         Some("install" | "uninstall") => manage(args),
         _ => run_mode(args),

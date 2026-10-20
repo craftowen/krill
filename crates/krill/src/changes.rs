@@ -15,6 +15,15 @@ use krill_proto::screen::Msg as _;
 const USAGE: &str = "usage: krill changes [--repo <path>]";
 
 pub fn run(args: &[OsString]) -> ExitCode {
+    // `--repo <path>` 값 자리의 `help`는 경로이므로 첫 두 토큰만 본다.
+    let head: Vec<_> = args.iter().take(2).collect();
+    if head
+        .iter()
+        .any(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
+    {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let repo = match args {
         [] => std::env::current_dir(),
         [flag, repo] if flag == "--repo" => std::fs::canonicalize(repo),
@@ -97,5 +106,16 @@ fn stats(value: Option<Numstat>) -> String {
         }) => format!("+{a}/-{d}"),
         Some(_) => "binary".to_owned(),
         None => "none".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
     }
 }

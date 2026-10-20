@@ -37,13 +37,13 @@ pub fn run(raw_args: &[OsString]) -> ExitCode {
         }
     };
     let args = args_vec.as_slice();
-    if args
-        .first()
-        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
-        || args
-            .get(1)
-            .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help")))
-    {
+    // 서브커맨드 자리(`worktree --help`, `worktree new --help`)만 도움말로 본다.
+    // `new <name>` 이름 자리의 `help`는 워크트리 이름이다.
+    let help_here = matches!(
+        args.first().and_then(|a| a.to_str()),
+        Some("-h" | "--help" | "help")
+    ) || matches!(args.get(1).and_then(|a| a.to_str()), Some("-h" | "--help"));
+    if help_here {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -860,6 +860,19 @@ fn run_hooks(args: &[OsString]) -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_position_help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&[OsString::from("new"), OsString::from("--help")]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(&[OsString::from("cleanup"), OsString::from("-h")]),
+            ExitCode::SUCCESS
+        );
+    }
 
     #[test]
     fn parse_new_worktree_with_parent() {

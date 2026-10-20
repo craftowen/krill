@@ -9,9 +9,18 @@ use std::io::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
+const USAGE: &str = "usage: krill history clear";
+
 pub fn run(args: &[OsString]) -> ExitCode {
+    if args
+        .iter()
+        .any(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
+    {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     if !matches!(args, [command] if command == "clear") {
-        eprintln!("usage: krill history clear");
+        eprintln!("{USAGE}");
         return ExitCode::from(2);
     }
     match clear() {
@@ -51,5 +60,18 @@ fn clear() -> Result<(), String> {
         HistoryReply::Cleared => Ok(()),
         HistoryReply::Paused { .. } => Err("unexpected history pause response".into()),
         HistoryReply::Failed(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+        // 인자 없을 때는 usage+exit2 유지(회귀).
+        assert_eq!(run(&[]), ExitCode::from(2));
     }
 }

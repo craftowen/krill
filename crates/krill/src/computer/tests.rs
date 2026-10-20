@@ -389,3 +389,13 @@ fn jxa_scripts_preserve_pid_whose_specifier_without_array_evaluation() {
         );
     }
 }
+
+#[test]
+fn help_returns_zero_at_any_position() {
+    assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+    assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+    assert_eq!(
+        run(&[OsString::from("capabilities"), OsString::from("--help")]),
+        ExitCode::SUCCESS
+    );
+}

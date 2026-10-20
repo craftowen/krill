@@ -47,6 +47,11 @@ struct JsonHit {
 }
 
 pub fn run(raw: &[OsString]) -> ExitCode {
+    // 검색어 `help`와 구분하기 위해 `-h`/`--help`만 도움말로 본다. 베어 `help`는 검색어다.
+    if matches!(raw.first().and_then(|a| a.to_str()), Some("-h" | "--help")) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let Ok(args) = raw
         .iter()
         .cloned()
@@ -277,6 +282,14 @@ mod tests {
 
     fn vec_str(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        // 베어 `help`는 검색어다. 빈 저장소에서는 결과가 없어도 SUCCESS다.
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
     }
 
     #[test]

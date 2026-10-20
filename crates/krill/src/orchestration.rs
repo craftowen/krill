@@ -198,6 +198,14 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         eprintln!("orchestration: arguments must be UTF-8");
         return ExitCode::from(2);
     };
+    // 서브커맨드 자리만 도움말로 본다. 하위 명령의 프롬프트 텍스트(`ask ... help`)는 건드리지 않는다.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let Some((sub, rest)) = args.split_first() else {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
@@ -2139,6 +2147,16 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn help_returns_zero_at_top_level() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&[OsString::from("run-list"), OsString::from("--help")]),
+            ExitCode::SUCCESS
+        );
     }
 
     #[test]

@@ -27,6 +27,12 @@ pub fn run_ports(raw: &[OsString]) -> ExitCode {
     run_inner("ports", raw, dispatch_ports)
 }
 
+const SKILLS_USAGE: &str = "usage: krill skills list [--json] | krill skills get <name> [--full] [--references] [--reference <path>] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|all] [--global|--local <dir>|--dir <dir>] [--json]";
+const HANDOFF_USAGE: &str = "usage: krill handoff --from <session-id> [--to-agent <agent>] [--to-session <id>] [--prompt <text>] [--lines <N>] [--json]";
+const REFERENCE_USAGE: &str = "usage: krill reference list [--session <id>] [--worktree <path>] [--json] | krill reference add <url> [url...] [--session <id>] [--worktree <path>] [--json] | krill reference remove <url> [--session <id>] [--worktree <path>] [--json] | krill reference find [query] [--json]";
+const PORTS_USAGE: &str =
+    "usage: krill ports [--session <id>] [--no-probe] [--text <text>] [--json]";
+
 fn run_inner(label: &str, raw: &[OsString], f: fn(&[String]) -> io::Result<()>) -> ExitCode {
     let Ok(args) = raw
         .iter()
@@ -37,6 +43,33 @@ fn run_inner(label: &str, raw: &[OsString], f: fn(&[String]) -> io::Result<()>) 
         eprintln!("{label}: arguments must be UTF-8");
         return ExitCode::from(2);
     };
+    // 첫 인자(`krill skills --help`)는 `-h`/`--help`/베어 `help`를, 서브커맨드 직후
+    // (`krill skills get --help`)는 `-h`/`--help`만 도움말로 본다. 쿼리·검색어 자리인
+    // 베어 `help`(`reference find help`)와 옵션값 자리(`ports --text --help`)는
+    // 각 dispatch가 판단한다.
+    // `get --help`는 이름 없이 온 도움말이다. `--text --help`는 `--text`의 값이다.
+    let second_is_help = matches!(args.as_slice(), [sub, flag]
+        if matches!(flag.as_str(), "-h" | "--help") && sub != "--text");
+    let help_here = matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) || second_is_help;
+    if help_here {
+        let usage = match label {
+            "skills" => SKILLS_USAGE,
+            "handoff" => HANDOFF_USAGE,
+            "reference" => REFERENCE_USAGE,
+            "ports" => PORTS_USAGE,
+            _ => {
+                return {
+                    eprintln!("{label}: unknown command");
+                    ExitCode::from(2)
+                };
+            }
+        };
+        println!("{usage}");
+        return ExitCode::SUCCESS;
+    }
     match f(&args) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
@@ -655,6 +688,18 @@ mod tests {
 
     fn args(raw: &[&str]) -> Vec<String> {
         raw.iter().map(|arg| (*arg).to_owned()).collect()
+    }
+
+    #[test]
+    fn help_returns_zero_for_all_dispatches() {
+        use std::ffi::OsString;
+        assert_eq!(run_skills(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run_handoff(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run_reference(&[OsString::from("help")]), ExitCode::SUCCESS);
+        assert_eq!(run_ports(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        // unknown subcommand 에러 메시지는 유지(exit2).
+        assert_eq!(run_skills(&[OsString::from("nope")]), ExitCode::from(2));
+        assert_eq!(run_ports(&[OsString::from("--bogus")]), ExitCode::from(2));
     }
 
     #[test]
