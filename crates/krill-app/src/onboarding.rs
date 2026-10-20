@@ -10,10 +10,14 @@
 //!   입력으로만 읽는다.
 
 use std::ffi::{OsStr, OsString};
-use std::io::{self, Read as _};
+use std::io;
+#[cfg(unix)]
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+#[cfg(unix)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -31,13 +35,16 @@ actions!(onboarding, [OpenChecks]);
 /// 끝까지 간 뒤 상태 디렉터리에 만드는 표시 파일(구 방식, 마이그레이션 입력으로만 읽는다).
 pub const DONE_FILE: &str = "onboarding.done";
 /// 로그인 셸이 PATH를 알려 주기까지 기다리는 최대 시간. 멈춘 rc 파일이 온보딩을 붙잡지 않게 한다.
+#[cfg(unix)]
 const SHELL_TIMEOUT: Duration = Duration::from_secs(5);
 /// rc 파일이 stdout에 무엇을 찍어도 PATH 줄을 골라내기 위한 표시.
+#[cfg(unix)]
 const PATH_MARK: &str = "__MK_PATH__=";
 /// 대화상자에 보이는 diff 최대 줄 수. 나머지는 CLI로 본다.
 const DIFF_LINES: usize = 30;
 /// 리더 스레드가 파이프 EOF 없이 버티는 추가 유예. 호출자는 [`SHELL_TIMEOUT`]에
 /// 먼저 끊고, 리더는 이 유예가 지나면 종료해 스레드 누수를 막는다(AS-14).
+#[cfg(unix)]
 const READER_GRACE: Duration = Duration::from_secs(5);
 
 use crate::i18n::catalog::checks as ctext;
@@ -78,7 +85,7 @@ impl Env {
                 .unwrap_or_else(|| "/bin/zsh".into()),
             krill: krill_proto::daemon::sibling_exe("krill").ok()?,
             state: krill_proto::daemon::state_dir()?,
-            home: std::env::var_os("HOME")?.into(),
+            home: krill_proto::os::home_dir()?,
             state_overridden: krill_proto::daemon::state_dir_override().is_some(),
         })
     }
@@ -122,6 +129,7 @@ pub struct Survey {
 }
 
 /// 살아 있는 `login_path` 리더 스레드 수(AS-14 누수 감시).
+#[cfg(unix)]
 static READER_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(test)]
@@ -130,8 +138,10 @@ pub(crate) fn login_path_reader_count() -> usize {
     READER_THREADS.load(Ordering::Relaxed)
 }
 
+#[cfg(unix)]
 struct ReaderGuard;
 
+#[cfg(unix)]
 impl Drop for ReaderGuard {
     fn drop(&mut self) {
         READER_THREADS.fetch_sub(1, Ordering::Relaxed);
@@ -139,6 +149,7 @@ impl Drop for ReaderGuard {
 }
 
 /// `shell -l -i -c`로 로그인·대화형 셸의 PATH를 얻는다. 실패하거나 [`SHELL_TIMEOUT`]을 넘기면 `None`.
+#[cfg(unix)]
 pub fn login_path(shell: &OsStr) -> Option<OsString> {
     let script = format!("printf '\\n{PATH_MARK}%s\\n' \"$PATH\"");
     let mut child = crate::platform::background_command(shell)
@@ -192,6 +203,12 @@ pub fn login_path(shell: &OsStr) -> Option<OsString> {
         .find_map(|l| l.strip_prefix(PATH_MARK))
         .filter(|p| !p.is_empty())
         .map(OsString::from)
+}
+
+/// Windows has no POSIX login shell. Use the PATH inherited from Explorer.
+#[cfg(windows)]
+pub fn login_path(_shell: &OsStr) -> Option<OsString> {
+    std::env::var_os("PATH").filter(|path| !path.is_empty())
 }
 
 /// git·에이전트·`krill` CLI를 감지한다. 셸과 `--version`을 띄우므로 백그라운드에서 부른다.

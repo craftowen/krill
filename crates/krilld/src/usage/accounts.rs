@@ -423,7 +423,7 @@ fn sh_quote(s: &str) -> String {
 }
 
 pub fn default_home() -> PathBuf {
-    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+    krill_proto::os::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
 pub fn host_default_dir(home: &Path, provider: ProviderKind) -> PathBuf {

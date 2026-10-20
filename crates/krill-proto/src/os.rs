@@ -7,6 +7,35 @@
 //! - 넣지 않는 것: 읽기 측(실행 비트·소유자, `PermissionsExt`·`MetadataExt`), `Permissions::from_mode`(Windows는
 //!   빈 `Permissions`를 만들 수 없다), `symlink`(파일·디렉터리 구분과 권한이 다르다). 호출처가 cfg로 분기한다.
 
+/// Native user home. Windows providers use `USERPROFILE`, including when Git Bash sets a different `HOME`.
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    let key = "USERPROFILE";
+    #[cfg(not(windows))]
+    let key = "HOME";
+    std::env::var_os(key)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Background CLI work must not allocate a Windows console, including npm `.cmd` launchers.
+pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    configure_background(&mut command);
+    command
+}
+
+/// Keep a configured command's arguments/environment while hiding its Windows console.
+pub fn configure_background(command: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    let _ = command;
+}
+
 #[cfg(unix)]
 pub use std::os::unix::{ffi, fs, net};
 

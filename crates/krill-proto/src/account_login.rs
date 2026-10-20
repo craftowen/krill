@@ -5,7 +5,6 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::control::Program;
 use crate::usage::ProviderKind;
 
 /// OWE-705 신원 정보. 토큰·키체인 값은 포함하지 않는다.
@@ -22,55 +21,52 @@ pub struct AuthStatus {
     pub identity: Option<Identity>,
 }
 
-/// `dir`이 `None`이면 호스트 기본 계정이다. env를 지워 실행한다: Claude는 `CLAUDE_CONFIG_DIR`이 있기만 해도
-/// (값이 `~/.claude`여도) 다른 키체인 항목을 쓰는데, 호스트 세션은 env 없이 뜬다.
-pub fn login_program(provider: ProviderKind, dir: Option<&Path>) -> Option<Program> {
-    let tail: &[&str] = match provider {
-        ProviderKind::Claude => &["claude", "auth", "login", "--claudeai"],
-        ProviderKind::Codex => &["codex", "login"],
-        // agy starts authentication in its interactive TUI; there is no `login` subcommand.
+/// Build a native login process without a POSIX `env` executable or shell quoting.
+/// The caller resolves `exe` with the same PATH used for discovery and verification.
+/// Interactive callers retain their console; background callers use `os::configure_background`.
+pub fn login_command(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<Command> {
+    if dir.is_some_and(|dir| dir.as_os_str().is_empty()) {
+        return None;
+    }
+    let args: &[&str] = match provider {
+        ProviderKind::Claude => &["auth", "login", "--claudeai"],
+        ProviderKind::Codex => &["login"],
+        ProviderKind::OpenCode => &["auth", "login"],
         ProviderKind::Antigravity => &[],
-        ProviderKind::OpenCode => &["opencode", "auth", "login"],
         ProviderKind::Gemini => return None,
     };
-    let mut args = if provider == ProviderKind::Antigravity {
-        let mut args = vec![b"agy".to_vec()];
+    let mut command = Command::new(exe);
+    command.args(args);
+    if provider == ProviderKind::Antigravity {
         if let Some(dir) = dir {
-            if dir.as_os_str().is_empty() {
-                return None;
-            }
-            args.insert(0, b"SSH_CONNECTION=krill".to_vec());
-            args.push(format!("--gemini_dir={}", dir.join(".gemini").to_str()?).into_bytes());
-        }
-        args
-    } else if provider == ProviderKind::OpenCode {
-        match dir {
-            Some(dir) if dir.as_os_str().is_empty() => return None,
-            Some(dir) => vec![
-                format!("XDG_DATA_HOME={}", dir.join("data").to_str()?).into_bytes(),
-                format!("XDG_STATE_HOME={}", dir.join("state").to_str()?).into_bytes(),
-                b"OPENCODE_DB=opencode.db".to_vec(),
-            ],
-            None => Vec::new(),
+            command.env("SSH_CONNECTION", "krill");
+            let mut arg = std::ffi::OsString::from("--gemini_dir=");
+            arg.push(dir.join(".gemini"));
+            command.arg(arg);
         }
     } else {
-        match dir {
-            Some(dir) if dir.as_os_str().is_empty() => return None,
-            Some(dir) => vec![format!("{}={}", provider.env_var(), dir.to_str()?).into_bytes()],
-            None => vec![b"-u".to_vec(), provider.env_var().as_bytes().to_vec()],
-        }
-    };
-    let mut clean = Vec::new();
-    for key in provider.credential_overrides() {
-        clean.extend([b"-u".to_vec(), key.as_bytes().to_vec()]);
+        configure_account(&mut command, provider, dir);
     }
-    clean.extend(args);
-    args = clean;
-    args.extend(tail.iter().map(|s| s.as_bytes().to_vec()));
-    Some(Program::Custom {
-        program: b"/usr/bin/env".to_vec(),
-        args,
-    })
+    Some(command)
+}
+
+fn configure_account(command: &mut Command, provider: ProviderKind, dir: Option<&Path>) {
+    for key in provider.credential_overrides() {
+        command.env_remove(key);
+    }
+    match dir {
+        Some(dir) if provider == ProviderKind::OpenCode => {
+            command.env("XDG_DATA_HOME", dir.join("data"));
+            command.env("XDG_STATE_HOME", dir.join("state"));
+            command.env("OPENCODE_DB", "opencode.db");
+        }
+        Some(dir) => {
+            command.env(provider.env_var(), dir);
+        }
+        None => {
+            command.env_remove(provider.env_var());
+        }
+    }
 }
 
 pub fn parse_claude_status(json: &str) -> Option<AuthStatus> {
@@ -108,7 +104,7 @@ pub fn agy_token_logged_in(dir: &Path) -> bool {
 }
 
 /// 비밀값을 출력하지 않는 CLI 상태 조회. stdout·stderr를 함께 읽되 결과에는 신원만 남긴다.
-/// Codex는 상태를 stderr에 쓰며 로그아웃이면 비영(非零) 종료한다. `dir`이 `None`이면 호스트 기본 계정([`login_program`]).
+/// Codex는 상태를 stderr에 쓰며 로그아웃이면 비영(非零) 종료한다. `dir`이 `None`이면 호스트 기본 계정([`login_command`]).
 pub fn probe(exe: &Path, provider: ProviderKind, dir: Option<&Path>) -> Option<AuthStatus> {
     if provider == ProviderKind::Antigravity {
         let dir = dir?;
@@ -134,30 +130,16 @@ pub fn probe_with_environment(
         ProviderKind::OpenCode => &["auth", "list"],
         _ => return None,
     };
-    let mut cmd = Command::new(exe);
+    let mut cmd = crate::os::background_command(exe);
     if let Some(home) = home {
         cmd.env("HOME", home);
+        #[cfg(windows)]
+        cmd.env("USERPROFILE", home);
     }
     if let Some(path) = path {
         cmd.env("PATH", path);
     }
-    for key in provider.credential_overrides() {
-        cmd.env_remove(key);
-    }
-    match dir {
-        Some(dir) if provider == ProviderKind::OpenCode => {
-            cmd.env("XDG_DATA_HOME", dir.join("data"));
-            cmd.env("XDG_STATE_HOME", dir.join("state"));
-            cmd.env("OPENCODE_DB", "opencode.db");
-            cmd.env_remove("OPENCODE_CONFIG_DIR");
-        }
-        Some(dir) => {
-            cmd.env(provider.env_var(), dir);
-        }
-        None => {
-            cmd.env_remove(provider.env_var());
-        }
-    }
+    configure_account(&mut cmd, provider, dir);
     let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
@@ -281,78 +263,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn login_uses_env_and_literal_profile_argument() {
-        for (provider, expected) in [
-            (
-                ProviderKind::Claude,
-                vec![
-                    "CLAUDE_CONFIG_DIR=/tmp/a b;$x",
-                    "claude",
-                    "auth",
-                    "login",
-                    "--claudeai",
-                ],
-            ),
-            (
-                ProviderKind::Codex,
-                vec!["CODEX_HOME=/tmp/a b;$x", "codex", "login"],
-            ),
-        ] {
-            let mut expected_args = Vec::new();
+    fn native_login_scopes_profiles_without_shell_syntax() {
+        let dir = Path::new("profile 한글 with spaces;$x&data");
+        for provider in ProviderKind::ALL {
+            let command = login_command(Path::new("provider.cmd"), provider, Some(dir)).unwrap();
+            assert_eq!(command.get_program(), "provider.cmd");
+            let env: std::collections::BTreeMap<_, _> = command.get_envs().collect();
             for key in provider.credential_overrides() {
-                expected_args.extend([b"-u".to_vec(), key.as_bytes().to_vec()]);
+                if *key != "OPENCODE_DB" {
+                    assert_eq!(env.get(std::ffi::OsStr::new(key)), Some(&None));
+                }
             }
-            expected_args.extend(expected.into_iter().map(|s| s.as_bytes().to_vec()));
-            assert_eq!(
-                login_program(provider, Some(Path::new("/tmp/a b;$x"))),
-                Some(Program::Custom {
-                    program: b"/usr/bin/env".to_vec(),
-                    args: expected_args,
-                })
+            match provider {
+                ProviderKind::Antigravity => {
+                    assert_eq!(command.get_args().count(), 1);
+                }
+                ProviderKind::OpenCode => {
+                    assert_eq!(
+                        env[std::ffi::OsStr::new("XDG_DATA_HOME")],
+                        Some(dir.join("data").as_os_str())
+                    );
+                    assert_eq!(
+                        env[std::ffi::OsStr::new("XDG_STATE_HOME")],
+                        Some(dir.join("state").as_os_str())
+                    );
+                }
+                _ => assert_eq!(
+                    env[std::ffi::OsStr::new(provider.env_var())],
+                    Some(dir.as_os_str())
+                ),
+            }
+        }
+        assert!(
+            login_command(
+                Path::new("claude"),
+                ProviderKind::Claude,
+                Some(Path::new(""))
+            )
+            .is_none()
+        );
+        assert!(login_command(Path::new("gemini"), ProviderKind::Gemini, None).is_none());
+        for provider in [ProviderKind::Claude, ProviderKind::Codex] {
+            let command = login_command(Path::new(provider.as_str()), provider, None).unwrap();
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == provider.env_var() && value.is_none())
             );
         }
-        assert_eq!(
-            login_program(ProviderKind::Claude, Some(Path::new(""))),
-            None
-        );
-        assert_eq!(
-            login_program(ProviderKind::Antigravity, Some(Path::new(""))),
-            None
-        );
-        assert_eq!(
-            login_program(ProviderKind::Antigravity, None),
-            Some(Program::Custom {
-                program: b"/usr/bin/env".to_vec(),
-                args: vec![b"agy".to_vec()],
-            })
-        );
-        let Some(Program::Custom { program, args }) =
-            login_program(ProviderKind::OpenCode, Some(Path::new("/tmp/a")))
-        else {
-            panic!("OpenCode must support scoped account login");
-        };
-        assert_eq!(program, b"/usr/bin/env");
-        assert!(args.contains(&b"XDG_DATA_HOME=/tmp/a/data".to_vec()));
-        assert!(args.contains(&b"XDG_STATE_HOME=/tmp/a/state".to_vec()));
-        assert!(args.contains(&b"OPENCODE_DB=opencode.db".to_vec()));
-        assert!(args.ends_with(&[b"opencode".to_vec(), b"auth".to_vec(), b"login".to_vec()]));
-        assert_eq!(
-            login_program(ProviderKind::Antigravity, Some(Path::new("/tmp/a"))),
-            Some(Program::Custom {
-                program: b"/usr/bin/env".to_vec(),
-                args: [
-                    "SSH_CONNECTION=krill",
-                    "agy",
-                    &format!(
-                        "--gemini_dir={}",
-                        Path::new("/tmp/a").join(".gemini").to_string_lossy()
-                    ),
-                ]
-                .into_iter()
-                .map(|s| s.as_bytes().to_vec())
-                .collect(),
-            })
-        );
     }
 
     /// 호스트 기본 계정은 env 없이 다룬다. Claude는 `CLAUDE_CONFIG_DIR`이 설정되기만 해도(값이 `~/.claude`여도)
@@ -361,29 +319,6 @@ mod tests {
     #[cfg(unix)] // 가짜 CLI가 /bin/sh 스크립트다.
     fn host_account_login_and_probe_drop_config_env() {
         use std::os::unix::fs::PermissionsExt as _;
-        let mut clean = Vec::new();
-        for key in ProviderKind::Claude.credential_overrides() {
-            clean.extend([b"-u".to_vec(), key.as_bytes().to_vec()]);
-        }
-        clean.extend(
-            [
-                "-u",
-                "CLAUDE_CONFIG_DIR",
-                "claude",
-                "auth",
-                "login",
-                "--claudeai",
-            ]
-            .into_iter()
-            .map(|s| s.as_bytes().to_vec()),
-        );
-        assert_eq!(
-            login_program(ProviderKind::Claude, None),
-            Some(Program::Custom {
-                program: b"/usr/bin/env".to_vec(),
-                args: clean,
-            })
-        );
         let root = std::env::temp_dir().join(format!("owe700-host-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let exe = root.join("fake-cli");
@@ -600,3 +535,6 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests;
