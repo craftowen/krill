@@ -8001,3 +8001,57 @@ fn terminal_tab_renders_themes_preview_and_selects_theme(cx: &mut TestAppContext
 
     fs::remove_dir_all(d).ok();
 }
+
+#[gpui::test]
+fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestAppContext) {
+    use krill_proto::mobile::{ConnectMode, MobileReply, MobileRequest};
+    let d = dir("mobile-background-pair");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile = mobile::Panel::new(std::sync::Arc::new(|request| {
+                Ok(match request {
+                    MobileRequest::MintPairingTicket { mode, .. } => MobileReply::PairingOffer {
+                        url: format!("http://127.0.0.1:1234/#pair={mode:?}"),
+                        host: "127.0.0.1".into(),
+                        port: 1234,
+                        expires_at_ms: u64::MAX,
+                        mode,
+                        interfaces: Vec::new(),
+                    },
+                    _ => MobileReply::Devices(Vec::new()),
+                })
+            }));
+            v.set_tab(AdminTab::Mobile, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.mobile_pair(ConnectMode::Tunnel, None, cx);
+            assert!(v.mobile.pairing_pending());
+            assert!(
+                !v.mobile.pending,
+                "connection wait must not lock mobile controls"
+            );
+            // 요청을 아직 실행하지 않은 상태에서도 창을 그리며 다른 경로를 고를 수 있다.
+        });
+        window.draw(cx).clear(cx);
+        view.update(cx, |v, cx| {
+            v.mobile_pair(ConnectMode::Lan, None, cx);
+            assert_eq!(v.mobile.mode, ConnectMode::Lan);
+            v.set_tab(AdminTab::General, cx);
+            assert_eq!(v.tab, AdminTab::General);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let mobile = &view.read(cx).mobile;
+        assert!(!mobile.pairing_pending());
+        assert_eq!(mobile.mode, ConnectMode::Lan);
+        assert!(mobile.offer.as_ref().unwrap().0.contains("Lan"));
+    });
+    fs::remove_dir_all(d).ok();
+}
