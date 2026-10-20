@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """publish-github.sh 게시 가드 회귀 테스트. 임시 git 저장소·로컬 bare origin·가짜 gh만 쓰고 네트워크·빌드는 없다."""
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -117,6 +118,42 @@ class PublishGuardTests(unittest.TestCase):
         # 이미 게시된 버전은 사유가 있어도 넘길 수 없다.
         self.assert_blocked(self.publish(FAKE_RELEASE="1", KRILL_PUBLISH_FORCE="hotfix"),
                             "cannot be overridden")
+
+    def test_dry_run_adds_signed_windows_assets(self):
+        w = self.work / "packaging"
+        fakes = {
+            "bundle.sh": 'o=$2; mkdir -p "$o"; echo zip > "$o/Krill-0.1.0-arm64-adhoc.zip"; '
+                         'echo "$(printf a%.0s {1..64})  x" > "$o/Krill-0.1.0-arm64-adhoc.zip.sha256"',
+            "release.sh": 'o=$6; mkdir -p "$o/homebrew-krill"; touch "$o/Krill-0.1.0.dmg" '
+                          '"$o/Krill-0.1.0-source.tar.gz" "$o/homebrew-krill/SHA256SUMS"',
+            "install.sh": "", "install-linux.sh": "", "windows/install.ps1": "",
+            # VERSION PUBLIC_KEY UPDATE_URL OUT_DIR
+            "windows/build-vm.sh": 'echo "$2 $3" > "$4/vm-args"; echo zip > "$4/Krill-$1-windows-x64.zip"; '
+                                   'echo "$(printf b%.0s {1..64})  x" > "$4/Krill-$1-windows-x64.zip.sha256"',
+        }
+        for name, body in fakes.items():
+            (w / name).parent.mkdir(parents=True, exist_ok=True)
+            (w / name).write_text(f"#!/bin/bash\nset -e\n{body}\n")
+        (w / "macos").mkdir()
+        shutil.copy2(HERE / "macos/ed25519_manifest.py", w / "macos/ed25519_manifest.py")
+        (self.work / "crates/krill-proto/src").mkdir(parents=True)
+        (self.work / "crates/krill-proto/src/ipc.rs").write_text("pub const PROTO_MIN: u16 = 3;\n")
+        key = self.work.parent / "update.key"
+        key.write_text(os.urandom(32).hex() + "\n")
+        result = self.publish("--dry-run", KRILL_WIN_VM_DIR="/unused", KRILL_UPDATE_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        dist = self.work / "packaging/dist"
+        for asset in ("Krill-0.1.0-windows-x64.zip", "Krill-0.1.0-windows-x64.zip.sha256",
+                      "latest-windows.json", "install.ps1"):
+            self.assertIn(f"packaging/dist/{asset}\n", result.stdout)
+        pub, url = (dist / "vm-args").read_text().split()
+        self.assertEqual(pub, (key.parent / "update.key.pub").read_text().strip())
+        self.assertEqual(url, "https://github.com/o/r/releases/latest/download/latest-windows.json")
+        manifest = json.loads((dist / "latest-windows.json").read_text())
+        self.assertEqual(manifest["url"],
+                         "https://github.com/o/r/releases/download/v0.1.0/Krill-0.1.0-windows-x64.zip")
+        self.assertEqual((manifest["sha256"], manifest["min_daemon_protocol"]), ("b" * 64, 3))
+        self.assertEqual(json.loads((dist / "latest.json").read_text())["sha256"], "a" * 64)
 
     def test_script_never_uploads_into_existing_release(self):
         script = (HERE / "publish-github.sh").read_text()

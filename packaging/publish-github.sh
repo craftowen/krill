@@ -29,6 +29,9 @@ Options:
   --preflight        게시 가드만 실행하고 끝낸다(하나라도 실패하면 1)
 
 Environment:
+  KRILL_GCP_PROJECT=<id>      Linux tar.gz를 GCP 임시 VM에서 빌드해 자산에 넣는다(packaging/linux/build-gcp.sh)
+  KRILL_WIN_VM_DIR=<dir>      Windows zip을 상시 Windows VM에서 빌드해 latest-windows.json·install.ps1과 함께 넣는다
+                             (packaging/windows/build-vm.sh)
   KRILL_PUBLISH_FORCE=<사유>  사람 전용 탈출구. 대화형 터미널에서 태그를 직접 입력해야 하며 사유를 출력한다.
                              이미 게시된 태그·릴리스, 로컬 태그 불일치, 공개 표면 위반은 덮어쓰지 못한다
 USAGE
@@ -345,6 +348,30 @@ if [[ -n "${KRILL_GCP_PROJECT:-}" ]]; then
 fi
 LINUX_ASSETS=("$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz "$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz.sha256)
 [[ "${#LINUX_ASSETS[@]}" -gt 0 ]] || echo "warning: no Linux tarballs (set KRILL_GCP_PROJECT to build them)" >&2
+# Windows zip: KRILL_WIN_VM_DIR가 있으면 상시 Windows VM을 켜서 빌드·스모크 후 끈다(packaging/windows/README.md).
+# 매니페스트는 macOS와 같은 키로 맥에서 서명한다. latest.json은 스키마상 항목 하나라 Windows는 latest-windows.json을 따로 둔다.
+if [[ -n "${KRILL_WIN_VM_DIR:-}" ]]; then
+  WIN_ZIP_NAME="Krill-${VERSION}-windows-x64.zip"
+  WIN_PUB=$(python3 packaging/macos/ed25519_manifest.py keygen --key-file "$UPDATE_KEY_FILE")
+  bash packaging/windows/build-vm.sh "$VERSION" "$WIN_PUB" \
+    "${REPO_URL}/releases/latest/download/latest-windows.json" "$OUT_DIR"
+  python3 packaging/macos/ed25519_manifest.py sign \
+    --key-file "$UPDATE_KEY_FILE" \
+    --version "$VERSION" \
+    --url "${REPO_URL}/releases/download/${TAG}/${WIN_ZIP_NAME}" \
+    --sha256 "$(awk '{print $1}' "$OUT_DIR/${WIN_ZIP_NAME}.sha256")" \
+    --min-daemon-protocol "$MIN_DAEMON_PROTO" \
+    --channel "$RELEASE_CHANNEL" \
+    --rollout-pct 100 \
+    --output "$OUT_DIR/latest-windows.json"
+  cp packaging/windows/install.ps1 "$OUT_DIR/install.ps1"
+fi
+WINDOWS_ASSETS=("$OUT_DIR"/Krill-"${VERSION}"-windows-x64.zip "$OUT_DIR"/Krill-"${VERSION}"-windows-x64.zip.sha256)
+if [[ "${#WINDOWS_ASSETS[@]}" -gt 0 ]]; then
+  WINDOWS_ASSETS+=("$OUT_DIR/latest-windows.json" "$OUT_DIR/install.ps1")
+else
+  echo "warning: no Windows zip (set KRILL_WIN_VM_DIR to build it)" >&2
+fi
 
 ASSETS=(
   "$OUT_DIR/Krill-${VERSION}.dmg"
@@ -356,6 +383,7 @@ ASSETS=(
   "$OUT_DIR/install.sh"
   "$OUT_DIR/install-linux.sh"
   ${LINUX_ASSETS[@]+"${LINUX_ASSETS[@]}"}
+  ${WINDOWS_ASSETS[@]+"${WINDOWS_ASSETS[@]}"}
 )
 
 if [[ "$DRY_RUN" -eq 1 ]]; then

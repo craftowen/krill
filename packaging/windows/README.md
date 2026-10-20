@@ -44,6 +44,18 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\bundle.ps1 -Version 0
 Windows 매니페스트는 `latest-windows.json`이다. macOS와 같은 키·`packaging/macos/ed25519_manifest.py sign`으로 만든다(서명 형식이 플랫폼과 무관하다).
 macOS `latest.json`과 이름이 겹치지 않게 `-UpdateUrl`을 `…/releases/latest/download/latest-windows.json`으로 준다. 비우면 업데이터 기본값(macOS `latest.json`)을 본다.
 
+`build.ps1`은 위 빌드·nupkg 확인(캐시 `%LOCALAPPDATA%\krill-release-cache`)·`bundle.ps1`·`.zip.sha256`를 한 번에 한다.
+`smoke.ps1 -Zip <zip>`은 임시 폴더에 `install.ps1`로 설치해 데몬 기동·세션 입출력·krilld 강제 종료 생존을 보고,
+`krill-app.exe`를 5초 띄워 결과만 적는다(헤드리스 SSH에선 창이 못 떠 끝날 수 있어 실패로 보지 않는다).
+
+## 맥에서 게시 (`publish-github.sh`)
+
+`KRILL_WIN_VM_DIR=<VM 접속 폴더>`를 주면 `publish-github.sh`가 `build-vm.sh`로 상시 Windows VM을 켜서
+`git archive HEAD`를 `build.ps1`·`smoke.ps1`로 빌드·검사하고 zip·`.sha256`을 가져온 뒤 VM을 끈다(삭제 안 함).
+공개키(`-PublicKey`)는 맥의 업데이트 키에서 뽑아 넘기고, 비밀키는 VM에 보내지 않는다. `latest-windows.json`은
+맥에서 macOS와 같은 키로 서명하고, zip·`.sha256`·`latest-windows.json`·`install.ps1`을 릴리스 자산에 넣는다.
+VM 접속 폴더에는 `up.sh`·`ssh.sh`·`down.sh`·`ip`·`id_ed25519`·`known_hosts`가 있어야 한다(저장소 밖).
+
 ## 릴리스 워크플로 (OWE-839)
 
 `.github/workflows/release.yml`의 `build-windows` 잡이 위 빌드(`+crt-static`)·ConPTY nupkg 해시 확인·`bundle.ps1`을 돌려
