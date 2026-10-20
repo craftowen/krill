@@ -439,6 +439,10 @@ impl Shell {
                     .selected_index(self.layout.active())
                     .children(tabs)
                     .on_click(cx.listener(|this, i: &usize, _, cx| {
+                        // 가운데 diff가 열려 있으면 탭을 누르는 것으로 닫고 터미널로 돌아간다.
+                        if this.diff.read(cx).has_center_diff() {
+                            this.close_center_diff(cx);
+                        }
                         this.change(true, cx, |l| l.activate(*i));
                     })),
             )

@@ -795,6 +795,7 @@ impl Shell {
             .detach();
         let diff = cx.new(|cx| {
             let mut panel = krill_app::diff::Panel::unconnected(folder, cx);
+            panel.set_split_center(true);
             panel.set_tab(panel_tab, cx);
             if panel_collapsed {
                 panel.set_visible(false, cx);
@@ -3014,6 +3015,14 @@ impl Shell {
             cx.notify();
             return;
         }
+        // 가운데 diff가 터미널을 덮고 있으면 Esc로 닫고, 다른 키는 가려진 터미널로 보내지 않는다.
+        if self.diff.read(cx).has_center_diff() {
+            if e.keystroke.key == "escape" && !e.keystroke.modifiers.modified() {
+                self.close_center_diff(cx);
+                cx.stop_propagation();
+            }
+            return;
+        }
         // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace만 Ctrl+U로 보낸다.
         let ks = &e.keystroke;
         let Some(l) = self.focused_live() else { return };
@@ -3372,6 +3381,8 @@ impl Shell {
             if let Some(old) = focused {
                 self.commit_ime(old, None, cx);
             }
+            self.diff
+                .update(cx, krill_app::diff::Panel::clear_selection);
         }
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
@@ -4819,6 +4830,11 @@ impl Render for Shell {
         } else {
             None
         };
+        let center_diff = if settings_view.is_none() {
+            self.render_center_diff(window, cx)
+        } else {
+            None
+        };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
         let (warning, warning_fg) = (p.warning, p.warning_foreground);
@@ -4892,6 +4908,10 @@ impl Render for Shell {
                 }
                 if this.settings.is_some() {
                     this.close_settings(Some(window), cx);
+                    return;
+                }
+                if this.diff.read(cx).has_center_diff() {
+                    this.close_center_diff(cx);
                     return;
                 }
                 if this.layout.visible().len() == 1
@@ -5156,7 +5176,10 @@ impl Render for Shell {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_key_up(cx.listener(Self::on_key_up))
             .on_modifiers_changed(cx.listener(Self::on_link_modifiers))
-            .when(settings_view.is_none(), |d| d.child(input))
+            .when(
+                settings_view.is_none() && !self.diff.read(cx).has_center_diff(),
+                |d| d.child(input),
+            )
             .on_drag_move(
                 cx.listener(|this, e: &DragMoveEvent<Drag>, _, cx| this.on_column_drag(e, cx)),
             )
@@ -5274,6 +5297,7 @@ impl Render for Shell {
                                     ))
                                     .children(tree)
                                     .children(self.render_chat_overlay(cx))
+                                    .children(center_diff)
                                     // ⌘F 검색 바: 터미널 영역 기준 우측 정렬 오버레이(OWE-849).
                                     // 창 루트가 아니라 터미널 컨테이너 자식으로 그려 우측 패널
                                     // 너비·접힘과 무관하게 항상 터미널 우측에 붙는다.
