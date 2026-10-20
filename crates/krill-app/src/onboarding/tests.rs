@@ -1424,7 +1424,7 @@ fn wizard_fix_all_installs_hooks_and_skills_and_copy_queues_terminal_command(
         ".cursor/hooks.json",
         ".config/opencode/plugins/minikrill.js",
         ".claude/skills/minikrill/SKILL.md",
-        ".codex/skills/mk-orchestration/SKILL.md",
+        ".codex/skills/orchestration/SKILL.md",
         ".gemini/config/skills/worktree-checkpoints/SKILL.md",
     ] {
         assert!(

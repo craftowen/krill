@@ -613,22 +613,9 @@ mod tests {
                 .iter()
                 .find(|skill| skill.name == name)
                 .unwrap();
-            // Orca와 이름이 겹치는 스킬은 `mk-<name>`으로 설치된다.
-            let (folder, content) = if matches!(name, "orchestration" | "computer-use") {
-                (
-                    format!("mk-{name}"),
-                    skill.content.replacen(
-                        &format!("name: {name}\n"),
-                        &format!("name: mk-{name}\n"),
-                        1,
-                    ),
-                )
-            } else {
-                (name.to_owned(), skill.content.to_owned())
-            };
             assert_eq!(
-                std::fs::read_to_string(dir.join(folder).join("SKILL.md"))?,
-                format!("{content}\n<!-- minikrill-managed-skill -->\n")
+                std::fs::read_to_string(dir.join(name).join("SKILL.md"))?,
+                format!("{}\n<!-- minikrill-managed-skill -->\n", skill.content)
             );
         }
         dispatch_skills(&args(&["get", "minikrill", "--full"]))?;
