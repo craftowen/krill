@@ -33,7 +33,13 @@ async function browser(){
   const ready=()=>evaluate("KrillMobile.store.connection.phase==='ready'");
   return {call,evaluate,open,click,stored,ready};
  }
- return {send,page,traffic,async close(){socket.close();const exited=new Promise(r=>chrome.once('exit',r));chrome.kill('SIGKILL');await exited;fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});}};
+ return {send,page,traffic,async close(){
+  const exited=chrome.exitCode!==null||chrome.signalCode!==null?Promise.resolve():new Promise(r=>chrome.once('exit',r));
+  // Browser.close는 렌더러·프로필 쓰기까지 정리한다. 부모만 SIGKILL하면 남은 자식과 rmdir가 경쟁한다.
+  const forced=setTimeout(()=>{chrome.kill('SIGKILL');socket.close();},5000);
+  try{if(socket.readyState===WebSocket.OPEN)await Promise.race([send('Browser.close'),exited]);else chrome.kill('SIGTERM');await exited;}
+  finally{clearTimeout(forced);socket.close();fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});}
+ }};
 }
 
 exports.main=async function main({base,fragment}){
