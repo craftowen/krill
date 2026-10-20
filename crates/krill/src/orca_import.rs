@@ -21,7 +21,7 @@
 //!   "orca_dir": "/Users/alice/Library/Application Support/orca",
 //!   "profile_id": "default",
 //!   "dry_run": true,
-//!   "domains": ["accounts", "ssh", "projects", "settings"],
+//!   "domains": ["accounts", "ssh", "projects", "settings", "sessions"],
 //!   "accounts": {
 //!     "skipped": false,
 //!     "skipped_reason": null,
@@ -87,6 +87,21 @@
 //!     "quick_commands_merged": 1,
 //!     "agents_updated": 1,
 //!     "schedules_merged": 1
+//!   },
+//!   "sessions": {
+//!     "skipped": false,
+//!     "skipped_reason": null,
+//!     "resumed": 1,
+//!     "already_resumed": 0,
+//!     "items": [
+//!       {
+//!         "agent": "claude",
+//!         "id": "<claude-session-uuid>",
+//!         "cwd": "/Users/dev/project-alpha",
+//!         "title": "작업 A",
+//!         "resumed": true
+//!       }
+//!     ]
 //!   }
 //! }
 //! ```
@@ -107,7 +122,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use krill_proto::agent::{self, Agents, Profile as AgentProfile};
+use krill_proto::agent_history::{
+    Action, FEAT_AGENT_HISTORY, FEAT_AI_VAULT, Response, VaultAgent, VaultTarget,
+};
 use krill_proto::config_document;
+use krill_proto::control::{FEAT_CONTROL, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{WorkspaceStatus, WorktreeStore, worktree_key};
@@ -191,7 +210,7 @@ fn invalid_data(msg: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
-/// 이관 대상 도메인(4대 도메인).
+/// 이관 대상 도메인.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportDomain {
@@ -199,10 +218,17 @@ pub enum ImportDomain {
     Ssh,
     Projects,
     Settings,
+    Sessions,
 }
 
 impl ImportDomain {
-    pub const ALL: [Self; 4] = [Self::Accounts, Self::Ssh, Self::Projects, Self::Settings];
+    pub const ALL: [Self; 5] = [
+        Self::Accounts,
+        Self::Ssh,
+        Self::Projects,
+        Self::Settings,
+        Self::Sessions,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -211,6 +237,7 @@ impl ImportDomain {
             Self::Ssh => "ssh",
             Self::Projects => "projects",
             Self::Settings => "settings",
+            Self::Sessions => "sessions",
         }
     }
 
@@ -220,8 +247,9 @@ impl ImportDomain {
             "ssh" | "hosts" | "remote" => Ok(Self::Ssh),
             "projects" | "project" | "repos" | "worktrees" => Ok(Self::Projects),
             "settings" | "setting" | "config" => Ok(Self::Settings),
+            "sessions" | "session" | "tabs" => Ok(Self::Sessions),
             other => Err(invalid(format!(
-                "unknown import domain '{other}' (expected accounts,ssh,projects,settings)"
+                "unknown import domain '{other}' (expected accounts,ssh,projects,settings,sessions)"
             ))),
         }
     }
@@ -237,7 +265,7 @@ impl ImportDomain {
         }
         if set.is_empty() {
             return Err(invalid(
-                "--only requires at least one domain (accounts,ssh,projects,settings)",
+                "--only requires at least one domain (accounts,ssh,projects,settings,sessions)",
             ));
         }
         Ok(set.into_iter().collect())
@@ -301,8 +329,40 @@ pub struct OrcaImportReport {
     pub ssh: SshImportSummary,
     pub projects: ProjectsImportSummary,
     pub settings: SettingsImportSummary,
+    #[serde(default)]
+    pub sessions: SessionsImportSummary,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+}
+
+/// Orca 열린 탭의 에이전트 세션(`sessions`) 도메인 계획·결과.
+/// 실제 이관(`dry_run == false`)은 `krilld`에 `ResumeVault`를 보내 각 세션을 그 워크트리에서 이어 띄운다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsImportSummary {
+    #[serde(default)]
+    pub skipped: bool,
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
+    /// 이번 실행에서 `krilld`가 띄운 세션 수.
+    #[serde(default)]
+    pub resumed: usize,
+    /// 이전 이관에서 이미 띄워 건너뛴 세션 수(재실행 멱등).
+    #[serde(default)]
+    pub already_resumed: usize,
+    #[serde(default)]
+    pub items: Vec<ImportedSessionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedSessionSummary {
+    pub agent: String,
+    pub id: String,
+    pub cwd: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    /// 이번 실행에서 띄웠거나 이전 이관에서 이미 띄운 세션이면 `true`.
+    #[serde(default)]
+    pub resumed: bool,
 }
 
 /// 다계정(`accounts`) 도메인 계획·결과·스킵 사유.
@@ -621,6 +681,12 @@ pub fn run_import(opts: &ImportOptions) -> io::Result<OrcaImportReport> {
         report.settings.skipped = true;
         report.settings.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
     }
+    if selected.contains(&ImportDomain::Sessions) {
+        report.sessions = import_sessions_domain(opts, &domains_map, &mut warnings);
+    } else {
+        report.sessions.skipped = true;
+        report.sessions.skipped_reason = Some("--only 목록에서 제외됨".to_owned());
+    }
 
     report.warnings = warnings;
     Ok(report)
@@ -709,6 +775,37 @@ pub fn format_report_human(report: &OrcaImportReport) -> String {
             st.schedules_merged
         )
         .ok();
+    }
+    if report.domains.iter().any(|d| d == "sessions") {
+        let se = &report.sessions;
+        if se.skipped {
+            writeln!(
+                out,
+                "  sessions: skipped ({})",
+                se.skipped_reason.as_deref().unwrap_or("데몬 필요")
+            )
+            .ok();
+        } else {
+            writeln!(
+                out,
+                "  sessions: {} found, {} resumed, {} already resumed",
+                se.items.len(),
+                se.resumed,
+                se.already_resumed
+            )
+            .ok();
+            for item in &se.items {
+                writeln!(
+                    out,
+                    "    - [{}] {} {}{}",
+                    item.agent,
+                    item.cwd,
+                    item.title.as_deref().unwrap_or(&item.id),
+                    if item.resumed { " *" } else { "" }
+                )
+                .ok();
+            }
+        }
     }
     for w in &report.warnings {
         writeln!(out, "  warning: {w}").ok();
@@ -1614,6 +1711,30 @@ fn should_auto_start_daemon(dry_run: bool) -> bool {
     true
 }
 
+/// `krilld` 소켓에 연결한다(`auto_start`면 `daemon::connect`로 데몬 자동 기동 포함).
+fn connect_daemon(
+    socket: &Path,
+    hello: &ipc::ClientHello,
+    auto_start: bool,
+) -> Result<daemon::Connection, String> {
+    match daemon::handshake(socket, hello, Duration::from_secs(10)) {
+        Ok(conn) => Ok(conn),
+        Err(_first_err) if auto_start => {
+            let paths = daemon::Paths::dev()
+                .map(|mut p| {
+                    p.socket = socket.to_path_buf();
+                    p
+                })
+                .map_err(|e| {
+                    format!("cannot resolve daemon paths for {}: {e}", socket.display())
+                })?;
+            daemon::connect(&paths, hello)
+                .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))
+        }
+        Err(e) => Err(format!("cannot connect to {}: {e}", socket.display())),
+    }
+}
+
 /// `krilld` 소켓에 연결(단독 CLI 실행 시 `daemon::connect` 자동 기동 포함)해 `UsageRequest`를 보낸다.
 fn daemon_usage_request(
     socket: &Path,
@@ -1629,22 +1750,7 @@ fn daemon_usage_request(
         | FEAT_USAGE_MANAGE
         | FEAT_ACCOUNT_CONNECTION
         | FEAT_ACCOUNT_POLICY;
-    let mut conn = match daemon::handshake(socket, &hello, Duration::from_secs(10)) {
-        Ok(conn) => conn,
-        Err(_first_err) if auto_start => {
-            let paths = daemon::Paths::dev()
-                .map(|mut p| {
-                    p.socket = socket.to_path_buf();
-                    p
-                })
-                .map_err(|e| {
-                    format!("cannot resolve daemon paths for {}: {e}", socket.display())
-                })?;
-            daemon::connect(&paths, &hello)
-                .map_err(|e| format!("cannot connect to {}: {e}", socket.display()))?
-        }
-        Err(e) => return Err(format!("cannot connect to {}: {e}", socket.display())),
-    };
+    let mut conn = connect_daemon(socket, &hello, auto_start)?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("krilld does not support FEAT_USAGE".to_owned());
     }
@@ -1669,6 +1775,189 @@ fn daemon_usage_request(
         UsageReply::Failed(e) => Err(e.to_string()),
         _ => Err("unexpected reply from krilld".to_owned()),
     }
+}
+
+// ============================================================================
+// Domain 5: Open Agent Sessions (`sessions` via `krilld` ResumeVault)
+// ============================================================================
+
+/// 이미 이어 띄운 Orca 세션 기록(재실행 시 중복 기동 방지). 한 줄에 `<agent>:<id>` 하나.
+const SESSIONS_LEDGER_FILE: &str = "orca-sessions-imported";
+
+/// Orca `workspaceSession`에서 아직 열린 탭에 붙은 에이전트 세션을 모은다. 열린 탭의 `aiVaultTitle`과,
+/// 탭이 살아 있는 `sleepingAgentSessionsByPaneKey`(분할 칸 포함)가 대상이다. 닫힌 탭·원격 호스트
+/// (`workspaceSessionsByHostId`)·로컬에 없는 경로는 뺀다.
+fn orca_open_sessions(domains: &BTreeMap<String, Json>) -> Vec<(VaultTarget, Option<String>)> {
+    let Some(ws) = domains.get("workspaceSession") else {
+        return Vec::new();
+    };
+    let mut tabs: BTreeMap<&str, &Json> = BTreeMap::new();
+    if let Some(map) = ws.get("tabsByWorktree").and_then(Json::as_object) {
+        for tab in map.values().filter_map(Json::as_array).flatten() {
+            if let Some(id) = tab.get("id").and_then(Json::as_str) {
+                tabs.insert(id, tab);
+            }
+        }
+    }
+    let tab_title = |tab: &Json| {
+        tab.pointer("/aiVaultTitle/title")
+            .or_else(|| tab.get("title"))
+            .and_then(Json::as_str)
+            .map(str::to_owned)
+    };
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    let mut push = |agent: Option<&Json>, id: Option<&Json>, worktree: Option<&Json>, title| {
+        let (Some(agent), Some(id), Some(worktree)) = (
+            agent.and_then(Json::as_str).and_then(VaultAgent::parse),
+            id.and_then(Json::as_str).map(str::trim),
+            worktree.and_then(Json::as_str),
+        ) else {
+            return;
+        };
+        let cwd = split_worktree_key(worktree).1;
+        if id.is_empty() || !Path::new(&cwd).is_dir() || !seen.insert((agent, id.to_owned())) {
+            return;
+        }
+        let target = VaultTarget {
+            agent,
+            id: id.to_owned(),
+            cwd,
+            modified: 0,
+        };
+        out.push((target, title));
+    };
+    for tab in tabs.values() {
+        push(
+            tab.pointer("/aiVaultTitle/agent"),
+            tab.pointer("/aiVaultTitle/sessionId"),
+            tab.get("worktreeId"),
+            tab_title(tab),
+        );
+    }
+    if let Some(map) = ws
+        .get("sleepingAgentSessionsByPaneKey")
+        .and_then(Json::as_object)
+    {
+        for pane in map.values() {
+            let Some(tab) = pane
+                .get("tabId")
+                .and_then(Json::as_str)
+                .and_then(|id| tabs.get(id))
+            else {
+                continue;
+            };
+            push(
+                pane.get("agent"),
+                pane.pointer("/providerSession/id"),
+                pane.get("worktreeId"),
+                tab_title(tab),
+            );
+        }
+    }
+    out
+}
+
+fn import_sessions_domain(
+    opts: &ImportOptions,
+    domains: &BTreeMap<String, Json>,
+    warnings: &mut Vec<String>,
+) -> SessionsImportSummary {
+    let mut summary = SessionsImportSummary::default();
+    let found = orca_open_sessions(domains);
+    if found.is_empty() {
+        return summary;
+    }
+    let ledger = opts.state_dir.join(SESSIONS_LEDGER_FILE);
+    let done: BTreeSet<String> = fs::read_to_string(&ledger)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    let mut conn = None;
+    if !opts.dry_run {
+        let socket = opts.state_dir.join("run").join("krilld.sock");
+        let mut hello = daemon::client_hello(ClientRole::Cli, "krill import orca");
+        let required = FEAT_CONTROL | FEAT_AGENT_HISTORY | FEAT_AI_VAULT;
+        hello.features |= required;
+        match connect_daemon(&socket, &hello, should_auto_start_daemon(false)) {
+            Ok(c) if c.negotiated.features & required == required => conn = Some(c),
+            Ok(_) => {
+                summary.skipped = true;
+                summary.skipped_reason =
+                    Some("krilld does not support session resume; update the daemon".to_owned());
+            }
+            Err(e) => {
+                summary.skipped = true;
+                summary.skipped_reason = Some(format!(
+                    "데몬 필요: krilld에 연결할 수 없어 세션 이관을 건너뜀 ({e})"
+                ));
+            }
+        }
+    }
+    for (target, title) in found {
+        let key = format!("{}:{}", target.agent.profile(), target.id);
+        let mut resumed = done.contains(&key);
+        if resumed {
+            summary.already_resumed += 1;
+        } else if let Some(c) = conn.as_mut() {
+            match resume_vault(c, &target) {
+                Ok(()) => {
+                    resumed = true;
+                    summary.resumed += 1;
+                    if let Err(e) = append_line(&ledger, &key) {
+                        warnings.push(format!(
+                            "failed to record {key} in {}: {e}",
+                            ledger.display()
+                        ));
+                    }
+                }
+                Err(e) => warnings.push(format!("session {key} not resumed: {e}")),
+            }
+        }
+        summary.items.push(ImportedSessionSummary {
+            agent: target.agent.profile().to_owned(),
+            id: target.id,
+            cwd: target.cwd,
+            title,
+            resumed,
+        });
+    }
+    summary
+}
+
+/// 열린 제어 연결로 `ResumeVault`를 보내 세션 하나를 그 cwd에서 이어 띄운다.
+fn resume_vault(conn: &mut daemon::Connection, target: &VaultTarget) -> Result<(), String> {
+    let timeout = Some(Duration::from_secs(10));
+    conn.stream
+        .set_read_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    conn.stream
+        .set_write_timeout(timeout)
+        .map_err(|e| e.to_string())?;
+    let frame = Request::AgentHistory(Action::ResumeVault(target.clone()))
+        .encode()
+        .map_err(|e| e.to_string())?;
+    conn.stream.write_all(&frame).map_err(|e| e.to_string())?;
+    let (kind, body) = ipc::read_frame(&mut conn.stream)
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "krilld disconnected".to_owned())?;
+    match Reply::decode(kind, &body).map_err(|e| e.to_string())? {
+        Reply::AgentHistory(Response::Resumed { .. }) => Ok(()),
+        Reply::Failed(e) => Err(e.to_string()),
+        _ => Err("unexpected reply from krilld".to_owned()),
+    }
+}
+
+fn append_line(path: &Path, line: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    writeln!(options.open(path)?, "{line}")
 }
 
 fn resolve_claude_profile_dir(
@@ -4815,6 +5104,72 @@ mod tests {
             BTreeMap::from([("settings".to_owned(), serde_json::json!({}))]);
         let note = detect_agy_import_note(&opts, &disk_only).unwrap();
         assert!(note.contains("1개"), "{note}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn sessions_import_collects_open_tab_agents_and_skips_resumed() {
+        let root = std::env::temp_dir().join(format!("orca-sessions-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let wt = root.join("wt");
+        fs::create_dir_all(&wt).unwrap();
+        let wt_key = format!("repo1::{}", wt.display());
+        let gone_key = format!("repo1::{}", root.join("missing").display());
+        let domains: BTreeMap<String, Json> = BTreeMap::from([(
+            "workspaceSession".to_owned(),
+            serde_json::json!({
+                "tabsByWorktree": {
+                    (wt_key.as_str()): [
+                        {"id": "t1", "worktreeId": wt_key, "title": "shell",
+                         "aiVaultTitle": {"agent": "claude", "sessionId": "c-1", "title": "작업 A"}},
+                        {"id": "t2", "worktreeId": wt_key, "title": "split"},
+                        {"id": "t3", "worktreeId": gone_key, "title": "gone",
+                         "aiVaultTitle": {"agent": "claude", "sessionId": "c-gone"}}
+                    ]
+                },
+                "sleepingAgentSessionsByPaneKey": {
+                    // 같은 탭의 같은 세션은 한 번만, 분할 칸의 다른 에이전트는 따로.
+                    "t1:l1": {"tabId": "t1", "worktreeId": wt_key, "agent": "claude",
+                              "providerSession": {"key": "session_id", "id": "c-1"}},
+                    "t2:l1": {"tabId": "t2", "worktreeId": wt_key, "agent": "antigravity",
+                              "providerSession": {"key": "conversation_id", "id": "g-1"}},
+                    // 닫힌 탭의 세션은 뺀다.
+                    "t9:l1": {"tabId": "t9", "worktreeId": wt_key, "agent": "claude",
+                              "providerSession": {"key": "session_id", "id": "c-closed"}}
+                }
+            }),
+        )]);
+        let found = orca_open_sessions(&domains);
+        let ids: Vec<_> = found
+            .iter()
+            .map(|(t, title)| (t.agent.profile(), t.id.as_str(), title.as_deref()))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                ("claude", "c-1", Some("작업 A")),
+                ("agy", "g-1", Some("split")),
+            ]
+        );
+        assert!(found.iter().all(|(t, _)| t.cwd == wt.display().to_string()));
+
+        let opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: root.join("state"),
+            orca_dir: root.join("orca"),
+            domains: vec![ImportDomain::Sessions],
+            dry_run: true,
+        };
+        append_line(&opts.state_dir.join(SESSIONS_LEDGER_FILE), "claude:c-1").unwrap();
+        let mut warnings = Vec::new();
+        let summary = import_sessions_domain(&opts, &domains, &mut warnings);
+        assert!(!summary.skipped);
+        assert_eq!((summary.resumed, summary.already_resumed), (0, 1));
+        assert_eq!(
+            summary.items.iter().map(|i| i.resumed).collect::<Vec<_>>(),
+            [true, false]
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
         fs::remove_dir_all(&root).ok();
     }
 }
