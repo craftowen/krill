@@ -801,7 +801,7 @@ fn admin_center_tabs_accounts_auto_switch_and_ssh_hosts(cx: &mut TestAppContext)
         view.update(cx, |v, cx| v.connect_ssh_host(host.clone(), cx));
     });
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("admin-link-pairing").is_some());
+    assert!(vcx.debug_bounds("admin-link-pairing").is_none());
     vcx.update(|_, cx| {
         let pending = take_pending_ssh_connect(cx).unwrap();
         assert_eq!(pending.label, "mac-node-1");
@@ -4829,7 +4829,7 @@ fn mobile_eighth_tab_qr_and_mode_invalidation(cx: &mut TestAppContext) {
                     _ => MobileReply::Devices(Vec::new()),
                 })
             }));
-            assert_eq!(AdminTab::ALL.get(7), Some(&AdminTab::Mobile));
+            assert!(AdminTab::ALL.contains(&AdminTab::Mobile));
             v.set_tab(AdminTab::Mobile, cx);
             // OWE-880: 탭 진입 시 상태 자동 조회가 시작된다.
             assert!(v.mobile.pending, "entering the tab auto-fetches status");
@@ -8053,5 +8053,51 @@ fn mobile_pairing_keeps_path_selection_and_other_tabs_available(cx: &mut TestApp
         assert_eq!(mobile.mode, ConnectMode::Lan);
         assert!(mobile.offer.as_ref().unwrap().0.contains("Lan"));
     });
+    fs::remove_dir_all(d).ok();
+}
+
+/// SSH 입력과 초대 링크 기반 Krill 연결은 서로 다른 설정 페이지에만 표시된다.
+#[gpui::test]
+fn ssh_and_remote_krill_have_separate_pages(cx: &mut TestAppContext) {
+    let d = dir("remote-krill-separate");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(1200.)));
+    vcx.update(|window, cx| {
+        let pairing = cx.new(|cx| {
+            crate::link_ui::PairingView::new(
+                std::sync::Arc::new(crate::link_ui::MockLinkBackend::new()),
+                window,
+                cx,
+            )
+        });
+        view.update(cx, |v, cx| {
+            v.remote_krill = Some(pairing);
+            v.set_tab(AdminTab::Ssh, cx);
+        });
+    });
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-tab-ssh").is_some());
+    assert!(vcx.debug_bounds("admin-tab-remote-krill").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-import").is_some());
+    assert!(vcx.debug_bounds("link-server-panel").is_none());
+    assert!(vcx.debug_bounds("admin-link-pairing").is_none());
+    let tab = vcx.debug_bounds("admin-tab-remote-krill").unwrap();
+    vcx.simulate_click(tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-server-panel").is_some());
+    assert!(vcx.debug_bounds("link-client-input-link").is_some());
+    assert!(vcx.debug_bounds("admin-ssh-import").is_none());
+    assert!(vcx.debug_bounds("link-pairing-modal").is_none());
+    // 탭을 왕복해도 입력 중인 링크·짝짓기 상태를 가진 뷰는 유지된다.
+    let pairing = vcx.update(|_, cx| view.read(cx).remote_krill.clone().unwrap());
+    vcx.update(|_, cx| {
+        view.update(cx, |v, cx| {
+            v.set_tab(AdminTab::Ssh, cx);
+            v.set_tab(AdminTab::RemoteKrill, cx);
+        });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(view.read(cx).remote_krill.as_ref(), Some(&pairing)));
     fs::remove_dir_all(d).ok();
 }

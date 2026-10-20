@@ -17,8 +17,8 @@ pub mod real;
 use std::sync::Arc;
 
 use gpui::{
-    App, ClipboardItem, Context, Entity, EventEmitter, FocusHandle, KeyDownEvent, Render,
-    SharedString, Subscription, Task, Window, actions, div, prelude::*,
+    App, ClipboardItem, Context, Entity, EventEmitter, Render, SharedString, Subscription, Task,
+    Window, div, prelude::*,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::input::{Input, InputEvent, InputState};
@@ -36,16 +36,6 @@ pub use qr::{
 };
 
 use crate::i18n::link_ui as text;
-
-actions!(link_ui, [ClosePairing]);
-
-/// 짝짓기 모달의 키 컨텍스트. 메인 창 안 모달에서도 macOS 표준 ⌘W 닫기를 받는다(OWE-878).
-pub const KEY_CONTEXT: &str = "Pairing";
-
-/// 짝짓기 모달의 전역 키 바인딩. 앱 시작 때 한 번 등록한다.
-pub fn bind_keys(cx: &mut App) {
-    cx.bind_keys([crate::keys::bind("cmd-w", ClosePairing, Some(KEY_CONTEXT))]);
-}
 
 /// `ServerPanel`·`ClientDialog`가 외부로 알리는 이벤트.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1284,25 +1274,14 @@ impl Render for ClientDialog {
     }
 }
 
-/// `PairingView`가 외부로 알리는 이벤트. 메인 창 안 모달로 뜨므로 OS 창을 직접
-/// 닫지 않고 호스트(`Shell`)가 모달 슬롯을 비우게 한다(OWE-903).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Event {
-    /// 모달을 닫는다(Esc·⌘W·바깥 클릭·닫기 버튼).
-    Close,
-}
-
 /// 서버 패널("이 Mac에 다른 기기 접속 허용")과 클라이언트 대화상자("다른 Mac 추가")를
 /// 한 화면에 묶어 보여주는 통합 뷰.
 #[derive(Debug)]
 pub struct PairingView {
     pub server: Entity<ServerPanel>,
     pub client: Entity<ClientDialog>,
-    focus: FocusHandle,
     _events: Vec<Subscription>,
 }
-
-impl EventEmitter<Event> for PairingView {}
 
 impl PairingView {
     pub fn new(backend: Arc<dyn LinkBackend>, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -1319,94 +1298,26 @@ impl PairingView {
                 }
             }),
         ];
-        let focus = cx.focus_handle();
-        window.focus(&focus, cx);
         Self {
             server,
             client,
-            focus,
             _events: events,
         }
     }
 }
 
 impl Render for PairingView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let p = crate::ui::palette(cx);
-        // OWE-903: 별도 OS 창 대신 메인 창 안 중앙 모달. 서버 패널 + 클라이언트
-        // 대화상자를 한 카드에 세로로 쌓고 카드 안에서 스크롤한다. 카드 높이는
-        // 고정한다(기존 창 980×780 계승).
-        let card = div()
-            .id("link-pairing-modal")
-            .debug_selector(|| "link-pairing-modal".into())
-            .key_context(KEY_CONTEXT)
-            .track_focus(&self.focus)
-            .occlude()
-            .w(crate::ui::SETTINGS_MODAL_WIDTH)
-            .max_w(window.viewport_size().width - crate::ui::SPACE_4 * 2.)
-            .h(window.viewport_size().height - crate::ui::SPACE_4 * 2.)
-            .max_h(gpui::px(780.))
-            .rounded(crate::ui::RADIUS_LG)
-            .bg(p.popover)
-            .text_color(p.popover_foreground)
-            .border_1()
-            .border_color(p.border)
-            .shadow_lg()
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("link-pairing-view")
+            .debug_selector(|| "link-pairing-view".into())
+            .w_full()
+            .min_w_0()
             .flex()
             .flex_col()
-            .on_action(cx.listener(|_, _: &ClosePairing, _, cx| cx.emit(Event::Close)))
-            .on_key_down(cx.listener(|_, e: &KeyDownEvent, _, cx| {
-                if e.keystroke.key.as_str() == "escape" {
-                    cx.emit(Event::Close);
-                    cx.stop_propagation();
-                }
-            }))
-            .on_mouse_down_out(cx.listener(|_, _, _, cx| cx.emit(Event::Close)))
-            .child(
-                div()
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_6()
-                    .pt_6()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::ui::TEXT_LG)
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .child(text::PAIRING_TITLE.get()),
-                    )
-                    .child(
-                        Button::new("link-pairing-close")
-                            .ghost()
-                            .small()
-                            .icon(gpui_component::IconName::Close)
-                            .debug_selector(|| "link-pairing-close".into())
-                            .accessibility_label(text::CLOSE_BUTTON.get())
-                            .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
-                    ),
-            )
-            .child(
-                div()
-                    .id("link-pairing-view")
-                    .debug_selector(|| "link-pairing-view".into())
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .px_6()
-                    .pb_6()
-                    .pt_4()
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .child(self.server.clone())
-                    .child(self.client.clone()),
-            );
-        crate::ui::modal_backdrop(window.viewport_size(), card)
+            .gap_4()
+            .child(self.server.clone())
+            .child(self.client.clone())
     }
 }
 
@@ -1414,24 +1325,24 @@ impl Render for PairingView {
 #[path = "link_ui/tests.rs"]
 mod tests;
 
-/// 설정·사이드바가 공유하는 짝짓기 모달 진입점(OWE-903).
+/// 앱 메뉴 등이 공유하는 원격 Krill 설정 페이지 진입점.
 ///
-/// 별도 OS 창을 띄우지 않고 메인 창(`Shell`) 안 `ui::modal_backdrop` 모달로 연다.
+/// 메인 창(`Shell`) 안 설정의 원격 Krill 탭을 연다.
 /// 호스트가 등록돼 있으면 거기에 위임하고, 없으면(테스트·호스트 미기동) 경고만 남긴다.
 pub fn open_pairing(cx: &mut App) {
     // 현재 업데이트가 끝난 뒤 디스패치한다. 호출자가 `Shell` 업데이트 안이어도
     // 핸들러가 `Shell`을 다시 읽다가 재진입 panic이 나지 않게 한다.
     cx.defer(|cx| {
         if !dispatch_host(HostCommand::Open, cx) {
-            tracing::warn!("pairing modal host missing; ignoring open_pairing");
+            tracing::warn!("remote Krill settings host missing; ignoring open_pairing");
         }
     });
 }
 
-/// 메인 창(`Shell`)이 짝짓기 모달을 인앱으로 열 때 쓰는 명령.
+/// 메인 창(`Shell`)이 원격 Krill 설정을 인앱으로 열 때 쓰는 명령.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostCommand {
-    /// 짝짓기 모달을 연다. 이미 열려 있으면 앞으로 가져온다.
+    /// 원격 Krill 설정 페이지를 연다.
     Open,
 }
 
@@ -1443,7 +1354,7 @@ struct HostRegistry {
 
 impl gpui::Global for HostRegistry {}
 
-/// 메인 창(`Shell`)을 짝짓기 모달 호스트로 등록한다.
+/// 메인 창(`Shell`)을 원격 Krill 설정 호스트로 등록한다.
 /// 콜백은 호스트 엔티티가 이미 해제됐으면 `None`, 이 창이 처리했으면 `Some(true)`,
 /// 건너뛰면 `Some(false)`를 돌려준다.
 pub fn register_host(

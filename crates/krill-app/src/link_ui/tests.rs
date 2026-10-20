@@ -426,12 +426,13 @@ fn pairing_view_renders_server_and_client_together(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("link-server-panel").is_some());
     assert!(vcx.debug_bounds("link-client-dialog").is_some());
     assert!(vcx.debug_bounds("link-invite-qr").is_some());
-    // OWE-903: 별도 창 대신 넓은 모달 규격 카드로 뜬다.
-    let card = vcx.debug_bounds("link-pairing-modal").expect("modal card");
+    // 페이지 본문은 예전 모달 폭에 갇히지 않고 사용할 수 있는 폭을 채운다.
+    let page = vcx.debug_bounds("link-pairing-view").expect("pairing page");
     assert!(
-        (f32::from(card.size.width) - f32::from(crate::ui::SETTINGS_MODAL_WIDTH)).abs() < 1.,
-        "modal card must use SETTINGS_MODAL_WIDTH: {card:?}"
+        page.size.width > crate::ui::SETTINGS_MODAL_WIDTH,
+        "{page:?}"
     );
+    assert!(vcx.debug_bounds("link-pairing-modal").is_none());
 }
 
 #[gpui::test]
@@ -587,52 +588,18 @@ fn client_close_resets_form_instead_of_closing_window(cx: &mut TestAppContext) {
     });
 }
 
-/// OWE-903: 짝짓기 모달은 Esc로 OS 창을 닫지 않고 호스트에 닫기를 알린다.
+/// 연결 설정은 모달 장식 없이 페이지 본문으로 렌더한다.
 #[gpui::test]
-fn pairing_modal_emits_close_on_esc(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        super::bind_keys(cx);
-    });
+fn pairing_page_renders_panels_without_modal(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
     let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::new());
-    let (view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
+    let (_view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
     vcx.simulate_resize(size(px(1100.), px(1800.)));
     vcx.run_until_parked();
-    assert!(vcx.debug_bounds("link-pairing-modal").is_some());
+    assert!(vcx.debug_bounds("link-pairing-modal").is_none());
     assert!(vcx.debug_bounds("link-pairing-view").is_some());
-    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
-    let flag = fired.clone();
-    let _sub = vcx.update(|_, cx| {
-        cx.subscribe(&view, move |_, _: &Event, _| {
-            flag.set(true);
-        })
-    });
-    vcx.simulate_keystrokes("escape");
-    vcx.run_until_parked();
-    assert!(fired.get(), "Esc must emit Close to the modal host");
-}
-
-/// OWE-903: 짝짓기 모달은 ⌘W로 OS 창을 닫지 않고 호스트에 닫기를 알린다.
-#[gpui::test]
-fn pairing_modal_emits_close_on_cmd_w(cx: &mut TestAppContext) {
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        super::bind_keys(cx);
-    });
-    let backend: Arc<dyn LinkBackend> = Arc::new(MockLinkBackend::new());
-    let (view, vcx) = cx.add_window_view(|window, cx| PairingView::new(backend, window, cx));
-    vcx.simulate_resize(size(px(1100.), px(1800.)));
-    vcx.run_until_parked();
-    let fired = std::rc::Rc::new(std::cell::Cell::new(false));
-    let flag = fired.clone();
-    let _sub = vcx.update(|_, cx| {
-        cx.subscribe(&view, move |_, _: &Event, _| {
-            flag.set(true);
-        })
-    });
-    vcx.simulate_keystrokes("cmd-w");
-    vcx.run_until_parked();
-    assert!(fired.get(), "cmd-W must emit Close to the modal host");
+    assert!(vcx.debug_bounds("link-server-panel").is_some());
+    assert!(vcx.debug_bounds("link-client-input-link").is_some());
 }
 
 /// OWE-903: 짝짓기 진입점은 호스트에 위임하고, 호스트가 없으면 조용히 무시한다(별도 창 없음).
