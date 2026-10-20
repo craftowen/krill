@@ -252,6 +252,14 @@ struct Fields {
     tool_name: Option<String>,
     #[serde(alias = "notificationType")]
     notification_type: Option<String>,
+    #[serde(alias = "agentId", alias = "subagent_id", alias = "subagentId")]
+    agent_id: Option<String>,
+    #[serde(alias = "parentSessionId")]
+    parent_session_id: Option<String>,
+    #[serde(alias = "teammateId")]
+    teammate_id: Option<String>,
+    #[serde(default, alias = "isSubagent")]
+    is_subagent: bool,
 }
 
 /// Claude·Codex·Cursor·OpenCode·Antigravity hook payload 하나를 상태로. 상태를 바꾸지 않는 이벤트(서브에이전트·압축 등)와
@@ -267,6 +275,15 @@ struct Fields {
 /// | `SessionEnd`, Cursor `sessionEnd` | exited |
 pub fn normalize(payload: &[u8]) -> Option<AgentState> {
     let f: Fields = serde_json::from_slice(payload).ok()?;
+    if f.is_subagent
+        || f.agent_id.as_deref().is_some_and(|s| !s.is_empty())
+        || f.parent_session_id
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || f.teammate_id.as_deref().is_some_and(|s| !s.is_empty())
+    {
+        return None;
+    }
     let asks = f.tool_name.as_deref().is_some_and(asks_user);
     Some(match f.hook_event_name.as_deref()? {
         "SessionStart" | "sessionStart" | "Stop" | "StopFailure" | "Interrupt" | "AfterAgent"

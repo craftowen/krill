@@ -459,6 +459,11 @@ impl HibernationGuard<'_> {
 }
 
 impl Tap {
+    /// 목록 표시용 터미널 제목([`krill_proto::control::display_title`]).
+    pub(crate) fn title(&self) -> Option<String> {
+        krill_proto::control::display_title(lock(&self.0.live).engine.title())
+    }
+
     /// 원본 출력 정지 시간(MK-047). 재기동 시 보수적으로 0부터 센다.
     pub(crate) fn quiet_ms(&self) -> u64 {
         u64::try_from(lock(&self.0.live).last_output.elapsed().as_millis()).unwrap_or(u64::MAX)

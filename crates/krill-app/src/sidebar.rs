@@ -2854,13 +2854,18 @@ impl Sidebar {
             .map(String::as_str)
             .map(str::trim)
             .filter(|t| !t.is_empty());
+        // 칸이 열려 있으면 그 제목(즉시 반영), 아니면 krilld가 알려 준 제목. 에이전트 기본 제목은 자동 제목에 양보한다.
         let explicit_title = self
             .titles
             .get(&session.id)
-            .map(String::as_str)
-            .filter(|t| !krill_proto::git::is_default_branch_or_worktree_name(t));
+            .and_then(|t| krill_proto::control::display_title(t))
+            .or_else(|| session.status.title.clone())
+            .filter(|t| {
+                !krill_proto::git::is_default_branch_or_worktree_name(t)
+                    && !t.eq_ignore_ascii_case("claude code")
+            });
         let title = custom_title
-            .or(explicit_title)
+            .or(explicit_title.as_deref())
             .or_else(|| self.auto_titles.get(&session.id).map(String::as_str))
             .or_else(|| self.titles.get(&session.id).map(String::as_str));
         session_label(session, title)
@@ -2871,7 +2876,7 @@ impl Sidebar {
         if host.is_local() {
             self.session_label(session)
         } else {
-            session_label(session, None)
+            session_label(session, session.status.title.as_deref())
         }
     }
 

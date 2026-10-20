@@ -4676,3 +4676,27 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// 칸이 열리지 않은 세션도 krilld가 보낸 터미널 제목으로 이름을 보이고, 칸 제목의 상태 글리프는 떼며,
+/// 에이전트 기본 제목(`Claude Code`)은 첫 프롬프트 자동 제목에 양보한다.
+#[gpui::test]
+fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    vcx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let mut bg = session(21, AgentState::Working, Some("/repo"));
+            bg.status.title = Some("krill 프로젝트 진행 상황".into());
+            assert_eq!(s.session_label(&bg).0, "krill 프로젝트 진행 상황");
+
+            let open = session(22, AgentState::Working, Some("/repo"));
+            s.set_title(open.id, "⠂ PWA QR 코드 스캔 UX", cx);
+            assert_eq!(s.session_label(&open).0, "PWA QR 코드 스캔 UX");
+
+            let mut generic = session(23, AgentState::Done, Some("/repo"));
+            generic.status.title = Some("Claude Code".into());
+            s.set_auto_title(generic.id, "fix-login-timeout", cx);
+            assert_eq!(s.session_label(&generic).0, "fix-login-timeout");
+        });
+    });
+}

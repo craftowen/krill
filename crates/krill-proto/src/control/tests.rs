@@ -112,6 +112,7 @@ fn fixtures_v1() {
                         agent: "claude".to_owned(),
                         since_unix_ns: 1_760_000_000_000_000_000,
                         foreground: None,
+                        title: None,
                     },
                 },
             ])),
@@ -1027,6 +1028,7 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
                 agent: "claude".into(),
                 since_unix_ns: 42,
                 foreground: None,
+                title: None,
             },
         },
     ];
@@ -1063,6 +1065,59 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
         let (kind, body) = read_frame(&mut invalid.as_slice()).unwrap().unwrap();
         assert!(Reply::decode(kind, &body).is_err());
     }
+}
+
+/// 세션 제목 꼬리는 전경 프로세스 꼬리 뒤에 붙어 구 디코더가 무시하고, 새 디코더는 둘 다 복원한다.
+#[test]
+fn states_title_tail_is_backward_compatible() {
+    let base = vec![
+        SessionStatus {
+            session: SessionId(1),
+            status: AgentStatus::UNKNOWN,
+        },
+        SessionStatus {
+            session: SessionId(2),
+            status: AgentStatus::UNKNOWN,
+        },
+    ];
+    let mut titled = base.clone();
+    titled[1].status.title = Some("krill 프로젝트 진행 상황".into());
+    let reply = Reply::States(titled);
+    let frame = reply.encode().unwrap();
+    let (kind, body) = read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(Reply::decode(kind, &body).unwrap(), reply);
+    assert_eq!(
+        postcard::from_bytes::<Reply>(&body).unwrap(),
+        Reply::States(base)
+    );
+
+    let invalid = Reply::States(vec![SessionStatus {
+        session: SessionId(1),
+        status: AgentStatus {
+            title: Some("x".repeat(MAX_TITLE_TEXT + 1)),
+            ..AgentStatus::UNKNOWN
+        },
+    }])
+    .encode()
+    .unwrap();
+    let (kind, body) = read_frame(&mut invalid.as_slice()).unwrap().unwrap();
+    assert!(Reply::decode(kind, &body).is_err());
+}
+
+#[test]
+fn display_title_strips_agent_status_glyphs() {
+    assert_eq!(
+        display_title("✳ krill 프로젝트 진행 상황").as_deref(),
+        Some("krill 프로젝트 진행 상황")
+    );
+    assert_eq!(
+        display_title("⠂ PWA QR 코드 스캔 UX").as_deref(),
+        Some("PWA QR 코드 스캔 UX")
+    );
+    assert_eq!(display_title("✦  Working").as_deref(), Some("Working"));
+    assert_eq!(display_title("~/krill").as_deref(), Some("~/krill"));
+    assert_eq!(display_title(" ✳ \u{7}"), None);
+    assert!(display_title(&"가".repeat(200)).is_some_and(|t| t.len() <= MAX_TITLE_TEXT));
 }
 
 /// postcard는 필드를 순서대로만 읽으므로 `skip_serializing_if`로 빠진 필드가 있으면 디코드가 밀린다.

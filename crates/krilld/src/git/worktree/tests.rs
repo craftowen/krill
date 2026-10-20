@@ -798,3 +798,24 @@ fn clean_worktree_with_initialized_submodule_removes_without_force() {
     assert!(removed.branch_deleted);
     assert!(!wt_path.exists());
 }
+
+#[test]
+fn worktreeinclude_doublestar_matches_root_and_nested_env_files() {
+    let f = Fixture::new("wt-include-doublestar", "");
+    fs::write(f.repo.join(".gitignore"), ".env*\n").unwrap();
+    fs::write(f.repo.join(".worktreeinclude"), "**/.env*\n").unwrap();
+    fs::write(f.repo.join(".env.local"), "ROOT=1\n").unwrap();
+    fs::create_dir_all(f.repo.join("a/b")).unwrap();
+    fs::write(f.repo.join("a/b/.env.local"), "NESTED=2\n").unwrap();
+
+    let (wt, _) = f.created("env-copy", Setup::Skip);
+    let wt_path = path(&wt);
+    assert_eq!(
+        fs::read_to_string(wt_path.join(".env.local")).unwrap(),
+        "ROOT=1\n"
+    );
+    assert_eq!(
+        fs::read_to_string(wt_path.join("a/b/.env.local")).unwrap(),
+        "NESTED=2\n"
+    );
+}
