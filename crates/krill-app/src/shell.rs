@@ -547,9 +547,13 @@ pub struct Shell {
     zoomed_pane: Option<PaneId>,
     /// 가운데 영역 파일(에디터) 탭(MK-119).
     files: files::Files,
-    closed_sessions: Vec<krill_proto::SessionId>,
     #[cfg(test)]
     ime_discards: Rc<std::cell::Cell<usize>>,
+    /// 닫기로 데몬 종료를 요청한 세션(테스트 확인용).
+    #[cfg(test)]
+    closed_sessions: Vec<krill_proto::SessionId>,
+    /// 닫은 탭·칸의 (호스트, 폴더). 세션은 닫을 때 끝나므로 ⌘⇧T는 이 폴더에 새 탭을 연다.
+    closed_dirs: Vec<(krill_app::hosts::HostId, PathBuf)>,
     pub(super) accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     pub(super) ssh_hosts: Vec<krill_app::ssh_hosts::SshHost>,
     pub(super) host_manager: krill_app::hosts::HostManager,
@@ -951,9 +955,11 @@ impl Shell {
             security: krill_app::security::State::default(),
             zoomed_pane: None,
             files: files::Files::default(),
-            closed_sessions: Vec::new(),
             #[cfg(test)]
             ime_discards: Rc::default(),
+            #[cfg(test)]
+            closed_sessions: Vec::new(),
+            closed_dirs: Vec::new(),
             accounts_snapshot,
             accounts_poll: None,
             update_poll: None,
@@ -2257,10 +2263,53 @@ impl Shell {
         self.send(&out, window, cx);
     }
 
-    fn record_closed_pane(&mut self, pane: PaneId) {
-        if let Some(s) = self.layout.session(pane) {
-            self.closed_sessions.push(s);
+    fn record_closed_pane(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        self.remember_closed_dir(pane, cx);
+        self.close_sessions(&[pane], cx);
+    }
+
+    fn remember_closed_dir(&mut self, pane: PaneId, cx: &App) {
+        if let Some(dir) = self.pane_cwd(pane, cx) {
+            self.closed_dirs.push((self.layout.host(pane).clone(), dir));
         }
+    }
+
+    /// 사용자가 닫은 칸의 세션을 데몬에서도 끝낸다(Orca처럼 닫기 = 종료). 다른 칸·창에 같은 세션이 떠 있으면 남긴다.
+    /// 앱 종료(⌘Q)·창 닫기·크래시는 이 경로를 타지 않아 세션이 산다. 요청이 실패한 세션은 '분리된 세션'에 남는다.
+    fn close_sessions(&mut self, panes: &[PaneId], cx: &mut Context<Self>) {
+        let closing: Vec<_> = panes
+            .iter()
+            .filter_map(|&p| {
+                let host = self.layout.host(p).clone();
+                let session = self.layout.session(p)?;
+                Some((self.target_for_host(&host), host, session))
+            })
+            .collect();
+        #[cfg(test)]
+        self.closed_sessions
+            .extend(closing.iter().map(|(_, _, session)| *session));
+        if closing.is_empty() {
+            return;
+        }
+        // 액션 처리 중에는 이 창이 빌려져 있어 창들의 레이아웃을 읽을 수 없으므로, 칸이 빠진 다음 틱에 본다.
+        cx.defer(move |cx| {
+            let targets: Vec<_> = closing
+                .into_iter()
+                .filter(|(_, host, session)| !session_shown(host, *session, cx))
+                .filter_map(|(target, _, session)| Some((target?, session)))
+                .collect();
+            if targets.is_empty() {
+                return;
+            }
+            cx.background_executor()
+                .spawn(async move {
+                    for (target, session) in targets {
+                        let call = krill_app::resources::daemon_call_for(Some(target));
+                        call(&krill_proto::control::Request::Close { session }).ok();
+                    }
+                })
+                .detach();
+        });
     }
 
     /// 칸이 아직 레이아웃에 있으면 true(확인 대화상자를 기다리는 동안 닫혔을 수 있다).
@@ -2289,24 +2338,19 @@ impl Shell {
             return;
         }
         self.zoomed_pane = None;
-        self.record_closed_pane(pane);
+        self.record_closed_pane(pane, cx);
         self.change(true, cx, |l| {
             l.focus(pane);
             l.close_pane();
         });
     }
 
-    fn record_closed_tab(&mut self, tab_idx: usize) {
+    pub(super) fn record_closed_tab(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
         if let Some(tab) = self.layout.tabs().get(tab_idx) {
-            let mut l = self.layout.clone();
-            l.activate(tab_idx);
-            for p in l.visible() {
-                if let Some(s) = l.session(p) {
-                    self.closed_sessions.push(s);
-                } else {
-                    let _ = tab;
-                }
-            }
+            let focused = tab.focused;
+            self.remember_closed_dir(focused, cx);
+            let panes = self.layout.tab_panes(tab_idx);
+            self.close_sessions(&panes, cx);
         }
     }
 
@@ -4356,7 +4400,7 @@ impl Shell {
                                                     cx.stop_propagation();
                                                     // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
                                                     this.zoomed_pane = None;
-                                                    this.record_closed_pane(id);
+                                                    this.record_closed_pane(id, cx);
                                                     this.change(true, cx, |layout| {
                                                         layout.focus(id);
                                                         layout.close_pane();
@@ -4696,6 +4740,24 @@ impl Shell {
             _ => text::APP_TITLE.get().to_owned(),
         }
     }
+}
+
+/// 어느 메인 창·플로팅 창의 레이아웃에 같은 호스트 세션이 떠 있으면 true.
+fn session_shown(
+    host: &krill_app::hosts::HostId,
+    session: krill_proto::SessionId,
+    cx: &App,
+) -> bool {
+    cx.windows().into_iter().any(|w| {
+        let shell = if let Some(h) = w.downcast::<Shell>() {
+            h.entity(cx).ok()
+        } else if let Some(h) = w.downcast::<popout::Floating>() {
+            h.read(cx).ok().map(|f| f.shell.clone())
+        } else {
+            None
+        };
+        shell.is_some_and(|e| e.read(cx).layout.sessions_for_host(host).contains(&session))
+    })
 }
 
 impl Render for Shell {
@@ -5054,8 +5116,8 @@ impl Render for Shell {
                 if this.settings.is_some() {
                     this.close_settings(None, cx);
                 }
-                if let Some(session) = this.closed_sessions.pop() {
-                    this.open_session(session, cx);
+                if let Some((host, dir)) = this.closed_dirs.pop() {
+                    this.new_folder_tab_on(host, &dir, Program::Login, cx);
                 } else {
                     this.change(true, cx, Layout::new_tab);
                 }

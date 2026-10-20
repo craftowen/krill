@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use crate::orca_import::{ImportDomain, ImportOptions, format_report_human, run_import};
 
-const USAGE: &str = "usage: krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings] [--from <orca-dir>]";
+const USAGE: &str = "usage: krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] [--from <orca-dir>]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     match execute(raw) {

@@ -172,7 +172,7 @@ fn zoom_badge_and_unzoom_button(cx: &mut TestAppContext) {
     assert!(cx.debug_bounds(badge).is_none());
 }
 
-/// OWE-871: 패인 헤더 ×는 ⌘W처럼 닫은 세션을 기록하고 확대 상태를 푼다.
+/// OWE-871: 패인 헤더 ×는 ⌘W처럼 세션을 데몬에서 끝내고 확대 상태를 푼다.
 #[gpui::test]
 fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
     use krill_proto::SessionId;
@@ -216,7 +216,10 @@ fn pane_header_close_records_and_unzooms(cx: &mut TestAppContext) {
     });
     assert_eq!(zoomed, None);
     assert_eq!(panes, 1);
-    assert!(closed.contains(&SessionId(7)), "closed pane is reopenable");
+    assert!(
+        closed.contains(&SessionId(7)),
+        "closed pane ends its session"
+    );
 }
 
 /// OWE-872 테스트용: 칸에 세션을 붙이고 사이드바에 실행 중(`Working`) 스냅샷을 연결한다.
@@ -3339,7 +3342,7 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
         );
     }
 
-    // Jump to tab 2 via cmd-9, attach a session, close tab 2 (cmd-shift-w), and reopen via cmd-shift-t.
+    // Jump to tab 2 via cmd-9, attach a session, close tab 2 (cmd-shift-w): the session ends, so cmd-shift-t opens a fresh tab.
     cx.simulate_keystrokes("cmd-9");
     assert_eq!(layout_of(&view, cx).active(), 2);
     let (ours, _theirs) = UnixStream::pair().unwrap();
@@ -3355,7 +3358,7 @@ fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &m
     cx.simulate_keystrokes("cmd-shift-t");
     let reopened = layout_of(&view, cx);
     assert_eq!(reopened.tabs().len(), 3);
-    assert_eq!(
+    assert_ne!(
         reopened.session(reopened.active_tab().focused),
         Some(krill_proto::SessionId(77))
     );
@@ -5245,9 +5248,9 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
     assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
 }
 
-/// AS-20: 닫기 버튼·가운데 버튼 모두 단축키와 같은 세션 복원 이력을 남긴다.
+/// 닫기 버튼·가운데 버튼 모두 탭 세션을 데몬에서 끝낸다(Orca처럼 닫기 = 종료).
 #[gpui::test]
-fn pointer_closed_tabs_reopen_the_original_session(cx: &mut TestAppContext) {
+fn pointer_closed_tabs_end_their_session(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("pointer-reopen"));
     for middle in [false, true] {
         cx.simulate_keystrokes("cmd-t");
@@ -5271,12 +5274,16 @@ fn pointer_closed_tabs_reopen_the_original_session(cx: &mut TestAppContext) {
         }
         cx.run_until_parked();
         assert!(!layout_of(&view, cx).visible().contains(&pane));
-        assert_eq!(cx.update(|_, cx| view.read(cx).closed_sessions.len()), 1);
+        assert_eq!(
+            cx.update(|_, cx| view.read(cx).closed_sessions.last().copied()),
+            Some(session)
+        );
         cx.simulate_keystrokes("cmd-shift-t");
         let reopened = layout_of(&view, cx);
-        assert_eq!(
+        assert_ne!(
             reopened.session(reopened.active_tab().focused),
-            Some(session)
+            Some(session),
+            "closed session is gone, not reattached"
         );
     }
 }
@@ -5367,12 +5374,12 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert!(layout_of(&view, cx).tabs().is_empty());
 
-    // Cmd+Shift+T로 방금 닫은 기본 탭 세션을 복원하고, Cmd+W로 다시 마지막 탭을 닫을 수 있다.
+    // 닫은 탭 세션은 데몬에서 끝났으므로 Cmd+Shift+T는 새 탭을 연다.
     cx.simulate_keystrokes("cmd-shift-t");
     cx.run_until_parked();
     let reopened = layout_of(&view, cx);
     assert_eq!(reopened.tabs().len(), 1);
-    assert_eq!(
+    assert_ne!(
         reopened.session(reopened.active_tab().focused),
         Some(session)
     );
