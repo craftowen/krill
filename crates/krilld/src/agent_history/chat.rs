@@ -4,6 +4,7 @@
 //! 4대 에이전트(`claude`·`codex`·`agy`·`opencode`)의 대화를 단일 `ChatItem` 스키마
 //! (`User`·`Assistant`·`Reasoning`·`ToolCall`·`ToolResult`·`Question`·`Permission`)로 정규화한다.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -18,8 +19,8 @@ use serde_json::Value;
 use crate::agent::control::StoredLaunch;
 
 use super::vault::{
-    VaultRoots, agy_candidate_dirs, collect_roots, extract_agy_user_request, normalize_path,
-    opencode_candidate_bases,
+    VaultRoots, agy_candidate_dirs, collect_roots, extract_agy_user_request,
+    extract_agy_workspace_from_record, normalize_path, opencode_candidate_bases,
 };
 
 /// 폴링 1회당 읽는 최대 바이트(512 KiB).
@@ -475,6 +476,7 @@ fn find_newest_transcript_by_cwd(
         }
         VaultAgent::Agy => {
             for cand in agy_candidate_dirs(root, true) {
+                scan_agy_brain_for_cwd(&cand, norm_cwd, &mut best);
                 if let Ok(files) = fs::read_dir(cand.join("sessions")) {
                     for file in files.take(128).flatten() {
                         let p = file.path();
@@ -545,6 +547,132 @@ fn walk_codex_for_cwd(
     }
 }
 
+fn scan_agy_brain_for_cwd(cand: &Path, norm_cwd: &str, best: &mut Option<(u64, PathBuf, String)>) {
+    let Ok(brain_dir) = fs::read_dir(cand.join("brain")) else {
+        return;
+    };
+    let mut transcripts: Vec<(u64, PathBuf, String)> = Vec::new();
+    for entry in brain_dir.take(1024).flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() || !ft.is_dir() {
+            continue;
+        }
+        let conv_id = entry.file_name().to_string_lossy().into_owned();
+        let conv_dir = entry.path();
+        let logs = conv_dir.join(".system_generated/logs");
+        let Some(p) = [
+            logs.join("transcript.jsonl"),
+            logs.join("transcript_full.jsonl"),
+            conv_dir.join("transcript.jsonl"),
+        ]
+        .into_iter()
+        .find(|p| p.is_file()) else {
+            continue;
+        };
+        let Some(mtime) = file_mtime(&p) else {
+            continue;
+        };
+        if best.as_ref().is_some_and(|b| mtime <= b.0) {
+            continue;
+        }
+        transcripts.push((mtime, p, conv_id));
+    }
+    if transcripts.is_empty() {
+        return;
+    }
+    transcripts.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let (by_id, by_display) = read_agy_history_tail(&cand.join("history.jsonl"));
+    for (mtime, p, conv_id) in transcripts.into_iter().take(32) {
+        if best.as_ref().is_some_and(|b| mtime <= b.0) {
+            break;
+        }
+        if by_id.get(&conv_id).is_some_and(|w| w == norm_cwd)
+            || peek_agy_transcript_cwd(&p, &by_display)
+                .is_some_and(|w| normalize_path(&w) == norm_cwd)
+        {
+            *best = Some((mtime, p, conv_id));
+            break;
+        }
+    }
+}
+
+fn read_agy_history_tail(path: &Path) -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+    let mut by_id = BTreeMap::new();
+    let mut by_display = BTreeMap::new();
+    let Ok(mut file) = File::open(path) else {
+        return (by_id, by_display);
+    };
+    if let Ok(len) = file.metadata().map(|m| m.len())
+        && len > 128 * 1024
+    {
+        file.seek(SeekFrom::Start(len - 128 * 1024)).ok();
+    }
+    let mut reader = BufReader::with_capacity(8192, file.take(128 * 1024));
+    let mut line = Vec::new();
+    while reader.read_until(b'\n', &mut line).ok().unwrap_or(0) > 0 {
+        if let Ok(v) = serde_json::from_slice::<Value>(&line)
+            && let Some(ws) = v
+                .get("workspace")
+                .or_else(|| v.get("cwd"))
+                .and_then(Value::as_str)
+            && !ws.trim().is_empty()
+        {
+            let norm = normalize_path(ws.trim());
+            if let Some(cid) = v
+                .get("conversationId")
+                .or_else(|| v.get("id"))
+                .and_then(Value::as_str)
+                && !cid.trim().is_empty()
+            {
+                by_id.insert(cid.trim().to_owned(), norm.clone());
+            }
+            if let Some(disp) = v
+                .get("display")
+                .or_else(|| v.get("title"))
+                .and_then(Value::as_str)
+                && !disp.trim().is_empty()
+            {
+                by_display.insert(disp.trim().to_owned(), norm);
+            }
+        }
+        line.clear();
+    }
+    (by_id, by_display)
+}
+
+fn peek_agy_transcript_cwd(path: &Path, by_display: &BTreeMap<String, String>) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut reader = BufReader::with_capacity(8192, file.take(64 * 1024));
+    let mut line = Vec::new();
+    for _ in 0..16 {
+        line.clear();
+        if reader.read_until(b'\n', &mut line).ok()? == 0 {
+            break;
+        }
+        let Ok(v) = serde_json::from_slice::<Value>(&line) else {
+            continue;
+        };
+        if let Some(cwd) = extract_agy_workspace_from_record(&v) {
+            return Some(cwd);
+        }
+        if let Some(content) = v
+            .get("content")
+            .or_else(|| v.get("text"))
+            .and_then(Value::as_str)
+        {
+            let req = extract_agy_user_request(content);
+            if !req.is_empty()
+                && let Some(ws) = by_display.get(req.trim())
+            {
+                return Some(ws.clone());
+            }
+        }
+    }
+    None
+}
+
 fn peek_jsonl_id_and_cwd(path: &Path) -> Option<(String, String)> {
     let file = File::open(path).ok()?;
     let mut reader = BufReader::with_capacity(4096, file.take(32 * 1024));
@@ -585,6 +713,10 @@ fn peek_jsonl_id_and_cwd(path: &Path) -> Option<(String, String)> {
             && !c.trim().is_empty()
         {
             c.trim().clone_into(&mut cwd);
+            break;
+        }
+        if let Some(extracted) = extract_agy_workspace_from_record(&v) {
+            cwd = extracted;
             break;
         }
     }
@@ -863,18 +995,8 @@ fn parse_agy_line(v: &Value, out: &mut Vec<ChatItem>) {
                 },
             );
         }
-    } else if source == "MODEL" || rec_type == "PLANNER_RESPONSE" || role == "assistant" {
-        if !content.trim().is_empty() {
-            push_item(
-                out,
-                ChatItem {
-                    kind: ChatItemKind::Assistant,
-                    text: bounded(content.trim(), MAX_CHAT_TEXT),
-                    ..ChatItem::default()
-                },
-            );
-        }
-    } else if matches!(rec_type, "TOOL_RESULT" | "FUNCTION_RESPONSE") || role == "tool" {
+    } else if matches!(rec_type, "TOOL_RESULT" | "FUNCTION_RESPONSE" | "GENERIC") || role == "tool"
+    {
         let tool_id = v
             .get("tool_call_id")
             .or_else(|| v.get("id"))
@@ -883,15 +1005,30 @@ fn parse_agy_line(v: &Value, out: &mut Vec<ChatItem>) {
         let output = v
             .get("output")
             .or_else(|| v.get("content"))
+            .or_else(|| v.get("error"))
             .map(value_summary)
             .unwrap_or_default();
+        let is_error = v.get("is_error").and_then(Value::as_bool) == Some(true)
+            || v.get("status").and_then(Value::as_str) == Some("ERROR")
+            || v.get("error").is_some();
         push_item(
             out,
             ChatItem {
                 kind: ChatItemKind::ToolResult,
                 tool_id: bounded(tool_id, MAX_TEXT),
                 text: bounded(&output, MAX_CHAT_TEXT),
-                is_error: v.get("is_error").and_then(Value::as_bool) == Some(true),
+                is_error,
+                ..ChatItem::default()
+            },
+        );
+    } else if (source == "MODEL" || rec_type == "PLANNER_RESPONSE" || role == "assistant")
+        && !content.trim().is_empty()
+    {
+        push_item(
+            out,
+            ChatItem {
+                kind: ChatItemKind::Assistant,
+                text: bounded(content.trim(), MAX_CHAT_TEXT),
                 ..ChatItem::default()
             },
         );
@@ -1221,7 +1358,9 @@ fn emit_tool_or_special(name: &str, tool_id: &str, input: &Value, out: &mut Vec<
         .or_else(|| input.get("Description"))
         .or_else(|| input.get("toolSummary"))
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .trim()
+        .trim_matches('"');
     let summary = extract_tool_summary(input, &file_path);
     push_item(
         out,
@@ -1321,14 +1460,12 @@ fn extract_tool_file_path(input: &Value) -> String {
         "path",
         "TargetFile",
         "AbsolutePath",
-        "DirectoryPath",
-        "SearchDirectory",
-        "SearchPath",
     ] {
-        if let Some(p) = input.get(key).and_then(Value::as_str)
-            && !p.trim().is_empty()
-        {
-            return p.trim().to_owned();
+        if let Some(p) = input.get(key).and_then(Value::as_str) {
+            let trimmed = p.trim().trim_matches('"').trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
         }
     }
     let patch_text = input
@@ -1356,11 +1493,15 @@ fn extract_tool_summary(input: &Value, file_path: &str) -> String {
         "Query",
         "pattern",
         "Pattern",
+        "DirectoryPath",
+        "SearchDirectory",
+        "SearchPath",
     ] {
-        if let Some(s) = input.get(key).and_then(Value::as_str)
-            && !s.trim().is_empty()
-        {
-            return s.trim().to_owned();
+        if let Some(s) = input.get(key).and_then(Value::as_str) {
+            let trimmed = s.trim().trim_matches('"').trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_owned();
+            }
         }
     }
     if !file_path.is_empty() {
@@ -1606,6 +1747,54 @@ mod tests {
             oc_snap.next_offset,
         );
         assert!(oc_again.items.is_empty());
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn agy_brain_transcript_binds_by_cwd_and_normalizes_generic_tool_results() {
+        let dir = std::env::temp_dir().join(format!("owe945-agy-brain-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let logs = dir.join("brain/conv-agy-77/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let transcript = logs.join("transcript.jsonl");
+        let lines = [
+            r#"{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","content":"<USER_REQUEST>\n모바일 사용성 개선해라\n</USER_REQUEST>"}"#,
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","thinking":"원인 파악","tool_calls":[{"name":"run_command","args":{"CommandLine":"\"cargo test\"","Cwd":"\"/tmp/agy-demo\"","toolSummary":"\"Run tests\""}}]}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"GENERIC","status":"DONE","content":"The command exited with code 0."}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"PLANNER_RESPONSE","content":"수정을 마쳤습니다."}"#,
+        ];
+        fs::write(&transcript, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let roots = VaultRoots {
+            claude: Vec::new(),
+            codex: Vec::new(),
+            agy: vec![dir.clone()],
+            opencode: Vec::new(),
+        };
+        let stored = StoredLaunch {
+            profile: "Antigravity".to_owned(),
+            permission: krill_proto::agent::Permission::Manual,
+            session_id: None,
+            transcript_path: None,
+            cwd: b"/tmp/agy-demo".to_vec(),
+            hibernation_blocked: true,
+            account: None,
+        };
+        let snap = poll_session_in(&roots, Some(&stored), b"/tmp/agy-demo", 0);
+        assert!(snap.bound);
+        assert_eq!(snap.session_id, "conv-agy-77");
+        assert_eq!(snap.items.len(), 5);
+        assert_eq!(snap.items[0].kind, ChatItemKind::User);
+        assert_eq!(snap.items[0].text, "모바일 사용성 개선해라");
+        assert_eq!(snap.items[1].kind, ChatItemKind::Reasoning);
+        assert_eq!(snap.items[2].kind, ChatItemKind::ToolCall);
+        assert_eq!(snap.items[2].title, "Run tests");
+        assert_eq!(snap.items[2].text, "cargo test");
+        assert_eq!(snap.items[3].kind, ChatItemKind::ToolResult);
+        assert_eq!(snap.items[3].text, "The command exited with code 0.");
+        assert_eq!(snap.items[4].kind, ChatItemKind::Assistant);
+        assert_eq!(snap.items[4].text, "수정을 마쳤습니다.");
 
         fs::remove_dir_all(dir).unwrap();
     }

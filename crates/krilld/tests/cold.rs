@@ -629,6 +629,15 @@ fn agent_history_scans_on_request_and_resumes_both_agents() {
         .unwrap();
         assert_eq!(metadata["session_id"], sid);
         assert_eq!(metadata["profile"], agent.profile());
+        // 하이브리드 채팅 폴링은 별도 기능 비트 없이 FEAT_AGENT_HISTORY만으로 열린다.
+        // 이 클라이언트의 협상 비트는 v0.1.20과 같아, 배포된 앱이 새 데몬에서 계속 폴링할 수 있음을 지킨다.
+        assert!(matches!(
+            request(
+                &mut stream,
+                &Request::AgentHistory(Action::ChatPoll { session, offset: 0 })
+            ),
+            Reply::AgentHistory(Response::ChatPolled(_))
+        ));
         request(&mut stream, &Request::Close { session });
     }
     drop(stream);
