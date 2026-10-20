@@ -1616,6 +1616,7 @@ impl Registry {
                         status::foreground_process(root, tap.foreground(), exited, |pid| {
                             crate::sys::process_name(pid).ok()
                         });
+                    status.title = tap.title();
                     SessionStatus { session, status }
                 })
                 .collect(),

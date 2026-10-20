@@ -447,7 +447,28 @@ pub struct AgentStatus {
     /// [`Reply::States`] 프레임 끝 꼬리로만 오가 구버전(`Record`·v1 fixture)과 상호 호환한다.
     #[serde(default, skip)]
     pub foreground: Option<String>,
+    /// 터미널 제목(OSC 0·2)에서 상태 글리프를 뗀 표시용 제목([`display_title`]). 없으면 `None`.
+    /// `foreground` 꼬리 뒤 두 번째 꼬리로만 오가 구버전과 상호 호환한다.
+    #[serde(default, skip)]
+    pub title: Option<String>,
 }
+
+/// 에이전트가 터미널 제목 앞에 붙이는 상태 글리프(Claude Code `✳`·점자 스피너, Gemini `✦`·`◇` 등)와 제어 문자를
+/// 떼어 낸 제목. 바뀌는 스피너가 목록을 매번 다시 그리지 않게 하고, 남는 게 없으면 `None`이다.
+#[must_use]
+pub fn display_title(raw: &str) -> Option<String> {
+    let clean = crate::screen::sanitize_title_max(raw, MAX_TITLE_TEXT);
+    let trimmed = clean
+        .trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '\u{2800}'..='\u{28ff}' | '\u{2700}'..='\u{27bf}' | '\u{25a0}'..='\u{25ff}' | '·' | '*')
+        })
+        .trim_end();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+/// [`AgentStatus::title`] UTF-8 바이트 상한.
+pub const MAX_TITLE_TEXT: usize = 256;
 
 impl AgentStatus {
     /// MK-049 shared UI badge for inferred title/screen evidence.
@@ -463,6 +484,7 @@ impl AgentStatus {
         agent: String::new(),
         since_unix_ns: 0,
         foreground: None,
+        title: None,
     };
 }
 
@@ -945,11 +967,19 @@ impl Msg for Reply {
     fn encode(&self) -> Result<Vec<u8>, crate::ipc::Error> {
         if let Self::States(rows) = self {
             let mut body = postcard::to_stdvec(self).map_err(crate::ipc::Error::Codec)?;
-            if rows.iter().any(|r| r.status.foreground.is_some()) {
+            let has_title = rows.iter().any(|r| r.status.title.is_some());
+            if has_title || rows.iter().any(|r| r.status.foreground.is_some()) {
                 for row in rows {
                     body.extend(
                         postcard::to_stdvec(&row.status.foreground)
                             .map_err(crate::ipc::Error::Codec)?,
+                    );
+                }
+            }
+            if has_title {
+                for row in rows {
+                    body.extend(
+                        postcard::to_stdvec(&row.status.title).map_err(crate::ipc::Error::Codec)?,
                     );
                 }
             }
@@ -966,7 +996,7 @@ impl Msg for Reply {
                 && let Self::States(rows) = &mut reply
             {
                 let mut tail = rest;
-                for row in rows {
+                for row in rows.iter_mut() {
                     let (fg, next) = postcard::take_from_bytes::<Option<String>>(tail)
                         .map_err(crate::ipc::Error::Codec)?;
                     if fg
@@ -979,6 +1009,22 @@ impl Msg for Reply {
                     }
                     row.status.foreground = fg;
                     tail = next;
+                }
+                if !tail.is_empty() {
+                    for row in rows.iter_mut() {
+                        let (title, next) = postcard::take_from_bytes::<Option<String>>(tail)
+                            .map_err(crate::ipc::Error::Codec)?;
+                        if title
+                            .as_ref()
+                            .is_some_and(|t| t.is_empty() || t.len() > MAX_TITLE_TEXT)
+                        {
+                            return Err(crate::ipc::Error::Codec(
+                                postcard::Error::DeserializeBadEncoding,
+                            ));
+                        }
+                        row.status.title = title;
+                        tail = next;
+                    }
                 }
             }
             return Ok(reply);
