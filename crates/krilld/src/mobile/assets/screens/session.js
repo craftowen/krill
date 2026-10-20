@@ -5,8 +5,9 @@
  M.screens.session=(root,ctx)=>{
  const {el,button,go,state,route}=ctx;let group=state.groups.get(route.groupKey),session=state.sessions.get(route.sessionId)||group?.sessions[0];
  if(!group||!session){root.append(ctx.header('Workspace','/host/local'),el('p','Session not found','empty'),button('Open workspaces',()=>go('/host/local'),'primary'));return {};}
- const selectedId=session.id,savedMode=state.preferences?.sessionViewModes?.[selectedId],isAgent=Boolean(session.agent&&/claude|codex|agy|antigravity|opencode/i.test(session.agent));
- let viewMode=M.chat?.mount?(savedMode==='chat'||savedMode==='term'?savedMode:(isAgent?'chat':'term')):'term';
+ // 기본 보기는 모든 세션에서 터미널이다. Chat은 사용자가 세션별로 직접 고른 경우에만 연다.
+ const selectedId=session.id,savedMode=state.preferences?.sessionViewModes?.[selectedId];
+ let viewMode=M.chat?.mount&&savedMode==='chat'?'chat':'term';
  const screen=el('section',undefined,'session screen'),header=ctx.header(group.label,'/host/local'),title=header.querySelector('h1'),summary=el('small','Connecting…','session-summary');title.parentElement.append(summary);
  const modeBtn=button(viewMode==='chat'?'Term':'Chat',()=>toggleViewMode(),'ghost small mode-toggle');header.append(modeBtn);
  const git=button('Git changes',()=>go(`/git/${selectedId}`),'icon-button','git');header.append(git);
