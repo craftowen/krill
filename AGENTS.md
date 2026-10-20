@@ -13,17 +13,19 @@ Krill = 어떤 AI 코딩 에이전트든 끊기지 않게 병렬로 돌리는 �
 ## 명령
 
 ```bash
-scripts/check.sh            # fmt --check · clippy -D warnings · nextest · doctest · cargo deny --locked — 작업 완료 주장 전 반드시 0으로 끝나야 한다
+scripts/check.sh            # 릴리스 후보의 전체 통합 검사: fmt · clippy · nextest · doctest · cargo deny
 cargo fmt --all             # 포맷 적용
 cargo nextest run -p <크레이트>   # 한 크레이트 테스트
 cargo build --workspace --bins && cargo run -p krill-app   # 앱 실행(보조 바이너리 krill·krill-holder·krilld를 먼저 빌드해야 한다)
 scripts/check-windows.sh [-p <크레이트>] [--clippy]   # Mac에서 Windows 타깃 cargo check(저장소 밖 격리 툴체인, OWE-811). Windows 코드를 건드리면 0이어야 한다
 ```
 
-- 반복 수정 중 중간 검증은 `cargo check -p <크레이트>`와 `cargo nextest run -p <크레이트> <필터>`만 실행한다.
-- 전체 `scripts/check.sh`는 작업 완료(커밋) 직전 1회만 실행한다.
-- 중간 검증은 최종 검증을 대체하지 않는다. `scripts/check.sh`가 0으로 끝나야 완료를 주장·커밋할 수 있다.
-- 예외(위험도 낮음): 바뀐 파일이 전부 (a) Markdown 문서(`*.md`, `docs/**`)이거나 (b) `Cargo.toml`의 `[profile.*]` 디버그 정보 설정(`debug`·`split-debuginfo`)뿐이면 `check.sh`를 생략하고 `git diff --check`만 확인한다. `.rs` 파일(주석·doc 주석 포함)·스크립트·lint·deny 설정이 하나라도 섞이면 예외가 아니다. 생략했으면 커밋 메시지에 `check.sh 생략(<사유>)`를 적는다.
+- 반복 수정 중에는 변경한 크레이트의 `cargo check -p <크레이트> --locked`와 변경 동작에 관련된 테스트만 실행한다. 작은 수정마다 워크스페이스 전체를 빌드·검사하지 않는다.
+- 논리 변경을 마무리하거나 커밋할 때는 포맷 검사, 영향받은 크레이트의 clippy, 관련 테스트를 확인한다. 이 범위의 검증으로 개발 작업 완료·커밋이 가능하며, 전체 `scripts/check.sh`를 요구하지 않는다.
+- IPC·공유 프로토콜·PTY/FFI·세션 생존 등 여러 크레이트의 계약을 바꾸면 해당 경로의 통합·생존 테스트도 개발 중에 실행한다. 전체 통합 검사와 구분한다.
+- 전체 `scripts/check.sh`는 변경을 모은 최종 릴리스 후보에서 실행하고, 0으로 끝난 HEAD만 릴리스한다. Windows 변경이 포함된 후보는 `scripts/check-windows.sh --clippy`도 통과해야 한다. 개발 중 Windows 검증은 영향받은 크레이트로 한정한다.
+- 검사 결과에는 대상 HEAD와 실행 범위를 기록한다. 이미 통과한 동일 HEAD의 전체 검사는 반복하지 않으며, 릴리스 후보 코드가 바뀌면 최종 HEAD에서 다시 확인한다. 부분 검사 통과를 전체 검사 통과로 보고하지 않는다.
+- 바뀐 파일이 전부 Markdown 문서(`*.md`)이거나 `Cargo.toml`의 `[profile.*]` 디버그 정보 설정(`debug`·`split-debuginfo`)뿐이면 Cargo 검사를 생략하고 `git diff --check`만 확인한다. 다른 코드·스크립트·lint·deny 설정이 섞이면 위 영향 범위별 검증을 따른다. 생략했으면 커밋 메시지에 `check.sh 생략(<사유>)`를 적는다.
 
 툴체인: Homebrew `rustc 1.98.1`(rustup 없음 → `rust-toolchain.toml` 대신 `Cargo.toml`의 `rust-version = "1.98"`로 MSRV 고정). 최신 stable 1.99 전용 기능(패키지 레벨 default-features 덮어쓰기 등)에 기대지 않는다. Xcode 없음(CommandLineTools만) — gpui는 `font-kit` + `runtime_shaders` 기능으로 빌드. Apple Developer 인증서 없음(MK-104).
 
@@ -62,5 +64,5 @@ packaging/            # macOS 번들·DMG·Ed25519 매니페스트·설치 스�
 ## 이슈·작업 흐름
 
 - 로드맵 ID(`[MK-xxx]`)는 `docs/ROADMAP.md` 행 ID다.
-- 한 커밋 = 한 논리 변경. 작업 완료 전 `scripts/check.sh`가 0으로 끝나야 한다.
+- 한 커밋 = 한 논리 변경. 개발 작업 완료·커밋은 위 단계별 검증 규칙을 따르고, 전체 `scripts/check.sh` 통과는 릴리스 후보의 필수 조건이다.
 - 장애별 보장 범위(무엇이 살아남고 무엇을 잃을 수 있는지)는 ARCHITECTURE §4.1이 규범이다.
