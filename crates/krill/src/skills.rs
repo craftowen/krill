@@ -8,7 +8,7 @@ use std::process::ExitCode;
 
 use krill_proto::daemon;
 use krill_proto::orchestration::{
-    PortEntry, WorktreeStore, builtin_skills, extract_local_urls, install_skill,
+    PortEntry, WorktreeStore, builtin_skills, extract_local_urls, install_skill, skill_references,
 };
 
 pub fn run_skills(raw: &[OsString]) -> ExitCode {
@@ -53,7 +53,7 @@ fn run_inner(label: &str, raw: &[OsString], f: fn(&[String]) -> io::Result<()>) 
 fn dispatch_skills(args: &[String]) -> io::Result<()> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(bad_arg(
-            "usage: krill skills list [--json] | krill skills get <name> [--full] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|all] [--global|--local <dir>|--dir <dir>] [--json]",
+            "usage: krill skills list [--json] | krill skills get <name> [--full] [--references] [--reference <path>] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|all] [--global|--local <dir>|--dir <dir>] [--json]",
         ));
     };
     match sub.as_str() {
@@ -71,24 +71,102 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
             Ok(())
         }
         "get" | "show" => {
-            let Some((name, tail)) = rest.split_first() else {
-                return Err(bad_arg("missing skill <name>"));
-            };
+            let mut name = None;
             let mut json = false;
-            for arg in tail {
+            let mut full = false;
+            let mut list_refs = false;
+            let mut ref_path = None;
+            let mut it = rest.iter();
+            while let Some(arg) = it.next() {
                 match arg.as_str() {
+                    "--skill" => {
+                        if name.is_some() {
+                            return Err(bad_arg("skill name specified more than once"));
+                        }
+                        name = Some(it.next().ok_or_else(|| bad_arg("missing --skill"))?);
+                    }
                     "--json" => json = true,
-                    "--full" => {}
+                    "--full" => full = true,
+                    "--references" => list_refs = true,
+                    "--reference" => {
+                        ref_path = Some(
+                            it.next()
+                                .ok_or_else(|| bad_arg("missing --reference"))?
+                                .clone(),
+                        );
+                    }
+                    _ if !arg.starts_with('-') && name.is_none() => name = Some(arg),
                     _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
                 }
             }
-            let Some(skill) = builtin_skills().iter().find(|s| s.name == name.trim()) else {
+            let name = name.ok_or_else(|| bad_arg("missing skill <name>"))?;
+            let trimmed = name.trim();
+            let stripped = trimmed.strip_prefix("krill-").unwrap_or(trimmed);
+            let Some(skill) = builtin_skills()
+                .iter()
+                .find(|s| s.name == trimmed || s.name == stripped)
+            else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("skill not found: {name}"),
                 ));
             };
-            if json {
+            if list_refs {
+                let refs = skill_references(skill.name);
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": skill.name,
+                        "references": refs.iter().map(|(p, _)| *p).collect::<Vec<_>>(),
+                    }))?;
+                } else {
+                    for (path, _) in refs {
+                        println!("{path}");
+                    }
+                }
+            } else if let Some(req_ref) = ref_path {
+                let req = req_ref.trim();
+                let candidates = [
+                    req.to_owned(),
+                    format!("{req}.md"),
+                    format!("references/{req}"),
+                    format!("references/{req}.md"),
+                ];
+                let Some((matched_path, content)) = skill_references(skill.name)
+                    .iter()
+                    .find(|(path, _)| candidates.iter().any(|c| c == path))
+                else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("reference not found for skill {}: {req_ref}", skill.name),
+                    ));
+                };
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": skill.name,
+                        "reference": matched_path,
+                        "content": content,
+                    }))?;
+                } else {
+                    println!("{}", content.trim_end());
+                }
+            } else if full {
+                let mut full_content = skill.content.trim_end().to_owned();
+                for (path, ref_content) in skill_references(skill.name) {
+                    full_content.push_str("\n\n---\n<!-- ");
+                    full_content.push_str(path);
+                    full_content.push_str(" -->\n\n");
+                    full_content.push_str(ref_content.trim_end());
+                }
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": skill.name,
+                        "description": skill.description,
+                        "content": full_content,
+                    }))?;
+                } else {
+                    println!("{full_content}");
+                }
+            } else if json {
                 print_json(skill)?;
             } else {
                 println!("{}", skill.content.trim_end());
@@ -635,6 +713,33 @@ mod tests {
         dispatch_skills(&args(&["get", "minikrill", "--full", "--json"]))?;
         dispatch_skills(&args(&["get", "computer-use", "--full"]))?;
         dispatch_skills(&args(&["get", "computer-use", "--full", "--json"]))?;
+        dispatch_skills(&args(&["get", "orchestration", "--references"]))?;
+        dispatch_skills(&args(&["get", "orchestration", "--references", "--json"]))?;
+        dispatch_skills(&args(&[
+            "get",
+            "orchestration",
+            "--reference",
+            "references/worker-contract.md",
+        ]))?;
+        dispatch_skills(&args(&[
+            "get",
+            "orchestration",
+            "--reference",
+            "worker-contract",
+            "--json",
+        ]))?;
+        dispatch_skills(&args(&["get", "orchestration", "--full"]))?;
+        dispatch_skills(&args(&["get", "orchestration", "--full", "--json"]))?;
+        dispatch_skills(&args(&["get", "krill-orchestration"]))?;
+        dispatch_skills(&args(&["get", "--skill", "krill-orchestration", "--json"]))?;
+        let missing_ref = dispatch_skills(&args(&[
+            "get",
+            "orchestration",
+            "--reference",
+            "nonexistent-ref",
+        ]))
+        .unwrap_err();
+        assert_eq!(missing_ref.kind(), io::ErrorKind::NotFound);
         assert!(dispatch_skills(&args(&["install", "--skill"])).is_err());
         assert!(dispatch_skills(&args(&["install", "minikrill", "--agent", "unknown"])).is_err());
         std::fs::remove_dir_all(dir)

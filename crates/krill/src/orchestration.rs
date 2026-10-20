@@ -15,8 +15,9 @@ use krill_proto::control::{FEAT_CLI, FEAT_CONTROL, Failure, Reply, Request};
 use krill_proto::daemon;
 use krill_proto::ipc::{self, ClientRole};
 use krill_proto::orchestration::{
-    DEFAULT_MAX_WORKER_DEPTH, Dispatch, GateStatus, MessageType, OrchAction, OrchResponse,
-    OrchestrationStore, Run, SendParams, TaskStatus, WorkerStartSpec, worker_preamble,
+    DEFAULT_MAX_WORKER_DEPTH, Dispatch, DispatchStatus, GateStatus, MessageType, OrchAction,
+    OrchResponse, OrchestrationStore, Run, SendParams, TaskStatus, WorkerStartSpec,
+    worker_preamble,
 };
 use krill_proto::screen::Msg;
 
@@ -25,24 +26,28 @@ use crate::remote::Target;
 const USAGE: &str = "\
 usage: krill [--host <user@host>] orchestration <subcommand> [options]
   run-create --title <title> [--coordinator <session-id>] [--json]
+  run-show [<run-id>] [--json]
   run-use <run-id|--clear> [--json]
   run-current [--json]
   run-list [--json]
   task-create [--run <run-id>] --title <title> [--desc <text>] [--deps <t1,t2>] [--json]
   task-list [--run <run-id>] [--json]
   task-update <task-id> --status <pending|ready|dispatched|completed|failed|blocked> [--summary <text>] [--json]
-  worker-start [--spec <json>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--depth <N>] [--max-depth <N>] [--preamble <full|minimal|none>|--no-preamble] --prompt <text> [--json]
-  send --from <name> --to <target> [--type <type>] --summary <text> [--body <text>] [--run <id>] [--task <id>] [--dispatch <id>] [--outcome <succeeded|failed>] [--json]
+  worker-start [--spec <json|text>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--depth <N>] [--max-depth <N>] [--preamble <full|minimal|none>|--no-preamble] --prompt <text> [--json]
+  send --from <name> [--to <target>] [--type <type>] --summary <text> [--body <text>] [--run <id>] [--task <id>] [--dispatch <id>] [--outcome <succeeded|failed>] [--json]
   check [--to <name>] [--types <t1,t2>] [--unread] [--ack] [--wait] [--timeout-ms <N>] [--json]
-  ask (--from <name> --to <target> --summary <question> [--body <text>] | --question-id <msg-id>) [--wait] [--timeout-ms <N>] [--json]
+  inbox [--to <name>] [--run <id>] [--all] [--json]
+  ask (--from <name> [--to <target>] --summary <question> [--body <text>] | --question-id <msg-id>) [--wait] [--timeout-ms <N>] [--json]
   reply <msg-id> [--from <name>] --body <answer> [--json]
   gate-create --from <name> --question <text> [--options <a,b>] [--run <id>] [--task <id>] [--json]
   gate-list [--pending] [--json]
   gate-resolve <gate-id> --decision <choice> [--rationale <text>] [--by <name>] [--json]
   worker-list [--run <run-id>] [--json]
   worker-show <worker-or-dispatch> [--json]
+  dispatch-show [<dispatch-or-worker>] [--dispatch <id>] [--task <task-id>] [--preamble] [--json]
   worker-read <worker-or-dispatch> [--lines <N>] [--json]
   worker-stop <worker-or-dispatch> [--json]
+  worker-retain <worker-or-dispatch> [--json]
   worker-release <worker-or-dispatch> [--json]
   worker-abandon <worker-or-dispatch> [--json]
   reset [--run <run-id>] [--json]";
@@ -219,6 +224,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
 
     let res = match sub.as_str() {
         "run-create" => cmd_run_create_ctx(&ctx, rest),
+        "run-show" => cmd_run_show_ctx(&ctx, rest),
         "run-use" => cmd_run_use_ctx(&ctx, rest),
         "run-current" => cmd_run_current_ctx(&ctx, rest),
         "run-list" | "runs" => cmd_run_list_ctx(&ctx, rest),
@@ -228,6 +234,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         "worker-start" => cmd_worker_start_ctx(&ctx, rest),
         "send" => cmd_send_ctx(&ctx, rest),
         "check" => cmd_check_ctx(&ctx, rest),
+        "inbox" => cmd_inbox_ctx(&ctx, rest),
         "ask" => cmd_ask_ctx(&ctx, rest),
         "reply" => cmd_reply_ctx(&ctx, rest),
         "gate-create" => cmd_gate_create_ctx(&ctx, rest),
@@ -235,8 +242,10 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         "gate-resolve" => cmd_gate_resolve_ctx(&ctx, rest),
         "worker-list" | "workers" => cmd_worker_list_ctx(&ctx, rest),
         "worker-show" => cmd_worker_show_ctx(&ctx, rest),
+        "dispatch-show" => cmd_dispatch_show_ctx(&ctx, rest),
         "worker-read" => cmd_worker_read_ctx(&ctx, rest),
         "worker-stop" => cmd_worker_stop_ctx(&ctx, rest, false),
+        "worker-retain" => cmd_worker_retain_ctx(&ctx, rest),
         "worker-release" => cmd_worker_stop_ctx(&ctx, rest, true),
         "worker-abandon" => cmd_worker_abandon_ctx(&ctx, rest),
         "reset" => cmd_reset_ctx(&ctx, rest),
@@ -271,7 +280,10 @@ fn cmd_run_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--title" => title = it.next().cloned(),
+            "--title" | "--objective" => title = it.next().cloned(),
+            "--worktree" | "--cwd" => {
+                it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+            }
             "--coordinator" => {
                 let v = it.next().ok_or_else(|| bad_arg("missing --coordinator"))?;
                 coordinator = Some(
@@ -307,6 +319,56 @@ fn cmd_run_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn cmd_run_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let mut given = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--id" | "--run" => {
+                let id = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                given = Some(id.clone());
+            }
+            "--json" => json = true,
+            s if !s.starts_with('-') && given.is_none() => {
+                given = Some(s.to_owned());
+            }
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
+    let store = ctx.load_store()?;
+    let run_id = store.resolve_run_id(given.as_deref())?;
+    let Some(run) = store.runs.iter().find(|r| r.id == run_id) else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("run not found: {run_id}"),
+        ));
+    };
+    let tasks_in_run: Vec<_> = store.tasks.iter().filter(|t| t.run_id == run_id).collect();
+    let dispatches_in_run: Vec<_> = store
+        .dispatches
+        .iter()
+        .filter(|d| d.run_id == run_id)
+        .collect();
+    if json {
+        print_json(&serde_json::json!({
+            "run": run,
+            "tasks": tasks_in_run,
+            "workers": dispatches_in_run,
+        }))?;
+    } else {
+        println!(
+            "{}\t{}\ttasks={}\tworkers={}\t{}",
+            run.id,
+            run.status.as_str(),
+            tasks_in_run.len(),
+            dispatches_in_run.len(),
+            run.title
+        );
+    }
+    Ok(())
+}
+
 fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut target_run: Option<Option<String>> = None;
     let mut json = false;
@@ -314,7 +376,7 @@ fn cmd_run_use_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--clear" => target_run = Some(None),
-            "--run" => {
+            "--run" | "--id" => {
                 let id = it.next().ok_or_else(|| bad_arg("missing --run"))?;
                 target_run = Some(Some(id.clone()));
             }
@@ -410,22 +472,46 @@ fn cmd_task_create_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--run" => run_id = it.next().cloned(),
-            "--title" => title = it.next().cloned(),
-            "--desc" | "--description" => {
+            "--title" | "--task-title" => title = it.next().cloned(),
+            "--desc" | "--description" | "--spec" => {
                 desc = it.next().cloned().unwrap_or_default();
+            }
+            "--parent" => {
+                let p = it.next().ok_or_else(|| bad_arg("missing --parent"))?;
+                if !p.trim().is_empty() {
+                    deps.push(p.trim().to_owned());
+                }
             }
             "--deps" => {
                 if let Some(raw) = it.next() {
-                    deps.extend(
-                        raw.split(',')
-                            .map(str::trim)
-                            .filter(|s| !s.is_empty())
-                            .map(str::to_owned),
-                    );
+                    if raw.trim_start().starts_with('[') {
+                        let parsed = serde_json::from_str::<Vec<String>>(raw)
+                            .map_err(|e| bad_arg(format!("invalid --deps JSON: {e}")))?;
+                        deps.extend(
+                            parsed
+                                .into_iter()
+                                .map(|s| s.trim().to_owned())
+                                .filter(|s| !s.is_empty()),
+                        );
+                    } else {
+                        deps.extend(
+                            raw.split(',')
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned),
+                        );
+                    }
                 }
             }
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
+    if title.is_none() && !desc.trim().is_empty() {
+        let first_line = desc.lines().next().unwrap_or_default().trim();
+        let derived: String = first_line.chars().take(80).collect();
+        if !derived.is_empty() {
+            title = Some(derived);
         }
     }
     let title = title.ok_or_else(|| bad_arg("missing --title"))?;
@@ -507,24 +593,30 @@ fn cmd_task_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
 }
 
 fn cmd_task_update_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let Some((task_id, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <task-id>"));
-    };
+    let mut task_id = None;
     let mut status = None;
     let mut summary = None;
     let mut json = false;
-    let mut it = rest.iter();
+    let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--id" | "--task" => {
+                let id = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                task_id = Some(id.clone());
+            }
             "--status" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --status"))?;
                 status = Some(TaskStatus::parse(raw)?);
             }
-            "--summary" => summary = it.next().cloned(),
+            "--summary" | "--result" => summary = it.next().cloned(),
             "--json" => json = true,
+            s if !s.starts_with('-') && task_id.is_none() => {
+                task_id = Some(s.to_owned());
+            }
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
+    let task_id = task_id.ok_or_else(|| bad_arg("missing <task-id>"))?;
     let status = status.ok_or_else(|| bad_arg("missing --status"))?;
     let updated = match ctx.try_ipc(
         &OrchAction::UpdateTask {
@@ -536,7 +628,7 @@ fn cmd_task_update_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     )? {
         Some(OrchResponse::Task(t)) => t,
         _ => {
-            OrchestrationStore::mutate(ctx.state_dir, |s| s.update_task(task_id, status, summary))?
+            OrchestrationStore::mutate(ctx.state_dir, |s| s.update_task(&task_id, status, summary))?
         }
     };
     if json {
@@ -603,46 +695,52 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut explicit_depth: Option<u32> = None;
     let mut explicit_max_depth: Option<u32> = None;
     let mut preamble_mode = PreambleMode::Full;
+    let mut auto_create_task = false;
     let mut json = false;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--spec" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --spec"))?;
-                let parsed: WorkerStartSpec = serde_json::from_str(raw)
-                    .map_err(|e| bad_arg(format!("invalid --spec JSON: {e}")))?;
-                if spec.run_id.is_none() {
-                    spec.run_id = parsed.run_id;
-                }
-                if spec.task_id.is_none() {
-                    spec.task_id = parsed.task_id;
-                }
-                if spec.worker.is_none() {
-                    spec.worker = parsed.worker;
-                }
-                if explicit_agent.is_none() && parsed.agent.is_some() {
-                    spec.agent = parsed.agent;
-                }
-                if spec.account.is_none() {
-                    spec.account = parsed.account;
-                }
-                if spec.session_id.is_none() {
-                    spec.session_id = parsed.session_id;
-                }
-                if spec.cwd.is_none() {
-                    spec.cwd = parsed.cwd;
-                }
-                if spec.prompt.is_none() {
-                    spec.prompt = parsed.prompt;
-                }
-                if explicit_depth.is_none() && parsed.depth.is_some() {
-                    spec.depth = parsed.depth;
-                }
-                if explicit_max_depth.is_none() && parsed.max_depth.is_some() {
-                    spec.max_depth = parsed.max_depth;
-                }
-                if parsed.no_spawn {
-                    spec.no_spawn = true;
+                if raw.trim_start().starts_with('{') {
+                    let parsed: WorkerStartSpec = serde_json::from_str(raw)
+                        .map_err(|e| bad_arg(format!("invalid --spec JSON: {e}")))?;
+                    if spec.run_id.is_none() {
+                        spec.run_id = parsed.run_id;
+                    }
+                    if spec.task_id.is_none() {
+                        spec.task_id = parsed.task_id;
+                    }
+                    if spec.worker.is_none() {
+                        spec.worker = parsed.worker;
+                    }
+                    if explicit_agent.is_none() && parsed.agent.is_some() {
+                        spec.agent = parsed.agent;
+                    }
+                    if spec.account.is_none() {
+                        spec.account = parsed.account;
+                    }
+                    if spec.session_id.is_none() {
+                        spec.session_id = parsed.session_id;
+                    }
+                    if spec.cwd.is_none() {
+                        spec.cwd = parsed.cwd;
+                    }
+                    if spec.prompt.is_none() {
+                        spec.prompt = parsed.prompt;
+                    }
+                    if explicit_depth.is_none() && parsed.depth.is_some() {
+                        spec.depth = parsed.depth;
+                    }
+                    if explicit_max_depth.is_none() && parsed.max_depth.is_some() {
+                        spec.max_depth = parsed.max_depth;
+                    }
+                    if parsed.no_spawn {
+                        spec.no_spawn = true;
+                    }
+                } else {
+                    spec.prompt = Some(raw.clone());
+                    auto_create_task = true;
                 }
             }
             "--run" => spec.run_id = it.next().cloned(),
@@ -654,11 +752,20 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             "--account" => {
                 spec.account = Some(take_opt(&mut it, "--account")?.clone());
             }
-            "--session" => {
+            "--session" | "--terminal" => {
                 let v = it.next().ok_or_else(|| bad_arg("missing --session"))?;
                 spec.session_id = Some(v.parse::<u64>().map_err(|_| bad_arg("invalid --session"))?);
             }
             "--cwd" => spec.cwd = it.next().cloned(),
+            "--worktree" => {
+                let val = it.next().ok_or_else(|| bad_arg("missing --worktree"))?;
+                if val != "current" {
+                    spec.cwd = Some(val.clone());
+                }
+            }
+            "--model" | "--effort" | "--retry-of" => {
+                it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+            }
             "--prompt" => spec.prompt = it.next().cloned(),
             "--depth" => {
                 let v = it.next().ok_or_else(|| bad_arg("missing --depth"))?;
@@ -681,7 +788,6 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
-    let worker_name = spec.worker.ok_or_else(|| bad_arg("missing --worker"))?;
     let prompt = spec.prompt.ok_or_else(|| bad_arg("missing --prompt"))?;
     let raw_agent = explicit_agent
         .or(spec.agent)
@@ -713,7 +819,14 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let cwd_str = work_cwd.to_string_lossy().into_owned();
 
     // 스폰 전에 run/task 유효성과 상태를 먼저 검증해 잘못된 요청이 고아 PTY 세션을 남기지 않게 한다.
-    let store = ctx.load_store()?;
+    let mut store = ctx.load_store()?;
+    let worker_name = match spec.worker {
+        Some(w) => w,
+        None if auto_create_task => {
+            format!("{agent}-{}", store.dispatches.len().saturating_add(1))
+        }
+        None => return Err(bad_arg("missing --worker")),
+    };
     let current_pane = std::env::var("MK_PANE_ID")
         .ok()
         .and_then(|v| v.parse::<u64>().ok());
@@ -728,6 +841,29 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             .resolve_run_id(None)
             .map_err(|_| bad_arg("missing --run"))?,
     };
+    if spec.task_id.is_none() && auto_create_task {
+        let first_line = prompt.lines().next().unwrap_or_default().trim();
+        let mut derived_title: String = first_line.chars().take(80).collect();
+        if derived_title.is_empty() {
+            derived_title.clone_from(&worker_name);
+        }
+        let created_task = match ctx.try_ipc(
+            &OrchAction::CreateTask {
+                run_id: run_id.clone(),
+                title: derived_title.clone(),
+                description: prompt.clone(),
+                deps: Vec::new(),
+            },
+            Duration::from_secs(2),
+        )? {
+            Some(OrchResponse::Task(t)) => t,
+            _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
+                s.create_task(&run_id, &derived_title, &prompt, Vec::new())
+            })?,
+        };
+        spec.task_id = Some(created_task.id);
+        store = ctx.load_store()?;
+    }
     store.validate_worker_start_with_depth(
         &run_id,
         spec.task_id.as_deref(),
@@ -840,6 +976,8 @@ fn cmd_send_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut msg_type = MessageType::Status;
     let mut summary = None;
     let mut body = String::new();
+    let mut files_modified = None;
+    let mut report_path = None;
     let mut run_id = None;
     let mut task_id = None;
     let mut dispatch_id = None;
@@ -854,18 +992,43 @@ fn cmd_send_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --type"))?;
                 msg_type = MessageType::parse(raw)?;
             }
-            "--summary" => summary = it.next().cloned(),
+            "--summary" | "--subject" => summary = it.next().cloned(),
             "--body" => body = it.next().cloned().unwrap_or_default(),
+            "--files-modified" => files_modified = it.next().cloned(),
+            "--report-path" => report_path = it.next().cloned(),
+            "--phase" | "--thread-id" | "--priority" => {
+                it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+            }
             "--run" => run_id = it.next().cloned(),
-            "--task" => task_id = it.next().cloned(),
-            "--dispatch" => dispatch_id = it.next().cloned(),
+            "--task" | "--task-id" => task_id = it.next().cloned(),
+            "--dispatch" | "--dispatch-id" => dispatch_id = it.next().cloned(),
             "--outcome" | "--status" => outcome = it.next().cloned(),
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
+    if summary.is_none() && !body.trim().is_empty() {
+        let first_line = body.lines().next().unwrap_or_default().trim();
+        if !first_line.is_empty() {
+            summary = Some(first_line.to_owned());
+        }
+    }
+    if let Some(files) = files_modified.filter(|s| !s.trim().is_empty()) {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("files_modified: ");
+        body.push_str(files.trim());
+    }
+    if let Some(rp) = report_path.filter(|s| !s.trim().is_empty()) {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("report_path: ");
+        body.push_str(rp.trim());
+    }
     let from = from.ok_or_else(|| bad_arg("missing --from"))?;
-    let to = to.ok_or_else(|| bad_arg("missing --to"))?;
+    let to = to.unwrap_or_else(|| "coordinator".to_owned());
     let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
     let params = SendParams {
         from,
@@ -919,7 +1082,7 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--to" | "--for" => to = it.next().cloned(),
+            "--to" | "--for" | "--terminal" => to = it.next().cloned(),
             "--types" | "--type" => {
                 if let Some(raw) = it.next() {
                     for part in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
@@ -928,8 +1091,19 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 }
             }
             "--unread" => unread_only = true,
+            "--all" => unread_only = false,
             "--ack" => ack = true,
-            "--wait" => wait = true,
+            "--peek" => ack = false,
+            "--wait" => {
+                wait = true;
+                if let Some(next_arg) = it.as_slice().first()
+                    && let Ok(secs) = next_arg.parse::<u64>()
+                    && secs > 0
+                {
+                    let _ = it.next();
+                    timeout_ms = secs.saturating_mul(1000);
+                }
+            }
             "--timeout-ms" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --timeout-ms"))?;
                 timeout_ms = raw
@@ -991,6 +1165,58 @@ fn cmd_check_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
+fn cmd_inbox_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let mut rcpt = "coordinator".to_owned();
+    let mut run_filter: Option<String> = None;
+    let mut all = false;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--to" | "--for" | "--terminal" => {
+                let val = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                rcpt.clone_from(val);
+            }
+            "--run" => {
+                let val = it.next().ok_or_else(|| bad_arg("missing --run"))?;
+                run_filter = Some(val.clone());
+            }
+            "--all" => all = true,
+            "--json" => json = true,
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
+    let store = ctx.load_store()?;
+    let messages: Vec<_> = store
+        .messages
+        .into_iter()
+        .filter(|msg| {
+            (msg.to == rcpt || msg.to == "@all")
+                && (all || !msg.acked)
+                && run_filter
+                    .as_ref()
+                    .is_none_or(|rid| msg.run_id.as_ref() == Some(rid))
+        })
+        .collect();
+    if json {
+        print_json(&messages)?;
+    } else {
+        println!("ID\tFROM\tTO\tTYPE\tACK\tSUMMARY");
+        for m in messages {
+            println!(
+                "{}\t{}\t{}\t{}\t{}\t{}",
+                m.id,
+                m.from,
+                m.to,
+                m.msg_type.as_str(),
+                if m.acked { "acked" } else { "new" },
+                m.summary
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 fn cmd_ask(state_dir: &Path, args: &[String]) -> io::Result<()> {
     cmd_ask_ctx(&OrchCtx::local(state_dir), args)
@@ -1001,6 +1227,7 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     let mut to = None;
     let mut summary = None;
     let mut body = String::new();
+    let mut options = None;
     let mut run_id = None;
     let mut task_id = None;
     let mut question_id = None;
@@ -1014,12 +1241,14 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             "--to" => to = it.next().cloned(),
             "--summary" | "--question" => summary = it.next().cloned(),
             "--body" => body = it.next().cloned().unwrap_or_default(),
+            "--options" => options = it.next().cloned(),
             "--run" => run_id = it.next().cloned(),
             "--task" => task_id = it.next().cloned(),
-            "--question-id" | "--id" => {
+            "--question-id" | "--id" | "--resume" => {
                 question_id = Some(take_opt(&mut it, "--question-id")?.clone());
             }
             "--wait" => wait = true,
+            "--no-wait" => wait = false,
             "--timeout-ms" => {
                 let raw = it.next().ok_or_else(|| bad_arg("missing --timeout-ms"))?;
                 timeout_ms = raw
@@ -1029,6 +1258,13 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             "--json" => json = true,
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
+    }
+    if let Some(opts) = options.filter(|s| !s.trim().is_empty()) {
+        if !body.is_empty() {
+            body.push('\n');
+        }
+        body.push_str("Options: ");
+        body.push_str(opts.trim());
     }
     let question = if let Some(qid) = question_id {
         // 타임아웃 뒤 같은 질문을 다시 기다린다. 새 Question을 만들지 않는다.
@@ -1041,7 +1277,7 @@ fn cmd_ask_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             })?
     } else {
         let from = from.ok_or_else(|| bad_arg("missing --from"))?;
-        let to = to.ok_or_else(|| bad_arg("missing --to"))?;
+        let to = to.unwrap_or_else(|| "coordinator".to_owned());
         let summary = summary.ok_or_else(|| bad_arg("missing --summary"))?;
         let params = SendParams {
             from,
@@ -1131,23 +1367,29 @@ fn cmd_reply(state_dir: &Path, args: &[String]) -> io::Result<()> {
 }
 
 fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let Some((msg_id, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <msg-id>"));
-    };
+    let mut msg_id = None;
     let mut from = "coordinator".to_owned();
     let mut body = None;
     let mut json = false;
-    let mut it = rest.iter();
+    let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
+            "--id" | "--message" => {
+                let id = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                msg_id = Some(id.clone());
+            }
             "--from" => {
                 from.clone_from(it.next().ok_or_else(|| bad_arg("missing --from"))?);
             }
             "--body" | "--answer" => body = it.next().cloned(),
             "--json" => json = true,
+            s if !s.starts_with('-') && msg_id.is_none() => {
+                msg_id = Some(s.to_owned());
+            }
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
+    let msg_id = msg_id.ok_or_else(|| bad_arg("missing <msg-id>"))?;
     let body = body.ok_or_else(|| bad_arg("missing --body"))?;
     let reply = match ctx.try_ipc(
         &OrchAction::ReplyMessage {
@@ -1158,7 +1400,7 @@ fn cmd_reply_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         Duration::from_secs(2),
     )? {
         Some(OrchResponse::Message(m)) => m,
-        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(msg_id, &from, &body))?,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.reply_message(&msg_id, &from, &body))?,
     };
     if json {
         print_json(&reply)?;
@@ -1268,25 +1510,31 @@ fn cmd_gate_resolve(state_dir: &Path, args: &[String]) -> io::Result<()> {
 }
 
 fn cmd_gate_resolve_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let Some((gate_id, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <gate-id>"));
-    };
+    let mut gate_id = None;
     let mut decision = None;
     let mut rationale = None;
     let mut by = "coordinator".to_owned();
     let mut json = false;
-    let mut it = rest.iter();
+    let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--decision" => decision = it.next().cloned(),
+            "--id" | "--gate" => {
+                let id = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                gate_id = Some(id.clone());
+            }
+            "--decision" | "--resolution" => decision = it.next().cloned(),
             "--rationale" => rationale = it.next().cloned(),
             "--by" => {
                 by.clone_from(it.next().ok_or_else(|| bad_arg("missing --by"))?);
             }
             "--json" => json = true,
+            s if !s.starts_with('-') && gate_id.is_none() => {
+                gate_id = Some(s.to_owned());
+            }
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
+    let gate_id = gate_id.ok_or_else(|| bad_arg("missing <gate-id>"))?;
     let decision = decision.ok_or_else(|| bad_arg("missing --decision"))?;
     let gate = match ctx.try_ipc(
         &OrchAction::ResolveGate {
@@ -1299,7 +1547,7 @@ fn cmd_gate_resolve_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     )? {
         Some(OrchResponse::Gate(g)) => g,
         _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
-            s.resolve_gate(gate_id, &decision, rationale, &by)
+            s.resolve_gate(&gate_id, &decision, rationale, &by)
         })?,
     };
     if json {
@@ -1340,14 +1588,25 @@ fn cmd_worker_list_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     if json {
         print_json(&workers)?;
     } else {
+        let live_ids = ctx
+            .effective_target()
+            .ok()
+            .and_then(|t| crate::session::list_session_ids_on_target(&t).ok());
         println!("DISPATCH\tWORKER\tAGENT\tSTATUS\tSESSION\tTASK");
         for w in workers {
+            let status_str = if w.status == DispatchStatus::Active
+                && let (Some(sid), Some(ids)) = (w.session_id, live_ids.as_ref())
+                && !ids.contains(&sid)
+            {
+                "active(exited)"
+            } else {
+                w.status.as_str()
+            };
             println!(
-                "{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{}\t{status_str}\t{}\t{}",
                 w.id,
                 w.worker_name,
                 w.agent,
-                w.status.as_str(),
                 w.session_id
                     .map_or_else(|| "-".to_owned(), |n| n.to_string()),
                 w.task_id.as_deref().unwrap_or("-")
@@ -1363,16 +1622,29 @@ fn cmd_worker_show(state_dir: &Path, args: &[String]) -> io::Result<()> {
 }
 
 fn cmd_worker_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let Some((target, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <worker-or-dispatch>"));
-    };
-    let json = rest.iter().any(|a| a == "--json");
+    let mut target = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dispatch" | "--worker" => {
+                let val = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                target = Some(val.clone());
+            }
+            "--json" => json = true,
+            s if !s.starts_with('-') && target.is_none() => {
+                target = Some(s.to_owned());
+            }
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
+    let target = target.ok_or_else(|| bad_arg("missing <worker-or-dispatch>"))?;
     let store = ctx.load_store()?;
     let Some(disp) = store
         .dispatches
         .iter()
         .rev()
-        .find(|d| d.id == *target || d.worker_name == *target)
+        .find(|d| d.id == target || d.worker_name == target)
     else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1399,31 +1671,114 @@ fn cmd_worker_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_worker_read_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let Some((target_name, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <worker-or-dispatch>"));
-    };
-    let mut lines = 40_usize;
+fn cmd_dispatch_show_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let mut target = None;
+    let mut task_filter = None;
+    let mut preamble = false;
     let mut json = false;
-    let mut it = rest.iter();
+    let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--lines" => {
+            "--dispatch" | "--worker" => {
+                let val = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                target = Some(val.clone());
+            }
+            "--task" => {
+                let val = it.next().ok_or_else(|| bad_arg("missing --task"))?;
+                task_filter = Some(val.clone());
+            }
+            "--preamble" => preamble = true,
+            "--json" => json = true,
+            s if !s.starts_with('-') && target.is_none() => {
+                target = Some(s.to_owned());
+            }
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
+    }
+    if target.is_none() && task_filter.is_none() {
+        return Err(bad_arg("missing <dispatch-or-worker> or --task <task-id>"));
+    }
+    let store = ctx.load_store()?;
+    let disp = store
+        .dispatches
+        .iter()
+        .rev()
+        .find(|d| {
+            let matches_target = target
+                .as_ref()
+                .is_none_or(|t| d.id == *t || d.worker_name == *t);
+            let matches_task = task_filter
+                .as_ref()
+                .is_none_or(|tid| d.task_id.as_ref() == Some(tid));
+            matches_target && matches_task
+        })
+        .ok_or_else(|| {
+            let label = target.as_deref().or(task_filter.as_deref()).unwrap_or("?");
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("dispatch not found: {label}"),
+            )
+        })?;
+    if json {
+        if preamble {
+            print_json(&serde_json::json!({
+                "dispatch": disp,
+                "preamble": worker_preamble(disp),
+            }))?;
+        } else {
+            print_json(disp)?;
+        }
+    } else if preamble {
+        println!("{}", worker_preamble(disp));
+    } else {
+        println!(
+            "dispatch: {}\nworker:   {}\nagent:    {}\nstatus:   {}\nrun:      {}\ntask:     {}\nsession:  {}\ncwd:      {}\nprompt:   {}",
+            disp.id,
+            disp.worker_name,
+            disp.agent,
+            disp.status.as_str(),
+            disp.run_id,
+            disp.task_id.as_deref().unwrap_or("-"),
+            disp.session_id
+                .map_or_else(|| "-".to_owned(), |n| n.to_string()),
+            disp.cwd,
+            disp.prompt
+        );
+    }
+    Ok(())
+}
+
+fn cmd_worker_read_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let mut target_name = None;
+    let mut lines = 40_usize;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dispatch" | "--worker" => {
+                let val = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                target_name = Some(val.clone());
+            }
+            "--lines" | "--limit" => {
                 let raw = take_opt(&mut it, "--lines")?;
                 lines = raw
                     .parse::<usize>()
                     .map_err(|_| bad_arg("invalid --lines"))?;
             }
             "--json" => json = true,
+            s if !s.starts_with('-') && target_name.is_none() => {
+                target_name = Some(s.to_owned());
+            }
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
+    let target_name = target_name.ok_or_else(|| bad_arg("missing <worker-or-dispatch>"))?;
     let store = ctx.load_store()?;
     let Some(disp) = store
         .dispatches
         .iter()
         .rev()
-        .find(|d| d.id == *target_name || d.worker_name == *target_name)
+        .find(|d| d.id == target_name || d.worker_name == target_name)
     else {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
@@ -1464,20 +1819,35 @@ fn cmd_worker_stop(state_dir: &Path, args: &[String], release: bool) -> io::Resu
     cmd_worker_stop_ctx(&OrchCtx::local(state_dir), args, release)
 }
 
-fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io::Result<()> {
-    let Some((target_name, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <worker-or-dispatch>"));
-    };
-    if let Some(arg) = rest.iter().find(|a| *a != "--json") {
-        return Err(bad_arg(format!("unexpected argument {arg}")));
+fn parse_worker_or_dispatch_args(args: &[String]) -> io::Result<(String, bool)> {
+    let mut target_name = None;
+    let mut json = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--dispatch" | "--worker" => {
+                let val = it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                target_name = Some(val.clone());
+            }
+            "--json" => json = true,
+            s if !s.starts_with('-') && target_name.is_none() => {
+                target_name = Some(s.to_owned());
+            }
+            _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
+        }
     }
-    let json = rest.iter().any(|a| a == "--json");
+    let target_name = target_name.ok_or_else(|| bad_arg("missing <worker-or-dispatch>"))?;
+    Ok((target_name, json))
+}
+
+fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io::Result<()> {
+    let (target_name, json) = parse_worker_or_dispatch_args(args)?;
     let store = ctx.load_store()?;
     let selected = store
         .dispatches
         .iter()
         .rev()
-        .find(|d| d.id == *target_name || d.worker_name == *target_name)
+        .find(|d| d.id == target_name || d.worker_name == target_name)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -1540,20 +1910,38 @@ fn cmd_worker_stop_ctx(ctx: &OrchCtx<'_>, args: &[String], release: bool) -> io:
     Ok(())
 }
 
-fn cmd_worker_abandon_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
-    let Some((target_name, rest)) = args.split_first() else {
-        return Err(bad_arg("missing <worker-or-dispatch>"));
+fn cmd_worker_retain_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let (target_name, json) = parse_worker_or_dispatch_args(args)?;
+    let disp = match ctx.try_ipc(
+        &OrchAction::RetainWorker {
+            worker_or_dispatch: target_name.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Dispatch(d)) => d,
+        _ => OrchestrationStore::mutate(ctx.state_dir, |s| s.retain_worker(&target_name))?,
     };
-    if let Some(arg) = rest.iter().find(|a| *a != "--json") {
-        return Err(bad_arg(format!("unexpected argument {arg}")));
+    if json {
+        print_json(&disp)?;
+    } else {
+        println!(
+            "{}\t{}\t{}",
+            disp.id,
+            disp.worker_name,
+            disp.status.as_str()
+        );
     }
-    let json = rest.iter().any(|a| a == "--json");
+    Ok(())
+}
+
+fn cmd_worker_abandon_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let (target_name, json) = parse_worker_or_dispatch_args(args)?;
     let store = ctx.load_store()?;
     let selected = store
         .dispatches
         .iter()
         .rev()
-        .find(|d| d.id == *target_name || d.worker_name == *target_name)
+        .find(|d| d.id == target_name || d.worker_name == target_name)
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -2284,6 +2672,234 @@ mod tests {
             OrchestrationStore::load(&dir)?.messages.len(),
             before_len + 1
         );
+        std::fs::remove_dir_all(dir)
+    }
+
+    #[test]
+    fn orca_parity_subcommands_and_flag_aliases() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("mk-orca-parity-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let ctx = OrchCtx::local(&dir);
+
+        // 1. run-create with --objective and --worktree / --cwd
+        cmd_run_create_ctx(
+            &ctx,
+            &args(&[
+                "--objective",
+                "Orca Objective",
+                "--worktree",
+                "current",
+                "--cwd",
+                "/tmp",
+                "--json",
+            ]),
+        )?;
+        let run = OrchestrationStore::load(&dir)?.runs[0].clone();
+        assert_eq!(run.title, "Orca Objective");
+
+        // 2. run-use with --id and run-show
+        cmd_run_use_ctx(&ctx, &args(&["--id", &run.id, "--json"]))?;
+        cmd_run_show_ctx(&ctx, &args(&["--id", &run.id, "--json"]))?;
+        cmd_run_show_ctx(&ctx, &args(&[&run.id]))?;
+
+        // 3. task-create with --task-title, --spec (deriving title), --parent, JSON --deps
+        cmd_task_create_ctx(&ctx, &args(&["--task-title", "Parent Task", "--json"]))?;
+        let t1 = OrchestrationStore::load(&dir)?.tasks[0].clone();
+        assert_eq!(t1.title, "Parent Task");
+
+        cmd_task_create_ctx(
+            &ctx,
+            &args(&[
+                "--spec",
+                "Derived Title From Spec\nSecond line details",
+                "--parent",
+                &t1.id,
+                "--deps",
+                &format!("[\"{}\"]", t1.id),
+                "--json",
+            ]),
+        )?;
+        let t2 = OrchestrationStore::load(&dir)?.tasks[1].clone();
+        assert_eq!(t2.title, "Derived Title From Spec");
+        assert_eq!(t2.deps, vec![t1.id.clone()]);
+
+        // 4. task-update with --id and --result
+        cmd_task_update_ctx(
+            &ctx,
+            &args(&[
+                "--id",
+                &t1.id,
+                "--status",
+                "completed",
+                "--result",
+                "Done via --result",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        assert_eq!(
+            store.tasks[0].result_summary.as_deref(),
+            Some("Done via --result")
+        );
+        assert_eq!(store.tasks[1].status, TaskStatus::Ready);
+
+        // 5. worker-start with plain-text --spec (auto-creates task and worker name) + Orca flags
+        cmd_worker_start_ctx(
+            &ctx,
+            &args(&[
+                "--spec",
+                "Auto task from plain spec\nMore instructions",
+                "--agent",
+                "codex",
+                "--worktree",
+                "current",
+                "--model",
+                "gpt-5",
+                "--effort",
+                "high",
+                "--retry-of",
+                "disp-0",
+                "--no-spawn",
+                "--json",
+            ]),
+        )?;
+        let store = OrchestrationStore::load(&dir)?;
+        assert_eq!(store.tasks.len(), 3);
+        assert_eq!(store.tasks[2].title, "Auto task from plain spec");
+        assert_eq!(store.tasks[2].status, TaskStatus::Dispatched);
+        let disp = store.dispatches[0].clone();
+        assert_eq!(disp.worker_name, "codex-1");
+        assert_eq!(disp.task_id.as_deref(), Some(store.tasks[2].id.as_str()));
+
+        // 6. dispatch-show (--dispatch, --task, --preamble) and worker-show (--dispatch)
+        cmd_dispatch_show_ctx(&ctx, &args(&["--dispatch", &disp.id, "--json"]))?;
+        cmd_dispatch_show_ctx(
+            &ctx,
+            &args(&["--task", &store.tasks[2].id, "--preamble", "--json"]),
+        )?;
+        cmd_dispatch_show_ctx(&ctx, &args(&[&disp.id, "--preamble"]))?;
+        cmd_worker_show_ctx(&ctx, &args(&["--dispatch", &disp.id, "--json"]))?;
+        cmd_worker_read_ctx(
+            &ctx,
+            &args(&["--dispatch", &disp.id, "--limit", "10", "--json"]),
+        )?;
+
+        // 7. worker-retain (--dispatch) clears active task lock without closing session
+        cmd_worker_retain_ctx(&ctx, &args(&["--dispatch", &disp.id, "--json"]))?;
+        let store = OrchestrationStore::load(&dir)?;
+        assert_eq!(store.dispatches[0].status, DispatchStatus::Retained);
+        assert_eq!(store.tasks[2].status, TaskStatus::Ready);
+        assert_eq!(store.tasks[2].active_dispatch_id, None);
+
+        // 8. send (default --to coordinator, --subject, --files-modified, --report-path) & inbox / check
+        cmd_send_ctx(
+            &ctx,
+            &args(&[
+                "--from",
+                "codex-1",
+                "--body",
+                "First line summary\nDetails",
+                "--files-modified",
+                "src/lib.rs",
+                "--report-path",
+                "/tmp/rep.md",
+                "--phase",
+                "impl",
+                "--thread-id",
+                "th-1",
+                "--priority",
+                "high",
+                "--task-id",
+                &store.tasks[2].id,
+                "--dispatch-id",
+                &disp.id,
+                "--json",
+            ]),
+        )?;
+        let last_msg = OrchestrationStore::load(&dir)?
+            .messages
+            .last()
+            .unwrap()
+            .clone();
+        assert_eq!(last_msg.to, "coordinator");
+        assert_eq!(last_msg.summary, "First line summary");
+        assert!(last_msg.body.contains("files_modified: src/lib.rs"));
+        assert!(last_msg.body.contains("report_path: /tmp/rep.md"));
+
+        cmd_inbox_ctx(&ctx, &args(&["--run", &run.id, "--json"]))?;
+        cmd_check_ctx(
+            &ctx,
+            &args(&[
+                "--terminal",
+                "coordinator",
+                "--all",
+                "--peek",
+                "--wait",
+                "1",
+                "--json",
+            ]),
+        )?;
+
+        // 9. ask (default --to coordinator, --options, --no-wait, --resume) & reply (--id)
+        cmd_ask_ctx(
+            &ctx,
+            &args(&[
+                "--from",
+                "codex-1",
+                "--question",
+                "Which option?",
+                "--options",
+                "A,B",
+                "--no-wait",
+                "--json",
+            ]),
+        )?;
+        let q_msg = OrchestrationStore::load(&dir)?
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.msg_type == MessageType::Question)
+            .unwrap()
+            .clone();
+        assert_eq!(q_msg.to, "coordinator");
+        assert!(q_msg.body.contains("Options: A,B"));
+
+        cmd_reply_ctx(&ctx, &args(&["--id", &q_msg.id, "--body", "A", "--json"]))?;
+        cmd_ask_ctx(
+            &ctx,
+            &args(&[
+                "--resume",
+                &q_msg.id,
+                "--wait",
+                "--timeout-ms",
+                "10",
+                "--json",
+            ]),
+        )?;
+
+        // 10. gate-resolve with --id and --resolution
+        cmd_gate_create_ctx(
+            &ctx,
+            &args(&[
+                "--from",
+                "codex-1",
+                "--question",
+                "Merge?",
+                "--options",
+                "yes,no",
+                "--json",
+            ]),
+        )?;
+        let gate_id = OrchestrationStore::load(&dir)?.gates[0].id.clone();
+        cmd_gate_resolve_ctx(
+            &ctx,
+            &args(&["--id", &gate_id, "--resolution", "yes", "--json"]),
+        )?;
+        assert_eq!(
+            OrchestrationStore::load(&dir)?.gates[0].decision.as_deref(),
+            Some("yes")
+        );
+
         std::fs::remove_dir_all(dir)
     }
 }

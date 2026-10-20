@@ -2349,6 +2349,14 @@ impl Registry {
                     },
                 )
             }
+            OrchAction::RetainWorker { worker_or_dispatch } => {
+                OrchestrationStore::mutate(&dir, |s| s.retain_worker(&worker_or_dispatch)).map(
+                    |d| {
+                        self.notify_orch();
+                        OrchResponse::Dispatch(d)
+                    },
+                )
+            }
             OrchAction::Reset { run_id } => OrchestrationStore::mutate(&dir, |s| {
                 s.reset(run_id.as_deref());
                 Ok(())
