@@ -92,7 +92,7 @@ impl PortCache {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn detect(
         &mut self,
         session: u64,
