@@ -563,6 +563,67 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
         theme.colors.success = p.success;
         theme.colors.success_foreground = p.primary_foreground;
 
+        let (
+            button_bg,
+            button_hover,
+            button_active,
+            primary_hover,
+            primary_active,
+            secondary_hover,
+            secondary_active,
+            danger_hover,
+            danger_active,
+        ) = if mode.is_dark() {
+            (
+                hexa(0x00ff_ffff, 0.05),
+                hexa(0x00ff_ffff, 0.13),
+                hexa(0x00ff_ffff, 0.21),
+                hex(0x00ff_ffff),
+                hex(0x00c8_c8c8),
+                hex(0x0036_3636),
+                hex(0x0044_4444),
+                hex(0x00ff_8285),
+                hex(0x00e0_484b),
+            )
+        } else {
+            (
+                p.background,
+                hexa(0x0000_0000, 0.07),
+                hexa(0x0000_0000, 0.13),
+                hex(0x0030_3030),
+                hex(0x0000_0000),
+                hex(0x00e5_e5e5),
+                hex(0x00d4_d4d4),
+                hex(0x00c8_0010),
+                hex(0x00a8_000d),
+            )
+        };
+        theme.colors.button = button_bg;
+        theme.colors.button_foreground = p.foreground;
+        theme.colors.button_hover = button_hover;
+        theme.colors.button_active = button_active;
+
+        theme.colors.primary_hover = primary_hover;
+        theme.colors.primary_active = primary_active;
+        theme.colors.button_primary = p.primary;
+        theme.colors.button_primary_foreground = p.primary_foreground;
+        theme.colors.button_primary_hover = primary_hover;
+        theme.colors.button_primary_active = primary_active;
+
+        theme.colors.secondary_hover = secondary_hover;
+        theme.colors.secondary_active = secondary_active;
+        theme.colors.button_secondary = p.secondary;
+        theme.colors.button_secondary_foreground = p.secondary_foreground;
+        theme.colors.button_secondary_hover = secondary_hover;
+        theme.colors.button_secondary_active = secondary_active;
+
+        theme.colors.danger_hover = danger_hover;
+        theme.colors.danger_active = danger_active;
+        theme.colors.button_danger = p.destructive;
+        theme.colors.button_danger_foreground = p.destructive_foreground;
+        theme.colors.button_danger_hover = danger_hover;
+        theme.colors.button_danger_active = danger_active;
+
         theme.colors.list = p.sidebar;
         theme.colors.list_hover = p.sidebar_accent;
         theme.colors.list_active = p.sidebar_accent;
@@ -621,11 +682,39 @@ mod tests {
             assert_eq!(cx.theme().background, DARK.background);
             assert_eq!(cx.theme().sidebar, DARK.sidebar);
             assert_eq!(cx.theme().radius, RADIUS_SM);
+            assert_ne!(cx.theme().button, cx.theme().button_hover);
+            assert_ne!(cx.theme().button_hover, cx.theme().button_active);
+            assert_ne!(cx.theme().button_primary, cx.theme().button_primary_hover);
+            assert_ne!(
+                cx.theme().button_primary_hover,
+                cx.theme().button_primary_active
+            );
+            assert_ne!(
+                cx.theme().button_secondary,
+                cx.theme().button_secondary_hover
+            );
+            assert_ne!(
+                cx.theme().button_secondary_hover,
+                cx.theme().button_secondary_active
+            );
+            assert_ne!(cx.theme().button_danger, cx.theme().button_danger_hover);
+            assert_ne!(
+                cx.theme().button_danger_hover,
+                cx.theme().button_danger_active
+            );
 
             apply(ThemeMode::Light, cx);
             assert_eq!(cx.theme().mode, ThemeMode::Light);
             assert_eq!(cx.theme().background, LIGHT.background);
             assert_eq!(cx.theme().sidebar, LIGHT.sidebar);
+            assert_ne!(cx.theme().button, cx.theme().button_hover);
+            assert_ne!(cx.theme().button_hover, cx.theme().button_active);
+            assert_ne!(cx.theme().button_primary, cx.theme().button_primary_hover);
+            assert_ne!(
+                cx.theme().button_secondary,
+                cx.theme().button_secondary_hover
+            );
+            assert_ne!(cx.theme().button_danger, cx.theme().button_danger_hover);
         });
     }
 
@@ -923,6 +1012,17 @@ mod tests {
             ".text_size(gpui::px(",
             ".text_size(rems(",
             ".text_size(gpui::rems(",
+            // STYLEGUIDE §4: GPUI 기본 `.text_xs/sm/base/lg/xl/2xl/3xl` 대신 `ui::TEXT_*` 정본 토큰만 쓴다.
+            ".text_xs(",
+            ".text_sm(",
+            ".text_base(",
+            ".text_lg(",
+            ".text_xl(",
+            ".text_2xl(",
+            ".text_3xl(",
+            // STYLEGUIDE §6.5: 생 픽셀 아이콘 크기(`.with_size(px(..))`) 대신 `ui::ICON_*` 토큰만 쓴다.
+            ".with_size(px(",
+            ".with_size(gpui::px(",
         ];
         let unqualified = ["rgb", "rgba", "hsla", "black", "white", "hex", "hexa"];
 
@@ -1035,6 +1135,8 @@ mod tests {
             "div().shadow_2xl()",
             "div().text_size(px(13.))",
             "div().text_size(rems(0.75))",
+            "div().text_sm()",
+            "Icon::new(IconName::File).with_size(px(14.))",
         ] {
             let v = scan_design_system_violations("bad.rs", bad);
             assert!(!v.is_empty(), "expected violation for `{bad}`");

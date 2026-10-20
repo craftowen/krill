@@ -184,6 +184,12 @@ impl From<Pixels> for Size {
     }
 }
 
+impl From<f32> for Size {
+    fn from(size: f32) -> Self {
+        Size::Size(px(size))
+    }
+}
+
 /// A trait for setting the size of an element.
 /// Size::Medium is use by default.
 #[allow(patterns_in_fns_without_body)]

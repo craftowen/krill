@@ -122,7 +122,7 @@ impl Render for Tooltip {
                 .justify_between()
                 .py_0p5()
                 .px_2()
-                .text_sm()
+                .text_xs()
                 .gap_3()
                 .refine_style(&self.style)
                 .map(|this| {

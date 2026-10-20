@@ -156,6 +156,16 @@ pub fn switch(
     let thumb_selector = thumb_id.clone();
     let track_bg = if checked { p.primary } else { p.muted };
     let track_border = if checked { p.primary } else { p.border };
+    let hover_bg = if checked {
+        p.primary.opacity(0.88)
+    } else {
+        p.accent
+    };
+    let active_bg = if checked {
+        p.primary.opacity(0.75)
+    } else {
+        p.accent.opacity(0.8)
+    };
     let thumb_bg = if checked {
         p.primary_foreground
     } else {
@@ -179,6 +189,11 @@ pub fn switch(
         .when(disabled, |d| d.opacity(0.5).cursor_default())
         .when(!disabled, |d| {
             d.cursor_pointer()
+                .hover(|s| {
+                    s.bg(hover_bg)
+                        .border_color(if checked { hover_bg } else { p.ring })
+                })
+                .active(|s| s.bg(active_bg))
                 .on_click(move |_, window, cx| on_toggle(!checked, window, cx))
         })
         .child(

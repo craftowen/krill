@@ -1877,7 +1877,7 @@ impl Render for Palette {
                             .justify_center()
                             .child(
                                 Icon::new(IconName::File)
-                                    .with_size(px(14.))
+                                    .with_size(crate::ui::ICON_SM)
                                     .text_color(muted),
                             )
                     } else if let Some(pip_state) = item.state {

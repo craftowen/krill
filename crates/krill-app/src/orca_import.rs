@@ -1328,7 +1328,7 @@ fn render_domain_row(
                         .justify_center()
                         .children(checked.then(|| {
                             Icon::new(IconName::Check)
-                                .with_size(px(12.))
+                                .with_size(ui::ICON_XS)
                                 .text_color(box_fg)
                         })),
                 )

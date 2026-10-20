@@ -2181,6 +2181,9 @@ impl Sidebar {
         window: Option<&mut Window>,
         cx: &mut Context<Self>,
     ) {
+        if self.editing.as_ref().is_some_and(|(p, _)| p == &path) {
+            return;
+        }
         self.cursor = Some(index);
         if self.selected_worktree.as_ref() != Some(&path) {
             self.selected_worktree = Some(path.clone());
@@ -2653,6 +2656,10 @@ impl Sidebar {
     }
 
     fn rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editing.as_ref().is_some_and(|(p, _)| p == &path) {
+            self.finish_rename(Some(window), cx);
+            return;
+        }
         let name = self.name(&path);
         let input = cx.new(|cx| InputState::new(window, cx).default_value(name));
         input.update(cx, |input, cx| input.focus(window, cx));

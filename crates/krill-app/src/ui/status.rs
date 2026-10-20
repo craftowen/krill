@@ -146,13 +146,13 @@ pub fn agent_icon(agent: &str, size_px: f32, fg: Hsla) -> AnyElement {
     }
 }
 
-/// 명시적 `agent`가 비어 있을 때 터미널 제목(`* Claude Code` 등)에서 에이전트 종류를 추론한다.
+/// 에이전트가 없거나 셸 이름만 알려졌을 때 터미널 제목에서 에이전트 종류를 추론한다.
 #[must_use]
 pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
     if !agent.is_empty()
         && !matches!(
             agent,
-            "zsh" | "bash" | "fish" | "sh" | "nu" | "pwsh" | "cmd"
+            "sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh" | "powershell" | "cmd"
         )
     {
         return agent;
