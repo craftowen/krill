@@ -257,8 +257,9 @@ fn unsafe_ansi_boundaries_restore_original_scroll_regions_alt_screen_and_origin(
         drop(pty.user);
         session.wait().unwrap();
         let paths = segments(&store.session_dir(id)).unwrap();
-        assert_eq!(paths.len(), 2, "{tag}");
-        let last = segment::read(&paths[1], None).unwrap().unwrap();
+        // PTY 한 번 쓰기가 여러 번 읽히면 prefix만으로도 세그먼트가 나뉜다.
+        assert!(paths.len() >= 2, "{tag}: {paths:?}");
+        let last = segment::read(paths.last().unwrap(), None).unwrap().unwrap();
         assert!(last.keyframe_bytes.is_empty(), "{tag}");
         let after = store.history(id).unwrap().restore().unwrap().screen();
         assert_eq!(before.rows, after.rows, "{tag}");
