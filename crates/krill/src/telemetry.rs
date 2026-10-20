@@ -10,6 +10,15 @@ use krill_proto::telemetry::{self, Consent, Reason};
 const USAGE: &str = "usage: krill telemetry status|enable|disable";
 
 pub fn run(args: &[OsString]) -> ExitCode {
+    // 서브커맨드 자리만 도움말로 본다(status|enable|disable 고정이라 값 오인 없음).
+    let help_here = matches!(
+        args.first().and_then(|a| a.to_str()),
+        Some("-h" | "--help" | "help")
+    ) || matches!(args.get(1).and_then(|a| a.to_str()), Some("-h" | "--help"));
+    if help_here {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let args: Vec<String> = args
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
@@ -66,4 +75,15 @@ fn flip(want_on: bool) -> ExitCode {
         return status();
     }
     ExitCode::SUCCESS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+    }
 }

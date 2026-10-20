@@ -70,7 +70,13 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         eprintln!("{COMPUTER_USAGE}");
         return ExitCode::from(2);
     };
-    if matches!(sub.as_str(), "-h" | "--help" | "help") {
+    // `krill computer --help` 또는 서브커맨드 직후(`capabilities --help`)만 도움말로 본다.
+    // 하위 명령의 옵션값 자리는 각 cmd_*가 판단한다.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) || matches!(rest.first(), Some(s) if matches!(s.as_str(), "-h" | "--help" | "help"))
+    {
         println!("{COMPUTER_USAGE}");
         return ExitCode::SUCCESS;
     }

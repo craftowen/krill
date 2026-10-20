@@ -53,10 +53,11 @@ struct Args {
 }
 
 pub fn run(args: &[OsString]) -> ExitCode {
-    if args
-        .first()
-        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
-    {
+    // `--comment help` 같은 옵션값과 구분하기 위해 첫 인자만 본다.
+    if matches!(
+        args.first().and_then(|a| a.to_str()),
+        Some("-h" | "--help" | "help")
+    ) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -353,6 +354,13 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+    }
 
     #[test]
     fn parse_session_hint() {

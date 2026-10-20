@@ -73,6 +73,11 @@ pub fn run(args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // 도움말은 데몬·SSH 연결 전에 판정한다. 연결 실패와 usage를 구분하기 위해서다.
+    if has_help_before_literal(&rest) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let target = match Target::establish(host) {
         Ok(target) => target,
         Err(e) => {
@@ -83,7 +88,39 @@ pub fn run(args: &[OsString]) -> ExitCode {
     run_with_target(&target, &rest)
 }
 
+fn is_help_flag(s: &OsString) -> bool {
+    matches!(s.to_str(), Some("-h" | "--help" | "help"))
+}
+
+/// 도움말 판정: 서브커맨드 자리(`ls --help`, `--help`)와 `--` 앞의 전역 플래그만 본다.
+/// 세션 ID·전송 텍스트(`send 1 help`, `send 1 --text --help`)·`--` 뒤 리터럴은 도움말이 아니다.
+fn has_help_before_literal(args: &[OsString]) -> bool {
+    let mut it = args.iter();
+    // `--host`는 extract_host가 이미 걷어냈으나, 직접 호출(run_with_target) 경로를 위해 여기서도 건너뛴다.
+    let first = if args.first().is_some_and(|a| a == "--host") {
+        it.next();
+        it.next();
+        it.next()
+    } else {
+        it.next()
+    };
+    let Some(cmd) = first else {
+        return false;
+    };
+    // 베어 `--help` (서브커맨드 없음)
+    if is_help_flag(cmd) {
+        return true;
+    }
+    // 서브커맨드 직후 플래그만 본다. 그 뒤는 각 명령의 인자(ID·텍스트·쿼리)다.
+    matches!(it.next().and_then(|s| s.to_str()), Some("-h" | "--help"))
+        || matches!(cmd.to_str(), Some("-h" | "--help" | "help"))
+}
+
 pub(crate) fn run_with_target(target: &Target, rest: &[OsString]) -> ExitCode {
+    if has_help_before_literal(rest) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let result = match rest.split_first() {
         Some((cmd, rest)) if cmd == "ls" => list(target, rest),
         Some((cmd, rest)) if cmd == "new" => create(target, rest),
@@ -1189,6 +1226,28 @@ mod tests {
         assert_eq!(env_parsed.from, SessionId(9));
 
         assert!(parse_fork_args(&[], false, None, (80, 24)).is_err());
+    }
+
+    #[test]
+    fn help_flag_detection_respects_literal_separator() {
+        let help =
+            |s: &[&str]| has_help_before_literal(&s.iter().map(OsString::from).collect::<Vec<_>>());
+        assert!(is_help_flag(&OsString::from("--help")));
+        assert!(is_help_flag(&OsString::from("-h")));
+        assert!(is_help_flag(&OsString::from("help")));
+        assert!(!is_help_flag(&OsString::from("--hel")));
+        assert!(help(&["send", "--help"]));
+        assert!(help(&["ls", "--help"]));
+        assert!(help(&["--help"]));
+        assert!(!help(&["send", "--", "--help"]));
+        assert!(!help(&["send", "1", "--", "--help"]));
+        // 세션 ID·전송 텍스트 자리의 `help`는 도움말이 아니다.
+        assert!(!help(&["send", "1", "help"]));
+        assert!(!help(&["send", "1", "--text", "--help"]));
+        // 없는 서브커맨드 뒤 `--help`도 usage를 보여준다(오타 탐색 친화적).
+        assert!(help(&["search-is-not-a-session-cmd", "--help"]));
+        // `read 1 --lines --help`에서 --help는 --lines 값 자리가 아니라 오인 방지를 위해 도움말이 아니다.
+        assert!(!help(&["read", "1", "--lines", "--help"]));
     }
 
     #[test]

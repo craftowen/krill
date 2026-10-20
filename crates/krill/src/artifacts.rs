@@ -111,12 +111,17 @@ fn execute(ctx: &Ctx, raw: &[OsString]) -> Result<String, Error> {
         .map(|s| s.to_str().map(str::to_owned))
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| Error::Usage("arguments must be UTF-8".into()))?;
+    // 서브커맨드 자리만 도움말로 본다. `--title help` 같은 옵션값은 제목이다.
+    let help_here = matches!(
+        args.first().map(String::as_str),
+        Some("-h" | "--help" | "help")
+    ) || matches!(args.get(1), Some(s) if matches!(s.as_str(), "-h" | "--help"));
+    if help_here {
+        return Ok(USAGE.into());
+    }
     let Some((cmd, rest)) = args.split_first() else {
         return Err(Error::Usage(USAGE.into()));
     };
-    if matches!(cmd.as_str(), "-h" | "--help" | "help") {
-        return Ok(USAGE.into());
-    }
     let opts = parse(rest)?;
     let api = opts
         .api_url
@@ -792,6 +797,26 @@ esac
         assert_eq!(
             serde_json::from_str::<Value>(&out).unwrap()["slug"],
             "other"
+        );
+    }
+
+    #[test]
+    fn help_returns_usage_string() {
+        let env = Env::new("help");
+        assert!(
+            env.run(&["--help"])
+                .unwrap()
+                .contains("krill artifacts share")
+        );
+        assert!(
+            env.run(&["share", "--help"])
+                .unwrap()
+                .contains("krill artifacts share")
+        );
+        assert!(
+            env.run(&["list", "-h"])
+                .unwrap()
+                .contains("krill artifacts share")
         );
     }
 

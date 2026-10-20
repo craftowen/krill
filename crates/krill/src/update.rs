@@ -21,7 +21,7 @@ pub fn run(raw: &[OsString]) -> ExitCode {
     while idx < raw.len() {
         let arg = raw[idx].to_string_lossy();
         match arg.as_ref() {
-            "-h" | "--help" => {
+            "-h" | "--help" | "help" => {
                 println!("{USAGE}");
                 return ExitCode::SUCCESS;
             }

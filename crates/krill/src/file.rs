@@ -73,17 +73,12 @@ pub struct ParsedCommand {
 }
 
 pub fn run(args: &[OsString]) -> ExitCode {
-    if args
-        .first()
-        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
-    {
-        println!("{USAGE}");
-        return ExitCode::SUCCESS;
-    }
-    if args
-        .get(1)
-        .is_some_and(|a| matches!(a.to_str(), Some("-h" | "--help")))
-    {
+    // `open`/`diff` 서브커맨드 자리만 도움말로 본다. 파일 경로 인자의 `help`는 경로다.
+    let help_here = matches!(
+        args.first().and_then(|a| a.to_str()),
+        Some("-h" | "--help" | "help")
+    ) || matches!(args.get(1).and_then(|a| a.to_str()), Some("-h" | "--help"));
+    if help_here {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
@@ -586,6 +581,19 @@ fn print_result(req: &FileRequest, json: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(
+            run(&[OsString::from("open"), OsString::from("--help")]),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(
+            run(&[OsString::from("diff"), OsString::from("-h")]),
+            ExitCode::SUCCESS
+        );
+    }
 
     #[test]
     fn parse_open_and_diff_arguments() {

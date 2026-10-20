@@ -27,7 +27,41 @@ enum Command {
     },
     Help,
 }
+/// `--address` 값 위치를 제외하고 도움말 플래그가 있으면 true.
+/// `pair --address --help`의 `--help`는 주소 값으로 보고 도움말로 오인하지 않는다.
+/// 도움말 판정: 첫 토큰(`pair --help`의 서브커맨드 자리) 또는 서브커맨드 직후만 본다.
+/// `revoke <device_id>` 자리의 베어 `help`는 기기 ID가 아니라 도움말로 보는 것이 친절하므로
+/// 첫 토큰 베어 `help`는 허용하되, ID 자리 베어 `help`는 도움말로 본다. `--address` 값은 건너뛴다.
+fn has_help_flag(args: &[OsString]) -> bool {
+    let mut skip_next = false;
+    let mut pos = 0;
+    for v in args {
+        if skip_next {
+            skip_next = false;
+            pos += 1;
+            continue;
+        }
+        let s = v.to_str().unwrap_or("");
+        if s == "--address" {
+            skip_next = true;
+            pos += 1;
+            continue;
+        }
+        // pos 0: 서브커맨드 자리. pos 1: 서브커맨드 직후(`-h`/`--help`만).
+        if pos == 0 && matches!(s, "-h" | "--help" | "help") {
+            return true;
+        }
+        if pos == 1 && matches!(s, "-h" | "--help") {
+            return true;
+        }
+        pos += 1;
+    }
+    false
+}
 fn parse(args: &[OsString]) -> Result<Command, &'static str> {
+    if has_help_flag(args) {
+        return Ok(Command::Help);
+    }
     let mut a = args
         .iter()
         .map(|v| v.to_str().ok_or("arguments must be UTF-8"));
@@ -281,6 +315,30 @@ mod tests {
     fn args(a: &[&str]) -> Vec<OsString> {
         a.iter().map(OsString::from).collect()
     }
+    #[test]
+    fn help_flag_before_literal_returns_help() {
+        assert!(has_help_flag(&[OsString::from("--help")]));
+        assert!(has_help_flag(&[
+            OsString::from("pair"),
+            OsString::from("--help")
+        ]));
+        assert!(has_help_flag(&[
+            OsString::from("devices"),
+            OsString::from("-h")
+        ]));
+        // `--address --help`: --help는 주소 값이므로 도움말이 아니다.
+        assert!(!has_help_flag(&[
+            OsString::from("pair"),
+            OsString::from("--address"),
+            OsString::from("--help")
+        ]));
+        assert!(matches!(parse(&[OsString::from("-h")]), Ok(Command::Help)));
+        assert!(matches!(
+            parse(&[OsString::from("--help")]),
+            Ok(Command::Help)
+        ));
+    }
+
     #[test]
     fn command_validation() {
         assert_eq!(

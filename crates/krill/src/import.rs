@@ -10,6 +10,15 @@ use crate::orca_import::{ImportDomain, ImportOptions, format_report_human, run_i
 const USAGE: &str = "usage: krill import orca [--dry-run] [--json] [--only accounts,ssh,projects,settings,sessions] [--from <orca-dir>]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
+    // `--from <orca-dir>` 값 자리의 `help`는 경로이므로 첫 두 토큰만 본다.
+    let head: Vec<_> = raw.iter().take(2).collect();
+    if head
+        .iter()
+        .any(|a| matches!(a.to_str(), Some("-h" | "--help" | "help")))
+    {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     match execute(raw) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
@@ -103,4 +112,15 @@ fn execute(raw: &[OsString]) -> io::Result<()> {
         println!("{}", format_report_human(&report));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+    }
 }

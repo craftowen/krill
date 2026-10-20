@@ -1,6 +1,5 @@
 //! `krill account`: 프로바이더 다계정 조회·등록·삭제·원클릭 전환·자동전환 설정(MK-107·MK-108).
 
-use krill_proto::os::ffi::OsStringExt as _;
 use std::ffi::OsString;
 use std::io::Write as _;
 use std::process::ExitCode;
@@ -17,6 +16,15 @@ use krill_proto::usage::{
 const USAGE: &str = "usage: krill account [list [--json] | history [--json] | direct-usage <on|off> | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
+    // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
+    let help_here = matches!(
+        raw.first().and_then(|a| a.to_str()),
+        Some("-h" | "--help" | "help")
+    ) || matches!(raw.get(1).and_then(|a| a.to_str()), Some("-h" | "--help"));
+    if help_here {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     let Ok(args) = raw
         .iter()
         .cloned()
@@ -207,13 +215,15 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
         .ok_or("account not found")?;
     // 호스트 기본 계정은 env 없이 다룬다(Claude는 env가 있으면 다른 키체인 항목을 쓴다).
     let dir = (!account.host_default).then(|| std::path::Path::new(&account.profile_dir));
-    let status = login_command(provider, dir)?
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let status = login_command(provider, dir, &path)?
         .status()
         .map_err(|e| e.to_string())?;
     if !status.success() {
         return Err("login failed or was cancelled".to_owned());
     }
-    let exe = provider.as_str();
+    let exe = krill_proto::agent::which(provider.as_str(), &path)
+        .ok_or("provider executable not found")?;
     let auth = if provider == ProviderKind::Antigravity && account.host_default {
         std::fs::write(
             std::path::Path::new(&account.profile_dir).join(".krill-login-completed"),
@@ -236,7 +246,7 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
             std::thread::sleep(Duration::from_millis(200));
         }
     } else {
-        krill_proto::account_login::probe(std::path::Path::new(exe), provider, dir)
+        krill_proto::account_login::probe(&exe, provider, dir)
     }
     .filter(|s| s.logged_in)
     .ok_or("login could not be verified")?;
@@ -271,15 +281,12 @@ fn login(provider: &str, id: &str) -> Result<(), String> {
 fn login_command(
     provider: ProviderKind,
     dir: Option<&std::path::Path>,
+    path: &std::ffi::OsStr,
 ) -> Result<std::process::Command, String> {
-    let Some(krill_proto::control::Program::Custom { program, args }) =
-        krill_proto::account_login::login_program(provider, dir)
-    else {
-        return Err("provider does not support interactive account login".to_owned());
-    };
-    let mut command = std::process::Command::new(OsString::from_vec(program));
-    command.args(args.into_iter().map(OsString::from_vec));
-    Ok(command)
+    let exe = krill_proto::agent::which(provider.as_str(), path)
+        .ok_or("provider executable not found")?;
+    krill_proto::account_login::login_command(&exe, provider, dir)
+        .ok_or_else(|| "provider does not support interactive account login".to_owned())
 }
 
 /// OWE-709: `auto-switch on|off [threshold]`를 [`UsageRequest::SetAutoSwitch`]로 푼다.
@@ -586,6 +593,13 @@ mod tests {
     use krill_proto::usage::{AccountInfo, Snapshot};
 
     #[test]
+    fn help_returns_zero() {
+        assert_eq!(run(&[OsString::from("--help")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("-h")]), ExitCode::SUCCESS);
+        assert_eq!(run(&[OsString::from("help")]), ExitCode::SUCCESS);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn login_command_runs_fake_claude_in_selected_profile() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -596,10 +610,9 @@ mod tests {
         let exe = root.join("claude");
         std::fs::write(&exe, "#!/bin/sh\n[ \"$1 $2 $3\" = 'auth login --claudeai' ] || exit 8\nprintf '%s' \"$HOME\" > \"$CLAUDE_CONFIG_DIR/login-called\"\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let status = login_command(ProviderKind::Claude, Some(&profile))
+        let status = login_command(ProviderKind::Claude, Some(&profile), root.as_os_str())
             .unwrap()
             .env("HOME", &root)
-            .env("CLAUDE_CONFIG_DIR", root.join("wrong"))
             .env("PATH", &root)
             .status()
             .unwrap();
