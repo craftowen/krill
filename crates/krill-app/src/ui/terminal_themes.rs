@@ -1,4 +1,4 @@
-//! Orca 호환 30종 내장 터미널 테마 카탈로그·커스텀 테마·Ghostty/Warp 테마 가져오기(OWE-956).
+//! 내장 터미널 테마 카탈로그(Krill 기본 `Krill Deep` + Orca 호환 30종)·커스텀 테마·Ghostty/Warp 테마 가져오기(OWE-956).
 //!
 //! 출처: `.ref/orca/src/shared/terminal-themes/` (`defaults.ts`, `popular-dark-core.ts`,
 //! `popular-dark-extended.ts`, `popular-light.ts`, `classic.ts`),
@@ -10,10 +10,10 @@ use gpui::Hsla;
 use krill_proto::theme::{Rgb, Theme as TerminalTheme};
 use serde::{Deserialize, Serialize};
 
-use super::theme::{TERMINAL_DARK, TERMINAL_LIGHT, rgba_bytes, term_rgb};
+use super::theme::{TERMINAL_DARK, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, rgba_bytes, term_rgb};
 
-/// 기본 다크 터미널 테마 이름(Orca `DEFAULT_TERMINAL_THEME_DARK`).
-pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Ghostty Default Style Dark";
+/// 기본 다크 터미널 테마 이름(Krill 고유 [`TERMINAL_DARK`], 데몬 기본 테마와 같다).
+pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Krill Deep";
 /// 기본 라이트 터미널 테마 이름(Orca `DEFAULT_TERMINAL_THEME_LIGHT`).
 pub const DEFAULT_TERMINAL_THEME_LIGHT: &str = "Builtin Tango Light";
 /// 사용자 가져오기 테마 선택값 접두사(`custom:<id>`).
@@ -76,13 +76,20 @@ const fn builtin(
     }
 }
 
-/// Orca 내장 30종 터미널 테마 카탈로그(`.ref/orca/src/shared/terminal-themes/index.ts` 정본 순서).
+/// 내장 터미널 테마 카탈로그: Krill 기본 `Krill Deep` 다음에 Orca 내장 30종
+/// (`.ref/orca/src/shared/terminal-themes/index.ts` 정본 순서).
 pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
-    // 1..=2: defaults.ts
+    // 0: Krill 고유 다크 기본
     BuiltinTerminalTheme {
         name: DEFAULT_TERMINAL_THEME_DARK,
         is_dark: true,
         theme: TERMINAL_DARK,
+    },
+    // 1..=2: defaults.ts
+    BuiltinTerminalTheme {
+        name: "Ghostty Default Style Dark",
+        is_dark: true,
+        theme: TERMINAL_GHOSTTY_DARK,
     },
     BuiltinTerminalTheme {
         name: DEFAULT_TERMINAL_THEME_LIGHT,
@@ -962,7 +969,7 @@ pub fn canonical_terminal_theme_name(name: &str) -> &str {
     trimmed
 }
 
-/// 내장 30종 카탈로그에서 이름으로 테마를 찾는다(대소문자 및 `Builtin ` 접두사 호환).
+/// 내장 카탈로그에서 이름으로 테마를 찾는다(대소문자 및 `Builtin ` 접두사 호환).
 #[must_use]
 pub fn builtin_terminal_theme(name: &str) -> Option<&'static BuiltinTerminalTheme> {
     let canonical = canonical_terminal_theme_name(name);
@@ -1842,15 +1849,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builtin_catalog_has_all_30_orca_themes_with_unique_names() {
-        assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 30);
-        assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, DEFAULT_TERMINAL_THEME_DARK);
+    fn builtin_catalog_has_krill_deep_and_all_30_orca_themes_with_unique_names() {
+        // Krill Deep + Orca 30종.
+        assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 31);
+        assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, "Krill Deep");
         assert_eq!(BUILTIN_TERMINAL_THEMES[0].theme, TERMINAL_DARK);
         assert_eq!(
-            BUILTIN_TERMINAL_THEMES[1].name,
+            builtin_terminal_theme("Ghostty Default Style Dark").map(|b| b.theme),
+            Some(TERMINAL_GHOSTTY_DARK)
+        );
+        assert_eq!(
+            BUILTIN_TERMINAL_THEMES[2].name,
             DEFAULT_TERMINAL_THEME_LIGHT
         );
-        assert_eq!(BUILTIN_TERMINAL_THEMES[1].theme, TERMINAL_LIGHT);
+        assert_eq!(BUILTIN_TERMINAL_THEMES[2].theme, TERMINAL_LIGHT);
 
         let mut names = std::collections::BTreeSet::new();
         for entry in BUILTIN_TERMINAL_THEMES {
