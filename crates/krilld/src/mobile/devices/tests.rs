@@ -113,3 +113,25 @@ fn seen_within_flush_window_stays_in_memory_until_next_save() {
     assert_eq!(reopened.list().first().unwrap().last_seen_ms, late + 1);
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn capacity_is_distinct_from_invalid_ticket_and_frees_after_revoke() {
+    let mut devices = Devices::open(None).unwrap();
+    let mut first = None;
+    for _ in 0..MAX_DEVICES {
+        let ticket = devices.mint(1, true).unwrap();
+        let (device, _) = devices.pair(&ticket.token, "phone", 2).unwrap();
+        first.get_or_insert(device.device_id);
+    }
+    let ticket = devices.mint(3, true).unwrap();
+    assert_eq!(
+        devices.pair(&ticket.token, "extra", 4).unwrap_err().kind(),
+        io::ErrorKind::StorageFull
+    );
+    assert!(
+        devices.ticket(4).is_some(),
+        "capacity does not consume the QR"
+    );
+    devices.revoke(first.as_deref(), false, 5).unwrap();
+    assert!(devices.pair(&ticket.token, "replacement", 6).is_ok());
+}

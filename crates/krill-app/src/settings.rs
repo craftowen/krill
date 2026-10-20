@@ -500,6 +500,10 @@ const HOSTS_FILE: &str = "hosts.toml";
 #[derive(Default)]
 pub struct Config {
     settings: Settings,
+    initial_loaded: bool,
+    durable: Settings,
+    epoch: u64,
+    revision: u64,
     /// 마지막 읽기 오류. 설정 창에 보인다.
     error: Option<SharedString>,
     dir: Option<PathBuf>,
@@ -586,14 +590,12 @@ fn is_daemon_state_dir(dir: Option<&Path>) -> bool {
 
 /// `accounts.toml`·`hosts.toml` 등이 바뀌었음을 전역 설정 관찰자(`Shell`·`SettingsView`)에 알린다.
 pub fn notify_external_change(cx: &mut App) {
-    let stamps = cx
-        .try_global::<Config>()
-        .and_then(|c| c.dir.as_deref().map(file_stamps));
-    if cx.has_global::<Config>()
-        && let Some(stamps) = stamps
-    {
-        cx.global_mut::<Config>().stamp = stamps;
+    if !cx.has_global::<Config>() {
+        return;
     }
+    // Notify observers using memory only; even metadata may block on a remote volume.
+    cx.global_mut::<Config>().stamp = [None; 7];
+    reload(cx);
 }
 
 /// 관리자 창에서 요청한 SSH 호스트 연결 요청을 꺼낸다.
@@ -862,6 +864,19 @@ pub fn take_pending_notice(cx: &mut App) -> Option<String> {
 pub fn init(cx: &mut App) {
     init_at(krill_proto::daemon::state_dir(), cx);
     cx.on_action(|_: &OpenSettings, cx| open_window(cx));
+    cx.on_app_quit(|cx| {
+        let pending = cx
+            .try_global::<FileIoQueue>()
+            .is_some()
+            .then(|| cx.global_mut::<FileIoQueue>().0.take())
+            .flatten();
+        cx.background_spawn(async move {
+            if let Some(pending) = pending {
+                pending.await.ok();
+            }
+        })
+    })
+    .detach();
     cx.spawn(async move |cx| {
         loop {
             cx.background_executor().timer(POLL).await;
@@ -884,6 +899,10 @@ pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
     }
     cx.set_global(Config {
         settings: Settings::default(),
+        initial_loaded: false,
+        durable: Settings::default(),
+        epoch: next_revision(),
+        revision: next_revision(),
         error: None,
         dir,
         defaults,
@@ -896,21 +915,120 @@ pub fn init_at(dir: Option<PathBuf>, cx: &mut App) {
     reload(cx);
 }
 
-fn reload_if_changed(cx: &mut App) {
-    let c = cx.global::<Config>();
-    let Some(dir) = c.dir.as_deref() else {
-        return;
-    };
-    let now = file_stamps(dir);
-    if now != c.stamp {
-        reload(cx);
-    }
+fn next_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
-/// 설정·키맵·계정·호스트 파일을 다시 읽어 적용한다. 없는 파일은 기본값, 틀린 파일은 그 부분만 직전 값을 유지한다.
+/// Await queued configuration writes before an explicit application quit.
+pub fn flush_file_io(cx: &mut App) -> gpui::Task<()> {
+    background_file_io(cx, || ())
+}
+
+#[derive(Default)]
+struct ReloadState {
+    pending_epoch: Option<u64>,
+    again: bool,
+}
+impl Global for ReloadState {}
+
+/// File mutations are serialized without making the event loop wait on a lock.
+#[derive(Default)]
+struct FileIoQueue(Option<tokio::sync::oneshot::Receiver<()>>);
+impl Global for FileIoQueue {}
+
+pub(crate) fn background_file_io<R: Send + 'static>(
+    cx: &mut App,
+    work: impl FnOnce() -> R + Send + 'static,
+) -> gpui::Task<R> {
+    if !cx.has_global::<FileIoQueue>() {
+        cx.set_global(FileIoQueue::default());
+    }
+    let (done, next) = tokio::sync::oneshot::channel();
+    let previous = cx.global_mut::<FileIoQueue>().0.replace(next);
+    cx.background_spawn(async move {
+        if let Some(previous) = previous {
+            previous.await.ok();
+        }
+        let result = work();
+        done.send(()).ok();
+        result
+    })
+}
+
+fn reload_if_changed(cx: &mut App) {
+    start_reload(false, cx);
+}
+
+/// Load files on the background executor; completion only applies the current revision.
 pub fn reload(cx: &mut App) {
+    start_reload(true, cx);
+}
+
+fn start_reload(force: bool, cx: &mut App) {
     let c = cx.global::<Config>();
-    let (dir, defaults, mut settings) = (c.dir.clone(), c.defaults.clone(), c.settings.clone());
+    let epoch = c.epoch;
+    let (dir, settings, revision, previous) =
+        (c.dir.clone(), c.settings.clone(), c.revision, c.stamp);
+    if !cx.has_global::<ReloadState>() {
+        cx.set_global(ReloadState::default());
+    }
+    let pending = cx.global_mut::<ReloadState>();
+    if pending.pending_epoch == Some(epoch) {
+        pending.again |= force;
+        return;
+    }
+    pending.pending_epoch = Some(epoch);
+    pending.again = false;
+    let work = background_file_io(cx, move || {
+        if !force && dir.as_deref().map_or([None; 7], file_stamps) == previous {
+            return None;
+        }
+        Some(read_config(dir.as_deref(), settings))
+    });
+    cx.spawn(async move |cx| {
+        let loaded = work.await;
+        cx.update(|cx| {
+            if cx.global::<Config>().epoch != epoch {
+                return;
+            }
+            let pending = cx.global_mut::<ReloadState>();
+            pending.pending_epoch = None;
+            let again = std::mem::take(&mut pending.again);
+            let c = cx.global::<Config>();
+            if c.revision == revision
+                && let Some((settings, keys, stamp, mut errors)) = loaded
+            {
+                let defaults = c.defaults.clone();
+                crate::i18n::set_language(settings.language, cx);
+                match keys.map(|keys| bindings(defaults, &keys, cx)) {
+                    Some(Ok(bindings)) => {
+                        cx.clear_key_bindings();
+                        cx.bind_keys(bindings);
+                    }
+                    Some(Err(error)) => errors.push(error),
+                    None => {}
+                }
+                let c = cx.global_mut::<Config>();
+                c.initial_loaded = true;
+                c.durable = settings.clone();
+                c.settings = settings;
+                c.stamp = stamp;
+                c.error = (!errors.is_empty()).then(|| errors.join("\n").into());
+                crate::alert::sync_settings(cx);
+                cx.defer(apply);
+            }
+            if again {
+                reload(cx);
+            }
+        });
+    })
+    .detach();
+}
+
+type LoadedConfig = (Settings, Option<Keys>, [Option<SystemTime>; 7], Vec<String>);
+
+fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
     let mut errors = Vec::new();
     // 틀린 keys.toml이면 `None`: 키맵을 건드리지 않는다(직전 재정의 유지).
     let mut keys = Some(Keys::default());
@@ -959,36 +1077,19 @@ pub fn reload(cx: &mut App) {
             }
         }
     }
-    crate::i18n::set_language(settings.language, cx);
-    match keys.map(|k| bindings(defaults, &k, cx)) {
-        Some(Ok(b)) => {
-            cx.clear_key_bindings();
-            cx.bind_keys(b);
-        }
-        Some(Err(e)) => errors.push(e),
-        None => {}
-    }
-    if !errors.is_empty() {
-        tracing::warn!(count = errors.len(), "settings reload failed");
-    }
-    // 사람이 직접 만든 opt-in 표식은 설정값보다 우선한다(읽기 경로에서 지우지 않는다).
-    settings.hibernation_enabled |= dir
-        .as_deref()
-        .is_some_and(|d| d.join(HIBERNATION_FLAG).is_file());
-    let c = cx.global_mut::<Config>();
-    let enabled = settings.hibernation_enabled;
-    let auto_rename = settings.auto_rename_branch_from_work;
-    let workspace_trust = settings.workspace_trust_preset_enabled;
-    c.settings = settings;
-    c.stamp = stamp;
-    c.error = (!errors.is_empty()).then(|| errors.join("\n").into());
+    settings.hibernation_enabled |= dir.is_some_and(|d| d.join(HIBERNATION_FLAG).is_file());
     if !settings_read_failed {
-        sync_hibernation_file(dir.as_deref(), enabled);
-        sync_auto_rename_file(dir.as_deref(), auto_rename);
-        sync_workspace_trust_file(dir.as_deref(), workspace_trust);
+        sync_hibernation_file(dir, settings.hibernation_enabled);
+        sync_auto_rename_file(dir, settings.auto_rename_branch_from_work);
+        sync_workspace_trust_file(dir, settings.workspace_trust_preset_enabled);
     }
-    crate::alert::sync_settings(cx);
-    cx.defer(apply);
+    (settings, keys, stamp, errors)
+}
+
+/// Whether the initial disk read has completed; absent configuration uses normal defaults.
+pub fn is_loaded(cx: &App) -> bool {
+    cx.try_global::<Config>()
+        .is_none_or(|config| config.initial_loaded || config.dir.is_none())
 }
 
 /// 현재 적용된 설정. `init` 전(단위 테스트 등)이면 기본값을 돌려준다.
@@ -1012,7 +1113,7 @@ pub fn editor_font_pt(cx: &App) -> u8 {
         .map_or_else(default_editor_font_size, |c| c.settings.editor_font_size())
 }
 
-fn edit_or_in_memory(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+fn edit_or_in_memory(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
     if !cx.has_global::<Config>() {
         cx.set_global(Config::default());
     }
@@ -1026,24 +1127,28 @@ fn edit_or_in_memory(cx: &mut App, f: impl FnOnce(&mut Settings)) {
 
 /// 포커스된 터미널에서 `⌘=`/`⌘+`/`⌘-`로 터미널 글꼴 크기를 한 단계 조절하고 `settings.toml`에 저장한다(OWE-843).
 pub fn step_terminal_font_size(dir: i8, cx: &mut App) {
-    edit_or_in_memory(cx, |s| {
+    edit_or_in_memory(cx, move |s| {
         s.terminal_font_size = s.terminal_font_size_step(dir);
     });
 }
 
 /// 포커스된 터미널에서 `⌘0`으로 터미널 글꼴 크기를 기본값(13pt)으로 되돌리고 저장한다(OWE-843).
 pub fn reset_terminal_font_size(cx: &mut App) {
-    edit_or_in_memory(cx, |s| s.terminal_font_size = DEFAULT_TERMINAL_FONT_SIZE);
+    edit_or_in_memory(cx, move |s| {
+        s.terminal_font_size = DEFAULT_TERMINAL_FONT_SIZE;
+    });
 }
 
 /// 포커스된 코드 에디터 탭에서 `⌘=`/`⌘+`/`⌘-`로 에디터 글꼴 크기를 한 단계 조절하고 `settings.toml`에 저장한다(OWE-843).
 pub fn step_editor_font_size(dir: i8, cx: &mut App) {
-    edit_or_in_memory(cx, |s| s.editor_font_size = s.editor_font_size_step(dir));
+    edit_or_in_memory(cx, move |s| {
+        s.editor_font_size = s.editor_font_size_step(dir);
+    });
 }
 
 /// 포커스된 코드 에디터 탭에서 `⌘0`으로 에디터 글꼴 크기를 기본값(12pt)으로 되돌리고 저장한다(OWE-843).
 pub fn reset_editor_font_size(cx: &mut App) {
-    edit_or_in_memory(cx, |s| s.editor_font_size = DEFAULT_EDITOR_FONT_SIZE);
+    edit_or_in_memory(cx, move |s| s.editor_font_size = DEFAULT_EDITOR_FONT_SIZE);
 }
 
 /// 터미널 배경 불투명도(`50..=100`). 매 프레임 렌더에서 부르므로 전체 복제 없이 읽는다.
@@ -1115,7 +1220,7 @@ pub fn confirm_running_close(cx: &App) -> bool {
 /// 실행 중 닫기 확인을 켜고 끄고 `settings.toml`에 저장한다(OWE-872 '다시 묻지 않기'·설정 스위치).
 pub fn set_confirm_running_close(enabled: bool, cx: &mut App) {
     if cx.has_global::<Config>() && current(cx).confirm_running_close != enabled {
-        edit(cx, |s| s.confirm_running_close = enabled);
+        edit(cx, move |s| s.confirm_running_close = enabled);
     }
 }
 
@@ -1151,9 +1256,8 @@ pub fn trigger_manual_update_check(cx: &mut App) {
             let mut next = cx.try_global::<UpdateState>().cloned().unwrap_or_default();
             match res {
                 Ok(CheckStatus::Ready(staged)) => {
-                    if current(cx).auto_restart_update && staged.spawn_relauncher().is_ok() {
-                        cx.quit();
-                        return;
+                    if current(cx).auto_restart_update {
+                        restart_staged_update(staged.clone(), cx);
                     }
                     next.staged = Some(staged.clone());
                     next.status = CheckStatus::Ready(staged);
@@ -1169,6 +1273,44 @@ pub fn trigger_manual_update_check(cx: &mut App) {
             }
             cx.set_global(next);
             cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
+/// Prepare the relauncher off the event loop, then use the application's durable quit action.
+fn restart_staged_update(staged: crate::updater::StagedUpdate, cx: &mut App) {
+    #[derive(Default)]
+    struct RestartPending(bool);
+    impl Global for RestartPending {}
+    if cx
+        .try_global::<RestartPending>()
+        .is_some_and(|pending| pending.0)
+    {
+        return;
+    }
+    cx.set_global(RestartPending(true));
+    let work = background_file_io(cx, move || staged.spawn_relauncher());
+    cx.spawn(async move |cx| {
+        let result = work.await;
+        cx.update(|cx| {
+            cx.set_global(RestartPending(false));
+            match result {
+                Ok(()) => {
+                    if let Ok(quit) = cx.build_action("shell::Quit", None) {
+                        cx.dispatch_action(quit.as_ref());
+                    }
+                }
+                Err(error) => {
+                    let mut state = cx
+                        .try_global::<crate::updater::UpdateState>()
+                        .cloned()
+                        .unwrap_or_default();
+                    state.status = crate::updater::CheckStatus::Error(error.user_message());
+                    cx.set_global(state);
+                    cx.refresh_windows();
+                }
+            }
         });
     })
     .detach();
@@ -1232,12 +1374,12 @@ pub fn sync_workspace_trust_file(dir: Option<&Path>, enabled: bool) {
     }
 }
 
-/// 시스템 외관 변경은 System 선택일 때 외관을 따르고, Dark 선택일 때 다크 모드를 유지한다.
+/// 시스템 외관 변경은 System 선택일 때 외관을 따르고, Dark/Light 고정 선택일 때는 고정 모드를 유지한다.
 pub fn system_appearance_changed(appearance: gpui::WindowAppearance, cx: &mut App) {
     match current(cx).theme {
         ThemeChoice::System => cx.defer(move |cx| crate::ui::apply(appearance.into(), cx)),
         ThemeChoice::Dark => cx.defer(|cx| crate::ui::apply(ThemeMode::Dark, cx)),
-        ThemeChoice::Light => {}
+        ThemeChoice::Light => cx.defer(|cx| crate::ui::apply(ThemeMode::Light, cx)),
     }
 }
 
@@ -1267,56 +1409,83 @@ fn apply(cx: &mut App) {
 /// 설정을 고쳐 바로 적용하고 `settings.toml`에 쓴다. 디스크의 유효한 최신 파일을
 /// 바탕으로 변경을 적용해 1초 폴링 전 외부 편집이 메모리 설정으로 덮어쓰기되지 않게 한다.
 /// 디스크 파일이 손상됐거나 읽을 수 없으면 쓰지 않고 오류만 남긴다.
-fn edit(cx: &mut App, f: impl FnOnce(&mut Settings)) {
+fn edit(cx: &mut App, f: impl Fn(&mut Settings) + Send + 'static) {
     let c = cx.global::<Config>();
-    let (mut settings, dir) = (c.settings.clone(), c.dir.clone());
-    let Some(dir) = dir else {
+    let Some(dir) = c.dir.clone() else {
         cx.global_mut::<Config>().error = Some(text::NO_STATE_DIR.get().into());
         return;
     };
+    let before = c.settings.clone();
+    let mut next = before.clone();
+    f(&mut next);
+    let c = cx.global_mut::<Config>();
+    c.revision = next_revision();
+    let revision = c.revision;
+    let epoch = c.epoch;
+    c.settings = next;
+    c.error = None;
+    cx.defer(apply);
+    let work = background_file_io(cx, move || persist_settings_edit(&dir, f));
+    cx.spawn(async move |cx| {
+        let result = work.await;
+        cx.update(|cx| {
+            let c = cx.global_mut::<Config>();
+            if c.epoch != epoch {
+                return;
+            }
+            if let Ok((settings, _)) = &result {
+                c.durable = settings.clone();
+            }
+            if c.revision != revision {
+                return;
+            }
+            c.initial_loaded = true;
+            match result {
+                Ok((settings, stamp)) => {
+                    c.settings = settings;
+                    c.stamp[0] = stamp;
+                }
+                Err(error) => {
+                    c.settings = c.durable.clone();
+                    c.error = Some(format!("{SETTINGS_FILE}: {error}").into());
+                }
+            }
+            cx.defer(apply);
+        });
+    })
+    .detach();
+}
+
+fn persist_settings_edit(
+    dir: &Path,
+    edit: impl Fn(&mut Settings),
+) -> Result<(Settings, Option<SystemTime>), String> {
     let path = dir.join(SETTINGS_FILE);
     let base = match std::fs::read_to_string(&path) {
         Ok(body) => {
-            let Ok(disk) = Settings::parse(&body) else {
-                cx.global_mut::<Config>().error =
-                    Some(format!("{SETTINGS_FILE}: {}", text::INVALID_SETTINGS.get()).into());
-                return;
-            };
-            settings = disk;
+            Settings::parse(&body).map_err(|_| text::INVALID_SETTINGS.get().to_owned())?;
             Some(body)
         }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => {
-            cx.global_mut::<Config>().error = Some(format!("{SETTINGS_FILE}: {e}").into());
-            return;
-        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
     };
-    f(&mut settings);
-    match save_settings(&path, &settings, base.as_deref()) {
-        Ok(()) => {
-            crate::i18n::set_language(settings.language, cx);
-            let enabled = settings.hibernation_enabled;
-            let auto_rename = settings.auto_rename_branch_from_work;
-            let workspace_trust = settings.workspace_trust_preset_enabled;
-            let c = cx.global_mut::<Config>();
-            c.settings = settings;
-            c.stamp[0] = modified(&path);
-            sync_hibernation_file(Some(&dir), enabled);
-            sync_auto_rename_file(Some(&dir), auto_rename);
-            sync_workspace_trust_file(Some(&dir), workspace_trust);
-            cx.defer(apply);
-        }
-        Err(e) => cx.global_mut::<Config>().error = Some(format!("{SETTINGS_FILE}: {e}").into()),
-    }
+    let mut settings = base
+        .as_deref()
+        .map(Settings::parse)
+        .transpose()
+        .map_err(|_| text::INVALID_SETTINGS.get().to_owned())?
+        .unwrap_or_default();
+    edit(&mut settings);
+    save_settings(&path, &settings, base.as_deref()).map_err(|error| error.to_string())?;
+    sync_hibernation_file(Some(dir), settings.hibernation_enabled);
+    sync_auto_rename_file(Some(dir), settings.auto_rename_branch_from_work);
+    sync_workspace_trust_file(Some(dir), settings.workspace_trust_preset_enabled);
+    Ok((settings, modified(&path)))
 }
 
 /// Select the UI language, apply it to open windows, and persist it in settings.toml.
 pub fn set_language(language: Language, cx: &mut App) {
-    let previous = current(cx).language;
-    edit(cx, |settings| settings.language = language);
-    if current(cx).language != previous {
-        reload(cx);
-    }
+    edit(cx, move |settings| settings.language = language);
 }
 
 /// 손상 파일을 덮어쓰지 않는다. 완성된 임시 파일만 같은 디렉터리에서 원자 교체한다.
@@ -1459,18 +1628,24 @@ fn open_file(name: &str, template: &str, cx: &mut App) {
         return;
     };
     let path = dir.join(name);
-    if !path.exists() {
-        std::fs::create_dir_all(&dir).ok();
-        if name == SETTINGS_FILE {
-            write_settings(&path, template).ok();
-        } else if name == krill_proto::agent::FILE_NAME {
-            // 프로필 env에 비밀값(API 키 등)이 들어갈 수 있어 0600 원자 쓰기로 만든다.
-            write_settings(&path, template).ok();
-        } else {
-            std::fs::write(&path, template).ok();
+    let template = template.to_owned();
+    let name = name.to_owned();
+    let work = background_file_io(cx, move || {
+        if !path.exists() {
+            std::fs::create_dir_all(&dir).ok();
+            if name == SETTINGS_FILE {
+                write_settings(&path, &template).ok();
+            } else {
+                std::fs::write(&path, template).ok();
+            }
         }
-    }
-    cx.open_with_system(&path);
+        path
+    });
+    cx.spawn(async move |cx| {
+        let path = work.await;
+        cx.update(|cx| cx.open_with_system(&path));
+    })
+    .detach();
 }
 
 /// 메인 워크스페이스 창(`Shell`)이 설정 페이지를 인앱 뷰로 열거나 닫을 때 쓰는 명령(Orca `activeView === 'settings'` 패리티).
@@ -2290,9 +2465,10 @@ pub struct SettingsView {
     account_rule_pending: bool,
     /// 브라우저 OAuth 로그인 진행 중(OWE-881). 있으면 해당 계정 행에 진행 표시·[취소].
     login_pending: Option<PendingLogin>,
-    /// `OpenCode` 로그인은 터미널에서 진행한다(OWE-881). `true`면 안내 카드와
+    /// agy·OpenCode 대화형 로그인 안내를 표시할 제공자. 값이 있으면 안내 카드와
     /// [터미널에서 실행] 버튼을 보이고, 버튼을 누르기 전에는 명령을 큐에 넣지 않는다.
-    opencode_login_prompt: bool,
+    terminal_login_provider: Option<krill_proto::usage::ProviderKind>,
+    terminal_login_account: Option<krill_proto::usage::AccountInfo>,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     /// 같은 기기 중복 등록 `(중복 id, 남길 id)`와 그것을 구한 호스트 목록(`ssh -G`, 백그라운드).
     ssh_duplicates: Vec<(String, String)>,
@@ -2306,6 +2482,7 @@ pub struct SettingsView {
     ssh_form: Option<SshForm>,
     tailscale_peers: Vec<crate::ssh_hosts::TailscalePeer>,
     tailscale_loaded: bool,
+    tailscale_pending: bool,
     ssh_auth_failed_host: Option<crate::ssh_hosts::SshHost>,
     ssh_keygen_confirm_host: Option<crate::ssh_hosts::SshHost>,
     skill_status: Option<SharedString>,
@@ -2318,6 +2495,11 @@ pub struct SettingsView {
     /// Agents 탭 렌더용 `agents.toml` 캐시((수정 시각, 본문), 새로고침 진행 중)와 디스크 읽기 횟수(AS-06).
     agents_file_cache: AgentsFileCache,
     agents_file_reads: u64,
+    agents_parsed: Option<std::sync::Arc<krill_proto::agent::Agents>>,
+    font_names: std::sync::Arc<Vec<String>>,
+    fonts_pending: bool,
+    theme_imports_pending: std::collections::BTreeSet<&'static str>,
+    fonts_checked: Option<std::time::Instant>,
     /// 기록 일시중지 데몬 지원. `None`은 아직 확인 전, `Some(false)`면 토글 비활성.
     history_pause_supported: Option<bool>,
     recording_status: Option<SharedString>,
@@ -2360,21 +2542,45 @@ pub struct SettingsView {
     space: space::Panel,
     /// 스케줄 추가/편집 모달 상태(OWE-740).
     schedule_modal: Option<schedules::ScheduleModal>,
+    schedule_form_generation: u64,
+    schedule_log_generation: u64,
     /// 선택된 스케줄 실행 기록 로그 뷰어(OWE-740).
     schedule_log: Option<schedules::ScheduleLogView>,
     /// 스케줄 즉시 실행·조작 오류(OWE-740).
     schedule_error: Option<SharedString>,
-    /// 터미널 탭에서 편집·미리보기 중인 테마 모드(OWE-956). `None`이면 앱의 현재 모드를 따른다.
+    /// 터미널 탭에서 현재 편집·미리보기 중인 테마 모드(OWE-956). `None`이면 앱의 현재 모드를 따른다.
     terminal_theme_target: Option<ThemeMode>,
     /// 터미널 테마 목록 검색 입력(OWE-956).
     terminal_theme_search: Option<(
         gpui::Entity<gpui_component::input::InputState>,
         Subscription,
     )>,
-    /// Ghostty·Warp 테마 가져오기 결과 메시지(OWE-956). 두 번째 값은 경고 여부.
+    /// Ghostty·Warp 테마 가져오기 상태 메시지(OWE-956). 두 번째 값은 경고/실패 여부.
     terminal_theme_status: Option<(SharedString, bool)>,
     /// 설정 창 루트 포커스. 아무것도 포커스되지 않으면 ⌘F 문맥([`SEARCH_CONTEXT`])이 키 경로에 없다.
+    file_jobs: std::collections::BTreeMap<&'static str, u64>,
+    file_revision: u64,
+    services: ServiceCache,
+    services_pending: bool,
+    services_checked: Option<std::time::Instant>,
+    services_poll: Option<gpui::Task<()>>,
     focus: gpui::FocusHandle,
+}
+
+#[derive(Default)]
+struct ServiceCache {
+    worktrees: std::sync::Arc<krill_proto::orchestration::WorktreeStore>,
+    orchestration: std::sync::Arc<krill_proto::orchestration::OrchestrationStore>,
+    aliases: std::collections::BTreeMap<String, String>,
+    schedules: Vec<krill_proto::schedule::Schedule>,
+    runs: Vec<krill_proto::schedule::ScheduleRun>,
+}
+
+fn canonical_repo_key(raw: &str) -> String {
+    std::fs::canonicalize(raw)
+        .unwrap_or_else(|_| PathBuf::from(raw))
+        .display()
+        .to_string()
 }
 
 /// ⌘F([`FocusSearch`])가 설정 창 안에서만 동작하게 하는 키 문맥. 셸의 터미널 찾기 ⌘F와 겹치지 않는다.
@@ -2540,6 +2746,7 @@ impl SettingsView {
         crate::orca_import::ensure_scanned(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
+                this.services_checked = None;
                 this.refresh_accounts_async(cx);
             }),
             tab: AdminTab::General,
@@ -2550,7 +2757,8 @@ impl SettingsView {
             accounts_offline: false,
             account_rule_pending: false,
             login_pending: None,
-            opencode_login_prompt: false,
+            terminal_login_provider: None,
+            terminal_login_account: None,
             ssh_hosts: Vec::new(),
             ssh_duplicates: Vec::new(),
             ssh_duplicates_for: None,
@@ -2561,6 +2769,7 @@ impl SettingsView {
             ssh_form: None,
             tailscale_peers: Vec::new(),
             tailscale_loaded: false,
+            tailscale_pending: false,
             ssh_auth_failed_host: None,
             ssh_keygen_confirm_host: None,
             skill_status: None,
@@ -2570,6 +2779,11 @@ impl SettingsView {
             accounts_refresh_pending: false,
             agents_file_cache: (None, false),
             agents_file_reads: 0,
+            agents_parsed: None,
+            font_names: std::sync::Arc::new(Vec::new()),
+            fonts_pending: false,
+            theme_imports_pending: std::collections::BTreeSet::new(),
+            fonts_checked: None,
             history_pause_supported: None,
             recording_status: None,
             added_counter: 1,
@@ -2589,13 +2803,37 @@ impl SettingsView {
             workflow_form: None,
             space: space::Panel::default(),
             schedule_modal: None,
+            schedule_form_generation: 0,
+            schedule_log_generation: 0,
             schedule_log: None,
             schedule_error: None,
             terminal_theme_target: None,
             terminal_theme_search: None,
             terminal_theme_status: None,
+            file_jobs: std::collections::BTreeMap::default(),
+            file_revision: 0,
+            services: ServiceCache::default(),
+            services_pending: false,
+            services_checked: None,
+            services_poll: None,
             focus: cx.focus_handle(),
         };
+        view.services_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(POLL).await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.tab == AdminTab::Workflows {
+                            this.services_checked = None;
+                            this.refresh_service_cache(cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }));
         view.refresh_accounts_async(cx);
         // 점검 스냅샷이 바뀌면 일반 탭 요약도 다시 그린다(구독은 앱 수명 동안 둔다).
         cx.observe_global::<crate::onboarding::ChecksSnapshot>(|_, cx| cx.notify())
@@ -2613,6 +2851,174 @@ impl SettingsView {
         })
         .detach();
         view
+    }
+
+    fn refresh_font_names(&mut self, cx: &mut Context<Self>) {
+        if self.fonts_pending
+            || self
+                .fonts_checked
+                .is_some_and(|at| at.elapsed() < Duration::from_mins(1))
+        {
+            return;
+        }
+        self.fonts_pending = true;
+        let text = cx.text_system().clone();
+        cx.spawn(async move |this, cx| {
+            let names = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut names = text.all_font_names();
+                    names.retain(|name| !name.starts_with('.'));
+                    let mut names = crate::terminal_font::usable_terminal_fonts(&text, &names);
+                    names.sort_unstable();
+                    names.dedup();
+                    std::sync::Arc::new(names)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.fonts_pending = false;
+                this.fonts_checked = Some(std::time::Instant::now());
+                this.font_names = names;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn save_agent_edit(
+        &mut self,
+        agent_id: &'static str,
+        args: String,
+        env: String,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = state_dir(cx);
+        self.file_job(
+            "agent-edit",
+            move || {
+                let dir = dir.ok_or_else(|| text::NO_STATE_DIR.get().to_owned())?;
+                save_agent_profile(&dir, agent_id, &args, &env)?;
+                let path = dir.join(krill_proto::agent::FILE_NAME);
+                let body = std::fs::read_to_string(&path).ok();
+                let parsed = std::sync::Arc::new(
+                    krill_proto::agent::Agents::load(body.as_deref()).unwrap_or_default(),
+                );
+                Ok::<_, String>(((modified(&path), body), parsed))
+            },
+            move |this, result, _| {
+                let status = match result {
+                    Ok((cache, parsed)) => {
+                        this.agents_file_cache.0 = Some(cache);
+                        this.agents_parsed = Some(parsed);
+                        (text::AGENT_SAVED.get().into(), false)
+                    }
+                    Err(error) => (error.into(), true),
+                };
+                if let Some(edit) = this.agent_edits.get_mut(agent_id) {
+                    edit.status = Some(status);
+                }
+            },
+            cx,
+        );
+    }
+
+    fn file_job<R: Send + 'static>(
+        &mut self,
+        key: &'static str,
+        work: impl FnOnce() -> R + Send + 'static,
+        finish: impl FnOnce(&mut Self, R, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_jobs.contains_key(key)
+            && !matches!(
+                key,
+                "ssh-edit"
+                    | "worktree-edit"
+                    | "schedule-edit"
+                    | "keys-edit"
+                    | "account-local"
+                    | "agent-edit"
+            )
+        {
+            return;
+        }
+        self.file_revision = self.file_revision.wrapping_add(1);
+        let revision = self.file_revision;
+        self.file_jobs.insert(key, revision);
+        let job = background_file_io(cx, work);
+        cx.spawn(async move |this, cx| {
+            let result = job.await;
+            this.update(cx, |this, cx| {
+                if this.file_jobs.get(key) != Some(&revision) {
+                    return;
+                }
+                this.file_jobs.remove(key);
+                this.services_checked = None;
+                finish(this, result, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn refresh_service_cache(&mut self, cx: &mut Context<Self>) {
+        if self.services_pending || self.services_checked.is_some_and(|at| at.elapsed() < POLL) {
+            return;
+        }
+        self.services_pending = true;
+        let dir = state_dir(cx);
+        let revision = self.file_revision;
+        let repo = self
+            .workflow_form
+            .as_ref()
+            .map(|form| form.repo_path.read(cx).value().to_string());
+        cx.spawn(async move |this, cx| {
+            let cache = cx
+                .background_executor()
+                .spawn(async move {
+                    let Some(dir) = dir else {
+                        return ServiceCache::default();
+                    };
+                    ServiceCache {
+                        worktrees: std::sync::Arc::new(
+                            krill_proto::orchestration::WorktreeStore::load(&dir)
+                                .unwrap_or_default(),
+                        ),
+                        orchestration: std::sync::Arc::new(
+                            krill_proto::orchestration::OrchestrationStore::load(&dir)
+                                .unwrap_or_default(),
+                        ),
+                        aliases: repo
+                            .into_iter()
+                            .map(|raw| {
+                                let canonical = canonical_repo_key(&raw);
+                                (raw, canonical)
+                            })
+                            .collect(),
+                        schedules: krill_proto::schedule::Schedules::load(&dir)
+                            .unwrap_or_default()
+                            .schedule,
+                        runs: krill_proto::schedule::load_coalesced_runs(&dir).unwrap_or_default(),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.services_pending = false;
+                if this.file_revision != revision {
+                    return;
+                }
+                this.services = cache;
+                this.services_checked = Some(std::time::Instant::now());
+                if let Some(form) = &mut this.workflow_form {
+                    form.loaded_repo = None;
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn tab(&self) -> AdminTab {
@@ -2662,6 +3068,10 @@ impl SettingsView {
         self.shortcuts = shortcuts::Recorder::default();
         if tab == AdminTab::Ssh && !self.tailscale_loaded {
             self.refresh_tailscale_peers(cx);
+        }
+        if tab == AdminTab::Workflows {
+            self.services_checked = None;
+            self.refresh_service_cache(cx);
         }
         if tab == AdminTab::Mobile {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
@@ -2727,6 +3137,26 @@ impl SettingsView {
         &self.accounts_snapshot
     }
 
+    pub fn update_accounts_snapshot(
+        &mut self,
+        snapshot: krill_proto::usage::AccountsSnapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if self.account_rule_pending {
+            return;
+        }
+        if let Some(error) = snapshot
+            .details
+            .handoffs
+            .iter()
+            .find_map(|h| h.error.as_ref())
+        {
+            self.account_error = Some(error.clone().into());
+        }
+        self.accounts_snapshot = snapshot;
+        cx.notify();
+    }
+
     pub fn ssh_hosts(&self) -> &[crate::ssh_hosts::SshHost] {
         &self.ssh_hosts
     }
@@ -2747,13 +3177,10 @@ impl SettingsView {
             );
             return;
         }
-        let result = crate::accounts::request_local(
-            &crate::accounts::default_home(),
-            dir.as_deref(),
-            &krill_proto::usage::UsageRequest::UpsertAutoSwitchRule(rule),
-        )
-        .map_err(|e| e.to_string());
-        self.finish_account_rule_request(result, cx);
+        self.apply_account_request(
+            krill_proto::usage::UsageRequest::UpsertAutoSwitchRule(rule),
+            cx,
+        );
     }
 
     pub fn clear_account_rule(
@@ -2774,16 +3201,13 @@ impl SettingsView {
             );
             return;
         }
-        let result = crate::accounts::request_local(
-            &crate::accounts::default_home(),
-            dir.as_deref(),
-            &krill_proto::usage::UsageRequest::RemoveAutoSwitchRule {
+        self.apply_account_request(
+            krill_proto::usage::UsageRequest::RemoveAutoSwitchRule {
                 provider,
                 from_account_id: from_account_id.to_owned(),
             },
-        )
-        .map_err(|e| e.to_string());
-        self.finish_account_rule_request(result, cx);
+            cx,
+        );
     }
 
     /// 데몬 IPC(연결·읽기 타임아웃 포함)는 UI 스레드를 막지 않게 백그라운드에서 돌린다.
@@ -2826,19 +3250,26 @@ impl SettingsView {
     }
 
     /// 렌더는 메모리 캐시만 읽고, 수정 시각 확인·본문 읽기는 백그라운드로 보낸다(AS-06).
+    #[cfg(all(test, unix))]
     fn cached_agents_file(&mut self, dir: Option<&Path>, cx: &mut Context<Self>) -> Option<String> {
-        let cached = self
-            .agents_file_cache
+        self.ensure_agents_file(dir, cx);
+        self.agents_file_cache
             .0
             .as_ref()
-            .and_then(|(_, body)| body.clone());
-        let Some(dir) = dir else { return cached };
+            .and_then(|(_, body)| body.clone())
+    }
+
+    fn ensure_agents_file(&mut self, dir: Option<&Path>, cx: &mut Context<Self>) {
+        let Some(dir) = dir else {
+            return;
+        };
         if self.agents_file_cache.1 {
-            return cached;
+            return;
         }
         self.agents_file_cache.1 = true;
         let path = dir.join(krill_proto::agent::FILE_NAME);
         let previous = self.agents_file_cache.0.as_ref().map(|(stamp, _)| *stamp);
+        let revision = self.file_revision;
         cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
@@ -2847,22 +3278,29 @@ impl SettingsView {
                     if previous == Some(stamp) {
                         None
                     } else {
-                        Some((stamp, std::fs::read_to_string(path).ok()))
+                        let body = std::fs::read_to_string(path).ok();
+                        let parsed = std::sync::Arc::new(
+                            krill_proto::agent::Agents::load(body.as_deref()).unwrap_or_default(),
+                        );
+                        Some(((stamp, body), parsed))
                     }
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.agents_file_cache.1 = false;
-                if let Some(loaded) = loaded {
+                if this.file_revision != revision {
+                    return;
+                }
+                if let Some((loaded, parsed)) = loaded {
                     this.agents_file_reads += 1;
                     this.agents_file_cache.0 = Some(loaded);
+                    this.agents_parsed = Some(parsed);
                     cx.notify();
                 }
             })
             .ok();
         })
         .detach();
-        cached
     }
 
     /// 데몬 없이 계정을 바꾸려 하면 막고 "데몬 연결 필요"를 띄운 뒤 다시 연결을 확인한다(OWE-697).
@@ -2886,6 +3324,8 @@ impl SettingsView {
             return;
         }
         self.accounts_refresh_pending = true;
+        let file_revision = self.file_revision;
+        cx.notify();
         let before = (self.accounts_snapshot.clone(), self.account_error.clone());
         let home = crate::orca_import::state(cx)
             .and_then(|s| s.home_override.clone())
@@ -2937,7 +3377,10 @@ impl SettingsView {
                     this.probe_identities(cx);
                 }
                 // 시작 뒤 처리된 계정 요청의 성공·거부는 오래된 갱신보다 최신이다.
-                if this.accounts_snapshot == before.0 && this.account_error == before.1 {
+                if !this.account_rule_pending
+                    && this.accounts_snapshot == before.0
+                    && this.account_error == before.1
+                {
                     let mut next = loaded.0;
                     if !daemon {
                         Self::merge_local_snapshot_tails(&this.accounts_snapshot, &mut next);
@@ -2945,12 +3388,33 @@ impl SettingsView {
                     this.accounts_snapshot = next;
                     this.account_error = loaded.2.map(SharedString::from);
                 }
-                this.ssh_hosts = loaded.1;
+                if this.file_revision == file_revision {
+                    this.ssh_hosts = loaded.1;
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    fn refresh_accounts_manually(&mut self, cx: &mut Context<Self>) {
+        let daemon = is_daemon_state_dir(state_dir(cx).as_deref());
+        self.apply_account_request(krill_proto::usage::UsageRequest::ListAccounts, cx);
+        if daemon {
+            cx.spawn(async move |this, cx| {
+                for delay_ms in [700_u64, 1_100] {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(delay_ms))
+                        .await;
+                    this.update(cx, |this, cx| {
+                        this.refresh_accounts_async(cx);
+                    })
+                    .ok();
+                }
+            })
+            .detach();
+        }
     }
 
     fn merge_local_snapshot_tails(
@@ -2962,6 +3426,9 @@ impl SettingsView {
         }
         if prev.advanced.supported {
             next.advanced.clone_from(&prev.advanced);
+        }
+        if prev.details.supported {
+            next.details.clone_from(&prev.details);
         }
         if !prev.statuses.is_empty() && next.statuses.is_empty() {
             next.statuses.clone_from(&prev.statuses);
@@ -2998,6 +3465,7 @@ impl SettingsView {
             return;
         }
         self.identities.1.extend(todo.iter().map(|a| a.id.clone()));
+        let before = self.accounts_snapshot.clone();
         cx.spawn(async move |this, cx| {
             let (found, snapshot) = cx
                 .background_executor()
@@ -3045,7 +3513,10 @@ impl SettingsView {
                 .await;
             this.update(cx, |this, cx| {
                 this.identities.0.extend(found);
-                if let Some(snap) = snapshot {
+                if !this.account_rule_pending
+                    && this.accounts_snapshot == before
+                    && let Some(snap) = snapshot
+                {
                     this.accounts_snapshot = snap;
                 }
                 cx.notify();
@@ -3063,14 +3534,29 @@ impl SettingsView {
         let dir = state_dir(cx);
         if !is_daemon_state_dir(dir.as_deref()) {
             let home = crate::accounts::default_home();
-            crate::accounts::request_local(
-                &home,
-                dir.as_deref(),
-                &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
-            )
-            .ok();
-            self.orphan_profiles = crate::accounts::orphans_local(&home, dir.as_deref());
-            cx.notify();
+            self.file_job(
+                "account-local",
+                move || {
+                    let result = crate::accounts::request_local(
+                        &home,
+                        dir.as_deref(),
+                        &krill_proto::usage::UsageRequest::PurgeOrphanProfiles,
+                    );
+                    let orphans = crate::accounts::orphans_local(&home, dir.as_deref());
+                    (result, orphans)
+                },
+                |this, (result, orphans), cx| {
+                    match result {
+                        Ok(snapshot) => {
+                            this.accounts_snapshot = snapshot;
+                            this.orphan_profiles = orphans;
+                        }
+                        Err(error) => this.account_error = Some(error.to_string().into()),
+                    }
+                    cx.notify();
+                },
+                cx,
+            );
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -3096,7 +3582,7 @@ impl SettingsView {
         .detach();
     }
 
-    /// 추가와 재로그인 모두 백그라운드 로그인 CLI를 실행한다. 앱 스레드에서는 IPC를 기다리지 않는다.
+    /// Claude·Codex는 백그라운드, agy·OpenCode는 안내 후 터미널에서 로그인한다.
     /// 브라우저 로그인이 끝나기 전에는 `login_pending`을 유지해 진행 표시·[취소]를 보이고,
     /// 스레드가 남긴 [`crate::accounts::LoginOutcome`]으로 성공·실패·취소를 닫는다(OWE-881).
     fn login_account(
@@ -3111,14 +3597,17 @@ impl SettingsView {
         }
         if !matches!(
             provider,
-            krill_proto::usage::ProviderKind::Claude
-                | krill_proto::usage::ProviderKind::Codex
-                | krill_proto::usage::ProviderKind::Antigravity
+            krill_proto::usage::ProviderKind::Claude | krill_proto::usage::ProviderKind::Codex
         ) {
-            // OWE-881: OpenCode는 안내 카드에서 [터미널에서 실행]을 눌러야 명령이 간다.
+            // 대화형 로그인은 안내 카드에서 [터미널에서 실행]을 눌러야 명령이 간다.
             // 예전처럼 호출 즉시 큐에 넣고 설정 화면을 닫지 않는다.
-            if provider == krill_proto::usage::ProviderKind::OpenCode {
-                self.opencode_login_prompt = true;
+            if matches!(
+                provider,
+                krill_proto::usage::ProviderKind::OpenCode
+                    | krill_proto::usage::ProviderKind::Antigravity
+            ) {
+                self.terminal_login_provider = Some(provider);
+                self.terminal_login_account = account;
                 self.account_error = None;
                 cx.notify();
                 return;
@@ -3280,11 +3769,95 @@ impl SettingsView {
         cx.notify();
     }
 
-    /// `OpenCode` 안내 카드의 [터미널에서 실행](OWE-881). 사용자가 직접 누른 뒤라
+    /// 대화형 로그인 안내 카드의 [터미널에서 실행]. 사용자가 직접 누른 뒤라
     /// 설정 화면이 닫히고 활성 터미널에서 로그인 명령이 실행돼도 된다.
-    fn run_opencode_login(&mut self, cx: &mut Context<Self>) {
-        self.opencode_login_prompt = false;
-        queue_terminal_command("opencode auth login", cx);
+    fn run_terminal_login(&mut self, cx: &mut Context<Self>) {
+        use krill_proto::usage::UsageRequest;
+        if self.account_rule_pending || self.daemon_required(cx) {
+            return;
+        }
+        let Some(provider) = self.terminal_login_provider.take() else {
+            return;
+        };
+        let account = self.terminal_login_account.take();
+        let dir = state_dir(cx);
+        let daemon = is_daemon_state_dir(dir.as_deref());
+        let n = self.added_counter;
+        let home = crate::orca_import::state(cx)
+            .and_then(|s| s.home_override.clone())
+            .or_else(|| {
+                cfg!(test)
+                    .then(|| dir.as_ref().map(|d| d.join("test-home")))
+                    .flatten()
+            })
+            .unwrap_or_else(crate::accounts::default_home);
+        self.added_counter = n.saturating_add(1);
+        let request = move || {
+            let paths = if daemon {
+                Some(krill_proto::daemon::Paths::dev().map_err(|e| e.to_string())?)
+            } else {
+                None
+            };
+            let send = |req: &UsageRequest| match &paths {
+                Some(paths) => crate::accounts::request_ipc(paths, req),
+                None => crate::accounts::request_local(&home, dir.as_deref(), req)
+                    .map_err(|e| e.to_string()),
+            };
+            let snap = send(&UsageRequest::ListAccounts)?;
+            let account = if let Some(account) = account {
+                account
+            } else {
+                let mut next = n;
+                let label = loop {
+                    let label = format!("{} Profile #{next}", provider.display_name());
+                    if !snap
+                        .accounts
+                        .iter()
+                        .any(|a| a.provider == provider && a.label == label)
+                    {
+                        break label;
+                    }
+                    next = next.saturating_add(1);
+                };
+                send(&UsageRequest::AddAccount {
+                    provider,
+                    label: label.clone(),
+                    email: None,
+                    profile_dir: String::new(),
+                })?
+                .accounts
+                .into_iter()
+                .find(|a| a.provider == provider && a.label == label)
+                .ok_or_else(|| "new account profile missing".to_owned())?
+            };
+            Ok::<_, String>((
+                send(&UsageRequest::ListAccounts)?,
+                crate::accounts::terminal_login_command(&account),
+            ))
+        };
+        {
+            self.account_rule_pending = true;
+            cx.spawn(async move |this, cx| {
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { request() })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.account_rule_pending = false;
+                    match result {
+                        Ok((snap, command)) => {
+                            this.accounts_snapshot = snap;
+                            this.account_error = None;
+                            queue_terminal_command(&command, cx);
+                        }
+                        Err(error) => this.account_error = Some(error.into()),
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
         cx.notify();
     }
 
@@ -3323,16 +3896,21 @@ impl SettingsView {
             }
             let home = crate::accounts::default_home();
             let prev = self.accounts_snapshot.clone();
-            match crate::accounts::request_local(&home, dir.as_deref(), &req) {
-                Ok(mut snap) => {
-                    Self::merge_local_snapshot_tails(&prev, &mut snap);
-                    self.accounts_snapshot = snap;
-                    self.account_error = None;
-                    cx.defer(notify_external_change);
-                }
-                Err(e) => self.account_error = Some(e.to_string().into()),
-            }
-            cx.notify();
+            self.account_error = None;
+            self.file_job(
+                "account-local",
+                move || crate::accounts::request_local(&home, dir.as_deref(), &req),
+                move |this, result, cx| match result {
+                    Ok(mut snap) => {
+                        Self::merge_local_snapshot_tails(&prev, &mut snap);
+                        this.accounts_snapshot = snap;
+                        this.account_error = None;
+                        cx.defer(notify_external_change);
+                    }
+                    Err(error) => this.account_error = Some(error.to_string().into()),
+                },
+                cx,
+            );
             return;
         }
         // 실제 상태 디렉터리에서는 데몬이 확정 경로다. 로컬을 먼저 쓰면 데몬
@@ -3366,11 +3944,18 @@ impl SettingsView {
 
     pub fn import_ssh_hosts(&mut self, cx: &mut Context<Self>) {
         let dir = state_dir(cx);
-        if let Ok(hosts) = crate::ssh_hosts::import_from_ssh_config(dir.as_deref(), None) {
-            self.ssh_hosts = hosts;
-            cx.defer(notify_external_change);
-            cx.notify();
-        }
+        self.file_job(
+            "ssh-edit",
+            move || crate::ssh_hosts::import_from_ssh_config(dir.as_deref(), None),
+            |this, result, cx| match result {
+                Ok(hosts) => {
+                    this.ssh_hosts = hosts;
+                    cx.defer(notify_external_change);
+                }
+                Err(error) => this.ssh_status = Some(error.to_string().into()),
+            },
+            cx,
+        );
     }
 
     /// 호스트 목록이 바뀌었으면 같은 기기 중복을 백그라운드에서 다시 구한다.
@@ -3416,33 +4001,47 @@ impl SettingsView {
 
     pub fn remove_ssh_host(&mut self, id: &str, cx: &mut Context<Self>) {
         let dir = state_dir(cx);
-        if let Ok(hosts) = crate::ssh_hosts::remove_host(dir.as_deref(), id) {
-            self.ssh_hosts = hosts;
-            self.ssh_host_statuses.remove(id);
-            self.ssh_remote_infos.remove(id);
-            if let Some(form) = &mut self.ssh_form
-                && form.editing_id.as_deref() == Some(id)
-            {
-                form.editing_id = None;
-                form.error = None;
-            }
-            if self
-                .ssh_auth_failed_host
-                .as_ref()
-                .is_some_and(|h| h.id == id)
-            {
-                self.ssh_auth_failed_host = None;
-            }
-            if self
-                .ssh_keygen_confirm_host
-                .as_ref()
-                .is_some_and(|h| h.id == id)
-            {
-                self.ssh_keygen_confirm_host = None;
-            }
-            cx.defer(notify_external_change);
-            cx.notify();
-        }
+        let id = id.to_owned();
+        let bg_id = id.clone();
+        self.file_job(
+            "ssh-edit",
+            move || crate::ssh_hosts::remove_host(dir.as_deref(), &bg_id),
+            move |this, result, cx| {
+                let hosts = match result {
+                    Ok(hosts) => hosts,
+                    Err(error) => {
+                        this.ssh_status = Some(error.to_string().into());
+                        return;
+                    }
+                };
+                this.ssh_hosts = hosts;
+                this.ssh_host_statuses.remove(&id);
+                this.ssh_remote_infos.remove(&id);
+                if let Some(form) = &mut this.ssh_form
+                    && form.editing_id.as_deref() == Some(id.as_str())
+                {
+                    form.editing_id = None;
+                    form.error = None;
+                }
+                if this
+                    .ssh_auth_failed_host
+                    .as_ref()
+                    .is_some_and(|h| h.id == id)
+                {
+                    this.ssh_auth_failed_host = None;
+                }
+                if this
+                    .ssh_keygen_confirm_host
+                    .as_ref()
+                    .is_some_and(|h| h.id == id)
+                {
+                    this.ssh_keygen_confirm_host = None;
+                }
+                cx.defer(notify_external_change);
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     pub fn ssh_host_status(&self, id: &str) -> SshHostCardStatus {
@@ -3553,7 +4152,8 @@ impl SettingsView {
         }
     }
 
-    /// 입력값(이름·주소·포트·키 파일)을 검증해 `hosts.toml`에 저장한다. 실패 시 한국어/영어 안내 오류를 설정한다.
+    /// Validate immediately and queue `hosts.toml` persistence; completion reports storage errors.
+    /// Input fields are cleared only after a successful write and only if the user has not edited them.
     pub fn submit_ssh_host(
         &mut self,
         label: &str,
@@ -3577,88 +4177,121 @@ impl SettingsView {
         };
         let dir = state_dir(cx);
         let editing_id = self.ssh_form.as_ref().and_then(|f| f.editing_id.clone());
-        let save_res = if let Some(id) = &editing_id {
-            crate::ssh_hosts::update_host(
-                dir.as_deref(),
-                id,
-                &valid.label,
-                &valid.destination,
-                valid.port,
-                valid.identity_file,
-            )
-        } else {
-            crate::ssh_hosts::add_host(
-                dir.as_deref(),
-                &valid.label,
-                &valid.destination,
-                valid.port,
-                valid.identity_file,
-            )
-        };
-        match save_res {
-            Ok(hosts) => {
-                self.ssh_hosts = hosts;
-                if let Some(form) = &mut self.ssh_form {
-                    form.editing_id = None;
-                    form.error = None;
-                }
-                let status_tmpl = if editing_id.is_some() {
-                    text::SSH_UPDATED
+        let initial_form_values = self.ssh_form.as_ref().map(|form| {
+            [
+                form.label.read(cx).value().to_string(),
+                form.address.read(cx).value().to_string(),
+                form.port.read(cx).value().to_string(),
+                form.identity_file.read(cx).value().to_string(),
+            ]
+        });
+        let submitted_edit_id = editing_id.clone();
+        let label = valid.label.clone();
+        let editing = editing_id.is_some();
+        self.file_job(
+            "ssh-edit",
+            move || {
+                if let Some(id) = &editing_id {
+                    crate::ssh_hosts::update_host(
+                        dir.as_deref(),
+                        id,
+                        &valid.label,
+                        &valid.destination,
+                        valid.port,
+                        valid.identity_file,
+                    )
                 } else {
-                    text::SSH_ADDED
-                };
-                self.ssh_status = Some(status_tmpl.format(&[("label", &valid.label)]).into());
-                cx.defer(notify_external_change);
-                cx.notify();
-                Ok(())
-            }
-            Err(e) => {
-                let msg: SharedString = e.to_string().into();
-                if let Some(form) = &mut self.ssh_form {
-                    form.error = Some(msg.clone());
+                    crate::ssh_hosts::add_host(
+                        dir.as_deref(),
+                        &valid.label,
+                        &valid.destination,
+                        valid.port,
+                        valid.identity_file,
+                    )
                 }
-                self.ssh_status = Some(msg);
-                cx.notify();
-                Err(crate::ssh_hosts::HostInputError::InvalidAddress)
-            }
-        }
+            },
+            move |this, result, cx| match result {
+                Ok(hosts) => {
+                    this.ssh_hosts = hosts;
+                    cx.spawn(async move |this, cx| {
+                        this.update_in(cx, |this, window, cx| {
+                            let Some(form) = &mut this.ssh_form else {
+                                return;
+                            };
+                            let Some(submitted) = initial_form_values else {
+                                return;
+                            };
+                            let inputs =
+                                [&form.label, &form.address, &form.port, &form.identity_file];
+                            if form.editing_id != submitted_edit_id
+                                || inputs
+                                    .iter()
+                                    .zip(&submitted)
+                                    .any(|(input, value)| input.read(cx).value().as_str() != value)
+                            {
+                                return;
+                            }
+                            let inputs = inputs.map(Clone::clone);
+                            form.editing_id = None;
+                            form.error = None;
+                            for input in inputs {
+                                input.update(cx, |input, cx| input.set_value("", window, cx));
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    })
+                    .detach();
+                    let message = if editing {
+                        text::SSH_UPDATED
+                    } else {
+                        text::SSH_ADDED
+                    };
+                    this.ssh_status = Some(message.format(&[("label", &label)]).into());
+                    cx.defer(notify_external_change);
+                }
+                Err(error) => {
+                    let message: SharedString = error.to_string().into();
+                    if let Some(form) = &mut this.ssh_form {
+                        form.error = Some(message.clone());
+                    }
+                    this.ssh_status = Some(message);
+                }
+            },
+            cx,
+        );
+        Ok(())
     }
 
-    fn submit_ssh_host_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn submit_ssh_host_form(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(form) = &self.ssh_form else {
             return;
         };
-        let label_input = form.label.clone();
-        let addr_input = form.address.clone();
-        let port_input = form.port.clone();
-        let key_input = form.identity_file.clone();
-        let label = label_input.read(cx).value().to_string();
-        let address = addr_input.read(cx).value().to_string();
-        let port = port_input.read(cx).value().to_string();
-        let identity_file = key_input.read(cx).value().to_string();
-        if self
-            .submit_ssh_host(&label, &address, &port, &identity_file, cx)
-            .is_ok()
-        {
-            label_input.update(cx, |s, cx| s.set_value("", window, cx));
-            addr_input.update(cx, |s, cx| s.set_value("", window, cx));
-            port_input.update(cx, |s, cx| s.set_value("", window, cx));
-            key_input.update(cx, |s, cx| s.set_value("", window, cx));
-        }
+        let label = form.label.read(cx).value().to_string();
+        let address = form.address.read(cx).value().to_string();
+        let port = form.port.read(cx).value().to_string();
+        let identity_file = form.identity_file.read(cx).value().to_string();
+        self.submit_ssh_host(&label, &address, &port, &identity_file, cx)
+            .ok();
     }
 
     /// Tailscale 피어 목록을 백그라운드 실행기에서 조회해 갱신한다(UI 스레드 블로킹 금지).
     pub fn refresh_tailscale_peers(&mut self, cx: &mut Context<Self>) {
+        if self.tailscale_pending {
+            return;
+        }
         self.tailscale_loaded = true;
         if cfg!(test) && std::env::var_os("KRILL_TAILSCALE_BIN").is_none() {
             return;
         }
+        self.tailscale_pending = true;
         cx.spawn(async move |this, cx| {
             let peers = cx
                 .background_executor()
                 .spawn(async move { crate::ssh_hosts::discover_tailscale_peers() })
                 .await;
             this.update(cx, |this, cx| {
+                this.tailscale_pending = false;
                 this.tailscale_peers = peers;
                 cx.notify();
             })
@@ -3817,6 +4450,7 @@ impl SettingsView {
         }
         self.ssh_status = Some(format!("{}: {}", host.label, text::SSH_TESTING.get()).into());
         cx.notify();
+        let revision = self.file_revision;
         cx.spawn(async move |this, cx| {
             let host_for_bg = host.clone();
             let res = cx
@@ -3824,6 +4458,11 @@ impl SettingsView {
                 .spawn(async move { crate::ssh_hosts::test_connection(&host_for_bg) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.file_revision != revision {
+                    this.ssh_test_pending.remove(&host.id);
+                    this.ssh_remote_infos.remove(&host.id);
+                    return;
+                }
                 this.apply_ssh_test_result(host, res, cx);
             })
             .ok();
@@ -3856,12 +4495,22 @@ impl SettingsView {
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty());
         let home = Self::ssh_home_dir(cx);
-        if has_custom_key || crate::ssh_hosts::has_default_ssh_key(Some(&home)) {
-            self.launch_ssh_copy_id(host, cx);
-        } else {
-            self.ssh_keygen_confirm_host = Some(host);
-            cx.notify();
-        }
+        let revision = self.file_revision.wrapping_add(1);
+        self.file_job(
+            "ssh-key-check",
+            move || has_custom_key || crate::ssh_hosts::has_default_ssh_key(Some(&home)),
+            move |this, has_key, cx| {
+                if this.file_revision != revision {
+                    return;
+                }
+                if has_key {
+                    this.launch_ssh_copy_id(host, cx);
+                } else {
+                    this.ssh_keygen_confirm_host = Some(host);
+                }
+            },
+            cx,
+        );
     }
 
     /// 키 생성 확인 후 `~/.ssh/id_ed25519`를 생성하고 새 터미널 탭에서 `ssh-copy-id`를 실행한다.
@@ -3870,16 +4519,22 @@ impl SettingsView {
             return;
         };
         let home = Self::ssh_home_dir(cx);
+        let revision = self.file_revision;
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move { crate::ssh_hosts::generate_default_ssh_key(Some(&home)) })
                 .await;
-            this.update(cx, |this, cx| match res {
-                Ok(_) => this.launch_ssh_copy_id(host, cx),
-                Err(e) => {
-                    this.ssh_status = Some(format!("{}: {e}", host.label).into());
-                    cx.notify();
+            this.update(cx, |this, cx| {
+                if this.file_revision != revision {
+                    return;
+                }
+                match res {
+                    Ok(_) => this.launch_ssh_copy_id(host, cx),
+                    Err(e) => {
+                        this.ssh_status = Some(format!("{}: {e}", host.label).into());
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -3909,11 +4564,19 @@ impl SettingsView {
     /// OWE-897: 원격 OS·아키·버전·소켓을 백그라운드에서 조회한다.
     /// 네트워크 IO는 UI 스레드에서 절대 하지 않는다(CONVENTIONS T7).
     pub fn refresh_remote_info(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
+        if self
+            .ssh_remote_infos
+            .get(&host.id)
+            .is_some_and(|state| matches!(state.probe, RemoteProbeState::Loading))
+        {
+            return;
+        }
         self.ssh_remote_infos
             .entry(host.id.clone())
             .or_default()
             .probe = RemoteProbeState::Loading;
         cx.notify();
+        let revision = self.file_revision;
         cx.spawn(async move |this, cx| {
             let opts = host.to_ssh_options();
             let res = cx
@@ -3921,6 +4584,11 @@ impl SettingsView {
                 .spawn(async move { krill_hosts::managed::query_remote_info(&opts) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.file_revision != revision {
+                    this.ssh_test_pending.remove(&host.id);
+                    this.ssh_remote_infos.remove(&host.id);
+                    return;
+                }
                 this.apply_remote_probe(&host, res, cx);
             })
             .ok();
@@ -3950,6 +4618,13 @@ impl SettingsView {
 
     /// OWE-897: 원격에 로컬 런타임을 설치·기동한다(전 과정 백그라운드).
     pub fn install_remote(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
+        if self
+            .ssh_remote_infos
+            .get(&host.id)
+            .is_some_and(|state| matches!(state.install, RemoteInstallState::Running))
+        {
+            return;
+        }
         self.ssh_remote_infos
             .entry(host.id.clone())
             .or_default()
@@ -3957,12 +4632,18 @@ impl SettingsView {
         self.ssh_status = Some(text::SSH_REMOTE_INSTALLING.get().into());
         cx.notify();
         let bg_host = host.clone();
+        let revision = self.file_revision;
         cx.spawn(async move |this, cx| {
             let res = cx
                 .background_executor()
                 .spawn(async move { run_managed_install(&bg_host) })
                 .await;
             this.update(cx, |this, cx| {
+                if this.file_revision != revision {
+                    this.ssh_test_pending.remove(&host.id);
+                    this.ssh_remote_infos.remove(&host.id);
+                    return;
+                }
                 this.apply_install_result(&host, res, cx);
             })
             .ok();
@@ -4008,9 +4689,14 @@ impl SettingsView {
 
     pub fn run_doctor(&mut self, cx: &mut Context<Self>) {
         let dir = state_dir(cx);
-        let report = run_doctor_check(dir.as_deref());
-        self.doctor_status = Some(report.into());
-        cx.notify();
+        self.file_job(
+            "doctor",
+            move || run_doctor_check(dir.as_deref()),
+            |this, report, _| {
+                this.doctor_status = Some(report.into());
+            },
+            cx,
+        );
     }
 
     /// 7탭 기록 일시중지 토글. `Paused` ACK를 받은 뒤에만 `settings.toml`에 저장하고,
@@ -4038,7 +4724,7 @@ impl SettingsView {
                 Ok(echoed) if echoed == paused => {
                     this.history_pause_supported = Some(true);
                     this.recording_status = None;
-                    edit(cx, |s| s.recording_paused = paused);
+                    edit(cx, move |s| s.recording_paused = paused);
                 }
                 Ok(_) | Err(PauseError::Unsupported) => {
                     this.history_pause_supported = Some(false);
@@ -4121,14 +4807,14 @@ impl SettingsView {
             layout::segment(id, label, s.theme == choice)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
-                    edit(cx, |s| s.theme = choice);
+                    edit(cx, move |s| s.theme = choice);
                 })
         };
         let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
             layout::segment(id, label, s.keep_awake == mode)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
-                    edit(cx, |s| s.keep_awake = mode);
+                    edit(cx, move |s| s.keep_awake = mode);
                 })
         };
         let language_button = |id: &'static str, label: &'static str, language: Language| {
@@ -4203,7 +4889,9 @@ impl SettingsView {
                                 layout::secondary("zoom-out", "−")
                                     .disabled(zoom_at_min)
                                     .debug_selector(|| "zoom-out".into())
-                                    .on_click(|_, _, cx| edit(cx, |s| s.zoom = s.zoom_step(-1))),
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| s.zoom = s.zoom_step(-1));
+                                    }),
                             )
                             .child(
                                 div()
@@ -4219,13 +4907,15 @@ impl SettingsView {
                                 layout::secondary("zoom-in", "+")
                                     .disabled(zoom_at_max)
                                     .debug_selector(|| "zoom-in".into())
-                                    .on_click(|_, _, cx| edit(cx, |s| s.zoom = s.zoom_step(1))),
+                                    .on_click(|_, _, cx| {
+                                        edit(cx, move |s| s.zoom = s.zoom_step(1));
+                                    }),
                             )
                             .child(
                                 layout::ghost("zoom-reset", text::RESET.get())
                                     .disabled(zoom_at_default)
                                     .debug_selector(|| "zoom-reset".into())
-                                    .on_click(|_, _, cx| edit(cx, |s| s.zoom = 1.0)),
+                                    .on_click(|_, _, cx| edit(cx, move |s| s.zoom = 1.0)),
                             ),
                     ),
             )
@@ -4247,7 +4937,7 @@ impl SettingsView {
                         "notif-toggle",
                         s.notifications,
                         false,
-                        |next, _, cx| edit(cx, |s| s.notifications = next),
+                        |next, _, cx| edit(cx, move |s| s.notifications = next),
                     ))),
             )
             .child(
@@ -4261,7 +4951,7 @@ impl SettingsView {
                         "notify-input-toggle",
                         s.notify_on_input,
                         notif_disabled,
-                        |next, _, cx| edit(cx, |s| s.notify_on_input = next),
+                        |next, _, cx| edit(cx, move |s| s.notify_on_input = next),
                     ))),
             )
             .child(
@@ -4272,7 +4962,7 @@ impl SettingsView {
                         "notify-done-toggle",
                         s.notify_on_done,
                         notif_disabled,
-                        |next, _, cx| edit(cx, |s| s.notify_on_done = next),
+                        |next, _, cx| edit(cx, move |s| s.notify_on_done = next),
                     ))),
             )
             .child(
@@ -4283,7 +4973,7 @@ impl SettingsView {
                         "notify-bell-toggle",
                         s.notify_on_bell,
                         notif_disabled,
-                        |next, _, cx| edit(cx, |s| s.notify_on_bell = next),
+                        |next, _, cx| edit(cx, move |s| s.notify_on_bell = next),
                     ))),
             )
             .child(
@@ -4294,7 +4984,7 @@ impl SettingsView {
                         "sound-toggle",
                         s.notification_sound,
                         notif_disabled,
-                        |next, _, cx| edit(cx, |s| s.notification_sound = next),
+                        |next, _, cx| edit(cx, move |s| s.notification_sound = next),
                     ))),
             )
             .child(
@@ -4308,7 +4998,7 @@ impl SettingsView {
                         "notify-inactive-toggle",
                         s.notify_only_inactive,
                         notif_disabled,
-                        |next, _, cx| edit(cx, |s| s.notify_only_inactive = next),
+                        |next, _, cx| edit(cx, move |s| s.notify_only_inactive = next),
                     ))),
             )
             .child(
@@ -4456,9 +5146,7 @@ impl SettingsView {
                 layout::primary("settings-update-restart", restart_label)
                     .debug_selector(|| "settings-update-restart".into())
                     .on_click(move |_, _, cx| {
-                        if staged.spawn_relauncher().is_ok() {
-                            cx.quit();
-                        }
+                        restart_staged_update(staged.clone(), cx);
                     }),
             );
         }
@@ -4478,7 +5166,7 @@ impl SettingsView {
                     "update-auto-restart-toggle",
                     s.auto_restart_update,
                     false,
-                    |next, _, cx| edit(cx, |s| s.auto_restart_update = next),
+                    |next, _, cx| edit(cx, move |s| s.auto_restart_update = next),
                 ))),
         ]
     }
@@ -4501,13 +5189,19 @@ impl SettingsView {
         input
     }
 
-    fn import_ghostty_themes(cx: &mut Context<Self>) {
+    fn import_ghostty_themes(&mut self, cx: &mut Context<Self>) {
+        if !self.theme_imports_pending.insert("ghostty") {
+            return;
+        }
+        let revision = cx.try_global::<Config>().map(|config| config.revision);
         cx.spawn(async move |this, cx| {
             let imported = cx
                 .background_executor()
                 .spawn(async move { crate::ui::discover_and_import_ghostty() })
                 .await;
             this.update(cx, |this, cx| {
+                this.theme_imports_pending.remove("ghostty");
+                let select = cx.try_global::<Config>().map(|config| config.revision) == revision;
                 let has_any = imported.found
                     || !imported.custom_themes.is_empty()
                     || imported.dark_theme.is_some()
@@ -4517,15 +5211,15 @@ impl SettingsView {
                     edit(cx, move |s| {
                         crate::ui::merge_custom_themes(
                             &mut s.terminal_custom_themes,
-                            imported.custom_themes,
+                            imported.custom_themes.clone(),
                         );
-                        if let Some(dark) = imported.dark_theme {
+                        if select && let Some(dark) = imported.dark_theme.clone() {
                             s.terminal_theme_dark = dark;
                         }
-                        if let Some(light) = imported.light_theme {
+                        if select && let Some(light) = imported.light_theme.clone() {
                             s.terminal_theme_light = light;
                         }
-                        if let Some(use_sep) = imported.use_separate_light_theme {
+                        if select && let Some(use_sep) = imported.use_separate_light_theme {
                             s.terminal_use_separate_light_theme = use_sep;
                         }
                     });
@@ -4546,13 +5240,17 @@ impl SettingsView {
         .detach();
     }
 
-    fn import_warp_themes(cx: &mut Context<Self>) {
+    fn import_warp_themes(&mut self, cx: &mut Context<Self>) {
+        if !self.theme_imports_pending.insert("warp") {
+            return;
+        }
         cx.spawn(async move |this, cx| {
             let report = cx
                 .background_executor()
                 .spawn(async move { crate::ui::discover_and_import_warp_themes() })
                 .await;
             this.update(cx, |this, cx| {
+                this.theme_imports_pending.remove("warp");
                 if report.themes.is_empty() {
                     this.terminal_theme_status =
                         Some((text::TERMINAL_THEME_IMPORT_NONE.get().into(), true));
@@ -4560,7 +5258,10 @@ impl SettingsView {
                     let count = report.themes.len();
                     let themes = report.themes;
                     edit(cx, move |s| {
-                        crate::ui::merge_custom_themes(&mut s.terminal_custom_themes, themes);
+                        crate::ui::merge_custom_themes(
+                            &mut s.terminal_custom_themes,
+                            themes.clone(),
+                        );
                     });
                     this.terminal_theme_status = Some((
                         text::TERMINAL_THEME_IMPORTED_OK
@@ -4619,7 +5320,7 @@ impl SettingsView {
         const PREVIEW_FN: &str = "apply_theme";
         const PREVIEW_ARGS: &str = "(mode: ThemeMode) -> ";
         const PREVIEW_RET: &str = "TerminalTheme ";
-        const PREVIEW_COMMENT: &str = "// 31 built-in + custom themes";
+        const PREVIEW_COMMENT: &str = "// 30 built-in + custom themes";
         const PREVIEW_CURSOR_CHAR: &str = " ";
 
         let preview = crate::ui::terminal_theme_for_mode(target_mode, s);
@@ -4837,8 +5538,8 @@ impl SettingsView {
             text::TERMINAL_THEME_IMPORT_GHOSTTY.get(),
         )
         .debug_selector(|| "terminal-theme-import-ghostty".into())
-        .on_click(cx.listener(|_, _, _, cx| {
-            Self::import_ghostty_themes(cx);
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.import_ghostty_themes(cx);
         }));
 
         let import_warp_btn = layout::secondary(
@@ -4846,8 +5547,8 @@ impl SettingsView {
             text::TERMINAL_THEME_IMPORT_WARP.get(),
         )
         .debug_selector(|| "terminal-theme-import-warp".into())
-        .on_click(cx.listener(|_, _, _, cx| {
-            Self::import_warp_themes(cx);
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.import_warp_themes(cx);
         }));
 
         let mut list = div()
@@ -4940,10 +5641,10 @@ impl SettingsView {
                             let val = sel_val.clone();
                             edit(cx, move |s| {
                                 if want_dark {
-                                    s.terminal_theme_dark = val;
+                                    s.terminal_theme_dark.clone_from(&val);
                                 } else {
                                     s.terminal_use_separate_light_theme = true;
-                                    s.terminal_theme_light = val;
+                                    s.terminal_theme_light.clone_from(&val);
                                 }
                             });
                         })
@@ -5172,23 +5873,21 @@ impl SettingsView {
         let editor_font_pt = format!("{}pt", s.editor_font_size());
         let opacity_val = s.terminal_opacity_pct();
         let opacity_pct = format!("{opacity_val}%");
+        self.refresh_font_names(cx);
+        let font_names = self.font_names.clone();
         let family = s.terminal_font_family.clone();
         let font_family = layout::secondary("terminal-font-family", family.clone())
             .debug_selector(|| "terminal-font-family".into())
-            .dropdown_menu(move |mut menu, window, _| {
-                // 설치 글꼴 중 고정폭만(OWE-899, 숨김 시스템 글꼴 `.` 시작 제외). 열 때만 읽는다.
-                // 글꼴마다 해석·advance를 재므로 항목이 많으면 열리는 데 시간이 걸릴 수 있다.
-                let text: &gpui::TextSystem = window.text_system();
-                let mut names = text.all_font_names();
-                names.retain(|n| !n.starts_with('.'));
-                names = crate::terminal_font::usable_terminal_fonts(text, &names);
-                names.sort_unstable();
-                names.dedup();
+            .disabled(self.fonts_pending && self.font_names.is_empty())
+            .dropdown_menu(move |mut menu, _, _| {
                 menu = menu.scrollable(true).max_h(px(360.));
-                for name in names {
+                for name in font_names.iter().cloned() {
                     let checked = name == family;
                     menu = menu.item(PopupMenuItem::new(name.clone()).checked(checked).on_click(
-                        move |_, _, cx| edit(cx, |s| s.terminal_font_family.clone_from(&name)),
+                        move |_, _, cx| {
+                            let name = name.clone();
+                            edit(cx, move |s| s.terminal_font_family.clone_from(&name));
+                        },
                     ));
                 }
                 menu
@@ -5196,7 +5895,7 @@ impl SettingsView {
         let cursor_button = |id: &'static str, title: &'static str, shape: TerminalCursorShape| {
             layout::segment(id, title, s.terminal_cursor_shape == shape)
                 .debug_selector(move || id.into())
-                .on_click(move |_, _, cx| edit(cx, |s| s.terminal_cursor_shape = shape))
+                .on_click(move |_, _, cx| edit(cx, move |s| s.terminal_cursor_shape = shape))
         };
         div()
             .flex()
@@ -5238,7 +5937,7 @@ impl SettingsView {
                                     .disabled(font_size <= 10)
                                     .debug_selector(|| "font-dec".into())
                                     .on_click(|_, _, cx| {
-                                        edit(cx, |s| {
+                                        edit(cx, move |s| {
                                             s.terminal_font_size =
                                                 s.terminal_font_size().saturating_sub(1).max(10);
                                         });
@@ -5259,7 +5958,7 @@ impl SettingsView {
                                     .disabled(font_size >= 24)
                                     .debug_selector(|| "font-inc".into())
                                     .on_click(|_, _, cx| {
-                                        edit(cx, |s| {
+                                        edit(cx, move |s| {
                                             s.terminal_font_size =
                                                 s.terminal_font_size().saturating_add(1).min(24);
                                         });
@@ -5271,7 +5970,7 @@ impl SettingsView {
                                     .tooltip(text::FONT_RESET.get())
                                     .debug_selector(|| "font-reset".into())
                                     .on_click(|_, _, cx| {
-                                        edit(cx, |s| {
+                                        edit(cx, move |s| {
                                             s.terminal_font_size = default_terminal_font_size();
                                         });
                                     }),
@@ -5290,7 +5989,7 @@ impl SettingsView {
                             .debug_selector(|| "editor-font-dec".into())
                             .ghost()
                             .on_click(|_, _, cx| {
-                                edit(cx, |s| {
+                                edit(cx, move |s| {
                                     s.editor_font_size = s.editor_font_size_step(-1);
                                 });
                             }),
@@ -5308,7 +6007,7 @@ impl SettingsView {
                             .debug_selector(|| "editor-font-inc".into())
                             .ghost()
                             .on_click(|_, _, cx| {
-                                edit(cx, |s| {
+                                edit(cx, move |s| {
                                     s.editor_font_size = s.editor_font_size_step(1);
                                 });
                             }),
@@ -5320,7 +6019,7 @@ impl SettingsView {
                             .debug_selector(|| "editor-font-reset".into())
                             .ghost()
                             .on_click(|_, _, cx| {
-                                edit(cx, |s| s.editor_font_size = default_editor_font_size());
+                                edit(cx, move |s| s.editor_font_size = default_editor_font_size());
                             }),
                     ),
             )
@@ -5334,7 +6033,7 @@ impl SettingsView {
                                     .disabled(opacity_val <= 50)
                                     .debug_selector(|| "opacity-dec".into())
                                     .on_click(|_, _, cx| {
-                                        edit(cx, |s| {
+                                        edit(cx, move |s| {
                                             s.terminal_opacity_pct =
                                                 s.terminal_opacity_pct().saturating_sub(5).max(50);
                                         });
@@ -5355,7 +6054,7 @@ impl SettingsView {
                                     .disabled(opacity_val >= 100)
                                     .debug_selector(|| "opacity-inc".into())
                                     .on_click(|_, _, cx| {
-                                        edit(cx, |s| {
+                                        edit(cx, move |s| {
                                             s.terminal_opacity_pct =
                                                 s.terminal_opacity_pct().saturating_add(5).min(100);
                                         });
@@ -5366,7 +6065,7 @@ impl SettingsView {
                                     .disabled(opacity_val == default_terminal_opacity_pct())
                                     .debug_selector(|| "opacity-reset".into())
                                     .on_click(|_, _, cx| {
-                                        edit(cx, |s| s.terminal_opacity_pct = 100);
+                                        edit(cx, move |s| s.terminal_opacity_pct = 100);
                                     }),
                             ),
                     ),
@@ -5418,7 +6117,7 @@ impl SettingsView {
                         "cursor-blink-toggle",
                         s.terminal_cursor_blink,
                         false,
-                        |next, _, cx| edit(cx, |s| s.terminal_cursor_blink = next),
+                        |next, _, cx| edit(cx, move |s| s.terminal_cursor_blink = next),
                     ))),
             )
             .child(layout::section_title(
@@ -5437,7 +6136,7 @@ impl SettingsView {
                         "option-meta-toggle",
                         s.option_as_meta,
                         false,
-                        |next, _, cx| edit(cx, |s| s.option_as_meta = next),
+                        |next, _, cx| edit(cx, move |s| s.option_as_meta = next),
                     ))),
             )
             .child(
@@ -5451,7 +6150,7 @@ impl SettingsView {
                         "copy-select-toggle",
                         s.copy_on_select,
                         false,
-                        |next, _, cx| edit(cx, |s| s.copy_on_select = next),
+                        |next, _, cx| edit(cx, move |s| s.copy_on_select = next),
                     ))),
             )
             .child(
@@ -5465,20 +6164,27 @@ impl SettingsView {
                         "confirm-running-close-toggle",
                         s.confirm_running_close,
                         false,
-                        |next, _, cx| edit(cx, |s| s.confirm_running_close = next),
+                        |next, _, cx| edit(cx, move |s| s.confirm_running_close = next),
                     ))),
             )
     }
 
     /// 계정 행의 5h·7d 미니 사용량 바(OWE-719, OWE-797). 리셋 시각은 인라인 메타데이터와 묶음 툴팁([`format_account_usage`])에 함께 표시한다.
     fn render_usage_bar(
-        key: &'static str,
-        window_label: &'static str,
+        key: &str,
+        window_label: &str,
         win: Option<&krill_proto::usage::Window>,
         brand_color: gpui::Hsla,
         p: &crate::ui::Palette,
     ) -> gpui::Div {
         const BAR_W: f32 = 44.;
+        let label_id = format!("admin-usage-label-{key}");
+        let reset_id = format!("admin-usage-reset-{key}");
+        let label_width = if window_label.chars().count() > 5 {
+            164.
+        } else {
+            28.
+        };
         let now_secs = crate::accounts::display::now();
         let display =
             crate::accounts::display::window(win, i64::try_from(now_secs).unwrap_or(i64::MAX));
@@ -5497,10 +6203,10 @@ impl SettingsView {
             .gap_1p5()
             .child(
                 // 고정폭 + 줄바꿈 금지: 20px에서는 "5시간"이 "5시/간"으로 접혔다(OWE-719 QA D3).
-                mono(div().w(px(28.)).flex_none().whitespace_nowrap())
-                    .debug_selector(move || format!("admin-usage-label-{key}"))
+                mono(div().w(px(label_width)).flex_none().truncate())
+                    .debug_selector(move || label_id.clone())
                     .text_color(p.muted_foreground)
-                    .child(window_label),
+                    .child(window_label.to_owned()),
             )
             .child(
                 div()
@@ -5522,7 +6228,7 @@ impl SettingsView {
             )
             .children(reset.map(|reset| {
                 mono(div().flex_none().whitespace_nowrap())
-                    .debug_selector(move || format!("admin-usage-reset-{key}"))
+                    .debug_selector(move || reset_id.clone())
                     .text_color(p.muted_foreground)
                     .child(reset)
             }))
@@ -5858,7 +6564,14 @@ impl SettingsView {
         );
         let conn = crate::accounts::display::connection(snap, acc, &usage);
         let needs_login = conn == Some(ConnectionStatus::NeedsLogin);
-        let can_login = !orca && matches!(provider, ProviderKind::Claude | ProviderKind::Codex);
+        let can_login = !orca
+            && matches!(
+                provider,
+                ProviderKind::Claude
+                    | ProviderKind::Codex
+                    | ProviderKind::Antigravity
+                    | ProviderKind::OpenCode
+            );
         let manageable = !acc.host_default && !orca;
         // OWE-881: 이 계정이 브라우저 로그인 대기 중이면 진행 문구와 [취소]만 보인다.
         let logging_in = self
@@ -5870,7 +6583,19 @@ impl SettingsView {
             .as_ref()
             .is_some_and(|p| p.account_id == acc.id && p.cancelling);
         let (primary, heading) = account_heading(acc);
-        let detail = if logging_in {
+        let switching = snap
+            .details
+            .handoffs
+            .iter()
+            .any(|h| h.account_id == acc.id && h.to.is_none() && h.error.is_none());
+        let switch_failed = snap
+            .details
+            .handoffs
+            .iter()
+            .any(|h| h.account_id == acc.id && h.error.is_some());
+        let detail = if switching {
+            text::ACCOUNT_SESSION_SWITCHING.get().to_owned()
+        } else if logging_in {
             text::ACCOUNT_LOGIN_WAITING.get().to_owned()
         } else if needs_login && can_login {
             text::ACCOUNT_SIGN_IN_TO_USE.get().to_owned()
@@ -6024,8 +6749,12 @@ impl SettingsView {
 
         let usage_id = format!("admin-account-usage-{}", acc.id);
         let usage_tip_id = usage_id.clone();
-        let usage_tip = format_account_usage(&acc.usage);
-        let usage_cluster = div()
+        let meters = snap.meters_for(&acc.id);
+        let usage_tip = meters.map_or_else(
+            || format_account_usage(&acc.usage),
+            |m| crate::accounts::display::meters_summary(m, crate::accounts::display::now()),
+        );
+        let mut usage_cluster = div()
             .id(SharedString::from(usage_id.clone()))
             .debug_selector(move || usage_id.clone())
             .tooltip(move |window, cx| {
@@ -6034,21 +6763,48 @@ impl SettingsView {
             .flex_none()
             .flex()
             .flex_col()
-            .gap_0p5()
-            .child(Self::render_usage_bar(
-                "5h",
-                text::WINDOW_5H.get(),
-                acc.usage.five_hour.as_ref(),
-                brand,
-                p,
-            ))
-            .child(Self::render_usage_bar(
-                "7d",
-                text::WINDOW_7D.get(),
-                acc.usage.seven_day.as_ref(),
-                brand,
-                p,
-            ));
+            .gap_0p5();
+        if let Some(meters) = meters {
+            for meter in &meters.meters {
+                let label = crate::accounts::display::meter_label(meter);
+                usage_cluster = usage_cluster.child(if let Some(value) = &meter.value {
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_size(crate::ui::TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .child(label)
+                        .child(value.clone())
+                } else {
+                    Self::render_usage_bar(&meter.key, &label, meter.window.as_ref(), brand, p)
+                });
+            }
+            if meters.meters.is_empty() {
+                usage_cluster = usage_cluster.child(
+                    div()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child("—"),
+                );
+            }
+        } else {
+            usage_cluster = usage_cluster
+                .child(Self::render_usage_bar(
+                    "5h",
+                    text::WINDOW_5H.get(),
+                    acc.usage.five_hour.as_ref(),
+                    brand,
+                    p,
+                ))
+                .child(Self::render_usage_bar(
+                    "7d",
+                    text::WINDOW_7D.get(),
+                    acc.usage.seven_day.as_ref(),
+                    brand,
+                    p,
+                ));
+        }
 
         // 주 동작 하나: 로그인이 필요하면 "다시 로그인", 아니면 비활성 계정에만 "전환"(.ghost().small()).
         // 로그인 대기 중이면 진행 표시 대신 [로그인 취소]만 둔다(OWE-881).
@@ -6096,7 +6852,7 @@ impl SettingsView {
                     this.login_account(provider, Some(login_account.clone()), cx);
                 })),
             );
-        } else if !orca && !acc.active {
+        } else if !orca && (!acc.active || switch_failed) && !switching {
             let switch_id = format!("admin-switch-account-{}", acc.id);
             let acc_id = acc.id.clone();
             actions = actions.child(
@@ -6179,7 +6935,8 @@ impl SettingsView {
         }
 
         let can_click_switch = !(orca
-            || acc.active
+            || acc.active && !switch_failed
+            || switching
             || self.rename.is_some()
             || self.removing.is_some()
             || self.armed.is_some()
@@ -6208,6 +6965,7 @@ impl SettingsView {
             .when(can_click_switch, |d| {
                 d.cursor_pointer()
                     .hover(|s| s.bg(p.accent))
+                    .active(|s| s.bg(p.sidebar_accent))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if this.rename.is_none() && this.removing.is_none() && this.armed.is_none()
                         {
@@ -6553,15 +7311,16 @@ impl SettingsView {
                 );
 
             let mut list = div().flex().flex_col().gap_2();
-            // OWE-881: OpenCode 로그인은 터미널에서 진행한다. [+ 계정 추가]를 눌러도
+            // agy·OpenCode 로그인은 터미널에서 진행한다. [+ 계정 추가]를 눌러도
             // 명령을 바로 큐에 넣지 않고, 이 안내 카드의 [터미널에서 실행]을 눌러야 간다.
-            if provider == ProviderKind::OpenCode && self.opencode_login_prompt {
-                let run_id = "admin-opencode-login-run".to_owned();
-                let dismiss_id = "admin-opencode-login-dismiss".to_owned();
+            if self.terminal_login_provider == Some(provider) {
+                let run_id = format!("admin-{}-login-run", provider.as_str());
+                let dismiss_id = format!("admin-{}-login-dismiss", provider.as_str());
+                let guide_id = format!("admin-{}-login-guide", provider.as_str());
                 list = list.child(
                     div()
-                        .id("admin-opencode-login-guide")
-                        .debug_selector(|| "admin-opencode-login-guide".into())
+                        .id(SharedString::from(guide_id.clone()))
+                        .debug_selector(move || guide_id.clone())
                         .flex()
                         .flex_col()
                         .gap_2()
@@ -6580,7 +7339,11 @@ impl SettingsView {
                             div()
                                 .text_size(crate::ui::TEXT_XS)
                                 .text_color(p.muted_foreground)
-                                .child(text::OPENCODE_LOGIN_GUIDE.get()),
+                                .child(if provider == ProviderKind::Antigravity {
+                                    text::AGY_LOGIN_GUIDE.get()
+                                } else {
+                                    text::OPENCODE_LOGIN_GUIDE.get()
+                                }),
                         )
                         .child(
                             layout::controls()
@@ -6593,7 +7356,7 @@ impl SettingsView {
                                     .debug_selector(move || run_id.clone())
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
-                                            this.run_opencode_login(cx);
+                                            this.run_terminal_login(cx);
                                         },
                                     )),
                                 )
@@ -6605,7 +7368,8 @@ impl SettingsView {
                                     .debug_selector(move || dismiss_id.clone())
                                     .on_click(cx.listener(
                                         move |this, _, _, cx| {
-                                            this.opencode_login_prompt = false;
+                                            this.terminal_login_provider = None;
+                                            this.terminal_login_account = None;
                                             cx.notify();
                                         },
                                     )),
@@ -7010,9 +7774,10 @@ impl SettingsView {
                                 text::ACCOUNTS_REFRESH.get(),
                             )
                             .icon(IconName::RefreshCw)
+                            .loading(self.accounts_refresh_pending)
                             .debug_selector(|| "admin-accounts-refresh".into())
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.apply_account_request(UsageRequest::ListAccounts, cx);
+                                this.refresh_accounts_manually(cx);
                             })),
                         )
                         .child(
@@ -7077,11 +7842,13 @@ impl SettingsView {
                         .text_color(p.muted_foreground)
                         .hover(|st| {
                             st.border_color(p.muted_foreground.opacity(0.35))
+                                .bg(p.accent.opacity(0.5))
                                 .text_color(p.foreground)
                         })
+                        .active(|st| st.bg(p.accent))
                 })
                 .on_click(move |_, _, cx| {
-                    edit(cx, |s| agent_id.clone_into(&mut s.default_agent));
+                    edit(cx, move |s| agent_id.clone_into(&mut s.default_agent));
                 })
                 .child(crate::ui::icons::agent_menu_icon(agent_id))
                 .child(label)
@@ -7124,7 +7891,7 @@ impl SettingsView {
             .on_click(|_, _, cx| {
                 cx.global_mut::<Config>().pending_permission =
                     Some(krill_proto::agent::Permission::Yolo);
-                edit(cx, |s| s.yolo_mode = true);
+                edit(cx, move |s| s.yolo_mode = true);
             });
         let manual_seg = layout::segment(
             "admin-yolo-manual",
@@ -7135,7 +7902,7 @@ impl SettingsView {
         .on_click(|_, _, cx| {
             cx.global_mut::<Config>().pending_permission =
                 Some(krill_proto::agent::Permission::Manual);
-            edit(cx, |s| s.yolo_mode = false);
+            edit(cx, move |s| s.yolo_mode = false);
         });
         let yolo_row = layout::row(p)
             .child(layout::label(
@@ -7164,7 +7931,7 @@ impl SettingsView {
                 "hib-toggle",
                 s.hibernation_enabled,
                 false,
-                |next, _, cx| edit(cx, |s| s.hibernation_enabled = next),
+                |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
             )));
 
         let auto_setup_row = layout::row(p)
@@ -7187,33 +7954,43 @@ impl SettingsView {
                             let env = (!cfg!(test))
                                 .then(crate::onboarding::Env::current)
                                 .flatten();
-                            if let Some(env) = &env
-                                && !env.is_isolated_state()
-                            {
-                                drop(crate::onboarding::stage_binaries(&env.krill, &base));
-                            }
-                            let installed = setup_all_agents_and_skills_at(&base, &state);
-                            if let Some(env) = env
-                                && !env.is_isolated_state()
-                            {
-                                crate::onboarding::actions::auto_prepare(env.clone(), cx).detach();
-                                let state = state.clone();
-                                cx.background_executor()
-                                    .spawn(async move {
+                            let bg_env = env.clone();
+                            this.file_job(
+                                "setup-agents",
+                                move || {
+                                    if let Some(env) = &bg_env
+                                        && !env.is_isolated_state()
+                                    {
+                                        drop(crate::onboarding::stage_binaries(&env.krill, &base));
+                                    }
+                                    let installed = setup_all_agents_and_skills_at(&base, &state);
+                                    if let Some(env) = &bg_env
+                                        && !env.is_isolated_state()
+                                    {
                                         drop(
                                             crate::onboarding::install_codex_hook_with_login_path(
-                                                &env, &state,
+                                                env, &state,
                                             ),
                                         );
-                                    })
-                                    .detach();
-                            }
-                            if !installed.is_empty() {
-                                let msg = text::SKILLS_INSTALLED
-                                    .format(&[("path", &installed.join(", "))]);
-                                this.skill_status = Some(msg.into());
-                                cx.notify();
-                            }
+                                    }
+                                    installed
+                                },
+                                move |this, installed, cx| {
+                                    if let Some(env) = env
+                                        && !env.is_isolated_state()
+                                    {
+                                        crate::onboarding::actions::auto_prepare(env, cx).detach();
+                                    }
+                                    if !installed.is_empty() {
+                                        this.skill_status = Some(
+                                            text::SKILLS_INSTALLED
+                                                .format(&[("path", &installed.join(", "))])
+                                                .into(),
+                                        );
+                                    }
+                                },
+                                cx,
+                            );
                         })),
                 ),
             );
@@ -7235,14 +8012,16 @@ impl SettingsView {
 
         let builtin_agents = krill_proto::agent::Agents::load(None).unwrap_or_default();
         let dir = state_dir(cx);
-        let user_agents = self.cached_agents_file(dir.as_deref(), cx);
+        self.ensure_agents_file(dir.as_deref(), cx);
         // 초기 읽기가 끝나기 전에 편집기를 기본값으로 만들면 사용자 인자가
         // 늦게 도착해도 입력 상태에 반영되지 않는다. 로드 후 처음 만든다.
         if dir.is_some() && self.agents_file_cache.0.is_none() {
             return root.children(self.render_agent_extra_rows(s, cx));
         }
-        let effective = krill_proto::agent::Agents::load(user_agents.as_deref())
-            .unwrap_or_else(|_| builtin_agents.clone());
+        let effective = self
+            .agents_parsed
+            .clone()
+            .unwrap_or_else(|| std::sync::Arc::new(builtin_agents.clone()));
         root = root.child(self.render_agent_catalog_card(&builtin_agents, &effective, window, cx));
         root.child(self.render_skills_card(cx))
             .children(self.render_agent_extra_rows(s, cx))
@@ -7262,16 +8041,16 @@ impl SettingsView {
                 "auto-rename-branch-toggle",
                 s.auto_rename_branch_from_work,
                 false,
-                |next, _, cx| edit(cx, |s| s.auto_rename_branch_from_work = next),
+                |next, _, cx| edit(cx, move |s| s.auto_rename_branch_from_work = next),
             )));
 
         let is_1h = s.prompt_cache_ttl_secs >= 3_600;
         let ttl_5m = layout::segment("prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
             .debug_selector(|| "prompt-cache-ttl-5m".into())
-            .on_click(|_, _, cx| edit(cx, |s| s.prompt_cache_ttl_secs = 300));
+            .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 300));
         let ttl_1h = layout::segment("prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
             .debug_selector(|| "prompt-cache-ttl-1h".into())
-            .on_click(|_, _, cx| edit(cx, |s| s.prompt_cache_ttl_secs = 3_600));
+            .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 3_600));
         let cache_timer_card = layout::card(p)
             .debug_selector(|| "prompt-cache-timer-card".into())
             .flex()
@@ -7295,7 +8074,7 @@ impl SettingsView {
                         "prompt-cache-timer-toggle",
                         s.prompt_cache_timer_enabled,
                         false,
-                        |next, _, cx| edit(cx, |s| s.prompt_cache_timer_enabled = next),
+                        |next, _, cx| edit(cx, move |s| s.prompt_cache_timer_enabled = next),
                     ))),
             )
             .when(s.prompt_cache_timer_enabled, |d| {
@@ -7347,7 +8126,7 @@ impl SettingsView {
                                 }
                             } else {
                                 this.workspace_trust_confirm_pending = false;
-                                edit(cx, |s| s.workspace_trust_preset_enabled = false);
+                                edit(cx, move |s| s.workspace_trust_preset_enabled = false);
                                 cx.notify();
                             }
                         });
@@ -7391,7 +8170,7 @@ impl SettingsView {
                                 .on_click(cx.listener(
                                     |this, _, _, cx| {
                                         this.workspace_trust_confirm_pending = false;
-                                        edit(cx, |s| s.workspace_trust_preset_enabled = true);
+                                        edit(cx, move |s| s.workspace_trust_preset_enabled = true);
                                         cx.notify();
                                     },
                                 )),
@@ -7670,28 +8449,7 @@ impl SettingsView {
                             };
                             let args = edit.args.read(cx).value();
                             let env = edit.env.read(cx).value();
-                            let saved = match state_dir(cx) {
-                                Some(dir) => {
-                                    let res = save_agent_profile(&dir, agent_id, &args, &env);
-                                    if res.is_ok() {
-                                        let path = dir.join(krill_proto::agent::FILE_NAME);
-                                        let stamp = std::fs::metadata(&path)
-                                            .and_then(|m| m.modified())
-                                            .ok();
-                                        this.agents_file_cache.0 =
-                                            Some((stamp, std::fs::read_to_string(&path).ok()));
-                                    }
-                                    res
-                                }
-                                None => Err(text::NO_STATE_DIR.get().to_owned()),
-                            };
-                            if let Some(edit) = this.agent_edits.get_mut(agent_id) {
-                                edit.status = Some(match saved {
-                                    Ok(()) => (text::AGENT_SAVED.get().into(), false),
-                                    Err(e) => (e.into(), true),
-                                });
-                            }
-                            cx.notify();
+                            this.save_agent_edit(agent_id, args.to_string(), env.to_string(), cx);
                         })),
                     )
                     .child(
@@ -7715,29 +8473,7 @@ impl SettingsView {
                                 env_entity.update(cx, |s, cx| {
                                     s.set_value(def_env.clone(), window, cx);
                                 });
-                                let saved = match state_dir(cx) {
-                                    Some(dir) => {
-                                        let res =
-                                            save_agent_profile(&dir, agent_id, &def_args, &def_env);
-                                        if res.is_ok() {
-                                            let path = dir.join(krill_proto::agent::FILE_NAME);
-                                            let stamp = std::fs::metadata(&path)
-                                                .and_then(|m| m.modified())
-                                                .ok();
-                                            this.agents_file_cache.0 =
-                                                Some((stamp, std::fs::read_to_string(&path).ok()));
-                                        }
-                                        res
-                                    }
-                                    None => Err(text::NO_STATE_DIR.get().to_owned()),
-                                };
-                                if let Some(edit) = this.agent_edits.get_mut(agent_id) {
-                                    edit.status = match saved {
-                                        Ok(()) => None,
-                                        Err(e) => Some((e.into(), true)),
-                                    };
-                                }
-                                cx.notify();
+                                this.save_agent_edit(agent_id, def_args, def_env, cx);
                             },
                         )),
                     ),
@@ -7772,7 +8508,10 @@ impl SettingsView {
                             .flex()
                             .items_center()
                             .gap_2p5()
+                            .rounded(crate::ui::RADIUS_SM)
                             .cursor_pointer()
+                            .hover(|d| d.opacity(0.85))
+                            .active(|d| d.opacity(0.7))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if !this.agent_expanded.remove(agent_id) {
                                     this.agent_expanded.insert(agent_id);
@@ -7875,29 +8614,44 @@ impl SettingsView {
                                             crate::accounts::default_home()
                                         };
                                         let state = state_dir(cx).unwrap_or_else(|| base.clone());
-                                        let status_msg = if id_owned == "codex" {
+                                        if id_owned == "codex" {
                                             queue_terminal_command(
                                                 format!("{hook_copy} --yes"),
                                                 cx,
                                             );
-                                            text::HOOK_QUEUED.get().to_owned()
+                                            this.skill_status =
+                                                Some(text::HOOK_QUEUED.get().into());
                                         } else {
-                                            match install_agent_hook_at(&id_owned, &base, &state) {
-                                                Ok(path) => text::SKILLS_INSTALLED.format(&[(
-                                                    "path",
-                                                    &path.display().to_string(),
-                                                )]),
-                                                Err(e) => {
-                                                    queue_terminal_command(
-                                                        format!("{hook_copy} --yes"),
-                                                        cx,
-                                                    );
-                                                    text::HOOK_INSTALL_FAILED
-                                                        .format(&[("error", &e.to_string())])
-                                                }
-                                            }
-                                        };
-                                        this.skill_status = Some(status_msg.into());
+                                            let id = id_owned.clone();
+                                            let fallback = hook_copy.clone();
+                                            this.file_job(
+                                                "hook-install",
+                                                move || install_agent_hook_at(&id, &base, &state),
+                                                move |this, result, cx| {
+                                                    this.skill_status = Some(match result {
+                                                        Ok(path) => text::SKILLS_INSTALLED
+                                                            .format(&[(
+                                                                "path",
+                                                                &path.display().to_string(),
+                                                            )])
+                                                            .into(),
+                                                        Err(error) => {
+                                                            queue_terminal_command(
+                                                                format!("{fallback} --yes"),
+                                                                cx,
+                                                            );
+                                                            text::HOOK_INSTALL_FAILED
+                                                                .format(&[(
+                                                                    "error",
+                                                                    &error.to_string(),
+                                                                )])
+                                                                .into()
+                                                        }
+                                                    });
+                                                },
+                                                cx,
+                                            );
+                                        }
                                         cx.notify();
                                     },
                                 )),
@@ -7960,13 +8714,18 @@ impl SettingsView {
                                 } else {
                                     crate::accounts::default_home()
                                 };
-                                let installed = install_all_skills_at(&base);
-                                if !installed.is_empty() {
-                                    let msg = text::SKILLS_INSTALLED
-                                        .format(&[("path", &installed.join(", "))]);
-                                    this.skill_status = Some(msg.into());
-                                    cx.notify();
-                                }
+                                this.file_job(
+                                    "skill-install",
+                                    move || install_all_skills_at(&base),
+                                    |this, installed, _| {
+                                        this.skill_status = Some(
+                                            text::SKILLS_INSTALLED
+                                                .format(&[("path", &installed.join(", "))])
+                                                .into(),
+                                        );
+                                    },
+                                    cx,
+                                );
                             })),
                         ),
                     ),
@@ -8005,26 +8764,36 @@ impl SettingsView {
                                     } else {
                                         crate::accounts::default_home()
                                     };
-                                    let mut installed = Vec::new();
-                                    for dir in [
-                                        home.join(".claude/skills"),
-                                        home.join(".codex/skills"),
-                                        home.join(".gemini/config/skills"),
-                                        home.join(".cursor/skills"),
-                                        home.join(".config/opencode/skills"),
-                                    ] {
-                                        if let Ok(path) = krill_proto::orchestration::install_skill(
-                                            skill_name, &dir,
-                                        ) {
-                                            installed.push(path.display().to_string());
-                                        }
-                                    }
-                                    if !installed.is_empty() {
-                                        let msg = text::SKILLS_INSTALLED
-                                            .format(&[("path", &installed.join(", "))]);
-                                        this.skill_status = Some(msg.into());
-                                        cx.notify();
-                                    }
+                                    this.file_job(
+                                        "skill-install",
+                                        move || {
+                                            let mut installed = Vec::new();
+                                            for dir in [
+                                                home.join(".claude/skills"),
+                                                home.join(".codex/skills"),
+                                                home.join(".gemini/config/skills"),
+                                                home.join(".cursor/skills"),
+                                                home.join(".config/opencode/skills"),
+                                            ] {
+                                                if let Ok(path) =
+                                                    krill_proto::orchestration::install_skill(
+                                                        skill_name, &dir,
+                                                    )
+                                                {
+                                                    installed.push(path.display().to_string());
+                                                }
+                                            }
+                                            installed
+                                        },
+                                        |this, installed, _| {
+                                            this.skill_status = Some(
+                                                text::SKILLS_INSTALLED
+                                                    .format(&[("path", &installed.join(", "))])
+                                                    .into(),
+                                            );
+                                        },
+                                        cx,
+                                    );
                                 },
                             )),
                         ),
@@ -8702,7 +9471,7 @@ impl SettingsView {
                                 .gap_3()
                                 .child(crate::ui::icons::svg_box(
                                     crate::ui::icons::SERVER_SVG,
-                                    16.,
+                                    crate::ui::ICON_MD,
                                     p.muted_foreground,
                                 ))
                                 .child(
@@ -8796,16 +9565,9 @@ impl SettingsView {
             self.sync_workflow_repo_hooks(window, cx);
             return;
         }
-        let default_repo = std::env::current_dir()
-            .ok()
-            .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)))
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        let dir = state_dir(cx);
-        let store = dir
-            .as_deref()
-            .map(krill_proto::orchestration::WorktreeStore::load_cached)
-            .unwrap_or_default();
+        self.refresh_service_cache(cx);
+        let default_repo = std::env::var("PWD").unwrap_or_default();
+        let store = self.services.worktrees.clone();
         let loaded_repo = Self::normalize_repo_key(&default_repo);
         let default_setup = store.setup_script_for(&default_repo).unwrap_or_default();
         let default_archive = store.archive_script_for(&default_repo).unwrap_or_default();
@@ -8911,17 +9673,19 @@ impl SettingsView {
         let archive_inp = form.archive_script.clone();
         let symlink_inp = form.symlink_path.clone();
 
-        let store = state_dir(cx)
-            .as_deref()
-            .and_then(|d| krill_proto::orchestration::WorktreeStore::load(d).ok())
-            .unwrap_or_default();
+        self.refresh_service_cache(cx);
+        let store = self.services.worktrees.clone();
         let repo_setup = next_repo
             .as_deref()
-            .and_then(|k| store.setup_script_for(k))
+            .and_then(|key| {
+                store.setup_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
+            })
             .unwrap_or_default();
         let repo_archive = next_repo
             .as_deref()
-            .and_then(|k| store.archive_script_for(k))
+            .and_then(|key| {
+                store.archive_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
+            })
             .unwrap_or_default();
 
         let target_setup = if cur_setup == prev_setup {
@@ -8970,17 +9734,19 @@ impl SettingsView {
         let archive_inp = form.archive_script.clone();
         let symlink_inp = form.symlink_path.clone();
         let next_repo = Self::normalize_repo_key(repo_raw);
-        let store = state_dir(cx)
-            .as_deref()
-            .and_then(|d| krill_proto::orchestration::WorktreeStore::load(d).ok())
-            .unwrap_or_default();
+        self.refresh_service_cache(cx);
+        let store = self.services.worktrees.clone();
         let repo_setup = next_repo
             .as_deref()
-            .and_then(|k| store.setup_script_for(k))
+            .and_then(|key| {
+                store.setup_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
+            })
             .unwrap_or_default();
         let repo_archive = next_repo
             .as_deref()
-            .and_then(|k| store.archive_script_for(k))
+            .and_then(|key| {
+                store.archive_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
+            })
             .unwrap_or_default();
         if let Some(form) = &mut self.workflow_form {
             form.pending_repo_path = None;
@@ -9005,13 +9771,7 @@ impl SettingsView {
         if trimmed.is_empty() {
             return None;
         }
-        let path = Path::new(trimmed);
-        Some(
-            std::fs::canonicalize(path)
-                .unwrap_or_else(|_| path.to_path_buf())
-                .display()
-                .to_string(),
-        )
+        Some(trimmed.to_owned())
     }
 
     pub fn add_worktree_symlink_for(
@@ -9019,7 +9779,7 @@ impl SettingsView {
         repo_raw: &str,
         rel_path: &str,
         cx: &mut Context<Self>,
-    ) -> Result<Vec<String>, String> {
+    ) -> Result<(), String> {
         let Some(dir) = state_dir(cx) else {
             let msg = text::NO_STATE_DIR.get().to_owned();
             if let Some(form) = &mut self.workflow_form {
@@ -9036,32 +9796,27 @@ impl SettingsView {
             cx.notify();
             return Err(msg);
         };
-        let result = krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-            store.add_symlink(&repo_key, rel_path)
-        });
-        match result {
-            Ok(list) => {
-                if let Some(form) = &mut self.workflow_form {
-                    if Self::normalize_repo_key(&form.repo_path.read(cx).value()).as_deref()
-                        != Some(repo_key.as_str())
-                    {
-                        form.pending_repo_path = Some(repo_key);
-                    }
-                    form.status = Some((text::HOOKS_SAVED.get().into(), false));
-                }
-                cx.defer(notify_external_change);
-                cx.notify();
-                Ok(list)
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                if let Some(form) = &mut self.workflow_form {
-                    form.status = Some((msg.clone().into(), true));
-                }
-                cx.notify();
-                Err(msg)
-            }
+        if let Some(form) = &mut self.workflow_form
+            && Self::normalize_repo_key(&form.repo_path.read(cx).value()).as_deref()
+                != Some(repo_key.as_str())
+        {
+            form.pending_repo_path = Some(repo_key.clone());
         }
+        let rel_path = krill_proto::orchestration::validate_symlink_path(rel_path)
+            .map_err(|error| error.to_string())?;
+        self.file_job(
+            "worktree-edit",
+            move || {
+                let repo_key = canonical_repo_key(&repo_key);
+                krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                    store.add_symlink(&repo_key, &rel_path)
+                })
+                .map_err(|error| error.to_string())
+            },
+            |this, result, cx| this.finish_workflow_write(result.map(|_| ()), cx),
+            cx,
+        );
+        Ok(())
     }
 
     pub fn remove_worktree_symlink_for(
@@ -9071,17 +9826,33 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         if let Some(dir) = state_dir(cx) {
-            krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-                store.remove_symlink(repo_key, rel_path);
-                Ok(())
-            })
-            .ok();
-            if let Some(form) = &mut self.workflow_form {
-                form.status = Some((text::HOOKS_SAVED.get().into(), false));
-            }
-            cx.defer(notify_external_change);
-            cx.notify();
+            let repo_key = repo_key.to_owned();
+            let rel_path = rel_path.to_owned();
+            self.file_job(
+                "worktree-edit",
+                move || {
+                    let repo_key = canonical_repo_key(&repo_key);
+                    krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                        store.remove_symlink(&repo_key, &rel_path);
+                        Ok(())
+                    })
+                    .map_err(|error| error.to_string())
+                },
+                SettingsView::finish_workflow_write,
+                cx,
+            );
         }
+    }
+
+    fn finish_workflow_write(&mut self, result: Result<(), String>, cx: &mut Context<Self>) {
+        if let Some(form) = &mut self.workflow_form {
+            form.status = Some(match result {
+                Ok(()) => (text::HOOKS_SAVED.get().into(), false),
+                Err(error) => (error.into(), true),
+            });
+        }
+        self.refresh_service_cache(cx);
+        cx.defer(notify_external_change);
     }
 
     pub fn save_repo_hooks_for(
@@ -9109,41 +9880,21 @@ impl SettingsView {
         };
         let setup_trimmed = setup_cmd.unwrap_or("").trim().to_owned();
         let archive_trimmed = archive_cmd.unwrap_or("").trim().to_owned();
-        let result = krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-            store.set_setup_script(&repo_key, &setup_trimmed)?;
-            store.set_archive_script(&repo_key, &archive_trimmed)?;
-            Ok(())
-        });
-        match result {
-            Ok(()) => {
-                if let Some(form) = &mut self.workflow_form {
-                    let cur_repo = Self::normalize_repo_key(&form.repo_path.read(cx).value());
-                    if cur_repo.as_deref() == Some(repo_key.as_str()) {
-                        let cur_setup = form.setup_script.read(cx).value().trim().to_owned();
-                        let cur_archive = form.archive_script.read(cx).value().trim().to_owned();
-                        if cur_setup == setup_trimmed && cur_archive == archive_trimmed {
-                            form.loaded_repo = Some(repo_key);
-                            form.loaded_setup = setup_trimmed;
-                            form.loaded_archive = archive_trimmed;
-                        } else {
-                            form.loaded_repo = None;
-                        }
-                    }
-                    form.status = Some((text::HOOKS_SAVED.get().into(), false));
-                }
-                cx.defer(notify_external_change);
-                cx.notify();
-                Ok(())
-            }
-            Err(err) => {
-                let msg = err.to_string();
-                if let Some(form) = &mut self.workflow_form {
-                    form.status = Some((msg.clone().into(), true));
-                }
-                cx.notify();
-                Err(msg)
-            }
-        }
+        self.file_job(
+            "worktree-edit",
+            move || {
+                let repo_key = canonical_repo_key(&repo_key);
+                krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
+                    store.set_setup_script(&repo_key, &setup_trimmed)?;
+                    store.set_archive_script(&repo_key, &archive_trimmed)?;
+                    Ok(())
+                })
+                .map_err(|error| error.to_string())
+            },
+            SettingsView::finish_workflow_write,
+            cx,
+        );
+        Ok(())
     }
 
     pub fn submit_quick_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -9159,10 +9910,10 @@ impl SettingsView {
         let editing_idx = form.qc_editing;
         let name_inp = form.qc_name.clone();
         let text_inp = form.qc_text.clone();
-        edit(cx, |s| {
+        edit(cx, move |s| {
             let entry = crate::commands::QuickCommand {
-                name,
-                text: cmd_text,
+                name: name.clone(),
+                text: cmd_text.clone(),
             };
             if let Some(idx) = editing_idx
                 && let Some(slot) = s.quick_commands.get_mut(idx)
@@ -9216,9 +9967,9 @@ impl SettingsView {
     ) -> Result<crate::webhook::Endpoint, String> {
         if let Ok(ep) = crate::webhook::Endpoint::from_url_input(raw_url) {
             let ep_clone = ep.clone();
-            edit(cx, |s| {
+            edit(cx, move |s| {
                 if !s.webhooks.contains(&ep_clone) {
-                    s.webhooks.push(ep_clone);
+                    s.webhooks.push(ep_clone.clone());
                 }
             });
             if let Some(form) = &mut self.workflow_form {
@@ -9261,11 +10012,8 @@ impl SettingsView {
         let qc_count =
             text::QUICK_COMMANDS_COUNT.format(&[("count", &s.quick_commands.len().to_string())]);
         let wh_count = text::WEBHOOKS_COUNT.format(&[("count", &s.webhooks.len().to_string())]);
-        let dir = state_dir(cx);
-        let orch = dir
-            .as_deref()
-            .map(krill_proto::orchestration::OrchestrationStore::load_cached)
-            .unwrap_or_default();
+        self.refresh_service_cache(cx);
+        let orch = self.services.orchestration.clone();
         let pending_gates = orch
             .gates
             .iter()
@@ -9277,15 +10025,29 @@ impl SettingsView {
             ("workers", &orch.dispatches.len().to_string()),
             ("gates", &pending_gates.to_string()),
         ]);
-        let reset = self.confirm_button("admin-orch-reset", text::ORCH_RESET.get(), cx, |_, cx| {
-            if let Some(dir) = state_dir(cx) {
-                krill_proto::orchestration::OrchestrationStore::reset_via_daemon_or_disk(
-                    &dir, None,
-                )
-                .ok();
-                cx.defer(notify_external_change);
-            }
-        });
+        let reset = self.confirm_button(
+            "admin-orch-reset",
+            text::ORCH_RESET.get(),
+            cx,
+            |this, cx| {
+                if let Some(dir) = state_dir(cx) {
+                    this.file_job(
+                        "orchestration-reset",
+                        move || {
+                            krill_proto::orchestration::OrchestrationStore::reset_via_daemon_or_disk(&dir, None)
+                            .map_err(|error| error.to_string())
+                        },
+                        |this, result, cx| {
+                            if let Err(error) = result {
+                                this.doctor_status = Some(error.into());
+                            }
+                            cx.defer(notify_external_change);
+                        },
+                        cx,
+                    );
+                }
+            },
+        );
         let mut orch_card = layout::card(p).flex().flex_col().gap_2().child(
             div()
                 .w_full()
@@ -9328,7 +10090,7 @@ impl SettingsView {
             layout::segment(gpui::ElementId::Name(id.clone().into()), label, active)
                 .debug_selector(move || id.clone())
                 .on_click(move |_, _, cx| {
-                    edit(cx, |s| s.copy_context_lines = lines);
+                    edit(cx, move |s| s.copy_context_lines = lines);
                 })
         });
         let lines_row = layout::row(p)
@@ -9474,7 +10236,7 @@ impl SettingsView {
                                             {
                                                 this.cancel_quick_command_edit(window, cx);
                                             }
-                                            edit(cx, |s| {
+                                            edit(cx, move |s| {
                                                 if idx < s.quick_commands.len() {
                                                     s.quick_commands.remove(idx);
                                                 }
@@ -9491,7 +10253,7 @@ impl SettingsView {
             "admin-webhook-clear",
             text::WEBHOOK_CLEAR.get(),
             cx,
-            |_, cx| edit(cx, |s| s.webhooks.clear()),
+            |_, cx| edit(cx, move |s| s.webhooks.clear()),
         );
         let mut wh_card = layout::card(p)
             .id("admin-webhooks-card")
@@ -9518,7 +10280,7 @@ impl SettingsView {
                                 )
                                 .debug_selector(|| "admin-webhook-add-local".into())
                                 .on_click(|_, _, cx| {
-                                    edit(cx, |s| {
+                                    edit(cx, move |s| {
                                         let n = s.webhooks.len().saturating_add(1);
                                         s.webhooks.push(crate::webhook::Endpoint::Ntfy {
                                             url: format!(
@@ -9638,7 +10400,7 @@ impl SettingsView {
                                 )
                                 .debug_selector(move || rm_id.clone())
                                 .on_click(move |_, _, cx| {
-                                    edit(cx, |s| {
+                                    edit(cx, move |s| {
                                         if idx < s.webhooks.len() {
                                             s.webhooks.remove(idx);
                                         }
@@ -9666,10 +10428,7 @@ impl SettingsView {
                 ),
             );
 
-        let wt_store = dir
-            .as_deref()
-            .map(krill_proto::orchestration::WorktreeStore::load_cached)
-            .unwrap_or_default();
+        let wt_store = self.services.worktrees.clone();
 
         let active_repo = self
             .workflow_form
@@ -9680,6 +10439,8 @@ impl SettingsView {
                     .as_ref()
                     .and_then(|f| f.loaded_repo.clone())
             });
+        let active_repo =
+            active_repo.map(|raw| self.services.aliases.get(&raw).cloned().unwrap_or(raw));
         let active_repo_display = active_repo
             .as_deref()
             .and_then(|r| Path::new(r).file_name().and_then(|n| n.to_str()))
@@ -10102,6 +10863,7 @@ impl SettingsView {
                         .rounded(crate::ui::RADIUS_SM)
                         .bg(p.background)
                         .hover(|d| d.bg(p.accent))
+                        .active(|d| d.bg(p.sidebar_accent))
                         .font_family(crate::ui::FONT_MONO)
                         .text_size(crate::ui::TEXT_XS)
                         .truncate()
@@ -10230,7 +10992,7 @@ impl SettingsView {
                             s.secure_keyboard_entry,
                             false,
                             |next, _, cx| {
-                                edit(cx, |s| s.secure_keyboard_entry = next);
+                                edit(cx, move |s| s.secure_keyboard_entry = next);
                                 crate::platform::set_secure_event_input(next);
                             },
                         ))),
@@ -10572,6 +11334,7 @@ impl Render for SettingsView {
                             d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
                         })
                         .hover(|d| d.bg(p.sidebar_accent).text_color(p.foreground))
+                        .active(|d| d.bg(p.accent).text_color(p.foreground))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_tab(tab, cx);
                         }))

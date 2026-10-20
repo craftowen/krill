@@ -259,9 +259,9 @@ impl Shell {
                 ));
             }
         }
-        for (spec, status) in self.host_manager.statuses() {
+        for (spec, status) in &self.host_statuses {
             let id = krill_app::hosts::HostId::Remote(spec.id.clone());
-            if status == krill_app::hosts::HostStatus::Connected
+            if *status == krill_app::hosts::HostStatus::Connected
                 && !out.iter().any(|(h, _)| h == &id)
             {
                 out.push((id, spec.display_name().to_owned()));

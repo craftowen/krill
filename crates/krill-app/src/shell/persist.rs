@@ -1,7 +1,9 @@
 //! 레이아웃 저장은 단일 작업자가 디바운스한 뒤 수행한다. UI는 fsync를 기다리지 않는다.
 
+use std::cell::RefCell;
 use std::path::Path;
-use std::sync::{Mutex, mpsc};
+use std::rc::Rc;
+use std::sync::mpsc;
 use std::time::Duration;
 
 use krill_app::layout::Layout;
@@ -10,24 +12,58 @@ const DELAY: Duration = Duration::from_millis(150);
 
 enum Message {
     Save(Box<Layout>),
-    Flush(mpsc::Sender<()>),
+    Flush(mpsc::Sender<bool>),
 }
 
 #[derive(Default)]
 pub(super) struct Saver {
-    worker: Mutex<Option<Worker>>,
+    worker: Rc<RefCell<Option<Worker>>>,
 }
 
 struct Worker {
-    send: mpsc::Sender<Message>,
-    task: std::thread::JoinHandle<()>,
+    send: Option<mpsc::Sender<Message>>,
+    task: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Saver {
+    /// The app retains the join handle even after a window closes. Shutdown
+    /// awaits the final durable write on a background thread, never in Drop.
+    pub(super) fn new(cx: &mut gpui::App) -> Self {
+        let saver = Self::default();
+        let worker = saver.worker.clone();
+        cx.on_app_quit(move |cx| {
+            let task = worker.borrow_mut().as_mut().and_then(|worker| {
+                worker.send.take();
+                worker.task.take()
+            });
+            cx.background_executor().spawn(async move {
+                if let Some(task) = task {
+                    task.join().ok();
+                }
+            })
+        })
+        .detach();
+        saver
+    }
+
+    /// Ordered barrier: window close awaits this without blocking input/render.
+    pub(super) fn barrier(&self, cx: &gpui::App) -> gpui::Task<bool> {
+        let (send, recv) = mpsc::channel();
+        let queued = self
+            .worker
+            .borrow()
+            .as_ref()
+            .and_then(|w| w.send.as_ref())
+            .is_none_or(|worker| worker.send(Message::Flush(send)).is_ok());
+        if self.worker.borrow().is_none() {
+            return gpui::Task::ready(true);
+        }
+        cx.background_executor()
+            .spawn(async move { queued && recv.recv().unwrap_or(false) })
+    }
+
     pub(super) fn save(&self, path: &std::path::Path, layout: &Layout) {
-        let Ok(mut worker) = self.worker.lock() else {
-            return;
-        };
+        let mut worker = self.worker.borrow_mut();
         if worker.is_none() {
             let path = path.to_owned();
             let (send, recv) = mpsc::channel();
@@ -35,45 +71,40 @@ impl Saver {
                 .name("layout-save".into())
                 .spawn(move || run(&path, &recv))
             {
-                Ok(task) => *worker = Some(Worker { send, task }),
-                Err(err) => eprintln!("layout save worker failed to start: {err}"),
+                Ok(task) => {
+                    *worker = Some(Worker {
+                        send: Some(send),
+                        task: Some(task),
+                    });
+                }
+                Err(err) => tracing::error!(error = %err, "layout save worker failed to start"),
             }
         }
-        if let Some(worker) = worker.as_ref() {
-            worker
-                .send
-                .send(Message::Save(Box::new(layout.clone())))
-                .ok();
+        if let Some(worker) = worker.as_ref().and_then(|w| w.send.as_ref()) {
+            worker.send(Message::Save(Box::new(layout.clone()))).ok();
         }
     }
 
-    /// 디바운스 대기분을 지금 쓰고 끝날 때까지(최대 5초) 기다린다. 앱 종료 직전 저장용.
+    #[cfg(test)]
     pub(super) fn flush(&self) {
         let (send, recv) = mpsc::channel();
-        let sent = self.worker.lock().is_ok_and(|worker| {
+        if let Some(worker) = self.worker.borrow().as_ref() {
             worker
+                .send
                 .as_ref()
-                .is_some_and(|w| w.send.send(Message::Flush(send)).is_ok())
-        });
-        if sent {
-            recv.recv_timeout(Duration::from_secs(5)).ok();
+                .unwrap()
+                .send(Message::Flush(send))
+                .unwrap();
+            assert!(recv.recv_timeout(Duration::from_secs(5)).unwrap());
         }
     }
 }
 
 impl Drop for Saver {
     fn drop(&mut self) {
-        let worker = self
-            .worker
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        if let Some(Worker { send, task }) = worker {
-            // 정상 창 종료에서는 마지막 디바운스 대기분도 저장하고 끝낸다.
-            drop(send);
-            if task.join().is_err() {
-                eprintln!("layout save worker failed to stop");
-            }
+        if let Some(worker) = self.worker.borrow_mut().as_mut() {
+            // Disconnect drains pending saves; the app quit hook owns the join.
+            worker.send.take();
         }
     }
 }
@@ -90,8 +121,8 @@ fn run(path: &Path, recv: &mpsc::Receiver<Message>) {
         match message {
             Ok(Message::Save(layout)) => pending = Some(layout),
             Ok(Message::Flush(done)) => {
-                write(path, &mut pending);
-                done.send(()).ok();
+                let saved = write(path, &mut pending);
+                done.send(saved).ok();
             }
             Err(error) => {
                 write(path, &mut pending);
@@ -103,12 +134,15 @@ fn run(path: &Path, recv: &mpsc::Receiver<Message>) {
     }
 }
 
-fn write(path: &std::path::Path, pending: &mut Option<Box<Layout>>) {
-    if let Some(layout) = pending.take()
-        && let Err(err) = layout.save(path)
-    {
-        eprintln!("layout save failed: {err}");
+fn write(path: &std::path::Path, pending: &mut Option<Box<Layout>>) -> bool {
+    if let Some(layout) = pending.as_ref() {
+        if let Err(err) = layout.save(path) {
+            tracing::error!(error = %err, "layout save failed");
+            return false;
+        }
+        pending.take();
     }
+    true
 }
 
 #[test]
@@ -121,7 +155,53 @@ fn closing_saver_flushes_latest_layout() {
     saver.save(&path, &layout);
     layout.new_tab();
     saver.save(&path, &layout);
+    let worker = saver.worker.clone();
     drop(saver);
+    worker
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .task
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
     assert_eq!(Layout::load(&path).unwrap(), layout);
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn dropping_saver_does_not_wait_for_a_stalled_worker() {
+    let (release, wait) = mpsc::channel();
+    let (started, ready) = mpsc::channel();
+    let (send, _recv) = mpsc::channel();
+    let task = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        // Timeout lets an old blocking Drop fail instead of hanging the suite.
+        wait.recv_timeout(Duration::from_secs(2)).ok();
+    });
+    ready.recv_timeout(Duration::from_secs(2)).unwrap();
+    let saver = Saver::default();
+    *saver.worker.borrow_mut() = Some(Worker {
+        send: Some(send),
+        task: Some(task),
+    });
+    let worker = saver.worker.clone();
+    let began = std::time::Instant::now();
+    drop(saver);
+    let elapsed = began.elapsed();
+    release.send(()).ok();
+    worker
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .task
+        .take()
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "UI Drop waited for disk worker: {elapsed:?}"
+    );
 }

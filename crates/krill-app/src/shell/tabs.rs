@@ -157,13 +157,14 @@ impl Shell {
                     Some(Program::Agent { id }) => launch_agent_id(id),
                     _ => "",
                 };
-                let raw_agent = session.map_or(launch_agent, |s| {
-                    if s.status.agent.is_empty() {
-                        launch_agent
-                    } else {
-                        &s.status.agent
-                    }
+                let detected_agent = session.map_or("", |s| {
+                    ui::status::infer_agent_from_status(&s.status, &label)
                 });
+                let raw_agent = if detected_agent.is_empty() {
+                    launch_agent
+                } else {
+                    detected_agent
+                };
                 let agent = ui::status::infer_agent_from_title(raw_agent, &label);
                 let state = session.map_or(AgentState::Unknown, |s| s.status.state);
                 let unread = host.is_local()
@@ -658,7 +659,7 @@ impl Shell {
             return;
         }
         self.record_closed_tab(index, cx);
-        self.change(true, cx, |l| l.close_tab(index));
+        self.close_layout(cx, |l| l.close_tab(index));
     }
 
     /// OWE-872: 실행 중 닫기 확인 대화상자에서 '닫기'를 눌렀다.
@@ -796,7 +797,7 @@ impl Shell {
         for i in closing {
             self.record_closed_tab(i, cx);
         }
-        self.change(true, cx, |l| l.close_other_tabs(keep_index));
+        self.close_layout(cx, |l| l.close_other_tabs(keep_index));
     }
 
     /// OWE-734: `index` 오른쪽의 고정되지 않은 탭을 일괄 닫는다.
@@ -812,7 +813,7 @@ impl Shell {
         for i in closing {
             self.record_closed_tab(i, cx);
         }
-        self.change(true, cx, |l| l.close_tabs_to_right(index));
+        self.close_layout(cx, |l| l.close_tabs_to_right(index));
     }
 
     /// OWE-870: `index` 왼쪽의 고정되지 않은 탭을 일괄 닫는다.
@@ -828,7 +829,7 @@ impl Shell {
         for i in closing {
             self.record_closed_tab(i, cx);
         }
-        self.change(true, cx, |l| l.close_tabs_to_left(index));
+        self.close_layout(cx, |l| l.close_tabs_to_left(index));
     }
 
     /// OWE-734: 고정되지 않은 에디터(파일) 탭을 일괄 닫는다.

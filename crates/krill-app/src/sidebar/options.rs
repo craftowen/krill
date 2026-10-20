@@ -23,7 +23,7 @@ use super::{
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 
-type ProjectVisuals = BTreeMap<PathBuf, super::project_icon::ProjectVisual>;
+type ProjectVisuals = BTreeMap<PathBuf, super::external::ProjectVisualMeta>;
 
 /// 사이드바 워크트리 목록 그룹화 기준.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -946,17 +946,12 @@ pub(super) fn rows_with_options<'a>(
 
 impl Sidebar {
     pub(super) fn local_rows(&self) -> Vec<Row> {
-        let state_dir = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty());
         let mut statuses = self.worktree_statuses.clone();
         let mut updated_at = self.worktree_updated_at.clone();
         let mut unread_worktrees = BTreeSet::new();
         let mut checkpoint_prs = BTreeSet::new();
-        if let Some(dir) = state_dir {
-            let store = krill_proto::orchestration::WorktreeStore::load_cached(dir);
+        {
+            let store = &self.disk.store;
             for (k, v) in &store.statuses {
                 if let Ok(st) = WorkspaceStatus::parse(v) {
                     statuses.entry(PathBuf::from(k)).or_insert(st);
@@ -1039,21 +1034,30 @@ impl Sidebar {
     }
 
     pub fn set_group_by(&mut self, group_by: GroupBy, cx: &mut Context<Self>) {
-        if self.options.group_by != group_by {
+        if !self.disk.initialized {
+            self.disk.startup.touch("group_by");
+        }
+        if self.options.group_by != group_by || !self.disk.initialized {
             self.options.group_by = group_by;
             self.persist(cx);
         }
     }
 
     pub fn set_sort_by(&mut self, sort_by: SortBy, cx: &mut Context<Self>) {
-        if self.options.sort_by != sort_by {
+        if !self.disk.initialized {
+            self.disk.startup.touch("sort_by");
+        }
+        if self.options.sort_by != sort_by || !self.disk.initialized {
             self.options.sort_by = sort_by;
             self.persist(cx);
         }
     }
 
     pub fn set_card_layout(&mut self, layout: CardLayout, cx: &mut Context<Self>) {
-        if self.options.card_layout != layout {
+        if !self.disk.initialized {
+            self.disk.startup.touch("card_layout");
+        }
+        if self.options.card_layout != layout || !self.disk.initialized {
             self.options.card_layout = layout;
             self.persist(cx);
         }
@@ -1065,7 +1069,18 @@ impl Sidebar {
     }
 
     pub fn set_card_property(&mut self, prop: CardProperty, enabled: bool, cx: &mut Context<Self>) {
-        if self.options.card_properties.get(prop) != enabled {
+        if !self.disk.initialized {
+            let field = match prop {
+                CardProperty::Issue => "card_properties.issue",
+                CardProperty::Pr => "card_properties.pr",
+                CardProperty::Comment => "card_properties.comment",
+                CardProperty::Ports => "card_properties.ports",
+                CardProperty::Branch => "card_properties.branch",
+                CardProperty::Host => "card_properties.host",
+            };
+            self.disk.startup.touch(field);
+        }
+        if self.options.card_properties.get(prop) != enabled || !self.disk.initialized {
             self.options.card_properties.set(prop, enabled);
             self.persist(cx);
         }
@@ -1098,7 +1113,10 @@ impl Sidebar {
     }
 
     pub fn clear_repo_filters(&mut self, cx: &mut Context<Self>) {
-        if !self.options.filters.repos.is_empty() {
+        if !self.disk.initialized {
+            self.disk.startup.touch("repos.clear");
+        }
+        if !self.options.filters.repos.is_empty() || !self.disk.initialized {
             self.options.filters.repos.clear();
             self.persist(cx);
         }
@@ -1110,20 +1128,29 @@ impl Sidebar {
     }
 
     pub fn clear_host_filters(&mut self, cx: &mut Context<Self>) {
-        if !self.options.filters.hosts.is_empty() {
+        if !self.disk.initialized {
+            self.disk.startup.touch("hosts.clear");
+        }
+        if !self.options.filters.hosts.is_empty() || !self.disk.initialized {
             self.options.filters.hosts.clear();
             self.persist(cx);
         }
     }
 
     pub fn reset_filters(&mut self, cx: &mut Context<Self>) {
-        if self.options.filters.active_count() > 0 {
+        if !self.disk.initialized {
+            self.disk.startup.reset_filters();
+        }
+        if self.options.filters != WorkspaceFilters::default() || !self.disk.initialized {
             self.options.filters.reset();
             self.persist(cx);
         }
     }
 
     pub fn fold_group(&mut self, key: GroupKey, open: Option<bool>, cx: &mut Context<Self>) {
+        if !self.disk.initialized {
+            self.disk.startup.ui.collapsed_groups.insert(key);
+        }
         let closed = self.collapsed_groups.contains(&key);
         if open.unwrap_or(closed) {
             self.collapsed_groups.remove(&key);
@@ -1205,13 +1232,8 @@ impl Sidebar {
         if let Some(custom) = self.issues.get(path) {
             return Some(custom.clone());
         }
-        let dir = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty())?;
-        let store = krill_proto::orchestration::WorktreeStore::load_cached(dir);
-        store
+        self.disk
+            .store
             .issues
             .get(&path.to_string_lossy().into_owned())
             .cloned()

@@ -92,9 +92,11 @@ Orca 아티팩트 클라이언트 규약과 호환된다.
 
 - **런타임 의존성 0**: HTML·셸 스크립트를 Wrangler Text 모듈로 번들하여 콜드 스타트를 줄인다(응답 시간 추정, 미측정).
 - **제공 경로**:
-  - `GET /`: 제품 소개 랜딩 페이지 (한/영 토글, 인터랙티브 앱 프리뷰 및 `⌘K` Jump Palette 체험, 3계층 데몬 생존 아키텍처, 오케스트레이션 DAG, 아티팩트 공유 안내, CLI 레퍼런스)
+  - `GET /`: 제품 소개 랜딩 페이지 (한/영 토글, 실제 Claude Code 세션을 연 macOS 앱 캡처, 3계층 데몬 생존 아키텍처, 오케스트레이션 DAG, 아티팩트 공유 안내, CLI 레퍼런스)
   - `GET /docs` (`/docs/*`): 빠른 시작·설치·아키텍처·CLI 전체 레퍼런스 문서
-  - `GET /install.sh`: `curl -fsSL https://krill.page/install.sh | sh` 설치 스크립트
+  - `GET /install.sh`: macOS용 `curl -fsSL https://krill.page/install.sh | bash` 설치 스크립트
+  - `GET /install.ps1`: Windows x64용 `irm https://krill.page/install.ps1 | iex` 설치 스크립트. 최신 Windows 릴리스 ZIP·SHA-256이 있어야 설치하며, 홈페이지는 배포 전까지 준비 중으로 표시한다.
+  - 설치 안내는 접속 환경에 따라 macOS·Windows·Linux·모바일 탭을 선택하며 직접 전환할 수도 있다. Linux는 원격 호스트 CLI 설치, 모바일은 Mac 앱 QR 연결을 안내한다.
 
 ---
 

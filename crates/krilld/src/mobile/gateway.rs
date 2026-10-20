@@ -204,7 +204,7 @@ impl Intent {
             })
             .and_then(|b| serde_json::from_slice::<Self>(&b).ok())
             .unwrap_or_else(|| Self {
-                mode: ConnectMode::Lan,
+                mode: ConnectMode::Tunnel,
                 custom: None,
                 rid: String::new(),
                 key: String::new(),
@@ -214,6 +214,17 @@ impl Intent {
                 tunnel_token: None,
                 tunnel_hostname: None,
             });
+        // Retire LAN exposure without deleting any paired-device credential or PTY.
+        // Explicit loopback remains available to isolated QA fixtures only.
+        let loopback = intent
+            .custom
+            .as_deref()
+            .and_then(|value| value.parse::<std::net::SocketAddrV4>().ok())
+            .is_some_and(|address| address.ip().is_loopback());
+        if intent.mode == ConnectMode::Lan && !loopback {
+            intent.mode = ConnectMode::Tunnel;
+            intent.custom = None;
+        }
         if decode_hex::<16>(&intent.rid).is_err() || decode_hex::<32>(&intent.key).is_err() {
             intent.rid = hex(&random()?.into_iter().take(16).collect::<Vec<_>>());
             intent.key = hex(&random()?);
@@ -464,8 +475,9 @@ impl Gateway {
                 custom_address,
                 rotate,
             } => {
+                reject_retired_mode(mode, custom_address.as_deref())?;
                 configure(&mut state, mode, custom_address, now)?;
-                state.devices.mint(now, rotate)?;
+                let ticket = state.devices.mint(now, rotate)?;
                 state.tunnel_retry_at = None;
                 reconcile(&mut state, now)?;
                 if mode == ConnectMode::Tunnel {
@@ -478,7 +490,11 @@ impl Gateway {
                         if state.stopped || state.mode != mode {
                             return Err(io::Error::other("모바일 연결 모드가 변경되었습니다"));
                         }
-                        if state.devices.ticket(now_ms()).is_none() {
+                        if state
+                            .devices
+                            .ticket(now_ms())
+                            .is_none_or(|current| current.token != ticket.token)
+                        {
                             return Err(io::Error::other(
                                 "페어링 요청이 취소되었거나 만료되었습니다",
                             ));
@@ -524,9 +540,15 @@ impl Gateway {
                 mode,
                 custom_address,
             } => {
+                reject_retired_mode(mode, custom_address.as_deref())?;
                 configure(&mut state, mode, custom_address, now)?;
                 reconcile(&mut state, now)?;
                 status(&state, now)
+            }
+            MobileRequest::CancelPairingTicket => {
+                state.devices.clear_ticket();
+                reconcile(&mut state, now)?;
+                MobileReply::Revoked { count: 0 }
             }
             MobileRequest::CurrentPairingOffer => pairing_offer(&state, now)?,
             MobileRequest::Status => {
@@ -584,6 +606,19 @@ impl Drop for Gateway {
         self.shared.wake();
     }
 }
+fn reject_retired_mode(mode: ConnectMode, custom: Option<&str>) -> io::Result<()> {
+    let loopback = custom
+        .and_then(|value| value.parse::<std::net::SocketAddrV4>().ok())
+        .is_some_and(|address| address.ip().is_loopback());
+    if mode == ConnectMode::Lan && !loopback {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "LAN pairing has been retired; choose Relay server or Tailscale",
+        ));
+    }
+    Ok(())
+}
+// Lan discriminant is retained only for decoding and explicit loopback QA.
 fn configure(s: &mut State, mode: ConnectMode, custom: Option<String>, now: u64) -> io::Result<()> {
     let mut next_custom = custom;
     let mut named_changed = false;
@@ -1121,8 +1156,8 @@ fn serve(
         Err(error) => {
             // RFC 6455 policy violation은 인증/프로토콜 거부만 나타낸다.
             // EOF·timeout·쓰기 오류는 이 신호를 보내지 않아 클라이언트가 전송 실패와 구별한다.
-            if error.kind() == io::ErrorKind::InvalidData {
-                ws::write(&mut socket, 8, &1008_u16.to_be_bytes()).ok();
+            if let Some(code) = auth_close_code(&error) {
+                ws::write(&mut socket, 8, &code.to_be_bytes()).ok();
                 socket.shutdown(Shutdown::Write).ok();
                 socket
                     .set_read_timeout(Some(Duration::from_millis(50)))
@@ -1144,6 +1179,20 @@ fn serve(
     let ping = lock(&shared.state).ping;
     socket.set_read_timeout(Some(ping))?;
     bridge(socket, channel, registry, hello.clone())
+}
+
+pub(super) fn auth_close_code(error: &io::Error) -> Option<u16> {
+    use super::devices::AuthRejection;
+    if let Some(rejection) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<AuthRejection>())
+    {
+        return Some(match rejection {
+            AuthRejection::Capacity => 4009,
+            AuthRejection::Cooldown => 1013,
+        });
+    }
+    (error.kind() == io::ErrorKind::InvalidData).then_some(1008)
 }
 
 fn authenticate(socket: &mut TcpStream, shared: &Arc<Shared>, id: u64) -> io::Result<Channel> {

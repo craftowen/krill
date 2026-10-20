@@ -427,11 +427,20 @@ fn stop_failure_rate_limit_detects_documented_payload() {
 /// OWE-710용 임시 홈: Claude 계정 High·Low + 사용량 캐시, 활성은 High.
 fn rate_limit_home(tag: &str, high_five: u8, low_five: u8) -> (PathBuf, PathBuf) {
     use crate::usage::CLAUDE_CACHE;
-    use krill_proto::usage::ProviderKind;
+    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
     let root = std::env::temp_dir().join(format!("krilld-stop-fail-{tag}-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     let home = root.join("home");
     let state = root.join("state");
+    accounts::set_auto_switch(
+        &home,
+        Some(&state),
+        &AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        },
+    )
+    .unwrap();
     for (label, five) in [("High", high_five), ("Low", low_five)] {
         let profile = home.join(format!("claude-{label}"));
         accounts::add_account(
@@ -525,11 +534,20 @@ fn non_rate_limit_stop_failure_does_not_trigger() {
 
 /// OWE-901용 임시 홈: agy 계정 High·Low + 사용량 파일, 활성은 High.
 fn agy_rate_limit_home(tag: &str, high_five: u8, low_five: u8) -> (PathBuf, PathBuf) {
-    use krill_proto::usage::ProviderKind;
+    use krill_proto::usage::{AutoSwitchPolicy, ProviderKind};
     let root = std::env::temp_dir().join(format!("krilld-agy-fail-{tag}-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     let home = root.join("home");
     let state = root.join("state");
+    accounts::set_auto_switch(
+        &home,
+        Some(&state),
+        &AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        },
+    )
+    .unwrap();
     for (label, five) in [("High", high_five), ("Low", low_five)] {
         let profile = home.join(format!("agy-{label}"));
         accounts::add_account(

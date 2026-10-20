@@ -290,7 +290,7 @@ pub(crate) fn profile_dir_for_vault_target_in(
     None
 }
 
-pub(super) fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
+pub(crate) fn agy_candidate_dirs(dir: &Path, include_sibling: bool) -> Vec<PathBuf> {
     let mut dirs = vec![
         dir.to_path_buf(),
         dir.join(".gemini/antigravity-cli"),

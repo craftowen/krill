@@ -88,6 +88,13 @@ pub fn checkpoint_badge_parts(
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty())?;
     let store = krill_proto::orchestration::WorktreeStore::load_cached(dir);
+    checkpoint_parts_from_store(&store, worktree)
+}
+
+pub(super) fn checkpoint_parts_from_store(
+    store: &Store,
+    worktree: &Path,
+) -> Option<CheckpointParts> {
     let candidates = path_aliases(worktree);
     for key in candidates {
         let unread = store.unread.get(&key).copied().unwrap_or(false);
@@ -144,7 +151,7 @@ pub fn checkpoint_badge_element(parts: &CheckpointParts, p: &crate::ui::Palette)
                 .gap_0p5()
                 .child(
                     Icon::new(gpui_kit_assets::IconName::Link)
-                        .with_size(crate::ui::ICON_2XS)
+                        .with_size(crate::ui::ICON_XS)
                         .text_color(p.muted_foreground),
                 )
                 .child(parts.refs_len.to_string()),
@@ -166,6 +173,13 @@ pub fn session_orch_parts(sidebar_path: Option<&Path>, session_id: u64) -> Optio
         .and_then(Path::parent)
         .filter(|p| !p.as_os_str().is_empty())?;
     let orch = krill_proto::orchestration::OrchestrationStore::load_cached(dir);
+    orch_parts_from_store(&orch, session_id)
+}
+
+pub(super) fn orch_parts_from_store(
+    orch: &krill_proto::orchestration::OrchestrationStore,
+    session_id: u64,
+) -> Option<OrchBadge> {
     if let Some(disp) = orch
         .dispatches
         .iter()
@@ -220,7 +234,7 @@ pub fn session_orch_element(badge: &OrchBadge, p: &crate::ui::Palette) -> Div {
         .text_color(fg)
         .child(crate::ui::icons::svg_icon(
             crate::ui::icons::WORKFLOW_SVG,
-            10.,
+            crate::ui::ICON_XS,
             fg,
         ))
         .child(label)
@@ -658,6 +672,15 @@ struct ImportedProjectsFile {
     lineage: BTreeMap<String, ImportedWorktreeLineage>,
 }
 
+/// `projects.toml`에 저장된 프로젝트 아이콘 명세(Orca `RepoIcon` 패리티).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, Deserialize)]
+pub struct ImportedRepoIcon {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub value: String,
+}
+
 #[derive(Debug, Default, Deserialize)]
 struct ImportedProject {
     #[serde(default)]
@@ -722,51 +745,6 @@ pub(super) fn imported_repo_paths(state_dir: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// `projects.toml`의 프로젝트 아이콘(CLI `StoredRepoIcon`): `lucide`·`emoji`·`image`(https URL 또는 로컬 경로).
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
-pub(super) struct ImportedRepoIcon {
-    #[serde(default)]
-    pub kind: String,
-    #[serde(default)]
-    pub value: String,
-}
-
-/// 이관 프로젝트의 헤더 표시 메타(배지 색·아이콘·git 여부).
-#[derive(Debug, Clone)]
-pub(super) struct ImportedVisual {
-    pub badge_color: Option<String>,
-    pub repo_icon: Option<ImportedRepoIcon>,
-    pub is_git: bool,
-}
-
-/// 로컬 이관 프로젝트의 표시 메타를 정규 경로(와 linked 워크트리면 주 워크트리 경로) 키로 모은다.
-pub(super) fn imported_visuals(state_dir: &Path) -> BTreeMap<PathBuf, ImportedVisual> {
-    let mut out = BTreeMap::new();
-    let Some(file) = load_imported_projects(state_dir) else {
-        return out;
-    };
-    for proj in file.projects {
-        let raw = proj.path.trim();
-        if proj.archived || proj.host_id.is_some() || raw.is_empty() {
-            continue;
-        }
-        let visual = ImportedVisual {
-            badge_color: proj
-                .badge_color
-                .map(|c| c.trim().to_owned())
-                .filter(|c| !c.is_empty()),
-            repo_icon: proj.repo_icon,
-            is_git: proj.kind.as_deref() != Some("folder"),
-        };
-        let norm = normalize_imported_path(Path::new(raw));
-        if let Some(main) = main_worktree(&norm) {
-            out.insert(normalize_imported_path(&main), visual.clone());
-        }
-        out.insert(norm, visual);
-    }
-    out
-}
-
 fn load_imported_projects(state_dir: &Path) -> Option<ImportedProjectsFile> {
     let mut bytes = Vec::new();
     let file = fs::File::open(state_dir.join(PROJECTS_FILE)).ok()?;
@@ -814,7 +792,7 @@ fn resolve_repo_for_worktree(
 /// 과거 이관분(`[[projects]]` 원본 경로 vs `[worktrees]` 정규 경로)이 섞인 파일도
 /// 사이드바에서 하나의 저장소로 합쳐지도록 읽는 쪽에서도 정규화한다.
 /// 별칭 후보가 아니면 시스템 콜 없이 그대로 둔다(스냅샷 폴링 부하 방지).
-pub(super) fn normalize_imported_path(path: &Path) -> PathBuf {
+fn normalize_imported_path(path: &Path) -> PathBuf {
     if !["/tmp", "/var", "/etc", "/private"]
         .iter()
         .any(|prefix| path.starts_with(prefix))
@@ -864,10 +842,6 @@ pub fn include_imported_projects(
             continue;
         }
         let wt_path = normalize_imported_path(Path::new(wt_key.trim()));
-        // Orca 이관 목록은 지운 워크트리도 남긴다. 디스크에 없는 것은 보이지 않는다(사용자 실측: 92개 중 54개가 없는 폴더).
-        if !wt_path.is_dir() {
-            continue;
-        }
         let repo = resolve_repo_for_worktree(&file.projects, wt.repo_id.as_deref(), &wt_path);
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
@@ -884,9 +858,6 @@ pub fn include_imported_projects(
             continue;
         }
         let wt_path = normalize_imported_path(Path::new(wt_str));
-        if !wt_path.is_dir() {
-            continue;
-        }
         let repo = resolve_repo_for_worktree(&file.projects, lin.repo_id.as_deref(), &wt_path);
         let list = trees.entry(repo).or_default();
         if !list.contains(&wt_path) {
@@ -1069,6 +1040,822 @@ pub(super) fn apply_imported_project_prefs(
     }
 }
 
+/// 사이드바 프로젝트 헤더에 그릴 이름·배지 색·아이콘 정보.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProjectVisualMeta {
+    pub display_name: Option<String>,
+    pub badge_color: Option<String>,
+    pub icon: Option<crate::ui::icons::ProjectIcon>,
+}
+
+const REPO_ICON_DIR: &str = "repo-icons";
+const MAX_ICON_SOURCE_BYTES: u64 = 64 * 1024;
+const MAX_ICON_IMAGE_BYTES: usize = 256 * 1024;
+
+/// Orca `REPO_ICON_FILE_STEMS`(`.ref/orca/src/main/repo-icon-file-detection.ts`)와 같은 탐색 우선순위.
+const REPO_ICON_FILE_STEMS: &[&str] = &[
+    "favicon",
+    "public/favicon",
+    "app/favicon",
+    "app/icon",
+    "src/favicon",
+    "src/app/icon",
+    "assets/favicon",
+    "assets/icon",
+    "static/favicon",
+    "logo",
+    "public/logo",
+    "public/icon",
+    "src-tauri/icons/icon",
+    "app-icon",
+    "icon",
+    "packaging/macos/favicon",
+    "packaging/windows/favicon",
+    "packaging/favicon",
+];
+
+const REPO_ICON_RASTER_EXTS: &[&str] = &["png", "webp", "ico"];
+
+/// Orca `REPO_ICON_SOURCE_FILE_CANDIDATES`(`.ref/orca/src/main/repo-icon-file-detection.ts`).
+const REPO_ICON_SOURCE_FILES: &[&str] = &[
+    "index.html",
+    "public/index.html",
+    "app/routes/__root.tsx",
+    "src/routes/__root.tsx",
+    "app/root.tsx",
+    "src/root.tsx",
+    "src/index.html",
+];
+
+const RESERVED_GITHUB_PATHS: &[&str] = &[
+    "orgs",
+    "users",
+    "settings",
+    "marketplace",
+    "explore",
+    "topics",
+    "collections",
+    "events",
+    "sponsors",
+    "notifications",
+    "login",
+    "join",
+    "about",
+    "pricing",
+    "security",
+    "features",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CachedIconOutcome {
+    LocalFile(PathBuf),
+    RemoteUrl(String),
+    None,
+}
+
+type IconProbeKey = (PathBuf, bool);
+type IconProbeEntry = (Option<SystemTime>, CachedIconOutcome);
+
+static DETECTED_ICON_CACHE: LazyLock<Mutex<BTreeMap<IconProbeKey, IconProbeEntry>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(not(test))]
+static IN_FLIGHT_ICON_URLS: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+/// PNG·WebP·ICO 헤더인지 확인한다. 실제 이미지 디코딩은 gpui가 담당한다.
+#[must_use]
+pub fn has_valid_icon_bytes(bytes: &[u8]) -> bool {
+    let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+    let is_webp = bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP";
+    let is_ico = bytes.len() >= 6
+        && bytes.starts_with(&[0, 0, 1, 0])
+        && u16::from_le_bytes([bytes[4], bytes[5]]) > 0;
+    is_png || is_webp || is_ico
+}
+
+fn has_valid_icon_magic(path: &Path) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let Ok(meta) = file.metadata() else {
+        return false;
+    };
+    if !meta.is_file() || meta.len() < 8 || meta.len() > (MAX_ICON_IMAGE_BYTES as u64) * 8 {
+        return false;
+    }
+    let mut header = [0u8; 12];
+    let Ok(n) = file.read(&mut header) else {
+        return false;
+    };
+    has_valid_icon_bytes(&header[..n])
+}
+
+fn short_sha256_hex(input: &str) -> String {
+    use sha2::{Digest as _, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    let mut out = String::with_capacity(16);
+    for &b in &digest[..8] {
+        use std::fmt::Write as _;
+        write!(&mut out, "{b:02x}").ok();
+    }
+    out
+}
+
+/// 원격 아이콘 URL이 로컬 디스크에 캐시될 경로(`<cache_dir>/url-<sha256_prefix>.png`).
+#[must_use]
+pub fn cached_icon_path_for_url(cache_dir: &Path, url: &str) -> PathBuf {
+    cache_dir.join(format!("url-{}.png", short_sha256_hex(url.trim())))
+}
+
+fn write_cached_icon_bytes(target: &Path, bytes: &[u8]) -> io::Result<()> {
+    if !has_valid_icon_bytes(bytes) || bytes.len() > MAX_ICON_IMAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid icon image bytes",
+        ));
+    }
+    let Some(parent) = target.parent() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "icon target has no parent",
+        ));
+    };
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    builder.mode(0o700);
+    builder.create(parent)?;
+    let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
+    let res = (|| -> io::Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        fs::rename(&tmp, target)?;
+        Ok(())
+    })();
+    if res.is_err() {
+        fs::remove_file(&tmp).ok();
+    }
+    res
+}
+
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u8;
+    for b in input.bytes() {
+        if b.is_ascii_whitespace() {
+            continue;
+        }
+        if b == b'=' {
+            break;
+        }
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' | b'-' => 62,
+            b'/' | b'_' => 63,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xFF) as u8);
+            if out.len() > MAX_ICON_IMAGE_BYTES {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `data:image/(png|webp);base64,...` 데이터 URL을 `<cache_dir>`에 디코드·저장하고 경로를 돌려준다.
+pub fn cache_data_url_icon(data_url: &str, cache_dir: &Path) -> Option<PathBuf> {
+    let trimmed = data_url.trim();
+    let (ext, b64) = if let Some(rest) = trimmed.strip_prefix("data:image/png;base64,") {
+        ("png", rest)
+    } else {
+        let rest = trimmed.strip_prefix("data:image/webp;base64,")?;
+        ("webp", rest)
+    };
+    let target = cache_dir.join(format!("data-{}.{ext}", short_sha256_hex(trimmed)));
+    if has_valid_icon_magic(&target) {
+        return Some(target);
+    }
+    let bytes = decode_base64(b64)?;
+    write_cached_icon_bytes(&target, &bytes).ok()?;
+    Some(target)
+}
+
+fn resolve_or_fetch_remote_icon(
+    url: &str,
+    cache_dir: &Path,
+) -> Option<crate::ui::icons::ProjectIcon> {
+    let target = cached_icon_path_for_url(cache_dir, url);
+    if has_valid_icon_magic(&target) {
+        return Some(crate::ui::icons::ProjectIcon::Image(target));
+    }
+    #[cfg(not(test))]
+    {
+        let clean_url = url.trim().to_owned();
+        let should_spawn = IN_FLIGHT_ICON_URLS
+            .lock()
+            .is_ok_and(|mut set| set.insert(clean_url.clone()));
+        if should_spawn {
+            std::thread::spawn(move || {
+                let out = std::process::Command::new("/usr/bin/curl")
+                    .args([
+                        "-fsSL",
+                        "--max-time",
+                        "5",
+                        "--max-filesize",
+                        "262144",
+                        &clean_url,
+                    ])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .output();
+                if let Ok(out) = out
+                    && out.status.success()
+                {
+                    write_cached_icon_bytes(&target, &out.stdout).ok();
+                }
+            });
+        }
+    }
+    None
+}
+
+fn extract_attr_value(tag: &str, attr_name: &str) -> Option<String> {
+    let lower = tag.to_ascii_lowercase();
+    let mut search_from = 0;
+    while let Some(pos) = lower.get(search_from..)?.find(attr_name) {
+        let idx = search_from + pos;
+        let before_ok = idx == 0
+            || lower.as_bytes().get(idx - 1).is_some_and(|b| {
+                b.is_ascii_whitespace() || *b == b'<' || *b == b'"' || *b == b'\''
+            });
+        let after_idx = idx + attr_name.len();
+        let rest = tag.get(after_idx..)?.trim_start();
+        if before_ok && let Some(after_eq) = rest.strip_prefix('=') {
+            let after_eq = after_eq.trim_start();
+            if let Some(quote) = after_eq.chars().next().filter(|&c| c == '"' || c == '\'') {
+                let inner = after_eq.get(quote.len_utf8()..)?;
+                if let Some(end) = inner.find(quote) {
+                    return inner.get(..end).map(|s| s.trim().to_owned());
+                }
+            }
+        }
+        search_from = after_idx;
+    }
+    None
+}
+
+fn extract_icon_link_hrefs(source: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let lower = source.to_ascii_lowercase();
+    let mut from = 0;
+    while let Some(pos) = lower.get(from..).and_then(|s| s.find("<link")) {
+        let start = from + pos;
+        let Some(end_rel) = lower.get(start..).and_then(|s| s.find('>')) else {
+            break;
+        };
+        let end = start + end_rel + 1;
+        if let Some(tag) = source.get(start..end)
+            && let Some(rel) = extract_attr_value(tag, "rel")
+            && rel
+                .split_ascii_whitespace()
+                .any(|tok| tok.eq_ignore_ascii_case("icon") || tok.eq_ignore_ascii_case("shortcut"))
+            && let Some(href) = extract_attr_value(tag, "href")
+            && !href.is_empty()
+        {
+            out.push(href);
+        }
+        from = end;
+    }
+    out
+}
+
+fn resolve_local_icon_href(
+    repo_path: &Path,
+    source_file: &Path,
+    raw_href: &str,
+) -> Option<PathBuf> {
+    let href = raw_href.trim().split('#').next()?.split('?').next()?.trim();
+    if href.is_empty()
+        || href.starts_with("http://")
+        || href.starts_with("https://")
+        || href.starts_with("data:")
+        || href.starts_with("//")
+    {
+        return None;
+    }
+    let canon_repo = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let mut candidates = Vec::new();
+    if let Some(stripped) = href.strip_prefix('/') {
+        candidates.push(repo_path.join("public").join(stripped));
+        candidates.push(repo_path.join(stripped));
+    } else {
+        if let Some(parent) = source_file.parent() {
+            candidates.push(parent.join(href));
+        }
+        candidates.push(repo_path.join("public").join(href));
+        candidates.push(repo_path.join(href));
+    }
+    for cand in candidates {
+        let ext_ok = cand.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            REPO_ICON_RASTER_EXTS
+                .iter()
+                .any(|ext| e.eq_ignore_ascii_case(ext))
+        });
+        if !ext_ok {
+            continue;
+        }
+        let Ok(canon_cand) = fs::canonicalize(&cand) else {
+            continue;
+        };
+        if canon_cand.starts_with(&canon_repo) && has_valid_icon_magic(&canon_cand) {
+            return Some(canon_cand);
+        }
+    }
+    None
+}
+
+/// 프로젝트 폴더에서 로컬 파비콘·로고 이미지 파일(PNG·WebP·ICO)을 찾는다.
+#[must_use]
+pub fn detect_local_file_icon(repo_path: &Path) -> Option<PathBuf> {
+    for stem in REPO_ICON_FILE_STEMS {
+        for ext in REPO_ICON_RASTER_EXTS {
+            let candidate = repo_path.join(format!("{stem}.{ext}"));
+            if has_valid_icon_magic(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
+    for rel in REPO_ICON_SOURCE_FILES {
+        let source_path = repo_path.join(rel);
+        let Ok(file) = fs::File::open(&source_path) else {
+            continue;
+        };
+        let mut bytes = Vec::new();
+        if file
+            .take(MAX_ICON_SOURCE_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+            || u64::try_from(bytes.len()).map_or(true, |n| n > MAX_ICON_SOURCE_BYTES)
+        {
+            continue;
+        }
+        let Ok(text) = std::str::from_utf8(&bytes) else {
+            continue;
+        };
+        for href in extract_icon_link_hrefs(text) {
+            if let Some(found) = resolve_local_icon_href(repo_path, &source_path, &href) {
+                return Some(found);
+            }
+        }
+    }
+    None
+}
+
+/// 웹사이트 주소에서 Google S2 파비콘 URL을 만든다(Orca `faviconUrlFromWebsite` + `detectLocalPackageHomepageIcon` 패리티).
+#[must_use]
+pub fn favicon_url_from_website(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed);
+    let authority = without_scheme.split(['/', '?', '#']).next()?.trim();
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = host_port.split(':').next()?.trim().to_ascii_lowercase();
+    let host = host.strip_prefix("www.").unwrap_or(&host);
+    if host.is_empty()
+        || !host.contains('.')
+        || matches!(
+            host,
+            "localhost"
+                | "127.0.0.1"
+                | "0.0.0.0"
+                | "::1"
+                | "github.com"
+                | "gitlab.com"
+                | "bitbucket.org"
+        )
+    {
+        return None;
+    }
+    Some(format!(
+        "https://www.google.com/s2/favicons?domain={host}&sz=64"
+    ))
+}
+
+/// `<repo_path>/package.json`의 `homepage` 필드에서 파비콘 URL을 추출한다.
+#[must_use]
+pub fn detect_package_homepage_favicon_url(repo_path: &Path) -> Option<String> {
+    let pkg_path = repo_path.join("package.json");
+    let file = fs::File::open(pkg_path).ok()?;
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_ICON_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || u64::try_from(bytes.len()).map_or(true, |n| n > MAX_ICON_SOURCE_BYTES)
+    {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    let homepage = val.get("homepage")?.as_str()?;
+    favicon_url_from_website(homepage)
+}
+
+fn read_icon_cargo_manifest(path: &Path) -> Option<toml::Value> {
+    let mut source = String::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_ICON_SOURCE_BYTES + 1)
+        .read_to_string(&mut source)
+        .ok()?;
+    if source.len() as u64 > MAX_ICON_SOURCE_BYTES {
+        return None;
+    }
+    toml::from_str(&source).ok()
+}
+
+/// Rust 패키지·워크스페이스의 homepage에서 파비콘 URL을 찾는다.
+#[must_use]
+pub fn detect_cargo_homepage_favicon_url(repo_path: &Path) -> Option<String> {
+    let manifest = read_icon_cargo_manifest(&repo_path.join("Cargo.toml"))?;
+    let package = manifest.get("package");
+    let homepage = package.and_then(|p| p.get("homepage"));
+    if let Some(url) = homepage.and_then(toml::Value::as_str) {
+        return favicon_url_from_website(url);
+    }
+    let workspace_homepage = |manifest: &toml::Value| {
+        favicon_url_from_website(
+            manifest
+                .get("workspace")?
+                .get("package")?
+                .get("homepage")?
+                .as_str()?,
+        )
+    };
+    // 가상 워크스페이스 루트와 같은 루트의 상속 설정을 먼저 처리한다.
+    if package.is_none()
+        || homepage
+            .and_then(|h| h.get("workspace"))
+            .and_then(toml::Value::as_bool)
+            == Some(true)
+    {
+        if manifest.get("workspace").is_some() {
+            return workspace_homepage(&manifest);
+        }
+        if let Some(workspace) = package
+            .and_then(|p| p.get("workspace"))
+            .and_then(toml::Value::as_str)
+        {
+            return workspace_homepage(&read_icon_cargo_manifest(
+                &repo_path.join(workspace).join("Cargo.toml"),
+            )?);
+        }
+        for parent in repo_path.ancestors().skip(1) {
+            if let Some(manifest) = read_icon_cargo_manifest(&parent.join("Cargo.toml"))
+                && manifest.get("workspace").is_some()
+            {
+                return workspace_homepage(&manifest);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+#[path = "project_icon_tests.rs"]
+mod project_icon_tests;
+
+fn is_valid_github_slug(slug: &str) -> bool {
+    let bytes = slug.as_bytes();
+    if bytes.is_empty() || bytes.len() > 39 {
+        return false;
+    }
+    let first_last_ok = bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric);
+    first_last_ok
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        && !RESERVED_GITHUB_PATHS
+            .iter()
+            .any(|r| r.eq_ignore_ascii_case(slug))
+}
+
+/// GitHub 원격 URL이나 소유자 문자열에서 계정/조직 슬러그를 추출한다(Orca `githubAvatarSlug` 패리티).
+#[must_use]
+pub fn github_avatar_slug(raw: &str) -> Option<String> {
+    let trimmed = raw.trim().trim_start_matches('@').trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // 1. SCP 형식: `git@github.com:owner/repo.git`
+    if let Some((host_part, path_part)) = trimmed.split_once(':')
+        && !path_part.starts_with("//")
+        && host_part
+            .rsplit_once('@')
+            .map_or(host_part, |(_, h)| h)
+            .eq_ignore_ascii_case("github.com")
+    {
+        let owner = path_part
+            .trim_start_matches('/')
+            .split('/')
+            .next()?
+            .trim_end_matches(".git");
+        return is_valid_github_slug(owner).then(|| owner.to_ascii_lowercase());
+    }
+    // 2. 스킴 있는 URL(`https://github.com/owner/repo.git`, `ssh://git@github.com/owner/repo`) 또는 `github.com/owner/repo`
+    let without_scheme = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .or_else(|| trimmed.strip_prefix("ssh://"))
+        .or_else(|| trimmed.strip_prefix("git://"))
+        .unwrap_or(trimmed);
+    if let Some((authority, rest)) = without_scheme.split_once('/') {
+        let host = authority
+            .rsplit_once('@')
+            .map_or(authority, |(_, h)| h)
+            .split(':')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let host = host.strip_prefix("www.").unwrap_or(host);
+        if host.eq_ignore_ascii_case("github.com") {
+            let owner = rest
+                .trim_start_matches('/')
+                .split(['/', '?', '#'])
+                .next()?
+                .trim_end_matches(".git");
+            return is_valid_github_slug(owner).then(|| owner.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn parse_git_config_remotes(config_text: &str) -> (Option<String>, Option<String>) {
+    let mut current_remote: Option<&str> = None;
+    let mut origin: Option<String> = None;
+    let mut upstream: Option<String> = None;
+    for raw_line in config_text.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        if let Some(section) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            let section = section.trim();
+            current_remote = section
+                .strip_prefix("remote")
+                .map(str::trim)
+                .and_then(|rest| rest.strip_prefix('"'))
+                .and_then(|rest| rest.strip_suffix('"'));
+            continue;
+        }
+        if let Some(remote_name) = current_remote
+            && let Some((k, v)) = line.split_once('=')
+            && k.trim().eq_ignore_ascii_case("url")
+        {
+            let url = v.trim().trim_matches('"').trim();
+            if !url.is_empty() {
+                if remote_name == "origin" && origin.is_none() {
+                    origin = Some(url.to_owned());
+                } else if remote_name == "upstream" && upstream.is_none() {
+                    upstream = Some(url.to_owned());
+                }
+            }
+        }
+    }
+    (origin, upstream)
+}
+
+/// Git 저장소의 `.git/config`(`upstream` → `origin` 순)에서 GitHub 소유자 아바타 URL을 추출한다(Orca `detectGitHubAvatarIcon` 패리티).
+#[must_use]
+pub fn detect_github_avatar_url(repo_path: &Path) -> Option<String> {
+    let direct_cfg = repo_path.join(".git/config");
+    let config_path = if direct_cfg.is_file() {
+        direct_cfg
+    } else {
+        let main_repo = main_worktree(repo_path)?;
+        let main_cfg = main_repo.join(".git/config");
+        if main_cfg.is_file() {
+            main_cfg
+        } else {
+            return None;
+        }
+    };
+    let file = fs::File::open(config_path).ok()?;
+    let mut bytes = Vec::new();
+    if file
+        .take(MAX_ICON_SOURCE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || u64::try_from(bytes.len()).map_or(true, |n| n > MAX_ICON_SOURCE_BYTES)
+    {
+        return None;
+    }
+    let text = std::str::from_utf8(&bytes).ok()?;
+    let (origin, upstream) = parse_git_config_remotes(text);
+    for remote_url in [upstream.as_deref(), origin.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(slug) = github_avatar_slug(remote_url) {
+            return Some(format!("https://github.com/{slug}.png?size=64"));
+        }
+    }
+    None
+}
+
+fn probe_project_icon_source(repo_path: &Path, is_git: bool) -> CachedIconOutcome {
+    let mtime = fs::metadata(repo_path).ok().and_then(|m| m.modified().ok());
+    let key = (repo_path.to_path_buf(), is_git);
+    if let Ok(cache) = DETECTED_ICON_CACHE.lock()
+        && let Some((cached_mtime, outcome)) = cache.get(&key)
+        && *cached_mtime == mtime
+    {
+        return outcome.clone();
+    }
+    let outcome = if let Some(local) = detect_local_file_icon(repo_path) {
+        CachedIconOutcome::LocalFile(local)
+    } else if let Some(favicon_url) = detect_package_homepage_favicon_url(repo_path) {
+        CachedIconOutcome::RemoteUrl(favicon_url)
+    } else if let Some(favicon_url) = detect_cargo_homepage_favicon_url(repo_path) {
+        CachedIconOutcome::RemoteUrl(favicon_url)
+    } else if is_git && let Some(avatar_url) = detect_github_avatar_url(repo_path) {
+        CachedIconOutcome::RemoteUrl(avatar_url)
+    } else {
+        CachedIconOutcome::None
+    };
+    if let Ok(mut cache) = DETECTED_ICON_CACHE.lock() {
+        cache.insert(key, (mtime, outcome.clone()));
+    }
+    outcome
+}
+
+fn resolve_explicit_repo_icon(
+    spec: &ImportedRepoIcon,
+    repo_path: &Path,
+    cache_dir: Option<&Path>,
+) -> Option<crate::ui::icons::ProjectIcon> {
+    let val = spec.value.trim();
+    if val.is_empty() {
+        return None;
+    }
+    match spec.kind.trim() {
+        "lucide" => Some(crate::ui::icons::ProjectIcon::Lucide(val.to_owned())),
+        "emoji" => Some(crate::ui::icons::ProjectIcon::Emoji(val.to_owned())),
+        "image" => {
+            if val.starts_with("data:image/") {
+                cache_data_url_icon(val, cache_dir?).map(crate::ui::icons::ProjectIcon::Image)
+            } else if val.starts_with("https://") || val.starts_with("http://") {
+                resolve_or_fetch_remote_icon(val, cache_dir?)
+            } else {
+                let raw_path = val.strip_prefix("file://").unwrap_or(val);
+                let p = Path::new(raw_path);
+                let candidate = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    repo_path.join(p)
+                };
+                has_valid_icon_magic(&candidate)
+                    .then_some(crate::ui::icons::ProjectIcon::Image(candidate))
+            }
+        }
+        _ => None,
+    }
+}
+
+/// 명시된 아이콘 또는 자동 감지(파일 → package.json/Cargo.toml 홈페이지 → GitHub 아바타).
+#[must_use]
+pub fn resolve_project_icon(
+    repo_path: &Path,
+    is_git: bool,
+    cache_dir: Option<&Path>,
+    explicit: Option<&ImportedRepoIcon>,
+) -> Option<crate::ui::icons::ProjectIcon> {
+    if let Some(spec) = explicit
+        && let Some(resolved) = resolve_explicit_repo_icon(spec, repo_path, cache_dir)
+    {
+        return Some(resolved);
+    }
+    match probe_project_icon_source(repo_path, is_git) {
+        CachedIconOutcome::LocalFile(path) => Some(crate::ui::icons::ProjectIcon::Image(path)),
+        CachedIconOutcome::RemoteUrl(url) => resolve_or_fetch_remote_icon(&url, cache_dir?),
+        CachedIconOutcome::None => None,
+    }
+}
+
+#[derive(Clone)]
+struct ImportedVisualEntry {
+    display_name: Option<String>,
+    badge_color: Option<String>,
+    repo_icon: Option<ImportedRepoIcon>,
+    is_git: bool,
+}
+
+fn default_icon_cache_dir() -> Option<PathBuf> {
+    #[cfg(not(test))]
+    {
+        krill_proto::daemon::state_dir().map(|d| d.join(REPO_ICON_DIR))
+    }
+    #[cfg(test)]
+    {
+        None
+    }
+}
+
+/// 사이드바에 표시할 프로젝트별(`repo_paths` + `folder_paths`) 표시 이름·배지 색·아이콘 맵을 계산한다.
+pub(super) fn resolve_project_visuals(
+    state_dir: Option<&Path>,
+    repo_paths: &[PathBuf],
+    folder_paths: &[PathBuf],
+) -> BTreeMap<PathBuf, ProjectVisualMeta> {
+    let cache_dir = state_dir
+        .map(|d| d.join(REPO_ICON_DIR))
+        .or_else(default_icon_cache_dir);
+    let mut imported_map: BTreeMap<PathBuf, ImportedVisualEntry> = BTreeMap::new();
+    if let Some(dir) = state_dir
+        && let Some(file) = load_imported_projects(dir)
+    {
+        for proj in file.projects {
+            if proj.archived || proj.host_id.is_some() || proj.path.trim().is_empty() {
+                continue;
+            }
+            let norm = normalize_imported_path(Path::new(proj.path.trim()));
+            let key =
+                main_worktree(&norm).map_or_else(|| norm.clone(), |m| normalize_imported_path(&m));
+            let display_name = Some(proj.display_name.trim())
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let badge_color = proj
+                .badge_color
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned);
+            let is_git = proj.kind.as_deref() != Some("folder");
+            let entry = ImportedVisualEntry {
+                display_name,
+                badge_color,
+                repo_icon: proj.repo_icon,
+                is_git,
+            };
+            if norm != key {
+                imported_map.insert(norm, entry.clone());
+            }
+            imported_map.insert(key, entry);
+        }
+    }
+
+    let mut out = BTreeMap::new();
+    for (path, default_is_git) in repo_paths
+        .iter()
+        .map(|p| (p, true))
+        .chain(folder_paths.iter().map(|p| (p, false)))
+    {
+        let norm_path = normalize_imported_path(path);
+        let imported = imported_map
+            .get(path)
+            .or_else(|| imported_map.get(&norm_path));
+        let display_name = imported.and_then(|e| e.display_name.clone());
+        let badge_color = imported.and_then(|e| e.badge_color.clone());
+        let explicit_icon = imported.and_then(|e| e.repo_icon.as_ref());
+        let is_git = imported.map_or(default_is_git, |e| e.is_git) || path.join(".git").exists();
+        let icon = resolve_project_icon(path, is_git, cache_dir.as_deref(), explicit_icon);
+        if display_name.is_some() || badge_color.is_some() || icon.is_some() {
+            out.insert(
+                path.clone(),
+                ProjectVisualMeta {
+                    display_name,
+                    badge_color,
+                    icon,
+                },
+            );
+        }
+    }
+    out
+}
+
 /// 디렉터리 mtime별 발견 목록 캐시(스냅샷 폴링마다 디렉터리 IO를 반복하지 않기 위해).
 type WorktreeDiscovery = (Option<SystemTime>, Vec<PathBuf>);
 static WORKTREE_CACHE: LazyLock<Mutex<BTreeMap<PathBuf, WorktreeDiscovery>>> =
@@ -1153,7 +1940,7 @@ pub fn parse_ps_parents(text: &str) -> BTreeMap<u32, u32> {
 
 /// 현재 프로세스 표(pid → ppid). 실패하면 `None`(호출자는 기존 cwd 동작으로 fail-open).
 pub fn parent_map() -> Option<BTreeMap<u32, u32>> {
-    let out = crate::platform::background_command("ps")
+    let out = std::process::Command::new("ps")
         .args(["-eo", "pid,ppid"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1647,41 +2434,6 @@ fn owe803_symlink_alias_imports_merge_into_single_repo() {
     fs::remove_dir_all(root).unwrap();
 }
 
-/// 지운 워크트리가 Orca 이관 목록(`[worktrees]`·`[lineage]`)에 남아 사이드바 수가 부풀던 문제.
-#[cfg(test)]
-#[test]
-fn imported_worktrees_missing_on_disk_are_skipped() {
-    let root = std::env::temp_dir().join(format!("mk-imported-gone-{}", std::process::id()));
-    fs::remove_dir_all(&root).ok();
-    fs::create_dir_all(root.join("repo")).unwrap();
-    fs::create_dir_all(root.join("live")).unwrap();
-    let root = fs::canonicalize(&root).unwrap();
-    let (repo, live) = (root.join("repo"), root.join("live"));
-    let gone = root.join("gone");
-    fs::write(
-        root.join(PROJECTS_FILE),
-        format!(
-            "[[projects]]\nid = \"r1\"\npath = \"{repo}\"\n\n\
-             [worktrees.\"{live}\"]\nrepo_id = \"r1\"\n\n\
-             [worktrees.\"{gone}\"]\nrepo_id = \"r1\"\n\n\
-             [lineage.\"{gone}\"]\nrepo_id = \"r1\"\nworktree_path = \"{gone}\"\n",
-            repo = repo.display(),
-            live = live.display(),
-            gone = gone.display(),
-        ),
-    )
-    .unwrap();
-    let mut trees: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::new();
-    let mut meta: super::Meta = BTreeMap::new();
-    include_imported_projects(&root, &mut trees, &mut meta);
-    fs::remove_dir_all(&root).ok();
-    assert_eq!(
-        trees.get(&repo),
-        Some(&vec![repo.clone(), live]),
-        "{trees:?}"
-    );
-}
-
 /// 설 실기(v0.1.8): ⌘N으로 만든 linked 워크트리가 독립 프로젝트로 등록돼 "저장소 wt1" 그룹이 하나 더 생겼다.
 /// 등록은 주 워크트리로, 이미 잘못 등록된 항목은 주 저장소 그룹 안으로 들어가야 한다.
 #[cfg(test)]
@@ -1764,4 +2516,112 @@ fn owe852_register_project_persists_and_dedupes() {
 
     fs::remove_dir_all(&dir).ok();
     fs::remove_dir_all(&repo).ok();
+}
+
+#[cfg(test)]
+#[test]
+fn orca_project_icon_detection_and_visual_meta_resolution() {
+    use crate::ui::icons::ProjectIcon;
+
+    let base = std::env::temp_dir().join(format!("mk-proj-icons-{}", std::process::id()));
+    fs::remove_dir_all(&base).ok();
+    let state_dir = base.join("state");
+    let repo_local_icon = base.join("aasoft-client");
+    let repo_github = base.join("minikrill");
+    let folder_drive = base.join("gdrive");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::create_dir_all(repo_local_icon.join("public")).unwrap();
+    fs::create_dir_all(repo_github.join(".git")).unwrap();
+    fs::create_dir_all(&folder_drive).unwrap();
+
+    // 1. Local file icon (`public/logo.png` with valid PNG header)
+    let png_bytes: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let logo_path = repo_local_icon.join("public/logo.png");
+    fs::write(&logo_path, png_bytes).unwrap();
+    assert_eq!(
+        detect_local_file_icon(&repo_local_icon),
+        Some(logo_path.clone())
+    );
+
+    // 2. GitHub avatar URL from `.git/config` (`upstream` preferred over `origin`)
+    fs::write(
+        repo_github.join(".git/config"),
+        r#"[remote "origin"]
+	url = git@github.com:craftowen/minikrill.git
+"#,
+    )
+    .unwrap();
+    let gh_url = detect_github_avatar_url(&repo_github).unwrap();
+    assert_eq!(gh_url, "https://github.com/craftowen.png?size=64");
+
+    // Pre-seed cached GitHub avatar on disk so `resolve_project_visuals` resolves immediately without network
+    let cached_gh = cached_icon_path_for_url(&state_dir.join(REPO_ICON_DIR), &gh_url);
+    fs::create_dir_all(cached_gh.parent().unwrap()).unwrap();
+    fs::write(&cached_gh, png_bytes).unwrap();
+
+    // 3. `package.json` homepage favicon URL (skips github.com, accepts custom domain)
+    fs::write(
+        repo_local_icon.join("package.json"),
+        r#"{"homepage": "https://aasoft.kr/docs"}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        detect_package_homepage_favicon_url(&repo_local_icon).as_deref(),
+        Some("https://www.google.com/s2/favicons?domain=aasoft.kr&sz=64")
+    );
+
+    // 4. `projects.toml` with badge_color, display_name, and explicit repo_icon
+    fs::write(
+        state_dir.join(PROJECTS_FILE),
+        format!(
+            r##"[[projects]]
+id = "p-local"
+path = "{}"
+display_name = "AAsoft Client"
+badge_color = "#3b82f6"
+kind = "git"
+
+[[projects]]
+id = "p-gh"
+path = "{}"
+display_name = "minikrill"
+kind = "git"
+
+[[projects]]
+id = "p-folder"
+path = "{}"
+display_name = "구글드라이브"
+badge_color = "#ef4444"
+kind = "folder"
+"##,
+            repo_local_icon.display(),
+            repo_github.display(),
+            folder_drive.display(),
+        ),
+    )
+    .unwrap();
+
+    let visuals = resolve_project_visuals(
+        Some(&state_dir),
+        &[repo_local_icon.clone(), repo_github.clone()],
+        std::slice::from_ref(&folder_drive),
+    );
+
+    let v_local = visuals.get(&repo_local_icon).unwrap();
+    assert_eq!(v_local.display_name.as_deref(), Some("AAsoft Client"));
+    assert_eq!(v_local.badge_color.as_deref(), Some("#3b82f6"));
+    assert_eq!(v_local.icon, Some(ProjectIcon::Image(logo_path)));
+
+    let v_gh = visuals.get(&repo_github).unwrap();
+    assert_eq!(v_gh.display_name.as_deref(), Some("minikrill"));
+    assert_eq!(v_gh.icon, Some(ProjectIcon::Image(cached_gh)));
+
+    let v_folder = visuals.get(&folder_drive).unwrap();
+    assert_eq!(v_folder.display_name.as_deref(), Some("구글드라이브"));
+    assert_eq!(v_folder.badge_color.as_deref(), Some("#ef4444"));
+    assert_eq!(v_folder.icon, None);
+
+    fs::remove_dir_all(&base).ok();
 }

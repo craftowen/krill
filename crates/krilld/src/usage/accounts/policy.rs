@@ -512,6 +512,7 @@ mod engine_tests {
         let state = home.join("state");
         std::fs::create_dir_all(&state).unwrap();
         let mut file = AccountsFile::default();
+        file.auto_switch.enabled = true;
         for (id, pct, delta) in [
             ("active", active, 4000),
             ("low", 10, 5000),

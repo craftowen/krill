@@ -16,6 +16,7 @@ fn open<'a>(cx: &'a mut TestAppContext, state: &Path) -> &'a mut VisualTestConte
     let (_, cx) = cx.add_window_view(|_, _| gpui::Empty);
     let state = state.to_path_buf();
     cx.update(|window, cx| offer_report(state, |_, _| {}, window, cx));
+    cx.run_until_parked();
     cx
 }
 
@@ -53,6 +54,7 @@ fn dismiss_does_not_ask_again(cx: &mut TestAppContext) {
     assert!(!state.join("diagnostics").exists());
     let s = state.clone();
     cx.update(|window, cx| offer_report(s, |_, _| {}, window, cx));
+    cx.run_until_parked();
     assert!(!cx.has_pending_prompt());
     fs::remove_dir_all(&state).ok();
 }

@@ -47,6 +47,42 @@ fn tick(cx: &mut VisualTestContext) {
     cx.run_until_parked();
 }
 
+#[test]
+fn file_request_lock_contention_defers_without_consuming_the_queue() {
+    let dir = TempDir::new("queue-lock-contention");
+    let queue = dir.0.join(FILE_REQUESTS_FILE);
+    fs::write(
+        &queue,
+        br#"{"requests":[{"id":1,"kind":"open","worktree":"/repo","path":"/repo/a.rs","relative_path":"a.rs"}]}"#,
+    )
+    .unwrap();
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.0.join(FILE_REQUESTS_LOCK))
+        .unwrap();
+    lock.lock().unwrap();
+    let path = dir.0.clone();
+    let (send, recv) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        send.send(take_pending_file_requests(&path)).unwrap();
+    });
+    // 구 blocking lock에서도 단언 전에 잠금을 풀어 테스트가 영구 정지하지 않게 한다.
+    let deferred = recv.recv_timeout(Duration::from_secs(1));
+    let preserved = queue.exists();
+    lock.unlock().unwrap();
+    worker.join().unwrap();
+    assert!(deferred.unwrap().is_empty(), "busy queue must defer");
+    assert!(preserved, "busy queue must remain for the next poll");
+    let requests = take_pending_file_requests(&dir.0);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].id, 1);
+    assert!(!queue.exists());
+    assert!(take_pending_file_requests(&dir.0).is_empty());
+}
+
 /// 열기 → 키 입력은 에디터로(터미널 아님) → dirty 점 → ⌘S 원자적 저장 → 깨끗.
 #[gpui::test]
 fn open_type_dirty_and_save(cx: &mut TestAppContext) {
@@ -143,6 +179,7 @@ fn closing_dirty_tab_asks(cx: &mut TestAppContext) {
     cx.simulate_input("z");
 
     cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
     assert!(cx.has_pending_prompt());
     cx.simulate_prompt_answer(etext::CANCEL.get());
     cx.run_until_parked();
@@ -486,7 +523,7 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
                 cells: row("see (https://example.com/docs?x=1)."),
             },
         ];
-        let frame = &encode_update(Revision(1), Seq(1), ops).unwrap()[0];
+        let frame = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
         let (k, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
         assert!(s.on_frame(pane, k, &body, cx));
     });
@@ -822,4 +859,182 @@ fn long_line_wraps_and_cursor_reaches_end(cx: &mut TestAppContext) {
         state.read(cx).cursor_position()
     });
     assert_eq!(cursor, gpui_component::input::Position::new(0, 599));
+}
+
+#[gpui::test]
+fn explicit_close_bulk_waits_for_unsaved_confirmation_before_terminating(cx: &mut TestAppContext) {
+    let dir = TempDir::new("close-sessions-after-unsaved");
+    let file = dir.0.join("dirty.txt");
+    fs::write(&file, "text\n").unwrap();
+    let (view, cx) = open(cx, state_path("close-sessions-after-unsaved"));
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    view.update(cx, |s, _| {
+        s.close_call = Some(Arc::new(move |request| {
+            if matches!(request, krill_proto::control::Request::List) {
+                return Ok(krill_proto::control::Reply::Sessions(Vec::new()));
+            }
+            recorded.lock().unwrap().push(request.clone());
+            Ok(krill_proto::control::Reply::Closed)
+        }));
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, krill_proto::SessionId(107));
+    });
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_input("draft");
+    assert!(dirty(&view, pane, cx));
+    cx.simulate_keystrokes("cmd-t");
+    view.update(cx, |s, cx| s.close_other_tabs(s.layout.active(), cx));
+    cx.run_until_parked();
+    assert!(cx.has_pending_prompt());
+    assert!(requests.lock().unwrap().is_empty());
+    cx.simulate_prompt_answer(etext::CANCEL.get());
+    cx.run_until_parked();
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(
+        layout_of(&view, cx)
+            .sessions()
+            .contains(&krill_proto::SessionId(107))
+    );
+    view.update(cx, |s, cx| s.close_other_tabs(s.layout.active(), cx));
+    cx.run_until_parked();
+    cx.simulate_prompt_answer(etext::DISCARD.get());
+    cx.run_until_parked();
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: krill_proto::SessionId(107)
+        }]
+    );
+}
+
+/// The file worker is deliberately held while UI actions and drawing continue.
+#[gpui::test]
+fn slow_open_keeps_ui_responsive_and_rejects_replaced_preview(cx: &mut TestAppContext) {
+    let dir = TempDir::new("async-stale-open");
+    let old = dir.0.join("old.txt");
+    let new = dir.0.join("new.txt");
+    fs::write(&old, "old").unwrap();
+    fs::write(&new, "new").unwrap();
+    let (view, cx) = open(cx, state_path("async-stale-open"));
+    let (release, gate) = tokio::sync::oneshot::channel();
+    view.update(cx, |shell, cx| {
+        shell.files.next_io = Some(gate);
+        shell.open_file_preview(old.clone(), cx);
+    });
+    cx.run_until_parked();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    assert!(cx.update(|_, cx| view.read(cx).files.loading.contains_key(&pane)));
+    assert!(
+        cx.debug_bounds("file-pane").is_some(),
+        "draws while disk work is pending"
+    );
+    view.update(cx, |shell, cx| shell.open_file_preview(new.clone(), cx));
+    cx.run_until_parked();
+    assert_eq!(layout_of(&view, cx).active_tab().focused, pane);
+    assert_eq!(editor_text(&view, pane, cx), "new");
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(
+        editor_text(&view, pane, cx),
+        "new",
+        "late IO must not replace the new preview"
+    );
+}
+
+#[gpui::test]
+fn edits_during_slow_save_stay_dirty_and_close_waits_for_completion(cx: &mut TestAppContext) {
+    let dir = TempDir::new("async-save-edit");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("async-save-edit"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    view.update(cx, |shell, cx| {
+        shell.files.next_io = Some(gate);
+        shell.save_file(pane, cx).detach();
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("y");
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "xyinitial");
+    assert!(cx.update(|_, cx| view.read(cx).files.tabs[&pane].saving));
+    let closed = cx.update(|_, cx| {
+        view.update(cx, |_, cx| {
+            Shell::resolve_unsaved(async { Some(0) }, &[pane], cx)
+        })
+    });
+    assert!(
+        !cx.foreground_executor().block_test(closed),
+        "inflight save cannot authorize close"
+    );
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "xinitial");
+    assert!(dirty(&view, pane, cx));
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert_eq!(fs::read_to_string(&file).unwrap(), "xyinitial");
+    assert!(!dirty(&view, pane, cx));
+}
+
+#[gpui::test]
+fn late_reload_does_not_discard_new_input(cx: &mut TestAppContext) {
+    let dir = TempDir::new("async-reload-edit");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("async-reload-edit"));
+    let pane = open_file(&view, &file, cx);
+    fs::write(&file, "external change").unwrap();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    cx.update(|window, cx| {
+        view.update(cx, |shell, cx| {
+            shell.files.next_io = Some(gate);
+            shell.reload_file(pane, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert_eq!(editor_text(&view, pane, cx), "xinitial");
+    assert!(dirty(&view, pane, cx));
+}
+
+#[gpui::test]
+fn accepted_save_survives_tab_discard_and_quit_barrier_waits(cx: &mut TestAppContext) {
+    let dir = TempDir::new("async-save-discard");
+    let file = dir.0.join("file.txt");
+    fs::write(&file, "initial").unwrap();
+    let (view, cx) = open(cx, state_path("async-save-discard"));
+    let pane = open_file(&view, &file, cx);
+    cx.simulate_keystrokes("x");
+    cx.run_until_parked();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    view.update(cx, |shell, cx| {
+        shell.files.next_io = Some(gate);
+        shell.save_file(pane, cx).detach();
+        shell.files.tabs.remove(&pane);
+        shell.change(true, cx, Layout::close_pane);
+    });
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = finished.clone();
+    cx.update(|_, cx| {
+        let barrier = flush_editor_writes(cx);
+        cx.spawn(async move |cx| {
+            barrier.await;
+            observed.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = cx;
+        })
+        .detach();
+    });
+    cx.run_until_parked();
+    assert!(!finished.load(std::sync::atomic::Ordering::SeqCst));
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(fs::read_to_string(file).unwrap(), "xinitial");
 }

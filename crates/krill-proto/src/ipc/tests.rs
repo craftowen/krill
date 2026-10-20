@@ -240,6 +240,11 @@ fn served_usage_is_advertised() {
 #[test]
 fn feature_registry_matches_architecture_and_frozen_values() {
     let registry = [
+        (
+            "FEAT_ORCH_RETAIN",
+            crate::orchestration::FEAT_ORCH_RETAIN,
+            19,
+        ),
         ("FEAT_MOBILE", crate::mobile::FEAT_MOBILE, 56),
         ("FEAT_CLIPBOARD", crate::clipboard::FEAT_CLIPBOARD, 33),
         ("FEAT_CONTROL", crate::control::FEAT_CONTROL, 1),
@@ -268,6 +273,11 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ("FEAT_SEARCH", crate::search::FEAT_SEARCH, 8),
         ("FEAT_TERM_MODES", crate::term_modes::FEAT_TERM_MODES, 13),
         ("FEAT_USAGE", crate::usage::FEAT_USAGE, 17),
+        (
+            "FEAT_PROVIDER_DETAILS",
+            crate::usage::FEAT_PROVIDER_DETAILS,
+            15,
+        ),
         ("FEAT_USAGE_AGY", crate::usage::FEAT_USAGE_AGY, 53),
         ("FEAT_USAGE_RULES", crate::usage::FEAT_USAGE_RULES, 54),
         ("FEAT_HISTORY_PAUSE", crate::history::FEAT_HISTORY_PAUSE, 55),
@@ -306,6 +316,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
             50,
         ),
         ("FEAT_AI_VAULT", crate::agent_history::FEAT_AI_VAULT, 32),
+        ("FEAT_CHAT_POLL", crate::agent_history::FEAT_CHAT_POLL, 63),
         ("FEAT_HIBERNATION", crate::control::FEAT_HIBERNATION, 51),
         (
             "FEAT_WORKTREE_PREPARE",

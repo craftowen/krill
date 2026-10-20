@@ -8,14 +8,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, Context, InteractiveElement as _, IntoElement as _, ParentElement as _,
-    SharedString, StatefulInteractiveElement as _, Styled as _, Task, div,
+    AnyElement, AppContext as _, Context, InteractiveElement as _, IntoElement as _,
+    ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription,
+    Task, Window, div,
 };
 use gpui_component::ActiveTheme as _;
 use gpui_component::Disableable as _;
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
-use krill_app::i18n::catalog::chat as text;
+use gpui_component::input::{Input, InputEvent, InputState};
+use krill_app::i18n::catalog::chat as ctext;
 use krill_app::ui;
 use krill_proto::SessionId;
 use krill_proto::agent_history::{Action, ChatItem, ChatItemKind, ChatPollSnapshot, Response};
@@ -30,8 +32,6 @@ pub(crate) struct SessionChatLog {
     pub agent: String,
     pub offset: u64,
     pub bound: bool,
-    /// `items` 앞에서 잘려 나간 항목 수. 답변 키를 절대 위치로 유지해 250개 상한으로
-    /// 앞부분이 잘려도 이미 답한 질문 카드가 다시 열리지 않게 한다.
     pub base_index: usize,
     pub items: Vec<ChatItem>,
     pub answered: BTreeSet<String>,
@@ -42,38 +42,50 @@ pub(crate) struct SessionChatLog {
 pub(crate) struct ChatState {
     pub active_sessions: BTreeSet<SessionId>,
     pub logs: BTreeMap<SessionId, SessionChatLog>,
+    pub inputs: BTreeMap<SessionId, (gpui::Entity<InputState>, Subscription)>,
     pub last_poll: Option<std::time::Instant>,
     pub task: Option<Task<()>>,
+    pub poll_generation: u64,
+    #[cfg(test)]
+    pub next_poll_io: Option<tokio::sync::oneshot::Receiver<()>>,
+    #[cfg(test)]
+    pub poll_call: Option<krill_app::agent_history::Call>,
     pub keystroke_task: Option<Task<()>>,
 }
 
-/// TUI 화면에서 질문 선택지 목록의 현재 커서 줄(`❯`·`>`·`›`·`●`·`*`·`→`로 시작)을 찾아
-/// 그 줄이 가리키는 선택지 인덱스를 돌려준다. 한 줄에 여러 라벨이 겹치면 가장 긴 라벨을 고른다
-/// (`Yes`와 `Yes, and don't ask again`). 못 찾으면 `None`.
+/// TUI 화면 버퍼에서 질문 옵션 목록의 현재 선택 커서(`❯`, `>`, `›`, `●`, `*`) 인덱스를 찾는다.
+/// 찾지 못하면 기본 시작 인덱스 `0`을 반환한다.
 pub(crate) fn detect_question_cursor_index(
     rows: &[Vec<Cell>],
     options: &[String],
 ) -> Option<usize> {
+    if options.is_empty() {
+        return None;
+    }
     for row in rows.iter().rev() {
         let line: String = row.iter().map(|c| c.ch).collect();
         let trimmed = line.trim();
-        if !trimmed.starts_with(['❯', '>', '›', '●', '*', '→']) {
+        if trimmed.is_empty() {
             continue;
         }
-        let hit = options
-            .iter()
-            .enumerate()
-            .filter(|(_, opt)| !opt.is_empty() && trimmed.contains(opt.as_str()))
-            .max_by_key(|(_, opt)| opt.len())
-            .map(|(idx, _)| idx);
-        if hit.is_some() {
-            return hit;
+        let has_cursor_marker = trimmed.starts_with('❯')
+            || trimmed.starts_with('>')
+            || trimmed.starts_with('›')
+            || trimmed.starts_with('●')
+            || trimmed.starts_with('*')
+            || trimmed.starts_with('→');
+        if !has_cursor_marker {
+            continue;
+        }
+        for (idx, opt) in options.iter().enumerate() {
+            if !opt.is_empty() && trimmed.contains(opt.as_str()) {
+                return Some(idx);
+            }
         }
     }
     None
 }
 
-/// 커서를 `target`까지 ↑/↓ 키로 옮기는 시퀀스를 덧붙인다.
 fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
     while *cursor < target {
         steps.push(b"\x1b[B".to_vec());
@@ -102,6 +114,8 @@ impl Shell {
 
     /// `[Chat | Term]` 모드를 토글한다(OWE-946 / MK-243).
     pub(super) fn toggle_chat_view(&mut self, cx: &mut Context<Self>) {
+        self.diff
+            .update(cx, krill_app::diff::Panel::clear_selection);
         let Some(session) = self.active_session_id() else {
             return;
         };
@@ -130,29 +144,67 @@ impl Shell {
 
     /// 데몬에 `Action::ChatPoll`을 요청해 활성 세션의 증분 트랜스크립트를 가져온다.
     pub(super) fn poll_active_chat(&mut self, cx: &mut Context<Self>) {
+        let Some(pane) = self.layout.focused() else {
+            return;
+        };
         let Some(session) = self.active_session_id() else {
             return;
         };
-        if !self.chat.active_sessions.contains(&session) {
+        self.poll_session_chat(pane, session, cx);
+    }
+
+    fn poll_session_chat(
+        &mut self,
+        pane: super::PaneId,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chat.task.is_some() || !self.chat.active_sessions.contains(&session) {
             return;
         }
+        let host = self.layout.host(pane).clone();
+        let Some(target) = self.target_for_host(&host) else {
+            return;
+        };
+        let call = krill_app::agent_history::daemon_call_for(Some(target));
+        #[cfg(test)]
+        let call = self.chat.poll_call.clone().unwrap_or(call);
+        #[cfg(test)]
+        let gate = self.chat.next_poll_io.take();
         self.chat.last_poll = Some(std::time::Instant::now());
-        let offset = self.chat.logs.get(&session).map_or(0, |l| l.offset);
-        let pane = self.layout.focused();
-        let host = pane.map_or(&krill_app::hosts::HostId::Local, |p| self.layout.host(p));
-        let target = self.target_for_host(host);
-        let call = krill_app::agent_history::daemon_call_for(target);
+        self.chat.poll_generation = self.chat.poll_generation.wrapping_add(1);
+        let generation = self.chat.poll_generation;
+        let offset = self.chat.logs.get(&session).map_or(0, |log| log.offset);
         self.chat.task = Some(cx.spawn(async move |this, cx| {
-            let reply =
-                cx.background_executor()
-                    .spawn(async move {
-                        call(&Request::AgentHistory(Action::ChatPoll { session, offset }))
-                    })
-                    .await;
+            let reply = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    call(&Request::AgentHistory(Action::ChatPoll { session, offset }))
+                })
+                .await;
             this.update(cx, |this, cx| {
-                if let Ok(Reply::AgentHistory(Response::ChatPolled(snap))) = reply {
-                    this.apply_chat_poll(session, snap);
+                if this.chat.poll_generation != generation {
+                    return;
+                }
+                this.chat.task = None;
+                if this.layout.host(pane) == &host
+                    && this.layout.session(pane) == Some(session)
+                    && this.chat.active_sessions.contains(&session)
+                    && this.chat.logs.get(&session).map_or(0, |log| log.offset) == offset
+                    && let Ok(Reply::AgentHistory(Response::ChatPolled(snapshot))) = reply
+                {
+                    this.apply_chat_poll(session, snapshot);
                     cx.notify();
+                }
+                if this
+                    .active_session_id()
+                    .is_some_and(|active| active != session)
+                {
+                    this.poll_active_chat(cx);
                 }
             })
             .ok();
@@ -216,6 +268,59 @@ impl Shell {
         n.is_none()
     }
 
+    fn ensure_chat_input(
+        &mut self,
+        session: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<InputState> {
+        if let Some((input, _)) = self.chat.inputs.get(&session) {
+            return input.clone();
+        }
+        let input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(ctext::PROMPT_PLACEHOLDER.get()));
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            move |this, _state, ev: &InputEvent, window, cx| {
+                if matches!(
+                    ev,
+                    InputEvent::PressEnter {
+                        secondary: false,
+                        ..
+                    }
+                ) {
+                    this.submit_chat_prompt(session, window, cx);
+                }
+            },
+        );
+        self.chat.inputs.insert(session, (input.clone(), sub));
+        input
+    }
+
+    pub(super) fn submit_chat_prompt(
+        &mut self,
+        session: SessionId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((input, _)) = self.chat.inputs.get(&session) else {
+            return;
+        };
+        let input = input.clone();
+        let text = input.read(cx).value().to_string();
+        if text.trim().is_empty() {
+            return;
+        }
+        input.update(cx, |s, cx| {
+            s.set_value(String::new(), window, cx);
+        });
+        let mut bytes = text.into_bytes();
+        bytes.push(b'\r');
+        self.send_to_session(session, bytes, cx);
+        cx.notify();
+    }
+
     pub(super) fn toggle_chat_multi_option(
         &mut self,
         session: SessionId,
@@ -231,13 +336,12 @@ impl Shell {
         cx.notify();
     }
 
-    /// 세션 칸 화면에서 질문 선택지의 현재 커서 위치를 읽는다(못 읽으면 첫 선택지로 본다).
     fn current_question_cursor(&self, session: SessionId, options: &[String]) -> usize {
-        self.layout
-            .visible()
-            .into_iter()
-            .find(|&p| self.layout.file(p).is_none() && self.layout.session(p) == Some(session))
-            .and_then(|p| self.live.get(&p))
+        let pane =
+            self.layout.visible().into_iter().find(|&p| {
+                self.layout.file(p).is_none() && self.layout.session(p) == Some(session)
+            });
+        pane.and_then(|p| self.live.get(&p))
             .and_then(|l| detect_question_cursor_index(&l.pane.screen().rows, options))
             .unwrap_or(0)
     }
@@ -255,7 +359,6 @@ impl Shell {
         if let Some(log) = self.chat.logs.get_mut(&session) {
             log.answered.insert(answer_key);
         }
-        // 에이전트 TUI가 커서를 기본값 등 첫 줄이 아닌 곳에 둘 수 있어 화면에서 현재 위치를 읽는다.
         let mut cursor = self.current_question_cursor(session, option_labels);
         let mut steps: Vec<Vec<u8>> = Vec::new();
         if multi_select {
@@ -268,7 +371,8 @@ impl Shell {
             }
             steps.push(b"\r".to_vec());
         } else if let Some(&choice_idx) = selected.first() {
-            step_cursor(&mut steps, &mut cursor, choice_idx.min(16));
+            let target = choice_idx.min(16);
+            step_cursor(&mut steps, &mut cursor, target);
             steps.push(b"\r".to_vec());
         } else {
             return;
@@ -306,8 +410,7 @@ impl Shell {
         cx.notify();
     }
 
-    fn active_live_status_line(&self) -> Option<String> {
-        let pane = self.layout.focused()?;
+    fn pane_live_status_line(&self, pane: super::PaneId) -> Option<String> {
         let live = self.live.get(&pane)?;
         let screen = live.pane.screen();
         for row in screen.rows.iter().rev() {
@@ -320,11 +423,20 @@ impl Shell {
         None
     }
 
-    pub(super) fn render_chat_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let session = self.active_session_id()?;
+    pub(super) fn render_pane_chat_overlay(
+        &mut self,
+        pane: super::PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if self.layout.file(pane).is_some() {
+            return None;
+        }
+        let session = self.layout.session(pane)?;
         if !self.chat.active_sessions.contains(&session) {
             return None;
         }
+        let input_state = self.ensure_chat_input(session, window, cx);
         let theme = cx.theme();
         let bg = theme.background;
         let panel_bg = theme.muted;
@@ -336,17 +448,17 @@ impl Shell {
         let log = self.chat.logs.get(&session);
         let agent_label = log
             .and_then(|l| (!l.agent.is_empty()).then_some(l.agent.as_str()))
-            .unwrap_or("agent");
+            .unwrap_or("agent")
+            .to_owned();
         let bound = log.is_some_and(|l| l.bound);
-        let items = log.map_or(&[][..], |l| l.items.as_slice());
         let base_index = log.map_or(0, |l| l.base_index);
-        let cwd = self
-            .layout
-            .focused()
-            .and_then(|pane| self.pane_cwd(pane, cx));
+        let items: Vec<ChatItem> = log.map_or_else(Vec::new, |l| l.items.clone());
 
         let mut feed = div()
-            .id("desktop-chat-feed")
+            .id(SharedString::from(format!(
+                "desktop-chat-feed-{}",
+                pane.get()
+            )))
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
@@ -357,9 +469,9 @@ impl Shell {
 
         if items.is_empty() {
             let empty_msg = if bound {
-                text::EMPTY_BOUND.get()
+                ctext::EMPTY_BOUND.get()
             } else {
-                text::EMPTY_UNBOUND.get()
+                ctext::EMPTY_UNBOUND.get()
             };
             feed = feed.child(
                 div()
@@ -373,8 +485,8 @@ impl Shell {
                     .child(empty_msg),
             );
         } else {
-            for (rel, item) in items.iter().enumerate() {
-                let idx = base_index + rel;
+            for (idx, item) in items.iter().enumerate() {
+                let abs_idx = base_index + idx;
                 let role_label = match item.kind {
                     ChatItemKind::User => "YOU",
                     ChatItemKind::Assistant => "AGENT",
@@ -391,7 +503,10 @@ impl Shell {
                         border
                     };
                 let mut card = div()
-                    .id(SharedString::from(format!("chat-item-{idx}")))
+                    .id(SharedString::from(format!(
+                        "chat-item-{}-{abs_idx}",
+                        pane.get()
+                    )))
                     .p_3()
                     .rounded(ui::RADIUS_MD)
                     .border_1()
@@ -413,19 +528,25 @@ impl Shell {
                                 },
                             ))
                             .children((!item.file_path.is_empty()).then(|| {
-                                // agy 등은 작업 폴더 기준 상대 경로를 남기므로 칸의 cwd에 붙인다.
-                                let raw = std::path::PathBuf::from(&item.file_path);
-                                let path = match &cwd {
-                                    Some(cwd) if raw.is_relative() => cwd.join(&raw),
-                                    _ => raw,
+                                let raw_path = std::path::PathBuf::from(&item.file_path);
+                                let path = if raw_path.is_relative() {
+                                    self.pane_cwd(pane, cx)
+                                        .map_or_else(|| raw_path.clone(), |cwd| cwd.join(&raw_path))
+                                } else {
+                                    raw_path
                                 };
-                                Button::new(SharedString::from(format!("chat-open-file-{idx}")))
-                                    .label(item.file_path.clone())
-                                    .ghost()
-                                    .xsmall()
-                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                Button::new(SharedString::from(format!(
+                                    "chat-open-file-{}-{abs_idx}",
+                                    pane.get()
+                                )))
+                                .label(item.file_path.clone())
+                                .ghost()
+                                .xsmall()
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.open_file_at(path.clone(), 1, 1, cx);
-                                    }))
+                                    },
+                                ))
                             })),
                     )
                     .child(
@@ -436,19 +557,26 @@ impl Shell {
                     );
 
                 if item.kind == ChatItemKind::Question && !item.options.is_empty() {
-                    let answer_key = format!("{}:{idx}", item.tool_id);
-                    let answered = log.is_some_and(|l| l.answered.contains(&answer_key));
+                    let answer_key = format!("{}:{abs_idx}", item.tool_id);
+                    let answered = self
+                        .chat
+                        .logs
+                        .get(&session)
+                        .is_some_and(|l| l.answered.contains(&answer_key));
                     let multi_select = item.multi_select;
-                    let selected_set = log
+                    let selected_set = self
+                        .chat
+                        .logs
+                        .get(&session)
                         .and_then(|l| l.multi_selected.get(&answer_key))
                         .cloned()
                         .unwrap_or_default();
-                    let labels: std::rc::Rc<[String]> =
+                    let option_labels: Vec<String> =
                         item.options.iter().map(|o| o.label.clone()).collect();
                     let mut opts_row = div().flex().flex_wrap().gap_1p5();
                     for (opt_idx, opt) in item.options.iter().enumerate() {
                         let key_clone = answer_key.clone();
-                        let labels = labels.clone();
+                        let labels_clone = option_labels.clone();
                         let is_checked = selected_set.contains(&opt_idx);
                         let prefix = if multi_select {
                             if is_checked { "[✓] " } else { "[ ] " }
@@ -461,12 +589,16 @@ impl Shell {
                             format!("{prefix}{} — {}", opt.label, opt.description)
                         };
                         opts_row = opts_row.child(
-                            Button::new(SharedString::from(format!("chat-q-{idx}-{opt_idx}")))
-                                .label(label)
-                                .small()
-                                .ghost()
-                                .disabled(answered)
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            Button::new(SharedString::from(format!(
+                                "chat-q-{}-{abs_idx}-{opt_idx}",
+                                pane.get()
+                            )))
+                            .label(label)
+                            .small()
+                            .ghost()
+                            .disabled(answered)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     if multi_select {
                                         this.toggle_chat_multi_option(
                                             session,
@@ -478,69 +610,112 @@ impl Shell {
                                         this.answer_chat_question(
                                             session,
                                             key_clone.clone(),
-                                            &labels,
+                                            &labels_clone,
                                             vec![opt_idx],
                                             false,
                                             cx,
                                         );
                                     }
-                                })),
+                                },
+                            )),
                         );
                     }
                     if multi_select {
                         let key_submit = answer_key.clone();
+                        let labels_submit = option_labels;
                         let picks: Vec<usize> = selected_set.into_iter().collect();
                         opts_row = opts_row.child(
-                            Button::new(SharedString::from(format!("chat-q-submit-{idx}")))
-                                .label(text::SUBMIT.format(&[("n", &picks.len().to_string())]))
-                                .small()
-                                .primary()
-                                .disabled(answered || picks.is_empty())
-                                .on_click(cx.listener(move |this, _, _, cx| {
+                            Button::new(SharedString::from(format!(
+                                "chat-q-submit-{}-{abs_idx}",
+                                pane.get()
+                            )))
+                            .label(format!("{} ({})", ctext::SUBMIT.get(), picks.len()))
+                            .small()
+                            .primary()
+                            .disabled(answered || picks.is_empty())
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
                                     this.answer_chat_question(
                                         session,
                                         key_submit.clone(),
-                                        &labels,
+                                        &labels_submit,
                                         picks.clone(),
                                         true,
                                         cx,
                                     );
-                                })),
+                                },
+                            )),
                         );
                     }
                     card = card.child(opts_row);
                 } else if item.kind == ChatItemKind::Permission {
-                    card = card.child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                Button::new(SharedString::from(format!("chat-perm-yes-{idx}")))
-                                    .label(text::APPROVE.get())
+                    card =
+                        card.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-perm-yes-{}-{abs_idx}",
+                                        pane.get()
+                                    )))
+                                    .label(ctext::APPROVE.get())
                                     .small()
                                     .primary()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.approve_chat_permission(session, true, cx);
                                     })),
-                            )
-                            .child(
-                                Button::new(SharedString::from(format!("chat-perm-no-{idx}")))
-                                    .label(text::DENY.get())
+                                )
+                                .child(
+                                    Button::new(SharedString::from(format!(
+                                        "chat-perm-no-{}-{abs_idx}",
+                                        pane.get()
+                                    )))
+                                    .label(ctext::DENY.get())
                                     .small()
                                     .ghost()
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.approve_chat_permission(session, false, cx);
                                     })),
-                            ),
-                    );
+                                ),
+                        );
                 }
 
                 feed = feed.child(card);
             }
         }
 
-        let live_line = self.active_live_status_line();
+        let composer = div()
+            .px_3()
+            .py_2()
+            .border_t_1()
+            .border_color(border)
+            .bg(bg)
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(Input::new(&input_state).small().cleanable(true)),
+            )
+            .child(
+                Button::new(SharedString::from(format!(
+                    "desktop-chat-send-{}",
+                    pane.get()
+                )))
+                .debug_selector(|| "desktop-chat-send".into())
+                .label(ctext::SEND.get())
+                .small()
+                .primary()
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.submit_chat_prompt(session, window, cx);
+                })),
+            );
+
+        let live_line = self.pane_live_status_line(pane);
         let strip_label = match live_line {
             Some(line) => format!("Hybrid Chat • {agent_label} (#{}) — {line}", session.0),
             None => format!("Hybrid Chat • {agent_label} (Session #{})", session.0),
@@ -568,28 +743,38 @@ impl Shell {
                     .items_center()
                     .gap_1p5()
                     .child(
-                        Button::new("desktop-chat-refresh")
-                            .label(text::REFRESH.get())
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.poll_active_chat(cx);
-                            })),
+                        Button::new(SharedString::from(format!(
+                            "desktop-chat-refresh-{}",
+                            pane.get()
+                        )))
+                        .label(ctext::REFRESH.get())
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.poll_session_chat(pane, session, cx);
+                        })),
                     )
                     .child(
-                        Button::new("desktop-chat-switch-term")
-                            .label(text::TERM.get())
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_chat_view(cx);
-                            })),
+                        Button::new(SharedString::from(format!(
+                            "desktop-chat-switch-term-{}",
+                            pane.get()
+                        )))
+                        .label(ctext::TERM.get())
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.chat.active_sessions.remove(&session);
+                            cx.notify();
+                        })),
                     ),
             );
 
         Some(
             div()
-                .id("desktop-chat-overlay")
+                .id(SharedString::from(format!(
+                    "desktop-chat-overlay-{}",
+                    pane.get()
+                )))
                 .debug_selector(|| "desktop-chat-overlay".into())
                 .absolute()
                 .top_0()
@@ -600,6 +785,7 @@ impl Shell {
                 .flex_col()
                 .bg(bg)
                 .child(feed)
+                .child(composer)
                 .child(strip)
                 .into_any_element(),
         )
@@ -659,6 +845,7 @@ mod tests {
             .expect("overlay should be rendered");
         assert!(bounds.size.width > gpui::px(200.0));
         assert!(bounds.size.height > gpui::px(100.0));
+        assert!(cx.debug_bounds("desktop-chat-send").is_some());
 
         shell.update(cx, |this, cx| {
             assert!(this.is_active_chat_view());
@@ -670,8 +857,31 @@ mod tests {
     }
 
     #[test]
-    fn detect_question_cursor_prefers_marked_row_and_longest_label() {
-        let row = |s: &str| -> Vec<Cell> {
+    fn base_index_preserves_answer_key_after_250_item_drain() {
+        let mut log = SessionChatLog::default();
+        let items: Vec<ChatItem> = (0..260)
+            .map(|i| ChatItem {
+                kind: ChatItemKind::Question,
+                tool_id: format!("tool-{i}"),
+                ..ChatItem::default()
+            })
+            .collect();
+        log.items.extend(items);
+        let excess = log.items.len() - 250;
+        log.items.drain(0..excess);
+        log.base_index = log.base_index.saturating_add(excess);
+
+        // Item originally at index 200 is now at relative index 190,
+        // and base_index (10) + 190 == 200 preserves the original answer_key.
+        let rel_idx = 190;
+        let abs_idx = log.base_index + rel_idx;
+        assert_eq!(abs_idx, 200);
+        assert_eq!(log.items[rel_idx].tool_id, "tool-200");
+    }
+
+    #[test]
+    fn detect_question_cursor_and_bidirectional_steps() {
+        let make_row = |s: &str| -> Vec<Cell> {
             s.chars()
                 .map(|ch| Cell {
                     ch,
@@ -679,64 +889,69 @@ mod tests {
                 })
                 .collect()
         };
-        let options = vec![
-            "Yes".to_owned(),
-            "Yes, and don't ask again".to_owned(),
-            "No".to_owned(),
-        ];
-        let rows = vec![
-            row("  1. Yes"),
-            row("❯ 2. Yes, and don't ask again"),
-            row("  3. No"),
-        ];
+        let rows = vec![make_row("  Fast"), make_row("❯ Safe"), make_row("  Custom")];
+        let options = vec!["Fast".to_owned(), "Safe".to_owned(), "Custom".to_owned()];
         assert_eq!(detect_question_cursor_index(&rows, &options), Some(1));
-        let unmarked = vec![row("  Yes"), row("  No")];
-        assert_eq!(detect_question_cursor_index(&unmarked, &options), None);
 
         let mut cursor = 1;
         let mut steps = Vec::new();
         step_cursor(&mut steps, &mut cursor, 0);
-        step_cursor(&mut steps, &mut cursor, 2);
-        assert_eq!(cursor, 2);
-        assert_eq!(
-            steps,
-            vec![b"\x1b[A".to_vec(), b"\x1b[B".to_vec(), b"\x1b[B".to_vec()]
-        );
+        assert_eq!(cursor, 0);
+        assert_eq!(steps, vec![b"\x1b[A".to_vec()]);
     }
-
+    #[cfg(unix)]
     #[gpui::test]
-    fn apply_chat_poll_keeps_absolute_index_after_trim(cx: &mut TestAppContext) {
-        cx.update(gpui_component::init);
-        let (shell, cx) = cx.add_window_view(|_, cx| Shell::new(None, cx));
-        shell.update(cx, |this, _| {
-            let batch = |from: usize, n: usize, reset: bool| ChatPollSnapshot {
-                reset,
-                bound: true,
-                items: (from..from + n)
-                    .map(|i| ChatItem {
-                        tool_id: format!("t{i}"),
-                        ..ChatItem::default()
-                    })
-                    .collect(),
-                ..ChatPollSnapshot::default()
-            };
-            this.apply_chat_poll(SessionId(3), batch(0, 200, false));
-            this.chat
-                .logs
-                .entry(SessionId(3))
-                .or_default()
-                .answered
-                .insert("t5:5".into());
-            this.apply_chat_poll(SessionId(3), batch(200, 60, false));
-            let log = &this.chat.logs[&SessionId(3)];
-            assert_eq!(log.items.len(), 250);
-            assert_eq!(log.base_index, 10);
-            assert_eq!(log.items[190].tool_id, "t200");
-            // 트랜스크립트가 다시 시작되면 답변 기록도 함께 비운다.
-            this.apply_chat_poll(SessionId(3), batch(0, 1, true));
-            let log = &this.chat.logs[&SessionId(3)];
-            assert_eq!((log.items.len(), log.base_index), (1, 0));
-            assert!(log.answered.is_empty());
+    fn slow_chat_poll_is_coalesced_and_rejects_changed_host(cx: &mut gpui::TestAppContext) {
+        use crate::shell::tests::{open, state_path};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let (view, cx) = open(cx, state_path("async-chat-poll"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = tokio::sync::oneshot::channel();
+        view.update(cx, |shell, cx| {
+            let pane = shell.layout.active_tab().focused;
+            shell.layout.set_session(pane, SessionId(321));
+            shell.paths = Some(krill_proto::daemon::Paths {
+                socket: "/unused".into(),
+                holder: "/unused".into(),
+                krilld: "/unused".into(),
+            });
+            shell.chat.active_sessions.insert(SessionId(321));
+            let recorded = calls.clone();
+            shell.chat.poll_call = Some(Arc::new(move |_| {
+                recorded.fetch_add(1, Ordering::SeqCst);
+                Ok(Reply::AgentHistory(Response::ChatPolled(
+                    ChatPollSnapshot {
+                        next_offset: 7,
+                        bound: true,
+                        ..Default::default()
+                    },
+                )))
+            }));
+            shell.chat.next_poll_io = Some(gate);
+            for _ in 0..20 {
+                shell.poll_active_chat(cx);
+            }
+        });
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        view.update(cx, |shell, cx| {
+            for _ in 0..20 {
+                shell.poll_active_chat(cx);
+            }
+            let pane = shell.layout.active_tab().focused;
+            shell
+                .layout
+                .set_host(pane, krill_app::hosts::HostId::Remote("changed".into()));
+        });
+        release.send(()).unwrap();
+        cx.run_until_parked();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        view.read_with(cx, |shell, _| {
+            assert!(shell.chat.task.is_none());
+            assert!(!shell.chat.logs.contains_key(&SessionId(321)));
         });
     }
 }

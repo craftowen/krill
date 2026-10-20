@@ -99,7 +99,9 @@ pub struct Wizard {
     folder_check_requested: bool,
     pub(super) last_recheck: Instant,
     focus: FocusHandle,
-    task: Option<Task<()>>,
+    tasks: HashMap<&'static str, Task<()>>,
+    checks_revision: u64,
+    recheck_again: bool,
     fix_tasks: HashMap<String, Task<()>>,
     activation: Option<Subscription>,
 }
@@ -143,7 +145,9 @@ impl Wizard {
             folder_check_requested: false,
             last_recheck: Instant::now(),
             focus: cx.focus_handle(),
-            task: None,
+            tasks: HashMap::new(),
+            checks_revision: 0,
+            recheck_again: false,
             fix_tasks: HashMap::new(),
             activation: None,
         }
@@ -171,21 +175,33 @@ impl Wizard {
         }
         self.checks_loading = true;
         cx.notify();
+        let revision = self.checks_revision;
         let env = self.env.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let collected: Collected = cx
-                .background_executor()
-                .spawn(async move { collect(&env) })
-                .await;
-            this.update(cx, |w, cx| {
-                w.apply_collected(collected);
-                if let Some(checks) = &w.checks {
-                    super::store_snapshot(cx, checks.clone());
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.tasks.insert(
+            "checks",
+            cx.spawn(async move |this, cx| {
+                let collected: Collected = cx
+                    .background_executor()
+                    .spawn(async move { collect(&env) })
+                    .await;
+                this.update(cx, |w, cx| {
+                    if w.checks_revision != revision {
+                        w.checks_loading = false;
+                        w.recheck(cx);
+                        return;
+                    }
+                    w.apply_collected(collected);
+                    if let Some(checks) = &w.checks {
+                        super::store_snapshot(cx, checks.clone());
+                    }
+                    cx.notify();
+                    if std::mem::take(&mut w.recheck_again) {
+                        w.recheck(cx);
+                    }
+                })
+                .ok();
+            }),
+        );
     }
 
     fn apply_collected(&mut self, collected: Collected) {
@@ -199,41 +215,55 @@ impl Wizard {
     /// 조용한 재검사(`doctor` + `app.*`). 조치·설정 변경 뒤 반영용.
     fn recheck(&mut self, cx: &mut Context<Self>) {
         if self.checks_loading {
+            self.recheck_again = true;
             return;
         }
         self.checks_loading = true;
         self.last_recheck = Instant::now();
         cx.notify();
+        let revision = self.checks_revision;
         let env = self.env.clone();
         let folders = self.folder_check_requested;
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let collected = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut collected = collect(&env);
-                    if folders {
-                        let check =
-                            perm::decide_folder_probe(&perm::probe_folders(FOLDER_PROBE_TIMEOUT));
-                        if let Some(slot) = collected
-                            .app
-                            .iter_mut()
-                            .find(|check| check.id == perm::FOLDERS_ID)
-                        {
-                            *slot = check;
+        self.tasks.insert(
+            "checks",
+            cx.spawn(async move |this, cx| {
+                let collected = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut collected = collect(&env);
+                        if folders {
+                            let check = perm::decide_folder_probe(&perm::probe_folders(
+                                FOLDER_PROBE_TIMEOUT,
+                            ));
+                            if let Some(slot) = collected
+                                .app
+                                .iter_mut()
+                                .find(|check| check.id == perm::FOLDERS_ID)
+                            {
+                                *slot = check;
+                            }
                         }
+                        collected
+                    })
+                    .await;
+                this.update(cx, |w, cx| {
+                    if w.checks_revision != revision {
+                        w.checks_loading = false;
+                        w.recheck(cx);
+                        return;
                     }
-                    collected
+                    w.apply_collected(collected);
+                    if let Some(checks) = &w.checks {
+                        super::store_snapshot(cx, checks.clone());
+                    }
+                    cx.notify();
+                    if std::mem::take(&mut w.recheck_again) {
+                        w.recheck(cx);
+                    }
                 })
-                .await;
-            this.update(cx, |w, cx| {
-                w.apply_collected(collected);
-                if let Some(checks) = &w.checks {
-                    super::store_snapshot(cx, checks.clone());
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
+                .ok();
+            }),
+        );
     }
 
     /// 모달 재포커스(시스템 설정에서 돌아옴) → 디바운스 후 재검사.
@@ -274,38 +304,41 @@ impl Wizard {
         let link = cli_link_target(self.survey.as_ref());
         let prep = (!self.env.is_isolated_state())
             .then(|| super::actions::auto_prepare(self.env.clone(), cx));
-        self.task = Some(cx.spawn(async move |this, cx| {
-            if let Some(prep) = prep {
-                drop(prep.await);
-            }
-            let link_installed = cx
-                .background_executor()
-                .spawn(async move {
-                    drop(crate::settings::setup_all_agents_and_skills_at(
-                        &home, &state,
-                    ));
-                    if !env.is_isolated_state() {
-                        drop(super::install_codex_hook_with_login_path(&env, &state));
-                    }
-                    if let Some(link_path) = link {
-                        if env.is_isolated_state() {
-                            return true;
-                        }
-                        return install_cli_link(&env.krill, &env.home, &link_path).is_ok();
-                    }
-                    false
-                })
-                .await;
-            this.update(cx, |w, cx| {
-                w.busy.remove("fix-all");
-                if link_installed && let Some(survey) = &mut w.survey {
-                    survey.cli = Cli::Installed;
+        self.tasks.insert(
+            "fix-all",
+            cx.spawn(async move |this, cx| {
+                if let Some(prep) = prep {
+                    drop(prep.await);
                 }
-                cx.notify();
-            })
-            .ok();
-            this.update(cx, Self::recheck).ok();
-        }));
+                let link_installed = cx
+                    .background_executor()
+                    .spawn(async move {
+                        drop(crate::settings::setup_all_agents_and_skills_at(
+                            &home, &state,
+                        ));
+                        if !env.is_isolated_state() {
+                            drop(super::install_codex_hook_with_login_path(&env, &state));
+                        }
+                        if let Some(link_path) = link {
+                            if env.is_isolated_state() {
+                                return true;
+                            }
+                            return install_cli_link(&env.krill, &env.home, &link_path).is_ok();
+                        }
+                        false
+                    })
+                    .await;
+                this.update(cx, |w, cx| {
+                    w.busy.remove("fix-all");
+                    if link_installed && let Some(survey) = &mut w.survey {
+                        survey.cli = Cli::Installed;
+                    }
+                    cx.notify();
+                })
+                .ok();
+                this.update(cx, Self::recheck).ok();
+            }),
+        );
     }
 
     pub(super) fn toggle_expand(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -321,20 +354,27 @@ impl Wizard {
     }
 
     fn run_fix(&mut self, fix: Fix, check: &Check, cx: &mut Context<Self>) {
-        let perm_open = |value: &str| {
-            crate::platform::permissions::open_first_available(&[
-                value,
-                crate::platform::permissions::SETTINGS_ROOT_URL,
-            ]);
+        let perm_open = |value: &str, cx: &mut Context<Self>| {
+            let value = value.to_owned();
+            cx.background_spawn(async move {
+                crate::platform::permissions::open_first_available(&[
+                    &value,
+                    crate::platform::permissions::SETTINGS_ROOT_URL,
+                ]);
+            })
+            .detach();
         };
         match fix {
             Fix::Runner => self.run_runner(&check.id, cx),
             Fix::Copy => self.copy_fix(&check.id, &check.fix.value, cx),
-            Fix::OpenSettings => perm_open(&check.fix.value),
+            Fix::OpenSettings => perm_open(&check.fix.value, cx),
             Fix::Reveal => {
-                crate::platform::permissions::open_first_available(&[
-                    crate::platform::permissions::APPLICATIONS_URL,
-                ]);
+                cx.background_spawn(async {
+                    crate::platform::permissions::open_first_available(&[
+                        crate::platform::permissions::APPLICATIONS_URL,
+                    ]);
+                })
+                .detach();
             }
             Fix::AllowNotifications => self.allow_notifications(cx),
             Fix::ProbeFolders => self.probe_folders(cx),
@@ -384,22 +424,28 @@ impl Wizard {
             return;
         }
         cx.notify();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let status = cx
-                .background_executor()
-                .spawn(async move {
-                    perm::request_notification_authorization(AUTH_REQUEST_TIMEOUT);
-                    perm::query_notification_status(NOTIFICATION_QUERY_TIMEOUT)
+        self.tasks.insert(
+            "notify-allow",
+            cx.spawn(async move |this, cx| {
+                let status = cx
+                    .background_executor()
+                    .spawn(async move {
+                        perm::request_notification_authorization(AUTH_REQUEST_TIMEOUT);
+                        (
+                            perm::query_notification_status(NOTIFICATION_QUERY_TIMEOUT),
+                            perm::bundle_id(),
+                        )
+                    })
+                    .await;
+                this.update(cx, |w, cx| {
+                    w.busy.remove("notify-allow");
+                    let check = perm::decide_notifications(status.0, status.1.as_deref());
+                    w.replace_app_check(check);
+                    cx.notify();
                 })
-                .await;
-            this.update(cx, |w, cx| {
-                w.busy.remove("notify-allow");
-                let check = perm::decide_notifications(status, perm::bundle_id().as_deref());
-                w.replace_app_check(check);
-                cx.notify();
-            })
-            .ok();
-        }));
+                .ok();
+            }),
+        );
     }
 
     /// `[검사]`. 폴더 프로브 묶음을 돌려 행에 반영한다.
@@ -409,21 +455,25 @@ impl Wizard {
             return;
         }
         cx.notify();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let results = cx
-                .background_executor()
-                .spawn(async move { perm::probe_folders(FOLDER_PROBE_TIMEOUT) })
-                .await;
-            this.update(cx, |w, cx| {
-                w.busy.remove("folders-probe");
-                w.replace_app_check(perm::decide_folder_probe(&results));
-                cx.notify();
-            })
-            .ok();
-        }));
+        self.tasks.insert(
+            "folders-probe",
+            cx.spawn(async move |this, cx| {
+                let results = cx
+                    .background_executor()
+                    .spawn(async move { perm::probe_folders(FOLDER_PROBE_TIMEOUT) })
+                    .await;
+                this.update(cx, |w, cx| {
+                    w.busy.remove("folders-probe");
+                    w.replace_app_check(perm::decide_folder_probe(&results));
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
     }
 
     fn replace_app_check(&mut self, check: Check) {
+        self.checks_revision = self.checks_revision.wrapping_add(1);
         if let Some(checks) = &mut self.checks
             && let Some(slot) = checks.iter_mut().find(|c| c.id == check.id)
         {
@@ -1194,5 +1244,41 @@ impl Render for Wizard {
             .child(body)
             .child(Self::render_footer(cx));
         ui::modal_backdrop(window.viewport_size(), card)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod async_tests {
+    use super::*;
+
+    #[gpui::test]
+    fn collect_and_permission_job_keep_independent_completions(cx: &mut gpui::TestAppContext) {
+        let root =
+            std::env::temp_dir().join(format!("krill-checks-overlap-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        cx.update(gpui_component::init);
+        let env = Env {
+            shell: root.join("missing-shell").into_os_string(),
+            krill: root.join("missing-krill"),
+            state: root.join("state"),
+            home: root.join("home"),
+            state_overridden: true,
+        };
+        let wizard = cx.new(|cx| Wizard::new(env, cx));
+        wizard.update(cx, |wizard, cx| {
+            wizard.begin_collect(cx);
+            wizard.allow_notifications(cx);
+            assert!(wizard.checks_loading);
+            assert!(wizard.busy.contains("notify-allow"));
+            assert!(wizard.tasks.contains_key("checks"));
+            assert!(wizard.tasks.contains_key("notify-allow"));
+        });
+        cx.run_until_parked();
+        wizard.read_with(cx, |wizard, _| {
+            assert!(!wizard.checks_loading);
+            assert!(!wizard.busy.contains("notify-allow"));
+            assert!(wizard.survey.is_some());
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

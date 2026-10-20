@@ -450,8 +450,12 @@ fn paste_pairs_once_and_server_uses_one_switch(cx: &mut TestAppContext) {
         let client = view.read(cx).client.clone();
         client.update(cx, |dialog, cx| {
             dialog.paste_from_clipboard(window, cx);
-            dialog.submit_pair(cx);
         });
+    });
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let client = view.read(cx).client.clone();
+        client.update(cx, ClientDialog::submit_pair);
     });
     vcx.run_until_parked();
     vcx.update(|window, cx| {

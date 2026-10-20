@@ -10,9 +10,10 @@ pub const MOBILE_REPLY: u8 = 0x65;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectMode {
-    #[default]
+    /// Retired LAN discriminant (0). Decode for existing saved configurations only.
     Lan,
     Tailscale,
+    #[default]
     Tunnel,
 }
 
@@ -37,6 +38,8 @@ pub enum MobileRequest {
     CurrentPairingOffer,
     /// 인증된 모바일 워크플로 JSON. 기존 세션 IPC·오케스트레이션 저장소로 연결한다.
     Workflow(String),
+    /// Cancel only the pending QR; paired devices and terminal sessions survive.
+    CancelPairingTicket,
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +155,17 @@ mod tests {
     use crate::ipc;
     #[test]
     fn fixtures_and_roundtrips() {
+        assert_eq!(postcard::to_allocvec(&ConnectMode::Lan).unwrap(), vec![0]);
+        assert_eq!(
+            postcard::to_allocvec(&ConnectMode::Tailscale).unwrap(),
+            vec![1]
+        );
+        assert_eq!(ConnectMode::default(), ConnectMode::Tunnel);
         for (value, fixture) in [
+            (
+                MobileRequest::CancelPairingTicket,
+                vec![2, 0, 0, 0, 0x45, 8],
+            ),
             (MobileRequest::Status, vec![2, 0, 0, 0, 0x45, 1]),
             (MobileRequest::ListDevices, vec![2, 0, 0, 0, 0x45, 2]),
             (

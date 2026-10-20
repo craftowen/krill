@@ -1,3 +1,5 @@
+// Krill modification (Apache-2.0 §4(b)): native clipboard IO is queued.
+use crate::clipboard_worker::CLIPBOARD;
 use std::{
     cell::{Cell, RefCell},
     ffi::{OsStr, OsString},
@@ -1022,11 +1024,22 @@ impl Platform for WindowsPlatform {
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        write_to_clipboard(item);
+        CLIPBOARD.write(item);
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        read_from_clipboard()
+        CLIPBOARD.cached()
+    }
+
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<std::result::Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        let executor = self.background_executor();
+        let timer = executor.timer(std::time::Duration::from_secs(2));
+        executor.spawn(crate::clipboard_worker::with_deadline(
+            CLIPBOARD.read_async(),
+            timer,
+        ))
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {

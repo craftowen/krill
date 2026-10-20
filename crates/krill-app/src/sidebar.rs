@@ -31,14 +31,17 @@ use crate::jump::Item;
 use crate::open_in::Target;
 use crate::worktree;
 
+mod async_state;
 pub mod external;
+mod hooks;
 mod ipc;
 pub mod lineage;
 pub mod options;
 mod pr;
-mod project_icon;
+mod startup;
 mod view;
 
+pub use async_state::flush_file_io;
 pub use lineage::{MAX_LINEAGE_DEPTH, can_assign_parent};
 pub use options::{
     CardLayout, CardProperties, CardProperty, GroupBy, GroupKey, PrGroup, SortBy, WorkspaceFilters,
@@ -602,8 +605,11 @@ pub struct Sidebar {
     selected_worktree: Option<PathBuf>,
     /// 목록에서 제거한 저장소·폴더 프로젝트(OWE-845). `projects.toml` 정리와 별개로 행을 숨긴다.
     removed_projects: BTreeSet<PathBuf>,
-    /// 로컬 프로젝트 헤더 아이콘·배지 색(Orca `RepoIcon`). `projects.toml`을 다시 읽을 때 갱신한다.
-    project_visuals: BTreeMap<PathBuf, project_icon::ProjectVisual>,
+    /// 프로젝트(저장소·폴더) 헤더 아이콘·배지 색상·표시 이름 메타.
+    project_visuals: BTreeMap<PathBuf, external::ProjectVisualMeta>,
+    disk: async_state::State,
+    /// 저장소 훅 IO는 렌더링과 분리해 마지막 완료 결과만 표시한다.
+    setup_prompt: hooks::SetupPrompt,
     /// 워크트리 삭제 확인 모달 상태(OWE-847). `Some`일 때 모달을 띄운다.
     delete_confirm: Option<DeleteConfirm>,
     path: Option<PathBuf>,
@@ -694,34 +700,14 @@ fn load_auto_titles_from_sidebar_path(sidebar_path: Option<&Path>) -> BTreeMap<S
 
 impl Sidebar {
     pub fn new(path: Option<PathBuf>) -> Self {
-        let mut error = None;
-        let mut writable = true;
-        let (prefs, options, lin, ui, project_order) = match path.as_deref().map(load_state) {
-            Some(Ok(state)) => state,
-            Some(Err(err)) if err.kind() != io::ErrorKind::NotFound => {
-                writable = path
-                    .as_deref()
-                    .is_some_and(|p| matches!(p.try_exists(), Ok(false)));
-                error = Some(err.to_string());
-                (
-                    Preferences::default(),
-                    WorkspaceOptions::default(),
-                    lineage::LineageState::default(),
-                    UiExpansionState::default(),
-                    Vec::new(),
-                )
-            }
-            _ => (
-                Preferences::default(),
-                WorkspaceOptions::default(),
-                lineage::LineageState::default(),
-                UiExpansionState::default(),
-                Vec::new(),
-            ),
-        };
-        let comments = external::load_comments_from_sidebar_path(path.as_deref());
-        let auto_titles = load_auto_titles_from_sidebar_path(path.as_deref());
-        let mut this = Self {
+        // Construction runs inside cx.new: all persisted state is loaded later on the executor.
+        let (prefs, options, lin, ui) = (
+            Preferences::default(),
+            WorkspaceOptions::default(),
+            lineage::LineageState::default(),
+            UiExpansionState::default(),
+        );
+        Self {
             snapshot: Snapshot::default(),
             meta: Meta::new(),
             local_status: HostStatus::Connected,
@@ -732,7 +718,7 @@ impl Sidebar {
             remote_info: BTreeMap::new(),
             collapsed_hosts: ui.collapsed_hosts,
             show_offline_hosts: false,
-            project_order,
+            project_order: Vec::new(),
             row_hosts: Vec::new(),
             action_host: None,
             prs: BTreeMap::new(),
@@ -750,7 +736,7 @@ impl Sidebar {
             worktree_hosts: BTreeMap::new(),
             automation_worktrees: BTreeSet::new(),
             cli_worktrees: BTreeSet::new(),
-            comments,
+            comments: BTreeMap::new(),
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
             sleeping_worktrees: lin.sleeping_worktrees,
@@ -760,9 +746,10 @@ impl Sidebar {
             selected_worktree: ui.selected_worktree,
             removed_projects: ui.removed_projects,
             project_visuals: BTreeMap::new(),
+            setup_prompt: hooks::SetupPrompt::default(),
             delete_confirm: None,
-            path: path.filter(|_| writable),
-            error,
+            path,
+            error: None,
             poll_error: None,
             notice: None,
             task: None,
@@ -775,19 +762,13 @@ impl Sidebar {
             pending_prompts: BTreeMap::new(),
             custom_titles: BTreeMap::new(),
             titles: BTreeMap::new(),
-            auto_titles,
+            auto_titles: BTreeMap::new(),
             last_cache_tick_sec: None,
             now_override_ns: None,
             focused: None,
             unread: BTreeSet::new(),
-            agents: sort_agents(
-                Agents::load(None)
-                    .unwrap_or_default()
-                    .profiles
-                    .into_iter()
-                    .map(|(id, p)| AgentProfile { id, name: p.name })
-                    .collect(),
-            ),
+            agents: Vec::new(),
+            disk: async_state::State::default(),
             visible: true,
             active: true,
             cursor: None,
@@ -799,46 +780,7 @@ impl Sidebar {
             rendered_rows: 0,
             #[cfg(test)]
             renders: 0,
-        };
-        if let Some(dir) = this.state_dir().map(Path::to_path_buf) {
-            if !this.parents.is_empty() && !dir.join(external::COMMENTS_FILE).exists() {
-                let legacy = std::mem::take(&mut this.parents);
-                krill_proto::orchestration::WorktreeStore::mutate(&dir, |store| {
-                    for (child, parent) in legacy {
-                        let c = child.to_string_lossy().into_owned();
-                        let p = parent.to_string_lossy().into_owned();
-                        store.set_parent(&c, Some(&p)).ok();
-                        if store.parents.get(&c) != Some(&p) {
-                            store.parents.insert(c, p);
-                        }
-                    }
-                    Ok(())
-                })
-                .ok();
-                lineage::invalidate_parents_cache();
-            }
-            this.parents = this.merged_parents();
         }
-        // `sync` 안에서 자동 접힘이 먼저 반영되므로 행은 접힘 상태로 만든다.
-        let (trees_changed, auto_changed) = this.sync_imported_projects_from_disk();
-        if trees_changed {
-            this.rows = if this.options.filters.contains_host(&HostId::Local) {
-                this.local_rows()
-            } else {
-                Vec::new()
-            };
-            this.row_hosts = vec![HostId::Local; this.rows.len()];
-            if let Some(sel) = &this.selected_worktree {
-                this.cursor = this.rows.iter().position(|r| match r {
-                    Row::Worktree(p) | Row::Folder(p) | Row::Repository(p) => p == sel,
-                    _ => false,
-                });
-            }
-        }
-        if auto_changed {
-            this.write_state();
-        }
-        this
     }
 
     /// OWE-900: 세션 없는 워크트리가 많은 프로젝트는 접힌 상태로 시작한다.
@@ -850,8 +792,13 @@ impl Sidebar {
     /// - 데몬 발견 프로젝트는 빈 prefs 항목을 표시로 남겨 재시작 후 재접힘을 막는다
     ///   (사용자가 펼치면 그 상태가 유지된다). 핀·세션이 있으면 접지 않는다.
     /// - 저장은 호출자가 맡는다(`new`는 `write_state`, 나머지는 `persist`).
-    fn auto_collapse_idle_heavy_repos(&mut self, state_dir: &Path) -> bool {
-        let imported = external::imported_repo_paths(state_dir);
+    fn auto_collapse_idle_heavy_repos(&mut self, imported: &BTreeSet<String>) -> bool {
+        let occupied: BTreeSet<&Path> = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter_map(|s| s.worktree.as_deref())
+            .collect();
         let mut changed = false;
         let repos: Vec<PathBuf> = self.snapshot.trees.keys().cloned().collect();
         for repo in repos {
@@ -861,12 +808,7 @@ impl Sidebar {
             let Some(trees) = self.snapshot.trees.get(&repo) else {
                 continue;
             };
-            let has_session = trees.iter().any(|t| {
-                self.snapshot
-                    .sessions
-                    .iter()
-                    .any(|s| s.worktree.as_deref() == Some(t.as_path()))
-            });
+            let has_session = trees.iter().any(|t| occupied.contains(t.as_path()));
             if has_session {
                 continue;
             }
@@ -895,77 +837,15 @@ impl Sidebar {
         changed
     }
 
+    #[cfg(all(test, unix))]
     fn sync_imported_projects_from_disk(&mut self) -> (bool, bool) {
-        let Some(dir) = self
-            .path
-            .as_deref()
-            .and_then(Path::parent)
-            .filter(|p| !p.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-        else {
-            return (false, false);
-        };
-        if let Ok(wt_store) = krill_proto::orchestration::WorktreeStore::load(&dir) {
-            for (k, v) in &wt_store.statuses {
-                if let Ok(st) = krill_proto::orchestration::WorkspaceStatus::parse(v) {
-                    self.worktree_statuses.insert(PathBuf::from(k), st);
-                }
-            }
-            for (k, &ts) in &wt_store.updated_at {
-                self.worktree_updated_at.insert(PathBuf::from(k), ts);
-            }
-            for (k, iss) in &wt_store.issues {
-                self.issues.insert(PathBuf::from(k), iss.clone());
-            }
-        }
-        let prev_trees = self.snapshot.trees.clone();
-        external::include_imported_projects(&dir, &mut self.snapshot.trees, &mut self.meta);
-        let auto_changed = self.auto_collapse_idle_heavy_repos(&dir);
-        external::apply_imported_project_prefs(
-            &dir,
-            &mut self.prefs,
-            &mut self.comments,
-            &mut self.issues,
-            &mut self.worktree_statuses,
+        let data = async_state::DiskSnapshot::load(
+            self.path.as_deref(),
+            self.snapshot.clone(),
+            self.meta.clone(),
         );
-        self.sync_project_visuals(&dir);
-        (
-            self.snapshot.trees != prev_trees || !self.snapshot.trees.is_empty(),
-            auto_changed,
-        )
-    }
-
-    /// 저장소(트리 키)와 워크트리 밖 세션 폴더의 헤더 아이콘·배지 색을 다시 계산한다.
-    fn sync_project_visuals(&mut self, state_dir: &Path) {
-        let repos: Vec<PathBuf> = self.snapshot.trees.keys().cloned().collect();
-        let mut folders: Vec<PathBuf> = Vec::new();
-        for s in &self.snapshot.sessions {
-            if s.worktree.is_none()
-                && let Some(cwd) = &s.cwd
-                && !self.snapshot.trees.contains_key(cwd)
-                && !folders.contains(cwd)
-            {
-                folders.push(cwd.clone());
-            }
-        }
-        self.project_visuals = project_icon::resolve(state_dir, &repos, &folders);
-    }
-
-    /// 로컬 프로젝트 헤더 아이콘. 원격 호스트 행은 항상 `None`(기본 폴더 아이콘).
-    pub(super) fn project_icon(
-        &self,
-        host: &HostId,
-        path: &Path,
-    ) -> Option<&crate::ui::icons::ProjectIcon> {
-        host.is_local()
-            .then(|| self.project_visuals.get(path)?.icon.as_ref())
-            .flatten()
-    }
-
-    pub(super) fn project_badge_color(&self, host: &HostId, path: &Path) -> Option<&str> {
-        host.is_local()
-            .then(|| self.project_visuals.get(path)?.badge_color.as_deref())
-            .flatten()
+        let auto = self.apply_disk_snapshot(data);
+        (true, auto)
     }
 
     /// OWE-898: 라이브 워크트리 집합에 없는 파생 상태(상태·갱신시각·이슈·포트·호스트 라벨·자동/CLI 표시)를
@@ -1000,15 +880,9 @@ impl Sidebar {
 
     /// 외부 파일(`projects.toml`, `worktree-comments.toml`) 변경을 즉시 반영해 사이드바 트리를 다시 그린다.
     pub fn reload_external(&mut self, cx: &mut Context<Self>) {
-        lineage::invalidate_parents_cache();
-        self.comments = external::load_comments_from_sidebar_path(self.path.as_deref());
-        let (_, auto_changed) = self.sync_imported_projects_from_disk();
-        self.prune_stale_worktree_state();
-        if auto_changed {
-            self.persist(cx);
-        } else {
-            self.rebuild(cx);
-        }
+        self.disk.generation = self.disk.generation.wrapping_add(1);
+        self.disk.task = None;
+        self.ensure_external_polling(cx);
     }
 
     #[cfg(test)]
@@ -1146,7 +1020,10 @@ impl Sidebar {
 
     /// 선택된 워크트리/폴더 경로를 갱신하고 영속화한다(OWE-842).
     pub fn select_worktree(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
-        if self.selected_worktree != path {
+        if !self.disk.initialized {
+            self.disk.startup.touch("selected");
+        }
+        if self.selected_worktree != path || !self.disk.initialized {
             self.selected_worktree = path;
             self.persist(cx);
         }
@@ -1154,6 +1031,9 @@ impl Sidebar {
 
     /// 호스트 섹션 접기/펼치기(OWE-845: `UiExpansionState`에 저장해 재시작 후에도 유지).
     pub fn fold_host(&mut self, host: &HostId, open: Option<bool>, cx: &mut Context<Self>) {
+        if !self.disk.initialized {
+            self.disk.startup.ui.collapsed_hosts.insert(host.clone());
+        }
         let closed = self.collapsed_hosts.contains(host);
         if open.unwrap_or(closed) {
             self.collapsed_hosts.remove(host);
@@ -1179,56 +1059,99 @@ impl Sidebar {
     /// [`HostManager`]의 원격 호스트 목록과 상태를 동기화하고 백그라운드 폴링을 시작한다.
     pub fn sync_remote_hosts(&mut self, manager: &HostManager, cx: &mut Context<Self>) {
         self.remote_manager = Some(manager.clone());
-        let statuses = manager.statuses();
-        let mut next = Vec::with_capacity(statuses.len());
-        let info = statuses
-            .iter()
-            .filter_map(|(spec, _)| {
-                manager
-                    .connection_info(&spec.id)
-                    .map(|info| (spec.id.clone(), info))
+        self.disk.remote_generation = self.disk.remote_generation.wrapping_add(1);
+        if self.disk.remote_refresh.pending {
+            self.disk.remote_refresh.again = true;
+            return;
+        }
+        self.disk.remote_refresh.pending = true;
+        #[cfg(all(test, unix))]
+        {
+            self.disk.remote_starts += 1;
+        }
+        #[cfg(all(test, unix))]
+        let gate = self.disk.next_remote_io.take();
+        let generation = self.disk.remote_generation;
+        let manager = manager.clone();
+        cx.spawn(async move |this, cx| {
+            let (statuses, info, mut sources) = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(all(test, unix))]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    let statuses = manager.statuses();
+                    let info = statuses
+                        .iter()
+                        .filter_map(|(spec, _)| {
+                            manager
+                                .connection_info(&spec.id)
+                                .map(|info| (spec.id.clone(), info))
+                        })
+                        .collect();
+                    let sources: BTreeMap<_, _> = statuses
+                        .iter()
+                        .filter_map(|(spec, _)| {
+                            manager
+                                .target_for(&HostId::Remote(spec.id.clone()), None)
+                                .map(|target| (spec.id.clone(), status_source(target)))
+                        })
+                        .collect();
+                    (statuses, info, sources)
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                s.disk.remote_refresh.pending = false;
+                if s.disk.remote_generation != generation {
+                    if std::mem::take(&mut s.disk.remote_refresh.again)
+                        && let Some(manager) = s.remote_manager.clone()
+                    {
+                        s.sync_remote_hosts(&manager, cx);
+                    }
+                    return;
+                }
+                s.disk.remote_refresh.again = false;
+                let mut changed = s.remote_info != info || s.remote_hosts.len() != statuses.len();
+                s.remote_info = info;
+                let previous = std::mem::take(&mut s.remote_hosts);
+                s.remote_hosts = statuses
+                    .into_iter()
+                    .map(|(spec, status)| {
+                        let mut entry = previous
+                            .iter()
+                            .find(|r| r.id == spec.id)
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                changed = true;
+                                RemoteHost {
+                                    error: None,
+                                    id: spec.id.clone(),
+                                    label: spec.display_name().to_owned(),
+                                    status,
+                                    snapshot: Snapshot::default(),
+                                    meta: Meta::new(),
+                                    source: None,
+                                }
+                            });
+                        let label = spec.display_name().to_owned();
+                        changed |= entry.label != label || entry.status != status;
+                        entry.label = label;
+                        entry.status = status;
+                        if entry.source.is_none() && s.visible {
+                            entry.source = sources.remove(&spec.id);
+                        }
+                        entry
+                    })
+                    .collect();
+                if changed {
+                    s.rebuild(cx);
+                }
+                s.start_remote_polling(cx);
             })
-            .collect();
-        let mut changed = statuses.len() != self.remote_hosts.len() || self.remote_info != info;
-        self.remote_info = info;
-        for (spec, status) in statuses {
-            let label = spec.display_name().to_owned();
-            if let Some(mut existing) = self.remote_hosts.iter().find(|r| r.id == spec.id).cloned()
-            {
-                if existing.label != label || existing.status != status {
-                    changed = true;
-                }
-                existing.label = label;
-                existing.status = status;
-                if existing.source.is_none() && self.is_visible() {
-                    existing.source = manager
-                        .target_for(&HostId::Remote(spec.id.clone()), None)
-                        .map(|t| Arc::new(ipc::Socket::new(t)) as Arc<dyn Source>);
-                }
-                next.push(existing);
-            } else {
-                changed = true;
-                let source = self
-                    .is_visible()
-                    .then(|| manager.target_for(&HostId::Remote(spec.id.clone()), None))
-                    .flatten()
-                    .map(|t| Arc::new(ipc::Socket::new(t)) as Arc<dyn Source>);
-                next.push(RemoteHost {
-                    id: spec.id,
-                    label,
-                    status,
-                    snapshot: Snapshot::default(),
-                    meta: Meta::new(),
-                    source,
-                    error: None,
-                });
-            }
-        }
-        self.remote_hosts = next;
-        if changed {
-            self.rebuild(cx);
-        }
-        self.start_remote_polling(cx);
+            .ok();
+        })
+        .detach();
     }
 
     /// 단위·통합 테스트나 커스텀 소스로 원격 호스트를 등록한다.
@@ -1272,15 +1195,9 @@ impl Sidebar {
         }
     }
 
-    fn ensure_remote_sources(&mut self) {
+    fn ensure_remote_sources(&mut self, cx: &mut Context<Self>) {
         if let Some(manager) = self.remote_manager.clone() {
-            for remote in &mut self.remote_hosts {
-                if remote.source.is_none() {
-                    remote.source = manager
-                        .target_for(&HostId::Remote(remote.id.clone()), None)
-                        .map(status_source);
-                }
-            }
+            self.sync_remote_hosts(&manager, cx);
         }
     }
 
@@ -1296,7 +1213,13 @@ impl Sidebar {
             return;
         }
         if force_once {
-            self.ensure_remote_sources();
+            self.ensure_remote_sources(cx);
+        }
+        // A manager may still be resolving sources on a worker after unhide.
+        // Do not retain an already-finished empty poll task that would prevent
+        // the manager completion from starting polling once sources arrive.
+        if self.remote_hosts.iter().all(|host| host.source.is_none()) {
+            return;
         }
         self.remote_task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
@@ -1323,7 +1246,7 @@ impl Sidebar {
                                 let meta = source.meta(&snap.trees);
                                 (snap, meta)
                             });
-                            (id, res)
+                            (id, source, res)
                         })
                     })
                     .collect();
@@ -1336,37 +1259,35 @@ impl Sidebar {
                         return None;
                     }
                     let mut changed = false;
-                    for (id, res) in results {
-                        let transport = s
-                            .remote_manager
-                            .as_ref()
-                            .and_then(|m| m.connection_info(&id));
+                    for (id, source, res) in results {
                         let Some(entry) = s.remote_hosts.iter_mut().find(|r| r.id == id) else {
                             continue;
                         };
-                        match res {
-                            Ok((snap, meta)) => {
-                                if entry.status != HostStatus::Connected
-                                    || entry.snapshot != snap
-                                    || entry.meta != meta
-                                {
-                                    entry.status = HostStatus::Connected;
-                                    entry.snapshot = snap;
-                                    entry.meta = meta;
-                                    changed = true;
-                                }
-                                entry.error = None;
+                        if !entry
+                            .source
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &source))
+                        {
+                            continue;
+                        }
+                        if let Ok((snap, meta)) = res {
+                            if entry.status != HostStatus::Connected
+                                || entry.snapshot != snap
+                                || entry.meta != meta
+                            {
+                                entry.status = HostStatus::Connected;
+                                entry.snapshot = snap;
+                                entry.meta = meta;
+                                changed = true;
                             }
-                            Err(err) => {
-                                let status = transport
-                                    .as_ref()
-                                    .map_or(HostStatus::Disconnected, |t| t.status);
-                                let error = Some(err.to_string());
-                                if entry.status != status || entry.error != error {
-                                    entry.status = status;
-                                    entry.error = error;
-                                    changed = true;
-                                }
+                        } else {
+                            let status = s
+                                .remote_info
+                                .get(&id)
+                                .map_or(HostStatus::Disconnected, |t| t.status);
+                            if entry.status != status {
+                                entry.status = status;
+                                changed = true;
                             }
                         }
                     }
@@ -1392,7 +1313,7 @@ impl Sidebar {
                 self.connect_source(source, cx);
             }
             if self.remote_task.is_none() && !self.remote_hosts.is_empty() {
-                self.ensure_remote_sources();
+                self.ensure_remote_sources(cx);
                 self.start_remote_polling(cx);
             }
         } else {
@@ -1521,7 +1442,7 @@ impl Sidebar {
             && self.selected_worktree.as_ref() != Some(&wt)
         {
             self.selected_worktree = Some(wt);
-            self.write_state();
+            self.write_state(cx);
         }
         if changed || cleared {
             cx.notify();
@@ -1565,7 +1486,7 @@ impl Sidebar {
         if uncollapsed {
             self.persist(cx);
         } else if target_wt.is_some() {
-            self.write_state();
+            self.write_state(cx);
         }
         let idx = self.rows.iter().position(|r| match r {
             Row::Worktree(p) | Row::Folder(p) => target_wt.as_ref() == Some(p),
@@ -1595,7 +1516,7 @@ impl Sidebar {
                     .iter()
                     .position(|r| matches!(r, Row::Worktree(p) if p == path));
             }
-            self.write_state();
+            self.write_state(cx);
             cx.notify();
         } else {
             self.expanded_cards.insert(path.to_path_buf());
@@ -1697,7 +1618,6 @@ impl Sidebar {
         self.persist(cx);
     }
 
-    /// 호스트 머리줄을 그리면(원격 호스트가 있으면) 그 아래 행 전체를 한 단계 민다.
     fn host_indent(&self) -> f32 {
         if self.remote_hosts.is_empty() {
             0.
@@ -1706,10 +1626,27 @@ impl Sidebar {
         }
     }
 
+    pub(super) fn project_icon(&self, path: &Path) -> Option<&crate::ui::icons::ProjectIcon> {
+        self.project_visuals.get(path).and_then(|v| v.icon.as_ref())
+    }
+
+    pub(super) fn project_badge_color(&self, path: &Path) -> Option<&str> {
+        self.project_visuals
+            .get(path)
+            .and_then(|v| v.badge_color.as_deref())
+    }
+
+    pub(super) fn project_header_name(&self, path: &Path) -> String {
+        self.project_visuals
+            .get(path)
+            .and_then(|v| v.display_name.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or_else(|| basename(path), str::to_owned)
+    }
+
     fn rebuild(&mut self, cx: &mut Context<Self>) {
-        if self.state_dir().is_some() {
-            self.parents = self.merged_parents();
-        }
+        self.ensure_external_polling(cx);
         if self.remote_hosts.is_empty() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
                 self.local_rows()
@@ -1820,13 +1757,11 @@ impl Sidebar {
                 // 워크트리 발견·메타 IO는 connect_source의 백그라운드 단계에서 끝낸다.
                 let status_changed = self.local_status != HostStatus::Connected;
                 self.local_status = HostStatus::Connected;
-                let parents_changed =
-                    self.state_dir().is_some() && self.merged_parents() != self.parents;
+
                 if snapshot != self.snapshot
                     || meta != self.meta
                     || comments != self.comments
                     || auto_titles != self.auto_titles
-                    || parents_changed
                     || self.poll_error.is_some()
                     || status_changed
                     || crate::alert::needs_snapshot(cx)
@@ -1841,7 +1776,7 @@ impl Sidebar {
                     self.meta = meta;
                     self.comments = comments;
                     self.auto_titles = auto_titles;
-                    let (_, auto_changed) = self.sync_imported_projects_from_disk();
+                    let auto_changed = self.include_imported_snapshot();
                     self.poll_error = None;
                     let live = &self.snapshot.sessions;
                     self.titles.retain(|id, _| live.iter().any(|s| s.id == *id));
@@ -1863,16 +1798,12 @@ impl Sidebar {
                         self.rebuild(cx);
                     }
                 } else {
-                    // 백그라운드로 받은 원격 프로젝트 아이콘이 캐시에 들어오면 헤더를 다시 그린다.
-                    let icons_fetched = project_icon::take_fetched();
-                    if icons_fetched {
-                        self.sync_imported_projects_from_disk();
-                    }
+                    let visuals_changed = false;
                     let now_ns = self.now_unix_ns();
                     let next_tick = self
                         .has_active_cache_timer(now_ns, cx)
                         .then_some(now_ns / 1_000_000_000);
-                    if icons_fetched || self.last_cache_tick_sec != next_tick {
+                    if visuals_changed || self.last_cache_tick_sec != next_tick {
                         self.last_cache_tick_sec = next_tick;
                         cx.notify();
                     }
@@ -1901,6 +1832,9 @@ impl Sidebar {
     }
 
     pub fn connect_source(&mut self, source: Arc<dyn Source>, cx: &mut Context<Self>) {
+        self.ensure_external_polling(cx);
+        self.disk.poll_generation = self.disk.poll_generation.wrapping_add(1);
+        self.task = None;
         self.source = Some(source);
         crate::alert::listen(&cx.weak_entity(), cx);
         self.spawn_local_polling(false, cx);
@@ -1911,6 +1845,7 @@ impl Sidebar {
             return;
         }
         let sidebar_path = self.path.clone();
+        let generation = self.disk.poll_generation;
         self.task = Some(cx.spawn(async move |this, cx| {
             let bg = cx.background_executor().clone();
             let mut forced = force_once;
@@ -1951,7 +1886,7 @@ impl Sidebar {
                     })
                     .await;
                 let next_delay = this.update(cx, |s, cx| {
-                    if !s.is_visible() && !forced {
+                    if s.disk.poll_generation != generation || (!s.is_visible() && !forced) {
                         return None;
                     }
                     s.apply_with_auto_titles(result, comments, auto_titles, cx);
@@ -1967,42 +1902,47 @@ impl Sidebar {
         }));
     }
 
-    fn write_state(&mut self) {
-        let persisted_parents = if self.state_dir().is_some() {
-            BTreeMap::new()
-        } else {
-            self.parents.clone()
-        };
-        if let Some(path) = &self.path {
-            let lin = lineage::LineageState {
-                parents: persisted_parents,
-                collapsed_lineage: self.collapsed_lineage.clone(),
-                sleeping_worktrees: self.sleeping_worktrees.clone(),
-            };
-            let ui = UiExpansionState {
-                collapsed: self.collapsed.clone(),
-                collapsed_groups: self.collapsed_groups.clone(),
-                collapsed_hosts: self.collapsed_hosts.clone(),
-                expanded_cards: self.expanded_cards.clone(),
-                selected_worktree: self.selected_worktree.clone(),
-                shown_external: self.shown_external.clone(),
-                removed_projects: self.removed_projects.clone(),
-            };
-            if let Err(e) = save_state(
-                path,
-                &self.prefs,
-                &self.options,
-                &lin,
-                &ui,
-                &self.project_order,
-            ) {
-                self.error = Some(e.to_string());
-            }
+    fn write_state(&mut self, cx: &mut Context<Self>) {
+        self.disk.generation = self.disk.generation.wrapping_add(1);
+        if !self.disk.initialized {
+            let current = startup::capture(self);
+            self.disk.startup.record(current);
+            self.disk.dirty = true;
+            self.ensure_external_polling(cx);
+            return;
         }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let prefs = self.prefs.clone();
+        let opts = self.options.clone();
+        let lin = lineage::LineageState {
+            parents: if self.state_dir().is_some() {
+                BTreeMap::new()
+            } else {
+                self.parents.clone()
+            },
+            collapsed_lineage: self.collapsed_lineage.clone(),
+            sleeping_worktrees: self.sleeping_worktrees.clone(),
+        };
+        let ui = UiExpansionState {
+            collapsed: self.collapsed.clone(),
+            collapsed_groups: self.collapsed_groups.clone(),
+            collapsed_hosts: self.collapsed_hosts.clone(),
+            expanded_cards: self.expanded_cards.clone(),
+            selected_worktree: self.selected_worktree.clone(),
+            shown_external: self.shown_external.clone(),
+            removed_projects: self.removed_projects.clone(),
+        };
+        let order = self.project_order.clone();
+        self.enqueue_disk_write(
+            move || save_state(&path, &prefs, &opts, &lin, &ui, &order),
+            cx,
+        );
     }
 
     fn persist(&mut self, cx: &mut Context<Self>) {
-        self.write_state();
+        self.write_state(cx);
         self.rebuild(cx);
     }
 
@@ -2038,6 +1978,7 @@ impl Sidebar {
     }
 
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.disk.poll_generation = self.disk.poll_generation.wrapping_add(1);
         self.task = None;
         self.remote_task = None;
         self.spawn_local_polling(true, cx);
@@ -2084,7 +2025,7 @@ impl Sidebar {
             && self.selected_worktree.as_ref() != Some(&folder)
         {
             self.selected_worktree = Some(folder);
-            self.write_state();
+            self.write_state(cx);
         }
         self.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
         cx.notify();
@@ -2127,7 +2068,7 @@ impl Sidebar {
             && self.selected_worktree.as_ref() != Some(&wt)
         {
             self.selected_worktree = Some(wt);
-            self.write_state();
+            self.write_state(cx);
         }
         self.action_host = Some(host);
         cx.emit(Selected(id));
@@ -2187,7 +2128,7 @@ impl Sidebar {
         self.cursor = Some(index);
         if self.selected_worktree.as_ref() != Some(&path) {
             self.selected_worktree = Some(path.clone());
-            self.write_state();
+            self.write_state(cx);
         }
         if let Some(sess_id) = self
             .snapshot_for(&host)
@@ -2312,6 +2253,14 @@ impl Sidebar {
     /// `open`: `None`이면 뒤집고, `Some(true)`면 펼치고, `Some(false)`면 접는다.
     /// 저장소·폴더·워크트리의 접힘은 `UiExpansionState`에 저장해 재시작 후에도 유지한다(OWE-845).
     pub fn fold(&mut self, path: &Path, open: Option<bool>, cx: &mut Context<Self>) {
+        if !self.disk.initialized {
+            self.disk.startup.ui.collapsed.insert(path.to_path_buf());
+            self.disk
+                .startup
+                .ui
+                .expanded_cards
+                .insert(path.to_path_buf());
+        }
         let closed = self.collapsed.contains(path);
         if open.unwrap_or(closed) {
             self.collapsed.remove(path);
@@ -2514,10 +2463,22 @@ impl Sidebar {
             let pairs: Vec<_> = sessions_in_wt
                 .iter()
                 .filter(|s| {
-                    !s.status.agent.is_empty()
+                    !crate::ui::status::infer_agent_from_status(
+                        &s.status,
+                        s.status.title.as_deref().unwrap_or_default(),
+                    )
+                    .is_empty()
                         || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
                 })
-                .map(|s| (s.status.state, s.status.agent.as_str()))
+                .map(|s| {
+                    (
+                        s.status.state,
+                        crate::ui::status::infer_agent_from_status(
+                            &s.status,
+                            s.status.title.as_deref().unwrap_or_default(),
+                        ),
+                    )
+                })
                 .collect();
             let state = crate::ui::status::summarize(&pairs)
                 .groups
@@ -2534,11 +2495,7 @@ impl Sidebar {
             } else if let Some(&ts) = self.worktree_updated_at.get(path) {
                 ts
             } else {
-                fs::metadata(path)
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map_or(0, |d| d.as_secs())
+                self.disk.folder_updated_at.get(path).copied().unwrap_or(0)
             };
             let age = if latest_session_ns > 0 {
                 crate::jump::format_age_ns(latest_session_ns, now_ns)
@@ -2684,6 +2641,9 @@ impl Sidebar {
                 .filter(|c| !c.is_control())
                 .take(128)
                 .collect();
+            if !self.disk.initialized {
+                self.disk.startup.names.insert(path.clone());
+            }
             self.prefs.entry(path).or_default().name = name;
             self.edit_subscription = None;
             if let (Some(window), Some(focus)) = (window, &self.focus) {
@@ -2705,13 +2665,30 @@ impl Sidebar {
         }
     }
 
+    /// Register a project through the same durable queue used by sidebar edits.
+    pub fn register_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(dir) = self.state_dir().map(Path::to_path_buf) else {
+            return;
+        };
+        self.enqueue_disk_write(
+            move || external::register_project(&dir, &path).map(|_| ()),
+            cx,
+        );
+    }
+
     /// 저장소·폴더 프로젝트를 목록에서 제거한다(OWE-845).
     /// `projects.toml`에 기록된 이관 프로젝트는 파일에서도 지우고,
     /// 그 외에는 제거 집합에 넣어 행을 숨긴다(재시작 후에도 유지).
     pub fn remove_project(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if let Some(dir) = self.state_dir().map(Path::to_path_buf) {
-            external::remove_imported_project(&dir, &path);
-            self.sync_imported_projects_from_disk();
+            let removed = path.clone();
+            self.enqueue_disk_write(
+                move || {
+                    external::remove_imported_project(&dir, &removed);
+                    Ok(())
+                },
+                cx,
+            );
         }
         self.collapsed.remove(&path);
         self.expanded_cards.remove(&path);
@@ -2912,10 +2889,22 @@ impl Sidebar {
         let pairs: Vec<_> = sessions
             .iter()
             .filter(|s| {
-                !s.status.agent.is_empty()
+                !crate::ui::status::infer_agent_from_status(
+                    &s.status,
+                    s.status.title.as_deref().unwrap_or_default(),
+                )
+                .is_empty()
                     || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
             })
-            .map(|s| (s.status.state, s.status.agent.as_str()))
+            .map(|s| {
+                (
+                    s.status.state,
+                    crate::ui::status::infer_agent_from_status(
+                        &s.status,
+                        s.status.title.as_deref().unwrap_or_default(),
+                    ),
+                )
+            })
             .collect();
         (crate::ui::status::summarize(&pairs), unread)
     }

@@ -2,6 +2,7 @@ use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext, point, p
 
 use super::*;
 
+use krill_proto::SessionId;
 use krill_proto::control::Program;
 
 pub(super) fn state_path(name: &str) -> PathBuf {
@@ -17,14 +18,17 @@ pub(super) fn open(
     let state_dir = path.parent().map(std::path::Path::to_path_buf);
     cx.update(|cx| {
         gpui_component::init(cx);
-        krill_app::settings::init_at(state_dir, cx);
         bind_keys(cx);
+        krill_app::settings::init_at(state_dir, cx);
     });
     let (view, cx) = cx.add_window_view(|_, cx| Shell::new(Some(path), cx));
+    cx.run_until_parked();
     cx.update(|window, cx| {
         let focus = view.read(cx).focus.clone();
         window.focus(&focus, cx);
     });
+    // Startup disk restoration and settings reads now complete asynchronously.
+    cx.run_until_parked();
     (view, cx)
 }
 
@@ -40,6 +44,7 @@ fn drag(cx: &mut VisualTestContext, from: Point<Pixels>, to: Point<Pixels>) {
 }
 
 pub(super) fn layout_of(view: &Entity<Shell>, cx: &mut VisualTestContext) -> Layout {
+    cx.run_until_parked();
     cx.update(|_, cx| {
         view.read(cx).saver.flush();
         view.read(cx).layout.clone()
@@ -95,6 +100,7 @@ fn keys_drag_and_restart_restore(cx: &mut TestAppContext) {
     // 놓을 때 저장됐고, 재시작(새 Shell)은 같은 레이아웃을 복원한다.
     assert_eq!(Layout::load(&path).unwrap(), l);
     let restored = cx.update(|_, cx| cx.new(|cx| Shell::new(Some(path.clone()), cx)));
+    cx.run_until_parked();
     assert_eq!(layout_of(&restored, cx), l);
 }
 
@@ -842,6 +848,7 @@ fn folder_tab_and_agent_use_selected_directory(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(layout_of(&view, cx), before_cancel);
     let restored = cx.update(|_, cx| cx.new(|cx| Shell::new(Some(path.clone()), cx)));
+    cx.run_until_parked();
     restored.update(cx, |this, _| {
         assert_eq!(this.folder(), folder);
         assert_eq!(
@@ -2238,10 +2245,16 @@ fn terminal_palette_push_tracks_theme_and_reconnect(cx: &mut TestAppContext) {
             Ok(())
         }
     }
-    let (view, cx) = open(cx, state_path("theme"));
+    let path = state_path("theme");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        path.with_file_name("settings.toml"),
+        "terminal_use_separate_light_theme = true\n",
+    )
+    .unwrap();
+    let (view, cx) = open(cx, path);
     let frames = Rc::new(RefCell::new(Vec::new()));
     cx.update(|_, cx| {
-        krill_app::settings::init_at(None, cx);
         view.update(cx, |this, cx| {
             this.appearance = Some(Box::new(Memory(Rc::clone(&frames))));
             this.push_appearance(cx);
@@ -2569,11 +2582,13 @@ fn update_ready_waits_for_successful_link(cx: &mut TestAppContext) {
                 ),
                 Next::Read(_)
             ));
-            assert!(ready.exists());
+
             assert!(s.update_ready.is_none());
             drop(peer);
         });
     });
+    cx.run_until_parked();
+    assert!(ready.exists());
     std::fs::remove_dir_all(state).unwrap();
 }
 
@@ -2597,13 +2612,15 @@ fn update_ready_does_not_wait_for_remote_only_panes(cx: &mut TestAppContext) {
                 .set_host(pane, krill_app::hosts::HostId::Remote("gone-host".into()));
             s.arm_update_ready(state.clone());
             s.sync(cx);
-            assert!(
-                ready.exists(),
-                "remote-only visible panes must not block update health"
-            );
+
             assert!(s.update_ready.is_none());
         });
     });
+    cx.run_until_parked();
+    assert!(
+        ready.exists(),
+        "remote-only visible panes must not block update health"
+    );
     std::fs::remove_dir_all(state).ok();
 }
 
@@ -3221,6 +3238,36 @@ fn daemon_watch_disconnect_releases_assertion_when_sidebar_polling_is_stopped(
 }
 
 #[gpui::test]
+#[cfg(target_os = "macos")]
+fn shifted_brackets_cycle_tabs_with_macos_keystrokes(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("shifted-bracket-tabs"));
+    cx.simulate_keystrokes("cmd-t cmd-t cmd-1 cmd-d");
+    let panes = layout_of(&view, cx).visible();
+    assert_eq!(panes.len(), 2);
+
+    // macOS gpui는 ⇧⌘[ / ⇧⌘]의 Shift를 문자에 반영해 ⌘{ / ⌘}로 전달한다.
+    for (key, active) in [
+        ("cmd-}", 1),
+        ("cmd-}", 2),
+        ("cmd-}", 0),
+        ("cmd-{", 2),
+        ("cmd-{", 1),
+        ("cmd-{", 0),
+    ] {
+        cx.simulate_keystrokes(key);
+        assert_eq!(layout_of(&view, cx).active(), active, "{key}");
+    }
+
+    // Shift 없는 ⌘[ / ⌘]는 같은 탭 안에서 분할 칸만 전환한다.
+    cx.simulate_keystrokes("cmd-]");
+    assert_eq!(layout_of(&view, cx).active(), 0);
+    assert_eq!(layout_of(&view, cx).active_tab().focused, panes[0]);
+    cx.simulate_keystrokes("cmd-[");
+    assert_eq!(layout_of(&view, cx).active(), 0);
+    assert_eq!(layout_of(&view, cx).active_tab().focused, panes[1]);
+}
+
+#[gpui::test]
 fn orca_parity_shortcuts_pane_cycle_zoom_clear_select_all_and_tab_numbers(cx: &mut TestAppContext) {
     let path = state_path("orca-shortcuts");
     let (view, cx) = open(cx, path);
@@ -3403,6 +3450,7 @@ fn clipboard_image_and_external_paths_paste_into_focused_pane(cx: &mut TestAppCo
     cx.update(|window, cx| {
         view.update(cx, |s, cx| s.paste_clipboard_item(&item, window, cx));
     });
+    cx.run_until_parked();
     let (k, b) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
     let pasted = String::from_utf8(Input::decode(k, &b).unwrap().bytes).unwrap();
     assert!(
@@ -3492,6 +3540,7 @@ fn account_switch_and_auto_switch_banner_notification(cx: &mut TestAppContext) {
                     statuses: Vec::new(),
                     advanced: krill_proto::usage::AccountPolicyState::default(),
                     connections: Box::default(),
+                    details: Box::default(),
                 },
                 cx,
             );
@@ -3750,6 +3799,9 @@ fn status_account_rule_helpers_persist_all_fields_and_remove_rule(cx: &mut TestA
     };
     cx.update(|_, cx| {
         krill_app::settings::init_at(Some(state.clone()), cx);
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
         view.update(cx, |shell, cx| {
             shell.link = Link::Down;
             shell.paths = Some(krill_proto::daemon::Paths {
@@ -3758,13 +3810,17 @@ fn status_account_rule_helpers_persist_all_fields_and_remove_rule(cx: &mut TestA
                 krilld: PathBuf::from("/bin/echo"),
             });
             shell.upsert_account_rule(rule.clone(), cx);
-            assert_eq!(
-                shell.accounts_snapshot.auto_switch.rules,
-                vec![rule.clone()]
-            );
         });
     });
     cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |shell, _| shell
+            .accounts_snapshot
+            .auto_switch
+            .rules
+            .clone()),
+        vec![rule.clone()]
+    );
     let saved = krill_app::accounts::request_local(
         &krill_app::accounts::default_home(),
         Some(&state),
@@ -4368,7 +4424,14 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
             let manager = s.host_manager.clone();
             s.sidebar.update(cx, move |sb, cx| {
                 sb.sync_remote_hosts(&manager, cx);
-                sb.set_remote_host_status("studio-mac", HostStatus::Connected, cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.sidebar.update(cx, |sidebar, cx| {
+                sidebar.set_remote_host_status("studio-mac", HostStatus::Connected, cx);
             });
             assert_eq!(
                 s.execution_locations(cx),
@@ -5200,6 +5263,7 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
                 statuses: Vec::new(),
                 advanced: krill_proto::usage::AccountPolicyState::default(),
                 connections: Box::default(),
+                details: Box::default(),
             };
             cx.notify();
         });
@@ -7014,6 +7078,28 @@ fn jump_palette_opens_sessionless_worktree_in_new_tab(cx: &mut TestAppContext) {
     };
     let (view, cx) = open(cx, state_path("jump-worktree"));
     cx.update(|_, cx| {
+        let history = view.read(cx).history.clone();
+        history.update(cx, |h, _| {
+            h.set_call(std::sync::Arc::new(|r| {
+                use krill_proto::agent_history::{Action, Response, SearchSnapshot, Snapshot};
+                use krill_proto::control::{Reply, Request};
+                Ok(Reply::AgentHistory(match r {
+                    Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                        entries: Vec::new(),
+                        truncated: false,
+                        skipped: false,
+                    }),
+                    Request::AgentHistory(Action::Search(_)) => {
+                        Response::Searched(SearchSnapshot {
+                            hits: Vec::new(),
+                            truncated: false,
+                            skipped: false,
+                        })
+                    }
+                    _ => unreachable!(),
+                }))
+            }));
+        });
         let sidebar = view.read(cx).sidebar.clone();
         sidebar.update(cx, |s, cx| {
             s.connect_source(std::sync::Arc::new(Memory(snapshot)), cx);
@@ -7431,4 +7517,367 @@ fn main_window_title_shows_worktree(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let want = format!("{app} — wt-title");
     assert_eq!(cx.window_title().as_deref(), Some(want.as_str()));
+}
+
+/// 종료 요청은 UI 테스트에서 인메모리로 기록한다(실제 데몬/외부 IO를 기다리지 않는다).
+fn record_session_closes(
+    view: &Entity<Shell>,
+    cx: &mut VisualTestContext,
+) -> Arc<std::sync::Mutex<Vec<krill_proto::control::Request>>> {
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    view.update(cx, |s, _| {
+        s.close_call = Some(Arc::new(move |request| {
+            if matches!(request, krill_proto::control::Request::List) {
+                return Ok(krill_proto::control::Reply::Sessions(Vec::new()));
+            }
+            recorded.lock().unwrap().push(request.clone());
+            Ok(krill_proto::control::Reply::Closed)
+        }));
+    });
+    requests
+}
+
+#[gpui::test]
+fn explicit_close_cmd_w_and_tab_close_terminate_daemon_sessions(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-keys"));
+    let requests = record_session_closes(&view, cx);
+    cx.simulate_keystrokes("cmd-d");
+    view.update(cx, |s, _| {
+        for (pane, id) in s.layout.visible().into_iter().zip([101, 102]) {
+            s.layout.set_session(pane, SessionId(id));
+        }
+    });
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: SessionId(102)
+        }]
+    );
+    assert_eq!(layout_of(&view, cx).sessions(), vec![SessionId(101)]);
+    cx.simulate_keystrokes("cmd-shift-w");
+    cx.run_until_parked();
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![
+            krill_proto::control::Request::Close {
+                session: SessionId(102)
+            },
+            krill_proto::control::Request::Close {
+                session: SessionId(101)
+            },
+        ]
+    );
+}
+
+#[gpui::test]
+fn explicit_close_bulk_closes_all_split_sessions_and_keeps_pinned_tabs(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-bulk"));
+    let requests = record_session_closes(&view, cx);
+    cx.simulate_keystrokes("cmd-t cmd-t cmd-d");
+    view.update(cx, |s, cx| {
+        for index in 0..s.layout.tabs().len() {
+            for pane in s.layout.tab_panes(index) {
+                s.layout.set_session(pane, SessionId(u64::from(pane.get())));
+            }
+        }
+        s.layout.toggle_pin_tab(0);
+        s.close_other_tabs(1, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "both split panes terminate"
+    );
+    assert_eq!(
+        layout_of(&view, cx).tabs().len(),
+        2,
+        "pinned and kept tabs survive"
+    );
+}
+
+#[gpui::test]
+fn explicit_close_confirmation_cancel_preserves_daemon_session(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-confirm"));
+    let requests = record_session_closes(&view, cx);
+    let pane = layout_of(&view, cx).active_tab().focused;
+    attach_running(&view, cx, pane, SessionId(103));
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(requests.lock().unwrap().is_empty());
+    view.update(cx, Shell::cancel_running_close);
+    assert!(layout_of(&view, cx).pane_exists(pane));
+    cx.simulate_keystrokes("cmd-w");
+    view.update(cx, Shell::confirm_running_close);
+    cx.run_until_parked();
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: SessionId(103)
+        }]
+    );
+}
+
+#[gpui::test]
+fn explicit_close_preserves_shared_session_and_host_identity(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-shared"));
+    let requests = record_session_closes(&view, cx);
+    cx.simulate_keystrokes("cmd-t cmd-t");
+    view.update(cx, |s, _| {
+        for index in 0..s.layout.tabs().len() {
+            let pane = s.layout.tab_panes(index)[0];
+            s.layout.set_session(pane, SessionId(104));
+            if index == 0 {
+                s.layout
+                    .set_host(pane, krill_app::hosts::HostId::Remote("other".into()));
+            }
+        }
+    });
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "another local pane owns the same session"
+    );
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "remote ID must not prevent closing the local session"
+    );
+}
+
+#[gpui::test]
+fn explicit_close_switching_tabs_and_closing_window_preserve_sessions(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-preserve"));
+    let requests = record_session_closes(&view, cx);
+    view.update(cx, |s, _| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, SessionId(105));
+    });
+    cx.simulate_keystrokes("cmd-t cmd-shift-[");
+    cx.run_until_parked();
+    cx.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn explicit_close_sidebar_removes_open_panes_and_sends_close(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-sidebar"));
+    let requests = record_session_closes(&view, cx);
+    view.update(cx, |s, _| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, SessionId(106));
+        s.paths = Some(Paths {
+            socket: PathBuf::new(),
+            holder: PathBuf::new(),
+            krilld: PathBuf::new(),
+        });
+    });
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.confirm_close_sidebar_session(
+                &krill_app::hosts::HostId::Local,
+                SessionId(106),
+                window,
+                cx,
+            );
+        });
+    });
+    cx.simulate_prompt_answer(krill_app::i18n::catalog::resources::KILL_CONFIRM.get());
+    cx.run_until_parked();
+    assert!(
+        layout_of(&view, cx).tabs().is_empty(),
+        "no pane remains to respawn the closed session"
+    );
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: SessionId(106)
+        }]
+    );
+}
+
+#[gpui::test]
+fn explicit_close_captures_session_created_before_layout_receives_it(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-pending-create"));
+    let requests = record_session_closes(&view, cx);
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        let live = Live::new(Task::ready(()));
+        assert!(close::Creation::publish(&live.creation, SessionId(108)));
+        s.live.insert(pane, live);
+        s.do_close_pane(pane, cx);
+    });
+    cx.run_until_parked();
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: SessionId(108)
+        }]
+    );
+}
+
+#[gpui::test]
+fn explicit_close_marks_inflight_creation_for_termination(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-before-create"));
+    let requests = record_session_closes(&view, cx);
+    let creation = view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        let live = Live::new(Task::ready(()));
+        let creation = live.creation.clone();
+        s.live.insert(pane, live);
+        s.do_close_pane(pane, cx);
+        creation
+    });
+    assert!(
+        !close::Creation::publish(&creation, SessionId(109)),
+        "late Create result must be terminated by the background worker"
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "no session ID was available yet"
+    );
+}
+
+#[gpui::test]
+fn explicit_close_reports_daemon_failure(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-failure"));
+    view.update(cx, |s, _| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_session(pane, SessionId(110));
+        s.close_call = Some(Arc::new(|_| {
+            Ok(krill_proto::control::Reply::Failed(
+                krill_proto::control::Failure::NoHolder,
+            ))
+        }));
+    });
+    cx.simulate_keystrokes("cmd-w");
+    cx.run_until_parked();
+    assert_eq!(
+        view.read_with(cx, |s, _| s.notice.clone()),
+        Some(krill_proto::control::Failure::NoHolder.to_string())
+    );
+}
+
+#[gpui::test]
+fn explicit_close_hidden_inflight_creation_is_also_terminated(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-hidden-create"));
+    let requests = record_session_closes(&view, cx);
+    let creation = view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        let creation = Arc::default();
+        s.creations.insert(pane, Arc::clone(&creation));
+        s.change(true, cx, Layout::new_tab);
+        s.do_close_tab(0, cx);
+        creation
+    });
+    cx.run_until_parked();
+    assert!(!close::Creation::publish(&creation, SessionId(111)));
+    assert!(requests.lock().unwrap().is_empty());
+}
+
+#[gpui::test]
+fn explicit_close_contended_creation_finishes_off_ui_thread(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("explicit-close-contended-create"));
+    let requests = record_session_closes(&view, cx);
+    let creation = Arc::new(std::sync::Mutex::new(close::Creation::default()));
+    assert!(close::Creation::publish(&creation, SessionId(112)));
+    let held = creation.lock().unwrap();
+    view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.creations.insert(pane, Arc::clone(&creation));
+        s.do_close_pane(pane, cx);
+    });
+    drop(held);
+    cx.run_until_parked();
+    assert!(!close::Creation::publish(&creation, SessionId(113)));
+    assert_eq!(
+        *requests.lock().unwrap(),
+        vec![krill_proto::control::Request::Close {
+            session: SessionId(112)
+        }]
+    );
+}
+
+#[gpui::test]
+fn host_snapshot_does_not_block_menus_or_apply_superseded_sources(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("async-host-snapshot"));
+    let host = |id: &str| {
+        krill_hosts::ExternalHost::new(
+            krill_hosts::RemoteHostSpec {
+                id: id.into(),
+                label: id.into(),
+                address: id.into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            },
+            PathBuf::from("/unused"),
+            krill_hosts::HostConnectionInfo {
+                status: krill_hosts::HostStatus::Connected,
+                detail: None,
+                error: None,
+            },
+            || {
+                krill_hosts::RemoteConnector::new(
+                    || Err(std::io::ErrorKind::NotConnected.into()),
+                    |_, _| {},
+                )
+            },
+        )
+    };
+    let (release, gate) = tokio::sync::oneshot::channel();
+    view.update(cx, |shell, cx| {
+        shell.next_host_io = Some(gate);
+        shell.external_hosts = vec![host("old")];
+        shell.sync_hosts(cx);
+    });
+    cx.run_until_parked();
+    view.update(cx, |shell, cx| {
+        let generation = shell.host_generation;
+        for _ in 0..100 {
+            shell.sync_hosts(cx);
+        }
+        assert_eq!(
+            shell.host_generation, generation,
+            "refresh ticks coalesce without invalidating an unchanged source"
+        );
+        assert!(shell.host_refresh_running && shell.host_refresh_again);
+        assert_eq!(shell.execution_locations(cx).len(), 1);
+        assert!(
+            shell
+                .target_for_host(&krill_hosts::HostId::Remote("old".into()))
+                .is_none()
+        );
+        shell.external_hosts = vec![host("new")];
+        shell.sync_hosts(cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("panel-column").is_some());
+    release.send(()).unwrap();
+    cx.run_until_parked();
+    view.read_with(cx, |shell, cx| {
+        assert!(
+            shell
+                .target_for_host(&krill_hosts::HostId::Remote("old".into()))
+                .is_none()
+        );
+        assert!(
+            shell
+                .target_for_host(&krill_hosts::HostId::Remote("new".into()))
+                .is_some()
+        );
+        assert!(
+            shell
+                .execution_locations(cx)
+                .iter()
+                .any(|(id, _)| *id == krill_hosts::HostId::Remote("new".into()))
+        );
+    });
 }

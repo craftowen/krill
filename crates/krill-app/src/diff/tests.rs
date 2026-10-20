@@ -167,6 +167,84 @@ fn watch_action_reselects_selected_file_even_when_list_is_same() {
     );
 }
 
+#[gpui::test]
+fn explorer_operations_run_after_ui_callback_and_preserve_order(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::new();
+    let root = repo.0.clone();
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| Panel::unconnected(root.clone(), cx));
+    let first = root.join("queued.txt");
+    let renamed = root.join("renamed.txt");
+    view.update(vcx, |panel, cx| {
+        panel.explorer_create_file(&root, "queued.txt", cx);
+        panel.explorer_rename(&first, "renamed.txt", cx);
+        assert!(
+            !first.exists(),
+            "filesystem work must not run inside the UI callback"
+        );
+        assert!(!renamed.exists());
+        panel.explorer.show_dotfiles = false;
+        assert!(
+            !panel.explorer.show_dotfiles,
+            "UI state remains available while work is pending"
+        );
+    });
+    vcx.run_until_parked();
+    assert!(!first.exists());
+    assert!(renamed.is_file(), "rename must run after create");
+    assert!(!vcx.read(|cx| view.read(cx).explorer.show_dotfiles));
+}
+
+#[gpui::test]
+fn explorer_repository_switch_discards_queued_old_mutations(cx: &mut gpui::TestAppContext) {
+    let old = Repo::new();
+    let new = Repo::new();
+    let root = old.0.clone();
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| Panel::unconnected(root.clone(), cx));
+    view.update(vcx, |panel, cx| {
+        panel.explorer_create_file(&root, "cancelled.txt", cx);
+        panel.set_repo(new.0.clone(), cx);
+    });
+    vcx.run_until_parked();
+    assert!(!root.join("cancelled.txt").exists());
+    assert!(!new.0.join("cancelled.txt").exists());
+    assert_eq!(vcx.read(|cx| view.read(cx).explorer.repo.clone()), new.0);
+}
+
+#[gpui::test]
+fn expanding_a_second_folder_during_scan_keeps_both_user_intents(cx: &mut gpui::TestAppContext) {
+    let repo = Repo::new();
+    let root = repo.0.clone();
+    for name in ["first", "second"] {
+        std::fs::create_dir(root.join(name)).unwrap();
+        std::fs::write(root.join(name).join("child.txt"), "visible").unwrap();
+    }
+    cx.update(gpui_component::init);
+    let (view, vcx) = cx.add_window_view(|_, cx| Panel::unconnected(root.clone(), cx));
+    view.update(vcx, |panel, cx| {
+        panel.explorer.loaded_root = true;
+        panel.explorer.expanded.insert(root.join("first"));
+        panel.refresh_explorer_async(cx);
+        // This directory was not in the worker's captured request.
+        panel.toggle_explorer_dir(&root.join("second"), cx);
+        assert!(panel.explorer.loading);
+    });
+    vcx.run_until_parked();
+    vcx.read(|cx| {
+        let explorer = &view.read(cx).explorer;
+        for name in ["first", "second"] {
+            assert!(explorer.expanded.contains(&root.join(name)));
+            assert!(
+                explorer
+                    .rows
+                    .iter()
+                    .any(|row| row.path == root.join(name).join("child.txt"))
+            );
+        }
+    });
+}
+
 /// AS-26: 패치 실패 문구는 카탈로그 한글로 보인다(원문 영어는 `patch`에 유지).
 #[test]
 fn patch_error_message_is_korean_catalog() {
@@ -1889,6 +1967,7 @@ fn right_panel_icon_only_tabs_switch_on_click_show_tooltips_and_fit_default_widt
         PanelTab::Files,
         PanelTab::Search,
         PanelTab::Checks,
+        PanelTab::History,
         PanelTab::Changes,
     ] {
         click(tab.selector(), cx);

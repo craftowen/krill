@@ -93,6 +93,7 @@ fn open(cx: &mut TestAppContext) -> (Entity<Shell>, gpui::AnyWindowHandle) {
         shell
     });
     let shell = handle.update(cx, |_, _, cx| cx.entity()).unwrap();
+    cx.run_until_parked();
     (shell, handle.into())
 }
 
@@ -134,36 +135,10 @@ fn linked_account_refresh_keeps_daemon_snapshot_on_ipc_failure(cx: &mut TestAppC
     assert!(notice.is_some(), "명시적 새로고침 실패를 알린다");
 }
 
-/// OWE-652: 상태바·사이드바 '에이전트 대시보드' 버튼은 인앱 모달을 열고, 새 OS 창을 띄우지 않는다.
+/// 상태바 기록 버튼은 우측 패널 탭을 열고, 바깥 클릭 후에도 열린 상태를 유지한다.
 #[gpui::test]
-fn status_dashboard_button_opens_singleton_window(cx: &mut TestAppContext) {
-    let (_main, main_window) = open(cx);
-    cx.run_until_parked();
-    let mut visual = VisualTestContext::from_window(main_window, cx);
-    let bounds = visual
-        .debug_bounds("dashboard-popout")
-        .expect("dashboard button");
-    visual.simulate_click(bounds.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(cx.windows().len(), 1, "dashboard opens as an in-app modal");
-    assert!(visual.debug_bounds("dashboard-modal").is_some());
-    cx.read(|cx| assert!(existing_dashboard(cx).is_some()));
-    let bounds = visual
-        .debug_bounds("dashboard-popout")
-        .expect("dashboard button");
-    visual.simulate_click(bounds.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(
-        cx.windows().len(),
-        1,
-        "second click keeps in-app modal without opening a window"
-    );
-    cx.read(|cx| assert!(existing_dashboard(cx).is_some()));
-}
-
-/// OWE-652: 상태바 '세션 히스토리' 토글은 팝오버를 열고, 바깥 클릭은 닫는다.
-#[gpui::test]
-fn status_history_toggle_opens_and_outside_click_closes(cx: &mut TestAppContext) {
+fn status_history_toggle_opens_right_panel_and_stays_open(cx: &mut TestAppContext) {
+    use krill_app::diff::PanelTab;
     let (main, main_window) = open(cx);
     cx.run_until_parked();
     let mut visual = VisualTestContext::from_window(main_window, cx);
@@ -174,25 +149,48 @@ fn status_history_toggle_opens_and_outside_click_closes(cx: &mut TestAppContext)
     cx.run_until_parked();
     let is_open =
         |cx: &mut TestAppContext| cx.update(|cx| main.read(cx).history.read(cx).is_open());
-    assert!(is_open(cx), "history popover opens");
-    // 열린 상태에서 헤더를 다시 누르면 닫힌 채로 둔다(바깥 닫기와 같은 제스처).
-    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(!is_open(cx), "header click closes history popover");
-    // 닫힌 상태에서 헤더를 누르면 다시 열린다.
-    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(is_open(cx), "history popover reopens");
-    // 팝오버(오른쪽 위 상태바)와 헤더를 피한 왼쪽 아래를 누르면 닫힌다.
-    let size = visual.update(|window, _| window.viewport_size());
-    assert!(
-        size.width > gpui::px(560.) && size.height > gpui::px(200.),
-        "window must fit popover + away point, got {size:?}"
+    assert!(is_open(cx));
+    main.read_with(cx, |s, cx| {
+        assert!(!s.panel_collapsed);
+        assert_eq!(s.diff.read(cx).active_tab(), PanelTab::History);
+        assert_eq!(s.layout.panel_tab(), PanelTab::History);
+    });
+    let column = visual.debug_bounds("panel-column").expect("right panel");
+    let history = visual
+        .debug_bounds("agent-history-panel")
+        .expect("history body");
+    assert!(history.origin.x >= column.origin.x);
+    assert!(history.right() <= column.right());
+    assert!(history.bottom() <= column.bottom());
+    assert!(visual.debug_bounds("agent-history-popover").is_none());
+    // 터미널 영역을 눌러도 기록이 유지된다.
+    visual.simulate_click(
+        gpui::point(gpui::px(10.), gpui::px(100.)),
+        gpui::Modifiers::default(),
     );
-    let away = gpui::point(gpui::px(10.), size.height - gpui::px(10.));
-    visual.simulate_click(away, gpui::Modifiers::default());
     cx.run_until_parked();
-    assert!(!is_open(cx), "outside click closes history popover");
+    assert!(is_open(cx));
+    let files = visual
+        .debug_bounds(PanelTab::Files.selector())
+        .expect("files tab");
+    visual.simulate_click(files.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!is_open(cx));
+    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(is_open(cx));
+    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!is_open(cx));
+    main.read_with(cx, |s, _| assert!(s.panel_collapsed));
+    // 접힌 패널도 기록 탭을 선택하면 다시 열린다.
+    visual.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(is_open(cx));
+    visual.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!is_open(cx));
+    main.read_with(cx, |s, _| assert!(s.panel_collapsed));
 }
 
 /// OWE-652: 오케스트레이션 빈 상태 조건 — Run·Task가 모두 없을 때만 안내한다.
@@ -1427,4 +1425,250 @@ fn settings_shortcut_labels_match_their_admin_tabs() {
         text::OPEN_WORKFLOWS_SETTINGS.get(),
         text::OPEN_ADMIN_ACCOUNTS.get()
     );
+}
+
+#[gpui::test]
+fn status_bar_hides_unconfigured_opencode_host_default_and_shows_managed_opencode(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::usage::{AccountInfo, Snapshot};
+    let (shell, handle) = open(cx);
+    cx.update(|cx| {
+        cx.set_global(krill_app::accounts::installed::Installed(Some(vec![
+            ProviderKind::Claude,
+            ProviderKind::OpenCode,
+        ])));
+    });
+    shell.update(cx, |s, cx| {
+        s.accounts_snapshot.accounts = vec![
+            AccountInfo {
+                id: "claude:default".into(),
+                provider: ProviderKind::Claude,
+                label: "Default".into(),
+                email: None,
+                profile_dir: "/tmp/claude".into(),
+                active: true,
+                host_default: true,
+                stale: false,
+                usage: Snapshot::default(),
+            },
+            AccountInfo {
+                id: "opencode:default".into(),
+                provider: ProviderKind::OpenCode,
+                label: "Default".into(),
+                email: None,
+                profile_dir: "/tmp/opencode".into(),
+                active: true,
+                host_default: true,
+                stale: false,
+                usage: Snapshot::default(),
+            },
+        ];
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    assert!(vcx.debug_bounds("status-provider-pill-claude").is_some());
+    assert!(
+        vcx.debug_bounds("status-provider-pill-opencode").is_none(),
+        "unconfigured host-default OpenCode pill without usage should stay hidden"
+    );
+
+    shell.update(cx, |s, cx| {
+        s.accounts_snapshot.accounts[1].host_default = false;
+        cx.notify();
+    });
+    vcx.run_until_parked();
+    assert!(
+        vcx.debug_bounds("status-provider-pill-opencode").is_some(),
+        "managed OpenCode profile should show its status bar pill"
+    );
+}
+
+#[gpui::test]
+fn status_usage_refresh_sets_loading_and_schedules_followup_polls(cx: &mut TestAppContext) {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (main, handle) = open(cx);
+    let dir = std::env::temp_dir().join(format!("mk-usage-refresh-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket = dir.join("krilld.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    std::thread::spawn(move || {
+        let server_hello = krill_proto::ipc::ServerHello {
+            proto_min: krill_proto::ipc::PROTO_MIN,
+            proto_max: krill_proto::ipc::PROTO_MAX,
+            features: krill_proto::ipc::FEATURES & !krill_proto::daemon::FEAT_HOLDER_WATCH,
+            build: krill_proto::BUILD.to_owned(),
+            instance_id: 1,
+        }
+        .encode()
+        .unwrap();
+        let reply = krill_proto::usage::UsageReply::Accounts(
+            krill_proto::usage::AccountsSnapshot::default(),
+        )
+        .encode()
+        .unwrap();
+        for mut stream in listener.incoming().flatten() {
+            stream.write_all(&server_hello).ok();
+            krill_proto::ipc::read_frame(&mut stream).ok();
+            if let Ok(Some(_)) = krill_proto::ipc::read_frame(&mut stream) {
+                stream.write_all(&reply).ok();
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    });
+    let paths = krill_proto::daemon::Paths {
+        socket,
+        holder: dir.join("krill-holder"),
+        krilld: dir.join("krilld"),
+    };
+    main.update(cx, |s, cx| {
+        s.paths = Some(paths);
+        s.link = Link::Up;
+        cx.notify();
+    });
+    cx.run_until_parked();
+
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    let refresh = vcx
+        .debug_bounds("status-usage-refresh")
+        .expect("refresh button");
+    vcx.simulate_click(refresh.center(), gpui::Modifiers::default());
+    assert!(
+        vcx.read(|cx| main.read(cx).usage_refresh.is_some()),
+        "manual refresh immediately enters loading state"
+    );
+
+    vcx.executor().advance_clock(Duration::from_millis(800));
+    vcx.run_until_parked();
+    vcx.executor().advance_clock(Duration::from_millis(1200));
+    vcx.run_until_parked();
+
+    for _ in 0..100 {
+        if hits.load(Ordering::SeqCst) >= 3 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        hits.load(Ordering::SeqCst) >= 3,
+        "manual refresh issues immediate + follow-up ListAccounts probes, got {}",
+        hits.load(Ordering::SeqCst)
+    );
+    assert!(
+        !vcx.read(|cx| main.read(cx).usage_refresh.is_some()),
+        "loading state clears after follow-up polls complete"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn expanded_usage_keeps_both_windows_and_never_invents_zero() {
+    use krill_app::i18n::catalog::settings as labels;
+    use krill_proto::usage::{Snapshot, Window};
+    let usage = Snapshot {
+        five_hour: Some(Window {
+            percent: 23,
+            resets_at: None,
+        }),
+        seven_day: Some(Window {
+            percent: 76,
+            resets_at: None,
+        }),
+    };
+    assert_eq!(
+        expanded_account_usage(&usage, 1000),
+        format!(
+            "{} 23% · {} 76%",
+            labels::WINDOW_5H.get(),
+            labels::WINDOW_7D.get()
+        )
+    );
+    assert_eq!(
+        expanded_account_usage(&Snapshot::default(), 1000),
+        format!(
+            "{} — · {} —",
+            labels::WINDOW_5H.get(),
+            labels::WINDOW_7D.get()
+        )
+    );
+    let expired = Window {
+        percent: 99,
+        resets_at: Some("900".into()),
+    };
+    let label = status_window_label("5h", Some(&expired), 1000);
+    assert!(!label.contains("99%"));
+    assert!(!label.contains("0%"));
+    assert!(expanded_usage_fits(px(1800.), px(16.), 4));
+    assert!(!expanded_usage_fits(px(1000.), px(16.), 4));
+    assert!(!expanded_usage_fits(px(1800.), px(24.), 4));
+    assert!(expanded_usage_fits(px(1000.), px(16.), 1));
+}
+
+#[gpui::test]
+fn status_bar_switches_provider_windows_when_resized(cx: &mut TestAppContext) {
+    use krill_proto::usage::{AccountInfo, Snapshot, Window};
+    let (shell, handle) = open(cx);
+    shell.update(cx, |s, cx| {
+        s.accounts_snapshot.accounts = ProviderKind::ALL
+            .into_iter()
+            .map(|provider| AccountInfo {
+                id: provider.as_str().into(),
+                provider,
+                label: provider.display_name().into(),
+                email: None,
+                profile_dir: "/tmp/provider-layout".into(),
+                active: true,
+                host_default: false,
+                stale: false,
+                usage: Snapshot {
+                    five_hour: Some(Window {
+                        percent: 23,
+                        resets_at: Some((krill_app::accounts::display::now() + 12_600).to_string()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 76,
+                        resets_at: Some(
+                            (krill_app::accounts::display::now() + 432_000).to_string(),
+                        ),
+                    }),
+                },
+            })
+            .collect();
+        cx.notify();
+    });
+    cx.run_until_parked();
+    let vcx = &mut VisualTestContext::from_window(handle, cx);
+    for (width, mode) in [(1800., "expanded"), (1000., "compact"), (1800., "expanded")] {
+        vcx.simulate_resize(gpui::size(px(width), px(900.)));
+        vcx.run_until_parked();
+        let selectors = if mode == "expanded" {
+            [
+                "status-provider-expanded-claude",
+                "status-provider-expanded-codex",
+                "status-provider-expanded-agy",
+                "status-provider-expanded-opencode",
+            ]
+        } else {
+            [
+                "status-provider-compact-claude",
+                "status-provider-compact-codex",
+                "status-provider-compact-agy",
+                "status-provider-compact-opencode",
+            ]
+        };
+        for selector in selectors {
+            assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
+        }
+        let left = vcx.debug_bounds("status-bar-left").unwrap();
+        let right = vcx.debug_bounds("status-bar-right").unwrap();
+        assert!(
+            left.right() <= right.left(),
+            "usage overlaps status actions at {width}px"
+        );
+    }
 }

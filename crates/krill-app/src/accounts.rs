@@ -3,9 +3,13 @@
 //! - 데몬(`krilld`)이 연결되어 있으면 `FEAT_USAGE` IPC(`UsageRequest`/`UsageReply`)로 요청한다.
 //! - 자동전환 판정·기록은 krilld 하나만 한다(OWE-697). 로컬 폴백은 `accounts.toml`과 캐시를 읽기만 하고
 //!   자동전환을 평가하지 않는다. 로컬 변이(`request_local`)는 데몬 없는 임시 상태 디렉터리(테스트)용이다.
+//!
+//! OAuth process lifecycle reference: Orca claude-login-session.ts / codex-login-session.ts,
+//! Copyright (c) 2026 Lovecast Inc., MIT License.
 
 pub mod display;
 pub mod installed;
+mod login_output;
 
 #[cfg(test)]
 #[cfg(unix)]
@@ -128,11 +132,26 @@ pub struct AccountsFile {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredAutoSwitch {
+    #[serde(default = "default_switch_enabled")]
     pub enabled: bool,
+    #[serde(default = "default_switch_threshold")]
     pub threshold_percent: u8,
+    #[serde(default = "default_switch_on_rate_limit")]
     pub switch_on_rate_limit: bool,
     #[serde(default)]
     pub rules: Vec<AutoSwitchRule>,
+}
+
+fn default_switch_enabled() -> bool {
+    AutoSwitchPolicy::default().enabled
+}
+
+fn default_switch_threshold() -> u8 {
+    krill_proto::usage::DEFAULT_AUTO_SWITCH_PERCENT
+}
+
+fn default_switch_on_rate_limit() -> bool {
+    AutoSwitchPolicy::default().switch_on_rate_limit
 }
 
 impl Default for StoredAutoSwitch {
@@ -210,6 +229,7 @@ fn failure_text(e: krill_proto::control::Failure) -> String {
 fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
     let mut hello = daemon::client_hello(ClientRole::App, "krill-app accounts");
     hello.features = FEAT_USAGE
+        | krill_proto::usage::FEAT_PROVIDER_DETAILS
         | krill_proto::usage::FEAT_USAGE_AGY
         | krill_proto::usage::FEAT_USAGE_RULES
         | krill_proto::usage::FEAT_USAGE_STATUS
@@ -222,6 +242,12 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
         return Err("FEAT_USAGE not negotiated".to_owned());
     }
     let required = req.required_features();
+    let required = required
+        | if matches!(req, UsageRequest::SwitchAccount { .. }) {
+            krill_proto::usage::FEAT_PROVIDER_DETAILS
+        } else {
+            0
+        };
     if conn.negotiated.features & required != required {
         return Err("daemon does not support this account extension; restart daemon".to_owned());
     }
@@ -394,6 +420,10 @@ pub fn request_local(
             io::ErrorKind::Unsupported,
             "direct usage requires daemon",
         )),
+        UsageRequest::ImportOrcaAntigravity { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "Orca account vault import requires daemon",
+        )),
         UsageRequest::SetProvisioning(_) | UsageRequest::GetProvisioning => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "provisioning requires daemon",
@@ -453,6 +483,12 @@ pub fn start_login(
     account: &AccountInfo,
     newly_added: bool,
 ) -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>, String> {
+    // agy needs a TTY for its account picker and the SSH OAuth code prompt.
+    if account.provider == ProviderKind::Antigravity {
+        return Err(crate::i18n::catalog::settings::AGY_LOGIN_GUIDE
+            .get()
+            .to_owned());
+    }
     let program = krill_proto::account_login::login_program(account.provider, login_dir(account))
         .ok_or_else(|| {
         crate::i18n::catalog::settings::ACCOUNT_LOGIN_UNSUPPORTED
@@ -479,6 +515,40 @@ pub fn start_login(
         })
         .map_err(|e| e.to_string())?;
     Ok(cancel)
+}
+
+/// Interactive providers need a terminal for their account picker and OAuth code prompt.
+pub fn terminal_login_command(account: &AccountInfo) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
+    if account.provider == ProviderKind::Antigravity {
+        return if account.host_default {
+            "agy".into()
+        } else {
+            format!(
+                "env SSH_CONNECTION=krill agy --gemini_dir={}",
+                quote(
+                    &Path::new(&account.profile_dir)
+                        .join(".gemini")
+                        .to_string_lossy()
+                )
+            )
+        };
+    }
+    let unsets = ProviderKind::OpenCode
+        .credential_overrides()
+        .iter()
+        .map(|key| format!("-u {key}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if account.host_default {
+        return format!("env {unsets} opencode auth login");
+    }
+    let dir = Path::new(&account.profile_dir);
+    format!(
+        "env {unsets} XDG_DATA_HOME={} XDG_STATE_HOME={} OPENCODE_DB=opencode.db opencode auth login",
+        quote(&dir.join("data").to_string_lossy()),
+        quote(&dir.join("state").to_string_lossy())
+    )
 }
 
 /// 백그라운드 브라우저 로그인의 종료 사유(OWE-881). 설정 탭의 모니터가
@@ -528,7 +598,11 @@ pub(crate) fn record_login_outcome_for_test(account_id: &str, outcome: LoginOutc
 /// 백그라운드 로그인 스레드가 남긴 종료 사유를 꺼낸다. 없으면 아직 진행 중이다(OWE-881).
 #[must_use]
 pub fn take_login_outcome(account_id: &str) -> Option<LoginOutcome> {
-    lock_login_outcomes().remove(account_id)
+    match login_outcomes().try_lock() {
+        Ok(mut outcomes) => outcomes.remove(account_id),
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner().remove(account_id),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 fn run_browser_login(
@@ -564,13 +638,8 @@ fn run_browser_login(
     }
     let browser = temp.join("browser");
     let link_file = temp.join("authorize-url");
-    if std::fs::write(
-        &browser,
-        format!(
-            "#!/bin/sh\nprintf '%s' \"$1\" > '{}'\n",
-            link_file.display()
-        ),
-    )
+    if std::fs::write(&browser,
+        "#!/bin/sh\nfor arg do\ncase \"$arg\" in https://*) printf '%s' \"$arg\" > \"$KRILL_LOGIN_URL_FILE.tmp\" && mv \"$KRILL_LOGIN_URL_FILE.tmp\" \"$KRILL_LOGIN_URL_FILE\";; esac\ndone\n")
     .is_err()
     {
         std::fs::remove_dir_all(&temp).ok();
@@ -583,9 +652,11 @@ fn run_browser_login(
         fail(LoginFailReason::SpawnFailed);
         return;
     }
-    let Ok(mut child) = crate::platform::background_command(std::ffi::OsStr::from_bytes(program))
+    let mut command = std::process::Command::new(std::ffi::OsStr::from_bytes(program));
+    command
         .args(args.iter().map(|arg| std::ffi::OsStr::from_bytes(arg)))
         .env("BROWSER", &browser)
+        .env("KRILL_LOGIN_URL_FILE", &link_file)
         .env(
             "PATH",
             crate::onboarding::login_path(
@@ -593,29 +664,31 @@ fn run_browser_login(
             )
             .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default()),
         )
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-    else {
+        // Claude's OAuth flow treats stdin EOF as cancellation. Keep the pipe alive until exit.
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let Ok(mut child) = command.spawn() else {
         std::fs::remove_dir_all(&temp).ok();
         fail(LoginFailReason::SpawnFailed);
         return;
     };
+    let links = login_output::watch(&mut child, account.provider);
     let deadline = std::time::Instant::now() + Duration::from_secs(600);
     let mut opened = false;
     let mut timed_out = false;
+    let mut cancelled = false;
     let success = loop {
         if cancel.load(Ordering::Relaxed) {
             child.kill().ok();
             child.wait().ok();
-            std::fs::remove_dir_all(&temp).ok();
-            record_login_outcome(&account.id, LoginOutcome::Cancelled);
-            cleanup_failed_login(paths, account, newly_added);
-            return;
+            cancelled = true;
+            break false;
         }
+        let browser_link = std::fs::read_to_string(&link_file).ok();
+        let printed_link = links.try_iter().last();
         if !opened
-            && let Ok(raw) = std::fs::read_to_string(&link_file)
+            && let Some(raw) = browser_link.or(printed_link)
             && let Some(url) = authorize_url(account.provider, &raw)
         {
             opened = if cfg!(target_os = "macos") {
@@ -645,12 +718,43 @@ fn run_browser_login(
     let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
     let path = crate::onboarding::login_path(&shell)
         .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
-    let status = krill_proto::agent::which(account.provider.as_str(), &path)
-        .and_then(|exe| krill_proto::account_login::probe(&exe, account.provider, dir));
-    if success && let Some(status) = status.filter(|s| s.logged_in) {
-        if let Some(dir) = dir {
-            std::fs::write(dir.join(".krill-login-completed"), b"").ok();
+    let status = if account.provider == ProviderKind::Antigravity && account.host_default && success
+    {
+        // The native host account may live in Keychain. The daemon owns that probe.
+        std::fs::write(
+            Path::new(&account.profile_dir).join(".krill-login-completed"),
+            b"",
+        )
+        .ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            let connected = request_ipc(paths, &UsageRequest::ListAccounts).is_ok_and(|s| {
+                s.connection_for(&account.id) == krill_proto::usage::ConnectionStatus::Connected
+            });
+            if connected {
+                break Some(krill_proto::account_login::AuthStatus {
+                    logged_in: true,
+                    identity: None,
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(200));
         }
+    } else {
+        krill_proto::agent::which(account.provider.as_str(), &path)
+            .and_then(|exe| krill_proto::account_login::probe(&exe, account.provider, dir))
+    };
+    if (success || newly_added)
+        && let Some(status) = status.filter(|s| s.logged_in)
+    {
+        // A late cancel/CLI error must not delete a newly authenticated account.
+        std::fs::write(
+            Path::new(&account.profile_dir).join(".krill-login-completed"),
+            b"",
+        )
+        .ok();
         if let Some(identity) = status.identity {
             let label = if auto_label(account) {
                 identity.org_name.unwrap_or_else(|| identity.email.clone())
@@ -669,6 +773,9 @@ fn run_browser_login(
             .ok();
         }
         record_login_outcome(&account.id, LoginOutcome::Succeeded);
+    } else if cancelled {
+        cleanup_failed_login(paths, account, newly_added);
+        record_login_outcome(&account.id, LoginOutcome::Cancelled);
     } else {
         let reason = if timed_out {
             LoginFailReason::TimedOut
@@ -680,17 +787,33 @@ fn run_browser_login(
     std::fs::remove_dir_all(temp).ok();
 }
 
-fn authorize_url(provider: ProviderKind, raw: &str) -> Option<&str> {
+pub(super) fn authorize_url(provider: ProviderKind, raw: &str) -> Option<&str> {
     let url = raw.trim();
-    let authority = url
-        .strip_prefix("https://")?
-        .split(['/', '?', '#'])
-        .next()?;
-    if authority.contains('@') || authority.contains(':') || authority.is_empty() {
+    let parsed = gpui::http_client::Url::parse(url).ok()?;
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || url.chars().any(char::is_whitespace)
+    {
         return None;
     }
+    let authority = parsed.host_str()?;
     let allowed = match provider {
-        ProviderKind::Claude => ["claude.ai", "console.anthropic.com"].contains(&authority),
+        ProviderKind::Claude => {
+            // Claude prints a pasted-code link as well. Only BROWSER's localhost callback can
+            // finish unattended. Orca claude-sign-in-browser.ts, Lovecast Inc. (2026), MIT.
+            let callback = parsed
+                .query_pairs()
+                .find(|(key, _)| key == "redirect_uri")?
+                .1;
+            let callback = gpui::http_client::Url::parse(&callback).ok()?;
+            ["claude.com", "claude.ai", "console.anthropic.com"].contains(&authority)
+                && callback.scheme() == "http"
+                && matches!(callback.host_str(), Some("localhost" | "127.0.0.1"))
+                && callback.username().is_empty()
+                && callback.password().is_none()
+        }
         ProviderKind::Codex => ["auth.openai.com", "chatgpt.com"].contains(&authority),
         ProviderKind::Antigravity => ["accounts.google.com"].contains(&authority),
         _ => false,
@@ -1054,6 +1177,7 @@ pub fn refresh_local(home: &Path, state_dir: Option<&Path>) -> AccountsSnapshot 
         advanced: krill_proto::usage::AccountPolicyState::default(),
         // OWE-719: 연결 상태도 데몬만 안다. 앱 폴백은 `supported: false`라 화면이 사용량 상태로 대신 그린다.
         connections: Box::default(),
+        details: Box::default(),
     }
 }
 
@@ -1957,4 +2081,11 @@ mod manage_tests {
         );
         std::fs::remove_dir_all(root).ok();
     }
+}
+
+#[test]
+fn async_login_poll_never_waits_for_outcome_writer() {
+    let guard = lock_login_outcomes();
+    assert_eq!(take_login_outcome("contended-poll"), None);
+    drop(guard);
 }

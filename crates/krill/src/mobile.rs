@@ -6,7 +6,7 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
-const HELP: &str = "usage: krill mobile pair [--tunnel] [--address <ip:port>] [--json]\n       krill mobile devices [--json]\n       krill mobile revoke <device_id|--all> [--json]\n       krill mobile serve [--tunnel]";
+const HELP: &str = "usage: krill mobile pair [--tunnel|--tailscale] [--address <ip:port>] [--json]\n       krill mobile devices [--json]\n       krill mobile revoke <device_id|--all> [--json]\n       krill mobile serve [--tunnel]";
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
     Pair {
@@ -33,6 +33,7 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
         .map(|v| v.to_str().ok_or("arguments must be UTF-8"));
     let command = a.next().transpose()?.unwrap_or("--help");
     let mut tunnel = false;
+    let mut tailscale = false;
     let mut address = None;
     let mut json = false;
     let mut all = false;
@@ -40,7 +41,8 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
     while let Some(arg) = a.next() {
         match arg? {
             "--json" if !json => json = true,
-            "--tunnel" if !tunnel => tunnel = true,
+            "--tunnel" if !tunnel && !tailscale => tunnel = true,
+            "--tailscale" if !tailscale && !tunnel => tailscale = true,
             "--address" if address.is_none() => {
                 address = Some(
                     a.next()
@@ -55,25 +57,40 @@ fn parse(args: &[OsString]) -> Result<Command, &'static str> {
         }
     }
     match command {
-        "--help" | "-h" if !tunnel && !json && !all && id.is_none() && address.is_none() => {
+        "--help" | "-h"
+            if !tailscale && !tunnel && !json && !all && id.is_none() && address.is_none() =>
+        {
             Ok(Command::Help)
         }
-        "pair" if !all && id.is_none() => Ok(Command::Pair {
-            mode: if tunnel {
-                ConnectMode::Tunnel
-            } else {
-                ConnectMode::Lan
-            },
-            address,
-            json,
-        }),
-        "devices" if !all && !tunnel && id.is_none() && address.is_none() => {
+        "pair" if !all && id.is_none() => {
+            let loopback = address
+                .as_deref()
+                .and_then(|value| value.parse::<std::net::SocketAddrV4>().ok())
+                .is_some_and(|address| address.ip().is_loopback());
+            if !tailscale && !tunnel && address.is_some() && !loopback {
+                return Err(
+                    "LAN pairing has been retired; use --tailscale for a tailnet address or Relay server without --address",
+                );
+            }
+            Ok(Command::Pair {
+                mode: if tailscale {
+                    ConnectMode::Tailscale
+                } else if !tunnel && loopback {
+                    ConnectMode::Lan
+                } else {
+                    ConnectMode::Tunnel
+                },
+                address,
+                json,
+            })
+        }
+        "devices" if !tailscale && !all && !tunnel && id.is_none() && address.is_none() => {
             Ok(Command::Devices { json })
         }
-        "revoke" if !tunnel && address.is_none() && (all != id.is_some()) => {
+        "revoke" if !tailscale && !tunnel && address.is_none() && (all != id.is_some()) => {
             Ok(Command::Revoke { id, all, json })
         }
-        "serve" if !all && !json && id.is_none() && address.is_none() => {
+        "serve" if !tailscale && !all && !json && id.is_none() && address.is_none() => {
             Ok(Command::Serve { tunnel })
         }
         _ => Err(HELP),
@@ -277,7 +294,30 @@ mod tests {
                 ..
             })
         ));
+        assert!(matches!(
+            parse(&args(&["pair"])),
+            Ok(Command::Pair {
+                mode: ConnectMode::Tunnel,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&args(&["pair", "--tailscale"])),
+            Ok(Command::Pair {
+                mode: ConnectMode::Tailscale,
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse(&args(&["pair", "--address", "127.0.0.1:0", "--json"])),
+            Ok(Command::Pair {
+                mode: ConnectMode::Lan,
+                ..
+            })
+        ));
         for a in [
+            vec!["pair", "--address", "192.168.1.2:0"],
+            vec!["pair", "--tunnel", "--tailscale"],
             vec!["revoke"],
             vec!["revoke", "phone", "--all"],
             vec!["pair", "--address"],

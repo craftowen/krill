@@ -1,4 +1,4 @@
-//! IPv4 인터페이스 선택. 가상 브리지를 제외하고 Tailscale, 기본 경로 LAN, 나머지 LAN, 수동 주소 순이다.
+//! IPv4 선택. 신규 직접 연결은 Tailscale만 허용하고 loopback은 격리 QA에 쓴다.
 use krill_proto::mobile::{ConnectMode, NetworkInterface};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddrV4};
@@ -30,7 +30,7 @@ pub fn detect() -> io::Result<Vec<NetworkInterface>> {
         });
     Ok(crate::sys::ipv4_interfaces()?
         .into_iter()
-        .filter(|(name, ip)| !excluded(name) && (tailscale(*ip) || ip.is_private()))
+        .filter(|(name, ip)| !excluded(name) && tailscale(*ip))
         .map(|(name, ip)| NetworkInterface {
             default_route: default.as_ref() == Some(&name),
             name,
@@ -64,13 +64,19 @@ pub fn select(
     }
     let custom = custom.map(parse).transpose()?;
     if let Some(address) = custom {
+        if !address.ip().is_loopback() && (mode == ConnectMode::Lan || !tailscale(*address.ip())) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "select a Tailscale address",
+            ));
+        }
         return Ok(address);
     }
     let chosen = interfaces
         .iter()
         .filter(|i| !excluded(&i.name))
         .filter_map(|i| Some((i, i.address.parse::<Ipv4Addr>().ok()?)))
-        .filter(|(_, ip)| tailscale(*ip) || (mode == ConnectMode::Lan && ip.is_private()))
+        .filter(|(_, ip)| mode == ConnectMode::Tailscale && tailscale(*ip))
         .min_by_key(|(i, ip)| {
             (
                 if tailscale(*ip) {
@@ -122,67 +128,33 @@ mod tests {
         }
     }
     #[test]
-    fn priority_exclusions_and_manual_fallback() {
-        let mut all = vec![
-            nic("docker0", "100.64.0.1", true),
-            nic("en1", "192.168.1.2", false),
-            nic("en0", "10.1.1.2", true),
-            nic("utun5", "100.127.255.254", false),
+    fn only_tailscale_or_explicit_loopback_can_select_direct_address() {
+        let all = vec![
+            nic("en0", "192.168.1.2", true),
+            nic("utun5", "100.64.1.2", false),
         ];
         assert_eq!(
-            select(&all, ConnectMode::Lan, None)
+            select(&all, ConnectMode::Tailscale, None)
                 .unwrap()
                 .ip()
                 .to_string(),
-            "100.127.255.254"
+            "100.64.1.2"
         );
+        assert!(select(&all, ConnectMode::Lan, None).is_err());
+        assert!(select(&all, ConnectMode::Lan, Some("192.168.1.2:8765")).is_err());
+        assert!(select(&all, ConnectMode::Tailscale, Some("192.168.1.2:8765")).is_err());
         assert_eq!(
             select(&all, ConnectMode::Lan, Some("127.0.0.1:8765"))
                 .unwrap()
-                .to_string(),
-            "127.0.0.1:8765"
+                .port(),
+            8765
         );
-        all.pop();
-        assert_eq!(
-            select(&all, ConnectMode::Lan, None)
-                .unwrap()
-                .ip()
-                .to_string(),
-            "10.1.1.2"
-        );
-        assert_eq!(
-            select(&all, ConnectMode::Lan, Some("192.168.1.2:8765"))
-                .unwrap()
-                .to_string(),
-            "192.168.1.2:8765"
-        );
-        assert!(select(&all, ConnectMode::Tailscale, None).is_err());
-        for name in [
-            "docker0",
-            "br-test",
-            "vmnet1",
-            "vboxnet0",
-            "veth123",
-            "bridge100",
-        ] {
-            assert!(excluded(name));
-        }
-        for ip in ["100.64.0.0", "100.127.255.255"] {
-            assert!(tailscale(ip.parse().unwrap()));
-        }
-        for ip in ["100.63.255.255", "100.128.0.0"] {
-            assert!(!tailscale(ip.parse().unwrap()));
-        }
-        assert_eq!(
-            select(&[], ConnectMode::Lan, Some("192.168.2.9:8765"))
-                .unwrap()
-                .to_string(),
-            "192.168.2.9:8765"
-        );
-        assert!(select(&[], ConnectMode::Lan, Some("0.0.0.0:80")).is_err());
         assert_eq!(
             select(&all, ConnectMode::Tunnel, None).unwrap().ip(),
             &Ipv4Addr::LOCALHOST
         );
+        assert!(excluded("docker0"));
+        assert!(tailscale("100.127.255.255".parse().unwrap()));
+        assert!(!tailscale("100.128.0.0".parse().unwrap()));
     }
 }

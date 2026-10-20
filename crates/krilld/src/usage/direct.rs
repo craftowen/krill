@@ -1,6 +1,7 @@
 //! OWE-719: 계정별 읽기 전용 직접 사용량. 토큰·응답 원문은 캐시·로그·IPC에 넣지 않는다.
 //! Orca(MIT)의 rate-limits/claude-oauth-usage-request.ts, codex-backend-usage-client.ts,
 //! claude-accounts/keychain.ts의 엔드포인트·저장소 규약을 참고한 독립 Rust 구현이다.
+//! Copyright (c) 2026 Lovecast Inc., MIT License (Orca reference).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
@@ -21,6 +22,8 @@ type Key = (PathBuf, ProviderKind, PathBuf);
 static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 const INTERVAL: Duration = Duration::from_secs(60);
+const REQUEST_INTERVAL: Duration = Duration::from_secs(5);
+const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_BYTES: u64 = 512 * 1024;
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
@@ -33,37 +36,59 @@ pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<
         .map(|(_, usage)| usage.clone())
 }
 
-/// OWE-702의 틱과 `ListAccounts`가 호출한다. 네트워크·자격증명 IO는 별도 스레드에서만 수행한다.
+/// OWE-702의 주기 틱이 호출한다. 네트워크·자격증명 IO는 별도 스레드에서만 수행한다.
 pub fn refresh(home: &Path, state: Option<&Path>) {
+    refresh_with_interval(home, state, INTERVAL, false);
+}
+
+/// `ListAccounts`·계정 변경 요청이 호출한다. 수동 새로고침이 60초/300초 틱 간격에 막히지 않게 짧은 쿨다운만 둔다.
+pub fn refresh_on_request(home: &Path, state: Option<&Path>) {
+    refresh_with_interval(home, state, REQUEST_INTERVAL, true);
+}
+
+fn refresh_with_interval(home: &Path, state: Option<&Path>, interval: Duration, interactive: bool) {
     let file = accounts::load_file(home, state);
     if !file.direct_usage {
         lock(&CACHE).retain(|(h, _, _), _| h != home);
         agy::evict(home);
+        super::meters::evict(home);
         return;
     }
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
-    agy::refresh(home, state, &file);
-    let profiles = [ProviderKind::Claude, ProviderKind::Codex]
-        .into_iter()
-        .map(|p| (p, accounts::host_default_dir(home, p), true))
-        .chain(file.accounts.iter().filter_map(|a| {
-            Some((
-                ProviderKind::parse(&a.provider)?,
-                PathBuf::from(&a.profile_dir),
-                false,
-            ))
-        }));
+    agy::refresh(home, state, &file, interactive);
+    let profiles = [
+        ProviderKind::Claude,
+        ProviderKind::Codex,
+        ProviderKind::OpenCode,
+    ]
+    .into_iter()
+    .map(|p| (p, accounts::host_default_dir(home, p), true))
+    .chain(file.accounts.iter().filter_map(|a| {
+        Some((
+            ProviderKind::parse(&a.provider)?,
+            PathBuf::from(&a.profile_dir),
+            false,
+        ))
+    }));
     for (provider, dir, host) in profiles {
-        if !matches!(provider, ProviderKind::Claude | ProviderKind::Codex) || !dir.is_dir() {
+        if !matches!(
+            provider,
+            ProviderKind::Claude | ProviderKind::Codex | ProviderKind::OpenCode
+        ) || !(dir.is_dir() || provider == ProviderKind::OpenCode && host)
+        {
             continue;
         }
         let key = (home.to_path_buf(), provider, dir);
-        if lock(&CACHE)
-            .get(&key)
-            .is_some_and(|(at, _)| at.elapsed() < INTERVAL)
-            || !lock(&PENDING).insert(key.clone())
+        if lock(&CACHE).get(&key).is_some_and(|(at, u)| {
+            let min_age = if u.error.is_some() {
+                ERROR_RETRY_INTERVAL
+            } else {
+                interval
+            };
+            at.elapsed() < min_age
+        }) || !lock(&PENDING).insert(key.clone())
         {
             continue;
         }
@@ -84,11 +109,14 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
                 .ok()
                 .map(|d| d.as_secs());
             let usage = match result {
-                Some(usage) => ProfileUsage {
-                    usage,
-                    updated_at: now,
-                    ..ProfileUsage::default()
-                },
+                Some((usage, meters)) => {
+                    super::meters::remember(&job.0, job.1, &job.2, meters);
+                    ProfileUsage {
+                        usage,
+                        updated_at: now,
+                        ..ProfileUsage::default()
+                    }
+                }
                 None => ProfileUsage {
                     error: Some("갱신 실패".into()),
                     detail: Some("사용량 갱신 실패".into()),
@@ -111,12 +139,16 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
 
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
 #[cfg(test)]
-fn fetch(_: ProviderKind, _: &Path, _: bool) -> Option<Usage> {
+fn fetch(_: ProviderKind, _: &Path, _: bool) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
     None
 }
 
 #[cfg(not(test))]
-fn fetch(provider: ProviderKind, dir: &Path, host: bool) -> Option<Usage> {
+fn fetch(
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
     let (token, account) = credentials(provider, dir, host)?;
     query(provider, &token, account.as_deref(), |config| {
         pipe_command(
@@ -142,16 +174,33 @@ fn query(
     token: &str,
     account: Option<&str>,
     send: impl FnOnce(&str) -> Option<Zeroizing<Vec<u8>>>,
-) -> Option<Usage> {
+) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
     let config = request_config(provider, token, account)?;
     let body = send(&config)?;
     let text = std::str::from_utf8(&body).ok()?;
+    let meters = super::meters::parse(provider, text);
     let usage = if provider == ProviderKind::Claude {
         super::parse_claude(text)
+    } else if provider == ProviderKind::OpenCode {
+        let window = |label| {
+            meters
+                .meters
+                .iter()
+                .find(|m| m.label == label)
+                .and_then(|m| m.window.as_ref())
+                .map(|w| Window {
+                    percent: w.percent,
+                    resets_at: w.resets_at.clone(),
+                })
+        };
+        Usage {
+            five_hour: window("5h"),
+            seven_day: window("7d"),
+        }
     } else {
         parse_codex_backend(text)
     };
-    (!usage.is_empty()).then_some(usage)
+    (!usage.is_empty() || !meters.meters.is_empty()).then_some((usage, meters))
 }
 
 /// 토큰이 명령행·환경 변수에 노출되지 않도록 curl 설정을 stdin으로 전한다.
@@ -182,6 +231,10 @@ fn request_config(
             "https://chatgpt.com/backend-api/wham/usage",
             "header = \"User-Agent: codex-cli\"\nheader = \"OpenAI-Beta: codex-1\"\nheader = \"originator: Codex Desktop\"\n",
         ),
+        ProviderKind::OpenCode => (
+            "https://opencode.ai/zen/go/v1/usage",
+            "header = \"Accept: application/json\"\n",
+        ),
         _ => return None,
     };
     let mut config = Zeroizing::new(format!(
@@ -195,7 +248,7 @@ fn request_config(
     Some(config)
 }
 
-fn read_file(path: &Path) -> Option<Zeroizing<Vec<u8>>> {
+pub(super) fn read_file(path: &Path) -> Option<Zeroizing<Vec<u8>>> {
     let file = std::fs::File::open(path).ok()?;
     if file.metadata().ok()?.len() > MAX_BYTES {
         return None;
@@ -210,6 +263,29 @@ fn credentials(
     dir: &Path,
     host: bool,
 ) -> Option<(Zeroizing<String>, Option<String>)> {
+    if provider == ProviderKind::OpenCode {
+        let auth = if host {
+            let home = accounts::default_home();
+            std::env::var_os("XDG_DATA_HOME")
+                .map_or_else(|| home.join(".local/share"), PathBuf::from)
+                .join("opencode/auth.json")
+        } else {
+            dir.join("data/opencode/auth.json")
+        };
+        let raw = read_file(&auth)?;
+        let mut json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+        let key = ["opencode-go", "opencode"].into_iter().find_map(|name| {
+            let credential = json.get_mut(name)?;
+            if credential.get("type").and_then(serde_json::Value::as_str) != Some("api") {
+                return None;
+            }
+            match credential.get_mut("key")?.take() {
+                serde_json::Value::String(s) if !s.is_empty() => Some(Zeroizing::new(s)),
+                _ => None,
+            }
+        })?;
+        return Some((key, None));
+    }
     let raw = if provider == ProviderKind::Claude {
         let user = std::env::var("USER")
             .ok()
@@ -317,14 +393,22 @@ fn pipe_command(exe: &str, args: &[&str], input: &[u8]) -> Option<Zeroizing<Vec<
 
 pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
     if !host {
-        // 프로필 판정은 krill-proto와 공유한다(OWE-901 중복 제거). 내용은 읽지 않는다.
+        // 로그인 판정은 krill-proto와 공유한다. 신원은 로그인된 프로필에서만 읽는다.
+        let logged_in = krill_proto::account_login::agy_token_logged_in(dir);
         return Some(AuthStatus {
-            logged_in: krill_proto::account_login::agy_token_logged_in(dir),
-            identity: None,
+            logged_in,
+            identity: logged_in
+                .then(|| {
+                    read_file(&dir.join(".gemini/antigravity-cli/antigravity-oauth-token"))
+                        .and_then(|raw| {
+                            accounts::identity_from_credentials(ProviderKind::Antigravity, &raw)
+                        })
+                })
+                .flatten(),
         });
     }
     // 호스트(OWE-901): 키체인 파싱 → 토큰 파일 존재 순(코디네이터 결정: 마커 검사 없음).
-    // 파일은 존재·크기만 보고 내용을 읽지 않는다. 호스트 `dir`은 이미
+    // 로그인은 존재·크기로 판정하고, 표시용 이메일만 상한 있는 읽기로 얻는다. 호스트 `dir`은 이미
     // `~/.gemini/antigravity-cli`라 토큰 파일명을 직접 붙인다(프로필 헬퍼와 다름).
     if let Some(raw) = keychain("gemini", "antigravity")
         && let Some(status) = parse_antigravity_auth(&raw)
@@ -337,7 +421,9 @@ pub(super) fn antigravity_auth(dir: &Path, host: bool) -> Option<AuthStatus> {
     {
         return Some(AuthStatus {
             logged_in: true,
-            identity: None,
+            identity: read_file(&token).and_then(|raw| {
+                accounts::identity_from_credentials(ProviderKind::Antigravity, &raw)
+            }),
         });
     }
     None
@@ -371,7 +457,9 @@ fn parse_antigravity_auth(raw: &[u8]) -> Option<AuthStatus> {
             .is_some_and(|s| !s.is_empty());
     Some(AuthStatus {
         logged_in: valid,
-        identity: None,
+        identity: valid
+            .then(|| accounts::identity_from_credentials(ProviderKind::Antigravity, &decoded))
+            .flatten(),
     })
 }
 
@@ -433,6 +521,7 @@ pub(crate) mod agy {
     static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
     /// 주기 실행 간격(5분)·캐시 유효(10분). 5h·주간 창에는 충분하고 agy 실행 부담을 낮춘다.
     const INTERVAL: Duration = Duration::from_secs(300);
+    const REQUEST_INTERVAL: Duration = Duration::from_secs(15);
     const TTL: Duration = Duration::from_secs(600);
     /// `agy -p /usage` 실행 타임아웃(agy 자체 `--print-timeout 20s`보다 길게).
     const TIMEOUT: Duration = Duration::from_secs(30);
@@ -474,10 +563,20 @@ pub(crate) mod agy {
     }
 
     /// `direct::refresh`가 `SAVE_LOCK` 없이 호출한다. 실제 실행은 스레드에서만.
-    pub(super) fn refresh(home: &Path, state: Option<&Path>, file: &accounts::AccountsFile) {
+    pub(super) fn refresh(
+        home: &Path,
+        state: Option<&Path>,
+        file: &accounts::AccountsFile,
+        interactive: bool,
+    ) {
         if cfg!(test) || latched() {
             return;
         }
+        let interval = if interactive {
+            REQUEST_INTERVAL
+        } else {
+            INTERVAL
+        };
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -501,7 +600,7 @@ pub(crate) mod agy {
             let key = (home.to_path_buf(), dir);
             if lock(&CACHE)
                 .get(&key)
-                .is_some_and(|(at, _)| at.elapsed() < INTERVAL)
+                .is_some_and(|(at, _)| at.elapsed() < interval)
                 || !lock(&PENDING).insert(key.clone())
             {
                 continue;
@@ -527,7 +626,13 @@ pub(crate) mod agy {
                 .flatten();
                 // 조회 중 사용자가 직접 조회를 끄면 결과도 버린다.
                 let enabled = accounts::load_file(&job.0, state.as_deref()).direct_usage;
-                if enabled && let Some(usage) = usage {
+                if enabled && let Some((usage, meters)) = usage {
+                    super::super::meters::remember(
+                        &job.0,
+                        ProviderKind::Antigravity,
+                        &job.1,
+                        meters,
+                    );
                     // 한도 도달(100%)이면 다음 실행부터 다른 계정이 잡히게 기록한다(OWE-901).
                     if usage_max(&usage) >= 100
                         && let Some(id) = account_id_for(&job.0, state.as_deref(), &job.1, host)
@@ -585,7 +690,11 @@ pub(crate) mod agy {
 
     /// 버전 게이트를 포함한 실조회 한 번. `exe`는 호출자가 정한다(실행은 로그인 셸 PATH의 agy,
     /// 테스트는 가짜 바이너리).
-    fn fetch(exe: &Path, dir: &Path, host: bool) -> Option<Usage> {
+    fn fetch(
+        exe: &Path,
+        dir: &Path,
+        host: bool,
+    ) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
         if latched() {
             return None;
         }
@@ -622,7 +731,9 @@ pub(crate) mod agy {
             return None;
         }
         let usage = krill_proto::usage::parse_antigravity_usage(text);
-        (!usage.is_empty()).then_some(from_proto_snapshot(&usage))
+        let meters = super::super::meters::parse(ProviderKind::Antigravity, text);
+        (!usage.is_empty() || !meters.meters.is_empty())
+            .then_some((from_proto_snapshot(&usage), meters))
     }
 
     /// krill-proto 봉투를 krilld 내부 사용량으로 옮긴다(토큰·원문은 버린다).
@@ -642,7 +753,7 @@ pub(crate) mod agy {
     #[cfg(test)]
     #[cfg(unix)]
     pub(super) fn fetch_for_tests(exe: &Path, dir: &Path, host: bool) -> Option<Usage> {
-        fetch(exe, dir, host)
+        fetch(exe, dir, host).map(|(usage, _)| usage)
     }
 
     #[cfg(test)]
@@ -1164,7 +1275,7 @@ mod tests {
 
     #[test]
     fn injected_http_reads_quota_and_maps_failures_to_unknown() {
-        let usage = query(ProviderKind::Claude, "fixture-only", None, |config| {
+        let (usage, meters) = query(ProviderKind::Claude, "fixture-only", None, |config| {
             assert!(config.contains("request = \"GET\""));
             assert!(config.contains("anthropic-beta: oauth-2025-04-20"));
             Some(Zeroizing::new(
@@ -1172,6 +1283,7 @@ mod tests {
             ))
         })
         .unwrap();
+        assert_eq!(meters.meters.len(), 2);
         assert_eq!(usage.five_hour.unwrap().percent, 42);
         assert_eq!(usage.seven_day.unwrap().percent, 8);
         assert!(query(ProviderKind::Claude, "fixture-only", None, |_| None).is_none());

@@ -1,7 +1,9 @@
+// Krill modification (Apache-2.0 §4(b)): pasteboard access is queued outside
+// MacPlatform's mutex; async reads obtain fresh data without blocking UI events.
+use crate::clipboard_worker::{Board, ClipboardWorker};
 use crate::{
     AppleActivity, AppleDispatcher, BoolExt, MacDisplay, MacKeyboardLayout, MacKeyboardMapper,
-    MacWindow, events::key_to_native, ns_string, pasteboard::Pasteboard, renderer,
-    set_active_window_cursor_style,
+    MacWindow, events::key_to_native, ns_string, renderer, set_active_window_cursor_style,
 };
 use anyhow::{Context as _, anyhow};
 use block2::RcBlock;
@@ -185,8 +187,7 @@ pub(crate) struct MacPlatformState {
     headless: bool,
     activation_policy: ActivationPolicy,
     application_created: bool,
-    general_pasteboard: Pasteboard,
-    find_pasteboard: Pasteboard,
+    pasteboards: ClipboardWorker,
     reopen: Option<Box<dyn FnMut()>>,
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     thermal_observer: Option<ThermalObserver>,
@@ -254,8 +255,7 @@ impl MacPlatform {
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
             foreground_executor: ForegroundExecutor::new(dispatcher),
             renderer_context: renderer::Context::default(),
-            general_pasteboard: Pasteboard::general(),
-            find_pasteboard: Pasteboard::find(),
+            pasteboards: ClipboardWorker::new(),
             reopen: None,
             quit: None,
             menu_command: None,
@@ -1230,23 +1230,33 @@ impl Platform for MacPlatform {
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
-        let state = self.0.lock();
-        state.general_pasteboard.read()
+        let pasteboards = self.0.lock().pasteboards.clone();
+        pasteboards.cached(Board::General)
+    }
+
+    fn read_from_clipboard_async(
+        &self,
+    ) -> Task<Result<Option<ClipboardItem>, gpui::ClipboardReadError>> {
+        let pasteboards = self.0.lock().pasteboards.clone();
+        let read = pasteboards.read_async();
+        let executor = self.background_executor();
+        let timer = executor.timer(std::time::Duration::from_secs(2));
+        executor.spawn(crate::clipboard_worker::with_deadline(read, timer))
     }
 
     fn write_to_clipboard(&self, item: ClipboardItem) {
-        let state = self.0.lock();
-        state.general_pasteboard.write(item);
+        let pasteboards = self.0.lock().pasteboards.clone();
+        pasteboards.write(Board::General, item);
     }
 
     fn read_from_find_pasteboard(&self) -> Option<ClipboardItem> {
-        let state = self.0.lock();
-        state.find_pasteboard.read()
+        let pasteboards = self.0.lock().pasteboards.clone();
+        pasteboards.cached(Board::Find)
     }
 
     fn write_to_find_pasteboard(&self, item: ClipboardItem) {
-        let state = self.0.lock();
-        state.find_pasteboard.write(item);
+        let pasteboards = self.0.lock().pasteboards.clone();
+        pasteboards.write(Board::Find, item);
     }
 
     fn write_credentials(&self, url: &str, username: &str, password: &[u8]) -> Task<Result<()>> {

@@ -9,15 +9,15 @@
 //!   사이드바 프로젝트/워크트리 트리, `Settings > Accounts`, `Settings > Ssh`, 상태바를 갱신한다.
 
 use std::collections::BTreeSet;
-use std::io::{self, Read as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::{
-    App, Deferred, Div, FontWeight, InteractiveElement as _, ParentElement as _, SharedString,
-    Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
+    App, AppContext as _, Deferred, Div, FontWeight, InteractiveElement as _, ParentElement as _,
+    SharedString, Stateful, StatefulInteractiveElement as _, Styled as _, Window, div, px,
 };
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
@@ -78,6 +78,8 @@ impl ImportDomain {
             Self::Accounts => text::CAT_ACCOUNTS_DESC.format(&[
                 ("claude", &r.claude_count().to_string()),
                 ("codex", &r.codex_count().to_string()),
+                ("agy", &r.provider_count("agy").to_string()),
+                ("opencode", &r.provider_count("opencode").to_string()),
             ]),
             Self::Ssh => text::CAT_SSH_DESC.format(&[("ssh", &r.ssh_count().to_string())]),
             Self::Projects => text::CAT_PROJECTS_DESC.format(&[
@@ -122,6 +124,13 @@ pub struct OrcaImportReport {
 }
 
 impl OrcaImportReport {
+    pub fn provider_count(&self, provider: &str) -> usize {
+        self.accounts
+            .items
+            .iter()
+            .filter(|i| i.provider.eq_ignore_ascii_case(provider))
+            .count()
+    }
     #[must_use]
     pub fn claude_count(&self) -> usize {
         let from_items = self
@@ -192,6 +201,11 @@ impl OrcaImportReport {
     pub fn total_importable(&self) -> usize {
         self.claude_count()
             .saturating_add(self.codex_count())
+            .saturating_add(
+                self.provider_count("agy")
+                    .max(usize::from(self.accounts.agy_detected)),
+            )
+            .saturating_add(self.provider_count("opencode"))
             .saturating_add(self.ssh_count())
             .saturating_add(self.ssh.environments_merged)
             .saturating_add(self.projects_count())
@@ -208,6 +222,8 @@ impl OrcaImportReport {
         let counts = [
             ("claude", self.claude_count()),
             ("codex", self.codex_count()),
+            ("agy", self.provider_count("agy")),
+            ("opencode", self.provider_count("opencode")),
             ("ssh", self.ssh_count()),
             ("projects", self.projects_count()),
             ("worktrees", self.worktrees_count()),
@@ -249,6 +265,9 @@ impl OrcaImportReport {
             .saturating_add(self.accounts.claude_updated)
             .saturating_add(self.accounts.codex_added)
             .saturating_add(self.accounts.codex_updated);
+        let accounts_total = accounts_total
+            .saturating_add(self.accounts.agy_added)
+            .saturating_add(self.accounts.opencode_added);
         let ssh_total = self.ssh.hosts_added.saturating_add(self.ssh.hosts_updated);
         let proj_total = self
             .projects
@@ -299,6 +318,10 @@ pub struct AccountsImportSummary {
     pub codex_added: usize,
     #[serde(default)]
     pub codex_updated: usize,
+    #[serde(default)]
+    pub agy_added: usize,
+    #[serde(default)]
+    pub opencode_added: usize,
     #[serde(default)]
     pub active_claude: Option<String>,
     #[serde(default)]
@@ -453,16 +476,28 @@ pub struct ImportedSessionSummary {
 }
 
 /// `krill import orca` 서브프로세스 기본 실행 제한 시간(`OWE-767`).
-pub const IMPORT_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(15);
+pub const IMPORT_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// `krill import orca --json` 표준출력 최대 바이트(4 MiB, `OWE-767`).
 pub const MAX_IMPORT_STDOUT_BYTES: u64 = 4 * 1024 * 1024;
 /// `krill import orca` 표준에러 최대 바이트(64 KiB, `OWE-767`).
 pub const MAX_IMPORT_STDERR_BYTES: u64 = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum DiscoveryPhase {
+    #[default]
+    Idle,
+    Pending,
+    Ready,
+}
+
 /// 앱 전역 Orca 마이그레이션 상태(온보딩 마법사 및 `Settings > General` / `Accounts` 공유).
 #[derive(Debug, Clone)]
 pub struct OrcaImportState {
     pub orca_dir_override: Option<PathBuf>,
+    discovery_generation: u64,
+    discovery: DiscoveryPhase,
+    detected_orca_dir: Option<PathBuf>,
+    resolved_krill_bin: Option<PathBuf>,
     pub krill_bin_override: Option<PathBuf>,
     pub home_override: Option<PathBuf>,
     pub state_dir_override: Option<PathBuf>,
@@ -482,6 +517,10 @@ impl Default for OrcaImportState {
     fn default() -> Self {
         Self {
             orca_dir_override: None,
+            discovery_generation: 0,
+            discovery: DiscoveryPhase::Idle,
+            detected_orca_dir: None,
+            resolved_krill_bin: None,
             krill_bin_override: None,
             home_override: None,
             state_dir_override: None,
@@ -560,7 +599,14 @@ pub fn set_env_paths(
         changed = true;
     }
     if changed {
+        st.discovery_generation = st.discovery_generation.wrapping_add(1);
+        st.discovery = DiscoveryPhase::Idle;
+        st.detected_orca_dir = None;
+        st.resolved_krill_bin = None;
+        st.scanning = false;
+        st.importing = false;
         st.preview = None;
+        st.last_result = None;
         st.error = None;
     }
 }
@@ -585,32 +631,65 @@ pub fn default_orca_dir(home: &Path) -> PathBuf {
 /// 실수로 감지되지 않도록 명시적 오버라이드 또는 격리된 `home_override`/`state_dir/orca`만 검사한다.
 #[must_use]
 pub fn detect_orca_dir(cx: &App) -> Option<PathBuf> {
-    if let Some(st) = state(cx) {
-        if let Some(ref custom) = st.orca_dir_override {
-            return custom.is_dir().then(|| custom.clone());
-        }
-        if let Some(ref home) = st.home_override {
-            let candidate = default_orca_dir(home);
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
+    state(cx).and_then(|state| state.detected_orca_dir.clone())
+}
+
+fn find_orca_dir(st: &OrcaImportState, state_dir: Option<&Path>) -> Option<PathBuf> {
+    if let Some(custom) = &st.orca_dir_override {
+        return custom.is_dir().then(|| custom.clone());
+    }
+    if let Some(home) = &st.home_override {
+        let candidate = default_orca_dir(home);
+        if candidate.is_dir() {
+            return Some(candidate);
         }
     }
     if cfg!(test) {
-        if let Some(dir) = effective_state_dir(cx) {
-            let candidate = dir.join("orca");
-            if candidate.is_dir() {
-                return Some(candidate);
-            }
-        }
-        return None;
+        return state_dir
+            .map(|dir| dir.join("orca"))
+            .filter(|path| path.is_dir());
     }
-    if let Some(env_dir) = std::env::var_os("KRILL_ORCA_DIR").map(PathBuf::from) {
-        return env_dir.is_dir().then_some(env_dir);
-    }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let candidate = default_orca_dir(&home);
+    let candidate = std::env::var_os("KRILL_ORCA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| default_orca_dir(Path::new(&home))))?;
     candidate.is_dir().then_some(candidate)
+}
+
+fn discover_paths(cx: &mut App) {
+    ensure_state(cx);
+    let current = cx.global::<OrcaImportState>();
+    if current.discovery != DiscoveryPhase::Idle {
+        return;
+    }
+    let snapshot = OrcaImportState {
+        orca_dir_override: current.orca_dir_override.clone(),
+        home_override: current.home_override.clone(),
+        krill_bin_override: current.krill_bin_override.clone(),
+        ..OrcaImportState::default()
+    };
+    let generation = current.discovery_generation;
+    let dir = effective_state_dir(cx);
+    cx.global_mut::<OrcaImportState>().discovery = DiscoveryPhase::Pending;
+    let job = cx.background_spawn(async move {
+        let orca = find_orca_dir(&snapshot, dir.as_deref());
+        let bin = find_krill_bin(snapshot.krill_bin_override);
+        (orca, bin)
+    });
+    cx.spawn(async move |cx| {
+        let (orca, bin) = job.await;
+        cx.update(|cx| {
+            let st = cx.global_mut::<OrcaImportState>();
+            if st.discovery_generation != generation {
+                return;
+            }
+            st.discovery = DiscoveryPhase::Ready;
+            st.detected_orca_dir = orca;
+            st.resolved_krill_bin = bin;
+            ensure_scanned(cx);
+            cx.refresh_windows();
+        });
+    })
+    .detach();
 }
 
 #[must_use]
@@ -664,7 +743,16 @@ fn probe_daemon_handshake(state_dir: Option<&Path>) -> bool {
 /// 4) `CARGO_TARGET_DIR/debug/krill`
 #[must_use]
 pub fn resolve_krill_bin(cx: &App) -> Option<PathBuf> {
-    if let Some(bin) = state(cx).and_then(|s| s.krill_bin_override.clone())
+    state(cx).and_then(|state| {
+        state
+            .resolved_krill_bin
+            .clone()
+            .or_else(|| state.krill_bin_override.clone())
+    })
+}
+
+fn find_krill_bin(override_bin: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(bin) = override_bin
         && bin.is_file()
     {
         return Some(bin);
@@ -776,47 +864,8 @@ pub fn run_krill_import_with_timeout(
         .take()
         .ok_or_else(|| io::Error::other("missing krill import stderr"))?;
 
-    let out_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(MAX_IMPORT_STDOUT_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
-    let err_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .take(MAX_IMPORT_STDERR_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
-
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.0.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Ok(None) => {
-                break Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "krill import orca timed out",
-                ));
-            }
-            Err(e) => break Err(e),
-        }
-    };
-    child.0.kill().ok();
-    child.0.wait().ok();
-    let status = status?;
-    let stdout_bytes = out_reader
-        .join()
-        .map_err(|_| io::Error::other("krill import stdout reader failed"))??;
-    let stderr_bytes = err_reader
-        .join()
-        .map_err(|_| io::Error::other("krill import stderr reader failed"))?
-        .unwrap_or_default();
+    let (status, stdout_bytes, stderr_bytes) =
+        read_import_output(&mut child, stdout, stderr, Instant::now() + timeout)?;
 
     if u64::try_from(stdout_bytes.len()).unwrap_or(u64::MAX) > MAX_IMPORT_STDOUT_BYTES {
         return Err(io::Error::new(
@@ -840,9 +889,50 @@ pub fn run_krill_import_with_timeout(
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
 }
 
+fn import_timeout() -> io::Error {
+    io::Error::new(io::ErrorKind::TimedOut, "krill import orca timed out")
+}
+
+fn read_import_output(
+    child: &mut ReapChild,
+    stdout: std::process::ChildStdout,
+    stderr: std::process::ChildStderr,
+    deadline: Instant,
+) -> io::Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let out_reader = crate::process_io::read(stdout, MAX_IMPORT_STDOUT_BYTES + 1, deadline)?;
+    let err_reader = crate::process_io::read(stderr, MAX_IMPORT_STDERR_BYTES + 1, deadline)?;
+    let status = loop {
+        if let Some(status) = child.0.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            return Err(import_timeout());
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    // Descendants may still own either pipe after the direct child has exited.
+    // The shared helper has its own deadline and bounded worker admission.
+    let finish_deadline = deadline + Duration::from_millis(50);
+    let stdout = out_reader.finish(finish_deadline)?;
+    let stderr = err_reader.finish(finish_deadline)?;
+    if stdout.timed_out || stderr.timed_out {
+        return Err(import_timeout());
+    }
+    if u64::try_from(stdout.bytes.len()).unwrap_or(u64::MAX) > MAX_IMPORT_STDOUT_BYTES
+        || u64::try_from(stderr.bytes.len()).unwrap_or(u64::MAX) > MAX_IMPORT_STDERR_BYTES
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "krill import orca output exceeds size limit",
+        ));
+    }
+    Ok((status, stdout.bytes, stderr.bytes))
+}
+
 /// Orca 디렉터리가 감지되었고 아직 미리보기 스캔이 없으면 백그라운드 `--dry-run --json` 스캔을 시작한다.
 pub fn ensure_scanned(cx: &mut App) {
     ensure_state(cx);
+    discover_paths(cx);
     let Some(orca_dir) = detect_orca_dir(cx) else {
         return;
     };
@@ -860,6 +950,10 @@ pub fn ensure_scanned(cx: &mut App) {
 /// `krill import orca --dry-run --json`을 비동기 실행해 감지 요약을 갱신한다.
 pub fn scan_preview(cx: &mut App) {
     ensure_state(cx);
+    if state(cx).is_some_and(|st| st.scanning || st.importing) {
+        return;
+    }
+    discover_paths(cx);
     let Some(orca_dir) = detect_orca_dir(cx) else {
         return;
     };
@@ -868,6 +962,7 @@ pub fn scan_preview(cx: &mut App) {
         cx.refresh_windows();
         return;
     };
+    let generation = cx.global::<OrcaImportState>().discovery_generation;
     let state_dir = effective_state_dir(cx);
     let (home_dir, timeout, link_known) = {
         let st = cx.global_mut::<OrcaImportState>();
@@ -899,6 +994,9 @@ pub fn scan_preview(cx: &mut App) {
         let (res, daemon_ok) = rx.await;
         cx.update(|cx| {
             let st = cx.global_mut::<OrcaImportState>();
+            if st.discovery_generation != generation {
+                return;
+            }
             st.scanning = false;
             if st.daemon_link_up.is_none()
                 && let Some(ok) = daemon_ok
@@ -973,6 +1071,7 @@ pub fn import_selected(cx: &mut App) {
         cx.refresh_windows();
         return;
     };
+    let generation = cx.global::<OrcaImportState>().discovery_generation;
     let state_dir = effective_state_dir(cx);
     let (home_dir, timeout, link_known) = {
         let st = cx.global_mut::<OrcaImportState>();
@@ -1010,6 +1109,9 @@ pub fn import_selected(cx: &mut App) {
         cx.update(|cx| {
             {
                 let st = cx.global_mut::<OrcaImportState>();
+                if st.discovery_generation != generation {
+                    return;
+                }
                 st.importing = false;
                 if st.daemon_link_up.is_none()
                     && let Some(ok) = daemon_ok
@@ -1049,7 +1151,7 @@ pub fn import_selected(cx: &mut App) {
 #[must_use]
 pub fn render_banner(id_prefix: &'static str, cx: &App) -> Option<Stateful<Div>> {
     let _orca_dir = detect_orca_dir(cx)?;
-    let st = state(cx).cloned().unwrap_or_default();
+    let st = state(cx)?;
     // OWE-882: 스캔이 끝났는데 가져올 항목이 하나도 없으면 빈 카드·[전체 가져오기]를 노출하지 않는다.
     if let Some(report) = st.preview.as_ref().or(st.last_result.as_ref())
         && report.total_importable() == 0
@@ -2121,7 +2223,10 @@ mod tests {
                 cx,
             );
             set_daemon_link_up(false, cx);
+            // Isolate the render test after background directory discovery has completed.
+            cx.global_mut::<OrcaImportState>().detected_orca_dir = Some(fx.orca_dir.clone());
         });
+        wait_until(cx, |cx| cx.read(is_orca_detected));
 
         // 1. Repeatedly call render_banner / daemon_available on the UI thread and verify 0 socket connects
         cx.read(|cx| {
@@ -2277,6 +2382,8 @@ mod tests {
                 None,
                 cx,
             );
+            // This render-only fixture starts with an already discovered directory.
+            cx.global_mut::<OrcaImportState>().detected_orca_dir = Some(fx.orca_dir.clone());
             assert!(is_orca_detected(cx));
             // 스캔 전(preview 없음): 스캔 중 카드 노출
             assert!(render_banner("test", cx).is_some());
@@ -2291,5 +2398,62 @@ mod tests {
             cx.global_mut::<OrcaImportState>().preview = Some(with_items);
             assert!(render_banner("test", cx).is_some());
         });
+    }
+    #[gpui::test]
+    fn async_discovery_ignores_previous_environment(cx: &mut TestAppContext) {
+        let fx = setup_orca_fixture("async-discovery");
+        let second = fx.root.join("second-orca");
+        fs::create_dir_all(&second).unwrap();
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            set_env_paths(
+                Some(fx.home.clone()),
+                Some(fx.orca_dir.clone()),
+                Some(fx.state_dir.clone()),
+                None,
+                cx,
+            );
+            discover_paths(cx);
+            assert_eq!(state(cx).unwrap().discovery, DiscoveryPhase::Pending);
+            assert!(detect_orca_dir(cx).is_none());
+            set_env_paths(None, Some(second.clone()), None, None, cx);
+            let preview = OrcaImportReport {
+                orca_dir: second.display().to_string(),
+                ..OrcaImportReport::default()
+            };
+            cx.global_mut::<OrcaImportState>().preview = Some(preview);
+            discover_paths(cx);
+        });
+        cx.run_until_parked();
+        cx.read(|cx| {
+            assert_eq!(detect_orca_dir(cx), Some(second));
+            assert_ne!(state(cx).unwrap().discovery, DiscoveryPhase::Pending);
+            assert!(state(cx).unwrap().error.is_none());
+        });
+    }
+    #[test]
+    fn async_import_deadline_covers_descendant_owned_output_pipes() {
+        let fx = setup_orca_fixture("descendant-pipe");
+        let bin = fx.root.join("descendant-output.sh");
+        let report = serde_json::to_string(&OrcaImportReport::default()).unwrap();
+        fs::write(
+            &bin,
+            format!(
+                "#!/bin/sh\nsleep 1 &\nprintf '%s' '{}'\nexit 0\n",
+                report.replace('\'', "'\\''")
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let result = run_krill_import_with_timeout(
+            &bin,
+            &fx.orca_dir,
+            Some(&fx.state_dir),
+            Some(&fx.home),
+            &ImportDomain::ALL,
+            true,
+            Duration::from_millis(50),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
     }
 }

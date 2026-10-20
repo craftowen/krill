@@ -10,11 +10,10 @@
 //! `.ref/orca/src/renderer/src/components/right-sidebar/file-explorer-name-filter-projection.ts`
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
+use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
 use gpui::prelude::FluentBuilder as _;
@@ -71,6 +70,54 @@ pub enum EditKind {
     Rename { target: PathBuf },
 }
 
+enum Operation {
+    CreateFile { parent: PathBuf, name: String },
+    CreateFolder { parent: PathBuf, name: String },
+    Rename { target: PathBuf, name: String },
+    Delete { target: PathBuf },
+}
+
+/// UI 핸들을 포함하지 않는 백그라운드 IO용 상태.
+struct DiskState {
+    repo: PathBuf,
+    home: PathBuf,
+    expanded: BTreeSet<PathBuf>,
+    dir_cache: BTreeMap<PathBuf, Vec<DirEntry>>,
+    ignored: BTreeSet<String>,
+    selected: Option<PathBuf>,
+}
+
+impl DiskState {
+    fn capture(explorer: &Explorer) -> Self {
+        Self {
+            repo: explorer.repo.clone(),
+            home: explorer.home.clone(),
+            expanded: explorer.expanded.clone(),
+            dir_cache: explorer.dir_cache.clone(),
+            ignored: explorer.ignored.clone(),
+            selected: explorer.selected.clone(),
+        }
+    }
+
+    fn run(self, operation: Operation) -> (Self, io::Result<PathBuf>, bool) {
+        // 디스크 모델은 이 작업 안에서만 생성한다. GPUI 핸들은 스레드 사이로 옮기지 않는다.
+        let mut model = Explorer::new(self.repo);
+        model.home = self.home;
+        model.expanded = self.expanded;
+        model.dir_cache = self.dir_cache;
+        model.ignored = self.ignored;
+        model.selected = self.selected;
+        let open = matches!(operation, Operation::CreateFile { .. });
+        let result = match operation {
+            Operation::CreateFile { parent, name } => model.create_file(&parent, &name),
+            Operation::CreateFolder { parent, name } => model.create_folder(&parent, &name),
+            Operation::Rename { target, name } => model.rename_path(&target, &name),
+            Operation::Delete { target } => model.delete_path(&target),
+        };
+        (Self::capture(&model), result, open)
+    }
+}
+
 /// 휴지통 이동 확인 대화상자 상태.
 #[derive(Debug, Clone)]
 pub struct PendingDelete {
@@ -111,6 +158,9 @@ pub struct Explorer {
     pub(crate) editing: Option<(EditKind, Entity<InputState>, Option<Subscription>)>,
     pub(crate) pending_delete: Option<PendingDelete>,
     pub(crate) error: Option<String>,
+    operations: VecDeque<Operation>,
+    operation_task: Option<Task<()>>,
+    operation_generation: u64,
     #[cfg(test)]
     pub(crate) rendered_rows: usize,
 }
@@ -159,6 +209,9 @@ impl Explorer {
             editing: None,
             pending_delete: None,
             error: None,
+            operations: VecDeque::new(),
+            operation_task: None,
+            operation_generation: 0,
             #[cfg(test)]
             rendered_rows: 0,
         }
@@ -171,6 +224,9 @@ impl Explorer {
 
     /// 워크트리 루트가 바뀔 때 캐시와 펼침 상태를 초기화한다.
     pub fn set_repo(&mut self, repo: PathBuf, load_now: bool) {
+        self.operations.clear();
+        self.operation_task = None;
+        self.operation_generation = self.operation_generation.wrapping_add(1);
         self.repo = repo;
         self.loaded_root = false;
         self.loading = false;
@@ -357,6 +413,13 @@ impl Explorer {
             self.filter_collapsed.clear();
         }
         self.filter_query = next;
+        // 이 동기 디스크 모델 API는 백그라운드 작업·헤드리스 테스트 전용이다.
+        if !self.filter_query.trim().is_empty() && self.filter_files_cache.is_none() {
+            let scanned = scan_worktree_entries(&self.repo, MAX_FILTER_ENTRIES);
+            let rels: Vec<String> = scanned.iter().map(|e| e.relative_path.clone()).collect();
+            self.ignored.extend(query_git_ignored(&self.repo, &rels));
+            self.filter_files_cache = Some(scanned);
+        }
         self.rebuild_rows();
     }
 
@@ -365,12 +428,22 @@ impl Explorer {
         let Some(sel) = &self.selected else {
             return self.repo.clone();
         };
-        if sel.is_dir() {
+        if self.path_is_dir(sel) {
             sel.clone()
         } else {
             sel.parent()
                 .map_or_else(|| self.repo.clone(), Path::to_path_buf)
         }
+    }
+
+    fn path_is_dir(&self, path: &Path) -> bool {
+        path == self.repo
+            || self.rows.iter().any(|row| row.path == path && row.is_dir)
+            || self
+                .dir_cache
+                .values()
+                .flatten()
+                .any(|entry| entry.path == path && entry.is_dir)
     }
 
     /// 새 빈 파일을 생성하고 부모 폴더를 펼쳐 트리에 반영한다.
@@ -608,14 +681,6 @@ impl Explorer {
             let root = self.repo.clone();
             self.visit_cached_dir(&root, 0);
             return;
-        }
-        if self.filter_files_cache.is_none() {
-            let scanned = scan_worktree_entries(&self.repo, MAX_FILTER_ENTRIES);
-            let rels: Vec<String> = scanned.iter().map(|e| e.relative_path.clone()).collect();
-            for ignored_rel in query_git_ignored(&self.repo, &rels) {
-                self.ignored.insert(ignored_rel);
-            }
-            self.filter_files_cache = Some(scanned);
         }
         let Some(all_entries) = self.filter_files_cache.as_ref() else {
             return;
@@ -901,42 +966,20 @@ fn scan_worktree_entries(repo: &Path, limit: usize) -> Vec<DirEntry> {
 }
 
 fn query_git_ignored(repo: &Path, relative_paths: &[String]) -> Vec<String> {
-    if relative_paths.is_empty() || !repo.join(".git").exists() {
-        return Vec::new();
-    }
-    let Ok(mut child) = crate::platform::background_command("git")
-        .current_dir(repo)
-        .args(["check-ignore", "--stdin", "-z"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return Vec::new();
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        let mut payload = Vec::new();
-        for rel in relative_paths {
-            payload.extend_from_slice(rel.as_bytes());
-            payload.push(0);
-        }
-        stdin.write_all(&payload).ok();
-    }
-    let Ok(output) = child.wait_with_output() else {
-        return Vec::new();
-    };
-    output
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .map(|s| String::from_utf8_lossy(s).trim_end_matches('/').to_owned())
-        .collect()
+    super::search::query_git_ignored_set_with_limits(
+        repo,
+        relative_paths,
+        Duration::from_secs(5),
+        4 * 1024 * 1024,
+    )
+    .into_iter()
+    .collect()
 }
 
 impl Panel {
     /// `Files` 탭으로 전환하고 파일 필터 입력창을 준비한다.
     pub fn show_files(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.tab = super::PanelTab::Files;
+        self.set_tab(super::PanelTab::Files, cx);
         self.ensure_explorer_loaded_async(cx);
         let input = self.ensure_explorer_filter_input(window, cx);
         input.update(cx, |s, cx| s.focus(window, cx));
@@ -979,6 +1022,9 @@ impl Panel {
                 }
                 this.explorer.dir_cache.insert(root, entries);
                 this.explorer.rebuild_rows();
+                if !this.explorer.expanded.is_empty() {
+                    this.refresh_explorer_async(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -997,6 +1043,7 @@ impl Panel {
         let generation = self.explorer.load_generation;
         let repo = self.explorer.repo.clone();
         let dirs: Vec<PathBuf> = self.explorer.expanded.iter().cloned().collect();
+        let requested: BTreeSet<PathBuf> = dirs.iter().cloned().collect();
         self.explorer.load_task = Some(cx.spawn(async move |this, cx| {
             let loaded = cx
                 .background_executor()
@@ -1035,7 +1082,7 @@ impl Panel {
                     .explorer
                     .expanded
                     .iter()
-                    .filter(|dir| !live.contains(*dir))
+                    .filter(|dir| requested.contains(*dir) && !live.contains(*dir))
                     .cloned()
                     .collect();
                 for dir in stale {
@@ -1050,6 +1097,16 @@ impl Panel {
                     cx.notify();
                 } else {
                     this.schedule_explorer_filter(query, cx);
+                }
+                // A user may expand another directory during this scan. Do not
+                // collapse it or leave it without data; coalesce into one follow-up.
+                if this
+                    .explorer
+                    .expanded
+                    .iter()
+                    .any(|dir| !this.explorer.dir_cache.contains_key(dir))
+                {
+                    this.refresh_explorer_async(cx);
                 }
             })
             .ok();
@@ -1145,39 +1202,137 @@ impl Panel {
 
     /// 파일 탐색기에서 폴더 펼침/접기를 토글한다.
     pub fn toggle_explorer_dir(&mut self, dir: &Path, cx: &mut Context<Self>) {
-        self.explorer.toggle_dir(dir);
+        self.ensure_explorer_loaded_async(cx);
+        self.explorer.selected = Some(dir.to_path_buf());
+        if !self.explorer.filter_query.trim().is_empty() {
+            if !self.explorer.filter_collapsed.remove(dir) {
+                self.explorer.filter_collapsed.insert(dir.to_path_buf());
+            }
+            self.explorer.rebuild_rows();
+        } else if self.explorer.expanded.remove(dir) {
+            self.explorer.rebuild_rows();
+        } else {
+            self.explorer.expanded.insert(dir.to_path_buf());
+            if self.explorer.dir_cache.contains_key(dir) {
+                self.explorer.rebuild_rows();
+            } else {
+                self.refresh_explorer_async(cx);
+            }
+        }
         cx.notify();
     }
 
     /// 파일 탐색기 파일명 필터를 설정한다.
     pub fn set_explorer_filter(&mut self, query: impl Into<String>, cx: &mut Context<Self>) {
-        self.explorer.set_filter_query(query);
-        cx.notify();
+        self.ensure_explorer_loaded_async(cx);
+        self.apply_explorer_filter_now(query.into(), cx);
     }
 
     /// 파일 탐색기 숨김 파일(`.dotfiles`) 표시를 토글한다.
     pub fn toggle_explorer_dotfiles(&mut self, cx: &mut Context<Self>) {
-        self.explorer.toggle_dotfiles();
+        self.ensure_explorer_loaded_async(cx);
+        self.explorer.show_dotfiles = !self.explorer.show_dotfiles;
+        self.explorer.rebuild_rows();
         cx.notify();
     }
 
     /// 파일 탐색기 `.gitignore` 파일 표시를 토글한다.
     pub fn toggle_explorer_ignored(&mut self, cx: &mut Context<Self>) {
-        self.explorer.toggle_ignored();
+        self.ensure_explorer_loaded_async(cx);
+        self.explorer.show_ignored = !self.explorer.show_ignored;
+        self.explorer.rebuild_rows();
         cx.notify();
     }
 
-    /// 파일 탐색기에서 새 파일을 만들고 중앙 에디터로 열기 이벤트를 내보낸다.
-    pub fn explorer_create_file(
-        &mut self,
-        parent_dir: &Path,
-        name: &str,
-        cx: &mut Context<Self>,
-    ) -> io::Result<PathBuf> {
-        let created = self.explorer.create_file(parent_dir, name)?;
-        cx.emit(OpenFile(created.clone()));
+    fn queue_explorer_operation(&mut self, operation: Operation, cx: &mut Context<Self>) {
+        self.explorer.operations.push_back(operation);
+        if self.explorer.operation_task.is_some() {
+            return;
+        }
+        let generation = self.explorer.operation_generation;
+        self.explorer.operation_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(Some((state, operation))) = this.update(cx, |s, _| {
+                    let operation = s.explorer.operations.pop_front();
+                    if operation.is_none() {
+                        s.explorer.operation_task = None;
+                    }
+                    operation.map(|op| (DiskState::capture(&s.explorer), op))
+                }) else {
+                    return;
+                };
+                let original_selection = state.selected.clone();
+                let original_expanded = state.expanded.clone();
+                let (state, result, open) = cx
+                    .background_executor()
+                    .spawn(async move { state.run(operation) })
+                    .await;
+                let applied = this.update(cx, |s, cx| {
+                    if s.explorer.operation_generation != generation {
+                        return false;
+                    }
+                    match result {
+                        Ok(path) => {
+                            // 변경 전 읽기 작업이 뒤늦게 캐시를 덮어쓰지 않게 한다.
+                            s.explorer.load_generation = s.explorer.load_generation.wrapping_add(1);
+                            s.explorer.load_task = None;
+                            s.explorer.loading = false;
+                            s.explorer.loaded_root = true;
+                            s.explorer.dir_cache = state.dir_cache;
+                            s.explorer.ignored = state.ignored;
+                            // Apply the operation's expansion delta without
+                            // replacing unrelated user actions during its IO.
+                            for dir in original_expanded.symmetric_difference(&state.expanded) {
+                                if s.explorer.expanded.contains(dir)
+                                    == original_expanded.contains(dir)
+                                {
+                                    if state.expanded.contains(dir) {
+                                        s.explorer.expanded.insert(dir.clone());
+                                    } else {
+                                        s.explorer.expanded.remove(dir);
+                                    }
+                                }
+                            }
+                            if s.explorer.selected == original_selection {
+                                s.explorer.selected = state.selected;
+                            }
+                            s.explorer.error = None;
+                            s.explorer.filter_files_cache = None;
+                            let query = s.explorer.filter_query.clone();
+                            s.schedule_explorer_filter(query, cx);
+                            if s.explorer
+                                .expanded
+                                .iter()
+                                .any(|dir| !s.explorer.dir_cache.contains_key(dir))
+                            {
+                                s.refresh_explorer_async(cx);
+                            }
+                            if open {
+                                cx.emit(OpenFile(path));
+                            }
+                        }
+                        Err(error) => s.explorer.error = Some(error.to_string()),
+                    }
+                    cx.notify();
+                    true
+                });
+                if !matches!(applied, Ok(true)) {
+                    return;
+                }
+            }
+        }));
         cx.notify();
-        Ok(created)
+    }
+
+    /// 새 파일 생성을 예약하고 완료 시 중앙 에디터로 열기 이벤트를 내보낸다.
+    pub fn explorer_create_file(&mut self, parent_dir: &Path, name: &str, cx: &mut Context<Self>) {
+        self.queue_explorer_operation(
+            Operation::CreateFile {
+                parent: parent_dir.to_path_buf(),
+                name: name.to_owned(),
+            },
+            cx,
+        );
     }
 
     /// 파일 탐색기에서 새 폴더를 만든다.
@@ -1186,22 +1341,25 @@ impl Panel {
         parent_dir: &Path,
         name: &str,
         cx: &mut Context<Self>,
-    ) -> io::Result<PathBuf> {
-        let created = self.explorer.create_folder(parent_dir, name)?;
-        cx.notify();
-        Ok(created)
+    ) {
+        self.queue_explorer_operation(
+            Operation::CreateFolder {
+                parent: parent_dir.to_path_buf(),
+                name: name.to_owned(),
+            },
+            cx,
+        );
     }
 
     /// 파일 탐색기에서 파일이나 폴더 이름을 바꾼다.
-    pub fn explorer_rename(
-        &mut self,
-        target: &Path,
-        new_name: &str,
-        cx: &mut Context<Self>,
-    ) -> io::Result<PathBuf> {
-        let renamed = self.explorer.rename_path(target, new_name)?;
-        cx.notify();
-        Ok(renamed)
+    pub fn explorer_rename(&mut self, target: &Path, new_name: &str, cx: &mut Context<Self>) {
+        self.queue_explorer_operation(
+            Operation::Rename {
+                target: target.to_path_buf(),
+                name: new_name.to_owned(),
+            },
+            cx,
+        );
     }
 
     /// 파일 탐색기의 휴지통(`~/.Trash`) 기준 홈 디렉터리를 설정한다.
@@ -1210,14 +1368,13 @@ impl Panel {
     }
 
     /// 파일 탐색기에서 파일이나 폴더를 휴지통(`~/.Trash`)으로 옮긴다.
-    pub fn explorer_delete(
-        &mut self,
-        target: &Path,
-        cx: &mut Context<Self>,
-    ) -> io::Result<PathBuf> {
-        let trashed = self.explorer.delete_path(target)?;
-        cx.notify();
-        Ok(trashed)
+    pub fn explorer_delete(&mut self, target: &Path, cx: &mut Context<Self>) {
+        self.queue_explorer_operation(
+            Operation::Delete {
+                target: target.to_path_buf(),
+            },
+            cx,
+        );
     }
 
     /// 파일 탐색기에서 휴지통 이동 확인 대화상자를 열고 취소 버튼에 기본 포커스를 준다.
@@ -1227,13 +1384,13 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.explorer.ensure_loaded();
+        self.ensure_explorer_loaded_async(cx);
         if !target.starts_with(&self.explorer.repo) || target == self.explorer.repo {
             self.explorer.error = Some("cannot delete worktree root or outside path".to_owned());
             cx.notify();
             return;
         }
-        let is_dir = fs::symlink_metadata(target).is_ok_and(|m| m.file_type().is_dir());
+        let is_dir = self.explorer.path_is_dir(target);
         let name = target
             .file_name()
             .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
@@ -1256,17 +1413,10 @@ impl Panel {
     }
 
     /// 열려 있는 휴지통 이동 확인 대화상자를 확정해 `~/.Trash`로 이동한다.
-    pub fn confirm_explorer_delete(
-        &mut self,
-        cx: &mut Context<Self>,
-    ) -> Option<io::Result<PathBuf>> {
-        let pending = self.explorer.pending_delete.take()?;
-        let res = self.explorer_delete(&pending.path, cx);
-        if let Err(err) = &res {
-            self.explorer.error = Some(err.to_string());
-            cx.notify();
+    pub fn confirm_explorer_delete(&mut self, cx: &mut Context<Self>) {
+        if let Some(pending) = self.explorer.pending_delete.take() {
+            self.explorer_delete(&pending.path, cx);
         }
-        Some(res)
     }
 
     /// 현재 열려 있는 휴지통 이동 확인 대화상자 상태.
@@ -1350,17 +1500,14 @@ impl Panel {
             cx.notify();
             return;
         }
-        let result = match kind {
+        match kind {
             EditKind::NewFile { parent } => {
-                self.explorer_create_file(&parent, &value, cx).map(|_| ())
+                self.explorer_create_file(&parent, &value, cx);
             }
             EditKind::NewFolder { parent } => {
-                self.explorer_create_folder(&parent, &value, cx).map(|_| ())
+                self.explorer_create_folder(&parent, &value, cx);
             }
-            EditKind::Rename { target } => self.explorer_rename(&target, &value, cx).map(|_| ()),
-        };
-        if let Err(err) = result {
-            self.explorer.error = Some(err.to_string());
+            EditKind::Rename { target } => self.explorer_rename(&target, &value, cx),
         }
         cx.notify();
     }
@@ -1370,11 +1517,7 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        // 비동기 로드 진행 중에는 첫 페인트를 막지 않고 로딩 표시만 한다(OWE-849).
-        // 비동기 킥 없이 렌더된 경우에만 동기 백스톱으로 채운다.
-        if !self.explorer.loaded_root && !self.explorer.loading {
-            self.explorer.ensure_loaded();
-        }
+        self.ensure_explorer_loaded_async(cx);
         let filter_input = self.ensure_explorer_filter_input(window, cx);
         let p = ui::palette(cx);
         let show_dotfiles = self.explorer.show_dotfiles;
@@ -1563,7 +1706,7 @@ impl Panel {
             "right" => {
                 cx.stop_propagation();
                 if let Some(selected) = self.explorer.selected.clone()
-                    && selected.is_dir()
+                    && self.explorer.path_is_dir(&selected)
                     && !self.explorer.expanded.contains(&selected)
                 {
                     self.toggle_explorer_dir(&selected, cx);
@@ -1572,7 +1715,9 @@ impl Panel {
             "left" => {
                 cx.stop_propagation();
                 if let Some(selected) = self.explorer.selected.clone() {
-                    if selected.is_dir() && self.explorer.expanded.contains(&selected) {
+                    if self.explorer.path_is_dir(&selected)
+                        && self.explorer.expanded.contains(&selected)
+                    {
                         self.toggle_explorer_dir(&selected, cx);
                     } else {
                         self.explorer.select_parent();
@@ -1583,7 +1728,7 @@ impl Panel {
             "enter" => {
                 cx.stop_propagation();
                 if let Some(selected) = self.explorer.selected.clone() {
-                    if selected.is_dir() {
+                    if self.explorer.path_is_dir(&selected) {
                         self.toggle_explorer_dir(&selected, cx);
                     } else {
                         self.open_file_preview = false;
@@ -1728,7 +1873,7 @@ impl Panel {
             .editing
             .as_ref()
             .is_some_and(|(kind, _, _)| match kind {
-                EditKind::Rename { target } => target.is_dir(),
+                EditKind::Rename { target } => self.explorer.path_is_dir(target),
                 EditKind::NewFile { .. } => false,
                 EditKind::NewFolder { .. } => true,
             });

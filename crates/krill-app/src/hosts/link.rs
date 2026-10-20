@@ -349,13 +349,16 @@ impl Drop for Starting<'_> {
 impl Drop for Lease {
     fn drop(&mut self) {
         // 앱이 생성한 자식만 정리한다. 상태 파일의 PID는 프로세스 소유권 증거가 아니다.
-        if let Ok(mut guard) = self.child.lock()
-            && let Some(mut child) = guard.take()
-        {
+        let child = self
+            .child
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(mut child) = child {
             let pid = child.id();
             let slot = self.slot.clone();
-            child.kill().ok();
             std::thread::spawn(move || {
+                child.kill().ok();
                 child.wait().ok();
                 if let Ok(mut pids) = slot.owned.lock() {
                     pids.remove(&pid);

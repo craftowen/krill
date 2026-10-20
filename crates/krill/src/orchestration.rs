@@ -127,6 +127,14 @@ impl<'a> OrchCtx<'a> {
             }
             return Ok(None);
         }
+        if matches!(action, OrchAction::RetainWorker { .. })
+            && conn.negotiated.features & krill_proto::orchestration::FEAT_ORCH_RETAIN == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "update krilld to retain workers",
+            ));
+        }
         let io_wait = timeout.saturating_add(Duration::from_secs(5));
         conn.stream.set_read_timeout(Some(io_wait))?;
         conn.stream
@@ -134,18 +142,10 @@ impl<'a> OrchCtx<'a> {
         let encoded = Request::Orchestration(action.clone())
             .encode()
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-        if conn.stream.write_all(&encoded).is_err() {
-            if is_remote {
-                return Err(io::Error::other("remote krilld disconnected"));
-            }
-            return Ok(None);
-        }
-        let Some((kind, body)) = ipc::read_frame(&mut conn.stream)? else {
-            if is_remote {
-                return Err(io::Error::other("remote krilld disconnected"));
-            }
-            return Ok(None);
-        };
+        // A partial write or missing reply cannot prove that the daemon did not mutate.
+        conn.stream.write_all(&encoded)?;
+        let (kind, body) =
+            ipc::read_frame(&mut conn.stream)?.ok_or(io::ErrorKind::UnexpectedEof)?;
         let reply = Reply::decode(kind, &body)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         match reply {

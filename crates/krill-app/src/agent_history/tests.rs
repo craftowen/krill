@@ -112,9 +112,9 @@ fn failed_resume_preserves_list_and_emits_nothing(cx: &mut TestAppContext) {
     });
 }
 
-/// OWE-652: 바깥 클릭은 팝오버를 닫는다.
+/// 세션 기록은 패널 본문으로 그리며 바깥 클릭으로 닫히지 않는다.
 #[gpui::test]
-fn outside_click_closes_popover(cx: &mut TestAppContext) {
+fn panel_fills_available_space_and_stays_open_on_outside_click(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let call: Call = Arc::new(|_| {
         Ok(Reply::AgentHistory(Response::Scanned(Snapshot {
@@ -126,28 +126,20 @@ fn outside_click_closes_popover(cx: &mut TestAppContext) {
     let (panel, cx) = cx.add_window_view(|_, _| Panel::new(call));
     panel.update(cx, Panel::toggle);
     cx.run_until_parked();
-    panel.read_with(cx, |p, _| assert!(p.open));
-    assert!(
-        cx.debug_bounds("agent-history-popover").is_some(),
-        "popover paints above the status bar"
-    );
-    let toggle = cx.debug_bounds("agent-history-toggle").expect("toggle");
-    // 열린 상태에서 헤더를 누르면 바깥 닫기와 같은 제스처라 닫힌 채로 둔다.
-    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    panel.read_with(cx, |p, _| assert!(!p.open));
-    // 닫힌 상태에서 헤더를 누르면 다시 열린다.
-    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    panel.read_with(cx, |p, _| assert!(p.open));
+    let bounds = cx
+        .debug_bounds("agent-history-panel")
+        .expect("history panel");
     let size = cx.update(|window, _| window.viewport_size());
-    // 헤더(왼쪽 위 한 줄)와 팝오버(오른쪽 520px)를 모두 피한 왼쪽 아래를 누른다.
-    assert!(
-        size.width > gpui::px(560.) && size.height > gpui::px(200.),
-        "window must fit popover + away point, got {size:?}"
+    assert_eq!(bounds.size, size);
+    let list = cx.debug_bounds("agent-history-list").expect("history list");
+    assert!(list.size.height > size.height / 2.);
+    cx.simulate_click(
+        gpui::point(gpui::px(10.), size.height - gpui::px(10.)),
+        gpui::Modifiers::default(),
     );
-    let away = gpui::point(gpui::px(10.), size.height - gpui::px(10.));
-    cx.simulate_click(away, gpui::Modifiers::default());
+    cx.run_until_parked();
+    panel.read_with(cx, |p, _| assert!(p.open && p.data.is_some()));
+    panel.update(cx, Panel::close);
     cx.run_until_parked();
     panel.read_with(cx, |p, _| assert!(!p.open && p.data.is_none()));
 }
@@ -383,7 +375,7 @@ fn query_and_filter_changes_while_busy_run_latest_vault_search(cx: &mut TestAppC
 
 /// OWE-857: 팝오버가 열리면 상단 제목·새로고침 버튼이 보이고 검색창에 자동 포커스된다.
 #[gpui::test]
-fn opening_popover_focuses_search_and_shows_header(cx: &mut TestAppContext) {
+fn opening_panel_focuses_search_and_shows_header(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let call: Call = Arc::new(|_| {
         Ok(Reply::AgentHistory(Response::Scanned(Snapshot {
@@ -396,8 +388,8 @@ fn opening_popover_focuses_search_and_shows_header(cx: &mut TestAppContext) {
     panel.update(cx, Panel::toggle);
     cx.run_until_parked();
     assert!(
-        cx.debug_bounds("agent-history-popover").is_some(),
-        "popover opens"
+        cx.debug_bounds("agent-history-panel").is_some(),
+        "panel opens"
     );
     assert!(
         cx.debug_bounds("agent-history-title").is_some(),
@@ -440,4 +432,45 @@ fn toggle_exposes_button_role_and_label(cx: &mut TestAppContext) {
     });
     assert_eq!(role, Some(gpui::Role::Button));
     assert_eq!(label.as_deref(), Some(text::TITLE.get()));
+}
+
+#[gpui::test]
+fn hidden_consumer_refreshes_query_and_changed_scope_paths(cx: &mut TestAppContext) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    let call: Call = Arc::new(move |request| {
+        recorded.lock().unwrap().push(request.clone());
+        Ok(Reply::AgentHistory(match request {
+            Request::AgentHistory(Action::Scan) => Response::Scanned(Snapshot {
+                entries: Vec::new(),
+                truncated: false,
+                skipped: false,
+            }),
+            Request::AgentHistory(Action::Search(_)) => Response::Searched(SearchSnapshot {
+                hits: Vec::new(),
+                truncated: false,
+                skipped: false,
+            }),
+            _ => unreachable!(),
+        }))
+    });
+    let panel = cx.new(|_| Panel::new(call));
+    panel.update(cx, Panel::scan);
+    cx.run_until_parked();
+    panel.update(cx, |panel, cx| {
+        assert!(!panel.is_open());
+        assert!(!panel.busy);
+        panel.set_query("latest query", cx);
+        panel.set_scope(VaultScope::Workspace, cx);
+        panel.update_scope_paths(Some("/tmp/new-scope".into()), Vec::new(), cx);
+    });
+    cx.run_until_parked();
+    assert!(matches!(requests.lock().unwrap().last(),
+        Some(Request::AgentHistory(Action::Search(query)))
+        if query.query == "latest query" && query.paths == ["/tmp/new-scope"]));
+    panel.update(cx, Panel::close);
+    let before = requests.lock().unwrap().len();
+    panel.update(cx, |panel, cx| panel.set_query("closed consumer", cx));
+    cx.run_until_parked();
+    assert_eq!(requests.lock().unwrap().len(), before);
 }

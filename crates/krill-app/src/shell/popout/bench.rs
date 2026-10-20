@@ -156,9 +156,9 @@ pub(crate) fn run(mode: String) -> ExitCode {
                 bg.timer(Duration::from_secs(2)).await;
                 let after = bg.spawn(async { footprint().map_err(|e| e.to_string()) }).await?;
                 let started = Instant::now();
-                let cpu_before = cpu_seconds()?;
+                let cpu_before = bg.spawn(async { cpu_seconds().map_err(|e| e.to_string()) }).await?;
                 bg.timer(Duration::from_secs(10)).await;
-                let cpu_delta = cpu_seconds()? - cpu_before;
+                let cpu_delta = bg.spawn(async { cpu_seconds().map_err(|e| e.to_string()) }).await? - cpu_before;
                 let cpu_pct = cpu_delta / started.elapsed().as_secs_f64() * 100.;
                 let delta = after.saturating_sub(before);
                 println!("MK098 mode={mode} baseline_bytes={before} popout_bytes={after} delta_bytes={delta} idle_cpu_seconds={cpu_delta:.2} idle_cpu_pct={cpu_pct:.1} sample_seconds={:.3}", started.elapsed().as_secs_f64());

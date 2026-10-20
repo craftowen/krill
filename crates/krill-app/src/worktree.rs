@@ -76,6 +76,8 @@ pub struct Dialog {
     candidates: Vec<String>,
     /// OWE-853: 드롭다운 키보드 하이라이트(필터 목록 내 인덱스). `None`이면 Enter가 생성 제출이다.
     highlight: Option<usize>,
+    hooks: krill_proto::orchestration::RepoHookSummary,
+    hooks_task: Option<Task<()>>,
 }
 
 struct Preparation {
@@ -189,41 +191,21 @@ pub fn branch_suggestions(
 /// OWE-853: 로컬 `git for-each-ref`로 브랜치·태그를 읽는다(새 IPC 없이).
 /// 실패·타임아웃 시 빈 목록으로 조용히 넘어간다. 호출자는 백그라운드에서 부른다.
 pub fn list_git_refs(repo: &Path) -> Vec<String> {
-    use std::time::{Duration, Instant};
-    let child = crate::platform::background_command("git")
+    let mut command = crate::platform::background_command("git");
+    command
         .current_dir(repo)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
         .args([
             "for-each-ref",
+            "--count=50",
             "--format=%(refname:short)",
             "refs/heads",
             "refs/remotes",
             "refs/tags",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .stdin(std::process::Stdio::null())
-        .spawn()
-        .ok();
-    let Some(mut child) = child else {
-        return Vec::new();
-    };
-    let deadline = Instant::now() + Duration::from_millis(1500);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-            _ => {
-                child.kill().ok();
-                child.wait().ok();
-                return Vec::new();
-            }
-        }
-    }
-    let output = child.wait_with_output().map_or(Vec::new(), |o| o.stdout);
+        ]);
+    let output =
+        crate::pull_request::execute(&mut command, Duration::from_millis(1500)).unwrap_or_default();
     let text = String::from_utf8_lossy(&output);
     let mut out = Vec::new();
     for line in text.lines() {
@@ -306,7 +288,25 @@ impl Dialog {
             preparation_ready: false,
             candidates: Vec::new(),
             highlight: None,
+            hooks: krill_proto::orchestration::RepoHookSummary::default(),
+            hooks_task: None,
         };
+        let repo = dialog.repo.clone();
+        let state_dir = crate::settings::state_dir(cx);
+        dialog.hooks_task = Some(cx.spawn(async move |this, cx| {
+            let hooks = cx
+                .background_executor()
+                .spawn(async move {
+                    krill_proto::orchestration::inspect_repo_hooks(&repo, state_dir.as_deref())
+                })
+                .await;
+            this.update(cx, |dialog, cx| {
+                dialog.hooks = hooks;
+                dialog.hooks_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         dialog.prepare(cx);
         dialog
     }
@@ -735,9 +735,7 @@ impl Render for Dialog {
             .label(text::CLOSE.get())
             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close)));
         let footer = || div().flex().flex_wrap().justify_end().gap_2();
-        let state_dir = crate::settings::state_dir(cx);
-        let repo_hooks =
-            krill_proto::orchestration::inspect_repo_hooks(&self.repo, state_dir.as_deref());
+        let repo_hooks = &self.hooks;
         let body = div().flex().flex_col().gap_4();
         let filtered = match &self.phase {
             Phase::Edit(_) => self.filtered_bases(cx),

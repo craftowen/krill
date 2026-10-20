@@ -16,22 +16,35 @@ pub fn offer_report(
     window: &mut Window,
     cx: &mut App,
 ) {
-    let logs = diag::pending(&state);
-    if logs.is_empty() {
-        return;
-    }
-    let detail = text::DETAIL.get().replace("{n}", &logs.len().to_string());
-    let answer = window.prompt(
-        PromptLevel::Warning,
-        text::TITLE.get(),
-        Some(&detail),
-        &[text::BUNDLE.get(), text::DISMISS.get()],
-        cx,
-    );
     let handle = window.window_handle();
     cx.spawn(async move |cx| {
-        if answer.await == Ok(0) {
-            match diag::write_bundle(&state) {
+        let dir = state.clone();
+        let logs = cx
+            .background_executor()
+            .spawn(async move { diag::pending(&dir) })
+            .await;
+        if logs.is_empty() {
+            return;
+        }
+        let detail = text::DETAIL.get().replace("{n}", &logs.len().to_string());
+        let Ok(answer) = handle.update(cx, |_, window, cx| {
+            window.prompt(
+                PromptLevel::Warning,
+                text::TITLE.get(),
+                Some(&detail),
+                &[text::BUNDLE.get(), text::DISMISS.get()],
+                cx,
+            )
+        }) else {
+            return;
+        };
+        let Ok(answer) = answer.await else { return };
+        if answer == 0 {
+            match cx
+                .background_executor()
+                .spawn(async move { diag::write_bundle(&state) })
+                .await
+            {
                 Ok(path) => cx.update(|cx| on_bundle(&path, cx)),
                 Err(e) => {
                     // 번들을 못 만들면 알리고 확인 처리하지 않는다: 다음 실행에서 다시 물어 로그를 잃지 않는다.
@@ -52,7 +65,9 @@ pub fn offer_report(
                 }
             }
         }
-        diag::acknowledge(&logs);
+        cx.background_executor()
+            .spawn(async move { diag::acknowledge(&logs) })
+            .await;
     })
     .detach();
 }

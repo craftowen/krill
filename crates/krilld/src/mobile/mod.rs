@@ -8,4 +8,5 @@ pub mod pwa;
 mod pwa_rpc;
 pub mod relay;
 pub mod tunnel;
+mod workspaces;
 mod ws;

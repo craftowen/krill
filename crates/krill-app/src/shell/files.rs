@@ -71,8 +71,9 @@ fn take_pending_file_requests(state_dir: &Path) -> Vec<CliFileRequest> {
     else {
         return Vec::new();
     };
-    // std `File::lock`은 Unix에서 `flock(LOCK_EX)`라 CLI 쪽 잠금과 같고 Windows에서도 돈다.
-    if lock.lock().is_err() {
+    // CLI가 쓰는 중이면 큐를 그대로 두고 다음 감시 주기에 다시 시도한다.
+    // 잠금을 기다리면 파일 요청 하나가 다른 창의 요청 소비까지 막을 수 있다.
+    if lock.try_lock().is_err() {
         return Vec::new();
     }
     let Ok(file) = std::fs::File::open(&file_path) else {
@@ -94,6 +95,46 @@ fn take_pending_file_requests(state_dir: &Path) -> Vec<CliFileRequest> {
         .unwrap_or_default()
 }
 
+/// The app owns queued disk writes even when the originating tab/window goes away.
+#[derive(Default)]
+struct PendingEditorWrites(Option<tokio::sync::oneshot::Receiver<()>>);
+impl gpui::Global for PendingEditorWrites {}
+
+fn editor_write_queue(cx: &mut App) -> Option<tokio::sync::oneshot::Receiver<()>> {
+    if !cx.has_global::<PendingEditorWrites>() {
+        cx.set_global(PendingEditorWrites::default());
+        cx.on_app_quit(|cx| {
+            let tail = cx.global_mut::<PendingEditorWrites>().0.take();
+            cx.background_executor().spawn(async move {
+                if let Some(tail) = tail {
+                    tail.await.ok();
+                }
+            })
+        })
+        .detach();
+    }
+    cx.global_mut::<PendingEditorWrites>().0.take()
+}
+
+fn flush_editor_writes(cx: &mut App) -> Task<()> {
+    let previous = editor_write_queue(cx);
+    let (finish, tail) = tokio::sync::oneshot::channel();
+    let (done, wait) = tokio::sync::oneshot::channel();
+    cx.global_mut::<PendingEditorWrites>().0 = Some(tail);
+    cx.background_executor()
+        .spawn(async move {
+            if let Some(previous) = previous {
+                previous.await.ok();
+            }
+            finish.send(()).ok();
+            done.send(()).ok();
+        })
+        .detach();
+    cx.background_executor().spawn(async move {
+        wait.await.ok();
+    })
+}
+
 actions!(shell, [SaveFile, QuickOpen]);
 
 pub(super) fn bind_keys(cx: &mut App) {
@@ -104,6 +145,10 @@ pub(super) fn bind_keys(cx: &mut App) {
     ]);
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Independent watcher, focus, palette and window-close lifecycle flags"
+)]
 pub(super) struct Files {
     /// 불러온 파일 칸. 보인 적 있는 칸만 들어 있다(숨은 복원 탭은 처음 보일 때 읽는다).
     tabs: HashMap<PaneId, FileTab>,
@@ -113,12 +158,35 @@ pub(super) struct Files {
     /// 탭·칸 포커스가 바뀌었다. 다음 그리기에서 키보드 포커스를 에디터나 터미널로 옮긴다.
     pub(super) refocus: bool,
     close_guard: bool,
+    closing: bool,
+    next_request: u64,
+    loading: HashMap<PaneId, (u64, PathBuf)>,
+    quick_generation: u64,
+    quick_loading: bool,
+    #[cfg(test)]
+    next_io: Option<tokio::sync::oneshot::Receiver<()>>,
     /// 다음 그리기 전에 디코드 캐시를 버릴 이미지 경로(재로드·저장·탭 닫힘). 놓으려면 창이 있어야 해서 모아 둔다.
     released: Vec<PathBuf>,
     /// 터미널 링크(OWE-663 4번, OWE-867): 디스크 확인 캐시, ⌘ 아래 링크(칸, 밑줄 범위), 열고 나서 옮길 (파일, 줄, 열).
-    links: path_link::Cache,
+    link_lookup: Option<LinkLookup>,
+    link_generation: u64,
+    link_open_generation: u64,
     pub(super) hover: Option<(PaneId, Highlight)>,
     goto: Option<(PathBuf, u32, u32)>,
+}
+
+#[derive(PartialEq)]
+struct LinkKey {
+    pane: PaneId,
+    row: Vec<krill_proto::screen::Cell>,
+    line: u16,
+    column: u16,
+    cwd: Option<PathBuf>,
+}
+struct LinkLookup {
+    key: LinkKey,
+    ready: bool,
+    found: Option<PathLink>,
 }
 
 impl Default for Files {
@@ -130,8 +198,17 @@ impl Default for Files {
             quick_open: None,
             refocus: true,
             close_guard: false,
+            closing: false,
+            next_request: 0,
+            loading: HashMap::new(),
+            quick_generation: 0,
+            quick_loading: false,
+            #[cfg(test)]
+            next_io: None,
             released: Vec::new(),
-            links: path_link::Cache::default(),
+            link_lookup: None,
+            link_generation: 0,
+            link_open_generation: 0,
             hover: None,
             goto: None,
         }
@@ -141,6 +218,8 @@ impl Default for Files {
 impl Files {
     pub(super) fn close_quick_open(&mut self) {
         self.quick_open = None;
+        self.quick_generation = self.quick_generation.wrapping_add(1);
+        self.quick_loading = false;
     }
 
     /// 닫히거나 바뀌는 탭의 이미지 캐시를 놓도록 예약한다.
@@ -154,6 +233,10 @@ impl Files {
 }
 
 struct FileTab {
+    path: PathBuf,
+    revision: u64,
+    saving: bool,
+    preview_generation: u64,
     doc: Option<Doc>,
     body: Body,
     error: Option<String>,
@@ -181,33 +264,68 @@ enum Shown {
     /// 원문과 그릴 때 쓰는 요소 id(새로 만들 때마다 바꿔 `TextView`가 이전 파싱 결과를 쓰지 않게 한다).
     Markdown(SharedString, ElementId),
     Table(gpui::Entity<CsvView>),
-    Notebook(Result<ipynb::Notebook, ipynb::ParseError>),
+    Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
     Image(gpui::Entity<ImageView>),
 }
 
-/// 에디터 내용으로 미리보기를 만든다. SVG도 디스크가 아니라 지금 버퍼로 그린다(OWE-874).
-fn build_preview(preview: Preview, text: &str, _path: &Path, cx: &mut App) -> Shown {
-    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Parse bounded preview data on the executor; entity creation remains on the UI.
+enum PreparedPreview {
+    Markdown(String),
+    Table(csv::Table),
+    Notebook(Result<Arc<fview::NotebookPreview>, ipynb::ParseError>),
+    Svg(Arc<gpui::Image>),
+}
+
+fn prepare_preview(preview: Preview, text: &str) -> PreparedPreview {
     match preview {
-        Preview::Markdown => {
-            let n = GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            Shown::Markdown(
-                SharedString::from(text.to_owned()),
-                ElementId::Name(format!("file-md-{n}").into()),
-            )
-        }
+        Preview::Markdown => PreparedPreview::Markdown(text.to_owned()),
         Preview::Table(delimiter) => {
             let head = text.as_bytes();
             let head = head.get(..csv::PREVIEW_BYTES).unwrap_or(head);
-            let len = u64::try_from(text.len()).unwrap_or(u64::MAX);
-            let table = csv::preview(head, len, delimiter);
-            Shown::Table(cx.new(|_| CsvView::new(table)))
+            PreparedPreview::Table(csv::preview(
+                head,
+                u64::try_from(text.len()).unwrap_or(u64::MAX),
+                delimiter,
+            ))
         }
-        Preview::Notebook => Shown::Notebook(ipynb::parse(text)),
-        Preview::Svg => {
-            Shown::Image(cx.new(|_| ImageView::new_svg_bytes(text.as_bytes().to_vec())))
-        }
+        Preview::Notebook => PreparedPreview::Notebook(
+            ipynb::parse(text).map(|notebook| Arc::new(fview::NotebookPreview::new(notebook))),
+        ),
+        Preview::Svg => PreparedPreview::Svg(Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Svg,
+            text.as_bytes().to_vec(),
+        ))),
     }
+}
+
+fn build_preview(prepared: PreparedPreview, cx: &mut App) -> Shown {
+    static GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    match prepared {
+        PreparedPreview::Markdown(text) => {
+            let n = GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Shown::Markdown(text.into(), ElementId::Name(format!("file-md-{n}").into()))
+        }
+        PreparedPreview::Table(table) => Shown::Table(cx.new(|_| CsvView::new(table))),
+        PreparedPreview::Notebook(result) => Shown::Notebook(result),
+        PreparedPreview::Svg(image) => Shown::Image(cx.new(|_| ImageView::new_svg_image(image))),
+    }
+}
+
+fn read_file(
+    path: &Path,
+    preview: bool,
+) -> (
+    std::io::Result<(Opened, editor::Stamp)>,
+    Option<PreparedPreview>,
+) {
+    let opened = editor::open(path);
+    let prepared = match &opened {
+        Ok((Opened::Text(kind, text), _)) if preview => {
+            editor::preview(*kind).map(|p| prepare_preview(p, text))
+        }
+        _ => None,
+    };
+    (opened, prepared)
 }
 
 /// (미리보기 버튼, 편집 버튼) 이름.
@@ -285,7 +403,7 @@ impl Shell {
     pub(super) fn file_actions(root: gpui::Div, cx: &mut Context<Self>) -> gpui::Div {
         root.on_action(cx.listener(|this, _: &SaveFile, _, cx| {
             if let Some(pane) = this.layout.focused() {
-                this.save_file(pane, cx);
+                this.save_file(pane, cx).detach();
             }
         }))
         .on_action(cx.listener(|this, _: &QuickOpen, window, cx| {
@@ -382,6 +500,8 @@ impl Shell {
     /// 파일을 가운데 영역의 탭으로 연다(이미 열려 있으면 그 탭으로).
     pub(super) fn open_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.close_settings(None, cx);
+        self.diff
+            .update(cx, krill_app::diff::Panel::clear_selection);
         self.change(true, cx, move |l| {
             l.open_file(path);
         });
@@ -391,6 +511,8 @@ impl Shell {
     /// 파일을 미리보기 탭으로 연다(OWE-849): 같은 칸을 재사용하며 다음 단일 클릭이 교체한다.
     pub(super) fn open_file_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         self.close_settings(None, cx);
+        self.diff
+            .update(cx, krill_app::diff::Panel::clear_selection);
         self.change(true, cx, move |l| {
             l.open_file_preview(path);
         });
@@ -428,7 +550,8 @@ impl Shell {
         &mut self,
         pane: PaneId,
         position: gpui::Point<Pixels>,
-        cx: &App,
+        open: bool,
+        cx: &mut Context<Self>,
     ) -> Option<(u16, PathLink)> {
         let cwd = self.pane_cwd(pane, cx);
         let l = self.live.get(&pane)?;
@@ -437,9 +560,152 @@ impl Shell {
         if screen.link_at(line, column).is_some() {
             return None;
         }
-        let row = screen.rows.get(usize::from(line))?;
-        let link = self.files.links.link_at(row, column, cwd.as_deref())?;
-        Some((line, link))
+        let row = screen.rows.get(usize::from(line))?.clone();
+        let key = LinkKey {
+            pane,
+            row,
+            line,
+            column,
+            cwd,
+        };
+        if open {
+            if let Some(lookup) = &self.files.link_lookup
+                && lookup.key == key
+                && lookup.ready
+            {
+                return lookup.found.clone().map(|link| (line, link));
+            }
+            self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
+            let generation = self.files.link_open_generation;
+            let session = l.pane.session();
+            let row = key.row;
+            let cwd = key.cwd;
+            cx.spawn(async move |this, cx| {
+                let found = cx
+                    .background_executor()
+                    .spawn(async move {
+                        path_link::Cache::default().link_at(&row, column, cwd.as_deref())
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.files.link_open_generation == generation
+                        && this.layout.focused() == Some(pane)
+                        && this
+                            .live
+                            .get(&pane)
+                            .is_some_and(|live| live.pane.session() == session)
+                        && let Some(link) = found
+                    {
+                        this.open_path_link(link, cx);
+                    }
+                })
+                .ok();
+            })
+            .detach();
+            return None;
+        }
+        if let Some(lookup) = &mut self.files.link_lookup
+            && lookup.key == key
+        {
+            return lookup.found.clone().map(|link| (line, link));
+        }
+        self.files.link_generation = self.files.link_generation.wrapping_add(1);
+        let generation = self.files.link_generation;
+        let row = key.row.clone();
+        let cwd = key.cwd.clone();
+        self.files.link_lookup = Some(LinkLookup {
+            key,
+            ready: false,
+            found: None,
+        });
+        cx.spawn(async move |this, cx| {
+            let found =
+                cx.background_executor()
+                    .spawn(async move {
+                        path_link::Cache::default().link_at(&row, column, cwd.as_deref())
+                    })
+                    .await;
+            let pointer = this
+                .read_with(cx, |this, _| this.window)
+                .ok()
+                .flatten()
+                .and_then(|handle| {
+                    handle
+                        .update(cx, |_, window, _| {
+                            (window.mouse_position(), window.modifiers().platform)
+                        })
+                        .ok()
+                });
+            this.update(cx, |this, cx| {
+                if this.files.link_generation != generation {
+                    return;
+                }
+                let Some(lookup) = &mut this.files.link_lookup else {
+                    return;
+                };
+                let current_row = this
+                    .live
+                    .get(&pane)
+                    .and_then(|l| l.pane.shown().rows.get(usize::from(line)).cloned());
+                if current_row.as_ref() != Some(&lookup.key.row) {
+                    return;
+                }
+                lookup.ready = true;
+                lookup.found.clone_from(&found);
+                if let Some(link) = found {
+                    let under_pointer = pointer.is_some_and(|(position, command)| {
+                        command
+                            && this.live.get(&pane).is_some_and(|live| {
+                                cell_at(&live.painted, &live.pane.shown(), position)
+                                    == Some((column, line))
+                            })
+                    });
+                    if under_pointer {
+                        this.files.hover = Some((
+                            pane,
+                            Highlight {
+                                line,
+                                column: link.column,
+                                cols: link.cols,
+                            },
+                        ));
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        None
+    }
+
+    pub(super) fn open_terminal_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let focused = self.layout.focused();
+        let session = focused.and_then(|pane| self.live.get(&pane)?.pane.session());
+        self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
+        let generation = self.files.link_open_generation;
+        cx.spawn(async move |this, cx| {
+            let check = path.clone();
+            let is_file = cx
+                .background_executor()
+                .spawn(async move { check.is_file() })
+                .await;
+            this.update(cx, |this, cx| {
+                if this.files.link_open_generation != generation
+                    || this.layout.focused() != focused
+                    || focused.and_then(|pane| this.live.get(&pane)?.pane.session()) != session
+                {
+                    return;
+                }
+                if is_file {
+                    this.open_file(path, cx);
+                } else {
+                    cx.reveal_path(&path);
+                }
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
@@ -450,6 +716,10 @@ impl Shell {
         cmd: bool,
         cx: &mut Context<Self>,
     ) {
+        if !cmd {
+            self.files.link_generation = self.files.link_generation.wrapping_add(1);
+            self.files.link_lookup = None;
+        }
         let next = if cmd {
             let osc_or_url = self.live.get(&pane).and_then(|l| {
                 let screen = l.pane.shown();
@@ -460,9 +730,13 @@ impl Shell {
                     },
                 )
             });
+            if osc_or_url.is_some() {
+                self.files.link_generation = self.files.link_generation.wrapping_add(1);
+                self.files.link_lookup = None;
+            }
             osc_or_url
                 .or_else(|| {
-                    self.path_link_at(pane, position, cx)
+                    self.path_link_at(pane, position, false, cx)
                         .map(|(line, link)| Highlight {
                             line,
                             column: link.column,
@@ -520,7 +794,12 @@ impl Shell {
     }
 
     /// 파일 칸 하나를 그린다: 경로 줄, 디스크 변경 띠, 에디터(또는 열 수 없음 안내).
-    pub(super) fn render_file_pane(&self, id: PaneId, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_file_pane(
+        &self,
+        id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let p = krill_app::ui::palette(cx);
         let is_split = self.layout.visible().len() > 1;
         let path = self.layout.file(id).map(Path::to_owned).unwrap_or_default();
@@ -626,16 +905,7 @@ impl Shell {
                                     .ghost()
                                     .xsmall()
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        if let Some(doc) = this
-                                            .files
-                                            .tabs
-                                            .get_mut(&id)
-                                            .and_then(|t| t.doc.as_mut())
-                                        {
-                                            let now = editor::stamp(doc.path()).ok().flatten();
-                                            doc.keep_mine(now);
-                                        }
-                                        cx.notify();
+                                        this.keep_file(id, cx);
                                     })),
                             ),
                     ),
@@ -666,7 +936,9 @@ impl Shell {
             }) => match shown {
                 Shown::Markdown(src, md_id) => fview::markdown(md_id.clone(), src.clone(), cx),
                 Shown::Table(view) => view.clone().into_any_element(),
-                Shown::Notebook(Ok(nb)) => fview::notebook(("file-ipynb", id.get()), nb, cx),
+                Shown::Notebook(Ok(nb)) => {
+                    fview::notebook(("file-ipynb", id.get()), nb.clone(), window, cx)
+                }
                 Shown::Notebook(Err(_)) => notice(ftext::IPYNB_INVALID.get().to_owned()),
                 Shown::Image(view) => view.clone().into_any_element(),
             },
@@ -764,18 +1036,42 @@ impl Shell {
         else {
             return;
         };
-        // SVG 미리보기는 경로 캐시가 아니라 그때그때 버퍼로 그리므로(OWE-874) 놓을 캐시가 없다.
-        *shown = if on {
-            let text = state.read(cx).text().to_string();
-            let path = tab
-                .doc
-                .as_ref()
-                .map(|d| d.path().to_owned())
-                .unwrap_or_default();
-            Some(build_preview(*preview, &text, &path, cx))
+        tab.preview_generation = tab.preview_generation.wrapping_add(1);
+        let generation = tab.preview_generation;
+        if on {
+            let text = state.read(cx).text().clone();
+            let state_id = state.entity_id();
+            let preview = *preview;
+            let revision = tab.revision;
+            cx.spawn(async move |this, cx| {
+                let prepared = cx
+                    .background_executor()
+                    .spawn(async move { prepare_preview(preview, &text.to_string()) })
+                    .await;
+                this.update(cx, |this, cx| {
+                    let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                        return;
+                    };
+                    if tab.preview_generation != generation || tab.revision != revision {
+                        return;
+                    }
+                    let Body::Text { state, shown, .. } = &mut tab.body else {
+                        return;
+                    };
+                    if state.entity_id() != state_id {
+                        return;
+                    }
+                    *shown = Some(build_preview(prepared, cx));
+                    this.files.refocus = true;
+                    this.sync_file_states(cx);
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         } else {
-            None
-        };
+            *shown = None;
+        }
         self.files.refocus = true;
         self.sync_file_states(cx);
         cx.notify();
@@ -904,11 +1200,12 @@ impl Shell {
     }
 
     /// `krill file open|diff` CLI가 상태 디렉터리(`file-requests.json`)에 넣은 요청을 소비한다.
-    pub(super) fn poll_file_requests(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(state_dir) = self.file_requests_dir(cx) else {
-            return;
-        };
-        let requests = take_pending_file_requests(&state_dir);
+    fn apply_file_requests(
+        &mut self,
+        requests: Vec<CliFileRequest>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if requests.is_empty() {
             return;
         }
@@ -948,24 +1245,16 @@ impl Shell {
         for path in std::mem::take(&mut self.files.released) {
             fview::release_image(&path, window, cx);
         }
-        self.poll_file_requests(window, cx);
         self.apply_goto(window, cx);
+        self.files
+            .loading
+            .retain(|pane, (_, path)| self.layout.file(*pane) == Some(path.as_path()));
         for pane in self.layout.visible() {
-            if let Some(path) = self.layout.file(pane)
+            if let Some(path) = self.layout.file(pane).map(Path::to_owned)
                 && !self.files.tabs.contains_key(&pane)
+                && !self.files.loading.contains_key(&pane)
             {
-                let saved = self.layout.file_state(pane);
-                let mut tab = Self::load_file_tab(pane, path.to_owned(), saved, window, cx);
-                if self
-                    .files
-                    .goto
-                    .as_ref()
-                    .is_some_and(|(goto_path, _, _)| goto_path == path)
-                    && let Body::Text { shown, .. } = &mut tab.body
-                {
-                    *shown = None;
-                }
-                self.files.tabs.insert(pane, tab);
+                self.start_file_load(pane, path, window, cx);
             }
         }
         self.sync_file_states(cx);
@@ -996,31 +1285,61 @@ impl Shell {
             self.files.close_guard = true;
             let weak = cx.weak_entity();
             window.on_window_should_close(cx, move |window, cx| {
-                let Some(shell) = weak.upgrade() else {
-                    return true;
-                };
-                let dirty = shell.read(cx).dirty_files();
-                if dirty.is_empty() {
-                    return true;
-                }
-                let detail = shell.read(cx).unsaved_detail(&dirty);
-                let answer = prompt_unsaved(&detail, window, cx);
-                let (weak, handle) = (weak.clone(), window.window_handle());
-                cx.spawn(async move |cx| {
-                    let close = weak
-                        .update(cx, |_, cx| Self::resolve_unsaved(answer, &dirty, cx))
-                        .ok();
-                    let Some(close) = close else { return };
-                    if close.await {
-                        handle
-                            .update(cx, |_, window, _| window.remove_window())
-                            .ok();
-                    }
-                })
-                .detach();
+                weak.update(cx, |this, cx| this.request_close(window, cx))
+                    .ok();
                 false
             });
         }
+    }
+
+    /// Close only after dirty-file decisions and a durable layout barrier.
+    pub(crate) fn request_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.files.closing {
+            return;
+        }
+        self.files.closing = true;
+        let dirty = self.dirty_files();
+        let close = if dirty.is_empty() {
+            Task::ready(true)
+        } else {
+            let answer = prompt_unsaved(&self.unsaved_detail(&dirty), window, cx);
+            Self::resolve_unsaved(answer, &dirty, cx)
+        };
+        let handle = window.window_handle();
+        cx.spawn(async move |this, cx| {
+            let close = close.await;
+            if close {
+                let Ok((barrier, layout, editor_saved)) = this.update(cx, |this, cx| {
+                    (
+                        this.saver.barrier(cx),
+                        this.layout.clone(),
+                        flush_editor_writes(cx),
+                    )
+                }) else {
+                    return;
+                };
+                editor_saved.await;
+                if barrier.await {
+                    let unchanged = this
+                        .read_with(cx, |this, _| {
+                            this.dirty_files().is_empty() && this.layout == layout
+                        })
+                        .unwrap_or(false);
+                    if unchanged {
+                        handle
+                            .update(cx, |_, window, _| window.remove_window())
+                            .ok();
+                        return;
+                    }
+                }
+            }
+            this.update(cx, |this, cx| {
+                this.files.closing = false;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// 경로 링크의 줄로 커서를 옮긴다. 아직 안 읽은 탭이면 이번에 읽고 다음 프레임에 옮긴다.
@@ -1037,7 +1356,6 @@ impl Shell {
         };
         let Some(tab) = self.files.tabs.get_mut(&pane) else {
             self.files.goto = Some((path, line, col));
-            window.request_animation_frame();
             return;
         };
         if let Body::Text { shown, .. } = &mut tab.body
@@ -1053,21 +1371,69 @@ impl Shell {
         self.sync_file_states(cx);
     }
 
+    fn start_file_load(
+        &mut self,
+        pane: PaneId,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.files.next_request = self.files.next_request.wrapping_add(1);
+        let generation = self.files.next_request;
+        self.files.loading.insert(pane, (generation, path.clone()));
+        let saved = self.layout.file_state(pane);
+        #[cfg(test)]
+        let gate = self.files.next_io.take();
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let (opened, prepared) = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    read_file(&read_path, saved.is_none_or(|s| s.preview))
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.layout.file(pane) != Some(path.as_path())
+                    || this.files.loading.get(&pane) != Some(&(generation, path.clone()))
+                {
+                    return;
+                }
+                this.files.loading.remove(&pane);
+                let mut tab =
+                    Self::load_file_tab(pane, path.clone(), saved, window, cx, opened, prepared);
+                if this.files.goto.as_ref().is_some_and(|(p, _, _)| *p == path)
+                    && let Body::Text { shown, .. } = &mut tab.body
+                {
+                    *shown = None;
+                }
+                this.files.tabs.insert(pane, tab);
+                this.files.refocus = true;
+                this.apply_goto(window, cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn load_file_tab(
         pane: PaneId,
         path: PathBuf,
         saved: Option<layout::SavedFileState>,
         window: &mut Window,
         cx: &mut Context<Self>,
+        opened: std::io::Result<(Opened, editor::Stamp)>,
+        prepared: Option<PreparedPreview>,
     ) -> FileTab {
-        let (body, stamp) = match editor::open(&path) {
+        let (body, stamp) = match opened {
             Ok((Opened::Text(kind, text), stamp)) => {
                 let language = editor::language(kind, &path);
                 let preview = editor::preview(kind);
-                let show_preview = saved.is_none_or(|s| s.preview);
-                let shown = preview
-                    .filter(|_| show_preview)
-                    .map(|preview| build_preview(preview, &text, &path, cx));
+                let shown = prepared.map(|prepared| build_preview(prepared, cx));
                 let state = cx.new(|cx| {
                     EditorState::new(window, cx)
                         .language(language)
@@ -1091,6 +1457,10 @@ impl Shell {
                     this.sync_file_states(cx);
                 });
                 return FileTab {
+                    path: path.clone(),
+                    revision: 0,
+                    saving: false,
+                    preview_generation: 0,
                     doc: Some(Doc::new(path, baseline, stamp)),
                     body: Body::Text {
                         state,
@@ -1114,6 +1484,10 @@ impl Shell {
             Err(e) => {
                 krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
                 return FileTab {
+                    path: path.clone(),
+                    revision: 0,
+                    saving: false,
+                    preview_generation: 0,
                     doc: None,
                     body: Body::Failed(e.to_string()),
                     error: None,
@@ -1122,6 +1496,10 @@ impl Shell {
         };
         // 텍스트가 아닌 탭도 디스크 지문을 들고 있어 바뀌면 다시 읽는다(편집이 없어 늘 깨끗하다).
         FileTab {
+            path: path.clone(),
+            revision: 0,
+            saving: false,
+            preview_generation: 0,
             doc: Some(Doc::new(path, String::new(), stamp)),
             body,
             error: None,
@@ -1135,97 +1513,248 @@ impl Shell {
         let (Some(doc), Body::Text { state, .. }) = (tab.doc.as_mut(), &tab.body) else {
             return;
         };
-        let unchanged = *state.read(cx).text() == *doc.saved();
-        if doc.edited(unchanged) {
-            cx.notify();
-        }
-    }
-
-    /// ⌘S: 원자적으로 저장한다. 성공하면 true.
-    // ponytail: fsync까지 UI 스레드에서 한다. 네트워크 볼륨에서 멈춤이 보이면 백그라운드 작업으로.
-    pub(super) fn save_file(&mut self, pane: PaneId, cx: &mut Context<Self>) -> bool {
-        let Some(tab) = self.files.tabs.get_mut(&pane) else {
-            return false;
-        };
-        let (Some(doc), Body::Text { state, .. }) = (tab.doc.as_mut(), &tab.body) else {
-            return false;
-        };
-        let text = state.read(cx).text().to_string();
-        let saved = match doc.save(text) {
-            Ok(()) => {
-                tab.error = None;
-                true
-            }
-            Err(SaveError::Conflict) => {
-                tab.error = Some(etext::SAVE_CONFLICT.get().to_owned());
-                false
-            }
-            Err(SaveError::Io(e)) => {
-                krill_app::onboarding::actions::note_access_denied(doc.path(), &e, cx);
-                tab.error = Some(etext::SAVE_FAILED.format(&[("error", &e.to_string())]));
-                false
-            }
-        };
+        tab.revision = tab.revision.wrapping_add(1);
+        let revision = tab.revision;
+        let state_id = state.entity_id();
+        let text = state.read(cx).text().clone();
+        let baseline = doc.saved_snapshot();
+        // Optimistically mark dirty, then compare the persistent rope off-thread.
+        // This keeps typing independent of the size of the saved buffer.
+        doc.edited(false);
         cx.notify();
-        saved
-    }
-
-    /// 디스크 내용으로 다시 읽는다(깨끗한 탭의 자동 재로드, 또는 dirty 탭에서 사용자가 고름). 커서 줄은 유지한다.
-    fn reload_file(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
-        let saved = self.layout.file_state(pane);
-        let Some(tab) = self.files.tabs.get_mut(&pane) else {
-            return;
-        };
-        if !matches!(tab.body, Body::Text { .. }) {
-            // 이미지·표·자리표시자: 분류부터 다시 한다(종류가 바뀌었을 수 있다). 이미지 캐시도 버린다.
-            let Some(path) = tab.doc.as_ref().map(|d| d.path().to_owned()) else {
-                return;
-            };
-            if tab.shows_image() {
-                self.files.released.push(path.clone());
-            }
-            let fresh = Self::load_file_tab(pane, path, saved, window, cx);
-            self.files.tabs.insert(pane, fresh);
-            cx.notify();
-            return;
-        }
-        let (
-            Some(doc),
-            Body::Text {
-                state,
-                preview,
-                shown,
-                ..
-            },
-        ) = (tab.doc.as_mut(), &mut tab.body)
-        else {
-            return;
-        };
-        match editor::open(doc.path()) {
-            Ok((Opened::Text(_, text), stamp)) => {
-                state.update(cx, |s, cx| {
-                    let cursor = s.cursor_position();
-                    s.set_value(text, window, cx);
-                    s.set_cursor_position(cursor, window, cx);
-                });
-                let text = state.read(cx).text().to_string();
-                if let (Some(preview), Some(_)) = (*preview, shown.as_ref()) {
-                    *shown = Some(build_preview(preview, &text, doc.path(), cx));
+        cx.spawn(async move |this, cx| {
+            let compared_baseline = baseline.clone();
+            let unchanged = cx
+                .background_executor()
+                .spawn(async move { text == *compared_baseline })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                    return;
+                };
+                if tab.revision != revision {
+                    return;
                 }
-                doc.reloaded(text, stamp);
-                tab.error = None;
-            }
-            Ok((other, stamp)) => {
-                doc.keep_mine(Some(stamp));
-                tab.error = Some(not_text(&other));
-            }
-            Err(e) => {
-                krill_app::onboarding::actions::note_access_denied(doc.path(), &e, cx);
-                doc.keep_mine(editor::stamp(doc.path()).ok().flatten());
-                tab.error = Some(etext::OPEN_FAILED.format(&[("error", &e.to_string())]));
-            }
+                let (Some(doc), Body::Text { state, .. }) = (tab.doc.as_mut(), &tab.body) else {
+                    return;
+                };
+                if state.entity_id() == state_id
+                    && Arc::ptr_eq(&doc.saved_snapshot(), &baseline)
+                    && doc.edited(unchanged)
+                {
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Save a snapshot off-thread. Edits made while fsync runs stay dirty.
+    pub(super) fn save_file(&mut self, pane: PaneId, cx: &mut Context<Self>) -> Task<bool> {
+        let Some(tab) = self.files.tabs.get_mut(&pane) else {
+            return Task::ready(false);
+        };
+        let (Some(doc), Body::Text { state, .. }) = (tab.doc.as_ref(), &tab.body) else {
+            return Task::ready(false);
+        };
+        if tab.saving {
+            return Task::ready(false);
         }
-        cx.notify();
+        tab.saving = true;
+        let mut snapshot = doc.clone();
+        let path = doc.path().to_owned();
+        let text = state.read(cx).text().clone();
+        let revision = tab.revision;
+        let state_id = state.entity_id();
+        #[cfg(test)]
+        let gate = self.files.next_io.take();
+        let previous = editor_write_queue(cx);
+        let (finish, tail) = tokio::sync::oneshot::channel();
+        cx.global_mut::<PendingEditorWrites>().0 = Some(tail);
+        let (completed, result) = tokio::sync::oneshot::channel();
+        cx.background_executor()
+            .spawn(async move {
+                if let Some(previous) = previous {
+                    previous.await.ok();
+                }
+                #[cfg(test)]
+                if let Some(gate) = gate {
+                    gate.await.ok();
+                }
+                let result = snapshot.save(text.to_string());
+                completed.send((snapshot, result)).ok();
+                finish.send(()).ok();
+            })
+            .detach();
+        cx.spawn(async move |this, cx| {
+            let Ok((snapshot, result)) = result.await else {
+                return false;
+            };
+            this.update(cx, |this, cx| {
+                let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                    return false;
+                };
+                let Body::Text { state, .. } = &tab.body else {
+                    return false;
+                };
+                if state.entity_id() != state_id || this.layout.file(pane) != Some(path.as_path()) {
+                    return false;
+                }
+                tab.saving = false;
+                let saved = match result {
+                    Ok(()) => {
+                        tab.doc = Some(snapshot);
+                        let unchanged = tab.revision == revision;
+                        if let Some(doc) = &mut tab.doc {
+                            doc.edited(unchanged);
+                        }
+                        tab.error = None;
+                        unchanged
+                    }
+                    Err(SaveError::Conflict) => {
+                        tab.error = Some(etext::SAVE_CONFLICT.get().to_owned());
+                        false
+                    }
+                    Err(SaveError::Io(e)) => {
+                        krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                        tab.error = Some(etext::SAVE_FAILED.format(&[("error", &e.to_string())]));
+                        false
+                    }
+                };
+                if !saved && tab.error.is_none() {
+                    this.file_edited(pane, cx);
+                }
+                cx.notify();
+                saved
+            })
+            .unwrap_or(false)
+        })
+    }
+
+    fn keep_file(&mut self, pane: PaneId, cx: &mut Context<Self>) {
+        let Some(tab) = self.files.tabs.get(&pane) else {
+            return;
+        };
+        let Some(doc) = &tab.doc else { return };
+        let path = doc.path().to_owned();
+        let revision = tab.revision;
+        let before = doc.clone();
+        cx.spawn(async move |this, cx| {
+            let read_path = path.clone();
+            let now = cx
+                .background_executor()
+                .spawn(async move { editor::stamp(&read_path) })
+                .await;
+            this.update(cx, |this, cx| {
+                let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                    return;
+                };
+                if tab.revision != revision || tab.saving {
+                    return;
+                }
+                let Some(doc) = &mut tab.doc else { return };
+                if *doc != before || this.layout.file(pane) != Some(path.as_path()) {
+                    return;
+                }
+                if let Ok(now) = now {
+                    doc.keep_mine(now);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Read and parse off-thread; refuse stale results after any edit, save or close.
+    fn reload_file(&mut self, pane: PaneId, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.files.tabs.get(&pane) else {
+            return;
+        };
+        if tab.saving || self.files.loading.contains_key(&pane) {
+            return;
+        }
+        let Some(doc) = &tab.doc else { return };
+        let path = doc.path().to_owned();
+        let before = doc.clone();
+        let revision = tab.revision;
+        self.files.next_request = self.files.next_request.wrapping_add(1);
+        let generation = self.files.next_request;
+        self.files.loading.insert(pane, (generation, path.clone()));
+        let saved = self.layout.file_state(pane);
+        let previewing = matches!(&tab.body, Body::Text { shown: Some(_), .. });
+        #[cfg(test)]
+        let gate = self.files.next_io.take();
+        cx.spawn_in(window, async move |this, cx| {
+            let read_path = path.clone();
+            let (opened, prepared) = cx
+                .background_executor()
+                .spawn(async move {
+                    #[cfg(test)]
+                    if let Some(gate) = gate {
+                        gate.await.ok();
+                    }
+                    read_file(&read_path, previewing)
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                if this.files.loading.get(&pane) != Some(&(generation, path.clone())) {
+                    return;
+                }
+                this.files.loading.remove(&pane);
+                let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                    return;
+                };
+                if tab.revision != revision
+                    || tab.saving
+                    || tab.doc.as_ref() != Some(&before)
+                    || this.layout.file(pane) != Some(path.as_path())
+                {
+                    return;
+                }
+                if !matches!(tab.body, Body::Text { .. }) {
+                    if tab.shows_image() {
+                        this.files.released.push(path.clone());
+                    }
+                    let fresh =
+                        Self::load_file_tab(pane, path, saved, window, cx, opened, prepared);
+                    this.files.tabs.insert(pane, fresh);
+                    cx.notify();
+                    return;
+                }
+                let (Some(doc), Body::Text { state, shown, .. }) =
+                    (tab.doc.as_mut(), &mut tab.body)
+                else {
+                    return;
+                };
+                match opened {
+                    Ok((Opened::Text(_, text), stamp)) => {
+                        state.update(cx, |s, cx| {
+                            let cursor = s.cursor_position();
+                            s.set_value(text, window, cx);
+                            s.set_cursor_position(cursor, window, cx);
+                        });
+                        let text = state.read(cx).text().to_string();
+                        *shown = prepared.map(|p| build_preview(p, cx));
+                        doc.reloaded(text, stamp);
+                        tab.revision = tab.revision.wrapping_add(1);
+                        tab.error = None;
+                    }
+                    Ok((other, stamp)) => {
+                        doc.keep_mine(Some(stamp));
+                        tab.error = Some(not_text(&other));
+                    }
+                    Err(e) => {
+                        krill_app::onboarding::actions::note_access_denied(&path, &e, cx);
+                        tab.error = Some(etext::OPEN_FAILED.format(&[("error", &e.to_string())]));
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn watch_files(window: &mut Window, cx: &mut Context<Self>) -> Task<()> {
@@ -1242,37 +1771,49 @@ impl Shell {
                         .files
                         .tabs
                         .iter()
-                        .filter_map(|(p, t)| Some((*p, t.doc.as_ref()?.path().to_owned())))
+                        .filter_map(|(p, t)| Some((*p, t.revision, t.doc.clone()?)))
                         .collect::<Vec<_>>();
                     Some((paths, req_dir))
                 }) else {
                     return;
                 };
-                let (stamps, has_requests) = cx
+                let (stamps, requests) = cx
                     .background_executor()
                     .spawn(async move {
-                        let has_requests = req_dir.as_deref().is_some_and(|dir| {
-                            matches!(dir.join(FILE_REQUESTS_FILE).try_exists(), Ok(true))
-                        });
+                        // 큐의 잠금·읽기·삭제를 모두 IO 작업에서 마친다.
+                        // 화면 그리기에서는 CLI나 디스크를 기다리지 않는다.
+                        let requests = req_dir
+                            .as_deref()
+                            .map(take_pending_file_requests)
+                            .unwrap_or_default();
                         let stamps = paths
                             .into_iter()
-                            .map(|(p, path)| (p, editor::stamp(&path)))
+                            .map(|(p, revision, doc)| {
+                                let now = editor::stamp(doc.path());
+                                (p, revision, doc, now)
+                            })
                             .collect::<Vec<_>>();
-                        (stamps, has_requests)
+                        (stamps, requests)
                     })
                     .await;
-                if stamps.is_empty() && !has_requests {
+                if stamps.is_empty() && requests.is_empty() {
                     continue;
                 }
                 let polled = this.update_in(cx, |this, window, cx| {
-                    if has_requests {
-                        this.poll_file_requests(window, cx);
-                    }
-                    for (pane, now) in stamps {
+                    this.apply_file_requests(requests, window, cx);
+                    for (pane, revision, before, now) in stamps {
                         // stat 자체가 실패하면(권한 등) 판단하지 않고 다음 주기에 다시 본다.
                         let Ok(now) = now else { continue };
-                        let Some(doc) = this.files.tabs.get_mut(&pane).and_then(|t| t.doc.as_mut())
-                        else {
+                        let Some(tab) = this.files.tabs.get_mut(&pane) else {
+                            continue;
+                        };
+                        if tab.saving
+                            || tab.revision != revision
+                            || tab.doc.as_ref() != Some(&before)
+                        {
+                            continue;
+                        }
+                        let Some(doc) = tab.doc.as_mut() else {
                             continue;
                         };
                         match doc.poll(now) {
@@ -1292,7 +1833,9 @@ impl Shell {
     /// ⌘P: 작업 폴더의 파일을 퍼지 검색해 연다. 목록은 백그라운드에서 만든 뒤 팔레트를 띄운다.
     /// OWE-862: ⌘J·⌘P·⇧⌘P는 단일 모달이라 열 때 다른 팔레트를 닫고, 파일 모드로 연다.
     pub(super) fn toggle_quick_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.files.quick_open.take().is_some() {
+        self.files.quick_generation = self.files.quick_generation.wrapping_add(1);
+        let generation = self.files.quick_generation;
+        if self.files.quick_open.take().is_some() || std::mem::take(&mut self.files.quick_loading) {
             self.files.refocus = true;
             cx.notify();
             return;
@@ -1303,13 +1846,41 @@ impl Shell {
             cx.notify();
         }
         let root = self.folder();
+        self.files.quick_loading = true;
         cx.spawn_in(window, async move |this, cx| {
-            let scan = root.clone();
-            let files = cx
-                .background_executor()
-                .spawn(async move { editor::quick_open::list(&scan) })
-                .await;
+            let (files, items) = loop {
+                if !this
+                    .read_with(cx, |this, _| {
+                        this.files.quick_generation == generation
+                            && this.files.quick_loading
+                            && this.folder() == root
+                    })
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+                let scan = root.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        editor::quick_open::try_list(&scan).map(|files| {
+                            let items = editor::quick_open::items(&files);
+                            (files, items)
+                        })
+                    })
+                    .await;
+                if let Some(result) = result {
+                    break result;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+            };
             this.update_in(cx, |this, window, cx| {
+                if this.files.quick_generation != generation || this.folder() != root {
+                    return;
+                }
+                this.files.quick_loading = false;
                 if this.settings.is_some() {
                     // OWE-860: 설정에서 ⌘P를 누르면 설정을 닫고 빠른 열기로 전환한다.
                     this.close_settings(Some(&mut *window), cx);
@@ -1323,7 +1894,6 @@ impl Shell {
                 if let Some(pane) = this.layout.focused() {
                     this.commit_ime(pane, Some(window), cx);
                 }
-                let items = editor::quick_open::items(&files);
                 let palette = cx.new(|cx| jump::Palette::new(items, window, cx));
                 palette.update(cx, |p, cx| {
                     p.set_mode(jump::Mode::Files, cx);
@@ -1353,12 +1923,19 @@ impl Shell {
     }
 
     /// 닫히는 칸에 미저장 파일이 있으면 레이아웃 변경을 되돌리고 묻는다. 물었으면 true.
-    pub(super) fn hold_dirty_close(&mut self, before: &Layout, cx: &mut Context<Self>) -> bool {
+    pub(super) fn hold_dirty_close(
+        &mut self,
+        before: &Layout,
+        policy: close::Policy,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let lost: Vec<PaneId> = self
             .files
             .tabs
             .iter()
-            .filter(|(p, t)| t.is_dirty() && self.layout.file(**p).is_none())
+            .filter(|(p, t)| {
+                (t.is_dirty() || t.saving) && self.layout.file(**p) != Some(t.path.as_path())
+            })
             .map(|(p, _)| *p)
             .collect();
         if lost.is_empty() {
@@ -1366,7 +1943,12 @@ impl Shell {
                 .files
                 .tabs
                 .keys()
-                .filter(|p| self.layout.file(**p).is_none())
+                .filter(|p| {
+                    self.files
+                        .tabs
+                        .get(p)
+                        .is_some_and(|t| self.layout.file(**p) != Some(t.path.as_path()))
+                })
                 .copied()
                 .collect();
             for p in gone {
@@ -1395,8 +1977,10 @@ impl Shell {
                 return;
             };
             if close.await {
-                this.update(cx, |this, cx| this.change(true, cx, move |l| *l = after))
-                    .ok();
+                this.update(cx, |this, cx| {
+                    this.change_with_policy(true, policy, cx, move |l| *l = after);
+                })
+                .ok();
             }
         })
         .detach();
@@ -1407,7 +1991,7 @@ impl Shell {
         self.files
             .tabs
             .iter()
-            .filter(|(_, t)| t.is_dirty())
+            .filter(|(_, t)| t.is_dirty() || t.saving)
             .map(|(p, _)| *p)
             .collect()
     }
@@ -1429,8 +2013,27 @@ impl Shell {
         let panes = panes.to_vec();
         cx.spawn(async move |this, cx| {
             let choice = answer.await;
-            this.update(cx, |this, cx| match choice {
-                Some(0) => panes.iter().all(|p| this.save_file(*p, cx)),
+            if choice == Some(0) {
+                for pane in &panes {
+                    let Ok(save) = this.update(cx, |this, cx| this.save_file(*pane, cx)) else {
+                        return false;
+                    };
+                    if !save.await {
+                        return false;
+                    }
+                }
+                return this
+                    .read_with(cx, |this, _| {
+                        panes.iter().all(|p| {
+                            this.files
+                                .tabs
+                                .get(p)
+                                .is_none_or(|t| !t.is_dirty() && !t.saving)
+                        })
+                    })
+                    .unwrap_or(false);
+            }
+            this.update(cx, |this, _cx| match choice {
                 Some(1) => {
                     for p in &panes {
                         if let Some(tab) = this.files.tabs.remove(p) {
@@ -1459,7 +2062,48 @@ fn quit_now(cx: &mut App) {
         .filter_map(|w| w.downcast::<Shell>())
         .find(|w| w.read(cx).is_ok_and(|s| !s.dirty_files().is_empty()));
     let Some(handle) = dirty else {
-        cx.quit();
+        // GPUI quit observers only have a 200ms budget. Finish filesystem work
+        // while the event loop is still running, before requesting app shutdown.
+        let pending = cx
+            .windows()
+            .into_iter()
+            .filter_map(|w| w.downcast::<Shell>())
+            .filter_map(|window| {
+                window
+                    .read(cx)
+                    .ok()
+                    .map(|shell| (window, shell.layout.clone(), shell.saver.barrier(cx)))
+            })
+            .collect::<Vec<_>>();
+        let editor_saved = flush_editor_writes(cx);
+        let settings_saved = krill_app::settings::flush_file_io(cx);
+        let sidebar_saved = krill_app::sidebar::flush_file_io(cx);
+        let star_saved = krill_app::star_nag::flush(cx);
+        cx.spawn(async move |cx| {
+            editor_saved.await;
+            settings_saved.await;
+            sidebar_saved.await;
+            star_saved.await;
+            let mut snapshots = Vec::new();
+            for (window, layout, barrier) in pending {
+                if !barrier.await {
+                    return;
+                }
+                snapshots.push((window, layout));
+            }
+            cx.update(|cx| {
+                if snapshots.iter().all(|(window, layout)| {
+                    window.read(cx).is_ok_and(|shell| {
+                        shell.layout == *layout && shell.dirty_files().is_empty()
+                    })
+                }) {
+                    cx.quit();
+                } else {
+                    quit_app(cx);
+                }
+            });
+        })
+        .detach();
         return;
     };
     handle

@@ -618,12 +618,18 @@ impl SettingsView {
     }
 
     fn save_key(&mut self, target: &Target, key: &str, cx: &mut Context<Self>) {
-        self.write_keys(cx, |t, defaults| {
-            set_key(t, defaults, target.action, target.old.as_deref(), key);
+        let target = target.clone();
+        let key = key.to_owned();
+        self.write_keys(cx, move |t, defaults| {
+            set_key(t, defaults, target.action, target.old.as_deref(), &key);
         });
     }
 
-    fn write_keys(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Keys, &[Pair])) {
+    fn write_keys(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Keys, &[Pair]) + Send + 'static,
+    ) {
         let Some(c) = cx.try_global::<Config>() else {
             return;
         };
@@ -631,16 +637,21 @@ impl SettingsView {
             return;
         };
         let defaults = pairs(&c.defaults);
-        match edit_keys(&dir, |t| f(t, &defaults)) {
-            Ok(()) => {
-                self.shortcuts.error = None;
-                super::reload(cx);
-            }
-            Err(e) => {
-                self.shortcuts.error = Some(text::SC_WRITE_FAILED.format(&[("error", &e)]).into());
-            }
-        }
-        cx.notify();
+        self.file_job(
+            "keys-edit",
+            move || edit_keys(&dir, |keys| f(keys, &defaults)),
+            |this, result, cx| match result {
+                Ok(()) => {
+                    this.shortcuts.error = None;
+                    super::reload(cx);
+                }
+                Err(error) => {
+                    this.shortcuts.error =
+                        Some(text::SC_WRITE_FAILED.format(&[("error", &error)]).into());
+                }
+            },
+            cx,
+        );
     }
 
     pub(super) fn confirm_conflict(&mut self, cx: &mut Context<Self>) {
@@ -651,7 +662,7 @@ impl SettingsView {
 
     pub(super) fn reset_shortcut(&mut self, action: &'static str, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
-        self.write_keys(cx, |t, defaults| reset_action(t, defaults, action));
+        self.write_keys(cx, move |t, defaults| reset_action(t, defaults, action));
     }
 
     pub(super) fn reset_all_shortcuts(&mut self, cx: &mut Context<Self>) {
@@ -665,7 +676,8 @@ impl SettingsView {
     /// 바인딩 하나만 지운다(OWE-863). 기본 키면 그 액션의 기본 키만 끈다.
     pub(super) fn delete_key(&mut self, action: &'static str, key: &str, cx: &mut Context<Self>) {
         self.shortcuts.conflict = None;
-        self.write_keys(cx, |t, defaults| remove_key(t, defaults, action, key));
+        let key = key.to_owned();
+        self.write_keys(cx, move |t, defaults| remove_key(t, defaults, action, &key));
     }
 
     /// 액션의 현재 키를 모두 꺼 단축키를 비활성화한다(OWE-863). 초기화로 되돌릴 수 있다.
@@ -676,8 +688,9 @@ impl SettingsView {
         cx: &mut Context<Self>,
     ) {
         self.shortcuts.conflict = None;
-        self.write_keys(cx, |t, defaults| {
-            disable_action(t, defaults, action, current);
+        let current = current.to_vec();
+        self.write_keys(cx, move |t, defaults| {
+            disable_action(t, defaults, action, &current);
         });
     }
 

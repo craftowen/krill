@@ -15,7 +15,7 @@
 use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::net::UnixStream;
 use std::ffi::OsStr;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Stdio};
 use std::sync::{Arc, Mutex};
@@ -312,21 +312,23 @@ pub fn raw_patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io:
             cmd.arg(OsStr::from_bytes(old));
         }
     }
-    let mut child = Reap(cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?);
+    let mut child = Reap(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?,
+    );
     let stdout = child
         .0
         .stdout
         .take()
         .ok_or_else(|| io::Error::other("missing git stdout"))?;
-    // The reader stops and closes the pipe even when git emits an unbounded patch.
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(u64::try_from(MAX_PATCH_BYTES).unwrap_or(u64::MAX) + 1)
-            .read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
     let deadline = Instant::now() + TIMEOUT;
+    let reader = crate::process_io::read(
+        stdout,
+        u64::try_from(MAX_PATCH_BYTES).unwrap_or(u64::MAX) + 1,
+        deadline,
+    )?;
     let status = loop {
         match child.0.try_wait() {
             Ok(Some(status)) => break Ok(status),
@@ -340,12 +342,17 @@ pub fn raw_patch(repo: &Path, file: &ChangedFile, comparison: Comparison) -> io:
             Err(e) => break Err(e),
         }
     };
-    // Close the writer before joining, including on timeout/error.
+    // A descendant may retain stdout after this child exits. Finish by deadline.
     child.0.kill().ok();
     child.0.wait().ok();
-    let bytes = reader
-        .join()
-        .map_err(|_| io::Error::other("git reader failed"))??;
+    let captured = reader.finish(deadline + Duration::from_millis(50))?;
+    if captured.timed_out {
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "git diff pipe timed out",
+        ));
+    }
+    let bytes = captured.bytes;
     if bytes.len() > MAX_PATCH_BYTES {
         return Err(io::Error::other("diff exceeds 4 MiB limit"));
     }
@@ -524,6 +531,7 @@ fn watch_action(
 pub struct Panel {
     repo: PathBuf,
     tab: PanelTab,
+    history: Option<Entity<crate::agent_history::Panel>>,
     explorer: Explorer,
     open_file_preview: bool,
     search: WorkspaceSearch,
@@ -609,6 +617,7 @@ impl Panel {
         Self {
             repo,
             tab: PanelTab::default(),
+            history: None,
             explorer,
             open_file_preview: false,
             search,
@@ -701,6 +710,27 @@ impl Panel {
         std::mem::replace(&mut self.open_file_preview, false)
     }
 
+    pub fn set_history(
+        &mut self,
+        history: Entity<crate::agent_history::Panel>,
+        cx: &mut Context<Self>,
+    ) {
+        self.history = Some(history);
+        self.sync_history(cx);
+    }
+
+    fn sync_history(&self, cx: &mut Context<Self>) {
+        if let Some(history) = &self.history {
+            let open = self.visible && self.tab == PanelTab::History;
+            history.update(cx, |h, cx| {
+                h.update_scope_paths(Some(self.repo.display().to_string()), Vec::new(), cx);
+                if open != h.is_open() {
+                    h.toggle(cx);
+                }
+            });
+        }
+    }
+
     pub fn connect(&mut self, target: impl Into<HostTarget>, cx: &mut Context<Self>) {
         let target = target.into();
         self.editing.connect(target.clone());
@@ -739,6 +769,7 @@ impl Panel {
         self.pending_diff_path = None;
         self.checks.reset();
         let old_repo = std::mem::replace(&mut self.repo, repo);
+        self.sync_history(cx);
         if self.visible
             && let Some(source) = self.source.clone()
         {
@@ -782,6 +813,7 @@ impl Panel {
             return;
         }
         self.visible = visible;
+        self.sync_history(cx);
         if visible {
             self.watch_gen = 0;
             self.refresh_branch_sync(cx);
@@ -1026,7 +1058,7 @@ impl Panel {
         if self.repo != repo {
             self.set_repo(repo, cx);
         }
-        self.tab = PanelTab::Changes;
+        self.set_tab(PanelTab::Changes, cx);
         self.comparison = if staged {
             Comparison::Index
         } else {
@@ -1045,13 +1077,13 @@ impl Panel {
                 && existing.staged.is_none()
                 && existing.unstaged.is_none()
             {
-                existing.status = probe_file_status(&self.repo, clean_rel, staged);
+                existing.status = if staged { *b"M." } else { *b".M" };
             } else {
                 self.pending_diff_path = None;
             }
             self.select(idx, cx);
         } else {
-            let status = probe_file_status(&self.repo, clean_rel, staged);
+            let status = if staged { *b"M." } else { *b".M" };
             self.changes.files.push(ChangedFile {
                 path: target_bytes,
                 old_path: None,
@@ -1070,7 +1102,7 @@ impl Panel {
     }
 
     pub fn select(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(file) = self.changes.files.get(index).cloned() else {
+        let Some(mut file) = self.changes.files.get(index).cloned() else {
             return;
         };
         self.patch_gen = self.patch_gen.wrapping_add(1);
@@ -1081,22 +1113,36 @@ impl Panel {
         self.message = text::LOADING.get().into();
         self.state.update(cx, |s, cx| s.set_files([], cx));
         let (repo, comparison) = (self.repo.clone(), self.comparison);
+        let probe = self.pending_diff_path.as_ref() == Some(&file.path)
+            && file.staged.is_none()
+            && file.unstaged.is_none();
         self.patch_task = Some(cx.spawn(async move |this, cx| {
-            let result = cx
+            let (result, status) = cx
                 .background_executor()
                 .spawn(async move {
-                    let raw = raw_patch(&repo, &file, comparison)?;
-                    let files = if raw.is_empty() {
-                        Vec::new()
-                    } else {
-                        DiffFile::parse(&raw).map_err(io::Error::other)?
-                    };
-                    Ok::<_, io::Error>((raw, files))
+                    if probe {
+                        let path = String::from_utf8_lossy(&file.path);
+                        file.status =
+                            probe_file_status(&repo, &path, comparison == Comparison::Index);
+                    }
+                    let result = (|| {
+                        let raw = raw_patch(&repo, &file, comparison)?;
+                        let files = if raw.is_empty() {
+                            Vec::new()
+                        } else {
+                            DiffFile::parse(&raw).map_err(io::Error::other)?
+                        };
+                        Ok::<_, io::Error>((raw, files))
+                    })();
+                    (result, file.status)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 if this.patch_gen != generation {
                     return;
+                }
+                if probe && let Some(file) = this.changes.files.get_mut(index) {
+                    file.status = status;
                 }
                 match result {
                     Ok((raw, files)) => {
@@ -1220,11 +1266,15 @@ impl Panel {
             .items_center()
             .justify_center()
             .gap_1()
-            .child(Icon::new(tab.icon()).size(px(14.)).text_color(if active {
-                p.sidebar_accent_foreground
-            } else {
-                p.muted_foreground
-            }))
+            .child(
+                tab.icon()
+                    .size(px(crate::ui::ICON_MD))
+                    .text_color(if active {
+                        p.sidebar_accent_foreground
+                    } else {
+                        p.muted_foreground
+                    }),
+            )
             .when(active, |d| {
                 d.child(
                     div()
@@ -1304,6 +1354,16 @@ impl Panel {
                         ),
                     )
                     .child(
+                        Self::render_tab_button(
+                            PanelTab::History,
+                            self.tab == PanelTab::History,
+                            p,
+                        )
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.set_tab(PanelTab::History, cx)),
+                        ),
+                    )
+                    .child(
                         Self::render_tab_button(PanelTab::Checks, checks_active, p)
                             .when_some(checks_dot, |d, dot_color| {
                                 d.child(
@@ -1350,7 +1410,11 @@ impl Panel {
                                 .tooltip(text::REFRESH.get())
                                 .accessibility_label(text::REFRESH.get())
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.tab == PanelTab::Files {
+                                    if this.tab == PanelTab::History {
+                                        if let Some(history) = &this.history {
+                                            history.update(cx, crate::agent_history::Panel::scan);
+                                        }
+                                    } else if this.tab == PanelTab::Files {
                                         this.refresh_explorer_async(cx);
                                     } else if this.tab == PanelTab::Search {
                                         this.spawn_async_search(cx);
@@ -1988,6 +2052,19 @@ impl Render for Panel {
         }
         let p = crate::ui::palette(cx);
         let top_bar = self.render_top_bar(cx);
+
+        if self.tab == PanelTab::History {
+            return div()
+                .size_full()
+                .min_w_0()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .bg(p.sidebar)
+                .text_color(p.sidebar_foreground)
+                .child(top_bar)
+                .child(div().flex_1().min_h_0().children(self.history.clone()));
+        }
 
         if self.tab == PanelTab::Files {
             let explorer_pane = self.render_explorer_pane(window, cx);

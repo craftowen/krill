@@ -65,7 +65,7 @@ pub fn sync_dock_tile(label: Option<&str>) -> Option<String> {
 }
 
 /// 유휴 잠자기 방지 핸들(MK-044). Windows는 `SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)`로 잡고 Drop 시
-/// `ES_CONTINUOUS`로 푼다. 이 상태는 부른 스레드에 묶이므로 잡고 놓는 쪽은 같은 스레드(gpui UI 스레드의 `alert`)다.
+/// `ES_CONTINUOUS`로 푼다. 이 상태는 부른 스레드에 묶이므로 잡고 놓는 쪽은 같은 스레드(`alert`의 전용 sleep assertion 작업 스레드)다.
 /// 그 밖의 OS는 잡지 못한다(`acquire`가 `None`).
 #[derive(Debug)]
 pub struct SleepAssertion(u32);

@@ -72,7 +72,17 @@ pub fn upgrade(stream: &mut TcpStream, allowed_origin: Option<&str>) -> io::Resu
         let gzip = headers
             .get("accept-encoding")
             .is_some_and(|v| v.split(',').any(|part| part.trim() == "gzip"));
-        super::pwa::serve(stream, path, gzip)?;
+        super::pwa::serve_request(stream, path, query, gzip)?;
+        return Ok(false);
+    }
+    if query
+        .split('&')
+        .filter_map(|part| part.split_once('='))
+        .any(|(name, value)| name == "v" && value != super::pwa::asset_hash())
+    {
+        stream.write_all(
+            b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
         return Ok(false);
     }
     if query

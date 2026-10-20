@@ -3,7 +3,7 @@ use ring::digest;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 18] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 21] = [
     (
         "index.html",
         "text/html; charset=utf-8",
@@ -17,10 +17,22 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 18] = [
         include_bytes!("assets/app.js.gz"),
     ),
     (
+        "sw.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/sw.js"),
+        include_bytes!("assets/sw.js.gz"),
+    ),
+    (
         "crypto.js",
         "text/javascript; charset=utf-8",
         include_bytes!("assets/crypto.js"),
         include_bytes!("assets/crypto.js.gz"),
+    ),
+    (
+        "i18n.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/i18n.js"),
+        include_bytes!("assets/i18n.js.gz"),
     ),
     (
         "client.js",
@@ -33,6 +45,12 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 18] = [
         "text/javascript; charset=utf-8",
         include_bytes!("assets/terminal.js"),
         include_bytes!("assets/terminal.js.gz"),
+    ),
+    (
+        "qr.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/qr.js"),
+        include_bytes!("assets/qr.js.gz"),
     ),
     (
         "screens/home.js",
@@ -140,7 +158,16 @@ fn route(name: &str) -> String {
         format!("/{name}")
     }
 }
+#[cfg(test)]
 pub(super) fn serve(writer: &mut impl Write, path: &str, gzip: bool) -> io::Result<()> {
+    serve_request(writer, path, "", gzip)
+}
+pub(super) fn serve_request(
+    writer: &mut impl Write,
+    path: &str,
+    _query: &str,
+    gzip: bool,
+) -> io::Result<()> {
     let asset = ASSETS.iter().find(|(name, ..)| route(name) == path);
     let (status, mime, body, encoding) = asset.map_or(
         (

@@ -29,7 +29,16 @@ pub(crate) mod control;
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
 // ponytail: POSIX 문법이라 fish·nu 같은 로그인 셸에서는 깨진다. 지원하려면 그때 `/bin/zsh -l -i -c`로 감싼다.
-const PREFLIGHT: &str = r#"hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }; if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@""#;
+const PREFLIGHT: &str = r#"
+case "${KRILL_ACCOUNT_PROVIDER-}" in
+  claude) unset CLAUDE_CONFIG_DIR ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY CLAUDECODE CLAUDE_CODE_ENTRYPOINT; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CLAUDE_CONFIG_DIR="$KRILL_ACCOUNT_DIR"; fi;;
+  codex) unset CODEX_HOME OPENAI_API_KEY CODEX_API_KEY OPENAI_BASE_URL; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export CODEX_HOME="$KRILL_ACCOUNT_DIR"; fi;;
+  opencode) unset OPENCODE_CONFIG_DIR OPENCODE_AUTH_CONTENT OPENCODE_DB OPENCODE_API_KEY OPENAI_API_KEY ANTHROPIC_API_KEY GOOGLE_API_KEY GEMINI_API_KEY; if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export XDG_DATA_HOME="$KRILL_ACCOUNT_DIR/data" XDG_STATE_HOME="$KRILL_ACCOUNT_DIR/state" OPENCODE_DB=opencode.db; fi;;
+  agy) if [ -n "${KRILL_ACCOUNT_DIR-}" ]; then export SSH_CONNECTION=krill; fi;;
+esac
+unset KRILL_ACCOUNT_PROVIDER KRILL_ACCOUNT_DIR
+hint=$1; shift; command -v "$1" >/dev/null 2>&1 || { printf '%s\n' "$hint" >&2; exit 127; }; if [ "$(basename "$1")" = agy ] && [ "${2#--gemini_dir=}" != "$2" ]; then SSH_CONNECTION=krill exec "$@"; fi; exec "$@"
+"#;
 
 /// 이 프로세스의 환경과 passwd로 에이전트 실행 argv·env를 만든다.
 /// 프로그램 파일명이 `claude`면 `UUIDv4`를 사전 발급하고 버전 게이트된 세션별 설정을 주입한다.
@@ -1271,6 +1280,25 @@ fn apply_account_env(
         });
     }
     if let Some(account) = &account {
+        if let Some(provider) = ProviderKind::from_env_var(&account.env_key) {
+            login
+                .env
+                .retain(|(key, _)| key != b"KRILL_ACCOUNT_PROVIDER" && key != b"KRILL_ACCOUNT_DIR");
+            login.env.push((
+                b"KRILL_ACCOUNT_PROVIDER".to_vec(),
+                provider.as_str().as_bytes().to_vec(),
+            ));
+            login.env.push((
+                b"KRILL_ACCOUNT_DIR".to_vec(),
+                account.dir.as_bytes().to_vec(),
+            ));
+            login.env.retain(|(key, _)| {
+                !provider
+                    .credential_overrides()
+                    .iter()
+                    .any(|name| key.as_slice() == name.as_bytes())
+            });
+        }
         // OWE-699: 켜져 있을 때만 실행 전 멱등 프로비저닝. 실패해도 실행은 그대로 간다(경고만).
         if let Some(provider) = Path::new(prog)
             .file_name()
@@ -1285,6 +1313,9 @@ fn apply_account_env(
             );
         }
         if is(profile, "opencode") && !account.dir.is_empty() {
+            login
+                .env
+                .push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
             for (key, suffix) in [("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state")] {
                 login.env.retain(|(k, _)| k.as_slice() != key.as_bytes());
                 login.env.push((
@@ -1309,8 +1340,20 @@ fn apply_account_env(
             }
         }
     }
-    // 사용자가 프로필에 적은 값이 마지막에 이긴다(OWE-657).
+    // User environment remains customizable; credential authority belongs to the selected account.
     for (key, value) in &profile.env {
+        if let Some(provider) = account
+            .as_ref()
+            .and_then(|a| ProviderKind::from_env_var(&a.env_key))
+            && (key == provider.env_var()
+                || matches!(key.as_str(), "KRILL_ACCOUNT_PROVIDER" | "KRILL_ACCOUNT_DIR")
+                || provider.credential_overrides().contains(&key.as_str())
+                || account.as_ref().is_some_and(|a| !a.dir.is_empty())
+                    && provider == ProviderKind::OpenCode
+                    && matches!(key.as_str(), "XDG_DATA_HOME" | "XDG_STATE_HOME"))
+        {
+            continue;
+        }
         login.env.retain(|(k, _)| k.as_slice() != key.as_bytes());
         login
             .env

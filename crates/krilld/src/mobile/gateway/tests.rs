@@ -424,7 +424,17 @@ fn wrong_e2ee_proof_never_consumes_ticket_and_is_rate_limited() {
     socket.write_all(b"GET /ws HTTP/1.1\r\nHost: localhost\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").unwrap();
     let mut bytes = Vec::new();
     socket.read_to_end(&mut bytes).unwrap();
-    assert!(String::from_utf8(bytes).unwrap().ends_with("\r\n\r\n"));
+    let header_end = bytes
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .unwrap()
+        + 4;
+    assert!(
+        std::str::from_utf8(&bytes[..header_end])
+            .unwrap()
+            .starts_with("HTTP/1.1 101")
+    );
+    assert_eq!(&bytes[header_end..], &[0x88, 2, 0x03, 0xf5]); // 1013: 인증 cooldown
 }
 
 #[test]
@@ -635,7 +645,7 @@ fn connect_mode_survives_daemon_restart() {
     let dir = std::env::temp_dir().join(format!("mk-mobile-intent-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
-    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Lan);
+    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     g.request(MobileRequest::SetConnectMode {
         mode: ConnectMode::Tunnel,
         custom_address: None,
@@ -644,10 +654,10 @@ fn connect_mode_survives_daemon_restart() {
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
     assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     drop(g);
-    // 손상된 파일은 모바일을 끄지 않고 LAN으로 시작한다.
+    // 손상된 파일은 기본 Relay 모드로 시작한다.
     std::fs::write(dir.join(INTENT_FILE), b"{").unwrap();
     let g = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
-    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Lan);
+    assert_eq!(lock(&g.shared.state).mode, ConnectMode::Tunnel);
     drop(g);
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -868,13 +878,14 @@ fn rendezvous_credentials_migrate_old_intent_and_survive_mode_changes() {
     assert_eq!(first.rid.len(), 32);
     assert_eq!(first.key.len(), 64);
     let gateway = Gateway::start(Weak::new(), Some(&dir), hello()).unwrap();
-    gateway.request(MobileRequest::SetConnectMode {
+    let reply = gateway.request(MobileRequest::SetConnectMode {
         mode: ConnectMode::Lan,
         custom_address: None,
     });
+    assert!(matches!(reply, MobileReply::Failed(_)));
     drop(gateway);
     let second = Intent::load(Some(&dir)).unwrap();
-    assert_eq!(second.mode, ConnectMode::Lan);
+    assert_eq!(second.mode, ConnectMode::Tunnel);
     assert_eq!((first.rid, first.key), (second.rid, second.key));
     assert_eq!(
         std::fs::metadata(dir.join(INTENT_FILE))
@@ -1460,4 +1471,119 @@ fn revoking_all_devices_cancels_a_pending_pairing_wait() {
     assert!(matches!(reply, MobileReply::Failed(_)));
     assert!(lock(&gateway.shared.state).listeners.is_empty());
     worker.join().unwrap();
+}
+
+#[test]
+fn retired_lan_intent_migrates_without_changing_device_credentials() {
+    let dir = std::env::temp_dir().join(format!("mk-mobile-retired-{}", hex(&random().unwrap())));
+    let mut devices = super::super::devices::Devices::open(Some(&dir)).unwrap();
+    let ticket = devices.mint(1, true).unwrap();
+    let (device, _) = devices.pair(&ticket.token, "saved phone", 2).unwrap();
+    let secret = devices.device_secret(&device.device_id).unwrap();
+    let before = std::fs::read(dir.join("mobile-devices.json")).unwrap();
+    super::super::devices::write_private(
+        &dir.join(INTENT_FILE),
+        &serde_json::to_vec(&serde_json::json!({"mode":"Lan","custom":"192.168.1.4:1234"}))
+            .unwrap(),
+    )
+    .unwrap();
+    let intent = Intent::load(Some(&dir)).unwrap();
+    assert_eq!(intent.mode, ConnectMode::Tunnel);
+    assert_eq!(intent.custom, None);
+    let reopened = super::super::devices::Devices::open(Some(&dir)).unwrap();
+    assert_eq!(reopened.device_secret(&device.device_id).unwrap(), secret);
+    assert_eq!(
+        std::fs::read(dir.join("mobile-devices.json")).unwrap(),
+        before
+    );
+    assert_eq!(Intent::load(Some(&dir)).unwrap().mode, ConnectMode::Tunnel);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cancel_qr_with_zero_devices_closes_exposure_without_revoking_devices() {
+    let (_registry, gateway) = start();
+    let (_, ticket) = offer(&gateway);
+    assert_eq!(
+        gateway.request(MobileRequest::CancelPairingTicket),
+        MobileReply::Revoked { count: 0 }
+    );
+    let state = lock(&gateway.shared.state);
+    assert!(state.devices.ticket(now_ms()).is_none());
+    assert!(
+        state
+            .devices
+            .pairing_secret(&ticket.token, now_ms())
+            .is_err()
+    );
+    assert!(state.listeners.is_empty());
+    assert_eq!(state.devices.active_count(), 0);
+}
+
+#[test]
+fn auth_close_codes_distinguish_capacity_cooldown_and_rejection() {
+    assert_eq!(
+        auth_close_code(&io::Error::new(
+            io::ErrorKind::StorageFull,
+            super::super::devices::AuthRejection::Capacity
+        )),
+        Some(4009)
+    );
+    assert_eq!(
+        auth_close_code(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            super::super::devices::AuthRejection::Cooldown
+        )),
+        Some(1013)
+    );
+    assert_eq!(
+        auth_close_code(&io::ErrorKind::InvalidData.into()),
+        Some(1008)
+    );
+    assert_eq!(auth_close_code(&io::ErrorKind::TimedOut.into()), None);
+    assert_eq!(auth_close_code(&io::ErrorKind::StorageFull.into()), None);
+    assert_eq!(
+        auth_close_code(&io::ErrorKind::PermissionDenied.into()),
+        None
+    );
+    assert!(reject_retired_mode(ConnectMode::Lan, None).is_err());
+    assert!(reject_retired_mode(ConnectMode::Lan, Some("192.168.1.2:1234")).is_err());
+    assert!(reject_retired_mode(ConnectMode::Lan, Some("127.0.0.1:1234")).is_ok());
+}
+
+#[test]
+fn cancel_qr_preserves_paired_device_and_authenticated_connection() {
+    let (_registry, gateway) = start();
+    let (port, ticket) = offer(&gateway);
+    let mut phone = Client::pair(port, &ticket);
+    phone.ipc();
+    let id = phone.device.clone();
+    let verifier = lock(&gateway.shared.state)
+        .devices
+        .device_secret(&id)
+        .unwrap();
+    lock(&gateway.shared.state)
+        .devices
+        .mint(now_ms(), true)
+        .unwrap();
+    assert_eq!(
+        gateway.request(MobileRequest::CancelPairingTicket),
+        MobileReply::Revoked { count: 0 }
+    );
+    assert_eq!(
+        lock(&gateway.shared.state)
+            .devices
+            .device_secret(&id)
+            .unwrap(),
+        verifier
+    );
+    phone.write(&MobileRequest::Status.encode().unwrap());
+    let (kind, body) = phone.read().unwrap();
+    assert!(matches!(
+        MobileReply::decode(kind, &body).unwrap(),
+        MobileReply::GatewayStatus {
+            active_offer: false,
+            ..
+        }
+    ));
 }

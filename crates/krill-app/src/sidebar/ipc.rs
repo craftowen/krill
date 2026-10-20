@@ -491,7 +491,6 @@ fn states_from_json(raw: &str) -> BTreeMap<PathBuf, super::external::ExternalHit
 /// `KRILL_CLAUDE_BIN` 환경변수로 실행 파일을 바꿀 수 있다(테스트 주입·수동 지정용).
 /// 바이너리가 없거나·시간을 넘기거나·실패하면 빈 목록으로 fail-open해 사이드바 폴링을 막지 않는다.
 fn read_cli_states_with(cli_bin: &Path) -> BTreeMap<PathBuf, super::external::ExternalHit> {
-    use std::io::Read as _;
     use std::process::Stdio;
     let Ok(mut child) = crate::platform::background_command(cli_bin)
         .args(["agents", "--json"])
@@ -507,15 +506,12 @@ fn read_cli_states_with(cli_bin: &Path) -> BTreeMap<PathBuf, super::external::Ex
         child.wait().ok();
         return BTreeMap::new();
     };
-    // 리더가 먼저 파이프를 닫아도 자식이 SIGPIPE로 죽지 않게 bounded로 읽는다.
-    let reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(EXTERNAL_MAX_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        Ok::<_, io::Error>(bytes)
-    });
     let deadline = Instant::now() + EXTERNAL_TIMEOUT;
+    let Ok(reader) = crate::process_io::read(stdout, EXTERNAL_MAX_BYTES + 1, deadline) else {
+        child.kill().ok();
+        child.wait().ok();
+        return BTreeMap::new();
+    };
     let exited_ok = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.success(),
@@ -528,10 +524,16 @@ fn read_cli_states_with(cli_bin: &Path) -> BTreeMap<PathBuf, super::external::Ex
             }
         }
     };
-    // 성공·실패·시간 초과 모두 자식을 거두고(join 전 kill) 리더를 기다린다.
+    // 자손이 파이프를 상속해도 직접 자식의 종료 후 무기한 join하지 않는다.
     child.kill().ok();
     child.wait().ok();
-    let bytes = reader.join().ok().and_then(Result::ok).unwrap_or_default();
+    let Ok(captured) = reader.finish(deadline + Duration::from_millis(50)) else {
+        return BTreeMap::new();
+    };
+    if captured.timed_out {
+        return BTreeMap::new();
+    }
+    let bytes = captured.bytes;
     if !exited_ok || u64::try_from(bytes.len()).is_ok_and(|n| n > EXTERNAL_MAX_BYTES) {
         return BTreeMap::new();
     }

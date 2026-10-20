@@ -149,6 +149,10 @@ fn closing_last_window_then_reopening_restores_layout(cx: &mut gpui::TestAppCont
         assert_eq!(cx.windows().len(), 1);
         // 창을 다시 열어도 저장된 세션 연결은 지워지지 않는다.
         assert_eq!(krill_app::layout::Layout::load(&path).unwrap(), layout);
+    });
+    // The restored shell installs its action tree after the background load.
+    cx.run_until_parked();
+    cx.update(|cx| {
         let window = cx.windows()[0];
         window
             .update(cx, |_, window, cx| {
@@ -157,13 +161,16 @@ fn closing_last_window_then_reopening_restores_layout(cx: &mut gpui::TestAppCont
             .unwrap();
     });
     cx.run_until_parked();
-    // 편집 중에는 디바운스 저장한다. 정상 창 종료는 마지막 대기분까지 저장해야 한다.
+    // Normal close waits for the asynchronous durable save barrier.
     cx.update(|cx| {
         cx.windows()[0]
-            .update(cx, |_, window, _| window.remove_window())
+            .downcast::<shell::Shell>()
+            .unwrap()
+            .update(cx, shell::Shell::request_close)
             .unwrap();
     });
     cx.run_until_parked();
+    cx.update(|cx| assert!(cx.windows().is_empty()));
     let restored = krill_app::layout::Layout::load(&path).unwrap();
     assert_eq!(restored.tabs().len(), 2);
     assert_eq!(restored.sessions(), [krill_proto::SessionId(583)]);

@@ -525,10 +525,15 @@ fn handle_mux_frame(
         // 챌린지는 데몬이 만든다(serve_mux_client). DO가 정하면 같은 챌린지로 녹화한 세션을 재생할 수 있다.
         // DO는 빈 OPEN만 보낸다. 내용이 있거나(서버 지정 챌린지) 이미 열린 conn_id면 거부한다.
         MUX_OPEN => {
+            // DO는 빈 OPEN만 보낸다. 챌린지는 E2EE 종단인 데몬이 생성한다.
             if !payload.is_empty() || sessions.contains_key(&conn_id) {
                 outbox.send_close(conn_id, 1002);
                 return;
             }
+            let Ok(challenge) = random() else {
+                outbox.send_close(conn_id, 1011);
+                return;
+            };
             let (tx, rx) = mpsc::channel::<(u8, Vec<u8>)>();
             let Ok((local, server)) = UnixStream::pair() else {
                 outbox.send_close(conn_id, 1011);
@@ -588,9 +593,9 @@ fn handle_mux_frame(
                 .spawn(move || {
                     crate::alloc::mobile_thread().ok();
                     let code = match serve_mux_client(
-                        conn_id, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
+                        conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
                     ) {
-                        Err(err) if err.kind() == io::ErrorKind::InvalidData => 1008,
+                        Err(err) => super::gateway::auth_close_code(&err).unwrap_or(1011),
                         _ => 1000,
                     };
                     out.send_close(conn_id, code);
@@ -664,6 +669,7 @@ fn recv_open_frame(rx: &mpsc::Receiver<(u8, Vec<u8>)>) -> io::Result<(u8, Vec<u8
 )]
 fn serve_mux_client(
     conn_id: u32,
+    challenge: [u8; 32],
     rx: &mpsc::Receiver<(u8, Vec<u8>)>,
     close_tx: &mpsc::Sender<(u8, Vec<u8>)>,
     mut local: UnixStream,
@@ -675,14 +681,8 @@ fn serve_mux_client(
     hello: &ServerHello,
 ) -> io::Result<()> {
     lock(&shared.state).devices.attempt(now_ms())?;
-    // 직접 연결 경로(gateway::authenticate)와 같은 생성기·형식. 릴레이는 챌린지를 모른 채 텍스트로만 넘긴다.
-    let challenge = random()?;
-    outbox.send_mux(
-        MUX_TEXT,
-        conn_id,
-        &serde_json::to_vec(&serde_json::json!({"version":2,"challenge":hex(&challenge)}))
-            .map_err(io::Error::other)?,
-    )?;
+    let greeting = serde_json::json!({"version": 2, "challenge": hex(&challenge)});
+    outbox.send_mux(MUX_TEXT, conn_id, greeting.to_string().as_bytes())?;
     let (opcode, body) = recv_client_frame(rx, TIMEOUT)?;
     if opcode != ws::TEXT || body.len() > 4096 {
         return Err(invalid());

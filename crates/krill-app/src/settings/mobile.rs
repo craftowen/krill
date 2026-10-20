@@ -64,7 +64,7 @@ impl Default for Panel {
 impl Panel {
     pub fn new(call: Call) -> Self {
         Self {
-            mode: ConnectMode::Lan,
+            mode: ConnectMode::Tunnel,
             address: None,
             offer: None,
             copied_url: None,
@@ -104,7 +104,11 @@ impl Panel {
                 interfaces,
                 ..
             } => {
-                self.mode = mode;
+                self.mode = if mode == ConnectMode::Lan {
+                    ConnectMode::Tunnel
+                } else {
+                    mode
+                };
                 if self.copied_url.as_deref() != Some(url.as_str()) {
                     self.copied_url = None;
                 }
@@ -125,7 +129,11 @@ impl Panel {
                 self.interfaces = interfaces;
             }
             MobileReply::GatewayStatus { mode, devices, .. } => {
-                self.mode = mode;
+                self.mode = if mode == ConnectMode::Lan {
+                    ConnectMode::Tunnel
+                } else {
+                    mode
+                };
                 self.devices = devices;
             }
             MobileReply::Devices(devices) => {
@@ -147,6 +155,7 @@ impl SettingsView {
             MobileRequest::MintPairingTicket { .. }
                 | MobileRequest::SetConnectMode { .. }
                 | MobileRequest::RevokeDevice { all: true, .. }
+                | MobileRequest::CancelPairingTicket
         ) {
             self.mobile.offer = None;
             self.mobile.copied_url = None;
@@ -199,6 +208,7 @@ impl SettingsView {
             return;
         }
         self.mobile.generation = self.mobile.generation.wrapping_add(1);
+        let generation = self.mobile.generation;
         self.mobile.pending = true;
         self.mobile.error = None;
         let call = Arc::clone(&self.mobile.call);
@@ -219,6 +229,9 @@ impl SettingsView {
                 })
                 .await;
             this.update(cx, |this, cx| {
+                if this.mobile.generation != generation {
+                    return;
+                }
                 this.mobile.pending = false;
                 match got.0 {
                     Ok(reply) => this.mobile.accept(reply),
@@ -339,14 +352,6 @@ impl SettingsView {
 
         let mode_options = [
             (
-                ConnectMode::Lan,
-                "mobile-lan",
-                text::LAN.get(),
-                text::LAN_DESC
-                    .mac_or(crate::i18n::catalog::other_os::LAN_DESC)
-                    .get(),
-            ),
-            (
                 ConnectMode::Tunnel,
                 "mobile-tunnel",
                 text::TUNNEL.get(),
@@ -411,9 +416,11 @@ impl SettingsView {
                 .child(layout::label(p, title, Some(desc)));
             mode_card = mode_card.child(option_row);
         }
-        root = root.child(mode_card);
+        root = root
+            .child(mode_card)
+            .child(layout::label(p, text::MODE_IMMEDIATE.get(), None));
 
-        if !self.mobile.interfaces.is_empty() && self.mobile.mode != ConnectMode::Tunnel {
+        if !self.mobile.interfaces.is_empty() && self.mobile.mode == ConnectMode::Tailscale {
             let mut interfaces = layout::card(p).flex().flex_wrap().gap_1p5();
             let auto_selected = self.mobile.address.is_none();
             interfaces = interfaces.child(
@@ -424,7 +431,18 @@ impl SettingsView {
                         cx.listener(|this, _, _, cx| this.mobile_pair(this.mobile.mode, None, cx)),
                     ),
             );
-            for (index, interface) in self.mobile.interfaces.iter().enumerate() {
+            for (index, interface) in
+                self.mobile
+                    .interfaces
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, interface)| {
+                        interface
+                            .address
+                            .parse::<std::net::Ipv4Addr>()
+                            .is_ok_and(|ip| (u32::from(ip) & 0xffc0_0000) == 0x6440_0000)
+                    })
+            {
                 let address = format!("{}:0", interface.address);
                 let selected = self.mobile.address.as_deref() == Some(address.as_str());
                 let label = format!("{} ({})", interface.name, interface.address);
@@ -489,6 +507,16 @@ impl SettingsView {
                     ),
             );
         root = root.child(pair_actions);
+        if self.mobile.offer.is_some() || self.mobile.pairing_pending() {
+            root = root.child(
+                layout::secondary("mobile-cancel-qr", text::CANCEL_QR.get())
+                    .disabled(self.mobile.pending)
+                    .debug_selector(|| "mobile-cancel-qr".into())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.mobile_action(MobileRequest::CancelPairingTicket, cx);
+                    })),
+            );
+        }
 
         if let Some((url, expires, qr)) = &self.mobile.offer {
             let seconds = expires.saturating_sub(krill_proto::mobile::client::now_ms()) / 1000;
@@ -737,7 +765,7 @@ impl SettingsView {
 /// 접속 기록이 없으면 `NEVER`, 경과는 분/시간/일 단위로 표기한다(OWE-880).
 fn device_line(device: &PairedMobileDevice, connected: bool, now: u64) -> String {
     format!(
-        "{} {} · {}: {} · {}: {}",
+        "{} {} · {}: {} · {}: {} · ID: {}",
         if connected { "●" } else { "○" },
         if connected {
             text::CONNECTED.get()
@@ -751,7 +779,8 @@ fn device_line(device: &PairedMobileDevice, connected: bool, now: u64) -> String
             text::NEVER.get().to_owned()
         } else {
             ago(now, device.last_seen_ms)
-        }
+        },
+        device.key_fingerprint.chars().take(12).collect::<String>()
     )
 }
 

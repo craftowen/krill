@@ -46,6 +46,7 @@ use crate::shell::{Launch, Shell};
 use crate::status::{self, Statuses};
 use crate::store::{Limits, Store};
 
+mod account_switch;
 mod agent_history;
 mod hibernation;
 mod schedule;
@@ -142,6 +143,13 @@ pub struct Registry {
     upgrading: Mutex<bool>,
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
+    account_work: (
+        Mutex<BTreeMap<krill_proto::usage::ProviderKind, String>>,
+        std::sync::Condvar,
+    ),
+    account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
+    account_recovered: std::sync::atomic::AtomicBool,
+    account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
     /// main에 프로세스 종료를 알린다(업그레이드 답을 보낸 뒤).
     exit: OnceLock<Sender<()>>,
     /// 디스크 사용량을 잴 상태 디렉터리(MK-071).
@@ -166,6 +174,14 @@ impl Registry {
     /// 다시 넘긴 세션은 바로 다시 띄운다. 기록을 열지 못해도 세션은 띄운다(그 세션만 디스크 기록이 없다).
     pub fn new(holder: Option<(Holder, Vec<Kept>)>, dir: Option<&Path>) -> Self {
         let started = Instant::now();
+        if !cfg!(test)
+            && let Err(error) = crate::usage::accounts::codex_home::migrate(
+                &crate::usage::accounts::default_home(),
+                dir,
+            )
+        {
+            tracing::warn!(kind = ?error.kind(), "Codex account home migration failed");
+        }
         let at = |name: &str| dir.map_or_else(PathBuf::new, |d| d.join(name));
         // 기록 저장소를 열지 못해도 세션은 띄운다. 조용히 넘기지 않고 경고를 남겨 `krill doctor`가 보인다.
         let store = dir.and_then(|d| match Store::open(d, Limits::default()) {
@@ -190,6 +206,10 @@ impl Registry {
             git_watch: Mutex::default(),
             upgrading: Mutex::new(false),
             resuming: Mutex::default(),
+            account_work: (Mutex::default(), std::sync::Condvar::new()),
+            account_handoffs: Mutex::new(account_switch::load(dir)),
+            account_recovered: std::sync::atomic::AtomicBool::new(false),
+            account_replacements: Mutex::default(),
             exit: OnceLock::new(),
             dir: dir.map(Path::to_path_buf),
             mobile: OnceLock::new(),
@@ -601,7 +621,7 @@ impl Registry {
             let req = UsageRequest::decode(k, &body)?;
             let required = req.required_features();
             let reply = if n.features & required == required {
-                self.on_usage(&peer, role, req)
+                self.on_usage_negotiated(&peer, role, req, n.features)
             } else {
                 krill_proto::usage::UsageReply::Failed(Failure::BadRequest)
             }
@@ -686,6 +706,11 @@ impl Registry {
                 )) if n.features & krill_proto::agent_history::FEAT_AI_VAULT == 0 => {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::AgentHistory(krill_proto::agent_history::Action::ChatPoll {
+                    ..
+                })) if n.features & krill_proto::agent_history::FEAT_CHAT_POLL == 0 => {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(
                     Request::Create(ref c)
                     | Request::Resume { create: ref c, .. }
@@ -709,11 +734,22 @@ impl Registry {
                 {
                     Reply::Failed(Failure::BadRequest)
                 }
+                Ok(Request::Orchestration(
+                    krill_proto::orchestration::OrchAction::RetainWorker { .. },
+                )) if n.features & krill_proto::orchestration::FEAT_ORCH_RETAIN == 0 => {
+                    Reply::Failed(Failure::BadRequest)
+                }
                 Ok(req) if role == Role::Observer && !read_only(&req) => {
                     Reply::Failed(Failure::Denied)
                 }
                 Ok(req) => self.handle_as(&peer, &client.name, req, &mut clients),
                 Err(_) => Reply::Failed(Failure::BadRequest),
+            };
+            let reply = match reply {
+                Reply::Orchestration(response) => {
+                    Reply::Orchestration(response.for_features(n.features))
+                }
+                reply => reply,
             };
             let sent = s.write_all(&reply.encode()?);
             if reply == Reply::Upgrade(control::Upgraded::Started)
@@ -1695,7 +1731,7 @@ impl Registry {
         }
         // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다(다음 실행부터 적용).
         // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
-        // 평가는 공개 API만 써서 기존 정책을 그대로 따른다. 실행 중 세션의 env는 바꾸지 않는다.
+        // 자동 정책은 다음 실행의 계정을 고른다. 실행 중 재개는 명시적인 사용자 전환에서만 한다.
         // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
         // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
         if (status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload))
@@ -1823,11 +1859,22 @@ impl Registry {
         self.clear_sleeping(id);
     }
 
+    #[cfg(all(test, unix))]
     fn on_usage(
         &self,
         peer: &Peer,
         role: Role,
         req: krill_proto::usage::UsageRequest,
+    ) -> krill_proto::usage::UsageReply {
+        self.on_usage_negotiated(peer, role, req, ipc::FEATURES)
+    }
+
+    fn on_usage_negotiated(
+        &self,
+        peer: &Peer,
+        role: Role,
+        req: krill_proto::usage::UsageRequest,
+        features: u64,
     ) -> krill_proto::usage::UsageReply {
         use crate::usage::accounts;
         use krill_proto::usage::{UsageReply, UsageRequest};
@@ -1845,7 +1892,35 @@ impl Registry {
         let home = accounts::default_home();
         let state = self.state_dir();
         let state_ref = state.as_deref();
-        match req {
+        let mut reply = match req {
+            UsageRequest::ImportOrcaAntigravity {
+                source_dir,
+                dry_run,
+            } => {
+                match accounts::orca_vault::import(
+                    &home,
+                    state_ref,
+                    Path::new(&source_dir),
+                    dry_run,
+                ) {
+                    Ok(snap) => {
+                        if !dry_run
+                            && features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0
+                            && let Some(active) = snap.accounts.iter().find(|a| {
+                                a.provider == krill_proto::usage::ProviderKind::Antigravity
+                                    && a.active
+                            })
+                        {
+                            self.queue_account_switch(active.provider, &active.id);
+                        }
+                        UsageReply::Accounts(snap)
+                    }
+                    Err(e) => {
+                        tracing::warn!(kind = ?e.kind(), "Orca account vault import failed");
+                        UsageReply::Failed(os(&e))
+                    }
+                }
+            }
             UsageRequest::SetProvisioning(enabled) => {
                 match accounts::set_provisioning(&home, state_ref, enabled) {
                     Ok(enabled) => UsageReply::Provisioning(enabled),
@@ -1876,7 +1951,12 @@ impl Registry {
                 provider,
                 account_id,
             } => match accounts::switch_account(&home, state_ref, provider, &account_id) {
-                Ok(snap) => UsageReply::Accounts(snap),
+                Ok(snap) => {
+                    if features & krill_proto::usage::FEAT_PROVIDER_DETAILS != 0 {
+                        self.queue_account_switch(provider, &account_id);
+                    }
+                    UsageReply::Accounts(snap)
+                }
                 Err(e) => UsageReply::Failed(os(&e)),
             },
             UsageRequest::AddAccount {
@@ -1962,7 +2042,11 @@ impl Registry {
                     Err(e) => UsageReply::Failed(os(&e)),
                 }
             }
+        };
+        if let UsageReply::Accounts(snap) = &mut reply {
+            self.account_switch_snapshot(snap);
         }
+        reply
     }
 
     /// 레지스트리에 남은 세션(실행·휴면·종료 표시 포함)이 실행에 쓴 계정 프로필 폴더(OWE-704).

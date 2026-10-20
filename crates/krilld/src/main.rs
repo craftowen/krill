@@ -206,10 +206,17 @@ fn main() -> ExitCode {
             .name("usage-tick".to_owned())
             .spawn(move || {
                 let mut seen = None;
+                let mut quota_tick = std::time::Instant::now();
                 loop {
-                    thread::sleep(krilld::registry::usage_tick::TICK);
+                    r.wait_account_work(
+                        krilld::registry::usage_tick::TICK.saturating_sub(quota_tick.elapsed()),
+                    );
                     if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        r.tick_accounts(&mut seen);
+                        if quota_tick.elapsed() >= krilld::registry::usage_tick::TICK {
+                            r.tick_accounts(&mut seen);
+                            quota_tick = std::time::Instant::now();
+                        }
+                        r.process_account_work();
                     }))
                     .is_err()
                     {

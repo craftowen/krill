@@ -7,11 +7,15 @@ fn browser_login_accepts_only_https_provider_authorize_hosts() {
     for (provider, url) in [
         (
             ProviderKind::Claude,
-            "https://claude.ai/oauth/authorize?code=abc",
+            "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
         ),
         (
             ProviderKind::Claude,
-            "https://console.anthropic.com/oauth/authorize",
+            "https://console.anthropic.com/oauth/authorize?redirect_uri=http%3A%2F%2F127.0.0.1%3A5000%2Fcallback",
+        ),
+        (
+            ProviderKind::Claude,
+            "https://claude.com/cai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
         ),
         (ProviderKind::Codex, "https://auth.openai.com/authorize"),
         (ProviderKind::Codex, "https://chatgpt.com/auth"),
@@ -23,11 +27,14 @@ fn browser_login_accepts_only_https_provider_authorize_hosts() {
         assert_eq!(authorize_url(provider, url), Some(url));
     }
     for url in [
-        "http://claude.ai/oauth/authorize",
-        "https://claude.ai.evil.test/",
-        "https://evil.test/",
-        "https://user@claude.ai/",
-        "https://claude.ai:8443/",
+        "http://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
+        "https://claude.ai.evil.test/?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
+        "https://evil.test/?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
+        "https://user@claude.ai/?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
+        "https://claude.ai:8443/?redirect_uri=http%3A%2F%2Flocalhost%3A5000%2Fcallback",
+        "https://claude.ai/oauth/authorize?code=abc",
+        "https://claude.ai/oauth/authorize?redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback",
+        "https://claude.ai/oauth/authorize?redirect_uri=http%3A%2F%2Fevil.test%3A5000%2Fcallback",
     ] {
         assert_eq!(authorize_url(ProviderKind::Claude, url), None);
     }
@@ -199,5 +206,54 @@ fn failed_relogin_preserves_existing_profile_without_ipc() {
             .join(".claude.json")
             .is_file()
     );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agy_terminal_login_preserves_literal_profile_and_never_uses_login_subcommand() {
+    use krill_proto::usage::AccountInfo;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("krill-agy-command-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let exe = root.join("agy");
+    std::fs::write(&exe, "#!/bin/sh\n[ \"$SSH_CONNECTION\" = krill ] && [ \"$#\" = 1 ] && [ \"$1\" = \"--gemini_dir=$EXPECTED_PROFILE/.gemini\" ]\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut account = AccountInfo {
+        usage: krill_proto::usage::Snapshot::default(),
+        id: "agy-fixture".into(),
+        provider: ProviderKind::Antigravity,
+        label: "Work".into(),
+        email: None,
+        profile_dir: root.join("profile ' ; $literal").display().to_string(),
+        active: false,
+        host_default: false,
+        stale: false,
+    };
+    let command = super::terminal_login_command(&account);
+    assert!(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", &command])
+            .env(
+                "PATH",
+                std::env::join_paths([root.as_path(), Path::new("/usr/bin"), Path::new("/bin")])
+                    .unwrap()
+            )
+            .env("EXPECTED_PROFILE", &account.profile_dir)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let paths = krill_proto::daemon::Paths {
+        socket: root.join("unused.sock"),
+        holder: root.join("unused-holder"),
+        krilld: root.join("unused-krilld"),
+    };
+    assert!(
+        super::start_login(&paths, &account, true).is_err(),
+        "interactive agy must not run behind hidden pipes"
+    );
+    account.host_default = true;
+    assert_eq!(super::terminal_login_command(&account), "agy");
     std::fs::remove_dir_all(root).unwrap();
 }

@@ -70,6 +70,7 @@ pub const FEATURES: u64 = crate::screen::FEAT_SCREEN
     | crate::control::FEAT_WORKTREE_PREPARE
     | crate::agent_history::FEAT_AGENT_HISTORY
     | crate::agent_history::FEAT_AI_VAULT
+    | crate::agent_history::FEAT_CHAT_POLL
     | crate::control::FEAT_GIT_EDIT
     | crate::usage::FEAT_USAGE
     | crate::usage::FEAT_USAGE_AGY
@@ -78,14 +79,16 @@ pub const FEATURES: u64 = crate::screen::FEAT_SCREEN
     | crate::usage::FEAT_USAGE_RATELIMIT
     | crate::usage::FEAT_USAGE_MANAGE
     | crate::usage::FEAT_ACCOUNT_CONNECTION
+    | crate::usage::FEAT_PROVIDER_DETAILS
     | crate::usage::FEAT_ACCOUNT_POLICY
     | crate::history::FEAT_HISTORY_PAUSE
     | crate::control::FEAT_SESSION_ACCOUNT
     | crate::control::FEAT_SESSION_FORK
     | crate::control::FEAT_CLEAR_SCROLLBACK
-    | crate::mobile::FEAT_MOBILE;
+    | crate::mobile::FEAT_MOBILE
+    | crate::orchestration::FEAT_ORCH_RETAIN;
 // 기능 비트는 서로 겹치면 안 된다(2026-10-15 번호 충돌 사고 방지). 비트가 모두 다르면 합의 1 비트 수가 항목 수와 같다.
-const _: () = assert!(FEATURES.count_ones() == 44);
+const _: () = assert!(FEATURES.count_ones() == 47);
 /// 프레임 최대 길이(`len` 값 기준).
 pub const MAX_FRAME: usize = 1 << 20;
 /// [`ClientHello::name`] 최대 바이트.

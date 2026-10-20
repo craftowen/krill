@@ -147,6 +147,98 @@ fn input_goes_through_journal_and_ack() {
     assert_eq!(notice.bytes, b"observer");
 }
 
+#[test]
+fn account_handoff_holds_typing_for_the_selected_account_without_replaying_inflight_input() {
+    let now = Now::get();
+    let mut p = linked();
+    p.input(b"already sent\r", now);
+    sent(out(&mut p));
+    p.pause_account_input();
+    p.input(b"use new account\r", now);
+    assert!(
+        sent(out(&mut p)).is_empty(),
+        "old credentials must not receive new prompts"
+    );
+    assert!(
+        p.link(SessionId(1), 9, Vec::new(), input::FEAT_INPUT, now)
+            .is_empty()
+    );
+    assert!(
+        sent(out(&mut p)).is_empty(),
+        "a reconnect must not release held prompts to the original account"
+    );
+    let uncertain = p.handoff_account(SessionId(2)).unwrap();
+    assert_eq!(uncertain.fate, Fate::Uncertain);
+    assert_eq!(uncertain.bytes, b"already sent\r");
+    assert!(
+        p.link(SessionId(2), 9, Vec::new(), input::FEAT_INPUT, now)
+            .is_empty()
+    );
+    let frames = sent(out(&mut p));
+    let bytes: Vec<_> = frames
+        .iter()
+        .filter(|(kind, _)| *kind == input::kind::INPUT)
+        .flat_map(|(kind, body)| Input::decode(*kind, body).unwrap().bytes)
+        .collect();
+    assert_eq!(bytes, b"use new account\r");
+    assert!(
+        p.keep_account_input(),
+        "hidden tabs retain their writer until input acknowledgement"
+    );
+    let last = frames
+        .iter()
+        .filter(|(kind, _)| *kind == input::kind::INPUT)
+        .map(|(kind, body)| Input::decode(*kind, body).unwrap().id)
+        .next_back()
+        .unwrap();
+    feed(
+        &mut p,
+        &InputAck {
+            id: last,
+            result: InputResult::Applied,
+        }
+        .encode()
+        .unwrap(),
+    );
+    assert!(!p.keep_account_input());
+
+    for failed in [false, true] {
+        let mut p = linked();
+        p.pause_account_input();
+        p.input(b"held prompt\r", now);
+        let notices = p.resume_account_input(failed, now);
+        let frames = sent(out(&mut p));
+        if failed {
+            assert!(frames.is_empty());
+            assert!(notices.is_empty());
+            assert!(p.account_switching());
+            assert_eq!(
+                p.journal.held_bytes(),
+                b"held prompt\r".len(),
+                "retain complete input until retry rather than only a notice preview"
+            );
+            p.link(SessionId(1), 9, Vec::new(), input::FEAT_INPUT, now);
+            assert!(
+                sent(out(&mut p)).is_empty(),
+                "failure stays paused on reconnect"
+            );
+            p.handoff_account(SessionId(2));
+            p.link(SessionId(2), 10, Vec::new(), input::FEAT_INPUT, now);
+            let frames = sent(out(&mut p));
+            assert_eq!(
+                Input::decode(frames[0].0, &frames[0].1).unwrap().bytes,
+                b"held prompt\r"
+            );
+        } else {
+            assert!(notices.is_empty());
+            assert_eq!(
+                Input::decode(frames[0].0, &frames[0].1).unwrap().bytes,
+                b"held prompt\r"
+            );
+        }
+    }
+}
+
 /// krilld 대신 히스토리 요청에 답한다: 핫 `hot`행(아래부터 "h0", "h1"…), 콜드 페이지는 `pages[i]`(위부터).
 fn answer(p: &mut Pane<Vec<u8>>, hot: usize, pages: &[Vec<String>]) {
     for _ in 0..20 {

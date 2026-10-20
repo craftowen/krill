@@ -16,6 +16,8 @@
 //! - **새 셸 incarnation에는 보내지 않는다**: 보류 입력은 친 세션에만 간다. 다시 붙은 세션이 다르면(세션이 사라졌거나
 //!   칸이 새 셸로 바뀜) [`Fate::NewSession`]으로 버린다. krilld는 새 프로세스에 이전 [`crate::SessionId`]를 다시 쓰지
 //!   않는다(세션 id = 셸 incarnation).
+//!   명시적 계정 전환은 UI가 같은 대화의 새 계정 세션을 확인한 뒤, 전환 대기 중의 **미전송** 입력만
+//!   승계할 수 있다. 이미 전송해 적용 여부를 모르는 입력은 이 경우에도 재전송하지 않는다.
 //! - 연결 정체성은 krilld 세대(`instance_id`)가 아니라 세션이다. krilld가 재기동해도 holder가 PTY를 들고 있어
 //!   세션은 같다(perf-first #5).
 //!
@@ -180,6 +182,15 @@ impl Journal {
     /// 보류 중인 바이트 수(배너 표시용).
     pub fn held_bytes(&self) -> usize {
         self.held_bytes
+    }
+
+    pub fn has_pending_input(&self) -> bool {
+        self.held_bytes > 0 || !self.sent.is_empty()
+    }
+
+    /// Hold new input while an account replacement starts; existing acknowledgements still apply.
+    pub fn pause(&mut self) {
+        self.linked = false;
     }
 
     /// 사용자 입력. 붙어 있으면 지금 보낼 프레임들([`MAX_INPUT`]씩 나눔)을, 끊겨 있으면 보류하고 빈 목록을 준다.

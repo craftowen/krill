@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn account_handoff_rebinds_background_tabs_without_touching_remote_sessions() {
+    let mut layout = Layout::default();
+    layout.set_session(PaneId(0), SessionId(7));
+    layout.new_tab();
+    layout.set_session(PaneId(1), SessionId(7));
+    layout.new_tab();
+    layout.set_session(PaneId(2), SessionId(7));
+    layout.set_host(PaneId(2), HostId::Remote("ssh".into()));
+    assert_eq!(
+        layout.rebind_session(&HostId::Local, SessionId(7), SessionId(9)),
+        [PaneId(0), PaneId(1)]
+    );
+    assert_eq!(layout.session(PaneId(0)), Some(SessionId(9)));
+    assert_eq!(layout.session(PaneId(1)), Some(SessionId(9)));
+    assert_eq!(layout.session(PaneId(2)), Some(SessionId(7)));
+    assert!(
+        layout
+            .rebind_session(&HostId::Local, SessionId(7), SessionId(9))
+            .is_empty()
+    );
+}
+
 fn temp_path(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("mk-layout-{}-{name}", std::process::id()));
     fs::remove_dir_all(&dir).ok();

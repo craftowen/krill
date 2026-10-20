@@ -1,4 +1,43 @@
 use super::*;
+
+#[test]
+fn provider_details_tail_preserves_the_prior_wire_prefix() {
+    let snapshot = AccountsSnapshot {
+        details: Box::new(ProviderDetails {
+            supported: true,
+            accounts: vec![],
+            handoffs: vec![],
+        }),
+        ..AccountsSnapshot::default()
+    };
+    let reply = UsageReply::Accounts(snapshot);
+    let frame = reply.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(
+        body,
+        [
+            2, 0, 0, 90, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0
+        ]
+    );
+    assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
+    assert_eq!(
+        reply.for_features(FEAT_USAGE),
+        UsageReply::Accounts(AccountsSnapshot::default())
+    );
+    let request = UsageRequest::ImportOrcaAntigravity {
+        source_dir: "o".into(),
+        dry_run: true,
+    };
+    let frame = request.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    assert_eq!(body, [16, 1, b'o', 1]);
+    assert_eq!(UsageRequest::decode(kind, &body).unwrap(), request);
+    assert!(request.is_read());
+    assert_eq!(
+        request.required_features(),
+        FEAT_USAGE | FEAT_USAGE_AGY | FEAT_PROVIDER_DETAILS
+    );
+}
 use crate::{control::Failure, ipc};
 
 proptest::proptest! {
@@ -122,6 +161,7 @@ fn multi_account_messages_roundtrip() {
         statuses: Vec::new(),
         advanced: AccountPolicyState::default(),
         connections: Box::default(),
+        details: Box::default(),
     };
     let reply = UsageReply::Accounts(snap);
     let encoded = reply.encode().unwrap();
@@ -170,7 +210,10 @@ fn legacy_auto_switch_and_accounts_bytes_remain_bidirectionally_compatible() {
         Accounts(OldAccounts),
     }
 
-    let policy = AutoSwitchPolicy::default();
+    let policy = AutoSwitchPolicy {
+        enabled: true,
+        ..AutoSwitchPolicy::default()
+    };
     let old_request = [5, 1, 90, 1];
     assert_eq!(
         UsageRequest::decode(kind::USAGE_REQ, &old_request).unwrap(),
@@ -231,6 +274,7 @@ fn legacy_auto_switch_and_accounts_bytes_remain_bidirectionally_compatible() {
         statuses: Vec::new(),
         advanced: AccountPolicyState::default(),
         connections: Box::default(),
+        details: Box::default(),
     });
     let encoded = reply.encode().unwrap();
     let (kind, body) = ipc::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
@@ -268,6 +312,7 @@ fn usage_extensions_are_filtered_and_requests_require_negotiation() {
     let reply = UsageReply::Accounts(AccountsSnapshot {
         accounts: vec![account],
         auto_switch: AutoSwitchPolicy {
+            enabled: true,
             rules: vec![AutoSwitchRule {
                 provider: ProviderKind::Antigravity,
                 ..rule()
@@ -285,6 +330,7 @@ fn usage_extensions_are_filtered_and_requests_require_negotiation() {
         statuses: Vec::new(),
         advanced: AccountPolicyState::default(),
         connections: Box::default(),
+        details: Box::default(),
     });
     let legacy = reply.clone().for_features(FEAT_USAGE);
     let frame = legacy.encode().unwrap();
@@ -413,6 +459,7 @@ fn account_status_tail_is_n1_bidirectionally_compatible() {
         switched: Vec::new(),
         advanced: AccountPolicyState::default(),
         connections: Box::default(),
+        details: Box::default(),
         statuses: vec![
             AccountStatusInfo {
                 account_id: "claude-work".into(),
@@ -435,7 +482,7 @@ fn account_status_tail_is_n1_bidirectionally_compatible() {
         panic!("old reply");
     };
     assert_eq!(old.accounts, vec![status_account()]);
-    assert!(old.auto_switch.enabled);
+    assert!(!old.auto_switch.enabled);
 
     // rules 인식 구버전 디코더는 새 꼬리(튜플)의 첫 목록만 읽는다.
     let ruled = UsageReply::Accounts(AccountsSnapshot {
@@ -488,6 +535,10 @@ fn account_status_tail_is_n1_bidirectionally_compatible() {
 
     // 규칙도 상태도 없으면 구버전 바이트와 같은 몸통이다.
     let bare = UsageReply::Accounts(AccountsSnapshot {
+        auto_switch: AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        },
         statuses: vec![AccountStatusInfo {
             account_id: "a".into(),
             status: AccountStatus::Ok,
@@ -783,7 +834,10 @@ fn rule_requests_append_variant_tags_and_roundtrip() {
         &[5, 0, 0, 0, 0x41, 4, 0, 1, b'a'],
     );
     fixture(
-        &UsageRequest::SetAutoSwitch(AutoSwitchPolicy::default()),
+        &UsageRequest::SetAutoSwitch(AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        }),
         &[5, 0, 0, 0, 0x41, 5, 1, 90, 1],
     );
     fixture(
@@ -936,6 +990,10 @@ fn advanced_policy_tail_is_gated_and_legacy_prefix_is_unchanged() {
 fn connection_tail_negotiation_roundtrip_and_n_minus_one_prefix() {
     type Legacy = (u8, Vec<AccountInfo>, (bool, u8, bool), Vec<AutoSwitchEvent>);
     let snap = AccountsSnapshot {
+        auto_switch: AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        },
         connections: Box::new(ConnectionsSnapshot {
             supported: true,
             direct_usage: true,
@@ -1006,6 +1064,10 @@ fn connection_tail_has_frozen_bytes_and_prior_policy_decoder_can_skip_it() {
         Vec<AccountStatusInfo>,
     );
     let reply = UsageReply::Accounts(AccountsSnapshot {
+        auto_switch: AutoSwitchPolicy {
+            enabled: true,
+            ..AutoSwitchPolicy::default()
+        },
         connections: Box::new(ConnectionsSnapshot {
             supported: true,
             direct_usage: true,

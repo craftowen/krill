@@ -17,6 +17,8 @@ use std::time::UNIX_EPOCH;
 
 use krill_proto::time::parse_reset_epoch;
 
+pub(crate) mod meters;
+
 /// 경고 기준 사용률(상태바 80% 경고, MK-084 완료 조건).
 pub const WARN_PERCENT: u8 = 80;
 /// Claude 캐시 파일(`~/.claude` 안, 읽기 전용).

@@ -95,6 +95,10 @@ pub const SIDEBAR_HEADER_HEIGHT: Pixels = px(32.);
 pub const SIDEBAR_EMPTY_PY: Pixels = px(24.);
 /// 하단 상태 바 높이(Orca `h-6` = 24px).
 pub const STATUS_BAR_HEIGHT: Pixels = px(24.);
+/// Space reserved for status actions, refresh, gaps and window padding at 100% UI zoom.
+pub const STATUS_USAGE_CONTROLS_WIDTH: Pixels = px(480.);
+/// Budget per expanded provider, including both usage windows and reset countdowns.
+pub const STATUS_USAGE_PROVIDER_WIDTH: Pixels = px(280.);
 /// 사이드바 세션 행 높이(32px, `sidebar::ROW_HEIGHT` 정본).
 pub const SIDEBAR_ROW_HEIGHT: Pixels = px(32.);
 /// 우측 패널 파일·검색 행 높이(26px, `diff::explorer::ROW_HEIGHT` 정본).
@@ -138,9 +142,6 @@ pub const DASHBOARD_SIZE: gpui::Size<Pixels> = gpui::Size {
 pub const SIDEBAR_DEFAULT_WIDTH: f32 = 240.0;
 /// 오른쪽 패널 기본 폭(pt).
 pub const PANEL_DEFAULT_WIDTH: f32 = 280.0;
-/// MK-082 세션 히스토리 팝오버와 스크롤 목록.
-pub const AGENT_HISTORY_WIDTH: Pixels = px(520.);
-pub const AGENT_HISTORY_MAX_HEIGHT: Pixels = px(360.);
 /// 분할선 마우스 드래그 잡는 폭(pt). 시각적 선은 1pt로 그린다.
 pub const DIVIDER_HIT_PX: Pixels = px(5.);
 
@@ -630,6 +631,9 @@ pub fn apply(mode: ThemeMode, cx: &mut App) {
 pub fn sync(cx: &mut App) {
     apply(cx.theme().mode, cx);
 }
+
+pub const AGENT_HISTORY_WIDTH: Pixels = px(520.);
+pub const AGENT_HISTORY_MAX_HEIGHT: Pixels = px(360.);
 
 #[cfg(test)]
 mod tests {

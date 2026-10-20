@@ -136,7 +136,8 @@ fn icon(bytes: &'static [u8], size_px: f32, color: Hsla) -> Icon {
 
 /// 에이전트 아이콘. 에이전트를 모르는 셸 세션은 터미널 아이콘.
 pub fn agent_icon(agent: &str, size_px: f32, fg: Hsla) -> AnyElement {
-    if agent.is_empty() {
+    let agent = infer_agent_from_title(agent, "");
+    if is_shell_agent(agent) {
         Icon::new(IconName::SquareTerminal)
             .with_size(px(size_px))
             .text_color(fg)
@@ -149,12 +150,10 @@ pub fn agent_icon(agent: &str, size_px: f32, fg: Hsla) -> AnyElement {
 /// 에이전트가 없거나 셸 이름만 알려졌을 때 터미널 제목에서 에이전트 종류를 추론한다.
 #[must_use]
 pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
-    if !agent.is_empty()
-        && !matches!(
-            agent,
-            "sh" | "bash" | "zsh" | "fish" | "nu" | "pwsh" | "powershell" | "cmd"
-        )
-    {
+    if let Some(known) = known_agent(agent) {
+        return known;
+    }
+    if !is_shell_agent(agent) {
         return agent;
     }
     let lower = title.to_ascii_lowercase();
@@ -171,6 +170,53 @@ pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
     } else {
         agent
     }
+}
+
+/// Hooks identify the agent first; foreground process survives renamed session titles.
+#[must_use]
+pub fn infer_agent_from_status<'a>(
+    status: &'a krill_proto::control::AgentStatus,
+    title: &str,
+) -> &'a str {
+    if is_shell_agent(&status.agent)
+        && let Some(agent) = status.foreground.as_deref().and_then(known_agent)
+    {
+        return agent;
+    }
+    infer_agent_from_title(&status.agent, title)
+}
+
+fn is_shell_agent(agent: &str) -> bool {
+    agent.is_empty()
+        || [
+            "sh",
+            "bash",
+            "zsh",
+            "fish",
+            "nu",
+            "pwsh",
+            "powershell",
+            "cmd",
+            "shell",
+        ]
+        .iter()
+        .any(|shell| agent.eq_ignore_ascii_case(shell))
+}
+
+fn known_agent(agent: &str) -> Option<&'static str> {
+    let name = agent.rsplit(['/', '\\']).next().unwrap_or(agent);
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    [
+        ("claude", "claude"),
+        ("codex", "codex"),
+        ("agy", "agy"),
+        ("antigravity", "agy"),
+        ("opencode", "opencode"),
+        ("cursor", "cursor"),
+        ("cursor-agent", "cursor"),
+    ]
+    .into_iter()
+    .find_map(|(alias, id)| name.eq_ignore_ascii_case(alias).then_some(id))
 }
 
 /// 같은 상태의 세션 묶음.
@@ -486,6 +532,41 @@ pub fn cache_timer_chip(remaining_secs: u32, cx: &App) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_identity_survives_renaming_and_shell_hooks() {
+        use krill_proto::control::AgentStatus;
+        for (raw, expected) in [
+            ("Claude", "claude"),
+            ("/opt/bin/codex", "codex"),
+            ("C:\\bin\\opencode.exe", "opencode"),
+            ("Antigravity", "agy"),
+        ] {
+            assert_eq!(infer_agent_from_title(raw, "renamed task"), expected);
+        }
+        let mut status = AgentStatus {
+            agent: "zsh".into(),
+            foreground: Some("/opt/bin/codex".into()),
+            ..AgentStatus::UNKNOWN
+        };
+        assert_eq!(
+            infer_agent_from_status(&status, "custom task title"),
+            "codex"
+        );
+        status.agent = "claude".into();
+        assert_eq!(infer_agent_from_status(&status, "Codex task"), "claude");
+        status.agent.clear();
+        status.foreground = None;
+        assert_eq!(
+            infer_agent_from_status(&status, "OpenCode task"),
+            "opencode"
+        );
+        assert_eq!(
+            infer_agent_from_title("my-agent", "Claude task"),
+            "my-agent"
+        );
+        assert!(is_shell_agent("zsh"));
+    }
 
     #[test]
     fn state_maps_to_glyph() {

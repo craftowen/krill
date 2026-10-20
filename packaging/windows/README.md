@@ -65,6 +65,20 @@ VM 접속 폴더에는 `up.sh`·`ssh.sh`·`down.sh`·`ip`·`id_ed25519`·`known_
 
 ## 설치·업데이트·제거
 
+Windows 릴리스 ZIP과 `.sha256`이 공개된 뒤에는 PowerShell에서 한 줄로 설치한다.
+홈페이지는 배포 전까지 준비 중으로 표시한다.
+
+```powershell
+irm https://krill.page/install.ps1 | iex
+```
+
+인자 없이 실행하면 최신 릴리스의 x64 ZIP과 SHA-256을 내려받고 검증한 뒤 설치하며,
+시작 메뉴·사용자 PATH를 등록하고 앱을 연다. ARM64·32비트 Windows는 거부한다.
+`-Release v<버전>`으로 버전을 선택하고 `-NoOpen`으로 자동 실행을 생략할 수 있다.
+홈페이지 Worker는 이 디렉터리의 `install.ps1` 원본을 직접 번들한다.
+
+이미 받은 ZIP으로 설치하거나 업데이트하려면:
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File install.ps1 -Zip .\Krill-0.1.5-windows-x64.zip [-AddToPath]
 & "$env:LOCALAPPDATA\Programs\Krill\krill-app.exe" --update-cli [--check] [--json]
@@ -75,3 +89,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Zip .\Krill-0.1.5-windows-
   지울 수 없는 구 이미지(아직 도는 holder 등)는 `Krill.trash`로 옮겨 두고 다음 업데이트 때 지운다.
 - 제거: Krill 프로세스를 끝낸 뒤 `%LOCALAPPDATA%\Programs\Krill`(와 `.prev`·`.trash`), 시작 메뉴 `Krill.lnk`를 지운다.
   세션·설정까지 지우려면 `%LOCALAPPDATA%\Krill`도 지운다.
+
+설치기 회귀 검사: `pwsh -NoProfile -File packaging/windows/test_install.ps1`.
+임시 ZIP과 가짜 다운로드 응답으로 해시 검증·미배포·기존 설치 보존·설치를 검사한다.
+실제 Windows의 바로 가기·PATH 등록·앱 실행 검증은 별도다.

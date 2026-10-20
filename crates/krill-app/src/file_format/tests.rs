@@ -412,12 +412,12 @@ fn viewers_render(cx: &mut gpui::TestAppContext) {
     struct Host {
         image: Entity<view::ImageView>,
         csv: Entity<view::CsvView>,
-        notebook: ipynb::Notebook,
+        notebook: std::sync::Arc<view::NotebookPreview>,
     }
     impl Render for Host {
         fn render(
             &mut self,
-            _: &mut gpui::Window,
+            window: &mut gpui::Window,
             cx: &mut gpui::Context<Self>,
         ) -> impl IntoElement {
             div()
@@ -427,7 +427,7 @@ fn viewers_render(cx: &mut gpui::TestAppContext) {
                 .child(self.image.clone())
                 .child(self.csv.clone())
                 .child(view::markdown("md", "# 제목\n\n- 항목", cx))
-                .child(view::notebook("nb", &self.notebook, cx))
+                .child(view::notebook("nb", self.notebook.clone(), window, cx))
                 .child(view::placeholder(
                     Path::new("/tmp/a.pdf"),
                     Kind::Pdf,
@@ -455,7 +455,7 @@ fn viewers_render(cx: &mut gpui::TestAppContext) {
             )
         }),
         csv: cx.new(|_| view::CsvView::new(table)),
-        notebook,
+        notebook: std::sync::Arc::new(view::NotebookPreview::new(notebook)),
     });
     cx.run_until_parked();
     assert_eq!(
@@ -472,4 +472,38 @@ fn placeholder_size_label_uses_bytes_and_kb_below_one_mib() {
     assert_eq!(size_label(4096), "4 KB");
     assert_eq!(size_label(1025), "2 KB");
     assert_eq!(size_label(5 * 1024 * 1024), "5.0 MB");
+}
+
+#[gpui::test]
+fn notebook_virtualizes_many_cells_and_outputs(cx: &mut gpui::TestAppContext) {
+    use gpui::{IntoElement, Render};
+    struct Host(std::sync::Arc<view::NotebookPreview>);
+    impl Render for Host {
+        fn render(
+            &mut self,
+            window: &mut gpui::Window,
+            cx: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            view::notebook("many-notebook", self.0.clone(), window, cx)
+        }
+    }
+    let notebook = ipynb::Notebook {
+        cells: (0..50_000)
+            .map(|_| ipynb::Cell {
+                kind: ipynb::CellKind::Code,
+                source: "x".into(),
+                execution_count: None,
+                outputs: vec![ipynb::Output::Text("output".into())],
+            })
+            .collect(),
+    };
+    let preview = std::sync::Arc::new(view::NotebookPreview::new(notebook));
+    cx.update(gpui_component::init);
+    let (_view, cx) = cx.add_window_view(|_, _| Host(preview));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("notebook-row-0").is_some());
+    assert!(
+        cx.debug_bounds("notebook-row-99999").is_none(),
+        "offscreen cells and outputs are not constructed"
+    );
 }

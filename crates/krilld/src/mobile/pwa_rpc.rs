@@ -68,9 +68,22 @@ enum Action {
         since: Option<String>,
     },
     CreateTerminal {
-        cwd_session: u64,
+        #[serde(default)]
+        cwd_session: Option<u64>,
+        #[serde(default)]
+        workspace: Option<String>,
         #[serde(default)]
         agent: Option<String>,
+    },
+    CreateWorkspace {
+        repository: String,
+        name: String,
+        #[serde(default)]
+        base: Option<String>,
+        #[serde(default)]
+        setup_hash: Option<String>,
+        #[serde(default)]
+        skip_setup: bool,
     },
     CloseTerminal {
         session: u64,
@@ -78,7 +91,13 @@ enum Action {
     Prompt {
         session: u64,
         text: String,
+        #[serde(default)]
+        photo: Option<PreparedPhoto>,
     },
+    #[expect(
+        dead_code,
+        reason = "Legacy approval fields are decoded for compatibility but cannot authorize PTY input"
+    )]
     Approve {
         session: u64,
         value: String,
@@ -94,7 +113,14 @@ enum Action {
         session: u64,
         #[serde(default)]
         offset: u64,
+        /// Display-only replay boundary from a previously observed page; never approval authority.
+        #[serde(default)]
+        end_offset: Option<u64>,
     },
+    #[expect(
+        dead_code,
+        reason = "Legacy question fields are decoded for compatibility but cannot authorize PTY input"
+    )]
     AnswerQuestion {
         session: u64,
         #[serde(default)]
@@ -129,6 +155,44 @@ enum Action {
         path: Option<String>,
     },
 }
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreparedPhoto {
+    mime: String,
+    data: String,
+}
+
+fn chat_page_value(
+    snapshot: krill_proto::agent_history::ChatPollSnapshot,
+    offset: u64,
+) -> io::Result<Value> {
+    let identity = crate::agent_history::chat::generation(&snapshot);
+    let generation = hex(ring::digest::digest(&ring::digest::SHA256, identity.as_bytes()).as_ref());
+    let start = if snapshot.reset { 0 } else { offset };
+    let mut value = to_value(snapshot)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("generation".into(), generation.into());
+        object.insert("page_start".into(), start.into());
+        object.insert("reply_mode".into(), "review_in_term".into());
+        if let Some(items) = object.get_mut("items").and_then(Value::as_array_mut) {
+            // These are display IDs for an observed [start, next_offset) page. Historical
+            // replay must keep that byte end so later appends cannot change the partition.
+            for (index, item) in items.iter_mut().enumerate() {
+                if let Some(fields) = item.as_object_mut() {
+                    fields.insert("id".into(), format!("{start}:{index}").into());
+                }
+            }
+        }
+    }
+    Ok(value)
+}
+
+fn review_in_term() -> io::Error {
+    io::Error::other(
+        "This historical request cannot be verified against the current question. Confirm in Term.",
+    )
+}
+
 impl Backend {
     pub(super) fn new(registry: Weak<Registry>, dir: Option<&Path>, hello: ServerHello) -> Self {
         Self {
@@ -174,7 +238,11 @@ impl Backend {
                 }
                 Ok(data)
             }
-            Action::CreateTerminal { cwd_session, agent } => {
+            Action::CreateTerminal {
+                cwd_session,
+                workspace,
+                agent,
+            } => {
                 let program = match agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     None => Program::Login,
                     Some(id) if crate::agent::control::valid_session_id(id) => {
@@ -182,7 +250,18 @@ impl Backend {
                     }
                     Some(_) => return Err(invalid()),
                 };
-                let cwd = self.cwd(cwd_session)?;
+                let cwd = match (cwd_session, workspace) {
+                    (Some(session), None) => self.cwd(session)?,
+                    (None, Some(key)) => {
+                        let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
+                            return Err(invalid());
+                        };
+                        super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories)
+                            .cwd(&key)
+                            .ok_or_else(invalid)?
+                    }
+                    _ => return Err(invalid()),
+                };
                 match self.control(&Request::Create(Create {
                     program,
                     cwd: cwd.into_os_string().into_vec(),
@@ -191,6 +270,88 @@ impl Backend {
                     account: None,
                 }))? {
                     Reply::Created { session, .. } => Ok(json!({"session":session.0})),
+                    Reply::Failed(error) => Err(io::Error::other(error.to_string())),
+                    _ => Err(invalid()),
+                }
+            }
+            Action::CreateWorkspace {
+                repository,
+                name,
+                base,
+                setup_hash,
+                skip_setup,
+            } => {
+                let name = name.trim();
+                if name.is_empty()
+                    || name.len() > 256
+                    || name.chars().any(char::is_control)
+                    || base
+                        .as_ref()
+                        .is_some_and(|b| b.len() > 256 || b.chars().any(char::is_control))
+                    || skip_setup && setup_hash.is_some()
+                {
+                    return Err(invalid());
+                }
+                let Reply::Sidebar(sidebar) = self.control(&Request::Sidebar)? else {
+                    return Err(invalid());
+                };
+                let repo =
+                    super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories)
+                        .repository(&repository)
+                        .ok_or_else(invalid)?;
+                let setup = if skip_setup {
+                    control::Setup::Skip
+                } else if let Some(hash) = setup_hash {
+                    if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+                        return Err(invalid());
+                    }
+                    let bytes = hash
+                        .as_bytes()
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|pair| {
+                            std::str::from_utf8(pair)
+                                .map_err(|_| invalid())
+                                .and_then(|s| u8::from_str_radix(s, 16).map_err(|_| invalid()))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    control::Setup::Approve(bytes)
+                } else {
+                    control::Setup::Ask
+                };
+                match self.control(&Request::NewWorktree(control::NewWorktree {
+                    repo,
+                    name: name.to_owned(),
+                    base: base.filter(|b| !b.trim().is_empty()),
+                    setup,
+                }))? {
+                    Reply::SetupUntrusted { script, hash } => {
+                        Ok(json!({"needs_setup":true,"script":script,"hash":hex(&hash)}))
+                    }
+                    Reply::WorktreeCreated(mut tree) => {
+                        let session = match self.control(&Request::Create(Create {
+                            program: Program::Login,
+                            cwd: tree.path.clone(),
+                            cols: 80,
+                            rows: 24,
+                            account: None,
+                        })) {
+                            Ok(Reply::Created { session, .. }) => Some(session.0),
+                            other => {
+                                tree.warnings.push(format!(
+                                    "Workspace created; terminal unavailable: {other:?}"
+                                ));
+                                None
+                            }
+                        };
+                        let path = PathBuf::from(std::ffi::OsStr::from_bytes(&tree.path));
+                        let path = fs::canonicalize(&path).unwrap_or(path);
+                        Ok(json!({"workspace":hex(path.as_os_str().as_bytes()),
+                            "path":path.to_string_lossy(),"branch":tree.branch,"session":session,
+                            "setup_session":tree.setup.map(|s| s.0),"warnings":tree.warnings}))
+                    }
+                    Reply::WorktreeFailed(error) => Err(io::Error::other(error)),
                     Reply::Failed(error) => Err(io::Error::other(error.to_string())),
                     _ => Err(invalid()),
                 }
@@ -204,37 +365,41 @@ impl Backend {
                     _ => Err(invalid()),
                 }
             }
-            Action::Prompt { session, text } => {
+            Action::Prompt {
+                session,
+                text,
+                photo,
+            } => {
                 if text.len() >= krill_proto::input::MAX_INPUT {
                     return Err(invalid());
                 }
-                if text.is_empty() {
-                    self.input(session, b"\r".to_vec())?;
-                } else {
-                    let bracketed =
-                        self.session_bracketed_paste(session) || text.contains(['\n', '\r']);
-                    let payload = if bracketed {
-                        format_bracketed_paste(&text)
-                    } else {
-                        sanitize_plain_input(&text)
-                    };
-                    if payload.len() > krill_proto::input::MAX_INPUT {
-                        return Err(invalid());
-                    }
-                    self.input_paced(
-                        session,
-                        &[payload, b"\r".to_vec()],
-                        Duration::from_millis(60),
-                    )?;
+                // Prepare the image before sending anything, then submit image and text in order.
+                let path = photo
+                    .map(|photo| save_photo(&photo.mime, &photo.data))
+                    .transpose()?;
+                let combined = path.as_ref().map_or_else(
+                    || text.clone(),
+                    |path| {
+                        format!(
+                            "{} {}",
+                            krill_proto::agent::hooks::shell_quote(&path.to_string_lossy()),
+                            text
+                        )
+                    },
+                );
+                let result = self.send_prompt(session, &combined);
+                if result.is_err()
+                    && let Some(path) = path
+                {
+                    fs::remove_file(path).ok();
                 }
+                result?;
                 Ok(json!({"sent":true}))
             }
-            Action::Approve { session, value } => {
-                if value.is_empty() || value.len() > 128 || value.contains(['\r', '\n']) {
-                    return Err(invalid());
-                }
-                self.input(session, format!("{value}\r").into_bytes())?;
-                Ok(json!({"sent":true}))
+            Action::Approve { .. } => {
+                // Transcript IDs and visible text cannot atomically prove the current PTY question.
+                // Fail closed, including requests from older clients without a card identity.
+                Err(review_in_term())
             }
             Action::Photo {
                 session,
@@ -281,30 +446,21 @@ impl Backend {
                 }
                 Ok(json!({"attached":true,"path":path.to_string_lossy()}))
             }
-            Action::ChatPoll { session, offset } => {
-                let registry = self.registry.upgrade().ok_or_else(invalid)?;
-                to_value(registry.chat_poll(SessionId(session), offset))
-            }
-            Action::AnswerQuestion {
+            Action::ChatPoll {
                 session,
-                selected,
-                option_count,
-                multi_select,
-                custom_text,
+                offset,
+                end_offset,
             } => {
-                let (screen_text, bracketed) = self.session_screen_and_bracketed_paste(session);
-                let initial_cursor = detect_question_cursor_index(&screen_text, option_count);
-                let steps = plan_question_keystrokes_from(
-                    &selected,
-                    option_count,
-                    multi_select,
-                    custom_text.as_deref(),
-                    bracketed,
-                    initial_cursor,
-                )?;
-                self.input_paced(session, &steps, Duration::from_millis(60))?;
-                Ok(json!({"sent":true,"steps":steps.len()}))
+                let registry = self.registry.upgrade().ok_or_else(invalid)?;
+                let snapshot = registry.chat_poll(SessionId(session), offset);
+                let snapshot = if let Some(end) = end_offset {
+                    crate::agent_history::chat::replay_page(snapshot, offset, end)?
+                } else {
+                    snapshot
+                };
+                chat_page_value(snapshot, offset)
             }
+            Action::AnswerQuestion { .. } => Err(review_in_term()),
             Action::Accounts => to_value(self.accounts(&UsageRequest::ListAccounts)?),
             Action::SwitchAccount {
                 provider,
@@ -374,12 +530,24 @@ impl Backend {
             .upgrade()
             .is_some_and(|reg| reg.session_bracketed_paste(SessionId(session)))
     }
-    fn session_screen_and_bracketed_paste(&self, session: u64) -> (String, bool) {
-        self.registry
-            .upgrade()
-            .map_or((String::new(), false), |reg| {
-                reg.session_screen_and_bracketed_paste(SessionId(session))
-            })
+    fn send_prompt(&self, session: u64, text: &str) -> io::Result<()> {
+        if text.is_empty() {
+            return self.input(session, b"\r".to_vec());
+        }
+        let bracketed = self.session_bracketed_paste(session) || text.contains(['\n', '\r']);
+        let payload = if bracketed {
+            format_bracketed_paste(text)
+        } else {
+            sanitize_plain_input(text)
+        };
+        if payload.len() > krill_proto::input::MAX_INPUT {
+            return Err(invalid());
+        }
+        self.input_paced(
+            session,
+            &[payload, b"\r".to_vec()],
+            Duration::from_millis(60),
+        )
     }
     fn wire(&self) -> io::Result<Wire> {
         let registry = self.registry.upgrade().ok_or_else(invalid)?;
@@ -504,6 +672,7 @@ impl Backend {
                 repositories: Vec::new(),
             },
         };
+        let catalog = super::workspaces::Catalog::load(self.dir.as_deref(), &sidebar.repositories);
         let truncated = sessions.len() > 64;
         let rows: Vec<_> = sessions
             .into_iter()
@@ -514,7 +683,7 @@ impl Backend {
                     .iter()
                     .find(|s| s.session == info.session)
                     .map_or(&[][..], |s| s.cwd.as_slice());
-                let group = session_group(info.session, cwd, &sidebar.repositories);
+                let group = session_group(info.session, cwd, &catalog.repositories);
                 (info, cwd, group)
             })
             .collect();
@@ -523,7 +692,20 @@ impl Backend {
                 .filter_map(|(_, cwd, group)| git_cwd(cwd, group)),
         );
         let mut cards = Vec::new();
+        let mut workspace_titles = std::collections::BTreeMap::new();
+        let auto_titles = self
+            .dir
+            .as_deref()
+            .map(krill_proto::git::load_session_auto_titles)
+            .unwrap_or_default();
         for (info, cwd_bytes, group) in rows {
+            if let Some(title) = auto_titles.get(&info.session)
+                && let Some(path) = &group.path
+            {
+                workspace_titles
+                    .entry(PathBuf::from(path))
+                    .or_insert_with(|| title.clone());
+            }
             let state = states
                 .iter()
                 .find(|s| s.session == info.session)
@@ -538,6 +720,15 @@ impl Backend {
             } else {
                 state.agent.clone()
             };
+            let title = state
+                .title
+                .as_deref()
+                .filter(|title| {
+                    !krill_proto::git::is_default_branch_or_worktree_name(title)
+                        && !title.eq_ignore_ascii_case("claude code")
+                })
+                .or_else(|| auto_titles.get(&info.session).map(String::as_str))
+                .or(state.title.as_deref());
             let cwd = String::from_utf8_lossy(cwd_bytes);
             let text = match control(&Request::Capture {
                 session: info.session,
@@ -557,7 +748,7 @@ impl Backend {
             let git = git_cwd(cwd_bytes, &group)
                 .and_then(|path| git.get(&path))
                 .unwrap_or(&Value::Null);
-            cards.push(json!({"id":info.session.0,"state":state.state,"agent":agent,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
+            cards.push(json!({"id":info.session.0,"state":state.state,"agent":agent,"title":title,"foreground":state.foreground,"cwd":cwd,"lines":lines,"exited":info.status.is_some(),"branch":git.get("branch"),"added":git.get("added"),"deleted":git.get("deleted"),
                 "repo_key":group.repo_key,"worktree_key":group.worktree_key,
                 "group_label":group.label,"group_path":group.path,
                 "state_source":state.source,"state_confidence":state.confidence,
@@ -565,8 +756,8 @@ impl Backend {
         }
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
-            "repositories":repositories_json(&sidebar.repositories),"truncated":truncated,
-            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"hybrid_chat":true},
+            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles),"truncated":truncated,
+            "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true},
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
     }
@@ -650,15 +841,22 @@ impl Backend {
             .iter()
             .map(|file| String::from_utf8_lossy(&file.path).into_owned())
             .collect();
-        let patch = if let Some(path) = path {
-            if !files.iter().any(|p| p == path)
-                || Path::new(path)
-                    .components()
-                    .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        let patch = if let Some(raw_path) = path {
+            let rel_path = Path::new(raw_path)
+                .strip_prefix(&cwd)
+                .ok()
+                .and_then(|p| p.to_str())
+                .unwrap_or(raw_path);
+            if Path::new(rel_path)
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
             {
-                return Err(invalid());
+                return Ok(json!({"diff_status":"outside_scope","patch":"","files":files}));
             }
-            read_patch(&cwd, path)?
+            if !files.iter().any(|p| p == rel_path) {
+                return Ok(json!({"diff_status":"no_current_diff","patch":"","files":files}));
+            }
+            read_patch(&cwd, rel_path)?
         } else {
             String::new()
         };
@@ -738,12 +936,6 @@ fn path_label(bytes: &[u8]) -> String {
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
         .into_owned()
-}
-fn repositories_json(repositories: &[control::RepositoryTrees]) -> Vec<Value> {
-    repositories.iter().map(|repo| json!({
-        "key":hex(&repo.repo),"label":path_label(&repo.repo),"path":String::from_utf8_lossy(&repo.repo),
-        "worktree_keys":repo.worktrees.iter().map(|tree| hex(tree)).collect::<Vec<_>>()
-    })).collect()
 }
 fn host_metadata() -> Value {
     #[cfg(windows)]
@@ -957,6 +1149,7 @@ fn sanitize_plain_input(text: &str) -> Vec<u8> {
 
 /// 터미널 화면 텍스트에서 현재 선택 포인터(`❯`·`›`·`▸`·`>`)가 위치한 질문 옵션 인덱스(0-based)를 추정한다.
 /// 감지할 수 없으면 기본값 `0`을 반환한다.
+#[cfg(test)]
 fn detect_question_cursor_index(screen_text: &str, option_count: usize) -> usize {
     let max_idx = option_count.max(16);
     let tail: Vec<&str> = screen_text
@@ -999,6 +1192,7 @@ fn detect_question_cursor_index(screen_text: &str, option_count: usize) -> usize
     0
 }
 
+#[cfg(test)]
 fn step_cursor(steps: &mut Vec<Vec<u8>>, cursor: &mut usize, target: usize) {
     while *cursor < target {
         steps.push(b"\x1b[B".to_vec());
@@ -1030,6 +1224,7 @@ fn plan_question_keystrokes(
 
 /// 인터랙티브 질문 카드(`AskUserQuestion` 등)의 응답을 현재 TUI 커서 위치(`initial_cursor`) 기준
 /// 60ms 간격 키스트로크 시퀀스로 계획한다(OWE-946 / MK-243).
+#[cfg(test)]
 fn plan_question_keystrokes_from(
     selected: &[usize],
     option_count: usize,
@@ -1110,6 +1305,140 @@ mod tests {
     use super::*;
 
     #[test]
+    fn historical_approval_and_question_requests_fail_closed_before_input() {
+        let backend = test_backend();
+        // No Registry is present: these errors prove no attach or PTY write was attempted.
+        for request in [
+            r#"{"action":"approve","session":7,"value":"y"}"#,
+            r#"{"action":"approve","session":7,"value":"n"}"#,
+            r#"{"action":"answer_question","session":7,"selected":[0],"option_count":2}"#,
+            r#"{"action":"answer_question","session":7,"selected":[1],"option_count":2,"multi_select":true,"custom_text":"Other"}"#,
+        ] {
+            for _ in 0..2 {
+                let response: Value = serde_json::from_str(&backend.request(request)).unwrap();
+                assert_eq!(response["ok"], false);
+                assert!(
+                    response["error"]
+                        .as_str()
+                        .unwrap()
+                        .contains("Confirm in Term")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_accepts_one_prepared_photo_and_rejects_bad_preparation_before_input() {
+        assert!(
+            serde_json::from_str::<Action>(r#"{"action":"prompt","session":7,"text":"plain"}"#)
+                .is_ok()
+        );
+        let request = r#"{"action":"prompt","session":7,"text":"image then text","photo":{"mime":"image/jpeg","data":"Zg=="}}"#;
+        let Action::Prompt {
+            text,
+            photo: Some(photo),
+            ..
+        } = serde_json::from_str::<Action>(request).unwrap()
+        else {
+            panic!("prepared photo must survive JSON decoding");
+        };
+        assert_eq!(text, "image then text");
+        assert_eq!(photo.mime, "image/jpeg");
+        assert_eq!(photo.data, "Zg==");
+        let backend = test_backend();
+        for photo in [
+            json!({"mime":"text/html","data":"Zg=="}),
+            json!({"mime":"image/jpeg","data":"invalid"}),
+        ] {
+            let response: Value = serde_json::from_str(
+                &backend.request(
+                    &json!({"action":"prompt","session":7,"text":"keep draft","photo":photo})
+                        .to_string(),
+                ),
+            )
+            .unwrap();
+            assert_eq!(response["ok"], false);
+        }
+    }
+
+    #[test]
+    fn mobile_chat_small_append_pages_replay_with_original_display_ids() {
+        use crate::agent_history::chat::{poll_transcript_file, replay_page};
+        use krill_proto::agent_history::VaultAgent;
+        let dir = std::env::temp_dir().join(format!("mobile-replay-pages-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("history.jsonl");
+        let mut file = fs::File::create(&path).unwrap();
+        let mut offset = 0;
+        let mut observed = Vec::new();
+        for index in 0..300 {
+            let text = if index == 48 || index == 49 {
+                "same text".to_owned()
+            } else {
+                format!("message {index}")
+            };
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"user","message":{"role":"user","content":text}})
+            )
+            .unwrap();
+            let snapshot = poll_transcript_file(VaultAgent::Claude, "sid", &path, offset);
+            assert_eq!(snapshot.items.len(), 1);
+            let end = snapshot.next_offset;
+            observed.push((offset, end, chat_page_value(snapshot, offset).unwrap()));
+            offset = end;
+        }
+        for (start, end, original) in &observed {
+            // Reading after all appends would return up to 128 records; replay retains
+            // the original one-record partition and ID rather than comparing text.
+            let current = poll_transcript_file(VaultAgent::Claude, "sid", &path, *start);
+            let replay = replay_page(current, *start, *end).unwrap();
+            assert_eq!(chat_page_value(replay, *start).unwrap(), *original);
+        }
+        let a = observed.get(48).unwrap();
+        let b = observed.get(49).unwrap();
+        assert_eq!(a.2["items"][0]["text"], b.2["items"][0]["text"]);
+        assert_ne!(a.2["items"][0]["id"], b.2["items"][0]["id"]);
+        let action: Action = serde_json::from_value(json!({
+            "action":"chat_poll","session":7,"offset":a.0,"end_offset":a.1
+        }))
+        .unwrap();
+        assert!(matches!(action, Action::ChatPoll { end_offset: Some(end), .. } if end == a.1));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn mobile_chat_page_identity_is_additive_and_replays_without_changing_legacy_snapshot() {
+        use krill_proto::agent_history::{ChatItem, ChatPollSnapshot};
+        let snapshot = ChatPollSnapshot {
+            items: vec![ChatItem {
+                text: "stable".into(),
+                ..ChatItem::default()
+            }],
+            next_offset: 64,
+            bound: true,
+            ..ChatPollSnapshot::default()
+        };
+        let legacy = serde_json::to_value(&snapshot).unwrap();
+        assert!(legacy["items"][0].get("id").is_none());
+        let page = chat_page_value(snapshot.clone(), 32).unwrap();
+        assert_eq!(page, chat_page_value(snapshot.clone(), 32).unwrap());
+        assert_eq!(page["items"][0]["id"], "32:0");
+        assert_eq!(page["reply_mode"], "review_in_term");
+        let reset = chat_page_value(
+            ChatPollSnapshot {
+                reset: true,
+                ..snapshot
+            },
+            512,
+        )
+        .unwrap();
+        assert_eq!(reset["page_start"], 0);
+        assert_eq!(reset["items"][0]["id"], "0:0");
+    }
+
+    #[test]
     fn bracketed_paste_and_question_keystroke_planner_work() {
         assert_eq!(
             format_bracketed_paste("hi\x1b[201~\nthere"),
@@ -1178,7 +1507,7 @@ mod tests {
         assert_eq!(outside.repo_key, None);
         assert_eq!(outside.path.as_deref(), Some("/outside/sub"));
         assert_eq!(
-            repositories_json(&repositories)[1]["worktree_keys"],
+            super::super::workspaces::Catalog::load(None, &repositories).repositories_json()[1]["worktree_keys"],
             json!([])
         );
     }
@@ -1327,13 +1656,39 @@ mod tests {
         for request in [
             r#"{"action":"create_terminal","cwd_session":1,"cwd":"/tmp"}"#,
             r#"{"action":"create_terminal","cwd_session":1,"program":"/bin/sh"}"#,
-            r#"{"action":"create_terminal"}"#,
             r#"{"action":"close_terminal","session":1,"extra":true}"#,
         ] {
             assert!(
                 serde_json::from_str::<Action>(request).is_err(),
                 "{request}"
             );
+        }
+        // 생성 출처는 기존 세션 또는 등록 워크스페이스 중 하나다.
+        for request in [
+            r#"{"action":"create_terminal","cwd_session":1}"#,
+            r#"{"action":"create_terminal","workspace":"registered-key"}"#,
+        ] {
+            assert!(serde_json::from_str::<Action>(request).is_ok(), "{request}");
+        }
+        for request in [
+            r#"{"action":"create_terminal"}"#,
+            r#"{"action":"create_terminal","cwd_session":1,"workspace":"key"}"#,
+        ] {
+            let reply: Value = serde_json::from_str(&test_backend().request(request)).unwrap();
+            assert_eq!(reply["ok"], false, "{request}");
+        }
+    }
+
+    #[test]
+    fn terminal_creation_requires_one_registered_workspace_or_session() {
+        let backend = test_backend();
+        for request in [
+            r#"{"action":"create_terminal"}"#,
+            r#"{"action":"create_terminal","cwd_session":1,"workspace":"key"}"#,
+            r#"{"action":"create_workspace","repository":"key","name":" "}"#,
+        ] {
+            let reply: Value = serde_json::from_str(&backend.request(request)).unwrap();
+            assert_eq!(reply["ok"], false, "{request}");
         }
     }
 

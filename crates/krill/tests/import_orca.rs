@@ -251,7 +251,8 @@ fn cli_import_orca_dry_run_daemon_skip_and_daemon_ipc_apply() {
         r#"{"oauthAccount":{"emailAddress":"dev@example.com","organizationUuid":"org-dev","organizationName":"Dev Org"}}"#,
     )
     .unwrap();
-    // OWE-896: agy vault는 존재만 감지한다(암호화 — 개별 이관 불가).
+    // Invalid legacy fixture: detect the vault and report that it could not be imported.
+    // Native v10 decryption and account import are covered by the daemon vault tests.
     let agy_vault_dir = orca_dir.join("antigravity-accounts");
     fs::create_dir_all(&agy_vault_dir).unwrap();
     fs::write(agy_vault_dir.join("vault"), b"encrypted-fixture").unwrap();

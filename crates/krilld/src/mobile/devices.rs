@@ -9,6 +9,20 @@ use std::path::{Path, PathBuf};
 
 pub const TICKET_TTL_MS: u64 = 300_000;
 const MAX_DEVICES: usize = 32;
+#[derive(Debug)]
+pub(super) enum AuthRejection {
+    Capacity,
+    Cooldown,
+}
+impl std::fmt::Display for AuthRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Capacity => "mobile device limit reached; revoke an unused device",
+            Self::Cooldown => "mobile authentication cooldown",
+        })
+    }
+}
+impl std::error::Error for AuthRejection {}
 const MAX_FILE: u64 = 1 << 20;
 /// 재접속 인증마다 fsync하지 않는다. `last_seen_ms`는 이 간격으로만(또는 다른 변경과 함께) 디스크에 남긴다.
 const SEEN_FLUSH_MS: u64 = 600_000;
@@ -87,7 +101,10 @@ impl Devices {
     /// 실패 예산은 ticket 회전으로 초기화하지 않는다. 전체 게이트웨이에 적용해 주소 우회를 막는다.
     pub fn attempt(&mut self, now: u64) -> io::Result<()> {
         if now < self.retry_at {
-            return Err(io::ErrorKind::PermissionDenied.into());
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                AuthRejection::Cooldown,
+            ));
         }
         if self.retry_at != 0 {
             self.failures = 0;
@@ -122,7 +139,13 @@ impl Devices {
         now: u64,
     ) -> io::Result<(PairedMobileDevice, [u8; 32])> {
         self.pairing_secret(token, now)?;
-        if label.len() > 128 || self.active_count() >= MAX_DEVICES {
+        if self.active_count() >= MAX_DEVICES {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                AuthRejection::Capacity,
+            ));
+        }
+        if label.len() > 128 {
             return Err(invalid());
         }
         let credential = random()?;

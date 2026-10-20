@@ -25,6 +25,8 @@ sha2 = { workspace = true }
 serde-saphyr = { workspace = true }
 notify = { workspace = true }
 ring = { workspace = true }
+aes = { workspace = true }
+cbc = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 webpki-roots = { workspace = true }
