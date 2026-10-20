@@ -4178,7 +4178,7 @@ fn inline_rename_saves_on_enter_and_cancels_on_escape(cx: &mut TestAppContext) {
             .unwrap()
     });
     let save_at = vcx
-        .debug_bounds(&format!("rename-inline-save-{index}"))
+        .debug_bounds(format!("rename-inline-save-{index}").leak())
         .unwrap()
         .center();
     vcx.simulate_click(save_at, Modifiers::default());
