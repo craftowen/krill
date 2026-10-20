@@ -467,7 +467,7 @@ fn remote_attach_detaches_over_forward() {
 }
 
 #[test]
-fn remote_new_rejects_relative_cwd_and_worktree() {
+fn remote_new_rejects_relative_cwd_and_preserves_sessions_on_worktree_error() {
     let r = Remote::new("l");
     assert_eq!(
         r.run(&["--host", HOST, "new", "--", "/bin/sh"])
@@ -489,6 +489,8 @@ fn remote_new_rejects_relative_cwd_and_worktree() {
         .code(),
         Some(2)
     );
+    // --worktree is a new worktree name. A non-repository --cwd is an execution
+    // failure (1), while missing/relative remote --cwd is a usage error (2).
     let output = r.run(&[
         "--host",
         HOST,
@@ -502,7 +504,7 @@ fn remote_new_rejects_relative_cwd_and_worktree() {
     ]);
     assert_eq!(
         output.status.code(),
-        Some(2),
+        Some(1),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
