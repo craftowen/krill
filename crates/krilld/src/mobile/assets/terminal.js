@@ -167,7 +167,7 @@ globalThis.MkTerminalCodec=(()=>{
    const onMessage=e=>{if(generation!==this.generation||this.disposed)return;try{
     if(phase===0){const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');channel=new C.Channel(C.sha256(C.unhex(credentials.credential)),C.concat(C.unhex(challenge.challenge),nonce));this.channel=channel;socket.send(JSON.stringify({device_id:credentials.device_id,token:null,client_nonce:C.hex(nonce)}));socket.send(channel.seal(C.enc.encode('{"label":"Live terminal"}')));
      // 게이트웨이는 proof만 읽고 나머지를 IPC로 넘긴다(협상은 교집합). ServerHello를 기다리지 않고 Hello·role·attach를 함께 보낸다.
-     this.send(2,C.concat(T.v(1),T.v(1),T.v((1n<<56n)|1n|4n|4096n),T.v(0),T.text('minikrill-mobile-grid')));this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));phase=1;return;}
+     this.send(2,C.concat(T.v(1),T.v(1),T.v((1n<<56n)|1n|4n|4096n),T.v(0),T.text('minikrill-mobile-grid')));this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));this.prefit();phase=1;return;}
     const bytes=channel.open(e.data);if(phase===1){JSON.parse(new TextDecoder().decode(bytes));phase=2;return;}
     if(phase===2){if(bytes[4]!==1)throw Error('Unexpected terminal handshake');phase=3;return;}
     if(bytes.length<5||new DataView(bytes.buffer,bytes.byteOffset).getUint32(0,true)!==bytes.length-4)throw Error('Invalid screen frame');const body=bytes.slice(5),r=T.reader(body);
@@ -184,7 +184,7 @@ globalThis.MkTerminalCodec=(()=>{
    this.listen(socket,'message',onMessage);
    this.listen(socket,'close',e=>{if(generation===this.generation)this.disconnect(e.code===1008?'denied':'disconnected',e.code===1008?'Terminal authentication rejected':'Disconnected');});this.listen(socket,'error',()=>{if(generation===this.generation)this.disconnect('disconnected','Live terminal connection failed');});
    try{
-    if(warmChannel){this.channel=warmChannel;this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));}
+    if(warmChannel){this.channel=warmChannel;this.guard(()=>this.role(Uint8Array.from([0,2,0])));this.send(0x10,C.concat(T.v(this.session),Uint8Array.from([0,0])));this.prefit();}
     if(Array.isArray(messages))for(const data of messages.splice(0))onMessage({data});
    }catch(error){this.error(error);if(phase<3)socket.close();}
   }
@@ -197,6 +197,8 @@ globalThis.MkTerminalCodec=(()=>{
   // 키보드가 열려 줄어든 높이로는 행을 바꾸지 않는다(열 때마다 PTY가 줄었다 늘며 TUI가 다시 그려져 흔들린다). 그동안은 스크롤로 커서를 보인다.
   fitSize(){const p=this.port;if(!p.clientWidth)return null;const keyboard=this.root.dataset.keyboardOpen==='true',rowsFor=n=>Math.max(10,Math.min(200,Math.floor(n/this.cellHeight))),cols=Math.max(10,Math.min(2048,Math.floor((p.clientWidth-2)/this.cellWidth))),rows=!p.clientHeight?this.model.lines:keyboard?this.fitRows??rowsFor(p.clientHeight+(this.keyboardInset||0)):(this.fitRows=rowsFor(p.clientHeight));return {cols,rows};}
   async resize(force=false){const size=this.fitSize();if(!size)return;const {cols,rows}=size;if(this.resizePending)return this.resizePending;if(!force&&cols===this.model.cols&&rows===this.model.lines)return;this.resizePending=this.role(C.concat(T.v(1),T.v(cols),T.v(rows)));try{await this.resizePending;}finally{this.resizePending=null;}}
+  // 자동 Fit이면 크기 요청을 attach와 함께 보낸다. 첫 화면을 받은 뒤 보내면 왕복이 한 번 더 든다. 첫 화면 뒤 fitToPhone은 이 응답을 기다린다(resizePending).
+  prefit(){if(!this.autoFit||this.fit||this.resizePending||!this.port.clientHeight)return;const size=this.fitSize();if(!size)return;const pending=this.role(C.concat(T.v(1),T.v(size.cols),T.v(size.rows))),clear=()=>{if(this.resizePending===pending)this.resizePending=null;};pending.then(clear,clear);this.resizePending=pending;}
   resetHistory(){this.historySource=null;this.historySkip=0;this.historyPending=null;this.historyRows=[];this.historyEnd=false;this.historyElement.textContent='';}
   loadHistory(){if(!this.ready||this.historyPending||this.historyEnd||this.disposed)return;const req=++this.historyId,source=this.historySource===null?T.v(0):C.concat(T.v(1),T.v(this.historySource));this.send(0x12,C.concat(T.v(req),source,T.v(this.historySkip),T.v(Math.min(100,1000-this.historyRows.length))));this.historyPending={req,source:this.historySource,skip:this.historySkip};this.historyStatus.textContent='Loading earlier rows…';}
   // 2칸 글자(한글 등)는 글꼴 폭이 'M' 두 개와 달라 연속 구간을 span으로 묶고 2칸에 맞춘 자간을 준다. 안 그러면 히스토리 열이 캔버스와 어긋난다.

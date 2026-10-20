@@ -466,7 +466,12 @@ impl Registry {
             return attach::watch(s);
         }
         // macOS는 닫힌 피어의 setsockopt를 EINVAL로 거부한다(OWE-487). 이미 받은 요청은 처리해야 한다.
-        s.set_read_timeout(Some(ATTACH_TIMEOUT)).ok();
+        s.set_read_timeout(Some(if mobile {
+            attach::MOBILE_ATTACH_TIMEOUT
+        } else {
+            ATTACH_TIMEOUT
+        }))
+        .ok();
         let (mut role, first) = attach::roles::first(&mut s, n.features)?;
         if mobile && role != Role::Observer {
             role = Role::InteractiveWithSize { owns_size: false };
