@@ -20,6 +20,10 @@ cargo build --workspace --bins && cargo run -p krill-app   # 앱 실행(보조 �
 scripts/check-windows.sh [-p <크레이트>] [--clippy]   # Mac에서 Windows 타깃 cargo check(저장소 밖 격리 툴체인, OWE-811). Windows 코드를 건드리면 0이어야 한다
 ```
 
+- 반복 수정 중 중간 검증은 `cargo check -p <크레이트>`와 `cargo nextest run -p <크레이트> <필터>`만 실행한다.
+- 전체 `scripts/check.sh`는 작업 완료(커밋) 직전 1회만 실행한다.
+- 중간 검증은 최종 검증을 대체하지 않는다. `scripts/check.sh`가 0으로 끝나야 완료를 주장·커밋할 수 있다.
+
 툴체인: Homebrew `rustc 1.98.1`(rustup 없음 → `rust-toolchain.toml` 대신 `Cargo.toml`의 `rust-version = "1.98"`로 MSRV 고정). 최신 stable 1.99 전용 기능(패키지 레벨 default-features 덮어쓰기 등)에 기대지 않는다. Xcode 없음(CommandLineTools만) — gpui는 `font-kit` + `runtime_shaders` 기능으로 빌드. Apple Developer 인증서 없음(MK-104).
 
 ## 구조
