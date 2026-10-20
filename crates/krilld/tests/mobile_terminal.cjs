@@ -31,7 +31,7 @@ function fixture(){
 }
 const viewport=Object.assign(new EventTarget(),{scale:1,height:844,offsetTop:0});
 const globalEvents=new EventTarget(),storage=new Map(),timers=new Map();let clock=0,nextTimer=0;
-const context=vm.createContext({Event,EventTarget,AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,Map,Set,Promise,console,queueMicrotask,crypto:require('node:crypto').webcrypto,innerHeight:844,devicePixelRatio:1,visualViewport:viewport,document:{createElement:tag=>new Element(tag),createElementNS:(_,tag)=>new Element(tag)},localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},addEventListener:globalEvents.addEventListener.bind(globalEvents),setTimeout:(fn,delay)=>{const id=++nextTimer;timers.set(id,{fn,at:clock+delay});return id;},clearTimeout:id=>timers.delete(id)});
+const context=vm.createContext({Event,EventTarget,AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,Map,Set,Promise,console,queueMicrotask,crypto:require('node:crypto').webcrypto,innerHeight:844,devicePixelRatio:1,visualViewport:viewport,document:Object.assign(new EventTarget(),{visibilityState:'visible',createElement:tag=>new Element(tag),createElementNS:(_,tag)=>new Element(tag)}),localStorage:{getItem:k=>storage.get(k),setItem:(k,v)=>storage.set(k,v)},addEventListener:globalEvents.addEventListener.bind(globalEvents),setTimeout:(fn,delay)=>{const id=++nextTimer;timers.set(id,{fn,at:clock+delay});return id;},clearTimeout:id=>timers.delete(id)});
 vm.runInContext(`(${fixture})()`,context);vm.runInContext(source,context);
 const api=context.KrillMobile.terminal,T=context.MkTerminalCodec,C=context.MkCrypto;
 const event=(el,type,props={})=>{const e=new Event(type,{cancelable:true});Object.assign(e,props);el.dispatchEvent(e);return e;};
@@ -98,9 +98,31 @@ async function main(){
  context.document.activeElement=capture2;handle.setInputMode('buffered');assert.equal(commandFocused,1);context.document.activeElement=null;handle.setInputMode('direct');assert.equal(focused,1);
  socket.close();assert.equal(root.dataset.phase,'disconnected');handle.unmount();assert.equal(root.dataset.phase,undefined);
  ({root,handle,socket}=await mount(43));let statuses=[];handle.unmount();({root,handle,socket}=await mount(44,{onStatus:st=>statuses.push(st)}));context.document.activeElement=find(root,'live-capture');socket.close();assert.equal(statuses.at(-1).typing,true);context.document.activeElement=null;handle.unmount();
- ({root,handle,socket}=await mount(45));let fitting=handle.fitToPhone();socket.frame(0x2c,T.v(0));await fitting;const roles=()=>socket.sent.filter(a=>a[4]===0x17).length;let before17=roles();socket.frame(0x21,T.v(3),T.v(3),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(24)));await flush();viewport.offsetTop=5;event(viewport,'scroll');viewport.offsetTop=0;await flush();assert.equal(roles(),before17);handle.unmount();
- console.log('PASS disconnect reports typing for refocus, Fit skips same-column resize roles');
+ ({root,handle,socket}=await mount(45));const port45=find(root,'terminal-scroll');port45.scrollTop=10;event(port45,'scroll');assert.equal(socket.sent.filter(a=>a[4]===0x12).length,0);port45.scrollLeft=90;port45.clientHeight=360;let fitting=handle.fitToPhone();let fitRole=T.reader(socket.sent.filter(a=>a[4]===0x17).at(-1).slice(5));assert.equal(fitRole.n(),1);assert.equal(fitRole.n(),48);assert.equal(fitRole.n(),20);socket.frame(0x2c,T.v(0));await fitting;assert.equal(root.dataset.fit,'true');assert.equal(port45.scrollLeft,0);const roles=()=>socket.sent.filter(a=>a[4]===0x17).length;let before17=roles();socket.frame(0x21,T.v(3),T.v(3),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(20)));await flush();viewport.offsetTop=5;event(viewport,'scroll');viewport.offsetTop=0;await flush();assert.equal(roles(),before17);handle.unmount();
+ console.log('PASS disconnect reports typing for refocus, Fit fits cols+rows, resets scrollLeft, and skips same-size resize roles');
  console.log('PASS tap jitter focus, one-axis touch pan (no native horizontal), output/input keep scrollLeft, mode-switch refocus, text() and phase');
+ // 폰 기본 Fit: 저장된 선택이 켜짐이면 연결 직후 자동으로 맞추고(저장은 하지 않음), 사용자가 끄면 그 선택을 저장한다.
+ let prefs=[];({root,handle,socket}=await mount(47,{preferences:{fitToPhone:true},onPreferenceChange:p=>prefs.push(p)}));let port47=find(root,'terminal-scroll');const roles47=()=>socket.sent.filter(a=>a[4]===0x17).map(a=>[...a.slice(5)]);
+ assert.deepEqual(roles47().at(-1),[1,48,24]);port47.clientHeight=540;socket.frame(0x2c,T.v(0));await flush();assert.equal(root.dataset.fit,'true');assert.deepEqual(prefs,[]);
+ // Fit 응답을 기다리는 동안 바뀐 높이(상태줄이 사라짐 등)도 응답 뒤에 맞춘다.
+ await advance(150);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ // 키보드가 열려 높이가 줄어도 행은 그대로, 이벤트가 몰려도 멈춘 뒤 한 번만 맞춘다.
+ port47.clientHeight=360;event(viewport,'resize');event(viewport,'resize');await advance(149);let n47=roles47().length;await advance(1);assert.equal(roles47().length,n47+1);assert.deepEqual(roles47().at(-1),[1,48,20]);socket.frame(0x2c,T.v(0));socket.frame(0x21,T.v(4),T.v(4),T.v(1),T.v(1),C.concat(T.v(0),T.v(48),T.v(20)));await flush();
+ viewport.height=544;port47.clientHeight=60;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);assert.equal(root.dataset.keyboardOpen,'true');
+ viewport.height=844;port47.clientHeight=360;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);
+ port47.clientHeight=540;event(viewport,'resize');await advance(200);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ port47.clientWidth=0;n47=roles47().length;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47);port47.clientWidth=390;
+ // 화면이 가려지면 크기 소유를 놓고(데스크톱 크기 복귀), 다시 보이면 맞춘다.
+ context.document.visibilityState='hidden';event(context.document,'visibilitychange');assert.deepEqual(roles47().at(-1),[0,2,0]);socket.frame(0x2c,T.v(0));context.document.visibilityState='visible';event(context.document,'visibilitychange');assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ let off=handle.fitToPhone();socket.frame(0x2c,T.v(0));await off;assert.equal(root.dataset.fit,'false');assert.equal(JSON.stringify(prefs),"[{\"fitToPhone\":false}]");handle.unmount();
+ ({root,handle,socket}=await mount(48,{preferences:{fitToPhone:false}}));assert.equal(JSON.stringify(socket.sent.filter(a=>a[4]===0x17).map(a=>[...a.slice(5)])),"[[0,2,0]]");handle.unmount();
+ console.log('PASS phone Fit by default: auto-fit on connect, debounced refit, keyboard keeps rows, hidden releases size, opt-out saved');
+ // 바닥에 있으면 화면 크기가 바뀌어도 바닥을 따라가고, 위로 올려 보는 중이면 위치를 유지한다.
+ ({root,handle,socket}=await mount(49));port47=find(root,'terminal-scroll');port47.scrollHeight=1000;port47.clientHeight=640;await advance(16);assert.equal(port47.scrollTop,1000);
+ port47.scrollTop=100;event(port47,'scroll');socket.frame(0x21,T.v(5),T.v(5),T.v(1),T.v(1),C.concat(T.v(0),T.v(80),T.v(30)));port47.scrollHeight=1108;await advance(16);assert.equal(port47.scrollTop,100);
+ for(let i=0;i<5;i++){socket.screen(`flow ${i}`);await advance(16);}assert.equal(port47.scrollTop,100);
+ port47.scrollTop=468;event(port47,"scroll");socket.frame(0x21,T.v(6),T.v(6),T.v(1),T.v(1),C.concat(T.v(0),T.v(80),T.v(40)));port47.scrollHeight=1288;await advance(16);assert.equal(port47.scrollTop,1288);handle.unmount();
+ console.log('PASS stick-to-bottom only while at bottom; scrolled-up position kept through output and resize');
  const warmSocket=new context.FakeSocket(),warmRoot=new Element('div');
  const warmHandle=api.mount(warmRoot,{sessionId:42,connect:()=>({socket:warmSocket,credentials:{device_id:'fixture',credential:''},messages:[JSON.stringify({version:2,challenge:''})]})});
  await flush();assert.equal(warmSocket.sent.length,5);assert.equal(warmSocket.sent[4][4],0x10);warmHandle.unmount();
