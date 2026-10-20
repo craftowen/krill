@@ -18,7 +18,7 @@ cargo fmt --all             # 포맷 적용
 cargo nextest run -p <크레이트>   # 한 크레이트 테스트
 cargo build --workspace --bins && cargo run -p krill-app   # 앱 실행(보조 바이너리 krill·krill-holder·krilld를 먼저 빌드해야 한다)
 scripts/check-windows.sh [-p <크레이트>] [--clippy]   # Mac에서 Windows 타깃 cargo check(저장소 밖 격리 툴체인, OWE-811). Windows 코드를 건드리면 0이어야 한다
-scripts/install-hooks.sh    # 클론마다 1회: git pre-push 훅(main·v* 태그 push 차단 + 공개 표면 점검) 켜기
+scripts/install-hooks.sh    # 클론마다 1회: git pre-push 훅(보호 ref 승인 사유 확인 + 공개 표면 점검) 켜기
 ```
 
 - 반복 수정 중에는 변경한 크레이트의 `cargo check -p <크레이트> --locked`와 변경 동작에 관련된 테스트만 실행한다. 작은 수정마다 워크스페이스 전체를 빌드·검사하지 않는다.
@@ -60,7 +60,7 @@ packaging/            # macOS 번들·DMG·Ed25519 매니페스트·설치 스�
 7. 측정하지 않은 수치는 문서·커밋·이슈에 쓰지 않는다. 추정이면 "추정".
 8. 하네스 파일(`AGENTS.md`, `docs/CONVENTIONS.md`, `scripts/`, lint·deny·fmt 설정)은 메인테이너 승인 없이 바꾸지 않는다.
    기계 강제: `.claude` 훅(`.claude/hooks/guard.sh`, Claude Code 전용)·`.github/CODEOWNERS`·git `pre-push`(`scripts/hooks/`).
-9. 에이전트는 `main`·`v*` 태그에 push하지 않는다. 그 외 브랜치 push·게시(`publish-github.sh`)·원격 설정 변경·유료 작업은 사용자가 그 작업을 명시적으로 지시했을 때만 한다.
+9. 사용자가 배포·릴리스·push를 명시적으로 지시하면 에이전트는 그 범위에 필요한 `main` 반영·push, `v*` 태그 push, 게시(`publish-github.sh`)까지 수행한다. 같은 작업의 승인을 단계마다 다시 묻지 않는다. 보호 ref push에는 `KRILL_ALLOW_PROTECTED_PUSH='<사용자 지시와 작업 사유>'`를 지정해 사유를 기록한다. Claude Code의 원격 명령은 첫 줄에 `# KRILL_ALLOW_REMOTE: <사용자 지시와 작업 사유>`를 적으면 현재 세션에서 실행할 수 있다. 승인 표시는 실제 사용자 지시가 있을 때만 쓴다. 최종 HEAD 검사·CI·공개 표면 점검과 기존 릴리스 덮어쓰기 금지는 유지한다. 그 외 원격 쓰기·원격 설정 변경·유료 작업은 별도의 명시 지시가 있을 때만 한다.
 10. **UI/UX는 [docs/STYLEGUIDE.md](docs/STYLEGUIDE.md)와 `krill_app::ui` 토큰·프리미티브만 쓴다.** 미구현 기능을 UI에 미리 표기하지 않는다.
 
 ## 이슈·작업 흐름

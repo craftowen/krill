@@ -2,15 +2,24 @@
 
 GitHub Releases 게시의 **공식 경로**는 로컬 맥에서 메인테이너가 돌리는 `packaging/publish-github.sh`다.
 `.github/workflows/release.yml`은 수동 예비·Windows 자산 추가용이며 같은 규칙(main 끝 또는 태그 커밋에서만,
-기존 자산 덮어쓰기 없음)을 따른다. `git push`·릴리스 생성은 사람이 한다(AGENTS.md 규칙 9).
+기존 자산 덮어쓰기 없음)을 따른다. 사용자가 배포·릴리스·push를 명시 지시하면 에이전트도 필요한 main·태그 push와 릴리스 생성을 수행한다(AGENTS.md 규칙 9).
 
 ```sh
 bash packaging/publish-github.sh --preflight      # 가드만 확인(빌드·업로드 없음, 실패 시 1)
 bash packaging/publish-github.sh --bump patch     # 가드 통과 후 버전·Cargo.lock·THIRD_PARTY_NOTICES.md를 한 커밋으로 만들고 멈춤
-#   → 메인테이너가 그 커밋을 main에 올리고 CI가 녹색이 될 때까지 기다린다
+#   → 메인테이너 또는 사용자 지시를 받은 에이전트가 그 커밋을 main에 올리고 CI 통과를 기다린다
 bash packaging/publish-github.sh --dry-run        # 조립만(가드 실패는 경고). --bin-dir은 여기서만 허용
 bash packaging/publish-github.sh                  # 가드 → 빌드 → 재확인 → 태그 푸시 → gh release create
 ```
+
+사용자 지시에 따라 보호 ref를 push할 때는 사유를 지정한다. 게시 스크립트 내부 태그 push에도 같은 사유가 전달된다.
+
+```sh
+KRILL_ALLOW_PROTECTED_PUSH='사용자 배포 지시: 검증한 릴리스 후보 main 반영' git push origin HEAD:main
+KRILL_ALLOW_PROTECTED_PUSH='사용자 배포 지시: 검증한 릴리스 태그 게시' bash packaging/publish-github.sh
+```
+
+Claude Code에서는 원격 명령의 첫 줄에 `# KRILL_ALLOW_REMOTE: <사용자 지시와 작업 사유>`를 추가한다. 같은 작업의 승인을 다시 요청하거나 세션을 재시작할 필요는 없다. 이 표시는 실제 사용자 지시가 있을 때만 사용하며, 아래 가드는 그대로 적용된다.
 
 빌드 전에 모든 가드를 보고, 하나라도 실패하면 아무것도 빌드·업로드하지 않는다(v0.1.6 덮어쓰기 사고 대응).
 
@@ -29,6 +38,7 @@ bash packaging/publish-github.sh                  # 가드 → 빌드 → 재확
   다른 워크트리 빌드가 게시 바이너리를 덮어쓰지 못하게 한다. 락이 단독 사용을 보장한다.
 - `KRILL_PUBLISH_FORCE=<사유>`는 사람 전용이다. 대화형 터미널에서 태그를 직접 입력해 확인해야 하고 사유를 출력한다.
 - 회귀 테스트: `python3 packaging/test_publish.py`(임시 git 저장소·로컬 bare origin·가짜 `gh`, 네트워크·빌드 없음).
+- 승인·push 훅 회귀 테스트: `python3 scripts/test_hooks.py`(로컬 bare origin에 실제 push, Claude 훅 호출, 네트워크·빌드 없음).
 
 # 로컬 릴리스와 개인 Homebrew tap (MK-072)
 

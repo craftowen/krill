@@ -277,7 +277,7 @@ p.write_text(updated)
   cargo update -w
   python3 docs/licensing/generate_notices.py
   git commit -m "Release v${VERSION}" Cargo.toml Cargo.lock THIRD_PARTY_NOTICES.md
-  echo "Committed Release v${VERSION}. Get it onto origin/main (maintainer push), wait for CI to pass,"
+  echo "Committed Release v${VERSION}. Get it onto origin/main (maintainer or user-authorized agent push), wait for CI to pass,"
   echo "then publish it with: bash packaging/publish-github.sh"
   exit 0
 fi

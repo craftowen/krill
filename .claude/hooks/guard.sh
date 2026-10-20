@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Claude Code PreToolUse 훅: AGENTS.md 규칙 8(하네스 파일)·9(push·게시·원격 변경) 기계 강제.
 # 입력: stdin JSON {tool_name, tool_input{file_path|notebook_path|command}}. exit 2 = 차단(stderr가 에이전트에게 간다).
-# 우회(사람이 Claude를 띄울 때만): KRILL_HARNESS_APPROVED=1(하네스 파일), KRILL_ALLOW_REMOTE=1(원격 쓰기 명령).
-# 사용자가 직접 지시한 원격 작업은 프롬프트에서 `! <명령>`으로 사용자가 실행하면 이 훅을 거치지 않는다.
+# 세션 설정: KRILL_HARNESS_APPROVED=1(하네스 파일), KRILL_ALLOW_REMOTE=1(원격 쓰기 명령).
+# 사용자 지시를 받은 원격 명령은 첫 줄에 `# KRILL_ALLOW_REMOTE: <사용자 지시와 작업 사유>`를 기록한다.
+# 이 표시는 사용자 지시를 기록하는 것이며 자동 승인이나 배포 검증 생략을 뜻하지 않는다.
 set -uo pipefail
 command -v jq >/dev/null || { echo "guard.sh: jq가 없어 하네스 보호 훅을 실행할 수 없다(차단)" >&2; exit 2; }
 input=$(cat)
@@ -23,8 +24,13 @@ if [[ $tool == Bash ]]; then
   elif grep -Eq "${pre}((ba|z)?sh$s+)?[^[:space:]]*publish-github\.sh" <<<"$cmd"; then why='publish-github.sh 게시'
   fi
   [[ -z $why ]] && exit 0
-  echo "차단: $why — AGENTS.md 규칙 9. 에이전트는 main·v* 태그에 push하지 않고, 그 외 push·게시·원격 설정 변경은 사용자가 명시적으로 지시했을 때만 한다." >&2
-  echo "사용자 지시가 있으면 사용자에게 \`! <명령>\`으로 직접 실행해 달라고 하거나, 사람이 KRILL_ALLOW_REMOTE=1로 Claude를 다시 띄운다." >&2
+  first_line=${cmd%%$'\n'*}
+  if [[ $first_line =~ ^#[[:space:]]KRILL_ALLOW_REMOTE:[[:space:]]*(.*[^[:space:]].*)$ ]]; then
+    echo "허용: $why — 사용자 지시 기록: ${BASH_REMATCH[1]}" >&2
+    exit 0
+  fi
+  echo "차단: $why — AGENTS.md 규칙 9. 사용자 배포·릴리스·push 지시는 필요한 main·v* 태그 push와 게시를 허용한다. 그 외 원격 쓰기는 별도 명시 지시가 필요하다." >&2
+  echo "해당 지시를 받았으면 명령 첫 줄에 '# KRILL_ALLOW_REMOTE: <사용자 지시와 작업 사유>'를 기록한다. 재시작은 필요 없다." >&2
   exit 2
 fi
 
