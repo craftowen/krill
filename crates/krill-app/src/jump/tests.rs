@@ -576,3 +576,37 @@ fn infer_agent_from_title_detects_brands_when_status_agent_is_empty() {
     assert_eq!(infer_agent_from_title("claude", "zsh"), "claude");
     assert_eq!(infer_agent_from_title("", "zsh"), "");
 }
+
+#[gpui::test]
+fn jump_palette_windowing_across_chats_and_worktrees(cx: &mut TestAppContext) {
+    let sessions: Vec<Item> = (1..=10)
+        .map(|i| item(i, &format!("s-{i}"), false))
+        .collect();
+    let (view, _events, cx) = open(cx, sessions);
+    let worktrees: Vec<WorktreeEntry> = (0..10)
+        .map(|i| worktree(&format!("wt-{i}"), &format!("wt-{i}"), None))
+        .collect();
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| p.set_worktrees(worktrees, cx));
+    });
+    cx.run_until_parked();
+
+    // Move selection into Worktrees section (index 10 = first worktree, index 16 = 7th worktree > EMPTY_QUERY_WORKTREE_CAP).
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.selected = 16;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        // Selecting a worktree must NOT jump chat_window to the end of chats.
+        assert_eq!(p.chat_window(), (0, super::EMPTY_QUERY_RECENT_TAB_CAP, 4));
+        // And the selected worktree (index 6 within Worktrees) must be inside worktree_window.
+        let (wt_start, wt_end, _) = p.worktree_window();
+        assert!((wt_start..wt_end).contains(&6));
+        assert!(p.selected_list_child_index().is_some());
+    });
+}
