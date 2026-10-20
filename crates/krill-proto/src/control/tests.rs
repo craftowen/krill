@@ -1064,3 +1064,17 @@ fn states_foreground_tail_preserves_n_minus_one_in_both_directions() {
         assert!(Reply::decode(kind, &body).is_err());
     }
 }
+
+/// postcard는 필드를 순서대로만 읽으므로 `skip_serializing_if`로 빠진 필드가 있으면 디코드가 밀린다.
+/// 빈 오케스트레이션 스냅샷(`current_run_id: None`)이 CLI에서 `bad body`로 깨지던 회귀.
+#[test]
+fn orchestration_snapshot_reply_roundtrips_without_current_run() {
+    use crate::orchestration::{OrchResponse, OrchestrationStore};
+    let empty = Reply::Orchestration(OrchResponse::Snapshot(OrchestrationStore::default()));
+    roundtrip(&empty);
+    let current = Reply::Orchestration(OrchResponse::Snapshot(OrchestrationStore {
+        current_run_id: Some("run-1".into()),
+        ..OrchestrationStore::default()
+    }));
+    roundtrip(&current);
+}
