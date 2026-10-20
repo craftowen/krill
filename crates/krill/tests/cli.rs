@@ -34,6 +34,14 @@ impl Daemon {
         Self::configured_schedules(tag, config, None)
     }
     fn configured_schedules(tag: &str, config: Option<&str>, schedules: Option<&str>) -> Self {
+        Self::configured_schedules_home(tag, config, schedules, false)
+    }
+    fn configured_schedules_home(
+        tag: &str,
+        config: Option<&str>,
+        schedules: Option<&str>,
+        isolated_home: bool,
+    ) -> Self {
         let dir = std::env::temp_dir().join(format!("mk045-{}-{tag}", std::process::id()));
         fs::remove_dir_all(&dir).ok();
         fs::create_dir_all(&dir).unwrap();
@@ -54,6 +62,21 @@ impl Daemon {
             // 가짜 터널의 폴백 계약은 공개 PWA 배포 여부·실제 릴레이에 의존하지 않는다.
             .env("KRILL_MOBILE_ORIGIN", "http://127.0.0.1:0")
             .env("KRILL_STATE_DIR", &dir)
+            .envs(
+                [
+                    "HOME",
+                    "CLAUDE_CONFIG_DIR",
+                    "CODEX_HOME",
+                    "ANTIGRAVITY_CLI_HOME",
+                    "AGY_HOME",
+                    "OPENCODE_CONFIG_DIR",
+                    "OPENCODE_DATA_DIR",
+                    "XDG_DATA_HOME",
+                ]
+                .into_iter()
+                .filter(|_| isolated_home)
+                .map(|name| (name, dir.join("empty-home"))),
+            )
             .env_remove("KRILL_SESSION_ID")
             .env_remove("MK_SESSION_ID")
             .env_remove("KRILL_PANE_ID")
@@ -1795,4 +1818,12 @@ esac
     }
 
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn search_literal_help_queries_an_isolated_daemon() {
+    let d = Daemon::configured_schedules_home("search-literal-help", None, None, true);
+    let out = d.ok(&["search", "help", "--json"]);
+    let report: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(report["hits"], serde_json::json!([]));
 }
