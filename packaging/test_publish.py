@@ -119,7 +119,7 @@ class PublishGuardTests(unittest.TestCase):
         self.assert_blocked(self.publish(FAKE_RELEASE="1", KRILL_PUBLISH_FORCE="hotfix"),
                             "cannot be overridden")
 
-    def test_dry_run_adds_signed_windows_assets(self):
+    def test_dry_run_only_adds_available_signed_windows_assets(self):
         w = self.work / "packaging"
         fakes = {
             "bundle.sh": 'o=$2; mkdir -p "$o"; echo zip > "$o/Krill-0.1.0-arm64-adhoc.zip"; '
@@ -140,6 +140,11 @@ class PublishGuardTests(unittest.TestCase):
         (self.work / "crates/krill-proto/src/ipc.rs").write_text("pub const PROTO_MIN: u16 = 3;\n")
         key = self.work.parent / "update.key"
         key.write_text(os.urandom(32).hex() + "\n")
+        result = self.publish("--dry-run", KRILL_WIN_VM_DIR="", KRILL_UPDATE_KEY_FILE=str(key))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("no Windows zip", result.stderr)
+        for name in ("Krill-0.1.0-windows-x64.zip", "latest-windows.json", "install.ps1"):
+            self.assertNotIn(f"packaging/dist/{name}\n", result.stdout)
         result = self.publish("--dry-run", KRILL_WIN_VM_DIR="/unused", KRILL_UPDATE_KEY_FILE=str(key))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         dist = self.work / "packaging/dist"
