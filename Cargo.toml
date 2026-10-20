@@ -153,6 +153,10 @@ allow_attributes_without_reason = "deny"
 let_underscore_must_use = "deny"
 string_slice = "warn"
 
+# 빌드 속도(OWE-958 실측): 우리 크레이트도 줄 정보만 남겨 재빌드·테스트 빌드 시간을 줄인다(lldb 변수 조회 불가, 백트레이스 파일:줄은 유지).
+[profile.dev]
+debug = "line-tables-only"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
