@@ -2006,7 +2006,16 @@ impl Registry {
             .map(|p| p.as_os_str().as_bytes().to_vec())
             .unwrap_or_default();
         let stored = self.agents.stored(id).ok().flatten().or_else(|| {
-            let status_agent = self.status.get(id).agent;
+            let mut status_agent = self.status.get(id).agent;
+            if status_agent.is_empty()
+                && let Some(fg_name) = lock(&self.state)
+                    .sessions
+                    .get(&id)
+                    .and_then(|e| e.session.tap().foreground())
+                    .and_then(|pid| crate::sys::process_name(pid).ok())
+            {
+                status_agent = fg_name;
+            }
             let agent = krill_proto::agent_history::VaultAgent::parse(&status_agent)?;
             Some(crate::agent::control::StoredLaunch {
                 profile: agent.profile().to_owned(),
