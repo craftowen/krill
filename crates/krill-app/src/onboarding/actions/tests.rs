@@ -328,7 +328,10 @@ fn automatic_setup_only_stages_and_links_without_hooks_or_permissions(
     assert_eq!(*result.borrow(), Some(Ok(())));
     assert!(link.is_file());
     assert!(home.join(".claude/skills/minikrill/SKILL.md").is_file());
-    assert!(home.join(".codex/skills/orchestration/SKILL.md").is_file());
+    assert!(
+        home.join(".codex/skills/mk-orchestration/SKILL.md")
+            .is_file()
+    );
     assert!(
         home.join(".gemini/config/skills/worktree-checkpoints/SKILL.md")
             .is_file()

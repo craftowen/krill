@@ -5850,7 +5850,7 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         ".cursor/hooks.json",
         ".config/opencode/plugins/minikrill.js",
         ".claude/skills/minikrill/SKILL.md",
-        ".codex/skills/orchestration/SKILL.md",
+        ".codex/skills/mk-orchestration/SKILL.md",
         ".gemini/config/skills/worktree-checkpoints/SKILL.md",
         ".cursor/skills/minikrill/SKILL.md",
         ".config/opencode/skills/minikrill/SKILL.md",
