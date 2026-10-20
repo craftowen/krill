@@ -255,6 +255,7 @@ KRILL_GCP_PROJECT=<project> bash packaging/linux/build-gcp.sh VERSION
 
 `publish-github.sh`는 `KRILL_GCP_PROJECT`가 있으면 위 GCP 빌드를 돌리고, Linux tar.gz와
 `install-linux.sh`를 릴리스 자산에 넣는다. 원격 머신 설치는 `install-linux.sh`(→ `~/.local/bin`).
+`KRILL_WIN_VM_DIR`가 있으면 Windows zip·`latest-windows.json`·`install.ps1`도 넣는다([windows/README.md](windows/README.md)).
 
 원격 Linux 요구사항(2026-10-18 실측):
 - glibc 2.34 이상(Ubuntu 22.04+, Debian 12+, RHEL/Rocky 9+), 커널 5.9 이상. Rocky 8(glibc 2.28)에서는
