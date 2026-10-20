@@ -9,6 +9,7 @@
 
 pub mod display;
 pub mod installed;
+mod login_browser;
 mod login_output;
 
 #[cfg(test)]
@@ -466,13 +467,7 @@ pub fn parse_claude_identity(json: &str) -> Option<Identity> {
 /// `CLAUDE_CONFIG_DIR=<dir> claude auth status --json`(1회 0.29초 실측, 보고서 C5). `dir`이 `None`이면 호스트 기본
 /// 로그인을 묻는다. 실패·시간 초과·미로그인은 `None`(호출자는 무시한다). 백그라운드에서만 부른다.
 pub fn claude_identity(exe: &Path, dir: Option<&Path>) -> Option<Identity> {
-    let mut cmd = crate::platform::background_command(exe);
-    cmd.args(["auth", "status", "--json"]);
-    match dir {
-        Some(dir) => cmd.env("CLAUDE_CONFIG_DIR", dir),
-        None => cmd.env_remove("CLAUDE_CONFIG_DIR"),
-    };
-    parse_claude_identity(&krill_proto::agent::capture(cmd, Duration::from_secs(5))?)
+    krill_proto::account_login::probe(exe, ProviderKind::Claude, dir)?.identity
 }
 
 /// 로그인 CLI를 백그라운드에서 실행하고, 허용된 인증 링크가 준비되면 브라우저를 연다.
@@ -489,29 +484,26 @@ pub fn start_login(
             .get()
             .to_owned());
     }
-    let program = krill_proto::account_login::login_program(account.provider, login_dir(account))
-        .ok_or_else(|| {
-        crate::i18n::catalog::settings::ACCOUNT_LOGIN_UNSUPPORTED
-            .get()
-            .to_owned()
-    })?;
-    let krill_proto::control::Program::Custom { program, args } = program else {
-        return Err("unsupported login command".to_owned());
-    };
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
+    let path = crate::onboarding::login_path(&shell)
+        .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
+    let exe = krill_proto::agent::which(account.provider.as_str(), &path)
+        .ok_or_else(|| "provider executable not found".to_owned())?;
+    let mut command =
+        krill_proto::account_login::login_command(&exe, account.provider, login_dir(account))
+            .ok_or_else(|| {
+                crate::i18n::catalog::settings::ACCOUNT_LOGIN_UNSUPPORTED
+                    .get()
+                    .to_owned()
+            })?;
+    command.env("PATH", path);
     let (paths, account) = (paths.clone(), account.clone());
     let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let cancel_for_thread = cancel.clone();
     std::thread::Builder::new()
         .name("account-login-browser".into())
         .spawn(move || {
-            run_browser_login(
-                &paths,
-                &account,
-                newly_added,
-                &program,
-                &args,
-                &cancel_for_thread,
-            );
+            run_browser_login(&paths, &account, newly_added, command, &cancel_for_thread);
         })
         .map_err(|e| e.to_string())?;
     Ok(cancel)
@@ -519,6 +511,22 @@ pub fn start_login(
 
 /// Interactive providers need a terminal for their account picker and OAuth code prompt.
 pub fn terminal_login_command(account: &AccountInfo) -> String {
+    #[cfg(windows)]
+    {
+        let provider = account.provider.as_str();
+        let id = account.id.replace('\'', "''");
+        let exe = krill_proto::daemon::sibling_exe("krill")
+            .unwrap_or_else(|_| PathBuf::from("krill.exe"));
+        let exe = exe.to_string_lossy().replace('\'', "''");
+        // The terminal's default shell is PowerShell. Let the native CLI own profile scoping.
+        format!("& '{exe}' account login {provider} '{id}'")
+    }
+    #[cfg(not(windows))]
+    terminal_login_command_unix(account)
+}
+
+#[cfg(not(windows))]
+fn terminal_login_command_unix(account: &AccountInfo) -> String {
     let quote = |s: &str| format!("'{}'", s.replace('\'', "'\\''"));
     if account.provider == ProviderKind::Antigravity {
         return if account.host_default {
@@ -609,11 +617,9 @@ fn run_browser_login(
     paths: &Paths,
     account: &AccountInfo,
     newly_added: bool,
-    program: &[u8],
-    args: &[Vec<u8>],
+    mut command: std::process::Command,
     cancel: &std::sync::atomic::AtomicBool,
 ) {
-    use krill_proto::os::ffi::OsStrExt as _;
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt as _;
     use std::sync::atomic::Ordering;
@@ -636,34 +642,16 @@ fn run_browser_login(
         fail(LoginFailReason::SpawnFailed);
         return;
     }
-    let browser = temp.join("browser");
     let link_file = temp.join("authorize-url");
-    if std::fs::write(&browser,
-        "#!/bin/sh\nfor arg do\ncase \"$arg\" in https://*) printf '%s' \"$arg\" > \"$KRILL_LOGIN_URL_FILE.tmp\" && mv \"$KRILL_LOGIN_URL_FILE.tmp\" \"$KRILL_LOGIN_URL_FILE\";; esac\ndone\n")
-    .is_err()
-    {
+    let Ok(browser) = login_browser::write_helper(&temp) else {
         std::fs::remove_dir_all(&temp).ok();
         fail(LoginFailReason::SpawnFailed);
         return;
-    }
-    #[cfg(unix)]
-    if std::fs::set_permissions(&browser, std::fs::Permissions::from_mode(0o700)).is_err() {
-        std::fs::remove_dir_all(&temp).ok();
-        fail(LoginFailReason::SpawnFailed);
-        return;
-    }
-    let mut command = std::process::Command::new(std::ffi::OsStr::from_bytes(program));
+    };
+    krill_proto::os::configure_background(&mut command);
     command
-        .args(args.iter().map(|arg| std::ffi::OsStr::from_bytes(arg)))
         .env("BROWSER", &browser)
         .env("KRILL_LOGIN_URL_FILE", &link_file)
-        .env(
-            "PATH",
-            crate::onboarding::login_path(
-                &std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into()),
-            )
-            .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default()),
-        )
         // Claude's OAuth flow treats stdin EOF as cancellation. Keep the pipe alive until exit.
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -685,7 +673,7 @@ fn run_browser_login(
             cancelled = true;
             break false;
         }
-        let browser_link = std::fs::read_to_string(&link_file).ok();
+        let browser_link = login_browser::read_link(&link_file);
         let printed_link = links.try_iter().last();
         if !opened
             && let Some(raw) = browser_link.or(printed_link)
@@ -715,8 +703,10 @@ fn run_browser_login(
         }
     };
     let dir = login_dir(account);
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| "/bin/zsh".into());
-    let path = crate::onboarding::login_path(&shell)
+    let path = command
+        .get_envs()
+        .find(|(key, _)| *key == "PATH")
+        .and_then(|(_, value)| value.map(std::ffi::OsStr::to_owned))
         .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
     let status = if account.provider == ProviderKind::Antigravity && account.host_default && success
     {
@@ -743,8 +733,13 @@ fn run_browser_login(
             std::thread::sleep(Duration::from_millis(200));
         }
     } else {
-        krill_proto::agent::which(account.provider.as_str(), &path)
-            .and_then(|exe| krill_proto::account_login::probe(&exe, account.provider, dir))
+        krill_proto::account_login::probe_with_environment(
+            Path::new(command.get_program()),
+            account.provider,
+            dir,
+            None,
+            Some(&path),
+        )
     };
     if (success || newly_added)
         && let Some(status) = status.filter(|s| s.logged_in)
@@ -821,7 +816,7 @@ pub(super) fn authorize_url(provider: ProviderKind, raw: &str) -> Option<&str> {
     allowed.then_some(url)
 }
 
-/// 로그인·조회 대상 프로필. 호스트 기본 계정은 `None`(env 없이 실행, [`krill_proto::account_login::login_program`]).
+/// 로그인·조회 대상 프로필. 호스트 기본 계정은 `None`(env 없이 실행, [`krill_proto::account_login::login_command`]).
 fn login_dir(account: &AccountInfo) -> Option<&Path> {
     (!account.host_default).then(|| Path::new(&account.profile_dir))
 }
@@ -935,7 +930,7 @@ pub fn default_home() -> PathBuf {
     }
     #[cfg(not(test))]
     {
-        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from)
+        krill_proto::os::home_dir().unwrap_or_else(std::env::temp_dir)
     }
 }
 

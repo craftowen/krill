@@ -128,8 +128,7 @@ fn failed_new_login_deletes_account_through_daemon_and_trashes_managed_profile()
         &paths,
         &account,
         true,
-        b"/krill-test-missing-login-cli",
-        &[],
+        std::process::Command::new("/krill-test-missing-login-cli"),
         &std::sync::atomic::AtomicBool::new(false),
     );
     assert_eq!(
@@ -181,8 +180,11 @@ fn failed_relogin_preserves_existing_profile_without_ipc() {
         &paths,
         &account,
         false,
-        b"/bin/sleep",
-        &[b"30".to_vec()],
+        {
+            let mut command = std::process::Command::new("/bin/sleep");
+            command.arg("30");
+            command
+        },
         &std::sync::atomic::AtomicBool::new(true),
     );
     assert_eq!(
@@ -193,8 +195,7 @@ fn failed_relogin_preserves_existing_profile_without_ipc() {
         &paths,
         &account,
         false,
-        b"/krill-test-missing-login-cli",
-        &[],
+        std::process::Command::new("/krill-test-missing-login-cli"),
         &std::sync::atomic::AtomicBool::new(false),
     );
     assert_eq!(

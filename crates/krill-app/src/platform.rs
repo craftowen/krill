@@ -38,16 +38,7 @@ pub use windows::*;
 /// Background CLI work must never allocate a Windows console. Piped stdout/stderr
 /// remain available, so discovery and diagnostics keep their existing contracts.
 pub fn background_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    let command = std::process::Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        let mut command = command;
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-        command
-    }
-    #[cfg(not(windows))]
-    command
+    krill_proto::os::background_command(program)
 }
 
 /// Refresh existing windows after a theme or attention-count change.
