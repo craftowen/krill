@@ -427,6 +427,14 @@ pub struct ProjectsStore {
     pub lineage: BTreeMap<String, StoredWorktreeLineage>,
 }
 
+/// 프로젝트 아이콘(Orca `RepoIcon`). `kind`는 `lucide`(값=아이콘 이름)·`emoji`·`image`(값=https URL
+/// 또는 `<state_dir>/repo-icons/`에 풀어 둔 로컬 파일 경로)다.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredRepoIcon {
+    pub kind: String,
+    pub value: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredProject {
     pub id: String,
@@ -434,6 +442,8 @@ pub struct StoredProject {
     pub display_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub badge_color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_icon: Option<StoredRepoIcon>,
     /// `"git"` 또는 `"folder"`.
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2044,6 +2054,115 @@ fn extract_remote_host(endpoint: &str) -> Option<(String, Option<u16>)> {
 // Domain 3: Projects, Repos, Folder Workspaces & Worktree Metadata (`projects`)
 // ============================================================================
 
+/// Orca `RepoIcon`(`.ref/orca/src/shared/repo-icon.ts`):
+/// `{type:"lucide",name}` · `{type:"emoji",emoji}` · `{type:"image",src,source}`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+struct OrcaRepoIcon {
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    emoji: String,
+    src: String,
+}
+
+/// Orca `MAX_REPO_ICON_UPLOAD_BYTES`와 같은 이미지 상한.
+const MAX_REPO_ICON_BYTES: usize = 256 * 1024;
+pub const REPO_ICON_DIR: &str = "repo-icons";
+
+/// Orca 아이콘을 Krill 저장 형식으로 옮긴다. 인라인 `data:` 이미지는 `projects.toml` 상한을 넘지 않게
+/// `<state_dir>/repo-icons/<id>.<ext>`로 풀어 경로만 남긴다(`write = false`면 파일은 쓰지 않는다).
+fn import_repo_icon(
+    icon: Option<&OrcaRepoIcon>,
+    state_dir: &Path,
+    id: &str,
+    write: bool,
+) -> Option<StoredRepoIcon> {
+    let icon = icon?;
+    let (kind, value) = match icon.kind.trim() {
+        "lucide" => {
+            let name = icon.name.trim();
+            let ok = name.len() <= 40
+                && name.starts_with(|c: char| c.is_ascii_alphabetic())
+                && name.chars().all(|c| c.is_ascii_alphanumeric());
+            ("lucide", ok.then(|| name.to_owned())?)
+        }
+        "emoji" => {
+            let emoji = icon.emoji.trim();
+            let ok = !emoji.is_empty() && emoji.chars().count() <= 16;
+            ("emoji", ok.then(|| emoji.to_owned())?)
+        }
+        "image" => {
+            let src = icon.src.trim();
+            if src.starts_with("https://") {
+                ("image", src.to_owned())
+            } else {
+                let (ext, b64) = src
+                    .strip_prefix("data:image/png;base64,")
+                    .map(|b| ("png", b))
+                    .or_else(|| {
+                        src.strip_prefix("data:image/webp;base64,")
+                            .map(|b| ("webp", b))
+                    })?;
+                let bytes = decode_base64(b64)?;
+                let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
+                let is_webp = bytes.get(..4) == Some(b"RIFF") && bytes.get(8..12) == Some(b"WEBP");
+                if !(is_png || is_webp) {
+                    return None;
+                }
+                let path = state_dir
+                    .join(REPO_ICON_DIR)
+                    .join(format!("{}.{ext}", slugify(id)));
+                if write && fs::read(&path).ok().as_deref() != Some(bytes.as_slice()) {
+                    let dir = path.parent()?;
+                    ensure_dir_0700(dir).ok()?;
+                    let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+                    if fs::write(&tmp, &bytes)
+                        .and_then(|()| fs::rename(&tmp, &path))
+                        .is_err()
+                    {
+                        fs::remove_file(&tmp).ok();
+                        return None;
+                    }
+                }
+                ("image", path.to_string_lossy().into_owned())
+            }
+        }
+        _ => return None,
+    };
+    Some(StoredRepoIcon {
+        kind: kind.to_owned(),
+        value,
+    })
+}
+
+/// 표준 base64(패딩 허용) 디코더. 상한([`MAX_REPO_ICON_BYTES`])을 넘거나 잘못된 문자면 `None`.
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let (mut buf, mut bits) = (0u32, 0u32);
+    for b in input.bytes().filter(|b| !b.is_ascii_whitespace()) {
+        let v = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(u8::try_from((buf >> bits) & 0xFF).ok()?);
+            if out.len() > MAX_REPO_ICON_BYTES {
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 struct OrcaRepo {
@@ -2051,6 +2170,7 @@ struct OrcaRepo {
     path: String,
     display_name: String,
     badge_color: Option<String>,
+    repo_icon: Option<OrcaRepoIcon>,
     kind: Option<String>,
     worktree_base_ref: Option<String>,
     worktree_base_path: Option<String>,
@@ -2078,6 +2198,7 @@ struct OrcaProject {
     id: String,
     display_name: String,
     badge_color: Option<String>,
+    repo_icon: Option<OrcaRepoIcon>,
     kind: Option<String>,
     source_repo_ids: Vec<String>,
 }
@@ -2259,6 +2380,14 @@ fn import_projects_domain(
                 .clone()
                 .or_else(|| proj_meta.and_then(|p| p.badge_color.clone()))
                 .filter(|s| !s.trim().is_empty());
+            let repo_icon = import_repo_icon(
+                repo.repo_icon
+                    .as_ref()
+                    .or_else(|| proj_meta.and_then(|p| p.repo_icon.as_ref())),
+                &opts.state_dir,
+                &repo.id,
+                !opts.dry_run,
+            );
             let kind = repo
                 .kind
                 .as_deref()
@@ -2297,6 +2426,7 @@ fn import_projects_domain(
                 path: clean_path,
                 display_name,
                 badge_color,
+                repo_icon,
                 kind,
                 host_id: None,
                 worktree_base_ref: repo.worktree_base_ref.filter(|s| !s.trim().is_empty()),
@@ -2343,6 +2473,9 @@ fn import_projects_domain(
             let badge_color = proj
                 .and_then(|p| p.badge_color.clone())
                 .filter(|s| !s.trim().is_empty());
+            let repo_icon = proj.and_then(|p| {
+                import_repo_icon(p.repo_icon.as_ref(), &opts.state_dir, &p.id, !opts.dry_run)
+            });
             let kind = setup
                 .kind
                 .as_deref()
@@ -2381,6 +2514,7 @@ fn import_projects_domain(
                 path: clean_path,
                 display_name,
                 badge_color,
+                repo_icon,
                 kind,
                 host_id: setup
                     .host_id
@@ -2427,6 +2561,7 @@ fn import_projects_domain(
                 path: clean_path.clone(),
                 display_name: display_name.clone(),
                 badge_color: None,
+                repo_icon: None,
                 kind: "folder".to_owned(),
                 host_id: None,
                 worktree_base_ref: None,
@@ -2595,6 +2730,10 @@ fn upsert_project(
         }
         if candidate.badge_color.is_some() && existing.badge_color != candidate.badge_color {
             existing.badge_color.clone_from(&candidate.badge_color);
+            changed = true;
+        }
+        if candidate.repo_icon.is_some() && existing.repo_icon != candidate.repo_icon {
+            existing.repo_icon.clone_from(&candidate.repo_icon);
             changed = true;
         }
         if candidate.setup_script.is_some() && existing.setup_script != candidate.setup_script {
@@ -5015,6 +5154,90 @@ mod tests {
             BTreeMap::from([("settings".to_owned(), serde_json::json!({}))]);
         let note = detect_agy_import_note(&opts, &disk_only).unwrap();
         assert!(note.contains("1개"), "{note}");
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn imports_orca_repo_icons_and_extracts_data_urls_to_files() {
+        let root = std::env::temp_dir().join(format!("mk-repo-icons-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let state_dir = root.join("state");
+        let orca_dir = root.join("orca");
+        fs::create_dir_all(orca_dir.join("profiles").join("default")).unwrap();
+        fs::create_dir_all(&state_dir).unwrap();
+        // 1x1 투명 PNG.
+        let png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        let doc = serde_json::json!({
+            "repos": [
+                {"id": "r-gh", "path": "/tmp/mk-icons/gh", "kind": "git",
+                 "repoIcon": {"type": "image", "src": "https://github.com/craftowen.png?size=64", "source": "github"}},
+                {"id": "r-file", "path": "/tmp/mk-icons/file", "kind": "git",
+                 "repoIcon": {"type": "image", "src": format!("data:image/png;base64,{png}"), "source": "file"}},
+                {"id": "r-lucide", "path": "/tmp/mk-icons/lucide", "kind": "git",
+                 "repoIcon": {"type": "lucide", "name": "Rocket"}},
+                {"id": "r-emoji", "path": "/tmp/mk-icons/emoji", "kind": "git",
+                 "repoIcon": {"type": "emoji", "emoji": "🦀"}},
+                {"id": "r-bad", "path": "/tmp/mk-icons/bad", "kind": "git",
+                 "repoIcon": {"type": "image", "src": "data:image/png;base64,bm90IGEgcG5n", "source": "upload"}},
+            ],
+        });
+        fs::write(
+            orca_dir
+                .join("profiles")
+                .join("default")
+                .join("orca-data.json"),
+            doc.to_string(),
+        )
+        .unwrap();
+        let mut opts = ImportOptions {
+            home: root.join("home"),
+            state_dir: state_dir.clone(),
+            orca_dir,
+            domains: vec![ImportDomain::Projects],
+            dry_run: true,
+        };
+        fs::create_dir_all(&opts.home).unwrap();
+        run_import(&opts).unwrap();
+        assert!(
+            !state_dir.join(REPO_ICON_DIR).exists(),
+            "dry-run은 아이콘 파일을 쓰지 않는다"
+        );
+        opts.dry_run = false;
+        run_import(&opts).unwrap();
+
+        let store = ProjectsStore::load(&state_dir).unwrap();
+        let icon = |id: &str| {
+            store
+                .projects
+                .iter()
+                .find(|p| p.id == id)
+                .and_then(|p| p.repo_icon.clone())
+                .map(|i| (i.kind, i.value))
+        };
+        assert_eq!(
+            icon("r-gh"),
+            Some((
+                "image".to_owned(),
+                "https://github.com/craftowen.png?size=64".to_owned()
+            ))
+        );
+        let file = state_dir.join(REPO_ICON_DIR).join("r-file.png");
+        assert_eq!(
+            icon("r-file"),
+            Some(("image".to_owned(), file.to_string_lossy().into_owned()))
+        );
+        assert!(fs::read(&file).unwrap().starts_with(b"\x89PNG"));
+        assert_eq!(
+            icon("r-lucide"),
+            Some(("lucide".to_owned(), "Rocket".to_owned()))
+        );
+        assert_eq!(icon("r-emoji"), Some(("emoji".to_owned(), "🦀".to_owned())));
+        assert_eq!(icon("r-bad"), None, "PNG가 아닌 data URL은 버린다");
+        let raw = fs::read_to_string(state_dir.join(PROJECTS_FILE)).unwrap();
+        assert!(
+            !raw.contains("base64"),
+            "data URL을 projects.toml에 넣지 않는다"
+        );
         fs::remove_dir_all(&root).ok();
     }
 
