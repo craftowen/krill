@@ -125,6 +125,130 @@ fn input_is_processed_while_search_waits_for_recording() {
     );
 }
 
+/// 콜드 세그먼트의 read를 FIFO에서 멈춰 두어도 같은 연결의 INPUT을 처리한다.
+#[test]
+fn input_is_processed_while_cold_history_read_is_blocked() {
+    use crate::store::{Limits, Store};
+    use krill_proto::screen::{HistoryRequest, Source};
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    let root = std::env::temp_dir().join(format!("krill-history-input-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let store = Store::open(&root, Limits::default()).unwrap();
+    let size = WinSize { cols: 80, rows: 24 };
+    let rec = store.recorder(SessionId(1), size).unwrap();
+    let pty = rustix_openpty::openpty(None, None).unwrap();
+    let session = Session::start(
+        SessionId(1),
+        pty.controller,
+        size,
+        Arc::new(Appearance::load(PathBuf::new())),
+        Some(rec),
+    )
+    .unwrap();
+    let tap = session.tap();
+    let fifo = store
+        .session_dir(SessionId(1))
+        .join("seg-00000000000000000000.krs");
+    std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+    assert!(
+        std::process::Command::new("/usr/bin/mkfifo")
+            .args(["-m", "600"])
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let (mut client, server) = UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let attached = tap.clone();
+    let worker = thread::spawn(move || {
+        crate::attach::run_as(
+            server,
+            Attach {
+                session: SessionId(1),
+                stream: Stream::Screen { known: None },
+            },
+            1,
+            FEAT_INPUT,
+            Some(attached),
+            Role::Observer,
+            crate::attach::FRAME_MIN,
+        )
+    });
+    client
+        .write_all(
+            &HistoryRequest {
+                req: 1,
+                source: Source::Cold { page: 0 },
+                skip: 0,
+                count: 1,
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    // 제한된 시간 안에 읽기 시작을 확인하고 fd를 유지해 read의 EOF를 막는다.
+    let writer = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(file) => return Some(file),
+                Err(error)
+                    if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(2));
+                }
+                _ => return None,
+            }
+        }
+    });
+    let blocked_read = writer.join().unwrap();
+    let started = blocked_read.is_some();
+    client
+        .write_all(
+            &Input {
+                id: InputId(1),
+                bytes: b"input".to_vec(),
+            }
+            .encode()
+            .unwrap(),
+        )
+        .unwrap();
+    let reply = loop {
+        match ipc::read_frame(&mut client) {
+            Ok(Some((kind, body))) if kind == krill_proto::input::kind::INPUT_ACK => {
+                break InputAck::decode(kind, &body).ok();
+            }
+            Ok(Some(_)) => {}
+            _ => break None,
+        }
+    };
+    // 회귀 시에도 read를 풀고 테스트 소유 스레드와 PTY부터 정리한다.
+    drop(blocked_read);
+    client.shutdown(Shutdown::Both).unwrap();
+    worker.join().unwrap().ok();
+    drop(pty.user);
+    session.wait().unwrap();
+    std::fs::remove_dir_all(root).ok();
+    assert!(started, "cold history must start reading the test segment");
+    assert_eq!(
+        reply,
+        Some(InputAck {
+            id: InputId(1),
+            result: InputResult::Denied
+        }),
+        "cold history must not block the input request loop"
+    );
+}
+
 /// OWE-474: `guarded`는 엔진 panic을 잡고 엔진을 새로 만든 뒤 `false`를 돌려준다.
 /// 실제 주입원이던 kitty 키보드 스택 overflow는 좁은 포크에서 고쳐져 출력 바이트로는
 /// 더 이상 panic을 일으킬 수 없으므로, panic 자체를 클로저로 넣어 격리 기제(P4)를 확인한다.

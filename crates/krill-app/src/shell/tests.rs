@@ -3,6 +3,79 @@ use gpui::{Entity, Modifiers, Point, TestAppContext, VisualTestContext, point, p
 use super::*;
 
 use krill_proto::SessionId;
+#[gpui::test]
+fn cursor_blink_stops_when_hidden_or_inactive_and_restarts_visible(cx: &mut TestAppContext) {
+    use krill_proto::screen::{CursorShape, CursorStyle, Op, Revision, Seq, encode_update};
+    let (view, cx) = open(cx, state_path("cursor-cpu"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let frame = |s: &mut Shell, bytes: &[u8], cx: &mut Context<Shell>| {
+        let (kind, body) = ipc::read_frame(&mut &bytes[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, krill_proto::SessionId(41), ours, cx);
+            s.layout.set_session(pane, krill_proto::SessionId(41));
+            s.on_window_active_changed(true, cx);
+            let update = encode_update(
+                Revision(1),
+                Seq(0),
+                vec![
+                    Op::Reset { cols: 8, lines: 2 },
+                    Op::CursorStyle(CursorStyle {
+                        shape: CursorShape::Bar,
+                        blink: true,
+                    }),
+                ],
+            )
+            .unwrap();
+            frame(s, &update[0], cx);
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_some());
+            s.on_window_active_changed(false, cx);
+            assert!(s.cursor_blink.is_none());
+            s.on_window_active_changed(true, cx);
+            assert!(s.cursor_blink.as_ref().is_some_and(|(_, hidden)| !hidden));
+
+            s.chat.active_sessions.insert(krill_proto::SessionId(41));
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_none());
+            s.chat.active_sessions.clear();
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_some());
+
+            s.open_settings(krill_app::settings::AdminTab::General, None, cx);
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_none());
+            s.close_settings(None, cx);
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_some());
+            s.dashboard(cx);
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_none());
+            s.close_dashboard(None, cx);
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_some());
+
+            let terminal_layout = s.layout.clone();
+            s.layout.open_file("/tmp/cursor-file-view.txt".into());
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_none());
+            s.layout = terminal_layout;
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_some());
+
+            let mut cursor = s.live[&pane].pane.shown().cursor;
+            cursor.visible = false;
+            let update = encode_update(Revision(2), Seq(0), vec![Op::Cursor(cursor)]).unwrap();
+            frame(s, &update[0], cx);
+            s.sync_cursor_blink(true, cx);
+            assert!(s.cursor_blink.is_none());
+        });
+    });
+}
+
 use krill_proto::control::Program;
 
 pub(super) fn state_path(name: &str) -> PathBuf {

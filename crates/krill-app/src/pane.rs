@@ -23,6 +23,8 @@ use krill_proto::os::net::UnixStream;
 use std::io::{self, Write};
 use std::net::Shutdown;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -381,7 +383,26 @@ fn agent_call(target: &HostTarget, request: &Request) -> io::Result<Option<Reply
 /// 막지 않는다(OWE-579). 쓰기가 실패하거나 [`WRITE_TIMEOUT`]만큼 막히면, 또는 이 값을 버리면 스레드가 소켓을 닫는다.
 /// 그러면 읽는 쪽이 EOF를 받아 셸이 다시 붙는다(끊긴 채 열린 연결에 입력이 보류되지 않는다).
 #[derive(Debug)]
-pub struct Writer(mpsc::Sender<Vec<u8>>);
+pub struct Writer {
+    send: mpsc::SyncSender<PendingWrite>,
+    bytes: Arc<AtomicUsize>,
+}
+
+/// 설계 상한: ACK 대기 입력 1MiB와 제어 프레임 여유를 합친다. 쓰는 중인 프레임도 포함한다.
+const WRITE_QUEUE_BYTES: usize = 2 << 20;
+const WRITE_QUEUE_FRAMES: usize = 1_024;
+
+#[derive(Debug)]
+struct PendingWrite {
+    frame: Vec<u8>,
+    bytes: Arc<AtomicUsize>,
+}
+
+impl Drop for PendingWrite {
+    fn drop(&mut self) {
+        self.bytes.fetch_sub(self.frame.len(), Ordering::Relaxed);
+    }
+}
 
 impl Writer {
     /// # Errors
@@ -392,27 +413,39 @@ impl Writer {
 
     fn spawn_for(mut s: UnixStream, target: Option<HostTarget>) -> io::Result<Self> {
         s.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        let (tx, rx) = mpsc::sync_channel::<PendingWrite>(WRITE_QUEUE_FRAMES);
+        let bytes = Arc::new(AtomicUsize::new(0));
         thread::Builder::new()
             .name("pane-writer".to_owned())
             .spawn(move || {
                 let _connection_owner = target;
                 while let Ok(frame) = rx.recv() {
-                    if s.write_all(&frame).is_err() {
+                    if s.write_all(&frame.frame).is_err() {
                         break;
                     }
                 }
                 s.shutdown(Shutdown::Both).ok();
             })?;
-        Ok(Self(tx))
+        Ok(Self { send: tx, bytes })
     }
 }
 
 impl Write for Writer {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0
-            .send(buf.to_vec())
-            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        self.bytes
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |held| {
+                held.checked_add(buf.len())
+                    .filter(|n| *n <= WRITE_QUEUE_BYTES)
+            })
+            .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+        let pending = PendingWrite {
+            frame: buf.to_vec(),
+            bytes: Arc::clone(&self.bytes),
+        };
+        self.send.try_send(pending).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => io::Error::from(io::ErrorKind::WouldBlock),
+            mpsc::TrySendError::Disconnected(_) => io::Error::from(io::ErrorKind::BrokenPipe),
+        })?;
         Ok(buf.len())
     }
 

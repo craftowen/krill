@@ -47,6 +47,10 @@ pub const MAX_INPUT: usize = 64 * 1_024;
 /// 끊긴 동안 세션 하나에 보류하는 최대 바이트. 넘는 입력은 받지 않고 [`Fate::Full`]로 알린다.
 /// 설계값(perf-first #5, 측정 근거 없음).
 pub const HOLD_MAX: usize = 64 * 1_024;
+/// 연결된 세션 하나의 ACK 대기 입력 상한. 설계값이며 처리량 측정값이 아니다.
+pub const IN_FLIGHT_MAX: usize = 1 << 20;
+/// 작은 입력을 반복할 때 장부 항목 자체가 커지지 않도록 연결·보류 상태 모두 제한한다.
+const MAX_PENDING_FRAMES: usize = 1_024;
 /// 보류 입력의 유예. 친 지 이만큼 지난 입력은 다시 붙어도 보내지 않는다([`Fate::Expired`]). Orca와 같은 5분(설계값).
 pub const GRACE: Duration = Duration::from_mins(5);
 /// 보낸 입력의 ack를 이만큼 못 받으면 krilld가 멈춘 것으로 본다. 설계값(perf-first #13 "입력 후 2초").
@@ -127,7 +131,7 @@ pub enum Fate {
     NewSession,
     /// 세션이 끝나 krilld가 쓰지 않았다.
     SessionClosed,
-    /// 보류 상한([`HOLD_MAX`])을 넘어 받지 않았다.
+    /// 보류 또는 ACK 대기 상한을 넘어 받지 않았다.
     Full,
     /// 연결한 데몬이 [`FEAT_INPUT`]을 지원하지 않는다.
     Unsupported,
@@ -194,16 +198,26 @@ impl Journal {
     }
 
     /// 사용자 입력. 붙어 있으면 지금 보낼 프레임들([`MAX_INPUT`]씩 나눔)을, 끊겨 있으면 보류하고 빈 목록을 준다.
-    /// 보류 상한을 넘으면 통째로 받지 않고 [`Fate::Full`].
+    /// 보류·ACK 대기 바이트 또는 항목 상한을 넘으면 통째로 받지 않고 [`Fate::Full`].
     pub fn input(&mut self, bytes: &[u8], now: Now) -> Result<Vec<Input>, Notice> {
+        let frames = bytes.len().div_ceil(MAX_INPUT);
         if self.linked {
+            let sent_bytes: usize = self.sent.iter().map(|e| e.bytes.len()).sum();
+            if bytes.len() > IN_FLIGHT_MAX.saturating_sub(sent_bytes)
+                || frames > MAX_PENDING_FRAMES.saturating_sub(self.sent.len())
+            {
+                return Err(Notice {
+                    fate: Fate::Full,
+                    bytes: bytes.to_vec(),
+                });
+            }
             return Ok(bytes
                 .chunks(MAX_INPUT)
                 .map(|c| self.send(c.to_vec(), now))
                 .collect());
         }
         let total = self.held_bytes.saturating_add(bytes.len());
-        if total > HOLD_MAX {
+        if total > HOLD_MAX || frames > MAX_PENDING_FRAMES.saturating_sub(self.held.len()) {
             return Err(Notice {
                 fate: Fate::Full,
                 bytes: bytes.to_vec(),
@@ -277,8 +291,15 @@ impl Journal {
                 .duration_since(e.wall)
                 .map_or(true, |age| age < GRACE)
         });
-        let frames = fresh.into_iter().map(|e| self.send(e.bytes, now)).collect();
-        (frames, notice(Fate::Expired, old).into_iter().collect())
+        let mut frames = Vec::new();
+        let mut notices: Vec<_> = notice(Fate::Expired, old).into_iter().collect();
+        for entry in fresh {
+            match self.input(&entry.bytes, now) {
+                Ok(input) => frames.extend(input),
+                Err(rejected) => notices.push(rejected),
+            }
+        }
+        (frames, notices)
     }
 
     /// 보낸 입력 중 가장 오래된 것의 ack가 [`PROBE`] 넘게(깨어 있던 시간으로) 오지 않았다.

@@ -127,6 +127,7 @@ fn hsla(c: Rgb) -> Hsla {
 pub struct Terminal {
     screen: Rc<Screen>,
     theme: Theme,
+    row_cache: RowPlanCache,
 }
 
 impl Terminal {
@@ -134,6 +135,7 @@ impl Terminal {
         Self {
             screen: Rc::new(screen),
             theme,
+            row_cache: RowPlanCache::default(),
         }
     }
 
@@ -150,7 +152,8 @@ impl Terminal {
 
 impl Render for Terminal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut element = TerminalElement::new(self.screen.clone(), self.theme);
+        let mut element = TerminalElement::new(self.screen.clone(), self.theme)
+            .with_row_cache(self.row_cache.clone());
         element.opacity = crate::settings::terminal_opacity_alpha(cx);
         element.cursor = effective_cursor(
             self.screen.cursor_style,
@@ -357,6 +360,7 @@ pub struct TerminalElement {
     pub cursor_hidden: bool,
     /// 비포커스 칸의 빈 테두리 블록 커서(OWE-871). 셸이 포커스 칸이 아닐 때 켠다.
     pub cursor_hollow: bool,
+    row_cache: Option<RowPlanCache>,
 }
 
 impl TerminalElement {
@@ -375,7 +379,15 @@ impl TerminalElement {
             opacity: 1.,
             cursor_hidden: false,
             cursor_hollow: false,
+            row_cache: None,
         }
+    }
+
+    /// 요소를 다시 만들어도 같은 가시 pane의 행 계획을 재사용한다.
+    #[must_use]
+    pub fn with_row_cache(mut self, cache: RowPlanCache) -> Self {
+        self.row_cache = Some(cache);
+        self
     }
 
     /// 배경 알파를 곱한 터미널 배경색.
@@ -446,18 +458,22 @@ impl Element for TerminalElement {
         let family = crate::settings::terminal_font_family(cx);
         let background = self.background();
         window.paint_quad(fill(bounds, background));
-        let plans: Vec<_> = self
-            .screen
-            .rows
-            .iter()
-            .map(|r| plan_row(r, theme))
-            .collect();
+        let plans = self.row_cache.as_ref().map_or_else(
+            || {
+                self.screen
+                    .rows
+                    .iter()
+                    .map(|row| Rc::new(plan_row(row, theme)))
+                    .collect()
+            },
+            |cache| cache.plans(&self.screen, theme),
+        );
         let x0 = bounds.origin.x;
         let col_x = |col: u16| x0 + cell.width * f32::from(col);
         let line_y = |line: u16| bounds.origin.y + cell.height * f32::from(line);
 
         window.paint_layer(bounds, |window| {
-            for (line, plan) in (0u16..).zip(&plans) {
+            for (line, plan) in (0u16..).zip(plans.iter()) {
                 for span in &plan.bg {
                     let origin = point(col_x(span.column), line_y(line));
                     let extent = size(cell.width * f32::from(span.cols), cell.height);
@@ -509,7 +525,7 @@ impl Element for TerminalElement {
             (cell.height - probe.ascent - probe.descent) / 2. + probe.ascent * (1. - STRIKE_RISE);
 
         window.paint_layer(bounds, |window| {
-            for (line, plan) in (0u16..).zip(&plans) {
+            for (line, plan) in (0u16..).zip(plans.iter()) {
                 for (spans, dy) in [(&plan.underlines, underline_dy), (&plan.strikes, strike_dy)] {
                     for span in spans {
                         let origin = point(col_x(span.column), line_y(line) + dy);
@@ -690,6 +706,8 @@ impl Element for TerminalElement {
 }
 
 pub mod path_link;
+mod row_cache;
+pub use row_cache::RowPlanCache;
 
 #[cfg(test)]
 mod tests;

@@ -5,6 +5,49 @@ use krill_proto::{control::AgentStatus, input::Input, ipc, screen::Msg as _};
 
 use super::*;
 
+#[test]
+fn port_cache_tracks_replaced_screens_and_removes_stale_urls() {
+    use std::rc::Rc;
+    let screen_with_text = |text: &str| {
+        let mut screen = Screen::blank(80, 1);
+        screen.rows[0] = text
+            .chars()
+            .map(|ch| krill_proto::screen::Cell {
+                ch,
+                ..Default::default()
+            })
+            .collect();
+        Rc::new(screen)
+    };
+    let mut cache = PortCache::default();
+    let first = screen_with_text("Local: http://localhost:3000");
+    let expected =
+        krill_proto::orchestration::extract_local_urls(42, &screen_plain_text(&first), false);
+    assert!(!expected.is_empty());
+    assert_eq!(cache.detect(42, &first), expected);
+    let allocation = cache.entries.as_ptr();
+    assert_eq!(cache.detect(42, &first), expected);
+    assert_eq!(cache.entries.as_ptr(), allocation);
+
+    let mut cursor = (*first).clone();
+    cursor.cursor.column = 5;
+    let cursor = Rc::new(cursor);
+    assert_eq!(cache.detect(42, &cursor), expected);
+    assert_eq!(cache.entries.as_ptr(), allocation);
+    assert!(Rc::ptr_eq(&cache.screen.upgrade().unwrap(), &cursor));
+    drop(first);
+    drop(cursor);
+    assert!(cache.screen.upgrade().is_none());
+
+    let changed = screen_with_text("http://127.0.0.1:8080");
+    assert_eq!(
+        cache.detect(42, &changed),
+        krill_proto::orchestration::extract_local_urls(42, &screen_plain_text(&changed), false)
+    );
+    let cleared = screen_with_text("ready");
+    assert!(cache.detect(42, &cleared).is_empty());
+}
+
 #[gpui::test]
 fn status_indicators_expose_status_role_and_label(cx: &mut TestAppContext) {
     let p = &krill_app::ui::DARK;

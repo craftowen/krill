@@ -2,6 +2,26 @@ use krill_proto::screen::{Color, Cursor, Flags, Link};
 
 use super::*;
 
+#[test]
+fn capture_clock_limits_empty_attempts_but_preserves_idle_and_resync_fast_paths() {
+    let now = Instant::now();
+    let period = Duration::from_millis(8);
+    let mut clock = CaptureClock::default();
+    assert_eq!(clock.delay(now, period, false), Duration::ZERO);
+    clock.mark(now); // capture 결과가 비어도 시도한 시간은 기록한다.
+    assert_eq!(
+        clock.delay(now + Duration::from_millis(3), period, false),
+        Duration::from_millis(5)
+    );
+    clock.mark(now + period);
+    assert_eq!(clock.delay(now + period, period, false), period);
+    assert_eq!(clock.delay(now + period, period, true), Duration::ZERO);
+    assert_eq!(
+        clock.delay(now + Duration::from_millis(30), period, false),
+        Duration::ZERO
+    );
+}
+
 fn row(text: &str) -> Vec<Cell> {
     text.chars()
         .map(|ch| Cell {

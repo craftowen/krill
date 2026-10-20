@@ -57,6 +57,78 @@ fn daemon_status_dot(tip: String, color: gpui::Hsla) -> gpui::Stateful<gpui::Div
 /// 상태바 떼 미터 점 칸 수. 폭은 세션 수와 무관하게 이만큼 예약한다.
 const STATUS_SWARM_DOTS: usize = 8;
 
+/// 화면 객체가 그대로면 평문 변환도 생략한다. Weak로 이전 화면을 붙들지 않는다.
+#[derive(Default)]
+pub(super) struct PortCache {
+    screen: std::rc::Weak<Screen>,
+    text: String,
+    entries: Vec<krill_proto::orchestration::PortEntry>,
+}
+
+impl PortCache {
+    pub(super) fn matches(&self, screen: &std::rc::Rc<Screen>) -> bool {
+        self.screen
+            .upgrade()
+            .is_some_and(|old| std::rc::Rc::ptr_eq(&old, screen))
+    }
+
+    pub(super) fn entries(&self) -> &[krill_proto::orchestration::PortEntry] {
+        &self.entries
+    }
+
+    pub(super) fn into_data(self) -> (String, Vec<krill_proto::orchestration::PortEntry>) {
+        (self.text, self.entries)
+    }
+
+    pub(super) fn from_result(
+        screen: &std::rc::Rc<Screen>,
+        text: String,
+        entries: Vec<krill_proto::orchestration::PortEntry>,
+    ) -> Self {
+        Self {
+            screen: std::rc::Rc::downgrade(screen),
+            text,
+            entries,
+        }
+    }
+
+    #[cfg(test)]
+    fn detect(
+        &mut self,
+        session: u64,
+        screen: &std::rc::Rc<Screen>,
+    ) -> &[krill_proto::orchestration::PortEntry] {
+        if !self.matches(screen) {
+            (self.text, self.entries) = detect_ports(
+                session,
+                screen,
+                Some((
+                    std::mem::take(&mut self.text),
+                    std::mem::take(&mut self.entries),
+                )),
+            );
+            self.screen = std::rc::Rc::downgrade(screen);
+        }
+        &self.entries
+    }
+}
+
+/// 평문 변환·URL 감지는 백그라운드에서 실행하고 같은 텍스트면 결과를 재사용한다.
+pub(super) fn detect_ports(
+    session: u64,
+    screen: &Screen,
+    previous: Option<(String, Vec<krill_proto::orchestration::PortEntry>)>,
+) -> (String, Vec<krill_proto::orchestration::PortEntry>) {
+    let text = screen_plain_text(screen);
+    if let Some((old, entries)) = previous
+        && old == text
+    {
+        return (old, entries);
+    }
+    let entries = krill_proto::orchestration::extract_local_urls(session, &text, false);
+    (text, entries)
+}
+
 /// OWE-856: 세션 수·알림 수(상태 역할·이름 노출). 세션 수 옆에 세션별 상태 떼 미터.
 fn usage_status(
     p: &ui::Palette,
@@ -1721,15 +1793,14 @@ impl Shell {
             })
             .on_open_change(track_menu_open(cx.weak_entity()));
         let mut detected_ports = Vec::new();
-        for (sid, (_, entries)) in self.ports_cache.borrow().iter() {
-            if !self
-                .live
-                .values()
-                .any(|live| live.pane.session().is_some_and(|session| session.0 == *sid))
-            {
+        for (sid, cache) in self.ports_cache.borrow().iter() {
+            if !self.live.values().any(|live| {
+                live.pane.session().is_some_and(|session| session.0 == *sid)
+                    && cache.matches(&live.pane.shown())
+            }) {
                 continue;
             }
-            for entry in entries {
+            for entry in cache.entries() {
                 if !detected_ports
                     .iter()
                     .any(|e: &krill_proto::orchestration::PortEntry| e.url == entry.url)
