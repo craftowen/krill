@@ -631,7 +631,9 @@ fn survival_e2e_2_update_preserves_session_output_screen_and_zero_orphan_daemons
 
     // Phase 2(업그레이드 중) + Phase 3(업그레이드 후) 바이트·SHA-256 완전 일치(Gap 0).
     let (mut raw_stream, at) = attach_raw(&rig.sock, gen_session, resume_seq);
-    assert!(at.seq.0 >= u64::try_from(want.len()).unwrap());
+    // done-2는 생성기의 PTY 쓰기 완료다. 데몬이 나머지를 읽기 전 붙어도 정상이며,
+    // attach 시점까지의 재생과 이후 실시간 출력을 아래에서 연속 seq·바이트·해시로 검증한다.
+    assert!(at.seq.0 >= resume_seq);
     receive_exact_raw(&mut raw_stream, &mut got, want.len());
     fs::write(rig.dir.join("go-3"), []).unwrap();
     want.extend(phase_bytes(3));

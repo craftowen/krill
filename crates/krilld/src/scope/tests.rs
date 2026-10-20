@@ -175,7 +175,7 @@ fn nested_nc(sock: &Path) -> Child {
     nested_nc_as(sock, Path::new("/usr/bin/nc"))
 }
 
-/// `nested_nc`의 nc 경로 지정판. ad-hoc 서명한 복사본으로 피어 서명을 바꾼다.
+/// `nested_nc`의 nc 경로 지정판.
 fn nested_nc_as(sock: &Path, nc: &Path) -> Child {
     Command::new("/bin/sh")
         .arg("-c")
@@ -479,10 +479,10 @@ fn bogus_token_is_invalid() {
     assert_eq!(sys::verify_audit_token(&[1u8; 7]), CodeSign::invalid());
 }
 
-/// ad-hoc 서명한 nc 복사본. `identifier`를 지정해 피어 서명을 바꾼다.
-fn adhoc_nc(dir: &Path, tag: &str, identifier: &str) -> PathBuf {
-    let dst = dir.join(format!("nc-{tag}"));
-    fs::copy("/usr/bin/nc", &dst).unwrap();
+/// 테스트 바이너리 복사본을 서명한다. OS 버전별 시스템 nc 재서명 동작에 의존하지 않는다.
+fn adhoc_peer(dir: &Path, tag: &str, identifier: &str, sock: &Path) -> Child {
+    let dst = dir.join(format!("peer-{tag}"));
+    fs::copy(std::env::current_exe().unwrap(), &dst).unwrap();
     let out = Command::new("/usr/bin/codesign")
         .args(["-f", "-s", "-", "-i", identifier])
         .arg(&dst)
@@ -493,12 +493,27 @@ fn adhoc_nc(dir: &Path, tag: &str, identifier: &str) -> PathBuf {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    dst
+    Command::new(dst)
+        .args(["--exact", "scope::tests::signed_peer_child", "--nocapture"])
+        .env("KRILL_TEST_SIGNED_SOCKET", sock)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap()
 }
 
-/// 자식이 붙을 때까지 최대 15초 기다린다. 서명이 깨진 바이너리는 커널이 죽여 영원히 안 오므로 타임아웃으로
-/// 실패한다.
-fn accept_timeout(lis: &UnixListener) -> UnixStream {
+#[test]
+fn signed_peer_child() {
+    let Some(sock) = std::env::var_os("KRILL_TEST_SIGNED_SOCKET") else {
+        return;
+    };
+    let mut conn = krill_proto::os::net::UnixStream::connect(sock).unwrap();
+    std::io::copy(&mut conn, &mut std::io::sink()).unwrap();
+}
+
+/// 접속을 기다리는 동안 자식 종료도 감지해 서명 거부를 접속 타임아웃과 구분한다.
+fn accept_timeout(lis: &UnixListener, child: &mut Child) -> UnixStream {
     lis.set_nonblocking(true).unwrap();
     let start = std::time::Instant::now();
     loop {
@@ -509,6 +524,9 @@ fn accept_timeout(lis: &UnixListener) -> UnixStream {
                 return conn;
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("signed peer exited before connecting: {status}");
+                }
                 assert!(
                     start.elapsed() < std::time::Duration::from_secs(15),
                     "peer did not connect"
@@ -534,9 +552,8 @@ fn real_adhoc_peer_passes_when_signing_required() {
     let sock = dir.0.join("s");
     let lis = UnixListener::bind(&sock).unwrap();
     let audit = Audit::new(dir.0.join("audit.log"));
-    let nc = adhoc_nc(&dir.0, "pass", "com.example.mk-test-pass");
-    let mut child = nested_nc_as(&sock, &nc);
-    let conn = accept_timeout(&lis);
+    let mut child = adhoc_peer(&dir.0, "pass", "com.example.mk-test-pass", &sock);
+    let conn = accept_timeout(&lis, &mut child);
     let mut peer = Peer::of(&conn, &Roots::default());
     assert_eq!(peer.scope, Scope::Full);
     let token = sys::peer_token(conn.as_fd()).unwrap();
@@ -562,9 +579,8 @@ fn real_identifier_mismatch_is_denied() {
     let sock = dir.0.join("s");
     let lis = UnixListener::bind(&sock).unwrap();
     let audit = Audit::new(dir.0.join("audit.log"));
-    let nc = adhoc_nc(&dir.0, "evil", "com.example.mk-test-evil");
-    let mut child = nested_nc_as(&sock, &nc);
-    let conn = accept_timeout(&lis);
+    let mut child = adhoc_peer(&dir.0, "evil", "com.example.mk-test-evil", &sock);
+    let conn = accept_timeout(&lis, &mut child);
     let mut peer = Peer::of(&conn, &Roots::default());
     assert_eq!(peer.scope, Scope::Full);
     let token = sys::peer_token(conn.as_fd()).unwrap();
@@ -591,9 +607,8 @@ fn real_policy_off_keeps_full() {
     let sock = dir.0.join("s");
     let lis = UnixListener::bind(&sock).unwrap();
     let audit = Audit::new(dir.0.join("audit.log"));
-    let nc = adhoc_nc(&dir.0, "off", "com.example.mk-test-off");
-    let mut child = nested_nc_as(&sock, &nc);
-    let conn = accept_timeout(&lis);
+    let mut child = adhoc_peer(&dir.0, "off", "com.example.mk-test-off", &sock);
+    let conn = accept_timeout(&lis, &mut child);
     let mut peer = Peer::of(&conn, &Roots::default());
     assert_eq!(peer.scope, Scope::Full);
     assert!(

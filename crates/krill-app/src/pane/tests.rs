@@ -233,6 +233,24 @@ fn scroll_fetches_hot_then_cold_without_overlap() {
 }
 
 #[test]
+fn scroll_down_after_async_history_overscroll_moves_visible_rows() {
+    let mut p = linked();
+    update(&mut p, 1, snapshot(["s0", "s1", "s2"]));
+    // 응답 전에 실제 히스토리보다 훨씬 위로 스크롤한다.
+    assert!(!p.scroll(10_000));
+    answer(&mut p, 4, &[vec!["c0".into(), "c1".into()]]);
+    assert_eq!(texts(&p.shown()), ["c0", "c1", "h3"]);
+
+    // 첫 아래 방향 입력부터 화면이 한 행 이동해야 한다.
+    assert!(p.scroll(-1));
+    assert_eq!(texts(&p.shown()), ["c1", "h3", "h2"]);
+    assert_eq!(p.scroll_offset(), 5);
+    assert!(p.scroll(-5));
+    assert_eq!(texts(&p.shown()), ["s0", "s1", "s2"]);
+    assert_eq!(p.scroll_offset(), 0);
+}
+
+#[test]
 fn overlap_rule() {
     let r = |t: &str| row(t);
     let hot = vec![r("h0"), r("h1"), r("h2")]; // 아래부터, h2가 맨 위
