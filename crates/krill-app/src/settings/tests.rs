@@ -7819,3 +7819,185 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
 
     fs::remove_dir_all(d).ok();
 }
+
+/// OWE-956: 터미널 테마 기본값·TOML 왕복·커스텀 테마 추가/삭제·라이트/다크 분리 해석을 검증한다.
+#[test]
+fn terminal_themes_toml_roundtrip_and_mode_resolution() {
+    let mut s = Settings::default();
+    assert_eq!(
+        s.terminal_theme_dark,
+        crate::ui::DEFAULT_TERMINAL_THEME_DARK
+    );
+    assert_eq!(
+        s.terminal_theme_light,
+        crate::ui::DEFAULT_TERMINAL_THEME_LIGHT
+    );
+    assert!(s.terminal_use_separate_light_theme);
+    assert!(s.terminal_custom_themes.is_empty());
+    // 기본값은 기존 동작과 같다: 다크 → TERMINAL_DARK, 라이트 → TERMINAL_LIGHT.
+    assert_eq!(
+        crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &s),
+        crate::ui::TERMINAL_DARK
+    );
+    assert_eq!(
+        crate::ui::terminal_theme_for_mode(ThemeMode::Light, &s),
+        crate::ui::TERMINAL_LIGHT
+    );
+    // 이전 버전 settings.toml(테마 키 없음)도 같은 기본값으로 읽힌다.
+    let legacy = Settings::parse("theme = \"light\"\n").unwrap();
+    assert!(legacy.terminal_use_separate_light_theme);
+    assert_eq!(
+        crate::ui::terminal_theme_for_mode(ThemeMode::Light, &legacy),
+        crate::ui::TERMINAL_LIGHT
+    );
+
+    s.terminal_theme_dark = "Dracula".into();
+    s.terminal_theme_light = "Catppuccin Latte".into();
+    let light_separate = crate::ui::terminal_theme_for_mode(ThemeMode::Light, &s);
+    assert_eq!(
+        light_separate,
+        crate::ui::builtin_terminal_theme("Catppuccin Latte")
+            .unwrap()
+            .theme
+    );
+
+    // 분리를 끄면 라이트 모드도 다크 테마를 쓴다.
+    s.terminal_use_separate_light_theme = false;
+    let dark_resolved = crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &s);
+    let light_shared = crate::ui::terminal_theme_for_mode(ThemeMode::Light, &s);
+    assert_eq!(dark_resolved, light_shared);
+    assert_eq!(
+        dark_resolved,
+        crate::ui::builtin_terminal_theme("Dracula").unwrap().theme
+    );
+
+    // 알 수 없는 이름은 모드 기본값으로 돌아간다.
+    s.terminal_theme_dark = "No Such Theme".into();
+    assert_eq!(
+        crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &s),
+        crate::ui::TERMINAL_DARK
+    );
+
+    // 빈 `terminal_custom_themes`는 직렬화에서 빠져 이후 테이블 배열 편집이 성공한다.
+    let base_toml = s.to_toml();
+    assert!(!base_toml.contains("terminal_custom_themes"));
+
+    let custom = crate::ui::parse_warp_theme_yaml(
+        "name: Warp Test\nbackground: '#112233'\nforeground: '#ddeeff'\nterminal_colors:\n  normal:\n    red: '#ff0055'\n",
+        "warp-test.yaml",
+    )
+    .unwrap();
+    s.terminal_custom_themes.push(custom.clone());
+    s.terminal_theme_dark = custom.selection_value();
+    let with_custom_toml = krill_proto::config_document::edit_toml_aliases(
+        &base_toml,
+        &s,
+        &[("awake", "keep_awake"), ("zoom", "ui_zoom")],
+    )
+    .unwrap();
+    let reparsed = Settings::parse(&with_custom_toml).unwrap();
+    assert_eq!(reparsed.terminal_custom_themes.len(), 1);
+    assert_eq!(reparsed.terminal_theme_dark, "custom:warp:warp-test");
+    assert_eq!(
+        crate::ui::terminal_theme_for_mode(ThemeMode::Dark, &reparsed),
+        custom.to_terminal_theme().unwrap()
+    );
+
+    s.terminal_custom_themes.clear();
+    let cleared_toml = krill_proto::config_document::edit_toml_aliases(
+        &with_custom_toml,
+        &s,
+        &[("awake", "keep_awake"), ("zoom", "ui_zoom")],
+    )
+    .unwrap();
+    let reparsed_cleared = Settings::parse(&cleared_toml).unwrap();
+    assert!(reparsed_cleared.terminal_custom_themes.is_empty());
+}
+
+/// OWE-956: 터미널 탭에서 테마 목록·모드 전환·미리보기·삭제가 동작한다.
+#[gpui::test]
+fn terminal_tab_renders_themes_preview_and_selects_theme(cx: &mut TestAppContext) {
+    let d = dir("owe956-terminal-themes-ui");
+    init(cx, &d);
+    let custom = crate::ui::parse_warp_theme_yaml(
+        "name: My Warp Dark\nbackground: '#101418'\nforeground: '#e0e4e8'\nterminal_colors:\n  normal:\n    green: '#22cc66'\n",
+        "my-warp.yaml",
+    )
+    .unwrap();
+    cx.update(|cx| {
+        edit(cx, |s| {
+            s.terminal_custom_themes.push(custom);
+        });
+    });
+    let (view, vcx) = cx.add_window_view(|_, cx| {
+        let mut v = SettingsView::new(cx);
+        v.tab = AdminTab::Terminal;
+        v.terminal_theme_target = Some(ThemeMode::Dark);
+        v
+    });
+    vcx.simulate_resize(size(px(1280.), px(4000.)));
+    vcx.run_until_parked();
+
+    for sel in [
+        "terminal-section-themes",
+        "terminal-theme-picker-card",
+        "terminal-theme-preview-card",
+        "terminal-theme-custom-0",
+        "terminal-theme-builtin-0",
+    ] {
+        assert!(vcx.debug_bounds(sel).is_some(), "missing {sel}");
+    }
+
+    let click_sel = |vcx: &mut gpui::VisualTestContext, sel: &'static str| {
+        let b = vcx
+            .debug_bounds(sel)
+            .unwrap_or_else(|| panic!("missing selector {sel}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    // 다크 모드에서 가져온 테마를 고른다.
+    click_sel(vcx, "terminal-theme-custom-0");
+    vcx.update(|_, cx| {
+        assert_eq!(current(cx).terminal_theme_dark, "custom:warp:my-warp-dark");
+    });
+
+    // 삭제하면 다크 테마가 기본값으로 돌아간다.
+    click_sel(vcx, "terminal-theme-delete-0");
+    vcx.update(|_, cx| {
+        assert!(current(cx).terminal_custom_themes.is_empty());
+        assert_eq!(
+            current(cx).terminal_theme_dark,
+            crate::ui::DEFAULT_TERMINAL_THEME_DARK
+        );
+    });
+
+    // 라이트로 바꾸면 "다크 모드와 동일하게" 행이 나온다(기본은 분리 = 꺼짐).
+    click_sel(vcx, "terminal-theme-mode-light");
+    assert!(vcx.debug_bounds("terminal-theme-match-dark-row").is_some());
+    vcx.update(|_, cx| {
+        assert_eq!(view.read(cx).terminal_theme_target, Some(ThemeMode::Light));
+        assert!(current(cx).terminal_use_separate_light_theme);
+    });
+
+    click_sel(vcx, "terminal-theme-match-dark-toggle");
+    vcx.update(|_, cx| {
+        assert!(!current(cx).terminal_use_separate_light_theme);
+    });
+
+    // 라이트 내장 테마를 고르면 분리가 다시 켜지고 그 테마가 저장된다.
+    let (light_idx, light) = crate::ui::BUILTIN_TERMINAL_THEMES
+        .iter()
+        .enumerate()
+        .find(|(_, t)| !t.is_dark && t.name != crate::ui::DEFAULT_TERMINAL_THEME_LIGHT)
+        .unwrap();
+    let light_sel: &'static str = format!("terminal-theme-builtin-{light_idx}").leak();
+    click_sel(vcx, light_sel);
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert!(s.terminal_use_separate_light_theme);
+        assert_eq!(s.terminal_theme_light, light.name);
+    });
+
+    fs::remove_dir_all(d).ok();
+}

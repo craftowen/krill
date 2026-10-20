@@ -161,6 +161,20 @@ pub struct Settings {
     /// 워크스페이스 신뢰 프리셋 자동 등록 켜기/끄기(기본 true, OWE-737).
     #[serde(default = "default_true")]
     pub workspace_trust_preset_enabled: bool,
+    /// 다크 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Ghostty Default Style Dark"`, OWE-956).
+    #[serde(default = "default_terminal_theme_dark")]
+    pub terminal_theme_dark: String,
+    /// 라이트 모드 터미널 색상 테마 이름 또는 `custom:<id>`(기본 `"Builtin Tango Light"`, OWE-956).
+    #[serde(default = "default_terminal_theme_light")]
+    pub terminal_theme_light: String,
+    /// 라이트 모드에서 별도 터미널 테마를 쓸지(기본 true, Orca `terminalUseSeparateLightTheme`, OWE-956).
+    /// false면 라이트 모드에서도 다크 모드 테마를 쓴다.
+    #[serde(default = "default_true")]
+    pub terminal_use_separate_light_theme: bool,
+    /// 가져온 사용자 터미널 테마(Ghostty·Warp, OWE-956).
+    /// TOML 테이블 배열(`[[terminal_custom_themes]]`)은 스칼라 키 뒤에 와야 하므로 구조체 맨 끝에 둔다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub terminal_custom_themes: Vec<crate::ui::CustomTerminalTheme>,
 }
 
 pub const DEFAULT_TERMINAL_FONT_SIZE: u8 = 13;
@@ -195,6 +209,14 @@ const fn default_prompt_cache_ttl_secs() -> u32 {
 
 fn default_terminal_font_family() -> String {
     crate::ui::FONT_MONO.to_owned()
+}
+
+fn default_terminal_theme_dark() -> String {
+    crate::ui::DEFAULT_TERMINAL_THEME_DARK.to_owned()
+}
+
+fn default_terminal_theme_light() -> String {
+    crate::ui::DEFAULT_TERMINAL_THEME_LIGHT.to_owned()
 }
 
 /// 기본 터미널 커서 모양(OWE-658). `krill_proto::screen::CursorShape`는 와이어 타입이라 설정용 이름을 따로 둔다.
@@ -257,6 +279,10 @@ impl Default for Settings {
             auto_rename_branch_from_work: true,
             confirm_running_close: true,
             workspace_trust_preset_enabled: true,
+            terminal_theme_dark: default_terminal_theme_dark(),
+            terminal_theme_light: default_terminal_theme_light(),
+            terminal_use_separate_light_theme: true,
+            terminal_custom_themes: Vec::new(),
         }
     }
 }
@@ -277,6 +303,12 @@ impl Settings {
             .clamp(EDITOR_FONT_SIZE_MIN, EDITOR_FONT_SIZE_MAX);
         parsed.terminal_opacity_pct = parsed.terminal_opacity_pct.clamp(50, 100);
         parsed.prompt_cache_ttl_secs = parsed.prompt_cache_ttl_secs.clamp(60, 86_400);
+        if parsed.terminal_theme_dark.trim().is_empty() {
+            parsed.terminal_theme_dark = default_terminal_theme_dark();
+        }
+        if parsed.terminal_theme_light.trim().is_empty() {
+            parsed.terminal_theme_light = default_terminal_theme_light();
+        }
         let table: toml::Table = toml::from_str(s)?;
         if !table.contains_key("ui_zoom")
             && let Some(val) = table.get("zoom")
@@ -2325,6 +2357,15 @@ pub struct SettingsView {
     schedule_log: Option<schedules::ScheduleLogView>,
     /// 스케줄 즉시 실행·조작 오류(OWE-740).
     schedule_error: Option<SharedString>,
+    /// 터미널 탭에서 편집·미리보기 중인 테마 모드(OWE-956). `None`이면 앱의 현재 모드를 따른다.
+    terminal_theme_target: Option<ThemeMode>,
+    /// 터미널 테마 목록 검색 입력(OWE-956).
+    terminal_theme_search: Option<(
+        gpui::Entity<gpui_component::input::InputState>,
+        Subscription,
+    )>,
+    /// Ghostty·Warp 테마 가져오기 결과 메시지(OWE-956). 두 번째 값은 경고 여부.
+    terminal_theme_status: Option<(SharedString, bool)>,
     /// 설정 창 루트 포커스. 아무것도 포커스되지 않으면 ⌘F 문맥([`SEARCH_CONTEXT`])이 키 경로에 없다.
     focus: gpui::FocusHandle,
 }
@@ -2542,6 +2583,9 @@ impl SettingsView {
             schedule_modal: None,
             schedule_log: None,
             schedule_error: None,
+            terminal_theme_target: None,
+            terminal_theme_search: None,
+            terminal_theme_status: None,
             focus: cx.focus_handle(),
         };
         view.refresh_accounts_async(cx);
@@ -4430,9 +4474,688 @@ impl SettingsView {
                 ))),
         ]
     }
-    /// 터미널 탭(OWE-658, OWE-798): 글꼴·크기·투명도·기본 커서·Option 키·선택 복사.
-    fn render_terminal_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
+    fn terminal_theme_search_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<gpui_component::input::InputState> {
+        if let Some((input, _)) = &self.terminal_theme_search {
+            return input.clone();
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::TERMINAL_THEME_SEARCH.get())
+        });
+        let sub = cx.subscribe(&input, |_, _, _: &gpui_component::input::InputEvent, cx| {
+            cx.notify();
+        });
+        self.terminal_theme_search = Some((input.clone(), sub));
+        input
+    }
+
+    fn import_ghostty_themes(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let imported = cx
+                .background_executor()
+                .spawn(async move { crate::ui::discover_and_import_ghostty() })
+                .await;
+            this.update(cx, |this, cx| {
+                let has_any = imported.found
+                    || !imported.custom_themes.is_empty()
+                    || imported.dark_theme.is_some()
+                    || imported.light_theme.is_some();
+                if has_any {
+                    let count = imported.custom_themes.len().max(1);
+                    edit(cx, move |s| {
+                        crate::ui::merge_custom_themes(
+                            &mut s.terminal_custom_themes,
+                            imported.custom_themes,
+                        );
+                        if let Some(dark) = imported.dark_theme {
+                            s.terminal_theme_dark = dark;
+                        }
+                        if let Some(light) = imported.light_theme {
+                            s.terminal_theme_light = light;
+                        }
+                        if let Some(use_sep) = imported.use_separate_light_theme {
+                            s.terminal_use_separate_light_theme = use_sep;
+                        }
+                    });
+                    this.terminal_theme_status = Some((
+                        text::TERMINAL_THEME_IMPORTED_OK
+                            .format(&[("count", &count.to_string())])
+                            .into(),
+                        false,
+                    ));
+                } else {
+                    this.terminal_theme_status =
+                        Some((text::TERMINAL_THEME_IMPORT_NONE.get().into(), true));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn import_warp_themes(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let report = cx
+                .background_executor()
+                .spawn(async move { crate::ui::discover_and_import_warp_themes() })
+                .await;
+            this.update(cx, |this, cx| {
+                if report.themes.is_empty() {
+                    this.terminal_theme_status =
+                        Some((text::TERMINAL_THEME_IMPORT_NONE.get().into(), true));
+                } else {
+                    let count = report.themes.len();
+                    let themes = report.themes;
+                    edit(cx, move |s| {
+                        crate::ui::merge_custom_themes(&mut s.terminal_custom_themes, themes);
+                    });
+                    this.terminal_theme_status = Some((
+                        text::TERMINAL_THEME_IMPORTED_OK
+                            .format(&[("count", &count.to_string())])
+                            .into(),
+                        false,
+                    ));
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn render_terminal_theme_swatch(
+        p: &crate::ui::Palette,
+        theme: &krill_proto::theme::Theme,
+    ) -> gpui::Div {
+        let mut pill = div()
+            .flex_none()
+            .h(px(18.))
+            .px_1p5()
+            .rounded(crate::ui::RADIUS_XS)
+            .border_1()
+            .border_color(p.border)
+            .bg(crate::ui::terminal_rgb_hsla(theme.background))
+            .flex()
+            .items_center()
+            .gap_1();
+        for idx in 1..=6 {
+            pill = pill.child(
+                div()
+                    .w(px(6.))
+                    .h(px(6.))
+                    .rounded(crate::ui::RADIUS_XS)
+                    .bg(crate::ui::terminal_rgb_hsla(theme.ansi[idx])),
+            );
+        }
+        pill
+    }
+
+    fn render_terminal_theme_preview(
+        p: &crate::ui::Palette,
+        s: &Settings,
+        target_mode: ThemeMode,
+        active_label: &str,
+    ) -> gpui::Stateful<gpui::Div> {
+        const PREVIEW_PROMPT: &str = "krill@mac ~/minikrill ";
+        const PREVIEW_BRANCH: &str = "(main)";
+        const PREVIEW_CMD: &str = " $ cargo nextest run";
+        const PREVIEW_PASS: &str = "     PASS ";
+        const PREVIEW_SUITE: &str = "[ 0.042s] ";
+        const PREVIEW_TEST: &str = "krill-app::ui::terminal_themes";
+        const PREVIEW_KW: &str = "fn ";
+        const PREVIEW_FN: &str = "apply_theme";
+        const PREVIEW_ARGS: &str = "(mode: ThemeMode) -> ";
+        const PREVIEW_RET: &str = "TerminalTheme ";
+        const PREVIEW_COMMENT: &str = "// 30 built-in + custom themes";
+        const PREVIEW_CURSOR_CHAR: &str = " ";
+
+        let preview = crate::ui::terminal_theme_for_mode(target_mode, s);
+        let bg = crate::ui::terminal_rgb_hsla(preview.background);
+        let fg = crate::ui::terminal_rgb_hsla(preview.foreground);
+        let cursor_col = crate::ui::terminal_rgb_hsla(preview.cursor);
+        let c_red = crate::ui::terminal_rgb_hsla(preview.ansi[1]);
+        let c_green = crate::ui::terminal_rgb_hsla(preview.ansi[2]);
+        let c_yellow = crate::ui::terminal_rgb_hsla(preview.ansi[3]);
+        let c_blue = crate::ui::terminal_rgb_hsla(preview.ansi[4]);
+        let c_magenta = crate::ui::terminal_rgb_hsla(preview.ansi[5]);
+        let c_cyan = crate::ui::terminal_rgb_hsla(preview.ansi[6]);
+        let c_muted = crate::ui::terminal_rgb_hsla(preview.ansi[8]);
+
+        let cursor_el = match s.terminal_cursor_shape {
+            TerminalCursorShape::Block => div()
+                .w(px(7.))
+                .h(px(14.))
+                .bg(cursor_col)
+                .child(PREVIEW_CURSOR_CHAR),
+            TerminalCursorShape::Bar => div()
+                .w(px(2.))
+                .h(px(14.))
+                .bg(cursor_col)
+                .child(PREVIEW_CURSOR_CHAR),
+            TerminalCursorShape::Underline => div()
+                .w(px(7.))
+                .h(px(2.))
+                .mt(px(12.))
+                .bg(cursor_col)
+                .child(PREVIEW_CURSOR_CHAR),
+        };
+
+        let mut normal_strip = div().flex().items_center().gap_1();
+        let mut bright_strip = div().flex().items_center().gap_1();
+        for idx in 0..8 {
+            normal_strip = normal_strip.child(
+                div()
+                    .flex_1()
+                    .h(px(10.))
+                    .rounded(crate::ui::RADIUS_XS)
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(crate::ui::terminal_rgb_hsla(preview.ansi[idx])),
+            );
+            bright_strip = bright_strip.child(
+                div()
+                    .flex_1()
+                    .h(px(10.))
+                    .rounded(crate::ui::RADIUS_XS)
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(crate::ui::terminal_rgb_hsla(preview.ansi[idx + 8])),
+            );
+        }
+
+        div()
+            .id("terminal-theme-preview-card")
+            .debug_selector(|| "terminal-theme-preview-card".into())
+            .flex_1()
+            .min_w(px(260.))
+            .rounded(crate::ui::RADIUS_MD)
+            .border_1()
+            .border_color(p.border)
+            .overflow_hidden()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px_3()
+                    .py_2()
+                    .bg(p.muted)
+                    .border_b_1()
+                    .border_color(p.border)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(c_red))
+                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(c_yellow))
+                            .child(div().w(px(8.)).h(px(8.)).rounded_full().bg(c_green))
+                            .child(
+                                div()
+                                    .ml_1()
+                                    .text_size(crate::ui::TEXT_2XS)
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.muted_foreground)
+                                    .child(text::TERMINAL_THEME_PREVIEW.get()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("terminal-theme-active-label")
+                            .debug_selector(|| "terminal-theme-active-label".into())
+                            .truncate()
+                            .text_size(crate::ui::TEXT_2XS)
+                            .font_family(crate::ui::FONT_MONO)
+                            .text_color(p.foreground)
+                            .child(active_label.to_owned()),
+                    ),
+            )
+            .child(
+                div()
+                    .p_3()
+                    .bg(bg)
+                    .text_color(fg)
+                    .font_family(s.terminal_font_family.clone())
+                    .text_size(crate::ui::TEXT_XS)
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(div().text_color(c_green).child(PREVIEW_PROMPT))
+                            .child(div().text_color(c_magenta).child(PREVIEW_BRANCH))
+                            .child(div().text_color(fg).child(PREVIEW_CMD)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(div().text_color(c_green).child(PREVIEW_PASS))
+                            .child(div().text_color(c_cyan).child(PREVIEW_SUITE))
+                            .child(div().text_color(fg).child(PREVIEW_TEST)),
+                    )
+                    .child(div().text_color(c_muted).child(PREVIEW_COMMENT))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(div().text_color(c_magenta).child(PREVIEW_KW))
+                            .child(div().text_color(c_blue).child(PREVIEW_FN))
+                            .child(div().text_color(fg).child(PREVIEW_ARGS))
+                            .child(div().text_color(c_yellow).child(PREVIEW_RET))
+                            .child(cursor_el),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(p.border)
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(normal_strip)
+                            .child(bright_strip),
+                    ),
+            )
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "터미널 테마 섹션은 모드 토글·가져오기·검색·커스텀/내장 목록·실시간 미리보기를 한 카드에 그린다"
+    )]
+    fn render_terminal_themes_section(
+        &mut self,
+        s: &Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::{ActiveTheme as _, Icon, IconName, Sizable as _};
+        let p = crate::ui::palette(cx);
+        let target_mode = self
+            .terminal_theme_target
+            .unwrap_or_else(|| cx.theme().mode);
+        let want_dark = target_mode == ThemeMode::Dark;
+        let match_dark = target_mode == ThemeMode::Light && !s.terminal_use_separate_light_theme;
+
+        let active_selection = if target_mode == ThemeMode::Dark || match_dark {
+            crate::ui::canonical_terminal_theme_name(&s.terminal_theme_dark)
+        } else {
+            crate::ui::canonical_terminal_theme_name(&s.terminal_theme_light)
+        };
+        let active_label =
+            crate::ui::terminal_theme_display_label(active_selection, &s.terminal_custom_themes);
+
+        let search_input = self.terminal_theme_search_input(window, cx);
+        let query = search_input.read(cx).value().trim().to_ascii_lowercase();
+
+        let mode_segment = layout::segmented_control(
+            p,
+            [
+                (
+                    "terminal-theme-mode-dark",
+                    text::DARK.get(),
+                    ThemeMode::Dark,
+                ),
+                (
+                    "terminal-theme-mode-light",
+                    text::LIGHT.get(),
+                    ThemeMode::Light,
+                ),
+            ]
+            .into_iter()
+            .map(|(id, title, m)| {
+                layout::segment(id, title, target_mode == m)
+                    .debug_selector(move || id.into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.terminal_theme_target = Some(m);
+                        cx.notify();
+                    }))
+            }),
+        );
+
+        let import_ghostty_btn = layout::secondary(
+            "terminal-theme-import-ghostty",
+            text::TERMINAL_THEME_IMPORT_GHOSTTY.get(),
+        )
+        .debug_selector(|| "terminal-theme-import-ghostty".into())
+        .on_click(cx.listener(|_, _, _, cx| {
+            Self::import_ghostty_themes(cx);
+        }));
+
+        let import_warp_btn = layout::secondary(
+            "terminal-theme-import-warp",
+            text::TERMINAL_THEME_IMPORT_WARP.get(),
+        )
+        .debug_selector(|| "terminal-theme-import-warp".into())
+        .on_click(cx.listener(|_, _, _, cx| {
+            Self::import_warp_themes(cx);
+        }));
+
+        let mut list = div()
+            .id("terminal-theme-list")
+            .debug_selector(|| "terminal-theme-list".into())
+            .max_h(px(260.))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap_1();
+
+        let custom_matches: Vec<(usize, &crate::ui::CustomTerminalTheme)> = s
+            .terminal_custom_themes
+            .iter()
+            .enumerate()
+            .filter(|(_, ct)| ct.is_dark() == want_dark)
+            .filter(|(_, ct)| {
+                query.is_empty()
+                    || ct.name.to_ascii_lowercase().contains(&query)
+                    || ct.source.to_ascii_lowercase().contains(&query)
+            })
+            .collect();
+
+        let builtin_matches: Vec<(usize, &crate::ui::BuiltinTerminalTheme)> =
+            crate::ui::BUILTIN_TERMINAL_THEMES
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| b.is_dark == want_dark)
+                .filter(|(_, b)| query.is_empty() || b.name.to_ascii_lowercase().contains(&query))
+                .collect();
+
+        if custom_matches.is_empty() && builtin_matches.is_empty() {
+            list = list.child(
+                div()
+                    .py_4()
+                    .text_center()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::TERMINAL_THEME_EMPTY.get()),
+            );
+        }
+
+        if !custom_matches.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_size(crate::ui::TEXT_2XS)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(p.muted_foreground)
+                    .child(text::TERMINAL_THEME_IMPORTED.get()),
+            );
+            for (idx, ct) in custom_matches {
+                let sel_val = ct.selection_value();
+                let selected = active_selection == sel_val;
+                let row_id = SharedString::from(format!("terminal-theme-custom-{idx}"));
+                let del_id = SharedString::from(format!("terminal-theme-delete-{idx}"));
+                let custom_id = ct.id.clone();
+                let source_badge = match ct.source.as_str() {
+                    "ghostty" => text::TERMINAL_THEME_SOURCE_GHOSTTY.get(),
+                    "warp" => text::TERMINAL_THEME_SOURCE_WARP.get(),
+                    _ => text::TERMINAL_THEME_SOURCE_CUSTOM.get(),
+                };
+                let parsed_theme = ct.to_terminal_theme().unwrap_or(if want_dark {
+                    crate::ui::TERMINAL_DARK
+                } else {
+                    crate::ui::TERMINAL_LIGHT
+                });
+                let swatch = Self::render_terminal_theme_swatch(p, &parsed_theme);
+                let row_sel = row_id.clone();
+                let del_sel = del_id.clone();
+                list = list.child(
+                    div()
+                        .id(row_id)
+                        .debug_selector(move || row_sel.to_string())
+                        .px_2()
+                        .py_1p5()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .when(selected, |d| {
+                            d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
+                        })
+                        .hover(|d| d.bg(p.sidebar_accent))
+                        .active(|d| d.bg(p.accent))
+                        .on_click(move |_, _, cx| {
+                            let val = sel_val.clone();
+                            edit(cx, move |s| {
+                                if want_dark {
+                                    s.terminal_theme_dark = val;
+                                } else {
+                                    s.terminal_use_separate_light_theme = true;
+                                    s.terminal_theme_light = val;
+                                }
+                            });
+                        })
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .child(swatch)
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(crate::ui::TEXT_XS)
+                                        .text_color(p.foreground)
+                                        .child(ct.name.clone()),
+                                )
+                                .child(crate::ui::badge(
+                                    p,
+                                    crate::ui::BadgeTone::Muted,
+                                    source_badge,
+                                )),
+                        )
+                        .child(crate::ui::button_with_tooltip(
+                            Button::new(del_id.clone())
+                                .icon(IconName::Close)
+                                .ghost()
+                                .xsmall()
+                                .debug_selector(move || del_sel.to_string())
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    let cid = custom_id.clone();
+                                    edit(cx, move |s| {
+                                        s.terminal_custom_themes.retain(|t| t.id != cid);
+                                        let target_sel = format!("custom:{cid}");
+                                        if s.terminal_theme_dark == target_sel {
+                                            s.terminal_theme_dark = default_terminal_theme_dark();
+                                        }
+                                        if s.terminal_theme_light == target_sel {
+                                            s.terminal_theme_light = default_terminal_theme_light();
+                                        }
+                                    });
+                                }),
+                            del_id,
+                            text::TERMINAL_THEME_REMOVE.get(),
+                        )),
+                );
+            }
+        }
+
+        if !builtin_matches.is_empty() {
+            list = list.child(
+                div()
+                    .px_2()
+                    .pt_1()
+                    .text_size(crate::ui::TEXT_2XS)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(p.muted_foreground)
+                    .child(text::TERMINAL_THEME_BUILTIN.get()),
+            );
+            for (idx, entry) in builtin_matches {
+                let selected = active_selection.eq_ignore_ascii_case(entry.name);
+                let row_id = SharedString::from(format!("terminal-theme-builtin-{idx}"));
+                let row_sel = row_id.clone();
+                let theme_name = entry.name;
+                let swatch = Self::render_terminal_theme_swatch(p, &entry.theme);
+                list = list.child(
+                    div()
+                        .id(row_id)
+                        .debug_selector(move || row_sel.to_string())
+                        .px_2()
+                        .py_1p5()
+                        .rounded(crate::ui::RADIUS_SM)
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .when(selected, |d| {
+                            d.bg(p.sidebar_accent).font_weight(gpui::FontWeight::MEDIUM)
+                        })
+                        .hover(|d| d.bg(p.sidebar_accent))
+                        .active(|d| d.bg(p.accent))
+                        .on_click(move |_, _, cx| {
+                            edit(cx, move |s| {
+                                if want_dark {
+                                    theme_name.clone_into(&mut s.terminal_theme_dark);
+                                } else {
+                                    s.terminal_use_separate_light_theme = true;
+                                    theme_name.clone_into(&mut s.terminal_theme_light);
+                                }
+                            });
+                        })
+                        .child(swatch)
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.foreground)
+                                .child(theme_name),
+                        ),
+                );
+            }
+        }
+
+        let picker_col = div()
+            .w(px(300.))
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id("terminal-theme-search")
+                    .debug_selector(|| "terminal-theme-search".into())
+                    .child(
+                        gpui_component::input::Input::new(&search_input)
+                            .small()
+                            .prefix(Icon::new(IconName::Search).xsmall()),
+                    ),
+            )
+            .child(list);
+
+        let preview_col = Self::render_terminal_theme_preview(p, s, target_mode, &active_label);
+
+        let mut section = div()
+            .id("terminal-section-themes-wrap")
+            .debug_selector(|| "terminal-section-themes-wrap".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(layout::section_title(
+                p,
+                "terminal-section-themes",
+                text::SECTION_TERMINAL_THEMES.get(),
+            ))
+            .child(
+                layout::row(p)
+                    .child(layout::label(
+                        p,
+                        text::SECTION_TERMINAL_THEMES.get(),
+                        Some(text::SECTION_TERMINAL_THEMES_DESC.get()),
+                    ))
+                    .child(
+                        layout::controls()
+                            .child(mode_segment)
+                            .child(import_ghostty_btn)
+                            .child(import_warp_btn),
+                    ),
+            );
+
+        if let Some((status_msg, is_warn)) = &self.terminal_theme_status {
+            section = section.child(
+                div()
+                    .id("terminal-theme-status")
+                    .debug_selector(|| "terminal-theme-status".into())
+                    .px_3()
+                    .py_1p5()
+                    .rounded(crate::ui::RADIUS_SM)
+                    .bg(p.muted)
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(if *is_warn {
+                        p.warning
+                    } else {
+                        p.muted_foreground
+                    })
+                    .child(status_msg.clone()),
+            );
+        }
+
+        if target_mode == ThemeMode::Light {
+            section = section.child(
+                layout::row(p)
+                    .id("terminal-theme-match-dark-row")
+                    .debug_selector(|| "terminal-theme-match-dark-row".into())
+                    .child(layout::label(
+                        p,
+                        text::TERMINAL_THEME_MATCH_DARK.get(),
+                        Some(text::TERMINAL_THEME_MATCH_DARK_DESC.get()),
+                    ))
+                    .child(layout::controls().child(layout::switch(
+                        p,
+                        "terminal-theme-match-dark-toggle",
+                        !s.terminal_use_separate_light_theme,
+                        false,
+                        |match_dark_next, _, cx| {
+                            edit(cx, move |s| {
+                                s.terminal_use_separate_light_theme = !match_dark_next;
+                            });
+                        },
+                    ))),
+            );
+        }
+
+        section.child(
+            layout::card(p)
+                .id("terminal-theme-picker-card")
+                .debug_selector(|| "terminal-theme-picker-card".into())
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap_3()
+                .child(picker_col)
+                .child(preview_col),
+        )
+    }
+
+    /// 터미널 탭(OWE-658, OWE-798, OWE-956): 터미널 테마·미리보기·글꼴·크기·투명도·기본 커서·Option 키·선택 복사.
+    fn render_terminal_tab(
+        &mut self,
+        s: &Settings,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
+        let themes_section = self.render_terminal_themes_section(s, window, cx);
         let p = crate::ui::palette(cx);
         let row = || layout::row(p);
         let label = |title: &'static str, desc: &'static str| layout::label(p, title, Some(desc));
@@ -4471,6 +5194,7 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
+            .child(themes_section)
             .child(layout::section_title(
                 p,
                 "terminal-section-appearance",
@@ -9929,7 +10653,7 @@ impl Render for SettingsView {
             let page_header = Self::render_page_header(current_tab, None, cx);
             let body = match current_tab {
                 AdminTab::General => Self::render_general_tab(&s, cx),
-                AdminTab::Terminal => Self::render_terminal_tab(&s, cx),
+                AdminTab::Terminal => self.render_terminal_tab(&s, window, cx),
                 AdminTab::Accounts => self.render_accounts_tab(cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
                 AdminTab::Ssh => self.render_ssh_tab(window, cx),
