@@ -29,7 +29,7 @@ use crate::ui::{
     TEXT_XS,
 };
 
-/// 이관 대상 4대 도메인(`crates/krill/src/orca_import.rs`의 `ImportDomain`과 1:1 대응).
+/// 이관 대상 도메인(`crates/krill/src/orca_import.rs`의 `ImportDomain`과 1:1 대응).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ImportDomain {
@@ -37,10 +37,17 @@ pub enum ImportDomain {
     Ssh,
     Projects,
     Settings,
+    Sessions,
 }
 
 impl ImportDomain {
-    pub const ALL: [Self; 4] = [Self::Accounts, Self::Ssh, Self::Projects, Self::Settings];
+    pub const ALL: [Self; 5] = [
+        Self::Accounts,
+        Self::Ssh,
+        Self::Projects,
+        Self::Settings,
+        Self::Sessions,
+    ];
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -49,6 +56,7 @@ impl ImportDomain {
             Self::Ssh => "ssh",
             Self::Projects => "projects",
             Self::Settings => "settings",
+            Self::Sessions => "sessions",
         }
     }
 
@@ -59,6 +67,7 @@ impl ImportDomain {
             Self::Ssh => text::CAT_SSH.get(),
             Self::Projects => text::CAT_PROJECTS.get(),
             Self::Settings => text::CAT_SETTINGS.get(),
+            Self::Sessions => text::CAT_SESSIONS.get(),
         }
     }
 
@@ -80,6 +89,9 @@ impl ImportDomain {
                 ("commands", &r.settings.quick_commands_merged.to_string()),
                 ("schedules", &r.settings.schedules_merged.to_string()),
             ]),
+            Self::Sessions => {
+                text::CAT_SESSIONS_DESC.format(&[("sessions", &r.sessions_count().to_string())])
+            }
         }
     }
 }
@@ -103,6 +115,8 @@ pub struct OrcaImportReport {
     pub projects: ProjectsImportSummary,
     #[serde(default)]
     pub settings: SettingsImportSummary,
+    #[serde(default)]
+    pub sessions: SessionsImportSummary,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -160,6 +174,12 @@ impl OrcaImportReport {
         self.projects.worktrees_migrated
     }
 
+    /// 아직 Krill에서 띄우지 않은 Orca 열린 탭 세션 수.
+    #[must_use]
+    pub fn sessions_count(&self) -> usize {
+        self.sessions.items.iter().filter(|i| !i.resumed).count()
+    }
+
     #[must_use]
     pub fn commands_and_schedules_count(&self) -> usize {
         self.settings
@@ -179,6 +199,7 @@ impl OrcaImportReport {
             .saturating_add(self.commands_and_schedules_count())
             .saturating_add(self.settings.agents_updated)
             .saturating_add(usize::from(self.settings.settings_updated))
+            .saturating_add(self.sessions_count())
     }
 
     /// 0개인 항목은 빼고 ` · `로 잇는다(예: "원격 호스트 1개 · 프로젝트/폴더 1개").
@@ -191,6 +212,7 @@ impl OrcaImportReport {
             ("projects", self.projects_count()),
             ("worktrees", self.worktrees_count()),
             ("commands", self.commands_and_schedules_count()),
+            ("sessions", self.sessions_count()),
         ];
         text::SUMMARY
             .get()
@@ -248,6 +270,7 @@ impl OrcaImportReport {
                 ("projects", &proj_total.to_string()),
                 ("worktrees", &wt_total.to_string()),
                 ("settings", settings_label),
+                ("sessions", &self.sessions.resumed.to_string()),
             ])
         } else {
             text::RESULT_DONE.format(&[
@@ -256,6 +279,7 @@ impl OrcaImportReport {
                 ("projects", &proj_total.to_string()),
                 ("worktrees", &wt_total.to_string()),
                 ("settings", settings_label),
+                ("sessions", &self.sessions.resumed.to_string()),
             ])
         }
     }
@@ -397,6 +421,35 @@ pub struct SettingsImportSummary {
     pub agents_updated: usize,
     #[serde(default)]
     pub schedules_merged: usize,
+}
+
+/// CLI `SessionsImportSummary`와 1:1.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionsImportSummary {
+    #[serde(default)]
+    pub skipped: bool,
+    #[serde(default)]
+    pub skipped_reason: Option<String>,
+    #[serde(default)]
+    pub resumed: usize,
+    #[serde(default)]
+    pub already_resumed: usize,
+    #[serde(default)]
+    pub items: Vec<ImportedSessionSummary>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedSessionSummary {
+    #[serde(default)]
+    pub agent: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub cwd: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub resumed: bool,
 }
 
 /// `krill import orca` 서브프로세스 기본 실행 제한 시간(`OWE-767`).
@@ -1173,8 +1226,11 @@ pub fn render_modal(window: &Window, cx: &App) -> Option<Deferred> {
 
     let rows = ImportDomain::ALL.into_iter().map(|domain| {
         let checked = st.selected.contains(&domain);
-        let needs_daemon_badge =
-            domain == ImportDomain::Accounts && (!daemon_ok || skipped_reason.is_some());
+        let needs_daemon_badge = match domain {
+            ImportDomain::Accounts => !daemon_ok || skipped_reason.is_some(),
+            ImportDomain::Sessions => !daemon_ok,
+            _ => false,
+        };
         render_domain_row(domain, checked, needs_daemon_badge, report, p)
     });
 
@@ -1824,6 +1880,7 @@ mod tests {
             "orca-domain-ssh",
             "orca-domain-projects",
             "orca-domain-settings",
+            "orca-domain-sessions",
             "orca-modal-submit",
         ] {
             assert!(
@@ -1832,7 +1889,7 @@ mod tests {
             );
         }
 
-        // Step A: Click submit with all 4 domains while krilld is NOT running.
+        // Step A: Click submit with all domains while krilld is NOT running.
         // Accounts must be skipped with "데몬 필요", while SSH, Projects, and Settings apply immediately!
         let submit_center = settings_vcx
             .debug_bounds("orca-modal-submit")
@@ -1987,6 +2044,7 @@ mod tests {
             toggle_domain(ImportDomain::Ssh, cx);
             toggle_domain(ImportDomain::Projects, cx);
             toggle_domain(ImportDomain::Settings, cx);
+            toggle_domain(ImportDomain::Sessions, cx);
             import_selected(cx);
         });
 
