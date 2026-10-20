@@ -4,6 +4,7 @@ const assert=require('node:assert/strict'),{getEventListeners}=require('node:eve
 class Element extends EventTarget {
  constructor(tag,text,cls){super();this.tag=tag;this.textContent=text;this.className=cls;this.children=[];this.dataset={};this.attrs={};this.style={};this.scrollLeft=0;}
  append(...nodes){for(const n of nodes){n.parentElement=this;this.children.push(n);}}
+ insertBefore(node,before){if(node===before)return;node.remove();const index=before?this.children.indexOf(before):-1;node.parentElement=this;if(index<0)this.children.push(node);else this.children.splice(index,0,node);}
  prepend(...nodes){for(const n of nodes)n.parentElement=this;this.children.unshift(...nodes);}
  replaceChildren(...nodes){this.children=[];this.append(...nodes);}
  setAttribute(k,v){this.attrs[k]=v;}
