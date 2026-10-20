@@ -848,6 +848,12 @@ impl Layout {
     /// 파일을 미리보기로 연다(OWE-849): 이미 열려 있으면 그 탭·칸으로 포커스만 옮기고,
     /// 살아 있는 미리보기 칸이 있으면 그 칸을 재사용하며, 아니면 새 탭을 열어 슬롯에 기록한다.
     pub fn open_file_preview(&mut self, path: PathBuf) -> PaneId {
+        let tabs: Vec<_> = (0..self.tabs.len()).collect();
+        self.open_file_preview_in(path, &tabs)
+    }
+
+    /// 다른 워크스페이스의 미리보기 칸은 교체하지 않는다.
+    pub fn open_file_preview_in(&mut self, path: PathBuf, tabs: &[usize]) -> PaneId {
         if let Some((tab, pane)) = self.find_file_pane(&path) {
             self.active = tab;
             self.tabs[tab].focused = pane;
@@ -857,6 +863,7 @@ impl Layout {
         if let Some((pane, _)) = self.preview.clone()
             && self.preview_is_live()
             && let Some(tab) = self.tab_with(pane)
+            && tabs.contains(&tab)
         {
             self.files.insert(pane, path.clone());
             self.preview = Some((pane, path));
@@ -1015,7 +1022,13 @@ impl Layout {
 
     /// `Ctrl+Tab` / `Ctrl+Shift+Tab`: 최근 사용한 탭 순서(MRU)대로 활성 탭을 옮긴다.
     pub fn cycle_mru(&mut self, step: isize) {
-        if self.tabs.len() <= 1 {
+        let tabs: Vec<_> = (0..self.tabs.len()).collect();
+        self.cycle_mru_in(step, &tabs);
+    }
+
+    /// 지정된 워크스페이스 탭 안에서만 MRU를 순환한다. 커서는 전체 MRU 순서의 위치다.
+    pub fn cycle_mru_in(&mut self, step: isize, tabs: &[usize]) {
+        if tabs.len() <= 1 {
             self.mru.cursor = None;
             return;
         }
@@ -1023,11 +1036,26 @@ impl Layout {
         if self.mru.cursor.is_none() && self.mru.order.first().copied() != Some(self.active) {
             self.record_mru(self.active);
         }
-        let cur = self.mru.cursor.unwrap_or(0);
-        let len = self.mru.order.len().cast_signed();
-        let next = (cur.cast_signed() + step).rem_euclid(len).cast_unsigned();
-        self.mru.cursor = Some(next);
-        self.active = self.mru.order[next];
+        let eligible: Vec<_> = self
+            .mru
+            .order
+            .iter()
+            .enumerate()
+            .filter_map(|(pos, i)| tabs.contains(i).then_some(pos))
+            .collect();
+        if eligible.is_empty() {
+            return;
+        }
+        let cur = eligible
+            .iter()
+            .position(|&pos| self.mru.order[pos] == self.active)
+            .unwrap_or(0);
+        let next = (cur.cast_signed() + step)
+            .rem_euclid(eligible.len().cast_signed())
+            .cast_unsigned();
+        let cursor = eligible[next];
+        self.mru.cursor = Some(cursor);
+        self.active = self.mru.order[cursor];
     }
 
     /// `Ctrl` 키를 놓거나 스위처 선택을 확정할 때 현재 활성 탭을 MRU 맨 앞으로 올린다.

@@ -1537,6 +1537,19 @@ impl Sidebar {
         session.worktree.as_deref().or(session.cwd.as_deref())
     }
 
+    /// 경로를 포함하는 가장 가까운 워크스페이스 루트. 호스트 간 경로는 섞지 않는다.
+    pub fn workspace_for_path_on(&self, host: &HostId, path: &Path) -> Option<PathBuf> {
+        let snapshot = self.snapshot_for(host);
+        snapshot
+            .trees
+            .keys()
+            .chain(snapshot.trees.values().flatten())
+            .chain(snapshot.sessions.iter().filter_map(|s| s.worktree.as_ref()))
+            .filter(|root| !root.as_os_str().is_empty() && path.starts_with(root))
+            .max_by_key(|root| root.as_os_str().len())
+            .cloned()
+    }
+
     /// OWE-854: 셸 탭의 사용자 지정 제목을 세션별로 동기화한다. 바뀔 때만 다시 그린다.
     pub fn set_custom_titles(
         &mut self,

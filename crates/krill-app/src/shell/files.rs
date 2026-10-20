@@ -513,8 +513,9 @@ impl Shell {
         self.close_settings(None, cx);
         self.diff
             .update(cx, krill_app::diff::Panel::clear_selection);
+        let tabs = self.workspace_tabs(cx);
         self.change(true, cx, move |l| {
-            l.open_file_preview(path);
+            l.open_file_preview_in(path, &tabs);
         });
         self.files.refocus = true;
     }

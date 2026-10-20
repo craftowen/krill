@@ -127,26 +127,14 @@ impl Shell {
     ) -> impl IntoElement {
         let p = ui::palette(cx);
         let active = self.layout.active();
-        let mut labels: Vec<_> = self
-            .layout
-            .tabs()
-            .iter()
-            .map(|t| self.pane_label(t.focused, cx))
-            .collect();
-        // OWE-870: 사용자 지정 제목이 있으면 자동 제목 대신 쓴다(번호 매기기 전에 덮어쓴다).
-        for (i, label) in labels.iter_mut().enumerate() {
-            if let Some(custom) = self.layout.tab_title(i) {
-                custom.clone_into(label);
-            }
-        }
-        number_duplicates(&mut labels);
-        let tabs = self
-            .layout
-            .tabs()
-            .iter()
+        let labels = self.workspace_tab_labels(cx);
+        let visible_active = labels.iter().position(|(i, _)| *i == active).unwrap_or(0);
+        let indices: Vec<_> = labels.iter().map(|(i, _)| *i).collect();
+        let tabs = labels
+            .into_iter()
             .enumerate()
-            .zip(labels)
-            .map(|((i, tab), label)| {
+            .map(|(position, (i, label))| {
+                let tab = &self.layout.tabs()[i];
                 let selected = i == active;
                 let host = self.layout.host(tab.focused);
                 let session = self
@@ -340,7 +328,10 @@ impl Shell {
                                     .w(px(1.))
                                     .h(ui::SPACE_4)
                                     .bg(p.border)
-                                    .when(selected || i + 1 == active, Styled::invisible),
+                                    .when(
+                                        selected || position + 1 == visible_active,
+                                        Styled::invisible,
+                                    ),
                             ),
                     )
                     .on_mouse_down(
@@ -441,14 +432,16 @@ impl Shell {
                     .max_width(ui::TAB_MAX_WIDTH)
                     .menu(true)
                     .reveal_selected(true)
-                    .selected_index(self.layout.active())
+                    .selected_index(visible_active)
                     .children(tabs)
-                    .on_click(cx.listener(|this, i: &usize, _, cx| {
+                    .on_click(cx.listener(move |this, i: &usize, _, cx| {
                         // 가운데 diff가 열려 있으면 탭을 누르는 것으로 닫고 터미널로 돌아간다.
                         if this.diff.read(cx).has_center_diff() {
                             this.close_center_diff(cx);
                         }
-                        this.change(true, cx, |l| l.activate(*i));
+                        if let Some(&index) = indices.get(*i) {
+                            this.change(true, cx, |l| l.activate(index));
+                        }
                     })),
             )
             .child(
@@ -658,8 +651,7 @@ impl Shell {
         if index >= self.layout.tabs().len() {
             return;
         }
-        self.record_closed_tab(index, cx);
-        self.close_layout(cx, |l| l.close_tab(index));
+        self.close_workspace_tabs(vec![index], self.layout.active(), cx);
     }
 
     /// OWE-872: 실행 중 닫기 확인 대화상자에서 '닫기'를 눌렀다.
@@ -787,54 +779,42 @@ impl Shell {
 
     /// OWE-734: `keep_index`와 고정된 탭을 제외한 나머지 탭을 일괄 닫는다.
     pub(super) fn close_other_tabs(&mut self, keep_index: usize, cx: &mut Context<Self>) {
-        let closing: Vec<usize> = self
-            .layout
-            .tabs()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tab)| (i != keep_index && !tab.pinned).then_some(i))
+        let closing = self
+            .tabs_in_workspace(keep_index, cx)
+            .into_iter()
+            .filter(|&i| i != keep_index && !self.layout.is_tab_pinned(i))
             .collect();
-        for i in closing {
-            self.record_closed_tab(i, cx);
-        }
-        self.close_layout(cx, |l| l.close_other_tabs(keep_index));
+        self.close_workspace_tabs(closing, keep_index, cx);
     }
 
-    /// OWE-734: `index` 오른쪽의 고정되지 않은 탭을 일괄 닫는다.
+    /// 현재 워크스페이스에서 오른쪽의 비고정 탭만 닫는다.
     pub(super) fn close_tabs_to_right(&mut self, index: usize, cx: &mut Context<Self>) {
-        let closing: Vec<usize> = self
-            .layout
-            .tabs()
-            .iter()
-            .enumerate()
-            .skip(index + 1)
-            .filter_map(|(i, tab)| (!tab.pinned).then_some(i))
+        let closing = self
+            .tabs_in_workspace(index, cx)
+            .into_iter()
+            .filter(|&i| i > index && !self.layout.is_tab_pinned(i))
             .collect();
-        for i in closing {
-            self.record_closed_tab(i, cx);
-        }
-        self.close_layout(cx, |l| l.close_tabs_to_right(index));
+        self.close_workspace_tabs(closing, self.layout.active(), cx);
     }
 
-    /// OWE-870: `index` 왼쪽의 고정되지 않은 탭을 일괄 닫는다.
+    /// 현재 워크스페이스에서 왼쪽의 비고정 탭만 닫는다.
     pub(super) fn close_tabs_to_left(&mut self, index: usize, cx: &mut Context<Self>) {
-        let closing: Vec<usize> = self
-            .layout
-            .tabs()
-            .iter()
-            .enumerate()
-            .take(index)
-            .filter_map(|(i, tab)| (!tab.pinned).then_some(i))
+        let closing = self
+            .tabs_in_workspace(index, cx)
+            .into_iter()
+            .filter(|&i| i < index && !self.layout.is_tab_pinned(i))
             .collect();
-        for i in closing {
-            self.record_closed_tab(i, cx);
-        }
-        self.close_layout(cx, |l| l.close_tabs_to_left(index));
+        self.close_workspace_tabs(closing, self.layout.active(), cx);
     }
 
-    /// OWE-734: 고정되지 않은 에디터(파일) 탭을 일괄 닫는다.
+    /// 현재 워크스페이스에서 비고정 파일 탭만 닫는다.
     pub(super) fn close_all_editor_tabs(&mut self, cx: &mut Context<Self>) {
-        self.change(true, cx, Layout::close_all_editor_tabs);
+        let closing = self
+            .workspace_tabs(cx)
+            .into_iter()
+            .filter(|&i| self.layout.is_editor_tab(i) && !self.layout.is_tab_pinned(i))
+            .collect();
+        self.close_workspace_tabs(closing, self.layout.active(), cx);
     }
 
     /// OWE-734: `Ctrl+Tab` / `Ctrl+Shift+Tab`으로 최근 사용(MRU) 순서대로 탭을 순환한다.
@@ -843,7 +823,8 @@ impl Shell {
             return;
         }
         self.tab_context_menu = None;
-        self.change(true, cx, |l| l.cycle_mru(delta));
+        let tabs = self.workspace_tabs(cx);
+        self.change(true, cx, |l| l.cycle_mru_in(delta, &tabs));
     }
 
     /// OWE-734: `Ctrl` 키를 떼거나 스위처를 닫을 때 MRU 순서를 확정한다.
@@ -866,20 +847,19 @@ impl Shell {
         let tab = self.layout.tabs().get(index)?;
         let is_pinned = tab.pinned;
         let current_color = tab.color;
-        let has_closable_others = self
-            .layout
-            .tabs()
+        let visible = self.tabs_in_workspace(index, cx);
+        let has_closable_others = visible
             .iter()
-            .enumerate()
-            .any(|(i, t)| i != index && !t.pinned);
-        let has_closable_right = self.layout.tabs().iter().skip(index + 1).any(|t| !t.pinned);
-        let has_closable_left = self.layout.tabs().iter().take(index).any(|t| !t.pinned);
-        let has_closable_editors = self
-            .layout
-            .tabs()
+            .any(|&i| i != index && !self.layout.is_tab_pinned(i));
+        let has_closable_right = visible
             .iter()
-            .enumerate()
-            .any(|(i, t)| !t.pinned && self.layout.is_editor_tab(i));
+            .any(|&i| i > index && !self.layout.is_tab_pinned(i));
+        let has_closable_left = visible
+            .iter()
+            .any(|&i| i < index && !self.layout.is_tab_pinned(i));
+        let has_closable_editors = visible
+            .iter()
+            .any(|&i| !self.layout.is_tab_pinned(i) && self.layout.is_editor_tab(i));
         // OWE-736: 데몬이 세션 포크를 협상했을 때만 포크·이어하기 항목을 보인다.
         let pane = tab.focused;
         let peer_supports_fork = self.peer_supports_fork(pane);
@@ -1551,19 +1531,7 @@ impl Shell {
     ) -> Option<gpui::Deferred> {
         let cursor = self.layout.mru_cursor()?;
         let p = ui::palette(cx);
-        let mut labels: Vec<_> = self
-            .layout
-            .tabs()
-            .iter()
-            .map(|t| self.pane_label(t.focused, cx))
-            .collect();
-        // OWE-870: 사용자 지정 제목이 있으면 자동 제목 대신 쓴다(번호 매기기 전에 덮어쓴다).
-        for (i, label) in labels.iter_mut().enumerate() {
-            if let Some(custom) = self.layout.tab_title(i) {
-                custom.clone_into(label);
-            }
-        }
-        number_duplicates(&mut labels);
+        let labels = self.workspace_tab_labels(cx);
 
         let rows = self
             .layout
@@ -1573,7 +1541,7 @@ impl Shell {
             .enumerate()
             .filter_map(|(pos, tab_idx)| {
                 let tab = self.layout.tabs().get(tab_idx)?;
-                let label = labels.get(tab_idx)?.clone();
+                let label = labels.iter().find(|(i, _)| *i == tab_idx)?.1.clone();
                 let selected = pos == cursor;
                 let is_file = self.layout.file(tab.focused).is_some();
                 let host = self.layout.host(tab.focused);

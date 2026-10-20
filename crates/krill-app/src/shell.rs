@@ -31,6 +31,7 @@ pub(crate) mod popout;
 mod release;
 pub(crate) mod security;
 mod tabs;
+mod workspaces;
 
 // 앱이 꺼져 있던 동안의 변화 요약.
 mod away;
@@ -2845,6 +2846,15 @@ impl Shell {
             return;
         }
         self.zoomed_pane = None;
+        if let Some(index) = self
+            .layout
+            .tabs()
+            .iter()
+            .position(|t| t.root == PaneTree::Leaf(pane))
+        {
+            self.do_close_tab(index, cx);
+            return;
+        }
         self.record_closed_pane(pane, cx);
         self.close_layout(cx, |l| {
             l.focus(pane);
@@ -2884,7 +2894,8 @@ impl Shell {
         if self.settings.is_some() {
             self.close_settings(None, cx);
         }
-        let len = self.layout.tabs().len();
+        let tabs = self.workspace_tabs(cx);
+        let len = tabs.len();
         if len == 0 {
             return;
         }
@@ -2895,7 +2906,7 @@ impl Shell {
         } else {
             return;
         };
-        self.change(true, cx, |l| l.activate(target));
+        self.change(true, cx, |l| l.activate(tabs[target]));
     }
 
     fn cycle_session_focus(&mut self, delta: isize, cx: &mut Context<Self>) {
@@ -2905,7 +2916,7 @@ impl Shell {
         }
         let items = self.sidebar.read(cx).jump_items();
         if items.is_empty() {
-            self.change(true, cx, |l| l.cycle(delta));
+            self.cycle_workspace_tab(delta, cx);
             return;
         }
         let cur = self.layout.focused().and_then(|p| self.layout.session(p));
@@ -4076,6 +4087,7 @@ impl Shell {
             }
             if let Some(folder) = folder
                 && let Some(pane) = l.focused()
+                && (target.is_none() || l.launch(pane).is_none_or(|launch| launch.cwd.is_empty()))
             {
                 let mut launch = l.launch(pane).cloned().unwrap_or(Create {
                     account: None,
@@ -5531,13 +5543,13 @@ impl Render for Shell {
                 if this.settings.is_some() {
                     this.close_settings(None, cx);
                 }
-                this.change(true, cx, |l| l.cycle(1));
+                this.cycle_workspace_tab(1, cx);
             }))
             .on_action(cx.listener(|this, _: &PrevTab, _, cx| {
                 if this.settings.is_some() {
                     this.close_settings(None, cx);
                 }
-                this.change(true, cx, |l| l.cycle(-1));
+                this.cycle_workspace_tab(-1, cx);
             }))
             .on_action(cx.listener(|this, _: &NextRecentTab, _, cx| {
                 if this.settings.is_some() {
