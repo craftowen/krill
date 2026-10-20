@@ -1171,7 +1171,7 @@ impl Registry {
         let session = self.next_id();
         let state = self.state_dir();
         let Launch { argv, env } = match c.program {
-            Program::Login => Shell::Login.launch(),
+            Program::Login => crate::agent::login_in(state.as_deref()),
             Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
             Program::Agent { id } => {
                 let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;
@@ -1386,7 +1386,7 @@ impl Registry {
                 launch
             }
             None => match c.program {
-                Program::Login => Shell::Login.launch(),
+                Program::Login => crate::agent::login_in(state.as_deref()),
                 Program::Custom { program, args } => Shell::Custom { program, args }.launch(),
                 Program::Agent { id } => {
                     let agents = self.agents.agents().map_err(|_| Failure::UnknownAgent)?;

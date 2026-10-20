@@ -69,6 +69,151 @@ pub(crate) fn launch_in(
     launch_selected_in(profile, permission, session, state, None)
 }
 
+const ZSH_ACCOUNT_SYNC_ENV: &str = r#"# Managed by Krill — syncs active AI provider account profiles into login shells.
+if [ -n "${KRILL_ORIG_ZDOTDIR+x}" ]; then
+  if [ -n "$KRILL_ORIG_ZDOTDIR" ]; then
+    export ZDOTDIR="$KRILL_ORIG_ZDOTDIR"
+  else
+    unset ZDOTDIR
+  fi
+  unset KRILL_ORIG_ZDOTDIR
+else
+  unset ZDOTDIR
+fi
+if [ -f "${ZDOTDIR:-$HOME}/.zshenv" ]; then
+  . "${ZDOTDIR:-$HOME}/.zshenv"
+fi
+__krill_sync_accounts() {
+  local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/minikrill}/active-accounts.env"
+  if [ -f "$_krill_env" ]; then
+    unset CLAUDE_CONFIG_DIR CODEX_HOME OPENCODE_CONFIG_DIR OPENCODE_DB ANTIGRAVITY_CLI_HOME GEMINI_CLI_HOME
+    . "$_krill_env"
+    if [ "${CLAUDE_CONFIG_DIR-}" = "$HOME/.claude" ]; then unset CLAUDE_CONFIG_DIR; fi
+    if [ "${CODEX_HOME-}" = "$HOME/.codex" ]; then unset CODEX_HOME; fi
+    if [ "${ANTIGRAVITY_CLI_HOME-}" = "$HOME" ]; then unset ANTIGRAVITY_CLI_HOME; fi
+    if [ -n "${OPENCODE_CONFIG_DIR-}" ] && [ "$OPENCODE_CONFIG_DIR" != "$HOME/.local/share/opencode" ]; then
+      export XDG_DATA_HOME="$OPENCODE_CONFIG_DIR/data" XDG_STATE_HOME="$OPENCODE_CONFIG_DIR/state" OPENCODE_DB=opencode.db
+      unset OPENCODE_CONFIG_DIR
+    else
+      unset OPENCODE_CONFIG_DIR OPENCODE_DB
+    fi
+  fi
+}
+__krill_sync_accounts
+typeset -ga precmd_functions preexec_functions
+if (( ! ${precmd_functions[(I)__krill_sync_accounts]} )); then
+  precmd_functions+=(__krill_sync_accounts)
+fi
+if (( ! ${preexec_functions[(I)__krill_sync_accounts]} )); then
+  preexec_functions+=(__krill_sync_accounts)
+fi
+agy() {
+  __krill_sync_accounts
+  if [ -n "${ANTIGRAVITY_CLI_HOME-}" ] && [ "$ANTIGRAVITY_CLI_HOME" != "$HOME" ]; then
+    SSH_CONNECTION=krill command agy --gemini_dir="$ANTIGRAVITY_CLI_HOME/.gemini" "$@"
+  else
+    command agy "$@"
+  fi
+}
+"#;
+
+/// 로그인 셸(`Program::Login`) 실행 시 활성 계정 프로필 환경 변수와 셸 동기화 훅(`active-accounts.env`)을 주입한다.
+pub(crate) fn login_in(state: Option<&Path>) -> Launch {
+    let mut login = Shell::Login.launch();
+    let Some(state) = state else {
+        return login;
+    };
+    if cfg!(test)
+        && !state.join("accounts.toml").exists()
+        && !state.join("active-accounts.env").exists()
+    {
+        return login;
+    }
+    let home = accounts::default_home();
+    for (prog, provider) in [
+        ("claude", ProviderKind::Claude),
+        ("codex", ProviderKind::Codex),
+        ("opencode", ProviderKind::OpenCode),
+        ("agy", ProviderKind::Antigravity),
+        ("gemini", ProviderKind::Gemini),
+    ] {
+        let Some((_, active)) = accounts::active_account_info(&home, Some(state), prog) else {
+            continue;
+        };
+        let dir = &active.profile_dir;
+        if dir.is_empty() {
+            continue;
+        }
+        login.env.retain(|(key, _)| {
+            !provider
+                .credential_overrides()
+                .iter()
+                .any(|name| key.as_slice() == name.as_bytes())
+        });
+        if provider == ProviderKind::OpenCode {
+            login.env.retain(|(k, _)| {
+                !matches!(
+                    k.as_slice(),
+                    b"OPENCODE_DB" | b"XDG_DATA_HOME" | b"XDG_STATE_HOME" | b"OPENCODE_CONFIG_DIR"
+                )
+            });
+            login
+                .env
+                .push((b"OPENCODE_DB".to_vec(), b"opencode.db".to_vec()));
+            for (key, suffix) in [("XDG_DATA_HOME", "data"), ("XDG_STATE_HOME", "state")] {
+                login.env.push((
+                    key.as_bytes().to_vec(),
+                    Path::new(dir)
+                        .join(suffix)
+                        .into_os_string()
+                        .as_encoded_bytes()
+                        .to_vec(),
+                ));
+            }
+        } else {
+            let key = provider.env_var().as_bytes();
+            login.env.retain(|(k, _)| k.as_slice() != key);
+            login.env.push((key.to_vec(), dir.as_bytes().to_vec()));
+        }
+    }
+    let is_zsh = login
+        .argv
+        .first()
+        .and_then(|a| Path::new(std::ffi::OsStr::from_bytes(a)).file_name())
+        .is_some_and(|n| n == "zsh");
+    if is_zsh {
+        let zdotdir = state.join("shell").join("zsh");
+        let zshenv = zdotdir.join(".zshenv");
+        let ok = {
+            use krill_proto::os::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&zdotdir)
+                .and_then(|()| {
+                    accounts::write_atomic_0600(&zshenv, ZSH_ACCOUNT_SYNC_ENV.as_bytes())
+                })
+                .is_ok()
+        };
+        if ok {
+            let orig = login
+                .env
+                .iter()
+                .find(|(k, _)| k.as_slice() == b"ZDOTDIR")
+                .map_or_else(Vec::new, |(_, v)| v.clone());
+            login.env.retain(|(k, _)| {
+                k.as_slice() != b"ZDOTDIR" && k.as_slice() != b"KRILL_ORIG_ZDOTDIR"
+            });
+            login.env.push((b"KRILL_ORIG_ZDOTDIR".to_vec(), orig));
+            login.env.push((
+                b"ZDOTDIR".to_vec(),
+                zdotdir.into_os_string().as_encoded_bytes().to_vec(),
+            ));
+        }
+    }
+    login
+}
+
 /// OWE-712: 새 세션 하나에만 선택 계정을 적용한다. 전역 활성 계정은 바꾸지 않는다.
 pub(crate) fn launch_selected_in(
     profile: &Profile,
@@ -348,12 +493,9 @@ pub(crate) fn resume_account(
 fn active_account(state: Option<&Path>, program: &str) -> Option<LaunchAccount> {
     let provider = ProviderKind::parse(Path::new(program).file_name()?.to_str()?)?;
     let home = accounts::default_home();
-    let dir =
-        accounts::active_profile_env(&home, state, program).map_or_else(String::new, |(_, d)| d);
-    let id = if dir.is_empty() {
-        accounts::host_default_id(provider)
-    } else {
-        account_id(&accounts::load_file(&home, state), provider, &dir)
+    let (id, dir) = match accounts::active_account_info(&home, state, program) {
+        Some((_, active)) => (active.id, active.profile_dir),
+        None => (accounts::host_default_id(provider), String::new()),
     };
     Some(LaunchAccount {
         id,
@@ -367,10 +509,19 @@ fn account_id(file: &accounts::AccountsFile, provider: ProviderKind, dir: &str) 
     if dir.is_empty() {
         return accounts::host_default_id(provider);
     }
+    let home = accounts::default_home();
     file.accounts
         .iter()
         .find(|a| {
-            ProviderKind::parse(&a.provider) == Some(provider) && a.config_dir() == Path::new(dir)
+            if ProviderKind::parse(&a.provider) != Some(provider) {
+                return false;
+            }
+            let cfg = a.config_dir();
+            if cfg == Path::new(dir) {
+                return true;
+            }
+            provider == ProviderKind::Codex
+                && accounts::resolve_codex_dir(&home, &a.id, cfg) == Path::new(dir)
         })
         .map(|a| a.id.clone())
         .unwrap_or_default()

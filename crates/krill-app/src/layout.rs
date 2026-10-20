@@ -715,6 +715,9 @@ impl Layout {
             .collect();
         for &pane in &panes {
             self.sessions.insert(pane, to);
+            if let Some(launch) = self.launches.get_mut(&pane) {
+                launch.account = None;
+            }
         }
         panes
     }
@@ -907,6 +910,7 @@ impl Layout {
             .and_then(|p| self.launch(p))
             .cloned()
             .map(|mut c| {
+                c.account = None;
                 c.program = Program::Login;
                 c
             })

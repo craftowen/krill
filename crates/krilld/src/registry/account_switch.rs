@@ -39,6 +39,78 @@ pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
 }
 
 impl Registry {
+    fn live_agent_for_switch(
+        &self,
+        session: SessionId,
+    ) -> Option<crate::agent::control::StoredLaunch> {
+        if let Some(stored) = self.agents.stored(session).ok().flatten() {
+            if stored.account.is_none() && stored.hibernation_blocked {
+                let idle_shell = {
+                    let state = lock(&self.state);
+                    state
+                        .sessions
+                        .get(&session)
+                        .is_some_and(|e| e.session.tap().foreground() == Some(e.pid))
+                };
+                if idle_shell {
+                    return None;
+                }
+            }
+            return Some(stored);
+        }
+        let (root_pid, fg_pid, entry_cwd) = {
+            let state = lock(&self.state);
+            let entry = state.sessions.get(&session)?;
+            (
+                entry.pid,
+                entry.session.tap().foreground(),
+                entry.cwd.as_os_str().as_bytes().to_vec(),
+            )
+        };
+        let mut agent_pid = None;
+        let mut agent = None;
+        if let Some(mut cur) = fg_pid.filter(|&pid| pid > 0 && pid != root_pid) {
+            for _ in 0..16 {
+                if let Ok(name) = crate::sys::process_name(cur)
+                    && let Some(parsed) = krill_proto::agent_history::VaultAgent::parse(name.trim())
+                {
+                    agent_pid = Some(cur);
+                    agent = Some(parsed);
+                    break;
+                }
+                let Ok(parent) = crate::sys::parent_pid(cur) else {
+                    break;
+                };
+                if parent <= 1 || parent == cur || parent == root_pid {
+                    break;
+                }
+                cur = parent;
+            }
+        }
+        let agent = agent.or_else(|| {
+            let status_agent = self.status.get(session).agent;
+            krill_proto::agent_history::VaultAgent::parse(&status_agent)
+        })?;
+        let cwd = agent_pid
+            .and_then(|pid| crate::sys::current_directory(pid).ok())
+            .map(|p| p.into_os_string().as_encoded_bytes().to_vec())
+            .filter(|c| !c.is_empty())
+            .unwrap_or(entry_cwd);
+        let permission = self
+            .agents
+            .agents()
+            .map_or(krill_proto::agent::Permission::Yolo, |a| a.permission);
+        Some(crate::agent::control::StoredLaunch {
+            profile: agent.profile().to_owned(),
+            permission,
+            session_id: None,
+            transcript_path: None,
+            cwd,
+            hibernation_blocked: true,
+            account: None,
+        })
+    }
+
     pub(super) fn queue_account_switch(&self, provider: ProviderKind, account_id: &str) {
         let mut pending = lock(&self.account_work.0);
         let sessions: Vec<_> = {
@@ -57,7 +129,7 @@ impl Registry {
             if lock(&self.account_replacements).contains(&from) {
                 continue;
             }
-            let Some(stored) = self.agents.stored(from).ok().flatten() else {
+            let Some(stored) = self.live_agent_for_switch(from) else {
                 continue;
             };
             let Ok(agents) = self.agents.agents() else {
@@ -296,10 +368,9 @@ impl Registry {
                 .flatten()
                 .is_some_and(|a| {
                     a.account.is_some_and(|a| a.id == prepared.account_id)
-                        && source.as_ref().is_some_and(|s| {
+                        && source.as_ref().is_none_or(|s| {
                             s.profile == a.profile
-                                && s.session_id.is_some()
-                                && s.session_id == a.session_id
+                                && (s.session_id.is_none() || s.session_id == a.session_id)
                         })
                 });
             if !committed && owned {
@@ -348,9 +419,7 @@ impl Registry {
         let _claim = self.claim_resume(old).ok_or(Failure::BadRequest)?;
         let holder = self.holder.as_ref().ok_or(Failure::NoHolder)?;
         let stored = self
-            .agents
-            .stored(old)
-            .map_err(|e| super::os(&e))?
+            .live_agent_for_switch(old)
             .ok_or(Failure::UnknownAgent)?;
         let state_dir = self.state_dir();
         let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
@@ -380,18 +449,6 @@ impl Registry {
         let (canonical, profile) = agents
             .resolve(&stored.profile)
             .ok_or(Failure::UnknownAgent)?;
-        let session_id = stored
-            .session_id
-            .as_deref()
-            .filter(|id| crate::agent::control::valid_session_id(id))
-            .ok_or(Failure::BadRequest)?;
-        let source = crate::agent::resume_account(
-            profile,
-            state_dir.as_deref(),
-            stored.account.as_ref(),
-            Some(session_id),
-        )
-        .ok_or(Failure::BadRequest)?;
         if !target.host_default && !Path::new(&target.profile_dir).is_dir() {
             return Err(Failure::BadRequest);
         }
@@ -420,9 +477,40 @@ impl Registry {
                 entry.session.tap().size().unwrap_or(super::FALLBACK_SIZE),
             )
         };
+        let resolved_sid = stored
+            .session_id
+            .clone()
+            .filter(|id| crate::agent::control::valid_session_id(id))
+            .or_else(|| {
+                crate::agent_history::chat::resolve_session_transcript(
+                    state_dir.as_deref(),
+                    &stored,
+                    &cwd,
+                )
+                .map(|(_, sid)| sid)
+                .filter(|id| crate::agent::control::valid_session_id(id))
+            });
         // Preparation can fail. Until it succeeds the old process and PTY are untouched.
-        transcript::prepare(provider, home, &source, target, session_id, &cwd)
-            .map_err(|e| super::os(&e))?;
+        let resume_sid = if let Some(session_id) = resolved_sid.as_deref() {
+            let source = crate::agent::resume_account(
+                profile,
+                state_dir.as_deref(),
+                stored.account.as_ref(),
+                Some(session_id),
+            )
+            .unwrap_or_else(|| crate::agent::control::LaunchAccount {
+                id: accounts::host_default_id(provider),
+                env_key: provider.env_var().into(),
+                dir: String::new(),
+            });
+            match transcript::prepare(provider, home, &source, target, session_id, &cwd) {
+                Ok(()) => Some(session_id),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(super::os(&e)),
+            }
+        } else {
+            None
+        };
         let new = self.next_id();
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
@@ -430,14 +518,24 @@ impl Registry {
             session: new,
             committed: false,
         };
-        let (launch, sid, applied) = crate::agent::resume_in(
-            profile,
-            stored.permission,
-            new,
-            state_dir.as_deref(),
-            Some(session_id),
-            account.as_ref(),
-        )
+        let (launch, sid, applied) = if let Some(session_id) = resume_sid {
+            crate::agent::resume_in(
+                profile,
+                stored.permission,
+                new,
+                state_dir.as_deref(),
+                Some(session_id),
+                account.as_ref(),
+            )
+        } else {
+            crate::agent::launch_selected_in(
+                profile,
+                stored.permission,
+                new,
+                state_dir.as_deref(),
+                Some(account_id),
+            )
+        }
         .map_err(|e| super::os(&e))?;
         if applied.as_ref().is_none_or(|a| a.id != account_id) {
             self.discard_settings(new);

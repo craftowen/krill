@@ -182,3 +182,123 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
         fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[test]
+fn switch_without_transcript_launches_selected_account_and_login_shell_gets_active_env() {
+    let root = Path::new("/tmp").join(format!("kas-fresh-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    let home = root.join("home");
+    let from = root.join("from");
+    let to = root.join("to");
+    fs::create_dir_all(&state).unwrap();
+    fs::create_dir_all(&from).unwrap();
+    fs::create_dir_all(&to).unwrap();
+    fs::write(to.join("auth.json"), "selected fixture credentials").unwrap();
+    let snap = accounts::add_account(
+        &home,
+        Some(&state),
+        ProviderKind::Codex,
+        "Selected",
+        None,
+        to.to_str().unwrap(),
+    )
+    .unwrap();
+    let target = snap
+        .accounts
+        .iter()
+        .find(|a| a.label == "Selected")
+        .unwrap()
+        .id
+        .clone();
+    accounts::switch_account(&home, Some(&state), ProviderKind::Codex, &target).unwrap();
+
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let (master, _old_process) = UnixStream::pair().unwrap();
+    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Arc::new(Registry::new(
+        Some((
+            holder,
+            vec![Kept {
+                id: SessionId(9),
+                pid: 900,
+                status: None,
+                master: OwnedFd::from(master),
+            }],
+        )),
+        Some(&state),
+    ));
+    reg.agents
+        .remember_session(
+            SessionId(9),
+            &AgentLaunch {
+                profile: "codex".into(),
+                permission: Permission::Yolo,
+            },
+            None,
+            root.as_os_str().as_encoded_bytes().to_vec(),
+            Some(LaunchAccount {
+                id: "codex-old".into(),
+                env_key: "CODEX_HOME".into(),
+                dir: from.display().to_string(),
+            }),
+        )
+        .unwrap();
+    let reader = Arc::clone(&reg);
+    let reader_worker =
+        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+    let expected_home = to.clone();
+    let mock = std::thread::spawn(move || {
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Spawn {
+            req, id, argv, env, ..
+        } = ToHolder::decode(packet.frame()).unwrap()
+        else {
+            panic!("expected replacement spawn");
+        };
+        assert!(!argv.iter().any(|arg| arg == b"resume"));
+        assert!(env.iter().any(|(key, value)| key == b"CODEX_HOME"
+            && value == expected_home.as_os_str().as_encoded_bytes()));
+        let (master, mut process) = UnixStream::pair().unwrap();
+        holder_link
+            .send(
+                &FromHolder::Spawned { req, id, pid: 901 }.encode().unwrap(),
+                &[master.as_fd()],
+            )
+            .unwrap();
+        process.write_all(b"fresh selected account\r\n").unwrap();
+        let packet = holder_link.recv().unwrap().unwrap();
+        let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap() else {
+            panic!("expected old process retirement");
+        };
+        assert_eq!(old, SessionId(9));
+        holder_link
+            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+            .unwrap();
+        Some((id, process))
+    });
+    reg.queue_account_switch(ProviderKind::Codex, &target);
+    reg.process_account_work_in(&home);
+    let saved = load(Some(&state));
+    let result = saved.get(&SessionId(9)).unwrap();
+    let new = result.to.expect("durable replacement without transcript");
+    assert_eq!(
+        reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
+        target
+    );
+    drop(mock.join().unwrap());
+    reader_worker.join().unwrap();
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
