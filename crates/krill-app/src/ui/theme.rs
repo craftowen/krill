@@ -145,7 +145,7 @@ pub const AGENT_HISTORY_MAX_HEIGHT: Pixels = px(360.);
 pub const DIVIDER_HIT_PX: Pixels = px(5.);
 
 /// 0..=255 RGBA 바이트를 `Hsla` 상수로 변환한다.
-const fn rgba_bytes(red: u8, green: u8, blue: u8, alpha: u8) -> Hsla {
+pub(super) const fn rgba_bytes(red: u8, green: u8, blue: u8, alpha: u8) -> Hsla {
     let max_u8 = if red >= green && red >= blue {
         red
     } else if green >= blue {
@@ -204,7 +204,7 @@ pub const fn hexa(rgb: u32, alpha: f32) -> Hsla {
     c
 }
 
-const fn term_rgb(r: u8, g: u8, b: u8) -> Rgb {
+pub(super) const fn term_rgb(r: u8, g: u8, b: u8) -> Rgb {
     Rgb { r, g, b }
 }
 
@@ -422,15 +422,25 @@ pub fn terminal_surface_alpha(theme: TerminalTheme, opacity_pct: u8) -> Hsla {
     terminal_surface(theme).opacity(f32::from(opacity_pct.clamp(50, 100)) / 100.)
 }
 
-pub fn terminal_theme(cx: &App) -> TerminalTheme {
-    if cx
-        .try_global::<Theme>()
-        .is_some_and(|t| t.mode == ThemeMode::Light)
-    {
-        TERMINAL_LIGHT
+/// 주어진 [`ThemeMode`]와 설정에 따라 적용할 터미널 테마를 계산한다(OWE-956).
+/// 라이트 모드에서도 `terminal_use_separate_light_theme`가 `false`면 다크 터미널 테마를 그대로 쓴다.
+/// 선택값을 해석하지 못하면 모드별 기본 테마로 돌아간다.
+#[must_use]
+pub fn terminal_theme_for_mode(mode: ThemeMode, s: &crate::settings::Settings) -> TerminalTheme {
+    let use_light = mode == ThemeMode::Light && s.terminal_use_separate_light_theme;
+    let (selection, fallback) = if use_light {
+        (&s.terminal_theme_light, TERMINAL_LIGHT)
     } else {
-        TERMINAL_DARK
-    }
+        (&s.terminal_theme_dark, TERMINAL_DARK)
+    };
+    super::terminal_themes::resolve_terminal_theme(selection, &s.terminal_custom_themes)
+        .unwrap_or(fallback)
+}
+
+#[must_use]
+pub fn terminal_theme(cx: &App) -> TerminalTheme {
+    let mode = cx.try_global::<Theme>().map_or(ThemeMode::Dark, |t| t.mode);
+    terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
 /// 주어진 [`ThemeMode`]에 대응하는 Orca [`Palette`]를 돌려준다.
