@@ -4,7 +4,7 @@
 //! - 같은 revision 재접속은 스냅샷 생략, RESYNC는 스냅샷, 지연 히스토리(핫·콜드), 없는 세션 거부.
 //! - footprint: 화면 클라이언트 프로세스는 출력 1천 줄과 10만 줄 뒤 footprint가 같다(스크롤백을 들지 않는다).
 //!
-//! 측정값(release)은 docs/spikes/MK-023.md. 재현: `cargo test --release -p krilld --test attach -- --nocapture`.
+//! 측정값(release)은 비공개 MK-023 스파이크 기록. 재현: `cargo test --release -p krilld --test attach -- --nocapture`.
 
 #![cfg(unix)]
 #![expect(

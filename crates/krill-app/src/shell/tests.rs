@@ -4337,12 +4337,9 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
             window.draw(cx).clear(cx);
         });
         cx.run_until_parked();
-        let add_mac = cx.debug_bounds("sidebar-add-mac").expect("sidebar-add-mac");
-        let sidebar = cx.debug_bounds("sidebar-column").expect("sidebar-column");
-        let tabbar = cx.debug_bounds("titlebar").expect("titlebar");
         assert!(
-            add_mac.right() <= sidebar.right() && add_mac.right() <= tabbar.left(),
-            "sidebar-add-mac ({add_mac:?}) must stay inside sidebar ({sidebar:?}) and before tab bar ({tabbar:?}) in {lang:?}"
+            cx.debug_bounds("sidebar-add-mac").is_none(),
+            "Mac pairing lives in the admin SSH tab, not the titlebar ({lang:?})"
         );
     }
     cx.update(|window, cx| {
@@ -5600,6 +5597,16 @@ fn pinned_tab_guards_close_and_context_menu_colors_persist(cx: &mut TestAppConte
     // 다시 탭 0을 우클릭해 Purple 색상 태그를 지정한다.
     cx.simulate_mouse_down(tab0, MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
+    let none_bounds = cx
+        .debug_bounds("tab-menu-color-none")
+        .expect("tab-menu-color-none");
+    let gray_bounds = cx
+        .debug_bounds("tab-menu-color-gray")
+        .expect("tab-menu-color-gray");
+    assert_eq!(
+        none_bounds.origin.y, gray_bounds.origin.y,
+        "all 10 tab color swatches (none + 9 colors) must fit on a single horizontal row without wrapping"
+    );
     let purple = cx
         .debug_bounds("tab-menu-color-purple")
         .expect("tab-menu-color-purple")

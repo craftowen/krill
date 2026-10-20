@@ -31,3 +31,14 @@ filter = 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | 
 test-group = 'latency'
 threads-required = "num-test-threads"
 retries = 2
+
+# CI 전용(`cargo nextest run --profile ci`). default의 재시도·그룹·타임아웃을 그대로 물려받고,
+# 재시도로 녹색이 된 FLAKY가 묻히지 않게 junit(target/nextest/ci/junit.xml, flakyFailure 기록)으로 남긴다.
+# 한 테스트 실패로 나머지가 안 도는 것도 막는다(2026-10-18 macos-15-intel은 시간 초과 1건으로 2047개 중 786개만 실행).
+# 재시도 통과를 실패로 칠 때는 flaky-result = "fail"(nextest 0.9.148 확인).
+[profile.ci]
+fail-fast = false
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"

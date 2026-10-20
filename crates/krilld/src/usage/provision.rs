@@ -15,7 +15,7 @@ mod agy;
 mod codex;
 
 // 오웬 승인(OWE-720): 대화 기록 공유, settings.json 최초 한 번 복사, 프로필 기존 내용 보존.
-// Orca CLAUDE_PROFILE_HISTORY_DIRS와의 항목별 비교: docs/testing/owe-720-provision-2026-10-17.md.
+// Orca CLAUDE_PROFILE_HISTORY_DIRS와의 항목별 비교: 비공개 OWE-720 프로비저닝 비교 기록.
 
 /// 프로필에 `~/.claude/<이름>`을 가리키는 심볼릭 링크로 공유하는 폴더(대화 기록 + 사용자 확장).
 /// 원본 폴더가 없으면 건너뛴다(만들지 않는다).

@@ -22,7 +22,16 @@ multiple-versions = "warn"
 wildcards = "deny"
 allow-wildcard-paths = true
 workspace-dependencies = { duplicates = "deny", include-path-dependencies = true, unused = "deny" }
-deny = []
+# CONVENTIONS T5: krill-proto·krill-term은 gpui·tokio·nix·objc2에 의존하지 않는다. wrappers = 지금 그 크레이트를
+# 직접 의존하는 크레이트 전부(graph.targets 기준. cargo-deny가 `unmatched-wrapper` 경고로 빠진 것을 알려 준다).
+# 의존성 갱신으로 새 직접 의존자가 생기면 여기서 걸린다 — proto·term이 아닌지 확인하고 목록에 더한다.
+# 한계: proto·term이 이미 wrappers에 있는 크레이트를 새로 의존하면(간접 의존) 잡지 못한다.
+deny = [
+    { crate = "gpui-pre", reason = "T5", wrappers = ["gpui-base", "gpui-component", "gpui-kit-assets", "gpui-pre-apple", "gpui-pre-macos", "gpui-pre-platform", "gpui-pre-windows", "krill-app"] },
+    { crate = "tokio", reason = "T5", wrappers = ["backon", "hyper", "hyper-rustls", "hyper-util", "iroh", "iroh-dns", "iroh-relay", "krill-app", "krill-hosts", "krill-link", "n0-dns-resolver", "n0-future", "netwatch", "noq", "reqwest", "tokio-rustls", "tokio-stream", "tokio-util", "tokio-websockets", "tower"] },
+    { crate = "nix", reason = "T5(워크스페이스는 rustix를 쓴다)" },
+    { crate = "objc2", reason = "T5", wrappers = ["accesskit_macos", "block2", "dispatch2", "gpui-base", "gpui-component", "gpui-pre-apple", "gpui-pre-macos", "krill-app", "netdev", "objc2-app-kit", "objc2-cloud-kit", "objc2-core-data", "objc2-core-foundation", "objc2-core-graphics", "objc2-core-image", "objc2-core-text", "objc2-core-video", "objc2-core-wlan", "objc2-foundation", "objc2-metal", "objc2-quartz-core", "objc2-security", "objc2-security-foundation", "objc2-system-configuration", "objc2-user-notifications"] },
+]
 
 [sources]
 unknown-registry = "deny"
@@ -48,7 +57,7 @@ allow = ["0BSD"]
 crate = "notify"            # gpui-component
 allow = ["CC0-1.0"]
 # iroh(원격 연결 mk-link, MK-133) — 2026-10-16 오웬 승인. portmapper(attohttpc MPL-2.0)는 기능을 꺼서 들이지 않는다.
-# CDLA-Permissive-2.0: Mozilla 루트 인증서 데이터 번들의 퍼미시브 데이터 라이선스(docs/spikes/mk-130-iroh.md §3.b).
+# CDLA-Permissive-2.0: Mozilla 루트 인증서 데이터 번들의 퍼미시브 데이터 라이선스(MK-130 iroh 스파이크에서 확인).
 [[licenses.exceptions]]
 crate = "webpki-roots"      # iroh-relay · iroh-dns → n0-dns-resolver
 allow = ["CDLA-Permissive-2.0"]

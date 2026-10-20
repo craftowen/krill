@@ -4421,6 +4421,80 @@ fn stale_worktree_state_pruned_when_snapshot_shrinks(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn owe731_grouped_sorted_500_rows_60fps_within_budget(cx: &mut TestAppContext) {
+    struct Memory(Snapshot);
+    impl Source for Memory {
+        fn fetch(&self) -> io::Result<Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new(None));
+    let fixture = fixture();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.connect_source(Arc::new(Memory(fixture.clone())), cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let mut samples = Vec::new();
+    for (group_by, sort_by) in [
+        (GroupBy::Repo, SortBy::Smart),
+        (GroupBy::WorkspaceStatus, SortBy::Recent),
+        (GroupBy::PrStatus, SortBy::Name),
+        (GroupBy::None, SortBy::Smart),
+    ] {
+        let group_start = Instant::now();
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                s.set_group_by(group_by, cx);
+            });
+        });
+        cx.run_until_parked();
+        samples.push(group_start.elapsed());
+
+        let sort_start = Instant::now();
+        cx.update(|_, cx| {
+            view.update(cx, |s, cx| {
+                s.set_sort_by(sort_by, cx);
+            });
+        });
+        cx.run_until_parked();
+        samples.push(sort_start.elapsed());
+
+        let len = cx.update(|_, cx| view.read(cx).rows.len()).max(1);
+        for i in 0..30 {
+            let start = Instant::now();
+            cx.update(|_, cx| {
+                view.update(cx, |s, cx| {
+                    s.rendered_rows = 0;
+                    s.scroll.scroll_to_item((i * 17) % len, ScrollStrategy::Top);
+                    cx.notify();
+                });
+            });
+            cx.run_until_parked();
+            samples.push(start.elapsed());
+        }
+    }
+    samples.sort_unstable();
+    let p50 = samples[samples.len() / 2];
+    let p99 = samples[(samples.len() * 99) / 100];
+    let max = *samples.last().unwrap();
+    println!(
+        "OWE-731 500-row grouped/sorted benchmark: frames={} p50_us={} p99_us={} max_us={}",
+        samples.len(),
+        p50.as_micros(),
+        p99.as_micros(),
+        max.as_micros(),
+    );
+    assert!(
+        p99 < Duration::from_micros(16_670),
+        "p99 frame time {p99:?} exceeded 16.67ms (60fps) budget"
+    );
+}
+
 /// Orca처럼 프로젝트 머리줄을 끌어다 놓으면 순서가 바뀌고, `sidebar.bin`에 남아 다시 열어도 유지된다.
 #[gpui::test]
 fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {

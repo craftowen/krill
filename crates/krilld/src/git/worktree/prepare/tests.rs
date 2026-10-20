@@ -237,12 +237,26 @@ fn restart_removes_registration_even_when_checkout_directory_was_lost() {
 fn filters_are_skipped_without_executing_repository_programs() {
     let f = Fixture::new("prep-filter", "");
     f.git(&["config", "filter.test.smudge", "touch filter-ran"]);
+    fs::create_dir_all(f.repo.join("sub")).unwrap();
+    fs::write(f.repo.join("sub/.gitattributes"), "*.bin filter=test\n").unwrap();
+    f.git(&["add", "."]);
+    f.git(&["commit", "-q", "-m", "attributes"]);
     let pool = pool(&f);
     let req = request(&f, 9);
     assert_eq!(pool.request(&req), Status::Preparing);
     cleaned(&pool);
     assert_eq!(pool.request(&req), Status::Skipped);
     assert!(!f.repo.join("filter-ran").exists());
+}
+
+// `git lfs install` configures filter.lfs.* for every repository (GitHub macOS runners too).
+#[test]
+fn configured_but_unused_filters_still_prepare() {
+    let f = Fixture::new("prep-unused-filter", "");
+    f.git(&["config", "filter.lfs.process", "touch filter-ran"]);
+    let pool = pool(&f);
+    ready(&pool, &request(&f, 10));
+    assert!(!pool.tree().join("filter-ran").exists());
 }
 
 #[test]

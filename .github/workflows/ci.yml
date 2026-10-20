@@ -1,13 +1,15 @@
-# Krill CI — Linux 고속 게이트 (OWE-382, MK-017).
-# krill-proto·krill-term 단위 테스트 + clippy + cargo deny만. 모든 PR에서 항상 실행.
-# macOS 전체(clippy·nextest·PTY e2e)는 ci-macos.yml이 관련 경로 변경 시만 실행한다
+# Krill CI — Linux 고속 게이트 (OWE-382, MK-017). 모든 PR에서 항상 실행.
+# fmt · clippy · nextest(Linux에서 빌드되는 데몬 쪽 크레이트) · cargo deny(macOS·Linux 대상) ·
+# 공개 표면 점검 · 서드파티 고지 최신 여부.
+# macOS 전체(clippy·nextest·PTY e2e)는 ci-macos.yml이 테스트 입력 변경 시만 실행한다
 # (macOS 분 절약, 2026-10-15 오웬 결정).
 # 로컬 재현은 scripts/check.sh.
 name: ci
 
 on:
   push:
-    branches: [main]
+    # dev가 통합 브랜치다(main은 공개 릴리스 이력). release/**는 릴리스 준비 브랜치.
+    branches: [main, dev, 'release/**']
   pull_request:
 
 permissions:
@@ -22,33 +24,36 @@ env:
 
 jobs:
   linux:
-    name: fmt · clippy · nextest · deny (krill-proto·krill-term)
+    name: linux
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Rust 1.98 + clippy
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
           toolchain: "1.98"
           components: rustfmt, clippy
 
       - name: nextest · cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: cargo-nextest,cargo-deny
 
       - name: fmt
         run: cargo fmt --all --check
 
-      - name: clippy (krill-proto·krill-term)
-        run: cargo clippy -p krill-proto -p krill-term --all-targets --locked -- -D warnings
-        timeout-minutes: 20
+      # krill-holder sys/linux.rs 등 Linux 전용 unsafe·cfg 코드는 macOS 잡이 컴파일하지 않는다(레드팀 P1-4).
+      - name: clippy (krill-proto·krill-term·krill-holder·krilld·krill)
+        run: cargo clippy -p krill-proto -p krill-term -p krill-holder -p krilld -p krill --all-targets --locked -- -D warnings
+        timeout-minutes: 30
 
-      - name: nextest (krill-proto·krill-term)
-        run: cargo nextest run -p krill-proto -p krill-term --locked --no-tests=pass
-        timeout-minutes: 20
+      - name: nextest (krill-proto·krill-term·krill-holder·krilld·krill)
+        run: cargo nextest run --profile ci -p krill-proto -p krill-term -p krill-holder -p krilld -p krill --locked --no-tests=pass
+        timeout-minutes: 30
 
       - name: doctest (krill-proto·krill-term)
         run: cargo test -p krill-proto -p krill-term --doc --locked -q
@@ -59,3 +64,18 @@ jobs:
         # 해석이라 Linux에서도 동일하게 통과한다. macOS 잡(ci-macos.yml)은
         # 중복 실행하지 않는다.
         run: cargo deny --locked check --hide-inclusion-graph
+
+      - name: cargo deny (Linux 대상)
+        # Linux에서만 끌려오는 의존성의 advisories·licenses·sources를 본다. krill-app(gpui)은 Linux 빌드 대상이 아니다.
+        # cargo-deny 0.20.2의 --target은 한 번만 받으므로 대상별로 돌린다.
+        # bans는 빼는데, 타깃을 좁히면 macOS 전용 워크스페이스 의존성(objc2 등 13개)이 unused로 오탐되고 위 단계가 이미 본다.
+        run: |
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            cargo deny --locked --target "$t" --exclude krill-app check --hide-inclusion-graph advisories licenses sources
+          done
+
+      - name: 공개 표면 점검
+        run: scripts/public-surface.sh
+
+      - name: 서드파티 고지 최신 여부
+        run: python3 docs/licensing/generate_notices.py --check

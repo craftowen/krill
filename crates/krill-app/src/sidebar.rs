@@ -2756,6 +2756,9 @@ impl Sidebar {
     }
 
     pub(super) fn worktree_auto_title(&self, path: &Path) -> Option<&str> {
+        if self.auto_titles.is_empty() {
+            return None;
+        }
         self.snapshot
             .sessions
             .iter()
@@ -2838,6 +2841,7 @@ impl Sidebar {
 
     /// OWE-662: 워크트리 세션의 상태 묶음과 미확인 세션이 있는지.
     /// 에이전트도 상태 근거도 없는 셸(종료·알 수 없음)은 묶음에서 뺀다.
+    #[cfg(all(test, unix))]
     fn tree_summary_on(
         &self,
         host: &HostId,

@@ -40,7 +40,7 @@
 | MK-015 | [스파이크] 업데이터 방식(자체 ed25519 vs Velopack) | M1 | P1 | 두 방식으로 헬퍼 포함 앱 업데이트, 세션 유지·위조 거부·롤백, 비교 문서 | MK-007 | T4 S6 | OWE-380 |
 | MK-016 | [스파이크] 알림: 앱·헬퍼, 서명·미서명 | M1 | P1 | 서명 빌드에서 알림 표시·클릭 시 pane 이동, 헬퍼 알림 가능 여부 결론 | MK-007 | T4 S5 | OWE-381 |
 | MK-017 | CI: macOS 러너 clippy·nextest·PTY e2e + Linux는 krill-proto·krill-term 단위 테스트·cargo deny만 | M1 | P1 | PR마다 자동 실행, macOS 잡은 관련 경로 변경 시만 | MK-001 | T4-32 | OWE-382 |
-| MK-018 | krill-holder 구현(spawn, waitpid, fd 보관, SCM_RIGHTS, 동결 내부 프로토콜 v1) | M2 | P0 | MK-004·005 기준 합격, 내부 프로토콜 계약 테스트, 1,200줄 이하(결정 12-2) | MK-004, MK-005 | T2#7 | OWE-383 |
+| MK-018 | krill-holder 구현(spawn, waitpid, fd 보관, SCM_RIGHTS, 동결 내부 프로토콜 v1) | M2 | P0 | MK-004·005 기준 합격, 내부 프로토콜 계약 테스트, 줄 수 상한 macOS 빌드 1,300 + Linux 전용 300 + Windows 빌드 2,000(플랫폼별로 셈, 결정 12-2, 2026-10-19 개정 — CONVENTIONS §5) | MK-004, MK-005 | T2#7 | OWE-383 |
 | MK-019 | krilld 코어: 세션별 Term(핫 1,000행), PTY 리더, 세션 단위 catch_unwind, 2026 sync 데드라인 | M2 | P0 | 패닉 주입 시 다른 세션 무영향, 종료 신호 없는 sync 스트림 150ms 뒤 반영 | MK-018, MK-006, MK-010 | T2#8, T3#4, perf-first(PTY 리더: 1024B 꽉 찬 read 뒤에만 5~20µs 재읽기) | OWE-384 |
 | MK-020 | 질의 응답 권한과 재생 게이트(테마·픽셀 크기 푸시, 테마 전에는 내장 기본 테마로 즉시 응답) | M2 | P0 | 앱이 닫혀도 DA/DSR/OSC 10·11 응답(테마 미수신 시 내장 기본 테마, 마지막 테마는 디스크 저장), 재생 중 응답 0건, MK-008 응답 주체 표 16종 준수 | MK-008, MK-019 | T2#9 | OWE-385 |
 | MK-021 | IPC v1: UDS 0600 + getpeereid, 프레이밍, postcard, Hello 버전·feature 협상 | M2 | P0 | 다른 UID 거부, N-1 클라이언트 호환 테스트, 1MiB 초과 프레임 거부 | MK-019 | T2#10 | OWE-386 |
@@ -228,5 +228,5 @@
 | MK-242 | [Phase 2] Zero-State 증분 `ChatItem` 리더(`Action::ChatPoll`) & 모바일 PWA 채팅 뷰(`screens/chat.js` + `[Chat \| Term]` 토글 + 인라인 Diff 모달) | M12 | P1 | 4대 에이전트(`claude`·`codex`·`agy`·`opencode`) 오프셋 기반 증분 `ChatItem` 정규화, 모바일 `[Chat \| Term]` 1-탭 토글, Live Activity Strip, `Action::Git` 인라인 Diff 모달 테스트 통과 | MK-241 | M12 Phase 2 | OWE-945 |
 | MK-243 | [Phase 3] 인터랙티브 질문 카드(`Action::AnswerQuestion` + 60ms Paced Keystroke Injector) & 데스크톱 `[Chat \| Term]` 하이브리드 뷰 확장 | M12 | P1 | `AskUserQuestion` 선택지 버튼 1-탭 응답(`Down`×N + `Enter`) 및 자유 입력 주입, 데스크톱 `krill-app` 탭 헤더 `[Chat \| Term]` 토글 오버레이(`shell/chat.rs`) 테스트 통과 | MK-241, MK-242 | M12 Phase 3 | OWE-946 |
 
-M11의 `WCHK(X)`는 [docs/boost-2026-10-18-windows-port.md](boost-2026-10-18-windows-port.md) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
+M11의 `WCHK(X)`는 Windows 포팅 boost 보고서(비공개) §4 정의(Mac에서 Windows 타깃 `cargo check --locked --all-targets` 오류·경고 0)다. 선행 관계는 리니어 blockedBy를 따른다.
 

@@ -29,8 +29,12 @@ jobs:
         run: |
           rustup toolchain install 1.98.1 --profile minimal
           rustup override set 1.98.1
+      # 번들·서명(MK-061), DMG·Homebrew tap(MK-072), 게시 가드(publish-github.sh) 회귀 검사.
       - name: Packaging regression tests
-        run: python3 packaging/macos/test_pipeline.py
+        run: |
+          python3 packaging/macos/test_pipeline.py
+          python3 packaging/homebrew/test_release.py
+          python3 packaging/test_publish.py
       - name: Build, sign, verify and archive
         run: packaging/bundle.sh --profile "$BUILD_PROFILE"
       # ZIP 내부에 실행 권한과 코드 서명을 보존한다. 앱 디렉터리 자체는 업로드하지 않는다.
