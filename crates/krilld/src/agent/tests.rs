@@ -230,10 +230,10 @@ fn pane_env_has_pane_id() {
 #[test]
 fn pane_env_passes_state_dir() {
     let env = pane_env_in(krill_proto::SessionId(7), Some(Path::new("/s")));
-    assert_eq!(
-        env,
-        vec![kv("MK_PANE_ID", "7"), kv("KRILL_STATE_DIR", "/s")]
-    );
+    assert!(env.contains(&kv("MK_PANE_ID", "7")));
+    assert!(env.contains(&kv("KRILL_STATE_DIR", "/s")));
+    let (_, executable) = env.iter().find(|(key, _)| key == b"KRILL_CLI").unwrap();
+    assert!(Path::new(OsStr::from_bytes(executable)).is_absolute());
 }
 
 #[test]

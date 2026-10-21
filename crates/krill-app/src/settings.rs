@@ -2207,22 +2207,15 @@ pub fn install_agent_hook_at(
 /// 내장 스킬 전체를 지원 에이전트 스킬 디렉터리에 한 번에 설치한다.
 #[must_use]
 pub fn install_all_skills_at(home: &Path) -> Vec<String> {
-    let dirs = [
-        home.join(".claude/skills"),
-        home.join(".codex/skills"),
-        home.join(".gemini/config/skills"),
-        home.join(".cursor/skills"),
-        home.join(".config/opencode/skills"),
-    ];
-    let mut installed = Vec::new();
-    for skill in krill_proto::orchestration::builtin_skills() {
-        for dir in &dirs {
-            if let Ok(path) = krill_proto::orchestration::install_skill(skill.name, dir) {
-                installed.push(path.display().to_string());
-            }
-        }
+    let report = krill_proto::orchestration::sync_builtin_skills_at(home);
+    for error in &report.failures {
+        tracing::warn!(%error, "built-in skill synchronization skipped a target");
     }
-    installed
+    report
+        .installed
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect()
 }
 
 /// 모든 지원 에이전트 상태 감지 훅과 내장 스킬을 원클릭으로 일괄 설치한다.
@@ -8023,8 +8016,14 @@ impl SettingsView {
             .clone()
             .unwrap_or_else(|| std::sync::Arc::new(builtin_agents.clone()));
         root = root.child(self.render_agent_catalog_card(&builtin_agents, &effective, window, cx));
-        root.child(self.render_skills_card(cx))
-            .children(self.render_agent_extra_rows(s, cx))
+        if let Some(status) = &self.skill_status {
+            root = root.child(
+                layout::card(p)
+                    .debug_selector(|| "admin-agent-setup-status".into())
+                    .child(div().text_size(crate::ui::TEXT_XS).child(status.clone())),
+            );
+        }
+        root.children(self.render_agent_extra_rows(s, cx))
     }
 
     #[inline(never)]
@@ -8681,143 +8680,6 @@ impl SettingsView {
                     ),
             )
             .when(is_open, |d| d.child(edit_section))
-    }
-
-    #[inline(never)]
-    fn render_skills_card(&mut self, cx: &mut Context<Self>) -> gpui::Div {
-        let p = crate::ui::palette(cx);
-        let mut skills_card = layout::card(p)
-            .debug_selector(|| "admin-skills-card".into())
-            .flex()
-            .flex_col()
-            .gap_2()
-            .text_size(crate::ui::TEXT_SM)
-            .child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .child(layout::label(p, text::SKILLS_TITLE.get(), None))
-                    .child(
-                        layout::controls().child(
-                            layout::primary(
-                                "admin-install-all-skills",
-                                text::SKILLS_INSTALL_ALL.get(),
-                            )
-                            .debug_selector(|| "admin-install-all-skills".into())
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                let base = if cfg!(test) {
-                                    state_dir(cx).unwrap_or_else(crate::accounts::default_home)
-                                } else {
-                                    crate::accounts::default_home()
-                                };
-                                this.file_job(
-                                    "skill-install",
-                                    move || install_all_skills_at(&base),
-                                    |this, installed, _| {
-                                        this.skill_status = Some(
-                                            text::SKILLS_INSTALLED
-                                                .format(&[("path", &installed.join(", "))])
-                                                .into(),
-                                        );
-                                    },
-                                    cx,
-                                );
-                            })),
-                        ),
-                    ),
-            );
-        for skill in krill_proto::orchestration::builtin_skills() {
-            let btn_id = format!("admin-install-skill-{}", skill.name);
-            let row_id = format!("admin-skill-row-{}", skill.name);
-            let skill_name = skill.name;
-            skills_card = skills_card.child(
-                div()
-                    .id(gpui::ElementId::Name(row_id.clone().into()))
-                    .debug_selector(move || row_id.clone())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_3()
-                    .p_2p5()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.background)
-                    .border_1()
-                    .border_color(p.border)
-                    .child(layout::label(p, skill.name, Some(skill.description)))
-                    .child(
-                        layout::controls().child(
-                            layout::secondary(
-                                gpui::ElementId::Name(btn_id.clone().into()),
-                                text::SKILLS_INSTALL.get(),
-                            )
-                            .debug_selector(move || btn_id.clone())
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    let home = if cfg!(test) {
-                                        state_dir(cx).unwrap_or_else(crate::accounts::default_home)
-                                    } else {
-                                        crate::accounts::default_home()
-                                    };
-                                    this.file_job(
-                                        "skill-install",
-                                        move || {
-                                            let mut installed = Vec::new();
-                                            for dir in [
-                                                home.join(".claude/skills"),
-                                                home.join(".codex/skills"),
-                                                home.join(".gemini/config/skills"),
-                                                home.join(".cursor/skills"),
-                                                home.join(".config/opencode/skills"),
-                                            ] {
-                                                if let Ok(path) =
-                                                    krill_proto::orchestration::install_skill(
-                                                        skill_name, &dir,
-                                                    )
-                                                {
-                                                    installed.push(path.display().to_string());
-                                                }
-                                            }
-                                            installed
-                                        },
-                                        |this, installed, _| {
-                                            this.skill_status = Some(
-                                                text::SKILLS_INSTALLED
-                                                    .format(&[("path", &installed.join(", "))])
-                                                    .into(),
-                                            );
-                                        },
-                                        cx,
-                                    );
-                                },
-                            )),
-                        ),
-                    ),
-            );
-        }
-        if let Some(status) = &self.skill_status {
-            skills_card = skills_card.child(
-                div()
-                    .id("admin-skills-status")
-                    .debug_selector(|| "admin-skills-status".into())
-                    .w_full()
-                    .min_w_0()
-                    .p_2()
-                    .rounded(crate::ui::RADIUS_SM)
-                    .bg(p.card)
-                    .border_1()
-                    .border_color(p.border)
-                    .font_family(crate::ui::FONT_MONO)
-                    .text_size(crate::ui::TEXT_XS)
-                    .child(status.clone()),
-            );
-        }
-        skills_card
     }
 
     fn render_remote_krill_tab(
