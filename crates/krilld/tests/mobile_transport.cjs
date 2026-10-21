@@ -27,9 +27,9 @@ test('updates wait for queued RPCs and uncertain mutation results until explicit
  await h.tick(15000);await assert.rejects(mutation,/timed out/);assert.equal(h.transport.updateBusy,true);const count=socket.sent.length;h.transport.resume(true);await flush();await h.advance(h.sockets.at(-1));h.response(h.sockets.at(-1),{sessions:[]});await flush();assert.equal(h.transport.updateBusy,true);h.transport.reconnect();await flush();assert.equal(socket.sent.length,count);await h.advance(h.sockets.at(-1));h.response(h.sockets.at(-1),{sessions:[]});await flush();assert.equal(h.transport.updateBusy,false);h.transport.close();
 });
 test('a definitive daemon rejection does not leave automatic updates blocked',async()=>{const h=harness(),{pending,socket}=await h.start(4);h.response(socket,{sessions:[]});await pending;const rejected=h.transport.rpc({action:'prompt',text:'rejected'});await flush();h.response(socket,{},false);await assert.rejects(rejected,/request rejected/);assert.equal(h.transport.updateBusy,false);h.transport.close();});
-test('version mismatch pauses obsolete handshakes so retries cannot starve the safe update point',async()=>{
+for(const stage of [0,1])test(`version mismatch at handshake stage ${stage} pauses retries for a safe update`,async()=>{
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true);let checks=0;h.endpoint.setUpdateHandler(()=>checks++);h.context.fetch=async()=>({ok:true,json:async()=>({hash:'fedcba9876543210',relay:true,url:''})});
- const {pending,socket}=await h.start();socket.emit('error');await pending;assert.equal(checks,1);assert.equal(h.endpoint.updatePending,true);assert.equal(h.transport.updateBusy,false);assert.equal(h.transport.state.retryAt,0);await h.tick(30000);assert.equal(h.sockets.length,1);h.endpoint.clearUpdatePending();h.transport.resume();await flush();assert.equal(h.sockets.length,2);h.transport.close();
+ const {pending,socket}=await h.start(stage);socket.emit('close',{code:1012});await pending;assert.equal(checks,1);assert.equal(h.endpoint.updatePending,true);assert.equal(h.transport.updateBusy,false);assert.equal(h.transport.state.retryAt,0);await h.tick(30000);assert.equal(h.sockets.length,1);h.endpoint.clearUpdatePending();h.transport.resume();await flush();assert.equal(h.sockets.length,2);h.transport.close();
 });
 test('replacement cancellation restores saved destination and credential together',()=>{const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),url:'https://saved.trycloudflare.com'},h=harness(saved,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'d'.repeat(32)),endpoint=h.context.KrillMobile.transport.bootstrap();assert.equal(endpoint.replacing,true);assert.match(endpoint.socketUrl(),/\/r\/dddd/);const restored=endpoint.restoreSaved();assert.equal(restored.device_id,saved.device_id);assert.equal(endpoint.socketUrl(),'wss://saved.trycloudflare.com/ws?v=0123456789abcdef');assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).rid,saved.rid);});
 test('device capacity is blocked with cleanup guidance rather than expired QR diagnosis',async()=>{const h=harness(),{pending,socket}=await h.start(2);socket.emit('close',{code:4009});await pending;assert.equal(h.transport.blocked,true);assert.match(h.transport.state.message,/device limit/);assert.doesNotMatch(h.transport.state.message,/expired/);h.transport.close();});
@@ -79,6 +79,21 @@ test('re-pairing the same relay desktop rotates its credential without adding a 
  e.describeHost({display_name:'Same PC'});e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'a'.repeat(32)).use();e.authenticated({device_id:'new',credential:'33'.repeat(32)});
  assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].name,'Same PC');assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).device_id,'new');
 });
+test('desktop aliases survive snapshots, reconnects, reloads and re-pairing without changing credentials',()=>{
+ const saved={device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},h=harness(saved,undefined,true),e=h.endpoint,id=e.profiles()[0].id;
+ e.describeHost({display_name:'Original hostname'});e.renameHost(id,'  작업용 맥  ');e.describeHost({display_name:'Another hostname'});e.authenticated({});
+ assert.equal(e.profiles()[0].name,'작업용 맥');assert.equal(e.credentials.credential,saved.credential);assert.equal(e.credentials.device_id,saved.device_id);
+ const reloaded=h.context.KrillMobile.transport.bootstrap();assert.equal(reloaded.profiles()[0].name,'작업용 맥');
+ reloaded.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'a'.repeat(32)).use();reloaded.authenticated({device_id:'rotated',credential:'22'.repeat(32)});reloaded.describeHost({display_name:'System hostname'});
+ assert.equal(reloaded.profiles().length,1);assert.equal(reloaded.profiles()[0].name,'작업용 맥');
+});
+test('renaming an inactive desktop preserves the active host and failed saves preserve its old name',()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
+ e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();e.authenticated({device_id:'second',credential:'22'.repeat(32)});const before=h.store.get('minikrill-mobile-v2');
+ e.renameHost(first,'Home PC');assert.equal(e.profiles().find(h=>h.id===first).name,'Home PC');assert.equal(h.store.get('minikrill-mobile-v2'),before);
+ for(const invalid of ['', '  ', 'x'.repeat(81)])assert.throws(()=>e.renameHost(first,invalid),/desktop name/);
+ h.context.localStorage.setItem=()=>{throw Error('quota');};assert.throws(()=>e.renameHost(first,'Lost edit'),/Could not save/);assert.equal(e.profiles().find(h=>h.id===first).name,'Home PC');assert.equal(e.profiles().find(h=>h.active).id,'relay:'+'b'.repeat(32));assert.equal(h.store.get('minikrill-mobile-v2'),before);
+});
 test('uncompleted pairing never changes the persisted active desktop',()=>{
  const h=harness({device_id:'original',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,before=h.store.get('krill-mobile-hosts-v1');
  e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();assert.equal(h.store.get('krill-mobile-hosts-v1'),before);assert.equal(e.profiles().length,1);
@@ -100,4 +115,22 @@ test('unavailable storage keeps pairing and host selection usable in memory',()=
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
  h.context.localStorage.setItem=()=>{throw Error('Storage disabled');};e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();
  assert.equal(e.authenticated({device_id:'second',credential:'22'.repeat(32)}).device_id,'second');assert.equal(e.storageFailed,true);assert.equal(e.profiles().length,2);assert.equal(e.selectHost(first).device_id,'first');assert.match(e.socketUrl(),/\/r\/aaaa/);
+});
+test('pool keeps two desktops authenticated concurrently and isolates equal session IDs',async()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
+ e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();const second=e.authenticated({device_id:'second',credential:'22'.repeat(32)}).id;e.selectHost(first);
+ const changes=[],pool=h.context.KrillMobile.transport.pool({endpoint:e,onChange:entry=>changes.push(entry.id)});pool.sync();await flush();assert.equal(h.sockets.length,2);
+ const a=h.sockets.find(s=>s.url.includes('/r/aaaa')),b=h.sockets.find(s=>s.url.includes('/r/bbbb'));assert(a&&b);
+ await h.advance(a);h.response(a,{host:{display_name:'First PC'},sessions:[{id:7,title:'first session'}]});await h.advance(b);h.response(b,{host:{display_name:'Second PC'},sessions:[{id:7,title:'second session'}]});await flush();
+ assert.equal(pool.get(first).transport.ready,true);assert.equal(pool.get(second).transport.ready,true);assert.equal(pool.get(first).snapshot.sessions[0].title,'first session');assert.equal(pool.get(second).snapshot.sessions[0].title,'second session');assert.equal(h.sockets.length,2,'background connections do not warm terminal sockets');
+ const auth=s=>JSON.parse(s.sent[0]);assert.equal(auth(a).device_id,'first');assert.equal(auth(b).device_id,'second');e.selectHost(second);pool.sync();assert.equal(a.closed,undefined);assert.equal(b.closed,undefined);assert.equal(h.sockets.length,2);
+ a.emit('close',{code:1006});await flush();assert.equal(pool.get(first).transport.ready,false);assert.equal(pool.get(second).transport.ready,true);assert.equal(pool.get(second).snapshot.sessions[0].title,'second session');
+ e.forgetHost(first);const old=pool.get(first);pool.sync();assert.equal(pool.get(first),undefined);assert.equal(old.transport.ready,false);assert.equal(pool.get(second).transport.ready,true);pool.close();h.transport.close();
+});
+test('background discovery/auth cannot replace the active desktop or revive removed credentials',async()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true),e=h.endpoint,first=e.profiles()[0].id,peer=e.forHost(first);
+ e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();const second=e.authenticated({device_id:'second',credential:'22'.repeat(32)}).id;
+ h.context.fetch=async()=>({ok:true,json:async()=>({hash:'fedcba9876543210',url:'https://firstnew.trycloudflare.com'})});await peer.locate();peer.authenticated({});peer.describeHost({display_name:'First renamed'});
+ assert.equal(e.profiles().find(p=>p.active).id,second);assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).device_id,'second');assert.equal(h.redirects.length,0);assert.match(peer.socketUrl(),/firstnew/);assert.equal(e.profiles().find(p=>p.id===first).name,'First renamed');assert.throws(()=>peer.authenticated({device_id:'second'}),/identity/);
+ e.forgetHost(first);peer.describeHost({display_name:'stale'});peer.authenticated({});assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].id,second);h.transport.close();
 });
