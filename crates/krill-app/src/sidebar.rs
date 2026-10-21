@@ -1115,6 +1115,7 @@ impl Sidebar {
                 let mut changed = s.remote_info != info || s.remote_hosts.len() != statuses.len();
                 s.remote_info = info;
                 let previous = std::mem::take(&mut s.remote_hosts);
+                let mut new_source = false;
                 s.remote_hosts = statuses
                     .into_iter()
                     .map(|(spec, status)| {
@@ -1140,12 +1141,16 @@ impl Sidebar {
                         entry.status = status;
                         if entry.source.is_none() && s.visible {
                             entry.source = sources.remove(&spec.id);
+                            new_source |= entry.source.is_some();
                         }
                         entry
                     })
                     .collect();
                 if changed {
                     s.rebuild(cx);
+                }
+                if new_source {
+                    s.remote_task = None;
                 }
                 s.start_remote_polling(cx);
             })
@@ -1238,63 +1243,69 @@ impl Sidebar {
                 }) else {
                     return;
                 };
-                let tasks: Vec<_> = sources
-                    .into_iter()
-                    .map(|(id, source)| {
-                        bg.spawn(async move {
-                            let res = source.fetch().map(|snap| {
-                                let meta = source.meta(&snap.trees);
-                                (snap, meta)
-                            });
-                            (id, source, res)
-                        })
-                    })
-                    .collect();
-                let mut results = Vec::with_capacity(tasks.len());
-                for t in tasks {
-                    results.push(t.await);
-                }
-                let next_delay = this.update(cx, |s, cx| {
-                    if (!s.is_visible() && !forced) || s.remote_hosts.is_empty() {
-                        return None;
-                    }
-                    let mut changed = false;
-                    for (id, source, res) in results {
-                        let Some(entry) = s.remote_hosts.iter_mut().find(|r| r.id == id) else {
-                            continue;
-                        };
-                        if !entry
-                            .source
-                            .as_ref()
-                            .is_some_and(|current| Arc::ptr_eq(current, &source))
-                        {
-                            continue;
-                        }
-                        if let Ok((snap, meta)) = res {
-                            if entry.status != HostStatus::Connected
-                                || entry.snapshot != snap
-                                || entry.meta != meta
+                let mut tasks = Vec::with_capacity(sources.len());
+                for (id, source) in sources {
+                    let bg = bg.clone();
+                    let this = this.clone();
+                    tasks.push(cx.spawn(async move |cx| {
+                        let (id, source, res) = bg
+                            .spawn(async move {
+                                let res = source.fetch().map(|snap| {
+                                    let meta = source.meta(&snap.trees);
+                                    (snap, meta)
+                                });
+                                (id, source, res)
+                            })
+                            .await;
+                        this.update(cx, |s, cx| {
+                            if (!s.is_visible() && !forced) || s.remote_hosts.is_empty() {
+                                return;
+                            }
+                            let Some(entry) = s.remote_hosts.iter_mut().find(|r| r.id == id) else {
+                                return;
+                            };
+                            if !entry
+                                .source
+                                .as_ref()
+                                .is_some_and(|current| Arc::ptr_eq(current, &source))
                             {
-                                entry.status = HostStatus::Connected;
-                                entry.snapshot = snap;
-                                entry.meta = meta;
-                                changed = true;
+                                return;
                             }
-                        } else {
-                            let status = s
-                                .remote_info
-                                .get(&id)
-                                .map_or(HostStatus::Disconnected, |t| t.status);
-                            if entry.status != status {
-                                entry.status = status;
-                                changed = true;
+                            let mut changed = false;
+                            if let Ok((snap, meta)) = res {
+                                if entry.status != HostStatus::Connected
+                                    || entry.snapshot != snap
+                                    || entry.meta != meta
+                                {
+                                    entry.status = HostStatus::Connected;
+                                    entry.snapshot = snap;
+                                    entry.meta = meta;
+                                    changed = true;
+                                }
+                            } else {
+                                let status = s
+                                    .remote_info
+                                    .get(&id)
+                                    .map_or(HostStatus::Disconnected, |t| t.status);
+                                if entry.status != status {
+                                    entry.status = status;
+                                    changed = true;
+                                }
                             }
-                        }
-                    }
-                    if changed {
-                        s.rebuild(cx);
-                    }
-                    s.is_visible().then(|| s.poll_interval())
+                            if changed {
+                                s.rebuild(cx);
+                            }
+                        })
+                        .ok();
+                    }));
+                }
+                for t in tasks {
+                    t.await;
+                }
+                let next_delay = this.update(cx, |s, _| {
+                    ((s.is_visible() || forced) && !s.remote_hosts.is_empty())
+                        .then(|| s.is_visible().then(|| s.poll_interval()))
+                        .flatten()
                 });
                 forced = false;
                 let Ok(Some(delay)) = next_delay else {
