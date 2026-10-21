@@ -23,8 +23,28 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  reuse:
+    name: reuse-linux-ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - id: proof
+        name: Verify same-SHA candidate validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/ci_evidence.py reuse --workflow ci.yml
+
   linux:
     name: linux
+    needs: reuse
+    if: needs.reuse.outputs.reuse != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -49,6 +69,22 @@ jobs:
         with:
           tool: cargo-nextest,cargo-deny
 
+      - name: Restore Rust dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-linux
+          cache-bin: 'false'
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+
+      - name: Release pipeline regressions
+        run: |
+          python3 packaging/test_ci_evidence.py
+          python3 packaging/test_release_check.py
+          python3 packaging/test_release_verify.py
+          python3 packaging/test_nightly.py
+          python3 packaging/test_publish.py
+
       - name: fmt
         run: cargo fmt --all --check
 
@@ -58,7 +94,7 @@ jobs:
         timeout-minutes: 30
 
       - name: nextest (krill-proto·krill-term·krill-holder·krilld·krill)
-        run: cargo nextest run --profile ci -p krill-proto -p krill-term -p krill-holder -p krilld -p krill --locked --no-tests=pass
+        run: cargo nextest run --profile ci -p krill-proto -p krill-term -p krill-holder -p krilld -p krill --locked --no-tests=pass --timings
         timeout-minutes: 30
 
       - name: doctest (krill-proto·krill-term)
@@ -85,3 +121,29 @@ jobs:
 
       - name: 서드파티 고지 최신 여부
         run: python3 docs/licensing/generate_notices.py --check
+
+      - name: Preserve test and build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-linux-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/ci/junit.xml
+            target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14
+
+  ci:
+    name: ci
+    needs: [reuse, linux]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Required validation result
+        env:
+          PROOF: ${{ needs.reuse.result }}
+          REUSED: ${{ needs.reuse.outputs.reuse }}
+          LINUX: ${{ needs.linux.result }}
+        run: |
+          [ "$PROOF" = success ]
+          if [ "$REUSED" = true ]; then [ "$LINUX" = skipped ]; else [ "$LINUX" = success ]; fi

@@ -25,6 +25,24 @@ env:
   CARGO_NET_RETRY: 10
 
 jobs:
+  reuse:
+    name: reuse-macos-ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      reuse: ${{ steps.proof.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - id: proof
+        name: Verify same-SHA candidate validation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 packaging/ci_evidence.py reuse --workflow ci-macos.yml
+
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -52,7 +70,7 @@ jobs:
           #   - packaging/macos/ed25519_manifest.py: krill-app updater/tests.rs·shell/popout/tests.rs가 실행
           #   - vendor/**: krill-app tests/i18n.rs include_str!, krill-proto build.rs 해시, [patch] 소스
           #   - .config/**(nextest 프로필)·.cargo/**(빌드 설정)·루트 Cargo/lint 설정·scripts/check.sh
-          re='^(crates/|vendor/|\.config/|\.cargo/|\.github/workflows/|Cargo\.(toml|lock)$|(deny|clippy|rustfmt)\.toml$|scripts/check\.sh$|AGENTS\.md$|CONTRIBUTING\.md$|README\.md$|docs/(ARCHITECTURE|CONVENTIONS|STYLEGUIDE)\.md$|packaging/macos/ed25519_manifest\.py$)'
+          re='^(crates/|vendor/|\.config/|\.cargo/|\.github/workflows/|Cargo\.(toml|lock)$|(deny|clippy|rustfmt)\.toml$|scripts/check\.sh$|AGENTS\.md$|CONTRIBUTING\.md$|README\.md$|docs/(ARCHITECTURE|CONVENTIONS|STYLEGUIDE)\.md$|packaging/)'
           case "$EVENT" in
             pull_request) base=HEAD^1 ;;
             push) base=$BEFORE; git fetch -q --depth=1 origin "$BEFORE" || base= ;;
@@ -74,8 +92,8 @@ jobs:
 
   check:
     name: clippy · nextest · doctest (${{ matrix.os }})
-    needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    needs: [changes, reuse]
+    if: needs.changes.outputs.rust == 'true' && needs.reuse.outputs.reuse != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -106,25 +124,49 @@ jobs:
         with:
           tool: cargo-nextest
 
+      - name: Restore Rust dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: ci-${{ matrix.os }}
+          cache-bin: 'false'
+          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
+
+      - name: Packaging regression tests
+        run: |
+          python3 packaging/macos/test_pipeline.py
+          python3 packaging/homebrew/test_release.py
+
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
         timeout-minutes: 60
 
       - name: nextest
         # PTY e2e(krill-holder survive, krill CLI 실PTY 테스트, krilld 통합) 포함.
-        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass
+        run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings
         timeout-minutes: 60
 
       - name: doctest
         run: cargo test --workspace --doc --locked -q
         timeout-minutes: 30
 
+      - name: Preserve test and build evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-${{ matrix.os }}-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/nextest/ci/junit.xml
+            target/cargo-timings/
+          if-no-files-found: warn
+          retention-days: 14
+
       # cargo deny는 Linux 잡(ci.yml)이 담당하므로 여기서 중복 실행하지 않는다.
 
   # required check용 고정 이름 잡. check가 건너뛰어졌으면 성공, 실패·취소면 실패.
   ci-macos:
     name: ci-macos
-    needs: [changes, check]
+    needs: [changes, check, reuse]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -133,6 +175,13 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           CHECK: ${{ needs.check.result }}
+          PROOF: ${{ needs.reuse.result }}
+          REUSED: ${{ needs.reuse.outputs.reuse }}
         run: |
-          echo "changes=$CHANGES check=$CHECK"
-          [ "$CHANGES" = success ] && { [ "$CHECK" = success ] || [ "$CHECK" = skipped ]; }
+          echo "changes=$CHANGES check=$CHECK reuse=$REUSED"
+          [ "$CHANGES" = success ] && [ "$PROOF" = success ]
+          if [ "$REUSED" = true ]; then
+            [ "$CHECK" = skipped ]
+          else
+            [ "$CHECK" = success ] || { [ "$CHECK" = skipped ] && [ "${{ needs.changes.outputs.rust }}" != true ]; }
+          fi

@@ -21,21 +21,22 @@ python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
 
 1. 실행 시작에 **원격 `dev`·`main`**을 fetch해 고정한다. 두 커밋이 모두 최신 게시 태그에 포함돼 있으면 생략한다. 원본 체크아웃은 건드리지 않는다. 작업 완료 후 `dev`에 커밋·push해 둔다. 미커밋 파일·push하지 않은 로컬 커밋·미통합 기능 브랜치는 포함하지 않으며 고정 이후 push는 다음 날 대상이다. `--after-release`로 지정한 기존 릴리스가 미게시 상태면 후보 생성도 생략한다.
 2. `/Volumes/krill-build/nightly/repository` 전용 clone에서 통합한다. 병합 충돌은 중단한다. workspace와 최신 게시 버전 중 큰 버전의 patch를 올리고 Cargo.lock·고지문과 함께 **최종 후보 커밋을 먼저** 만든다.
-3. 그 HEAD에서 `scripts/check.sh --memory`, Windows 전체 clippy, release 바이너리 빌드, 실제 GUI kill -9·출력 해시 재생 E2E, release holder 생존·업그레이드 테스트를 실행한다. 통과 기록은 HEAD별로 보관한다. Cargo 산출물은 `/Volumes/krill-build/targets/` 아래에만 둔다. 외장 볼륨이 없으면 내장 디스크로 폴백하지 않고 중단한다.
-4. `release/nightly-<시각>` 후보를 push하고 CI와 `release.yml`의 `build_only=true`를 실행한다. 이 모드는 macOS 게시 잡·모든 업로드 게시 잡을 건너뛰고 Windows/Linux 네이티브 빌드와 설치·데몬 kill 생존 스모크만 한다. GCP/상시 Windows VM은 호출하지 않는다. Windows에는 로컬 서명키의 **공개키만** 전달한다.
-   Windows 스모크는 `smoke-ci.ps1`이 WMI로 별도 테스트 프로세스를 띄워 Actions 러너의 제한된 Job 밖에서 실행한다. 실제 설치·CLI 자동 기동·터미널 입출력·데몬 kill 검증은 기존 `smoke.ps1` 그대로 수행하며, 테스트 경로의 프로세스만 정리한다. 제품의 holder 분리 보장은 바꾸지 않는다.
-5. 같은 HEAD의 Windows·Linux x86_64/aarch64 자산을 내려받아 출처 커밋·체크섬·Windows 버전과 공개키를 검증한다. 검사 중 `main`이 바뀌었으면 후보를 남기고 중단한다. 통과한 후보만 `main`에 fast-forward push하고 해당 CI도 확인한다.
-6. 기존 `publish-github.sh`가 macOS 패키지를 빌드하고 검증한 네이티브 자산을 함께 게시한다. `latest.json`·`latest-windows.json`은 로컬 키로 서명한다. 기존 태그·릴리스는 덮어쓰지 않는다. 중복 예약 실행은 잠금으로 막는다.
+3. 패키징 회귀 검사와 공개 표면 검사를 먼저 통과하고 고정 후보 `release/nightly`를 lease 조건으로 갱신한다. 강제 갱신 범위는 자동 후보 브랜치 하나이며 main·태그에는 사용하지 않는다. 후보 CI와 `release.yml build_only=true`(Windows/MSVC·Linux 두 아키텍처 네이티브 빌드·설치·생존 스모크)를 시작한다. 유료 VM을 호출하지 않고 서명키의 공개키만 전달한다.
+4. 원격 검사가 진행되는 동안 로컬에서 `scripts/check.sh`·Windows 전체 clippy·release 빌드·10개 터미널 메모리 검사·실제 GUI kill -9/출력 재생·holder 생존/업그레이드 검사를 실행한다. release 테스트를 먼저 컴파일하고 최종 출고 바이너리를 빌드한 다음, Cargo 재빌드 없이 검사한다. 각 게이트 뒤 바이너리 해시가 같아야 한다. 전체 검사 checkpoint와 최종 바이너리 receipt는 SHA·툴체인/컴파일 플래그·검사 범위·해시를 Ed25519로 서명하며 유효 시간은 24시간이다. 재개할 때 서명과 내용을 다시 확인한다. 23시간이 지났거나 툴체인/플래그/공개키가 바뀌면 새 SHA 후보를 만들어 검사한다. 손상된 서명은 차단한다. 같은 SHA에서 실패·취소된 CI는 다음 실행 시 전체 workflow를 한 번 재시작하며, 실행 중/성공한 native 빌드는 재사용한다.
+5. 후보의 Linux·macOS ARM/Intel 필수 잡과 Windows/Linux 빌드가 모두 실제로 성공해야 한다. 판정은 저장소·워크플로 경로/ID·SHA·브랜치·최신 실행/attempt·잡 결과를 확인한다. 다른 PR·누락·skipped 잡은 전체 검사 증거가 아니다. 같은 HEAD의 네이티브 자산을 내려받아 출처 커밋·체크섬·Windows 버전/공개키를 검증한다. 자산 이름에 attempt를 넣고 GitHub의 artifact ID·SHA-256으로 ZIP 자체도 검증한다.
+6. `main`이 그대로이고 후보가 깨끗하면 fast-forward push한다. main CI는 **동일 SHA 후보의 전체 검사 증거**가 있을 때만 그 결과를 재사용한다. 증거가 없거나 API 판정에 실패하면 전체 CI를 실행한다. 플랫폼·툴체인·컴파일 플래그별 의존성 캐시는 후보 브랜치에서 다음 날에도 재사용한다. PR 캐시 저장은 막고 검사 자체는 생략하지 않는다. 최적화 수준·LTO·테스트 기준은 낮추지 않는다.
+7. `publish-github.sh --verified-release <receipt>`는 고정된 출고 바이너리를 검증해 번들로 복사하고 서명·DMG 조립한다. 이 경로는 임의 `--bin-dir` 게시와 다르며 서명된 전체 검사 증거가 필수다. 코드 서명을 정규화한 사본의 해시로 출고 바이너리와 최종 서명 번들의 동일성을 확인하고, 서명 번들의 CLI/GUI·앱/데몬 kill -9 생존 스모크도 통과해야 한다. 전체 사이클에서 실행기가 기존 BSD 게시 락을 직접 보유하고 자신이 시작한 작업을 정리한 뒤 해제한다. 최종 태그와 16개 게시 자산을 다시 내려받아 해시·버전·업데이트 서명·소스 커밋까지 확인한 뒤에만 게시 성공으로 기록한다. 기존 태그·릴리스는 덮어쓰지 않는다.
+   Windows 스모크는 `smoke-ci.ps1`이 WMI로 테스트 프로세스를 Actions 러너 Job 밖에서 실행한다. 설치·CLI 자동 기동·입출력·데몬 kill 검증은 기존 `smoke.ps1`로 수행하며 테스트 경로의 프로세스만 정리한다.
 
-실패하면 새 릴리스를 게시하지 않고 단계·대상 HEAD·오류를 기록한다. `main` 반영 뒤 CI나 게시가 실패하면 그 검증 커밋은 `main`에 남을 수 있다. 게시 중 네트워크가 끊어지면 태그만 남는 등 일부 원격 쓰기가 끝났을 수 있으며, 다음 실행도 기존 태그·자산을 덮어쓰지 않는다.
+실패하면 새 릴리스를 게시하지 않고 단계·대상 HEAD·오류를 기록한다. `main` 반영 뒤 CI나 게시가 실패하면 그 검증 커밋은 `main`에 남을 수 있다. 게시 중 네트워크가 끊어지면 태그만 남는 등 일부 원격 쓰기가 끝났을 수 있으며, 다음 실행도 기존 태그·자산을 덮어쓰지 않는다. 게시 계획·readback은 clone 밖 `/Volumes/krill-build/nightly/publications/<SHA>/`에 보존한다. 원격 릴리스 생성 뒤 readback만 실패한 경우 다음 실행은 기존 자산을 다운로드해 검증하는 단계만 재개한다. 태그만 남은 경우는 중단하고 운영자가 상태를 확인한다.
 
 - 등록 파일: `~/Library/LaunchAgents/dev.krill.nightly.plist`.
 - 설치된 실행기·설정·HEAD별 통과 기록: `~/Library/Application Support/dev.krill.nightly/`. 실행기를 수정하면 `install`로 갱신한다. `dispatch.json`은 Orca 셸 시작 접수만 증명하며 배포 성공은 `status.json`으로 확인한다.
-- 실행 로그: `~/Library/Logs/Krill/nightly/`. 최근 결과는 설정 폴더의 `status.json`이며 실패 후보와 자산은 외장 볼륨에 남는다.
+- 실행 로그: `~/Library/Logs/Krill/nightly/`. 최근 결과는 설정 폴더의 `status.json`(명령별 소요 초·검사 run/attempt·재사용 출처 포함)이며 실패 후보와 자산은 외장 볼륨에 남는다.
 - 맥이 켜져 있고 사용자가 로그인돼 있어야 한다(GUI 생존·메모리 테스트). 잠자기 중 예약은 깨어날 때 실행될 수 있다. 종료·로그아웃 상태에서는 자정 실행을 보장하지 않는다.
 - 처음 설치 전 원격 `dev`를 준비하고, Orca 앱·CLI와 등록된 workspace, 기존 업데이트 서명키·GitHub 인증·Windows 크로스 검사 툴체인을 유지한다. 개발 중 검사는 AGENTS.md와 CONTRIBUTING.md의 부분 검사 범위를 따른다.
 
-회귀 검증: `python3 packaging/test_nightly.py`, `python3 packaging/test_publish.py`, `actionlint .github/workflows/release.yml`.
+회귀 검증: `python3 -m unittest discover -s packaging -p 'test_*.py'`, `actionlint`, `shellcheck packaging/publish-github.sh`.
 
 `dev` push에서는 Linux/macOS 전체 CI를 실행하지 않는다. 개발 중에는 변경 범위 검사만 하며, 전체 원격 CI는 `release/**` 야간 후보·`main` push와 PR에서 실행한다.
 
@@ -46,7 +47,11 @@ bash packaging/publish-github.sh --preflight      # 가드만 확인(빌드·업
 bash packaging/publish-github.sh --bump patch     # 가드 통과 후 버전·Cargo.lock·THIRD_PARTY_NOTICES.md를 한 커밋으로 만들고 멈춤
 #   → 메인테이너 또는 사용자 지시를 받은 에이전트가 그 커밋을 main에 올리고 CI 통과를 기다린다
 bash packaging/publish-github.sh --dry-run        # 조립만(가드 실패는 경고). --bin-dir은 여기서만 허용
-bash packaging/publish-github.sh                  # 가드 → 빌드 → 재확인 → 태그 푸시 → gh release create
+# 최종 후보에서 같은 env/target으로 전체 게이트·release 메모리/생존 검증 receipt 생성:
+CARGO_TARGET_DIR=/Volumes/krill-build/targets/krill-publish python3 packaging/release_check.py validate \
+  --head "$(git rev-parse HEAD)" --directory /Volumes/krill-build/nightly/staging/manual-final \
+  --key-file "$HOME/Library/Keychains/minikrill-codesign.keychain-db.ed25519.key"
+bash packaging/publish-github.sh --verified-release /Volumes/krill-build/nightly/staging/manual-final/validation.json
 ```
 
 사용자 지시에 따라 보호 ref를 push할 때는 사유를 지정한다. 게시 스크립트 내부 태그 push에도 같은 사유가 전달된다.
@@ -64,15 +69,17 @@ Claude Code에서는 원격 명령의 첫 줄에 `# KRILL_ALLOW_REMOTE: <사용�
 |---|---|---|
 | `/tmp/krill-publish.lock` `lockf` — 이 맥에서 동시에 한 번만(dry-run·preflight 포함) | 즉시 종료(75) | 없음 |
 | `git fetch origin` 후 HEAD == `origin/main` | 중단 | `KRILL_PUBLISH_FORCE` |
+| 동일 SHA main의 필수 Linux·macOS 잡 또는 검증된 후보 재사용 증거 | 중단 | 없음 |
 | HEAD의 GitHub check-runs가 모두 `success`(또는 `skipped`), 0개면 실패 | 중단 | `KRILL_PUBLISH_FORCE` |
 | `THIRD_PARTY_NOTICES.md`가 최신(`generate_notices.py --check`) | 중단 | `KRILL_PUBLISH_FORCE` |
 | 원격 태그(`git ls-remote --tags`)·GitHub 릴리스가 이미 있음 — 빌드 뒤 태그 직전에 한 번 더 확인 | 중단 | 없음(버전을 올린다) |
 | 로컬 태그가 있으면 HEAD를 가리켜야 함 | 중단 | 없음 |
+| 모든 실제 게시의 전체 게이트 서명 receipt·동결 바이너리·최종 서명 번들 lineage/실행 smoke | 중단 | 없음 |
 | 소스 tarball과 같은 `HEAD` 트리에 `docs/boost-*`·`docs/reports/`·`.night/` 없음, `scripts/public-surface.sh`가 있으면 `git archive HEAD`를 푼 경로로 실행 | 중단 | 없음 |
 
 - 기존 릴리스에 자산을 올리는 경로(`gh release upload --clobber`)는 없다. 태그만 푸시하고 `gh release create --verify-tag`로 만든다.
-- 게시 빌드는 전용 `CARGO_TARGET_DIR`(설정된 절대 경로의 형제 `krill-publish`, 없으면 `target/krill-publish`)을 써서
-  다른 워크트리 빌드가 게시 바이너리를 덮어쓰지 못하게 한다. 락이 단독 사용을 보장한다.
+- 게시 빌드는 전용 `CARGO_TARGET_DIR`(외장 볼륨 `/Volumes/krill-build/targets/krill-publish`; 외장 볼륨이 없으면 중단)을 써서
+  다른 워크트리 빌드가 게시 바이너리를 덮어쓰지 못하게 한다. 수동 전체 사이클도 `/usr/bin/lockf -k -t 0 /tmp/krill-publish.lock <실행 스크립트>`로 감싸고, 안쪽 publisher에는 `KRILL_PUBLISH_LOCKED=1`을 전달한다. 같은 env/target을 유지한다.
 - `KRILL_PUBLISH_FORCE=<사유>`는 사람 전용이다. 대화형 터미널에서 태그를 직접 입력해 확인해야 하고 사유를 출력한다.
 - 회귀 테스트: `python3 packaging/test_publish.py`(임시 git 저장소·로컬 bare origin·가짜 `gh`, 네트워크·빌드 없음).
 - 승인·push 훅 회귀 테스트: `python3 scripts/test_hooks.py`(로컬 bare origin에 실제 push, Claude 훅 호출, 네트워크·빌드 없음).
