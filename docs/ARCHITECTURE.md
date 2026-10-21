@@ -221,7 +221,7 @@ PWA는 `/`, `/manifest.json`, `/app.js`, `/app.css`, `/icon.svg`를 gzip 사전 
 - **Git**: git CLI만(`-c core.quotePath=false`, `GIT_OPTIONAL_LOCKS=0`, `GIT_TERMINAL_PROMPT=0`). 워크트리 생성·삭제는 데몬 작업 큐(앱 꺼져도 완료), status·diff 조회는 앱.
 - **워크트리 사전 준비(MK-095)**: 생성 창에서만 요청하며 데몬 전체에 준비본 하나, 디스크 예산 512 MiB, 요청 후 TTL 5분이다. `--detach --no-checkout --lock` 후 백그라운드 체크아웃하고, 제출 시 저장소·기준 커밋이 일치하면 이동·브랜치 생성으로 승격한다. 준비 중 setup·include 복사·checkout/fsmonitor hook은 실행하지 않으며 smudge/process filter 설정이 있거나 예산을 넘는 저장소는 일반 생성으로 돌아간다. 창 닫기·기준 ref 변경·명시적 취소는 해당 토큰을 취소한다. 소유 마커로 데몬 재시작 시 미완성 준비본만 정리하고, 승격한 워크트리는 보존한다.
 - **설정 호환**: `minikrill.toml` 기본, `orca.yaml`의 `scripts.setup`과 `.worktreeinclude`는 읽기 호환(MK-080, `scripts.archive`는 미사용). 환경 변수 `KRILL_*` + `ORCA_ROOT_PATH`·`ORCA_WORKTREE_PATH`·`CONDUCTOR_ROOT_PATH`.
-- **권한 기본값**: 에이전트 자체 기본(Manual). YOLO는 전역 토글 + pane 배지(T1-D6). 토글은 `agents.toml`에 저장하고 이후 생성하는 세션에 적용한다. pane 배지는 krilld가 생성 전에 저장한 세션별 실행 권한을 조회하므로 앱·데몬 재시작과 전역 토글 변경에도 유지된다.
+- **권한 기본값**: YOLO(지원하는 에이전트의 승인 확인 우회). 데스크톱 `+`·모바일에서 만드는 새 에이전트 세션에 적용하며, 전역 토글에서 Manual을 명시적으로 선택하면 에이전트 자체 권한을 쓴다. 토글은 `agents.toml`에 저장하고 이후 생성하는 세션에 적용한다. pane 배지는 krilld가 생성 전에 저장한 세션별 실행 권한을 조회하므로 앱·데몬 재시작과 전역 토글 변경에도 유지된다.
 
 ## 7. 상용 운영 (T4)
 

@@ -1,9 +1,9 @@
 use super::*;
 
 #[test]
-fn builtin_has_five_agents_with_manual_default() {
+fn builtin_has_five_agents_with_yolo_default() {
     let a = Agents::load(None).unwrap();
-    assert_eq!(a.permission, Permission::Manual);
+    assert_eq!(a.permission, Permission::Yolo);
     let ids: Vec<_> = a.profiles.keys().map(String::as_str).collect();
     assert_eq!(ids, ["agy", "claude", "codex", "cursor", "opencode"]);
     assert!(a.profiles.values().all(|p| !p.install.is_empty()));
@@ -17,7 +17,29 @@ fn builtin_has_five_agents_with_manual_default() {
 }
 
 #[test]
-fn yolo_args_only_when_toggled() {
+fn default_permission_bypasses_approvals_and_manual_remains_available() {
+    for user in [
+        None,
+        Some(""),
+        Some("[agent.mine]\nname = 'Mine'\nlaunch = ['mine']\n"),
+    ] {
+        let a = Agents::load(user).unwrap();
+        for (id, flag) in [
+            ("claude", "--dangerously-skip-permissions"),
+            ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+        ] {
+            assert_eq!(a.profiles[id].argv(a.permission), [id, flag]);
+        }
+    }
+    let a = Agents::load(Some("permission = 'manual'\n")).unwrap();
+    assert_eq!(a.permission, Permission::Manual);
+    for id in ["claude", "codex"] {
+        assert_eq!(a.profiles[id].argv(a.permission), [id]);
+    }
+}
+
+#[test]
+fn yolo_args_only_in_yolo_mode() {
     let a = Agents::load(None).unwrap();
     let claude = &a.profiles["claude"];
     assert_eq!(claude.argv(Permission::Manual), ["claude"]);

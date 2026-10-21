@@ -45,7 +45,7 @@ fn loopback_applies_profiles_and_screen_rules() {
     assert_eq!(parsed.version, SUPPORTED_VERSION);
     assert!(parsed.profiles.contains_key("aider"));
 
-    let mut agents = Agents::load(None).unwrap();
+    let mut agents = Agents::load(Some("permission = 'manual'\n")).unwrap();
     let before = agents.clone();
     parsed.apply(&mut agents);
     // 전역 권한은 서명 파일로 바뀌지 않는다.

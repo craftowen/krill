@@ -59,7 +59,7 @@
 | MK-034 | 셸 설정(로그인 셸·사용자 지정) + 환경 보정 | M2 | P1 | nvm/mise PATH가 Terminal.app과 같음 | MK-019 | T1#12 | OWE-399 |
 | MK-035 | 숨긴 터미널 메모리 강등: krilld 비가시 세션 핫 스크롤백 축소(화면·모드는 유지), krill-app 비가시 탭 렌더 캐시 해제 | M2 | P1 | 터미널 20개 중 보이는 4개만 grid 보유, 전환 시 100ms 안 재구성 | MK-009, MK-023 | T1#10, T2#23 | OWE-400 |
 | MK-036 | 세션 범위 권한(LOCAL_PEERPID 후손 판정, 감사 로그) | M3 | P0 | 세션 A 안에서 `krill send B` 기본 거부, 외부 셸은 허용, 거부는 감사 로그 | MK-021 | T2#16, T4-05 | OWE-401 |
-| MK-037 | 에이전트 프로필(TOML) + 내장 5종 + 런처 + 설치 감지 preflight + 권한 기본 Manual + YOLO 배지 + 자식 env 정리 | M3 | P0 | `krill agent list`가 감지·버전 출력, 미설치 안내, YOLO는 토글 시만, 자식 env에 내부 값 없음 | MK-034 | T4-07, T1#15, T4-21 | OWE-402 |
+| MK-037 | 에이전트 프로필(TOML) + 내장 5종 + 런처 + 설치 감지 preflight + 권한 기본 YOLO + YOLO 배지 + 자식 env 정리 | M3 | P0 | `krill agent list`가 감지·버전 출력, 미설치 안내, 새 세션 기본 YOLO·명시적 Manual 선택 유지, 자식 env에 내부 값 없음 | MK-034 | T4-07, T1#15, T4-21 | OWE-402 |
 | MK-038 | `krill hook <agent>`: {} 선출력, 소켓 전달, 재시도, fail-open | M3 | P0 | 전체 wall-clock 50ms 예산 안에서 `{}` 즉시 출력·flush, 소켓 실패 시 spool 파일에 append 후 종료(krilld 기동 시 수거), 200회 p95 < 10ms, stdin 막힘·과대 JSON(상한) 처리 | MK-036 | T4-08 | OWE-403 |
 | MK-039 | 데몬 상태 저장소 + 정규화(6상태 + 출처·신뢰도) | M3 | P0 | 이벤트 시퀀스 스냅샷 테스트, 앱 재시작 후 1초 안에 상태 동일, krilld 재기동 중 SessionStart·Stop 유실 0(spool 수거·이벤트 ID 중복 제거) | MK-038 | T4-09, T1#13 | OWE-404 |
 | MK-040 | Claude 세션별 --settings 주입 + --session-id 사전 발급 | M3 | P0 | 사용자 `~/.claude/settings.json` 바이트 무변경으로 waiting·done 수신 | MK-011, MK-039 | T4-10 | OWE-405 |

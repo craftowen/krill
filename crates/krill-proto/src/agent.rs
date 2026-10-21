@@ -1,7 +1,8 @@
 //! 에이전트 프로필(MK-037): 내장 5종 + 사용자 `agents.toml`, PATH 감지·버전.
 //!
 //! 내장 프로필도 사용자 파일과 같은 TOML([`BUILTIN`])이라 사용자가 같은 id로 덮어쓰거나 새 id를 더한다.
-//! 권한은 에이전트 자체 기본(Manual)이고, `yolo_args`는 전역 `permission = "yolo"`일 때만 붙는다
+//! 새 세션의 기본 권한은 YOLO이고, `permission = "manual"`로 에이전트 자체 권한을 쓸 수 있다.
+//! `yolo_args`는 전역 `permission = "yolo"`일 때만 붙는다
 //! (ARCHITECTURE §6, T1-D6). 모르는 키는 무시한다(hook·session 등은 뒤 이슈가 더한다).
 
 use std::collections::BTreeMap;
@@ -153,9 +154,9 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(5);
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
     /// 에이전트 자체 기본 권한(매번 묻기).
-    #[default]
     Manual,
     /// 프로필의 `yolo_args`를 붙인다. 켜진 pane에는 배지를 단다.
+    #[default]
     Yolo,
 }
 

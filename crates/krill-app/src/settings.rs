@@ -130,8 +130,8 @@ pub struct Settings {
     /// 기본 에이전트 ID(기본 `"claude"`).
     #[serde(default = "default_agent_id")]
     pub default_agent: String,
-    /// 새 에이전트 세션 YOLO 권한 우회 모드(기본 false).
-    #[serde(default)]
+    /// 새 에이전트 세션 YOLO 권한 우회 모드(기본 true).
+    #[serde(default = "default_true")]
     pub yolo_mode: bool,
     /// 유휴 세션 하이버네이션 opt-in(기본 false, docs/agents/hibernation.md).
     #[serde(default)]
@@ -269,7 +269,7 @@ impl Default for Settings {
             notify_on_done: true,
             notify_on_bell: true,
             default_agent: "claude".to_owned(),
-            yolo_mode: false,
+            yolo_mode: true,
             hibernation_enabled: false,
             recording_paused: false,
             secure_keyboard_entry: false,

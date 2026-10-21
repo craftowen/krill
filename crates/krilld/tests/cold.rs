@@ -279,7 +279,7 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
     fs::write(
         dir.join("agents.toml"),
         format!(
-            "permission = 'yolo'\n[agent.claude]\nname = 'Claude'\nlaunch = ['{}']\nyolo_args = ['--dangerously-skip-permissions']\n[agent.codex]\nname = 'Codex'\nlaunch = ['{}']\nyolo_args = ['--dangerously-bypass-approvals-and-sandbox']\n",
+            "[agent.claude]\nname = 'Claude'\nlaunch = ['{}']\nyolo_args = ['--dangerously-skip-permissions']\n[agent.codex]\nname = 'Codex'\nlaunch = ['{}']\nyolo_args = ['--dangerously-bypass-approvals-and-sandbox']\n",
             claude_bin.display(),
             codex_bin.display(),
         ),
@@ -317,6 +317,10 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
         }
     };
     let first_out = wait_line(&mut c, claude_old, "--session-id ");
+    assert!(
+        first_out.contains("--dangerously-skip-permissions"),
+        "{first_out}"
+    );
     let sid = first_out
         .split("--session-id ")
         .nth(1)
@@ -342,7 +346,11 @@ fn resume_claude_and_codex_after_daemon_crash_and_exit() {
     else {
         panic!("codex create failed");
     };
-    wait_line(&mut c, codex_old, "CODEX_ARGS:");
+    wait_line(
+        &mut c,
+        codex_old,
+        "--dangerously-bypass-approvals-and-sandbox",
+    );
     let (mut hook_conn, _) = connect(&daemon.sock).unwrap();
     let ev = HookEvent {
         id: EventId {
