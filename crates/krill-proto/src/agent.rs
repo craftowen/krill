@@ -80,7 +80,7 @@ install = "npm install -g @sourcegraph/amp"
 [agent.pi]
 name = "Pi"
 launch = ["pi"]
-install = "npm install -g @mariozechner/pi-coding-agent"
+install = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent"
 
 [agent.qwen]
 name = "Qwen Code"

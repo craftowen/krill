@@ -175,3 +175,28 @@ fn symlinks_at_roots_ancestors_references_and_locks_never_redirect_writes() {
     assert_eq!(fs::read_dir(&outside).unwrap().count(), 1);
     fs::remove_dir_all(home).unwrap();
 }
+
+#[test]
+fn pi_and_shared_agent_skill_roots_sync_builtin_bundle() {
+    let home = home("pi-roots");
+    let pi_dirs = skill_directories(&home, "pi");
+    assert!(pi_dirs.contains(&home.join(".pi/agent/skills")));
+    assert!(pi_dirs.contains(&home.join(".agents/skills")));
+    let all_dirs = skill_directories(&home, "all");
+    assert!(all_dirs.contains(&home.join(".pi/agent/skills")));
+    assert!(all_dirs.contains(&home.join(".agents/skills")));
+    let report = sync_builtin_skills(&pi_dirs);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert!(
+        home.join(".pi/agent/skills/krill-orchestration/SKILL.md")
+            .is_file()
+    );
+    assert!(
+        home.join(".agents/skills/krill-orchestration/SKILL.md")
+            .is_file()
+    );
+    let body = std::fs::read_to_string(home.join(".pi/agent/skills/krill-orchestration/SKILL.md"))
+        .unwrap();
+    assert!(body.contains("On pi, use the `bash` tool"));
+    fs::remove_dir_all(home).unwrap();
+}

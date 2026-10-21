@@ -27,7 +27,7 @@ pub fn run_ports(raw: &[OsString]) -> ExitCode {
     run_inner("ports", raw, dispatch_ports)
 }
 
-const SKILLS_USAGE: &str = "usage: krill skills list [--json] | krill skills get <name> [--full] [--references] [--reference <path>] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|all] [--global|--local <dir>|--dir <dir>] [--json]";
+const SKILLS_USAGE: &str = "usage: krill skills list [--json] | krill skills get <name> [--full] [--references] [--reference <path>] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|pi|all] [--global|--local <dir>|--dir <dir>] [--json]";
 const HANDOFF_USAGE: &str = "usage: krill handoff --from <session-id> [--to-agent <agent>] [--to-session <id>] [--prompt <text>] [--lines <N>] [--json]";
 const REFERENCE_USAGE: &str = "usage: krill reference list [--session <id>] [--worktree <path>] [--json] | krill reference add <url> [url...] [--session <id>] [--worktree <path>] [--json] | krill reference remove <url> [--session <id>] [--worktree <path>] [--json] | krill reference find [query] [--json]";
 const PORTS_USAGE: &str =
@@ -86,7 +86,7 @@ fn run_inner(label: &str, raw: &[OsString], f: fn(&[String]) -> io::Result<()>) 
 fn dispatch_skills(args: &[String]) -> io::Result<()> {
     let Some((sub, rest)) = args.split_first() else {
         return Err(bad_arg(
-            "usage: krill skills list [--json] | krill skills get <name> [--full] [--references] [--reference <path>] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|all] [--global|--local <dir>|--dir <dir>] [--json]",
+            "usage: krill skills list [--json] | krill skills get <name> [--full] [--references] [--reference <path>] [--json] | krill skills install <name>|--skill <name> [--agent|--target claude|codex|agy|antigravity|opencode|cursor|pi|all] [--global|--local <dir>|--dir <dir>] [--json]",
         ));
     };
     match sub.as_str() {
@@ -237,10 +237,10 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
             let name = name.ok_or_else(|| bad_arg("missing skill <name> or --skill <name>"))?;
             if !matches!(
                 target.as_str(),
-                "claude" | "codex" | "opencode" | "cursor" | "agy" | "antigravity" | "all"
+                "claude" | "codex" | "opencode" | "cursor" | "agy" | "antigravity" | "pi" | "all"
             ) {
                 return Err(bad_arg(
-                    "--agent/--target must be claude|codex|opencode|cursor|agy|antigravity|all",
+                    "--agent/--target must be claude|codex|opencode|cursor|agy|antigravity|pi|all",
                 ));
             }
             let dirs = if let Some(dir) = custom_dir {

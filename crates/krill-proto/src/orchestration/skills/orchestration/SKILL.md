@@ -10,7 +10,7 @@ Krill-specific command contracts and workflow guidance are independently authore
 
 Krill runs external AI CLIs. The coordinator chooses the work strategy; Krill records
 Run, Task, Dispatch, messages, and sessions. Use the Krill CLI for this workflow,
-including from agy/Antigravity. Native subagents and Orca commands do not register
+including from agy/Antigravity and pi. Native subagents and Orca commands do not register
 Krill workers and cannot replace these operations.
 
 ## Select the role and executable
@@ -99,9 +99,9 @@ and record actual evidence. Do not impersonate another worker or reuse a settled
   `worker_done` settles the dispatch and promotes dependencies; never mark a failed
   assignment successful merely to unblock them. Stop the assigned turn after settlement.
 
-## agy and asynchronous command tools
+## agy, pi, and asynchronous command tools
 
-On agy, use its terminal/command execution tool to invoke the CLI. A native
+On agy, use its terminal/command execution tool to invoke the CLI. On pi, use the `bash` tool (or `codemode` for parallel calls) to invoke the CLI. A native
 `task`/subagent tool is a different execution system. If the command tool returns
 an in-progress handle, use that tool's status/wait operation to collect the final
 exit status and JSON. A tool timeout, queued command, or empty interim output is

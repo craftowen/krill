@@ -14,7 +14,7 @@ and immediately before completion inspect
 For a blocker, use `ask --from <worker> --to coordinator --run <run-id> --summary
 "<question>" --wait --timeout-ms 10000 --json`. Preserve the returned message ID
 and re-wait with `ask --question-id <id> --wait --timeout-ms 10000 --json` after
-a timeout. In agy collect the command tool's final output before sending another ask.
+a timeout. In agy/pi collect the command tool's final output before sending another ask.
 
 On long work send a useful status/heartbeat at meaningful checkpoints with the
 same Run/Task/Dispatch IDs. It indicates progress, not successful completion.
