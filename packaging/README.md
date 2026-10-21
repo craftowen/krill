@@ -7,10 +7,11 @@ GitHub Releases 게시의 **공식 경로**는 로컬 맥에서 메인테이너�
 ## 야간 자동 배포
 
 `packaging/nightly.py`는 로그인한 macOS 사용자의 `launchd`에 매일 **한국시간 00:00 검사 시작**을 등록한다.
-시스템 시간대는 Asia/Seoul이어야 한다. 설치 즉시 빌드하거나 배포하지 않는다.
+시스템 시간대는 Asia/Seoul이어야 한다. 예약은 `launchd`가 깨우고, 실행은 **Orca의 일반 셸 터미널**에서 한다(AI 에이전트 호출 없음). 직접 실행한 launchd 자식은 macOS TCC 때문에 Documents·외장 볼륨 접근이 막히는 것을 실제 확인해 이 경로를 사용한다. Orca가 닫혀 있으면 시작하며 기존 원본 체크아웃의 파일·브랜치는 변경하지 않는다. 설치 즉시 빌드하거나 배포하지 않는다.
 
 ```sh
 python3 packaging/nightly.py install       # 이 저장소의 dev를 대상으로 등록·갱신
+python3 packaging/nightly.py install --after-release 0.1.23  # 기존 버전·3개 플랫폼 자산 게시 완료 뒤부터 후보 생성
 python3 packaging/nightly.py preflight     # 인증·툴·기존 서명키·외장 볼륨 확인, 빌드·원격 쓰기 없음
 python3 packaging/nightly.py status        # launchd 등록과 최근 실행 결과
 python3 packaging/nightly.py uninstall     # 예약 해제, 로그·검사 기록 보존
@@ -18,7 +19,7 @@ python3 packaging/nightly.py uninstall     # 예약 해제, 로그·검사 기�
 python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
 ```
 
-1. 실행 시작에 이 저장소의 **커밋된 로컬 `dev`**를 고정하고, 원격 `dev`·`main`도 가져온다. 세 커밋이 모두 최신 게시 태그에 포함돼 있으면 생략한다. 작업 중인 체크아웃은 읽기만 한다. 미커밋 파일과 미통합 기능 브랜치는 포함하지 않으며 고정 이후의 개발 커밋은 다음 날 대상이다.
+1. 실행 시작에 **원격 `dev`·`main`**을 fetch해 고정한다. 두 커밋이 모두 최신 게시 태그에 포함돼 있으면 생략한다. 원본 체크아웃은 건드리지 않는다. 작업 완료 후 `dev`에 커밋·push해 둔다. 미커밋 파일·push하지 않은 로컬 커밋·미통합 기능 브랜치는 포함하지 않으며 고정 이후 push는 다음 날 대상이다. `--after-release`로 지정한 기존 릴리스가 미게시 상태면 후보 생성도 생략한다.
 2. `/Volumes/krill-build/nightly/repository` 전용 clone에서 통합한다. 병합 충돌은 중단한다. workspace와 최신 게시 버전 중 큰 버전의 patch를 올리고 Cargo.lock·고지문과 함께 **최종 후보 커밋을 먼저** 만든다.
 3. 그 HEAD에서 `scripts/check.sh --memory`, Windows 전체 clippy, release 바이너리 빌드, 실제 GUI kill -9·출력 해시 재생 E2E, release holder 생존·업그레이드 테스트를 실행한다. 통과 기록은 HEAD별로 보관한다. Cargo 산출물은 `/Volumes/krill-build/targets/` 아래에만 둔다. 외장 볼륨이 없으면 내장 디스크로 폴백하지 않고 중단한다.
 4. `release/nightly-<시각>` 후보를 push하고 CI와 `release.yml`의 `build_only=true`를 실행한다. 이 모드는 macOS 게시 잡·모든 업로드 게시 잡을 건너뛰고 Windows/Linux 네이티브 빌드와 설치·데몬 kill 생존 스모크만 한다. GCP/상시 Windows VM은 호출하지 않는다. Windows에는 로컬 서명키의 **공개키만** 전달한다.
@@ -28,12 +29,14 @@ python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
 실패하면 새 릴리스를 게시하지 않고 단계·대상 HEAD·오류를 기록한다. `main` 반영 뒤 CI나 게시가 실패하면 그 검증 커밋은 `main`에 남을 수 있다. 게시 중 네트워크가 끊어지면 태그만 남는 등 일부 원격 쓰기가 끝났을 수 있으며, 다음 실행도 기존 태그·자산을 덮어쓰지 않는다.
 
 - 등록 파일: `~/Library/LaunchAgents/dev.krill.nightly.plist`.
-- 설치된 실행기·설정·HEAD별 통과 기록: `~/Library/Application Support/dev.krill.nightly/`. 실행기를 수정하면 `install`로 갱신한다.
+- 설치된 실행기·설정·HEAD별 통과 기록: `~/Library/Application Support/dev.krill.nightly/`. 실행기를 수정하면 `install`로 갱신한다. `dispatch.json`은 Orca 셸 시작 접수만 증명하며 배포 성공은 `status.json`으로 확인한다.
 - 실행 로그: `~/Library/Logs/Krill/nightly/`. 최근 결과는 설정 폴더의 `status.json`이며 실패 후보와 자산은 외장 볼륨에 남는다.
 - 맥이 켜져 있고 사용자가 로그인돼 있어야 한다(GUI 생존·메모리 테스트). 잠자기 중 예약은 깨어날 때 실행될 수 있다. 종료·로그아웃 상태에서는 자정 실행을 보장하지 않는다.
-- 처음 설치 전 `dev`를 준비하고, 기존 업데이트 서명키·GitHub 인증·Windows 크로스 검사 툴체인을 유지한다. 개발 중 검사는 AGENTS.md와 CONTRIBUTING.md의 부분 검사 범위를 따른다.
+- 처음 설치 전 원격 `dev`를 준비하고, Orca 앱·CLI와 등록된 workspace, 기존 업데이트 서명키·GitHub 인증·Windows 크로스 검사 툴체인을 유지한다. 개발 중 검사는 AGENTS.md와 CONTRIBUTING.md의 부분 검사 범위를 따른다.
 
 회귀 검증: `python3 packaging/test_nightly.py`, `python3 packaging/test_publish.py`, `actionlint .github/workflows/release.yml`.
+
+`dev` push에서는 Linux/macOS 전체 CI를 실행하지 않는다. 개발 중에는 변경 범위 검사만 하며, 전체 원격 CI는 `release/**` 야간 후보·`main` push와 PR에서 실행한다.
 
 ## 수동 게시
 

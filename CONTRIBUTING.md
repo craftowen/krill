@@ -16,7 +16,7 @@ Krill은 순수 Rust macOS 앱이다. 처음이라면 [README.md](README.md), [�
 4. Push 정책: 메인테이너 또는 사용자의 명시적인 배포·릴리스·push 지시를 받은 에이전트는 필요한 `main`·`v*` 태그 push를 수행할 수 있다. `KRILL_ALLOW_PROTECTED_PUSH='<사용자 지시와 작업 사유>'`로 사유를 기록한다. 클론마다 `scripts/install-hooks.sh`로 pre-push 훅을 켜면 승인 사유와 공개 표면을 점검한다. 최종 HEAD 검사와 CI 통과는 필수다. 외부 기여는 fork 브랜치에서 PR로 보낸다.
 5. PR은 템플릿을 채운다. 작은 PR을 선호한다.
 
-매일 한국시간 자정에 로컬 맥의 [야간 배포](packaging/README.md#야간-자동-배포)가 커밋된 `dev`와 원격 `main`·`dev`를 별도 clone에 고정한다. 최종 버전 커밋에서 전체 검사·메모리·release 생존 E2E·Windows 검사·Windows/Linux 네이티브 빌드와 스모크·CI를 통과한 뒤에만 `main` 반영과 릴리스 게시를 한다. 변경이 없으면 생략하고, 실패하면 기존 릴리스를 유지한다. 미커밋 파일과 통합하지 않은 기능 브랜치는 배포 대상이 아니다.
+매일 한국시간 자정에 로컬 맥의 [야간 배포](packaging/README.md#야간-자동-배포)가 **원격 `dev`에 push된 변경**과 원격 `main`을 별도 clone에 고정한다. 최종 버전 커밋에서 전체 검사·메모리·release 생존 E2E·Windows 검사·Windows/Linux 네이티브 빌드와 스모크·CI를 통과한 뒤에만 `main` 반영과 릴리스 게시를 한다. 변경이 없으면 생략하고, 실패하면 기존 릴리스를 유지한다. 작업 완료 후 `dev`에 커밋·push해 둔다. 미커밋 파일, push하지 않은 로컬 커밋, 통합하지 않은 기능 브랜치는 배포 대상이 아니다.
 
 ## 코드 규칙 요약 (상세는 CONVENTIONS.md)
 

@@ -9,8 +9,8 @@ name: ci-macos
 
 on:
   push:
-    # dev가 통합 브랜치다(main은 공개 릴리스 이력). release/**는 릴리스 준비 브랜치.
-    branches: [main, dev, 'release/**']
+    # dev push는 개발 중 부분 검사로 진행한다. 전체 CI는 야간 후보·main·PR에만 실행한다.
+    branches: [main, 'release/**']
   pull_request:
   workflow_dispatch:
 

@@ -117,6 +117,20 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(job["StartCalendarInterval"], {"Hour": 0, "Minute": 0})
         self.assertFalse(job.get("RunAtLoad", False))
         self.assertFalse(job.get("KeepAlive", False))
+        self.assertEqual(job["ProgramArguments"][2], "dispatch")
+
+    def test_dispatch_uses_orca_shell_and_safe_quoting_without_starting_an_agent(self):
+        with tempfile.TemporaryDirectory(prefix="nightly space ") as temporary:
+            root = Path(temporary)
+            config = {"orca_cli": "/path with spaces/orca", "workspace": "id:repo::/a b"}
+            result = {"ok": True, "result": {"terminal": {"handle": "test-terminal"}}}
+            with patch.object(nightly, "command", side_effect=["{}", json.dumps(result)]) as mocked:
+                nightly.dispatch(config, root / "config.json", preflight_only=True)
+            args = mocked.call_args_list[1].args[0]
+            self.assertEqual(args[1:3], ["terminal", "create"])
+            self.assertIn("preflight", args[args.index("--command") + 1])
+            self.assertNotIn("agent", args)
+            self.assertEqual(json.loads((root / "dispatch.json").read_text())["terminal"], "test-terminal")
 
     def test_patch_version_is_newer_than_both_workspace_and_latest_release(self):
         self.assertEqual(nightly.bump_version("0.1.2", "0.1.4"), "0.1.5")
@@ -262,7 +276,8 @@ class SnapshotTests(unittest.TestCase):
             (source / "dirty-file").write_text("must remain local\n")
             status = git(source, "status", "--porcelain")
             config = {"source": str(source), "branch": "dev", "repo": "o/r", "run_root": str(root / "nightly"),
-                      "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused"}
+                      "target_dir": str(nightly.TARGETS / "nightly"), "key_file": "/unused",
+                      "user.name": "nightly test", "user.email": "nightly@example.invalid"}
             release = nightly.Release(config, root / "state")
             real_command = nightly.command
 
@@ -288,6 +303,17 @@ class SnapshotTests(unittest.TestCase):
             self.assertEqual(git(release.work, "status", "--porcelain"), "")
             self.assertNotEqual(sha, frozen)
             self.assertIn(f"Nightly-Source: {frozen}", git(release.work, "log", "-1", "--format=%B"))
+            config["after_release"] = "0.1.1"
+            with patch.object(nightly, "command", side_effect=local_command):
+                incomplete = nightly.Release(config, root / "incomplete-state")
+                self.assertIsNone(incomplete.prepare())
+            self.assertIn("release assets", incomplete.state["reason"])
+            config["after_release"] = "0.1.2"
+            with patch.object(nightly, "command", side_effect=local_command):
+                waiting = nightly.Release(config, root / "waiting-state")
+                self.assertIsNone(waiting.prepare())
+            self.assertEqual(waiting.state["status"], "skipped")
+            self.assertIn("existing v0.1.2 release owner", waiting.state["reason"])
 
 
 if __name__ == "__main__":
