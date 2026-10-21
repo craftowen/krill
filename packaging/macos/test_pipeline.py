@@ -5,6 +5,7 @@ import os
 import pathlib
 import plistlib
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -30,6 +31,23 @@ class PipelineTests(unittest.TestCase):
         )
         for name in ("krill", "krill-holder", "krilld", "krill-link"):
             shutil.copy2(cls.bins / "krill-app", cls.bins / name)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            # Hosted runners need the temporary private-key keychain in their search list,
+            # even with codesign --keychain. This changes only the disposable CI user.
+            original = shlex.split(subprocess.check_output(
+                ["/usr/bin/security", "list-keychains", "-d", "user"], text=True))
+            cls.addClassCleanup(subprocess.run,
+                ["/usr/bin/security", "list-keychains", "-d", "user", "-s", *original],
+                capture_output=True, check=True)
+            cls.addClassCleanup(cls.fixture.cleanup)
+            bootstrap = subprocess.run(
+                [str(HERE.parent / "bundle.sh"), "--bin-dir", str(cls.bins), "--output", str(cls.root / "bootstrap")],
+                env=dict(os.environ, KRILL_CODESIGN_KEYCHAIN=str(cls.keychain)),
+                capture_output=True, text=True, timeout=60)
+            if bootstrap.returncode and "The specified item could not be found in the keychain" not in bootstrap.stderr:
+                raise RuntimeError(bootstrap.stdout + bootstrap.stderr)
+            subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", str(cls.keychain), *original],
+                           capture_output=True, check=True)
 
     @classmethod
     def tearDownClass(cls):
