@@ -7,6 +7,22 @@ use super::*;
 
 actions!(test, [Probe]);
 
+#[test]
+fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
+    assert!(Settings::default().yolo_mode);
+    assert!(toml::from_str::<Settings>("").unwrap().yolo_mode);
+    assert!(
+        toml::from_str::<Settings>("yolo_mode = true")
+            .unwrap()
+            .yolo_mode
+    );
+    assert!(
+        !toml::from_str::<Settings>("yolo_mode = false")
+            .unwrap()
+            .yolo_mode
+    );
+}
+
 #[gpui::test]
 fn account_login_and_status_badges_are_visible_without_launching_cli(cx: &mut TestAppContext) {
     use krill_proto::usage::{

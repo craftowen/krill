@@ -55,6 +55,7 @@ fn signed_rules_apply_without_restart_and_ignore_permission() {
     let dir = std::env::temp_dir().join(format!("mk091-signed-{}", std::process::id()));
     fs::remove_dir_all(&dir).ok();
     fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(FILE_NAME), "permission = 'manual'\n").unwrap();
     let c = Control::new(Some(&dir));
     assert!(!c.agents().unwrap().profiles.contains_key("aider"));
 
@@ -101,7 +102,7 @@ fn broken_signature_keeps_builtin_rules() {
     fs::write(dir.join(RULES_FILE_NAME), &bytes).unwrap();
     let agents = c.agents().unwrap();
     assert!(!agents.profiles.contains_key("aider"));
-    assert_eq!(agents.permission, Permission::Manual);
+    assert_eq!(agents.permission, Permission::Yolo);
     assert_eq!(c.screen_rules(), ScreenRules::default());
 
     // 잘린 파일도 마찬가지다.
@@ -135,7 +136,7 @@ fn permission_and_launch_survive_restart_without_changing_profiles() {
     let path = dir.join(FILE_NAME);
     fs::write(&path, "extra = 'kept'\n[agent.fixture]\nname = 'fixture'\nlaunch = ['/bin/echo', 'hi']\nyolo_args = ['--yes']\n").unwrap();
     let c = Control::new(Some(&dir));
-    assert_eq!(c.settings(None).unwrap().permission, Permission::Manual);
+    assert_eq!(c.settings(None).unwrap().permission, Permission::Yolo);
     assert_eq!(
         c.settings(Some(Permission::Yolo)).unwrap().permission,
         Permission::Yolo

@@ -38,7 +38,7 @@ fn agent_settings_and_metadata_obey_peer_scope() {
             &mut clients
         ),
         Reply::AgentSettings(control::AgentSettings {
-            permission: Permission::Manual,
+            permission: Permission::Yolo,
             ..
         })
     ));
