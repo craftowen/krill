@@ -26,13 +26,11 @@ use crate::hosts::{HostId, HostStatus};
 use crate::ui;
 use crate::ui::status::{self, Size};
 
-/// 카드 아래 세션 행의 왼쪽 안쪽 여백(px) = 카드 여백 + 이 값. 상태 글리프가 카드 제목 글자 아래에 오게 한다(Orca 중첩).
-/// 카드 왼쪽 끝 → 제목 글자 32(테두리 2(계보 자식 `border_l_2`) + `px_2p5` 10 + 상태 칸 14 + `gap_1p5` 6)에서
-/// 세션 행 자체의 `mx_1` 4를 뺀다.
-const CARD_TITLE_INSET: f32 = 28.;
-/// 폴더 아래 세션 행의 왼쪽 안쪽 여백(px, 호스트 들여쓰기 제외). 폴더 이름 글자 아래에 글리프가 온다:
-/// 머리줄 `ml` 4 + `px_2` 8 + 접기 버튼 20 + `gap_1p5` 6 + 폴더 아이콘 14 + `gap_1p5` 6 − 세션 행 `mx_1` 4.
-const FOLDER_TITLE_INSET: f32 = 54.;
+/// 카드 제목 아래 세션 이름 공간을 확보한다. 상태 글리프는 카드 상태 칸에 맞춘다.
+/// 카드 테두리 2 + 안쪽 여백 10 − 세션 행 바깥 여백 4.
+const CARD_SESSION_INSET: f32 = 8.;
+/// 폴더 행의 아이콘 아래에 세션 상태를 정렬한다(이름 아래로 중복 들여쓰지 않는다).
+const FOLDER_SESSION_INSET: f32 = 34.;
 
 #[derive(Clone)]
 struct TreeMenuMeta {
@@ -496,7 +494,7 @@ impl Sidebar {
             .mx_0()
             .ml(px(self.worktree_margin(depth)))
             .mr_1p5()
-            .pl(px(30.))
+            .pl(px(12.))
             .pr_2p5()
             .rounded_none()
             .border_l_1()
@@ -1108,7 +1106,7 @@ impl Sidebar {
                         }
                     ))
                     .when(*nested, |d| {
-                        // 하위 세션은 소속 카드(워크트리·폴더)의 제목 글자 아래에서 시작해 한 단계 깊어 보이게 한다.
+                        // 카드 상태 칸에 맞춰 세션 이름이 불필요하게 오른쪽으로 밀리지 않게 한다.
                         let pl = match &session.worktree {
                             Some(tree) => {
                                 let depth = if row_host.is_local() {
@@ -1116,9 +1114,15 @@ impl Sidebar {
                                 } else {
                                     0
                                 };
-                                self.worktree_margin(depth) + CARD_TITLE_INSET
+                                if inside_card && self.rows.len() < VIRTUALIZED_ROWS {
+                                    // 실제 카드 안에 렌더된 행은 이미 카드의 들여쓰기를 상속한다.
+                                    // 전역 좌표의 카드 여백을 다시 더하면 호스트/계보 깊이가 중복된다.
+                                    0.
+                                } else {
+                                    self.worktree_margin(depth) + CARD_SESSION_INSET
+                                }
                             }
-                            None => host_indent + FOLDER_TITLE_INSET,
+                            None => host_indent + FOLDER_SESSION_INSET,
                         };
                         d.pl(px(pl)).pr_2()
                     })
@@ -1149,6 +1153,7 @@ impl Sidebar {
                     ))
                     .child(
                         div()
+                            .debug_selector(move || format!("session-title-{index}"))
                             .flex_1()
                             .min_w_0()
                             .truncate()

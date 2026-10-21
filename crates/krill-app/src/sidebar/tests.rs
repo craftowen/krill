@@ -4834,7 +4834,7 @@ fn primary_worktree_is_always_first_in_project() {
     }
 }
 
-/// v0.1.17: 워크트리 카드 아래 세션 행은 카드 제목 글자 아래에서 시작해 카드의 자식으로 보인다.
+/// 카드 아래 세션은 상태 칸에 정렬해 이름 공간을 확보하고 계보 깊이는 유지한다.
 /// 계보 자식 워크트리의 세션은 그 워크트리 들여쓰기를 따르고, 폴더 > 세션도 폴더 이름 아래로 들여 쓴다.
 #[gpui::test]
 fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
@@ -4892,8 +4892,13 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
             let title = x(cx, format!("worktree-title-{tree}"));
             let glyph = x(cx, format!("session-state-{sess}"));
             assert!(
-                glyph >= title && glyph >= card + gpui::px(16.),
-                "{layout:?}: session {sess} glyph={glyph:?} must sit under card {tree} title={title:?} (card={card:?})"
+                glyph >= card + gpui::px(8.) && glyph < title,
+                "{layout:?}: session glyph={glyph:?} aligns with card status before title={title:?} (card={card:?})"
+            );
+            let session_title = x(cx, format!("session-title-{sess}"));
+            assert!(
+                session_title >= title && session_title <= title + gpui::px(24.),
+                "{layout:?}: session name {session_title:?} must stay near card title {title:?}"
             );
         }
         assert!(
@@ -4903,8 +4908,8 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
         let folder_title = x(cx, format!("folder-title-{folder}"));
         let glyph = x(cx, format!("session-state-{s3}"));
         assert!(
-            glyph >= folder_title,
-            "{layout:?}: folder session glyph={glyph:?} title={folder_title:?}"
+            glyph < folder_title,
+            "{layout:?}: folder session glyph={glyph:?} must not repeat the title indent={folder_title:?}"
         );
     }
 }
