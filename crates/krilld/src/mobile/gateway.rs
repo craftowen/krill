@@ -21,6 +21,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(super) const MAX_PENDING: usize = 4;
 pub(super) const MAX_CONNECTIONS: usize = 12;
 const STACK: usize = 128 * 1024;
+/// 스냅샷·계정 RPC를 수행하는 워커 스택. 수십 KB JSON을 중첩 빌더·직렬화로 조립하는데
+/// 128KiB 스레드에서는 `mobile_pwa` E2E 첫 스냅샷에서 스택 오버플로로 데몬이 중단됐다.
+/// 연결당 2개(`mobile-ipc` + `mobile-rpc`)에만 적용한다(수락·WS 루프·전달 스레드는 128KiB 유지).
+pub(super) const RPC_STACK: usize = 512 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
 /// 수락 스레드가 일이 없어도 깨어 reconcile(터널 감시·백오프)하는 최대 간격.
 const RECONCILE: Duration = Duration::from_secs(1);
@@ -1290,7 +1294,7 @@ fn bridge(
         })?;
     let worker = thread::Builder::new()
         .name("mobile-ipc".into())
-        .stack_size(STACK)
+        .stack_size(RPC_STACK)
         .spawn(move || {
             crate::alloc::mobile_thread().ok();
             // server_stop 복제가 fd를 붙잡고 있어 serve가 끝나도 local 쪽에 EOF가 오지 않는다.
