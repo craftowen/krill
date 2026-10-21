@@ -24,6 +24,7 @@ pub(crate) mod files;
 mod fit;
 mod folder;
 mod handoff;
+mod liveness;
 mod new_session;
 mod overlays;
 mod persist;
@@ -511,6 +512,7 @@ pub struct Shell {
     update_ready: Option<PathBuf>,
     /// 보이는 칸의 세션 연결(OWE-490).
     live: HashMap<PaneId, Live>,
+    pane_liveness: Option<Task<()>>,
     creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
     /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
     titles: HashMap<PaneId, String>,
@@ -963,6 +965,7 @@ impl Shell {
             recording: krill_app::recording::Status::default(),
             update_ready: None,
             live: HashMap::new(),
+            pane_liveness: None,
             creations: HashMap::new(),
             titles: HashMap::new(),
             agents: None,
@@ -3363,6 +3366,7 @@ impl Shell {
         linked: pane::Linked,
         cx: &mut Context<Self>,
     ) -> Next {
+        self.start_pane_liveness(cx);
         let Some(l) = self.live.get_mut(&pane) else {
             return Next::Gone;
         };
@@ -6309,6 +6313,7 @@ impl Shell {
         sock: UnixStream,
         cx: &mut Context<Self>,
     ) {
+        self.start_pane_liveness(cx);
         let mut l = Live::new(Task::ready(()));
         l.pane.link(
             session,
