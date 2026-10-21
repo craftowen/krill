@@ -310,6 +310,7 @@ pub struct SendParams {
 
 /// `krill orchestration worker-start --spec <json>` 입력 명세(MK-227).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerStartSpec {
     #[serde(default)]
     pub run_id: Option<String>,
@@ -1072,6 +1073,17 @@ impl OrchestrationStore {
         let mut resolved_dispatch_id = params.dispatch_id.clone();
 
         if params.msg_type == MessageType::WorkerDone {
+            let failed = match params.outcome.as_deref() {
+                None => false, // Preserve the pre-existing omitted-outcome success contract.
+                Some(value) if value.eq_ignore_ascii_case("succeeded") => false,
+                Some(value)
+                    if value.eq_ignore_ascii_case("failed")
+                        || value.eq_ignore_ascii_case("error") =>
+                {
+                    true
+                }
+                Some(_) => return Err(invalid("worker_done outcome must be succeeded|failed")),
+            };
             // 1. If dispatch_id was not explicitly given, infer from active dispatch of `from`.
             if resolved_dispatch_id.is_none() {
                 let matching: Vec<&Dispatch> = self
@@ -1157,10 +1169,6 @@ impl OrchestrationStore {
                     resolved_run_id = Some(task.run_id.clone());
                 }
             }
-
-            let failed = params.outcome.as_deref().is_some_and(|o| {
-                o.eq_ignore_ascii_case("failed") || o.eq_ignore_ascii_case("error")
-            });
 
             if let Some(ref disp_id) = resolved_dispatch_id
                 && let Some(disp) = self.dispatches.iter_mut().find(|d| d.id == *disp_id)
@@ -1567,6 +1575,7 @@ pub fn worker_preamble(dispatch: &Dispatch) -> String {
         "[MK ORCHESTRATION PREAMBLE]\n\
          Run: {run} | Dispatch: {disp} | Worker: {worker}{task_line}\n\
          Task Prompt: {prompt}\n\
+         First read the Krill worker contract: krill skills get orchestration --reference references/worker-contract.md. If KRILL_CLI is set, use that absolute executable instead of bare krill; quote it for your shell. This is the krill-orchestration skill, not Orca orchestration.\n\
          IMPORTANT: Always use the `krill orchestration` CLI via your shell/command tool to report status or ask questions; do NOT use built-in subagent tools (like `send_message`, `Task`, or `spawn_agent`).\n\
          When finished, report completion with:\n  \
          krill orchestration send --from {worker} --to coordinator --type worker_done --run {run}{task_flag} --dispatch {disp} --outcome succeeded --summary \"<result>\"\n\
@@ -2336,156 +2345,14 @@ pub fn probe_port(port: u16) -> bool {
 // Built-in Agent Skills Registry (MK-115)
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SkillEntry {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub content: &'static str,
-}
-
-pub const BUILTIN_SKILLS: &[SkillEntry] = &[
-    SkillEntry {
-        name: "minikrill",
-        description: "Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the `krill` CLI.",
-        content: "---\nname: minikrill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the krill CLI.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n",
-    },
-    SkillEntry {
-        name: "orchestration",
-        description: "Coordinate multi-agent runs, task DAGs, worker dispatches, threaded messages, blocking ask/reply, and decision gates via `krill orchestration`.",
-        content: "---\nname: orchestration\ndescription: Coordinate multi-agent runs, task DAGs, worker dispatches, messages, ask/reply, and decision gates via krill orchestration.\n---\n\n# Krill Multi-Agent Orchestration (`krill orchestration`)\n\n> **IMPORTANT**: Always run `krill orchestration` CLI commands via your shell/command tool to dispatch workers, send/check messages, or report completion. Do NOT use built-in subagent tools (such as `send_message`, `Task`, or `spawn_agent`) for Krill orchestration.\n\n## Role Classification\n\nDetermine your role before acting:\n- **Worker**: Your startup prompt includes `[MK ORCHESTRATION PREAMBLE]` or a `Run:` / `Dispatch:` / `Worker:` header. Execute the assigned task, send progress/questions via `krill orchestration`, and finish with `worker_done`.\n- **Coordinator**: The user asked you to decompose work, supervise workers, or manage a multi-agent DAG.\n\n## Safety Floor\n\n1. Never kill, stop, or abandon sessions outside your active `run-id`.\n2. Every active dispatch must reach a terminal state (`succeeded`, `failed`, `stopped`, `retained`, `released`, or `abandoned`).\n3. Respect recursion depth limits (`--depth` / `--max-depth`, default max 3).\n\n## Canonical Coordinator Loop\n\n1. **Create & select a Run**:\n   - `krill orchestration run-create --title \"Feature X\" --json` (alias: `--objective`)\n   - `krill orchestration run-use <run-id>` / `krill orchestration run-current --json`\n   - `krill orchestration run-show [<run-id>] --json` / `krill orchestration run-list --json`\n2. **Define the Task DAG**:\n   - `krill orchestration task-create --run <run-id> --title \"Implement API\" --desc \"...\" --json` (aliases: `--spec`, `--task-title`)\n   - `krill orchestration task-create --run <run-id> --title \"Verify UI\" --deps <task-1> --json`\n   - `krill orchestration task-list --run <run-id> --json`\n   - `krill orchestration task-update <task-id> --status <ready|completed|failed|blocked> --summary \"...\" --json`\n3. **Dispatch Workers (`claude`, `codex`, `agy`, `cursor`, `opencode`)**:\n   - `krill orchestration worker-start --run <run-id> --task <task-id> --worker backend --agent claude --cwd <dir> --prompt \"Implement API\" --json`\n   - Or pass a JSON/text spec: `krill orchestration worker-start --spec '{\"worker\":\"backend\",\"agent\":\"codex\",\"prompt\":\"...\"}' --json` (or `--spec \"<prompt text>\"`), plus `--account <id>`, `--depth <N>`, `--max-depth <N>`, `--preamble <full|minimal|none>`.\n4. **Supervise, Answer Questions & Resolve Gates**:\n   - Wait for worker events (Condvar-backed in `krilld`): `krill orchestration check --to coordinator --wait --timeout-ms 5000 --ack --json`\n   - Inspect unread inbox: `krill orchestration inbox --to coordinator --json`\n   - Reply to a worker question: `krill orchestration reply <msg-id> --body \"Proceed with approach A\" --json` (or `--id <msg-id>`)\n   - Decision gates:\n     - `krill orchestration gate-create --from backend --question \"Ship migration?\" --options \"yes,no\"`\n     - `krill orchestration gate-list --pending --json`\n     - `krill orchestration gate-resolve <gate-id> --decision yes --rationale \"Reviewed\"`\n5. **Inspect & Settle Workers**:\n   - `krill orchestration worker-list --run <run-id> --json`\n   - `krill orchestration worker-show <worker-or-dispatch> --json`\n   - `krill orchestration worker-read <worker-or-dispatch> --lines 60 --json`\n   - Keep terminal open after completion: `krill orchestration worker-retain <worker-or-dispatch> --json`\n   - Archive output & close worker session: `krill orchestration worker-release <worker-or-dispatch> --json` or `krill orchestration worker-stop <worker-or-dispatch> --json`\n   - Fence dead/unresponsive worker and return task to `ready`: `krill orchestration worker-abandon <worker-or-dispatch> --json`\n\n## Worker Contract\n\n- **Ask a blocking question** (waits for coordinator's `reply`):\n  - `krill orchestration ask --from <worker> --to coordinator --run <run-id> --wait --summary \"<question>\"`\n  - If timed out, resume waiting without creating a duplicate question:\n    `krill orchestration ask --question-id <msg-id> --wait --timeout-ms 30000`\n- **Report completion** (settles dispatch & auto-promotes dependent tasks to `ready`):\n  - `krill orchestration send --from backend --to coordinator --type worker_done --run <run-id> --task <task-id> --dispatch <dispatch-id> --outcome succeeded --summary \"API complete\"`\n  - On failure, pass `--outcome failed`.\n\n## Modular Reference Docs\n\nRun `krill skills get orchestration --references` to list detailed reference guides, or `krill skills get orchestration --reference references/<name>.md` to read one.\n",
-    },
-    SkillEntry {
-        name: "worktree-checkpoints",
-        description: "Track worktree progress, status badges (todo/in-progress/in-review/completed), PR/issue links, and URL references.",
-        content: "---\nname: worktree-checkpoints\ndescription: Track worktree progress, status badges, PR/issue links, and URL references.\n---\n\n# Krill Worktree Checkpoints & References\n\n- Update checkpoint state:\n  `krill set --workspace-status in-review --comment \"Ready for QA\" --pr 128 --issue OWE-626 --unread`\n- Clear unread dot:\n  `krill set --read`\n- Attach reference links:\n  `krill reference add https://github.com/org/repo/pull/128`\n  `krill reference list --json`\n",
-    },
-    SkillEntry {
-        name: "computer-use",
-        description: "Drive visible macOS native app and external browser windows via `krill computer` (accessibility tree snapshots, clicks, typing, keys, hotkeys, clipboard paste, and value setting).",
-        content: "---\nname: computer-use\ndescription: Drives the GUI of a visible local macOS app or external browser window through `krill computer`: accessibility tree snapshots, clicks, typing, keys, hotkeys, clipboard paste, and value setting. Prefer a programmatic path (shell, filesystem, git, HTTP, existing CLIs) whenever it can complete the task.\n---\n\n# Krill macOS Native Computer Use (`krill computer`)\n\nDrive visible local macOS native app or external browser windows (Chrome, Edge, Safari) via `krill computer`. Prefer a programmatic path whenever it can complete the task.\n\n## Core Loop\n\n- Check capabilities & TCC permissions:\n  - `krill computer capabilities --json`\n  - `krill computer permissions --json` (or `--id accessibility` / `--id screenshots`)\n- Discover running apps & windows:\n  - `krill computer list-apps --json`\n  - `krill computer list-windows --app <name|bundle|pid:N> --json`\n- Capture accessibility snapshot & element reference IDs:\n  - `krill computer get-app-state --app <app> [--window-id <id> | --window-index <n>] [--restore-window] [--no-screenshot] --json`\n- Perform semantic or coordinate actions (always inspect fresh state before choosing the next element index):\n  - `krill computer click --app <app> (--element-index <n> | --x <x> --y <y>) [--mouse-button left|right|middle] [--click-count <n>] [--modifiers <chord>] --json`\n  - `krill computer perform-secondary-action --app <app> --element-index <n> --action <name> --json`\n  - `krill computer set-value --app <app> --element-index <n> (--value <text> | --value-stdin) --json`\n  - `krill computer type-text --app <app> (--text <text> | --text-stdin) --json`\n  - `krill computer press-key --app <app> --key <key> --json`\n  - `krill computer hotkey --app <app> --key <key-combo> --json`\n  - `krill computer paste-text --app <app> (--text <text> | --text-stdin) --json` (preserves and restores the system clipboard)\n  - `krill computer scroll --app <app> (--element-index <n> | --x <x> --y <y>) --direction <up|down|left|right> [--pages <n>] --json`\n  - `krill computer drag --app <app> (--from-element-index <n> --to-element-index <n> | --from-x <x> --from-y <y> --to-x <x> --to-y <y>) --json`\n",
-    },
-];
-
-pub fn builtin_skills() -> &'static [SkillEntry] {
-    BUILTIN_SKILLS
-}
-
-pub const ORCHESTRATION_REFERENCES: &[(&str, &str)] = &[
-    (
-        "references/coordinator-loop.md",
-        "# Coordinator Loop Reference\n\n1. Create a run (`run-create --title <title>`) or select an existing run (`run-use <run-id>`).\n2. Create tasks (`task-create`) with `--deps <t1,t2>` to form a DAG. Tasks with satisfied dependencies start in `ready`.\n3. Dispatch ready tasks with `worker-start`. Use `--preamble full|minimal|none` to control injected worker instructions.\n4. Block on `check --to coordinator --wait --timeout-ms 10000 --ack` to process `worker_done`, `question`, `escalation`, and `decision_gate` messages.\n5. Inspect terminal output with `worker-read <worker-or-dispatch> --lines 60`, keep live sessions with `worker-retain`, or clean up finished workers with `worker-release`.\n",
-    ),
-    (
-        "references/worker-contract.md",
-        "# Worker Contract Reference\n\n1. Stay within the scope of your assigned task and `cwd`.\n2. Send periodic progress updates or heartbeats on long tasks: `krill orchestration send --from <worker> --to coordinator --type heartbeat --summary \"...\"`.\n3. When blocked, ask the coordinator and wait for a reply:\n   `krill orchestration ask --from <worker> --to coordinator --run <run-id> --wait --summary \"<question>\"`\n   If the wait times out, re-wait on the same question ID without creating a duplicate:\n   `krill orchestration ask --question-id <msg-id> --wait --timeout-ms 30000`\n4. When finished, always settle your dispatch with `worker_done`:\n   `krill orchestration send --from <worker> --to coordinator --type worker_done --run <run-id> --task <task-id> --dispatch <dispatch-id> --outcome succeeded --summary \"<concise 1-3 sentence summary>\"`\n",
-    ),
-    (
-        "references/messaging-and-gates.md",
-        "# Messaging, Group Addressing & Decision Gates\n\n- **Group Addressing**: `--to @all`, `@active`, `@idle`, `@claude`, `@codex`, `@agy`, `@cursor`, `@opencode`.\n- **Blocking Check**: `krill orchestration check --to <recipient> --wait --timeout-ms <ms> [--unread] [--ack]`.\n- **Inbox**: `krill orchestration inbox [--to <recipient>] [--json]` lists unacknowledged messages.\n- **Decision Gates**: Create with `gate-create --from <worker> --question \"...\" --options \"approve,reject\"`. Resolve with `gate-resolve <gate-id> --decision approve --rationale \"...\"` (decision must match one of the gate's configured options).\n",
-    ),
-    (
-        "references/recovery-and-cleanup.md",
-        "# Recovery, Fencing & Cleanup\n\n- **Dead / Unresponsive Worker**: Run `krill orchestration worker-abandon <worker-or-dispatch>` to fence the stale dispatch (`abandoned`), close its session if still present, and return the bound task to `ready` so a replacement worker can be started. Late `worker_done` messages from abandoned dispatches are rejected.\n- **Retaining vs Releasing**: Use `worker-retain <worker-or-dispatch>` to keep a worker's terminal open for debugging, or `worker-release <worker-or-dispatch>` to archive its terminal output and close the session.\n",
-    ),
-    (
-        "references/placement-and-remote.md",
-        "# Worktree Placement & Remote Host Orchestration\n\n- **Worktree Isolation**: Create isolated worktrees via `krill worktree new <name> --parent <base-path>` and pass `--cwd <worktree-path>` to `worker-start`.\n- **Remote Orchestration**: Prefix commands with `krill --host <user@host> orchestration ...`. Remote `worker-start` requires an explicit `--cwd <remote-abs-path>`.\n",
-    ),
-];
-
-#[must_use]
-pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
-    match name.trim().trim_start_matches("krill-") {
-        "orchestration" => ORCHESTRATION_REFERENCES,
-        _ => &[],
-    }
-}
-
-/// Orca도 같은 이름으로 설치하는 스킬. 맨 이름 자리에 Krill 사본이 있으면 Orca가
-/// "별도 사본이라 업데이트할 수 없음"으로 보므로 항상 `krill-<name>`에 설치한다.
-const ORCA_SKILL_NAMES: &[&str] = &["orchestration", "computer-use"];
-/// 맨 이름이 막혔을 때 쓰는 접두. 예전 버전(minikrill 시절)은 `mk-`를 썼다.
-const SKILL_PREFIX: &str = "krill-";
-const LEGACY_SKILL_PREFIX: &str = "mk-";
-
-fn prefixed_skill_content(skill: &SkillEntry, prefix: &str) -> String {
-    skill.content.replacen(
-        &format!("name: {}\n", skill.name),
-        &format!("name: {prefix}{}\n", skill.name),
-        1,
-    )
-}
-
-pub fn install_skill(name: &str, base_dir: &Path) -> io::Result<PathBuf> {
-    let Some(skill) = builtin_skills().iter().find(|s| s.name == name.trim()) else {
-        return Err(not_found(format!("unknown skill: {name}")));
-    };
-    let orca_owned = ORCA_SKILL_NAMES.contains(&skill.name);
-    let candidates = [
-        skill.name.to_owned(),
-        format!("{SKILL_PREFIX}{}", skill.name),
-    ];
-    let mut chosen = None;
-    for (index, candidate) in candidates.iter().enumerate().skip(usize::from(orca_owned)) {
-        let dir = base_dir.join(candidate);
-        if skill_candidate_writable(&dir, skill)? {
-            chosen = Some((dir, index != 0));
-            break;
-        }
-    }
-    let (skill_dir, use_fallback) = chosen.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "both skill paths belong to external skills or symlinks",
-        )
-    })?;
-    fs::create_dir_all(&skill_dir)?;
-    let path = skill_dir.join("SKILL.md");
-    let content = if use_fallback {
-        prefixed_skill_content(skill, SKILL_PREFIX)
-    } else {
-        skill.content.to_owned()
-    };
-    let content = format!("{content}\n<!-- minikrill-managed-skill -->\n");
-    atomic_write(&path, content.as_bytes())?;
-    // 예전 버전이 깔아 둔 자기 사본만 치운다(남의 스킬·심링크는 그대로):
-    // Orca와 겹치는 스킬의 맨 이름 자리, 그리고 모든 스킬의 옛 `mk-` 자리.
-    let mut stale = vec![base_dir.join(format!("{LEGACY_SKILL_PREFIX}{}", skill.name))];
-    if orca_owned {
-        stale.push(base_dir.join(skill.name));
-    }
-    for dir in stale {
-        if dir != skill_dir
-            && dir.join("SKILL.md").is_file()
-            && skill_candidate_writable(&dir, skill)?
-        {
-            fs::remove_file(dir.join("SKILL.md"))?;
-            fs::remove_dir(&dir).ok();
-        }
-    }
-    Ok(path)
-}
-
-fn skill_candidate_writable(dir: &Path, skill: &SkillEntry) -> io::Result<bool> {
-    for path in [dir.to_path_buf(), dir.join("SKILL.md")] {
-        match fs::symlink_metadata(path) {
-            Ok(meta) if meta.file_type().is_symlink() => return Ok(false),
-            Ok(_) => {}
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
-        }
-    }
-    match fs::read_to_string(dir.join("SKILL.md")) {
-        Ok(existing) => {
-            // Accept our generated marker, including the unmarked previous built-in text.
-            Ok(existing.contains("<!-- minikrill-managed-skill -->")
-                || existing == skill.content
-                || existing == prefixed_skill_content(skill, LEGACY_SKILL_PREFIX))
-        }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
-        Err(e) => Err(e),
-    }
-}
+mod skills;
+#[cfg(test)]
+use skills::ORCA_SKILL_NAMES;
+pub use skills::{
+    BUILTIN_SKILLS, ORCHESTRATION_REFERENCES, SkillEntry, SkillSyncReport, builtin_skills,
+    install_skill, skill_directories, skill_references, sync_builtin_skills,
+    sync_builtin_skills_at,
+};
 
 // ============================================================================
 // Atomic File & Lock Helpers
@@ -3025,6 +2892,58 @@ mod tests {
         store.reset(None);
         assert_eq!(store.next_seq, seq_before);
         Ok(())
+    }
+
+    #[test]
+    fn invalid_worker_outcomes_leave_dispatch_task_and_messages_unchanged() {
+        let mut store = OrchestrationStore::default();
+        let run = store.create_run("outcome validation", None).unwrap();
+        let task = store
+            .create_task(&run.id, "implementation", "", vec![])
+            .unwrap();
+        let child = store
+            .create_task(&run.id, "verification", "", vec![task.id.clone()])
+            .unwrap();
+        let dispatch = store
+            .start_worker(
+                &run.id,
+                Some(&task.id),
+                "worker",
+                "agy",
+                None,
+                "/tmp",
+                "work",
+            )
+            .unwrap();
+        let snapshot = store.clone();
+        let mut params = SendParams {
+            from: "worker".into(),
+            to: "coordinator".into(),
+            msg_type: MessageType::WorkerDone,
+            summary: "result".into(),
+            body: String::new(),
+            run_id: Some(run.id),
+            task_id: Some(task.id),
+            dispatch_id: Some(dispatch.id),
+            outcome: None,
+            reply_to: None,
+        };
+        for outcome in ["cancelled", "blocked", "suceeded", "", "success"] {
+            params.outcome = Some(outcome.into());
+            assert!(store.send_message(&params).is_err(), "accepted {outcome}");
+            assert_eq!(store, snapshot);
+        }
+        params.outcome = Some("succeeded".into());
+        store.send_message(&params).unwrap();
+        assert_eq!(
+            store
+                .tasks
+                .iter()
+                .find(|t| t.id == child.id)
+                .unwrap()
+                .status,
+            TaskStatus::Ready
+        );
     }
 
     #[test]

@@ -671,8 +671,8 @@ pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
     cx.spawn(async move |cx| {
         let result = background
             .spawn(async move {
-                stage_helpers(&env).map_err(|e| ("bin.helpers", e))?;
                 drop(crate::settings::install_all_skills_at(&env.home));
+                stage_helpers(&env).map_err(|e| ("bin.helpers", e))?;
                 install_managed_cli(&env).map_err(|e| ("cli.path", e))
             })
             .await;

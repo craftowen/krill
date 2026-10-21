@@ -681,7 +681,7 @@ fn format_worker_preamble(
     match mode {
         PreambleMode::Full => Some(worker_preamble(dispatch)),
         PreambleMode::Minimal => Some(format!(
-            "[Krill Worker] run={} task={} dispatch={} worker={}: {}",
+            "[Krill Worker] run={} task={} dispatch={} worker={}: {}\nRead `krill skills get orchestration --reference references/worker-contract.md` using KRILL_CLI when set; use Krill CLI reporting, not Orca or native subagents.",
             dispatch.run_id,
             dispatch.task_id.as_deref().unwrap_or("-"),
             dispatch.id,
@@ -772,7 +772,9 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 }
             }
             "--model" | "--effort" | "--retry-of" => {
-                it.next().ok_or_else(|| bad_arg(format!("missing {arg}")))?;
+                return Err(bad_arg(format!(
+                    "{arg} is not supported by Krill worker-start; use a configured --agent profile and an explicit --task for retries"
+                )));
             }
             "--prompt" => spec.prompt = it.next().cloned(),
             "--depth" => {
@@ -2385,6 +2387,28 @@ mod tests {
         std::fs::remove_dir_all(dir)
     }
     #[test]
+    fn unsupported_launch_preferences_are_rejected_before_any_state_change() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-unsupported-launch-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        for flag in ["--model", "--effort", "--retry-of"] {
+            let error = cmd_worker_start(
+                &dir,
+                &args(&["--spec", "must not run", flag, "value", "--no-spawn"]),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!dir.join("orchestration.json").exists());
+        }
+        for key in ["model", "effort", "retry_of"] {
+            let spec = format!(r#"{{"prompt":"must not run","{key}":"value"}}"#);
+            assert!(cmd_worker_start(&dir, &args(&["--spec", &spec, "--no-spawn"])).is_err());
+            assert!(!dir.join("orchestration.json").exists());
+        }
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
     fn worker_start_rejects_unknown_session_before_mutate() {
         assert!(reject_missing_worker_session("w1", 7, &[7, 8]).is_ok());
         let err = reject_missing_worker_session("w1", 999, &[7, 8]).unwrap_err();
@@ -2761,7 +2785,7 @@ mod tests {
         );
         assert_eq!(store.tasks[1].status, TaskStatus::Ready);
 
-        // 5. worker-start with plain-text --spec (auto-creates task and worker name) + Orca flags
+        // 5. worker-start with plain-text --spec (auto-creates task and worker name).
         cmd_worker_start_ctx(
             &ctx,
             &args(&[
@@ -2771,12 +2795,6 @@ mod tests {
                 "codex",
                 "--worktree",
                 "current",
-                "--model",
-                "gpt-5",
-                "--effort",
-                "high",
-                "--retry-of",
-                "disp-0",
                 "--no-spawn",
                 "--json",
             ]),

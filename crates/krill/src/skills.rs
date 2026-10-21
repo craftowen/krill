@@ -246,24 +246,9 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
             let dirs = if let Some(dir) = custom_dir {
                 vec![dir]
             } else {
-                let home = std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .ok_or_else(|| io::Error::other("HOME is not set"))?;
-                match target.as_str() {
-                    "claude" => vec![home.join(".claude/skills")],
-                    "codex" => vec![home.join(".codex/skills")],
-                    "opencode" => vec![home.join(".config/opencode/skills")],
-                    "cursor" => vec![home.join(".cursor/skills")],
-                    "agy" | "antigravity" => vec![home.join(".gemini/config/skills")],
-                    "all" => vec![
-                        home.join(".claude/skills"),
-                        home.join(".codex/skills"),
-                        home.join(".config/opencode/skills"),
-                        home.join(".cursor/skills"),
-                        home.join(".gemini/config/skills"),
-                    ],
-                    _ => return Err(bad_arg("invalid skill target")),
-                }
+                let home = krill_proto::os::home_dir()
+                    .ok_or_else(|| io::Error::other("home directory unavailable"))?;
+                krill_proto::orchestration::skill_directories(&home, &target)
             };
             let mut installed = Vec::new();
             for d in dirs {
@@ -751,7 +736,7 @@ mod tests {
             };
             assert_eq!(
                 std::fs::read_to_string(dir.join(folder).join("SKILL.md"))?,
-                format!("{content}\n<!-- minikrill-managed-skill -->\n")
+                format!("{}\n<!-- minikrill-managed-skill -->\n", content.trim_end())
             );
         }
         dispatch_skills(&args(&["get", "minikrill", "--full"]))?;

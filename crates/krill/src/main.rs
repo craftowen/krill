@@ -99,6 +99,16 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
         let migrated = daemon::migrate::run();
         krill_log::init(krill_log::Component::Cli).ok();
         tracing::info!(?migrated, "cli starting");
+        // Hook/statusline hot paths and isolated runtimes must not mutate the host's skills.
+        if !cfg!(test)
+            && daemon::state_dir_override().is_none()
+            && let Some(home) = krill_proto::os::home_dir()
+        {
+            let report = krill_proto::orchestration::sync_builtin_skills_at(&home);
+            for error in report.failures {
+                tracing::warn!(%error, "built-in skill synchronization skipped a target");
+            }
+        }
     }
     if raw.first().is_some_and(|s| s == "__forward") {
         return remote::forward_main(&raw);
