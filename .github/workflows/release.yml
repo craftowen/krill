@@ -412,8 +412,10 @@ jobs:
             [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
           fi
           [[ "$(uname -m)" == "${EXPECTED_ARCH}" ]]
-          source /etc/os-release
-          [[ "${ID}" == ubuntu && "${VERSION_ID}" == 22.04 ]]
+          (
+            source /etc/os-release
+            [[ "${ID}" == ubuntu && "${VERSION_ID}" == 22.04 ]]
+          )
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
