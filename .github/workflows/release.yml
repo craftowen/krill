@@ -170,6 +170,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -220,6 +222,14 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       # +crt-static: VCRUNTIME140.dll 의존 제거(docs/research/windows-spike-OWE-837.md §4).
+      - name: Restore Windows release dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-windows-msvc-static
+          cache-bin: 'false'
+          save-if: ${{ inputs.build_only && github.ref == 'refs/heads/release/nightly' }}
+
       - name: Build release binaries
         env:
           RUSTFLAGS: -C target-feature=+crt-static
@@ -308,13 +318,13 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          & .\packaging\windows\smoke.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
+          & .\packaging\windows\smoke-ci.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
           git rev-parse HEAD | Set-Content -Encoding ascii packaging/dist/source-commit-windows.txt
 
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: krill-windows-${{ steps.meta.outputs.version }}
+          name: krill-windows-${{ steps.meta.outputs.version }}-attempt-${{ github.run_attempt }}
           path: |
             packaging/dist/Krill-${{ steps.meta.outputs.version }}-windows-x64.zip
             packaging/dist/Krill-${{ steps.meta.outputs.version }}-windows-x64.zip.sha256
@@ -335,7 +345,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: krill-windows-${{ needs.build-windows.outputs.version }}
+          name: krill-windows-${{ needs.build-windows.outputs.version }}-attempt-${{ github.run_attempt }}
           path: dist
 
       - name: Publish Windows assets
@@ -412,8 +422,10 @@ jobs:
             [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
           fi
           [[ "$(uname -m)" == "${EXPECTED_ARCH}" ]]
-          source /etc/os-release
-          [[ "${ID}" == ubuntu && "${VERSION_ID}" == 22.04 ]]
+          (
+            source /etc/os-release
+            [[ "${ID}" == ubuntu && "${VERSION_ID}" == 22.04 ]]
+          )
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential pkg-config
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
@@ -423,6 +435,14 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: "1.98.1"
+
+      - name: Restore Linux release dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-linux-${{ matrix.arch }}
+          cache-bin: 'false'
+          save-if: ${{ inputs.build_only && github.ref == 'refs/heads/release/nightly' }}
 
       - name: Build native Linux archive
         env:
@@ -441,7 +461,7 @@ jobs:
       - name: Upload verified Linux archive
         uses: actions/upload-artifact@v4
         with:
-          name: krill-linux-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+          name: krill-linux-${{ steps.meta.outputs.version }}-${{ matrix.arch }}-attempt-${{ github.run_attempt }}
           path: |
             packaging/dist/krill-${{ steps.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
             packaging/dist/krill-${{ steps.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
@@ -475,7 +495,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: krill-linux-${{ steps.meta.outputs.version }}-*
+          pattern: krill-linux-${{ steps.meta.outputs.version }}-*-attempt-${{ github.run_attempt }}
           merge-multiple: true
           path: dist
 

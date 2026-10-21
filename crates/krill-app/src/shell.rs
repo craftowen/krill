@@ -1969,8 +1969,7 @@ impl Shell {
             let source_state = state.clone();
             let service = bg
                 .spawn(async move {
-                    let executable = krill_proto::daemon::sibling_exe("mk-link")
-                        .unwrap_or_else(|_| PathBuf::from("mk-link"));
+                    let executable = krill_app::hosts::link::executable();
                     krill_app::hosts::link::LinkHosts::shared(state, executable)
                 })
                 .await;
@@ -2042,6 +2041,11 @@ impl Shell {
             self.host_source = Some(source);
         }
         if let Some(id) = reconnect {
+            if let Some(raw_id) = id.strip_prefix("iroh:")
+                && let Some(service) = &self.link_hosts
+            {
+                service.paired(raw_id);
+            }
             self.host_generation = self.host_generation.wrapping_add(1);
             self.host_pending_reconnects.push(id);
         }
