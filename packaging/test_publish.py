@@ -2,12 +2,14 @@
 """publish-github.sh 게시 가드 회귀 테스트. 임시 git 저장소·로컬 bare origin·가짜 gh만 쓰고 네트워크·빌드는 없다."""
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import shutil
 import subprocess
 import tempfile
 import unittest
+import zipfile
 
 HERE = Path(__file__).resolve().parent
 
@@ -119,7 +121,7 @@ class PublishGuardTests(unittest.TestCase):
         self.assert_blocked(self.publish(FAKE_RELEASE="1", KRILL_PUBLISH_FORCE="hotfix"),
                             "cannot be overridden")
 
-    def test_dry_run_only_adds_available_signed_windows_assets(self):
+    def prepare_fake_bundle(self):
         w = self.work / "packaging"
         fakes = {
             "bundle.sh": 'o=$2; mkdir -p "$o"; echo zip > "$o/Krill-0.1.0-arm64-adhoc.zip"; '
@@ -140,6 +142,10 @@ class PublishGuardTests(unittest.TestCase):
         (self.work / "crates/krill-proto/src/ipc.rs").write_text("pub const PROTO_MIN: u16 = 3;\n")
         key = self.work.parent / "update.key"
         key.write_text(os.urandom(32).hex() + "\n")
+        return key
+
+    def test_dry_run_only_adds_available_signed_windows_assets(self):
+        key = self.prepare_fake_bundle()
         result = self.publish("--dry-run", KRILL_WIN_VM_DIR="", KRILL_UPDATE_KEY_FILE=str(key))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("no Windows zip", result.stderr)
@@ -159,6 +165,56 @@ class PublishGuardTests(unittest.TestCase):
                          "https://github.com/o/r/releases/download/v0.1.0/Krill-0.1.0-windows-x64.zip")
         self.assertEqual((manifest["sha256"], manifest["min_daemon_protocol"]), ("b" * 64, 3))
         self.assertEqual(json.loads((dist / "latest.json").read_text())["sha256"], "a" * 64)
+
+    def test_nightly_native_assets_are_verified_and_windows_manifest_is_signed_locally(self):
+        key = self.prepare_fake_bundle()
+        shutil.copy2(HERE / "nightly_assets.py", self.work / "packaging/nightly_assets.py")
+        public_key = subprocess.check_output([
+            "python3", str(self.work / "packaging/macos/ed25519_manifest.py"),
+            "keygen", "--key-file", str(key)], text=True).strip()
+        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.work, text=True).strip()
+        assets = self.work.parent / "native-assets"
+        assets.mkdir()
+        for platform in ("windows", "x86_64", "aarch64"):
+            (assets / f"source-commit-{platform}.txt").write_text(head + "\n")
+        windows = assets / "Krill-0.1.0-windows-x64.zip"
+        with zipfile.ZipFile(windows, "w") as archive:
+            archive.writestr("Krill/Krill.json", json.dumps({
+                "CFBundleShortVersionString": "0.1.0", "KrillUpdatePublicKey": public_key}))
+        for arch in ("x86_64", "aarch64"):
+            (assets / f"krill-0.1.0-linux-{arch}.tar.gz").write_bytes(b"linux")
+        for archive in list(assets.glob("*.zip")) + list(assets.glob("*.tar.gz")):
+            (assets / f"{archive.name}.sha256").write_text(
+                hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
+        result = self.publish("--dry-run", KRILL_UPDATE_KEY_FILE=str(key), KRILL_RELEASE_ASSET_DIR=str(assets),
+                              KRILL_WIN_VM_DIR="", KRILL_GCP_PROJECT="")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("packaging/dist/krill-0.1.0-linux-aarch64.tar.gz", result.stdout)
+        manifest = json.loads((self.work / "packaging/dist/latest-windows.json").read_text())
+        self.assertEqual(manifest["sha256"], hashlib.sha256(windows.read_bytes()).hexdigest())
+        self.assertEqual(manifest["version"], "0.1.0")
+
+    def test_vm_and_prebuilt_assets_cannot_be_mixed(self):
+        for vm in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR"):
+            result = self.publish("--preflight", KRILL_RELEASE_ASSET_DIR="/unused", **{vm: "configured"})
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("cannot be combined with VM builds", result.stderr)
+
+    def test_main_advancing_during_bundle_build_stops_before_tagging(self):
+        key = self.prepare_fake_bundle()
+        bundle = self.work / "packaging/bundle.sh"
+        bundle.write_text(bundle.read_text() + '\ngit push -q origin moved-main:main\n')
+        self.commit("bundle fixture")
+        base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.work, text=True).strip()
+        git(self.work, "push", "origin", "main")
+        (self.work / "later-main-change").write_text("other publisher\n")
+        self.commit("main advanced")
+        git(self.work, "branch", "moved-main")
+        git(self.work, "reset", "--hard", base)
+        result = self.publish(KRILL_UPDATE_KEY_FILE=str(key))
+        self.assert_blocked(result, "origin/main changed while building")
+        tags = subprocess.check_output(["git", "tag", "--list"], cwd=self.work, text=True)
+        self.assertEqual(tags, "")
 
     def test_script_never_uploads_into_existing_release(self):
         script = (HERE / "publish-github.sh").read_text()

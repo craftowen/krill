@@ -32,6 +32,8 @@ Environment:
   KRILL_GCP_PROJECT=<id>      Linux tar.gz를 GCP 임시 VM에서 빌드해 자산에 넣는다(packaging/linux/build-gcp.sh)
   KRILL_WIN_VM_DIR=<dir>      Windows zip을 상시 Windows VM에서 빌드해 latest-windows.json·install.ps1과 함께 넣는다
                              (packaging/windows/build-vm.sh)
+  KRILL_RELEASE_ASSET_DIR=<dir> 같은 HEAD의 Windows/Linux 네이티브 빌드·스모크 산출물(야간 배포용).
+                             source-commit·체크섬·Windows 공개키 확인 후 가져온다. VM 빌드 옵션과 함께 쓰지 않는다.
   KRILL_PUBLISH_FORCE=<사유>  사람 전용 탈출구. 대화형 터미널에서 태그를 직접 입력해야 하며 사유를 출력한다.
                              이미 게시된 태그·릴리스, 로컬 태그 불일치, 공개 표면 위반은 덮어쓰지 못한다
 USAGE
@@ -98,6 +100,10 @@ if [[ -n "$BUMP" && ( "$DRY_RUN" -eq 1 || "$PREFLIGHT" -eq 1 ) ]]; then
 fi
 if [[ -n "$BIN_DIR" && "$DRY_RUN" -eq 0 ]]; then
   echo "--bin-dir is dry-run only; published binaries must come from this script's own build" >&2
+  exit 2
+fi
+if [[ -n "${KRILL_RELEASE_ASSET_DIR:-}" && ( -n "${KRILL_GCP_PROJECT:-}" || -n "${KRILL_WIN_VM_DIR:-}" ) ]]; then
+  echo "KRILL_RELEASE_ASSET_DIR cannot be combined with VM builds" >&2
   exit 2
 fi
 
@@ -346,6 +352,11 @@ chmod 755 "$OUT_DIR/install-linux.sh"
 if [[ -n "${KRILL_GCP_PROJECT:-}" ]]; then
   bash packaging/linux/build-gcp.sh "$VERSION" "$OUT_DIR"
 fi
+if [[ -n "${KRILL_RELEASE_ASSET_DIR:-}" ]]; then
+  ASSET_PUBLIC_KEY=$(python3 packaging/macos/ed25519_manifest.py keygen --key-file "$UPDATE_KEY_FILE")
+  python3 packaging/nightly_assets.py --directory "$KRILL_RELEASE_ASSET_DIR" --output "$OUT_DIR" \
+    --version "$VERSION" --commit "$HEAD_SHA" --public-key "$ASSET_PUBLIC_KEY"
+fi
 LINUX_ASSETS=("$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz "$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz.sha256)
 [[ "${#LINUX_ASSETS[@]}" -gt 0 ]] || echo "warning: no Linux tarballs (set KRILL_GCP_PROJECT to build them)" >&2
 # Windows zip: KRILL_WIN_VM_DIR가 있으면 상시 Windows VM을 켜서 빌드·스모크 후 끈다(packaging/windows/README.md).
@@ -355,6 +366,9 @@ if [[ -n "${KRILL_WIN_VM_DIR:-}" ]]; then
   WIN_PUB=$(python3 packaging/macos/ed25519_manifest.py keygen --key-file "$UPDATE_KEY_FILE")
   bash packaging/windows/build-vm.sh "$VERSION" "$WIN_PUB" \
     "${REPO_URL}/releases/latest/download/latest-windows.json" "$OUT_DIR"
+fi
+WIN_ZIP_NAME="Krill-${VERSION}-windows-x64.zip"
+if [[ -f "$OUT_DIR/$WIN_ZIP_NAME" ]]; then
   python3 packaging/macos/ed25519_manifest.py sign \
     --key-file "$UPDATE_KEY_FILE" \
     --version "$VERSION" \
@@ -404,6 +418,15 @@ fi
 # 빌드하는 사이 다른 쪽이 같은 버전을 게시했을 수 있다. 기존 릴리스에 올리는 경로는 없다(--clobber 금지).
 HARD_FAILS=0
 check_unpublished
+if git fetch --quiet origin; then
+  FINAL_MAIN_SHA=$(git rev-parse -q --verify refs/remotes/origin/main || true)
+  [[ "$HEAD_SHA" == "$FINAL_MAIN_SHA" ]] || hard_fail "origin/main changed while building; refusing to tag a stale candidate"
+else
+  hard_fail "cannot recheck origin/main before tagging"
+fi
+if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]] || ! git diff --quiet HEAD; then
+  hard_fail "source changed while building; refusing to tag an unvalidated tree"
+fi
 [[ "$HARD_FAILS" -eq 0 ]] || { echo "publish aborted before tagging" >&2; exit 1; }
 
 echo "==> [3/3] Tagging $TAG and publishing GitHub Release to $REPO..."
