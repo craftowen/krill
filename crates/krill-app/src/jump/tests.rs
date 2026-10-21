@@ -58,7 +58,8 @@ fn thousand() -> Vec<Item> {
 
 /// 완료 조건: 1,000개 항목 응답 ≤ 50ms. 검색 함수만 잰다(디버그 빌드).
 #[test]
-fn thousand_items_search_under_50ms() {
+// `_ms` 접미사로 기존 nextest latency 그룹에 포함해 다른 검사 부하와 격리한다.
+fn thousand_items_search_under_50_ms() {
     let items = thousand();
     for query in ["", "c", "워크", "0999", "feat대기", "zzz"] {
         let start = Instant::now();
@@ -138,7 +139,8 @@ fn hangul_preedit_filters_and_keys_confirm(cx: &mut TestAppContext) {
 
 /// 1,000개 항목에서 키 입력 → 거른 목록이 다시 그려질 때까지(테스트 플랫폼, 디버그 빌드).
 #[gpui::test]
-fn thousand_items_keystroke_to_render_under_50ms(cx: &mut TestAppContext) {
+// 입력부터 그리기까지의 50ms 기준은 latency 그룹에서 단독으로 측정한다.
+fn thousand_items_keystroke_to_render_under_50_ms(cx: &mut TestAppContext) {
     let (view, _, cx) = open(cx, thousand());
     let mut last = usize::MAX;
     for query in ["0", "09", "099", "0999"] {
