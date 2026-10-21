@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 from macos import ed25519_manifest as ed
 
@@ -101,6 +102,25 @@ def run(args, capture=False, timeout=14400):
     return result.stdout or ""
 
 
+def verify_bundle(receipt, head, key_file, bundle):
+    raw = verify(receipt, head, key_file)
+    paths = {name: bundle / "Contents" / ("MacOS" if name in ("krill-app", "krill") else "Helpers") / name
+             for name in BINARIES}
+    # 코드 서명만 제거한 두 사본을 비교한다. 원본·서명 번들은 수정하지 않는다.
+    with tempfile.TemporaryDirectory(prefix="lineage-", dir=Path(receipt).parent) as temporary:
+        for name, binary in paths.items():
+            normalized = []
+            for label, source in (("tested", raw / name), ("signed", binary)):
+                destination = Path(temporary) / (label + "-" + name)
+                shutil.copyfile(source, destination)
+                run(["/usr/bin/codesign", "--remove-signature", destination])
+                run(["/usr/bin/codesign", "--force", "--sign", "-", "--identifier", "dev.krill.lineage",
+                     "--timestamp=none", destination])
+                normalized.append(sha256(destination))
+            if normalized[0] != normalized[1]:
+                raise ValueError(f"signed bundle differs from the tested binary: {name}")
+
+
 def test_executable(package, target):
     output = run(["cargo", "test", "--release", "--locked", "-p", package, "--test", target,
                   "--no-run", "--message-format=json"], capture=True)
@@ -125,6 +145,8 @@ def validate(head, directory, key_file):
         raise ValueError("all release validation targets must stay on the external volume")
     if run(["git", "rev-parse", "HEAD"], capture=True).strip() != head:
         raise ValueError("validation source HEAD does not match")
+    if run(["git", "status", "--porcelain"], capture=True).strip():
+        raise ValueError("release validation requires a clean tracked and untracked source tree")
     run(["git", "diff", "--exit-code", "HEAD"])
     # 전체 check.sh는 최종 후보에서 한 번만. 메모리 검사는 아래에서 출고 바이너리에 직접 실행한다.
     checkpoint = directory.parent / f"{head}-full-check.json"
@@ -185,11 +207,15 @@ def main():
     parser.add_argument("--receipt", type=Path)
     parser.add_argument("--key-file", type=Path)
     parser.add_argument("--base")
+    parser.add_argument("--bundle", type=Path)
     args = parser.parse_args()
     if args.action == "target-dir":
         print(target_directory(args.base))
     elif args.action == "verify":
-        print(verify(args.receipt, args.head, args.key_file))
+        if args.bundle:
+            verify_bundle(args.receipt, args.head, args.key_file, args.bundle)
+        else:
+            print(verify(args.receipt, args.head, args.key_file))
     else:
         print(validate(args.head, args.directory, args.key_file))
 
