@@ -523,6 +523,7 @@ fn agent_profile_permissions_are_fixed_at_spawn_and_survive_restart() {
     let dir = tmp("agent-launch");
     let sock = dir.join("run/k.sock");
     fs::write(dir.join("agents.toml"), r#"
+permission = "manual"
 [agent.fixture]
 name = "Fixture"
 launch = ["/bin/sh", "-c", 'printf "ARG=%s\n" "$@"; printf "INTERNAL=%s/%s\n" "${MK_PANE_ID-unset}" "${KRILL_PRIVATE-unset}"; while :; do sleep 1; done', "fixture"]
