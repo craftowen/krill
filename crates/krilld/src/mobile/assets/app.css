@@ -191,6 +191,9 @@ button.account-row:disabled{opacity:1}
 .workspace-filters{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--border);background:var(--surface-panel)}
 .workspace-filters>select{flex:1;min-width:0;width:calc(50% - 4px);padding:6px 8px;min-height:36px}
 .workspace-filters>.text-button{flex:none;min-height:32px;margin:0;padding:4px 8px}
+.workspaces .workspace-list{padding-inline:var(--space-sm)}
+.workspaces .repo-group>.workspace-row{padding-inline-start:var(--space-xl)}
+.workspaces .repo-group>.workspace-row:after{left:calc(var(--space-xl) + var(--space-lg) + var(--space-sm))}
 
 /* Conversation text leads; tool runs and their individual payloads are closed disclosures. */
 .chat-feed{gap:12px;padding:12px 16px}
