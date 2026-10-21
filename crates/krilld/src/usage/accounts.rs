@@ -18,7 +18,7 @@ use krill_proto::usage::{
     AUTO_SWITCH_HYSTERESIS, AUTO_SWITCH_THRESHOLD_MAX, AUTO_SWITCH_THRESHOLD_MIN, AccountInfo,
     AccountStatus, AccountStatusInfo, AccountsSnapshot, AutoSwitchEvent, AutoSwitchMetric,
     AutoSwitchPolicy, AutoSwitchRule, DEFAULT_AUTO_SWITCH_PERCENT, OrphanProfile, ProviderKind,
-    Snapshot, Window as ProtoWindow,
+    ResetConsumeOutcome, Snapshot, Window as ProtoWindow,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1485,6 +1485,56 @@ pub fn switch_account(
     Ok(refresh_accounts_with(home, state_dir, false))
 }
 
+/// Codex banked reset 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다.
+/// Codex만 지원한다. 소진 성공(`Reset`·`AlreadyRedeemed`)에는 로컬 한도 기록을 지워
+/// 자동전환이 다시 평가하게 하고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
+/// 네트워크·자격증명 실패는 `Err`다(호출자가 자동 재시도하지 않는다: 멱등 키가 호출마다 새 값이라
+/// 재시도가 새 소진이 된다. 타임아웃은 크레딧부터 다시 확인한다).
+pub fn consume_reset_credit(
+    home: &Path,
+    state_dir: Option<&Path>,
+    provider: ProviderKind,
+    account_id: &str,
+) -> io::Result<(AccountsSnapshot, ResetConsumeOutcome, u64)> {
+    if provider != ProviderKind::Codex {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "reset credits are only available for codex",
+        ));
+    }
+    let snap = refresh_accounts_with(home, state_dir, false);
+    let Some(target) = snap
+        .accounts
+        .iter()
+        .find(|a| a.provider == provider && a.id == account_id)
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("account not found: {account_id}"),
+        ));
+    };
+    if !runnable(target) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("account has no krill profile dir: {account_id}"),
+        ));
+    }
+    let dir = PathBuf::from(&target.profile_dir);
+    let Some((outcome, windows)) =
+        super::direct::consume_reset_credit(provider, &dir, target.host_default, home, state_dir)
+    else {
+        return Err(io::Error::other("사용량 초기화 실패(크레딧부터 다시 확인)"));
+    };
+    if matches!(
+        outcome,
+        ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed
+    ) {
+        clear_rate_limited(provider, account_id);
+    }
+    super::direct::evict_profile(home, provider, &dir);
+    Ok((refresh_accounts(home, state_dir), outcome, windows))
+}
+
 /// 새 계정 프로필 등록(MK-107). `profile_dir`이 비어 있으면 기본 프로필 경로를 자동 생성한다.
 pub fn add_account(
     home: &Path,
@@ -1884,6 +1934,48 @@ mod tests {
 
         std::fs::remove_dir_all(&dir).ok();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn consume_reset_credit_rejects_without_network() {
+    use std::io::ErrorKind;
+    let root = std::env::temp_dir().join(format!("reset-credit-{}", std::process::id()));
+    std::fs::remove_dir_all(&root).ok();
+    let home = root.join("home");
+    let state = root.join("state");
+    let profile = home.join("codex-a");
+    std::fs::create_dir_all(&profile).unwrap();
+    // 프로바이더 제한·계정 확인은 네트워크 전에 일어난다.
+    assert_eq!(
+        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "x")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::InvalidInput
+    );
+    assert_eq!(
+        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "missing")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::NotFound
+    );
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(
+        state.join("accounts.toml"),
+        format!(
+            "[[accounts]]\nid = 'codex-a'\nprovider = 'codex'\nlabel = 'a'\nprofile_dir = '{}'\n",
+            profile.display()
+        ),
+    )
+    .unwrap();
+    // 자격증명이 없으면 소진 요청을 보내지 않고 실패한다(네트워크 금지).
+    assert_eq!(
+        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Other
+    );
+    std::fs::remove_dir_all(&root).ok();
 }
 
 #[cfg(test)]

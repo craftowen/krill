@@ -650,6 +650,141 @@ fn compact_account_usage(usage: &krill_proto::usage::Snapshot) -> String {
     krill_app::accounts::display::summary(usage, krill_app::accounts::display::now())
 }
 
+/// Codex banked reset 크레딧 수. 미터가 없으면 `None`(행 자체를 그리지 않는다).
+fn reset_credit_count(snap: &AccountsSnapshot, account: &AccountInfo) -> Option<u64> {
+    snap.meters_for(&account.id)?
+        .meters
+        .iter()
+        .find(|m| m.key == krill_proto::usage::RESET_CREDITS_METER_KEY)?
+        .value
+        .as_deref()?
+        .parse::<u64>()
+        .ok()
+}
+
+/// 상태바 사용량 팝업의 "사용량 초기화" 행(Codex 전용 2단계 확인).
+/// 1단계 행을 누르면 무장하고 메뉴가 닫히고, 다시 열면 안내·실행·취소 행이 보인다.
+fn append_reset_credit_rows(
+    mut menu: PopupMenu,
+    snap: &AccountsSnapshot,
+    active: Option<&AccountInfo>,
+    provider: ProviderKind,
+    reset_armed: Option<&(ProviderKind, String)>,
+    weak: &WeakEntity<Shell>,
+) -> PopupMenu {
+    if provider != ProviderKind::Codex {
+        return menu;
+    }
+    let Some(account) = active else {
+        return menu;
+    };
+    let Some(credits) = reset_credit_count(snap, account) else {
+        return menu;
+    };
+    let account_id = account.id.clone();
+    let armed = reset_armed.is_some_and(|(p, id)| *p == provider && *id == account_id);
+    if armed {
+        let (title, _) = krill_app::settings::account_heading(account);
+        let info = provider_text::PROVIDER_RESET_USAGE_INFO.format(&[("account", &title)]);
+        menu = menu.item(
+            PopupMenuItem::element(move |_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage-info")
+                    .debug_selector(|| "status-provider-reset-usage-info".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(info.clone())
+            })
+            .disabled(true),
+        );
+        let confirm_weak = weak.clone();
+        let confirm_id = account_id.clone();
+        menu = menu.item(
+            PopupMenuItem::element(move |_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage-confirm")
+                    .debug_selector(|| "status-provider-reset-usage-confirm".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .text_size(ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(p.destructive)
+                    .child(provider_text::PROVIDER_RESET_USAGE_CONFIRM.get())
+            })
+            .on_click(move |_, _, cx| {
+                confirm_weak
+                    .update(cx, |shell, cx| {
+                        shell.consume_reset_credit(provider, confirm_id.clone(), cx);
+                    })
+                    .ok();
+            }),
+        );
+        let cancel_weak = weak.clone();
+        menu = menu.item(
+            PopupMenuItem::element(|_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage-cancel")
+                    .debug_selector(|| "status-provider-reset-usage-cancel".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .child(provider_text::PROVIDER_RESET_USAGE_CANCEL.get())
+            })
+            .on_click(move |_, _, cx| {
+                cancel_weak
+                    .update(cx, |shell, _| {
+                        shell.reset_armed = None;
+                    })
+                    .ok();
+            }),
+        );
+    } else if credits > 0 {
+        let arm_weak = weak.clone();
+        menu = menu.item(
+            PopupMenuItem::element(move |_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage")
+                    .debug_selector(|| "status-provider-reset-usage".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.foreground)
+                    .child(provider_text::PROVIDER_RESET_USAGE.get())
+            })
+            .on_click(move |_, _, cx| {
+                arm_weak
+                    .update(cx, |shell, _| {
+                        shell.reset_armed = Some((provider, account_id.clone()));
+                    })
+                    .ok();
+            }),
+        );
+    } else {
+        menu = menu.item(
+            PopupMenuItem::element(|_, cx| {
+                let p = ui::palette(cx);
+                div()
+                    .id("status-provider-reset-usage")
+                    .debug_selector(|| "status-provider-reset-usage".into())
+                    .w(px(264.))
+                    .py_0p5()
+                    .text_size(ui::TEXT_SM)
+                    .text_color(p.muted_foreground)
+                    .child(provider_text::PROVIDER_RESET_USAGE_NONE.get())
+            })
+            .disabled(true),
+        );
+    }
+    menu
+}
+
 fn provider_usage_menu(
     mut menu: PopupMenu,
     snap: &AccountsSnapshot,
@@ -657,6 +792,7 @@ fn provider_usage_menu(
     weak: WeakEntity<Shell>,
     window: &mut Window,
     cx: &mut Context<PopupMenu>,
+    reset_armed: Option<&(ProviderKind, String)>,
 ) -> PopupMenu {
     let mut accounts: Vec<_> = snap
         .accounts
@@ -672,6 +808,8 @@ fn provider_usage_menu(
         .cloned();
 
     menu = menu.min_w(px(300.)).max_w(px(340.));
+    // `active`는 아래 규칙 서브메뉴에서 이동하므로 초기화 행은 복제본을 쓴다.
+    let reset_account = active.clone();
     let active_card = active.clone();
     let active_meters = active
         .as_ref()
@@ -860,7 +998,14 @@ fn provider_usage_menu(
         .separator()
         .label(provider_text::PROVIDER_ACCOUNTS_HEADER.get());
     for account in &accounts {
-        let (title, _) = krill_app::settings::account_heading(account);
+        let (mut title, _) = krill_app::settings::account_heading(account);
+        if title.trim().is_empty() {
+            title = if account.label.trim().is_empty() {
+                account.id.clone()
+            } else {
+                account.label.clone()
+            };
+        }
         let usage_summary = snap.meters_for(&account.id).map_or_else(
             || compact_account_usage(&account.usage),
             |m| {
@@ -941,6 +1086,8 @@ fn provider_usage_menu(
                             .child(
                                 div()
                                     .flex_none()
+                                    .max_w(px(120.))
+                                    .truncate()
                                     .font_family(ui::FONT_MONO)
                                     .text_size(ui::TEXT_2XS)
                                     .text_color(p.muted_foreground)
@@ -1068,38 +1215,46 @@ fn provider_usage_menu(
         );
     }
     let refresh_weak = weak.clone();
+    let reset_weak = weak.clone();
     let open_weak = weak;
-    menu.separator()
-        .item(
-            PopupMenuItem::new(provider_text::PROVIDER_REFRESH_USAGE.get()).on_click(
-                move |_, _, cx| {
-                    refresh_weak
-                        .update(cx, |shell, cx| {
-                            shell.refresh_usage_manually(cx);
-                        })
-                        .ok();
-                },
-            ),
-        )
-        .item(
-            PopupMenuItem::element(|_, cx| {
-                let p = ui::palette(cx);
-                div()
-                    .id("status-provider-open-accounts")
-                    .debug_selector(|| "status-provider-open-accounts".into())
-                    .text_size(ui::TEXT_SM)
-                    .text_color(p.foreground)
-                    .child(provider_text::PROVIDER_OPEN_SETTINGS.get())
-            })
-            .on_click(move |_, window, cx| {
-                open_settings_from_menu(
-                    &open_weak,
-                    krill_app::settings::AdminTab::Accounts,
-                    window,
-                    cx,
-                );
-            }),
-        )
+    menu = menu.separator().item(
+        PopupMenuItem::new(provider_text::PROVIDER_REFRESH_USAGE.get()).on_click(
+            move |_, _, cx| {
+                refresh_weak
+                    .update(cx, |shell, cx| {
+                        shell.refresh_usage_manually(cx);
+                    })
+                    .ok();
+            },
+        ),
+    );
+    menu = append_reset_credit_rows(
+        menu,
+        snap,
+        reset_account.as_ref(),
+        provider,
+        reset_armed,
+        &reset_weak,
+    );
+    menu.item(
+        PopupMenuItem::element(|_, cx| {
+            let p = ui::palette(cx);
+            div()
+                .id("status-provider-open-accounts")
+                .debug_selector(|| "status-provider-open-accounts".into())
+                .text_size(ui::TEXT_SM)
+                .text_color(p.foreground)
+                .child(provider_text::PROVIDER_OPEN_SETTINGS.get())
+        })
+        .on_click(move |_, window, cx| {
+            open_settings_from_menu(
+                &open_weak,
+                krill_app::settings::AdminTab::Accounts,
+                window,
+                cx,
+            );
+        }),
+    )
 }
 
 fn open_settings_from_menu(
@@ -1498,6 +1653,7 @@ impl Shell {
                         .debug_selector(move || detail_selector.clone())
                         .child(label),
                 );
+            let reset_armed = self.reset_armed.clone();
             provider_pills = provider_pills.child(
                 ui::button_with_tooltip_when(tooltips_on, pill_btn, selector, description)
                     .dropdown_menu(move |menu, window, cx| {
@@ -1508,6 +1664,7 @@ impl Shell {
                             weak.clone(),
                             window,
                             cx,
+                            reset_armed.as_ref(),
                         )
                     })
                     .on_open_change(track_menu_open(cx.weak_entity())),

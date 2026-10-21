@@ -5399,6 +5399,149 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
     assert!(cx.debug_bounds("admin-accounts-refresh").is_some());
 }
 
+/// 상태바 Codex 팝업의 "사용량 초기화" 2단계 확인(무장 → 실행/취소).
+#[gpui::test]
+fn status_provider_usage_menu_reset_credit_arms_and_confirms(cx: &mut TestAppContext) {
+    use krill_proto::usage::{
+        AccountInfo, AccountMeters, AccountsSnapshot, ProviderKind, Snapshot, UsageMeter, Window,
+    };
+
+    let layout = state_path("provider-usage-reset");
+    let state_dir = layout.parent().unwrap().to_path_buf();
+    let (view, cx) = open(cx, layout);
+    cx.update(|_, cx| {
+        krill_app::settings::init_at(Some(state_dir), cx);
+    });
+    cx.run_until_parked();
+    let codex = AccountInfo {
+        id: "codex-main".into(),
+        provider: ProviderKind::Codex,
+        label: "Codex Main".into(),
+        email: Some("codex@example.dev".into()),
+        profile_dir: "/tmp/codex-main".into(),
+        active: true,
+        host_default: false,
+        stale: false,
+        usage: Snapshot {
+            five_hour: Some(Window {
+                percent: 72,
+                resets_at: Some("2h 5m".into()),
+            }),
+            seven_day: Some(Window {
+                percent: 31,
+                resets_at: Some("5d 1h".into()),
+            }),
+        },
+    };
+    let with_credits = |credits: &str| AccountsSnapshot {
+        accounts: vec![codex.clone()],
+        auto_switch: krill_proto::usage::AutoSwitchPolicy::default(),
+        switched: Vec::new(),
+        statuses: Vec::new(),
+        advanced: krill_proto::usage::AccountPolicyState::default(),
+        connections: Box::default(),
+        details: Box::new(krill_proto::usage::ProviderDetails {
+            supported: true,
+            accounts: vec![AccountMeters {
+                account_id: codex.id.clone(),
+                plan: Some("plus".into()),
+                meters: vec![
+                    UsageMeter {
+                        key: "5h".into(),
+                        label: "5h".into(),
+                        window: codex.usage.five_hour.clone(),
+                        value: None,
+                    },
+                    UsageMeter {
+                        key: "reset_credits".into(),
+                        label: "Reset credits".into(),
+                        window: None,
+                        value: Some(credits.to_owned()),
+                    },
+                ],
+            }],
+            handoffs: Vec::new(),
+        }),
+    };
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            shell.accounts_snapshot = with_credits("2");
+            cx.notify();
+        });
+    });
+    cx.simulate_resize(gpui::size(px(1800.), px(900.)));
+    cx.run_until_parked();
+    let open_menu = |cx: &mut VisualTestContext| {
+        let pill = cx
+            .debug_bounds("status-provider-pill-codex")
+            .expect("Codex provider pill");
+        cx.simulate_click(pill.center(), Modifiers::default());
+        cx.run_until_parked();
+    };
+    open_menu(cx);
+    // 1단계 행을 누르면 무장하고 메뉴가 닫힌다.
+    let arm = cx
+        .debug_bounds("status-provider-reset-usage")
+        .expect("reset arm row");
+    cx.simulate_click(arm.center(), Modifiers::default());
+    cx.run_until_parked();
+    // 다시 열면 안내·실행·취소 행이 보인다.
+    open_menu(cx);
+    for selector in [
+        "status-provider-reset-usage-info",
+        "status-provider-reset-usage-confirm",
+        "status-provider-reset-usage-cancel",
+    ] {
+        assert!(
+            cx.debug_bounds(selector).is_some(),
+            "missing reset confirm row: {selector}"
+        );
+    }
+    assert!(cx.debug_bounds("status-provider-reset-usage").is_none());
+    // 취소하면 무장이 풀린다.
+    let cancel = cx
+        .debug_bounds("status-provider-reset-usage-cancel")
+        .unwrap();
+    cx.simulate_click(cancel.center(), Modifiers::default());
+    cx.run_until_parked();
+    open_menu(cx);
+    assert!(cx.debug_bounds("status-provider-reset-usage").is_some());
+    assert!(
+        cx.debug_bounds("status-provider-reset-usage-confirm")
+            .is_none()
+    );
+    // 실행하면 소진 요청을 보내고(테스트에 데몬이 없어 실패 배너) 무장이 풀린다.
+    let arm = cx.debug_bounds("status-provider-reset-usage").unwrap();
+    cx.simulate_click(arm.center(), Modifiers::default());
+    cx.run_until_parked();
+    open_menu(cx);
+    let confirm = cx
+        .debug_bounds("status-provider-reset-usage-confirm")
+        .unwrap();
+    cx.simulate_click(confirm.center(), Modifiers::default());
+    cx.run_until_parked();
+    let notice = cx.update(|_, cx| view.read(cx).notice.clone());
+    assert!(notice.is_some(), "consume failure must surface a notice");
+    // 크레딧이 없으면 비활성 행만 보인다.
+    cx.update(|_, cx| {
+        view.update(cx, |shell, cx| {
+            shell.notice = None;
+            shell.accounts_snapshot = with_credits("0");
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    open_menu(cx);
+    assert!(
+        cx.debug_bounds("status-provider-reset-usage").is_some(),
+        "exhausted credits still show a disabled row"
+    );
+    assert!(
+        cx.debug_bounds("status-provider-reset-usage-confirm")
+            .is_none()
+    );
+}
+
 /// 닫기 버튼·가운데 버튼 모두 탭 세션을 데몬에서 끝낸다(Orca처럼 닫기 = 종료).
 #[gpui::test]
 fn pointer_closed_tabs_end_their_session(cx: &mut TestAppContext) {
@@ -7968,5 +8111,27 @@ fn host_snapshot_does_not_block_menus_or_apply_superseded_sources(cx: &mut TestA
                 .iter()
                 .any(|(id, _)| *id == krill_hosts::HostId::Remote("new".into()))
         );
+    });
+}
+
+/// 손상된 탐색 인덱스(디스크 복원·경쟁으로 entries 범위를 벗어난 경우)에서도
+/// 뒤로/앞으로 탐색이 패닉 없이 실패한다.
+#[gpui::test]
+fn navigation_history_tolerates_corrupt_index_without_panicking(cx: &mut TestAppContext) {
+    let path = state_path("nav-history-corrupt-index");
+    let (view, cx) = open(cx, path);
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            s.nav_history.index = 999;
+        });
+    });
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert!(!s.can_navigate_back(cx));
+            assert!(!s.can_navigate_forward(cx));
+            assert!(!s.navigate_back(None, cx));
+            assert!(!s.navigate_forward(None, cx));
+        });
     });
 }

@@ -12,7 +12,9 @@ pub const FEAT_USAGE: u64 = 1 << 17;
 /// Provider-specific meters and running-session account handoff results.
 pub const FEAT_PROVIDER_DETAILS: u64 = 1 << 15;
 mod details;
-pub use details::{AccountMeters, ProviderDetails, SessionHandoff, UsageMeter};
+pub use details::{
+    AccountMeters, ProviderDetails, RESET_CREDITS_METER_KEY, SessionHandoff, UsageMeter,
+};
 /// Create 계정 선택·고급 정책·이력·모델별 창(OWE-712 지휘자 배정).
 pub const FEAT_ACCOUNT_POLICY: u64 = 1 << 61;
 /// OWE-719: 연결 상태·읽기 전용 직접 사용량 설정 꼬리.
@@ -32,6 +34,9 @@ pub const FEAT_USAGE_RATELIMIT: u64 = 1 << 60;
 /// 계정 라벨 변경·데이터 삭제·고아 프로필 정리 요청과 [`UsageReply::Orphans`](OWE-704·705).
 /// 협상하지 않은 데몬에는 보내지 않는다(구 데몬은 모르는 variant를 `BadRequest`로 거부).
 pub const FEAT_USAGE_MANAGE: u64 = 1 << 59;
+/// Codex banked rate-limit reset 크레딧 소진 요청·응답. 협상하지 않은 데몬에는 보내지 않는다
+/// (구 데몬은 모르는 variant를 `BadRequest`로 거부한다).
+pub const FEAT_USAGE_RESET: u64 = 1 << 49;
 /// 상태바 경고 기준 사용률(MK-084 완료 조건: 80% 경고). krilld와 UI가 같은 값을 쓴다.
 pub const WARN_PERCENT: u8 = 80;
 /// 상태바·계정 카드 위험 색 기준 사용률(OWE-708). [`WARN_PERCENT`] 이상은 경고, 이 값 이상은 위험.
@@ -687,6 +692,12 @@ pub enum UsageRequest {
         source_dir: String,
         dry_run: bool,
     },
+    /// Codex banked reset 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다 →
+    /// [`UsageReply::ResetConsumed`]. [`FEAT_USAGE_RESET`]을 협상한 피어에만 보낸다.
+    ConsumeResetCredit {
+        provider: ProviderKind,
+        account_id: String,
+    },
 }
 
 impl UsageRequest {
@@ -700,7 +711,8 @@ impl UsageRequest {
             | Self::RemoveAccount { provider, .. }
             | Self::RemoveAutoSwitchRule { provider, .. }
             | Self::RenameAccount { provider, .. }
-            | Self::DeleteAccount { provider, .. } => retired(*provider),
+            | Self::DeleteAccount { provider, .. }
+            | Self::ConsumeResetCredit { provider, .. } => retired(*provider),
             Self::SetAutoSwitch(policy) => policy.rules.iter().any(|rule| retired(rule.provider)),
             Self::UpsertAutoSwitchRule(rule) => retired(rule.provider),
             _ => false,
@@ -739,6 +751,10 @@ impl UsageRequest {
             Self::SwitchAccount { provider, .. }
             | Self::AddAccount { provider, .. }
             | Self::RemoveAccount { provider, .. } => Some(*provider),
+            Self::ConsumeResetCredit { provider, .. } => {
+                features |= FEAT_USAGE_RESET;
+                Some(*provider)
+            }
             Self::RenameAccount { provider, .. } | Self::DeleteAccount { provider, .. } => {
                 features |= FEAT_USAGE_MANAGE;
                 Some(*provider)
@@ -775,6 +791,16 @@ impl UsageRequest {
     }
 }
 
+/// Codex banked rate-limit reset 소진 결과. `wham/rate-limit-reset-credits/consume` 응답의
+/// `code` 그대로다(`reset`·`nothing_to_reset`·`no_credit`·`already_redeemed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetConsumeOutcome {
+    Reset,
+    NothingToReset,
+    NoCredit,
+    AlreadyRedeemed,
+}
+
 /// [`kind::USAGE_REPLY`]. variant는 끝에만 붙인다.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UsageReply {
@@ -785,6 +811,12 @@ pub enum UsageReply {
     Orphans(Vec<OrphanProfile>),
     /// [`UsageRequest::GetProvisioning`]·[`UsageRequest::SetProvisioning`] 응답.
     Provisioning(bool),
+    /// [`UsageRequest::ConsumeResetCredit`] 응답. 소진 결과와 소진 직후 스냅샷을 함께 돌려준다.
+    ResetConsumed {
+        snapshot: AccountsSnapshot,
+        outcome: ResetConsumeOutcome,
+        windows_reset: u64,
+    },
 }
 
 /// 등록되지 않은 Krill 관리 프로필 폴더(OWE-704). 이전 버전의 "제거"가 남긴 폴더 등.
@@ -798,6 +830,12 @@ impl UsageReply {
     /// Hide extensions that the peer cannot decode; retain the N-1 response prefix.
     #[must_use]
     pub fn for_features(mut self, features: u64) -> Self {
+        if features & FEAT_USAGE_RESET == 0
+            && let Self::ResetConsumed { snapshot, .. } = self
+        {
+            // 소진 결과를 모르는 피어에는 스냅샷만 남긴다(요청 자체가 새 비트를 요구한다).
+            self = Self::Accounts(snapshot);
+        }
         if let Self::Accounts(snapshot) = &mut self {
             if features & FEAT_PROVIDER_DETAILS == 0 {
                 *snapshot.details = ProviderDetails::default();
