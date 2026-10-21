@@ -288,6 +288,7 @@ pub struct WorkspaceFilters {
     pub always_show_default_branch: bool,
     pub hide_automation: bool,
     pub hide_cli: bool,
+    /// Project selector entries belong to this app's local host.
     pub repos: BTreeSet<PathBuf>,
     pub hosts: BTreeSet<String>,
 }
@@ -1001,6 +1002,11 @@ impl Sidebar {
     }
 
     pub(super) fn remote_rows(&self, remote: &super::RemoteHost) -> Vec<Row> {
+        // The project selector is populated from self.snapshot (local projects).
+        // Applying its paths to another PC hides valid daemon-owned projects,
+        // including when both machines happen to use the same absolute paths.
+        let mut options = self.options.clone();
+        options.filters.repos.clear();
         let parents = self.merged_parents();
         let ctx = WorktreeContext {
             meta: Some(&remote.meta),
@@ -1023,7 +1029,7 @@ impl Sidebar {
             &self.collapsed,
             &self.collapsed_groups,
             &self.shown_external,
-            &self.options,
+            &options,
             &ctx,
         )
     }
