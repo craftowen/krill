@@ -1103,6 +1103,127 @@ fn orchestration_worker_stop_settles_after_session_killed() {
     }
 }
 
+/// agy-shaped PTY work uses Krill's guide, absolute CLI, Unicode questions, and settlement.
+/// This exercises the real holder/daemon protocol with a fixture, not a live model.
+#[test]
+fn orchestration_agy_full_and_minimal_workers_read_guide_ask_and_report() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let d = Daemon::configured_schedules_home("agy-skills", None, None, true);
+    let scripts = d.dir.join("agy fixture with spaces");
+    fs::create_dir_all(&scripts).unwrap();
+    let executable = scripts.join("agy");
+    fs::write(&executable, include_str!("fixtures/krill-agy-worker.py")).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(
+        d.dir.join("agents.toml"),
+        format!(
+            "[agent.agy]\nname = \"AGY protocol fixture\"\nlaunch = [{}]\nyolo_args = []\n",
+            serde_json::to_string(&executable.display().to_string()).unwrap(),
+        ),
+    )
+    .unwrap();
+    let run: serde_json::Value = serde_json::from_str(&d.ok(&[
+        "orchestration",
+        "run-create",
+        "--title",
+        "AGY workflow",
+        "--json",
+    ]))
+    .unwrap();
+    let run = run["id"].as_str().unwrap();
+    for mode in ["full", "minimal"] {
+        let task: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "task-create",
+            "--run",
+            run,
+            "--title",
+            mode,
+            "--json",
+        ]))
+        .unwrap();
+        let task_id = task["id"].as_str().unwrap();
+        let dispatch: serde_json::Value = serde_json::from_str(&d.ok(&[
+            "orchestration",
+            "worker-start",
+            "--run",
+            run,
+            "--task",
+            task_id,
+            "--worker",
+            &format!("agy-{mode}"),
+            "--agent",
+            "agy",
+            "--preamble",
+            mode,
+            "--cwd",
+            scripts.to_str().unwrap(),
+            "--prompt",
+            "한글 작업\n검증 근거를 남기세요",
+            "--json",
+        ]))
+        .unwrap();
+        let deadline = Instant::now() + WAIT;
+        let question = loop {
+            let mail: serde_json::Value = serde_json::from_str(&d.ok(&[
+                "orchestration",
+                "inbox",
+                "--to",
+                "coordinator",
+                "--run",
+                run,
+                "--json",
+            ]))
+            .unwrap();
+            if let Some(question) = mail
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["msg_type"] == "question" && m["from"] == format!("agy-{mode}"))
+            {
+                break question["id"].as_str().unwrap().to_owned();
+            }
+            assert!(Instant::now() < deadline, "agy fixture did not ask: {mail}");
+            thread::sleep(Duration::from_millis(20));
+        };
+        d.ok(&[
+            "orchestration",
+            "reply",
+            &question,
+            "--body",
+            "검증 후 진행\n범위 유지",
+            "--json",
+        ]);
+        let sid = dispatch["session_id"].as_u64().unwrap().to_string();
+        d.wait_text(&sid, "agy-fixture-completion-accepted");
+        let task_state: serde_json::Value =
+            serde_json::from_str(&d.ok(&["orchestration", "task-list", "--run", run, "--json"]))
+                .unwrap();
+        assert!(
+            task_state
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["id"] == task_id && t["status"] == "completed")
+        );
+        let dispatch_id = dispatch["id"].as_str().unwrap();
+        let report: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(scripts.join(format!("agy-evidence-{dispatch_id}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert!(report["prompt"].as_str().unwrap().contains("한글 작업"));
+        for root in krill_proto::orchestration::skill_directories(&d.dir.join("empty-home"), "agy")
+        {
+            assert!(
+                !root.exists(),
+                "isolated daemon wrote host skills: {root:?}"
+            );
+        }
+        d.ok(&["orchestration", "worker-release", dispatch_id, "--json"]);
+        assert!(!ls_has_session(&d.ok(&["ls"]), &sid));
+    }
+}
+
 #[test]
 fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     use std::os::unix::fs::PermissionsExt;
