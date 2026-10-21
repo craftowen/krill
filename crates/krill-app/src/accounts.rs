@@ -27,8 +27,16 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
     AccountInfo, AccountsSnapshot, AutoSwitchPolicy, AutoSwitchRule, FEAT_USAGE, OrphanProfile,
-    ProviderKind, Snapshot, UsageReply, UsageRequest, Window,
+    ProviderKind, ResetConsumeOutcome, Snapshot, UsageReply, UsageRequest, Window,
 };
+
+/// [`UsageRequest::ConsumeResetCredit`] 결과. 스냅샷과 소진 결과를 함께 들고 온다.
+#[derive(Debug, Clone)]
+pub struct ResetConsumed {
+    pub snapshot: AccountsSnapshot,
+    pub outcome: ResetConsumeOutcome,
+    pub windows_reset: u64,
+}
 use serde::{Deserialize, Serialize};
 
 const ACCOUNTS_FILE: &str = "accounts.toml";
@@ -194,11 +202,31 @@ pub fn request(paths: Option<&Paths>, req: &UsageRequest) -> Result<AccountsSnap
 /// 데몬에만 묻는다(로컬 폴백 없음). 설정 화면이 데몬 연결 여부를 가릴 때 쓴다(OWE-697).
 pub fn request_ipc(paths: &Paths, req: &UsageRequest) -> Result<AccountsSnapshot, String> {
     match exchange(paths, req)? {
-        UsageReply::Accounts(snap) => Ok(snap),
+        UsageReply::Accounts(snap) | UsageReply::ResetConsumed { snapshot: snap, .. } => Ok(snap),
         UsageReply::Current(_) | UsageReply::Orphans(_) | UsageReply::Provisioning(_) => {
             Ok(AccountsSnapshot::default())
         }
         UsageReply::Failed(e) => Err(failure_text(e)),
+    }
+}
+
+/// Codex banked reset 크레딧 소진. 데몬에만 묻는다(로컬 폴백 없음).
+pub fn consume_reset_credit_ipc(
+    paths: &Paths,
+    req: &UsageRequest,
+) -> Result<ResetConsumed, String> {
+    match exchange(paths, req)? {
+        UsageReply::ResetConsumed {
+            snapshot,
+            outcome,
+            windows_reset,
+        } => Ok(ResetConsumed {
+            snapshot,
+            outcome,
+            windows_reset,
+        }),
+        UsageReply::Failed(e) => Err(failure_text(e)),
+        _ => Err("unexpected account reply".to_owned()),
     }
 }
 
@@ -207,9 +235,10 @@ pub fn orphans_ipc(paths: &Paths, req: &UsageRequest) -> Result<Vec<OrphanProfil
     match exchange(paths, req)? {
         UsageReply::Orphans(list) => Ok(list),
         UsageReply::Failed(e) => Err(failure_text(e)),
-        UsageReply::Accounts(_) | UsageReply::Current(_) | UsageReply::Provisioning(_) => {
-            Ok(Vec::new())
-        }
+        UsageReply::Accounts(_)
+        | UsageReply::Current(_)
+        | UsageReply::Provisioning(_)
+        | UsageReply::ResetConsumed { .. } => Ok(Vec::new()),
     }
 }
 
@@ -238,7 +267,8 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_USAGE_RATELIMIT
         | krill_proto::usage::FEAT_USAGE_MANAGE
         | krill_proto::usage::FEAT_ACCOUNT_POLICY
-        | krill_proto::usage::FEAT_ACCOUNT_CONNECTION;
+        | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
+        | krill_proto::usage::FEAT_USAGE_RESET;
     let mut conn = daemon::connect(paths, &hello).map_err(|e| e.to_string())?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("FEAT_USAGE not negotiated".to_owned());
@@ -429,6 +459,10 @@ pub fn request_local(
         UsageRequest::SetProvisioning(_) | UsageRequest::GetProvisioning => Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "provisioning requires daemon",
+        )),
+        UsageRequest::ConsumeResetCredit { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "reset credits require daemon",
         )),
         UsageRequest::SetAutoSwitch(policy) => set_auto_switch_local(home, state_dir, policy),
         UsageRequest::UpsertAutoSwitchRule(rule) => {

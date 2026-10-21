@@ -1998,6 +1998,17 @@ impl Registry {
                     Err(e) => UsageReply::Failed(os(&e)),
                 }
             }
+            UsageRequest::ConsumeResetCredit {
+                provider,
+                account_id,
+            } => match accounts::consume_reset_credit(&home, state_ref, provider, &account_id) {
+                Ok((snap, outcome, windows_reset)) => UsageReply::ResetConsumed {
+                    snapshot: snap,
+                    outcome,
+                    windows_reset,
+                },
+                Err(e) => UsageReply::Failed(os(&e)),
+            },
             UsageRequest::SetAutoSwitch(policy) => {
                 match accounts::set_auto_switch(&home, state_ref, &policy) {
                     Ok(snap) => UsageReply::Accounts(snap),
@@ -2043,8 +2054,12 @@ impl Registry {
                 }
             }
         };
-        if let UsageReply::Accounts(snap) = &mut reply {
-            self.account_switch_snapshot(snap);
+        match &mut reply {
+            UsageReply::Accounts(snap) => self.account_switch_snapshot(snap),
+            UsageReply::ResetConsumed { snapshot, .. } => {
+                self.account_switch_snapshot(snapshot);
+            }
+            _ => {}
         }
         reply
     }

@@ -594,6 +594,8 @@ pub struct Shell {
     /// 닫은 탭·칸의 (호스트, 폴더). 세션은 닫을 때 끝나므로 ⌘⇧T는 이 폴더에 새 탭을 연다.
     closed_dirs: Vec<(krill_app::hosts::HostId, PathBuf)>,
     pub(super) usage_refresh: Option<Task<()>>,
+    /// 상태바 사용량 팝업의 "사용량 초기화" 1단계(무장). 메뉴가 닫혔다 다시 열리면 확인 행을 보인다.
+    pub(super) reset_armed: Option<(krill_proto::usage::ProviderKind, String)>,
     account_handoff_poll: Option<Task<()>>,
     pub(super) accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     pub(super) ssh_hosts: Vec<krill_app::ssh_hosts::SshHost>,
@@ -1013,6 +1015,7 @@ impl Shell {
             closed_dirs: Vec::new(),
             accounts_snapshot,
             usage_refresh: None,
+            reset_armed: None,
             account_handoff_poll: None,
             accounts_poll: None,
             update_poll: None,
@@ -1344,17 +1347,28 @@ impl Shell {
     }
 
     fn prev_nav_index(&self, cx: &App) -> Option<usize> {
+        if self.nav_history.index >= self.nav_history.entries.len() {
+            return None;
+        }
         let cur = self.nav_history.entries.get(self.nav_history.index);
-        (0..self.nav_history.index).rev().find(|&i| {
-            let cand = &self.nav_history.entries[i];
+        let end = self.nav_history.index.min(self.nav_history.entries.len());
+        (0..end).rev().find(|&i| {
+            let Some(cand) = self.nav_history.entries.get(i) else {
+                return false;
+            };
             !Self::is_same_nav_target(cur, cand) && self.is_entry_reachable(cand, cx)
         })
     }
 
     fn next_nav_index(&self, cx: &App) -> Option<usize> {
+        if self.nav_history.index >= self.nav_history.entries.len() {
+            return None;
+        }
         let cur = self.nav_history.entries.get(self.nav_history.index);
         ((self.nav_history.index + 1)..self.nav_history.entries.len()).find(|&i| {
-            let cand = &self.nav_history.entries[i];
+            let Some(cand) = self.nav_history.entries.get(i) else {
+                return false;
+            };
             !Self::is_same_nav_target(cur, cand) && self.is_entry_reachable(cand, cx)
         })
     }
@@ -1374,7 +1388,9 @@ impl Shell {
         let Some(target_idx) = self.prev_nav_index(cx) else {
             return false;
         };
-        let entry = self.nav_history.entries[target_idx].clone();
+        let Some(entry) = self.nav_history.entries.get(target_idx).cloned() else {
+            return false;
+        };
         self.nav_history.index = target_idx;
         self.apply_nav_entry(entry, window, cx);
         true
@@ -1389,7 +1405,9 @@ impl Shell {
         let Some(target_idx) = self.next_nav_index(cx) else {
             return false;
         };
-        let entry = self.nav_history.entries[target_idx].clone();
+        let Some(entry) = self.nav_history.entries.get(target_idx).cloned() else {
+            return false;
+        };
         self.nav_history.index = target_idx;
         self.apply_nav_entry(entry, window, cx);
         true
@@ -2593,6 +2611,67 @@ impl Shell {
         .detach();
     }
 
+    /// Codex banked reset 크레딧 소진(상태바 사용량 팝업의 "사용량 초기화" 확인 단계).
+    /// 데몬 전용이다. 성공하면 스냅샷을 적용하고 소진 결과를 배너로 알린 뒤,
+    /// 백그라운드 재조회가 끝날 때까지 숫자를 당겨오게 새로고침을 예약한다.
+    pub(super) fn consume_reset_credit(
+        &mut self,
+        provider: krill_proto::usage::ProviderKind,
+        account_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        use krill_proto::usage::{ResetConsumeOutcome, UsageRequest};
+        self.reset_armed = None;
+        let req = UsageRequest::ConsumeResetCredit {
+            provider,
+            account_id,
+        };
+        let Some(paths) = self.paths.clone().filter(|_| self.link == Link::Up) else {
+            self.notice = Some(
+                krill_app::i18n::catalog::settings::ACCOUNTS_DAEMON_REQUIRED
+                    .get()
+                    .into(),
+            );
+            cx.notify();
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { krill_app::accounts::consume_reset_credit_ipc(&paths, &req) })
+                .await;
+            this.update(cx, |this, cx| match res {
+                Ok(consumed) => {
+                    this.apply_accounts_snapshot(consumed.snapshot, cx);
+                    this.notice = Some(match consumed.outcome {
+                        ResetConsumeOutcome::Reset | ResetConsumeOutcome::AlreadyRedeemed => {
+                            krill_app::i18n::catalog::status::PROVIDER_RESET_USAGE_DONE
+                                .format(&[("n", &consumed.windows_reset.to_string())])
+                        }
+                        ResetConsumeOutcome::NothingToReset => {
+                            krill_app::i18n::catalog::status::PROVIDER_RESET_USAGE_NOTHING
+                                .get()
+                                .to_owned()
+                        }
+                        ResetConsumeOutcome::NoCredit => {
+                            krill_app::i18n::catalog::status::PROVIDER_RESET_USAGE_NO_CREDIT
+                                .get()
+                                .to_owned()
+                        }
+                    });
+                    cx.defer(krill_app::settings::notify_external_change);
+                    this.refresh_usage_manually(cx);
+                }
+                Err(e) => {
+                    this.notice = Some(e);
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     pub(super) fn apply_accounts_snapshot(
         &mut self,
         snap: krill_proto::usage::AccountsSnapshot,
@@ -2930,7 +3009,10 @@ impl Shell {
         } else {
             return;
         };
-        self.change(true, cx, |l| l.activate(tabs[target]));
+        let Some(&tab) = tabs.get(target) else {
+            return;
+        };
+        self.change(true, cx, |l| l.activate(tab));
     }
 
     fn cycle_session_focus(&mut self, delta: isize, cx: &mut Context<Self>) {

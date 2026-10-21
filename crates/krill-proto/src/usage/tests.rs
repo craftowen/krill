@@ -1087,3 +1087,52 @@ fn connection_tail_has_frozen_bytes_and_prior_policy_decoder_can_skip_it() {
     assert_eq!(tail, [1, 1, 0]);
     assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
 }
+
+#[test]
+fn reset_credit_request_reply_roundtrip_and_feature_gate() {
+    // 요청은 enum 끝에 붙는다(Codex discriminant 1, 계정 id "a").
+    fixture(
+        &UsageRequest::ConsumeResetCredit {
+            provider: ProviderKind::Codex,
+            account_id: "a".into(),
+        },
+        &[5, 0, 0, 0, 0x41, 17, 1, 1, b'a'],
+    );
+    let request = UsageRequest::ConsumeResetCredit {
+        provider: ProviderKind::Codex,
+        account_id: "a".into(),
+    };
+    assert!(!request.is_read());
+    assert!(!request.contains_removed_provider());
+    assert_eq!(request.required_features(), FEAT_USAGE | FEAT_USAGE_RESET);
+    assert_eq!(
+        UsageRequest::ConsumeResetCredit {
+            provider: ProviderKind::Gemini,
+            account_id: "a".into(),
+        }
+        .required_features(),
+        FEAT_USAGE | FEAT_USAGE_RESET
+    );
+    assert!(
+        UsageRequest::ConsumeResetCredit {
+            provider: ProviderKind::Gemini,
+            account_id: "a".into(),
+        }
+        .contains_removed_provider()
+    );
+
+    let reply = UsageReply::ResetConsumed {
+        snapshot: AccountsSnapshot::default(),
+        outcome: ResetConsumeOutcome::Reset,
+        windows_reset: 2,
+    };
+    let frame = reply.encode().unwrap();
+    let (kind, body) = ipc::read_frame(&mut frame.as_slice()).unwrap().unwrap();
+    // 응답도 끝에 붙는다(5): 기본 스냅샷 바이트 뒤에 결과(0)·창 수(2).
+    assert!(body.starts_with(&[5]));
+    assert!(body.ends_with(&[0, 2]));
+    assert_eq!(UsageReply::decode(kind, &body).unwrap(), reply);
+    // 새 비트를 모르는 피어에는 스냅샷만 남는다.
+    let gated = reply.for_features(FEAT_USAGE);
+    assert_eq!(gated, UsageReply::Accounts(AccountsSnapshot::default()));
+}

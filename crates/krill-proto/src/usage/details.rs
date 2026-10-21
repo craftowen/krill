@@ -5,6 +5,10 @@ use serde::{Deserialize, Serialize};
 use super::Window;
 use crate::SessionId;
 
+/// Codex banked reset 크레딧 미터 키(`rate_limit_reset_credits.available_count`).
+/// 팝업·설정은 이 키로 남은 소진 가능 횟수를 읽는다.
+pub const RESET_CREDITS_METER_KEY: &str = "reset_credits";
+
 /// A meter actually reported by a provider. Missing meters are never invented as 0%.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UsageMeter {

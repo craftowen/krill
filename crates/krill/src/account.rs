@@ -10,10 +10,10 @@ use krill_proto::ipc::{self, ClientRole};
 use krill_proto::screen::Msg as _;
 use krill_proto::usage::{
     AccountsSnapshot, AutoSwitchMetric, AutoSwitchPolicy, AutoSwitchRule, FEAT_USAGE, ProviderKind,
-    UsageReply, UsageRequest,
+    ResetConsumeOutcome, UsageReply, UsageRequest,
 };
 
-const USAGE: &str = "usage: krill account [list [--json] | history [--json] | direct-usage <on|off> | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
+const USAGE: &str = "usage: krill account [list [--json] | history [--json] | direct-usage <on|off> | provisioning <on|off|status> [--json] | policy <predict|reset-first|cooldown> <on|off|minutes> | switch <provider> <id> | login <provider> <id> | add <provider> <label> [profile_dir] | rm <provider> <id> | consume-reset <provider> <id> [--json] | auto-switch <on|off> [threshold] | rule <provider> <from-id-or-label> <on|off> [threshold%] [max|5h|7d] [target-id-or-label|auto] | rule-rm <provider> <from-id-or-label>]";
 
 pub fn run(raw: &[OsString]) -> ExitCode {
     // 서브커맨드 자리만 도움말로 본다. `add <label> help`의 `help`는 라벨이다.
@@ -66,6 +66,14 @@ pub fn run(raw: &[OsString]) -> ExitCode {
                 ExitCode::FAILURE
             }
         };
+    }
+    let consume = match strs.as_slice() {
+        ["consume-reset", prov, id] => Some((*prov, *id, false)),
+        ["consume-reset", prov, id, "--json"] => Some((*prov, *id, true)),
+        _ => None,
+    };
+    if let Some((prov, id, json)) = consume {
+        return run_consume_reset(prov, id, json);
     }
     let (req, json) = match strs.as_slice() {
         [] | ["list" | "ls"] => (UsageRequest::ListAccounts, false),
@@ -457,8 +465,66 @@ fn request(req: &UsageRequest) -> Result<AccountsSnapshot, String> {
     match exchange(req)? {
         UsageReply::Accounts(snap) => Ok(snap),
         UsageReply::Current(_) | UsageReply::Orphans(_) => Ok(AccountsSnapshot::default()),
+        UsageReply::ResetConsumed { snapshot, .. } => Ok(snapshot),
         UsageReply::Provisioning(_) => Err("unexpected account reply".to_owned()),
         UsageReply::Failed(e) => Err(e.to_string()),
+    }
+}
+
+/// Codex banked rate-limit reset 크레딧 1개를 소진한다. 소진 결과와 소진 직후
+/// 계정 스냅샷을 함께 보여준다(데몬 `ConsumeResetCredit` 패리티).
+fn run_consume_reset(provider: &str, id: &str, json: bool) -> ExitCode {
+    let Some(provider) = ProviderKind::parse(provider) else {
+        eprintln!("account: unknown provider '{provider}' (expected claude|codex|agy|opencode)");
+        return ExitCode::from(2);
+    };
+    if provider != ProviderKind::Codex {
+        eprintln!("account: reset credits are codex-only");
+        return ExitCode::from(2);
+    }
+    let req = UsageRequest::ConsumeResetCredit {
+        provider,
+        account_id: id.to_owned(),
+    };
+    let outcome_label = |outcome: ResetConsumeOutcome| match outcome {
+        ResetConsumeOutcome::Reset => "reset",
+        ResetConsumeOutcome::NothingToReset => "nothing_to_reset",
+        ResetConsumeOutcome::NoCredit => "no_credit",
+        ResetConsumeOutcome::AlreadyRedeemed => "already_redeemed",
+    };
+    match exchange(&req) {
+        Ok(UsageReply::ResetConsumed {
+            snapshot,
+            outcome,
+            windows_reset,
+        }) => {
+            if json {
+                let accounts = serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null);
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "outcome": outcome_label(outcome),
+                        "windows_reset": windows_reset,
+                        "accounts": accounts,
+                    })
+                );
+            } else {
+                println!(
+                    "reset credit: {} (windows reset: {windows_reset})",
+                    outcome_label(outcome)
+                );
+                print_snapshot(&snapshot);
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(_) => {
+            eprintln!("account: unexpected reset reply");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("account: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -473,7 +539,8 @@ fn exchange(req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_USAGE_RATELIMIT
         | krill_proto::usage::FEAT_USAGE_MANAGE
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
-        | krill_proto::usage::FEAT_ACCOUNT_POLICY;
+        | krill_proto::usage::FEAT_ACCOUNT_POLICY
+        | krill_proto::usage::FEAT_USAGE_RESET;
     let mut conn = if matches!(
         req,
         UsageRequest::SetProvisioning(_) | UsageRequest::GetProvisioning

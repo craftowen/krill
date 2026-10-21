@@ -11,7 +11,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use krill_proto::account_login::AuthStatus;
-use krill_proto::usage::ProviderKind;
+use krill_proto::usage::{ProviderKind, ResetConsumeOutcome};
 use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
@@ -25,6 +25,12 @@ const INTERVAL: Duration = Duration::from_secs(60);
 const REQUEST_INTERVAL: Duration = Duration::from_secs(5);
 const ERROR_RETRY_INTERVAL: Duration = Duration::from_secs(2);
 const MAX_BYTES: u64 = 512 * 1024;
+
+/// 소진 직후 스냅샷이 소진 전 수치를 내놓지 않게 해당 프로필 캐시만 버린다.
+/// 다음 `refresh_on_request`가 백그라운드에서 다시 읽는다(직접 조회가 켜져 있을 때).
+pub(super) fn evict_profile(home: &Path, provider: ProviderKind, dir: &Path) {
+    lock(&CACHE).remove(&(home.to_path_buf(), provider, dir.to_path_buf()));
+}
 
 pub(super) fn cached(home: &Path, provider: ProviderKind, dir: &Path) -> Option<ProfileUsage> {
     if provider == ProviderKind::Antigravity {
@@ -101,9 +107,10 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
     let launched = std::thread::Builder::new()
         .name("account-usage".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(|| fetch(job.1, &job.2, host))
-                .ok()
-                .flatten();
+            let result =
+                std::panic::catch_unwind(|| fetch(job.1, &job.2, host, &job.0, state.as_deref()))
+                    .ok()
+                    .flatten();
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .ok()
@@ -139,7 +146,13 @@ fn spawn(key: &Key, host: bool, state: Option<PathBuf>) {
 
 /// 단위 테스트는 네트워크·실제 키체인을 절대 읽지 않는다.
 #[cfg(test)]
-fn fetch(_: ProviderKind, _: &Path, _: bool) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
+fn fetch(
+    _: ProviderKind,
+    _: &Path,
+    _: bool,
+    _: &Path,
+    _: Option<&Path>,
+) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
     None
 }
 
@@ -148,8 +161,10 @@ fn fetch(
     provider: ProviderKind,
     dir: &Path,
     host: bool,
+    home: &Path,
+    state: Option<&Path>,
 ) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
-    let (token, account) = credentials(provider, dir, host)?;
+    let (token, account) = credentials(provider, dir, host, home, state)?;
     query(provider, &token, account.as_deref(), |config| {
         pipe_command(
             "/usr/bin/curl",
@@ -203,23 +218,146 @@ fn query(
     (!usage.is_empty() || !meters.meters.is_empty()).then_some((usage, meters))
 }
 
-/// 토큰이 명령행·환경 변수에 노출되지 않도록 curl 설정을 stdin으로 전한다.
-fn request_config(
+/// Codex banked reset 크레딧 소진(사용량 초기화). 성공하면 `(결과, 초기화된 창 수)`.
+/// 토큰·요청 ID·원문은 로그·캐시·IPC에 넣지 않는다. 재시도는 새 멱등 키로 새 소진이 되니
+/// 호출자가 자동 재시도하지 않는다(타임아웃은 크레딧부터 다시 확인). CC-BY: Orca MIT 참고 구현과
+/// 별개의 Wham `rate-limit-reset-credits/consume` 호출이다.
+pub(crate) fn consume_reset_credit(
+    provider: ProviderKind,
+    dir: &Path,
+    host: bool,
+    home: &Path,
+    state: Option<&Path>,
+) -> Option<(ResetConsumeOutcome, u64)> {
+    if provider != ProviderKind::Codex {
+        return None;
+    }
+    let (token, account) = credentials(provider, dir, host, home, state)?;
+    let redeem_id = redeem_request_id()?;
+    consume_request(provider, &token, account.as_deref(), &redeem_id, |config| {
+        pipe_command(
+            "/usr/bin/curl",
+            &[
+                "-q",
+                "--config",
+                "-",
+                "--silent",
+                "--fail",
+                "--max-time",
+                "8",
+                "--max-filesize",
+                "524288",
+            ],
+            config.as_bytes(),
+        )
+    })
+}
+
+fn consume_request(
     provider: ProviderKind,
     token: &str,
     account: Option<&str>,
+    redeem_id: &str,
+    send: impl FnOnce(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<(ResetConsumeOutcome, u64)> {
+    let config = consume_config(provider, token, account, redeem_id)?;
+    let body = send(&config)?;
+    parse_consume_response(std::str::from_utf8(&body).ok()?)
+}
+
+/// 소진 요청 curl 설정. `data`는 JSON 큰따옴표와 겹치지 않게 작은따옴표로 감싼다.
+fn consume_config(
+    provider: ProviderKind,
+    token: &str,
+    account: Option<&str>,
+    redeem_id: &str,
 ) -> Option<Zeroizing<String>> {
+    if provider != ProviderKind::Codex || !check_credential_text(token, account) {
+        return None;
+    }
+    if redeem_id.is_empty()
+        || !redeem_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    let mut config = Zeroizing::new(format!(
+        "url = \"https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume\"\nrequest = \"POST\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: codex-cli\"\nheader = \"OpenAI-Beta: codex-1\"\nheader = \"originator: Codex Desktop\"\nheader = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\n"
+    ));
+    if let Some(account) = account {
+        config.push_str("header = \"ChatGPT-Account-Id: ");
+        config.push_str(account);
+        config.push_str("\"\n");
+    }
+    config.push_str("data = '{\"redeem_request_id\": \"");
+    config.push_str(redeem_id);
+    config.push_str("\"}'\n");
+    Some(config)
+}
+
+/// `consume` 응답 `code` 그대로의 결과와 초기화된 창 수. 모르는 코드는 `None`이다.
+fn parse_consume_response(text: &str) -> Option<(ResetConsumeOutcome, u64)> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let outcome = match json.get("code")?.as_str()? {
+        "reset" => ResetConsumeOutcome::Reset,
+        "nothing_to_reset" => ResetConsumeOutcome::NothingToReset,
+        "no_credit" => ResetConsumeOutcome::NoCredit,
+        "already_redeemed" => ResetConsumeOutcome::AlreadyRedeemed,
+        _ => return None,
+    };
+    let windows = json
+        .get("windows_reset")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    Some((outcome, windows))
+}
+
+/// 멱등 키(UUID v4). `ring`은 이미 `krilld` 직접 의존성이다(새 크레이트 없음).
+fn redeem_request_id() -> Option<String> {
+    use ring::rand::SecureRandom as _;
+    let mut bytes = [0_u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut bytes).ok()?;
+    if let Some(b) = bytes.get_mut(6) {
+        *b = (*b & 0x0f) | 0x40;
+    }
+    if let Some(b) = bytes.get_mut(8) {
+        *b = (*b & 0x3f) | 0x80;
+    }
+    let mut id = String::with_capacity(36);
+    for (i, b) in bytes.iter().enumerate() {
+        if i == 4 || i == 6 || i == 8 || i == 10 {
+            id.push('-');
+        }
+        for shift in [4, 0] {
+            id.push(char::from_digit(u32::from((b >> shift) & 0xf), 16).unwrap_or('0'));
+        }
+    }
+    Some(id)
+}
+
+/// 토큰이 명령행·환경 변수에 노출되지 않도록 curl 설정을 stdin으로 전한다.
+/// curl 설정에 그대로 들어가는 토큰·계정 ID 검증(인젝션 방지). 소진 요청도 같은 규칙이다.
+fn check_credential_text(token: &str, account: Option<&str>) -> bool {
     if token.is_empty()
         || !token
             .bytes()
             .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\\'))
     {
-        return None;
+        return false;
     }
-    if account.is_some_and(|a| {
+    !account.is_some_and(|a| {
         !a.bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
-    }) {
+    })
+}
+
+fn request_config(
+    provider: ProviderKind,
+    token: &str,
+    account: Option<&str>,
+) -> Option<Zeroizing<String>> {
+    if !check_credential_text(token, account) {
         return None;
     }
     let (url, headers) = match provider {
@@ -258,33 +396,66 @@ pub(super) fn read_file(path: &Path) -> Option<Zeroizing<Vec<u8>>> {
     Some(bytes)
 }
 
+fn opencode_go_override(home: &Path, state: Option<&Path>) -> Option<Zeroizing<String>> {
+    let candidates = [
+        state.map(|s| s.join("opencode-go-api-key")),
+        Some(
+            home.join(".config")
+                .join("minikrill")
+                .join("opencode-go-api-key"),
+        ),
+    ];
+    for path in candidates.into_iter().flatten() {
+        if let Some(raw) = read_file(&path) {
+            let trimmed = String::from_utf8_lossy(&raw).trim().to_owned();
+            if !trimmed.is_empty() {
+                return Some(Zeroizing::new(trimmed));
+            }
+        }
+    }
+    None
+}
+
 fn credentials(
     provider: ProviderKind,
     dir: &Path,
     host: bool,
+    home: &Path,
+    state: Option<&Path>,
 ) -> Option<(Zeroizing<String>, Option<String>)> {
     if provider == ProviderKind::OpenCode {
+        if let Some(key) = opencode_go_override(home, state) {
+            return Some((key, None));
+        }
         let auth = if host {
-            let home = accounts::default_home();
+            let default_home = accounts::default_home();
             std::env::var_os("XDG_DATA_HOME")
-                .map_or_else(|| home.join(".local/share"), PathBuf::from)
+                .map_or_else(|| default_home.join(".local/share"), PathBuf::from)
                 .join("opencode/auth.json")
         } else {
             dir.join("data/opencode/auth.json")
         };
-        let raw = read_file(&auth)?;
-        let mut json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
-        let key = ["opencode-go", "opencode"].into_iter().find_map(|name| {
-            let credential = json.get_mut(name)?;
-            if credential.get("type").and_then(serde_json::Value::as_str) != Some("api") {
-                return None;
-            }
-            match credential.get_mut("key")?.take() {
-                serde_json::Value::String(s) if !s.is_empty() => Some(Zeroizing::new(s)),
-                _ => None,
-            }
-        })?;
-        return Some((key, None));
+        let from_auth = read_file(&auth).and_then(|raw| {
+            let mut json: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+            ["opencode-go", "opencode"].into_iter().find_map(|name| {
+                let credential = json.get_mut(name)?;
+                if credential.get("type").and_then(serde_json::Value::as_str) != Some("api") {
+                    return None;
+                }
+                match credential.get_mut("key")?.take() {
+                    serde_json::Value::String(s) if !s.is_empty() => Some(Zeroizing::new(s)),
+                    _ => None,
+                }
+            })
+        });
+        if let Some(key) = from_auth {
+            return Some((key, None));
+        }
+        let env_key = std::env::var("OPENCODE_API_KEY")
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())?;
+        return Some((Zeroizing::new(env_key), None));
     }
     let raw = if provider == ProviderKind::Claude {
         let user = std::env::var("USER")
@@ -1210,10 +1381,10 @@ mod tests {
         let path = root.join(".credentials.json");
         let raw = br#"{"claudeAiOauth":{"accessToken":"fixture-only"}}"#;
         std::fs::write(&path, raw).unwrap();
-        let (token, _) = credentials(ProviderKind::Claude, &root, false).unwrap();
+        let (token, _) = credentials(ProviderKind::Claude, &root, false, &root, None).unwrap();
         assert_eq!(&*token, "fixture-only");
         assert_eq!(std::fs::read(&path).unwrap(), raw);
-        assert!(credentials(ProviderKind::Codex, &root, false).is_none());
+        assert!(credentials(ProviderKind::Codex, &root, false, &root, None).is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 
@@ -1236,6 +1407,23 @@ mod tests {
         let config = request_config(ProviderKind::Codex, &token, account.as_deref()).unwrap();
         assert!(config.contains("request = \"GET\""));
         assert!(config.contains("ChatGPT-Account-Id: acct-1"));
+        // 소진 설정도 같은 자격증명 검증·계정 스코프를 쓴다.
+        let consume = consume_config(
+            ProviderKind::Codex,
+            &token,
+            account.as_deref(),
+            "55cbe0c1-71ab-4c52-b855-70746ff52",
+        )
+        .unwrap();
+        assert!(consume.contains("rate-limit-reset-credits/consume"));
+        assert!(consume.contains("request = \"POST\""));
+        assert!(consume.contains("ChatGPT-Account-Id: acct-1"));
+        assert!(consume.contains("\"redeem_request_id\": \"55cbe0c1-71ab-4c52-b855-70746ff52\""));
+        assert!(consume_config(ProviderKind::Claude, &token, None, "k").is_none());
+        assert!(consume_config(ProviderKind::Codex, &token, None, "bad id!").is_none());
+        for invalid in ["token\r\ninjected", "token\"", "token\\"] {
+            assert!(consume_config(ProviderKind::Codex, invalid, None, "k").is_none());
+        }
         for invalid in ["token\r\ninjected", "token\"", "token\\"] {
             assert!(request_config(ProviderKind::Claude, invalid, None).is_none());
         }
@@ -1247,6 +1435,44 @@ mod tests {
             claude_service(Some(Path::new("/tmp/a"))),
             claude_service(None)
         );
+    }
+
+    #[test]
+    fn consume_response_maps_backend_codes_and_rejects_unknown() {
+        use ResetConsumeOutcome::*;
+        for (code, want) in [
+            ("reset", Reset),
+            ("nothing_to_reset", NothingToReset),
+            ("no_credit", NoCredit),
+            ("already_redeemed", AlreadyRedeemed),
+        ] {
+            let text = format!(r#"{{"code": "{code}", "windows_reset": 2}}"#);
+            assert_eq!(parse_consume_response(&text), Some((want, 2)));
+        }
+        assert!(parse_consume_response(r#"{"code": "reset"}"#).is_some());
+        assert_eq!(
+            parse_consume_response(r#"{"code": "reset"}"#),
+            Some((Reset, 0))
+        );
+        for bad in [
+            r#"{"code": "redeemed"}"#,
+            "{}",
+            "not json",
+            r#"{"code": 7}"#,
+        ] {
+            assert!(parse_consume_response(bad).is_none(), "{bad}");
+        }
+        assert!(
+            consume_config(
+                ProviderKind::Codex,
+                "t",
+                Some("a-1"),
+                "550e8400-e29b-41d4-a716-446655440000"
+            )
+            .is_some()
+        );
+        assert!(consume_config(ProviderKind::Codex, "t", None, "").is_none());
+        assert!(consume_config(ProviderKind::Claude, "t", None, "abc").is_none());
     }
     #[test]
     fn antigravity_native_metadata_is_validated_without_a_model_turn() {
@@ -1292,6 +1518,50 @@ mod tests {
                 Zeroizing::new(b"invalid response".to_vec())
             ))
             .is_none()
+        );
+    }
+
+    #[test]
+    fn consume_response_codes_map_to_outcomes_without_network() {
+        let ok = |code: &str, windows: u64| {
+            consume_request(
+                ProviderKind::Codex,
+                "fixture-only",
+                Some("acct-1"),
+                "k",
+                |_| {
+                    Some(Zeroizing::new(
+                        format!("{{\"code\":\"{code}\",\"windows_reset\":{windows}}}").into_bytes(),
+                    ))
+                },
+            )
+        };
+        assert_eq!(ok("reset", 2), Some((ResetConsumeOutcome::Reset, 2)));
+        assert_eq!(
+            ok("nothing_to_reset", 0),
+            Some((ResetConsumeOutcome::NothingToReset, 0))
+        );
+        assert_eq!(ok("no_credit", 0), Some((ResetConsumeOutcome::NoCredit, 0)));
+        assert_eq!(
+            ok("already_redeemed", 1),
+            Some((ResetConsumeOutcome::AlreadyRedeemed, 1))
+        );
+        assert!(ok("bogus", 0).is_none());
+        assert!(
+            consume_request(ProviderKind::Codex, "fixture-only", None, "k", |_| None).is_none()
+        );
+        // 멱등 키는 UUID v4 형태다(서버는 불투명 키로 취급한다).
+        let id = redeem_request_id().unwrap();
+        assert_eq!(id.len(), 36);
+        let parts: Vec<&str> = id.split('-').collect();
+        assert_eq!(
+            parts.iter().map(|p| p.len()).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        assert!(
+            parts
+                .iter()
+                .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
         );
     }
 

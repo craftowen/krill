@@ -127,6 +127,7 @@ Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.so
 | FEAT_THEME | `1 << 46` | `krill_proto::theme` (앱 테마·셀 픽셀 크기 푸시, OWE-590 지휘자 배정) |
 | FEAT_CLEAR_SCROLLBACK | `1 << 47` | `krill_proto::control` (세션 스크롤백 지우기 `Request::ClearScrollback`/`Reply::ScrollbackCleared` 한 쌍, OWE-873b 지휘자 배정; enum 끝에 추가) |
 | FEAT_GIT_EDIT | `1 << 48` | `krill_proto::control` (Git index 변경·커밋 `Request::GitEdit`/`Reply::GitEdited` 한 쌍, MK-088·OWE-453 지휘자 배정) |
+| FEAT_USAGE_RESET | `1 << 49` | `krill_proto::usage` (Codex banked reset 크레딧 소진 `UsageRequest::ConsumeResetCredit`/`UsageReply::ResetConsumed` 한 쌍; enum 끝에 추가) |
 | FEAT_AGENT_HISTORY | `1 << 50` | `krill_proto::agent_history` (요청 시 transcript 스캔·재개, control 한 쌍, MK-082·OWE-447 지휘자 배정) |
 | FEAT_CHAT_POLL | `1 << 63` | `krill_proto::agent_history` (하이브리드 채팅 기록 조회·이전 대화 페이지) |
 | FEAT_HIBERNATION | `1 << 51` | `krill_proto::control` (자동 종료 세션 재개 `Request::Hibernation`/`Reply::Hibernation`, MK-081·OWE-446 지휘자 배정) |
