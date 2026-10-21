@@ -170,6 +170,8 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: read
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
     outputs:
       tag: ${{ steps.meta.outputs.tag }}
       version: ${{ steps.meta.outputs.version }}
@@ -220,6 +222,14 @@ jobs:
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
 
       # +crt-static: VCRUNTIME140.dll 의존 제거(docs/research/windows-spike-OWE-837.md §4).
+      - name: Restore Windows release dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-windows-msvc-static
+          cache-bin: 'false'
+          save-if: ${{ inputs.build_only && github.ref == 'refs/heads/release/nightly' }}
+
       - name: Build release binaries
         env:
           RUSTFLAGS: -C target-feature=+crt-static
@@ -425,6 +435,14 @@ jobs:
         uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: "1.98.1"
+
+      - name: Restore Linux release dependencies
+        id: cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: release-linux-${{ matrix.arch }}
+          cache-bin: 'false'
+          save-if: ${{ inputs.build_only && github.ref == 'refs/heads/release/nightly' }}
 
       - name: Build native Linux archive
         env:

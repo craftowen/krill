@@ -16,7 +16,7 @@ cd "$(dirname "$0")/.."
 
 usage() {
   cat >&2 <<'USAGE'
-usage: bash packaging/publish-github.sh [VERSION] [--bump patch|minor|major] [--repo OWNER/REPO] [--bin-dir DIR] [--dry-run|--preflight]
+usage: bash packaging/publish-github.sh [VERSION] [--bump patch|minor|major] [--repo OWNER/REPO] [--verified-release RECEIPT] [--bin-dir DIR] [--dry-run|--preflight]
 
 Options:
   VERSION            릴리스 버전 (생략 시 Cargo.toml의 [workspace.package].version 사용)
@@ -24,6 +24,8 @@ Options:
                      함께 커밋한 뒤 멈춘다(그 커밋을 main에 올리고 CI가 녹색이 된 뒤 다시 실행해 발행)
   --repo OWNER/REPO  대상 GitHub 저장소 (생략 시 git remote origin에서 자동 추출)
   --bin-dir DIR      이미 빌드된 바이너리로 빌드 생략. --dry-run 전용(게시본은 항상 이 스크립트가 직접 빌드)
+  --verified-release RECEIPT  같은 HEAD의 전체 로컬·메모리·생존 검사를 증명하는 Ed25519 서명 receipt.
+                             서명·툴체인·범위·고정 바이너리 해시를 확인한 경우에만 게시 빌드를 재사용한다.
   --dry-run          로컬 번들·DMG·Homebrew tap·latest.json 조립까지만 수행하고 git push / gh release 생략.
                      가드 실패는 경고로만 출력한다
   --preflight        게시 가드만 실행하고 끝낸다(하나라도 실패하면 1)
@@ -44,6 +46,7 @@ VERSION=""
 BUMP=""
 REPO=""
 BIN_DIR=""
+VERIFIED_RELEASE=""
 DRY_RUN=0
 PREFLIGHT=0
 
@@ -62,6 +65,11 @@ while [[ $# -gt 0 ]]; do
     --bin-dir)
       [[ $# -ge 2 ]] || usage
       BIN_DIR="$2"
+      shift 2
+      ;;
+    --verified-release)
+      [[ $# -ge 2 ]] || usage
+      VERIFIED_RELEASE="$2"
       shift 2
       ;;
     --dry-run)
@@ -100,6 +108,10 @@ if [[ -n "$BUMP" && ( "$DRY_RUN" -eq 1 || "$PREFLIGHT" -eq 1 ) ]]; then
 fi
 if [[ -n "$BIN_DIR" && "$DRY_RUN" -eq 0 ]]; then
   echo "--bin-dir is dry-run only; published binaries must come from this script's own build" >&2
+  exit 2
+fi
+if [[ -n "$BIN_DIR" && -n "$VERIFIED_RELEASE" ]]; then
+  echo "--bin-dir cannot be combined with --verified-release" >&2
   exit 2
 fi
 if [[ -n "${KRILL_RELEASE_ASSET_DIR:-}" && ( -n "${KRILL_GCP_PROJECT:-}" || -n "${KRILL_WIN_VM_DIR:-}" ) ]]; then
@@ -175,6 +187,8 @@ DMG_URL="${REPO_URL}/releases/download/${TAG}/Krill-${VERSION}.dmg"
 OUT_DIR="packaging/dist"
 
 HEAD_SHA=$(git rev-parse HEAD)
+KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/minikrill-codesign.keychain-db}"
+UPDATE_KEY_FILE="${KRILL_UPDATE_KEY_FILE:-${KC_PATH}.ed25519.key}"
 
 # ---- 게시 가드 ----
 # soft: KRILL_PUBLISH_FORCE로 사람이 넘길 수 있다. hard: 넘길 수 없다(덮어쓰기·잘못된 소스·유출은 되돌릴 수 없음).
@@ -184,6 +198,17 @@ soft_fail() { echo "publish guard: $*" >&2; SOFT_FAILS=$((SOFT_FAILS + 1)); }
 hard_fail() { echo "publish guard (no override): $*" >&2; HARD_FAILS=$((HARD_FAILS + 1)); }
 HAVE_GH=0
 command -v gh >/dev/null 2>&1 && HAVE_GH=1
+
+if CARGO_TARGET_DIR=$(python3 packaging/release_check.py target-dir --base "${CARGO_TARGET_DIR:-}"); then
+  export CARGO_TARGET_DIR
+else
+  hard_fail "external build target validation failed; internal target fallback is forbidden"
+fi
+if [[ -n "$VERIFIED_RELEASE" ]]; then
+  if ! BIN_DIR=$(python3 packaging/release_check.py verify --receipt "$VERIFIED_RELEASE" --head "$HEAD_SHA" --key-file "$UPDATE_KEY_FILE"); then
+    hard_fail "verified release receipt or tested binaries are invalid"
+  fi
+fi
 
 # 같은 버전을 두 번 게시하지 않는다. 빌드 뒤 태그 직전에 한 번 더 확인한다.
 check_unpublished() {
@@ -224,6 +249,9 @@ if [[ "$HAVE_GH" -eq 1 ]]; then
   fi
 else
   soft_fail "gh CLI not found; cannot verify CI or existing releases"
+fi
+if [[ "$HAVE_GH" -eq 1 ]] && ! python3 packaging/ci_evidence.py verify --repo "$REPO" --sha "$HEAD_SHA" --branch main; then
+  hard_fail "required workflow validation proof is missing or invalid"
 fi
 if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   LOCAL_TAG_SHA=$(git rev-parse "refs/tags/${TAG}^{commit}")
@@ -288,13 +316,7 @@ p.write_text(updated)
   exit 0
 fi
 
-# 다른 워크트리 빌드가 게시 바이너리를 덮어쓰지 않게 게시 전용 target을 쓴다(위 락이 단독 사용을 보장).
-if [[ "${CARGO_TARGET_DIR:-}" == /* ]]; then
-  CARGO_TARGET_DIR="$(dirname "$CARGO_TARGET_DIR")/krill-publish"
-else
-  CARGO_TARGET_DIR="$PWD/target/krill-publish"
-fi
-export CARGO_TARGET_DIR
+# 위 가드에서 검증한 외장 볼륨의 게시 전용 target만 쓴다.
 echo "==> Using dedicated CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
 
 rm -rf "$OUT_DIR"
@@ -306,6 +328,9 @@ fi
 
 echo "==> [1/3] Building Krill.app bundle & ZIP..."
 bash packaging/bundle.sh "${BUNDLE_ARGS[@]}"
+if [[ -n "$VERIFIED_RELEASE" ]]; then
+  python3 packaging/release_check.py verify --receipt "$VERIFIED_RELEASE" --head "$HEAD_SHA" --key-file "$UPDATE_KEY_FILE" >/dev/null
+fi
 
 echo "==> [2/3] Building DMG, Homebrew tap & signed latest.json..."
 KRILL_RELEASE_ALLOW_DIRTY="$DRY_RUN" bash packaging/release.sh \
@@ -429,15 +454,27 @@ if [[ "$(git rev-parse HEAD)" != "$HEAD_SHA" ]] || ! git diff --quiet HEAD; then
 fi
 [[ "$HARD_FAILS" -eq 0 ]] || { echo "publish aborted before tagging" >&2; exit 1; }
 
+UPDATE_PUBKEY=$(python3 packaging/macos/ed25519_manifest.py keygen --key-file "$UPDATE_KEY_FILE")
+PLAN_ARGS=(plan --directory "$OUT_DIR" --plan "$OUT_DIR/publication.json" --head "$HEAD_SHA"
+  --repo "$REPO" --version "$VERSION" --key-file "$UPDATE_KEY_FILE")
+if [[ -n "${KRILL_RELEASE_ASSET_DIR:-}" ]]; then PLAN_ARGS+=(--all-platforms); fi
+python3 packaging/release_verify.py "${PLAN_ARGS[@]}"
+
 echo "==> [3/3] Tagging $TAG and publishing GitHub Release to $REPO..."
 if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
   git tag -a "$TAG" -m "Krill $TAG"
 fi
 git push origin "refs/tags/${TAG}"
+CREATE_STATUS=0
 gh release create "$TAG" "${ASSETS[@]}" \
   --repo "$REPO" \
   --title "Krill $TAG" \
   --generate-notes \
-  --verify-tag
+  --verify-tag || CREATE_STATUS=$?
+
+# 응답이 유실됐어도 쓰기를 재시도하지 않는다. 원격의 완전한 파일·서명 검증만 성공으로 인정한다.
+python3 packaging/release_verify.py verify --plan "$OUT_DIR/publication.json" --head "$HEAD_SHA" \
+  --repo "$REPO" --public-key "$UPDATE_PUBKEY" > "$OUT_DIR/public-verification.json"
+if [[ "$CREATE_STATUS" -ne 0 ]]; then echo "Create response failed; complete remote publication verified."; fi
 
 echo "Published Krill $TAG to ${REPO_URL}/releases/tag/${TAG}"

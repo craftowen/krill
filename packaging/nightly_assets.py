@@ -10,6 +10,14 @@ import shutil
 import zipfile
 
 
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def import_assets(directory, output, version, commit, public_key):
     if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         raise ValueError("invalid release version")
@@ -33,7 +41,7 @@ def import_assets(directory, output, version, commit, public_key):
         parts = checksum.read_text().split()
         if len(parts) != 2 or parts[1].lstrip("*") != archive:
             raise ValueError(f"invalid checksum filename: {archive}")
-        if parts[0].lower() != hashlib.sha256(path.read_bytes()).hexdigest():
+        if parts[0].lower() != sha256(path):
             raise ValueError(f"artifact checksum mismatch: {archive}")
         files.extend((path, checksum))
     with zipfile.ZipFile(directory / archives[0]) as archive:
