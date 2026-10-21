@@ -978,12 +978,21 @@ fn fault_injection_output_flood_isolation_and_disk_cap() {
         assert!(Instant::now() < flood_wait, "flood generator timed out");
         thread::sleep(Duration::from_millis(20));
     }
-    let (_, at_end) = attach_raw(&rig.sock, flood, 0);
-    assert!(
-        at_end.seq.0 >= flood_bytes,
-        "flood seq {} < target {flood_bytes}",
-        at_end.seq.0
-    );
+    // The generator's syswrite/file marker only proves PTY admission. Wait for
+    // the daemon to consume its tail before inspecting the sequence and store.
+    let drain_deadline = Instant::now() + WAIT;
+    let at_end = loop {
+        let (_, attached) = attach_raw(&rig.sock, flood, 0);
+        if attached.seq.0 >= flood_bytes {
+            break attached;
+        }
+        assert!(
+            Instant::now() < drain_deadline,
+            "flood seq {} < target {flood_bytes} after drain deadline",
+            attached.seq.0
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
 
     let session_dir = rig.dir.join(format!("sessions/{}.noindex", flood.0));
     let disk_bytes: u64 = fs::read_dir(&session_dir)
