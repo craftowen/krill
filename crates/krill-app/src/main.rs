@@ -84,6 +84,8 @@ fn main() -> std::process::ExitCode {
         cx.spawn(async move |cx| {
             let (bounds, paths, env) = startup.await;
             cx.update(|cx| {
+                #[cfg(target_os = "macos")]
+                krill_app::responsiveness::start(cx);
                 cx.set_global(StartupBounds(bounds));
                 krill_app::settings::init(cx);
                 let Some(window) = new_window(cx) else {

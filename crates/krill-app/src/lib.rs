@@ -31,6 +31,8 @@ pub(crate) mod process_io;
 pub mod pull_request;
 pub mod recording;
 pub mod resources;
+#[cfg(target_os = "macos")]
+pub mod responsiveness;
 pub mod search;
 pub mod security;
 pub mod settings;
