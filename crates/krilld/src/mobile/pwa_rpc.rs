@@ -693,6 +693,26 @@ impl Backend {
         );
         let mut cards = Vec::new();
         let mut workspace_titles = std::collections::BTreeMap::new();
+        // 데스크톱 스마트 정렬과 같은 워크트리 순위(승인대기 0 → 작업 중 2 → 완료 3 → 유휴 4).
+        let mut ranks: std::collections::BTreeMap<PathBuf, u8> = std::collections::BTreeMap::new();
+        for (info, _, group) in &rows {
+            let Some(path) = group.path.as_deref() else {
+                continue;
+            };
+            let rank = states
+                .iter()
+                .find(|s| s.session == info.session)
+                .map_or(4, |s| match s.status.state {
+                    control::AgentState::Waiting | control::AgentState::Blocked => 0,
+                    control::AgentState::Working => 2,
+                    control::AgentState::Done => 3,
+                    _ => 4,
+                });
+            ranks
+                .entry(PathBuf::from(path))
+                .and_modify(|r| *r = (*r).min(rank))
+                .or_insert(rank);
+        }
         let auto_titles = self
             .dir
             .as_deref()
@@ -756,7 +776,7 @@ impl Backend {
         }
         Ok(
             json!({"sessions":cards,"orchestration":self.orchestration()?,
-            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles),"truncated":truncated,
+            "repositories":catalog.repositories_json(),"workspaces":catalog.workspaces_json(&workspace_titles, &ranks),"truncated":truncated,
             "capabilities":{"snapshot_groups":true,"session_create":true,"session_close":true,"workspace_create":true,"worktree_create":true,"hybrid_chat":true},
             "host":self.host,"agents":agents_json(self.dir.as_deref())}),
         )
