@@ -61,6 +61,14 @@ pub struct PairedDevice {
     pub last_seen_at: Option<u64>,
 }
 
+/// 이 Mac에서 초대 링크로 등록한 원격 Mac. 수신 접근 권한 목록과는 별개다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairedHost {
+    pub id: String,
+    pub name: String,
+    pub status: krill_hosts::HostStatus,
+}
+
 /// 같은 Wi-Fi에서 발견된 근처 Mac 항목.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NearbyMac {
@@ -150,6 +158,10 @@ pub trait LinkBackend: Send + Sync + std::fmt::Debug {
     fn pair(&self, link: &str, device_name: &str) -> PairOutcome;
     /// 현재 짝지어진 기기 목록을 조회한다.
     fn devices(&self) -> Result<Vec<PairedDevice>, String>;
+    /// 이 Mac이 연결한 원격 Mac 목록과 현재 연결 상태. 조회만 하며 터널을 시작하지 않는다.
+    fn remote_hosts(&self) -> Result<Vec<PairedHost>, String> {
+        Ok(Vec::new())
+    }
     /// 지정한 기기의 연결 권한을 회수(연결 끊기)하고 갱신된 기기 목록을 돌려준다.
     fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String>;
     /// 같은 Wi-Fi의 근처 Mac 목록을 조회한다.

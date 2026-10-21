@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use super::backend::{
-    Invite, LinkBackend, NearbyMac, PairFailure, PairOutcome, PairedDevice, ServerStatus,
+    Invite, LinkBackend, NearbyMac, PairFailure, PairOutcome, PairedDevice, PairedHost,
+    ServerStatus,
 };
 use super::qr::QrMatrixSource;
 use crate::i18n::link_ui as text;
@@ -131,6 +132,22 @@ impl LinkBackend for RealLinkBackend {
         krill_link::load_devices(&self.state_dir)
             .map(|list| list.into_iter().map(device).collect())
             .map_err(|_| text::ERR_UNAVAILABLE.get().to_owned())
+    }
+
+    fn remote_hosts(&self) -> Result<Vec<PairedHost>, String> {
+        krill_link::load_hosts(&self.state_dir)
+            .map_err(|_| text::ERR_UNAVAILABLE.get().to_owned())?
+            .into_iter()
+            .map(|host| {
+                let info = crate::hosts::link::connection_info(&self.state_dir, &host.id)
+                    .map_err(|_| text::ERR_UNAVAILABLE.get().to_owned())?;
+                Ok(PairedHost {
+                    id: host.id,
+                    name: host.name,
+                    status: info.status,
+                })
+            })
+            .collect()
     }
 
     fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String> {

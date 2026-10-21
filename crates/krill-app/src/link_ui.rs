@@ -26,9 +26,9 @@ use gpui_component::{Disableable as _, Sizable as _};
 
 pub use backend::{
     DEFAULT_INVITE_TTL_SECS, INVITE_SCHEME_PREFIX, Invite, LinkBackend, MockLinkBackend, NearbyMac,
-    PairFailure, PairOutcome, PairedDevice, ServerStatus, current_epoch_secs, default_device_name,
-    extract_clipboard_invite, format_device_meta, format_relative_time, format_remaining,
-    is_valid_invite_link, sanitize_device_name,
+    PairFailure, PairOutcome, PairedDevice, PairedHost, ServerStatus, current_epoch_secs,
+    default_device_name, extract_clipboard_invite, format_device_meta, format_relative_time,
+    format_remaining, is_valid_invite_link, sanitize_device_name,
 };
 pub use qr::{
     DEFAULT_QR_SIZE, DefaultQrMatrix, QrMatrixSource, StaticQrMatrix, build_qr_matrix,
@@ -57,6 +57,7 @@ pub struct ServerPanel {
     qr_matrix: Vec<Vec<bool>>,
     copied: bool,
     devices: Vec<PairedDevice>,
+    remote_hosts: Vec<PairedHost>,
     confirm_revoke: Option<PairedDevice>,
     error: Option<SharedString>,
     busy: bool,
@@ -94,6 +95,7 @@ impl ServerPanel {
             qr_matrix: Vec::new(),
             copied: false,
             devices: Vec::new(),
+            remote_hosts: Vec::new(),
             confirm_revoke: None,
             error: None,
             busy: false,
@@ -126,7 +128,13 @@ impl ServerPanel {
                     && let Some((backend, generation)) = backend
                 {
                     let snapshot = bg
-                        .spawn(async move { (backend.server_status(), backend.devices()) })
+                        .spawn(async move {
+                            (
+                                backend.server_status(),
+                                backend.devices(),
+                                backend.remote_hosts(),
+                            )
+                        })
                         .await;
                     if this
                         .update(cx, |panel, cx| {
@@ -136,6 +144,9 @@ impl ServerPanel {
                                 }
                                 if let Ok(devices) = snapshot.1 {
                                     panel.devices = devices;
+                                }
+                                if let Ok(hosts) = snapshot.2 {
+                                    panel.remote_hosts = hosts;
                                 }
                                 cx.notify();
                             }
@@ -215,9 +226,15 @@ impl ServerPanel {
         let generation = self.generation;
         cx.notify();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
-            let (status_res, devices_res) = cx
+            let (status_res, devices_res, hosts_res) = cx
                 .background_executor()
-                .spawn(async move { (backend.server_status(), backend.devices()) })
+                .spawn(async move {
+                    (
+                        backend.server_status(),
+                        backend.devices(),
+                        backend.remote_hosts(),
+                    )
+                })
                 .await;
             this.update(cx, |panel, cx| {
                 if panel.generation != generation {
@@ -230,6 +247,10 @@ impl ServerPanel {
                 }
                 match devices_res {
                     Ok(devices) => panel.devices = devices,
+                    Err(e) => panel.error = Some(e.into()),
+                }
+                match hosts_res {
+                    Ok(hosts) => panel.remote_hosts = hosts,
                     Err(e) => panel.error = Some(e.into()),
                 }
                 cx.notify();
@@ -547,6 +568,65 @@ impl ServerPanel {
         section
     }
 
+    fn render_remote_hosts(&self, p: &crate::ui::Palette) -> gpui::Stateful<gpui::Div> {
+        use crate::i18n::catalog::sidebar as labels;
+        let mut section = div()
+            .id("link-remote-hosts")
+            .debug_selector(|| "link-remote-hosts".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_SM)
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(text::REMOTE_HOSTS_TITLE.get()),
+            );
+        if self.remote_hosts.is_empty() {
+            return section.child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::REMOTE_HOSTS_EMPTY.get()),
+            );
+        }
+        for host in &self.remote_hosts {
+            let (color, label) = match host.status {
+                krill_hosts::HostStatus::Connected => (p.success, labels::HOST_CONNECTED.get()),
+                krill_hosts::HostStatus::Connecting => (p.warning, labels::HOST_CONNECTING.get()),
+                krill_hosts::HostStatus::Disconnected => {
+                    (p.muted_foreground, labels::HOST_DISCONNECTED.get())
+                }
+            };
+            let selector = format!("link-remote-host-{}", host.id);
+            section = section.child(
+                div()
+                    .id(SharedString::from(selector.clone()))
+                    .debug_selector(move || selector.clone())
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .py_2()
+                    .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(crate::ui::TEXT_SM)
+                            .child(host.name.clone()),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(color)
+                            .child(label),
+                    ),
+            );
+        }
+        section
+    }
+
     fn render_devices_section(&self, p: &crate::ui::Palette, cx: &mut Context<Self>) -> gpui::Div {
         let mut section = div().flex().flex_col().gap_2().child(
             div()
@@ -746,6 +826,7 @@ impl Render for ServerPanel {
             })
             .when(enabled, |d| d.child(self.render_invite_section(p, cx)))
             .child(self.render_devices_section(p, cx))
+            .child(self.render_remote_hosts(p))
     }
 }
 
