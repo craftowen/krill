@@ -26,6 +26,7 @@ use control::LaunchAccount;
 
 pub(crate) mod claude;
 pub(crate) mod control;
+mod skills;
 
 /// `$0`=`mk-agent`, `$1`=설치 안내, 나머지=에이전트 argv.
 // ponytail: POSIX 문법이라 fish·nu 같은 로그인 셸에서는 깨진다. 지원하려면 그때 `/bin/zsh -l -i -c`로 감싼다.
@@ -121,6 +122,7 @@ agy() {
 pub(crate) fn login_in(state: Option<&Path>) -> Launch {
     let mut login = Shell::Login.launch();
     let Some(state) = state else {
+        skills::prepare(None, &login, None);
         return login;
     };
     if cfg!(test)
@@ -211,6 +213,7 @@ pub(crate) fn login_in(state: Option<&Path>) -> Launch {
             ));
         }
     }
+    skills::prepare(None, &login, None);
     login
 }
 
@@ -1661,6 +1664,12 @@ pub(crate) fn pane_env_in(
     state: Option<&Path>,
 ) -> Vec<(Vec<u8>, Vec<u8>)> {
     let mut env = vec![(b"MK_PANE_ID".to_vec(), session.0.to_string().into_bytes())];
+    if let Ok(executable) = mk_bin() {
+        env.push((
+            b"KRILL_CLI".to_vec(),
+            executable.as_os_str().as_bytes().to_vec(),
+        ));
+    }
     if let Some(state) = state {
         env.push((
             b"KRILL_STATE_DIR".to_vec(),
@@ -1705,6 +1714,7 @@ fn wrap_account(
     login: Launch,
     account: Option<&LaunchAccount>,
 ) -> Launch {
+    skills::prepare(Some(profile), &login, account);
     let Launch { mut argv, env } = login;
     argv.truncate(1);
     let hint = format!(

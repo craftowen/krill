@@ -5906,6 +5906,8 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         ".claude/skills/minikrill/SKILL.md",
         ".codex/skills/krill-orchestration/SKILL.md",
         ".gemini/config/skills/worktree-checkpoints/SKILL.md",
+        ".gemini/antigravity-cli/skills/krill-orchestration/SKILL.md",
+        ".gemini/antigravity-cli/skills/krill-orchestration/references/verification-and-evidence.md",
         ".cursor/skills/minikrill/SKILL.md",
         ".config/opencode/skills/minikrill/SKILL.md",
     ] {
@@ -6542,54 +6544,21 @@ fn owe793_settings_primitives_switch_segmented_and_no_row_overflow_in_narrow_win
     assert_eq!(notif_track.size.width, crate::ui::SWITCH_WIDTH);
     assert_eq!(notif_track.size.height, crate::ui::SWITCH_HEIGHT);
 
-    // 2) Agents 탭: 스킬 설치 카드의 '전체 설치'(primary)와 각 스킬 행의 '스킬 설치'(secondary)가
-    //    부모 행·카드 오른쪽 테두리를 절대 뚫고 나가지 않는지 검증
+    // Agents settings have no manual skill-install surface; hooks remain available.
     vcx.update(|window, cx| {
         view.update(cx, |v, cx| v.set_tab(AdminTab::Agents, cx));
         window.draw(cx).clear(cx);
     });
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let skills_card = bounds(vcx, "admin-skills-card");
-    assert!(
-        skills_card.right() <= column.right() + px(0.5),
-        "skills_card ({skills_card:?}) overflowed column ({column:?})"
-    );
-    let install_all = bounds(vcx, "admin-install-all-skills");
-    assert!(
-        install_all.right() <= skills_card.right() + px(0.5),
-        "install-all button ({install_all:?}) overflowed skills_card ({skills_card:?})"
-    );
-
-    for (row_sel, btn_sel) in [
-        ("admin-skill-row-minikrill", "admin-install-skill-minikrill"),
-        (
-            "admin-skill-row-orchestration",
-            "admin-install-skill-orchestration",
-        ),
-        (
-            "admin-skill-row-computer-use",
-            "admin-install-skill-computer-use",
-        ),
-        (
-            "admin-skill-row-worktree-checkpoints",
-            "admin-install-skill-worktree-checkpoints",
-        ),
+    for selector in [
+        "admin-skills-card",
+        "admin-install-all-skills",
+        "admin-install-skill-orchestration",
     ] {
-        let row_b = bounds(vcx, row_sel);
-        let btn_b = bounds(vcx, btn_sel);
         assert!(
-            row_b.right() <= skills_card.right() + px(0.5),
-            "skill row {row_sel} ({row_b:?}) overflowed skills_card ({skills_card:?})"
-        );
-        assert!(
-            btn_b.right() <= row_b.right() + px(0.5),
-            "skill button {btn_sel} ({btn_b:?}) overflowed skill row {row_sel} ({row_b:?})"
-        );
-        assert!(
-            btn_b.origin.x >= row_b.origin.x,
-            "skill button {btn_sel} ({btn_b:?}) left of skill row {row_sel} ({row_b:?})"
+            vcx.debug_bounds(selector).is_none(),
+            "manual skill installation remains: {selector}"
         );
     }
 
@@ -6858,7 +6827,6 @@ fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut Tes
         "admin-default-agent-card",
         "admin-agents-catalog-card",
         "admin-agent-editor-codex",
-        "admin-skills-card",
     ] {
         let b = bounds(vcx, sel);
         assert!(
