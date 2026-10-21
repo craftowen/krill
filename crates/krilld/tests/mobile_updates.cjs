@@ -98,3 +98,8 @@ test('a photo prepared for a previous desktop cannot send to its replacement',as
  const context=vm.createContext({transport:A,hostGeneration:1,M:{update:{hold(){holds++;return ()=>holds--;}}},URL:{createObjectURL:()=>'',revokeObjectURL(){}},Image:class{decode(){return decoded;}},document:{createElement:()=>({getContext:()=>({drawImage(){}}),toBlob:done=>done({size:1,arrayBuffer:async()=>new Uint8Array([1]).buffer})})},Uint8Array,btoa:()=>'',toast(){}});
  vm.runInContext(line+';globalThis.testPhoto=photo;',context);const pending=context.testPhoto(7,{type:'image/jpeg',size:1});assert.equal(holds,1);context.transport=B;context.hostGeneration=2;decode();await assert.rejects(pending,/target changed/);assert.equal(holds,0);assert.deepEqual(calls,[]);
 });
+test('closing a sheet discards hidden pairing inputs so secrets cannot keep safe updates busy',()=>{
+ const line=read('app.js').split('\n').find(l=>l.includes('function closeSheet()'));let cleared=0,restored=0;
+ const dialog={open:true,close(){this.open=false;}},sheetBody={replaceChildren(){assert.equal(dialog.open,false);cleared++;}},context=vm.createContext({dialog,sheetBody,restoreFocus(){restored++;}});
+ vm.runInContext(line+';globalThis.close=closeSheet;',context);context.close();assert.equal(cleared,1);assert.equal(restored,1);context.close();assert.equal(cleared,2);
+});
