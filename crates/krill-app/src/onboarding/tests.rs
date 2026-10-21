@@ -1330,10 +1330,6 @@ fn late_daemon(f: &Fake, down: u32) {
     );
 }
 
-fn doctor_calls(f: &Fake) -> u32 {
-    fs::read_to_string(f.root.join("doctor-calls")).map_or(0, |s| s.trim().parse().unwrap())
-}
-
 // OWE-714 D1: 점검이 데몬 소켓 준비 전에 돌아도, 잠깐 기다려 다시 점검한 뒤 판정한다.
 #[gpui::test]
 fn wizard_waits_for_late_daemon_instead_of_blocking(cx: &mut TestAppContext) {
@@ -1351,10 +1347,14 @@ fn wizard_waits_for_late_daemon_instead_of_blocking(cx: &mut TestAppContext) {
 fn doctor_settle_gives_up_after_wait_and_keeps_failure() {
     let f = fake("dead-daemon");
     late_daemon(&f, u32::MAX);
-    let checks = run_doctor_settled(&f.env.krill, Duration::from_millis(300));
+    let wait = Duration::from_millis(300);
+    let started = Instant::now();
+    let checks = run_doctor_settled(&f.env.krill, wait);
     let daemon = checks.iter().find(|c| c.id == "daemon.connect").unwrap();
     assert_eq!(daemon.status, Status::Fail);
-    assert!(doctor_calls(&f) >= 2, "retried at least once");
+    // Process startup may consume the entire budget. Retry behavior is covered
+    // by wizard_waits_for_late_daemon_instead_of_blocking above.
+    assert!(started.elapsed() >= wait, "kept failure until the deadline");
 }
 
 // OWE-714 D2: 누르기 전엔 hook 행에 오류가 없고, 설치 계획이 기존 설정과 충돌하면 오류색 "실패"가

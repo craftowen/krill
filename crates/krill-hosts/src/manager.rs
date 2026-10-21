@@ -315,6 +315,13 @@ impl HostManager {
 
     /// 사용자가 사이드바에서 '다시 연결'을 눌렀을 때 백오프를 즉시 해제하고 재연결 상태로 만든다.
     pub fn reconnect_now(&self, id: &str) {
+        if let Ok(mut external) = self.external.lock()
+            && let Some(host) = external.get_mut(id)
+        {
+            host.info.status = HostStatus::Connecting;
+            host.info.error = None;
+            return;
+        }
         let Some(slot) = self.slot(id) else {
             return;
         };

@@ -8694,8 +8694,7 @@ impl SettingsView {
             ));
         };
         let view = self.remote_krill.get_or_insert_with(|| {
-            let executable = krill_proto::daemon::sibling_exe("krill-link")
-                .unwrap_or_else(|_| PathBuf::from("krill-link"));
+            let executable = crate::hosts::link::executable();
             let backend =
                 std::sync::Arc::new(crate::link_ui::real::RealLinkBackend::new(dir, executable));
             cx.new(|cx| crate::link_ui::PairingView::new(backend, window, cx))

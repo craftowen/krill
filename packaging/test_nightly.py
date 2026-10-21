@@ -2,6 +2,12 @@
 """야간 배포의 실패 차단·커밋 고정·자산 출처 검증. 실제 빌드·원격 쓰기는 하지 않는다."""
 
 import hashlib
+import io
+import os
+import signal
+import sys
+import threading
+import time
 import json
 from pathlib import Path
 import subprocess
@@ -11,7 +17,7 @@ from unittest.mock import patch
 import zipfile
 
 import nightly
-from nightly_assets import import_assets
+from nightly_assets import download_artifact, import_assets
 
 SHA = "a" * 40
 BASE = "b" * 40
@@ -162,6 +168,9 @@ class PublicationTests(unittest.TestCase):
         importer = patch("nightly_assets.import_assets")
         self.importer = importer.start()
         self.addCleanup(importer.stop)
+        downloader = patch("nightly_assets.download_artifact", return_value={"id": 1})
+        self.downloader = downloader.start()
+        self.addCleanup(downloader.stop)
 
     def fake_run(self, *args, **_kwargs):
         args = tuple(map(str, args))
@@ -174,13 +183,16 @@ class PublicationTests(unittest.TestCase):
             return self.current
         if args == ("git", "status", "--porcelain"):
             return self.dirty
+        if "packaging/publish-github.sh" in args:
+            nightly.write_json(self.release.root / "publications" / SHA / "public-verification.json",
+                {"head": SHA, "tag": "v0.1.2", "verified_assets": [str(n) for n in range(16)]})
         return ""
 
     def fake_ci(self, _sha, branch, _workflows):
         self.calls.append(("wait-ci", branch))
         if self.failure == "ci" or self.failure == "main-ci" and branch == "main":
             raise nightly.NightlyError("injected CI failure")
-        return {"release.yml": {"id": 123}}
+        return {"release.yml": {"run_id": 123, "attempt": 2}}
 
     def promoted(self):
         return ("git", "push", "origin", "HEAD:refs/heads/main") in self.calls
@@ -194,16 +206,43 @@ class PublicationTests(unittest.TestCase):
         self.assertTrue(self.published())
         self.assertEqual(self.release.state["status"], "published")
         self.importer.assert_called_once()
-        receipt = self.release.state_dir / "checks" / f"{SHA}.json"
-        self.assertEqual(json.loads(receipt.read_text())["head"], SHA)
+        self.assertIn("validation_receipt", self.release.state)
         publish = next(i for i, call in enumerate(self.calls) if "packaging/publish-github.sh" in call)
         self.assertLess(self.calls.index(("wait-ci", "main")), publish)
-        downloads = [call for call in self.calls if call[:3] == ("gh", "run", "download")]
-        self.assertEqual(len(downloads), 3)
-        self.assertTrue(all(call.count("-n") == 1 for call in downloads))
+        dispatch = next(i for i, call in enumerate(self.calls) if call[:3] == ("gh", "workflow", "run"))
+        validate = next(i for i, call in enumerate(self.calls) if "validate" in call)
+        self.assertLess(dispatch, validate)
+        self.assertLess(validate, self.calls.index(("wait-ci", "release/nightly-test")))
+        self.assertTrue(any(any(arg.startswith("--force-with-lease=") for arg in call) for call in self.calls if call[:1] == ("git",) and len(call) > 1))
+        self.assertEqual(self.downloader.call_count, 3)
+        self.assertTrue(all(call.args[3].endswith("-attempt-2") for call in self.downloader.call_args_list))
+
+    def test_resumed_failed_ci_is_restarted_once_without_failed_job_filter(self):
+        original = self.release.git
+        self.release.git = lambda *args: (SHA + "\trefs/heads/release/nightly-test" if args[:1] == ("ls-remote",) else original(*args))
+        failed = nightly.FailedRun({"id": 12, "conclusion": "failure"})
+        with patch.object(nightly, "Evidence") as evidence:
+            evidence.return_value.proof.side_effect = [failed, nightly.Pending("running"), {"run_id": 123, "attempt": 2}]
+            self.release.publish()
+        reruns = [call for call in self.calls if call[:3] == ("gh", "run", "rerun")]
+        self.assertEqual(len(reruns), 1)
+        self.assertNotIn("--failed", reruns[0])
+        self.assertFalse(any(call[:3] == ("gh", "workflow", "run") for call in self.calls))
+
+    def test_readback_failure_cannot_mark_published(self):
+        original = self.release.run
+        def missing(*args, **kwargs):
+            result = original(*args, **kwargs)
+            if "packaging/publish-github.sh" in args:
+                (self.release.root / "publications" / SHA / "public-verification.json").unlink()
+            return result
+        self.release.run = missing
+        with self.assertRaises(FileNotFoundError):
+            self.release.publish()
+        self.assertNotEqual(self.release.state["status"], "published")
 
     def test_any_local_gate_or_native_ci_failure_prevents_promotion_and_publication(self):
-        for failure in ("scripts/check.sh", "scripts/check-windows.sh", "build", "pane_e2e", "survive", "ci"):
+        for failure in ("packaging/test_nightly.py", "packaging/release_check.py", "ci"):
             with self.subTest(failure=failure):
                 self.failure = failure
                 self.calls.clear()
@@ -215,7 +254,7 @@ class PublicationTests(unittest.TestCase):
                     path.unlink()
 
     def test_main_race_or_candidate_mutation_prevents_promotion(self):
-        for field, value in (("main", SHA), ("current", BASE), ("dirty", " M Cargo.toml")):
+        for field, value in (("main", "d" * 40), ("current", BASE), ("dirty", " M Cargo.toml")):
             with self.subTest(field=field):
                 old = getattr(self, field)
                 setattr(self, field, value)
@@ -302,6 +341,18 @@ class SnapshotTests(unittest.TestCase):
             self.assertFalse((release.work / "dirty-file").exists())
             self.assertEqual(git(release.work, "status", "--porcelain"), "")
             self.assertNotEqual(sha, frozen)
+            with patch.object(nightly, "command", side_effect=local_command):
+                resumed = nightly.Release(config, root / "state")
+                self.assertEqual(resumed.prepare()[0], sha)
+                self.assertTrue(resumed.state["resumed"])
+                pending = root / "state/pending.json"
+                data = json.loads(pending.read_text())
+                data["created_at"] = "2000-01-01T00:00:00+00:00"
+                nightly.write_json(pending, data)
+                renewed = nightly.Release(config, root / "state")
+                self.assertNotEqual(renewed.prepare()[0], sha)
+                self.assertFalse(renewed.state.get("resumed", False))
+
             self.assertIn(f"Nightly-Source: {frozen}", git(release.work, "log", "-1", "--format=%B"))
             config["after_release"] = "0.1.1"
             with patch.object(nightly, "command", side_effect=local_command):
@@ -314,6 +365,116 @@ class SnapshotTests(unittest.TestCase):
                 self.assertIsNone(waiting.prepare())
             self.assertEqual(waiting.state["status"], "skipped")
             self.assertIn("existing v0.1.2 release owner", waiting.state["reason"])
+
+
+class ArtifactTests(unittest.TestCase):
+    def test_artifact_is_bound_to_attempt_id_head_and_github_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as archive:
+                archive.writestr('source-commit-windows.txt', SHA)
+            raw = buffer.getvalue()
+            artifact = {'id': 8, 'name': 'windows-attempt-2', 'expired': False,
+                        'digest': 'sha256:' + hashlib.sha256(raw).hexdigest(),
+                        'workflow_run': {'id': 123, 'head_sha': SHA}}
+            def read(*_args, **_kwargs): return [{'artifacts': [artifact]}]
+            def fetch(identifier, stream):
+                self.assertEqual(identifier, 8)
+                stream.write(raw)
+            proof = download_artifact('o/r', 123, 2, artifact['name'], root / 'valid', SHA, read, fetch)
+            self.assertEqual(proof['attempt'], 2)
+            self.assertEqual((root / 'valid/source-commit-windows.txt').read_text(), SHA)
+            for field, value in (('expired', True), ('digest', 'sha256:' + '0' * 64),
+                                 ('workflow_run', {'id': 123, 'head_sha': BASE})):
+                old = artifact[field]
+                artifact[field] = value
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    download_artifact('o/r', 123, 2, artifact['name'], root / field, SHA, read, fetch)
+                artifact[field] = old
+            with self.assertRaises(ValueError):
+                download_artifact('o/r', 123, 3, artifact['name'], root / 'attempt', SHA, read, fetch)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as archive: archive.writestr('../outside', b'unsafe')
+            raw = buffer.getvalue()
+            artifact['digest'] = 'sha256:' + hashlib.sha256(raw).hexdigest()
+            with self.assertRaisesRegex(ValueError, 'unsafe'):
+                download_artifact('o/r', 123, 2, artifact['name'], root / 'unsafe', SHA, read, fetch)
+            self.assertFalse((root / 'outside').exists())
+
+
+class RecoveryTests(unittest.TestCase):
+    def test_remote_publication_readback_resumes_from_preserved_plan_and_never_skips_partial_release(self):
+        for valid in (True, False):
+            with self.subTest(valid=valid), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                config = {'repo': 'o/r', 'branch': 'dev', 'run_root': str(root), 'target_dir': '/unused', 'key_file': '/unused'}
+                release = nightly.Release(config, root / 'state')
+                release.work.mkdir()
+                release.state['public_key'] = PUB
+                pending = release.state_dir / 'pending.json'
+                nightly.write_json(pending, {'candidate_head': SHA, 'previous_release': 'v0.1.1'})
+                audit = root / 'publications' / SHA
+                nightly.write_json(audit / 'publication.json', {'signed': 'retained outside clone'})
+                def git(*args):
+                    if args[:2] == ('config', '--get'): return 'true'
+                    if args[:1] == ('rev-parse',): return SHA
+                    return ''
+                release.git = git
+                release.ancestor = lambda *_args: True
+                def run(*args, **_kwargs):
+                    if args[:3] == ('gh', 'release', 'view'):
+                        return json.dumps({'tagName': 'v0.1.2', 'assets': []})
+                    if 'packaging/release_verify.py' in args:
+                        if not valid: raise nightly.NightlyError('partial remote publication')
+                        nightly.write_json(audit / 'public-verification.json', {'head': SHA, 'tag': 'v0.1.2',
+                                           'verified_assets': list(range(16))})
+                    return ''
+                release.run = run
+                if valid:
+                    self.assertIsNone(release.prepare())
+                    self.assertEqual(release.state['status'], 'published')
+                    self.assertFalse(pending.exists())
+                else:
+                    with self.assertRaisesRegex(nightly.NightlyError, 'partial'):
+                        release.prepare()
+                    self.assertNotEqual(release.state['status'], 'published')
+                    self.assertTrue(pending.exists())
+                self.assertTrue((audit / 'publication.json').exists())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'BSD lockf interoperation')
+    def test_cancellation_reaps_owned_child_before_releasing_shared_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = root / 'config.json'
+            config.write_text('{}')
+            lock = root / 'publish.lock'
+            marker = root / 'child.pid'
+            previous_handler = signal.getsignal(signal.SIGTERM)
+            def cancel():
+                for _ in range(100):
+                    if marker.exists():
+                        os.kill(os.getpid(), signal.SIGTERM)
+                        return
+                    time.sleep(0.02)
+            def work(*_args):
+                blocked = subprocess.run(['/usr/bin/lockf', '-k', '-t', '0', str(lock), '/usr/bin/true'], capture_output=True)
+                self.assertEqual(blocked.returncode, 75)
+                nightly.command([sys.executable, '-c',
+                    'import os,time; from pathlib import Path; Path(' + repr(str(marker)) + ').write_text(str(os.getpid())); time.sleep(15)'], timeout=5)
+            timer = threading.Thread(target=cancel)
+            timer.start()
+            try:
+                with patch.object(nightly, 'PUBLISH_LOCK', lock), patch.object(nightly, 'run_release', side_effect=work), \
+                        patch.object(sys, 'argv', ['nightly.py', 'run', '--config', str(config)]):
+                    with self.assertRaises(SystemExit): nightly.main()
+                pid = int(marker.read_text())
+                with self.assertRaises(ProcessLookupError): os.kill(pid, 0)
+                unlocked = subprocess.run(['/usr/bin/lockf', '-k', '-t', '0', str(lock), '/usr/bin/true'], capture_output=True)
+                self.assertEqual(unlocked.returncode, 0)
+            finally:
+                signal.signal(signal.SIGTERM, previous_handler)
+                timer.join()
 
 
 if __name__ == "__main__":

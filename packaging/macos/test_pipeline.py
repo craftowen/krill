@@ -4,11 +4,14 @@ import hashlib
 import os
 import pathlib
 import plistlib
+import re
 import shutil
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -29,6 +32,23 @@ class PipelineTests(unittest.TestCase):
         )
         for name in ("krill", "krill-holder", "krilld", "krill-link"):
             shutil.copy2(cls.bins / "krill-app", cls.bins / name)
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            # Hosted runners need the temporary private-key keychain in their search list,
+            # even with codesign --keychain. This changes only the disposable CI user.
+            original = shlex.split(subprocess.check_output(
+                ["/usr/bin/security", "list-keychains", "-d", "user"], text=True))
+            cls.addClassCleanup(subprocess.run,
+                ["/usr/bin/security", "list-keychains", "-d", "user", "-s", *original],
+                capture_output=True, check=True)
+            cls.addClassCleanup(cls.fixture.cleanup)
+            bootstrap = subprocess.run(
+                [str(HERE.parent / "bundle.sh"), "--bin-dir", str(cls.bins), "--output", str(cls.root / "bootstrap")],
+                env=dict(os.environ, KRILL_CODESIGN_KEYCHAIN=str(cls.keychain)),
+                capture_output=True, text=True, timeout=60)
+            if bootstrap.returncode and "The specified item could not be found in the keychain" not in bootstrap.stderr:
+                raise RuntimeError(bootstrap.stdout + bootstrap.stderr)
+            subprocess.run(["/usr/bin/security", "list-keychains", "-d", "user", "-s", str(cls.keychain), *original],
+                           capture_output=True, check=True)
 
     @classmethod
     def tearDownClass(cls):
@@ -103,6 +123,19 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(list(self.output.glob(".krill.*")))
+
+    def test_signed_bundle_preserves_tested_machine_code(self):
+        sys.path.insert(0, str(HERE.parent))
+        import release_check
+        self.verified_package()
+        with patch.object(release_check, "verify", return_value=self.bins):
+            release_check.verify_bundle(self.output / "receipt.json", "a" * 40, self.output / "unused-key", self.app)
+            changed = self.output / "different"
+            subprocess.run(["/usr/bin/clang", "-x", "c", "-", "-o", str(changed)],
+                           input=b"int main(void) { return 1; }\n", check=True)
+            shutil.copyfile(changed, self.app / "Contents/Helpers/krilld")
+            with self.assertRaisesRegex(ValueError, "differs from the tested binary"):
+                release_check.verify_bundle(self.output / "receipt.json", "a" * 40, self.output / "unused-key", self.app)
 
     def test_ed25519_manifest_signing_and_forbidden_test_keys(self):
         script = str(HERE / "ed25519_manifest.py")
@@ -206,7 +239,14 @@ class PipelineTests(unittest.TestCase):
         self.verified_package()
         helper = self.app / "Contents/Helpers/krilld"
         data = bytearray(helper.read_bytes())
-        data[len(data) // 2] ^= 1
+        sections = subprocess.check_output(["/usr/bin/otool", "-l", str(helper)], text=True)
+        text = re.search(r"sectname __text\s+segname __TEXT\s+addr \S+\s+size (0x[0-9a-fA-F]+)\s+offset (\d+)", sections)
+        self.assertIsNotNone(text, "fixture must contain a signed machine-code section")
+        size, offset = int(text[1], 16), int(text[2])
+        self.assertGreater(size, 0)
+        self.assertLess(offset + size, len(data))
+        # A file midpoint can land in signing metadata on Intel; change actual signed code.
+        data[offset + size // 2] ^= 1
         helper.write_bytes(data)
         self.assertNotEqual(self.verify().returncode, 0)
 
