@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 LABEL = "dev.krill.nightly"
@@ -98,7 +99,7 @@ def workflow_results(runs, sha, branch, expected):
 def launch_agent(runner, config, logs):
     return {
         "Label": LABEL,
-        "ProgramArguments": ["/usr/bin/python3", str(runner), "run", "--config", str(config)],
+        "ProgramArguments": ["/usr/bin/python3", str(runner), "dispatch", "--config", str(config)],
         "StartCalendarInterval": {"Hour": 0, "Minute": 0},
         "ProcessType": "Background",
         "LowPriorityIO": True,
@@ -121,24 +122,24 @@ def preflight(config):
     target = Path(config["target_dir"]).resolve()
     if VOLUME not in root.parents or TARGETS not in target.parents:
         raise NightlyError("nightly work and Cargo targets must stay on /Volumes/krill-build")
-    source = Path(config["source"])
-    if not source.is_dir():
-        raise NightlyError(f"source repository is missing: {source}")
+    # launchd는 Documents 접근 권한을 상속하지 않는다. 런타임 입력은 원격 dev뿐이다.
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", config["repo"]):
+        raise NightlyError("invalid GitHub repository")
+    root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=root) as probe:
+        probe.write(b"nightly volume access check")
     for name in ("git", "gh", "cargo", "cargo-nextest", "cargo-deny", "zsh", "lockf", "codesign"):
         if not shutil.which(name):
             raise NightlyError(f"required tool is missing: {name}")
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
     command(["gh", "api", "user", "--jq", ".login"], env=env)
-    command(["git", "check-ref-format", "--branch", config["branch"]], cwd=source)
-    command(["git", "rev-parse", "--verify", f"refs/heads/{config['branch']}^{{commit}}"], cwd=source)
-    origin = command(["git", "remote", "get-url", "origin"], cwd=source)
-    match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?", origin)
-    if not match or match[1] != config["repo"]:
-        raise NightlyError("source origin does not match the configured GitHub repository")
+    command(["git", "check-ref-format", "--branch", config["branch"]])
+    command(["gh", "api", f"repos/{config['repo']}/git/ref/heads/{config['branch']}",
+             "--jq", ".object.sha"], env=env)
     key = Path(config["key_file"])
     if not key.is_file():
         raise NightlyError(f"existing update signing key is missing: {key}")
-    public_key = command(["/usr/bin/python3", source / "packaging/macos/ed25519_manifest.py",
+    public_key = command(["/usr/bin/python3", config["key_tool"],
                           "keygen", "--key-file", key], env=env)
     if not re.fullmatch(r"[0-9a-f]{64}", public_key):
         raise NightlyError("invalid update public key")
@@ -190,8 +191,6 @@ class Release:
         raise NightlyError(f"CI timed out at {sha} ({branch})")
 
     def prepare(self):
-        source = self.config["source"]
-        local = command(["git", "rev-parse", f"refs/heads/{self.config['branch']}^{{commit}}"], cwd=source)
         self.root.mkdir(parents=True, exist_ok=True)
         if not self.work.exists():
             command(["git", "init", "--initial-branch=nightly", self.work])
@@ -203,23 +202,33 @@ class Release:
         self.git("reset", "--hard")
         self.git("clean", "-fdx")
         self.git("fetch", "--prune", "--tags", "origin")
-        self.git("fetch", source, f"+{local}:refs/nightly/source")
         main = self.git("rev-parse", "origin/main")
         remote = self.git("rev-parse", f"origin/{self.config['branch']}")
-        latest = json.loads(self.run("gh", "release", "view", "--repo", self.config["repo"],
-                                    "--json", "tagName"))["tagName"]
+        published_release = json.loads(self.run("gh", "release", "view", "--repo", self.config["repo"],
+                                               "--json", "tagName,assets"))
+        latest = published_release["tagName"]
         published = self.git("rev-parse", f"refs/tags/{latest}^{{commit}}")
-        self.update(source_head=local, remote_source_head=remote, base_main=main, previous_release=latest)
-        if all(self.ancestor(sha, published) for sha in (local, remote, main)):
+        self.update(source_head=remote, base_main=main, previous_release=latest)
+        floor = self.config.get("after_release")
+        if floor and version_tuple(latest.removeprefix("v")) < version_tuple(floor):
+            self.update(status="skipped", reason=f"waiting for the existing v{floor} release owner")
+            return None
+        if floor and latest == f"v{floor}":
+            required = {f"Krill-{floor}.dmg", f"Krill-{floor}-windows-x64.zip", "latest.json", "latest-windows.json",
+                        f"krill-{floor}-linux-x86_64.tar.gz", f"krill-{floor}-linux-aarch64.tar.gz"}
+            available = {asset["name"] for asset in published_release.get("assets", [])}
+            if not required.issubset(available):
+                self.update(status="skipped", reason=f"waiting for v{floor} macOS/Windows/Linux release assets")
+                return None
+        if all(self.ancestor(sha, published) for sha in (remote, main)):
             self.update(status="skipped", reason="no committed changes since the last published release")
             return None
         branch = "release/nightly-" + datetime.now().strftime("%Y%m%d-%H%M%S")
         self.git("checkout", "-B", branch, main)
         for field in ("user.name", "user.email"):
-            value = command(["git", "config", "--get", field], cwd=source)
-            self.git("config", field, value)
+            self.git("config", field, self.config[field])
         self.git("config", "core.hooksPath", "scripts/hooks")
-        self.git("merge", "--no-edit", local, remote)
+        self.git("merge", "--no-edit", remote)
         manifest = self.work / "Cargo.toml"
         text = manifest.read_text()
         pattern = r'(?ms)(^\[workspace\.package\]\n.*?^version = ")([^"\n]+)(")'
@@ -231,7 +240,7 @@ class Release:
         self.run("cargo", "update", "--workspace", "--offline")
         self.run("python3", "docs/licensing/generate_notices.py", timeout=900)
         self.git("add", "Cargo.toml", "Cargo.lock", "THIRD_PARTY_NOTICES.md")
-        self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {local}\nNightly-Remote: {remote}")
+        self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {remote}\nNightly-Main: {main}")
         sha = self.git("rev-parse", "HEAD")
         self.update(candidate_head=sha, candidate_branch=branch, version=version)
         return sha, branch, version, main
@@ -313,30 +322,60 @@ def run_release(config, state_dir):
                 raise
 
 
-def install(source):
+def dispatch(config, config_path, preflight_only=False):
+    # macOS TCC 권한은 launchd 자식에게 상속되지 않는다. 권한이 있는 Orca 호스트에서 셸을 연다.
+    # AI 에이전트를 시작하지 않고 결정적인 실행기만 호출한다.
+    cli = config["orca_cli"]
+    command([cli, "open", "--json"], cwd=SUPPORT)
+    action = "preflight" if preflight_only else "run"
+    shell = shlex.join(["/usr/bin/python3", str(SUPPORT / "nightly.py"), action, "--config", str(config_path)])
+    result = json.loads(command([cli, "terminal", "create", "--worktree", config["workspace"],
+                                 "--title", "Krill nightly " + action, "--command", shell, "--json"], cwd=SUPPORT))
+    if not result.get("ok"):
+        raise NightlyError("Orca did not accept the nightly shell launch")
+    write_json(config_path.parent / "dispatch.json", {
+        "dispatched_at": datetime.now().astimezone().isoformat(), "action": action,
+        "terminal": result["result"]["terminal"]["handle"]})
+
+
+def install(source, after_release=None):
     SUPPORT.mkdir(parents=True, exist_ok=True)
     with (SUPPORT / "run.lock").open("w") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise NightlyError("nightly is running; install after it finishes") from error
-        install_locked(source)
+        install_locked(source, after_release)
 
 
-def install_locked(source):
+def install_locked(source, after_release=None):
     source = source.resolve()
     origin = command(["git", "remote", "get-url", "origin"], cwd=source)
     match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:)([\w.-]+/[\w.-]+?)(?:\.git)?", origin)
     if not match:
         raise NightlyError("origin must be a GitHub repository")
-    config = {"source": str(source), "branch": "dev", "repo": match[1],
+    config = {"branch": "dev", "repo": match[1],
               "run_root": str(VOLUME / "nightly"), "target_dir": str(TARGETS / "nightly"),
-              "key_file": str(Path.home() / "Library/Keychains/minikrill-codesign.keychain-db.ed25519.key")}
+              "key_file": str(Path.home() / "Library/Keychains/minikrill-codesign.keychain-db.ed25519.key"),
+              "key_tool": str(source / "packaging/macos/ed25519_manifest.py")}
+    cli = shutil.which("orca")
+    if not cli:
+        raise NightlyError("Orca CLI is required to run on the external build volume from a scheduled job")
+    workspace = json.loads(command([cli, "worktree", "current", "--json"], cwd=source))
+    config["orca_cli"] = cli
+    config["workspace"] = "id:" + workspace["result"]["worktree"]["id"]
+    if after_release:
+        version_tuple(after_release)
+        config["after_release"] = after_release
+    for field in ("user.name", "user.email"):
+        config[field] = command(["git", "config", "--get", field], cwd=source)
     preflight(config)
     SUPPORT.mkdir(parents=True, exist_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
     for name in ("nightly.py", "nightly_assets.py"):
         shutil.copyfile(source / "packaging" / name, SUPPORT / name)
+    shutil.copyfile(source / "packaging/macos/ed25519_manifest.py", SUPPORT / "ed25519_manifest.py")
+    config["key_tool"] = str(SUPPORT / "ed25519_manifest.py")
     write_json(CONFIG, config)
     CONFIG.chmod(0o600)
     PLIST.parent.mkdir(parents=True, exist_ok=True)
@@ -355,13 +394,15 @@ def install_locked(source):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "preflight", "run", "status", "uninstall"))
+    parser.add_argument("action", choices=("install", "preflight", "dispatch", "run", "status", "uninstall"))
     parser.add_argument("--source", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--config", type=Path, default=CONFIG)
+    parser.add_argument("--preflight-only", action="store_true", help="dispatch a build-free background probe")
+    parser.add_argument("--after-release", help="install: wait for this existing stable version to be published first")
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit("nightly received SIGTERM"))
     if args.action == "install":
-        install(args.source)
+        install(args.source, args.after_release)
     elif args.action == "uninstall":
         command(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"])
         PLIST.unlink(missing_ok=True)
@@ -374,6 +415,8 @@ def main():
         config = json.loads(args.config.read_text())
         if args.action == "preflight":
             preflight(config)
+        elif args.action == "dispatch":
+            dispatch(config, args.config, args.preflight_only)
         else:
             run_release(config, args.config.parent)
 
