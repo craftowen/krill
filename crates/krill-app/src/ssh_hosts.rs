@@ -525,9 +525,9 @@ pub fn parse_ssh_config(text: &str) -> Vec<SshHost> {
                 port = None;
                 identity = None;
             }
-            "hostname" => hostname = Some(rest[0].to_owned()),
-            "user" => user = Some(rest[0].to_owned()),
-            "port" => port = rest[0].parse::<u16>().ok(),
+            "hostname" => hostname = rest.first().map(|s| (*s).to_owned()),
+            "user" => user = rest.first().map(|s| (*s).to_owned()),
+            "port" => port = rest.first().and_then(|s| s.parse::<u16>().ok()),
             "identityfile" => identity = Some(rest.join(" ")),
             _ => {}
         }

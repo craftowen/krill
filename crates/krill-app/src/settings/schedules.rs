@@ -1146,20 +1146,28 @@ impl SettingsView {
             None => text::SCHEDULE_MODAL_ADD_TITLE.get().to_owned(),
         };
 
-        let field =
-            |label_text: &'static str, selector: &'static str, input: &gpui::Entity<InputState>| {
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(crate::ui::field_label(label_text, None, p))
-                    .child(
-                        div()
-                            .id(selector)
-                            .debug_selector(move || selector.into())
-                            .child(Input::new(input).small()),
-                    )
-            };
+        let field = |label_text: &'static str,
+                     selector: &'static str,
+                     input: &gpui::Entity<InputState>,
+                     hint: Option<&'static str>| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(crate::ui::field_label(label_text, None, p))
+                .child(
+                    div()
+                        .id(selector)
+                        .debug_selector(move || selector.into())
+                        .child(Input::new(input).small()),
+                )
+                .children(hint.map(|hint| {
+                    div()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(hint)
+                }))
+        };
 
         let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
         let reuse_btn = layout::segment(
@@ -1196,7 +1204,13 @@ impl SettingsView {
                 None,
                 p,
             ))
-            .child(layout::segmented_control(p, [reuse_btn, isolate_btn]));
+            .child(layout::segmented_control(p, [reuse_btn, isolate_btn]))
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::SCHEDULE_FIELD_WORKSPACE_MODE_HINT.get()),
+            );
 
         let mut dialog = div()
             .id("admin-schedule-modal")
@@ -1225,31 +1239,37 @@ impl SettingsView {
                 text::SCHEDULE_FIELD_ID.get(),
                 "admin-schedule-input-id",
                 &modal.id,
+                None,
             ))
             .child(field(
                 text::SCHEDULE_FIELD_CRON.get(),
                 "admin-schedule-input-cron",
                 &modal.cron,
+                Some(text::SCHEDULE_FIELD_CRON_HINT.get()),
             ))
             .child(field(
                 text::SCHEDULE_FIELD_CWD.get(),
                 "admin-schedule-input-cwd",
                 &modal.cwd,
+                None,
             ))
             .child(field(
                 text::SCHEDULE_FIELD_COMMAND.get(),
                 "admin-schedule-input-command",
                 &modal.command,
+                None,
             ))
             .child(field(
                 text::SCHEDULE_FIELD_PROMPT.get(),
                 "admin-schedule-input-prompt",
                 &modal.prompt,
+                None,
             ))
             .child(field(
                 text::SCHEDULE_FIELD_PRECHECK.get(),
                 "admin-schedule-input-precheck",
                 &modal.precheck,
+                Some(text::SCHEDULE_FIELD_PRECHECK_HINT.get()),
             ))
             .child(mode_row);
 

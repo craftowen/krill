@@ -427,6 +427,39 @@ pub fn partition_trees<'a>(
         .partition(|tree| tree.as_path() == repo || !is_claude_worktree(tree))
 }
 
+/// 같은 저장소 그룹 안에서 주 워크트리(`repo` 키) 밑으로 묶이지 않은 연결 워크트리를
+/// Orca처럼 본 워크트리 자식으로 묶는다(MK-176). 명시적 부모가 있는 항목은 건드리지 않으며,
+/// `can_assign_parent`을 통과한 것만 돌려준다. git linked 워크트리·Orca 이관 워크트리가
+/// 하단에서 평탄하게 풀리는 대신 `N 하위` 토글로 접히도록 렌더 계보의 입력이 된다.
+/// 호출자는 처음 묶인 부모를 접힘 상태로 시작시켜 Orca 기본 보기와 맞춘다.
+#[must_use]
+pub fn infer_repo_main_lineage(
+    trees: &std::collections::BTreeMap<PathBuf, Vec<PathBuf>>,
+    existing: &std::collections::BTreeMap<PathBuf, PathBuf>,
+) -> Vec<(PathBuf, PathBuf)> {
+    let mut out: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut probe = existing.clone();
+    for (repo, list) in trees {
+        if list.len() < 3 || !list.contains(repo) {
+            continue;
+        }
+        for child in list {
+            if child == repo || probe.contains_key(child) {
+                continue;
+            }
+            if !seen.insert(child.clone()) {
+                continue;
+            }
+            if super::lineage::can_assign_parent(&probe, child, repo) {
+                probe.insert(child.clone(), repo.clone());
+                out.push((child.clone(), repo.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// `<repo>/.claude/worktrees` 아래에 있는 디렉터리도 스냅샷에 보탠다(이미 있으면 중복 추가하지 않음).
 /// AS-09: 디렉터리 자체의 mtime이 그대로면 재스캔하지 않는다. `apply`가 0.5초마다 UI 스레드에서
 /// 부르고 백그라운드 조회가 같은 함수를 이미 실행하므로, 매번 `read_dir`+`canonicalize`(최대 64개)를
@@ -1291,6 +1324,9 @@ fn resolve_or_fetch_remote_icon(
                 {
                     write_cached_icon_bytes(&target, &out.stdout).ok();
                 }
+                if let Ok(mut set) = IN_FLIGHT_ICON_URLS.lock() {
+                    set.remove(clean_url.as_str());
+                }
             });
         }
     }
@@ -1939,7 +1975,17 @@ pub fn parse_ps_parents(text: &str) -> BTreeMap<u32, u32> {
 }
 
 /// 현재 프로세스 표(pid → ppid). 실패하면 `None`(호출자는 기존 cwd 동작으로 fail-open).
+type ParentMapCache = (Option<BTreeMap<u32, u32>>, Option<std::time::Instant>);
+
 pub fn parent_map() -> Option<BTreeMap<u32, u32>> {
+    static CACHE: LazyLock<Mutex<ParentMapCache>> = LazyLock::new(|| Mutex::new((None, None)));
+    const TTL: std::time::Duration = std::time::Duration::from_secs(2);
+    if let Ok(cache) = CACHE.lock()
+        && let (Some(map), Some(at)) = (&cache.0, &cache.1)
+        && at.elapsed() < TTL
+    {
+        return Some(map.clone());
+    }
     let out = std::process::Command::new("ps")
         .args(["-eo", "pid,ppid"])
         .stdin(std::process::Stdio::null())
@@ -1950,7 +1996,14 @@ pub fn parent_map() -> Option<BTreeMap<u32, u32>> {
     if !out.status.success() {
         return None;
     }
-    std::str::from_utf8(&out.stdout).ok().map(parse_ps_parents)
+    let map = std::str::from_utf8(&out.stdout).ok().map(parse_ps_parents);
+    if let Ok(mut cache) = CACHE.lock()
+        && let Some(ref m) = map
+    {
+        cache.0 = Some(m.clone());
+        cache.1 = Some(std::time::Instant::now());
+    }
+    map
 }
 
 /// AS-08: 외부 에이전트 pid가 세션 루트 pid 자신이거나 후손이면 참.
@@ -2624,4 +2677,37 @@ kind = "folder"
     assert_eq!(v_folder.icon, None);
 
     fs::remove_dir_all(&base).ok();
+}
+
+/// Orca처럼 같은 저장소의 연결 워크트리를 본 워크트리 자식으로 묶는다.
+/// 2개 미만은 평탄 유지, 명시적 부모는 유지, 사이클은 만들지 않는다.
+#[test]
+fn infer_repo_main_lineage_groups_linked_worktrees() {
+    let repo = PathBuf::from("/repo");
+    let trees: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::from([(
+        repo.clone(),
+        vec![
+            repo.clone(),
+            PathBuf::from("/repo/wt-1"),
+            PathBuf::from("/repo/wt-2"),
+        ],
+    )]);
+    let inferred = infer_repo_main_lineage(&trees, &BTreeMap::new());
+    assert_eq!(
+        inferred,
+        vec![
+            (PathBuf::from("/repo/wt-1"), repo.clone()),
+            (PathBuf::from("/repo/wt-2"), repo.clone()),
+        ]
+    );
+    // 2개 미만(본체+1)은 Orca처럼 평탄하게 둔다.
+    let small: BTreeMap<PathBuf, Vec<PathBuf>> = BTreeMap::from([(
+        repo.clone(),
+        vec![repo.clone(), PathBuf::from("/repo/wt-1")],
+    )]);
+    assert!(infer_repo_main_lineage(&small, &BTreeMap::new()).is_empty());
+    // 명시적 부모가 있으면 건드리지 않는다.
+    let explicit = BTreeMap::from([(PathBuf::from("/repo/wt-1"), PathBuf::from("/other"))]);
+    let inferred = infer_repo_main_lineage(&trees, &explicit);
+    assert_eq!(inferred, vec![(PathBuf::from("/repo/wt-2"), repo.clone())]);
 }
