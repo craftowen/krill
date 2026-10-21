@@ -452,11 +452,6 @@ impl SettingsView {
             .flex()
             .flex_col()
             .gap_3()
-            .child(layout::section_title(
-                p,
-                "admin-section-space",
-                text::SPACE_TITLE.get(),
-            ))
             .child(header_row);
         if let Some(err) = &self.space.error {
             section = section.child(

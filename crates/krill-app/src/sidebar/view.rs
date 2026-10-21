@@ -1721,7 +1721,10 @@ impl Sidebar {
             Vec::new()
         } else {
             self.card_session_indices(index)
-                .map(|i| self.render_row_with_menu(i, &self.rows[i], cx))
+                .filter_map(|i| {
+                    let row = self.rows.get(i)?;
+                    Some(self.render_row_with_menu(i, row, cx))
+                })
                 .collect()
         };
         if self.options.card_layout == super::CardLayout::Compact || compact_fallback {
