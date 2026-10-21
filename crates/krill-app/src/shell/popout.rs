@@ -576,25 +576,64 @@ fn expanded_usage_fits(width: gpui::Pixels, rem_size: gpui::Pixels, providers: u
             * scale
 }
 
-fn status_window_label(label: &str, win: Option<&krill_proto::usage::Window>, now: u64) -> String {
-    let display = krill_app::accounts::display::window(win, i64::try_from(now).unwrap_or(i64::MAX));
-    let reset = display
-        .percent
-        .and_then(|_| krill_app::settings::window_reset_suffix(win));
-    format!(
-        "{label} {}{}",
-        display.text,
-        reset.map_or_else(String::new, |r| format!(" {r}"))
-    )
+// Compact duration conventions follow Orca's rate-limit-reset-format.ts
+// (Copyright (c) 2026 Lovecast Inc., MIT License, .ref/orca/LICENSE).
+fn status_reset_duration(left: u64) -> String {
+    let minutes = left / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 24 {
+        return if minutes.is_multiple_of(60) {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {}m", minutes % 60)
+        };
+    }
+    if hours.is_multiple_of(24) {
+        format!("{}d", hours / 24)
+    } else {
+        format!("{}d {}h", hours / 24, hours % 24)
+    }
+}
+
+fn status_window_label(win: Option<&krill_proto::usage::Window>, now: u64) -> String {
+    let Some(win) = win else { return "—".into() };
+    let reset = win
+        .resets_at
+        .as_deref()
+        .map(|ts| krill_app::settings::classify_reset(ts, now));
+    match reset {
+        Some(krill_app::settings::ResetDue::Stale) => "— now".into(),
+        Some(krill_app::settings::ResetDue::Future(left)) => {
+            format!("{}% {}", win.percent.min(100), status_reset_duration(left))
+        }
+        _ => format!("{}%", win.percent.min(100)),
+    }
 }
 
 fn expanded_account_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> String {
-    use krill_app::i18n::catalog::settings as labels;
     format!(
         "{} · {}",
-        status_window_label(labels::WINDOW_5H.get(), usage.five_hour.as_ref(), now),
-        status_window_label(labels::WINDOW_7D.get(), usage.seven_day.as_ref(), now),
+        status_window_label(usage.five_hour.as_ref(), now),
+        status_window_label(usage.seven_day.as_ref(), now),
     )
+}
+
+fn compact_status_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> String {
+    let now_signed = i64::try_from(now).unwrap_or(i64::MAX);
+    let window = [usage.five_hour.as_ref(), usage.seven_day.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter_map(|w| {
+            krill_app::accounts::display::window(Some(w), now_signed)
+                .percent
+                .map(|pct| (pct, w))
+        })
+        .max_by_key(|(pct, _)| *pct)
+        .map(|(_, w)| w);
+    status_window_label(window, now)
 }
 
 fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) -> bool {
@@ -1394,7 +1433,9 @@ impl Shell {
             let label = if expanded {
                 expanded_label.clone()
             } else {
-                compact_label
+                active
+                    .filter(|a| !a.usage.is_empty())
+                    .map_or(compact_label, |a| compact_status_usage(&a.usage, now))
             };
             let color = match percent {
                 _ if status.as_ref().is_some_and(|s| {

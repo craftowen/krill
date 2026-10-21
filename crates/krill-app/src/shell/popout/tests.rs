@@ -1611,7 +1611,6 @@ fn status_usage_refresh_sets_loading_and_schedules_followup_polls(cx: &mut TestA
 
 #[test]
 fn expanded_usage_keeps_both_windows_and_never_invents_zero() {
-    use krill_app::i18n::catalog::settings as labels;
     use krill_proto::usage::{Snapshot, Window};
     let usage = Snapshot {
         five_hour: Some(Window {
@@ -1623,27 +1622,13 @@ fn expanded_usage_keeps_both_windows_and_never_invents_zero() {
             resets_at: None,
         }),
     };
-    assert_eq!(
-        expanded_account_usage(&usage, 1000),
-        format!(
-            "{} 23% · {} 76%",
-            labels::WINDOW_5H.get(),
-            labels::WINDOW_7D.get()
-        )
-    );
-    assert_eq!(
-        expanded_account_usage(&Snapshot::default(), 1000),
-        format!(
-            "{} — · {} —",
-            labels::WINDOW_5H.get(),
-            labels::WINDOW_7D.get()
-        )
-    );
+    assert_eq!(expanded_account_usage(&usage, 1000), "23% · 76%");
+    assert_eq!(expanded_account_usage(&Snapshot::default(), 1000), "— · —");
     let expired = Window {
         percent: 99,
         resets_at: Some("900".into()),
     };
-    let label = status_window_label("5h", Some(&expired), 1000);
+    let label = status_window_label(Some(&expired), 1000);
     assert!(!label.contains("99%"));
     assert!(!label.contains("0%"));
     assert!(expanded_usage_fits(px(1800.), px(16.), 4));
@@ -1713,5 +1698,41 @@ fn status_bar_switches_provider_windows_when_resized(cx: &mut TestAppContext) {
             left.right() <= right.left(),
             "usage overlaps status actions at {width}px"
         );
+    }
+}
+
+#[test]
+fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
+    use krill_proto::usage::{Snapshot, Window};
+    let now = 1_800_000_000;
+    let usage = Snapshot {
+        five_hour: Some(Window {
+            percent: 0,
+            resets_at: Some((now + 5460).to_string()),
+        }),
+        seven_day: Some(Window {
+            percent: 92,
+            resets_at: Some((now + 154_800).to_string()),
+        }),
+    };
+    // Formatting is deliberately independent of the app's selected language.
+    assert_eq!(
+        expanded_account_usage(&usage, now),
+        "0% 1h 31m · 92% 1d 19h"
+    );
+    assert_eq!(
+        expanded_account_usage(&usage, now + 60),
+        "0% 1h 30m · 92% 1d 18h"
+    );
+    assert_eq!(compact_status_usage(&usage, now), "92% 1d 19h");
+    assert_eq!(status_window_label(None, now), "—");
+    for (secs, expected) in [
+        (0, "0m"),
+        (59, "0m"),
+        (60, "1m"),
+        (3600, "1h"),
+        (86400, "1d"),
+    ] {
+        assert_eq!(status_reset_duration(secs), expected);
     }
 }
