@@ -11,6 +11,7 @@ pub mod display;
 pub mod installed;
 mod login_browser;
 mod login_output;
+pub mod opencode_go;
 
 #[cfg(test)]
 #[cfg(unix)]

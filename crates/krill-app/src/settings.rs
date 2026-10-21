@@ -2462,6 +2462,11 @@ pub struct SettingsView {
     /// [터미널에서 실행] 버튼을 보이고, 버튼을 누르기 전에는 명령을 큐에 넣지 않는다.
     terminal_login_provider: Option<krill_proto::usage::ProviderKind>,
     terminal_login_account: Option<krill_proto::usage::AccountInfo>,
+    /// `OpenCode` Go API key override (Orca `OpenCodeGoCredentials` parity): input + saved badge + error.
+    opencode_api_key_input: Option<gpui::Entity<gpui_component::input::InputState>>,
+    opencode_api_key_configured: bool,
+    opencode_api_key_pending: bool,
+    opencode_api_key_error: Option<SharedString>,
     ssh_hosts: Vec<crate::ssh_hosts::SshHost>,
     /// 같은 기기 중복 등록 `(중복 id, 남길 id)`와 그것을 구한 호스트 목록(`ssh -G`, 백그라운드).
     ssh_duplicates: Vec<(String, String)>,
@@ -2752,6 +2757,10 @@ impl SettingsView {
             login_pending: None,
             terminal_login_provider: None,
             terminal_login_account: None,
+            opencode_api_key_input: None,
+            opencode_api_key_configured: false,
+            opencode_api_key_pending: false,
+            opencode_api_key_error: None,
             ssh_hosts: Vec::new(),
             ssh_duplicates: Vec::new(),
             ssh_duplicates_for: None,
@@ -3852,6 +3861,102 @@ impl SettingsView {
             .detach();
         }
         cx.notify();
+    }
+
+    fn opencode_home_and_state(cx: &App) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+        let dir = state_dir(cx);
+        let home = crate::orca_import::state(cx)
+            .and_then(|s| s.home_override.clone())
+            .or_else(|| {
+                cfg!(test)
+                    .then(|| dir.as_ref().map(|d| d.join("test-home")))
+                    .flatten()
+            })
+            .unwrap_or_else(crate::accounts::default_home);
+        (home, dir)
+    }
+
+    fn ensure_opencode_api_key_input(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Entity<gpui_component::input::InputState> {
+        if let Some(input) = self.opencode_api_key_input.clone() {
+            return input;
+        }
+        let input = cx.new(|cx| {
+            gpui_component::input::InputState::new(window, cx)
+                .placeholder(text::OPENCODE_APIKEY_PLACEHOLDER.get())
+        });
+        self.opencode_api_key_input = Some(input.clone());
+        input
+    }
+
+    fn save_opencode_api_key(&mut self, cx: &mut Context<Self>) {
+        let key = self
+            .opencode_api_key_input
+            .as_ref()
+            .map(|i| i.read(cx).value().trim().to_owned())
+            .unwrap_or_default();
+        if key.is_empty() {
+            self.opencode_api_key_error = Some(text::OPENCODE_APIKEY_EMPTY.get().into());
+            cx.notify();
+            return;
+        }
+        let (home, dir) = Self::opencode_home_and_state(cx);
+        self.opencode_api_key_pending = true;
+        self.opencode_api_key_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let saved = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::accounts::opencode_go::save_override(&home, dir.as_deref(), &key)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.opencode_api_key_pending = false;
+                match saved {
+                    Ok(()) => {
+                        this.opencode_api_key_configured = true;
+                        this.opencode_api_key_error = None;
+                        this.opencode_api_key_input = None;
+                    }
+                    Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn clear_opencode_api_key(&mut self, cx: &mut Context<Self>) {
+        let (home, dir) = Self::opencode_home_and_state(cx);
+        self.opencode_api_key_pending = true;
+        self.opencode_api_key_error = None;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let cleared = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::accounts::opencode_go::clear_override(&home, dir.as_deref())
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.opencode_api_key_pending = false;
+                match cleared {
+                    Ok(()) => {
+                        this.opencode_api_key_configured = false;
+                        this.opencode_api_key_error = None;
+                    }
+                    Err(e) => this.opencode_api_key_error = Some(e.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub fn apply_account_request(
@@ -6535,6 +6640,115 @@ impl SettingsView {
         cx.notify();
     }
 
+    fn render_opencode_api_key_card(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::{IconName, Sizable as _};
+        let p = crate::ui::palette(cx);
+        let (home, dir) = Self::opencode_home_and_state(cx);
+        let configured = crate::accounts::opencode_go::has_override(&home, dir.as_deref());
+        self.opencode_api_key_configured = configured;
+        let input = self.ensure_opencode_api_key_input(window, cx);
+        let draft_empty = input.read(cx).value().trim().is_empty();
+        let pending = self.opencode_api_key_pending;
+        let tone = if configured {
+            crate::ui::BadgeTone::Success
+        } else {
+            crate::ui::BadgeTone::Muted
+        };
+        let badge_label = if configured {
+            text::OPENCODE_APIKEY_SAVED.get()
+        } else {
+            text::OPENCODE_APIKEY_NOT_SAVED.get()
+        };
+        let mut card = layout::card(p)
+            .id("admin-opencode-api-key-card")
+            .debug_selector(|| "admin-opencode-api-key-card".into())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(layout::label(
+                        p,
+                        text::OPENCODE_APIKEY_TITLE.get(),
+                        Some(text::OPENCODE_APIKEY_DESC.get()),
+                    ))
+                    .child(
+                        crate::ui::badge(p, tone, badge_label)
+                            .id("admin-opencode-api-key-badge")
+                            .debug_selector(|| "admin-opencode-api-key-badge".into()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(gpui_component::input::Input::new(&input).small()),
+                    )
+                    .child(
+                        layout::controls()
+                            .child(
+                                layout::secondary(
+                                    "admin-opencode-api-key-save",
+                                    if configured {
+                                        text::OPENCODE_APIKEY_REPLACE.get()
+                                    } else {
+                                        text::OPENCODE_APIKEY_SAVE.get()
+                                    },
+                                )
+                                .disabled(pending || draft_empty)
+                                .debug_selector(|| "admin-opencode-api-key-save".into())
+                                .on_click(cx.listener(
+                                    |this, _, _, cx| {
+                                        this.save_opencode_api_key(cx);
+                                    },
+                                )),
+                            )
+                            .when(configured, |c| {
+                                c.child(
+                                    layout::ghost(
+                                        "admin-opencode-api-key-clear",
+                                        text::OPENCODE_APIKEY_CLEAR.get(),
+                                    )
+                                    .icon(IconName::Close)
+                                    .disabled(pending)
+                                    .debug_selector(|| "admin-opencode-api-key-clear".into())
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            this.clear_opencode_api_key(cx);
+                                        },
+                                    )),
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::OPENCODE_APIKEY_HELP.get()),
+            );
+        if let Some(err) = self.opencode_api_key_error.clone() {
+            card = card.child(
+                crate::ui::error_banner(p, err)
+                    .id("admin-opencode-api-key-error")
+                    .debug_selector(|| "admin-opencode-api-key-error".into()),
+            );
+        }
+        card
+    }
+
     /// 계정 한 행(OWE-719, Orca accounts-pane 행 밀도): 아바타+상태 점, 이름·보조 줄, 5h·7d 미니 바, 주 동작 하나
     /// (전환 또는 다시 로그인)와 … 메뉴(다시 로그인·이름 변경·제거). 사용 중 표시는 행 강조와 "사용 중" 하나뿐이다.
     fn render_account_row(
@@ -7085,7 +7299,7 @@ impl SettingsView {
         Some(crate::ui::modal_backdrop(window.viewport_size(), card))
     }
 
-    fn render_accounts_tab(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_accounts_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) -> gpui::Div {
         use gpui_component::IconName;
         use krill_proto::usage::{ConnectionStatus, ProviderKind, UsageRequest};
         let p = crate::ui::palette(cx);
@@ -7311,33 +7525,21 @@ impl SettingsView {
                 let dismiss_id = format!("admin-{}-login-dismiss", provider.as_str());
                 let guide_id = format!("admin-{}-login-guide", provider.as_str());
                 list = list.child(
-                    div()
+                    layout::card(p)
                         .id(SharedString::from(guide_id.clone()))
                         .debug_selector(move || guide_id.clone())
                         .flex()
                         .flex_col()
                         .gap_2()
-                        .px_3()
-                        .py_3()
-                        .rounded(crate::ui::RADIUS_MD)
-                        .border_1()
-                        .border_color(p.border)
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .font_weight(gpui::FontWeight::MEDIUM)
-                                .child(text::ACCOUNT_LOGIN_UNSUPPORTED.get()),
-                        )
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(if provider == ProviderKind::Antigravity {
-                                    text::AGY_LOGIN_GUIDE.get()
-                                } else {
-                                    text::OPENCODE_LOGIN_GUIDE.get()
-                                }),
-                        )
+                        .child(layout::label(
+                            p,
+                            text::ACCOUNT_LOGIN_UNSUPPORTED.get(),
+                            if provider == ProviderKind::Antigravity {
+                                text::AGY_LOGIN_GUIDE.get().to_owned()
+                            } else {
+                                text::OPENCODE_LOGIN_GUIDE.get().to_owned()
+                            },
+                        ))
                         .child(
                             layout::controls()
                                 .child(
@@ -7404,8 +7606,11 @@ impl SettingsView {
                 .gap_3()
                 .child(header)
                 .child(subheader)
-                .child(active_line)
-                .child(list);
+                .child(active_line);
+            if provider == ProviderKind::OpenCode {
+                section = section.child(self.render_opencode_api_key_card(window, cx));
+            }
+            section = section.child(list);
 
             // 계정별 자동 전환 규칙은 섹션 하단 "고급" 하나로 접는다(기본 접힘).
             let ruled: Vec<_> = accounts
@@ -7560,14 +7765,11 @@ impl SettingsView {
             .items_center()
             .justify_between()
             .gap_2()
-            .child(
-                div()
-                    .min_w_0()
-                    .flex_1()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::AUTO_SWITCH_RATE_LIMIT.get()),
-            )
+            .child(layout::label(
+                p,
+                text::AUTO_SWITCH_RATE_LIMIT.get(),
+                Some(text::AUTO_SWITCH_RATE_LIMIT_DESC.get()),
+            ))
             .child(layout::controls().child(rl_switch));
         let preset_btns = krill_proto::usage::AUTO_SWITCH_PRESETS
             .into_iter()
@@ -7592,13 +7794,11 @@ impl SettingsView {
             .items_center()
             .justify_between()
             .gap_2()
-            .flex_wrap()
-            .child(
-                div()
-                    .text_size(crate::ui::TEXT_XS)
-                    .text_color(p.muted_foreground)
-                    .child(text::AUTO_SWITCH_THRESHOLD.get()),
-            )
+            .child(layout::label(
+                p,
+                text::AUTO_SWITCH_THRESHOLD.get(),
+                Some(text::AUTO_SWITCH_THRESHOLD_DESC.get()),
+            ))
             .child(layout::controls().child(layout::segmented_control(p, preset_btns)));
 
         // OWE-719 1부: 데몬이 연결 꼬리를 지원할 때만 "사용량 직접 조회" 토글을 보인다.
@@ -7642,7 +7842,11 @@ impl SettingsView {
                     .items_center()
                     .justify_between()
                     .gap_2()
-                    .child(layout::label(p, text::AUTO_SWITCH_TITLE.get(), None))
+                    .child(layout::label(
+                        p,
+                        text::AUTO_SWITCH_TITLE.get(),
+                        Some(text::AUTO_SWITCH_DESC.get()),
+                    ))
                     .child(layout::controls().child(toggle_btn)),
             )
             .child(threshold_row)
@@ -7707,14 +7911,11 @@ impl SettingsView {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(crate::i18n::catalog::shell::ACCOUNT_PREDICT.get()),
-                        )
+                        .child(layout::label(
+                            p,
+                            crate::i18n::catalog::shell::ACCOUNT_PREDICT.get(),
+                            Some(crate::i18n::catalog::shell::ACCOUNT_PREDICT_DESC.get()),
+                        ))
                         .child(layout::controls().child(predict_switch)),
                 )
                 .child(
@@ -7723,14 +7924,11 @@ impl SettingsView {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get()),
-                        )
+                        .child(layout::label(
+                            p,
+                            crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST.get(),
+                            Some(crate::i18n::catalog::shell::ACCOUNT_RESET_FIRST_DESC.get()),
+                        ))
                         .child(layout::controls().child(reset_switch)),
                 )
                 .child(
@@ -7739,13 +7937,11 @@ impl SettingsView {
                         .items_center()
                         .justify_between()
                         .gap_2()
-                        .flex_wrap()
-                        .child(
-                            div()
-                                .text_size(crate::ui::TEXT_XS)
-                                .text_color(p.muted_foreground)
-                                .child(crate::i18n::catalog::shell::ACCOUNT_COOLDOWN.get()),
-                        )
+                        .child(layout::label(
+                            p,
+                            crate::i18n::catalog::shell::ACCOUNT_COOLDOWN.get(),
+                            Some(crate::i18n::catalog::shell::ACCOUNT_COOLDOWN_DESC.get()),
+                        ))
                         .child(
                             layout::controls().child(layout::segmented_control(p, cooldown_btns)),
                         ),
@@ -8717,7 +8913,11 @@ impl SettingsView {
         let p = crate::ui::palette(cx);
         let mut root = div().flex().flex_col().gap_3().child(
             layout::row(p)
-                .child(layout::label(p, text::SSH_TITLE.get(), None))
+                .child(layout::label(
+                    p,
+                    text::SSH_TITLE.get(),
+                    Some(text::SSH_DESC.get()),
+                ))
                 .child(
                     layout::controls()
                         .child(
@@ -9919,7 +10119,7 @@ impl SettingsView {
                 .justify_between()
                 .gap_3()
                 .child(
-                    layout::label(p, text::ORCH_TITLE.get(), None).child(
+                    layout::label(p, text::ORCH_TITLE.get(), Some(text::ORCH_DESC.get())).child(
                         div()
                             .font_family(crate::ui::FONT_MONO)
                             .text_size(crate::ui::TEXT_XS)
@@ -10272,23 +10472,6 @@ impl SettingsView {
                 );
             }
         }
-        let files_row = layout::row(p)
-            .child(layout::label(
-                p,
-                text::FILES_TITLE.get(),
-                Some(text::FILES_DESC.get()),
-            ))
-            .child(
-                layout::controls().child(
-                    layout::secondary("workflow-open-settings", text::OPEN_SETTINGS.get())
-                        .debug_selector(|| "workflow-open-settings".into())
-                        .on_click(|_, _, cx| {
-                            let body = cx.global::<Config>().settings.to_toml();
-                            open_file(SETTINGS_FILE, &body, cx);
-                        }),
-                ),
-            );
-
         let wt_store = self.services.worktrees.clone();
 
         let active_repo = self
@@ -10635,6 +10818,12 @@ impl SettingsView {
                                 .id("admin-repo-setup-input")
                                 .debug_selector(|| "admin-repo-setup-input".into())
                                 .child(gpui_component::input::Input::new(&setup_input).small()),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::HOOKS_SETUP_HINT.get()),
                         ),
                 )
                 .child(
@@ -10652,6 +10841,12 @@ impl SettingsView {
                                 .id("admin-repo-archive-input")
                                 .debug_selector(|| "admin-repo-archive-input".into())
                                 .child(gpui_component::input::Input::new(&archive_input).small()),
+                        )
+                        .child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::HOOKS_ARCHIVE_HINT.get()),
                         ),
                 )
                 .child(
@@ -10768,7 +10963,6 @@ impl SettingsView {
             .child(lines_row)
             .child(qc_card)
             .child(wh_card)
-            .child(files_row)
     }
 
     fn render_resources_tab(&self, s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
@@ -11299,7 +11493,7 @@ impl Render for SettingsView {
             let body = match current_tab {
                 AdminTab::General => Self::render_general_tab(&s, cx),
                 AdminTab::Terminal => self.render_terminal_tab(&s, window, cx),
-                AdminTab::Accounts => self.render_accounts_tab(cx),
+                AdminTab::Accounts => self.render_accounts_tab(window, cx),
                 AdminTab::Agents => self.render_agents_tab(&s, window, cx),
                 AdminTab::Ssh => self.render_ssh_tab(window, cx),
                 AdminTab::RemoteKrill => self.render_remote_krill_tab(window, cx),
