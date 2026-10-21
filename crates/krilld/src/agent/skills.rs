@@ -41,6 +41,7 @@ fn directories(
         ("claude", "CLAUDE_CONFIG_DIR"),
         ("codex", "CODEX_HOME"),
         ("opencode", "OPENCODE_CONFIG_DIR"),
+        ("pi", "PI_CODING_AGENT_DIR"),
     ] {
         if (agent == "all" || agent == provider)
             && let Some(root) = env_path(launch, key)

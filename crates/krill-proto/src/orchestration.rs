@@ -1043,6 +1043,7 @@ impl OrchestrationStore {
                     d.agent.eq_ignore_ascii_case("agy")
                         || d.agent.eq_ignore_ascii_case("antigravity")
                 }
+                "@pi" => d.agent.eq_ignore_ascii_case("pi"),
                 _ => false,
             };
             if include {
@@ -3011,6 +3012,7 @@ mod tests {
         let run = store.create_run("Group mentions", None)?;
         store.start_worker(&run.id, None, "agy-w", "antigravity", None, "/tmp", "p")?;
         store.start_worker(&run.id, None, "cur-w", "cursor", None, "/tmp", "p")?;
+        store.start_worker(&run.id, None, "pi-w", "pi", None, "/tmp", "p")?;
         assert_eq!(store.resolve_recipients("@agy"), vec!["agy-w".to_owned()]);
         assert_eq!(
             store.resolve_recipients("@antigravity"),
@@ -3020,6 +3022,7 @@ mod tests {
             store.resolve_recipients("@cursor"),
             vec!["cur-w".to_owned()]
         );
+        assert_eq!(store.resolve_recipients("@pi"), vec!["pi-w".to_owned()]);
 
         fs::remove_dir_all(&dir).ok();
         Ok(())

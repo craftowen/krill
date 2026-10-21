@@ -90,13 +90,17 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Global discovery roots. agy's CLI-specific root and shared App/IDE root are distinct.
 /// Sources: <https://antigravity.google/docs/skills#cli-skill-locations> and the
 /// agy 1.4.3 bundled customization guide (shared `.gemini/config/skills`).
+/// pi supports Agent Skills locations (`~/.agents/skills/`) and the agent directory
+/// (`~/.pi/agent/skills/`); opencode also reads the shared `~/.agents/skills/`.
+/// Sources: pi `docs/skills.md` + `docs/configuration.md`, opencode `docs/skills/`.
 pub fn skill_directories(home: &Path, agent: &str) -> Vec<PathBuf> {
     let roots: &[&str] = match agent {
         "claude" => &[".claude/skills"],
         "codex" => &[".codex/skills"],
         "agy" | "antigravity" => &[".gemini/antigravity-cli/skills", ".gemini/config/skills"],
         "cursor" => &[".cursor/skills"],
-        "opencode" => &[".config/opencode/skills"],
+        "opencode" => &[".config/opencode/skills", ".agents/skills"],
+        "pi" => &[".agents/skills", ".pi/agent/skills"],
         "all" => &[
             ".claude/skills",
             ".codex/skills",
@@ -104,6 +108,8 @@ pub fn skill_directories(home: &Path, agent: &str) -> Vec<PathBuf> {
             ".gemini/config/skills",
             ".cursor/skills",
             ".config/opencode/skills",
+            ".agents/skills",
+            ".pi/agent/skills",
         ],
         _ => &[],
     };
