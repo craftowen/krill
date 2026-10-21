@@ -174,13 +174,16 @@ class PublicationTests(unittest.TestCase):
             return self.current
         if args == ("git", "status", "--porcelain"):
             return self.dirty
+        if "packaging/publish-github.sh" in args:
+            nightly.write_json(self.release.work / "packaging/dist/public-verification.json",
+                {"head": SHA, "tag": "v0.1.2", "verified_assets": [str(n) for n in range(16)]})
         return ""
 
     def fake_ci(self, _sha, branch, _workflows):
         self.calls.append(("wait-ci", branch))
         if self.failure == "ci" or self.failure == "main-ci" and branch == "main":
             raise nightly.NightlyError("injected CI failure")
-        return {"release.yml": {"id": 123}}
+        return {"release.yml": {"run_id": 123}}
 
     def promoted(self):
         return ("git", "push", "origin", "HEAD:refs/heads/main") in self.calls
@@ -194,16 +197,20 @@ class PublicationTests(unittest.TestCase):
         self.assertTrue(self.published())
         self.assertEqual(self.release.state["status"], "published")
         self.importer.assert_called_once()
-        receipt = self.release.state_dir / "checks" / f"{SHA}.json"
-        self.assertEqual(json.loads(receipt.read_text())["head"], SHA)
+        self.assertIn("validation_receipt", self.release.state)
         publish = next(i for i, call in enumerate(self.calls) if "packaging/publish-github.sh" in call)
         self.assertLess(self.calls.index(("wait-ci", "main")), publish)
+        dispatch = next(i for i, call in enumerate(self.calls) if call[:3] == ("gh", "workflow", "run"))
+        validate = next(i for i, call in enumerate(self.calls) if "validate" in call)
+        self.assertLess(dispatch, validate)
+        self.assertLess(validate, self.calls.index(("wait-ci", "release/nightly-test")))
+        self.assertTrue(any(any(arg.startswith("--force-with-lease=") for arg in call) for call in self.calls if call[:1] == ("git",) and len(call) > 1))
         downloads = [call for call in self.calls if call[:3] == ("gh", "run", "download")]
         self.assertEqual(len(downloads), 3)
         self.assertTrue(all(call.count("-n") == 1 for call in downloads))
 
     def test_any_local_gate_or_native_ci_failure_prevents_promotion_and_publication(self):
-        for failure in ("scripts/check.sh", "scripts/check-windows.sh", "build", "pane_e2e", "survive", "ci"):
+        for failure in ("packaging/test_nightly.py", "packaging/release_check.py", "ci"):
             with self.subTest(failure=failure):
                 self.failure = failure
                 self.calls.clear()
@@ -215,7 +222,7 @@ class PublicationTests(unittest.TestCase):
                     path.unlink()
 
     def test_main_race_or_candidate_mutation_prevents_promotion(self):
-        for field, value in (("main", SHA), ("current", BASE), ("dirty", " M Cargo.toml")):
+        for field, value in (("main", "d" * 40), ("current", BASE), ("dirty", " M Cargo.toml")):
             with self.subTest(field=field):
                 old = getattr(self, field)
                 setattr(self, field, value)

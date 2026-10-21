@@ -3,6 +3,7 @@
 
 import argparse
 import contextlib
+from ci_evidence import CANDIDATE_BRANCH, Evidence, Pending
 from datetime import datetime, timedelta
 import fcntl
 import json
@@ -62,6 +63,8 @@ def command(args, cwd=None, env=None, timeout=300):
     if capture:
         print(text, end="" if text.endswith("\n") else "\n", flush=True)
     if child.returncode:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
         raise NightlyError(f"command failed ({child.returncode}): {shlex.join(args)}")
     return text.strip()
 
@@ -155,7 +158,8 @@ class Release:
         self.work = self.root / "repository"
         self.env = dict(os.environ, CARGO_TARGET_DIR=config["target_dir"],
                         KRILL_ALLOW_PROTECTED_PUSH=AUTHORIZATION,
-                        KRILL_UPDATE_KEY_FILE=config["key_file"], CARGO_BUILD_JOBS="4")
+                        KRILL_UPDATE_KEY_FILE=config["key_file"], CARGO_BUILD_JOBS="4",
+                        CARGO_PROFILE_TEST_OPT_LEVEL="2", CARGO_PROFILE_TEST_DEBUG="line-tables-only")
         # 예약 실행은 유료 VM이나 사람 전용 가드 탈출구를 상속하지 않는다.
         for key in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR", "KRILL_PUBLISH_FORCE",
                     "KRILL_RELEASE_SIGNING_KEY", "KRILL_RELEASE_ASSET_DIR", "KRILL_PUBLISH_LOCKED"):
@@ -167,7 +171,17 @@ class Release:
         write_json(self.state_dir / "status.json", self.state)
 
     def run(self, *args, timeout=300):
-        return command(args, cwd=self.work, env=self.env, timeout=timeout)
+        started = time.monotonic()
+        outcome = "passed"
+        try:
+            return command(args, cwd=self.work, env=self.env, timeout=timeout)
+        except BaseException:
+            outcome = "failed"
+            raise
+        finally:
+            self.state.setdefault("commands", []).append({"command": list(map(str, args)),
+                "seconds": round(time.monotonic() - started, 3), "outcome": outcome})
+            self.update()
 
     def git(self, *args):
         return self.run("git", *args)
@@ -181,13 +195,18 @@ class Release:
 
     def wait_ci(self, sha, branch, workflows):
         deadline = time.monotonic() + 7200
+        evidence = Evidence(self.config["repo"])
         while time.monotonic() < deadline:
-            data = json.loads(self.run("gh", "api", f"repos/{self.config['repo']}/actions/runs"
-                                      f"?head_sha={sha}&branch={branch}&per_page=100"))
-            results = workflow_results(data["workflow_runs"], sha, branch, workflows)
-            if results is not None:
-                return results
-            time.sleep(30)
+            results = {}
+            try:
+                for workflow in sorted(workflows):
+                    results[workflow] = evidence.proof(workflow, sha, branch, allow_reuse=branch == "main")
+            except Pending as waiting:
+                print(str(waiting), flush=True)
+                time.sleep(30)
+                continue
+            self.update(ci={**self.state.get("ci", {}), branch: results})
+            return results
         raise NightlyError(f"CI timed out at {sha} ({branch})")
 
     def prepare(self):
@@ -223,7 +242,17 @@ class Release:
         if all(self.ancestor(sha, published) for sha in (remote, main)):
             self.update(status="skipped", reason="no committed changes since the last published release")
             return None
-        branch = "release/nightly-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+        branch = CANDIDATE_BRANCH
+        pending_file = self.state_dir / "pending.json"
+        if pending_file.exists():
+            pending = json.loads(pending_file.read_text())
+            if pending.get("source_head") == remote and pending.get("previous_release") == latest and main in (
+                    pending.get("base_main"), pending.get("candidate_head")):
+                candidate = pending["candidate_head"]
+                if self.ancestor(remote, candidate) and self.ancestor(main, candidate):
+                    self.git("checkout", "-B", branch, candidate)
+                    self.update(**pending, resumed=True)
+                    return candidate, branch, pending["version"], pending["base_main"]
         self.git("checkout", "-B", branch, main)
         for field in ("user.name", "user.email"):
             self.git("config", field, self.config[field])
@@ -243,6 +272,8 @@ class Release:
         self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {remote}\nNightly-Main: {main}")
         sha = self.git("rev-parse", "HEAD")
         self.update(candidate_head=sha, candidate_branch=branch, version=version)
+        write_json(self.state_dir / "pending.json", {key: self.state[key] for key in (
+            "source_head", "base_main", "previous_release", "candidate_head", "candidate_branch", "version")})
         return sha, branch, version, main
 
     def publish(self):
@@ -251,29 +282,32 @@ class Release:
         if prepared is None:
             return
         sha, branch, version, main = prepared
-        self.update(step="full-checks")
-        receipt = self.state_dir / "checks" / f"{sha}.json"
-        if not receipt.exists():
-            self.run("/usr/bin/python3", "packaging/test_nightly.py")
-            self.run("/usr/bin/python3", "packaging/test_publish.py")
-            self.run("/bin/zsh", "scripts/check.sh", "--memory", timeout=14400)
-            self.run("/bin/bash", "scripts/check-windows.sh", "--clippy", "--target-dir",
-                     TARGETS / "nightly-windows", timeout=7200)
-            self.run("cargo", "build", "--workspace", "--bins", "--release", "--locked", timeout=3600)
-            self.run("cargo", "test", "--release", "--locked", "-p", "krill-app", "--test", "pane_e2e",
-                     "release_survival::", "--", "--ignored", "--nocapture", "--test-threads=1", timeout=3600)
-            self.run("cargo", "test", "--release", "--locked", "-p", "krill-holder", "--test", "survive",
-                     "--", "--nocapture", "--test-threads=1", timeout=1800)
-            self.git("diff", "--exit-code", "HEAD")
-            write_json(receipt, {"head": sha, "scope": "check.sh --memory; Windows clippy; release app/holder survival",
-                                 "passed_at": datetime.now().astimezone().isoformat()})
+        self.update(step="start-native-builds-and-ci")
+        for test in ("test_ci_evidence.py", "test_release_check.py", "test_release_verify.py", "test_nightly.py", "test_publish.py",
+                     "macos/test_pipeline.py", "homebrew/test_release.py"):
+            self.run("/usr/bin/python3", "packaging/" + test)
         self.run("/bin/bash", "scripts/public-surface.sh")
-        self.git("push", "origin", f"HEAD:refs/heads/{branch}")
-        self.update(step="native-builds-and-ci")
+        # 안정된 후보 브랜치의 캐시를 다음 날에도 사용한다. main/tag에는 강제 push하지 않는다.
+        remote_ref = self.git("ls-remote", "origin", "refs/heads/" + branch)
+        previous = remote_ref.split()[0] if remote_ref else ""
+        if previous != sha:
+            self.git("push", f"--force-with-lease=refs/heads/{branch}:{previous}", "origin", f"HEAD:refs/heads/{branch}")
         self.run("gh", "workflow", "run", "release.yml", "--repo", self.config["repo"], "--ref", branch,
                  "-f", f"tag=v{version}", "-f", "build_only=true", "-f", f"public_key={public_key}")
+        # 원격 검사가 실행되는 동안 같은 후보의 로컬 전체·메모리·생존 검사를 진행한다.
+        self.update(step="full-local-checks")
+        receipt = self.root / "staging" / sha / "validation.json"
+        if receipt.exists():
+            self.run("/usr/bin/python3", "packaging/release_check.py", "verify", "--head", sha,
+                     "--receipt", receipt, "--key-file", self.config["key_file"])
+        else:
+            if receipt.parent.exists():
+                shutil.rmtree(receipt.parent)
+            self.run("/usr/bin/python3", "packaging/release_check.py", "validate", "--head", sha,
+                     "--directory", receipt.parent, "--key-file", self.config["key_file"], timeout=21600)
+        self.update(step="wait-native-builds-and-ci", validation_receipt=str(receipt))
         results = self.wait_ci(sha, branch, {"ci.yml", "ci-macos.yml", "release.yml"})
-        build_id = results["release.yml"]["id"]
+        build_id = results["release.yml"]["run_id"]
         assets = self.root / "assets" / sha
         if assets.exists():
             shutil.rmtree(assets)
@@ -288,15 +322,24 @@ class Release:
         import_assets(assets, verified, version, sha, public_key)
         self.update(step="promote-main", native_build_run=build_id)
         self.git("fetch", "origin", "main")
-        if self.git("rev-parse", "origin/main") != main:
+        current_main = self.git("rev-parse", "origin/main")
+        if current_main not in (main, sha):
             raise NightlyError("main changed during validation; candidate retained, retry next night")
         if self.git("rev-parse", "HEAD") != sha or self.git("status", "--porcelain"):
             raise NightlyError("candidate changed after validation")
-        self.git("push", "origin", "HEAD:refs/heads/main")
+        if current_main != sha:
+            self.git("push", "origin", "HEAD:refs/heads/main")
         self.wait_ci(sha, "main", {"ci.yml", "ci-macos.yml"})
         self.update(step="publish")
         self.env["KRILL_RELEASE_ASSET_DIR"] = str(verified)
-        self.run("/bin/bash", "packaging/publish-github.sh", "--repo", self.config["repo"], timeout=7200)
+        self.env["KRILL_PUBLISH_LOCKED"] = "1"
+        self.run("/bin/bash", "packaging/publish-github.sh", "--repo", self.config["repo"],
+                 "--verified-release", receipt, timeout=7200)
+        verification = json.loads((self.work / "packaging/dist/public-verification.json").read_text())
+        if verification.get("head") != sha or verification.get("tag") != f"v{version}" or len(verification.get("verified_assets", [])) != 16:
+            raise NightlyError("publication readback is missing or does not match the complete candidate")
+        self.update(publication=verification)
+        (self.state_dir / "pending.json").unlink(missing_ok=True)
         self.update(status="published", step="done", tag=f"v{version}",
                     finished_at=datetime.now().astimezone().isoformat())
 
@@ -328,7 +371,7 @@ def dispatch(config, config_path, preflight_only=False):
     cli = config["orca_cli"]
     command([cli, "open", "--json"], cwd=SUPPORT)
     action = "preflight" if preflight_only else "run"
-    shell = shlex.join(["/usr/bin/python3", str(SUPPORT / "nightly.py"), action, "--config", str(config_path)])
+    shell = "exec " + shlex.join(["/usr/bin/python3", str(SUPPORT / "nightly.py"), action, "--config", str(config_path)])
     result = json.loads(command([cli, "terminal", "create", "--worktree", config["workspace"],
                                  "--title", "Krill nightly " + action, "--command", shell, "--json"], cwd=SUPPORT))
     if not result.get("ok"):
@@ -355,7 +398,7 @@ def install_locked(source, after_release=None):
     if not match:
         raise NightlyError("origin must be a GitHub repository")
     config = {"branch": "dev", "repo": match[1],
-              "run_root": str(VOLUME / "nightly"), "target_dir": str(TARGETS / "nightly"),
+              "run_root": str(VOLUME / "nightly"), "target_dir": str(TARGETS / "krill-publish"),
               "key_file": str(Path.home() / "Library/Keychains/minikrill-codesign.keychain-db.ed25519.key"),
               "key_tool": str(source / "packaging/macos/ed25519_manifest.py")}
     cli = shutil.which("orca")
@@ -372,7 +415,7 @@ def install_locked(source, after_release=None):
     preflight(config)
     SUPPORT.mkdir(parents=True, exist_ok=True)
     LOGS.mkdir(parents=True, exist_ok=True)
-    for name in ("nightly.py", "nightly_assets.py"):
+    for name in ("nightly.py", "nightly_assets.py", "ci_evidence.py"):
         shutil.copyfile(source / "packaging" / name, SUPPORT / name)
     shutil.copyfile(source / "packaging/macos/ed25519_manifest.py", SUPPORT / "ed25519_manifest.py")
     config["key_tool"] = str(SUPPORT / "ed25519_manifest.py")
@@ -418,6 +461,11 @@ def main():
         elif args.action == "dispatch":
             dispatch(config, args.config, args.preflight_only)
         else:
+            if os.environ.get("KRILL_NIGHTLY_PUBLISH_LOCKED") != "1":
+                env = dict(os.environ, KRILL_NIGHTLY_PUBLISH_LOCKED="1")
+                result = subprocess.run(["/usr/bin/lockf", "-k", "-t", "0", "/tmp/krill-publish.lock",
+                    sys.executable, str(Path(__file__).resolve()), "run", "--config", str(args.config)], env=env)
+                raise SystemExit(result.returncode)
             run_release(config, args.config.parent)
 
 

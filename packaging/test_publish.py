@@ -38,6 +38,14 @@ class PublishGuardTests(unittest.TestCase):
         git(root, "init", "-q", "-b", "main", str(self.work))
         (self.work / "packaging").mkdir()
         shutil.copy2(HERE / "publish-github.sh", self.work / "packaging/publish-github.sh")
+        # 실제 CI API·볼륨 대신 경계만 스텁한다. 판정기 자체는 test_ci_evidence/test_release_check에서 검증한다.
+        (self.work / "packaging/ci_evidence.py").write_text(
+            "import os,sys\nsys.exit(1 if os.environ.get('FAKE_PROOF_FAIL') else 0)\n")
+        (self.work / "packaging/release_check.py").write_text(
+            "import os,sys\n"
+            "if sys.argv[1] == 'target-dir': print('/Volumes/krill-build/targets/krill-publish')\n"
+            "elif os.environ.get('FAKE_BINARY_PROOF_FAIL'): sys.exit(1)\n"
+            "else: print('/validated/release/bin')\n")
         (self.work / "packaging/bundle.sh").write_text("#!/bin/bash\nexit 1\n")
         (self.work / "docs/licensing").mkdir(parents=True)
         (self.work / "docs/licensing/generate_notices.py").write_text(
@@ -77,6 +85,13 @@ class PublishGuardTests(unittest.TestCase):
         git(self.work, "tag", "v0.1.0")
         git(self.work, "push", "-q", "origin", "v0.1.0")
         self.assert_blocked(self.publish("--preflight"), "tag v0.1.0 already exists on origin")
+
+    def test_green_unrelated_checks_cannot_replace_required_workflow_proof(self):
+        self.assert_blocked(self.publish("--preflight", FAKE_PROOF_FAIL="1"), "required workflow validation proof")
+
+    def test_verified_binary_receipt_failure_is_not_an_overrideable_guard(self):
+        self.assert_blocked(self.publish("--preflight", "--verified-release", "/receipt", FAKE_BINARY_PROOF_FAIL="1"),
+                            "verified release receipt or tested binaries are invalid")
 
     def test_existing_release_blocks(self):
         self.assert_blocked(self.publish("--preflight", FAKE_RELEASE="1"),
