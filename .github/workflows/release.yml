@@ -318,7 +318,7 @@ jobs:
         env:
           VERSION: ${{ steps.meta.outputs.version }}
         run: |
-          & .\packaging\windows\smoke.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
+          & .\packaging\windows\smoke-ci.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
           git rev-parse HEAD | Set-Content -Encoding ascii packaging/dist/source-commit-windows.txt
 
       - name: Upload Windows release artifact
