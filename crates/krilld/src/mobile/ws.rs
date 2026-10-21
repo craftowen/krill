@@ -75,21 +75,19 @@ pub fn upgrade(stream: &mut TcpStream, allowed_origin: Option<&str>) -> io::Resu
         super::pwa::serve_request(stream, path, query, gzip)?;
         return Ok(false);
     }
-    if query
+    // UI asset hashes do not define wire compatibility. Saved older PWAs must
+    // reach E2EE authentication and the daemon's protocol negotiation.
+    let mut versions = query
         .split('&')
         .filter_map(|part| part.split_once('='))
-        .any(|(name, value)| name == "v" && value != super::pwa::asset_hash())
-    {
-        stream.write_all(
-            b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )?;
-        return Ok(false);
-    }
-    if query
-        .split('&')
-        .filter_map(|part| part.split_once('='))
-        .any(|(name, value)| name == "v" && value != super::pwa::asset_hash())
-    {
+        .filter_map(|(name, value)| (name == "v").then_some(value));
+    if versions.next().is_some_and(|value| {
+        value.len() != 16
+            || !value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            || versions.next().is_some()
+    }) {
         stream.write_all(
             b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
         )?;
@@ -421,7 +419,7 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 101"));
     }
     #[test]
-    fn different_asset_version_returns_empty_409() {
+    fn malformed_asset_version_returns_empty_409() {
         for query in ["?v=old", "?other=1&v=", "?v=old&v=older"] {
             let (result, response) = handshake("https://tunnel.test", None, query);
             assert!(!result.unwrap());
@@ -435,6 +433,16 @@ mod tests {
                 .0
                 .unwrap()
         );
+    }
+    #[test]
+    fn older_valid_asset_version_reaches_protocol_negotiation() {
+        let (result, response) = handshake(
+            "https://krill-mobile.pages.dev",
+            Some("https://krill-mobile.pages.dev"),
+            "?v=fedcba9876543210",
+        );
+        assert!(result.unwrap());
+        assert!(response.starts_with("HTTP/1.1 101"));
     }
     proptest::proptest! {
         #[test]
