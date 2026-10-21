@@ -23,6 +23,7 @@ python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
 2. `/Volumes/krill-build/nightly/repository` 전용 clone에서 통합한다. 병합 충돌은 중단한다. workspace와 최신 게시 버전 중 큰 버전의 patch를 올리고 Cargo.lock·고지문과 함께 **최종 후보 커밋을 먼저** 만든다.
 3. 그 HEAD에서 `scripts/check.sh --memory`, Windows 전체 clippy, release 바이너리 빌드, 실제 GUI kill -9·출력 해시 재생 E2E, release holder 생존·업그레이드 테스트를 실행한다. 통과 기록은 HEAD별로 보관한다. Cargo 산출물은 `/Volumes/krill-build/targets/` 아래에만 둔다. 외장 볼륨이 없으면 내장 디스크로 폴백하지 않고 중단한다.
 4. `release/nightly-<시각>` 후보를 push하고 CI와 `release.yml`의 `build_only=true`를 실행한다. 이 모드는 macOS 게시 잡·모든 업로드 게시 잡을 건너뛰고 Windows/Linux 네이티브 빌드와 설치·데몬 kill 생존 스모크만 한다. GCP/상시 Windows VM은 호출하지 않는다. Windows에는 로컬 서명키의 **공개키만** 전달한다.
+   Windows 스모크는 `smoke-ci.ps1`이 WMI로 별도 테스트 프로세스를 띄워 Actions 러너의 제한된 Job 밖에서 실행한다. 실제 설치·CLI 자동 기동·터미널 입출력·데몬 kill 검증은 기존 `smoke.ps1` 그대로 수행하며, 테스트 경로의 프로세스만 정리한다. 제품의 holder 분리 보장은 바꾸지 않는다.
 5. 같은 HEAD의 Windows·Linux x86_64/aarch64 자산을 내려받아 출처 커밋·체크섬·Windows 버전과 공개키를 검증한다. 검사 중 `main`이 바뀌었으면 후보를 남기고 중단한다. 통과한 후보만 `main`에 fast-forward push하고 해당 CI도 확인한다.
 6. 기존 `publish-github.sh`가 macOS 패키지를 빌드하고 검증한 네이티브 자산을 함께 게시한다. `latest.json`·`latest-windows.json`은 로컬 키로 서명한다. 기존 태그·릴리스는 덮어쓰지 않는다. 중복 예약 실행은 잠금으로 막는다.
 
