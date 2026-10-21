@@ -338,6 +338,7 @@ fn mobile_frontend_regressions() {
         "mobile_screens.cjs",
         "mobile_chat.cjs",
         "mobile_transport.cjs",
+        "mobile_updates.cjs",
     ] {
         let result = std::process::Command::new("node")
             .arg(

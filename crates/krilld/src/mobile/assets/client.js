@@ -21,6 +21,7 @@
   history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?(pair?'#/pair-confirm':''):location.hash));
   let credentials=pair?null:saved,directOrigin=location.origin,destinationFixed=fixed;
   const hostId=c=>c.rid?'relay:'+c.rid:c.url?'tunnel:'+c.url:'direct:'+(c.origin||location.origin);
+  let updateHandler=null,updatePending=false;
   let storageFailed=false;const persist=()=>{try{localStorage.setItem(HOSTS,JSON.stringify({active:active?.id||null,hosts}));storageFailed=false;}catch{storageFailed=true;}};
   // Preserve the legacy credential during migration.
   if(saved&&!active){active={...saved,id:hostId(saved),origin:location.origin,fixed,name:'Desktop'};hosts.push(active);try{persist();}catch{}}
@@ -37,25 +38,56 @@
   navigator.serviceWorker?.register('/sw.js').catch(()=>{});
   return {parameters,pair,credentials,fixed,replacing:!!(pair&&saved),get storageFailed(){return storageFailed;},
    profiles(){return hosts.map(h=>({id:h.id,name:h.name||'Desktop',platform:h.platform,endpoint:h.fixed?(h.rid?'Relay · '+h.rid.slice(0,8):h.url):h.origin,active:h.id===active?.id}));},
-   selectHost(id){const host=hosts.find(h=>h.id===id);if(!host)throw Error('Desktop is no longer saved.');active=host;saved=credentials=host;rid=host.rid;url=host.url;directOrigin=host.origin||location.origin;destinationFixed=host.fixed??fixed;useRelay=!validUrl(url)&&validRid(rid);persist();try{localStorage.setItem(STORE,JSON.stringify(host));}catch{storageFailed=true;}return credentials;},
+   selectHost(id){const host=hosts.find(h=>h.id===id);if(!host)throw Error('Desktop is no longer saved.');updatePending=false;active=host;saved=credentials=host;rid=host.rid;url=host.url;directOrigin=host.origin||location.origin;destinationFixed=host.fixed??fixed;useRelay=!validUrl(url)&&validRid(rid);persist();try{localStorage.setItem(STORE,JSON.stringify(host));}catch{storageFailed=true;}return credentials;},
    forgetHost(id){const at=hosts.findIndex(h=>h.id===id);if(at<0)return;if(active?.id===id)throw Error('Switch to another desktop before removing this one.');hosts.splice(at,1);persist();},
    describeHost(host){if(!active||!credentials)return;let changed=false;for(const [key,value] of [['name',host?.display_name],['platform',host?.platform]])if(value&&active[key]!==value){active[key]=value;changed=true;}if(changed)persist();},
-   restoreSaved(){credentials=saved;directOrigin=active?.origin||location.origin;destinationFixed=active?.fixed??fixed;rid=saved?.rid;url=saved?.url;useRelay=!validUrl(url)&&validRid(rid);if(fixed&&/^[0-9a-f]{16}$/.test(saved?.hash||'')&&saved.hash!==hash)location.replace('/m/'+saved.hash+'/');return credentials;},
+   restoreSaved(){updatePending=false;credentials=saved;directOrigin=active?.origin||location.origin;destinationFixed=active?.fixed??fixed;rid=saved?.rid;url=saved?.url;useRelay=!validUrl(url)&&validRid(rid);if(fixed&&/^[0-9a-f]{16}$/.test(saved?.hash||'')&&saved.hash!==hash){if(updateHandler)updateHandler();else location.replace('/m/'+saved.hash+'/');}return credentials;},
    socketUrl(){if(!destinationFixed){const origin=new URL(directOrigin);return `${origin.protocol==='https:'?'wss:':'ws:'}//${origin.host}/ws`;}if(useRelay&&validRid(rid))return relayUrl();if(validUrl(url))return `wss://${url.slice(8)}/ws?v=${hash}`;if(validRid(rid))return relayUrl();throw Error('Scan a fresh QR code from desktop Settings → Mobile.');},
    // use() adopts reachable codes; null opens another origin or app version.
    adopt(href){
     const NOT='Not a Krill pairing code. Scan the QR code in desktop Settings → Mobile.';let u;try{u=new URL(href);}catch{throw Error(NOT);}
     const f=new URLSearchParams(u.hash.slice(1)),ticket=f.get('pair'),secret=f.get('key'),version=/^\/m\/([0-9a-f]{16})\/?$/.exec(u.pathname)?.[1];
     if(!/^[0-9a-f]+$/.test(ticket||'')||!secret||!/^https?:$/.test(u.protocol))throw Error(NOT);
-    if(!fixed)return u.origin===location.origin?{ticket,secret,use(){destinationFixed=false;directOrigin=u.origin;}}:null;
+    if(!fixed)return u.origin===location.origin?{ticket,secret,use(){updatePending=false;destinationFixed=false;directOrigin=u.origin;}}:null;
     if(u.origin===location.origin&&version&&version!==hash)return null;
     const t=f.get('t'),r=f.get('r'),next=t?'https://'+t:validUrl(u.origin)?u.origin:null;
     if(!validUrl(next)&&!validRid(r))throw Error(u.protocol==='http:'?'This direct code cannot be opened here. Choose Relay server in desktop Settings → Mobile, then tap New QR code.':NOT);
-    return {ticket,secret,use(){destinationFixed=true;url=validUrl(next)?next:null;rid=validRid(r)?r:null;useRelay=!url&&!!rid;}};
+    return {ticket,secret,use(){updatePending=false;destinationFixed=true;url=validUrl(next)?next:null;rid=validRid(r)?r:null;useRelay=!url&&!!rid;}};
    },
    authenticated(auth){credentials=auth.credential?auth:credentials;if(destinationFixed)credentials={...credentials,rid,url,hash};
     if(!credentials)return null;const id=hostId({...credentials,origin:directOrigin}),existing=hosts.find(h=>h.id===id);active={...existing,...credentials,id,origin:directOrigin,fixed:destinationFixed,name:existing?.name||'Desktop'};if(existing)hosts[hosts.indexOf(existing)]=active;else hosts.push(active);saved=credentials=active;persist();try{localStorage.setItem(STORE,JSON.stringify(credentials));}catch{storageFailed=true;}return credentials;},
    fallback(attempted){if(!destinationFixed)return;try{if(attempted===this.socketUrl()){if(!useRelay&&validRid(rid))useRelay=true;else if(useRelay&&validUrl(url))useRelay=false;}}catch{}},
+   setUpdateHandler(handler){updateHandler=handler;},
+   get updatePending(){return updatePending;},
+   clearUpdatePending(){updatePending=false;},
+   updateIdentity(){return fixed&&destinationFixed&&credentials&&active?JSON.stringify([active.id,credentials.device_id,rid||url]):null;},
+   async probeUpdate({signal}={}){
+    const identity=this.updateIdentity();if(!identity||!validRid(rid))return null;
+    const controller=new AbortController(),abort=()=>controller.abort(),timeout=setTimeout(abort,5000);
+    if(signal?.aborted){clearTimeout(timeout);return null;}signal?.addEventListener('abort',abort,{once:true});
+    try{
+     const response=await fetch('/r/'+encodeURIComponent(rid),{cache:'no-store',signal:controller.signal});
+     if(!response.ok||controller.signal.aborted||identity!==this.updateIdentity())return null;
+     const found=await response.json();
+     if(controller.signal.aborted||identity!==this.updateIdentity()||typeof found.hash!=='string'||!/^[0-9a-f]{16}$/.test(found.hash)||!(validUrl(found.url)||found.url===''||found.relay))return null;
+     return {identity,hash:found.hash,rid,url:validUrl(found.url)?found.url:null};
+    }finally{clearTimeout(timeout);signal?.removeEventListener('abort',abort);}
+   },
+   commitUpdate(found){
+    if(found.identity!==this.updateIdentity()||found.rid!==rid||!/^[0-9a-f]{16}$/.test(found.hash))return false;
+    let oldBook,oldSaved,writtenBook,writtenSaved;
+    try{
+     oldBook=localStorage.getItem(HOSTS);oldSaved=localStorage.getItem(STORE);
+     const book=JSON.parse(oldBook||'null'),stored=JSON.parse(oldSaved||'null');
+     const latest=book?.hosts?.find(h=>h.id===active.id);
+     if(book?.active!==active.id||latest?.device_id!==credentials.device_id||latest?.credential!==credentials.credential||stored?.device_id!==credentials.device_id||stored?.credential!==credentials.credential)return false;
+     const next={...latest,hash:found.hash,url:found.url,rid},nextHosts=book.hosts.map(h=>h.id===active.id?next:h),bookText=JSON.stringify({...book,active:next.id,hosts:nextHosts}),savedText=JSON.stringify(next);
+     if(localStorage.getItem(HOSTS)!==oldBook||localStorage.getItem(STORE)!==oldSaved)return false;
+     writtenBook=bookText;localStorage.setItem(HOSTS,bookText);writtenSaved=savedText;localStorage.setItem(STORE,savedText);
+     if(localStorage.getItem(HOSTS)!==bookText||localStorage.getItem(STORE)!==savedText)throw Error('Update destination not saved');
+     hosts.splice(0,hosts.length,...nextHosts);active=saved=credentials=next;url=next.url;useRelay=!validUrl(url)&&validRid(rid);storageFailed=false;return true;
+    }catch{storageFailed=true;try{if(oldBook!=null&&localStorage.getItem(HOSTS)===writtenBook)localStorage.setItem(HOSTS,oldBook);if(oldSaved!=null&&localStorage.getItem(STORE)===writtenSaved)localStorage.setItem(STORE,oldSaved);}catch{}return false;}
+   },
    // Cancelled discovery cannot replace a newer destination.
    async locate({isCurrent=()=>true,signal}={}){
     if(!destinationFixed||!validRid(rid))return false;
@@ -63,6 +95,7 @@
     if(!current())return false;signal?.addEventListener('abort',abort,{once:true});const timeout=setTimeout(abort,5000);
     try{const response=await fetch('/r/'+encodeURIComponent(requestRid),{cache:'no-store',signal:controller.signal});if(!current())return false;if(response.ok){const found=await response.json();if(!current())return false;if(typeof found.hash==='string'&&/^[0-9a-f]{16}$/.test(found.hash)&&(validUrl(found.url)||found.url===''||found.relay)){
      if(validUrl(found.url)){url=found.url;useRelay=false;}else{url=null;useRelay=true;}
+     if(found.hash!==hash&&updateHandler){updatePending=true;updateHandler();return false;}
      if(credentials){credentials={...credentials,rid,url,hash:found.hash};if(active){Object.assign(active,credentials);saved=active;persist();}localStorage.setItem(STORE,JSON.stringify(credentials));}
      if(found.hash!==hash){location.replace('/m/'+found.hash+'/'+location.search+location.hash);return true;}
     }}}catch{}finally{clearTimeout(timeout);signal?.removeEventListener('abort',abort);}
@@ -71,6 +104,7 @@
   };
  }
  M.transport={bootstrap,handoff,create(options){
+  let pendingRpc=0,uncertainMutation=false;
   let credentials=options.credentials,pair=options.pair,socket,channel,generation=0,connected=false,connecting=false,stopped=false,failed,queue=[],waiters=[],serial=Promise.resolve(),refreshing,timer,retryTimer,resumeTimer,connectController,warm=null,retryDelay=1000,last=null,authFailures=0,retryNotBefore=0,authBlocked=false,retryCount=0,nextRetryAt=0;
   const socketUrl=()=>options.endpoint?options.endpoint.socketUrl():options.url;
   let state={phase:'disconnected',message:'',generation,retryAt:0,blocked:false};
@@ -82,24 +116,24 @@
   function clearWarm(close=false){if(!warm)return;const w=warm;warm=null;w.cleanup();if(close)try{w.socket.close();}catch{}}
   // 미리 인증한 WS 하나를 터미널 탭 전환에 재사용한다. 첫 IPC 요청 대기는 5분.
   function warmTerminal(){if(!connected||!credentials||stopped||warm)return;let ws;try{ws=new WebSocket(socketUrl());}catch{return;}ws.binaryType='arraybuffer';const messages=[],auth=credentials,onMessage=e=>{if(warm?.socket!==ws)return;if(!warm.channel){try{const challenge=JSON.parse(e.data),nonce=crypto.getRandomValues(new Uint8Array(32));if(challenge.version!==2)throw Error('Unsupported terminal protocol');const ch=new C.Channel(C.sha256(C.unhex(auth.credential)),C.concat(C.unhex(challenge.challenge),nonce));ws.send(JSON.stringify({device_id:auth.device_id,token:null,client_nonce:C.hex(nonce)}));ws.send(ch.seal(C.enc.encode('{"label":"Live terminal"}')));ws.send(ch.seal(frame(2,C.concat(v(1),v(1),v((1n<<56n)|1n|4n|4096n|8192n),v(0),text('minikrill-mobile-grid')))));warm.channel=ch;}catch{clearWarm(true);}return;}messages.push(e.data);},onEnd=()=>{if(warm?.socket===ws)warm=null;cleanup();},cleanup=()=>{ws.removeEventListener?.('message',onMessage);ws.removeEventListener?.('close',onEnd);ws.removeEventListener?.('error',onEnd);};ws.addEventListener('message',onMessage);ws.addEventListener('close',onEnd);ws.addEventListener('error',onEnd);warm={socket:ws,credentials:auth,channel:null,messages,cleanup};}
-  function retry(delay=retryDelay){clearTimeout(retryTimer);if(stopped||authBlocked||(!credentials&&!pair))return;const wait=Math.max(delay,retryNotBefore-Date.now());nextRetryAt=Date.now()+wait;status('disconnected',retryNotBefore>Date.now()?'Authentication retry is cooling down. Wait, or scan a fresh QR code.':failed?.message||'Reconnecting…');retryTimer=setTimeout(connect,wait);retryDelay=Math.min(retryDelay*2,15000);}
+  function retry(delay=retryDelay){clearTimeout(retryTimer);if(options.endpoint?.updatePending){nextRetryAt=0;return;}if(stopped||authBlocked||(!credentials&&!pair))return;const wait=Math.max(delay,retryNotBefore-Date.now());nextRetryAt=Date.now()+wait;status('disconnected',retryNotBefore>Date.now()?'Authentication retry is cooling down. Wait, or scan a fresh QR code.':failed?.message||'Reconnecting…');retryTimer=setTimeout(connect,wait);retryDelay=Math.min(retryDelay*2,15000);}
   function disconnect(error){if(failed)return;failed=error;connected=false;clearTimeout(timer);clearTimeout(resumeTimer);resumeTimer=null;clearWarm(true);for(const w of waiters.splice(0))w.reject(error);status('disconnected',error.message);socket?.close();if(!connecting)retry();}
   const ask=request=>send(frame(0x45,C.concat(v(7),text(JSON.stringify(request)))));
   async function answer(current){
    const bytes=await plain();if(current!==generation)throw Error('Disconnected. Pending actions were not resent.');
-   if(bytes[4]!==0x65)throw Error('Unexpected daemon response');const r=reader(bytes.slice(5)),kind=Number(r.u());if(kind===4)throw Error(r.text());if(kind!==6)throw Error('Update the desktop for mobile workflows');const reply=JSON.parse(r.text());if(!reply.ok)throw Error(reply.error);return reply.data;
+   if(bytes[4]!==0x65)throw Error('Unexpected daemon response');const r=reader(bytes.slice(5)),kind=Number(r.u());if(kind===4)throw Object.assign(Error(r.text()),{definitive:true});if(kind!==6)throw Error('Update the desktop for mobile workflows');const reply=JSON.parse(r.text());if(!reply.ok)throw Object.assign(Error(reply.error),{definitive:true});return reply.data;
   }
-  function rpc(request){const current=generation;const operation=deadline(serial.then(()=>{
+  function rpc(request){const current=generation,mutation=!['snapshot','chat_poll','git','accounts'].includes(request.action);pendingRpc++;let submitted=false;const operation=deadline(serial.then(()=>{
    if(!connected||current!==generation)throw Error('Disconnected. The action was not resent.');
-   ask(request);return answer(current);
-  }),15000,'Desktop response timed out. The result may be unknown; pending actions were not resent.',current);serial=operation.catch(()=>{});return operation;}
+   ask(request);submitted=true;return answer(current);
+  }),15000,'Desktop response timed out. The result may be unknown; pending actions were not resent.',current);serial=operation.catch(()=>{});return operation.catch(error=>{if(mutation&&submitted&&!error.definitive)uncertainMutation=true;throw error;}).finally(()=>pendingRpc--);}
   // 폴링은 직전 etag를 보내고, 바뀐 게 없으면 데몬이 본문을 생략한다(unchanged). 화면도 다시 그리지 않는다.
   function snapshot(current,operation){const pending=operation.then(data=>{if(current!==generation)return;if(data.unchanged&&last&&data.etag===last.etag)return last;for(const s of data.sessions||[])if(!Number.isSafeInteger(s.id)||s.id<=0)throw Error('Unsupported session ID. Update the desktop.');last=data;options.onSnapshot?.(data);return data;}).finally(()=>{if(refreshing===pending)refreshing=null;});refreshing=pending;return pending;}
   function refresh(){return refreshing||snapshot(generation,rpc({action:'snapshot',...(last?.etag&&{since:last.etag})}));}
   // 숨은 탭은 갱신하지 않고(복귀 시 resume이 즉시 갱신), 라이브 터미널이 열려 있으면 화면 스트림이 주가 되므로 간격을 늘린다.
   function poll(){clearTimeout(timer);if(!connected||stopped)return;const current=generation;timer=setTimeout(async()=>{if(!globalThis.document?.hidden)try{await refresh();}catch(e){if(connected&&current===generation)options.onError?.(e);}poll();},M.activeTerminal?10000:2500);}
   async function connect(){
-   if(connecting||stopped||connected||authBlocked)return;if(Date.now()<retryNotBefore){retry();return;}connecting=true;clearTimeout(retryTimer);clearTimeout(timer);const current=++generation,controller=connectController=new AbortController(),isCurrent=()=>!stopped&&current===generation&&!controller.signal.aborted;queue=[];waiters=[];failed=null;status('connecting','Connecting…');await serial;if(!isCurrent())return;
+   if(connecting||stopped||connected||authBlocked||options.endpoint?.updatePending)return;if(Date.now()<retryNotBefore){retry();return;}connecting=true;clearTimeout(retryTimer);clearTimeout(timer);const current=++generation,controller=connectController=new AbortController(),isCurrent=()=>!stopped&&current===generation&&!controller.signal.aborted;queue=[];waiters=[];failed=null;status('connecting','Connecting…');await serial;if(!isCurrent())return;
    // 인증 중 전송 실패는 최대 2번 재시도하며 게이트웨이 60초 cooldown보다 오래 기다린다.
    let stage=0,attempted,quick=false;
    try{
@@ -124,7 +158,7 @@
     })(),20000,'Connection timed out. Pending actions were not resent.',current);if(!isCurrent())return;
    }catch(e){if(!isCurrent())return;retryCount++;if(stage===0&&!authBlocked){const located=await options.endpoint?.locate({isCurrent,signal:controller.signal});if(!isCurrent())return;if(located)stopped=true;else{options.endpoint?.fallback?.(attempted);try{quick=retryDelay<=1000&&socketUrl()!==attempted;}catch{}}}if(stage===2){if((e?.transport||failed?.transport)&&!authBlocked){authFailures++;retryNotBefore=Date.now()+65000*authFailures;if(authFailures>2)authBlocked=true;}else authBlocked=true;}options.onError?.(e);disconnect(e);status('disconnected',failed?.message||e.message);}finally{if(connectController===controller)connectController=null;controller.abort();if(current===generation){connecting=false;if(!connected)retry(quick?0:retryDelay);}}
   }
-  function reconnect(){connectController?.abort();disconnect(Error('Reconnecting… Pending actions were not resent.'));generation++;connecting=false;refreshing=null;authBlocked=false;authFailures=0;retryDelay=1000;connect();}
-  return {connect,rpc,refresh,reconnect,get state(){return {...state,retryAt:Math.max(retryNotBefore,nextRetryAt),retryCount,blocked:authBlocked};},setPair(nextPair){pair=nextPair;credentials=null;reconnect();},get ready(){return connected;},get blocked(){return authBlocked;},get credentials(){return credentials;},resume(stale){if(!connected){retryDelay=1000;connect();return;}if(stale){reconnect();return;}if(!warm||warm.socket.readyState===2||warm.socket.readyState===3||warm.socket.closed){clearWarm(true);warmTerminal();}clearTimeout(resumeTimer);const current=generation,op=refresh();resumeTimer=setTimeout(()=>{resumeTimer=null;if(connected&&current===generation&&refreshing===op)reconnect();},1500);op.then(()=>{clearTimeout(resumeTimer);resumeTimer=null;},e=>{clearTimeout(resumeTimer);resumeTimer=null;if(connected&&current===generation)options.onError?.(e);});},terminalConnect(){if(!connected||!credentials)throw Error(connecting?'Connecting…':'Reconnect to desktop first');let out;if(warm&&warm.socket.readyState!==2&&warm.socket.readyState!==3&&!warm.socket.closed){const w=warm;warm=null;w.cleanup();out={socket:w.socket,credentials:w.credentials,channel:w.channel,messages:w.messages};}else{clearWarm(true);out={socket:new WebSocket(socketUrl()),credentials};}warmTerminal();return out;},close(){stopped=true;connectController?.abort();clearTimeout(timer);clearTimeout(retryTimer);clearTimeout(resumeTimer);resumeTimer=null;clearWarm(true);disconnect(Error('Disconnected'));generation++;connecting=false;}};
+  function reconnect(acknowledge=true){if(acknowledge)uncertainMutation=false;connectController?.abort();disconnect(Error('Reconnecting… Pending actions were not resent.'));generation++;connecting=false;refreshing=null;authBlocked=false;authFailures=0;retryDelay=1000;connect();}
+  return {connect,rpc,refresh,reconnect,get updateBusy(){return connecting||!!pair||pendingRpc>0||uncertainMutation;},get state(){return {...state,retryAt:Math.max(retryNotBefore,nextRetryAt),retryCount,blocked:authBlocked};},setPair(nextPair){pair=nextPair;credentials=null;reconnect();},get ready(){return connected;},get blocked(){return authBlocked;},get credentials(){return credentials;},resume(stale){if(!connected){retryDelay=1000;connect();return;}if(stale){reconnect(false);return;}if(!warm||warm.socket.readyState===2||warm.socket.readyState===3||warm.socket.closed){clearWarm(true);warmTerminal();}clearTimeout(resumeTimer);const current=generation,op=refresh();resumeTimer=setTimeout(()=>{resumeTimer=null;if(connected&&current===generation&&refreshing===op)reconnect(false);},1500);op.then(()=>{clearTimeout(resumeTimer);resumeTimer=null;},e=>{clearTimeout(resumeTimer);resumeTimer=null;if(connected&&current===generation)options.onError?.(e);});},terminalConnect(){if(!connected||!credentials)throw Error(connecting?'Connecting…':'Reconnect to desktop first');let out;if(warm&&warm.socket.readyState!==2&&warm.socket.readyState!==3&&!warm.socket.closed){const w=warm;warm=null;w.cleanup();out={socket:w.socket,credentials:w.credentials,channel:w.channel,messages:w.messages};}else{clearWarm(true);out={socket:new WebSocket(socketUrl()),credentials};}warmTerminal();return out;},close(){stopped=true;connectController?.abort();clearTimeout(timer);clearTimeout(retryTimer);clearTimeout(resumeTimer);resumeTimer=null;clearWarm(true);disconnect(Error('Disconnected'));generation++;connecting=false;}};
  }};
 })();
