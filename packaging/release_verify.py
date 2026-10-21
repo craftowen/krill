@@ -156,13 +156,18 @@ def main():
     parser.add_argument("--version")
     parser.add_argument("--key-file", type=Path)
     parser.add_argument("--public-key")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--all-platforms", action="store_true")
     args = parser.parse_args()
     if args.action == "plan":
         plan = create_plan(args.directory, args.head, args.version, args.repo, args.key_file, args.all_platforms)
         args.plan.write_text(json.dumps(plan, indent=2) + "\n")
     else:
-        print(json.dumps(verify_public(json.loads(args.plan.read_text()), args.head, args.repo, args.public_key), indent=2))
+        result = json.dumps(verify_public(json.loads(args.plan.read_text()), args.head, args.repo, args.public_key), indent=2) + "\n"
+        if args.output:
+            args.output.write_text(result)
+        else:
+            print(result, end="")
 
 
 if __name__ == "__main__":

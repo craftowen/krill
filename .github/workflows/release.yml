@@ -324,7 +324,7 @@ jobs:
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@v4
         with:
-          name: krill-windows-${{ steps.meta.outputs.version }}
+          name: krill-windows-${{ steps.meta.outputs.version }}-attempt-${{ github.run_attempt }}
           path: |
             packaging/dist/Krill-${{ steps.meta.outputs.version }}-windows-x64.zip
             packaging/dist/Krill-${{ steps.meta.outputs.version }}-windows-x64.zip.sha256
@@ -345,7 +345,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: krill-windows-${{ needs.build-windows.outputs.version }}
+          name: krill-windows-${{ needs.build-windows.outputs.version }}-attempt-${{ github.run_attempt }}
           path: dist
 
       - name: Publish Windows assets
@@ -461,7 +461,7 @@ jobs:
       - name: Upload verified Linux archive
         uses: actions/upload-artifact@v4
         with:
-          name: krill-linux-${{ steps.meta.outputs.version }}-${{ matrix.arch }}
+          name: krill-linux-${{ steps.meta.outputs.version }}-${{ matrix.arch }}-attempt-${{ github.run_attempt }}
           path: |
             packaging/dist/krill-${{ steps.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz
             packaging/dist/krill-${{ steps.meta.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
@@ -495,7 +495,7 @@ jobs:
 
       - uses: actions/download-artifact@v4
         with:
-          pattern: krill-linux-${{ steps.meta.outputs.version }}-*
+          pattern: krill-linux-${{ steps.meta.outputs.version }}-*-attempt-${{ github.run_attempt }}
           merge-multiple: true
           path: dist
 

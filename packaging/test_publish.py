@@ -40,12 +40,15 @@ class PublishGuardTests(unittest.TestCase):
         shutil.copy2(HERE / "publish-github.sh", self.work / "packaging/publish-github.sh")
         # 실제 CI API·볼륨 대신 경계만 스텁한다. 판정기 자체는 test_ci_evidence/test_release_check에서 검증한다.
         (self.work / "packaging/ci_evidence.py").write_text(
-            "import os,sys\nsys.exit(1 if os.environ.get('FAKE_PROOF_FAIL') else 0)\n")
+            "import os,sys\ndef gh_json(*args,**kwargs): return {}\n"
+            "if __name__ == '__main__': sys.exit(1 if os.environ.get('FAKE_PROOF_FAIL') else 0)\n")
         (self.work / "packaging/release_check.py").write_text(
             "import os,sys\n"
             "if sys.argv[1] == 'target-dir': print('/Volumes/krill-build/targets/krill-publish')\n"
             "elif os.environ.get('FAKE_BINARY_PROOF_FAIL'): sys.exit(1)\n"
             "else: print('/validated/release/bin')\n")
+        (self.work / "packaging/macos").mkdir(exist_ok=True)
+        (self.work / "packaging/macos/smoke.py").write_text("# stub; actual packaged smoke is a native release gate\n")
         (self.work / "packaging/bundle.sh").write_text("#!/bin/bash\nexit 1\n")
         (self.work / "docs/licensing").mkdir(parents=True)
         (self.work / "docs/licensing/generate_notices.py").write_text(
@@ -128,6 +131,9 @@ class PublishGuardTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("--bin-dir is dry-run only", result.stderr)
 
+    def test_real_publication_requires_signed_full_validation_receipt(self):
+        self.assert_blocked(self.publish(), "publish requires --verified-release")
+
     def test_real_publish_stops_and_force_needs_a_terminal(self):
         red = {"FAKE_CHECKS": r"failure\tclippy"}
         self.assert_blocked(self.publish(**red), "KRILL_PUBLISH_FORCE='<reason>'")
@@ -151,7 +157,7 @@ class PublishGuardTests(unittest.TestCase):
         for name, body in fakes.items():
             (w / name).parent.mkdir(parents=True, exist_ok=True)
             (w / name).write_text(f"#!/bin/bash\nset -e\n{body}\n")
-        (w / "macos").mkdir()
+        (w / "macos").mkdir(exist_ok=True)
         shutil.copy2(HERE / "macos/ed25519_manifest.py", w / "macos/ed25519_manifest.py")
         (self.work / "crates/krill-proto/src").mkdir(parents=True)
         (self.work / "crates/krill-proto/src/ipc.rs").write_text("pub const PROTO_MIN: u16 = 3;\n")
@@ -226,7 +232,7 @@ class PublishGuardTests(unittest.TestCase):
         self.commit("main advanced")
         git(self.work, "branch", "moved-main")
         git(self.work, "reset", "--hard", base)
-        result = self.publish(KRILL_UPDATE_KEY_FILE=str(key))
+        result = self.publish("--verified-release", "/receipt", KRILL_UPDATE_KEY_FILE=str(key))
         self.assert_blocked(result, "origin/main changed while building")
         tags = subprocess.check_output(["git", "tag", "--list"], cwd=self.work, text=True)
         self.assertEqual(tags, "")

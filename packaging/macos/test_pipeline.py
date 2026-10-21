@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 HERE = pathlib.Path(__file__).resolve().parent
 
@@ -103,6 +104,19 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertFalse(list(self.output.glob(".krill.*")))
+
+    def test_signed_bundle_preserves_tested_machine_code(self):
+        sys.path.insert(0, str(HERE.parent))
+        import release_check
+        self.verified_package()
+        with patch.object(release_check, "verify", return_value=self.bins):
+            release_check.verify_bundle(self.output / "receipt.json", "a" * 40, self.output / "unused-key", self.app)
+            changed = self.output / "different"
+            subprocess.run(["/usr/bin/clang", "-x", "c", "-", "-o", str(changed)],
+                           input=b"int main(void) { return 1; }\n", check=True)
+            shutil.copyfile(changed, self.app / "Contents/Helpers/krilld")
+            with self.assertRaisesRegex(ValueError, "differs from the tested binary"):
+                release_check.verify_bundle(self.output / "receipt.json", "a" * 40, self.output / "unused-key", self.app)
 
     def test_ed25519_manifest_signing_and_forbidden_test_keys(self):
         script = str(HERE / "ed25519_manifest.py")

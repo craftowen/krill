@@ -3,7 +3,7 @@
 
 import argparse
 import contextlib
-from ci_evidence import CANDIDATE_BRANCH, Evidence, Pending
+from ci_evidence import CANDIDATE_BRANCH, Evidence, FailedRun, Pending
 from datetime import datetime, timedelta
 import fcntl
 import json
@@ -26,6 +26,7 @@ LOGS = Path.home() / "Library/Logs/Krill/nightly"
 PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 VOLUME = Path("/Volumes/krill-build")
 TARGETS = VOLUME / "targets"
+PUBLISH_LOCK = Path("/tmp/krill-publish.lock")
 AUTHORIZATION = "사용자 지시: 매일 한국시간 자정 dev 전체 검증 후 main·태그·릴리스 자동 배포"
 
 
@@ -162,7 +163,8 @@ class Release:
                         CARGO_PROFILE_TEST_OPT_LEVEL="2", CARGO_PROFILE_TEST_DEBUG="line-tables-only")
         # 예약 실행은 유료 VM이나 사람 전용 가드 탈출구를 상속하지 않는다.
         for key in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR", "KRILL_PUBLISH_FORCE",
-                    "KRILL_RELEASE_SIGNING_KEY", "KRILL_RELEASE_ASSET_DIR", "KRILL_PUBLISH_LOCKED"):
+                    "KRILL_RELEASE_SIGNING_KEY", "KRILL_RELEASE_ASSET_DIR", "KRILL_PUBLISH_LOCKED",
+                    "KRILL_PUBLICATION_AUDIT_DIR"):
             self.env.pop(key, None)
         self.state = {"started_at": datetime.now().astimezone().isoformat(), "status": "running"}
 
@@ -239,20 +241,43 @@ class Release:
             if not required.issubset(available):
                 self.update(status="skipped", reason=f"waiting for v{floor} macOS/Windows/Linux release assets")
                 return None
+        pending_file = self.state_dir / "pending.json"
+        pending = json.loads(pending_file.read_text()) if pending_file.exists() else {}
+        if pending.get("candidate_head") == published and latest != pending.get("previous_release"):
+            # 원격 create 뒤 응답/readback이 실패해도 증거를 버리거나 단순 skip하지 않는다.
+            audit = self.root / "publications" / published
+            plan = audit / "publication.json"
+            if not plan.is_file():
+                raise NightlyError("published candidate has no preserved signed plan; operator readback required")
+            self.git("checkout", "--detach", published)
+            self.run("/usr/bin/python3", "packaging/release_verify.py", "verify", "--plan", plan,
+                              "--head", published, "--repo", self.config["repo"],
+                              "--public-key", self.state["public_key"], "--output", audit / "public-verification.json", timeout=1800)
+            proof = json.loads((audit / "public-verification.json").read_text())
+            if proof.get("head") != published or len(proof.get("verified_assets", [])) != 16:
+                raise NightlyError("recovered publication readback does not match the complete candidate")
+            write_json(audit / "public-verification.json", proof)
+            self.update(status="published", tag=latest, publication=proof, readback_recovered=True)
+            pending_file.unlink()
+            return None
         if all(self.ancestor(sha, published) for sha in (remote, main)):
+            required = {f"Krill-{latest[1:]}.dmg", f"Krill-{latest[1:]}-windows-x64.zip", "latest.json", "latest-windows.json",
+                        f"krill-{latest[1:]}-linux-x86_64.tar.gz", f"krill-{latest[1:]}-linux-aarch64.tar.gz"}
+            if not required.issubset({asset["name"] for asset in published_release.get("assets", [])}):
+                raise NightlyError("latest release is incomplete; refusing a no-change success")
             self.update(status="skipped", reason="no committed changes since the last published release")
             return None
         branch = CANDIDATE_BRANCH
-        pending_file = self.state_dir / "pending.json"
-        if pending_file.exists():
-            pending = json.loads(pending_file.read_text())
-            if pending.get("source_head") == remote and pending.get("previous_release") == latest and main in (
-                    pending.get("base_main"), pending.get("candidate_head")):
-                candidate = pending["candidate_head"]
-                if self.ancestor(remote, candidate) and self.ancestor(main, candidate):
-                    self.git("checkout", "-B", branch, candidate)
-                    self.update(**pending, resumed=True)
-                    return candidate, branch, pending["version"], pending["base_main"]
+        created = datetime.fromisoformat(pending["created_at"]) if pending.get("created_at") else None
+        age = (datetime.now().astimezone() - created).total_seconds() if created else float("inf")
+        if (0 <= age < 23 * 3600 and pending.get("validation_context") == self.state.get("validation_context")
+                and pending.get("source_head") == remote and pending.get("previous_release") == latest
+                and main in (pending.get("base_main"), pending.get("candidate_head"))):
+            candidate = pending["candidate_head"]
+            if self.ancestor(remote, candidate) and self.ancestor(main, candidate):
+                self.git("checkout", "-B", branch, candidate)
+                self.update(**pending, resumed=True)
+                return candidate, branch, pending["version"], pending["base_main"]
         self.git("checkout", "-B", branch, main)
         for field in ("user.name", "user.email"):
             self.git("config", field, self.config[field])
@@ -269,15 +294,20 @@ class Release:
         self.run("cargo", "update", "--workspace", "--offline")
         self.run("python3", "docs/licensing/generate_notices.py", timeout=900)
         self.git("add", "Cargo.toml", "Cargo.lock", "THIRD_PARTY_NOTICES.md")
-        self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {remote}\nNightly-Main: {main}")
+        self.git("commit", "-m", f"Release v{version}\n\nNightly-Source: {remote}\nNightly-Main: {main}\nNightly-Candidate: {datetime.now().astimezone().isoformat()}")
         sha = self.git("rev-parse", "HEAD")
-        self.update(candidate_head=sha, candidate_branch=branch, version=version)
-        write_json(self.state_dir / "pending.json", {key: self.state[key] for key in (
-            "source_head", "base_main", "previous_release", "candidate_head", "candidate_branch", "version")})
+        self.update(candidate_head=sha, candidate_branch=branch, version=version,
+                    created_at=datetime.now().astimezone().isoformat())
+        write_json(self.state_dir / "pending.json", {key: self.state.get(key) for key in (
+            "source_head", "base_main", "previous_release", "candidate_head", "candidate_branch", "version", "created_at", "validation_context")})
         return sha, branch, version, main
 
     def publish(self):
         public_key = preflight(self.config)
+        flags = {key: value for key, value in self.env.items() if key.startswith(("RUST", "CARGO_", "CC", "CXX"))
+                 or key in ("SDKROOT", "MACOSX_DEPLOYMENT_TARGET", "CFLAGS", "CXXFLAGS", "LDFLAGS")}
+        self.update(public_key=public_key, validation_context={"rustc": command(["rustc", "-Vv"], env=self.env),
+                    "flags": flags, "public_key": public_key, "repository": self.config["repo"]})
         prepared = self.prepare()
         if prepared is None:
             return
@@ -292,8 +322,30 @@ class Release:
         previous = remote_ref.split()[0] if remote_ref else ""
         if previous != sha:
             self.git("push", f"--force-with-lease=refs/heads/{branch}:{previous}", "origin", f"HEAD:refs/heads/{branch}")
-        self.run("gh", "workflow", "run", "release.yml", "--repo", self.config["repo"], "--ref", branch,
-                 "-f", f"tag=v{version}", "-f", "build_only=true", "-f", f"public_key={public_key}")
+        if previous == sha:
+            # 새 사이클의 재개 시에만 실패한 전체 workflow를 한 번 재시작한다.
+            # --failed는 이전 attempt의 성공 잡을 생략하므로 전체 증거를 만들지 못한다.
+            evidence = Evidence(self.config["repo"])
+            for workflow in ("ci.yml", "ci-macos.yml"):
+                try:
+                    evidence.proof(workflow, sha, branch)
+                except FailedRun as failed:
+                    self.run("gh", "run", "rerun", str(failed.run["id"]), "--repo", self.config["repo"])
+                except Pending:
+                    pass
+        native_exists = False
+        if previous == sha:
+            try:
+                Evidence(self.config["repo"]).proof("release.yml", sha, branch)
+                native_exists = True
+            except Pending as waiting:
+                native_exists = waiting.run is not None
+            except FailedRun as failed:
+                self.run("gh", "run", "rerun", str(failed.run["id"]), "--repo", self.config["repo"])
+                native_exists = True
+        if not native_exists:
+            self.run("gh", "workflow", "run", "release.yml", "--repo", self.config["repo"], "--ref", branch,
+                     "-f", f"tag=v{version}", "-f", "build_only=true", "-f", f"public_key={public_key}")
         # 원격 검사가 실행되는 동안 같은 후보의 로컬 전체·메모리·생존 검사를 진행한다.
         self.update(step="full-local-checks")
         receipt = self.root / "staging" / sha / "validation.json"
@@ -311,11 +363,13 @@ class Release:
         assets = self.root / "assets" / sha
         if assets.exists():
             shutil.rmtree(assets)
+        from nightly_assets import download_artifact, import_assets
+        attempt = results["release.yml"]["attempt"]
+        artifacts = []
         for name in (f"krill-windows-{version}", f"krill-linux-{version}-x86_64", f"krill-linux-{version}-aarch64"):
-            self.run("gh", "run", "download", str(build_id), "--repo", self.config["repo"],
-                     "--dir", assets, "-n", name, timeout=900)
-        # 설치 때 검증한 도우미로 받은 산출물을 다시 확인한다.
-        from nightly_assets import import_assets
+            artifacts.append(download_artifact(self.config["repo"], build_id, attempt,
+                             f"{name}-attempt-{attempt}", assets, sha))
+        self.update(artifacts=artifacts)
         verified = self.root / "verified" / sha
         if verified.exists():
             shutil.rmtree(verified)
@@ -332,10 +386,11 @@ class Release:
         self.wait_ci(sha, "main", {"ci.yml", "ci-macos.yml"})
         self.update(step="publish")
         self.env["KRILL_RELEASE_ASSET_DIR"] = str(verified)
+        self.env["KRILL_PUBLICATION_AUDIT_DIR"] = str(self.root / "publications" / sha)
         self.env["KRILL_PUBLISH_LOCKED"] = "1"
         self.run("/bin/bash", "packaging/publish-github.sh", "--repo", self.config["repo"],
                  "--verified-release", receipt, timeout=7200)
-        verification = json.loads((self.work / "packaging/dist/public-verification.json").read_text())
+        verification = json.loads((self.root / "publications" / sha / "public-verification.json").read_text())
         if verification.get("head") != sha or verification.get("tag") != f"v{version}" or len(verification.get("verified_assets", [])) != 16:
             raise NightlyError("publication readback is missing or does not match the complete candidate")
         self.update(publication=verification)
@@ -407,6 +462,9 @@ def install_locked(source, after_release=None):
     workspace = json.loads(command([cli, "worktree", "current", "--json"], cwd=source))
     config["orca_cli"] = cli
     config["workspace"] = "id:" + workspace["result"]["worktree"]["id"]
+    previous = json.loads(CONFIG.read_text()) if CONFIG.exists() else {}
+    if previous.get("repo") == config["repo"] and previous.get("workspace"):
+        config["workspace"] = previous["workspace"]
     if after_release:
         version_tuple(after_release)
         config["after_release"] = after_release
@@ -461,12 +519,13 @@ def main():
         elif args.action == "dispatch":
             dispatch(config, args.config, args.preflight_only)
         else:
-            if os.environ.get("KRILL_NIGHTLY_PUBLISH_LOCKED") != "1":
-                env = dict(os.environ, KRILL_NIGHTLY_PUBLISH_LOCKED="1")
-                result = subprocess.run(["/usr/bin/lockf", "-k", "-t", "0", "/tmp/krill-publish.lock",
-                    sys.executable, str(Path(__file__).resolve()), "run", "--config", str(args.config)], env=env)
-                raise SystemExit(result.returncode)
-            run_release(config, args.config.parent)
+            # BSD lockf와 같은 flock 잠금을 실행기 자신이 보유한다. 취소 시 자식 정리 뒤 해제한다.
+            with PUBLISH_LOCK.open("a") as lock:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as error:
+                    raise NightlyError("another publisher holds the shared release lock") from error
+                run_release(config, args.config.parent)
 
 
 if __name__ == "__main__":

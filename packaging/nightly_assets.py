@@ -7,7 +7,12 @@ import json
 from pathlib import Path
 import re
 import shutil
+import stat
+import subprocess
+import tempfile
 import zipfile
+
+from ci_evidence import gh_json
 
 
 def sha256(path):
@@ -16,6 +21,46 @@ def sha256(path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def download_artifact(repository, run_id, attempt, name, directory, head, read=gh_json, fetch=None):
+    pages = read(f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100", paginate=True)
+    matches = [artifact for page in pages for artifact in page["artifacts"] if artifact["name"] == name]
+    if len(matches) != 1:
+        raise ValueError("expected one native artifact for the verified attempt")
+    artifact = matches[0]
+    workflow = artifact.get("workflow_run", {})
+    if (artifact.get("expired") or workflow.get("id") != run_id or workflow.get("head_sha") != head
+            or not name.endswith(f"-attempt-{attempt}")
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", artifact.get("digest", ""))):
+        raise ValueError("native artifact identity or digest does not match the verified attempt")
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryFile(dir=directory) as stream:
+        if fetch:
+            fetch(artifact["id"], stream)
+        else:
+            subprocess.run(["gh", "api", f"repos/{repository}/actions/artifacts/{artifact['id']}/zip"],
+                           stdout=stream, check=True, timeout=900)
+        stream.seek(0)
+        digest = hashlib.sha256()
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+        if artifact["digest"] != "sha256:" + digest.hexdigest():
+            raise ValueError("downloaded native artifact digest does not match GitHub evidence")
+        stream.seek(0)
+        with zipfile.ZipFile(stream) as archive:
+            names = set()
+            for member in archive.infolist():
+                name = member.filename
+                if (Path(name).name != name or name in (".", "..") or name in names
+                        or stat.S_ISLNK(member.external_attr >> 16) or (directory / name).exists()):
+                    raise ValueError("unsafe or duplicate native artifact member")
+                names.add(name)
+            for member in archive.infolist():
+                with archive.open(member) as source, (directory / member.filename).open("xb") as destination:
+                    shutil.copyfileobj(source, destination)
+    return {"id": artifact["id"], "name": artifact["name"], "digest": artifact["digest"],
+            "run_id": run_id, "attempt": attempt, "head": head}
 
 
 def import_assets(directory, output, version, commit, public_key):

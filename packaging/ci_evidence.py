@@ -27,7 +27,15 @@ class EvidenceError(RuntimeError):
 
 
 class Pending(EvidenceError):
-    pass
+    def __init__(self, message, run=None):
+        super().__init__(message)
+        self.run = run
+
+
+class FailedRun(EvidenceError):
+    def __init__(self, run):
+        super().__init__(f"run {run['id']}: {run.get('conclusion')}")
+        self.run = run
 
 
 def gh_json(endpoint, paginate=False):
@@ -97,9 +105,9 @@ class Evidence:
         if age < -300 or age > 86400:
             raise EvidenceError(f"{filename}: evidence is outside the 24-hour validity window")
         if run.get("status") != "completed":
-            raise Pending(f"waiting for {filename} run {run['id']}")
+            raise Pending(f"waiting for {filename} run {run['id']}", run)
         if run.get("conclusion") != "success":
-            raise EvidenceError(f"{filename} run {run['id']}: {run.get('conclusion')}")
+            raise FailedRun(run)
         return run
 
     def proof(self, filename, sha, branch, allow_reuse=False):

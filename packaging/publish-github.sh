@@ -318,6 +318,10 @@ fi
 
 # 위 가드에서 검증한 외장 볼륨의 게시 전용 target만 쓴다.
 echo "==> Using dedicated CARGO_TARGET_DIR=$CARGO_TARGET_DIR"
+if [[ "$DRY_RUN" -eq 0 && -z "$VERIFIED_RELEASE" ]]; then
+  echo "publish requires --verified-release from release_check.py validate for this HEAD" >&2
+  exit 1
+fi
 
 rm -rf "$OUT_DIR"
 
@@ -330,6 +334,9 @@ echo "==> [1/3] Building Krill.app bundle & ZIP..."
 bash packaging/bundle.sh "${BUNDLE_ARGS[@]}"
 if [[ -n "$VERIFIED_RELEASE" ]]; then
   python3 packaging/release_check.py verify --receipt "$VERIFIED_RELEASE" --head "$HEAD_SHA" --key-file "$UPDATE_KEY_FILE" >/dev/null
+  python3 packaging/release_check.py verify --receipt "$VERIFIED_RELEASE" --head "$HEAD_SHA" \
+    --key-file "$UPDATE_KEY_FILE" --bundle "$OUT_DIR/Krill.app"
+  python3 packaging/macos/smoke.py "$OUT_DIR/Krill.app"
 fi
 
 echo "==> [2/3] Building DMG, Homebrew tap & signed latest.json..."
@@ -459,6 +466,9 @@ PLAN_ARGS=(plan --directory "$OUT_DIR" --plan "$OUT_DIR/publication.json" --head
   --repo "$REPO" --version "$VERSION" --key-file "$UPDATE_KEY_FILE")
 if [[ -n "${KRILL_RELEASE_ASSET_DIR:-}" ]]; then PLAN_ARGS+=(--all-platforms); fi
 python3 packaging/release_verify.py "${PLAN_ARGS[@]}"
+AUDIT_DIR="${KRILL_PUBLICATION_AUDIT_DIR:-/Volumes/krill-build/nightly/publications/$HEAD_SHA}"
+mkdir -p "$AUDIT_DIR"
+cp "$OUT_DIR/publication.json" "$AUDIT_DIR/publication.json"
 
 echo "==> [3/3] Tagging $TAG and publishing GitHub Release to $REPO..."
 if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
@@ -474,7 +484,7 @@ gh release create "$TAG" "${ASSETS[@]}" \
 
 # 응답이 유실됐어도 쓰기를 재시도하지 않는다. 원격의 완전한 파일·서명 검증만 성공으로 인정한다.
 python3 packaging/release_verify.py verify --plan "$OUT_DIR/publication.json" --head "$HEAD_SHA" \
-  --repo "$REPO" --public-key "$UPDATE_PUBKEY" > "$OUT_DIR/public-verification.json"
+  --repo "$REPO" --public-key "$UPDATE_PUBKEY" --output "$AUDIT_DIR/public-verification.json"
 if [[ "$CREATE_STATUS" -ne 0 ]]; then echo "Create response failed; complete remote publication verified."; fi
 
 echo "Published Krill $TAG to ${REPO_URL}/releases/tag/${TAG}"
