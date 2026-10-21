@@ -221,5 +221,5 @@ async function connect(url,credential){
   console.log('Daemon webhook E2E passed: ntfy, Telegram, Discord, waiting/done, credential-free deep links and no app process');
   const {fragment}=await other.rpc({action:'install_handoff'});assert.match(fragment,/^pair=[0-9a-f]{64}&key=[\w-]{43}$/);await require('./mobile_install.cjs').main({base,fragment});
   console.log('PWA E2E passed: non-secure pure JS E2EE, gzip assets, approval, IME text, photo 0600, account switch, gate reply, diff, mock handoff and credential reconnect');
- } finally {try{const t=fs.readFileSync(path.join(dir,'holder.log'),'utf8').split('\n');console.error('HOLDERLOG-MDBG:'+JSON.stringify(t.filter(l=>l.includes('MDBG')).slice(-30)))}catch(e){console.error('noholderlog:'+e.message)}cleanup();}
+ } finally {try{const t=fs.readFileSync(path.join(dir,'holder.log'),'utf8').split('\n');console.error('HOLDERLOG-TAIL:'+JSON.stringify(t.slice(-25)))}catch(e){console.error('noholderlog:'+e.message)}cleanup();}
 })().catch(error=>{console.error(error.stack);process.exitCode=1;});

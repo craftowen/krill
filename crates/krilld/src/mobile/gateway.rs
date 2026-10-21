@@ -1076,6 +1076,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
                 };
                 mdbg(format!("serving id={id}"));
                 if let Err(error) = serve(socket, &s, id, &r, &h) {
+                    mdbg(format!("serve-ended id={id} kind={:?}", error.kind()));
                     tracing::debug!(kind=?error.kind(), "mobile connection ended");
                 }
                 drop(guard);
@@ -1188,10 +1189,17 @@ fn serve(
         }
     };
     shared.wake();
-    let registry = registry.upgrade().ok_or_else(invalid)?;
+    mdbg(format!("authenticated id={id}"));
+    let Some(registry) = registry.upgrade() else {
+        mdbg(format!("no-registry id={id}"));
+        return Err(invalid());
+    };
     let ping = lock(&shared.state).ping;
+    mdbg(format!("bridging id={id} ping_ms={}", ping.as_millis()));
     socket.set_read_timeout(Some(ping))?;
-    bridge(socket, channel, registry, hello.clone())
+    let result = bridge(socket, channel, registry, hello.clone());
+    mdbg(format!("bridge-ended id={id} ok={}", result.is_ok()));
+    result
 }
 
 pub(super) fn auth_close_code(error: &io::Error) -> Option<u16> {
