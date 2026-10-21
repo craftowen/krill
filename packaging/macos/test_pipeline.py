@@ -4,6 +4,7 @@ import hashlib
 import os
 import pathlib
 import plistlib
+import re
 import shutil
 import shlex
 import subprocess
@@ -238,7 +239,14 @@ class PipelineTests(unittest.TestCase):
         self.verified_package()
         helper = self.app / "Contents/Helpers/krilld"
         data = bytearray(helper.read_bytes())
-        data[len(data) // 2] ^= 1
+        sections = subprocess.check_output(["/usr/bin/otool", "-l", str(helper)], text=True)
+        text = re.search(r"sectname __text\s+segname __TEXT\s+addr \S+\s+size (0x[0-9a-fA-F]+)\s+offset (\d+)", sections)
+        self.assertIsNotNone(text, "fixture must contain a signed machine-code section")
+        size, offset = int(text[1], 16), int(text[2])
+        self.assertGreater(size, 0)
+        self.assertLess(offset + size, len(data))
+        # A file midpoint can land in signing metadata on Intel; change actual signed code.
+        data[offset + size // 2] ^= 1
         helper.write_bytes(data)
         self.assertNotEqual(self.verify().returncode, 0)
 
