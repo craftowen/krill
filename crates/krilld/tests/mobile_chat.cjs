@@ -121,5 +121,8 @@ async function main(){
  assert.equal(f.button('Load earlier messages').hidden,true);assert.equal(new Set(f.entry.items.map(item=>item.id)).size,1000);
  f.button('Back to latest').action();await flush();assert.deepEqual(Array.from(f.entry.items,item=>item.id),smallIds(50));assert.equal(f.entry.offset,offsets[1050]);f.dispose();
  console.log('PASS P1 1050 one-item append pages replay exact byte ends, 50 earlier reads stay unique/chronological, identical text retained');
+ f=fixture();await flush();const previousHost=deferred();f.handler=async req=>req.action==='prompt'?previousHost.promise:{generation:'old',items:[],next_offset:0};f.input('same text');f.submit();await flush();
+ f.state.drafts=new Map([[7,'same text']]);f.state.chatCache=new Map();f.remount();await flush();previousHost.resolve({sent:true});await flush();assert.equal(f.state.drafts.get(7),'same text');assert.equal(f.find('chat-input').value,'same text');f.dispose();
+ console.log('PASS late previous-host prompt completion cannot erase the new host draft with an identical session ID/text');
 }
 main().catch(error=>{console.error(error);process.exitCode=1;});

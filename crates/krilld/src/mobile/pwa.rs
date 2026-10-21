@@ -3,7 +3,7 @@ use ring::digest;
 use std::io::{self, Write};
 use std::sync::OnceLock;
 pub const APP: &[u8] = include_bytes!("assets/app.js");
-const ASSETS: [(&str, &str, &[u8], &[u8]); 21] = [
+const ASSETS: [(&str, &str, &[u8], &[u8]); 22] = [
     (
         "index.html",
         "text/html; charset=utf-8",
@@ -39,6 +39,12 @@ const ASSETS: [(&str, &str, &[u8], &[u8]); 21] = [
         "text/javascript; charset=utf-8",
         include_bytes!("assets/client.js"),
         include_bytes!("assets/client.js.gz"),
+    ),
+    (
+        "updates.js",
+        "text/javascript; charset=utf-8",
+        include_bytes!("assets/updates.js"),
+        include_bytes!("assets/updates.js.gz"),
     ),
     (
         "terminal.js",
@@ -242,6 +248,17 @@ mod hash_tests {
             .collect();
         let embedded: std::collections::BTreeSet<_> = ASSETS.iter().map(|a| a.0).collect();
         assert_eq!(listed, embedded);
+        let html = include_str!("assets/index.html");
+        let inventory: std::collections::BTreeSet<_> = html
+            .split("<meta name=\"krill-update\" content=\"1 ")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .split(' ')
+            .collect();
+        assert_eq!(inventory, embedded);
         let mut context = digest::Context::new(&digest::SHA256);
         for name in embedded {
             let bytes = std::fs::read(
