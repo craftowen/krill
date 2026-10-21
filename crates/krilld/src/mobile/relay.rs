@@ -136,13 +136,10 @@ impl Transport {
         self.tcp().set_nonblocking(false)?;
         let res = match self {
             Self::Plain(s) => s.write_all(&frame).and_then(|()| s.flush()),
-            Self::Tls(s) => (|| -> io::Result<()> {
-                s.conn.writer().write_all(&frame)?;
-                while s.conn.wants_write() {
-                    s.conn.write_tls(&mut s.sock)?;
-                }
-                s.sock.flush()
-            })(),
+            // StreamOwned drains TLS records between partial plaintext writes.
+            // Writing the whole frame into conn.writer() first exhausts rustls'
+            // 64 KiB buffer on large snapshots and disconnects every client.
+            Self::Tls(s) => s.write_all(&frame).and_then(|()| s.flush()),
         };
         self.tcp().set_nonblocking(true).ok();
         res
@@ -806,6 +803,79 @@ fn serve_mux_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn tls_large_frames_drain_buffer_and_preserve_next_message() {
+        // Public, test-only localhost certificate/key, with no production use.
+        let cert = rustls_pki_types::CertificateDer::from(
+            include_bytes!("../../tests/fixtures/mobile-relay-localhost.der").to_vec(),
+        );
+        let key = rustls_pki_types::PrivatePkcs8KeyDer::from(
+            include_bytes!("../../tests/fixtures/mobile-relay-localhost-key.der").to_vec(),
+        );
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert.clone()], key.into())
+            .unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let sizes = [128 * 1024, MAX_PLAINTEXT];
+        let server = thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let conn = rustls::ServerConnection::new(Arc::new(server_config)).unwrap();
+            let mut stream = rustls::StreamOwned::new(conn, socket);
+            for size in sizes {
+                let (kind, payload) = ws::read(&mut stream).unwrap();
+                assert_eq!(kind, ws::BINARY);
+                assert_eq!(payload.len(), size);
+                assert!(payload.iter().all(|&b| b == 0x5a));
+            }
+            let (kind, payload) = ws::read(&mut stream).unwrap();
+            assert_eq!(
+                (kind, payload.as_slice()),
+                (ws::TEXT, b"still connected".as_slice())
+            );
+        });
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+        let conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+        let socket = TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        socket
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut tls = rustls::StreamOwned::new(conn, socket);
+        while tls.conn.is_handshaking() {
+            tls.conn.complete_io(&mut tls.sock).unwrap();
+        }
+        let mut transport = Transport::Tls(Box::new(tls));
+        for size in sizes {
+            transport
+                .write_masked(ws::BINARY, &vec![0x5a; size])
+                .unwrap();
+        }
+        transport
+            .write_masked(ws::TEXT, b"still connected")
+            .unwrap();
+        server.join().unwrap();
+    }
+
     #[test]
     fn mux_frame_roundtrip_and_tls_config_init() {
         let frame = encode_mux(MUX_OPEN, 0x1234_5678, &[9_u8; 32]);
