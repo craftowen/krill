@@ -6016,6 +6016,56 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     fs::remove_dir_all(d2).ok();
 }
 
+/// `OpenCode` Go API 키(Orca `OpenCodeGoCredentials` 패리티): 카드는 디자인 시스템
+/// 카드·라벨·뱃지로 보이고, 저장/바꾸기·지우기가 상태 파일에 반영된다.
+#[gpui::test]
+fn opencode_go_api_key_card_saves_and_clears_override(cx: &mut TestAppContext) {
+    let d = dir("opencode-go-api-key");
+    init(cx, &d);
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1400.), px(6000.)));
+    vcx.run_until_parked();
+    let tab = vcx
+        .debug_bounds("admin-tab-accounts")
+        .expect("accounts tab");
+    vcx.simulate_click(tab.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("admin-opencode-api-key-card").is_some());
+    assert!(vcx.debug_bounds("admin-opencode-api-key-badge").is_some());
+    // 로그인 안내 카드(`admin-opencode-login-guide`)는 터미널 로그인 진행 중에만 뜬다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            let input = v.ensure_opencode_api_key_input(window, cx);
+            input.update(cx, |s, cx| s.set_value("  test-key-123  ", window, cx));
+        });
+    });
+    vcx.run_until_parked();
+    let save = vcx
+        .debug_bounds("admin-opencode-api-key-save")
+        .expect("save");
+    vcx.simulate_click(save.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let (home, dir) = SettingsView::opencode_home_and_state(cx);
+        assert_eq!(
+            crate::accounts::opencode_go::read_override(&home, dir.as_deref()).as_deref(),
+            Some("test-key-123")
+        );
+        assert!(view.read(cx).opencode_api_key_configured);
+    });
+    assert!(vcx.debug_bounds("admin-opencode-api-key-clear").is_some());
+    let clear = vcx
+        .debug_bounds("admin-opencode-api-key-clear")
+        .expect("clear");
+    vcx.simulate_click(clear.center(), gpui::Modifiers::default());
+    vcx.run_until_parked();
+    vcx.update(|_, cx| {
+        let (home, dir) = SettingsView::opencode_home_and_state(cx);
+        assert!(crate::accounts::opencode_go::read_override(&home, dir.as_deref()).is_none());
+    });
+    fs::remove_dir_all(d).ok();
+}
+
 /// OWE-760: 스케줄 모달이 빈 id·cwd·잘못된 cron·빈/미종료 따옴표 command를 검증해 오류 배너를 표시하고
 /// 모달을 닫지 않으며, 편집/저장 시 공백이 포함된 다중 단어 command 인자(`["bash", "-c", "cargo test --workspace"]`)를 보존한다.
 #[gpui::test]
