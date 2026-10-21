@@ -22,6 +22,11 @@ pub(super) const MAX_PENDING: usize = 4;
 pub(super) const MAX_CONNECTIONS: usize = 12;
 const STACK: usize = 128 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(5);
+// Temporary Linux-CI diagnosis, DO NOT MERGE.
+#[expect(clippy::print_stderr, reason = "temporary Linux CI diagnosis")]
+fn mdbg(message: impl std::fmt::Display) {
+    eprintln!("MDBG {message}");
+}
 /// 수락 스레드가 일이 없어도 깨어 reconcile(터널 감시·백오프)하는 최대 간격.
 const RECONCILE: Duration = Duration::from_secs(1);
 /// Cloudflare는 양방향 무전송 WS를 끊는다(Quick Tunnel 실측 약 125초). 이 주기로 ping하고,
@@ -992,12 +997,16 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
         reconcile(&mut state, now_ms()).ok();
         let now = Instant::now();
         let mut deadline: Option<Instant> = None;
-        for connection in state.connections.values() {
+        for (id, connection) in &state.connections {
             if connection.device.is_some() {
                 continue;
             }
             let due = connection.accepted + TIMEOUT;
             if now >= due {
+                mdbg(format!(
+                    "reaped id={id} elapsed_ms={}",
+                    now.duration_since(connection.accepted).as_millis()
+                ));
                 connection.socket.shutdown();
             } else {
                 deadline = Some(deadline.map_or(due, |d| d.min(due)));
@@ -1042,6 +1051,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
             return;
         };
         state.next = id;
+        mdbg(format!("accepted id={id}"));
         let Ok(kept) = socket.try_clone() else {
             continue;
         };
@@ -1064,6 +1074,7 @@ fn accept(shared: &Arc<Shared>, registry: &Weak<Registry>, hello: &ServerHello) 
                     shared: Arc::clone(&s),
                     id,
                 };
+                mdbg(format!("serving id={id}"));
                 if let Err(error) = serve(socket, &s, id, &r, &h) {
                     tracing::debug!(kind=?error.kind(), "mobile connection ended");
                 }
@@ -1151,9 +1162,11 @@ fn serve(
     if !ws::upgrade(&mut socket, origin.as_deref())? {
         return Ok(());
     }
+    mdbg(format!("upgraded id={id}"));
     let channel = match authenticate(&mut socket, shared, id) {
         Ok(channel) => channel,
         Err(error) => {
+            mdbg(format!("auth-failed id={id} kind={:?}", error.kind()));
             // RFC 6455 policy violation은 인증/프로토콜 거부만 나타낸다.
             // EOF·timeout·쓰기 오류는 이 신호를 보내지 않아 클라이언트가 전송 실패와 구별한다.
             if let Some(code) = auth_close_code(&error) {
