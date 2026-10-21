@@ -39,7 +39,7 @@ impl Drop for ProbeDir {
 fn link_helper_resolves_in_dev_and_bundle_layouts() {
     if let Some(expected) = std::env::var_os("MK_LINK_EXPECTED_PATH") {
         assert_eq!(
-            fs::canonicalize(krill_proto::daemon::sibling_exe("krill-link").unwrap()).unwrap(),
+            fs::canonicalize(krill_app::hosts::link::executable()).unwrap(),
             fs::canonicalize(PathBuf::from(expected)).unwrap()
         );
         return;

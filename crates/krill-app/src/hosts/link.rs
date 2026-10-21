@@ -97,7 +97,7 @@ impl LinkHosts {
                 .clone();
             let socket = krill_link::host_socket_path(&self.state_dir, &host.id)
                 .map_err(io::Error::other)?;
-            let info = connection_info(&self.state_dir, &host.id)?;
+            let mut info = connection_info(&self.state_dir, &host.id)?;
             let repaired = self
                 .repaired
                 .lock()
@@ -112,6 +112,16 @@ impl LinkHosts {
                 slot.revoked.store(true, Ordering::Release);
                 if let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade()) {
                     lease.stop();
+                }
+            }
+            if repaired
+                || slot.restart.load(Ordering::Acquire)
+                || slot.starting.load(Ordering::Acquire)
+            {
+                info.error = None;
+                if slot.starting.load(Ordering::Acquire) && info.status == HostStatus::Disconnected
+                {
+                    info.status = HostStatus::Connecting;
                 }
             }
             let spec = RemoteHostSpec {
@@ -189,6 +199,11 @@ pub fn begin_shutdown() -> Vec<Arc<LinkHosts>> {
 
 pub fn host_id(id: &str) -> String {
     format!("iroh:{id}")
+}
+
+/// 번들(`Contents/Helpers/krill-link`) 또는 개발 빌드(`target/.../krill-link`) 경로를 찾는다.
+pub fn executable() -> PathBuf {
+    krill_proto::daemon::sibling_exe("krill-link").unwrap_or_else(|_| PathBuf::from("krill-link"))
 }
 
 impl Slot {
