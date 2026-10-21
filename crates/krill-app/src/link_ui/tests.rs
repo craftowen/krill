@@ -628,3 +628,46 @@ fn open_pairing_dispatches_to_registered_host(cx: &mut TestAppContext) {
     cx.update(super::open_pairing);
     assert!(opened.get(), "open_pairing must dispatch to the host");
 }
+
+/// A client can have registered remote Macs without permitting any inbound devices.
+/// The settings panel must show the same remote registrations as the sidebar.
+#[gpui::test]
+fn remote_macs_render_without_inbound_devices_and_refresh(cx: &mut TestAppContext) {
+    use super::real::RealLinkBackend;
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-remote-list-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let host = krill_link::RemoteHost {
+        id: "studio".into(),
+        name: "Studio Mac".into(),
+        node_id: "aa".repeat(32),
+        relay_url: None,
+        addr_hints: Vec::new(),
+        added_at: 1000,
+    };
+    krill_link::save_hosts(&dir, &[host]).unwrap();
+    let backend = Arc::new(RealLinkBackend::new(
+        dir.clone(),
+        std::path::PathBuf::from("unused-link"),
+    ));
+    assert!(backend.devices().unwrap().is_empty());
+    assert_eq!(backend.remote_hosts().unwrap()[0].name, "Studio Mac");
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-remote-host-studio").is_some());
+    vcx.update(|_, cx| {
+        assert_eq!(
+            panel.read(cx).remote_hosts[0].status,
+            krill_hosts::HostStatus::Disconnected
+        );
+        assert!(!panel.read(cx).status.enabled);
+    });
+    krill_link::save_hosts(&dir, &[]).unwrap();
+    vcx.executor()
+        .advance_clock(std::time::Duration::from_secs(3));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-remote-host-studio").is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
