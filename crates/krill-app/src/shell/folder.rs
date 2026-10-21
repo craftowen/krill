@@ -132,9 +132,45 @@ impl Shell {
                 window.focus(&this.focus, cx);
                 cx.notify();
                 match e {
-                    add_project::Event::Browse => Self::choose_folder(cx),
-                    add_project::Event::Clone(url) => Self::clone_project(url.clone(), cx),
-                    add_project::Event::Create => Self::create_project(cx),
+                    add_project::Event::Browse(host) => {
+                        if host.is_local() {
+                            Self::choose_folder(cx);
+                        }
+                    }
+                    add_project::Event::OpenPath(host, path) => {
+                        this.new_folder_tab_on(host.clone(), path, Program::Login, cx);
+                    }
+                    add_project::Event::Clone { host, url } => {
+                        if host.is_local() {
+                            Self::clone_project(url.clone(), cx);
+                        }
+                    }
+                    add_project::Event::CloneAt { host, url, parent } => {
+                        let Some(dir) = add_project::clone_dir(url) else {
+                            return;
+                        };
+                        let program = Self::shell_script(
+                            r#"git clone -- "$1" "$2" && cd -- "$2"; exec "${SHELL:-/bin/zsh}" -l"#,
+                            &[url.as_bytes(), dir.as_bytes()],
+                        );
+                        this.new_folder_tab_on(host.clone(), parent, program, cx);
+                    }
+                    add_project::Event::Create(host) => {
+                        if host.is_local() {
+                            Self::create_project(cx);
+                        }
+                    }
+                    add_project::Event::CreateAt(host, path) => {
+                        let program = Self::shell_script(
+                            r#"mkdir -- "$1" && cd -- "$1" && git init; exec "${SHELL:-/bin/zsh}" -l"#,
+                            &[path.as_os_str().as_bytes()],
+                        );
+                        let parent = path.parent().map_or_else(
+                            || PathBuf::from("/"),
+                            std::path::Path::to_path_buf,
+                        );
+                        this.new_folder_tab_on(host.clone(), &parent, program, cx);
+                    }
                     add_project::Event::Close => {}
                 }
             },
