@@ -17,3 +17,7 @@ jobs:
           persist-credentials: false
       - name: Compare temporary certificate selectors and search scope
         run: python3 packaging/macos/diagnose_keychain.py
+      - name: Full packaging regressions after scope fix
+        run: |
+          python3 packaging/macos/test_pipeline.py
+          python3 packaging/homebrew/test_release.py
