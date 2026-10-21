@@ -11,12 +11,21 @@ on:
         description: '릴리스 태그 (예: v0.1.2, 비우면 Cargo.toml 버전 기준)'
         required: false
         type: string
+      build_only:
+        description: '야간 후보의 Windows/Linux 빌드·스모크만 실행 (태그·릴리스 게시 없음)'
+        default: false
+        type: boolean
+      public_key:
+        description: 'build_only 후보에 넣을 Ed25519 공개키 (64hex, 비밀키 아님)'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
 jobs:
   release:
+    if: ${{ !inputs.build_only }}
     runs-on: macos-15
     timeout-minutes: 30
     permissions:
@@ -184,6 +193,7 @@ jobs:
         shell: bash
         env:
           INPUT_TAG: ${{ inputs.tag }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           set -euo pipefail
           CARGO_VER=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
@@ -202,7 +212,7 @@ jobs:
           # 게시 소스 가드: 태그가 있으면 그 커밋, 없으면 origin/main 끝에서만 만든다.
           if TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
             [[ "${TAG_SHA}" == "${GITHUB_SHA}" ]] || { echo "tag ${TAG} points at ${TAG_SHA}, not ${GITHUB_SHA}" >&2; exit 1; }
-          else
+          elif [[ "${BUILD_ONLY}" != true ]]; then
             MAIN_SHA=$(git rev-parse origin/main)
             [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
           fi
@@ -233,8 +243,15 @@ jobs:
         shell: bash
         env:
           KRILL_RELEASE_SIGNING_KEY: ${{ secrets.KRILL_RELEASE_SIGNING_KEY }}
+          BUILD_ONLY: ${{ inputs.build_only }}
+          INPUT_PUBLIC_KEY: ${{ inputs.public_key }}
         run: |
           set -euo pipefail
+          if [[ "${BUILD_ONLY}" == true ]]; then
+            [[ "${INPUT_PUBLIC_KEY}" =~ ^[0-9a-f]{64}$ ]] || { echo "build_only needs a 64-hex public key" >&2; exit 1; }
+            echo "public_key=${INPUT_PUBLIC_KEY}" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
           if [[ -z "${KRILL_RELEASE_SIGNING_KEY}" ]]; then
             echo "::warning::KRILL_RELEASE_SIGNING_KEY is not set; the Windows zip ships without an update key and latest-windows.json is skipped"
             exit 0
@@ -262,7 +279,7 @@ jobs:
       # TODO(OWE-838): Authenticode 서명(signtool)은 여기서 zip 전에 exe에 한다. 인증서·비밀은 사람이 정한다.
 
       - name: Sign latest-windows.json
-        if: steps.key.outputs.public_key != ''
+        if: ${{ !inputs.build_only && steps.key.outputs.public_key != '' }}
         shell: bash
         env:
           KRILL_RELEASE_SIGNING_KEY: ${{ secrets.KRILL_RELEASE_SIGNING_KEY }}
@@ -285,6 +302,15 @@ jobs:
             --rollout-pct 100 \
             --output packaging/dist/latest-windows.json
 
+      - name: Verify nightly Windows installation and daemon survival
+        if: inputs.build_only
+        shell: powershell
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          & .\packaging\windows\smoke.ps1 -Zip "packaging\dist\Krill-$env:VERSION-windows-x64.zip"
+          git rev-parse HEAD | Set-Content -Encoding ascii packaging/dist/source-commit-windows.txt
+
       - name: Upload Windows release artifact
         uses: actions/upload-artifact@v4
         with:
@@ -293,6 +319,7 @@ jobs:
             packaging/dist/Krill-${{ steps.meta.outputs.version }}-windows-x64.zip
             packaging/dist/Krill-${{ steps.meta.outputs.version }}-windows-x64.zip.sha256
             packaging/dist/latest-windows.json
+            packaging/dist/source-commit-windows.txt
           if-no-files-found: error
           retention-days: 30
 
@@ -300,7 +327,7 @@ jobs:
   # 이미 있는 자산은 덮어쓰지 않는다. 잘못 올라간 자산은 사람이 지우고 다시 실행한다.
   publish-windows:
     needs: [release, build-windows]
-    if: ${{ !cancelled() && needs.build-windows.result == 'success' }}
+    if: ${{ !inputs.build_only && !cancelled() && needs.build-windows.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -362,6 +389,7 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           EXPECTED_ARCH: ${{ matrix.arch }}
+          BUILD_ONLY: ${{ inputs.build_only }}
         run: |
           set -euo pipefail
           CARGO_VER=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\([^"]*\)"/\1/p' Cargo.toml)
@@ -379,7 +407,7 @@ jobs:
           fi
           if TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
             [[ "${TAG_SHA}" == "${GITHUB_SHA}" ]] || { echo "tag ${TAG} points at ${TAG_SHA}, not ${GITHUB_SHA}" >&2; exit 1; }
-          else
+          elif [[ "${BUILD_ONLY}" != true ]]; then
             MAIN_SHA=$(git rev-parse origin/main)
             [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
           fi
@@ -423,7 +451,7 @@ jobs:
 
   publish-linux:
     needs: [release, build-linux]
-    if: ${{ !cancelled() && needs.build-linux.result == 'success' }}
+    if: ${{ !inputs.build_only && !cancelled() && needs.build-linux.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:

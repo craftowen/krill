@@ -4,6 +4,39 @@ GitHub Releases 게시의 **공식 경로**는 로컬 맥에서 메인테이너�
 `.github/workflows/release.yml`은 수동 예비·Windows 자산 추가용이며 같은 규칙(main 끝 또는 태그 커밋에서만,
 기존 자산 덮어쓰기 없음)을 따른다. 사용자가 배포·릴리스·push를 명시 지시하면 에이전트도 필요한 main·태그 push와 릴리스 생성을 수행한다(AGENTS.md 규칙 9).
 
+## 야간 자동 배포
+
+`packaging/nightly.py`는 로그인한 macOS 사용자의 `launchd`에 매일 **한국시간 00:00 검사 시작**을 등록한다.
+시스템 시간대는 Asia/Seoul이어야 한다. 설치 즉시 빌드하거나 배포하지 않는다.
+
+```sh
+python3 packaging/nightly.py install       # 이 저장소의 dev를 대상으로 등록·갱신
+python3 packaging/nightly.py preflight     # 인증·툴·기존 서명키·외장 볼륨 확인, 빌드·원격 쓰기 없음
+python3 packaging/nightly.py status        # launchd 등록과 최근 실행 결과
+python3 packaging/nightly.py uninstall     # 예약 해제, 로그·검사 기록 보존
+# 필요할 때만 즉시 같은 경로를 실행:
+python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
+```
+
+1. 실행 시작에 이 저장소의 **커밋된 로컬 `dev`**를 고정하고, 원격 `dev`·`main`도 가져온다. 세 커밋이 모두 최신 게시 태그에 포함돼 있으면 생략한다. 작업 중인 체크아웃은 읽기만 한다. 미커밋 파일과 미통합 기능 브랜치는 포함하지 않으며 고정 이후의 개발 커밋은 다음 날 대상이다.
+2. `/Volumes/krill-build/nightly/repository` 전용 clone에서 통합한다. 병합 충돌은 중단한다. workspace와 최신 게시 버전 중 큰 버전의 patch를 올리고 Cargo.lock·고지문과 함께 **최종 후보 커밋을 먼저** 만든다.
+3. 그 HEAD에서 `scripts/check.sh --memory`, Windows 전체 clippy, release 바이너리 빌드, 실제 GUI kill -9·출력 해시 재생 E2E, release holder 생존·업그레이드 테스트를 실행한다. 통과 기록은 HEAD별로 보관한다. Cargo 산출물은 `/Volumes/krill-build/targets/` 아래에만 둔다. 외장 볼륨이 없으면 내장 디스크로 폴백하지 않고 중단한다.
+4. `release/nightly-<시각>` 후보를 push하고 CI와 `release.yml`의 `build_only=true`를 실행한다. 이 모드는 macOS 게시 잡·모든 업로드 게시 잡을 건너뛰고 Windows/Linux 네이티브 빌드와 설치·데몬 kill 생존 스모크만 한다. GCP/상시 Windows VM은 호출하지 않는다. Windows에는 로컬 서명키의 **공개키만** 전달한다.
+5. 같은 HEAD의 Windows·Linux x86_64/aarch64 자산을 내려받아 출처 커밋·체크섬·Windows 버전과 공개키를 검증한다. 검사 중 `main`이 바뀌었으면 후보를 남기고 중단한다. 통과한 후보만 `main`에 fast-forward push하고 해당 CI도 확인한다.
+6. 기존 `publish-github.sh`가 macOS 패키지를 빌드하고 검증한 네이티브 자산을 함께 게시한다. `latest.json`·`latest-windows.json`은 로컬 키로 서명한다. 기존 태그·릴리스는 덮어쓰지 않는다. 중복 예약 실행은 잠금으로 막는다.
+
+실패하면 새 릴리스를 게시하지 않고 단계·대상 HEAD·오류를 기록한다. `main` 반영 뒤 CI나 게시가 실패하면 그 검증 커밋은 `main`에 남을 수 있다. 게시 중 네트워크가 끊어지면 태그만 남는 등 일부 원격 쓰기가 끝났을 수 있으며, 다음 실행도 기존 태그·자산을 덮어쓰지 않는다.
+
+- 등록 파일: `~/Library/LaunchAgents/dev.krill.nightly.plist`.
+- 설치된 실행기·설정·HEAD별 통과 기록: `~/Library/Application Support/dev.krill.nightly/`. 실행기를 수정하면 `install`로 갱신한다.
+- 실행 로그: `~/Library/Logs/Krill/nightly/`. 최근 결과는 설정 폴더의 `status.json`이며 실패 후보와 자산은 외장 볼륨에 남는다.
+- 맥이 켜져 있고 사용자가 로그인돼 있어야 한다(GUI 생존·메모리 테스트). 잠자기 중 예약은 깨어날 때 실행될 수 있다. 종료·로그아웃 상태에서는 자정 실행을 보장하지 않는다.
+- 처음 설치 전 `dev`를 준비하고, 기존 업데이트 서명키·GitHub 인증·Windows 크로스 검사 툴체인을 유지한다. 개발 중 검사는 AGENTS.md와 CONTRIBUTING.md의 부분 검사 범위를 따른다.
+
+회귀 검증: `python3 packaging/test_nightly.py`, `python3 packaging/test_publish.py`, `actionlint .github/workflows/release.yml`.
+
+## 수동 게시
+
 ```sh
 bash packaging/publish-github.sh --preflight      # 가드만 확인(빌드·업로드 없음, 실패 시 1)
 bash packaging/publish-github.sh --bump patch     # 가드 통과 후 버전·Cargo.lock·THIRD_PARTY_NOTICES.md를 한 커밋으로 만들고 멈춤
