@@ -4937,3 +4937,60 @@ fn session_label_uses_daemon_title_and_strips_status_glyphs(cx: &mut TestAppCont
         });
     });
 }
+
+#[gpui::test]
+fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let selected = PathBuf::from("/Users/local/projects/selected");
+    let hidden_local = PathBuf::from("/Users/local/projects/other");
+    let remote_repo = PathBuf::from("/Users/remote/projects/gwiinsaju");
+    let remote_home = PathBuf::from("/Users/remote");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: vec![],
+                trees: BTreeMap::from([
+                    (selected.clone(), vec![selected.clone()]),
+                    (hidden_local.clone(), vec![hidden_local.clone()]),
+                ]),
+            };
+            s.options.filters.repos.insert(selected.clone());
+            let mut loose = session(5, AgentState::Unknown, None);
+            loose.cwd = Some(remote_home.clone());
+            s.remote_hosts = vec![RemoteHost {
+                id: "paired-mac".into(),
+                label: "Mac-mini".into(),
+                status: HostStatus::Connected,
+                snapshot: Snapshot {
+                    sessions: vec![loose],
+                    trees: BTreeMap::from([
+                        (remote_repo.clone(), vec![remote_repo.clone()]),
+                        // Equal path strings on two PCs still identify separate projects.
+                        (hidden_local.clone(), vec![hidden_local.clone()]),
+                    ]),
+                },
+                meta: Meta::new(),
+                source: None,
+                error: None,
+            }];
+            s.rebuild(cx);
+            let local = s.local_rows();
+            assert!(local.contains(&Row::Repository(selected.clone())));
+            assert!(!local.contains(&Row::Repository(hidden_local.clone())));
+            let remote = s.remote_rows(&s.remote_hosts[0]);
+            assert!(remote.contains(&Row::Repository(remote_repo.clone())));
+            assert!(remote.contains(&Row::Worktree(remote_repo.clone())));
+            assert!(remote.contains(&Row::Repository(hidden_local.clone())));
+            assert!(remote.contains(&Row::Folder(remote_home.clone())));
+            assert_eq!(s.remote_hosts[0].snapshot.sessions.len(), 1);
+            // Host-level visibility remains an explicit independent control.
+            s.options
+                .filters
+                .hosts
+                .insert(HostId::Local.as_key().to_owned());
+            s.rebuild(cx);
+            assert!(s.row_hosts.iter().all(HostId::is_local));
+        });
+    });
+}
