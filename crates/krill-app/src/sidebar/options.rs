@@ -1390,8 +1390,8 @@ pub(super) fn host_visibility_summary(
         .collect();
     if selected.is_empty() || selected.len() == hosts.len() {
         text::ALL_HOSTS.get().to_owned()
-    } else if selected.len() == 1 {
-        selected[0].to_owned()
+    } else if let [only] = selected.as_slice() {
+        (*only).to_owned()
     } else {
         text::HOSTS_SELECTED_COUNT.format(&[("n", &selected.len().to_string())])
     }
@@ -1408,8 +1408,8 @@ pub(super) fn project_visibility_summary(filters: &WorkspaceFilters, repos: &[Pa
         .collect();
     if selected.is_empty() || selected.len() == repos.len() {
         text::ALL_PROJECTS.get().to_owned()
-    } else if selected.len() == 1 {
-        basename(selected[0])
+    } else if let [only] = selected.as_slice() {
+        basename(only)
     } else {
         text::PROJECTS_SELECTED_COUNT.format(&[("n", &selected.len().to_string())])
     }

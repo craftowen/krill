@@ -314,12 +314,11 @@ impl Preedit {
             }
         }
         for i in 0..groups.len() {
-            let next = if i + 1 < groups.len() {
-                groups[i + 1].0
-            } else {
-                self.columns
-            };
-            groups[i].2 = next.saturating_sub(groups[i].0);
+            let next = groups.get(i + 1).map_or(self.columns, |g| g.0);
+            if let Some(g) = groups.get_mut(i) {
+                let cur = g.0;
+                g.2 = next.saturating_sub(cur);
+            }
         }
         groups
     }

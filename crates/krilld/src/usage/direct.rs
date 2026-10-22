@@ -339,7 +339,7 @@ enum ClaudeResetProbe {
 }
 
 /// Claude 소진 프로그램. 서버가 아는 값만 쓴다.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaudeResetProgram {
     Juniper,
     Cedar,
@@ -356,6 +356,10 @@ impl ClaudeResetProgram {
 
 /// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 하나라도 실패하면
 /// `None`(기존 미터를 유지하고 다음 주기에 다시 시도한다).
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "테스트 빌드는 네트워크 조회 경로를 쓰지 않는다")
+)]
 pub(super) fn claude_reset_count(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
@@ -369,6 +373,7 @@ pub(super) fn claude_reset_count(
 
 /// 소진 시점에 제공 중인 프로그램. 바깥은 `None`(프로브 실패)과 제공 없음(`Some(None)`)을
 /// 구분한다. 실패는 `Err`(재시도 유도), 제공 없음은 `NoCredit`으로 답한다.
+#[expect(clippy::option_option, reason = "프로브 실패와 제공 없음을 구분한다")]
 pub(super) fn claude_offered_program(
     token: &str,
     send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
@@ -438,10 +443,7 @@ fn parse_cedar_status(text: &str, now: i64) -> Option<u64> {
         if left == 0 {
             continue;
         }
-        if let Some(start) = grant
-            .get("starts_at")
-            .and_then(serde_json::Value::as_str)
-        {
+        if let Some(start) = grant.get("starts_at").and_then(serde_json::Value::as_str) {
             let Some(start) = krill_proto::time::parse_reset_epoch(start) else {
                 continue;
             };
@@ -486,11 +488,8 @@ pub(super) fn claude_org_uuid(
     let body = send(&config)?;
     let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let uuid = json.pointer("/organization/uuid")?.as_str()?;
-    (!uuid.is_empty()
-        && uuid
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
-    .then(|| uuid.to_owned())
+    (!uuid.is_empty() && uuid.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        .then(|| uuid.to_owned())
 }
 
 /// Claude 리셋 소진. 성공하면 `(결과, 초기화된 창 수)`. 멱등 키가 없어 재시도 금지:
@@ -555,11 +554,7 @@ pub(super) fn post_json_status(config: &str) -> Option<(u16, Zeroizing<Vec<u8>>)
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    child
-        .stdin
-        .take()?
-        .write_all(config.as_bytes())
-        .ok()?;
+    child.stdin.take()?.write_all(config.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
@@ -1910,6 +1905,173 @@ mod tests {
                 .iter()
                 .all(|p| p.bytes().all(|b| b.is_ascii_hexdigit()))
         );
+    }
+
+    #[test]
+    fn claude_reset_probes_detect_offer_and_count_grants() {
+        // 주간 세션 리셋 제공 조건: eligible + arm=reset + available.
+        assert_eq!(
+            parse_juniper_status(
+                r#"{"juniper_tide":{"eligible":true,"arm":"reset","available":true}}"#
+            ),
+            Some(true)
+        );
+        for body in [
+            r#"{"juniper_tide":{"eligible":true,"arm":"control","available":true}}"#,
+            r#"{"juniper_tide":{"eligible":false,"arm":"reset","available":true}}"#,
+            r#"{"juniper_tide":{"eligible":true,"arm":"reset","available":false}}"#,
+            r#"{"juniper_tide":null}"#,
+        ] {
+            assert_eq!(parse_juniper_status(body), Some(false), "{body}");
+        }
+        assert!(parse_juniper_status(r#"{"juniper_tide":{}}"#).is_some());
+        assert!(parse_juniper_status("{}").is_none());
+        assert!(parse_juniper_status("not json").is_none());
+
+        // grant 합산: 사용 가능·기간 내·일시정지 아님만 센다.
+        let now = 1_780_000_000;
+        let grants = |inner: &str| {
+            parse_cedar_status(
+                &format!("{{\"cedar_ember\":{{\"eligible\":true,\"grants\":[{inner}]}}}}"),
+                now,
+            )
+        };
+        let grant = |id: &str, left: u64, extra: &str| {
+            format!("{{\"id\":\"{id}\",\"resets_left\":{left},\"usable_now\":true{extra}}}")
+        };
+        assert_eq!(
+            grants(&format!(
+                "{}, {}",
+                grant("a", 2, ""),
+                grant("b", 1, ",\"paused\":true")
+            )),
+            Some(2)
+        );
+        // 만료·미래·사용 불가·0회는 제외한다.
+        assert_eq!(
+            grants(&format!(
+                "{}, {}, {}, {}",
+                grant("a", 1, ",\"ends_at\":\"2020-01-01T00:00:00Z\""),
+                grant("b", 1, ",\"starts_at\":\"2030-01-01T00:00:00Z\""),
+                grant("c", 1, ""),
+                r#"{"id":"d","resets_left":3,"usable_now":false}"#,
+            )),
+            Some(1)
+        );
+        assert_eq!(
+            parse_cedar_status(
+                r#"{"cedar_ember":{"eligible":false,"grants":[{"id":"a","resets_left":2,"usable_now":true}]}}"#,
+                now
+            ),
+            Some(0)
+        );
+        assert_eq!(parse_cedar_status(r#"{"cedar_ember":null}"#, now), Some(0));
+        assert!(parse_cedar_status("{}", now).is_none());
+        assert!(parse_cedar_status(r#"{"cedar_ember":{}}"#, now).is_none());
+        assert!(parse_cedar_status("not json", now).is_none());
+
+        // 프로브 설정은 고정 쿼리·검증된 토큰만 쓴다.
+        let juniper = claude_probe_config("fixture-only", ClaudeResetProbe::Juniper).unwrap();
+        assert!(juniper.contains("?at_wall=1&skip_spend=1"));
+        let cedar = claude_probe_config("fixture-only", ClaudeResetProbe::Cedar).unwrap();
+        assert!(cedar.contains("?cedar_ember=1&skip_spend=1"));
+        assert!(claude_probe_config("bad\ntoken", ClaudeResetProbe::Juniper).is_none());
+
+        // 제공 프로그램 판정: juniper 우선, 다음 cedar, 없으면 제공 없음.
+        let offered = |juniper_body: &str, cedar_body: &str| {
+            claude_offered_program("fixture-only", |config| {
+                let body = if config.contains("at_wall") {
+                    juniper_body
+                } else {
+                    cedar_body
+                };
+                Some(Zeroizing::new(body.as_bytes().to_vec()))
+            })
+        };
+        assert_eq!(
+            offered(
+                r#"{"juniper_tide":{"eligible":true,"arm":"reset","available":true}}"#,
+                r#"{"cedar_ember":null}"#
+            ),
+            Some(Some(ClaudeResetProgram::Juniper))
+        );
+        assert_eq!(
+            offered(
+                r#"{"juniper_tide":{"eligible":false}}"#,
+                r#"{"cedar_ember":{"eligible":true,"grants":[{"id":"g","resets_left":1,"usable_now":true}]}}"#
+            ),
+            Some(Some(ClaudeResetProgram::Cedar))
+        );
+        assert_eq!(
+            offered(r#"{"juniper_tide":null}"#, r#"{"cedar_ember":null}"#),
+            Some(None)
+        );
+        assert!(
+            claude_offered_program("fixture-only", |_| None).is_none(),
+            "probe failure must not look like no offer"
+        );
+    }
+
+    #[test]
+    fn claude_reset_claim_maps_business_results() {
+        let claim = |status: u16, body: &str| {
+            claude_claim_reset(
+                "fixture-only",
+                "12345678-1234-1234-1234-1234567890ab",
+                ClaudeResetProgram::Juniper,
+                |_| Some((status, body.as_bytes().to_vec().into())),
+            )
+        };
+        assert_eq!(
+            claim(200, r#"{"result":"reset"}"#),
+            Some((ResetConsumeOutcome::Reset, 1))
+        );
+        assert_eq!(
+            claim(200, r#"{"result":"already_used"}"#),
+            Some((ResetConsumeOutcome::AlreadyRedeemed, 0))
+        );
+        assert_eq!(
+            claim(200, r#"{"result":"not_limited"}"#),
+            Some((ResetConsumeOutcome::NothingToReset, 0))
+        );
+        assert_eq!(
+            claim(200, r#"{"result":"ineligible"}"#),
+            Some((ResetConsumeOutcome::NoCredit, 0))
+        );
+        assert_eq!(
+            claim(200, r#"{"result":"unavailable"}"#),
+            Some((ResetConsumeOutcome::NoCredit, 0))
+        );
+        assert!(claim(200, r#"{"result":"bogus"}"#).is_none());
+        assert!(claim(200, "{}").is_none());
+        assert!(claim(500, r#"{"result":"reset"}"#).is_none());
+        assert!(claim(429, "{}").is_none());
+        assert!(claim(401, "{}").is_none());
+        assert!(
+            claude_claim_reset("bad\ntoken", "org", ClaudeResetProgram::Cedar, |_| None,).is_none()
+        );
+        assert!(
+            claude_claim_reset(
+                "fixture-only",
+                "bad uuid!",
+                ClaudeResetProgram::Cedar,
+                |_| None
+            )
+            .is_none()
+        );
+        // 조직 UUID 조회: 경로·형식 검증.
+        let org = |body: &str| {
+            claude_org_uuid("fixture-only", |_| {
+                Some(Zeroizing::new(body.as_bytes().to_vec()))
+            })
+        };
+        assert_eq!(
+            org(r#"{"organization":{"uuid":"12345678-1234-1234-1234-1234567890ab"}}"#),
+            Some("12345678-1234-1234-1234-1234567890ab".to_owned())
+        );
+        assert!(org(r#"{"organization":{}}"#).is_none());
+        assert!(org("{}").is_none());
+        assert!(claude_org_uuid("bad\ntoken", |_| None).is_none());
     }
 
     #[test]

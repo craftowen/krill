@@ -1330,7 +1330,7 @@ impl<W: Write> Pane<W> {
             .rposition(|r| !is_blank_row(r))
             .map_or(0, |idx| idx + 1);
         let mut prior = Vec::new();
-        for row in screen_rows[..non_blank_len].iter().rev() {
+        for row in screen_rows.iter().take(non_blank_len).rev() {
             if prior.len() >= MAX_PRIOR_ROWS {
                 break;
             }

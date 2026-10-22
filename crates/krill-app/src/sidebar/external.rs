@@ -1162,10 +1162,15 @@ static IN_FLIGHT_ICON_URLS: LazyLock<Mutex<BTreeSet<String>>> =
 #[must_use]
 pub fn has_valid_icon_bytes(bytes: &[u8]) -> bool {
     let is_png = bytes.starts_with(b"\x89PNG\r\n\x1a\n");
-    let is_webp = bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP";
+    let is_webp = bytes.len() >= 12
+        && bytes.starts_with(b"RIFF")
+        && bytes.get(8..).is_some_and(|tail| tail.starts_with(b"WEBP"));
     let is_ico = bytes.len() >= 6
         && bytes.starts_with(&[0, 0, 1, 0])
-        && u16::from_le_bytes([bytes[4], bytes[5]]) > 0;
+        && bytes
+            .get(4)
+            .zip(bytes.get(5))
+            .is_some_and(|(&lo, &hi)| u16::from_le_bytes([lo, hi]) > 0);
     is_png || is_webp || is_ico
 }
 
@@ -1183,14 +1188,14 @@ fn has_valid_icon_magic(path: &Path) -> bool {
     let Ok(n) = file.read(&mut header) else {
         return false;
     };
-    has_valid_icon_bytes(&header[..n])
+    header.get(..n).is_some_and(has_valid_icon_bytes)
 }
 
 fn short_sha256_hex(input: &str) -> String {
     use sha2::{Digest as _, Sha256};
     let digest = Sha256::digest(input.as_bytes());
     let mut out = String::with_capacity(16);
-    for &b in &digest[..8] {
+    for &b in digest.as_slice().iter().take(8) {
         use std::fmt::Write as _;
         write!(&mut out, "{b:02x}").ok();
     }

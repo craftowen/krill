@@ -6,8 +6,8 @@ pub(super) use identity::from_credentials as identity_from_credentials;
 mod login;
 pub(crate) mod orca_vault;
 mod policy;
-pub(crate) mod switch_work;
 mod profile_name;
+pub(crate) mod switch_work;
 pub use profile_name::{Keychain, Vault, adopt_email_dirs};
 
 use std::collections::BTreeMap;
@@ -1982,17 +1982,19 @@ fn consume_reset_credit_rejects_without_network() {
     std::fs::create_dir_all(&profile).unwrap();
     // 프로바이더 제한·계정 확인은 네트워크 전에 일어난다.
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "x")
+        consume_reset_credit(&home, Some(&state), ProviderKind::Antigravity, "x")
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput
     );
-    assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "missing")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::NotFound
-    );
+    for provider in [ProviderKind::Codex, ProviderKind::Claude] {
+        assert_eq!(
+            consume_reset_credit(&home, Some(&state), provider, "missing")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+    }
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
         state.join("accounts.toml"),
@@ -2005,6 +2007,20 @@ fn consume_reset_credit_rejects_without_network() {
     // 자격증명이 없으면 소진 요청을 보내지 않고 실패한다(네트워크 금지).
     assert_eq!(
         consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Other
+    );
+    std::fs::write(
+        state.join("accounts.toml"),
+        format!(
+            "[[accounts]]\nid = 'claude-a'\nprovider = 'claude'\nlabel = 'a'\nprofile_dir = '{}'\n",
+            profile.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "claude-a")
             .unwrap_err()
             .kind(),
         ErrorKind::Other

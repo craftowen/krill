@@ -1710,10 +1710,11 @@ fn dispatch_host(cmd: HostCommand, cx: &mut App) -> bool {
         return false;
     };
     let mut handled = false;
-    let mut i = handlers.len();
-    while i > 0 {
-        i -= 1;
-        match handlers[i](cmd, cx) {
+    for i in (0..handlers.len()).rev() {
+        let Some(handler) = handlers.get_mut(i) else {
+            continue;
+        };
+        match handler(cmd, cx) {
             Some(true) => {
                 handled = true;
                 break;

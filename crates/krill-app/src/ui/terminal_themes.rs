@@ -901,9 +901,9 @@ impl CustomTerminalTheme {
         };
         let cursor = parse_hex_rgb(&self.cursor).unwrap_or(fg);
         let mut ansi = fallback.ansi;
-        for (idx, hex_str) in self.ansi.iter().enumerate() {
+        for (slot, hex_str) in ansi.iter_mut().zip(self.ansi.iter()) {
             if let Some(rgb) = parse_hex_rgb(hex_str) {
-                ansi[idx] = rgb;
+                *slot = rgb;
             }
         }
         Some(TerminalTheme {
@@ -1107,7 +1107,7 @@ fn strip_yaml_comment(raw: &str) -> &str {
         } else if b == b'#'
             && !in_single
             && !in_double
-            && (i == 0 || bytes[i - 1].is_ascii_whitespace())
+            && (i == 0 || bytes.get(i - 1).is_some_and(u8::is_ascii_whitespace))
         {
             return raw.get(..i).unwrap_or(raw).trim();
         }
@@ -1248,10 +1248,13 @@ pub fn parse_warp_theme_yaml(
                     && let Some(idx) = WARP_COLOR_NAMES.iter().position(|&n| n == key)
                     && let Some(rgb) = parse_hex_rgb(val)
                 {
-                    if section == Section::Normal {
-                        normal[idx] = Some(rgb);
-                    } else if section == Section::Bright {
-                        bright[idx] = Some(rgb);
+                    let slots = match section {
+                        Section::Normal => normal.get_mut(idx),
+                        Section::Bright => bright.get_mut(idx),
+                        _ => None,
+                    };
+                    if let Some(slot) = slots {
+                        *slot = Some(rgb);
                     }
                 }
             }
@@ -1303,12 +1306,18 @@ pub fn parse_warp_theme_yaml(
         TERMINAL_DARK
     };
     let mut ansi = base.ansi;
-    for i in 0..8 {
-        if let Some(c) = normal[i] {
-            ansi[i] = c;
+    let (lo, hi) = ansi.split_at_mut(8);
+    for (((lo_slot, hi_slot), &n), &b) in lo
+        .iter_mut()
+        .zip(hi.iter_mut())
+        .zip(normal.iter())
+        .zip(bright.iter())
+    {
+        if let Some(c) = n {
+            *lo_slot = c;
         }
-        if let Some(c) = bright[i].or(normal[i]) {
-            ansi[i + 8] = c;
+        if let Some(c) = b.or(n) {
+            *hi_slot = c;
         }
     }
     let id = format!("warp:{}", normalize_theme_slug(&final_name));
@@ -1516,10 +1525,10 @@ pub fn parse_ghostty_theme_from_pairs(
             "palette" => {
                 if let Some((idx_str, hex_str)) = v.split_once('=')
                     && let Ok(idx) = idx_str.trim().parse::<usize>()
-                    && idx < 16
                     && let Some(rgb) = parse_hex_rgb(hex_str)
+                    && let Some(slot) = palette.get_mut(idx)
                 {
-                    palette[idx] = Some(rgb);
+                    *slot = Some(rgb);
                     palette_count += 1;
                 }
             }
@@ -1539,9 +1548,9 @@ pub fn parse_ghostty_theme_from_pairs(
         TERMINAL_DARK
     };
     let mut ansi = base.ansi;
-    for (idx, item) in palette.into_iter().enumerate() {
+    for (slot, item) in ansi.iter_mut().zip(palette) {
         if let Some(c) = item {
-            ansi[idx] = c;
+            *slot = c;
         }
     }
     let clean_name = if name.trim().is_empty() {

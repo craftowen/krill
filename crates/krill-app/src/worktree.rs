@@ -611,12 +611,8 @@ impl Dialog {
         if self.selected_agents.is_empty() {
             return Ok(vec![(base_req, None, prompt)]);
         }
-        if self.selected_agents.len() == 1 {
-            return Ok(vec![(
-                base_req,
-                Some(self.selected_agents[0].clone()),
-                prompt,
-            )]);
+        if let [only] = self.selected_agents.as_slice() {
+            return Ok(vec![(base_req, Some(only.clone()), prompt)]);
         }
         let mut out = Vec::with_capacity(self.selected_agents.len());
         for agent in &self.selected_agents {
