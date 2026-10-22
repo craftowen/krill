@@ -1,6 +1,7 @@
 use super::super::history_probe::{has_writer, no_open_files};
 use super::*;
-use std::fs::{File, FileTimes};
+use std::fs::{self, File, FileTimes, OpenOptions};
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
 type ConflictCase = (&'static str, &'static [u8], u64, &'static [u8], u64, bool);

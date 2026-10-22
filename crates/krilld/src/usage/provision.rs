@@ -19,6 +19,8 @@ mod codex;
 mod history_jobs;
 #[cfg(unix)]
 mod history_probe;
+#[cfg(unix)]
+mod history_store;
 
 // 오웬 승인(OWE-720): 대화 기록 공유, settings.json 최초 한 번 복사, 프로필 기존 내용 보존.
 // Orca CLAUDE_PROFILE_HISTORY_DIRS와의 항목별 비교: 비공개 OWE-720 프로비저닝 비교 기록.
