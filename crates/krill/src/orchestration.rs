@@ -950,6 +950,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     // 생성된 워크트리는 어느 후속 단계가 실패해도 보존하고 경로를 오류에 붙인다.
     with_created_worktree(created_child.as_deref(), || {
         let cwd_str = work_cwd.to_string_lossy().into_owned();
+        let mut auto_created_task = None;
         if spec.task_id.is_none() && auto_create_task {
             let first_line = prompt.lines().next().unwrap_or_default().trim();
             let mut derived_title: String = first_line.chars().take(80).collect();
@@ -970,18 +971,21 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                     s.create_task(&run_id, &derived_title, &prompt, Vec::new())
                 })?,
             };
+            auto_created_task = Some(created_task.id.clone());
             spec.task_id = Some(created_task.id);
         }
 
         let newly_spawned = session_id.is_none() && !spec.no_spawn;
         if newly_spawned {
-            let spawned = crate::session::spawn_agent_session_on_target(
-                &target,
-                &agent,
-                spec.account.clone(),
-                &work_cwd,
-            )
-            .map_err(|e| io::Error::other(format!("spawn {agent} worker session: {e}")))?;
+            let spawned = spawn_with_task_cleanup(ctx, auto_created_task.as_deref(), || {
+                crate::session::spawn_agent_session_on_target(
+                    &target,
+                    &agent,
+                    spec.account.clone(),
+                    &work_cwd,
+                )
+                .map_err(|e| io::Error::other(format!("spawn {agent} worker session: {e}")))
+            })?;
             session_id = Some(spawned);
         }
 
@@ -1057,6 +1061,45 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         // 디스패치는 기록됐으니 출력은 남기고, 프롬프트를 못 넣었으면 실패로 끝낸다(`krill send`로 다시 넣을 수 있다).
         delivered.map_err(|e| io::Error::other(format!("worker {}: {e}", dispatch.worker_name)))
     })
+}
+
+/// 세션 생성 전에 CLI가 만든 작업만 정산한다. 기존 작업과 이미 배정된 작업은 이 경로에서 바꾸지 않는다.
+fn spawn_with_task_cleanup(
+    ctx: &OrchCtx<'_>,
+    auto_created_task: Option<&str>,
+    spawn: impl FnOnce() -> io::Result<u64>,
+) -> io::Result<u64> {
+    spawn().map_err(|error| {
+        let Some(task_id) = auto_created_task else {
+            return error;
+        };
+        match fail_unstarted_task(ctx, task_id, &error.to_string()) {
+            Ok(()) => error,
+            Err(cleanup) => io::Error::new(
+                error.kind(),
+                format!("{error}; could not mark auto-created task {task_id} failed: {cleanup}"),
+            ),
+        }
+    })
+}
+
+fn fail_unstarted_task(ctx: &OrchCtx<'_>, task_id: &str, reason: &str) -> io::Result<()> {
+    let summary = Some(format!("worker session start failed: {reason}"));
+    match ctx.try_ipc(
+        &OrchAction::UpdateTask {
+            task_id: task_id.to_owned(),
+            status: TaskStatus::Failed,
+            summary: summary.clone(),
+        },
+        Duration::from_secs(2),
+    )? {
+        Some(OrchResponse::Task(_)) => Ok(()),
+        None => OrchestrationStore::mutate(ctx.state_dir, |store| {
+            store.update_task(task_id, TaskStatus::Failed, summary)
+        })
+        .map(|_| ()),
+        Some(_) => Err(io::Error::other("unexpected task update reply")),
+    }
 }
 
 fn with_created_worktree<T>(
@@ -2532,6 +2575,73 @@ mod tests {
             assert!(!dir.join("orchestration.json").exists());
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn spawn_failure_fails_only_auto_created_tasks_and_reports_cleanup_failure() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-spawn-cleanup-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let (automatic, explicit, successful) = OrchestrationStore::mutate(&dir, |store| {
+            let run = store.create_run("cleanup", None)?;
+            Ok((
+                store.create_task(&run.id, "automatic", "", Vec::new())?.id,
+                store.create_task(&run.id, "explicit", "", Vec::new())?.id,
+                store.create_task(&run.id, "successful", "", Vec::new())?.id,
+            ))
+        })?;
+        let ctx = OrchCtx::local(&dir);
+        let error = spawn_with_task_cleanup(&ctx, Some(&automatic), || {
+            Err(io::Error::other("injected spawn failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected spawn failure");
+        assert!(
+            spawn_with_task_cleanup(&ctx, None, || Err(io::Error::other(
+                "explicit task spawn failure"
+            )))
+            .is_err()
+        );
+        assert_eq!(
+            spawn_with_task_cleanup(&ctx, Some(&successful), || Ok(42))?,
+            42
+        );
+        let store = OrchestrationStore::load(&dir)?;
+        let task = store
+            .tasks
+            .iter()
+            .find(|task| task.id == automatic)
+            .unwrap();
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert_eq!(task.active_dispatch_id, None);
+        assert!(
+            task.result_summary
+                .as_deref()
+                .unwrap()
+                .contains("injected spawn failure")
+        );
+        for id in [explicit, successful] {
+            assert_eq!(
+                store
+                    .tasks
+                    .iter()
+                    .find(|task| task.id == id)
+                    .unwrap()
+                    .status,
+                TaskStatus::Ready
+            );
+        }
+        assert!(store.dispatches.is_empty());
+        let error = spawn_with_task_cleanup(&ctx, Some("missing-task"), || {
+            Err(io::Error::other("original spawn failure"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("original spawn failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("could not mark auto-created task missing-task failed")
+        );
+        std::fs::remove_dir_all(dir)
     }
 
     #[test]
