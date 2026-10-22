@@ -416,7 +416,7 @@ impl Gateway {
         }
         let address = state.selected?;
         let base = if state.mode == ConnectMode::Tunnel {
-            if relay_connected(&state) {
+            if relay_pairing(&state) {
                 fixed_base(&state)
             } else if let Some(tunnel) = state.tunnel.as_ref()
                 && let Some(url) = tunnel.ready_url()
@@ -504,7 +504,7 @@ impl Gateway {
                             ));
                         }
                         // 릴레이가 연결되면 퀵 터널의 DNS/엣지 정착을 기다리지 않는다.
-                        if relay_connected(&state) {
+                        if relay_pairing(&state) {
                             return pairing_offer(&state, now_ms());
                         }
                         // 기한이 지나도 준비되지 않으면 찍힌 URL로 낸다(터널 출처). 몇 초 뒤 새로고침하면 열린다.
@@ -524,7 +524,7 @@ impl Gateway {
                         let relay_failed = state
                             .relay
                             .as_ref()
-                            .is_none_or(|r| r.settled() && !r.connected());
+                            .is_none_or(|r| r.settled() && !r.pairing());
                         if timed_out || (fatal_tunnel_err && relay_failed) {
                             return Err(tunnel_unavailable(&state));
                         }
@@ -688,7 +688,7 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     let address = state.selected.ok_or_else(invalid)?;
     let host = address.ip().to_string();
     let port = address.port();
-    let relay_only = state.mode == ConnectMode::Tunnel && relay_connected(state);
+    let relay_only = state.mode == ConnectMode::Tunnel && relay_pairing(state);
     let base = if state.mode == ConnectMode::Tunnel {
         if relay_only {
             fixed_base(state)
@@ -736,11 +736,11 @@ fn pairing_offer(state: &State, now: u64) -> io::Result<MobileReply> {
     })
 }
 
-fn relay_connected(state: &State) -> bool {
+fn relay_pairing(state: &State) -> bool {
     state
         .relay
         .as_ref()
-        .is_some_and(super::relay::RelayClient::connected)
+        .is_some_and(super::relay::RelayClient::pairing)
 }
 
 fn fixed_base(state: &State) -> String {
@@ -948,7 +948,7 @@ fn supervise_tunnel(s: &mut State) {
     if named.is_none()
         && s.relay
             .as_ref()
-            .is_some_and(|r| !r.settled() || r.connected())
+            .is_some_and(|r| !r.settled() || r.pairing())
     {
         return;
     }
