@@ -79,4 +79,34 @@ mod tests {
         assert!(!forward.admit(7), "a flood within one second is capped");
         assert!(forward.admit(8), "the next second starts a fresh budget");
     }
+
+    #[test]
+    fn forwarded_warning_reaches_the_log_file() {
+        use log::Log as _;
+        let dir = std::env::temp_dir().join(format!("krill-log-forward-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let writer = crate::RollingLog::open(&dir, crate::Component::App).unwrap();
+        let forward = Forward {
+            window: AtomicU64::new(0),
+        };
+        tracing::subscriber::with_default(crate::subscriber::Logger::new(writer), || {
+            forward.log(
+                &log::Record::builder()
+                    .level(log::Level::Warn)
+                    .target("gpui_apple::metal_renderer")
+                    .args(format_args!("frames in 1000ms: rendered 3"))
+                    .build(),
+            );
+        });
+        let written = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap_or_default())
+            .collect::<String>();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(written.contains("frames in 1000ms"), "{written:?}");
+        assert!(
+            written.contains("gpui_apple::metal_renderer"),
+            "{written:?}"
+        );
+    }
 }

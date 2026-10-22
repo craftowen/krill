@@ -29,7 +29,11 @@ impl Subscriber for Logger {
         let target = metadata.target().split("::").next().unwrap_or_default();
         metadata.is_event()
             && *metadata.level() <= Level::INFO
-            && matches!(target, "krill_app" | "krilld" | "krill_holder" | "krill")
+            // krill_log: gpui 등 `log` 크레이트 경고를 넘기는 `forward`가 이 타깃으로 남긴다.
+            && matches!(
+                target,
+                "krill_app" | "krilld" | "krill_holder" | "krill" | "krill_log"
+            )
     }
 
     fn new_span(&self, _: &Attributes<'_>) -> Id {
