@@ -238,3 +238,52 @@ button.account-row:disabled{opacity:1}
 .settings-nav{display:flex;flex:none;gap:4px;padding:4px 8px calc(4px + env(safe-area-inset-bottom));border-top:1px solid var(--border);background:var(--surface-panel)}.settings-nav button{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:6px;min-height:var(--touch-target);padding:8px 4px;border-radius:var(--radius-row);font-size:calc(11px * var(--ui-scale,1));color:var(--muted-foreground)}.settings-nav [aria-current=page]{background:var(--surface-raised);color:var(--foreground)}.settings-nav svg{width:16px;height:16px}
 .about-block{position:relative;display:flex;flex-direction:column;gap:8px;padding:20px 16px}.about-block h3{margin:0;font-size:var(--font-body)}.about-block p{line-height:1.8}
 .key-row{gap:4px;padding:4px 12px}.key-row .key-move{background:transparent;font-size:calc(18px * var(--ui-scale,1))}.key-label input{width:20px;height:20px;margin:0 0 0 8px;accent-color:var(--foreground)}
+
+/* Responsive shell: reading columns, a wider conversation, and a full-width PTY.
+   These are content breakpoints: split-view and folded covers keep the phone flow. */
+:root{--reading-width:720px;--workspace-width:960px;--conversation-width:1040px;--command-width:1120px;--dialog-width:512px}
+#route-root,.terminal-mount,.chat-view,.chat-feed{min-width:0}
+/* The shell owns the hit-area floor, including compact session chrome. */
+#mobile-app :is(button,summary){min-width:var(--touch-target);min-height:var(--touch-target)}
+.session.screen>.page-header{min-height:var(--touch-target)}
+.session.screen>.page-header .header-copy{min-width:0}
+.session-tab,.accessory-key{flex-shrink:0}
+.buffered-command>.command-input{min-height:var(--touch-target)}
+.chat-tool-summary,.chat-tool-call>summary,.chat-tool-result>summary,.chat-reasoning>summary{align-content:center}
+.workspace-filters>select{min-height:var(--touch-target)}
+.connection-banner>span{min-width:0;flex:1}
+.branch-name>span{min-width:0;overflow-wrap:anywhere}
+.pair-screen{padding-bottom:calc(var(--space-xl) + env(safe-area-inset-bottom))}
+.sheet{max-width:min(600px,calc(100% - env(safe-area-inset-left) - env(safe-area-inset-right)))}
+#notice{max-width:var(--dialog-width);margin-inline:auto;overflow-wrap:anywhere;left:max(var(--space-md),env(safe-area-inset-left));right:max(var(--space-md),env(safe-area-inset-right))}
+
+@media(min-width:600px){
+ .home-topbar{width:100%;max-width:var(--reading-width);align-self:center}
+ .settings,.details{width:100%;max-width:var(--reading-width);align-self:center}
+ .workspaces{width:100%;max-width:var(--workspace-width);align-self:center}
+ .settings-list,.detail-list,.connection-log,.workspace-list{width:100%}
+ .settings-form{padding-inline:var(--space-lg)}
+ .form-sheet{border-radius:var(--radius-card)}
+ .workspace-filters>select{flex:0 1 280px;width:auto}
+ .workspace-toolbar>.spacer{flex:1}
+ .workspace-search{display:flex;align-items:center;gap:var(--space-sm)}
+ .workspace-search input{flex:1;min-width:0}
+ .workspace-search>.text-button{margin:0;flex:none}
+ .settings-nav{justify-content:center}
+ .settings-nav button{flex:0 1 160px}
+ .chat-view{width:100%;max-width:var(--conversation-width);align-self:center}
+ .chat-feed{padding-inline:max(var(--space-lg),calc((100% - 880px)/2))}
+ .chat-user{max-width:80%}
+ .chat-composer{padding-inline:var(--space-lg)}
+ .chat-composer-bar{justify-content:flex-end}
+ .chat-composer-bar>.small:first-child{margin-right:auto}
+ .chat-composer-bar>.primary{min-width:96px}
+ .command-dock>.accessory-row,.command-dock>.input-row,.command-dock>.buffered-command{width:100%;max-width:var(--command-width);margin-inline:auto}
+ .accessory-row{justify-content:center}
+ .keybar{flex:0 1 auto}
+ .sheet{width:calc(100% - 2 * var(--space-xl));max-width:var(--dialog-width);max-height:calc(100dvh - 2 * var(--space-xl) - env(safe-area-inset-top) - env(safe-area-inset-bottom));margin:auto;inset:0;border-radius:var(--radius-card)}
+ #sheet-content{padding:var(--space-lg);border-radius:var(--radius-card)}
+ .sheet-handle{display:none}
+ .sheet h2,.sheet p{overflow-wrap:anywhere}
+ .sheet .screen-text{min-height:0;height:45dvh}
+}

@@ -111,6 +111,12 @@ async function main(){
  viewport.height=544;port47.clientHeight=60;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);assert.equal(root.dataset.keyboardOpen,'true');
  viewport.height=844;port47.clientHeight=360;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47+1);
  port47.clientHeight=540;event(viewport,'resize');await advance(200);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ // Fold/rotation events refit width too. If the next fold arrives before the
+ // role acknowledgement, retain it and fit the final viewport after the reply.
+ port47.clientWidth=830;event(globalEvents,'orientationchange');await advance(150);assert.deepEqual(roles47().at(-1),[1,103,30]);
+ port47.clientWidth=320;event(globalEvents,'orientationchange');await advance(150);socket.frame(0x2c,T.v(0));await flush();await advance(150);assert.deepEqual(roles47().at(-1),[1,39,30]);socket.frame(0x2c,T.v(0));await flush();
+ port47.clientWidth=390;event(viewport,'resize');await advance(150);assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();
+ console.log('PASS fold/rotation refits width and retains the latest viewport during a pending resize');
  port47.clientWidth=0;n47=roles47().length;event(viewport,'resize');await advance(200);assert.equal(roles47().length,n47);port47.clientWidth=390;
  // 화면이 가려지면 크기 소유를 놓고(데스크톱 크기 복귀), 다시 보이면 맞춘다.
  context.document.visibilityState='hidden';event(context.document,'visibilitychange');assert.deepEqual(roles47().at(-1),[0,2,0]);socket.frame(0x2c,T.v(0));context.document.visibilityState='visible';event(context.document,'visibilitychange');assert.deepEqual(roles47().at(-1),[1,48,30]);socket.frame(0x2c,T.v(0));await flush();

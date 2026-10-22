@@ -168,7 +168,7 @@ globalThis.MkTerminalCodec=(()=>{
    const viewport=()=>{const vv=globalThis.visualViewport,inset=vv&&Math.abs(vv.scale-1)<.05?Math.max(0,innerHeight-vv.height-vv.offsetTop):0;this.keyboardInset=inset;this.root.style.setProperty('--keyboard-inset',`${inset}px`);const open=inset>80;
     // iOS는 키보드가 열릴 때 문서를 위로 밀어 헤더가 화면 밖으로 나간다. 셸은 스크롤하지 않으므로 문서 위치를 되돌린다.
     if(open&&(globalThis.scrollY||0)>0)globalThis.scrollTo?.(0,0);if(open&&this.root.dataset.keyboardOpen!=='true')(globalThis.requestAnimationFrame||setTimeout)(()=>this.revealCursor());this.root.dataset.keyboardOpen=String(open);this.dismiss.hidden=!open;this.live.hidden=open||this.inputMode!=='direct';this.queueFit();};
-   if(globalThis.visualViewport){this.listen(visualViewport,'resize',viewport);this.listen(visualViewport,'scroll',viewport);}this.listen(globalThis,'resize',viewport);this.listen(globalThis,'pagehide',()=>this.disconnect());
+   if(globalThis.visualViewport){this.listen(visualViewport,'resize',viewport);this.listen(visualViewport,'scroll',viewport);}this.listen(globalThis,'resize',viewport);this.listen(globalThis,'orientationchange',viewport);this.listen(globalThis,'pagehide',()=>this.disconnect());
    // PTY는 데스크톱과 공유한다. 화면이 가려지면(잠금·앱 전환) 크기 소유를 놓아 데스크톱 크기로 돌리고, 다시 보이면 맞춘다.
    this.listen(globalThis.document||globalThis,'visibilitychange',()=>this.guard(()=>this.syncVisibility()));this.listen(globalThis,'blur',()=>this.stopRepeat());viewport();
    if(globalThis.ResizeObserver){this.observer=new ResizeObserver(()=>{if(this.stick)this.scrollBottom();this.queueFit();});this.observer.observe(this.port);}
