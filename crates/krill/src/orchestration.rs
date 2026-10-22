@@ -817,15 +817,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         })
         .unwrap_or(DEFAULT_MAX_WORKER_DEPTH);
 
-    let work_cwd = match spec.cwd {
-        Some(c) => PathBuf::from(c),
-        None if ctx.is_remote() => {
-            return Err(bad_arg(
-                "remote worker-start requires --cwd <absolute path on the remote host>",
-            ));
-        }
-        None => std::env::current_dir()?,
-    };
+    let work_cwd = resolve_worker_cwd(spec.cwd.as_deref(), ctx.is_remote())?;
     let cwd_str = work_cwd.to_string_lossy().into_owned();
 
     // 스폰 전에 run/task 유효성과 상태를 먼저 검증해 잘못된 요청이 고아 PTY 세션을 남기지 않게 한다.
@@ -973,6 +965,35 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     }
     // 디스패치는 기록됐으니 출력은 남기고, 프롬프트를 못 넣었으면 실패로 끝낸다(`krill send`로 다시 넣을 수 있다).
     delivered.map_err(|e| io::Error::other(format!("worker {}: {e}", dispatch.worker_name)))
+}
+
+/// 로컬 cwd는 데몬에 넘기기 전에 절대 경로·디렉터리로 검증한다. 원격 경로는 로컬에서 읽지 않는다.
+fn resolve_worker_cwd(cwd: Option<&str>, remote: bool) -> io::Result<PathBuf> {
+    if remote {
+        let cwd = cwd.ok_or_else(|| {
+            bad_arg("remote worker-start requires --cwd <absolute path on the remote host>")
+        })?;
+        if !cwd.starts_with('/') {
+            return Err(bad_arg(
+                "remote --cwd must be an absolute path on the remote host",
+            ));
+        }
+        return Ok(PathBuf::from(cwd));
+    }
+    let path = cwd.map_or_else(std::env::current_dir, |cwd| Ok(PathBuf::from(cwd)))?;
+    let canonical = std::fs::canonicalize(&path).map_err(|e| {
+        bad_arg(format!(
+            "cannot resolve worker --cwd {}: {e}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(bad_arg(format!(
+            "worker --cwd is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
 }
 
 #[cfg(test)]
@@ -2406,6 +2427,43 @@ mod tests {
             assert!(!dir.join("orchestration.json").exists());
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn worker_cwd_is_canonical_and_invalid_paths_do_not_create_tasks() -> io::Result<()> {
+        let dir = std::env::temp_dir().join(format!("krill-worker-cwd-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("nested"))?;
+        std::fs::write(dir.join("file"), "file")?;
+        assert_eq!(
+            resolve_worker_cwd(Some(&dir.join("nested/..").to_string_lossy()), false)?,
+            std::fs::canonicalize(&dir)?
+        );
+        assert_eq!(
+            resolve_worker_cwd(Some("."), false)?,
+            std::fs::canonicalize(".")?
+        );
+        assert_eq!(
+            resolve_worker_cwd(None, false)?,
+            std::fs::canonicalize(std::env::current_dir()?)?
+        );
+        for path in [dir.join("missing"), dir.join("file")] {
+            let error = cmd_worker_start(
+                &dir.join("state"),
+                &args(&["--spec", "must not run", "--cwd", &path.to_string_lossy()]),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(error.to_string().contains("--cwd"), "{error}");
+            assert!(!dir.join("state/orchestration.json").exists());
+        }
+        assert!(resolve_worker_cwd(None, true).is_err());
+        assert!(resolve_worker_cwd(Some("relative"), true).is_err());
+        assert_eq!(
+            resolve_worker_cwd(Some("/remote/does/not/exist"), true)?,
+            PathBuf::from("/remote/does/not/exist")
+        );
+        std::fs::remove_dir_all(dir)
     }
 
     #[test]
