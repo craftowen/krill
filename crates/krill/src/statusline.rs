@@ -436,7 +436,7 @@ fn install_with(
     )?;
     writeln!(
         out,
-        "statusline install complete; pre-write backups use .minikrill-bak-* suffixes"
+        "statusline install complete; pre-write backups use .krill-bak-* suffixes"
     )
     .ok();
     Ok(())

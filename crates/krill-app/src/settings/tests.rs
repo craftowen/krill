@@ -8,6 +8,22 @@ use super::*;
 actions!(test, [Probe]);
 
 #[test]
+fn agent_status_hooks_default_on_and_fail_closed_on_unreadable_settings() {
+    let dir = std::env::temp_dir().join(format!("mk-agent-hooks-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    assert!(Settings::default().agent_status_hooks);
+    assert!(agent_status_hooks_enabled_at(&dir));
+    fs::write(dir.join(SETTINGS_FILE), "yolo_mode = false\n").unwrap();
+    assert!(agent_status_hooks_enabled_at(&dir));
+    fs::write(dir.join(SETTINGS_FILE), "agent_status_hooks = false\n").unwrap();
+    assert!(!agent_status_hooks_enabled_at(&dir));
+    fs::write(dir.join(SETTINGS_FILE), "agent_status_hooks = [").unwrap();
+    assert!(!agent_status_hooks_enabled_at(&dir));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
     assert!(Settings::default().yolo_mode);
     assert!(toml::from_str::<Settings>("").unwrap().yolo_mode);
@@ -1019,7 +1035,7 @@ fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
 
     let skills_dir = d.join("skills");
     for name in [
-        "minikrill",
+        "krill",
         "orchestration",
         "worktree-checkpoints",
         "computer-use",
@@ -1113,7 +1129,7 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
     assert_eq!(installed_path, agy_hooks);
     let hooks_val: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&agy_hooks).unwrap()).unwrap();
-    // CLI(`krill hook install agy`)와 같은 모양: `minikrill` 묶음 키, `hook agy` 포함 명령.
+    // CLI(`krill hook install agy`)와 같은 모양: `krill` 묶음 키, `hook agy` 포함 명령.
     for event in [
         "PreInvocation",
         "PostInvocation",
@@ -1121,7 +1137,7 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
         "PreToolUse",
         "PostToolUse",
     ] {
-        let entries = hooks_val["minikrill"][event]
+        let entries = hooks_val["krill"][event]
             .as_array()
             .unwrap_or_else(|| panic!("missing hook array for {event}"));
         assert!(!entries.is_empty(), "empty hook array for {event}");
@@ -1240,7 +1256,7 @@ fn accounts_tab_puts_add_button_above_cards_and_host_default_first(cx: &mut Test
     fs::remove_dir_all(d).unwrap();
 }
 
-/// OWE-696·697: Orca 감지 계정은 전환·제거 버튼 없이 "Krill에서 실행 불가(Orca 관리)"로 보이고,
+/// OWE-696·697: Orca 감지 계정은 전환 버튼 없이 "Krill에서 실행 불가(Orca 관리)"로 보이되 … 메뉴(목록에서 제거)는 남고,
 /// 데몬에 닿지 못한 화면은 "데몬 연결 필요" 배너와 함께 계정 변경을 거부한다(로컬 파일 쓰기 없음).
 #[gpui::test]
 fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppContext) {
@@ -1286,6 +1302,11 @@ fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppCont
     assert!(
         vcx.debug_bounds("admin-remove-account-claude-orca-96f8c826")
             .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-menu-claude-orca-96f8c826")
+            .is_some(),
+        "orca account must keep the … menu so it can be removed from Krill"
     );
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
@@ -1591,7 +1612,7 @@ fn hook_install_preserves_unparseable_and_wrong_typed_files() {
             true,
             false,
         ),
-        ("bundle-string", br#"{"minikrill": "nope"}"#, false, true),
+        ("bundle-string", br#"{"krill": "nope"}"#, false, true),
     ];
     for (name, bytes, claude_fails, agy_fails) in cases {
         for (path, install, fails) in [
@@ -1661,7 +1682,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     install_claude_hook(&claude_path).unwrap();
     let claude_out = fs::read_to_string(&claude_path).unwrap();
     let ours = json!({
-        "hooks": [{"type": "command", "name": "minikrill", "command": CLAUDE_HOOK_COMMAND}]
+        "hooks": [{"type": "command", "name": "krill", "command": CLAUDE_HOOK_COMMAND}]
     });
     let expected = json!({
         "theme": "dark",
@@ -1686,7 +1707,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     let backup = fs::read_dir(&root)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.to_string_lossy().contains(".minikrill-bak-"))
+        .find(|p| p.to_string_lossy().contains(".krill-bak-"))
         .expect("missing hook backup");
     assert_eq!(fs::read_to_string(backup).unwrap(), claude_before);
     // 멱등: 다시 설치해도 바이트가 같고 새 백업이 생기지 않는다.
@@ -1695,7 +1716,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     assert_eq!(fs::read_to_string(&claude_path).unwrap(), claude_out);
     assert_eq!(fs::read_dir(&root).unwrap().count(), backups_before);
 
-    // Antigravity: `minikrill` 묶음 키에 `hook agy <event>` 완성 명령 + timeout 10.
+    // Antigravity: `krill` 묶음 키에 `hook agy <event>` 완성 명령 + timeout 10.
     let agy_path = root.join("ahy-hooks.json");
     let agy_before = r#"{"user": 1}"#;
     fs::write(&agy_path, agy_before).unwrap();
@@ -1724,7 +1745,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
         };
         bundle.insert(event.to_owned(), serde_json::Value::Array(vec![entry]));
     }
-    let expected_agy = json!({"user": 1, "minikrill": bundle});
+    let expected_agy = json!({"user": 1, "krill": bundle});
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&agy_out).unwrap(),
         expected_agy
@@ -4118,17 +4139,6 @@ fn login_pending_without_outcome_times_out(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-708: 상태바와 계정 카드가 같은 경고(80)·위험(90) 기준을 쓴다.
-#[test]
-fn usage_tone_matches_shared_warn_and_critical_thresholds() {
-    use krill_proto::usage::{CRITICAL_PERCENT, WARN_PERCENT};
-    assert_eq!(usage_tone(WARN_PERCENT - 1), UsageTone::Normal);
-    assert_eq!(usage_tone(WARN_PERCENT), UsageTone::Warn);
-    assert_eq!(usage_tone(CRITICAL_PERCENT - 1), UsageTone::Warn);
-    assert_eq!(usage_tone(CRITICAL_PERCENT), UsageTone::Critical);
-    assert_eq!(usage_tone(100), UsageTone::Critical);
-}
-
 /// OWE-708: 접힌 규칙 요약 한 줄은 지표·임계치·대상·꺼짐을 담는다.
 #[test]
 fn rule_summary_names_metric_threshold_target_and_off() {
@@ -5832,7 +5842,7 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         ("admin-agent-hook-cursor", ".cursor/hooks.json"),
         (
             "admin-agent-hook-opencode",
-            ".config/opencode/plugins/minikrill.js",
+            ".config/opencode/plugins/krill.js",
         ),
     ] {
         click(vcx, selector);
@@ -5850,9 +5860,9 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     });
 
     // 2. "모두 자동 설정" 버튼 클릭 시 에이전트 훅과 모든 내장 스킬이 한 번에 설치된다.
-    //    스테이징된 `.local/share/minikrill/bin/krill`이 있으면 그 절대경로를 훅 설정에 기록한다.
+    //    스테이징된 `.local/share/krill/bin/krill`이 있으면 그 절대경로를 훅 설정에 기록한다.
     let d2 = dir("one-click-setup-all-btn");
-    let staged_krill = d2.join(".local/share/minikrill/bin/krill");
+    let staged_krill = d2.join(".local/share/krill/bin/krill");
     fs::create_dir_all(staged_krill.parent().unwrap()).unwrap();
     fs::write(&staged_krill, "#!/bin/sh\nexit 0\n").unwrap();
     vcx.update(|window, cx| {
@@ -5864,14 +5874,14 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         ".claude/settings.json",
         ".gemini/config/hooks.json",
         ".cursor/hooks.json",
-        ".config/opencode/plugins/minikrill.js",
-        ".claude/skills/minikrill/SKILL.md",
+        ".config/opencode/plugins/krill.js",
+        ".claude/skills/krill/SKILL.md",
         ".codex/skills/krill-orchestration/SKILL.md",
         ".gemini/config/skills/worktree-checkpoints/SKILL.md",
         ".gemini/antigravity-cli/skills/krill-orchestration/SKILL.md",
         ".gemini/antigravity-cli/skills/krill-orchestration/references/verification-and-evidence.md",
-        ".cursor/skills/minikrill/SKILL.md",
-        ".config/opencode/skills/minikrill/SKILL.md",
+        ".cursor/skills/krill/SKILL.md",
+        ".config/opencode/skills/krill/SKILL.md",
     ] {
         assert!(
             d2.join(rel_path).is_file(),
@@ -7689,15 +7699,23 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
     vcx.update(|window, cx| window.draw(cx).clear(cx));
 
     assert!(vcx.debug_bounds("admin-workflow-repo-select").is_some());
-    assert!(vcx.debug_bounds("admin-workflow-repo-chips").is_some());
+    assert!(
+        vcx.debug_bounds("admin-workflow-repo-chips").is_none(),
+        "project picker is a single dropdown row, not a chip list"
+    );
     assert!(vcx.debug_bounds("admin-symlinks-repo-badge").is_some());
     assert!(vcx.debug_bounds("admin-hooks-repo-badge").is_some());
     assert!(vcx.debug_bounds("admin-worktree-symlinks-chips").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
 
-    // repo-b 칩을 클릭하면 훅 입력창이 repo-b로 동기화되고 심볼릭 링크 카드는 repo-b 기준(빈 상태)으로 바뀐다.
-    click_sel(vcx, "admin-workflow-repo-chip-1");
+    // repo-b를 고르면 훅 입력창이 repo-b로 동기화되고 심볼릭 링크 카드는 repo-b 기준(빈 상태)으로 바뀐다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.load_repo_hooks_for(&repo_b, window, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     vcx.update(|_, cx| {
         let form = view.read(cx).workflow_form.as_ref().unwrap();
         assert_eq!(form.setup_script.read(cx).value().as_str(), "cargo check");
@@ -7708,8 +7726,13 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
     });
     assert!(vcx.debug_bounds("admin-worktree-symlinks-empty").is_some());
 
-    // 다시 repo-a 칩을 클릭하면 심볼릭 링크 칩 2개가 나타나고 × 버튼으로 제거할 수 있다.
-    click_sel(vcx, "admin-workflow-repo-chip-0");
+    // 다시 repo-a를 고르면 심볼릭 링크 칩 2개가 나타나고 × 버튼으로 제거할 수 있다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.load_repo_hooks_for(&repo_a, window, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
     click_sel(vcx, "admin-symlink-remove-0");
@@ -8146,7 +8169,7 @@ fn ssh_and_remote_krill_have_separate_pages(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("link-client-input-link").is_some());
     assert!(vcx.debug_bounds("admin-ssh-import").is_none());
     assert!(vcx.debug_bounds("link-pairing-modal").is_none());
-    // 탭을 왕복해도 입력 중인 링크·짝짓기 상태를 가진 뷰는 유지된다.
+    // 탭을 왕복해도 입력 중인 링크·페어링 상태를 가진 뷰는 유지된다.
     let pairing = vcx.update(|_, cx| view.read(cx).remote_krill.clone().unwrap());
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
@@ -8450,4 +8473,187 @@ fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
     cx.run_until_parked();
     assert!(!cx.read(|cx| current(cx).notifications));
     fs::remove_dir_all(root).unwrap();
+}
+
+/// 아티팩트 탭: 공개 공유 스위치가 게이트 파일을 켜고 끄며, `krill artifacts list --json` 목록을 그리고
+/// 행 삭제가 `krill artifacts delete <slug> --json`으로 전달된다. 오류 봉투는 배너로 보인다.
+#[gpui::test]
+fn artifacts_tab_lists_toggles_gate_and_deletes(cx: &mut TestAppContext) {
+    use std::sync::{Arc, Mutex};
+
+    let d = dir("artifacts-tab");
+    init(cx, &d);
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let fail_list = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run = {
+        let calls = calls.clone();
+        let fail_list = fail_list.clone();
+        space::CliRunner::new(move |args| {
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            calls.lock().unwrap().push(args.clone());
+            let out = match args.get(1).map(String::as_str) {
+                Some("list") if fail_list.load(std::sync::atomic::Ordering::SeqCst) => {
+                    r#"{"error":{"code":"http_500","message":"server returned HTTP 500"}}"#
+                }
+                Some("list") => {
+                    r#"{"artifacts":[{"artifact":{"slug":"s1","title":"Report","sourceContentType":"text/markdown","expiresAt":"2026-12-01T00:00:00Z"},"shareUrl":"https://share.krill.page/a/s1"},{"artifact":{"slug":"s2","originalFileName":"page.html"},"shareUrl":"https://share.krill.page/a/s2"}]}"#
+                }
+                Some("delete") => r#"{"deleted":true,"slug":"s1"}"#,
+                _ => "{}",
+            };
+            Ok(out.as_bytes().to_vec())
+        })
+    };
+
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_artifacts_runner(run, cx);
+            v.set_tab(AdminTab::Artifacts, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "admin-tab-artifacts",
+        "admin-artifacts-sharing",
+        "admin-artifacts-howto",
+        "admin-artifacts-list",
+        "admin-artifact-row-s1",
+        "admin-artifact-row-s2",
+        "admin-artifact-delete-s1",
+    ] {
+        assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    assert!(vcx.debug_bounds("admin-artifacts-error").is_none());
+    assert_eq!(calls.lock().unwrap()[0], ["artifacts", "list", "--json"]);
+
+    // 공개 공유 스위치 = 상태 디렉터리 게이트 파일.
+    let gate = d.join(krill_proto::artifacts::SHARING_ENABLED_FILE);
+    assert!(!gate.exists());
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_artifact_sharing(true, cx)));
+    assert!(gate.is_file());
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_artifact_sharing(false, cx)));
+    assert!(!gate.exists());
+
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.delete_artifact("s1".into(), cx)));
+    vcx.run_until_parked();
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == &["artifacts", "delete", "s1", "--json"])
+    );
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.artifacts.items.len(), 1);
+        assert_eq!(v.artifacts.items[0].artifact.slug, "s2");
+        assert!(v.artifacts.notice.as_ref().unwrap().contains("Report"));
+    });
+
+    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
+    vcx.update(|window, cx| {
+        view.update(cx, SettingsView::refresh_artifacts);
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-artifacts-error").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
+
+/// 앱 테마 선택: 누르면 바로 팔레트가 바뀌고 저장되며, 짝 터미널 테마는 사용자가 바꾸지 않았을 때만 따라 바뀐다.
+#[gpui::test]
+fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
+    let d = dir("ui-theme");
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let b = vcx
+            .debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    click(vcx, "ui-theme-glow");
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.ui_theme_dark, DarkUiTheme::Glow);
+        assert_eq!(
+            s.terminal_theme_dark,
+            crate::ui::terminal_themes::KRILL_GLOW
+        );
+        assert_eq!(crate::ui::palette(cx), &crate::ui::GLOW);
+        assert_eq!(cx.theme().background, crate::ui::GLOW.background);
+    });
+    let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
+    assert_eq!(saved.ui_theme_dark, DarkUiTheme::Glow);
+
+    // 사용자가 고른 터미널 테마는 앱 테마를 바꿔도 그대로 둔다.
+    vcx.update(|_, cx| edit(cx, |s| s.terminal_theme_dark = "Dracula".to_owned()));
+    vcx.run_until_parked();
+    click(vcx, "ui-theme-abyss");
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.ui_theme_dark, DarkUiTheme::Abyss);
+        assert_eq!(s.terminal_theme_dark, "Dracula");
+        assert_eq!(crate::ui::palette(cx), &crate::ui::ABYSS);
+    });
+
+    vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
+    vcx.run_until_parked();
+    click(vcx, "ui-theme-paper");
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+        assert_eq!(
+            s.terminal_theme_light,
+            crate::ui::terminal_themes::KRILL_PAPER
+        );
+        assert_eq!(cx.theme().mode, ThemeMode::Light);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
+    });
+    fs::remove_dir_all(&d).ok();
+}
+
+/// 앱 테마 키가 없는 예전 설정 파일은 기본 테마(심해·기본)로 읽는다.
+#[test]
+fn settings_without_ui_theme_keys_use_default_themes() {
+    let s = Settings::parse("theme = \"light\"").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
+    let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+}
+
+/// 워크플로 탭 프로젝트 선택 후보에는 실제 절대 경로만 들어가고
+/// `내 드라이브::workspace:…` 같은 내부 키는 빠진다.
+#[test]
+fn workflow_repo_candidates_keep_only_absolute_paths() {
+    let mut store = krill_proto::orchestration::WorktreeStore::default();
+    store
+        .setup_scripts
+        .insert("/repo/alpha".to_owned(), "bun install".to_owned());
+    store.parents.insert(
+        "/repo/alpha-wt".to_owned(),
+        "내 드라이브::workspace:2de7222e".to_owned(),
+    );
+    store
+        .parents
+        .insert("/repo/beta-wt".to_owned(), "/repo/beta".to_owned());
+    let got: Vec<String> = SettingsView::workflow_repo_candidates(&store)
+        .into_iter()
+        .collect();
+    assert_eq!(got, vec!["/repo/alpha".to_owned(), "/repo/beta".to_owned()]);
 }

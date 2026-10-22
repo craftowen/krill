@@ -152,7 +152,7 @@ fn walk_space(
         } else if file_type.is_dir() {
             let dir_name = entry.file_name();
             let dir_name_str = dir_name.to_string_lossy();
-            if dir_name_str == ".git" || dir_name_str == ".minikrill-preparing" {
+            if dir_name_str == ".git" || dir_name_str == ".krill-preparing" {
                 continue;
             }
             if let Some(art) = active_artifact {
@@ -324,7 +324,8 @@ pub fn discover_repositories(state_dir: Option<&Path>) -> Vec<PathBuf> {
             if state_dir.is_some() && state_dir != daemon::state_dir().as_deref() {
                 None
             } else {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Minikrill/worktrees"))
+                std::env::var_os("HOME")
+                    .map(|h| krill_proto::user_dirs::worktrees_root(Path::new(&h)))
             }
         })
         && let Ok(repos_dir) = fs::read_dir(wt_root)
@@ -718,7 +719,7 @@ pub fn remove_worktree_git(
         return Err("worktree is dirty; use --force to discard its files".to_owned());
     }
 
-    // 삭제 전 minikrill.toml / orca.yaml / 상태 디렉터리의 공유 심볼릭 링크를 먼저 해제한다.
+    // 삭제 전 krill.toml / orca.yaml / 상태 디렉터리의 공유 심볼릭 링크를 먼저 해제한다.
     unlink_worktree_symlinks(&path, &symlinks);
 
     let mut args: Vec<OsString> = ["worktree", "remove"].map(OsString::from).into();
@@ -790,7 +791,7 @@ fn parse_porcelain_worktrees(bytes: &[u8]) -> Vec<GitWorktreeEntry> {
         if let Some(raw_path) = field.strip_prefix(b"worktree ") {
             if raw_path
                 .split(|b| *b == b'/')
-                .any(|part| part == b".minikrill-preparing")
+                .any(|part| part == b".krill-preparing")
             {
                 continue;
             }
@@ -1605,7 +1606,7 @@ mod tests {
         )
         .unwrap();
         fs::write(
-            repo.join("minikrill.toml"),
+            repo.join("krill.toml"),
             "[worktree]\nsymlinks = [\".env\", \"secret/nested.txt\"]\n",
         )
         .unwrap();

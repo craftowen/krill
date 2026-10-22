@@ -1,4 +1,4 @@
-//! 짝짓기(`krill-link invite` / `krill-link pair`) 링크 포맷, ALPN `minikrill/pair/1` 핸드셰이크, 속도 제한기.
+//! 페어링(`krill-link invite` / `krill-link pair`) 링크 포맷, ALPN `krill/pair/1` 핸드셰이크, 속도 제한기.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -22,21 +22,19 @@ use crate::{
     store::{DEFAULT_INVITE_TTL, now_unix_secs, sanitize_id_slug, upsert_host},
 };
 
-/// 짝짓기 링크 스킴 접두어.
+/// 페어링 링크 스킴 접두어.
 pub const PAIR_URI_PREFIX: &str = "krill://pair?";
-/// 개명 전 링크 접두어. 이미 나간 초대 링크를 위해 해석만 받는다.
-pub const LEGACY_PAIR_URI_PREFIX: &str = "minikrill://pair?";
 const TICKET_OPTIONAL_PREFIX: &str = "mklink1:";
 const MAX_PAIR_FRAME_BYTES: usize = 8192;
 
-/// 기본 짝짓기 속도 제한 윈도우 (60초).
+/// 기본 페어링 속도 제한 윈도우 (60초).
 pub const DEFAULT_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// 윈도우당 최대 실패 허용 횟수 (5회).
 pub const DEFAULT_MAX_FAILURES: usize = 5;
 /// 윈도우당 최대 전체 시도 횟수 (15회).
 pub const DEFAULT_MAX_ATTEMPTS: usize = 15;
 
-/// `krill://pair?t=<ticket>&k=<token>` 짝짓기 링크.
+/// `krill://pair?t=<ticket>&k=<token>` 페어링 링크.
 ///
 /// `fmt::Debug`는 토큰 원문을 `"<redacted>"`로 마스킹한다.
 #[derive(Clone)]
@@ -55,7 +53,7 @@ impl fmt::Debug for PairLink {
 }
 
 impl PairLink {
-    /// 서버 주소와 1회용 토큰으로 짝짓기 링크를 만든다.
+    /// 서버 주소와 1회용 토큰으로 페어링 링크를 만든다.
     pub fn new(addr: EndpointAddr, token: InviteToken) -> Self {
         Self { addr, token }
     }
@@ -69,12 +67,11 @@ impl PairLink {
         ))
     }
 
-    /// `krill://pair?...`(옛 `minikrill://pair?...`도) 문자열을 파싱한다. 오류에 토큰이나 링크 원문을 남기지 않는다.
+    /// `krill://pair?...` 문자열을 파싱한다. 오류에 토큰이나 링크 원문을 남기지 않는다.
     pub fn parse(input: &str) -> Result<Self, Error> {
         let trimmed = input.trim();
         let query = trimmed
             .strip_prefix(PAIR_URI_PREFIX)
-            .or_else(|| trimmed.strip_prefix(LEGACY_PAIR_URI_PREFIX))
             .ok_or(Error::InvalidPairLink(
                 "pair link must start with krill://pair?",
             ))?;
@@ -153,7 +150,7 @@ pub struct PairWireResponse {
     pub reason: Option<String>,
 }
 
-/// 슬라이딩 윈도우 기반 짝짓기 시도 속도 제한기.
+/// 슬라이딩 윈도우 기반 페어링 시도 속도 제한기.
 #[derive(Debug)]
 pub struct PairRateLimiter {
     window: Duration,
@@ -189,7 +186,7 @@ impl PairRateLimiter {
         }
     }
 
-    /// 새 짝짓기 시도가 허용되는지 확인하고 시도 시각을 기록한다.
+    /// 새 페어링 시도가 허용되는지 확인하고 시도 시각을 기록한다.
     pub fn check_and_record_attempt(&self, now: Instant) -> bool {
         let Ok(mut guard) = self.state.lock() else {
             return false;
@@ -203,7 +200,7 @@ impl PairRateLimiter {
         true
     }
 
-    /// 짝짓기 토큰 검증 실패를 기록한다.
+    /// 페어링 토큰 검증 실패를 기록한다.
     pub fn record_failure(&self, now: Instant) {
         if let Ok(mut guard) = self.state.lock() {
             prune_old(&mut guard.failures, now, self.window);
@@ -347,7 +344,7 @@ pub async fn create_invite_command(
 }
 
 /// 클라이언트 `krill-link pair <링크> --name <기기 이름>`:
-/// ALPN `minikrill/pair/1`로 서버에 토큰·기기 이름을 보내 검증받고 `link/hosts.toml`에 호스트를 저장한다.
+/// ALPN `krill/pair/1`로 서버에 토큰·기기 이름을 보내 검증받고 `link/hosts.toml`에 호스트를 저장한다.
 pub async fn pair_with_server(
     state_dir: &Path,
     link_str: &str,
@@ -482,15 +479,10 @@ mod tests {
         assert_eq!(parsed.addr, addr);
         assert_eq!(parsed.token.as_str(), raw_tok);
 
-        // OWE-669: 이미 나간 옛 minikrill:// 링크도 같은 값으로 해석된다.
-        let legacy = encoded.replacen("krill://", "minikrill://", 1);
-        let parsed = PairLink::parse(&legacy).unwrap();
-        assert_eq!(parsed.addr, addr);
-        assert_eq!(parsed.token.as_str(), raw_tok);
         assert!(PairLink::parse(&encoded.replacen("krill://", "other://", 1)).is_err());
 
         // 잘못된 토큰이 들어간 링크 파싱 실패 시 오류에 토큰 원문이 남지 않는지 확인
-        let bad = "minikrill://pair?t=00&k=secret_bad_token_value_12345";
+        let bad = "krill://pair?t=00&k=secret_bad_token_value_12345";
         let err = PairLink::parse(bad).unwrap_err();
         assert!(!err.to_string().contains("secret_bad_token_value_12345"));
     }

@@ -66,7 +66,7 @@ fn echo_cursor_advance_clears_pending() {
     assert_eq!(overlay.origin, CellPoint { line: 0, column: 2 });
 }
 
-/// 커서가 숨겨진 동안(TUI)은 커서로 확인할 수 없어 만료 시간으로 지운다.
+/// 숨은 커서도 에코 전 위치에 머물면 확정 글자를 만료 시간까지 유지한다.
 #[test]
 fn hidden_cursor_keeps_pending_until_ttl() {
     let mut ime = Ime::default();
@@ -74,7 +74,7 @@ fn hidden_cursor_keeps_pending_until_ttl() {
     assert_eq!(ime.insert("한").pty, "한".as_bytes());
     let at = ime.pending_at().expect("확정 시각 기록");
     ime.set_cursor(CellPoint { line: 0, column: 0 }, false);
-    assert!(ime.pending().is_some(), "숨은 커서는 무시한다");
+    assert!(ime.pending().is_some(), "에코 전 커서 위치에서는 유지한다");
     ime.expire_pending(at + Duration::from_millis(499));
     assert!(ime.pending().is_some(), "만료 전 유지");
     ime.expire_pending(at + PENDING_TTL);

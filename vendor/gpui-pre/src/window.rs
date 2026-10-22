@@ -1,4 +1,4 @@
-// Modified by Minikrill (OWE-507): file drops restore mouse input modality before dispatch.
+// Modified by Krill (OWE-507): file drops restore mouse input modality before dispatch.
 #[cfg(feature = "profiler")]
 use crate::DebugFrameOverlayMode;
 #[cfg(any(feature = "inspector", debug_assertions))]

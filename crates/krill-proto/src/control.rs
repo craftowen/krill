@@ -14,7 +14,7 @@
 //! - [`Request::Close`]: 돌고 있으면 holder가 종료 단계(SIGHUP → SIGTERM → SIGKILL, 탈출한 후손 포함)를 시작하고,
 //!   끝나면 krilld가 세션을 지운다. 이미 끝났으면 바로 지운다. 종료를 기다리지 않고 [`Reply::Closed`]로 답한다.
 //! - [`Request::NewWorktree`](MK-042): krilld의 git 작업 큐에서 워크트리를 만든다(수 초 걸릴 수 있다, 답은 끝난 뒤).
-//!   레포의 `minikrill.toml` setup 스크립트를 이 내용으로 아직 신뢰한 적이 없으면 아무것도 만들지 않고
+//!   레포의 `krill.toml` setup 스크립트를 이 내용으로 아직 신뢰한 적이 없으면 아무것도 만들지 않고
 //!   [`Reply::SetupUntrusted`]로 답한다. 클라이언트는 사용자에게 스크립트를 보이고, 승인하면 받은 해시를
 //!   [`Setup::Approve`]에 실어 다시 보낸다. 성공하면 [`Reply::WorktreeCreated`], 실패하면 [`Reply::WorktreeFailed`].
 //! - [`Request::RemoveWorktree`](MK-043): [`FEAT_WORKTREE_REMOVE`]도 협상한 뒤에만 보낸다. dirty는 force가

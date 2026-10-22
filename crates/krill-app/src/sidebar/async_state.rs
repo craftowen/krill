@@ -573,7 +573,7 @@ impl Sidebar {
         .detach();
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(super) fn new_loaded(path: Option<PathBuf>) -> Self {
         let mut sidebar = Self::new(path);
         Startup::load(sidebar.path.as_deref()).apply(&mut sidebar);

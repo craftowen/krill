@@ -6,7 +6,7 @@ fn orca_setup_native_precedence_and_manifest_security() {
     fs::write(f.repo.join("orca.yaml"), "scripts:\n  setup: |\n    printf 'one'\n    printf 'two'\n  archive: ignored\ndefaultTabs: []\n").unwrap();
     fs::write(
         f.repo.join(".worktreeinclude"),
-        "# local files\n.env\n.env\n*.key\n!secret\nsecret\n../escape\nlink\nminikrill.toml\n",
+        "# local files\n.env\n.env\n*.key\n!secret\nsecret\n../escape\nlink\n",
     )
     .unwrap();
     fs::write(f.repo.join(".env"), "secret").unwrap();
@@ -278,9 +278,9 @@ fn owe751_archive_hook_trust_force_removal_timeout_and_output_cap() {
     )
     .unwrap();
     f.git(&["add", CONFIG]);
-    f.git(&["commit", "-q", "-m", "untrusted archive in minikrill.toml"]);
+    f.git(&["commit", "-q", "-m", "untrusted archive in krill.toml"]);
 
-    // 1. Untrusted minikrill.toml archive hook is refused on normal remove and skipped with warning on --force, never executing.
+    // 1. Untrusted krill.toml archive hook is refused on normal remove and skipped with warning on --force, never executing.
     let (w_untrusted, _) = f.created("untrusted-wt", Setup::Skip);
     let wt_untrusted_path = path(&w_untrusted);
     let err = f.remove(&w_untrusted, false).unwrap_err();

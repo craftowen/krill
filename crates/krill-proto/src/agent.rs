@@ -21,7 +21,7 @@ pub mod hooks;
 pub mod rules;
 
 /// 내장 5종(T4 §3.1.3 + Antigravity CLI). YOLO 인자: claude·codex·agy는 이 맥의 `--help`로 확인,
-/// cursor-agent `--force`는 미설치라 미확인. opencode는 권한 우회 플래그가 없어 비워 둔다.
+/// cursor-agent `--force`는 미설치라 미확인. `OpenCode` `--auto`는 설치된 CLI의 `--help`로 확인.
 pub const BUILTIN: &str = r#"
 [agent.claude]
 name = "Claude Code"
@@ -38,6 +38,7 @@ install = "npm install -g @openai/codex"
 [agent.opencode]
 name = "OpenCode"
 launch = ["opencode"]
+yolo_args = ["--auto"]
 install = "curl -fsSL https://opencode.ai/install | bash"
 
 [agent.cursor]

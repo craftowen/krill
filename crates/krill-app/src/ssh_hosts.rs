@@ -272,7 +272,7 @@ pub fn config_path(state_dir: Option<&Path>) -> PathBuf {
         dir.join(HOSTS_FILE)
     } else {
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        home.join(".config").join("minikrill").join(HOSTS_FILE)
+        krill_proto::user_dirs::config_dir(&home).join(HOSTS_FILE)
     }
 }
 
@@ -1250,11 +1250,11 @@ Host dev-box
         assert_eq!(home_args.last().unwrap(), &krill_hosts::ssh::remote_query());
         assert_eq!(
             host.resolve_remote_socket_from_home(
-                "/Users/remoteowen\nLibrary/Application Support/dev.minikrill.app\n",
+                "/Users/remoteowen\n.local/share/dev.krill.app\n",
             )
             .unwrap(),
             PathBuf::from(
-                "/Users/remoteowen/Library/Application Support/dev.minikrill.app/run/krilld.sock"
+                "/Users/remoteowen/.local/share/dev.krill.app/run/krilld.sock"
             )
         );
     }

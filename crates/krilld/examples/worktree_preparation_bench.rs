@@ -196,7 +196,7 @@ fn main() -> Result<()> {
         println!("expiry_wait_started=true");
         io::stdout().flush()?;
         let deadline = start + TTL + Duration::from_secs(30);
-        while root.join(".minikrill-preparing/owner.json").exists() {
+        while root.join(".krill-preparing/owner.json").exists() {
             if Instant::now() >= deadline {
                 return Err("unused preparation was not collected".into());
             }
@@ -206,7 +206,7 @@ fn main() -> Result<()> {
             .args(["worktree", "list", "--porcelain"])
             .current_dir(&repo)
             .output()?;
-        if String::from_utf8_lossy(&list.stdout).contains(".minikrill-preparing") {
+        if String::from_utf8_lossy(&list.stdout).contains(".krill-preparing") {
             return Err("expired git registration remains".into());
         }
         println!(

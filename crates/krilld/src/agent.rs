@@ -85,7 +85,7 @@ if [ -f "${ZDOTDIR:-$HOME}/.zshenv" ]; then
   . "${ZDOTDIR:-$HOME}/.zshenv"
 fi
 __krill_sync_accounts() {
-  local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/minikrill}/active-accounts.env"
+  local _krill_env="${KRILL_STATE_DIR:-$HOME/.config/krill}/active-accounts.env"
   if [ -f "$_krill_env" ]; then
     unset CLAUDE_CONFIG_DIR CODEX_HOME OPENCODE_CONFIG_DIR OPENCODE_DB ANTIGRAVITY_CLI_HOME GEMINI_CLI_HOME
     . "$_krill_env"

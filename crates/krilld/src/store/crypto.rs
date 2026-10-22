@@ -21,7 +21,7 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
-const SERVICE: &str = "com.minikrill.segment-key.v2";
+const SERVICE: &str = "com.krill.segment-key.v2";
 #[cfg(target_os = "macos")]
 const NOT_FOUND: i32 = -25300;
 #[cfg(target_os = "macos")]
@@ -113,7 +113,8 @@ impl Key {
             "{:x}",
             Sha256::digest(root.canonicalize()?.as_os_str().as_bytes())
         );
-        match keychain.find_generic_password(SERVICE, &account) {
+        let found = keychain.find_generic_password(SERVICE, &account);
+        match found {
             Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
             Err(e) if e.code() == NOT_FOUND && !existing => {
                 let mut bytes = Zeroizing::new([0; 32]);
@@ -144,9 +145,10 @@ impl Key {
     }
 
     fn derive(&self, salt: &[u8; SALT_LEN]) -> io::Result<aead::LessSafeKey> {
+        // Part of the on-disk v2 format, independent of the product display name.
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(self.0.as_ref());
         let okm = prk
-            .expand(&[b"minikrill segment v2"], &aead::AES_256_GCM)
+            .expand(&[b"krill segment v2"], &aead::AES_256_GCM)
             .map_err(crypto_error)?;
         Ok(aead::LessSafeKey::new(aead::UnboundKey::from(okm)))
     }

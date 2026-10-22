@@ -15,7 +15,7 @@ pub fn path(home: &Path, state_dir: Option<&Path>) -> PathBuf {
     if let Some(state) = state_dir {
         state.join(FILE_NAME)
     } else {
-        home.join(".config").join("minikrill").join(FILE_NAME)
+        krill_proto::user_dirs::config_dir(home).join(FILE_NAME)
     }
 }
 

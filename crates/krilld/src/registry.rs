@@ -143,10 +143,7 @@ pub struct Registry {
     upgrading: Mutex<bool>,
     /// 진행 중인 `Resume`의 `old` id. 같은 세션의 동시 재개는 먼저 잡은 쪽만 진행한다(K-25).
     resuming: Mutex<HashSet<SessionId>>,
-    account_work: (
-        Mutex<BTreeMap<krill_proto::usage::ProviderKind, String>>,
-        std::sync::Condvar,
-    ),
+    account_work: Arc<crate::usage::accounts::switch_work::SwitchWork>,
     account_handoffs: Mutex<BTreeMap<SessionId, krill_proto::usage::SessionHandoff>>,
     account_recovered: std::sync::atomic::AtomicBool,
     account_replacements: Mutex<std::collections::BTreeSet<SessionId>>,
@@ -206,7 +203,10 @@ impl Registry {
             git_watch: Mutex::default(),
             upgrading: Mutex::new(false),
             resuming: Mutex::default(),
-            account_work: (Mutex::default(), std::sync::Condvar::new()),
+            account_work: crate::usage::accounts::switch_work::subscribe(
+                &crate::usage::accounts::default_home(),
+                dir,
+            ),
             account_handoffs: Mutex::new(account_switch::load(dir)),
             account_recovered: std::sync::atomic::AtomicBool::new(false),
             account_replacements: Mutex::default(),
@@ -323,6 +323,10 @@ impl Registry {
             for &(id, e) in &found {
                 self.apply_agent_hook(&st, id, e)?;
                 hooked.push((id, e.payload.clone()));
+            }
+            drop(st);
+            for &(id, e) in &found {
+                self.auto_switch_from_hook(id, e);
             }
             Ok(())
         })
@@ -1648,6 +1652,14 @@ impl Registry {
                 .into_iter()
                 .map(|(session, root, exited, tap)| {
                     let mut status = self.status.get(session);
+                    // Pi has no hook identity. Its executable may be reported as `node`,
+                    // and its terminal title can be renamed. Keep the explicit launch identity.
+                    if status.agent.is_empty()
+                        && let Ok(Some(launch)) = self.agents.launch(session)
+                        && launch.profile == "pi"
+                    {
+                        status.agent = launch.profile;
+                    }
                     status.foreground =
                         status::foreground_process(root, tap.foreground(), exited, |pid| {
                             crate::sys::process_name(pid).ok()
@@ -1669,6 +1681,10 @@ impl Registry {
         };
         if let Some(id) = session {
             self.apply_agent_hook(&st, id, e)?;
+        }
+        drop(st);
+        if let Some(id) = session {
+            self.auto_switch_from_hook(id, e);
         }
         Ok(session)
     }
@@ -1729,9 +1745,8 @@ impl Registry {
                 entry.session.tap().agent_done(status.since_unix_ns);
             }
         }
-        // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다(다음 실행부터 적용).
+        // OWE-710: Claude StopFailure 한도 도달이면 자동전환을 즉시 평가한다.
         // OWE-901: agy Stop·PostInvocation 한도 봉투도 같이 본다.
-        // 자동 정책은 다음 실행의 계정을 고른다. 실행 중 재개는 명시적인 사용자 전환에서만 한다.
         // OWE-703 2단계 지시: 한도 도달이면 실행 당시 계정(OWE-698 기록)을 RateLimited로
         // 먼저 기록한다. 캐시 사용량이 미상·낮아도 후보에서 빠지고 평가가 일어난다.
         if (status::stop_failure_rate_limited(&e.payload) || status::agy_rate_limited(&e.payload))
@@ -1746,6 +1761,12 @@ impl Registry {
             };
             crate::usage::accounts::record_rate_limited(provider, &account_id);
         }
+        Ok(())
+    }
+
+    // Account evaluation wakes the session worker. Release `state` first: the worker's
+    // final handoff holds its queue lock while retiring the old session.
+    fn auto_switch_from_hook(&self, id: SessionId, e: &HookEvent) {
         if let Some(switched) = status::auto_switch_on_rate_limit(
             &crate::usage::accounts::default_home(),
             self.state_dir().as_deref(),
@@ -1764,7 +1785,6 @@ impl Registry {
                 );
             }
         }
-        Ok(())
     }
 
     fn close(&self, peer: &Peer, id: SessionId) -> Result<Reply, Failure> {
@@ -1945,6 +1965,9 @@ impl Registry {
             }
             UsageRequest::Get => UsageReply::Current(accounts::primary_snapshot(&home, state_ref)),
             UsageRequest::ListAccounts => {
+                if role != Role::Observer {
+                    self.adopt_profile_names(&home, state_ref);
+                }
                 UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
             }
             UsageRequest::SwitchAccount {
@@ -2029,7 +2052,11 @@ impl Registry {
                     &label,
                     email,
                 ) {
-                    Ok(snap) => UsageReply::Accounts(snap),
+                    Ok(_) => {
+                        // 로그인 직후 이메일이 확인되는 시점이라 임시 이름 폴더를 바로 옮긴다.
+                        self.adopt_profile_names(&home, state_ref);
+                        UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+                    }
                     Err(e) => UsageReply::Failed(os(&e)),
                 }
             }
@@ -2062,6 +2089,16 @@ impl Registry {
             _ => {}
         }
         reply
+    }
+
+    /// 이메일이 확인된 임시 이름(`claude-code-profile-n`) 프로필 폴더를 이메일 이름으로 옮긴다.
+    /// 세션이 쓴 폴더는 건너뛴다. 실패는 기록만 하고 요청 응답에는 영향을 주지 않는다.
+    fn adopt_profile_names(&self, home: &Path, state: Option<&Path>) {
+        use crate::usage::accounts;
+        let in_use = self.profiles_in_use();
+        if let Err(error) = accounts::adopt_email_dirs(home, state, &in_use, &accounts::Keychain) {
+            tracing::debug!(kind = ?error.kind(), "profile rename unavailable");
+        }
     }
 
     /// 레지스트리에 남은 세션(실행·휴면·종료 표시 포함)이 실행에 쓴 계정 프로필 폴더(OWE-704).

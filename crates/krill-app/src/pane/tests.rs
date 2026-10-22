@@ -209,25 +209,27 @@ fn account_handoff_holds_typing_for_the_selected_account_without_replaying_infli
         let notices = p.resume_account_input(failed, now);
         let frames = sent(out(&mut p));
         if failed {
-            assert!(frames.is_empty());
-            assert!(notices.is_empty());
-            assert!(p.account_switching());
-            assert_eq!(
-                p.journal.held_bytes(),
-                b"held prompt\r".len(),
-                "retain complete input until retry rather than only a notice preview"
-            );
-            p.link(SessionId(1), 9, Vec::new(), input::FEAT_INPUT, now);
             assert!(
-                sent(out(&mut p)).is_empty(),
-                "failure stays paused on reconnect"
+                frames.is_empty(),
+                "input meant for the new account never reaches the original session"
             );
-            p.handoff_account(SessionId(2));
-            p.link(SessionId(2), 10, Vec::new(), input::FEAT_INPUT, now);
+            assert_eq!(
+                notices,
+                [Notice {
+                    fate: input::Fate::AccountSwitchFailed,
+                    bytes: b"held prompt\r".to_vec(),
+                }]
+            );
+            assert!(!p.account_switching());
+            assert_eq!(p.journal.held_bytes(), 0);
+            // The daemon repeats the failed handoff in every snapshot. It must not pause the
+            // pane again, or the original session stops accepting keys until a retry.
+            assert!(p.resume_account_input(true, now).is_empty());
+            p.input(b"after failure\r", now);
             let frames = sent(out(&mut p));
             assert_eq!(
                 Input::decode(frames[0].0, &frames[0].1).unwrap().bytes,
-                b"held prompt\r"
+                b"after failure\r"
             );
         } else {
             assert!(notices.is_empty());

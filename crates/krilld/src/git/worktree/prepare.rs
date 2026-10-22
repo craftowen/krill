@@ -18,7 +18,7 @@ use crate::session::lock;
 
 pub const TTL: Duration = Duration::from_secs(300);
 pub const DISK_LIMIT: u64 = 512 * 1024 * 1024;
-const DIRECTORY: &str = ".minikrill-preparing";
+const DIRECTORY: &str = ".krill-preparing";
 const MARKER: &str = "owner.json";
 const RECENT: usize = 128;
 static POOL: OnceLock<Result<Arc<Pool>, String>> = OnceLock::new();
@@ -282,7 +282,7 @@ impl Pool {
             "--detach".into(),
             "--no-checkout".into(),
             "--lock".into(),
-            "--reason=minikrill speculative preparation".into(),
+            "--reason=krill speculative preparation".into(),
             path.clone().into_os_string(),
             commit.clone().into(),
         ];
@@ -585,7 +585,8 @@ pub(super) fn existing() -> Option<&'static Pool> {
 }
 
 pub(super) fn recover() -> Result<(), String> {
-    if root()?.join(DIRECTORY).join(MARKER).exists() {
+    let root = root()?;
+    if root.join(DIRECTORY).join(MARKER).exists() {
         global()?;
     }
     Ok(())

@@ -186,7 +186,7 @@ DMG_URL="${REPO_URL}/releases/download/${TAG}/Krill-${VERSION}.dmg"
 OUT_DIR="packaging/dist"
 
 HEAD_SHA=$(git rev-parse HEAD)
-KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/minikrill-codesign.keychain-db}"
+KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$(python3 packaging/macos/identity_paths.py)}"
 UPDATE_KEY_FILE="${KRILL_UPDATE_KEY_FILE:-${KC_PATH}.ed25519.key}"
 
 # ---- 게시 가드 ----
@@ -260,6 +260,24 @@ fi
 # --bump은 아래에서 고지문을 다시 만들어 같은 커밋에 넣는다.
 if [[ -z "$BUMP" ]] && ! python3 docs/licensing/generate_notices.py --check >/dev/null; then
   soft_fail "THIRD_PARTY_NOTICES.md is stale; run python3 docs/licensing/generate_notices.py and commit"
+fi
+# 모바일 PWA: 이 커밋의 에셋 해시가 고정 출처에 없으면 새 데몬의 QR이 404가 되고 PWA가 새 UI로 못 넘어간다
+# (v0.1.30 사고). 실제 게시면 cloud/mobile/deploy.sh(저장소 밖 Cloudflare 배포 도구)로 올린 뒤 다시 확인한다.
+MOBILE_ORIGIN=${KRILL_MOBILE_ORIGIN:-https://krill-mobile.pages.dev}
+MOBILE_CLOUD=${KRILL_MOBILE_CLOUD_DIR:-cloud/mobile}
+mobile_deployed() {
+  [[ $(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${MOBILE_ORIGIN}/m/$1/manifest.json" 2>/dev/null) == 200 ]]
+}
+if ! MOBILE_HASH=$(python3 packaging/release_check.py mobile-hash) || [[ ! "$MOBILE_HASH" =~ ^[0-9a-f]{16}$ ]]; then
+  hard_fail "cannot compute the mobile PWA asset hash"
+elif ! mobile_deployed "$MOBILE_HASH"; then
+  if [[ "$PREFLIGHT" -eq 0 && "$DRY_RUN" -eq 0 && -x "$MOBILE_CLOUD/deploy.sh" ]]; then
+    echo "==> Deploying mobile PWA ${MOBILE_HASH} to ${MOBILE_ORIGIN}"
+    "$MOBILE_CLOUD/deploy.sh" --repo "$PWD" || true
+    for _ in 1 2 3 4 5 6; do mobile_deployed "$MOBILE_HASH" && break; sleep 5; done
+  fi
+  mobile_deployed "$MOBILE_HASH" ||
+    soft_fail "mobile PWA ${MOBILE_HASH} is not deployed to ${MOBILE_ORIGIN}; run ${MOBILE_CLOUD}/deploy.sh --repo $PWD (or set KRILL_MOBILE_CLOUD_DIR)"
 fi
 # 공개 표면: 소스 tarball(git archive HEAD)과 같은 내용에 내부 문서·비밀이 없어야 한다.
 FORBIDDEN=$(git ls-tree -r --name-only HEAD | grep -E '^(docs/(boost-|reports/)|\.night/)' || true)
@@ -359,7 +377,7 @@ ZIP_SHA256=$(awk '{print $1}' "${ZIP_PATH}.sha256")
 ZIP_URL="${REPO_URL}/releases/download/${TAG}/${ZIP_NAME}"
 MIN_DAEMON_PROTO=$(sed -n 's/^pub const PROTO_MIN: u16 = \([0-9][0-9]*\);/\1/p' crates/krill-proto/src/ipc.rs)
 MIN_DAEMON_PROTO=${MIN_DAEMON_PROTO:-1}
-KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/minikrill-codesign.keychain-db}"
+KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$(python3 packaging/macos/identity_paths.py)}"
 UPDATE_KEY_FILE="${KRILL_UPDATE_KEY_FILE:-${KC_PATH}.ed25519.key}"
 RELEASE_CHANNEL="stable"
 if [[ "$VERSION" == *-* ]]; then

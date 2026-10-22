@@ -26,12 +26,14 @@ mod folder;
 mod handoff;
 mod liveness;
 mod new_session;
+mod notifications;
 mod overlays;
 mod persist;
 pub(crate) mod popout;
 mod release;
 pub(crate) mod security;
 mod tabs;
+mod terminal_menu;
 mod workspaces;
 
 // 앱이 꺼져 있던 동안의 변화 요약.
@@ -40,7 +42,7 @@ mod away;
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Shutdown;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -63,7 +65,7 @@ use gpui_component::menu::ContextMenuExt as _;
 use gpui_component::{Disableable as _, IconName, Sizable as _};
 use krill_app::detached;
 use krill_app::echo::EchoDraw;
-use krill_app::link::{BannerTone, Link, notice_text};
+use krill_app::link::{Link, notice_text};
 use krill_app::pane::{self, Pane};
 use krill_app::terminal::{
     Painted, Preedit, TerminalElement, cell_at, cell_size, file_link_target, link_target,
@@ -162,6 +164,8 @@ enum SelectKind {
 /// 보이는 칸 하나의 세션 연결과 입력 상태. 지우면 소켓을 닫아 IO 태스크도 끝난다.
 struct Live {
     pane: Pane<pane::Writer>,
+    target: Option<krill_app::hosts::HostTarget>,
+    suspended: bool,
     /// 연결을 끊을 때 쓰는 소켓 사본(IO 태스크가 읽는 소켓과 같다).
     sock: Option<UnixStream>,
     ime: Ime,
@@ -192,6 +196,8 @@ impl Live {
     fn new(task: Task<()>) -> Self {
         Self {
             pane: Pane::default(),
+            target: None,
+            suspended: false,
             sock: None,
             ime: Ime::default(),
             echo: EchoDraw::default(),
@@ -504,7 +510,7 @@ pub struct Shell {
     orch_poll: Option<Task<()>>,
     fits: fit::Pending,
     focus: FocusHandle,
-    /// 세션 데몬 감시 연결 상태(MK-025·MK-026). 끊겼거나 붙지 못했으면 가운데 열 위에 배너로 보인다.
+    /// 세션 데몬 감시 연결 상태(MK-025·MK-026). 재연결 상태는 우하단 알림으로 보인다.
     link: Link,
     daemon_task: Option<Task<()>>,
     /// 데몬 경로. [`Shell::connect_daemon`] 전에는 칸을 세션에 붙이지 않는다(레이아웃 테스트).
@@ -523,6 +529,9 @@ pub struct Shell {
     agent_client: Arc<dyn pane::AgentClient>,
     /// 마지막 입력 알림(누르면 닫힘).
     notice: Option<String>,
+    /// 이미 알린 계정 전환 실패. 데몬이 매 스냅샷마다 같은 실패를 다시 보내도 한 번만 띄운다.
+    handoff_errors: HashSet<String>,
+    notifications: notifications::Notifications,
     /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
     reconnected: Option<String>,
     reconnected_task: Option<Task<()>>,
@@ -554,7 +563,7 @@ pub struct Shell {
     )>,
     /// OWE-903 온보딩 모달(메인 창 안 `ui::modal_backdrop`).
     onboarding: Option<overlays::OnboardingModal>,
-    /// OWE-903 짝짓기 모달(메인 창 안 `ui::modal_backdrop`).
+    /// OWE-903 페어링 모달(메인 창 안 `ui::modal_backdrop`).
     /// OWE-903 렌더에서 지연 생성할 모달 요청.
     pending: overlays::PendingOverlays,
     /// 인앱 에이전트 대시보드 모달.
@@ -622,6 +631,10 @@ pub struct Shell {
     /// 마지막으로 실행 위치에 반영한 워크스페이스 선택(Orca `activeWorktreeId` 패리티).
     /// 메뉴에서 고른 실행 위치는 다음 선택 변경까지 유지한다.
     last_synced_selection: Option<(krill_app::hosts::HostId, PathBuf)>,
+    /// Ignore sessions removed by an explicit terminate action while the sidebar's
+    /// previous snapshot still contains them.
+    workspace_closing:
+        std::collections::HashSet<(krill_app::hosts::HostId, krill_proto::SessionId)>,
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
     ports_cache: std::cell::RefCell<HashMap<u64, popout::PortCache>>,
@@ -692,6 +705,7 @@ impl Shell {
                 this.last_synced_selection = Some(selected.clone());
                 this.launch_host = selected.0;
             }
+            this.reconcile_workspace_sessions(cx);
             cx.notify();
         });
         let selection = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::Selected, cx| {
@@ -864,11 +878,22 @@ impl Shell {
                 PathBuf::from(std::ffi::OsString::from_vec(c.cwd.clone()))
             });
         let theme_observer = cx.observe_global::<gpui_component::Theme>(|this, cx| {
+            this.sidebar.update(cx, |_, cx| cx.notify());
             this.push_appearance(cx);
         });
         let config_observer = cx.observe_global::<krill_app::settings::Config>(|this, cx| {
+            this.sidebar.update(cx, |_, cx| cx.notify());
             this.on_config_changed(cx);
         });
+        if !cx.has_global::<krill_app::hosts::link::ConnectionsChanged>() {
+            cx.set_global(krill_app::hosts::link::ConnectionsChanged::default());
+        }
+        cx.observe_global::<krill_app::hosts::link::ConnectionsChanged>(|this, cx| {
+            this.sync(cx);
+            this.sync_hosts(cx);
+            cx.notify();
+        })
+        .detach();
         // 점검 스냅샷이 바뀌면 상태바 경고도 다시 그린다(구독은 앱 수명 동안 둔다).
         cx.observe_global::<krill_app::onboarding::ChecksSnapshot>(|_, cx| cx.notify())
             .detach();
@@ -1006,7 +1031,9 @@ impl Shell {
             agent_task: None,
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
+            handoff_errors: HashSet::new(),
             reconnected: None,
+            notifications: notifications::Notifications::default(),
             reconnected_task: None,
             away_since: None,
             away: None,
@@ -1067,6 +1094,7 @@ impl Shell {
             link_poll: None,
             launch_host: krill_app::hosts::HostId::Local,
             last_synced_selection: None,
+            workspace_closing: std::collections::HashSet::new(),
             ports_cache: std::cell::RefCell::default(),
             settings: None,
             role: WindowRole::Main,
@@ -1149,6 +1177,7 @@ impl Shell {
                     _ => {}
                 }
                 this.sync(cx);
+                this.reconcile_workspace_sessions(cx);
                 if let Some((host, session)) = this.restore_session.take() {
                     this.open_session_on(host, session, cx);
                 }
@@ -2091,11 +2120,6 @@ impl Shell {
             self.host_source = Some(source);
         }
         if let Some(id) = reconnect {
-            if let Some(raw_id) = id.strip_prefix("iroh:")
-                && let Some(service) = &self.link_hosts
-            {
-                service.paired(raw_id);
-            }
             self.host_generation = self.host_generation.wrapping_add(1);
             self.host_pending_reconnects.push(id);
         }
@@ -2108,6 +2132,7 @@ impl Shell {
         self.host_refresh_again = false;
         let generation = self.host_generation;
         let reconnects = std::mem::take(&mut self.host_pending_reconnects);
+        let link_hosts = self.link_hosts.clone();
         let manager = self.host_manager.clone();
         let paths = self.paths.clone();
         let (complete, result) = tokio::sync::oneshot::channel();
@@ -2131,6 +2156,11 @@ impl Shell {
                 manager.sync_specs(&specs);
                 manager.sync_external_hosts(external);
                 for id in reconnects {
+                    if let Some(raw_id) = id.strip_prefix("iroh:")
+                        && let Some(service) = &link_hosts
+                    {
+                        service.paired(raw_id);
+                    }
                     manager.reconnect_now(&id);
                 }
                 let statuses = manager.statuses();
@@ -2777,20 +2807,10 @@ impl Shell {
                     }
                 } else if let Some(error) = &handoff.error
                     && self.layout.sessions().contains(&handoff.from)
+                    && self.handoff_errors.insert(error.clone())
                 {
-                    self.notice = Some(
-                        if self.live.values().any(|live| {
-                            live.pane.session() == Some(handoff.from)
-                                && live.pane.account_switching()
-                        }) {
-                            format!(
-                                "{} ({error})",
-                                krill_app::i18n::catalog::settings::ACCOUNT_INPUT_HELD.get()
-                            )
-                        } else {
-                            error.clone()
-                        },
-                    );
+                    // Failed switches already released the pane above; input is not held.
+                    self.notice = Some(error.clone());
                 }
             }
             rebound |= changed;
@@ -2798,6 +2818,12 @@ impl Shell {
                 break;
             }
         }
+        self.handoff_errors.retain(|error| {
+            snap.details
+                .handoffs
+                .iter()
+                .any(|h| h.error.as_ref() == Some(error))
+        });
         let pending = snap
             .details
             .handoffs
@@ -3174,6 +3200,28 @@ impl Shell {
         self.live.retain(|p, live| {
             visible.contains(p) || layout.pane_exists(*p) && live.pane.keep_account_input()
         });
+        let mut notices = Vec::new();
+        for (id, live) in &mut self.live {
+            if live.target.as_ref().is_some_and(|target| {
+                !target.is_current()
+                    || target.host().is_remote()
+                        && !self.host_targets.contains_key(layout.host(*id))
+            }) {
+                live.cut();
+                live.task = Task::ready(());
+                live.target = None;
+                live.suspended = true;
+                live.error = Some(
+                    krill_app::i18n::catalog::sidebar::HOST_DISCONNECTED
+                        .get()
+                        .into(),
+                );
+                notices.extend(live.pane.unlink());
+            }
+        }
+        for notice in &notices {
+            self.show(Some(notice), cx);
+        }
         self.security.retain_panes(&visible);
         if self.paths.is_none() && self.host_targets.is_empty() {
             return;
@@ -3190,13 +3238,33 @@ impl Shell {
                 self.layout.set_launch(p, self.launch_for(p));
                 self.save();
             }
-            let Some(target) = self.target_for_pane(p) else {
+            let Some(target) = self
+                .target_for_pane(p)
+                .filter(krill_app::hosts::HostTarget::is_current)
+            else {
                 continue;
             };
-            if let Entry::Vacant(e) = self.live.entry(p) {
-                let mut live = Live::new(Self::spawn_pane(p, target, None, cx));
-                live.creation = Arc::clone(self.creations.entry(p).or_default());
-                e.insert(live);
+            match self.live.entry(p) {
+                Entry::Vacant(entry) => {
+                    let mut live = Live::new(Self::spawn_pane(p, target.clone(), None, cx));
+                    live.target = Some(target);
+                    live.creation = Arc::clone(self.creations.entry(p).or_default());
+                    entry.insert(live);
+                }
+                Entry::Occupied(mut entry) => {
+                    let live = entry.get_mut();
+                    if live.suspended || live.target.as_ref().is_some_and(|old| old != &target) {
+                        live.cut();
+                        let notice = live.pane.unlink();
+                        live.task = Self::spawn_pane(p, target.clone(), None, cx);
+                        live.target = Some(target.clone());
+                        live.suspended = false;
+                        live.error = None;
+                        self.show(notice.as_ref(), cx);
+                    } else if live.target.is_none() {
+                        live.target = Some(target);
+                    }
+                }
             }
         }
         if !any_terminal && let Some(state) = self.update_ready.take() {
@@ -3222,6 +3290,9 @@ impl Shell {
             let mut attempt = 0u32;
             let is_remote = target.host().is_remote();
             loop {
+                if !target.is_current() {
+                    return;
+                }
                 let Ok(Some((want, known, launch, creation))) = this.read_with(cx, |t, _| {
                     let want = t.layout.session(pane);
                     let l = t.live.get(&pane)?;
@@ -3476,13 +3547,16 @@ impl Shell {
                 .get(&pane)
                 .and_then(|l| l.pane.session())
                 .or_else(|| self.layout.session(pane));
-            let task = Self::spawn_pane(pane, target, old, cx);
+            let task = Self::spawn_pane(pane, target.clone(), old, cx);
             if let Some(l) = self.live.get_mut(&pane) {
                 l.error = None;
                 l.ime.clear_pending();
                 l.task = task;
+                l.target = Some(target);
+                l.suspended = false;
             } else {
                 let mut live = Live::new(task);
+                live.target = Some(target);
                 live.creation = Arc::clone(self.creations.entry(pane).or_default());
                 self.live.insert(pane, live);
             }
@@ -3560,7 +3634,7 @@ impl Shell {
                 },
                 c.visible,
             );
-            // 확정 에코 만료(숨은 커서면 `set_cursor`이 무시하므로 시간으로 지운다, OWE-615 원인 1).
+            // 커서 전진으로 확인하지 못한 확정 글자는 시간으로 지운다(OWE-615 원인 1).
             l.ime.expire_pending(Instant::now());
             let title = krill_app::security::sanitize_title(&s.title);
             let search_res = l.pane.search_result().cloned();
@@ -4157,6 +4231,16 @@ impl Shell {
         }
         self.cancel_closed_pastes(cx);
         if policy == close::Policy::Terminate {
+            for index in 0..before.tabs().len() {
+                for pane in before.tab_panes(index) {
+                    if !self.layout.pane_exists(pane)
+                        && let Some(session) = before.session(pane)
+                    {
+                        self.workspace_closing
+                            .insert((before.host(pane).clone(), session));
+                    }
+                }
+            }
             self.close_removed_sessions(&before, cx);
         }
         let now_focused = self.layout.focused();
@@ -4174,7 +4258,8 @@ impl Shell {
         }
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
-        if self.folder() != folder {
+        // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
+        if now_focused.is_some() && self.folder() != folder {
             let folder = self.folder();
             self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
         }
@@ -4743,28 +4828,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// YOLO 권한 칸 표시. 단일 칸은 패인 헤더가 숨으므로 탭에도 붙인다(OWE-653).
-    fn yolo_badge(&self, pane: PaneId, cx: &App) -> Option<gpui::Div> {
-        let p = krill_app::ui::palette(cx);
-        self.live
-            .get(&pane)
-            .and_then(|l| l.launch.as_ref())
-            .filter(|launch| launch.permission == Permission::Yolo)
-            .map(|_| {
-                div()
-                    .debug_selector(|| "yolo-badge".into())
-                    .flex_none()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded(krill_app::ui::RADIUS_XS)
-                    .bg(p.warning)
-                    .text_color(p.warning_foreground)
-                    .text_size(krill_app::ui::TEXT_2XS)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(text::YOLO_BADGE.get())
-            })
-    }
-
     pub(super) fn host_name_for_pane(&self, pane: PaneId, cx: &App) -> Option<String> {
         let krill_app::hosts::HostId::Remote(id) = self.layout.host(pane) else {
             return None;
@@ -4909,7 +4972,6 @@ impl Shell {
         let p = krill_app::ui::palette(cx);
         // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
-        let yolo_badge = self.yolo_badge(id, cx);
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.zoomed_pane == Some(id);
@@ -4931,7 +4993,6 @@ impl Shell {
             .bg(p.sidebar.opacity(0.92))
             .border_1()
             .border_color(p.border)
-            .children(yolo_badge)
             .children(host_badge)
             .when(zoomed, |d| {
                 d.child(
@@ -5097,10 +5158,14 @@ impl Shell {
                                                     // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
                                                     this.zoomed_pane = None;
                                                     this.record_closed_pane(id, cx);
-                                                    this.change(true, cx, |layout| {
-                                                        layout.focus(id);
-                                                        layout.close_pane();
-                                                    });
+                                                    this.close_with_policy(
+                                                        close::Policy::Preserve,
+                                                        cx,
+                                                        |layout| {
+                                                            layout.focus(id);
+                                                            layout.close_pane();
+                                                        },
+                                                    );
                                                 })),
                                         ),
                                 )
@@ -5168,6 +5233,12 @@ impl Shell {
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseDownEvent, _, cx| {
                     if e.modifiers.platform {
+                        this.change(true, cx, |l| l.focus(id));
+                        let action = if e.modifiers.alt {
+                            terminal_menu::FileAction::OpenDefault
+                        } else {
+                            terminal_menu::FileAction::Open
+                        };
                         let mut file = None;
                         let mut url = None;
                         if let Some(l) = this.live.get(&id) {
@@ -5189,12 +5260,12 @@ impl Shell {
                         } else {
                             // 파일 링크는 가운데 에디터 탭으로(MK-119), 폴더는 Finder로. 출력 속 경로도 에디터로(OWE-663).
                             match file {
-                                Some(path) => this.open_terminal_file(path, cx),
+                                Some(path) => this.open_terminal_file(path, action, cx),
                                 None => {
                                     if let Some((_, link)) =
-                                        this.path_link_at(id, e.position, true, cx)
+                                        this.path_link_at(id, e.position, Some(action), cx)
                                     {
-                                        this.open_path_link(link, cx);
+                                        this.activate_terminal_file(link, action, cx);
                                     }
                                 }
                             }
@@ -5233,7 +5304,18 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                    // 끌지 않은 맨 클릭이 평문 URL 위면 브라우저로 연다(⌘ 없이도).
+                    let clicked = !e.modifiers.modified()
+                        && this.live.get(&id).is_some_and(|l| {
+                            l.selecting
+                                && l.selecting_kind == SelectKind::Char
+                                && l.selection.is_some_and(|s| s.anchor == s.head)
+                        });
                     if this.select_end(id, cx) {
+                        if clicked && let Some((_, uri)) = this.plain_url_at(id, e.position) {
+                            cx.open_url(&uri);
+                            return;
+                        }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
                         if krill_app::settings::copy_on_select(cx) {
                             this.copy(cx);
@@ -5302,79 +5384,18 @@ impl Shell {
                 this.paste_bytes(&text, window, cx);
             }));
         // 우클릭 메뉴는 프로그램이 마우스 보고를 켜지 않았을 때만(켰으면 우클릭은 프로그램 것이다).
-        let peer_supports_fork = self.peer_supports_fork(id);
-        let can_fork = self.can_fork_pane(id, cx);
-        let can_continue = self.can_continue_pane(id);
         let menu = self
             .live
             .get(&id)
             .filter(|l| !l.pane.modes().mouse())
-            .map(|l| (l.selection.is_some(), self.focus.clone()));
+            .map(|_| cx.weak_entity());
         match menu {
-            Some((has_selection, focus)) => pane
-                .context_menu(move |m, _, _| {
-                    // OWE-871: 복사·붙여넣기만 있던 메뉴에 선택·분할·줌·닫기·지우기를 연결한다.
-                    let m = m
-                        .action_context(focus.clone())
-                        .menu_with_disabled(text::COPY.get(), Box::new(Copy), !has_selection)
-                        .menu(text::PASTE.get(), Box::new(Paste))
-                        .separator()
-                        .menu(text::PANE_SELECT_ALL.get(), Box::new(SelectAll))
-                        .menu(text::PANE_CLEAR.get(), Box::new(ClearPane))
-                        .separator()
-                        .menu(text::SPLIT_RIGHT.get(), Box::new(SplitRight))
-                        .menu(text::SPLIT_DOWN.get(), Box::new(SplitDown))
-                        .menu(text::PANE_ZOOM_TOGGLE.get(), Box::new(ToggleZoomPane));
-                    if peer_supports_fork {
-                        m.separator()
-                            .menu_with_disabled(
-                                text::FORK_SESSION.get(),
-                                Box::new(ForkSession),
-                                !can_fork,
-                            )
-                            .menu_with_disabled(
-                                text::CONTINUE_IN_NEW_SESSION.get(),
-                                Box::new(ContinueInNewSession),
-                                !can_continue,
-                            )
-                            .separator()
-                            .menu(text::CLOSE_PANE.get(), Box::new(ClosePane))
-                    } else {
-                        m.separator()
-                            .menu(text::CLOSE_PANE.get(), Box::new(ClosePane))
-                    }
-                })
+            Some(weak) => pane
+                .context_menu(move |m, window, cx| terminal_menu::build(m, &weak, id, window, cx))
                 .into_any_element(),
             None => pane.into_any_element(),
         }
     }
-}
-
-/// 보존 톤 배너(STYLEGUIDE §3.3): `preserve` 12% 바탕·30% 테두리, 앞에 모노 크릴 마크 12px.
-fn preserve_banner(
-    id: &'static str,
-    msg: impl Into<SharedString>,
-    p: &krill_app::ui::Palette,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(id)
-        .debug_selector(move || id.into())
-        .px_3()
-        .py_1p5()
-        .flex()
-        .items_center()
-        .gap_1p5()
-        .bg(p.preserve.opacity(0.12))
-        .border_b_1()
-        .border_color(p.preserve.opacity(0.3))
-        .text_color(p.foreground)
-        .text_size(krill_app::ui::TEXT_XS)
-        .child(krill_app::ui::icons::svg_box(
-            krill_app::ui::icons::KRILL_SVG,
-            krill_app::ui::ICON_XS,
-            p.preserve,
-        ))
-        .child(div().min_w_0().child(msg.into()))
 }
 
 /// 분할선: 1pt 선 + 잡는 폭 5pt. 드래그 값은 `Drag`, 실제 크기 계산은 부모의 `on_drag_move`가 한다.
@@ -5472,7 +5493,8 @@ impl Render for Shell {
             cx.theme().mode == gpui_component::ThemeMode::Dark,
         );
         self.window = Some(window.window_handle());
-        // OWE-903: 라이브러리에서 들어온 온보딩·짝짓기 모달 요청을 엔티티로 만든다.
+        self.sync_notifications(window, cx);
+        // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
         self.open_pending_overlays(window, cx);
         // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
         // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
@@ -5604,9 +5626,9 @@ impl Render for Shell {
         };
         let p = krill_app::ui::palette(cx);
         let (sidebar_bg, bg, fg) = (p.sidebar, p.background, p.foreground);
-        let (warning, warning_fg) = (p.warning, p.warning_foreground);
 
         div()
+            .relative()
             // OWE-860: 설정 화면에서도 Shell 키 문맥을 유지해 전역 탐색 단축키(⌘J·⌘B·⌘P 등)와
             // 커스텀 ClosePane(⌘W) 바인딩이 동작하게 한다. 터미널 편집 액션은 각 핸들러의 settings 가드가 막는다.
             .key_context(KEY_CONTEXT)
@@ -5980,7 +6002,15 @@ impl Render for Shell {
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))
                                 .child(self.render_agents(cx))
-                                .child(div().flex_1().min_h_0().child(self.sidebar.clone()))
+                                .child(
+                                    div().flex_1().min_h_0().child(
+                                        self.sidebar
+                                            .clone()
+                                            .cached(gpui::StyleRefinement::default().size_full()),
+                                    ),
+                                )
+                                // 사이드바 스피너는 여기(셸)서 돌려 틱마다 사이드바를 다시 렌더하지 않는다.
+                                .child(self.sidebar.read(cx).spinner_overlay())
                                 .child(self.detached.clone())
                                 .child(Self::render_sidebar_footer(cx)),
                         )
@@ -6000,64 +6030,12 @@ impl Render for Shell {
                             .flex_col()
                             .bg(bg)
                             .child(self.render_tab_bar(window, cx))
-                            .children(self.link.banner().map(|msg| {
-                                let msg = krill_app::i18n::cached_notice(&msg);
-                                match self.link.banner_tone() {
-                                    BannerTone::Preserve => preserve_banner("link-banner", msg, p),
-                                    BannerTone::Warning => div()
-                                        .id("link-banner")
-                                        .px_3()
-                                        .py_1p5()
-                                        .bg(warning)
-                                        .text_color(warning_fg)
-                                        .text_size(krill_app::ui::TEXT_XS)
-                                        .child(msg),
-                                }
-                            }))
-                            .children(
-                                self.reconnected
-                                    .clone()
-                                    .map(|msg| preserve_banner("reconnected-banner", msg, p)),
-                            )
-                            .children(self.away.clone().map(|msg| {
-                                preserve_banner("away-summary", msg, p)
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.away = None;
-                                        cx.notify();
-                                    }))
-                            }))
-                            .children(self.notice.clone().map(|msg| {
-                                div()
-                                    .id("notice")
-                                    .px_3()
-                                    .py_1p5()
-                                    .bg(warning)
-                                    .text_color(warning_fg)
-                                    .text_size(krill_app::ui::TEXT_XS)
-                                    .child(krill_app::i18n::cached_notice(&msg))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.notice = None;
-                                        cx.notify();
-                                    }))
-                            }))
-                            .children(self.stalled_banner().map(|msg| {
-                                div()
-                                    .id("stalled")
-                                    .px_3()
-                                    .py_1p5()
-                                    .bg(warning)
-                                    .text_color(warning_fg)
-                                    .text_size(krill_app::ui::TEXT_XS)
-                                    .child(msg)
-                            }))
-                            .children(self.render_security_banner(cx))
-                            .children(krill_app::onboarding::banner::render(cx))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_h_0()
                                     .relative()
+                                    .debug_selector(|| "terminal-surface".into())
                                     .bg(krill_app::ui::terminal_surface_alpha(
                                         self.terminal_theme,
                                         krill_app::settings::terminal_opacity_pct(cx),
@@ -6099,7 +6077,7 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(dialog, _)| dialog.clone()),
             )
-            // OWE-903: 온보딩·짝짓기는 메인 창 안 모달로 그린다(별도 OS 창 없음).
+            // OWE-903: 온보딩·페어링은 메인 창 안 모달로 그린다(별도 OS 창 없음).
             .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
             .children(self.dashboard.clone())
             .children(self.quick_open_palette())
@@ -6108,9 +6086,12 @@ impl Render for Shell {
             .children(self.render_running_close_dialog(window, cx))
             .children(self.render_tab_rename_dialog(window, cx))
             .children(self.render_recent_tab_switcher(window, cx))
-            // 우하단 카드는 하나만: 업데이트 카드가 있으면 별 요청 카드(OWE-905)는 숨긴다.
+            .children(self.notification_overlay())
+            // Action/safety toasts take priority in this corner. The update
+            // remains available from the status bar, and its card returns once
+            // notices are dismissed, so floating surfaces never cover buttons.
             .children(
-                (self.role == WindowRole::Main)
+                (self.role == WindowRole::Main && !self.has_notifications(cx))
                     .then(|| {
                         Self::render_update_card(cx)
                             .map(IntoElement::into_any_element)

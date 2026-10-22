@@ -178,7 +178,11 @@ pub fn login_path(shell: &OsStr) -> Option<OsString> {
             loop {
                 match stdout.read(&mut buf) {
                     Ok(0) => break,
-                    Ok(n) => out.extend_from_slice(&buf[..n]),
+                    Ok(n) => {
+                        if let Some(chunk) = buf.get(..n) {
+                            out.extend_from_slice(chunk);
+                        }
+                    }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                         if std::time::Instant::now() >= deadline {
                             break;
@@ -258,12 +262,12 @@ fn in_app_bundle(krill: &Path) -> bool {
 }
 
 /// 심볼릭 링크가 가리킬 안정 경로. 앱 번들 안의 `krill`면 그대로 쓰고,
-/// 워크트리·임시 빌드면 워크트리가 지워져도 끊기지 않게 `~/.local/share/minikrill/bin/krill`를 쓴다.
+/// 워크트리·임시 빌드면 워크트리가 지워져도 끊기지 않게 `~/.local/share/krill/bin/krill`를 쓴다.
 pub(super) fn stable_mk_path(krill: &Path, home: &Path) -> PathBuf {
     if in_app_bundle(krill) {
         krill.to_path_buf()
     } else {
-        home.join(".local/share/minikrill/bin/krill")
+        krill_proto::user_dirs::share_dir(home).join("bin/krill")
     }
 }
 
@@ -432,10 +436,11 @@ fn dispatch_now(cmd: &HostCommand, cx: &mut App) -> bool {
         return false;
     };
     let mut handled = false;
-    let mut i = handlers.len();
-    while i > 0 {
-        i -= 1;
-        match handlers[i](cmd, cx) {
+    for i in (0..handlers.len()).rev() {
+        let Some(handler) = handlers.get_mut(i) else {
+            continue;
+        };
+        match handler(cmd, cx) {
             Some(true) => {
                 handled = true;
                 break;
@@ -1070,7 +1075,7 @@ fn bundle_root(exe: &Path) -> Option<PathBuf> {
         .map(Path::to_path_buf)
 }
 
-/// 비번들 빌드면 `krill`와 옆의 `krill-holder`·`krilld`를 `~/.local/share/minikrill/bin/`에 복사하고
+/// 비번들 빌드면 `krill`와 옆의 `krill-holder`·`krilld`를 `~/.local/share/krill/bin/`에 복사하고
 /// 안정 경로를 돌려준다. 앱 번들 안이면 `krill` 경로를 그대로 돌려준다.
 pub(crate) fn stage_binaries(krill: &Path, home: &Path) -> Result<PathBuf, String> {
     if !krill.is_file() {

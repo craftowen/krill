@@ -293,6 +293,42 @@ fn unsubscribe(display_id: CGDirectDisplayID, subscriber_id: SubscriberId) {
     }
 }
 
+/// Replaces a display's link that stopped delivering callbacks while subscribed (kitty e4b4a353,
+/// "CVDisplayLink getting stuck"). The old link is stopped but deliberately leaked, never
+/// released: a straggler io-thread callback may still be reading it (see the module notes).
+pub fn recreate_display_link(display_id: CGDirectDisplayID) -> Result<()> {
+    debug_assert_main_thread();
+    // Created outside the registry lock; see the lock ordering note above.
+    let new_link = unsafe {
+        sys::DisplayLink::new(
+            display_id,
+            display_link_output_callback,
+            display_id as usize as *mut c_void,
+        )?
+    };
+    let (mut old_link, link_to_start) = {
+        let mut registry = lock_registry();
+        // A never-started `new_link` dropped here has no io thread, so releasing it is safe.
+        let Some(entry) = registry.displays.get_mut(&display_id) else {
+            return Ok(());
+        };
+        let old_link = std::mem::replace(&mut entry.link, new_link);
+        (old_link, entry.running.then(|| entry.link.clone()))
+    };
+    unsafe { old_link.stop().log_err() };
+    std::mem::forget(old_link);
+    if let Some(mut link) = link_to_start
+        && let Err(error) = unsafe { link.start() }
+    {
+        // Let the next `subscribe` start it again.
+        if let Some(entry) = lock_registry().displays.get_mut(&display_id) {
+            entry.running = false;
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 /// A per-window source of frame requests, paced by the display the window is
 /// on. The wrapped dispatch source coalesces vsync ticks from the display's
 /// io thread and invokes `callback(data)` on the main queue.
@@ -331,6 +367,11 @@ impl WindowFrameSource {
             subscribe(display_id, self.frame_requests.clone(), self.signal.clone())?;
         self.registration = Some((display_id, subscriber_id));
         Ok(())
+    }
+
+    /// Whether this window is subscribed to a display's link.
+    pub fn is_running(&self) -> bool {
+        self.registration.is_some()
     }
 
     pub fn take_signal(&self) -> Option<(Instant, FrameRequestSource)> {

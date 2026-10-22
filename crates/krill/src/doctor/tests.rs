@@ -149,6 +149,23 @@ fn daemon_down_fails_and_skipped_stays_skip() {
     );
 }
 
+/// Windows도 실제 holder 기동 경로를 사용하고, 실행 파일 누락은 미지원이 아닌 실패다.
+#[test]
+fn missing_daemon_helper_reports_start_failure() {
+    let dir = std::env::temp_dir().join(format!("kd-{}", std::process::id()));
+    let paths = krill_proto::daemon::Paths {
+        socket: dir.join("krilld.sock"),
+        holder: dir.join("missing-holder"),
+        krilld: dir.join("missing-krilld"),
+    };
+    let result = super::connect_daemon(&paths);
+    assert!(
+        matches!(&result, Daemon::Down { error } if error.contains("executable not found")),
+        "{result:?}"
+    );
+    assert!(!dir.exists(), "missing helpers must not start a daemon");
+}
+
 /// OWE-684: holder 상실은 경고하고(종료 코드 영향 없음) 복구 힌트를 남긴다.
 #[test]
 fn holder_orphan_warns_with_recovery_hint() {

@@ -37,23 +37,6 @@ pub(crate) fn poll_session(
     poll_session_in(&roots, stored, fallback_cwd, offset)
 }
 
-/// 세션의 트랜스크립트 경로와 대화 ID를 해석한다.
-pub(crate) fn resolve_session_transcript(
-    state_dir: Option<&Path>,
-    stored: &StoredLaunch,
-    fallback_cwd: &[u8],
-) -> Option<(PathBuf, String)> {
-    let roots = collect_roots(state_dir);
-    let agent = VaultAgent::parse(&stored.profile)?;
-    let cwd_bytes = if stored.cwd.is_empty() {
-        fallback_cwd
-    } else {
-        stored.cwd.as_slice()
-    };
-    let cwd_str = String::from_utf8_lossy(cwd_bytes);
-    resolve_transcript(&roots, agent, stored, &cwd_str)
-}
-
 pub(crate) fn poll_session_in(
     roots: &VaultRoots,
     stored: Option<&StoredLaunch>,

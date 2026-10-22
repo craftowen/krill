@@ -188,7 +188,7 @@ pub fn claude_hook(command: &str) -> serde_json::Value {
 }
 
 /// Claude `settings.json` 머지. 항목 모양은 `{"hooks": [{"type": "command",
-/// "name": "minikrill", "command": ...}]}`이며 이미 있으면 건드리지 않는다.
+/// "name": "krill", "command": ...}]}`이며 이미 있으면 건드리지 않는다.
 pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<String> {
     let mut value = parse_hook_json(before)?;
     let root = value
@@ -209,7 +209,7 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
         handler
             .as_object_mut()
             .ok_or_else(|| merge_error("Claude hook handler must be an object"))?
-            .insert("name".into(), json!("minikrill"));
+            .insert("name".into(), json!("krill"));
         let entry = json!({"hooks": [handler]});
         if !entries.contains(&entry) {
             entries.push(entry);
@@ -218,7 +218,7 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
     encode_hook_json(&value)
 }
 
-/// Claude 외 에이전트 머지. Antigravity는 `minikrill` 묶음 키 아래에
+/// Claude 외 에이전트 머지. Antigravity는 `krill` 묶음 키 아래에
 /// `agy_event_command` 완성 명령(`hook agy <event>` 포함)을 넣는다.
 pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> io::Result<String> {
     let mut value = parse_hook_json(before)?;
@@ -227,16 +227,16 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
         .ok_or_else(|| merge_error("settings must be an object"))?;
     if agent == Agent::Agy {
         let bundle = root
-            .entry("minikrill")
+            .entry("krill")
             .or_insert(json!({}))
             .as_object_mut()
-            .ok_or_else(|| merge_error("hooks.minikrill must be an object"))?;
+            .ok_or_else(|| merge_error("hooks.krill must be an object"))?;
         for &event in agent.events() {
             let entries = bundle
                 .entry(event)
                 .or_insert(json!([]))
                 .as_array_mut()
-                .ok_or_else(|| merge_error(format!("minikrill.{event} must be an array")))?;
+                .ok_or_else(|| merge_error(format!("krill.{event} must be an array")))?;
             let ev_cmd = agy_event_command(command, event);
             let entry = if matches!(event, "PreToolUse" | "PostToolUse") {
                 json!({
@@ -272,7 +272,7 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
         let entry = if agent == Agent::Cursor {
             json!({"command": command})
         } else {
-            json!({"hooks": [{"type": "command", "name": "minikrill", "command": command}]})
+            json!({"hooks": [{"type": "command", "name": "krill", "command": command}]})
         };
         // 영수증 없이 같은 항목이 있으면 사용자 소유로 보고 가져오지 않는다.
         if !entries.contains(&entry) {

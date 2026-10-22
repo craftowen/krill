@@ -135,7 +135,7 @@ pub(super) fn read_config_with_state(
     top: &Path,
     state_dir: Option<&Path>,
 ) -> Result<Config, String> {
-    let mut config: Config = match read(&top.join(CONFIG))? {
+    let mut config: Config = match read(&krill_proto::user_dirs::repo_config(top))? {
         Some(s) => toml::from_str(&s).map_err(|e| format!("{CONFIG}: {e}"))?,
         None => Config::default(),
     };

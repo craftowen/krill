@@ -67,7 +67,7 @@ fn write_crash(dir: &Path, process: &str, info: &PanicHookInfo<'_>) -> io::Resul
     let seq = CRASH_SEQ.fetch_add(1, Ordering::Relaxed);
     let pid = std::process::id();
     let thread = std::thread::current();
-    let mut text = header("minikrill crash report", now);
+    let mut text = header("krill crash report", now);
     // `String`에 쓰는 `write!`는 실패하지 않는다.
     writeln!(text, "process: {process}").ok();
     writeln!(text, "pid: {pid}").ok();
@@ -162,11 +162,11 @@ pub fn acknowledge(logs: &[PathBuf]) {
     }
 }
 
-/// 리댁션한 진단 번들을 `<상태 디렉터리>/diagnostics/minikrill-diag-<unix초>.txt`(0600)로 쓰고 경로를 돌려준다.
+/// 리댁션한 진단 번들을 `<상태 디렉터리>/diagnostics/krill-diag-<unix초>.txt`(0600)로 쓰고 경로를 돌려준다.
 /// 크래시 로그는 최신 것부터 넣고 4MiB를 넘기면 멈춘다.
 pub fn write_bundle(state: &Path) -> io::Result<PathBuf> {
     let now = unix_secs();
-    let mut text = header("minikrill diagnostic bundle", now);
+    let mut text = header("krill diagnostic bundle", now);
     let dir = crash_dir(state);
     let mut logs = list(&dir, PENDING);
     logs.extend(list(&dir, SEEN));
@@ -187,7 +187,7 @@ pub fn write_bundle(state: &Path) -> io::Result<PathBuf> {
     }
     let out = state.join(BUNDLE_DIR);
     DirBuilder::new().recursive(true).mode(0o700).create(&out)?;
-    let path = out.join(format!("minikrill-diag-{now}.txt"));
+    let path = out.join(format!("krill-diag-{now}.txt"));
     OpenOptions::new()
         .write(true)
         .create(true)

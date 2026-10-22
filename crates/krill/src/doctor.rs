@@ -116,7 +116,7 @@ fn render_head(collected: &Collected) {
     #[cfg(unix)]
     println!("launch     dev build (posix_spawn + setsid; TCC attribution follows the launcher)");
     #[cfg(windows)]
-    println!("launch     SKIP: starting krilld is not supported on Windows yet");
+    println!("launch     detached holder (Windows bootstrap + Job breakaway)");
 }
 
 /// 현행 줄 형식을 그대로 그리는 항목(helpers·state·crash·record·telemetry·git·daemon·history).
@@ -263,7 +263,7 @@ fn collect(no_start: bool) -> Collected {
         Some(p) if !helpers_ok || !state_ok => Daemon::Skipped {
             reason: "fix the failures above first".to_owned(),
         },
-        Some(p) if no_start && cfg!(unix) => ping_daemon(p),
+        Some(p) if no_start => ping_daemon(p),
         Some(p) => connect_daemon(p),
     };
     let daemon_build = match &daemon {
@@ -391,7 +391,6 @@ fn probe_holder(paths: &Paths) -> Option<HolderStatus> {
 }
 
 /// krilld에 붙는다. 없으면 holder를 띄워 재결합까지 기다린다(현행 doctor).
-#[cfg(unix)]
 fn connect_daemon(paths: &Paths) -> Daemon {
     let hello = daemon::client_hello(ClientRole::Cli, "krill doctor");
     match daemon::connect(paths, &hello) {
@@ -613,24 +612,6 @@ fn executable(path: &Path) -> bool {
 #[cfg(windows)]
 fn login_path() -> Option<OsString> {
     std::env::var_os("PATH")
-}
-
-/// Windows에는 아직 데몬 기동 경로가 없다(holder exec 핸드오프는 Unix 전용). 떠 있으면 ping으로 붙고,
-/// 아니면 고장이 아니라 미지원으로 건너뛴다(`--no-start`도 같다).
-#[cfg(windows)]
-fn connect_daemon(paths: &Paths) -> Daemon {
-    match ping_daemon(paths) {
-        Daemon::Down { error } => Daemon::Skipped {
-            reason: format!(
-                "{} (ping: {error})",
-                std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "starting krilld is not supported on Windows yet",
-                )
-            ),
-        },
-        up => up,
-    }
 }
 
 /// 상태 디렉터리·`run/`에 실제로 써 본다. Unix 소유자(uid) 검사는 Windows ACL에 대응하는 것이 없어 건너뛴다

@@ -5,9 +5,12 @@ use serde::{Deserialize, Serialize};
 use super::Window;
 use crate::SessionId;
 
-/// Codex banked reset 크레딧 미터 키(`rate_limit_reset_credits.available_count`).
-/// 팝업·설정은 이 키로 남은 소진 가능 횟수를 읽는다.
+/// 리셋 크레딧 미터 키. 팝업·설정은 이 키로 남은 소진 가능 횟수를 읽는다.
+/// Codex는 `rate_limit_reset_credits.available_count`, Claude는 주간 세션 리셋(`juniper_tide`)
+/// 제공 여부와 프로모션 grant(`cedar_ember`) 사용 가능 합을 같은 키로 담는다.
 pub const RESET_CREDITS_METER_KEY: &str = "reset_credits";
+/// 리셋 크레딧 미터 라벨. [`crate::accounts::display::meter_label`]이 현지화한다.
+pub const RESET_CREDITS_METER_LABEL: &str = "Reset credits";
 
 /// A meter actually reported by a provider. Missing meters are never invented as 0%.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

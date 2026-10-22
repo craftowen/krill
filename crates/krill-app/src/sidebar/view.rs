@@ -4,10 +4,12 @@
 //! 호스트 섹션 헤더 배치 참고:
 //! `.ref/orca/src/renderer/src/components/sidebar/worktree-list/rows/HostSectionHeader.tsx`
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
+//! 에이전트 요약·목록의 공통 패널 배치 참고: 같은 MIT 원본의
+//! `WorktreeCardAgents.tsx`·`worktree-card-compact-agents.tsx`.
 
 use std::path::PathBuf;
 
-use gpui::{AnyElement, Context, Window, div, prelude::*, px, uniform_list};
+use gpui::{AnyElement, Context, Focusable as _, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::Input;
@@ -19,8 +21,8 @@ use krill_proto::control::{AgentProfile, Program};
 use super::{
     Activate, CHILD_INDENT, Collapse, Dismiss, Expand, KEY_CONTEXT, NewAgent1, NewAgent2,
     NewAgent3, NewAgent4, OpenInCursor, OpenInFinder, OpenInVsCode, OpenInZed, ROW_GROUP,
-    ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin, VIRTUALIZED_ROWS,
-    basename, state_text, text,
+    ROW_HEIGHT, Rename, Row, SelectNext, SelectPrev, Sidebar, Target, TogglePin, basename,
+    state_text, text,
 };
 use crate::hosts::{HostId, HostStatus};
 use crate::ui;
@@ -396,40 +398,9 @@ fn row_menu(
 }
 
 impl Sidebar {
-    /// 워크트리 바로 뒤의 세션만 카드 안에 넣는다. 주의 필요/폴더 행은 독립적으로 유지한다.
-    fn card_session_indices(&self, index: usize) -> std::ops::Range<usize> {
-        let start = index + 1;
-        let Some(Row::Worktree(path)) = self.rows.get(index) else {
-            return start..start;
-        };
-        let host = self.row_host(index);
-        let cursor_inside = self.cursor.is_some_and(|cursor| {
-            self.row_host(cursor) == host
-                && matches!(self.rows.get(cursor), Some(Row::Session(s, true)) if s.worktree.as_ref() == Some(path))
-        });
-        if !self.expanded_cards.contains(path) && !cursor_inside {
-            return start..start;
-        }
-        let count = self
-            .rows
-            .iter()
-            .skip(start)
-            .take_while(
-                |row| matches!(row, Row::Session(s, true) if s.worktree.as_ref() == Some(path)),
-            )
-            .count();
-        start..start + count
-    }
-
-    fn session_card_index(&self, index: usize) -> Option<usize> {
-        let Row::Session(session, true) = self.rows.get(index)? else {
-            return None;
-        };
-        let parent = (0..index)
-            .rev()
-            .find(|i| !matches!(self.rows.get(*i), Some(Row::Session(_, true))))?;
-        matches!(self.rows.get(parent), Some(Row::Worktree(path)) if session.worktree.as_ref() == Some(path))
-            .then_some(parent)
+    /// Rebuilt with the row model; lookup stays constant-time while scrolling a large card.
+    pub(super) fn session_card_index(&self, index: usize) -> Option<usize> {
+        self.card_parents.get(index).copied().flatten()
     }
 
     fn worktree_card_active(&self, index: usize, path: &std::path::Path) -> bool {
@@ -460,21 +431,20 @@ impl Sidebar {
                 ))
     }
 
-    /// 고정 높이 가상 목록에서는 행별 테두리를 이어 같은 워크트리 카드로 보이게 한다.
-    fn virtual_card_segment(
+    /// 카드 머리줄과 세션을 따로 가상화하되 표면·테두리는 끊김 없이 잇는다.
+    fn card_segment(
         &self,
         index: usize,
         row: &Row,
         element: gpui::Stateful<gpui::Div>,
         cx: &Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        if self.rows.len() < VIRTUALIZED_ROWS {
-            return element;
-        }
         if matches!(row, Row::Worktree(_)) {
-            return element.when(self.session_card_index(index + 1) == Some(index), |d| {
-                d.h(px(30.)).mb_0().border_b_0().rounded_b_none()
-            });
+            return element.when(
+                self.session_card_index(index + 1) == Some(index)
+                    && self.card_list.contains_row(index + 1),
+                |d| d.mb_0().pb_0().border_b_0().rounded_b_none(),
+            );
         }
         let Some(parent) = self.session_card_index(index) else {
             return element;
@@ -484,17 +454,60 @@ impl Sidebar {
         };
         let last = self.session_card_index(index + 1) != Some(parent);
         let depth = if self.row_host(parent).is_local() {
-            self.lineage_depth(path)
+            self.cached_lineage_depth(path)
         } else {
             0
         };
         let p = ui::palette(cx);
+        let active = self.worktree_card_active(parent, path);
+        if self.options.card_layout == super::CardLayout::Detailed {
+            // 요약 바와 같은 안쪽 경계로 잇는다. 세션별 가상화는 유지하고
+            // 바깥 워크트리 표면과 안쪽 에이전트 패널을 각각 연속해서 그린다.
+            let session = element
+                .h(px(26.))
+                .mx_0()
+                .px_1p5()
+                .rounded_none()
+                .border_l_1()
+                .border_r_1()
+                .border_color(p.worktree_sidebar_border)
+                .when(self.cursor != Some(index), |d| {
+                    d.bg(if active {
+                        p.sidebar.opacity(0.75)
+                    } else {
+                        p.sidebar_accent.opacity(0.65)
+                    })
+                })
+                .when(last, |d| d.border_b_1().rounded_b(ui::RADIUS_XS));
+            return div()
+                .id(("card-session-surface", index))
+                .debug_selector(move || format!("card-session-surface-{index}"))
+                .flex_none()
+                .ml(px(self.worktree_margin(depth)))
+                .mr_1p5()
+                .pl(px(30.))
+                .pr_2p5()
+                .border_l_1()
+                .border_r_1()
+                .border_color(ui::TRANSPARENT)
+                .when(last, |d| {
+                    d.pb_1p5().mb_0p5().border_b_1().rounded_b(ui::RADIUS_MD)
+                })
+                .when(active, |d| {
+                    d.bg(p.worktree_sidebar)
+                        .border_color(p.sidebar_ring.opacity(0.65))
+                })
+                .when(depth > 0 && !active, |d| {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                })
+                .child(session);
+        }
         element
-            .h(px(if last { 30. } else { ROW_HEIGHT }))
+            .h(px(if last { ROW_HEIGHT } else { 26. }))
             .mx_0()
             .ml(px(self.worktree_margin(depth)))
             .mr_1p5()
-            .pl(px(12.))
+            .pl(px(CARD_SESSION_INSET + CHILD_INDENT) + ui::SPACE_1)
             .pr_2p5()
             .rounded_none()
             .border_l_1()
@@ -523,14 +536,31 @@ impl Sidebar {
         let row_host = self.row_host(index).clone();
         let host_indent = self.host_indent();
         let base = div()
-            .id(index)
+            .id(super::viewport::row_id(&row_host, row))
             .group(ROW_GROUP)
             .role(gpui::Role::ListItem)
             .aria_position_in_set(index + 1)
             .aria_size_of_set(self.rows.len())
             .aria_selected(selected)
+            .relative()
             .flex_none()
             .overflow_hidden()
+            .when(self.card_list.pending_reveal.get() == Some(index), |d| {
+                let pending = self.card_list.pending_reveal.clone();
+                d.child(
+                    gpui::canvas(
+                        move |bounds, window, _| {
+                            if pending.get() == Some(index) {
+                                pending.set(None);
+                                window.request_autoscroll(bounds);
+                            }
+                        },
+                        |_, (), _, _| {},
+                    )
+                    .absolute()
+                    .size_full(),
+                )
+            })
             .when(dimmed, |d| d.opacity(0.45));
         let single_line = |d: gpui::Stateful<gpui::Div>| {
             d.h(px(ROW_HEIGHT))
@@ -1124,23 +1154,18 @@ impl Sidebar {
                         }
                     ))
                     .when(*nested, |d| {
-                        // 카드 상태 칸에 맞춰 세션 이름이 불필요하게 오른쪽으로 밀리지 않게 한다.
+                        // 한 단계의 세션 들여쓰기만 더한다. 호스트·계보 여백은 카드
+                        // 표면이 이미 갖고 있으므로 카드 안에서는 다시 누적하지 않는다.
                         let pl = match &session.worktree {
                             Some(tree) => {
                                 let depth = if row_host.is_local() {
-                                    self.lineage_depth(tree)
+                                    self.cached_lineage_depth(tree)
                                 } else {
                                     0
                                 };
-                                if inside_card && self.rows.len() < VIRTUALIZED_ROWS {
-                                    // 실제 카드 안에 렌더된 행은 이미 카드의 들여쓰기를 상속한다.
-                                    // 전역 좌표의 카드 여백을 다시 더하면 호스트/계보 깊이가 중복된다.
-                                    0.
-                                } else {
-                                    self.worktree_margin(depth) + CARD_SESSION_INSET
-                                }
+                                self.worktree_margin(depth) + CARD_SESSION_INSET + CHILD_INDENT
                             }
-                            None => host_indent + FOLDER_SESSION_INSET,
+                            None => host_indent + FOLDER_SESSION_INSET + CHILD_INDENT,
                         };
                         d.pl(px(pl)).pr_2()
                     })
@@ -1155,14 +1180,20 @@ impl Sidebar {
                         .text_color(p.sidebar_accent_foreground)
                     })
                     .child(
-                        status::status_glyph(session.status.state, unread, Size::Sm, cx)
-                            .debug_selector(move || format!("session-state-{index}"))
-                            .id(("session-status", index))
-                            .aria_label(state_tip.clone())
-                            .tooltip(move |window, cx| {
-                                gpui_component::tooltip::Tooltip::new(state_tip.clone())
-                                    .build(window, cx)
-                            }),
+                        status::status_glyph_slot(
+                            session.status.state,
+                            unread,
+                            Size::Sm,
+                            self.spinner_slots(index),
+                            cx,
+                        )
+                        .debug_selector(move || format!("session-state-{index}"))
+                        .id(("session-status", index))
+                        .aria_label(state_tip.clone())
+                        .tooltip(move |window, cx| {
+                            gpui_component::tooltip::Tooltip::new(state_tip.clone())
+                                .build(window, cx)
+                        }),
                     )
                     .child(status::agent_icon(
                         status::infer_agent_from_status(&session.status, &name),
@@ -1231,7 +1262,7 @@ impl Sidebar {
                     }))
             }
         };
-        self.virtual_card_segment(index, row, element, cx)
+        self.card_segment(index, row, element, cx)
     }
 
     /// 워크트리 카드 제목 자리(OWE-847): 이름 변경 중이면 인라인 입력창 + 저장(✓)·취소(✕) 버튼
@@ -1336,7 +1367,8 @@ impl Sidebar {
             row_host.clone(),
         );
         let closed = self.collapsed.contains(path);
-        let card_expanded = self.expanded_cards.contains(path);
+        let card_expanded = self.session_card_index(index + 1) == Some(index)
+            && self.card_list.contains_row(index + 1);
         let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
         let name = self.name(path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
@@ -1394,7 +1426,15 @@ impl Sidebar {
                 !s.status.agent.is_empty()
                     || !matches!(s.status.state, AgentState::Exited | AgentState::Unknown)
             })
-            .map(|s| (s.status.state, s.status.agent.as_str()))
+            .map(|s| {
+                (
+                    s.status.state,
+                    status::infer_agent_from_status(
+                        &s.status,
+                        s.status.title.as_deref().unwrap_or_default(),
+                    ),
+                )
+            })
             .collect();
         let summary = status::summarize(&summary_pairs);
         let tree_session_count = tree_sessions.len();
@@ -1432,7 +1472,8 @@ impl Sidebar {
         } else if let Some(top) = summary.groups.first() {
             // 완료(`Done`)는 체크 글리프, 그 외(작업 중·대기·종료·알 수 없음)는
             // 묶음 선두 상태의 글리프를 그대로 보인다. 유휴(묶음 없음)는 흐릿한 점.
-            status::status_glyph(top.state, false, Size::Md, cx).into_any_element()
+            status::status_glyph_slot(top.state, false, Size::Md, self.spinner_slots(index), cx)
+                .into_any_element()
         } else {
             div()
                 .size(ui::STATE_DOT)
@@ -1667,15 +1708,14 @@ impl Sidebar {
 
         let visible_comment = props.comment.then_some(comment).flatten();
         let has_agent_pill = !summary.groups.is_empty() || tree_session_count > 0;
-        let has_line3 = visible_comment.is_some() || has_agent_pill;
 
         let lineage_depth = if row_host.is_local() {
-            self.lineage_depth(path)
+            self.cached_lineage_depth(path)
         } else {
             0
         };
         let lineage_child_count = if row_host.is_local() {
-            self.lineage_children(path).len()
+            self.cached_lineage_child_count(path)
         } else {
             0
         };
@@ -1727,22 +1767,8 @@ impl Sidebar {
         });
 
         let is_editing_this = self.editing.as_ref().is_some_and(|(p, _)| p == path);
-        // OWE-900: 가상화 구간(`rows >= VIRTUALIZED_ROWS`)에서는 `uniform_list` 고정 높이
-        // 제약으로 가변 높이 상세 카드를 그릴 수 없어, 평문 행 대신 고정 높이 컴팩트 카드를
-        // 렌더한다. 상태 점·브랜치·코멘트·배지·들여쓰기를 유지해 세션 없는 이관 워크트리도
-        // 일반 카드와 같이 보인다.
-        let compact_fallback = self.rows.len() >= VIRTUALIZED_ROWS;
-        let session_rows: Vec<_> = if compact_fallback {
-            Vec::new()
-        } else {
-            self.card_session_indices(index)
-                .filter_map(|i| {
-                    let row = self.rows.get(i)?;
-                    Some(self.render_row_with_menu(i, row, cx))
-                })
-                .collect()
-        };
-        if self.options.card_layout == super::CardLayout::Compact || compact_fallback {
+        // Card headers and session rows have separate list entries at every size.
+        if self.options.card_layout == super::CardLayout::Compact {
             let compact_path = card_path.clone();
             let compact_fold = fold.clone();
             let compact_host = row_host.clone();
@@ -1790,6 +1816,7 @@ impl Sidebar {
                             .gap_1p5()
                             .child(
                                 div()
+                                    .debug_selector(move || format!("worktree-state-{index}"))
                                     .w(px(14.))
                                     .h(px(14.))
                                     .flex_none()
@@ -1889,8 +1916,6 @@ impl Sidebar {
                         cx,
                     ),
                 )
-                .when(!session_rows.is_empty(), gpui::Styled::pb_1)
-                .children(session_rows)
                 .on_click(cx.listener(move |s, _, window, cx| {
                     s.activate_worktree_card(
                         index,
@@ -1905,16 +1930,19 @@ impl Sidebar {
         let checkpoint_visible = card_checkpoint_parts
             .as_ref()
             .is_some_and(|parts| parts.label(has_issue_badge).is_some() || parts.unread);
-        let badge_count = usize::from(checkpoint_visible)
-            + usize::from(worktree_cache_badge.is_some())
-            + usize::from(host_badge.is_some())
-            + usize::from(issue_badge.is_some())
-            + usize::from(ports_badge.is_some())
-            + usize::from(dirty_badge.is_some())
-            + usize::from(pr_badge.is_some());
-        let has_badges = badge_count > 0;
-        let has_line2 = show_branch_subtitle || has_badges;
-        let dense_badges = badge_count >= 2 || checkpoint_visible;
+        // 미커밋 수(`±N`)는 1행 오른쪽 수치 열로 옮겼으므로 배지 줄에서 뺀다.
+        let has_badges = checkpoint_visible
+            || worktree_cache_badge.is_some()
+            || host_badge.is_some()
+            || issue_badge.is_some()
+            || ports_badge.is_some()
+            || pr_badge.is_some();
+        // 2행 왼쪽: 브랜치가 제목과 다르면 브랜치, 아니면 코멘트를 끌어올린다.
+        let line2_comment = (!show_branch_subtitle).then_some(visible_comment).flatten();
+        let tail_comment = visible_comment.filter(|_| line2_comment.is_none());
+        let has_line2 = !is_editing_this
+            && (show_branch_subtitle || line2_comment.is_some() || lineage_toggle_btn.is_some());
+        let has_line3 = tail_comment.is_some() || has_agent_pill;
         let checkpoint_pill = card_checkpoint_parts.as_ref().map(|parts| {
             let label = parts.label(has_issue_badge);
             let a11y = label.clone().unwrap_or_default();
@@ -1926,13 +1954,15 @@ impl Sidebar {
                 .child(super::external::checkpoint_badge_element(parts, p))
         });
 
+        // 왼쪽은 이름·브랜치·코멘트, 오른쪽 수치 열은 `±N`(1행)과 계보 접기(2행)를 세로로 맞춘다.
+        // 호버 액션은 1행 오른쪽 위에 겹쳐 띄우고, 핀 고정 별이 상시 보이는 동안만 그 폭을 비워 둔다.
         let header = div()
             .id(("worktree-header", index))
             .w_full()
             .flex()
             .flex_col()
             .gap_0p5()
-            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 + 자식 접기/펼치기 버튼 + 호버 액션 버튼 오버레이
+            // 1행: 상태 아이콘/점 + 워크트리 표시 이름 + [기본] 배지 | 미커밋 수 + 호버 액션 오버레이
             .child(
                 div()
                     .relative()
@@ -1941,8 +1971,10 @@ impl Sidebar {
                     .flex()
                     .items_center()
                     .gap_1p5()
+                    .when(pinned && !is_editing_this, |d| d.pr(px(22.)))
                     .child(
                         div()
+                            .debug_selector(move || format!("worktree-state-{index}"))
                             .w(px(14.))
                             .h(px(14.))
                             .flex_none()
@@ -1966,107 +1998,102 @@ impl Sidebar {
                                             format!("worktree-default-badge-{index}")
                                         })
                                         .flex_none()
-                                        .px_1p5()
-                                        .py(px(1.))
+                                        .px_1()
                                         .rounded(ui::RADIUS_XS)
-                                        .border_1()
-                                        .border_color(p.worktree_sidebar_border)
+                                        .bg(p.worktree_sidebar_accent)
                                         .text_size(ui::TEXT_2XS)
                                         .text_color(p.muted_foreground)
                                         .child(crate::i18n::catalog::general::DEFAULT.get()),
                                 )
-                            })
-                            .when(!is_editing_this, |d| d.children(lineage_toggle_btn)),
+                            }),
                     )
                     .when(!is_editing_this, |d| {
-                        d.child(
+                        d.children(dirty_badge).child(
                             div()
-                                .flex_none()
+                                .absolute()
+                                .top_0()
+                                .right_0()
+                                .h_full()
                                 .flex()
                                 .items_center()
                                 .gap_0p5()
+                                .rounded(ui::RADIUS_XS)
+                                .group_hover(ROW_GROUP, |d| {
+                                    d.bg(if is_active_worktree {
+                                        p.worktree_sidebar
+                                    } else {
+                                        p.sidebar_accent
+                                    })
+                                })
                                 .child(new_session_btn)
                                 .child(rename_btn)
                                 .child(pin_btn),
                         )
                     }),
             )
-            // 2행: 들여쓴 브랜치 이름 + 체크포인트·캐시 타이머·호스트·이슈·포트·미커밋·PR 배지
+            // 2행: 브랜치 이름(또는 코멘트) | 계보 자식 접기/펼치기
             .when(has_line2, |d| {
-                if show_branch_subtitle && dense_badges {
-                    d.child(
-                        div()
-                            .w_full()
-                            .pl(px(20.))
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .debug_selector(move || format!("worktree-branch-{index}"))
-                                    .w_full()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_size(ui::TEXT_XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(branch_subtitle),
-                            )
-                            .child(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .flex_wrap()
-                                    .items_center()
-                                    .gap_1()
-                                    .children(checkpoint_pill)
-                                    .children(worktree_cache_badge)
-                                    .children(host_badge)
-                                    .children(issue_badge)
-                                    .children(ports_badge)
-                                    .children(dirty_badge)
-                                    .children(pr_badge),
-                            ),
-                    )
-                } else {
-                    d.child(
-                        div()
-                            .w_full()
-                            .min_h(px(18.))
-                            .pl(px(20.))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap_1p5()
-                            .when(show_branch_subtitle, |d| {
-                                d.child(
-                                    div()
-                                        .debug_selector(move || format!("worktree-branch-{index}"))
-                                        .flex_1()
-                                        .min_w_0()
-                                        .truncate()
-                                        .text_size(ui::TEXT_XS)
-                                        .text_color(p.muted_foreground)
-                                        .child(branch_subtitle),
-                                )
-                            })
-                            .when(has_badges, |d| {
-                                d.child(
-                                    div()
-                                        .flex()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap_1()
-                                        .children(checkpoint_pill)
-                                        .children(worktree_cache_badge)
-                                        .children(host_badge)
-                                        .children(issue_badge)
-                                        .children(ports_badge)
-                                        .children(dirty_badge)
-                                        .children(pr_badge),
-                                )
-                            }),
-                    )
-                }
+                d.child(
+                    div()
+                        .w_full()
+                        .min_h(px(18.))
+                        .pl(px(20.))
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .when(pinned, |d| d.pr(px(22.)))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .when(show_branch_subtitle, |d| {
+                                    d.child(
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("worktree-branch-{index}")
+                                            })
+                                            .w_full()
+                                            .min_w_0()
+                                            .truncate()
+                                            .text_size(ui::TEXT_XS)
+                                            .text_color(p.muted_foreground)
+                                            .child(branch_subtitle),
+                                    )
+                                })
+                                .children(
+                                    super::external::render_comment(
+                                        line2_comment,
+                                        p.muted_foreground,
+                                    )
+                                    .map(|el| {
+                                        div()
+                                            .debug_selector(move || {
+                                                format!("worktree-comment-{index}")
+                                            })
+                                            .child(el)
+                                    }),
+                                ),
+                        )
+                        .children(lineage_toggle_btn),
+                )
+            })
+            // 배지 줄: 체크포인트·캐시 타이머·호스트·이슈·포트·PR (있을 때만)
+            .when(has_badges && !is_editing_this, |d| {
+                d.child(
+                    div()
+                        .w_full()
+                        .pl(px(20.))
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .children(checkpoint_pill)
+                        .children(worktree_cache_badge)
+                        .children(host_badge)
+                        .children(issue_badge)
+                        .children(ports_badge)
+                        .children(pr_badge),
+                )
             })
             // 3행: 코멘트 또는 에이전트 상태 요약(1개 세션이면 인라인 요약 줄, 다중 세션이면 알약 바)
             .when(has_line3, |d| {
@@ -2084,7 +2111,7 @@ impl Sidebar {
                         .flex_col()
                         .gap_1()
                         .children(
-                            super::external::render_comment(visible_comment, p.muted_foreground)
+                            super::external::render_comment(tail_comment, p.muted_foreground)
                                 .map(|el| {
                                     div()
                                         .debug_selector(move || format!("worktree-comment-{index}"))
@@ -2109,10 +2136,11 @@ impl Sidebar {
                                         .gap_1p5()
                                         .cursor_pointer()
                                         .hover(|d| d.bg(p.worktree_sidebar_accent))
-                                        .child(status::status_glyph(
+                                        .child(status::status_glyph_slot(
                                             sess.status.state,
                                             sess_unread,
                                             Size::Sm,
+                                            self.spinner_slots(index),
                                             cx,
                                         ))
                                         .child(status::agent_icon(
@@ -2151,12 +2179,15 @@ impl Sidebar {
                                 d.child(
                                     div()
                                         .id(("fold", index))
+                                        .debug_selector(move || format!("card-agent-summary-{index}"))
+                                        .aria_expanded(card_expanded)
                                         .w_full()
-                                        .h(px(25.))
-                                        .px_1p5()
+                                        .h(px(22.))
+                                        .px_1()
                                         .rounded(ui::RADIUS_XS)
                                         .border_1()
                                         .border_color(p.worktree_sidebar_border)
+                                        .when(card_expanded, |d| d.border_b_0().rounded_b_none())
                                         .bg(if is_active_worktree {
                                             p.sidebar.opacity(0.75)
                                         } else {
@@ -2201,7 +2232,12 @@ impl Sidebar {
                                                 })
                                                 .into_any_element()
                                         } else {
-                                            status::summary_element(&summary, cx).into_any_element()
+                                            status::summary_element(
+                                                &summary,
+                                                self.spinner_slots(index),
+                                                cx,
+                                            )
+                                            .into_any_element()
                                         })
                                         .child(
                                             Icon::new(if card_expanded {
@@ -2252,7 +2288,6 @@ impl Sidebar {
             .flex_col()
             .gap_0p5()
             .child(self.with_row_menu(index, &Row::Worktree(path.to_path_buf()), header, cx))
-            .children(session_rows)
             .on_click(cx.listener(move |s, _, window, cx| {
                 s.activate_worktree_card(
                     index,
@@ -2262,6 +2297,17 @@ impl Sidebar {
                     cx,
                 );
             }))
+    }
+
+    /// 행 스피너는 자리만 적는다(셸이 덮어 그림). 흐린 행은 덮어 그리는 스피너가
+    /// 행 투명도를 받지 못하므로 제자리 애니메이션(`None`)을 쓴다.
+    fn spinner_slots(&self, index: usize) -> Option<&status::SpinnerSlots> {
+        (!self.is_row_dimmed(index)).then_some(&self.spinner_slots)
+    }
+
+    /// 셸이 사이드바 바로 위에 두는 스피너 층.
+    pub fn spinner_overlay(&self) -> impl IntoElement {
+        status::spinner_overlay(&self.spinner_slots)
     }
 
     /// 행 + 우클릭 메뉴(세션 행은 열기·이어하기·종료 + 여기서 새 터미널·에이전트·Open in, 워크트리·폴더는 핀·이름 변경·계보 작업).
@@ -2374,62 +2420,46 @@ impl Sidebar {
 
     /// 가상 리스트(보이는 행만 만든다). 스크린 리더에는 이름 붙은 목록 하나로 보인다.
     pub(super) fn render_list(&mut self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        let content: AnyElement = if self.rows.len() >= VIRTUALIZED_ROWS {
-            uniform_list(
-                "worktree-list",
-                self.rows.len(),
-                cx.processor(|s, range: std::ops::Range<usize>, _, cx| {
-                    #[cfg(test)]
-                    {
-                        s.rendered_rows += range.len();
+        let editing = self
+            .editing
+            .as_ref()
+            .map(|(path, input)| (path.as_path(), input.read(cx).focus_handle(cx)));
+        self.card_list.focus_editor(editing);
+        let content = gpui::list(
+            self.card_list.state.clone(),
+            cx.processor(|s, item: usize, _, cx| {
+                let Some(index) = s.card_list.row_index(item) else {
+                    return div().into_any_element();
+                };
+                let Some(row) = s.rows.get(index).cloned() else {
+                    return div().into_any_element();
+                };
+                #[cfg(test)]
+                {
+                    s.rendered_rows += 1;
+                }
+                let joins_next = match &row {
+                    Row::Worktree(_) => {
+                        s.session_card_index(index + 1) == Some(index)
+                            && s.card_list.row_index(item + 1) == Some(index + 1)
                     }
-                    range
-                        .filter_map(|i| {
-                            let row = s.rows.get(i)?.clone();
-                            Some(
-                                div()
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .child(s.render_row_with_menu(i, &row, cx))
-                                    .into_any_element(),
-                            )
-                        })
-                        .collect()
-                }),
-            )
-            .track_scroll(&self.scroll)
-            .size_full()
-            .into_any_element()
-        } else {
-            #[cfg(test)]
-            let nested_rows: std::collections::BTreeSet<_> = (0..self.rows.len())
-                .flat_map(|i| self.card_session_indices(i))
-                .collect();
-            let items: Vec<AnyElement> = self
-                .rows
-                .clone()
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| self.session_card_index(*i).is_none())
-                .map(|(i, row)| self.render_row_with_menu(i, &row, cx))
-                .collect();
-            #[cfg(test)]
-            {
-                self.rendered_rows += items.len() + nested_rows.len();
-            }
-            div()
-                .id("worktree-list")
-                .size_full()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .children(items)
-                .into_any_element()
-        };
+                    Row::Session(_, true) => {
+                        s.session_card_index(index).is_some()
+                            && s.session_card_index(index + 1) == s.session_card_index(index)
+                    }
+                    _ => false,
+                };
+                div()
+                    .w_full()
+                    .when(!joins_next, gpui::Styled::pb_0p5)
+                    .child(s.render_row_with_menu(index, &row, cx))
+                    .into_any_element()
+            }),
+        )
+        .size_full();
         div()
             .id("worktree-list-a11y")
+            .debug_selector(|| "sidebar-viewport".to_owned())
             .role(gpui::Role::List)
             .aria_label(text::PROJECTS.get())
             .flex_1()
@@ -2726,6 +2756,7 @@ impl Render for Sidebar {
         {
             self.renders += 1;
         }
+        self.spinner_slots.clear();
         let p = ui::palette(cx);
         let list = self.render_list(cx);
         let setup_prompt = self.render_setup_prompt_card(cx);

@@ -89,7 +89,7 @@ fn execute(action: &str, args: &[&str]) -> io::Result<()> {
         return Ok(());
     }
     plan.apply()?;
-    println!("hooks {action} complete; pre-write backups use .minikrill-bak-* suffixes");
+    println!("hooks {action} complete; pre-write backups use .krill-bak-* suffixes");
     Ok(())
 }
 
@@ -165,8 +165,10 @@ fn config_path(agent: TargetAgent, home: &Path) -> io::Result<PathBuf> {
         TargetAgent::Other(Agent::Agy) => home.join(".gemini/config/hooks.json"),
         TargetAgent::Other(Agent::OpenCode) => {
             let xdg = directory_override("XDG_CONFIG_HOME", home.join(".config"))?;
-            directory_override("OPENCODE_CONFIG_DIR", xdg.join("opencode"))?
-                .join("plugins/minikrill.js")
+            krill_proto::user_dirs::opencode_plugin(&directory_override(
+                "OPENCODE_CONFIG_DIR",
+                xdg.join("opencode"),
+            )?)
         }
         TargetAgent::Other(Agent::Codex) => return Err(io::Error::other("Codex uses RPC trust")),
     })

@@ -334,48 +334,46 @@ identity_file = "~/.ssh/id_studio"
     .unwrap();
     fs::set_permissions(&home_ssh, fs::Permissions::from_mode(0o755)).unwrap();
 
-    // 구버전(또는 이관 전) 원격: 옛 번들 경로에만 소켓이 있다. 다음에는 새 경로가 이긴다.
-    for bundle in ["dev.minikrill.app", "dev.krill.app"] {
-        fs::create_dir_all(sock(bundle).parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(r.remote_socket(), sock(bundle)).unwrap();
-        fs::remove_file(r.ssh_log()).ok();
-        let out = Command::new(MK)
-            .args(["--host", "studio", "ls"])
-            .env("KRILL_STATE_DIR", &r.local_dir)
-            .env("KRILL_SSH_BIN", &home_ssh)
-            .env_remove("KRILL_REMOTE_SOCK")
-            .env("EXPECT_REMOTE", sock(bundle))
-            .env("MK099_LOG", r.ssh_log())
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{bundle} stderr: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let bundle = "dev.krill.app";
+    fs::create_dir_all(sock(bundle).parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(r.remote_socket(), sock(bundle)).unwrap();
+    fs::remove_file(r.ssh_log()).ok();
+    let out = Command::new(MK)
+        .args(["--host", "studio", "ls"])
+        .env("KRILL_STATE_DIR", &r.local_dir)
+        .env("KRILL_SSH_BIN", &home_ssh)
+        .env_remove("KRILL_REMOTE_SOCK")
+        .env("EXPECT_REMOTE", sock(bundle))
+        .env("MK099_LOG", r.ssh_log())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{bundle} stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 
-        let log = r.ssh_argv();
-        let lines: Vec<&str> = log.lines().collect();
-        assert_eq!(lines.len(), 2, "expected HOME query + tunnel spawn: {log}");
-        assert!(
-            lines[0].contains("-p 2222")
-                && lines[0].contains("-i ~/.ssh/id_studio")
-                && lines[0].contains("diffuser@test-remote")
-                && lines[0].contains(&krill_hosts::ssh::remote_query()),
-            "unexpected HOME query argv: {}",
-            lines[0]
-        );
-        assert!(
-            lines[1].contains("-p 2222")
-                && lines[1].contains("-i ~/.ssh/id_studio")
-                && lines[1].contains("-o ExitOnForwardFailure=yes")
-                && lines[1].contains("-o StreamLocalBindUnlink=yes")
-                && lines[1].contains(&format!(":{}", sock(bundle).display()))
-                && lines[1].contains("diffuser@test-remote"),
-            "unexpected tunnel argv: {}",
-            lines[1]
-        );
-    }
+    let log = r.ssh_argv();
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 2, "expected HOME query + tunnel spawn: {log}");
+    assert!(
+        lines[0].contains("-p 2222")
+            && lines[0].contains("-i ~/.ssh/id_studio")
+            && lines[0].contains("diffuser@test-remote")
+            && lines[0].contains(&krill_hosts::ssh::remote_query()),
+        "unexpected HOME query argv: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("-p 2222")
+            && lines[1].contains("-i ~/.ssh/id_studio")
+            && lines[1].contains("-o ExitOnForwardFailure=yes")
+            && lines[1].contains("-o StreamLocalBindUnlink=yes")
+            && lines[1].contains(&format!(":{}", sock(bundle).display()))
+            && lines[1].contains("diffuser@test-remote"),
+        "unexpected tunnel argv: {}",
+        lines[1]
+    );
     fs::remove_dir_all(&home).ok();
 }
 

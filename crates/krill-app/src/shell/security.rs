@@ -406,51 +406,74 @@ impl Shell {
         )
     }
 
-    /// 여러 줄 붙여넣기 경고 배너(붙여넣기 확인 / 취소, UI-1 디자인 토큰 적용).
-    pub(super) fn render_security_banner(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let pending = self.security.pending_paste()?;
+    /// Persistent safety confirmation inside the bottom-right toast stack.
+    pub(super) fn render_security_notice(
+        pending: &krill_app::security::PendingPaste,
+        shell: gpui::WeakEntity<Self>,
+        cx: &App,
+    ) -> AnyElement {
+        let confirm_shell = shell.clone();
+        let confirm = pending.clone();
+        let cancel = pending.clone();
         let p = krill_app::ui::palette(cx);
-        Some(
-            div()
-                .id("multiline-paste-warning")
-                .debug_selector(|| "multiline-paste-warning".into())
-                .px_3()
-                .py_1p5()
-                .bg(p.warning)
-                .text_color(p.warning_foreground)
-                .text_size(krill_app::ui::TEXT_XS)
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(div().flex_1().child(pending.warning_text()))
-                .child(
-                    div()
-                        .flex()
-                        .gap_1()
-                        .child(
-                            Button::new("paste-confirm")
-                                .label(sec_text::PASTE_CONFIRM.get())
-                                .debug_selector(|| "paste-confirm".into())
-                                .primary()
-                                .xsmall()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.confirm_pending_paste(window, cx);
-                                })),
-                        )
-                        .child(
-                            Button::new("paste-cancel")
-                                .label(sec_text::PASTE_CANCEL.get())
-                                .debug_selector(|| "paste-cancel".into())
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_pending_paste(cx);
-                                })),
-                        ),
-                )
-                .into_any_element(),
-        )
+        div()
+            .id("multiline-paste-warning")
+            .debug_selector(|| "multiline-paste-warning".into())
+            .w_full()
+            .min_w_0()
+            .px_3()
+            .py_1p5()
+            .bg(p.popover)
+            .text_color(p.popover_foreground)
+            .text_size(krill_app::ui::TEXT_XS)
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .whitespace_normal()
+                    .child(pending.warning_text()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_1()
+                    .child(
+                        Button::new("paste-confirm")
+                            .label(sec_text::PASTE_CONFIRM.get())
+                            .debug_selector(|| "paste-confirm".into())
+                            .primary()
+                            .xsmall()
+                            .on_click(move |_, window, cx| {
+                                confirm_shell
+                                    .update(cx, |this, cx| {
+                                        if this.security.pending_paste() == Some(&confirm) {
+                                            this.confirm_pending_paste(window, cx);
+                                        }
+                                    })
+                                    .ok();
+                            }),
+                    )
+                    .child(
+                        Button::new("paste-cancel")
+                            .label(sec_text::PASTE_CANCEL.get())
+                            .debug_selector(|| "paste-cancel".into())
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, cx| {
+                                shell
+                                    .update(cx, |this, cx| {
+                                        if this.security.pending_paste() == Some(&cancel) {
+                                            this.cancel_pending_paste(cx);
+                                        }
+                                    })
+                                    .ok();
+                            }),
+                    ),
+            )
+            .into_any_element()
     }
 
     /// 사이드바 하단 푸터(설정 + 활성 워크트리 이동·보드 대시보드). Secure Keyboard Entry는 앱 메뉴 토글만 둔다.
@@ -575,7 +598,7 @@ pub(crate) fn sniff_clipboard_image_extension(
 ///   파일이 디스크에 존재하지 않는 죽은 스크린샷 임시 경로면(#28245) 경로와 파일명 문자열을 건너뛰고
 ///   실제 이미지 바이트(`ClipboardEntry::Image`)를 저장해 붙여넣는다.
 /// - 비어 있지 않은 문자열 항목이 있으면 텍스트를 그대로 반환한다(이미지가 함께 있을 때는 공백만 있는 문자열은 건너뛴다).
-/// - 이미지 항목(`ClipboardEntry::Image`)이 있으면 `$TMPDIR/minikrill-paste/` 아래에 `0600` 파일로 저장하고
+/// - 이미지 항목(`ClipboardEntry::Image`)이 있으면 `$TMPDIR/krill-paste/` 아래에 `0600` 파일로 저장하고
 ///   셸 이스케이프된 파일 경로를 반환한다.
 pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
     use krill_proto::os::ffi::OsStrExt as _;
@@ -910,7 +933,7 @@ pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::pa
             "clipboard image size out of bounds",
         ));
     }
-    let dir = std::env::temp_dir().join("minikrill-paste");
+    let dir = std::env::temp_dir().join("krill-paste");
     std::fs::create_dir_all(&dir)?;
     #[cfg(unix)]
     {

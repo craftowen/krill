@@ -357,7 +357,8 @@ impl From<LegacyTail> for LayoutTail {
     }
 }
 
-/// 창 하나의 레이아웃. 불변식: 탭이 있으면 `active < tabs.len()`(없으면 `active == 0`), 각 탭의 `focused`는 그 탭의 잎.
+/// 창 하나의 레이아웃. 불변식: `active <= tabs.len()`이고 `active == tabs.len()`이면 보이는 탭이 없다
+/// (현재 워크스페이스의 탭을 모두 닫은 빈 화면). 각 탭의 `focused`는 그 탭의 잎.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Layout {
     tabs: Vec<Tab>,
@@ -582,7 +583,13 @@ impl Layout {
         &self.tabs[self.active]
     }
 
-    /// 활성 탭의 포커스 칸. 모든 탭이 닫혔으면 `None`.
+    /// 보이는 탭 없이 빈 화면을 띄운다. 다른 워크스페이스의 탭은 그대로 남는다(Orca 패리티).
+    pub fn deactivate(&mut self) {
+        self.active = self.tabs.len();
+        self.mru.cursor = None;
+    }
+
+    /// 활성 탭의 포커스 칸. 보이는 탭이 없으면 `None`.
     pub fn focused(&self) -> Option<PaneId> {
         self.tabs.get(self.active).map(|t| t.focused)
     }
@@ -1424,12 +1431,7 @@ impl Layout {
             sorted.windows(2).all(|w| w[0] != w[1])
         };
         let sessions_ok = self.sessions.keys().all(|p| seen.contains(p));
-        let active_ok = if self.tabs.is_empty() {
-            self.active == 0
-        } else {
-            self.active < self.tabs.len()
-        };
-        active_ok
+        self.active <= self.tabs.len()
             && widths_ok
             && tabs_ok
             && ids_ok

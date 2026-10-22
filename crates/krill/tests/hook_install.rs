@@ -31,7 +31,7 @@ impl Home {
             "claude" => ".claude/settings.json",
             "cursor" => ".cursor/hooks.json",
             "agy" | "antigravity" => ".gemini/config/hooks.json",
-            "opencode" => ".config/opencode/plugins/minikrill.js",
+            "opencode" => ".config/opencode/plugins/krill.js",
             _ => ".codex/config.toml",
         })
     }
@@ -226,7 +226,7 @@ fn unmodified_settings_roundtrip_bytes_and_keep_private_backups() {
         let backups: Vec<_> = fs::read_dir(h.config(agent).parent().unwrap())
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains("minikrill-bak"))
+            .filter(|e| e.file_name().to_string_lossy().contains("krill-bak"))
             .collect();
         assert_eq!(backups.len(), 2);
         for b in backups {
@@ -312,9 +312,9 @@ fn opencode_only_owns_its_plugin_and_respects_config_override() {
     c.env("OPENCODE_CONFIG_DIR", &custom)
         .args(["hook", "install", "opencode", "--yes"]);
     success(&output(&mut c, ""));
-    assert!(custom.join("plugins/minikrill.js").exists());
+    assert!(custom.join("plugins/krill.js").exists());
     success(&h.run("uninstall", "opencode", &["--yes"], ""));
-    assert!(!custom.join("plugins/minikrill.js").exists());
+    assert!(!custom.join("plugins/krill.js").exists());
 }
 
 #[test]
@@ -397,6 +397,31 @@ fn codex_rpc_install_preview_remove_preserves_user_trust_and_config() {
     assert!(h.read("codex").starts_with("# user comment"));
 }
 
+/// Finder로 뜬 앱은 launchd PATH라 `codex`를 못 찾는다. 호출자가 준 PATH로 찾아야 한다.
+#[test]
+fn codex_rpc_uses_the_caller_supplied_search_path() {
+    use krill_proto::hook_install::{Action, Plan, TargetAgent};
+    use std::path::Path;
+    let h = Home::new();
+    h.write("codex", "# original\n");
+    let bin = h.fake_codex();
+    let receipt = Plan::prepare_with_path(
+        Action::Install,
+        TargetAgent::Other(Agent::Codex),
+        &h.config("codex"),
+        &h.0.join("state"),
+        Path::new(MK),
+        Some(bin.as_os_str()),
+    )
+    .unwrap()
+    .unwrap()
+    .apply()
+    .unwrap();
+    assert!(receipt.complete);
+    let installed: toml::Value = toml::from_str(&h.read("codex")).unwrap();
+    assert!(!installed["hooks"]["state"].as_table().unwrap().is_empty());
+}
+
 #[test]
 fn codex_trust_conflicts_are_rejected_and_user_modified_hash_is_preserved() {
     let h = Home::new();
@@ -474,7 +499,7 @@ fn failed_codex_write_keeps_a_recoverable_receipt_and_does_not_claim_success_on_
 }
 
 #[test]
-fn opencode_plugin_executes_under_bun_and_does_not_spawn_outside_minikrill() {
+fn opencode_plugin_executes_under_bun_and_does_not_spawn_outside_krill() {
     let Some(bun) = krill_proto::agent::which("bun", &std::env::var_os("PATH").unwrap_or_default())
     else {
         return;
@@ -483,7 +508,7 @@ fn opencode_plugin_executes_under_bun_and_does_not_spawn_outside_minikrill() {
     success(&h.run("install", "opencode", &["--yes"], ""));
     let script = h.0.join("probe.mjs");
     fs::write(&script, r"
-import { KrillHook } from './.config/opencode/plugins/minikrill.js';
+import { KrillHook } from './.config/opencode/plugins/krill.js';
 let calls = 0;
 Bun.spawn = (args, options) => {
   calls++;
@@ -519,11 +544,11 @@ fn agy_hook_install_roundtrip_and_pre_tool_use_response() {
     success(&h.run("install", "agy", &["--yes"], ""));
     let installed = h.value("agy");
     assert!(installed.get("orca-status").is_some());
-    assert!(installed["minikrill"]["PreInvocation"].is_array());
-    assert!(installed["minikrill"]["PreToolUse"][0]["hooks"].is_array());
+    assert!(installed["krill"]["PreInvocation"].is_array());
+    assert!(installed["krill"]["PreToolUse"][0]["hooks"].is_array());
 
     // Execute the installed PreToolUse command inside a pane and verify it returns `{"decision":"ask"}`
-    let pre_cmd = installed["minikrill"]["PreToolUse"][0]["hooks"][0]["command"]
+    let pre_cmd = installed["krill"]["PreToolUse"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
     let mut cmd = Command::new("/bin/sh");
@@ -541,7 +566,7 @@ fn agy_hook_install_roundtrip_and_pre_tool_use_response() {
     assert_eq!(payload["hook_event_name"], "PreToolUse");
     assert_eq!(payload["tool_name"], "ask_question");
 
-    // Uninstall removes only minikrill bundle and restores original
+    // Uninstall removes only krill bundle and restores original
     success(&h.run("uninstall", "agy", &["--yes"], ""));
     assert_eq!(h.read("agy"), original);
 }

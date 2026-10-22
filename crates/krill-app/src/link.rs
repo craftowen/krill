@@ -69,6 +69,7 @@ pub fn notice_text(n: &Notice) -> String {
         Fate::SessionClosed => text::SESSION_CLOSED.get(),
         Fate::Full => text::FULL.get(),
         Fate::Unsupported => text::UNSUPPORTED.get(),
+        Fate::AccountSwitchFailed => text::ACCOUNT_SWITCH_FAILED.get(),
     };
     let s = String::from_utf8_lossy(&n.bytes);
     let mut preview: String = s

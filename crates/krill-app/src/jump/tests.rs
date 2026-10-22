@@ -18,8 +18,8 @@ fn ids(items: &[Item], query: &str) -> Vec<u64> {
 #[test]
 fn fuzzy_order_hangul_and_needs_you() {
     let items = [
-        item(1, "claude 1 · minikrill · 작업 중", false),
-        item(2, "codex 2 · 미니크릴 · 입력 대기", true),
+        item(1, "claude 1 · krill · 작업 중", false),
+        item(2, "codex 2 · 미니카 · 입력 대기", true),
         item(3, "claude 3 · mk-owe-422 · 완료", false),
         item(4, "claude 4 · main · 입력 대기", true),
     ];
@@ -27,7 +27,7 @@ fn fuzzy_order_hangul_and_needs_you() {
     assert_eq!(ids(&items, ""), [2, 4, 1, 3]);
     // 부분 수열·대소문자·공백 무시.
     assert_eq!(ids(&items, "MKO"), [3]);
-    assert_eq!(ids(&items, "mini krill"), [1]);
+    assert_eq!(ids(&items, "k rill"), [1]);
     // 한글 음절 단위 퍼지, 연속 일치가 흩어진 일치보다 앞.
     assert_eq!(ids(&items, "미니"), [2]);
     assert_eq!(ids(&items, "대기"), [2, 4]);
@@ -475,13 +475,13 @@ fn files_mode_uses_file_empty_text(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn jump_palette_worktrees_project_filters_and_cmd_digits(cx: &mut TestAppContext) {
-    let mut s1 = item(1, "* Claude Code · minikrill · main · 작업 중", false);
+    let mut s1 = item(1, "* Claude Code · krill · main · 작업 중", false);
     s1.title = "* Claude Code".into();
     s1.agent = "claude".into();
     s1.state = Some(AgentState::Working);
     s1.is_current_tab = true;
     s1.host_label = "Local Mac".into();
-    s1.repo_name = "minikrill".into();
+    s1.repo_name = "krill".into();
     s1.worktree_name = "main".into();
 
     let mut s2 = item(2, "zsh · orca · feat-jump · 완료", false);
@@ -495,11 +495,11 @@ fn jump_palette_worktrees_project_filters_and_cmd_digits(cx: &mut TestAppContext
     let (view, events, cx) = open(cx, vec![s1, s2]);
     let worktrees = vec![
         WorktreeItem::new(
-            "/tmp/minikrill".into(),
+            "/tmp/krill".into(),
             Some(SessionId(1)),
-            "minikrill".into(),
+            "krill".into(),
             "main".into(),
-            "minikrill".into(),
+            "krill".into(),
             "Local Mac".into(),
             "1분 미만".into(),
             Some(AgentState::Working),

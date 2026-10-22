@@ -1,5 +1,7 @@
-// Minikrill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
+// Krill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
 // 크기 변경 때 미리 만들지 않고 처음 그릴 때 만들며, 경로 없는 프레임을 그리면 놓는다.
+// Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 화면에 아직 안 올라간 드로어블이 꽉 차면 `nextDrawable`에서 메인 스레드를
+// 무기한 막지 않고 그 프레임을 건너뛴다(`DrawableBacklog`). 호출자가 다음 틱에 다시 present한다.
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -25,7 +27,148 @@ use objc2_core_video::{
 };
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// Drawables queued for display but not yet on screen. With `maximumDrawableCount` 3 and one more
+/// drawable held on screen, reaching this count means `nextDrawable` would block until the
+/// compositor catches up, stalling input handling on the main thread meanwhile.
+const MAX_DRAWABLES_IN_FLIGHT: usize = 2;
+/// Presented handlers can stop arriving (hidden window, dropped drawable, a compositor that is not
+/// showing this layer). Skipping must not freeze the window: once nothing has been queued for this
+/// long, acquire anyway; `nextDrawable` itself is bounded by the layer's one-second timeout.
+const STALE_BACKLOG: Duration = Duration::from_millis(250);
+/// `nextDrawable` waits longer than this are logged: they are the stalls users see as freezes.
+const SLOW_DRAWABLE: Duration = Duration::from_millis(100);
+
+/// Counts presented-but-not-yet-on-screen drawables so `draw` can skip instead of blocking.
+#[derive(Default)]
+struct DrawableBacklog {
+    // (generation, count): handlers queued before a stale reset belong to an older generation and
+    // must not drain the new count.
+    in_flight: Arc<Mutex<(u64, usize)>>,
+    last_queued: Option<Instant>,
+    stats: Arc<Mutex<FrameStats>>,
+}
+
+/// One second of presentation outcomes. Logged only when something was off, so a frozen window
+/// leaves a record of whether frames were skipped, dropped by the compositor, or shown late.
+#[derive(Default)]
+struct FrameStats {
+    since: Option<Instant>,
+    rendered: u32,
+    skipped: u32,
+    shown: u32,
+    // `presentedTime == 0`: the drawable never reached the screen.
+    dropped: u32,
+    slowest_shown: Duration,
+    stale_resets: u32,
+    size_changes: u32,
+    last_size: Option<(i32, i32)>,
+}
+
+impl FrameStats {
+    /// Returns the summary line for a finished one-second window that had anything unusual.
+    fn roll(&mut self, now: Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) < Duration::from_secs(1) {
+            return None;
+        }
+        let unusual = self.skipped > 0
+            || self.dropped > 0
+            || self.stale_resets > 0
+            || self.size_changes > 0
+            || self.slowest_shown >= SLOW_DRAWABLE;
+        let line = unusual.then(|| {
+            format!(
+                "frames in {}ms: rendered {}, skipped {}, shown {}, dropped {}, slowest shown {}ms, stale resets {}, size changes {}",
+                now.saturating_duration_since(since).as_millis(),
+                self.rendered,
+                self.skipped,
+                self.shown,
+                self.dropped,
+                self.slowest_shown.as_millis(),
+                self.stale_resets,
+                self.size_changes,
+            )
+        });
+        *self = FrameStats {
+            since: Some(now),
+            last_size: self.last_size,
+            ..FrameStats::default()
+        };
+        line
+    }
+}
+
+impl DrawableBacklog {
+    /// Whether a drawable can be acquired now without waiting on the compositor.
+    fn admit(&mut self, now: Instant) -> bool {
+        let mut in_flight = self.in_flight.lock();
+        if in_flight.1 < MAX_DRAWABLES_IN_FLIGHT {
+            return true;
+        }
+        let quiet = self.last_queued.map(|at| now.saturating_duration_since(at));
+        let stale = quiet.is_none_or(|quiet| quiet >= STALE_BACKLOG);
+        let mut stats = self.stats.lock();
+        if stale {
+            stats.stale_resets += u32::from(quiet.is_some());
+            *in_flight = (in_flight.0.wrapping_add(1), 0);
+        } else {
+            stats.skipped += 1;
+        }
+        stale
+    }
+
+    /// Records a drawable about to be presented; the returned guard runs when it reaches the screen.
+    fn queued(&mut self, now: Instant) -> impl Fn(f64) + 'static {
+        self.last_queued = Some(now);
+        self.stats.lock().rendered += 1;
+        let generation = {
+            let mut in_flight = self.in_flight.lock();
+            in_flight.1 += 1;
+            in_flight.0
+        };
+        let in_flight = Arc::clone(&self.in_flight);
+        let stats = Arc::clone(&self.stats);
+        move |presented_time| {
+            {
+                let mut in_flight = in_flight.lock();
+                if in_flight.0 == generation {
+                    in_flight.1 = in_flight.1.saturating_sub(1);
+                }
+            }
+            let mut stats = stats.lock();
+            if presented_time > 0.0 {
+                stats.shown += 1;
+                stats.slowest_shown = stats.slowest_shown.max(now.elapsed());
+            } else {
+                stats.dropped += 1;
+            }
+        }
+    }
+
+    /// Notes the drawable size and logs the previous second's outcomes if they were unusual.
+    fn observe_frame(&self, size: (i32, i32), now: Instant) {
+        let mut stats = self.stats.lock();
+        if stats.last_size.is_some_and(|last| last != size) {
+            stats.size_changes += 1;
+        }
+        stats.last_size = Some(size);
+        if let Some(line) = stats.roll(now) {
+            drop(stats);
+            log::warn!("{line}");
+        }
+    }
+}
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -115,6 +258,7 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    drawable_backlog: DrawableBacklog,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -191,7 +335,9 @@ impl MetalRenderer {
         // metal-rs doesn't bind these setters, so view the same object through
         // objc2's typed CAMetalLayer binding.
         let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
-        objc2_layer.setAllowsNextDrawableTimeout(false);
+        // Apple's default: `nextDrawable` gives up after one second instead of blocking the main
+        // thread for as long as the compositor holds every drawable (Zed #53390).
+        objc2_layer.setAllowsNextDrawableTimeout(true);
         objc2_layer.setNeedsDisplayOnBoundsChange(true);
         // UIKit sizes a view's backing layer itself; only AppKit-hosted
         // layers need to track their superlayer's bounds.
@@ -389,6 +535,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            drawable_backlog: DrawableBacklog::default(),
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -439,11 +586,11 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        // Minikrill 변경(OWE-665): 새 크기의 경로 텍스처는 경로를 처음 그릴 때 만든다.
+        // Krill 변경(OWE-665): 새 크기의 경로 텍스처는 경로를 처음 그릴 때 만든다.
         self.release_path_intermediate_textures();
     }
 
-    // Minikrill 변경(OWE-665)
+    // Krill 변경(OWE-665)
     fn release_path_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
@@ -498,14 +645,17 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Renders and presents `scene`. Returns `false` only when the frame was skipped because the
+    /// compositor still holds every drawable; the caller should present again on the next display
+    /// tick. Failures are logged and not retried, as before.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return true;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -513,23 +663,46 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
+        let now = Instant::now();
+        self.drawable_backlog
+            .observe_frame((viewport_size.width.0, viewport_size.height.0), now);
+        if !self.drawable_backlog.admit(now) {
+            return false;
+        }
+        let acquire_started = Instant::now();
+        let drawable = layer.next_drawable();
+        let waited = acquire_started.elapsed();
+        if waited > SLOW_DRAWABLE {
+            log::warn!("nextDrawable waited {}ms", waited.as_millis());
+        }
+        let Some(drawable) = drawable else {
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return true;
         };
 
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
-                return;
+                return true;
             }
         };
+
+        let on_screen = self.drawable_backlog.queued(Instant::now());
+        let block = RcBlock::new(move |presented: ptr::NonNull<AnyObject>| {
+            // SAFETY: Metal passes the presented `MTLDrawable`; `presentedTime` is a plain getter.
+            let presented_time: f64 =
+                unsafe { objc2::msg_send![presented.as_ptr(), presentedTime] };
+            on_screen(presented_time)
+        });
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI;
+        // Metal copies the block, so it outlives this frame.
+        unsafe {
+            drawable.add_presented_handler(&*RcBlock::as_ptr(&block).cast());
+        }
 
         if self.presents_with_transaction {
             command_buffer.commit();
@@ -539,6 +712,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        true
     }
 
     fn render_frame(
@@ -748,7 +922,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
-                    // Minikrill 변경(OWE-665): 경로 텍스처 지연 생성.
+                    // Krill 변경(OWE-665): 경로 텍스처 지연 생성.
                     if self.path_intermediate_texture.is_none() {
                         self.update_path_intermediate_textures(viewport_size);
                     }
@@ -810,7 +984,7 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
-        // Minikrill 변경(OWE-665): 경로 없는 프레임이면 창 크기 경로 텍스처를 놓는다(진행 중 명령 버퍼는 자기 참조를 쥔다).
+        // Krill 변경(OWE-665): 경로 없는 프레임이면 창 크기 경로 텍스처를 놓는다(진행 중 명령 버퍼는 자기 참조를 쥔다).
         if scene.paths.is_empty() {
             self.release_path_intermediate_textures();
         }
@@ -1723,6 +1897,62 @@ mod tests {
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
+
+    #[test]
+    fn frame_stats_log_only_unusual_seconds() {
+        let mut backlog = DrawableBacklog::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        backlog.observe_frame((100, 100), t0);
+        backlog.queued(t0)(1.0);
+        assert_eq!(
+            backlog.stats.lock().roll(t0 + ms(1000)),
+            None,
+            "a clean second is quiet"
+        );
+        backlog.queued(t0)(0.0);
+        backlog.observe_frame((200, 100), t0 + ms(1100));
+        let line = backlog.stats.lock().roll(t0 + ms(2000)).unwrap();
+        assert!(
+            line.contains("dropped 1") && line.contains("size changes 1"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn drawable_backlog_skips_instead_of_blocking_and_recovers_stale_counts() {
+        let mut backlog = DrawableBacklog::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let first = backlog.queued(t0);
+        assert!(backlog.admit(t0), "one queued drawable leaves one free");
+        let second = backlog.queued(t0);
+        assert!(
+            !backlog.admit(t0),
+            "two queued drawables would block nextDrawable"
+        );
+        assert!(!backlog.admit(t0 + STALE_BACKLOG - ms(1)));
+        first(1.0);
+        assert!(backlog.admit(t0 + ms(10)), "presentation frees a slot");
+
+        let t1 = t0 + ms(500);
+        let _third = backlog.queued(t1);
+        assert!(!backlog.admit(t1 + STALE_BACKLOG - ms(1)));
+        assert!(
+            backlog.admit(t1 + STALE_BACKLOG),
+            "a count that stops draining is reset rather than freezing the window"
+        );
+        let t2 = t1 + STALE_BACKLOG;
+        let fourth = backlog.queued(t2);
+        let _fifth = backlog.queued(t2);
+        second(1.0);
+        assert!(
+            !backlog.admit(t2),
+            "a handler from before the reset does not drain the new count"
+        );
+        fourth(1.0);
+        assert!(backlog.admit(t2));
+    }
 
     #[test]
     fn render_core_video_surface() {

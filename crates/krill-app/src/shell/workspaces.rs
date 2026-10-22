@@ -14,9 +14,96 @@ struct Workspace {
 }
 
 impl Shell {
+    /// Reconcile daemon IDs, never launches. Appending inactive tabs preserves
+    /// existing indices, split trees, focused panes and custom tab properties.
+    pub(super) fn reconcile_workspace_sessions(&mut self, cx: &mut Context<Self>) {
+        if self.layout_loading || self.role != WindowRole::Main {
+            return;
+        }
+        let sidebar = self.sidebar.read(cx);
+        self.workspace_closing.retain(|(host, session)| {
+            sidebar.session_on(host, *session).is_some_and(|session| {
+                session.status.state != krill_proto::control::AgentState::Exited
+            })
+        });
+        let Some((host, folder)) = sidebar.selected_workspace() else {
+            return;
+        };
+        let existing = self.layout.sessions_for_host(&host);
+        let missing: Vec<_> = sidebar
+            .live_sessions_in_workspace(&host, &folder)
+            .into_iter()
+            .filter(|session| {
+                !existing.contains(session)
+                    && !self.workspace_closing.contains(&(host.clone(), *session))
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let active = self.layout.active();
+        let focused = self.layout.focused();
+        let mut represented = existing;
+        for session in missing {
+            if represented.contains(&session) {
+                continue;
+            }
+            self.layout
+                .new_tab_after(self.layout.tabs().len().saturating_sub(1));
+            if let Some(pane) = self.layout.focused() {
+                self.layout.set_host(pane, host.clone());
+                self.layout.set_session(pane, session);
+                self.layout.set_launch(
+                    pane,
+                    Create {
+                        account: None,
+                        program: Program::Login,
+                        cwd: folder.as_os_str().as_bytes().to_vec(),
+                        cols: pane::SIZE.0,
+                        rows: pane::SIZE.1,
+                    },
+                );
+            }
+            represented.push(session);
+        }
+        if let Some(focused) = focused {
+            self.layout.activate(active);
+            self.layout.focus(focused);
+        } else {
+            self.sync(cx);
+        }
+        self.save();
+        self.refresh_detached(cx);
+        cx.notify();
+    }
+
     fn tab_workspace(&self, index: usize, cx: &App) -> Option<Workspace> {
-        // 분할 포커스 이동만으로 탭의 소속이 바뀌지 않게 첫 칸을 기준으로 삼는다.
-        let pane = *self.layout.tab_panes(index).first()?;
+        let selected = self
+            .sidebar
+            .read(cx)
+            .selected_workspace()
+            .map(|(host, folder)| Workspace { host, folder });
+        if let Some(selected) =
+            selected.filter(|workspace| self.tab_contains_workspace(index, workspace, cx))
+        {
+            return Some(selected);
+        }
+        // Without an explicit matching selection, split focus alone must not
+        // change the workspace shown in the tab bar.
+        self.pane_workspace(*self.layout.tab_panes(index).first()?, cx)
+    }
+
+    fn tab_contains_workspace(&self, index: usize, workspace: &Workspace, cx: &App) -> bool {
+        self.layout
+            .tab_panes(index)
+            .into_iter()
+            .any(|pane| self.pane_workspace(pane, cx).as_ref() == Some(workspace))
+    }
+
+    fn pane_workspace(&self, pane: PaneId, cx: &App) -> Option<Workspace> {
+        if !self.layout.pane_exists(pane) {
+            return None;
+        }
         let host = self.layout.host(pane).clone();
         // 실행 폴더는 영속 상태다. 라이브 cwd(cd)는 워크스페이스 소속을 바꾸지 않는다.
         let folder = self
@@ -49,7 +136,7 @@ impl Shell {
             return Vec::new();
         };
         (0..self.layout.tabs().len())
-            .filter(|&i| self.tab_workspace(i, cx).as_ref() == Some(&workspace))
+            .filter(|&i| self.tab_contains_workspace(i, &workspace, cx))
             .collect()
     }
 

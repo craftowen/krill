@@ -325,7 +325,7 @@ fn keychain_child() {
         .unwrap();
     assert!(Key::load_from(&root, true, &lost).is_err());
     assert!(
-        lost.find_generic_password("com.minikrill.segment-key.v2", "nonexistent")
+        lost.find_generic_password("com.krill.segment-key.v2", "nonexistent")
             .is_err()
     );
     drop((keychain, lost));

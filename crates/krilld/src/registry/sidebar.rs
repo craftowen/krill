@@ -166,7 +166,7 @@ fn parse(bytes: &[u8]) -> Option<RepositoryTrees> {
         .filter(|p| !p.is_empty() && p.len() <= 4096)
         .filter(|p| {
             !p.split(|b| *b == b'/')
-                .any(|part| part == b".minikrill-preparing")
+                .any(|part| part == b".krill-preparing")
         })
         .take(512)
         .map(<[u8]>::to_vec)
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn internal_preparations_are_hidden() {
-        let data = parse(b"worktree /repo\0\0worktree /wt/.minikrill-preparing/tree\0detached\0\0worktree /wt/agent\0\0").unwrap();
+        let data = parse(b"worktree /repo\0\0worktree /wt/.krill-preparing/tree\0detached\0\0worktree /wt/agent\0\0").unwrap();
         assert_eq!(data.worktrees, [b"/repo".to_vec(), b"/wt/agent".to_vec()]);
     }
 

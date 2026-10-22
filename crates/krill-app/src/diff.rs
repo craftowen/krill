@@ -1462,7 +1462,7 @@ impl Panel {
                         } else {
                             text::INDEX.get()
                         };
-                        crate::ui::segment(("comparison", i), format!("{label} {count}"), active)
+                        crate::ui::segment(p, ("comparison", i), format!("{label} {count}"), active)
                             .debug_selector(move || format!("comparison-{i}"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 if this.comparison != comparison {

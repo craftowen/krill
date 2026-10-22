@@ -114,20 +114,22 @@ trap 'rm -rf "$stage"' EXIT
 
 # TCC 권한이 리빌드·데몬 업그레이드 뒤에도 유지되도록 로컬 고정 코드 서명 인증서를 준비한다.
 # ad-hoc 서명(--sign -)은 매 빌드마다 cdhash가 바뀌어 TCC 승인이 무효화되고 구 데몬과 신 앱이 충돌한다.
-kc_path="${KRILL_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/minikrill-codesign.keychain-db}"
+kc_path="${KRILL_CODESIGN_KEYCHAIN:-$(python3 "$root/packaging/macos/identity_paths.py")}"
 kc_pass_file="$kc_path.pass"
-cs_identity="Minikrill Local Code Signing"
+cs_identity="Krill Local Code Signing"
 ensure_codesign_identity() {
-    if [ -f "$kc_path" ] && [ -f "$kc_pass_file" ]; then
+    if [ -e "$kc_path" ] || [ -e "$kc_pass_file" ]; then
+        [ -f "$kc_path" ] && [ -f "$kc_pass_file" ] || fail "incomplete existing signing identity; refusing to replace it"
         local pass
         pass=$(cat "$kc_pass_file")
-        if /usr/bin/security unlock-keychain -p "$pass" "$kc_path" 2>/dev/null && \
-           /usr/bin/security find-identity -p codesigning "$kc_path" 2>/dev/null | /usr/bin/grep -Fq "\"$cs_identity\""; then
+        /usr/bin/security unlock-keychain -p "$pass" "$kc_path" 2>/dev/null || fail "cannot unlock existing signing keychain"
+        if /usr/bin/security find-identity -p codesigning "$kc_path" 2>/dev/null | /usr/bin/grep -Fq "\"$cs_identity\""; then
             return 0
         fi
+        fail "existing signing certificate unavailable; refusing to replace it"
     fi
     mkdir -p "$(dirname "$kc_path")" "$stage/codesign"
-    local pass="minikrill-local-codesign"
+    local pass="krill-local-codesign"
     local old_umask
     old_umask=$(umask)
     umask 077
@@ -139,8 +141,8 @@ distinguished_name = dn
 x509_extensions = v3_cs
 prompt = no
 [dn]
-CN = Minikrill Local Code Signing
-O = Minikrill
+CN = Krill Local Code Signing
+O = Krill
 [v3_cs]
 basicConstraints = critical, CA:FALSE
 keyUsage = critical, digitalSignature

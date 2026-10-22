@@ -1007,7 +1007,6 @@ impl Sidebar {
         // including when both machines happen to use the same absolute paths.
         let mut options = self.options.clone();
         options.filters.repos.clear();
-        let parents = self.merged_parents();
         let ctx = WorktreeContext {
             meta: Some(&remote.meta),
             prs: Some(&self.prs),
@@ -1016,8 +1015,8 @@ impl Sidebar {
             focused: self.focused,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
-            parents: Some(&parents),
-            collapsed_lineage: Some(&self.collapsed_lineage),
+            // Lineage belongs to the local store. Matching absolute paths on a remote
+            // host do not make them descendants of local worktrees.
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),
@@ -1391,8 +1390,8 @@ pub(super) fn host_visibility_summary(
         .collect();
     if selected.is_empty() || selected.len() == hosts.len() {
         text::ALL_HOSTS.get().to_owned()
-    } else if selected.len() == 1 {
-        selected[0].to_owned()
+    } else if let [only] = selected.as_slice() {
+        (*only).to_owned()
     } else {
         text::HOSTS_SELECTED_COUNT.format(&[("n", &selected.len().to_string())])
     }
@@ -1409,8 +1408,8 @@ pub(super) fn project_visibility_summary(filters: &WorkspaceFilters, repos: &[Pa
         .collect();
     if selected.is_empty() || selected.len() == repos.len() {
         text::ALL_PROJECTS.get().to_owned()
-    } else if selected.len() == 1 {
-        basename(selected[0])
+    } else if let [only] = selected.as_slice() {
+        basename(only)
     } else {
         text::PROJECTS_SELECTED_COUNT.format(&[("n", &selected.len().to_string())])
     }
@@ -1843,7 +1842,7 @@ fn render_group_by_section(
                         let selector = group.selector();
                         let sb = sidebar_weak.clone();
                         let mn = menu_weak.clone();
-                        ui::segment(selector, group.short_label(), active)
+                        ui::segment(p, selector, group.short_label(), active)
                             .debug_selector(move || selector.into())
                             .on_click(move |_, _, cx| {
                                 sb.update(cx, |s, cx| s.set_group_by(group, cx)).ok();

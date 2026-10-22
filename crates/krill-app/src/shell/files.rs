@@ -10,6 +10,7 @@ use gpui_component::input::{Editor, EditorState, InputEvent};
 use krill_app::editor::{self, Disk, Doc, Opened, Poll, Preview, SaveError, Unopenable};
 use krill_app::file_format::view::{self as fview, CsvView, ImageView};
 use krill_app::file_format::{Kind, csv, ipynb};
+use krill_app::i18n::catalog::artifacts as atext;
 use krill_app::i18n::catalog::editor as etext;
 use krill_app::i18n::catalog::file_format as ftext;
 use krill_app::terminal::Highlight;
@@ -173,6 +174,8 @@ pub(super) struct Files {
     link_open_generation: u64,
     pub(super) hover: Option<(PaneId, Highlight)>,
     goto: Option<(PathBuf, u32, u32)>,
+    /// 아티팩트 공유(`krill artifacts share`)가 진행 중인 칸.
+    sharing: std::collections::HashSet<PaneId>,
 }
 
 #[derive(PartialEq)]
@@ -211,6 +214,7 @@ impl Default for Files {
             link_open_generation: 0,
             hover: None,
             goto: None,
+            sharing: std::collections::HashSet::new(),
         }
     }
 }
@@ -551,7 +555,7 @@ impl Shell {
         &mut self,
         pane: PaneId,
         position: gpui::Point<Pixels>,
-        open: bool,
+        action: Option<terminal_menu::FileAction>,
         cx: &mut Context<Self>,
     ) -> Option<(u16, PathLink)> {
         let cwd = self.pane_cwd(pane, cx);
@@ -569,7 +573,7 @@ impl Shell {
             column,
             cwd,
         };
-        if open {
+        if let Some(action) = action {
             if let Some(lookup) = &self.files.link_lookup
                 && lookup.key == key
                 && lookup.ready
@@ -597,7 +601,7 @@ impl Shell {
                             .is_some_and(|live| live.pane.session() == session)
                         && let Some(link) = found
                     {
-                        this.open_path_link(link, cx);
+                        this.activate_terminal_file(link, action, cx);
                     }
                 })
                 .ok();
@@ -680,7 +684,12 @@ impl Shell {
         None
     }
 
-    pub(super) fn open_terminal_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn open_terminal_file(
+        &mut self,
+        path: PathBuf,
+        action: terminal_menu::FileAction,
+        cx: &mut Context<Self>,
+    ) {
         let focused = self.layout.focused();
         let session = focused.and_then(|pane| self.live.get(&pane)?.pane.session());
         self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
@@ -699,7 +708,17 @@ impl Shell {
                     return;
                 }
                 if is_file {
-                    this.open_file(path, cx);
+                    this.activate_terminal_file(
+                        PathLink {
+                            column: 0,
+                            cols: 0,
+                            path,
+                            line: None,
+                            col: None,
+                        },
+                        action,
+                        cx,
+                    );
                 } else {
                     cx.reveal_path(&path);
                 }
@@ -709,7 +728,20 @@ impl Shell {
         .detach();
     }
 
+    /// ⌘ 없이 클릭해도 여는 평문 `http(s)://` URL. 프로그램이 마우스 보고를 켰으면 클릭은
+    /// 프로그램 것이고, OSC 8 링크는 보이는 글과 대상이 다를 수 있어 ⌘+클릭으로만 연다.
+    pub(super) fn plain_url_at(
+        &self,
+        pane: PaneId,
+        position: gpui::Point<Pixels>,
+    ) -> Option<(Highlight, String)> {
+        let l = self.live.get(&pane).filter(|l| !l.pane.modes().mouse())?;
+        let screen = l.pane.shown();
+        krill_app::terminal::url_link_target(&screen, &l.painted, position)
+    }
+
     /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
+    /// ⌘ 없이도 맨 클릭으로 열리는 평문 URL에는 밑줄을 긋는다.
     pub(super) fn update_path_hover(
         &mut self,
         pane: PaneId,
@@ -737,7 +769,7 @@ impl Shell {
             }
             osc_or_url
                 .or_else(|| {
-                    self.path_link_at(pane, position, false, cx)
+                    self.path_link_at(pane, position, None, cx)
                         .map(|(line, link)| Highlight {
                             line,
                             column: link.column,
@@ -746,7 +778,7 @@ impl Shell {
                 })
                 .map(|h| (pane, h))
         } else {
-            None
+            self.plain_url_at(pane, position).map(|(h, _)| (pane, h))
         };
         if self.files.hover != next {
             self.files.hover = next;
@@ -841,6 +873,7 @@ impl Shell {
                 )
             })
             .children(self.preview_toggle(id, cx))
+            .children(self.share_button(id, &path, cx))
             .when(is_split, |d| {
                 d.child(
                     Button::new(("file-pane-close", id.get()))
@@ -984,6 +1017,99 @@ impl Shell {
         Some(preview.is_some() && shown.is_some())
     }
 
+    /// 열린 HTML·Markdown 파일을 아티팩트(공개 링크)로 공유하는 머리 버튼.
+    fn share_button(&self, id: PaneId, path: &Path, cx: &mut Context<Self>) -> Option<Button> {
+        if !krill_proto::artifacts::is_shareable_path(path) {
+            return None;
+        }
+        let busy = self.files.sharing.contains(&id);
+        Some(
+            Button::new(("file-share-artifact", id.get()))
+                .debug_selector(|| "file-share-artifact".into())
+                .icon(IconName::Globe)
+                .label(if busy {
+                    atext::SHARING.get()
+                } else {
+                    atext::SHARE_BUTTON.get()
+                })
+                .ghost()
+                .xsmall()
+                .disabled(busy)
+                .tooltip(atext::SHARE_TOOLTIP.get())
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    cx.stop_propagation();
+                    this.share_file_artifact(id, window, cx);
+                })),
+        )
+    }
+
+    /// 칸의 파일을 공유한다(이미 공유했으면 같은 링크의 내용을 갱신한다). 링크는 클립보드에 복사한다.
+    /// 공개 공유가 꺼져 있으면 설정 > 아티팩트로 보낸다.
+    pub(super) fn share_file_artifact(
+        &mut self,
+        id: PaneId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(path) = self.layout.file(id).map(Path::to_owned) else {
+            return;
+        };
+        if self.files.sharing.contains(&id) {
+            return;
+        }
+        if self.files.tabs.get(&id).is_some_and(FileTab::is_dirty) {
+            self.notice = Some(atext::SAVE_FIRST.get().to_owned());
+            cx.notify();
+            return;
+        }
+        // 설정을 아직 안 열었으면 게이트·CLI가 krilld와 같은 상태 디렉터리를 보게 먼저 맞춘다.
+        if !cx.has_global::<krill_app::settings::Config>() {
+            let dir = self.state_dir(cx);
+            krill_app::settings::init_at(dir, cx);
+        }
+        if !krill_app::settings::artifacts::sharing_enabled(cx) {
+            self.notice = Some(atext::DISABLED.get().to_owned());
+            self.open_settings(krill_app::settings::AdminTab::Artifacts, Some(window), cx);
+            return;
+        }
+        let Some(run) = krill_app::settings::artifacts::runner(cx) else {
+            self.notice = Some(atext::ERROR.format(&[(
+                "error",
+                krill_app::i18n::catalog::orca_import::ERR_CLI_MISSING.get(),
+            )]));
+            cx.notify();
+            return;
+        };
+        self.files.sharing.insert(id);
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let res = cx
+                .background_executor()
+                .spawn(async move { krill_app::settings::artifacts::share_path(&run, &path) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.files.sharing.remove(&id);
+                this.notice = Some(match res {
+                    Ok(out) => {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                            out.share_url.clone(),
+                        ));
+                        let msg = if out.change == "updated" {
+                            atext::UPDATED
+                        } else {
+                            atext::SHARED
+                        };
+                        msg.format(&[("url", &out.share_url)])
+                    }
+                    Err(e) => e.message(),
+                });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     /// 파일 칸 머리의 편집/미리보기 토글(마크다운·CSV·ipynb·SVG만).
     fn preview_toggle(&self, id: PaneId, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let Some(Body::Text {
@@ -998,7 +1124,7 @@ impl Shell {
         let previewing = shown.is_some();
         let p = krill_app::ui::palette(cx);
         let segment_button = |name: &'static str, label: &'static str, on: bool| {
-            krill_app::ui::segment((name, id.get()), label, previewing == on)
+            krill_app::ui::segment(p, (name, id.get()), label, previewing == on)
                 .debug_selector(move || name.to_owned())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();

@@ -90,7 +90,7 @@ fn shared_install_receipt_backup_and_rollback_preserve_original_bytes_and_mode()
     let backups: Vec<_> = fs::read_dir(&home.0)
         .unwrap()
         .map(Result::unwrap)
-        .filter(|e| e.file_name().to_string_lossy().contains("minikrill-bak"))
+        .filter(|e| e.file_name().to_string_lossy().contains("krill-bak"))
         .collect();
     assert_eq!(backups.len(), 1);
     let backup = backups.first().unwrap();
@@ -238,7 +238,7 @@ fn incomplete_receipt_can_be_recovered_and_uninstall_preserves_later_user_change
 #[test]
 fn existing_opencode_plugin_is_an_already_exists_conflict_and_untouched() {
     let home = Home::new();
-    let plugin = home.0.join("minikrill.js");
+    let plugin = home.0.join("krill.js");
     fs::write(&plugin, "user plugin").unwrap();
     let error = Plan::prepare(
         Action::Install,

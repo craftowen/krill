@@ -1,4 +1,4 @@
-// Minikrill 변경(OWE-927, Apache-2.0 §4(b)): macOS 스크린샷·CleanShot X 등이 NSFilenamesPboardType/String과
+// Krill 변경(OWE-927, Apache-2.0 §4(b)): macOS 스크린샷·CleanShot X 등이 NSFilenamesPboardType/String과
 // 이미지(PNG/TIFF)를 동시에 올릴 때 앞선 항목이 죽은 임시 경로이거나 공백 문자열이어도 이미지로 폴백할 수 있도록
 // Pasteboard::read에서 이미지 엔트리를 함께 수집한다.
 use core::slice;

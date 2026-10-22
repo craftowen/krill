@@ -54,6 +54,7 @@ fn tab_title(tab: AdminTab) -> Message {
         AdminTab::Shortcuts => text::TAB_SHORTCUTS,
         AdminTab::Resources => text::TAB_RESOURCES,
         AdminTab::Mobile => crate::i18n::catalog::mobile::TAB,
+        AdminTab::Artifacts => crate::i18n::catalog::artifacts::TAB,
     }
 }
 
@@ -71,16 +72,10 @@ mod tests {
             assert!(search_tabs(q).contains(&AdminTab::Terminal), "{q}");
         }
         assert_eq!(search_tabs("ssh"), [AdminTab::Ssh]);
-        for q in [
-            "원격 Krill",
-            "remote krill",
-            "초대",
-            "invite",
-            "짝짓기",
-            "p2p",
-        ] {
+        for q in ["원격 Krill", "remote krill", "초대", "invite", "p2p"] {
             assert_eq!(search_tabs(q), [AdminTab::RemoteKrill], "{q}");
         }
+        assert!(search_tabs("페어링").contains(&AdminTab::RemoteKrill));
         assert_eq!(search_tabs("동면"), [AdminTab::Agents]);
         assert!(search_tabs("webhook").contains(&AdminTab::Workflows));
         // 알림 이벤트별 토글·테스트 알림(OWE-659)은 일반 탭에서 찾는다.

@@ -908,9 +908,10 @@ fn provisioning_usage_dispatch_and_access_control() {
     };
     assert_eq!(
         reg.on_usage(&full, Role::Interactive, UsageRequest::GetProvisioning),
-        UsageReply::Provisioning(false)
+        UsageReply::Provisioning(true),
+        "설정 파일이 없으면 기본 켜짐"
     );
-    for enabled in [true, false] {
+    for enabled in [false, true] {
         assert_eq!(
             reg.on_usage(
                 &full,
@@ -1404,4 +1405,82 @@ fn orchestration_ipc_wakes_check_messages_and_enforces_worker_depth() {
 
     drop(reg);
     fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn states_resolve_launched_pi_without_hooks_and_preserve_hook_identity() {
+    let dir = std::env::temp_dir().join(format!("krill-pi-identity-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let reg = Registry::new(None, Some(&dir));
+    let id = SessionId(1);
+    let (master, _output) = UnixStream::pair().unwrap();
+    let session = Session::start(
+        id,
+        OwnedFd::from(master),
+        WinSize { cols: 80, rows: 24 },
+        Arc::clone(&reg.look),
+        None,
+    )
+    .unwrap();
+    lock(&reg.state).sessions.insert(
+        id,
+        Entry {
+            session,
+            pid: 0,
+            cwd: dir.clone(),
+        },
+    );
+    reg.agents
+        .remember(
+            id,
+            &control::AgentLaunch {
+                profile: "pi".into(),
+                permission: Permission::Manual,
+            },
+        )
+        .unwrap();
+    let full = Peer {
+        pid: None,
+        scope: Scope::Full,
+    };
+    let Reply::States(states) = reg.states(&full) else {
+        panic!("states reply")
+    };
+    let status = &states.first().unwrap().status;
+    assert_eq!(
+        status.agent, "pi",
+        "a Pi launch must have runtime identity without a title or hook"
+    );
+    assert_eq!(status.state, control::AgentState::Unknown);
+    assert_eq!(
+        status.source, None,
+        "identity must not invent evidence of working/waiting state"
+    );
+    let restricted = Peer {
+        pid: None,
+        scope: Scope::Restricted,
+    };
+    assert_eq!(reg.states(&restricted), Reply::States(Vec::new()));
+    let hook = HookEvent {
+        id: krill_proto::hook::EventId {
+            pid: 123,
+            unix_ns: 1,
+        },
+        agent: "claude".into(),
+        ppid: 1,
+        input: krill_proto::hook::Input::Complete,
+        payload: br#"{"hook_event_name":"SessionStart","source":"startup"}"#.to_vec(),
+    };
+    reg.status.hook(&[(id, &hook)]).unwrap();
+    let Reply::States(states) = reg.states(&full) else {
+        panic!("states reply")
+    };
+    assert_eq!(
+        states.first().unwrap().status.agent,
+        "claude",
+        "hook identity takes precedence over a launch hint"
+    );
+    drop(reg);
+    fs::remove_dir_all(dir).unwrap();
 }

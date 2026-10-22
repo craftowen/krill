@@ -488,6 +488,108 @@ fn append_rule_menu(
     menu
 }
 
+/// 이름과 리셋 안내를 서로 다른 flex 항목으로 둬 좁은 창·UI 줌에서는 줄바꿈한다.
+fn render_popover_usage_detail(
+    window_label: &str,
+    selector: &str,
+    win: Option<&krill_proto::usage::Window>,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let display = krill_app::accounts::display::window(
+        win,
+        i64::try_from(krill_app::accounts::display::now()).unwrap_or(i64::MAX),
+    );
+    let percent_selector = format!("{selector}-percent");
+    let reset_selector = format!("{selector}-reset");
+    div()
+        .w_full()
+        .min_w_0()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_between()
+        .gap_x_2()
+        .gap_y_0p5()
+        .text_size(ui::TEXT_XS)
+        .child(
+            div()
+                .flex()
+                .flex_wrap()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .font_family(ui::FONT_MONO)
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(p.muted_foreground)
+                        .child(window_label.to_owned()),
+                )
+                .child(
+                    div()
+                        .debug_selector(move || percent_selector.clone())
+                        .font_family(ui::FONT_MONO)
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.foreground)
+                        .child(display.text),
+                ),
+        )
+        .children(krill_app::settings::window_reset_suffix(win).map(|reset| {
+            div()
+                .debug_selector(move || reset_selector.clone())
+                .min_w_0()
+                .whitespace_normal()
+                .text_color(p.muted_foreground)
+                .child(reset)
+        }))
+}
+
+fn render_popover_account_usage(
+    usage: &krill_proto::usage::Snapshot,
+    meters: Option<&krill_proto::usage::AccountMeters>,
+    selector: &str,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let mut rows = div().w_full().min_w_0().flex().flex_col().gap_1();
+    if let Some(meters) = meters {
+        for meter in &meters.meters {
+            let label = krill_app::accounts::display::meter_label(meter);
+            let id = format!("{selector}-{}", meter.key);
+            rows = rows.child(if let Some(value) = &meter.value {
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_wrap()
+                    .justify_between()
+                    .gap_2()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(label)
+                    .child(value.clone())
+            } else {
+                render_popover_usage_detail(&label, &id, meter.window.as_ref(), p)
+            });
+        }
+        if meters.meters.is_empty() {
+            rows = rows.child(div().text_size(ui::TEXT_XS).child("—"));
+        }
+        rows
+    } else {
+        rows.child(render_popover_usage_detail(
+            krill_app::i18n::catalog::settings::WINDOW_5H.get(),
+            &format!("{selector}-5h"),
+            usage.five_hour.as_ref(),
+            p,
+        ))
+        .child(render_popover_usage_detail(
+            krill_app::i18n::catalog::settings::WINDOW_7D.get(),
+            &format!("{selector}-7d"),
+            usage.seven_day.as_ref(),
+            p,
+        ))
+    }
+}
+
 fn render_popover_usage_row(
     window_label: &str,
     selector: String,
@@ -500,56 +602,18 @@ fn render_popover_usage_row(
         i64::try_from(krill_app::accounts::display::now()).unwrap_or(i64::MAX),
     );
     let pct = display.percent.unwrap_or(0);
-    let bar_color = krill_app::settings::usage_color(pct, brand_color, p);
-    let pct_text = display.text;
-    let reset_text = display
-        .percent
-        .and_then(|_| krill_app::settings::window_reset_suffix(win));
     let debug_sel = selector.clone();
+    let detail = render_popover_usage_detail(window_label, &selector, win, p);
 
     div()
         .id(gpui::SharedString::from(selector))
         .debug_selector(move || debug_sel.clone())
         .w_full()
+        .min_w_0()
         .flex()
         .flex_col()
         .gap_1()
-        .child(
-            div()
-                .w_full()
-                .flex()
-                .items_center()
-                .justify_between()
-                .gap_2()
-                .child(
-                    div()
-                        .font_family(ui::FONT_MONO)
-                        .text_size(ui::TEXT_2XS)
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(p.muted_foreground)
-                        .child(window_label.to_owned()),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_1p5()
-                        .child(
-                            div()
-                                .font_family(ui::FONT_MONO)
-                                .text_size(ui::TEXT_2XS)
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(krill_app::settings::usage_color(pct, p.foreground, p))
-                                .child(pct_text),
-                        )
-                        .children(reset_text.map(|r| {
-                            div()
-                                .text_size(ui::TEXT_2XS)
-                                .text_color(p.muted_foreground)
-                                .child(format!("· {r}"))
-                        })),
-                ),
-        )
+        .child(detail)
         .child(
             div()
                 .w_full()
@@ -562,7 +626,7 @@ fn render_popover_usage_row(
                         .h_full()
                         .w(gpui::relative(f32::from(pct) / 100.0))
                         .rounded_full()
-                        .bg(bar_color),
+                        .bg(brand_color),
                 ),
         )
 }
@@ -621,19 +685,96 @@ fn expanded_account_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> Str
     )
 }
 
-fn compact_status_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> String {
-    let now_signed = i64::try_from(now).unwrap_or(i64::MAX);
-    let window = [usage.five_hour.as_ref(), usage.seven_day.as_ref()]
-        .into_iter()
-        .flatten()
-        .filter_map(|w| {
-            krill_app::accounts::display::window(Some(w), now_signed)
-                .percent
-                .map(|pct| (pct, w))
+/// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간. `short`면 가장 큰 단위만(`9h 3m` → `9h`).
+fn status_window_parts(
+    win: Option<&krill_proto::usage::Window>,
+    now: u64,
+    short: bool,
+) -> (Option<u8>, Option<String>) {
+    let Some(win) = win else {
+        return (None, None);
+    };
+    let reset = win
+        .resets_at
+        .as_deref()
+        .map(|ts| krill_app::settings::classify_reset(ts, now));
+    match reset {
+        Some(krill_app::settings::ResetDue::Stale) => (None, Some("now".into())),
+        Some(krill_app::settings::ResetDue::Future(left)) => {
+            let full = status_reset_duration(left);
+            let reset = if short {
+                full.split(' ').next().unwrap_or_default().to_owned()
+            } else {
+                full
+            };
+            (Some(win.percent.min(100)), Some(reset))
+        }
+        _ => (Some(win.percent.min(100)), None),
+    }
+}
+
+/// 상태바 한 기간 칸: 막대 + 사용률 + 리셋. 모르면 빈 막대와 "—"(0%로 꾸미지 않음, OWE-703).
+fn status_window_segment(
+    win: Option<&krill_proto::usage::Window>,
+    now: u64,
+    short: bool,
+    p: &ui::Palette,
+) -> gpui::Div {
+    let (pct, reset) = status_window_parts(win, now, short);
+    let bar = if short {
+        ui::SPACE_4
+    } else {
+        ui::SPACE_4 + ui::SPACE_2
+    };
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .w(bar)
+                .h(ui::SPACE_1)
+                .rounded_full()
+                .overflow_hidden()
+                .bg(p.muted)
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(f32::from(pct.unwrap_or(0)) / 100.))
+                        .bg(pct.map_or(p.muted, |_| p.muted_foreground)),
+                ),
+        )
+        .child(
+            div()
+                .text_color(pct.map_or(p.muted_foreground, |_| p.foreground))
+                .child(pct.map_or_else(|| "—".to_owned(), |pct| format!("{pct}%"))),
+        )
+        .children(reset.map(|r| div().text_color(p.muted_foreground).child(r)))
+}
+
+/// 5시간·주간 밖 한도(모델별 풀 등)가 경고 수준이고 보이는 두 기간보다 높으면 그 이름과 사용률.
+fn status_hot_meter(
+    snap: &AccountsSnapshot,
+    account: &AccountInfo,
+    now: u64,
+) -> Option<(String, u8)> {
+    let now = i64::try_from(now).unwrap_or(i64::MAX);
+    let shown = [
+        account.usage.five_hour.as_ref(),
+        account.usage.seven_day.as_ref(),
+    ]
+    .into_iter()
+    .filter_map(|w| krill_app::accounts::display::window(w, now).percent)
+    .max()
+    .unwrap_or(0);
+    snap.meters_for(&account.id)?
+        .meters
+        .iter()
+        .filter_map(|m| {
+            let pct = krill_app::accounts::display::window(m.window.as_ref(), now).percent?;
+            (pct >= krill_proto::usage::WARN_PERCENT && pct > shown).then(|| (m.label.clone(), pct))
         })
-        .max_by_key(|(pct, _)| *pct)
-        .map(|(_, w)| w);
-    status_window_label(window, now)
+        .max_by_key(|(_, pct)| *pct)
 }
 
 fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) -> bool {
@@ -644,10 +785,6 @@ fn has_provider_pill(snap: &AccountsSnapshot, provider: ProviderKind, cx: &App) 
                 || !a.usage.is_empty()
                 || snap.meters_for(&a.id).is_some_and(|m| !m.meters.is_empty()))
     }) && krill_app::accounts::installed::is_installed(cx, provider)
-}
-
-fn compact_account_usage(usage: &krill_proto::usage::Snapshot) -> String {
-    krill_app::accounts::display::summary(usage, krill_app::accounts::display::now())
 }
 
 /// Codex banked reset 크레딧 수. 미터가 없으면 `None`(행 자체를 그리지 않는다).
@@ -672,7 +809,8 @@ fn append_reset_credit_rows(
     reset_armed: Option<&(ProviderKind, String)>,
     weak: &WeakEntity<Shell>,
 ) -> PopupMenu {
-    if provider != ProviderKind::Codex {
+    // Codex banked reset와 Claude 주간 세션 리셋·프로모션 grant가 같은 행을 쓴다.
+    if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return menu;
     }
     let Some(account) = active else {
@@ -785,6 +923,13 @@ fn append_reset_credit_rows(
     menu
 }
 
+/// 상태바 메뉴는 바 위로 열고(Orca처럼 하단바를 가리지 않음), 창 위쪽 여백까지만
+/// 자라며 넘치면 스크롤한다. 앵커가 넘친 메뉴를 창 안으로 밀어 올리며 바를 덮지 않게 한다.
+fn fit_above_status_bar(menu: PopupMenu, window: &Window) -> PopupMenu {
+    let room = window.viewport_size().height - ui::STATUS_BAR_HEIGHT - ui::SPACE_4 * 2.;
+    menu.max_h(room.max(ui::SPACE_4 * 8.)).scrollable(true)
+}
+
 fn provider_usage_menu(
     mut menu: PopupMenu,
     snap: &AccountsSnapshot,
@@ -807,7 +952,21 @@ fn provider_usage_menu(
         .or_else(|| accounts.first())
         .cloned();
 
-    menu = menu.min_w(px(300.)).max_w(px(340.));
+    let scale = f32::from(window.rem_size()) / 16.;
+    let width = (ui::DIALOG_WIDTH * scale)
+        .min((window.viewport_size().width - ui::SPACE_4 * 2.).max(ui::SPACE_4));
+    // PopupMenu places its check icon outside custom elements. A 100% row would
+    // add that rail to the full content width, overflowing and defeating wrapping.
+    let card_width = (width - ui::SPACE_2 * 2. - ui::SPACE_2 * scale).max(ui::SPACE_4);
+    let account_width = (card_width - (px(ui::ICON_XS) + ui::SPACE_1) * scale).max(ui::SPACE_4);
+    menu = menu
+        .min_w(width)
+        .max_w(width)
+        .max_h(
+            (window.viewport_size().height - ui::STATUS_BAR_HEIGHT - ui::SPACE_4 * 2.)
+                .max(ui::SPACE_4),
+        )
+        .scrollable(true);
     // `active`는 아래 규칙 서브메뉴에서 이동하므로 초기화 행은 복제본을 쓴다.
     let reset_account = active.clone();
     let active_card = active.clone();
@@ -893,7 +1052,8 @@ fn provider_usage_menu(
             let card = div()
                 .id(gpui::SharedString::from(card_id))
                 .debug_selector(move || debug_id.clone())
-                .w(px(284.))
+                .w(card_width)
+                .min_w_0()
                 .px_1()
                 .py_1()
                 .flex()
@@ -902,10 +1062,11 @@ fn provider_usage_menu(
                 .child(
                     div()
                         .w_full()
+                        .min_w_0()
                         .flex()
-                        .items_center()
-                        .justify_between()
-                        .gap_2()
+                        .flex_col()
+                        .items_start()
+                        .gap_1()
                         .child(
                             div()
                                 .flex()
@@ -922,8 +1083,9 @@ fn provider_usage_menu(
                         )
                         .children(active_badge.map(|name| {
                             div()
-                                .max_w(px(150.))
-                                .truncate()
+                                .w_full()
+                                .min_w_0()
+                                .whitespace_normal()
                                 .px_1p5()
                                 .py(px(1.))
                                 .rounded(ui::RADIUS_XS)
@@ -1006,12 +1168,8 @@ fn provider_usage_menu(
                 account.label.clone()
             };
         }
-        let usage_summary = snap.meters_for(&account.id).map_or_else(
-            || compact_account_usage(&account.usage),
-            |m| {
-                krill_app::accounts::display::meters_summary(m, krill_app::accounts::display::now())
-            },
-        );
+        let usage = account.usage.clone();
+        let meters = snap.meters_for(&account.id).cloned();
         let status = krill_app::accounts::display::account(
             account,
             snap.statuses.iter().find(|s| s.account_id == account.id),
@@ -1032,8 +1190,7 @@ fn provider_usage_menu(
             account.id
         );
         let account_weak = weak.clone();
-        // 계정 한 줄: 이름(활성은 굵게)·자동전환 배지·사용량. ✓가 이름 줄에 붙어 고른 계정이 바로 보이고
-        // 줄 전체를 눌러 전환한다. 상태는 정상이 아닐 때(로그인 필요·한도 등)만 둘째 줄에 보인다.
+        // 이름 아래에 창별 사용률·리셋 시간을 모두 둔다. 행 전체 클릭·활성 체크는 유지한다.
         let show_status = !matches!(
             status.status,
             krill_proto::usage::AccountStatus::Ok | krill_proto::usage::AccountStatus::Unknown
@@ -1042,27 +1199,32 @@ fn provider_usage_menu(
             PopupMenuItem::element(move |_, cx| {
                 let p = ui::palette(cx);
                 let debug_id = row_id.clone();
+                let title_selector = format!("{row_id}-title");
                 div()
                     .id(gpui::SharedString::from(row_id.clone()))
                     .debug_selector(move || debug_id.clone())
-                    .w(px(264.))
-                    .py_0p5()
+                    .w(account_width)
+                    .min_w_0()
+                    .py_1()
                     .flex()
                     .flex_col()
                     .items_start()
                     .justify_between()
-                    .gap_0p5()
+                    .gap_1()
                     .child(
                         div()
                             .w_full()
+                            .min_w_0()
                             .flex()
+                            .flex_wrap()
                             .items_center()
                             .gap_1p5()
                             .child(
                                 div()
+                                    .debug_selector(move || title_selector.clone())
                                     .flex_1()
                                     .min_w_0()
-                                    .truncate()
+                                    .whitespace_normal()
                                     .text_size(ui::TEXT_SM)
                                     .font_weight(if is_active {
                                         gpui::FontWeight::SEMIBOLD
@@ -1082,18 +1244,14 @@ fn provider_usage_menu(
                                     .text_size(ui::TEXT_2XS)
                                     .text_color(p.muted_foreground)
                                     .child(b)
-                            }))
-                            .child(
-                                div()
-                                    .flex_none()
-                                    .max_w(px(120.))
-                                    .truncate()
-                                    .font_family(ui::FONT_MONO)
-                                    .text_size(ui::TEXT_2XS)
-                                    .text_color(p.muted_foreground)
-                                    .child(usage_summary.clone()),
-                            ),
+                            })),
                     )
+                    .child(render_popover_account_usage(
+                        &usage,
+                        meters.as_ref(),
+                        &row_id,
+                        p,
+                    ))
                     .when(show_status, |d| {
                         d.child(krill_app::accounts::display::render_status(
                             format!("{row_id}-status"),
@@ -1581,26 +1739,14 @@ impl Shell {
                     now,
                 )
             });
-            let compact_label = percent.map_or_else(|| "—".to_owned(), |pct| format!("{pct}%"));
             let expanded_label = active
                 .map(|a| expanded_account_usage(&a.usage, now))
                 .unwrap_or_default();
-            let label = if expanded {
-                expanded_label.clone()
+            let hot = active.and_then(|a| status_hot_meter(&snap, a, now));
+            let color = if percent.is_some() {
+                p.foreground
             } else {
-                active
-                    .filter(|a| !a.usage.is_empty())
-                    .map_or(compact_label, |a| compact_status_usage(&a.usage, now))
-            };
-            let color = match percent {
-                _ if status.as_ref().is_some_and(|s| {
-                    s.status == krill_proto::usage::AccountStatus::RateLimited
-                }) =>
-                {
-                    p.warning
-                }
-                Some(pct) => krill_app::settings::usage_color(pct, p.foreground, p),
-                None => p.muted_foreground,
+                p.muted_foreground
             };
             let selector = format!("status-provider-pill-{}", provider.as_str());
             let debug_selector = selector.clone();
@@ -1629,36 +1775,43 @@ impl Shell {
                 if expanded { "expanded" } else { "compact" },
                 provider.as_str()
             );
+            // 프로바이더마다 5시간·주간 막대 쌍과 각 사용률·리셋(하단바 B안). 좁으면 막대를
+            // 줄이고 리셋을 가장 큰 단위 하나로 접는다.
+            let short = !expanded;
+            let usage = active.map(|a| a.usage.clone()).unwrap_or_default();
             let pill_btn = pill_btn
                 .accessibility_label(description.clone())
                 .child(ui::icons::provider_icon(provider, ui::ICON_SM, color))
-                .when(expanded && percent.is_some(), |button| {
-                    button.child(
-                        div()
-                            .w(ui::SPACE_4 * 2.)
-                            .h(ui::SPACE_1)
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(p.muted)
-                            .child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(f32::from(percent.unwrap_or(0)) / 100.))
-                                    .bg(color),
-                            ),
-                    )
-                })
                 .child(
                     div()
                         .debug_selector(move || detail_selector.clone())
-                        .child(label),
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(status_window_segment(
+                            usage.five_hour.as_ref(),
+                            now,
+                            short,
+                            p,
+                        ))
+                        .child(status_window_segment(
+                            usage.seven_day.as_ref(),
+                            now,
+                            short,
+                            p,
+                        ))
+                        .children(hot.map(|(label, pct)| {
+                            div()
+                                .text_color(p.foreground)
+                                .child(format!("{label} {pct}%"))
+                        })),
                 );
             let reset_armed = self.reset_armed.clone();
             provider_pills = provider_pills.child(
                 ui::button_with_tooltip_when(tooltips_on, pill_btn, selector, description)
-                    .dropdown_menu(move |menu, window, cx| {
+                    .dropdown_menu_with_anchor(gpui::Anchor::BottomLeft, move |menu, window, cx| {
                         provider_usage_menu(
-                            menu,
+                            fit_above_status_bar(menu, window),
                             &provider_snap,
                             provider,
                             weak.clone(),
@@ -1707,8 +1860,10 @@ impl Shell {
             "status-ssh-switcher",
             ssh_tooltip,
         )
-        .dropdown_menu(move |mut menu, _, _| {
-            menu = menu.min_w(px(240.)).label(text::SSH_MENU_TITLE.get());
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, move |mut menu, window, _| {
+            menu = fit_above_status_bar(menu, window)
+                .min_w(px(240.))
+                .label(text::SSH_MENU_TITLE.get());
             for host in &ssh_hosts {
                 let item_label = format!("{} ({})", host.label, host.destination);
                 let host = host.clone();
@@ -1761,11 +1916,13 @@ impl Shell {
             "status-orchestration-menu",
             orch_tooltip,
         )
-        .dropdown_menu({
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, {
                 let weak = cx.weak_entity();
                 let state_dir = state_dir.clone();
-                move |mut menu, _, _| {
-                    menu = menu.min_w(px(300.)).label(text::ORCH_MENU_TITLE.get());
+                move |mut menu, window, _| {
+                    menu = fit_above_status_bar(menu, window)
+                        .min_w(px(300.))
+                        .label(text::ORCH_MENU_TITLE.get());
                     // OWE-652: Run이 하나도 없으면 빈 상태 안내를 보인다.
                     if !orch_has_content(&orch_store) {
                         menu = menu.item(PopupMenuItem::new(text::ORCH_EMPTY.get()).disabled(true));
@@ -2022,8 +2179,10 @@ impl Shell {
             "status-ports-menu",
             ports_tooltip,
         )
-        .dropdown_menu(move |mut menu, _, _| {
-            menu = menu.min_w(px(240.)).label(text::PORTS_MENU_TITLE.get());
+        .dropdown_menu_with_anchor(gpui::Anchor::BottomRight, move |mut menu, window, _| {
+            menu = fit_above_status_bar(menu, window)
+                .min_w(px(240.))
+                .label(text::PORTS_MENU_TITLE.get());
             if detected_ports.is_empty() {
                 menu = menu.item(PopupMenuItem::new(text::PORTS_EMPTY.get()).disabled(true));
             } else {

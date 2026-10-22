@@ -158,6 +158,10 @@ impl Socket {
             .conn
             .lock()
             .map_err(|_| io::Error::other("sidebar socket mutex poisoned"))?;
+        if !self.target.is_current() {
+            *guard = None;
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         if guard
             .as_ref()
             .is_none_or(|c| c.features & required != required)
@@ -172,6 +176,10 @@ impl Socket {
             return Err(e);
         }
         let res = f(&mut conn.stream);
+        if !self.target.is_current() {
+            *guard = None;
+            return Err(io::ErrorKind::Interrupted.into());
+        }
         match &res {
             Ok(_) => self.target.record_outcome(true, None),
             Err(e) => {
@@ -244,6 +252,10 @@ impl Socket {
 }
 
 impl Source for Socket {
+    fn target(&self) -> Option<&HostTarget> {
+        Some(&self.target)
+    }
+
     fn fetch(&self) -> io::Result<Snapshot> {
         let is_local = self.target.allow_local_launch();
         // 외부 에이전트 상태는 로컬 호스트에서만 TTL 캐시에서 읽는다. 실패해도 krilld 스냅샷은 그대로 돌려준다.

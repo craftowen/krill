@@ -4,7 +4,7 @@ members = ["crates/*"]
 exclude = ["vendor"]
 
 [workspace.package]
-version = "0.1.29"
+version = "0.1.33"
 edition = "2024"
 rust-version = "1.98"
 license = "Apache-2.0"
@@ -19,6 +19,8 @@ krill-log = { path = "crates/krill-log" }
 krill-hosts = { path = "crates/krill-hosts" }
 krill-link = { path = "crates/krill-link" }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
+# gpui 등 log 크레이트 경고를 운영 로그로 넘긴다(krill-log forward). gpui 의존성으로 이미 Cargo.lock에 있는 버전.
+log = { version = "0.4.34", default-features = false, features = ["std"] }
 krilld = { path = "crates/krilld" }
 # IPC 제어 메시지(MK-021). postcard 기본 기능(heapless-cas)은 RUSTSEC-2023-0089로 cargo-deny 실패(C2 실측).
 postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }

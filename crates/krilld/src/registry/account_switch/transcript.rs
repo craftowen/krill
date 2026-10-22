@@ -12,8 +12,55 @@ use krill_proto::os::ffi::OsStrExt as _;
 use krill_proto::os::fs::OpenOptionsExt as _;
 use krill_proto::usage::{AccountInfo, ProviderKind};
 
-use crate::agent::control::LaunchAccount;
+use crate::agent::control::{LaunchAccount, StoredLaunch, valid_session_id, valid_transcript_path};
 use crate::usage::accounts;
+
+/// A bound ID (launch/resume/hook) is authoritative. A hook-bound file can also
+/// supply the ID, but cwd/mtime searches cannot prove which process owns a conversation.
+pub(super) fn session_id(provider: ProviderKind, stored: &StoredLaunch) -> io::Result<String> {
+    if let Some(id) = stored.session_id.as_deref() {
+        return if valid_session_id(id) {
+            Ok(id.to_owned())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid bound conversation identity",
+            ))
+        };
+    }
+    if let Some(path) = stored.transcript_path.as_deref() {
+        if !valid_transcript_path(path) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        return file_session_id(Path::new(path), provider);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "conversation identity is not bound",
+    ))
+}
+
+/// The conversation as the selected profile will see it, re-checked before the original retires.
+pub(super) struct PreparedTranscript {
+    path: Option<PathBuf>,
+    provider: ProviderKind,
+    id: String,
+}
+
+impl PreparedTranscript {
+    pub(super) fn verify(&self) -> io::Result<()> {
+        if let Some(path) = &self.path {
+            if matches!(self.provider, ProviderKind::Claude | ProviderKind::Codex) {
+                if file_session_id(path, self.provider)? != self.id {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+            } else if !path.exists() {
+                return Err(io::ErrorKind::NotFound.into());
+            }
+        }
+        Ok(())
+    }
+}
 
 pub(super) fn prepare(
     provider: ProviderKind,
@@ -22,23 +69,21 @@ pub(super) fn prepare(
     target: &AccountInfo,
     id: &str,
     cwd: &[u8],
-) -> io::Result<()> {
+) -> io::Result<PreparedTranscript> {
     let from = if source.dir.is_empty() {
         accounts::host_default_dir(home, provider)
     } else {
         PathBuf::from(&source.dir)
     };
     let to = Path::new(&target.profile_dir);
-    if from == to
+    // The same profile still has to hold the conversation; it only skips linking.
+    let same_profile = from == to
         || from
             .canonicalize()
             .ok()
             .zip(to.canonicalize().ok())
-            .is_some_and(|(a, b)| a == b)
-    {
-        return Ok(());
-    }
-    match provider {
+            .is_some_and(|(a, b)| a == b);
+    let path = match provider {
         ProviderKind::Claude | ProviderKind::Codex => {
             let base = if provider == ProviderKind::Claude {
                 "projects"
@@ -53,14 +98,17 @@ pub(super) fn prepare(
                 )
             })?;
             let relative = path.strip_prefix(&from).map_err(io::Error::other)?;
-            link_file(&path, &to.join(relative))?;
-            if provider == ProviderKind::Claude {
-                let children = path.with_file_name(id);
-                if children.is_dir() {
-                    link_tree(&children, &to.join(relative).with_file_name(id), &mut 4096)?;
+            let destination = to.join(relative);
+            if !same_profile {
+                link_file(&path, &destination)?;
+                if provider == ProviderKind::Claude {
+                    let children = path.with_file_name(id);
+                    if children.is_dir() {
+                        link_tree(&children, &destination.with_file_name(id), &mut 4096)?;
+                    }
                 }
             }
-            Ok(())
+            Some(destination)
         }
         ProviderKind::Antigravity => {
             let target_root = if target.host_default {
@@ -68,32 +116,111 @@ pub(super) fn prepare(
             } else {
                 to.join(".gemini/antigravity-cli")
             };
+            let mut path = None;
             for root in crate::agent_history::vault::agy_candidate_dirs(&from, true) {
                 let brain = root.join("brain").join(id);
                 if brain.is_dir() {
-                    return link_tree(&brain, &target_root.join("brain").join(id), &mut 4096);
+                    let destination = target_root.join("brain").join(id);
+                    if !same_profile {
+                        link_tree(&brain, &destination, &mut 4096)?;
+                    }
+                    path = Some(destination);
+                    break;
                 }
                 let session = root.join("sessions").join(format!("{id}.jsonl"));
                 if session.is_file() {
-                    return link_file(
-                        &session,
-                        &target_root.join("sessions").join(format!("{id}.jsonl")),
-                    );
+                    let destination = target_root.join("sessions").join(format!("{id}.jsonl"));
+                    if !same_profile {
+                        link_file(&session, &destination)?;
+                    }
+                    path = Some(destination);
+                    break;
                 }
             }
-            Err(io::ErrorKind::NotFound.into())
+            Some(path.ok_or(io::ErrorKind::NotFound)?)
         }
-        ProviderKind::OpenCode => opencode(source, target, id, cwd),
-        ProviderKind::Gemini => Err(io::ErrorKind::InvalidInput.into()),
+        ProviderKind::OpenCode => {
+            // Importing into the database it was exported from could duplicate the session.
+            if !same_profile {
+                opencode(source, target, id, cwd)?;
+            }
+            None
+        }
+        ProviderKind::Gemini => return Err(io::ErrorKind::InvalidInput.into()),
+    };
+    let prepared = PreparedTranscript {
+        path,
+        provider,
+        id: id.to_owned(),
+    };
+    prepared.verify()?;
+    Ok(prepared)
+}
+
+/// Read only provider identity metadata, never infer an ID from an arbitrary rollout filename.
+fn file_session_id(path: &Path, provider: ProviderKind) -> io::Result<String> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(io::ErrorKind::InvalidData.into());
     }
+    let mut head = Vec::new();
+    File::open(path)?.take(128 * 1024).read_to_end(&mut head)?;
+    let mut identity: Option<String> = None;
+    for record in String::from_utf8_lossy(&head)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+    {
+        let id = match provider {
+            ProviderKind::Codex
+                if record.get("type").and_then(serde_json::Value::as_str)
+                    == Some("session_meta") =>
+            {
+                if record.pointer("/payload/source/subagent").is_some() {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                record.pointer("/payload/id")
+            }
+            ProviderKind::Claude => {
+                if record
+                    .get("isSidechain")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                {
+                    return Err(io::ErrorKind::InvalidData.into());
+                }
+                record.get("sessionId")
+            }
+            _ => None,
+        }
+        .and_then(serde_json::Value::as_str);
+        if let Some(id) = id {
+            if !valid_session_id(id) || identity.as_deref().is_some_and(|previous| previous != id) {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+            identity = Some(id.to_owned());
+        }
+    }
+    identity.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "conversation transcript has no verified identity",
+        )
+    })
 }
 
 fn find_transcript(root: &Path, provider: ProviderKind, id: &str) -> io::Result<Option<PathBuf>> {
     let deadline = Instant::now() + Duration::from_secs(3);
+    // Only search provider-owned transcript levels. Claude subagent/workflow trees
+    // can exceed the whole search budget and cannot contain the parent conversation.
+    let max_depth = if provider == ProviderKind::Claude {
+        1
+    } else {
+        3
+    };
     let mut pending = vec![(root.to_path_buf(), 0_u8)];
     let mut nodes = 0_u32;
+    let mut found = None;
     while let Some((dir, depth)) = pending.pop() {
-        if depth > 4 || nodes >= 20_000 || Instant::now() > deadline {
+        if nodes >= 20_000 || Instant::now() > deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
         let entries = match fs::read_dir(&dir) {
@@ -109,7 +236,9 @@ fn find_transcript(root: &Path, provider: ProviderKind, id: &str) -> io::Result<
             let entry = entry?;
             let path = entry.path();
             if entry.file_type()?.is_dir() {
-                pending.push((path, depth.saturating_add(1)));
+                if depth < max_depth {
+                    pending.push((path, depth.saturating_add(1)));
+                }
                 continue;
             }
             let name = entry.file_name();
@@ -122,28 +251,16 @@ fn find_transcript(root: &Path, provider: ProviderKind, id: &str) -> io::Result<
             if !matches || !entry.file_type()?.is_file() {
                 continue;
             }
-            if provider == ProviderKind::Codex {
-                let mut head = Vec::new();
-                File::open(&path)?.take(128 * 1024).read_to_end(&mut head)?;
-                let valid = String::from_utf8_lossy(&head)
-                    .lines()
-                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-                    .any(|v| {
-                        v.get("type").and_then(serde_json::Value::as_str) == Some("session_meta")
-                            && v.pointer("/payload/id").and_then(serde_json::Value::as_str)
-                                == Some(id)
-                    });
-                if !valid {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "rollout identity mismatch",
-                    ));
-                }
+            if file_session_id(&path, provider)? != id || found.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "conversation transcript identity is mismatched or ambiguous",
+                ));
             }
-            return Ok(Some(path));
+            found = Some(path);
         }
     }
-    Ok(None)
+    Ok(found)
 }
 
 fn link_tree(from: &Path, to: &Path, budget: &mut usize) -> io::Result<()> {
@@ -439,6 +556,187 @@ esac
         fs::write(to.join(&name), "conflicting conversation").unwrap();
         assert!(prepare(ProviderKind::Codex, &root, &source, &target, id, b"").is_err());
         assert!(fs::read_to_string(from.join(&name)).unwrap().contains(id));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_transcript_search_skips_nested_subagent_workflow_dirs() {
+        // Claude Code workflow subagents leave `<project>/<sid>/subagents/workflows/wf_*`, one level
+        // below the search depth. Siblings on both sides keep the test order-independent.
+        let root =
+            std::env::temp_dir().join(format!("krill-deep-transcript-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let projects = root.join("projects");
+        for project in ["a-deep", "z-deep"] {
+            let deep = projects.join(project).join("sid/subagents/workflows/wf_1");
+            fs::create_dir_all(&deep).unwrap();
+            fs::write(deep.join("agent.jsonl"), "{}").unwrap();
+        }
+        let id = "3b71560c-6c71-4dce-86d0-5ce025eac068";
+        let wanted = projects.join("m-target").join(format!("{id}.jsonl"));
+        fs::create_dir_all(wanted.parent().unwrap()).unwrap();
+        fs::write(&wanted, format!("{{\"sessionId\":\"{id}\"}}\n")).unwrap();
+        assert_eq!(
+            find_transcript(&projects, ProviderKind::Claude, id).unwrap(),
+            Some(wanted)
+        );
+        assert_eq!(
+            find_transcript(&projects, ProviderKind::Claude, "missing").unwrap(),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_transcript_search_does_not_open_unrelated_subagent_dirs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("krill-unreadable-subagent-{}", std::process::id()));
+        let subagents = root.join("project/sid/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::set_permissions(&subagents, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = find_transcript(&root, ProviderKind::Claude, "missing");
+        // Restore permissions even when the search regresses, so fixture cleanup succeeds.
+        fs::set_permissions(&subagents, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), None);
+    }
+
+    #[test]
+    fn same_cwd_sessions_keep_distinct_bound_ids_and_bound_rollout_path_uses_metadata() {
+        use krill_proto::agent::Permission;
+        let root = std::env::temp_dir().join(format!("kas-identity-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let from = root.join("from");
+        let to = root.join("to");
+        fs::create_dir_all(from.join("sessions/2026/10/20")).unwrap();
+        fs::create_dir_all(&to).unwrap();
+        let source = LaunchAccount {
+            id: "codex-source".into(),
+            env_key: "CODEX_HOME".into(),
+            dir: from.display().to_string(),
+        };
+        let target = AccountInfo {
+            id: "codex-target".into(),
+            provider: ProviderKind::Codex,
+            label: "Target".into(),
+            email: None,
+            profile_dir: to.display().to_string(),
+            active: true,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+        let mut sessions = Vec::new();
+        for id in ["conversation-one", "conversation-two"] {
+            let path = from.join(format!("sessions/2026/10/20/rollout-date-{id}.jsonl"));
+            fs::write(&path, format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/same/project\"}}}}\n")).unwrap();
+            sessions.push(StoredLaunch {
+                profile: "codex".into(),
+                permission: Permission::Manual,
+                session_id: Some(id.into()),
+                transcript_path: Some(path.display().to_string()),
+                cwd: b"/same/project".to_vec(),
+                hibernation_blocked: false,
+                account: Some(source.clone()),
+            });
+        }
+        for stored in &sessions {
+            let id = session_id(ProviderKind::Codex, stored).unwrap();
+            assert_eq!(Some(&id), stored.session_id.as_ref());
+            let prepared = prepare(
+                ProviderKind::Codex,
+                &root,
+                &source,
+                &target,
+                &id,
+                &stored.cwd,
+            )
+            .unwrap();
+            prepared.verify().unwrap();
+            let path = prepared.path.as_ref().unwrap();
+            assert_eq!(file_session_id(path, ProviderKind::Codex).unwrap(), id);
+            fs::remove_file(path).unwrap();
+            assert_eq!(
+                prepared.verify().unwrap_err().kind(),
+                io::ErrorKind::NotFound
+            );
+        }
+        let mut path_only = sessions[0].clone();
+        path_only.session_id = None;
+        assert_eq!(
+            session_id(ProviderKind::Codex, &path_only).unwrap(),
+            "conversation-one"
+        );
+        path_only.transcript_path = None;
+        assert_eq!(
+            session_id(ProviderKind::Codex, &path_only)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bound_transcript_rejects_conflicting_metadata_and_same_profile_requires_file() {
+        use krill_proto::agent::Permission;
+        let root = std::env::temp_dir().join(format!("kas-bound-file-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("bound.jsonl");
+        let stored = StoredLaunch {
+            profile: "codex".into(),
+            permission: Permission::Manual,
+            session_id: None,
+            transcript_path: Some(path.display().to_string()),
+            cwd: b"/same/project".to_vec(),
+            hibernation_blocked: false,
+            account: None,
+        };
+        assert_eq!(
+            session_id(ProviderKind::Codex, &stored).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        fs::write(&path, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"one\"}}\n{\"type\":\"session_meta\",\"payload\":{\"id\":\"two\"}}\n").unwrap();
+        assert_eq!(
+            session_id(ProviderKind::Codex, &stored).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        fs::write(&path, "{\"sessionId\":\"claude-one\"}\n").unwrap();
+        assert_eq!(
+            session_id(ProviderKind::Claude, &stored).unwrap(),
+            "claude-one"
+        );
+        let source = LaunchAccount {
+            id: "codex-source".into(),
+            env_key: "CODEX_HOME".into(),
+            dir: root.display().to_string(),
+        };
+        let target = AccountInfo {
+            id: "codex-target".into(),
+            provider: ProviderKind::Codex,
+            label: "Target".into(),
+            email: None,
+            profile_dir: root.display().to_string(),
+            active: true,
+            host_default: false,
+            stale: false,
+            usage: krill_proto::usage::Snapshot::default(),
+        };
+        assert!(
+            prepare(
+                ProviderKind::Codex,
+                &root,
+                &source,
+                &target,
+                "missing",
+                b"/same/project"
+            )
+            .is_err()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

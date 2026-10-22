@@ -1,4 +1,4 @@
-// Minikrill 변경(OWE-665, Apache-2.0 §4(b)): 들여쓰기 안내선을 stroke path 대신 1px 사각형으로 그린다.
+// Krill 변경(OWE-665, Apache-2.0 §4(b)): 들여쓰기 안내선을 stroke path 대신 1px 사각형으로 그린다.
 // path를 그리면 Metal 렌더러가 창 크기 중간 텍스처를 쥐어, 코드 탭이 보이는 내내 GPU 메모리가 그만큼 늘었다.
 use crate::input::InputModeKind;
 use crate::input::{

@@ -14,7 +14,7 @@ use gpui::{
 use std::path::PathBuf;
 
 actions!(
-    minikrill,
+    krill,
     [
         NewWindow,
         CloseWindow,
@@ -71,9 +71,9 @@ fn main() -> std::process::ExitCode {
         });
         // Resolve startup files and helper paths while the application event loop stays responsive.
         let startup = cx.background_spawn(async {
-            let migrated = krill_proto::daemon::migrate::run();
             krill_log::init(krill_log::Component::App).ok();
-            tracing::info!(?migrated, "app starting");
+            krill_log::forward_log_warnings();
+            tracing::info!("app starting");
             let bounds = krill_app::layout::default_path()
                 .as_deref()
                 .and_then(krill_app::layout::Layout::peek_window_bounds);
@@ -100,6 +100,16 @@ fn main() -> std::process::ExitCode {
                     );
                 }
                 if let Some(state) = krill_proto::daemon::state_dir() {
+                    let incoming_state = state.clone();
+                    cx.background_spawn(async move {
+                        let executable = krill_app::hosts::link::executable();
+                        if let Err(error) =
+                            krill_link::service::ensure_default_server(&executable, &incoming_state)
+                        {
+                            tracing::warn!(%error, "failed to start incoming access");
+                        }
+                    })
+                    .detach();
                     window
                         .update(cx, |shell, window, cx| {
                             shell.arm_update_ready(state.clone());

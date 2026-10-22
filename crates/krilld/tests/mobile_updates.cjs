@@ -15,11 +15,11 @@ const flush=async()=>{for(let i=0;i<40;i++)await Promise.resolve();await new Pro
 function fixture(options={}){
  const optionsFixture=options;
  let now=100000,id=0,busy=false,blocked=false,next=bundle(options.change),found={hash:next.hash,relay:true,url:''},failFile,failCache=false,failState=false,failDestination=false;
- const timers=new Map(),requests=[],redirects=[],cache=new Map(),session=new Map(),store=new Map([['minikrill-mobile-v2',JSON.stringify({device_id:'device-A',credential:'c'.repeat(64),rid,hash:oldHash})]]),doc=Object.assign(new EventTarget(),{hidden:false}),events=new EventTarget();
+ const timers=new Map(),requests=[],redirects=[],cache=new Map(),session=new Map(),store=new Map([['krill-mobile-v2',JSON.stringify({device_id:'device-A',credential:'c'.repeat(64),rid,hash:oldHash})]]),doc=Object.assign(new EventTarget(),{hidden:false}),events=new EventTarget();
  const location=new URL(`https://phone.test/m/${oldHash}/?session=7#/host/local/group/project/s/7`);location.replace=url=>redirects.push(url);
  const C={enc:new TextEncoder(),concat:(...parts)=>Uint8Array.from(Buffer.concat(parts)),sha256:bytes=>Uint8Array.from(crypto.createHash('sha256').update(bytes).digest()),hex:bytes=>Buffer.from(bytes).toString('hex')};
  const context=vm.createContext({URL,URLSearchParams,AbortController,TextEncoder,TextDecoder,Uint8Array,Response,Event,Map,Set,MkCrypto:C,document:doc,navigator:{serviceWorker:Object.assign(new EventTarget(),{controller:{},register:async()=>{}})},location,history:{replaceState(_a,_b,url){location.href=new URL(url,location).href;}},Date:class extends Date{static now(){return now;}},setTimeout:(fn,ms)=>{const key=++id;timers.set(key,{fn,at:now+ms});return key;},clearTimeout:key=>timers.delete(key),addEventListener:events.addEventListener.bind(events),removeEventListener:events.removeEventListener.bind(events),
-  localStorage:{getItem:key=>store.get(key)||null,setItem:(key,value)=>{if(failDestination&&key==='minikrill-mobile-v2')throw Error('quota');store.set(key,value);}},
+  localStorage:{getItem:key=>store.get(key)||null,setItem:(key,value)=>{if(failDestination&&key==='krill-mobile-v2')throw Error('quota');store.set(key,value);}},
   sessionStorage:{getItem:key=>session.get(key)||null,setItem:(key,value)=>{if(failState)throw Error('quota');session.set(key,value);},removeItem:key=>session.delete(key)},
   caches:{open:async()=>({put:async(key,value)=>{if(failCache)throw Error('quota');cache.set(key,value);},keys:async()=>[...cache.keys()].map(url=>({url})),delete:async request=>cache.delete(request.url)})},
   fetch:async(url,options)=>{requests.push({url,options});if(url.startsWith('/r/'))return new Response(JSON.stringify(found));const cacheKey=new URL(url,location.origin).href;if(optionsFixture.swCache&&cache.has(cacheKey))return cache.get(cacheKey).clone();const name=url.endsWith('/')?'index.html':url.split(`/m/${next.hash}/`)[1];if(name===failFile)return new Response('Missing',{status:404});return new Response(next.files.get(name)||'wrong bundle');}
@@ -31,10 +31,10 @@ function fixture(options={}){
  return {context,api,endpoint,doc,events,requests,redirects,cache,session,store,state,advance,get restored(){return restored;},get hash(){return next.hash;},set busy(v){busy=v;},set blocked(v){blocked=v;},set failFile(v){failFile=v;},set failCache(v){failCache=v;},set failState(v){failState=v;},set failDestination(v){failDestination=v;},set found(v){found=v;}};
 }
 test('normal connection prepares every asset, then navigates once with the same credential and route',async()=>{
- const f=fixture(),before=f.store.get('minikrill-mobile-v2');f.api.start();await f.api.check();assert.equal(f.redirects.length,0);assert.equal(f.store.get('minikrill-mobile-v2'),before);
+ const f=fixture(),before=f.store.get('krill-mobile-v2');f.api.start();await f.api.check();assert.equal(f.redirects.length,0);assert.equal(f.store.get('krill-mobile-v2'),before);
  assert.equal(f.cache.size,inventory.length+1);assert(f.requests.every(r=>r.options.cache==='no-store'));
  await f.advance(1500);assert.deepEqual(f.redirects,[`/m/${f.hash}/?session=7#/host/local/group/project/s/7`]);
- const saved=JSON.parse(f.store.get('minikrill-mobile-v2'));assert.equal(saved.credential,'c'.repeat(64));assert.equal(saved.device_id,'device-A');assert.equal(saved.hash,f.hash);
+ const saved=JSON.parse(f.store.get('krill-mobile-v2'));assert.equal(saved.credential,'c'.repeat(64));assert.equal(saved.device_id,'device-A');assert.equal(saved.hash,f.hash);
  const handoff=JSON.parse(f.session.get('krill-mobile-update-v1'));assert.deepEqual(handoff.state,f.state);assert(!JSON.stringify(handoff).includes(saved.credential));assert(!f.requests.some(r=>r.options.method==='POST'));
  await f.advance(60000);assert.equal(f.redirects.length,1);f.api.stop();
 });
@@ -49,8 +49,8 @@ test('navigation waits until a service worker actually controls the page',async(
 });
 for(const failure of ['missing','cache','handoff','credential','hash','schema'])test(`${failure} failure preserves the current app and credential`,async()=>{
  const f=fixture(failure==='schema'?{change:{'index.html':read('index.html').replace('name="krill-update"','name="unsupported"')}}:{});
- const before=f.store.get('minikrill-mobile-v2');if(failure==='missing')f.failFile='terminal.js';if(failure==='cache')f.failCache=true;if(failure==='handoff')f.failState=true;if(failure==='credential')f.failDestination=true;if(failure==='hash')f.found={hash:'b'.repeat(16),relay:true,url:''};
- f.api.start();await f.api.check();await f.advance(2000);assert.equal(f.redirects.length,0);assert.equal(f.store.get('minikrill-mobile-v2'),before);f.api.stop();
+ const before=f.store.get('krill-mobile-v2');if(failure==='missing')f.failFile='terminal.js';if(failure==='cache')f.failCache=true;if(failure==='handoff')f.failState=true;if(failure==='credential')f.failDestination=true;if(failure==='hash')f.found={hash:'b'.repeat(16),relay:true,url:''};
+ f.api.start();await f.api.check();await f.advance(2000);assert.equal(f.redirects.length,0);assert.equal(f.store.get('krill-mobile-v2'),before);f.api.stop();
 });
 test('restoration is scoped to host/device/hash, expires, and consumes text only once',async()=>{
  for(const mismatch of ['none','host','hash','expired','malformed']){
@@ -85,7 +85,7 @@ test('hash-invalid cache-first responses are evicted so a repaired deployment ca
  f.api.start();await f.api.check();assert.equal(f.cache.size,0);assert.equal(f.redirects.length,0);await f.api.check();await f.advance(2000);assert.equal(f.redirects.length,1);f.api.stop();
 });
 test('legacy connection failure discovery delegates to the updater without writing a new hash',async()=>{
- const f=fixture();let notifications=0;f.endpoint.setUpdateHandler(()=>notifications++);await f.endpoint.locate();assert.equal(notifications,1);assert.equal(f.redirects.length,0);assert.equal(JSON.parse(f.store.get('minikrill-mobile-v2')).hash,oldHash);
+ const f=fixture();let notifications=0;f.endpoint.setUpdateHandler(()=>notifications++);await f.endpoint.locate();assert.equal(notifications,1);assert.equal(f.redirects.length,0);assert.equal(JSON.parse(f.store.get('krill-mobile-v2')).hash,oldHash);
 });
 test('view handoff restores scroll offsets without replaying any interaction',()=>{
  const f=fixture(),node={scrollTop:35,scrollLeft:20,scrollHeight:500,clientHeight:100,scrollWidth:400,clientWidth:100},root=Object.assign(new EventTarget(),{querySelectorAll:s=>s==='.chat-feed'?[node]:[]});let disconnected=false;

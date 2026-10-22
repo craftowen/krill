@@ -164,6 +164,99 @@ fn cache_skips_disk_for_same_candidate() {
 }
 
 #[test]
+fn spaces_and_korean_image_names_keep_the_whole_path() {
+    let dir = TempDir::new("spaced-images");
+    let name = "KakaoTalk_Photo_2026-10-22 보정 완료.jpeg";
+    let file = dir.0.join(name);
+    fs::write(&file, "image").unwrap();
+    // 파일 이름 일부도 실재할 때 긴 파일 이름 전체를 우선한다.
+    fs::write(dir.0.join("완료.jpeg"), "other image").unwrap();
+    for text in [
+        format!("저장: {name}"),
+        format!("저장: [{name}]"),
+        format!("저장: `{name}`"),
+        format!("저장: \"{name}\""),
+        format!("결과: {}", file.display()),
+        format!("결과: ~/{name}"),
+    ] {
+        let cells = row(&text);
+        let start = u16::try_from(row(text.split_once(": ").unwrap().0).len() + 2).unwrap();
+        let column = u16::try_from(cells.len() - 4).unwrap();
+        let link = Cache::default()
+            .link_at_with_home(&cells, column, Some(&dir.0), Some(&dir.0))
+            .unwrap();
+        assert_eq!(link.path, file, "{text}");
+        assert!(link.column >= start);
+        assert_eq!(link.line, None);
+        let inside_space = link.column + 29;
+        assert_eq!(
+            at(&text, inside_space, &dir.0).unwrap().path,
+            file,
+            "공백도 경로에 포함: {text}"
+        );
+        assert_eq!(
+            at(&text, 1, &dir.0),
+            None,
+            "주변 설명은 링크가 아니다: {text}"
+        );
+    }
+}
+
+#[test]
+fn quoted_paths_allow_parentheses_and_location_after_spaces() {
+    let dir = TempDir::new("quoted");
+    let file = dir.0.join("사진 (최종).jpeg");
+    fs::write(&file, "image").unwrap();
+    for text in [
+        "'사진 (최종).jpeg'",
+        "`사진 (최종).jpeg`",
+        "\"사진 (최종).jpeg\"",
+    ] {
+        assert_eq!(at(text, 3, &dir.0).unwrap().path, file, "{text}");
+    }
+    let file = dir.0.join("src/my file.rs");
+    fs::write(&file, "code").unwrap();
+    let link = at("src/my file.rs:12:3", 10, &dir.0).unwrap();
+    assert_eq!(
+        (link.path, link.line, link.col, link.cols),
+        (file, Some(12), Some(3), 19)
+    );
+}
+
+#[test]
+fn each_location_on_the_same_line_opens_its_own_file() {
+    let dir = TempDir::new("two-paths");
+    let file = dir.0.join("src/other.rs");
+    fs::write(&file, "code").unwrap();
+    let text = "src/main.rs:1 src/other.rs:2";
+    let mut cache = Cache::default();
+    let cells = row(text);
+    assert_eq!(
+        cache.link_at(&cells, 2, Some(&dir.0)).unwrap().path,
+        dir.0.join("src/main.rs")
+    );
+    let link = cache.link_at(&cells, 20, Some(&dir.0)).unwrap();
+    assert_eq!((link.path, link.line), (file, Some(2)));
+}
+
+proptest::proptest! {
+    #[test]
+    fn arbitrary_rows_have_bounded_candidates_and_valid_hit_ranges(
+        text in proptest::collection::vec(proptest::char::any(), 0..256),
+        column in proptest::prelude::any::<u16>(),
+    ) {
+        let cells = row(&text.into_iter().collect::<String>());
+        let candidates = candidates_at(&cells, column);
+        proptest::prop_assert!(candidates.len() <= 64);
+        if let Some(link) = Cache::default().link_at_with_home(&cells, column, None, None) {
+            proptest::prop_assert!(link.cols > 0);
+            proptest::prop_assert!((link.column..link.column.saturating_add(link.cols)).contains(&column));
+            proptest::prop_assert!(!link.path.to_string_lossy().chars().any(|c| c.is_control() || is_bidi_control(c)));
+        }
+    }
+}
+
+#[test]
 fn url_at_parses_plaintext_http_https_and_trims_punctuation() {
     let r = row("visit (https://example.com:8080/a/b?x=1&y=2#frag).");
     assert_eq!(url_at(&r, 6), None, "여는 괄호 위는 링크가 아니다");

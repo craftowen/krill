@@ -62,11 +62,10 @@ globalThis.WebSocket=class extends NativeWebSocket {
 """)
                 browser('--init-script', str(fault), 'open', cfg['url'])
                 browser('set','viewport','390','844')
-                browser('find','role','button','click','--name','Pair','--exact')
                 wait('KrillMobile.store.connection.phase==="ready" && recoverySockets.length>=2')
                 assert evaluate('sessionStorage.getItem("interrupted")') == 'yes'
                 assert len(json.loads((Path(cfg['dir'])/'mobile-devices.json').read_text())) == 1
-                assert evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("minikrill-mobile-v2"),hash:location.hash})') == {'secure':False,'subtle':'undefined','paired':True,'hash':'#/'}
+                assert evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("krill-mobile-v2"),hash:location.hash})') == {'secure':False,'subtle':'undefined','paired':True,'hash':'#/'}
                 assert evaluate('document.querySelector(".host-card").getBoundingClientRect().bottom<innerHeight')
                 shot('home')
                 browser('click','.host-main')
@@ -105,7 +104,7 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 photo.write_bytes(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII='))
                 browser('upload','.photo-picker',str(photo))
                 wait('document.getElementById("notice").textContent.includes("Photo attached")')
-                uploads=list((Path(cfg['dir'])/'paste/minikrill-paste').glob('mobile-*.jpg'))
+                uploads=list((Path(cfg['dir'])/'paste/krill-paste').glob('mobile-*.jpg'))
                 assert len(uploads)==1 and stat.S_IMODE(uploads[0].stat().st_mode)==0o600
                 original_route=evaluate('location.hash.slice(1)')
                 browser('find','role','button','click','--name','Create Tab','--exact')

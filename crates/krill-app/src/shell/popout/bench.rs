@@ -1,5 +1,6 @@
 //! 실제 Metal 창의 MK-098 재현 측정. 데몬/실제 에이전트 없이 고정된 10세션 화면을 쓴다.
 //! `KRILL_STATE_DIR` 격리 + onboarding.done 생성 후 krill-app --popout-bench=terminal|dashboard|both.
+//! `--popout-bench=accounts`는 같은 합성 계정으로 실제 상태바 팝업을 수동 확인한다.
 
 use std::{
     io,
@@ -37,6 +38,28 @@ impl sidebar::Source for Fixed {
                 })
                 .collect(),
             ..Default::default()
+        })
+    }
+}
+
+struct AccountsPreview;
+impl sidebar::Source for AccountsPreview {
+    fn fetch(&self) -> io::Result<sidebar::Snapshot> {
+        let repo = std::path::PathBuf::from("/tmp/krill-ui-preview");
+        let tree = repo.join("account-popup");
+        Ok(sidebar::Snapshot {
+            sessions: vec![sidebar::Session {
+                id: SessionId(51),
+                status: AgentStatus {
+                    state: AgentState::Done,
+                    agent: "pi".into(),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: Some(tree.clone()),
+                cwd: Some(tree.clone()),
+                account: None,
+            }],
+            trees: [(repo, vec![tree])].into(),
         })
     }
 }
@@ -104,18 +127,148 @@ fn cpu_seconds() -> Result<f64, Box<dyn std::error::Error>> {
     Ok(minutes.parse::<f64>()? * 60. + seconds.parse::<f64>()?)
 }
 
+pub(super) fn account_popup_snapshot() -> AccountsSnapshot {
+    use krill_proto::usage::{Snapshot, Window};
+    let now = krill_app::accounts::display::now();
+    let account = |id: &str, email: &str, active: bool, usage| AccountInfo {
+        id: id.into(),
+        provider: ProviderKind::Claude,
+        label: "Synthetic layout fixture".into(),
+        email: Some(email.into()),
+        profile_dir: "/tmp/krill-popup-layout-fixture".into(),
+        active,
+        host_default: false,
+        stale: false,
+        usage,
+    };
+    AccountsSnapshot {
+        accounts: vec![
+            account(
+                "layout-main",
+                "long.account.identity.for.the.primary.team.workspace@example.test",
+                true,
+                Snapshot {
+                    five_hour: Some(Window {
+                        percent: 23,
+                        resets_at: Some((now + 12_660).to_string()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 76,
+                        resets_at: Some((now + 432_000).to_string()),
+                    }),
+                },
+            ),
+            account(
+                "layout-other",
+                "another.long.account.identity.for.a.secondary.workspace@example.test",
+                false,
+                Snapshot {
+                    five_hour: Some(Window {
+                        percent: 99,
+                        resets_at: Some(now.saturating_sub(60).to_string()),
+                    }),
+                    seven_day: Some(Window {
+                        percent: 47,
+                        resets_at: None,
+                    }),
+                },
+            ),
+        ],
+        ..Default::default()
+    }
+}
+
 pub(crate) fn run(mode: String) -> ExitCode {
-    if !matches!(mode.as_str(), "terminal" | "dashboard" | "both")
-        || std::env::var_os("KRILL_STATE_DIR").is_none()
+    if !matches!(
+        mode.as_str(),
+        "terminal" | "dashboard" | "both" | "accounts"
+    ) || std::env::var_os("KRILL_STATE_DIR").is_none()
     {
-        eprintln!("BENCH_ERROR use KRILL_STATE_DIR and --popout-bench=terminal|dashboard|both");
+        eprintln!(
+            "BENCH_ERROR use KRILL_STATE_DIR and --popout-bench=terminal|dashboard|both|accounts"
+        );
         return ExitCode::FAILURE;
     }
     let failed = Arc::new(AtomicBool::new(true));
     let result = Arc::clone(&failed);
     gpui_platform::application().with_assets(gpui_kit_assets::Assets).run(move |cx| {
         crate::init(cx);
+        if mode == "accounts" {
+            let state = std::env::var_os("KRILL_STATE_DIR").map(std::path::PathBuf::from);
+            // Shell::new schedules a local snapshot read. Inject an empty home
+            // before construction so even that background read stays synthetic.
+            krill_app::orca_import::set_env_paths(
+                state.as_ref().map(|dir| dir.join("synthetic-home")),
+                state.as_ref().map(|dir| dir.join("synthetic-orca")),
+                state,
+                None,
+                cx,
+            );
+        }
         let Some(main) = crate::open_shell(cx, None) else { cx.quit(); return };
+        if mode == "accounts" {
+            cx.set_global(krill_app::accounts::installed::Installed(Some(vec![ProviderKind::Claude])));
+            main.update(cx, |shell, window, cx| {
+                shell.link = Link::Down;
+                shell.local_generation = shell.local_generation.wrapping_add(1);
+                shell.accounts_poll = None;
+                shell.usage_refresh = None;
+                shell.orch_poll = None;
+                // A settings change must not replace the fixed preview snapshot.
+                #[expect(clippy::used_underscore_binding, reason = "replace the retained settings observer only for the synthetic diagnostic")]
+                {
+                    shell._config_observer = cx.observe_global::<krill_app::settings::Config>(|_, cx| cx.notify());
+                }
+                shell.accounts_snapshot = account_popup_snapshot();
+                shell.notice = Some("Synthetic account popup preview".into());
+                shell.sidebar.update(cx, |s, cx| s.connect_source(Arc::new(AccountsPreview), cx));
+                if let Ok(width) = std::env::var("KRILL_BENCH_WIDTH")
+                    && let Ok(width) = width.parse::<f32>()
+                {
+                    let height = std::env::var("KRILL_BENCH_HEIGHT")
+                        .ok().and_then(|s| s.parse::<f32>().ok()).unwrap_or(760.);
+                    window.resize(gpui::size(px(width.clamp(320., 1600.)), px(height.clamp(320., 1200.))));
+                }
+                if let Ok(zoom) = std::env::var("KRILL_BENCH_ZOOM")
+                    && let Ok(zoom) = zoom.parse::<f32>()
+                {
+                    window.set_rem_size(px(16. * zoom.clamp(0.75, 2.)));
+                }
+                cx.notify();
+            }).ok();
+            if let Ok(view) = std::env::var("KRILL_BENCH_ACCOUNTS_VIEW") {
+                cx.spawn(async move |cx| {
+                    cx.background_executor().timer(Duration::from_millis(750)).await;
+                    cx.update_window(main.into(), |_, window, cx| {
+                        window.draw(cx).clear(cx);
+                        let position = if view == "popup" {
+                            gpui::point(px(80.), window.viewport_size().height - px(12.))
+                        } else {
+                            gpui::point(window.viewport_size().width - px(100.), window.viewport_size().height - px(65.))
+                        };
+                        eprintln!("ACCOUNTS_NATIVE_INPUT viewport={:?} position={position:?}", window.viewport_size());
+                        window.dispatch_event(gpui::PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                            position, pressed_button: None, modifiers: gpui::Modifiers::default(),
+                        }), cx);
+                        if view == "popup" {
+                            window.dispatch_event(gpui::PlatformInput::MouseDown(gpui::MouseDownEvent {
+                                position, button: gpui::MouseButton::Left, modifiers: gpui::Modifiers::default(), click_count: 1, first_mouse: false,
+                            }), cx);
+                            window.dispatch_event(gpui::PlatformInput::MouseUp(gpui::MouseUpEvent {
+                                position, button: gpui::MouseButton::Left, modifiers: gpui::Modifiers::default(), click_count: 1,
+                            }), cx);
+                        }
+                        // Let the native frame callback draw and present the input result.
+                        // A manual draw here would consume invalidation without presenting.
+                        window.refresh();
+                    }).ok();
+                    eprintln!("ACCOUNTS_NATIVE_INPUT_DISPATCHED");
+                }).detach();
+            }
+            result.store(false, Ordering::Relaxed);
+            println!("ACCOUNTS_FIXTURE pid={} · click the Claude status-bar pill to open the production popup", std::process::id());
+            return;
+        }
         main.update(cx, |shell, _, cx| {
             shell.link = Link::Up;
             screen(shell, cx);

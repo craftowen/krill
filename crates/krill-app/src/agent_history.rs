@@ -670,7 +670,7 @@ impl Render for Panel {
                 .into_iter()
                 .map(|(id, scope, label)| {
                     let active = self.scope == scope;
-                    crate::ui::segment(id, label, active)
+                    crate::ui::segment(p, id, label, active)
                         .debug_selector(move || id.into())
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.set_scope(scope, cx);
@@ -694,7 +694,7 @@ impl Render for Panel {
                 .map(|(id, agent, label)| {
                     let active = self.agent_filter == agent;
                     let btn =
-                        crate::ui::segment(id, label, active).debug_selector(move || id.into());
+                        crate::ui::segment(p, id, label, active).debug_selector(move || id.into());
                     let btn = match agent {
                         Some(ag) => btn.icon(crate::ui::icons::agent_menu_icon(ag.profile())),
                         None => btn,

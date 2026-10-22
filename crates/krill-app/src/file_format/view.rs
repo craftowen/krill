@@ -566,7 +566,7 @@ pub(crate) fn size_label(len: u64) -> String {
 }
 
 /// `open`은 Launch Services 응답을 기다리므로 UI 스레드 밖에서 실행한다. 로그에 경로는 남기지 않는다(A8).
-fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
+pub fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
     cx.background_spawn(async move {
         // Building an Open command can stat the target to avoid executing binaries.
         match command(&path).status() {

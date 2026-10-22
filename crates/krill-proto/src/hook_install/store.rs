@@ -49,7 +49,7 @@ pub fn read(path: &Path) -> io::Result<Option<String>> {
 }
 
 pub fn directory(path: &Path) -> io::Result<()> {
-    safe_path(&path.join(".minikrill-path-check"))?;
+    safe_path(&path.join(".krill-path-check"))?;
     DirBuilder::new().recursive(true).mode(0o700).create(path)
 }
 
@@ -75,7 +75,7 @@ fn sibling(path: &Path, kind: &str) -> io::Result<PathBuf> {
         .ok_or_else(|| error("missing file name"))?
         .to_string_lossy();
     Ok(path.with_file_name(format!(
-        "{name}.minikrill-{kind}-{}-{}",
+        "{name}.krill-{kind}-{}-{}",
         std::process::id(),
         SERIAL.fetch_add(1, Ordering::Relaxed)
     )))

@@ -8,6 +8,7 @@ use gpui::{App, Hsla, Pixels, Point, Rems, SharedString, TitlebarOptions, point,
 use gpui_component::{ActiveTheme as _, Theme, ThemeMode};
 use krill_proto::control::AgentState;
 use krill_proto::theme::{Rgb, Theme as TerminalTheme};
+use serde::{Deserialize, Serialize};
 
 /// UI 크롬(사이드바·탭 바·패널·대화상자·상태 바) 기본 산세리프 글꼴.
 /// `gpui-component`가 macOS에서 SF Pro(`.AppleSystemUIFont`)로 해석한다.
@@ -346,6 +347,251 @@ pub const DARK: Palette = Palette {
     split_divider_strong: hex(0x00a1_a1aa),
 };
 
+/// 다크 테마 `심연`: OLED 순수 검정과 무채색 크롬. 색은 상태색만 남긴다.
+pub const ABYSS: Palette = Palette {
+    background: hex(0x0000_0000),
+    editor_surface: hex(0x000a_0a0a),
+    foreground: hex(0x00ed_eded),
+    card: hex(0x000e_0e0e),
+    card_foreground: hex(0x00ed_eded),
+    popover: hex(0x000e_0e0e),
+    popover_foreground: hex(0x00ed_eded),
+    primary: hex(0x00e5_e5e5),
+    primary_foreground: hex(0x0017_1717),
+    secondary: hex(0x001a_1a1a),
+    secondary_foreground: hex(0x00ed_eded),
+    muted: hex(0x001a_1a1a),
+    muted_foreground: hex(0x008f_8f8f),
+    accent: hex(0x001f_1f1f),
+    accent_foreground: hex(0x00ed_eded),
+    destructive: hex(0x00ff_6568),
+    destructive_foreground: hex(0x00fa_fafa),
+    border: hexa(0x00ff_ffff, 0.09),
+    input: hexa(0x00ff_ffff, 0.15),
+    ring: hex(0x0052_5252),
+    sidebar: hex(0x0000_0000),
+    sidebar_foreground: hex(0x00ed_eded),
+    sidebar_primary: hex(0x0040_4040),
+    sidebar_primary_foreground: hex(0x00fa_fafa),
+    sidebar_accent: hex(0x001a_1a1a),
+    sidebar_accent_foreground: hex(0x00ed_eded),
+    sidebar_border: hexa(0x00ff_ffff, 0.08),
+    sidebar_ring: hex(0x0040_4040),
+    worktree_sidebar: hex(0x000f_0f0f),
+    worktree_sidebar_foreground: hex(0x00ed_eded),
+    worktree_sidebar_accent: hex(0x001c_1c1c),
+    worktree_sidebar_border: hexa(0x00ff_ffff, 0.08),
+    success: hex(0x004a_de80),
+    warning: hex(0x00ea_b308),
+    warning_foreground: hex(0x0017_1717),
+    agent_question: hex(0x00fb_923c),
+    preserve: hex(0x007d_d3fc),
+    split_divider: hex(0x0052_525b),
+    split_divider_strong: hex(0x00a1_a1aa),
+};
+
+/// 다크 테마 `조수`: 대비를 낮춘 청회색 슬레이트. 상태색도 채도를 낮춘다.
+pub const TIDEPOOL: Palette = Palette {
+    background: hex(0x001d_222c),
+    editor_surface: hex(0x0023_2936),
+    foreground: hex(0x00e5_e9f0),
+    card: hex(0x0026_2c38),
+    card_foreground: hex(0x00e5_e9f0),
+    popover: hex(0x002a_3140),
+    popover_foreground: hex(0x00e5_e9f0),
+    primary: hex(0x00e5_e9f0),
+    primary_foreground: hex(0x001d_222c),
+    secondary: hex(0x002e_3545),
+    secondary_foreground: hex(0x00e5_e9f0),
+    muted: hex(0x002e_3545),
+    muted_foreground: hex(0x00aa_b4c5),
+    accent: hex(0x0038_4052),
+    accent_foreground: hex(0x00e5_e9f0),
+    destructive: hex(0x00d0_707a),
+    destructive_foreground: hex(0x00fa_fafa),
+    border: hexa(0x00ff_ffff, 0.07),
+    input: hexa(0x00ff_ffff, 0.14),
+    ring: hex(0x005e_81ac),
+    sidebar: hex(0x0023_2935),
+    sidebar_foreground: hex(0x00e5_e9f0),
+    sidebar_primary: hex(0x005e_81ac),
+    sidebar_primary_foreground: hex(0x00fa_fafa),
+    sidebar_accent: hex(0x0032_3a4b),
+    sidebar_accent_foreground: hex(0x00e5_e9f0),
+    sidebar_border: hexa(0x00ff_ffff, 0.06),
+    sidebar_ring: hex(0x004c_566a),
+    worktree_sidebar: hex(0x002a_3140),
+    worktree_sidebar_foreground: hex(0x00e5_e9f0),
+    worktree_sidebar_accent: hex(0x0034_3c4e),
+    worktree_sidebar_border: hexa(0x00ff_ffff, 0.06),
+    success: hex(0x00a3_be8c),
+    warning: hex(0x00eb_cb8b),
+    warning_foreground: hex(0x001d_222c),
+    agent_question: hex(0x00d0_8770),
+    preserve: hex(0x0088_c0d0),
+    split_divider: hex(0x004c_566a),
+    split_divider_strong: hex(0x007b_88a1),
+};
+
+/// 다크 테마 `발광`: 거의 검은 남색 위 시안 강조. 상태색은 밝은 발광색을 쓴다.
+pub const GLOW: Palette = Palette {
+    background: hex(0x0004_070e),
+    editor_surface: hex(0x000a_1120),
+    foreground: hex(0x00e6_f4ff),
+    card: hex(0x000b_1220),
+    card_foreground: hex(0x00e6_f4ff),
+    popover: hex(0x000d_1526),
+    popover_foreground: hex(0x00e6_f4ff),
+    primary: hex(0x00df_eeff),
+    primary_foreground: hex(0x000b_1220),
+    secondary: hex(0x0011_1c30),
+    secondary_foreground: hex(0x00e6_f4ff),
+    muted: hex(0x0011_1c30),
+    muted_foreground: hex(0x007f_9cb8),
+    accent: hex(0x0016_263f),
+    accent_foreground: hex(0x00e6_f4ff),
+    destructive: hex(0x00ff_6b8b),
+    destructive_foreground: hex(0x00fa_fafa),
+    border: hexa(0x0050_c8ff, 0.10),
+    input: hexa(0x0050_c8ff, 0.18),
+    ring: hex(0x001f_a8b0),
+    sidebar: hex(0x0006_0a13),
+    sidebar_foreground: hex(0x00e6_f4ff),
+    sidebar_primary: hex(0x000b_7f86),
+    sidebar_primary_foreground: hex(0x00fa_fafa),
+    sidebar_accent: hex(0x0010_203a),
+    sidebar_accent_foreground: hex(0x00e6_f4ff),
+    sidebar_border: hexa(0x0050_c8ff, 0.08),
+    sidebar_ring: hex(0x001f_5c70),
+    worktree_sidebar: hex(0x000c_1628),
+    worktree_sidebar_foreground: hex(0x00e6_f4ff),
+    worktree_sidebar_accent: hex(0x0013_2640),
+    worktree_sidebar_border: hexa(0x0050_c8ff, 0.08),
+    success: hex(0x0039_f5a8),
+    warning: hex(0x00ff_d84d),
+    warning_foreground: hex(0x0004_070e),
+    agent_question: hex(0x00ff_8a3d),
+    preserve: hex(0x007c_c4ff),
+    split_divider: hex(0x001e_3a52),
+    split_divider_strong: hex(0x003d_6b8a),
+};
+
+/// 라이트 테마 `종이`: 따뜻한 미색 바탕과 잉크색 글자.
+pub const PAPER: Palette = Palette {
+    background: hex(0x00f7_f4ee),
+    editor_surface: hex(0x00fb_f9f4),
+    foreground: hex(0x001f_1d1a),
+    card: hex(0x00fb_f9f4),
+    card_foreground: hex(0x001f_1d1a),
+    popover: hex(0x00ff_fdf8),
+    popover_foreground: hex(0x001f_1d1a),
+    primary: hex(0x001f_1d1a),
+    primary_foreground: hex(0x00fa_f7f0),
+    secondary: hex(0x00ec_e6da),
+    secondary_foreground: hex(0x001f_1d1a),
+    muted: hex(0x00ec_e6da),
+    muted_foreground: hex(0x005f_5a50),
+    accent: hex(0x00e9_e3d6),
+    accent_foreground: hex(0x001f_1d1a),
+    destructive: hex(0x00c6_2828),
+    destructive_foreground: hex(0x00fd_f3f2),
+    border: hex(0x00e2_dccf),
+    input: hex(0x00dd_d6c7),
+    ring: hex(0x00a3_9d8f),
+    sidebar: hex(0x00ef_ebe3),
+    sidebar_foreground: hex(0x001f_1d1a),
+    sidebar_primary: hex(0x001f_1d1a),
+    sidebar_primary_foreground: hex(0x00fa_f7f0),
+    sidebar_accent: hex(0x00e3_dccd),
+    sidebar_accent_foreground: hex(0x001f_1d1a),
+    sidebar_border: hex(0x00e2_dccf),
+    sidebar_ring: hex(0x00a3_9d8f),
+    worktree_sidebar: hex(0x00ea_e5da),
+    worktree_sidebar_foreground: hex(0x001f_1d1a),
+    worktree_sidebar_accent: hex(0x00e0_d9ca),
+    worktree_sidebar_border: hex(0x00e2_dccf),
+    success: hex(0x001f_7a45),
+    warning: hex(0x00a1_6207),
+    warning_foreground: hex(0x00fa_fafa),
+    agent_question: hex(0x00c2_410c),
+    preserve: hex(0x0003_69a1),
+    split_divider: hex(0x008a_8474),
+    split_divider_strong: hex(0x006f_6a60),
+};
+
+/// 다크 모드 앱 테마. 설정 `ui_theme_dark`에 저장한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DarkUiTheme {
+    /// Krill 기본 심해 틴트([`DARK`]).
+    #[default]
+    Deep,
+    Abyss,
+    Tidepool,
+    Glow,
+}
+
+impl DarkUiTheme {
+    pub const ALL: [Self; 4] = [Self::Deep, Self::Abyss, Self::Tidepool, Self::Glow];
+
+    #[must_use]
+    pub const fn palette(self) -> &'static Palette {
+        match self {
+            Self::Deep => &DARK,
+            Self::Abyss => &ABYSS,
+            Self::Tidepool => &TIDEPOOL,
+            Self::Glow => &GLOW,
+        }
+    }
+
+    /// 이 테마와 짝인 내장 터미널 테마 이름.
+    #[must_use]
+    pub const fn terminal_theme_name(self) -> &'static str {
+        match self {
+            Self::Deep => super::terminal_themes::DEFAULT_TERMINAL_THEME_DARK,
+            Self::Abyss => super::terminal_themes::KRILL_ABYSS,
+            Self::Tidepool => super::terminal_themes::KRILL_TIDEPOOL,
+            Self::Glow => super::terminal_themes::KRILL_GLOW,
+        }
+    }
+}
+
+/// 라이트 모드 앱 테마. 설정 `ui_theme_light`에 저장한다.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LightUiTheme {
+    /// Krill 기본 라이트([`LIGHT`]).
+    #[default]
+    Classic,
+    Paper,
+}
+
+impl LightUiTheme {
+    pub const ALL: [Self; 2] = [Self::Classic, Self::Paper];
+
+    #[must_use]
+    pub const fn palette(self) -> &'static Palette {
+        match self {
+            Self::Classic => &LIGHT,
+            Self::Paper => &PAPER,
+        }
+    }
+
+    /// 이 테마와 짝인 내장 터미널 테마 이름.
+    #[must_use]
+    pub const fn terminal_theme_name(self) -> &'static str {
+        match self {
+            Self::Classic => super::terminal_themes::DEFAULT_TERMINAL_THEME_LIGHT,
+            Self::Paper => super::terminal_themes::KRILL_PAPER,
+        }
+    }
+}
+
+/// [`apply`]가 고른 팔레트. [`palette`]가 매 렌더 설정을 복제하지 않고 읽는다.
+struct ActivePalette(&'static Palette);
+
+impl gpui::Global for ActivePalette {}
+
 /// Krill 다크 터미널 기본 테마 `Krill Deep`. 데몬이 테마를 받기 전에 답하는 [`krill_proto::theme::DEFAULT`]와 같은 값이다.
 pub const TERMINAL_DARK: TerminalTheme = krill_proto::theme::DEFAULT;
 
@@ -437,7 +683,7 @@ pub fn terminal_theme(cx: &App) -> TerminalTheme {
     terminal_theme_for_mode(mode, &crate::settings::current(cx))
 }
 
-/// 주어진 [`ThemeMode`]에 대응하는 Orca [`Palette`]를 돌려준다.
+/// 주어진 [`ThemeMode`]의 기본 팔레트([`DARK`]·[`LIGHT`]). 설정 테마는 [`palette`]가 반영한다.
 #[inline]
 pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     if matches!(mode, ThemeMode::Dark) {
@@ -447,11 +693,14 @@ pub const fn palette_for(mode: ThemeMode) -> &'static Palette {
     }
 }
 
-/// 현재 앱의 활성 [`ThemeMode`]에 맞는 Orca [`Palette`]를 돌려준다.
+/// [`apply`]가 설정 테마(`ui_theme_dark`·`ui_theme_light`)로 고른 [`Palette`]를 돌려준다. [`apply`] 전에는 활성
+/// [`ThemeMode`]의 기본 팔레트다.
 /// `gpui_component::init`를 부르지 않은 단위 테스트에서도 패닉 없이 [`DARK`]로 동작한다.
 #[inline]
 pub fn palette(cx: &App) -> &'static Palette {
-    if cx.has_global::<Theme>() {
+    if let Some(active) = cx.try_global::<ActivePalette>() {
+        active.0
+    } else if cx.has_global::<Theme>() {
         palette_for(cx.theme().mode)
     } else {
         &DARK
@@ -503,8 +752,13 @@ pub const fn tab_tag_color(color: crate::layout::TabColor) -> Hsla {
 /// `gpui-component`의 전역 [`Theme`]에 `mode`와 Orca 색·글꼴·반경 토큰을 적용한다.
 pub fn apply(mode: ThemeMode, cx: &mut App) {
     Theme::change(mode, None, cx);
-    let p = palette_for(mode);
     let s = crate::settings::current(cx);
+    let p = if mode.is_dark() {
+        s.ui_theme_dark.palette()
+    } else {
+        s.ui_theme_light.palette()
+    };
+    cx.set_global(ActivePalette(p));
     let zoom = s.zoom();
     let rem = px(16. * zoom);
     let mono_pt = f32::from(s.editor_font_size());
@@ -754,10 +1008,17 @@ mod tests {
         (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
     }
 
-    /// 심해 틴트 대비 회귀: 본문·보조 글자가 모든 크롬 표면 위에서 WCAG AA(4.5:1) 이상, `preserve`도 바탕 위 AA.
+    /// 심해 틴트·앱 테마 대비 회귀: 본문·보조 글자가 모든 크롬 표면 위에서 WCAG AA(4.5:1) 이상, `preserve`도 바탕 위 AA.
     #[test]
     fn text_tokens_meet_wcag_aa_on_every_surface() {
-        for (name, p) in [("LIGHT", &LIGHT), ("DARK", &DARK)] {
+        for (name, p) in [
+            ("LIGHT", &LIGHT),
+            ("DARK", &DARK),
+            ("ABYSS", &ABYSS),
+            ("TIDEPOOL", &TIDEPOOL),
+            ("GLOW", &GLOW),
+            ("PAPER", &PAPER),
+        ] {
             let surfaces = [
                 ("background", p.background),
                 ("sidebar", p.sidebar),
@@ -786,6 +1047,31 @@ mod tests {
                 "{name}: preserve on background = {ratio:.2}:1"
             );
         }
+    }
+
+    /// 앱 테마마다 자기 팔레트를 쓰고, 짝 터미널 테마는 같은 밝기(다크·라이트)의 내장 테마다.
+    #[test]
+    fn ui_themes_map_to_palettes_and_paired_terminal_themes() {
+        assert_eq!(DarkUiTheme::default().palette(), &DARK);
+        assert_eq!(LightUiTheme::default().palette(), &LIGHT);
+        for theme in DarkUiTheme::ALL {
+            let p = theme.palette();
+            assert!(p.background.l < 0.15, "{theme:?}");
+            let paired = super::super::builtin_terminal_theme(theme.terminal_theme_name())
+                .unwrap_or_else(|| panic!("{theme:?} paired terminal theme missing"));
+            assert!(paired.is_dark, "{theme:?}");
+        }
+        for theme in LightUiTheme::ALL {
+            let p = theme.palette();
+            assert!(p.background.l > 0.9, "{theme:?}");
+            let paired = super::super::builtin_terminal_theme(theme.terminal_theme_name())
+                .unwrap_or_else(|| panic!("{theme:?} paired terminal theme missing"));
+            assert!(!paired.is_dark, "{theme:?}");
+        }
+        assert_eq!(
+            DarkUiTheme::Deep.terminal_theme_name(),
+            super::super::DEFAULT_TERMINAL_THEME_DARK
+        );
     }
 
     /// Krill Deep은 데몬 기본 테마와 같고, 글자·ANSI는 Ghostty Default Style Dark 그대로, 배경은 어둡다.

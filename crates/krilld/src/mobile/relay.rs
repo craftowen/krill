@@ -71,6 +71,7 @@ impl Stop {
 pub(super) struct RelayClient {
     connected: Arc<AtomicBool>,
     settled: Arc<AtomicBool>,
+    assets: Arc<AtomicBool>,
     stop: Arc<Stop>,
     wake_tx: Option<UnixStream>,
 }
@@ -79,6 +80,7 @@ impl std::fmt::Debug for RelayClient {
         f.debug_struct("RelayClient")
             .field("connected", &self.connected.load(Ordering::Acquire))
             .field("settled", &self.settled.load(Ordering::Acquire))
+            .field("assets", &self.assets.load(Ordering::Acquire))
             .finish_non_exhaustive()
     }
 }
@@ -279,10 +281,12 @@ impl RelayClient {
         let wake_clone = wake_tx.try_clone()?;
         let connected = Arc::new(AtomicBool::new(false));
         let settled = Arc::new(AtomicBool::new(false));
+        let assets = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(Stop::default());
-        let (c_flag, set_flag, s_flag) = (
+        let (c_flag, set_flag, a_flag, s_flag) = (
             Arc::clone(&connected),
             Arc::clone(&settled),
+            Arc::clone(&assets),
             Arc::clone(&stop),
         );
         let (sh, reg, h) = (Arc::clone(shared), registry.clone(), hello.clone());
@@ -297,6 +301,7 @@ impl RelayClient {
                     wake_rx,
                     &c_flag,
                     &set_flag,
+                    &a_flag,
                     &s_flag,
                     &sh,
                     &reg,
@@ -306,6 +311,7 @@ impl RelayClient {
         Ok(Self {
             connected,
             settled,
+            assets,
             stop,
             wake_tx: Some(wake_clone),
         })
@@ -316,6 +322,10 @@ impl RelayClient {
     pub fn settled(&self) -> bool {
         self.settled.load(Ordering::Acquire)
     }
+    /// 릴레이로 새 기기를 짝지을 수 있는지: 연결됐고 고정 출처에 현재 에셋 해시가 배포돼 있다(QR이 404가 아니다).
+    pub fn pairing(&self) -> bool {
+        self.connected() && self.assets.load(Ordering::Acquire)
+    }
 }
 
 #[expect(clippy::too_many_arguments, reason = "내부 감시 루프 컨텍스트 전달")]
@@ -325,40 +335,39 @@ fn supervise_loop(
     mut wake_rx: UnixStream,
     connected: &Arc<AtomicBool>,
     settled: &Arc<AtomicBool>,
+    assets: &Arc<AtomicBool>,
     stop: &Arc<Stop>,
     shared: &Arc<Shared>,
     registry: &Weak<Registry>,
     hello: &ServerHello,
 ) {
+    // 고정 출처에 이 앱 버전이 없으면 새 QR만 404가 된다(게이트웨이가 터널 QR로 낸다). 릴레이는 그래도 붙는다:
+    // 이미 짝지은 PWA(이전 해시)는 릴레이로 계속 접속해야 하고, 해시는 UI 식별용이지 프로토콜이 아니다.
+    // 첫 확인은 연결 전에 끝내 배포된 버전에서 터널을 괜히 띄우지 않게 한다.
+    if super::tunnel::publication_available(publication) {
+        assets.store(true, Ordering::Release);
+    } else {
+        watch_assets(
+            publication.clone(),
+            Arc::clone(assets),
+            Arc::clone(stop),
+            Arc::clone(shared),
+        );
+    }
     let wake_writer = Arc::new(Mutex::new(wake_tx));
     let mut delay = Duration::from_millis(200);
-    let mut assets_ready = false;
     while !stop.cancelled() {
-        // 고정 출처에 이 앱 버전이 없으면 QR은 404가 된다. 확인도 릴레이 스레드에서 한다.
-        if !assets_ready {
-            assets_ready = super::tunnel::publication_available(publication);
-        }
-        if stop.cancelled() {
-            return;
-        }
-        let res = if assets_ready {
-            run_once(
-                publication,
-                &wake_writer,
-                &mut wake_rx,
-                connected,
-                settled,
-                stop,
-                shared,
-                registry,
-                hello,
-            )
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "mobile PWA version is not deployed",
-            ))
-        };
+        let res = run_once(
+            publication,
+            &wake_writer,
+            &mut wake_rx,
+            connected,
+            settled,
+            stop,
+            shared,
+            registry,
+            hello,
+        );
         let first_settle = !settled.swap(true, Ordering::AcqRel);
         let was_connected = connected.swap(false, Ordering::AcqRel);
         if was_connected || first_settle {
@@ -376,6 +385,28 @@ fn supervise_loop(
         }
         delay = (delay * 2).min(Duration::from_secs(30));
     }
+}
+
+/// 늦게 배포된 에셋을 알아챈다. 배포를 확인하면 게이트웨이를 깨워 QR을 고정 출처로 바꾸고 끝난다.
+fn watch_assets(
+    publication: Publication,
+    assets: Arc<AtomicBool>,
+    stop: Arc<Stop>,
+    shared: Arc<Shared>,
+) {
+    thread::Builder::new()
+        .name("mobile-assets".into())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            while !stop.wait(Duration::from_secs(60)) {
+                if super::tunnel::publication_available(&publication) {
+                    assets.store(true, Ordering::Release);
+                    shared.wake();
+                    return;
+                }
+            }
+        })
+        .ok();
 }
 
 #[expect(clippy::too_many_arguments, reason = "단일 세션 루프 인자 전달")]

@@ -6,6 +6,9 @@ pub(super) use identity::from_credentials as identity_from_credentials;
 mod login;
 pub(crate) mod orca_vault;
 mod policy;
+mod profile_name;
+pub(crate) mod switch_work;
+pub use profile_name::{Keychain, Vault, adopt_email_dirs};
 
 use std::collections::BTreeMap;
 use std::io::{self, Write as _};
@@ -134,7 +137,7 @@ fn manually_pinned(
     false
 }
 /// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09). 파일 IO만 안에서 하고
-/// 다른 잠금을 잡지 않는 리프라 잠금 순서 문제가 없다.
+/// 자동전환 작업 알림은 마지막에 발행하며, 작업 큐 잠금 안에서는 이 잠금을 잡지 않는다.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 /// 원자 쓰기 임시 파일명 중복 방지용 단조 증가 값(K-09). pid와 합쳐 같은 프로세스 스레드끼리도 겹치지 않는다.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -166,15 +169,23 @@ pub struct AccountsFile {
     pub accounts: Vec<StoredAccount>,
     #[serde(default)]
     pub advanced_policy: krill_proto::usage::AdvancedPolicy,
-    /// OWE-699: 계정 프로필 프로비저닝(`super::provision`) opt-in. 기본 꺼짐 — 켜야만 프로필을 건드린다.
-    #[serde(default)]
+    /// OWE-699: 계정 프로필 프로비저닝(`super::provision`). 키가 없으면 켜짐(Orca처럼 스킬·대화 기록 공유,
+    /// 오웬 지시 2026-10-22). 명시한 `provisioning = false`는 그대로 존중한다.
+    #[serde(default = "provisioning_default")]
     pub provisioning: bool,
     /// OWE-719: 기존 자격증명을 읽기만 하는 직접 사용량 조회(오웬 지시로 기본 켜짐).
     #[serde(default = "direct_usage_default")]
     pub direct_usage: bool,
+    /// Krill 목록에서 지운 Orca 감지 계정 id. Orca 캐시 파일은 Orca 소유라 건드리지 않고 여기서 숨긴다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_accounts: Vec<String>,
 }
 
 fn direct_usage_default() -> bool {
+    true
+}
+
+fn provisioning_default() -> bool {
     true
 }
 
@@ -185,8 +196,9 @@ impl Default for AccountsFile {
             active: BTreeMap::new(),
             accounts: Vec::new(),
             advanced_policy: krill_proto::usage::AdvancedPolicy::default(),
-            provisioning: false,
+            provisioning: provisioning_default(),
             direct_usage: true,
+            hidden_accounts: Vec::new(),
         }
     }
 }
@@ -280,12 +292,12 @@ impl Window {
     }
 }
 
-/// `accounts.toml` 경로: `state_dir`이 주어지면 `<state_dir>/accounts.toml`, 아니면 `<home>/.config/minikrill/accounts.toml`.
+/// `accounts.toml` 경로: `state_dir`이 주어지면 `<state_dir>/accounts.toml`, 아니면 `<home>/.config/krill/accounts.toml`.
 pub fn config_path(home: &Path, state_dir: Option<&Path>) -> PathBuf {
     if let Some(state) = state_dir {
         state.join(ACCOUNTS_FILE)
     } else {
-        home.join(".config").join("minikrill").join(ACCOUNTS_FILE)
+        krill_proto::user_dirs::config_dir(home).join(ACCOUNTS_FILE)
     }
 }
 
@@ -403,7 +415,7 @@ fn write_active_env(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) 
         }
     }
     let target = state_dir.map_or_else(
-        || home.join(".config").join("minikrill").join(ACTIVE_ENV_FILE),
+        || krill_proto::user_dirs::config_dir(home).join(ACTIVE_ENV_FILE),
         |s| s.join(ACTIVE_ENV_FILE),
     );
     write_atomic_0600(&target, lines.as_bytes())
@@ -906,6 +918,9 @@ fn refresh_accounts_authenticated(
             // OWE-696: 캐시 행 uuid로 안정 id를 만든다(순번이 바뀌어도 같은 계정). uuid가 없는
             // 구버전 캐시만 순번 id. Orca 프로필 폴더는 Krill이 모르므로 경로를 비워 실행 불가로 둔다.
             let id = orca_detected_id(idx, &row);
+            if file.hidden_accounts.contains(&id) {
+                continue;
+            }
             if !row.id.is_empty() {
                 orca_uuids.insert(id.clone(), row.id.clone());
             }
@@ -1230,6 +1245,8 @@ fn refresh_accounts_authenticated(
         switched.clear();
     }
 
+    switch_work::notify(home, state_dir, &switched);
+
     for event in &switched {
         runtime.record(
             event.clone(),
@@ -1485,9 +1502,9 @@ pub fn switch_account(
     Ok(refresh_accounts_with(home, state_dir, false))
 }
 
-/// Codex banked reset 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다.
-/// Codex만 지원한다. 소진 성공(`Reset`·`AlreadyRedeemed`)에는 로컬 한도 기록을 지워
-/// 자동전환이 다시 평가하게 하고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
+/// 리셋 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다. Codex(banked reset)와
+/// Claude(주간 세션 리셋·프로모션 grant)를 지원한다. 소진 성공(`Reset`·`AlreadyRedeemed`)에는
+/// 로컬 한도 기록을 지워 자동전환이 다시 평가하게 하고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
 /// 네트워크·자격증명 실패는 `Err`다(호출자가 자동 재시도하지 않는다: 멱등 키가 호출마다 새 값이라
 /// 재시도가 새 소진이 된다. 타임아웃은 크레딧부터 다시 확인한다).
 pub fn consume_reset_credit(
@@ -1496,10 +1513,10 @@ pub fn consume_reset_credit(
     provider: ProviderKind,
     account_id: &str,
 ) -> io::Result<(AccountsSnapshot, ResetConsumeOutcome, u64)> {
-    if provider != ProviderKind::Codex {
+    if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "reset credits are only available for codex",
+            "reset credits are only available for codex and claude",
         ));
     }
     let snap = refresh_accounts_with(home, state_dir, false);
@@ -1520,9 +1537,12 @@ pub fn consume_reset_credit(
         ));
     }
     let dir = PathBuf::from(&target.profile_dir);
-    let Some((outcome, windows)) =
+    let outcome_windows = if provider == ProviderKind::Codex {
         super::direct::consume_reset_credit(provider, &dir, target.host_default, home, state_dir)
-    else {
+    } else {
+        consume_claude_reset(home, state_dir, &dir, target.host_default)
+    };
+    let Some((outcome, windows)) = outcome_windows else {
         return Err(io::Error::other("사용량 초기화 실패(크레딧부터 다시 확인)"));
     };
     if matches!(
@@ -1533,6 +1553,27 @@ pub fn consume_reset_credit(
     }
     super::direct::evict_profile(home, provider, &dir);
     Ok((refresh_accounts(home, state_dir), outcome, windows))
+}
+
+/// Claude 소진 한 걸음: 조직 조회 → 제공 프로그램 확인 → 소진. 제공 없음은 `NoCredit`으로,
+/// 단계 실패는 `Err`로 돌려준다(재시도 유도).
+fn consume_claude_reset(
+    home: &Path,
+    state_dir: Option<&Path>,
+    dir: &Path,
+    host: bool,
+) -> Option<(ResetConsumeOutcome, u64)> {
+    let token = super::direct::claude_token(dir, host, home, state_dir)?;
+    let org = super::direct::claude_org_uuid(&token, super::direct::get_text)?;
+    match super::direct::claude_offered_program(&token, super::direct::get_text)? {
+        Some(program) => super::direct::claude_claim_reset(
+            &token,
+            &org,
+            program,
+            super::direct::post_json_status,
+        ),
+        None => Some((ResetConsumeOutcome::NoCredit, 0)),
+    }
 }
 
 /// 새 계정 프로필 등록(MK-107). `profile_dir`이 비어 있으면 기본 프로필 경로를 자동 생성한다.
@@ -1700,6 +1741,10 @@ pub fn delete_account(
             "cannot remove host default account",
         ));
     }
+    if is_orca_detected(account_id) {
+        hide_orca_account(home, state_dir, provider, account_id)?;
+        return Ok(refresh_accounts(home, state_dir));
+    }
     let dir = {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
@@ -1729,6 +1774,28 @@ pub fn delete_account(
         tracing::warn!(error = %e, "account profile left as orphan");
     }
     Ok(refresh_accounts(home, state_dir))
+}
+
+fn is_orca_detected(account_id: &str) -> bool {
+    account_id.starts_with("claude-orca-")
+}
+
+/// Orca 감지 계정 삭제 = Krill 목록에서 숨김. Orca 프로필·캐시는 Orca 소유라 지우지 않는다.
+fn hide_orca_account(
+    home: &Path,
+    state_dir: Option<&Path>,
+    provider: ProviderKind,
+    account_id: &str,
+) -> io::Result<()> {
+    let _guard = lock(&SAVE_LOCK);
+    let mut file = load_writable(home, state_dir)?;
+    if !file.hidden_accounts.iter().any(|id| id == account_id) {
+        file.hidden_accounts.push(account_id.to_owned());
+    }
+    if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
+        file.active.remove(provider.as_str());
+    }
+    save_inner(home, state_dir, &file)
 }
 
 // 세션이 같은 폴더를 symlink·정규화된 경로로 기록했어도 보호한다.
@@ -1948,17 +2015,19 @@ fn consume_reset_credit_rejects_without_network() {
     std::fs::create_dir_all(&profile).unwrap();
     // 프로바이더 제한·계정 확인은 네트워크 전에 일어난다.
     assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "x")
+        consume_reset_credit(&home, Some(&state), ProviderKind::Antigravity, "x")
             .unwrap_err()
             .kind(),
         ErrorKind::InvalidInput
     );
-    assert_eq!(
-        consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "missing")
-            .unwrap_err()
-            .kind(),
-        ErrorKind::NotFound
-    );
+    for provider in [ProviderKind::Codex, ProviderKind::Claude] {
+        assert_eq!(
+            consume_reset_credit(&home, Some(&state), provider, "missing")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::NotFound
+        );
+    }
     std::fs::create_dir_all(&state).unwrap();
     std::fs::write(
         state.join("accounts.toml"),
@@ -1971,6 +2040,20 @@ fn consume_reset_credit_rejects_without_network() {
     // 자격증명이 없으면 소진 요청을 보내지 않고 실패한다(네트워크 금지).
     assert_eq!(
         consume_reset_credit(&home, Some(&state), ProviderKind::Codex, "codex-a")
+            .unwrap_err()
+            .kind(),
+        ErrorKind::Other
+    );
+    std::fs::write(
+        state.join("accounts.toml"),
+        format!(
+            "[[accounts]]\nid = 'claude-a'\nprovider = 'claude'\nlabel = 'a'\nprofile_dir = '{}'\n",
+            profile.display()
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        consume_reset_credit(&home, Some(&state), ProviderKind::Claude, "claude-a")
             .unwrap_err()
             .kind(),
         ErrorKind::Other
@@ -2078,7 +2161,8 @@ mod provisioning_regressions {
         let raw = "# future writer\nfuture = 'root'\ndirect_usage = false\n[[accounts]]\nid = 'one'\nprovider = 'claude'\nlabel = 'unchanged'\nprofile_dir = '/tmp/one'\nfuture = 'nested'\n[auto_switch]\nenabled = false\nthreshold_percent = 77\nfuture = 'policy'\n[active]\nclaude = 'one'\n[advanced_policy]\npredict_exhaustion = true\n";
         std::fs::write(&path, raw).unwrap();
         let before: toml::Value = toml::from_str(raw).unwrap();
-        for enabled in [true, false] {
+        // 키가 없으면 이미 켜짐이라, 끈 뒤 다시 켜는 순서로 두 값이 모두 파일에 적히는지 본다.
+        for enabled in [false, true] {
             assert_eq!(
                 set_provisioning(&root, Some(&root), enabled).unwrap(),
                 enabled
@@ -2120,7 +2204,10 @@ mod provisioning_regressions {
         let root = std::env::temp_dir().join(format!("owe722-corrupt-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = config_path(&root, Some(&root));
-        assert!(!provisioning(&root, Some(&root)).unwrap());
+        assert!(
+            provisioning(&root, Some(&root)).unwrap(),
+            "파일 없음 = 켜짐"
+        );
         assert!(!path.exists());
         let raw = "provisioning = [broken";
         std::fs::write(&path, raw).unwrap();
@@ -2141,7 +2228,7 @@ pub fn set_provisioning(home: &Path, state_dir: Option<&Path>, enabled: bool) ->
     Ok(file.provisioning)
 }
 
-/// 파일 없음은 기본 꺼짐으로 읽는다. 손상된 설정은 오류로 돌려주며 쓰지 않는다.
+/// 파일 없음은 기본 켜짐으로 읽는다. 손상된 설정은 오류로 돌려주며 쓰지 않는다.
 pub fn provisioning(home: &Path, state_dir: Option<&Path>) -> io::Result<bool> {
     let _guard = lock(&SAVE_LOCK);
     Ok(load_writable(home, state_dir)?.provisioning)

@@ -70,7 +70,6 @@ def main():
                 init.write_text('const Native=WebSocket;globalThis.qaSockets=[];globalThis.WebSocket=class extends Native{constructor(...a){super(...a);qaSockets.push(this);}};')
                 browser('--init-script',str(init),'open',config['url'])
                 browser('set','viewport','390','844')
-                browser('find','role','button','click','--name','Pair','--exact')
                 wait('KrillMobile.store.connection.phase==="ready"')
                 terminal = config['terminalSession']
                 assert len([line for line in cli('ls').splitlines() if line.split('\t')[0].isdigit()]) == expected_ptys
@@ -125,7 +124,6 @@ def main():
                     return result.stdout
                 second('open',second_offer)
                 second('set','viewport','390','844')
-                second('find','role','button','click','--name','Pair','--exact')
                 second('wait','--fn','KrillMobile.store.connection.phase==="ready"')
                 second('eval',f'KrillMobile.app.navigate("/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({terminal}).groupKey)+"/s/{terminal}");true')
                 second('wait','--fn','document.querySelector(".terminal-grid")?.getAttribute("aria-label").includes("KEYS:15")')

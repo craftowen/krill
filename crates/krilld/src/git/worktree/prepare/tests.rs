@@ -89,7 +89,7 @@ fn prepared_creation_preserves_includes_trust_and_name_collisions() {
     );
     assert!(
         !f.git(&["worktree", "list", "--porcelain"])
-            .contains(".minikrill-preparing")
+            .contains(".krill-preparing")
     );
     cleaned(&pool);
     // Consumed worktrees survive subsequent cancellation and TTL cleanup.
@@ -157,7 +157,7 @@ fn ttl_and_cancel_cleanup_registered_locked_worktrees() {
         ready(&pool, &req);
         assert!(
             f.git(&["worktree", "list", "--porcelain"])
-                .contains("locked minikrill speculative preparation")
+                .contains("locked krill speculative preparation")
         );
         assert_eq!(pool.request(&request(&f, 4)), Status::Busy);
         if cancel {
@@ -172,7 +172,7 @@ fn ttl_and_cancel_cleanup_registered_locked_worktrees() {
         cleaned(&pool);
         assert!(
             !f.git(&["worktree", "list", "--porcelain"])
-                .contains(".minikrill-preparing")
+                .contains(".krill-preparing")
         );
     }
 }
@@ -209,7 +209,7 @@ fn restart_recovers_marker_without_touching_created_worktrees() {
     cleaned(&recovered);
     assert!(
         !f.git(&["worktree", "list", "--porcelain"])
-            .contains(".minikrill-preparing")
+            .contains(".krill-preparing")
     );
 }
 
@@ -223,13 +223,13 @@ fn restart_removes_registration_even_when_checkout_directory_was_lost() {
     fs::remove_dir_all(pool.tree()).unwrap();
     assert!(
         f.git(&["worktree", "list", "--porcelain"])
-            .contains(".minikrill-preparing")
+            .contains(".krill-preparing")
     );
     let recovered = Pool::new(Arc::new(GitQueue::new().unwrap()), &f.root).unwrap();
     cleaned(&recovered);
     assert!(
         !f.git(&["worktree", "list", "--porcelain"])
-            .contains(".minikrill-preparing")
+            .contains(".krill-preparing")
     );
 }
 

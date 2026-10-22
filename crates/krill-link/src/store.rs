@@ -375,7 +375,7 @@ pub fn remove_device(state_dir: &Path, target: &str) -> Result<AllowedDevice, Er
 // 2. 원격 호스트 목록 (`link/hosts.toml`)
 // ============================================================================
 
-/// 클라이언트가 짝지은 원격 서버 호스트 한 건 (`link/hosts.toml`).
+/// 클라이언트가 페어링한 원격 서버 호스트 한 건 (`link/hosts.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteHost {
     /// 호스트 ID (`run/hosts/<id>.sock` 파일명에 사용).
@@ -390,7 +390,7 @@ pub struct RemoteHost {
     /// 서버 직접 IP 주소(`ip:port`) 힌트 목록.
     #[serde(default)]
     pub addr_hints: Vec<String>,
-    /// 짝짓기 시각 (Unix epoch 초).
+    /// 페어링 시각 (Unix epoch 초).
     #[serde(default)]
     pub added_at: u64,
 }
@@ -501,6 +501,35 @@ pub fn upsert_host(state_dir: &Path, mut host: RemoteHost) -> Result<RemoteHost,
     }
     save_hosts(state_dir, &hosts)?;
     Ok(host)
+}
+
+/// 정확한 등록 ID의 원격 호스트만 삭제한다. 짝짓기와 같은 잠금으로 다른 등록을 보존한다.
+pub fn remove_host(state_dir: &Path, id: &str) -> Result<RemoteHost, Error> {
+    validate_host_id(id)?;
+    let _lock = acquire_store_lock(state_dir)?;
+    let mut hosts = load_hosts(state_dir)?;
+    let index = hosts
+        .iter()
+        .position(|host| host.id == id)
+        .ok_or_else(|| Error::HostNotFound(id.to_owned()))?;
+    let host = hosts.remove(index);
+    save_hosts(state_dir, &hosts)?;
+    Ok(host)
+}
+
+/// 저장된 원격 호스트의 표시 이름만 바꾼다. 연결 정보와 ID는 그대로 둔다.
+pub fn rename_host(state_dir: &Path, host_id: &str, name: &str) -> Result<RemoteHost, Error> {
+    validate_host_id(host_id)?;
+    let _lock = acquire_store_lock(state_dir)?;
+    let mut hosts = load_hosts(state_dir)?;
+    let host = hosts
+        .iter_mut()
+        .find(|h| h.id == host_id)
+        .ok_or_else(|| Error::HostNotFound(host_id.to_owned()))?;
+    host.name = sanitize_display_name(name, &host.id);
+    let renamed = host.clone();
+    save_hosts(state_dir, &hosts)?;
+    Ok(renamed)
 }
 
 fn disambiguate_host_id(base_id: &str, node_id: &str, existing: &[RemoteHost]) -> String {
@@ -807,6 +836,13 @@ mod tests {
         assert_eq!(found.name, "집 맥미니");
         assert_eq!(found.to_endpoint_addr(false).unwrap(), addr);
 
+        let renamed = rename_host(&dir, "home-mac", " 세무\n사무소 ").unwrap();
+        assert_eq!(renamed.name, "세무사무소");
+        let found = find_host(&dir, "home-mac").unwrap();
+        assert_eq!(found.name, "세무사무소");
+        assert_eq!(found.to_endpoint_addr(false).unwrap(), addr);
+        assert!(rename_host(&dir, "missing", "x").is_err());
+
         // 다른 node_id가 같은 host.id("home-mac")로 들어오면 기존 호스트를 덮어쓰지 않고 구분된 ID를 부여한다.
         let sk2 = SecretKey::generate();
         let addr2 = EndpointAddr::new(sk2.public()).with_ip_addr("127.0.0.1:4434".parse().unwrap());
@@ -821,6 +857,37 @@ mod tests {
         assert_eq!(load_hosts(&dir).unwrap().len(), 2);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_a_host_preserves_other_hosts_and_inbound_permissions() {
+        let dir = std::env::temp_dir().join(format!("mklink-remove-host-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let mut hosts = Vec::new();
+        for id in ["studio", "laptop"] {
+            let addr = EndpointAddr::new(SecretKey::generate().public());
+            hosts.push(
+                upsert_host(
+                    &dir,
+                    RemoteHost::from_endpoint_addr(id.into(), id, &addr, 1000),
+                )
+                .unwrap(),
+            );
+        }
+        let device = upsert_device(&dir, SecretKey::generate().public(), "Phone", 1000).unwrap();
+        let before = fs::read(hosts_path(&dir)).unwrap();
+        // 표시 이름이나 모호한 접두어로 다른 연결을 삭제하지 않는다.
+        assert!(matches!(
+            remove_host(&dir, "stud"),
+            Err(Error::HostNotFound(_))
+        ));
+        assert_eq!(fs::read(hosts_path(&dir)).unwrap(), before);
+        assert_eq!(remove_host(&dir, "studio").unwrap(), hosts[0]);
+        assert_eq!(load_hosts(&dir).unwrap(), vec![hosts[1].clone()]);
+        assert_eq!(load_devices(&dir).unwrap(), vec![device]);
+        assert!(remove_host(&dir, "studio").is_err());
+        assert_eq!(load_hosts(&dir).unwrap(), vec![hosts[1].clone()]);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

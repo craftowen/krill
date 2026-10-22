@@ -1,10 +1,10 @@
 //! 워크트리 생성(MK-042, T4 §3.2.1). git 호출은 전부 [`GitQueue`]를 거치므로 같은 레포 작업은 직렬이다.
 //!
-//! 순서: 레포 설정(`minikrill.toml`) 읽기 → setup 신뢰 확인(신뢰하지 않으면 아무것도 만들지 않고 끝) → 이름 정리 →
+//! 순서: 레포 설정(`krill.toml`) 읽기 → setup 신뢰 확인(신뢰하지 않으면 아무것도 만들지 않고 끝) → 이름 정리 →
 //! 기준 ref 결정 → 이름 충돌이면 `-2`~`-100` → `git worktree add --no-track -b` → include 복사.
 //!
 //! ```toml
-//! # <레포>/minikrill.toml
+//! # <레포>/krill.toml
 //! [worktree]
 //! include = [".env", "config/local.json"]  # 레포 기준 리터럴 경로. gitignore된 것만 복사한다.
 //! setup = "pnpm install"                    # 새 워크트리에서 `/bin/sh -c`로 돈다. 내용이 바뀌면 다시 묻는다.
@@ -41,8 +41,8 @@ mod remove;
 pub use compat::environment;
 pub use remove::{remove, remove_with_state, serve_remove};
 
-/// 레포 설정 파일(ARCHITECTURE §5 설정 호환: `minikrill.toml` 기본).
-pub const CONFIG: &str = "minikrill.toml";
+/// 레포 설정 파일(ARCHITECTURE §5 설정 호환: `krill.toml` 기본).
+pub const CONFIG: &str = "krill.toml";
 /// setup 신뢰 기록. 상태 디렉터리 안.
 pub const TRUST_FILE: &str = "setup-trust";
 /// 이름이 겹칠 때 붙여 보는 마지막 번호(T4 §3.2.1).
@@ -85,7 +85,7 @@ pub enum Outcome {
     Untrusted { script: String, hash: Vec<u8> },
 }
 
-/// 워크트리 루트. `KRILL_WORKTREES_DIR`가 있으면 그것(개발·테스트 격리), 없으면 `~/Minikrill/worktrees`(T4 §3.2.1).
+/// 워크트리 루트. `KRILL_WORKTREES_DIR`가 있으면 그것(개발·테스트 격리), 없으면 `~/Krill/worktrees` (기존 트리는 호환 링크로 유지)(T4 §3.2.1).
 fn root() -> Result<PathBuf, String> {
     root_in(|key| std::env::var_os(key))
 }
@@ -96,7 +96,7 @@ fn root_in(get: impl Fn(&str) -> Option<OsString>) -> Result<PathBuf, String> {
         return Ok(PathBuf::from(d));
     }
     get("HOME")
-        .map(|h| PathBuf::from(h).join("Minikrill/worktrees"))
+        .map(|h| krill_proto::user_dirs::worktrees_root(Path::new(&h)))
         .ok_or_else(|| "HOME is not set".to_owned())
 }
 
@@ -377,7 +377,7 @@ pub fn rename_branch_from_prompt(
 }
 
 /// 생성·삭제의 여러 git 호출을 공통 디렉터리에서 하나의 작업으로 잠근다.
-fn transaction(q: &GitQueue, top: &Path) -> Result<fs::File, String> {
+fn transaction(q: &GitQueue, top: &Path) -> Result<Vec<fs::File>, String> {
     let common = output_path(
         git(
             q,
@@ -392,11 +392,11 @@ fn transaction(q: &GitQueue, top: &Path) -> Result<fs::File, String> {
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(common.join("minikrill-worktree.lock"))
+        .open(common.join("krill-worktree.lock"))
         .map_err(|e| format!("cannot open worktree lock: {e}"))?;
     file.lock()
         .map_err(|e| format!("cannot lock worktree transaction: {e}"))?;
-    Ok(file)
+    Ok(vec![file])
 }
 
 fn git<I, S>(q: &GitQueue, repo: &Path, args: I) -> Result<Output, String>

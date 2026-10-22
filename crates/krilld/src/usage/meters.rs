@@ -189,7 +189,7 @@ pub(super) fn parse(provider: ProviderKind, text: &str) -> AccountMeters {
                 value_meter(
                     &mut out,
                     krill_proto::usage::RESET_CREDITS_METER_KEY,
-                    "Reset credits",
+                    krill_proto::usage::RESET_CREDITS_METER_LABEL,
                     count.to_string(),
                 );
             }

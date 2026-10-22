@@ -130,8 +130,8 @@ pub(super) const ACTIONS: &[(&str, Message)] = &[
     ("shell::NewWorktree", text::SC_WORKTREE),
     ("popout::FloatTerminal", text::SC_FLOAT_TERMINAL),
     ("popout::DashboardPopout", text::SC_DASHBOARD),
-    ("minikrill::NewWindow", text::SC_NEW_WINDOW),
-    ("minikrill::CloseWindow", text::SC_CLOSE_WINDOW),
+    ("krill::NewWindow", text::SC_NEW_WINDOW),
+    ("krill::CloseWindow", text::SC_CLOSE_WINDOW),
     ("shell::Quit", text::SC_QUIT),
     ("settings::OpenSettings", text::SC_SETTINGS),
     ("settings::ZoomIn", text::SC_ZOOM_IN),
@@ -162,8 +162,8 @@ pub(super) fn action_category(action: &str) -> Category {
         | "shell::ActivateTab7"
         | "shell::ActivateTab8"
         | "shell::ActivateTab9"
-        | "minikrill::NewWindow"
-        | "minikrill::CloseWindow" => Category::Tabs,
+        | "krill::NewWindow"
+        | "krill::CloseWindow" => Category::Tabs,
         "shell::SplitRight"
         | "shell::SplitDown"
         | "shell::ClosePane"
@@ -987,6 +987,7 @@ impl SettingsView {
                         p,
                         [
                             layout::segment(
+                                p,
                                 "sc-filter-all",
                                 text::SC_FILTER_ALL.get(),
                                 active_filter == ShortcutFilter::All,
@@ -996,6 +997,7 @@ impl SettingsView {
                                 this.set_shortcut_filter(ShortcutFilter::All, cx);
                             })),
                             layout::segment(
+                                p,
                                 "sc-filter-modified",
                                 text::SC_FILTER_MODIFIED.get(),
                                 active_filter == ShortcutFilter::Modified,

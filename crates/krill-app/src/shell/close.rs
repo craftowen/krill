@@ -48,7 +48,27 @@ pub(super) fn send(
 
 impl Shell {
     pub(super) fn close_layout(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Layout)) {
-        self.change_with_policy(true, Policy::Terminate, cx, f);
+        self.close_with_policy(Policy::Terminate, cx, f);
+    }
+
+    /// 보이던 워크스페이스의 탭이 모두 닫히면 다른 워크스페이스로 넘어가지 않고 빈 화면으로 남는다(Orca 패리티).
+    pub(super) fn close_with_policy(
+        &mut self,
+        policy: Policy,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Layout),
+    ) {
+        let shown: Vec<PaneId> = self
+            .workspace_tabs(cx)
+            .into_iter()
+            .flat_map(|index| self.layout.tab_panes(index))
+            .collect();
+        self.change_with_policy(true, policy, cx, |layout| {
+            f(layout);
+            if !shown.is_empty() && !shown.iter().any(|pane| layout.pane_exists(*pane)) {
+                layout.deactivate();
+            }
+        });
     }
 
     /// 미저장 파일 확인이 끝나 실제로 제거된 칸만 종료한다. 같은 세션을 보는 다른 칸은 보존한다.
