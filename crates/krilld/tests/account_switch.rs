@@ -95,34 +95,47 @@ fn usage_reply(socket: &Path, request: &UsageRequest) -> UsageReply {
 
 #[test]
 fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
-    switch_survives_daemon_sigkill(false, ProviderKind::Codex, 1);
+    switch_survives_daemon_sigkill(false, ProviderKind::Codex, 1, None);
 }
 
 #[test]
 fn automatic_account_switch_rebinds_running_session_and_survives_daemon_sigkill() {
-    switch_survives_daemon_sigkill(true, ProviderKind::Codex, 1);
+    switch_survives_daemon_sigkill(true, ProviderKind::Codex, 1, None);
 }
 
 #[test]
 fn claude_switch_skips_subagent_workflows_and_survives_daemon_sigkill() {
-    switch_survives_daemon_sigkill(false, ProviderKind::Claude, 1);
+    switch_survives_daemon_sigkill(false, ProviderKind::Claude, 1, None);
 }
 
 #[test]
 fn parallel_switch_bounds_restarts_and_recovers_every_inflight_session() {
-    switch_survives_daemon_sigkill(false, ProviderKind::Codex, 3);
+    switch_survives_daemon_sigkill(false, ProviderKind::Codex, 3, None);
+}
+
+#[test]
+fn unverifiable_handoff_preserves_live_process_conversation_and_history() {
+    for failure in ["unknown", "missing"] {
+        switch_survives_daemon_sigkill(false, ProviderKind::Codex, 1, Some(failure));
+    }
 }
 
 #[expect(clippy::panic, reason = "integration-test fixture")]
-fn switch_survives_daemon_sigkill(automatic: bool, provider: ProviderKind, count: usize) {
+fn switch_survives_daemon_sigkill(
+    automatic: bool,
+    provider: ProviderKind,
+    count: usize,
+    failure: Option<&str>,
+) {
     let name = if provider == ProviderKind::Claude {
         "claude"
     } else {
         "codex"
     };
     let root = PathBuf::from(format!(
-        "/tmp/kas-it-{}-{automatic}-{name}-{count}",
-        std::process::id()
+        "/tmp/kas-it-{}-{automatic}-{name}-{count}-{}",
+        std::process::id(),
+        failure.unwrap_or("resume")
     ));
     fs::remove_dir_all(&root).ok();
     let state = root.join("state");
@@ -144,8 +157,12 @@ fn switch_survives_daemon_sigkill(automatic: bool, provider: ProviderKind, count
     }
     let wait_ready = target.join("wait-before-ready");
     fs::write(&wait_ready, "").unwrap();
-    let conversation = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    let transcript = if provider == ProviderKind::Claude {
+    // Same-cwd sessions each own a distinct conversation; none may resume another's.
+    let conversations: Vec<String> = (0..count)
+        .map(|i| format!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeee{i}"))
+        .collect();
+    let conversation = conversations[0].as_str();
+    let transcript_dir = if provider == ProviderKind::Claude {
         for project in ["a-deep", "m-target", "z-deep"] {
             fs::create_dir_all(
                 source.join(format!("projects/{project}/sid/subagents/workflows/wf_1")),
@@ -160,18 +177,20 @@ fn switch_survives_daemon_sigkill(automatic: bool, provider: ProviderKind, count
             .unwrap()
             .unwrap()
             .file_name();
-        format!(
-            "projects/{}/{conversation}.jsonl",
-            project.to_str().unwrap()
-        )
+        format!("projects/{}/", project.to_str().unwrap())
     } else {
-        format!("sessions/2026/10/20/rollout-date-{conversation}.jsonl")
+        "sessions/2026/10/20/rollout-date-".into()
     };
-    fs::write(
-        source.join(&transcript),
-        format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{conversation}\"}}}}\n"),
-    )
-    .unwrap();
+    let transcript_of = |id: &str| format!("{transcript_dir}{id}.jsonl");
+    for id in &conversations {
+        let identity = if provider == ProviderKind::Claude {
+            format!("{{\"sessionId\":\"{id}\"}}\n")
+        } else {
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\"}}}}\n")
+        };
+        fs::write(source.join(transcript_of(id)), identity).unwrap();
+    }
+    let transcript = transcript_of(conversation);
     let exe = root.join(name);
     let script = r#"#!/bin/sh
 if [ "$1" = --version ]; then printf '2.1.0 (Claude Code)\n'; exit 0; fi
@@ -179,7 +198,7 @@ if [ "$1" = auth ] && [ "$2" = status ]; then printf '{"loggedIn":true}\n'; exit
 if [ "$1" = login ] && [ "$2" = status ]; then printf 'Logged in using ChatGPT\n' >&2; exit 0; fi
 printf '%s' "$CODEX_HOME" > "$CODEX_HOME/observed-profile"
 printf '%s\n' "$$" >> "$CODEX_HOME/observed-starts"
-printf '%s\n' "$@" > "$CODEX_HOME/observed-args"
+printf '%s\n' "$@" >> "$CODEX_HOME/observed-args"
 while [ -f "$CODEX_HOME/wait-before-ready" ]; do sleep 0.05; done
 printf 'selected account ready: %s\n' "$CODEX_HOME"
 while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input"; printf 'fixture: %s\n' "$line"; done
@@ -249,7 +268,7 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input
     let (mut stream, first_generation) = wait_for(|| connect(&socket));
     daemon.generations.push(first_generation);
     let mut originals = Vec::new();
-    for _ in 0..count {
+    for conversation in &conversations {
         let created = control(
             &mut stream,
             &Request::Create(Create {
@@ -267,7 +286,9 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input
         let record = state.join("agent-launches").join(format!("{}.json", old.0));
         let mut metadata: serde_json::Value =
             serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
-        metadata["session_id"] = conversation.into();
+        if failure != Some("unknown") {
+            metadata["session_id"] = conversation.as_str().into();
+        }
         metadata["permission"] = "manual".into();
         fs::write(&record, serde_json::to_vec(&metadata).unwrap()).unwrap();
         originals.push(old);
@@ -278,6 +299,15 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input
             .ok()
             .filter(|s| s.lines().count() == count)
     });
+    if failure == Some("missing") {
+        fs::remove_file(source.join(&transcript)).unwrap();
+    }
+    let record = state.join("agent-launches").join(format!("{}.json", old.0));
+    let original_launch = fs::read(&record).unwrap();
+    let Reply::Sessions(before) = control(&mut stream, &Request::List) else {
+        panic!("session list failed");
+    };
+    let old_pid = before.iter().find(|s| s.session == old).unwrap().pid;
     if automatic {
         fs::write(
             source.join("usage_cache.json"),
@@ -298,6 +328,69 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input
                 account_id: b.id.clone(),
             },
         );
+    }
+    if let Some(failure) = failure {
+        let error = wait_for(|| {
+            let snapshot = usage(&socket, &UsageRequest::ListAccounts);
+            let handoff = snapshot.details.handoffs.iter().find(|h| h.from == old)?;
+            assert!(handoff.to.is_none());
+            handoff.error.clone()
+        });
+        assert!(
+            error.contains("original session preserved"),
+            "{failure}: {error}"
+        );
+        assert!(error.contains("before retrying"), "{failure}: {error}");
+        assert_eq!(fs::read(&record).unwrap(), original_launch);
+        assert!(!target.join("observed-profile").exists());
+        assert!(!state.join("account-replacement.json").exists());
+        assert_eq!(
+            fs::read_dir(state.join("account-replacements")).map_or(0, Iterator::count),
+            0
+        );
+        let Reply::Sessions(after) = control(&mut stream, &Request::List) else {
+            panic!("session list failed");
+        };
+        assert!(
+            after
+                .iter()
+                .any(|s| s.session == old && s.pid == old_pid && s.status.is_none())
+        );
+        assert_eq!(after.len(), before.len());
+        assert_eq!(
+            control(
+                &mut stream,
+                &Request::SendInput {
+                    session: old,
+                    bytes: b"original-still-responsive".to_vec(),
+                    submit: true,
+                    wait_submit: false
+                }
+            ),
+            Reply::InputSent
+        );
+        wait_for(|| {
+            let Reply::Captured { bytes, .. } = control(
+                &mut stream,
+                &Request::Capture {
+                    session: old,
+                    format: CaptureFormat::Plain,
+                },
+            ) else {
+                return None;
+            };
+            let text = String::from_utf8_lossy(&bytes);
+            (text.contains("selected account ready")
+                && text.contains("fixture: original-still-responsive"))
+            .then_some(())
+        });
+        assert_eq!(
+            control(&mut stream, &Request::Close { session: old }),
+            Reply::Closed
+        );
+        drop(daemon);
+        fs::remove_dir_all(root).unwrap();
+        return;
     }
     // Crash after the new process starts but before it becomes ready or commits its alias.
     wait_for(|| fs::read_to_string(target.join("observed-profile")).ok());
@@ -370,21 +463,26 @@ while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input
         fs::read_to_string(target.join("observed-profile")).unwrap(),
         target.to_str().unwrap()
     );
-    let resume_arg = if provider == ProviderKind::Claude {
-        format!("--resume={conversation}")
-    } else {
-        conversation.into()
-    };
-    assert!(
-        fs::read_to_string(target.join("observed-args"))
-            .unwrap()
-            .lines()
-            .any(|arg| arg == resume_arg)
-    );
-    assert_eq!(
-        fs::read(source.join(&transcript)).unwrap(),
-        fs::read(target.join(&transcript)).unwrap()
-    );
+    let observed_args = fs::read_to_string(target.join("observed-args")).unwrap();
+    // `replacements` follows `originals`, which follows `conversations`.
+    for (conversation, replacement) in conversations.iter().zip(&replacements) {
+        let record = state
+            .join("agent-launches")
+            .join(format!("{}.json", replacement.0));
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(record).unwrap()).unwrap();
+        assert_eq!(metadata["session_id"].as_str(), Some(conversation.as_str()));
+        let resume_arg = if provider == ProviderKind::Claude {
+            format!("--resume={conversation}")
+        } else {
+            conversation.clone()
+        };
+        assert!(observed_args.lines().any(|arg| arg == resume_arg));
+        assert_eq!(
+            fs::read(source.join(transcript_of(conversation))).unwrap(),
+            fs::read(target.join(transcript_of(conversation))).unwrap()
+        );
+    }
     assert_eq!(
         fs::read_to_string(source.join("auth.json")).unwrap(),
         "source-fixture-only"
