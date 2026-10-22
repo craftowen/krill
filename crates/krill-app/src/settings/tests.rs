@@ -8564,3 +8564,71 @@ fn artifacts_tab_lists_toggles_gate_and_deletes(cx: &mut TestAppContext) {
 
     fs::remove_dir_all(d).ok();
 }
+
+/// 앱 테마 선택: 누르면 바로 팔레트가 바뀌고 저장되며, 짝 터미널 테마는 사용자가 바꾸지 않았을 때만 따라 바뀐다.
+#[gpui::test]
+fn ui_theme_segments_switch_palette_and_follow_paired_terminal_theme(cx: &mut TestAppContext) {
+    let d = dir("ui-theme");
+    init(cx, &d);
+    let (_view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(820.), px(5000.)));
+    vcx.run_until_parked();
+    let click = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
+        let b = vcx
+            .debug_bounds(s)
+            .unwrap_or_else(|| panic!("missing selector {s}"));
+        vcx.simulate_click(b.center(), gpui::Modifiers::default());
+        vcx.run_until_parked();
+    };
+
+    click(vcx, "ui-theme-glow");
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.ui_theme_dark, DarkUiTheme::Glow);
+        assert_eq!(
+            s.terminal_theme_dark,
+            crate::ui::terminal_themes::KRILL_GLOW
+        );
+        assert_eq!(crate::ui::palette(cx), &crate::ui::GLOW);
+        assert_eq!(cx.theme().background, crate::ui::GLOW.background);
+    });
+    let saved = Settings::parse(&fs::read_to_string(d.join(SETTINGS_FILE)).unwrap()).unwrap();
+    assert_eq!(saved.ui_theme_dark, DarkUiTheme::Glow);
+
+    // 사용자가 고른 터미널 테마는 앱 테마를 바꿔도 그대로 둔다.
+    vcx.update(|_, cx| edit(cx, |s| s.terminal_theme_dark = "Dracula".to_owned()));
+    vcx.run_until_parked();
+    click(vcx, "ui-theme-abyss");
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.ui_theme_dark, DarkUiTheme::Abyss);
+        assert_eq!(s.terminal_theme_dark, "Dracula");
+        assert_eq!(crate::ui::palette(cx), &crate::ui::ABYSS);
+    });
+
+    vcx.update(|_, cx| edit(cx, |s| s.theme = ThemeChoice::Light));
+    vcx.run_until_parked();
+    click(vcx, "ui-theme-paper");
+    vcx.update(|_, cx| {
+        let s = current(cx);
+        assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+        assert_eq!(
+            s.terminal_theme_light,
+            crate::ui::terminal_themes::KRILL_PAPER
+        );
+        assert_eq!(cx.theme().mode, ThemeMode::Light);
+        assert_eq!(crate::ui::palette(cx), &crate::ui::PAPER);
+    });
+    fs::remove_dir_all(&d).ok();
+}
+
+/// 앱 테마 키가 없는 예전 설정 파일은 기본 테마(심해·기본)로 읽는다.
+#[test]
+fn settings_without_ui_theme_keys_use_default_themes() {
+    let s = Settings::parse("theme = \"light\"").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Deep);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Classic);
+    let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
+    assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
+    assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+}

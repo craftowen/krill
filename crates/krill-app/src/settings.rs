@@ -20,6 +20,8 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, ThemeMode};
 use serde::{Deserialize, Serialize};
 
+use crate::ui::{DarkUiTheme, LightUiTheme};
+
 pub use crate::i18n::Language;
 
 const SETTINGS_FILE: &str = "settings.toml";
@@ -71,6 +73,10 @@ pub enum KeepAwake {
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    /// 다크 모드에서 쓸 앱 색 조합.
+    pub ui_theme_dark: crate::ui::DarkUiTheme,
+    /// 라이트 모드에서 쓸 앱 색 조합.
+    pub ui_theme_light: crate::ui::LightUiTheme,
     pub language: Language,
     /// UI 배율(1.0 = 100%). 적용할 때 `ZOOM_MIN..=ZOOM_MAX`로 자른다.
     /// 레거시 `zoom` 키는 첫 로드 시 `terminal_font_size`로 이관하고 `ui_zoom = 1.0`으로 초기화한다(OWE-843).
@@ -251,6 +257,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::Dark,
+            ui_theme_dark: crate::ui::DarkUiTheme::Deep,
+            ui_theme_light: crate::ui::LightUiTheme::Classic,
             language: Language::Ko,
             zoom: 1.0,
             notifications: true,
@@ -297,6 +305,28 @@ fn has_legacy_zoom(s: &str) -> bool {
 }
 
 impl Settings {
+    /// 다크 앱 테마를 바꾼다. 다크 터미널 테마가 이전 앱 테마의 짝이면 새 테마의 짝으로 함께 바꾼다.
+    pub fn set_ui_theme_dark(&mut self, theme: crate::ui::DarkUiTheme) {
+        let paired = self.ui_theme_dark.terminal_theme_name();
+        if crate::ui::canonical_terminal_theme_name(&self.terminal_theme_dark) == paired {
+            theme
+                .terminal_theme_name()
+                .clone_into(&mut self.terminal_theme_dark);
+        }
+        self.ui_theme_dark = theme;
+    }
+
+    /// 라이트 앱 테마를 바꾼다. 라이트 터미널 테마가 이전 앱 테마의 짝이면 새 테마의 짝으로 함께 바꾼다.
+    pub fn set_ui_theme_light(&mut self, theme: crate::ui::LightUiTheme) {
+        let paired = self.ui_theme_light.terminal_theme_name();
+        if crate::ui::canonical_terminal_theme_name(&self.terminal_theme_light) == paired {
+            theme
+                .terminal_theme_name()
+                .clone_into(&mut self.terminal_theme_light);
+        }
+        self.ui_theme_light = theme;
+    }
+
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
         let mut parsed: Self = toml::from_str(s)?;
         parsed.terminal_font_size = parsed
@@ -4896,6 +4926,20 @@ impl SettingsView {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
+        let dark_theme_button = |id: &'static str, label: &'static str, theme: DarkUiTheme| {
+            layout::segment(id, label, s.ui_theme_dark == theme)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| {
+                    edit(cx, move |s| s.set_ui_theme_dark(theme));
+                })
+        };
+        let light_theme_button = |id: &'static str, label: &'static str, theme: LightUiTheme| {
+            layout::segment(id, label, s.ui_theme_light == theme)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| {
+                    edit(cx, move |s| s.set_ui_theme_light(theme));
+                })
+        };
         let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
             layout::segment(id, label, s.keep_awake == mode)
                 .debug_selector(move || id.into())
@@ -4963,6 +5007,62 @@ impl SettingsView {
                             ]
                             .into_iter()
                             .map(|(id, l, choice)| theme_button(id, l, choice)),
+                        )),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(text::DARK_THEME.get(), text::DARK_THEME_DESC.get()))
+                    .child(
+                        layout::controls().child(layout::segmented_control(
+                            p,
+                            [
+                                (
+                                    "ui-theme-deep",
+                                    text::UI_THEME_DEEP.get(),
+                                    DarkUiTheme::Deep,
+                                ),
+                                (
+                                    "ui-theme-abyss",
+                                    text::UI_THEME_ABYSS.get(),
+                                    DarkUiTheme::Abyss,
+                                ),
+                                (
+                                    "ui-theme-tidepool",
+                                    text::UI_THEME_TIDEPOOL.get(),
+                                    DarkUiTheme::Tidepool,
+                                ),
+                                (
+                                    "ui-theme-glow",
+                                    text::UI_THEME_GLOW.get(),
+                                    DarkUiTheme::Glow,
+                                ),
+                            ]
+                            .into_iter()
+                            .map(|(id, l, theme)| dark_theme_button(id, l, theme)),
+                        )),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(text::LIGHT_THEME.get(), text::LIGHT_THEME_DESC.get()))
+                    .child(
+                        layout::controls().child(layout::segmented_control(
+                            p,
+                            [
+                                (
+                                    "ui-theme-classic",
+                                    text::UI_THEME_CLASSIC.get(),
+                                    LightUiTheme::Classic,
+                                ),
+                                (
+                                    "ui-theme-paper",
+                                    text::UI_THEME_PAPER.get(),
+                                    LightUiTheme::Paper,
+                                ),
+                            ]
+                            .into_iter()
+                            .map(|(id, l, theme)| light_theme_button(id, l, theme)),
                         )),
                     ),
             )
