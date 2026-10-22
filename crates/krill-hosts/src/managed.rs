@@ -1,6 +1,6 @@
 //! OWE-897: 관리형 원격 서버(빈 SSH 호스트에 krill 설치·기동·업데이트).
 //!
-//! - 원격 OS/아키텍처 감지(`uname -s -m` 한 번 조회): macOS(`arm64`·`x86_64`)만 지원,
+//! - 원격 OS/아키텍처 감지(`uname -s -m` 한 번 조회): macOS(`arm64`)만 지원,
 //!   Linux는 미지원으로 보고한다(원격 데몬 경로·`launchd`가 macOS 전제).
 //! - 원격 krill 버전 조회(`~/.krill/bin/VERSION`, 없으면 PATH의 `krill` 유무만 보고).
 //! - 설치는 로컬에서 검증된 바이너리 바이트를 SSH stdin으로 전송한 뒤 원격에서
@@ -51,10 +51,6 @@ pub enum RemoteArch {
 }
 
 impl RemoteArch {
-    fn is_known(&self) -> bool {
-        matches!(self, Self::Arm64 | Self::X86_64)
-    }
-
     fn label(&self) -> String {
         match self {
             Self::Arm64 => "arm64".to_owned(),
@@ -98,11 +94,11 @@ pub struct RemotePlatform {
 }
 
 impl RemotePlatform {
-    /// macOS(`arm64`·`x86_64`)만 관리형 설치를 지원한다.
+    /// macOS(`arm64`)만 관리형 설치를 지원한다.
     /// Linux는 원격 데몬 경로·`launchd` 전제 때문에 미지원으로 보고한다(OWE-897).
     #[must_use]
     pub fn is_supported(&self) -> bool {
-        matches!(self.os, RemoteOs::Macos) && self.arch.is_known()
+        matches!(self.os, RemoteOs::Macos) && matches!(self.arch, RemoteArch::Arm64)
     }
 
     /// UI 표시용 (`macOS arm64` 등).
@@ -123,18 +119,13 @@ impl RemotePlatform {
     }
 
     /// 로컬 바이너리를 그대로 전송해 실행할 수 있는지.
-    /// 로컬 `x86_64`는 Rosetta 2로 `arm64` 원격에서도 돌므로 허용하고,
-    /// 로컬 `arm64`는 `arm64` 원격에만 전송한다(역방향은 실행 불가).
+    /// Apple Silicon Mac용 로컬 바이너리만 Apple Silicon 원격에 전송한다.
     #[must_use]
     pub fn accepts_local_arch(&self, local_arch: &str) -> bool {
         if !self.is_supported() {
             return false;
         }
-        match local_arch {
-            "x86_64" => true,
-            "aarch64" => matches!(self.arch, RemoteArch::Arm64),
-            _ => false,
-        }
+        local_arch == "aarch64"
     }
 }
 

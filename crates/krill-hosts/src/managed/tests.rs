@@ -141,14 +141,14 @@ fn parse_os_and_arch_cover_macos_linux_and_other() {
     assert!(mac.is_supported());
     assert_eq!(mac.describe(), "macOS arm64");
     assert!(mac.accepts_local_arch("aarch64"));
-    assert!(mac.accepts_local_arch("x86_64"));
+    assert!(!mac.accepts_local_arch("x86_64"));
 
     let intel = RemotePlatform {
         os: RemoteOs::Macos,
         arch: RemoteArch::X86_64,
         kernel: "Darwin".into(),
     };
-    assert!(intel.is_supported());
+    assert!(!intel.is_supported());
     assert!(!intel.accepts_local_arch("aarch64"));
 
     let linux = RemotePlatform {
@@ -446,7 +446,7 @@ fn install_refuses_unsupported_platform_and_arch_mismatch() {
     let err =
         install_remote_with_program(&opts, &fake.ssh_bin(), &spec, "aarch64", &payload, &remote)
             .unwrap_err();
-    assert_eq!(err.kind, InstallFailureKind::ArchMismatch);
+    assert_eq!(err.kind, InstallFailureKind::UnsupportedArch);
 }
 
 #[test]
