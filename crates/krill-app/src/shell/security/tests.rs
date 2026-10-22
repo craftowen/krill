@@ -188,6 +188,67 @@ fn pending_paste_in_another_pane_does_not_block_ready_paste(cx: &mut TestAppCont
 }
 
 #[test]
+fn remote_filename_is_sanitized() {
+    assert_eq!(
+        super::sanitize_remote_filename("Screen Shot 2026-10-22.png"),
+        "Screen_Shot_2026-10-22.png"
+    );
+    assert_eq!(
+        super::sanitize_remote_filename("../../etc/passwd"),
+        "passwd"
+    );
+    assert_eq!(super::sanitize_remote_filename(""), "pasted-file");
+    assert_eq!(super::sanitize_remote_filename("..."), "pasted-file");
+    assert_eq!(super::sanitize_remote_filename("a/b"), "b");
+}
+
+#[test]
+fn remote_text_paste_needs_no_upload() {
+    let host = krill_app::ssh_hosts::SshHost {
+        id: "ssh-test".to_owned(),
+        label: "test".to_owned(),
+        destination: "user@host.invalid".to_owned(),
+        port: None,
+        identity_file: None,
+        remote_socket: None,
+        imported: false,
+        copy_id_first: false,
+    };
+    let item = gpui::ClipboardItem::new_string("echo hello".to_owned());
+    assert_eq!(
+        super::clipboard_paste_payload_for_host(&item, Some(&host)),
+        Some(b"echo hello".to_vec())
+    );
+    assert_eq!(
+        super::clipboard_paste_payload_for_host(&item, None),
+        Some(b"echo hello".to_vec())
+    );
+}
+
+#[test]
+fn remote_image_paste_with_unusable_destination_cancels() {
+    let host = krill_app::ssh_hosts::SshHost {
+        id: "ssh-test".to_owned(),
+        label: "test".to_owned(),
+        destination: "-invalid".to_owned(),
+        port: None,
+        identity_file: None,
+        remote_socket: None,
+        imported: false,
+        copy_id_first: false,
+    };
+    let img = gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+    );
+    let item = gpui::ClipboardItem::new_image(&img);
+    assert_eq!(
+        super::clipboard_paste_payload_for_host(&item, Some(&host)),
+        None
+    );
+}
+
+#[test]
 fn preparation_admission_is_held_until_backend_guard_finishes() {
     let active = std::sync::atomic::AtomicUsize::new(0);
     let first = super::PreparationPermit::acquire(&active).unwrap();
@@ -199,4 +260,103 @@ fn preparation_admission_is_held_until_backend_guard_finishes() {
     assert!(super::PreparationPermit::acquire(&active).is_some());
     drop(second);
     assert_eq!(active.load(std::sync::atomic::Ordering::Acquire), 0);
+}
+
+fn upload_test_host() -> krill_app::ssh_hosts::SshHost {
+    krill_app::ssh_hosts::SshHost {
+        id: "upload-test".into(),
+        label: "Upload test".into(),
+        destination: "test.invalid".into(),
+        port: None,
+        identity_file: None,
+        remote_socket: None,
+        imported: false,
+        copy_id_first: false,
+    }
+}
+
+#[test]
+fn remote_upload_closes_stdin_and_uses_private_unique_paths() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = state_path("upload-eof").parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("ssh");
+    std::fs::write(&script, format!(
+        "#!/bin/sh\nexport TMPDIR='{}'\nfor arg in \"$@\"; do last=$arg; done\nexec /bin/sh -c \"$last\"\n",
+        root.display()
+    )).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let host = upload_test_host();
+    let first = super::upload_bytes_with_program(
+        &host,
+        "image.png",
+        b"one",
+        script.as_os_str(),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    let second = super::upload_bytes_with_program(
+        &host,
+        "image.png",
+        b"two",
+        script.as_os_str(),
+        Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_ne!(
+        first, second,
+        "same-named uploads must not overwrite each other"
+    );
+    assert_eq!(std::fs::read(&first).unwrap(), b"one");
+    assert_eq!(std::fs::read(&second).unwrap(), b"two");
+    assert_eq!(
+        std::fs::metadata(&first).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(std::path::Path::new(&first).parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_upload_stalled_stdin_is_bounded() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let root = state_path("upload-timeout").parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&root).unwrap();
+    let script = root.join("ssh");
+    std::fs::write(&script, "#!/bin/sh\nexec /bin/sleep 10\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let start = std::time::Instant::now();
+    assert!(
+        super::upload_bytes_with_program(
+            &upload_test_host(),
+            "image.png",
+            &vec![0; 1024 * 1024],
+            script.as_os_str(),
+            Duration::from_millis(100)
+        )
+        .is_none()
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "a blocked pipe must not hang the paste worker"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn link_only_remote_never_receives_a_local_media_path() {
+    let text = gpui::ClipboardItem::new_string("echo hello".into());
+    assert_eq!(
+        super::remote_text_without_upload(&text),
+        Some(b"echo hello".to_vec())
+    );
+    let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3]);
+    assert!(super::remote_text_without_upload(&gpui::ClipboardItem::new_image(&image)).is_none());
 }

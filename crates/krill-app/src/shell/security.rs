@@ -1,6 +1,8 @@
 //! MK-076 보안 강화 UI 연결(OSC 8 URL 미리보기, 제목 제어문자 필터, 여러 줄 붙여넣기 경고, Secure Keyboard Entry).
 //! `shell.rs` 병합 충돌을 줄이려고 동작·그리기를 이 모듈에 둔다.
 
+use std::time::Duration;
+
 use gpui::{AnyElement, App, Context, Pixels, Point, Window, actions, div, prelude::*};
 use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
@@ -104,13 +106,36 @@ impl Shell {
         let Some(id) = self.begin_clipboard_paste(window, cx) else {
             return;
         };
+        // 원격 칸이면 로컬 경로를 그대로 보내지 않고 SSH로 파일을 올려 원격 경로를 붙여넣는다.
+        // 앱(맥북)이 가진 클립보드를 원격 데몬(맥미니) PTY가 읽을 수 있게 한다.
+        let remote_pane = self
+            .layout
+            .focused()
+            .is_some_and(|pane| self.layout.host(pane).is_remote());
+        let remote_host: Option<krill_app::ssh_hosts::SshHost> =
+            self.layout
+                .focused()
+                .and_then(|pane| match self.layout.host(pane) {
+                    krill_app::hosts::HostId::Remote(id) => {
+                        self.ssh_hosts.iter().find(|h| h.id == *id).cloned()
+                    }
+                    krill_app::hosts::HostId::Local => None,
+                });
         let read = cx.read_from_clipboard_async();
         let handle = window.window_handle();
         cx.spawn(async move |this, cx| {
             let item = read.await.ok().flatten();
             let payload = cx
                 .background_executor()
-                .spawn(async move { item.as_ref().and_then(clipboard_paste_payload) })
+                .spawn(async move {
+                    item.as_ref().and_then(|item| {
+                        if remote_pane && remote_host.is_none() {
+                            remote_text_without_upload(item)
+                        } else {
+                            clipboard_paste_payload_for_host(item, remote_host.as_ref())
+                        }
+                    })
+                })
                 .await;
             handle
                 .update(cx, |_, window, cx| {
@@ -618,6 +643,261 @@ pub(crate) fn clipboard_paste_payload(item: &gpui::ClipboardItem) -> Option<Vec<
     }
 
     None
+}
+
+// A link-only remote cannot read files saved on this computer.
+fn remote_text_without_upload(item: &gpui::ClipboardItem) -> Option<Vec<u8>> {
+    if item.entries().iter().any(|entry| {
+        matches!(
+            entry,
+            gpui::ClipboardEntry::ExternalPaths(_) | gpui::ClipboardEntry::Image(_)
+        )
+    }) {
+        return None;
+    }
+    item.text()
+        .filter(|text| !text.is_empty())
+        .map(String::into_bytes)
+}
+
+pub(crate) fn clipboard_paste_payload_for_host(
+    item: &gpui::ClipboardItem,
+    remote: Option<&krill_app::ssh_hosts::SshHost>,
+) -> Option<Vec<u8>> {
+    let Some(host) = remote else {
+        return clipboard_paste_payload(item);
+    };
+    let has_valid_image = item.entries().iter().any(|entry| {
+        matches!(entry, gpui::ClipboardEntry::Image(img) if !img.bytes.is_empty() && img.bytes.len() <= MAX_CLIPBOARD_IMAGE_BYTES)
+    });
+    let _permit = PreparationPermit::acquire(&CLIPBOARD_PREPARATIONS)?;
+    remote_payload_inner(item, host, has_valid_image)
+}
+
+fn remote_payload_inner(
+    item: &gpui::ClipboardItem,
+    host: &krill_app::ssh_hosts::SshHost,
+    has_valid_image: bool,
+) -> Option<Vec<u8>> {
+    let mut skipped_dead = false;
+    for entry in item.entries() {
+        if let gpui::ClipboardEntry::ExternalPaths(paths) = entry {
+            if paths.paths().is_empty() {
+                continue;
+            }
+            let existing: Vec<&std::path::PathBuf> =
+                paths.paths().iter().filter(|p| p.exists()).collect();
+            if existing.is_empty() {
+                if has_valid_image {
+                    skipped_dead = true;
+                    continue;
+                }
+                return None;
+            }
+            return upload_local_paths(host, &existing);
+        }
+    }
+    if !skipped_dead {
+        let has_string = item.entries().iter().any(|entry| match entry {
+            gpui::ClipboardEntry::String(s) => {
+                if has_valid_image {
+                    !s.text().trim().is_empty()
+                } else {
+                    !s.text().is_empty()
+                }
+            }
+            _ => false,
+        });
+        if has_string
+            && let Some(text) = item.text()
+            && !text.is_empty()
+        {
+            return Some(text.into_bytes());
+        }
+    }
+    for entry in item.entries() {
+        if let gpui::ClipboardEntry::Image(img) = entry {
+            if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+                continue;
+            }
+            if let Some(payload) = upload_clipboard_image(host, img) {
+                return Some(payload);
+            }
+        }
+    }
+    None
+}
+
+fn sanitize_remote_filename(name: &str) -> String {
+    let trimmed = name.trim();
+    let base = trimmed.rsplit('/').next().unwrap_or(trimmed);
+    let mut out = String::new();
+    for ch in base.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+') {
+            out.push(ch);
+        } else if ch == ' ' {
+            out.push('_');
+        }
+    }
+    let out = out.trim_matches('.').trim();
+    if out.is_empty() {
+        return "pasted-file".to_owned();
+    }
+    if out.len() > 64 {
+        out.chars().take(64).collect()
+    } else {
+        out.to_owned()
+    }
+}
+
+fn upload_bytes_to_remote(
+    host: &krill_app::ssh_hosts::SshHost,
+    filename: &str,
+    bytes: &[u8],
+) -> Option<String> {
+    upload_bytes_with_program(
+        host,
+        filename,
+        bytes,
+        "ssh".as_ref(),
+        Duration::from_secs(15),
+    )
+}
+
+fn upload_bytes_with_program(
+    host: &krill_app::ssh_hosts::SshHost,
+    filename: &str,
+    bytes: &[u8],
+    program: &std::ffi::OsStr,
+    timeout: Duration,
+) -> Option<String> {
+    use std::io::{Read as _, Write as _};
+    use std::process::Stdio;
+    if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let destination = host.destination.trim();
+    if destination.is_empty() || destination.starts_with('-') {
+        return None;
+    }
+    let filename = sanitize_remote_filename(filename);
+    let mut args = host.common_ssh_args(10);
+    args.extend([
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        destination.to_owned(),
+        // A private, unique directory prevents collisions and follows the remote TMPDIR.
+        format!(
+            "umask 077; d=$(mktemp -d \"${{TMPDIR:-/tmp}}/krill-paste.XXXXXXXX\") || exit 1; \
+             if cat > \"$d/{filename}\"; then printf '%s\\n' \"$d/{filename}\"; \
+             else rm -rf \"$d\"; exit 1; fi"
+        ),
+    ]);
+    let mut child = krill_app::platform::background_command(program)
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdin = child.stdin.take()?;
+    // The writer owns stdin and drops it before wait: remote cat needs EOF to finish.
+    // Poll on the caller thread so a blocked write or stalled SSH is also bounded.
+    let success = std::thread::scope(|scope| {
+        let writer = scope.spawn(move || stdin.write_all(bytes).is_ok());
+        let deadline = std::time::Instant::now() + timeout;
+        let exited = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => {
+                    child.kill().ok();
+                    child.wait().ok();
+                    break false;
+                }
+            }
+        };
+        writer.join().unwrap_or(false) && exited
+    });
+    if !success {
+        return None;
+    }
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()?
+        .take(4097)
+        .read_to_end(&mut output)
+        .ok()?;
+    if output.len() > 4096 {
+        return None;
+    }
+    let path = String::from_utf8(output)
+        .ok()?
+        .trim_end_matches('\n')
+        .to_owned();
+    if !path.starts_with('/') || path.contains(['\n', '\r', '\0']) {
+        return None;
+    }
+    Some(path)
+}
+
+fn upload_local_paths(
+    host: &krill_app::ssh_hosts::SshHost,
+    paths: &[&std::path::PathBuf],
+) -> Option<Vec<u8>> {
+    let mut remote_paths: Vec<String> = Vec::new();
+    for path in paths {
+        use std::io::Read as _;
+        let file = std::fs::File::open(path).ok()?;
+        let metadata = file.metadata().ok()?;
+        if !metadata.is_file() || metadata.len() > 64 * 1024 * 1024 {
+            return None;
+        }
+        let mut bytes = Vec::new();
+        file.take(64 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        if bytes.is_empty() || bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+            return None;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| "pasted-file".to_owned(), sanitize_remote_filename);
+        remote_paths.push(upload_bytes_to_remote(host, &filename, &bytes)?);
+    }
+    if remote_paths.is_empty() {
+        return None;
+    }
+    Some(krill_term::paste::dropped(
+        remote_paths.iter().map(String::as_bytes),
+    ))
+}
+
+fn upload_clipboard_image(
+    host: &krill_app::ssh_hosts::SshHost,
+    img: &gpui::Image,
+) -> Option<Vec<u8>> {
+    if img.bytes.is_empty() || img.bytes.len() > MAX_CLIPBOARD_IMAGE_BYTES {
+        return None;
+    }
+    let sniffed_ext = sniff_clipboard_image_extension(&img.bytes, img.format);
+    let (ext, payload): (&str, Vec<u8>) =
+        if sniffed_ext == "tiff" || img.format == gpui::ImageFormat::Tiff {
+            if let Some(png) = krill_app::platform::tiff_to_png(&img.bytes) {
+                ("png", png)
+            } else {
+                (sniffed_ext, img.bytes.clone())
+            }
+        } else {
+            (sniffed_ext, img.bytes.clone())
+        };
+    let filename = format!("clipboard-{:016x}.{}", img.id, ext);
+    let remote_path = upload_bytes_to_remote(host, &filename, &payload)?;
+    Some(krill_term::paste::dropped([remote_path.as_bytes()]))
 }
 
 pub(crate) fn save_clipboard_image(img: &gpui::Image) -> std::io::Result<std::path::PathBuf> {
