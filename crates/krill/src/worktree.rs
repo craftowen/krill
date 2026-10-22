@@ -229,6 +229,7 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
     // 데몬의 cwd와 다르므로 요청 전에 절대 경로로 고정한다.
     let repo =
         std::fs::canonicalize(repo).map_err(|e| format!("cannot resolve repository: {e}"))?;
+    let base = base.or_else(|| resolved_parent.as_deref().and_then(parent_branch));
     Ok(ParsedNew {
         req: NewWorktree {
             repo: repo.as_os_str().as_bytes().to_vec(),
@@ -238,6 +239,22 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
         },
         parent: resolved_parent,
     })
+}
+
+/// 명시한 기준 ref가 없을 때만 부모의 현재 브랜치를 쓴다. detached HEAD·조회 실패는 데몬 기본값으로 폴백한다.
+fn parent_branch(parent: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(parent)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_owned())
 }
 
 fn utf8(s: &OsStr) -> Result<&str, String> {
@@ -897,6 +914,61 @@ mod tests {
         assert_eq!(parsed.req.repo, canon_parent.as_os_str().as_bytes());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parent_branch_is_default_but_explicit_base_and_detached_head_are_preserved() {
+        let dir = std::env::temp_dir().join(format!("krill-parent-base-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "parent-feature"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let mut args = vec![
+            OsString::from("new"),
+            OsString::from("child"),
+            OsString::from("--parent"),
+            dir.join("nested").into_os_string(),
+        ];
+        let parsed = parse(&args).unwrap();
+        assert_eq!(parsed.req.base.as_deref(), Some("parent-feature"));
+        assert_eq!(parsed.parent, Some(std::fs::canonicalize(&dir).unwrap()));
+        args.extend([OsString::from("--base"), OsString::from("HEAD~0")]);
+        assert_eq!(parse(&args).unwrap().req.base.as_deref(), Some("HEAD~0"));
+        args.truncate(4);
+        git(&["checkout", "--detach"]);
+        assert_eq!(parse(&args).unwrap().req.base, None);
+        assert_eq!(parent_branch(&dir.join("missing")), None);
+        let without_parent = parse(&[
+            OsString::from("new"),
+            OsString::from("top-level"),
+            OsString::from("--repo"),
+            dir.clone().into_os_string(),
+        ])
+        .unwrap();
+        assert_eq!(without_parent.req.base, None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
