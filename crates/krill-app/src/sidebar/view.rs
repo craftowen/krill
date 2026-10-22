@@ -1611,15 +1611,12 @@ impl Sidebar {
             Vec::new()
         };
         let ports_badge = (!ports_list.is_empty()).then(|| {
-            let text_str = ports_list
-                .iter()
-                .map(|port| format!(":{port}"))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let aria = ports_badge_text(&ports_list, usize::MAX);
+            let text_str = ports_badge_text(&ports_list, PORTS_BADGE_MAX);
             div()
                 .id(("ports-badge", index))
                 .role(gpui::Role::Status)
-                .aria_label(text_str.clone())
+                .aria_label(aria)
                 .debug_selector(move || format!("ports-badge-{index}"))
                 .flex_none()
                 .px_1()
@@ -2963,6 +2960,25 @@ impl Render for Sidebar {
             })
             .child(list)
     }
+}
+
+/// 카드 포트 배지에 보이는 최대 포트 수. 나머지는 `+N`으로 접는다.
+const PORTS_BADGE_MAX: usize = 3;
+
+/// 포트 목록을 `:3000 :8080 +2` 꼴로 만든다. 처음 `max`개만 보이고 나머지는 개수로 접는다.
+pub(super) fn ports_badge_text(ports: &[u16], max: usize) -> String {
+    let mut text = ports
+        .iter()
+        .take(max)
+        .map(|port| format!(":{port}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let rest = ports.len().saturating_sub(max);
+    if rest > 0 {
+        text.push_str(" +");
+        text.push_str(&rest.to_string());
+    }
+    text
 }
 
 /// 원격 연결 실패 메시지(ssh 표준 오류·터널 오류)를 사이드바에 보일 짧은 이유로 줄인다.

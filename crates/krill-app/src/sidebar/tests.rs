@@ -4994,3 +4994,12 @@ fn local_project_selection_does_not_hide_remote_daemon_projects(cx: &mut TestApp
         });
     });
 }
+
+#[test]
+fn ports_badge_text_folds_overflow_into_count() {
+    use super::view::ports_badge_text;
+    assert_eq!(ports_badge_text(&[3000, 8080], 3), ":3000 :8080");
+    assert_eq!(ports_badge_text(&[1, 2, 3], 3), ":1 :2 :3");
+    assert_eq!(ports_badge_text(&[1, 2, 3, 4, 5], 3), ":1 :2 :3 +2");
+    assert_eq!(ports_badge_text(&[1, 2, 3, 4], usize::MAX), ":1 :2 :3 :4");
+}
