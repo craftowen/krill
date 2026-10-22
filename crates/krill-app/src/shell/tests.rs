@@ -5437,6 +5437,15 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
         );
     }
 
+    // Orca처럼 팝업은 하단바 위로 열리고 바를 덮지 않는다.
+    let bar = cx.debug_bounds("status-bar").unwrap();
+    let card = cx.debug_bounds("status-provider-card-claude").unwrap();
+    let last = cx.debug_bounds("status-provider-open-accounts").unwrap();
+    assert!(
+        card.top() >= px(0.) && last.bottom() <= bar.top(),
+        "provider popover must sit above the status bar: {card:?} {last:?} vs {bar:?}"
+    );
+
     // host_default must be sorted above other accounts.
     let host_row = cx
         .debug_bounds("status-provider-account-claude-host_default")

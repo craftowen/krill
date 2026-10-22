@@ -728,7 +728,20 @@ impl Shell {
         .detach();
     }
 
+    /// ⌘ 없이 클릭해도 여는 평문 `http(s)://` URL. 프로그램이 마우스 보고를 켰으면 클릭은
+    /// 프로그램 것이고, OSC 8 링크는 보이는 글과 대상이 다를 수 있어 ⌘+클릭으로만 연다.
+    pub(super) fn plain_url_at(
+        &self,
+        pane: PaneId,
+        position: gpui::Point<Pixels>,
+    ) -> Option<(Highlight, String)> {
+        let l = self.live.get(&pane).filter(|l| !l.pane.modes().mouse())?;
+        let screen = l.pane.shown();
+        krill_app::terminal::url_link_target(&screen, &l.painted, position)
+    }
+
     /// ⌘를 누른 채 움직이면 링크 밑줄(OSC 8·평문 URL·파일 경로)을 갱신한다(OWE-867). 바뀔 때만 다시 그린다.
+    /// ⌘ 없이도 맨 클릭으로 열리는 평문 URL에는 밑줄을 긋는다.
     pub(super) fn update_path_hover(
         &mut self,
         pane: PaneId,
@@ -765,7 +778,7 @@ impl Shell {
                 })
                 .map(|h| (pane, h))
         } else {
-            None
+            self.plain_url_at(pane, position).map(|(h, _)| (pane, h))
         };
         if self.files.hover != next {
             self.files.hover = next;
@@ -1111,7 +1124,7 @@ impl Shell {
         let previewing = shown.is_some();
         let p = krill_app::ui::palette(cx);
         let segment_button = |name: &'static str, label: &'static str, on: bool| {
-            krill_app::ui::segment((name, id.get()), label, previewing == on)
+            krill_app::ui::segment(p, (name, id.get()), label, previewing == on)
                 .debug_selector(move || name.to_owned())
                 .on_click(cx.listener(move |this, _, window, cx| {
                     cx.stop_propagation();

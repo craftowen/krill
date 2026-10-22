@@ -1842,7 +1842,7 @@ fn render_group_by_section(
                         let selector = group.selector();
                         let sb = sidebar_weak.clone();
                         let mn = menu_weak.clone();
-                        ui::segment(selector, group.short_label(), active)
+                        ui::segment(p, selector, group.short_label(), active)
                             .debug_selector(move || selector.into())
                             .on_click(move |_, _, cx| {
                                 sb.update(cx, |s, cx| s.set_group_by(group, cx)).ok();

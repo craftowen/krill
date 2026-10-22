@@ -528,8 +528,26 @@ fn cmd_click_terminal_path_opens_editor_at_line(cx: &mut TestAppContext) {
         assert!(s.on_frame(pane, k, &body, cx));
     });
     cx.run_until_parked();
+    let url = Highlight {
+        line: 1,
+        column: 5,
+        cols: 28,
+    };
     cx.simulate_mouse_move(at(10.), None, Modifiers::default());
-    assert_eq!(hover(cx), None, "⌘ 없이는 URL 밑줄이 없다");
+    assert_eq!(hover(cx), Some(url), "평문 URL은 ⌘ 없이도 밑줄이 생긴다");
+    // 끌어서 선택하면 열지 않고, 끌지 않은 맨 클릭은 브라우저로 연다.
+    cx.simulate_mouse_down(at(10.), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_move(at(20.), Some(MouseButton::Left), Modifiers::default());
+    cx.simulate_mouse_up(at(20.), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(cx.opened_url(), None, "끌어 선택한 것은 링크 열기가 아니다");
+    cx.simulate_mouse_down(at(10.), MouseButton::Left, Modifiers::default());
+    cx.simulate_mouse_up(at(10.), MouseButton::Left, Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cx.opened_url().as_deref(),
+        Some("https://example.com/docs?x=1")
+    );
     cx.simulate_mouse_move(at(10.), None, cmd);
     assert_eq!(
         hover(cx),

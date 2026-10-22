@@ -1171,6 +1171,7 @@ impl SettingsView {
 
         let reuse_active = modal.workspace_mode == WorkspaceMode::Reuse;
         let reuse_btn = layout::segment(
+            p,
             "admin-schedule-mode-reuse",
             text::SCHEDULE_MODE_REUSE.get(),
             reuse_active,
@@ -1183,6 +1184,7 @@ impl SettingsView {
             }
         }));
         let isolate_btn = layout::segment(
+            p,
             "admin-schedule-mode-isolate",
             text::SCHEDULE_MODE_ISOLATE.get(),
             !reuse_active,

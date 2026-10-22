@@ -64,7 +64,7 @@ pub use store::{
 /// 데이터 터널 ALPN 식별자 (`b"krill/link/2"`).
 pub const ALPN_LINK: &[u8] = b"krill/link/2";
 
-/// 기기 짝짓기 ALPN 식별자 (`b"krill/pair/1"`).
+/// 기기 페어링 ALPN 식별자 (`b"krill/pair/1"`).
 pub const ALPN_PAIR: &[u8] = b"krill/pair/1";
 
 /// Legacy v1 preamble (v2 rejects the old ALPN instead of silently losing resume).

@@ -1925,7 +1925,16 @@ fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
         expanded_account_usage(&usage, now + 60),
         "0% 1h 30m · 92% 1d 18h"
     );
-    assert_eq!(compact_status_usage(&usage, now), "92% 1d 19h");
+    // 좁은 창은 막대 쌍을 유지하고 리셋만 가장 큰 단위로 접는다.
+    assert_eq!(
+        status_window_parts(usage.seven_day.as_ref(), now, true),
+        (Some(92), Some("1d".to_owned()))
+    );
+    assert_eq!(
+        status_window_parts(usage.five_hour.as_ref(), now, false),
+        (Some(0), Some("1h 31m".to_owned()))
+    );
+    assert_eq!(status_window_parts(None, now, true), (None, None));
     assert_eq!(status_window_label(None, now), "—");
     for (secs, expected) in [
         (0, "0m"),
@@ -1936,4 +1945,49 @@ fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
     ] {
         assert_eq!(status_reset_duration(secs), expected);
     }
+}
+
+/// 하단바 B안: 5시간·주간 밖 한도(예: 모델별 풀)는 경고 수준이면서 보이는 두 기간보다 높을 때만 덧붙인다.
+#[test]
+fn status_hot_meter_shows_only_a_higher_warning_pool() {
+    use krill_proto::usage::{
+        AccountInfo, AccountMeters, AccountsSnapshot, Snapshot, UsageMeter, Window,
+    };
+    let now = 1_800_000_000;
+    let win = |percent| Window {
+        percent,
+        resets_at: Some((now + 3600).to_string()),
+    };
+    let account = AccountInfo {
+        id: "agy".into(),
+        provider: ProviderKind::Antigravity,
+        label: "Antigravity".into(),
+        email: None,
+        profile_dir: "/tmp/hot-meter".into(),
+        active: true,
+        host_default: false,
+        stale: false,
+        usage: Snapshot {
+            five_hour: Some(win(0)),
+            seven_day: Some(win(76)),
+        },
+    };
+    let meter = |label: &str, percent| UsageMeter {
+        key: label.to_lowercase(),
+        label: label.into(),
+        window: Some(win(percent)),
+        value: None,
+    };
+    let mut snap = AccountsSnapshot::default();
+    snap.details.accounts.push(AccountMeters {
+        account_id: "agy".into(),
+        plan: None,
+        meters: vec![meter("Gemini", 100), meter("Flash", 50)],
+    });
+    assert_eq!(
+        status_hot_meter(&snap, &account, now),
+        Some(("Gemini".to_owned(), 100))
+    );
+    snap.details.accounts[0].meters = vec![meter("Gemini", 70)];
+    assert_eq!(status_hot_meter(&snap, &account, now), None);
 }

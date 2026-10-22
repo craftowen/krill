@@ -164,6 +164,13 @@ impl LinkBackend for RealLinkBackend {
         self.remote_hosts()
     }
 
+    fn rename_host(&self, id: &str, name: &str) -> Result<Vec<PairedHost>, String> {
+        let name = clean_host_name(name).ok_or_else(|| text::ERR_UNAVAILABLE.get().to_owned())?;
+        krill_link::rename_host(&self.state_dir, id, &name)
+            .map_err(|_| text::ERR_UNAVAILABLE.get().to_owned())?;
+        self.remote_hosts()
+    }
+
     fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String> {
         run(krill_link::revoke_device_command(&self.state_dir, id))
             .map_err(|_| text::ERR_UNAVAILABLE.get().to_owned())?;

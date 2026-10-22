@@ -1,4 +1,4 @@
-//! 짝짓기(`krill-link invite` / `krill-link pair`) 링크 포맷, ALPN `krill/pair/1` 핸드셰이크, 속도 제한기.
+//! 페어링(`krill-link invite` / `krill-link pair`) 링크 포맷, ALPN `krill/pair/1` 핸드셰이크, 속도 제한기.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -22,19 +22,19 @@ use crate::{
     store::{DEFAULT_INVITE_TTL, now_unix_secs, sanitize_id_slug, upsert_host},
 };
 
-/// 짝짓기 링크 스킴 접두어.
+/// 페어링 링크 스킴 접두어.
 pub const PAIR_URI_PREFIX: &str = "krill://pair?";
 const TICKET_OPTIONAL_PREFIX: &str = "mklink1:";
 const MAX_PAIR_FRAME_BYTES: usize = 8192;
 
-/// 기본 짝짓기 속도 제한 윈도우 (60초).
+/// 기본 페어링 속도 제한 윈도우 (60초).
 pub const DEFAULT_RATE_WINDOW: Duration = Duration::from_secs(60);
 /// 윈도우당 최대 실패 허용 횟수 (5회).
 pub const DEFAULT_MAX_FAILURES: usize = 5;
 /// 윈도우당 최대 전체 시도 횟수 (15회).
 pub const DEFAULT_MAX_ATTEMPTS: usize = 15;
 
-/// `krill://pair?t=<ticket>&k=<token>` 짝짓기 링크.
+/// `krill://pair?t=<ticket>&k=<token>` 페어링 링크.
 ///
 /// `fmt::Debug`는 토큰 원문을 `"<redacted>"`로 마스킹한다.
 #[derive(Clone)]
@@ -53,7 +53,7 @@ impl fmt::Debug for PairLink {
 }
 
 impl PairLink {
-    /// 서버 주소와 1회용 토큰으로 짝짓기 링크를 만든다.
+    /// 서버 주소와 1회용 토큰으로 페어링 링크를 만든다.
     pub fn new(addr: EndpointAddr, token: InviteToken) -> Self {
         Self { addr, token }
     }
@@ -150,7 +150,7 @@ pub struct PairWireResponse {
     pub reason: Option<String>,
 }
 
-/// 슬라이딩 윈도우 기반 짝짓기 시도 속도 제한기.
+/// 슬라이딩 윈도우 기반 페어링 시도 속도 제한기.
 #[derive(Debug)]
 pub struct PairRateLimiter {
     window: Duration,
@@ -186,7 +186,7 @@ impl PairRateLimiter {
         }
     }
 
-    /// 새 짝짓기 시도가 허용되는지 확인하고 시도 시각을 기록한다.
+    /// 새 페어링 시도가 허용되는지 확인하고 시도 시각을 기록한다.
     pub fn check_and_record_attempt(&self, now: Instant) -> bool {
         let Ok(mut guard) = self.state.lock() else {
             return false;
@@ -200,7 +200,7 @@ impl PairRateLimiter {
         true
     }
 
-    /// 짝짓기 토큰 검증 실패를 기록한다.
+    /// 페어링 토큰 검증 실패를 기록한다.
     pub fn record_failure(&self, now: Instant) {
         if let Ok(mut guard) = self.state.lock() {
             prune_old(&mut guard.failures, now, self.window);

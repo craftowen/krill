@@ -424,7 +424,7 @@ impl SettingsView {
             let mut interfaces = layout::card(p).flex().flex_wrap().gap_1p5();
             let auto_selected = self.mobile.address.is_none();
             interfaces = interfaces.child(
-                layout::segment("mobile-network-auto", text::AUTO.get(), auto_selected)
+                layout::segment(p, "mobile-network-auto", text::AUTO.get(), auto_selected)
                     .disabled(self.mobile.pending)
                     .debug_selector(|| "mobile-network-auto".into())
                     .on_click(
@@ -448,7 +448,7 @@ impl SettingsView {
                 let label = format!("{} ({})", interface.name, interface.address);
                 let if_id = format!("mobile-if-{index}");
                 interfaces = interfaces.child(
-                    layout::segment(("mobile-interface", index), label, selected)
+                    layout::segment(p, ("mobile-interface", index), label, selected)
                         .disabled(self.mobile.pending)
                         .debug_selector(move || if_id.clone())
                         .on_click(cx.listener(move |this, _, _, cx| {

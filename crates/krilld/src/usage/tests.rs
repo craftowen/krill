@@ -1710,6 +1710,41 @@ fn rename_account_keeps_id_dir_and_active() {
     fs::remove_dir_all(home).ok();
 }
 
+/// Orca 감지 계정 삭제는 Krill 목록에서만 숨긴다. Orca 캐시 파일은 그대로 두고 새로고침해도 다시 보이지 않는다.
+#[test]
+fn delete_orca_detected_account_hides_it_without_touching_orca_cache() {
+    use accounts::{delete_account, refresh_accounts};
+    use krill_proto::usage::ProviderKind;
+    let home = dir("orca-hide");
+    let state = home.join("state");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let cache = home.join(".claude/orca-usage-cache.json");
+    let body = r#"{"accounts":[
+        {"id":"aaaa-1111","label":"keep@example.com"},
+        {"id":"bbbb-2222","label":"gone@example.com"}
+    ]}"#;
+    fs::write(&cache, body).unwrap();
+    let ids = |snap: &krill_proto::usage::AccountsSnapshot| -> Vec<String> {
+        snap.accounts
+            .iter()
+            .filter(|a| a.id.starts_with("claude-orca-"))
+            .map(|a| a.id.clone())
+            .collect()
+    };
+    let before = refresh_accounts(&home, Some(&state));
+    let gone = ids(&before)
+        .into_iter()
+        .find(|id| id.contains("bbbb"))
+        .unwrap();
+    let snap = delete_account(&home, Some(&state), ProviderKind::Claude, &gone, &[]).unwrap();
+    assert!(!ids(&snap).contains(&gone), "{:?}", ids(&snap));
+    assert_eq!(ids(&snap).len(), 1);
+    assert_eq!(fs::read_to_string(&cache).unwrap(), body);
+    let again = refresh_accounts(&home, Some(&state));
+    assert!(!ids(&again).contains(&gone));
+    fs::remove_dir_all(home).ok();
+}
+
 /// OWE-704: 세션이 쓰는 프로필이면 EBUSY로 거부(등록·폴더 그대로), 아니면 등록을 지우고 관리 폴더는
 /// 휴지통으로 옮긴다. 사용자가 지정한 관리 루트 밖 폴더는 등록만 지운다. 고아 정리는 세션 폴더를 건너뛴다.
 #[test]

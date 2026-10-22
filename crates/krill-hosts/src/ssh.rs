@@ -394,9 +394,47 @@ pub fn resolve_remote_socket_with_program(
     remote_socket_for_home(&remote_home)
 }
 
+/// [`machine_key`] 결과를 다시 쓰는 시간. 앱은 호스트 동기화마다(1초 주기) 호스트별로 부르므로, 캐시가 없으면 그때마다
+/// `ssh` 프로세스를 띄운다. `~/.ssh/config` 수정 시각이 바뀌면 기한 전이라도 다시 묻는다. `Include`된 파일이나
+/// `/etc/ssh/ssh_config` 변경은 최대 이 시간만큼 늦게 반영된다.
+const MACHINE_KEY_TTL: Duration = Duration::from_secs(60);
+
+type MachineKeyCacheKey = (OsString, String, Option<u16>);
+type MachineKeyCacheEntry = (Instant, Option<std::time::SystemTime>, String);
+
+static MACHINE_KEYS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::BTreeMap<MachineKeyCacheKey, MachineKeyCacheEntry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::BTreeMap::new()));
+
+fn ssh_config_mtime() -> Option<std::time::SystemTime> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    std::fs::metadata(Path::new(&home).join(".ssh").join("config"))
+        .and_then(|m| m.modified())
+        .ok()
+}
+
 /// 접속 대상이 실제로 가리키는 기기(`user@hostname:port`, `ssh -G` 기준). `~/.ssh/config` 별칭과 IP로 따로 등록한
 /// 같은 기기를 하나로 묶는 데 쓴다. 네트워크에 붙지 않는다. `ssh -G`가 실패하면 입력을 그대로 쓴다.
+/// 결과는 [`MACHINE_KEY_TTL`] 동안 캐시한다.
 pub fn machine_key(destination: &str, port: Option<u16>) -> String {
+    let key = (ssh_program(), destination.to_owned(), port);
+    let mtime = ssh_config_mtime();
+    if let Ok(cache) = MACHINE_KEYS.lock()
+        && let Some((at, seen, value)) = cache.get(&key)
+        && at.elapsed() < MACHINE_KEY_TTL
+        && *seen == mtime
+    {
+        return value.clone();
+    }
+    let value = machine_key_uncached(destination, port);
+    if let Ok(mut cache) = MACHINE_KEYS.lock() {
+        cache.retain(|_, (at, _, _)| at.elapsed() < MACHINE_KEY_TTL);
+        cache.insert(key, (Instant::now(), mtime, value.clone()));
+    }
+    value
+}
+
+fn machine_key_uncached(destination: &str, port: Option<u16>) -> String {
     let fallback = || match port {
         Some(p) => format!("{}:{p}", destination.to_ascii_lowercase()),
         None => destination.to_ascii_lowercase(),

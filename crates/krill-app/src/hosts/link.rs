@@ -203,7 +203,7 @@ impl LinkHosts {
         }
     }
 
-    /// 새 초대로 짝지은 경우 이전 권한 해제 상태의 연결만 새로 시작한다.
+    /// 새 초대로 페어링한 경우 이전 권한 해제 상태의 연결만 새로 시작한다.
     pub fn paired(&self, id: &str) {
         if let Ok(mut ids) = self.suspended.lock() {
             ids.remove(id);

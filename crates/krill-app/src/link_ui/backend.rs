@@ -1,4 +1,4 @@
-//! 기기 짝짓기 백엔드 경계(`LinkBackend`)와 테스트·미리보기용 `MockLinkBackend`(MK-133b, OWE-669).
+//! 기기 페어링 백엔드 경계(`LinkBackend`)와 테스트·미리보기용 `MockLinkBackend`(MK-133b, OWE-669).
 //!
 //! 모든 백엔드 호출은 UI 스레드 블로킹을 막기 위해 `cx.background_executor()`에서 실행한다(CONVENTIONS T7).
 //! 실제 구현은 `real::RealLinkBackend`, 인메모리 구현은 `MockLinkBackend`다.
@@ -48,14 +48,14 @@ impl Invite {
     }
 }
 
-/// 짝지은 기기 한 대의 표시 정보.
+/// 페어링된 기기 한 대의 표시 정보.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairedDevice {
     /// 기기 고유 식별자(회수 호출용; 화면에는 기술 식별자를 노출하지 않는다).
     pub id: String,
     /// 기기 표시 이름(예: "오웬의 `MacBook` Air", "집 맥미니").
     pub name: String,
-    /// 짝짓기 추가 시각(Unix epoch 초).
+    /// 페어링 추가 시각(Unix epoch 초).
     pub added_at: u64,
     /// 마지막 접속 시각(Unix epoch 초, 접속 기록이 없으면 `None`).
     pub last_seen_at: Option<u64>,
@@ -80,7 +80,7 @@ pub struct NearbyMac {
     pub invite_link: String,
 }
 
-/// 클라이언트 짝짓기 실패 사유(비개발자 안내 문구와 1:1 대응).
+/// 클라이언트 페어링 실패 사유(비개발자 안내 문구와 1:1 대응).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PairFailure {
     /// 만료된 링크.
@@ -136,13 +136,13 @@ impl PairFailure {
 /// `LinkBackend::pair(link, device_name)` 결과.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PairOutcome {
-    /// 짝짓기 완료.
+    /// 페어링 완료.
     Paired(PairedDevice),
-    /// 짝짓기 실패 및 비개발자 한국어/영어 사유.
+    /// 페어링 실패 및 비개발자 한국어/영어 사유.
     Failed(PairFailure),
 }
 
-/// 기기 짝짓기 백엔드 경계.
+/// 기기 페어링 백엔드 경계.
 ///
 /// 모든 메서드는 UI 스레드가 아닌 백그라운드 실행기(`cx.background_executor()`)에서 호출한다.
 pub trait LinkBackend: Send + Sync + std::fmt::Debug {
@@ -154,10 +154,10 @@ pub trait LinkBackend: Send + Sync + std::fmt::Debug {
     fn server_status(&self) -> Result<ServerStatus, String>;
     /// 새 1회용 초대 링크와 만료 시각을 발급한다.
     fn create_invite(&self) -> Result<Invite, String>;
-    /// 초대 링크와 이 기기 이름으로 상대 Mac과 짝짓기를 시도한다. `host_name`이 비어 있지
+    /// 초대 링크와 이 기기 이름으로 상대 Mac과 페어링를 시도한다. `host_name`이 비어 있지
     /// 않으면 상대 Mac이 알려준 이름 대신 이 이름으로 원격 Mac을 저장한다.
     fn pair(&self, link: &str, device_name: &str, host_name: &str) -> PairOutcome;
-    /// 현재 짝지어진 기기 목록을 조회한다.
+    /// 현재 페어링된 기기 목록을 조회한다.
     fn devices(&self) -> Result<Vec<PairedDevice>, String>;
     /// 이 Mac이 연결한 원격 Mac 목록과 현재 연결 상태. 조회만 하며 터널을 시작하지 않는다.
     fn remote_hosts(&self) -> Result<Vec<PairedHost>, String> {
@@ -166,6 +166,11 @@ pub trait LinkBackend: Send + Sync + std::fmt::Debug {
     /// 등록된 원격 Mac 연결을 제거한다. 상대 Mac의 세션은 계속 실행된다.
     fn disconnect_host(&self, _id: &str) -> Result<Vec<PairedHost>, String> {
         Err(text::ERR_DISCONNECT.get().to_owned())
+    }
+
+    /// 이 Mac에 저장된 원격 Mac의 표시 이름만 바꾸고 갱신된 원격 Mac 목록을 돌려준다.
+    fn rename_host(&self, _id: &str, _name: &str) -> Result<Vec<PairedHost>, String> {
+        Err(text::ERR_UNAVAILABLE.get().to_owned())
     }
     /// 지정한 기기의 연결 권한을 회수(연결 끊기)하고 갱신된 기기 목록을 돌려준다.
     fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String>;
@@ -312,7 +317,7 @@ impl MockLinkBackend {
         }
     }
 
-    /// 짝지은 기기 목록을 설정한다.
+    /// 페어링된 기기 목록을 설정한다.
     pub fn set_devices(&self, devices: Vec<PairedDevice>) {
         if let Ok(mut guard) = self.state.lock() {
             guard.devices = devices;
@@ -512,7 +517,7 @@ pub fn format_relative_time(ts_secs: u64, now_secs: u64) -> String {
     text::TIME_DAYS_AGO.format(&[("d", &days.to_string())])
 }
 
-/// 짝지은 기기의 "추가 시각 · 마지막 접속" 메타 줄을 포맷한다.
+/// 페어링된 기기의 "추가 시각 · 마지막 접속" 메타 줄을 포맷한다.
 #[must_use]
 pub fn format_device_meta(device: &PairedDevice, now_secs: u64) -> String {
     let added = format_relative_time(device.added_at, now_secs);

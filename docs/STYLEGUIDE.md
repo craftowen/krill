@@ -194,9 +194,9 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 | 변형 | 메서드 | 용도 |
 |---|---|---|
-| **Primary** | `ui::primary(id, label)` (`.small().primary()`) | 한 화면/대화상자 흐름 또는 카드 헤더의 대표 일괄 액션(생성, 저장, 승인, 전체 설치, 모두 자동 설정) 또는 세그먼트 토글의 활성 항목 |
+| **Primary** | `ui::primary(id, label)` (`.small().primary()`) | 한 화면/대화상자 흐름 또는 카드 헤더의 대표 일괄 액션(생성, 저장, 승인, 전체 설치, 모두 자동 설정). 세그먼트 활성 항목에는 쓰지 않는다(아래 §6.3) |
 | **Outline / Secondary** | `ui::secondary(id, label)` (`.small().outline()`) | 주 동작 옆의 보조 동작, 개별 행 액션(스킬 설치, 연결 테스트, 폴더 열기, 가져오기, 복사) 등 채움 버튼이 무거울 때 |
-| **Ghost** | `ui::ghost(id, label)` (`.small().ghost()`) | 아이콘 전용 툴바 버튼, 목록 행 부가 액션(초기화·해제), 비활성 세그먼트 항목, **취소(Cancel)·닫기(Close)·건너뛰기(Skip)** |
+| **Ghost** | `ui::ghost(id, label)` (`.small().ghost()`) | 아이콘 전용 툴바 버튼, 목록 행 부가 액션(초기화·해제), **취소(Cancel)·닫기(Close)·건너뛰기(Skip)** |
 | **Danger** | `.danger()` / `ui::danger_confirm(...)` | 삭제, 기록 지우기, 신뢰되지 않은 스크립트 강제 실행 등 되돌릴 수 없는 파괴적 동작. **절대 취소/닫기에 쓰지 않는다.** |
 
 - 버튼 크기는 주변 행 높이에 맞춘다(24~28px 툴바·상태바에는 `.xsmall()`, 설정 행에는 `.small()`, 모달 하단 주 동작에는 기본 크기).
@@ -220,7 +220,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 - **2열 설정 행**: `ui::row(p)` 안에 왼쪽 `ui::label(p, title, desc)`과 오른쪽 `ui::controls()`를 배치한다.
   - **불변식**: `ui::card`와 `ui::row`는 항상 `w_full().min_w_0()`을 가져 부모 열을 채우면서 내부 긴 텍스트·자식 요소 때문에 부모 폭 밖으로 넘치지 않게 한다. `ui::label`은 반드시 `flex_1().min_w_0()`을 갖고, 오른쪽 컨트롤 묶음(`ui::controls`)은 `flex_none()`을 갖는다. `justify_between` 행 안에서 `flex_1()` 없이 `min_w_0()`만 주면 gpui flex 레이아웃에서 텍스트 열 폭이 0px로 무너져 한 글자씩 세로 줄바꿈되는 결함이 발생하며(OWE-651), 반대로 `flex_1().min_w_0()` 없이 긴 설명문을 넣으면 우측 버튼이 카드 테두리 밖으로 밀려 나간다(OWE-793).
 - **불리언 토글 스위치**: `ui::switch(p, id, checked, disabled, on_toggle)` — 켜기/끄기 불리언 설정은 2버튼 나열 대신 단일 알약 트랙(`SWITCH_WIDTH` × `SWITCH_HEIGHT`)과 원형 썸(`SWITCH_THUMB`) 스위치로 일관되게 표현한다.
-- **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다.
+- **세그먼트 컨트롤**: `ui::segmented_control(p, items)` + `ui::segment(id, label, active)` — 2~4개 선택지(테마·언어·커서 모양·캐시 TTL·임계값 프리셋 등)는 개별 버튼으로 흩어 놓지 않고 테두리 있는 트랙 안에 묶는다. Orca `SettingsSegmentedControl`과 같게 트랙은 `background` 50% + `border` + `RADIUS_SM`, 활성 항목은 `accent` 바탕 + `accent_foreground` + `MEDIUM`, 비활성 항목은 바탕 없이 `muted_foreground` 글자다. 활성 항목을 `primary`(다크 모드 흰 채움)로 그리면 같은 화면의 주 동작 버튼과 무게가 겹치므로 금지한다. 선택지 라벨에 영어 괄호 병기(`끄기 (Off)`)를 붙이지 않는다.
 - **모달 입력 필드 라벨**: `ui::field_label(name, optional_suffix, p)` — `<Input>` 바로 위에 `gap_1`로 쌓는다.
 - **인라인 오류 배너**: `ui::error_banner(p, message)` — 모달이나 폼 안에서 실패 사유를 사용자가 읽고 재시도할 수 있게 고정 표시한다.
 - **단축키 칩**: `ui::keycap(p, keys)` — 단축키 표시가 필요한 곳에서는 개별 스타일을 만들지 않고 반드시 `ui::keycap`을 쓴다. 실제 플랫폼 바인딩(`⌘`, `⇧`, `⌥`, `⌃`)과 표기가 정확히 일치해야 한다.

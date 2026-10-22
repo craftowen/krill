@@ -10,8 +10,8 @@ use gpui::{
     Deferred, Div, ElementId, FontWeight, Hsla, IntoElement, Pixels, SharedString, Stateful,
     Styled as _, anchored, deferred, div, point, prelude::*, px,
 };
-use gpui_component::Sizable as _;
 use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::{Selectable as _, Sizable as _};
 
 use super::theme::{
     FONT_MONO, MODAL_BACKDROP, Palette, RADIUS_MD, RADIUS_SM, RADIUS_XS, SWITCH_HEIGHT,
@@ -254,20 +254,39 @@ pub fn segmented_control(p: &Palette, items: impl IntoIterator<Item = impl IntoE
         .gap_0p5()
         .p(px(2.))
         .rounded(RADIUS_SM)
-        .bg(p.background)
+        .bg(p.background.opacity(0.5))
         .border_1()
         .border_color(p.border)
         .children(items)
 }
 
-/// [`segmented_control`] 안에 들어가는 개별 선택지 버튼(활성 시 `primary`, 비활성 시 `ghost`, OWE-793).
+/// [`segmented_control`] 안에 들어가는 개별 선택지 버튼(Orca `SettingsSegmentedControl` 대응, OWE-793).
+///
+/// 활성 항목은 `accent` 바탕 + `accent_foreground` + `MEDIUM`, 비활성 항목은 `muted_foreground` 글자만
+/// 있는 `ghost`다. 활성 항목을 `primary`(흰 채움)로 그리면 같은 화면의 주 동작 버튼과 무게가 겹친다.
 ///
 /// OWE-856: `toggled`는 접근성 메타데이터에만 반영되고(스타일 불변), 선택 상태를
 /// 보조 기술에 알린다.
-pub fn segment(id: impl Into<ElementId>, label: impl Into<SharedString>, active: bool) -> Button {
-    let btn = Button::new(id).small().label(label);
-    let btn = if active { btn.primary() } else { btn.ghost() };
-    btn.toggled(active)
+pub fn segment(
+    p: &Palette,
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    active: bool,
+) -> Button {
+    let btn = Button::new(id)
+        .small()
+        .ghost()
+        .rounded(RADIUS_XS)
+        .label(label)
+        .toggled(active);
+    if active {
+        btn.selected(true)
+            .bg(p.accent)
+            .text_color(p.accent_foreground)
+            .font_weight(FontWeight::MEDIUM)
+    } else {
+        btn.text_color(p.muted_foreground)
+    }
 }
 
 /// 2단계 확인이 있는 파괴적 동작 버튼(Orca UX Rule 1 공간 사전 예약 적용).
@@ -497,22 +516,23 @@ mod tests {
                 .child(super::segmented_control(
                     &DARK,
                     [
-                        super::segment("seg-a", "worktree", true),
-                        super::segment("seg-b", "index", false),
+                        super::segment(&DARK, "seg-a", "worktree", true),
+                        super::segment(&DARK, "seg-b", "index", false),
                     ],
                 ))
         }
     }
 
     /// OWE-856: 세그먼트 선택지는 보조 기술에 토글 상태로 노출된다.
-    /// `toggled`는 접근성 메타데이터 전용이라 선택 스타일을 바꾸지 않는다(시각 불변).
-    /// 토글→`aria_toggled` 매핑은 gpui-component이 보장하므로,
-    /// 여기서는 두 상태가 모두 그려지고 선택 스타일이 그대로임을 잠근다.
+    /// 토글→`aria_toggled` 매핑은 gpui-component이 보장하므로, 여기서는 활성 항목만
+    /// 선택 스타일(`accent` 채움)을 갖고 두 상태가 모두 그려지는지를 잠근다.
     #[gpui::test]
     fn segment_buttons_expose_toggle_state(cx: &mut gpui::TestAppContext) {
-        use gpui_component::Selectable as _;
         for active in [false, true] {
-            assert!(!super::segment("seg-probe", "worktree", active).is_selected());
+            assert_eq!(
+                super::segment(&DARK, "seg-probe", "worktree", active).is_selected(),
+                active
+            );
         }
         cx.update(gpui_component::init);
         let window = cx.add_window(|_, _| SegmentProbe);

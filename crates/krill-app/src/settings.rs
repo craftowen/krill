@@ -4903,35 +4903,35 @@ impl SettingsView {
     fn render_general_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         let p = crate::ui::palette(cx);
         let theme_button = |id: &'static str, label: &'static str, choice: ThemeChoice| {
-            layout::segment(id, label, s.theme == choice)
+            layout::segment(p, id, label, s.theme == choice)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
         let dark_theme_button = |id: &'static str, label: &'static str, theme: DarkUiTheme| {
-            layout::segment(id, label, s.ui_theme_dark == theme)
+            layout::segment(p, id, label, s.ui_theme_dark == theme)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.set_ui_theme_dark(theme));
                 })
         };
         let light_theme_button = |id: &'static str, label: &'static str, theme: LightUiTheme| {
-            layout::segment(id, label, s.ui_theme_light == theme)
+            layout::segment(p, id, label, s.ui_theme_light == theme)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.set_ui_theme_light(theme));
                 })
         };
         let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
-            layout::segment(id, label, s.keep_awake == mode)
+            layout::segment(p, id, label, s.keep_awake == mode)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.keep_awake = mode);
                 })
         };
         let language_button = |id: &'static str, label: &'static str, language: Language| {
-            layout::segment(id, label, s.language == language)
+            layout::segment(p, id, label, s.language == language)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     set_language(language, cx);
@@ -5706,7 +5706,7 @@ impl SettingsView {
             ]
             .into_iter()
             .map(|(id, title, m)| {
-                layout::segment(id, title, target_mode == m)
+                layout::segment(p, id, title, target_mode == m)
                     .debug_selector(move || id.into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.terminal_theme_target = Some(m);
@@ -6075,7 +6075,7 @@ impl SettingsView {
                 menu
             });
         let cursor_button = |id: &'static str, title: &'static str, shape: TerminalCursorShape| {
-            layout::segment(id, title, s.terminal_cursor_shape == shape)
+            layout::segment(p, id, title, s.terminal_cursor_shape == shape)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| edit(cx, move |s| s.terminal_cursor_shape = shape))
         };
@@ -6450,7 +6450,7 @@ impl SettingsView {
         });
         let rule_button =
             |id: String, label: SharedString, selected: bool, next: AutoSwitchRule| {
-                layout::segment(SharedString::from(id.clone()), label, selected)
+                layout::segment(p, SharedString::from(id.clone()), label, selected)
                     .disabled(self.account_rule_pending)
                     .debug_selector(move || id.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -6878,6 +6878,8 @@ impl SettingsView {
                     | ProviderKind::OpenCode
             );
         let manageable = !acc.host_default && !orca;
+        // Orca 감지 계정은 실행·이름 변경은 못 해도 Krill 목록에서 지울 수는 있다.
+        let removable = !acc.host_default;
         // OWE-881: 이 계정이 브라우저 로그인 대기 중이면 진행 문구와 [취소]만 보인다.
         let logging_in = self
             .login_pending
@@ -7177,7 +7179,7 @@ impl SettingsView {
                 })),
             );
         }
-        if can_login || manageable {
+        if can_login || removable {
             let menu_id = format!("admin-account-menu-{}", acc.id);
             let view = cx.entity().downgrade();
             let menu_acc = acc.clone();
@@ -7223,17 +7225,21 @@ impl SettingsView {
                                             .ok();
                                     },
                                 ));
+                        }
+                        if removable {
                             let (view, id) = (view.clone(), menu_acc.id.clone());
-                            menu = menu.separator().item(
-                                PopupMenuItem::new(text::ACCOUNT_REMOVE.get()).on_click(
+                            if can_login || manageable {
+                                menu = menu.separator();
+                            }
+                            menu =
+                                menu.item(PopupMenuItem::new(text::ACCOUNT_REMOVE.get()).on_click(
                                     move |_, _, cx| {
                                         view.update(cx, |this, cx| {
                                             this.start_remove(id.clone(), cx);
                                         })
                                         .ok();
                                     },
-                                ),
-                            );
+                                ));
                         }
                         menu
                     }),
@@ -7314,7 +7320,12 @@ impl SettingsView {
             .accounts_snapshot
             .accounts
             .iter()
-            .find(|a| a.id == id && !a.host_default && !crate::accounts::orca_managed(a))?;
+            .find(|a| a.id == id && !a.host_default)?;
+        let hint = if crate::accounts::orca_managed(acc) {
+            text::ACCOUNT_REMOVE_ORCA_HINT.get()
+        } else {
+            text::ACCOUNT_REMOVE_HINT.get()
+        };
         let p = crate::ui::palette(cx);
         let (provider, rm_acc) = (acc.provider, acc.id.clone());
         let cancel_id = format!("admin-remove-cancel-{}", acc.id);
@@ -7360,7 +7371,7 @@ impl SettingsView {
                         div()
                             .text_size(crate::ui::TEXT_XS)
                             .text_color(p.muted_foreground)
-                            .child(text::ACCOUNT_REMOVE_HINT.get()),
+                            .child(hint),
                     ),
             )
             .child(
@@ -7877,6 +7888,7 @@ impl SettingsView {
                 let selected = policy.threshold_percent == pct;
                 let policy_cl = policy.clone();
                 layout::segment(
+                    p,
                     gpui::ElementId::Name(id_str.clone().into()),
                     format!("{pct}%"),
                     selected,
@@ -7991,6 +8003,7 @@ impl SettingsView {
                 let selected = adv.cooldown_secs / 60 == mins;
                 let adv_cl = adv.clone();
                 layout::segment(
+                    p,
                     gpui::ElementId::Name(id_str.clone().into()),
                     crate::i18n::catalog::shell::ACCOUNT_COOLDOWN_MINUTES
                         .format(&[("minutes", &mins.to_string())]),
@@ -8174,14 +8187,20 @@ impl SettingsView {
             );
 
         // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
-        let yolo_seg = layout::segment("admin-yolo-yolo", text::YOLO_MODE_YOLO.get(), s.yolo_mode)
-            .debug_selector(|| "admin-yolo-yolo".into())
-            .on_click(|_, _, cx| {
-                cx.global_mut::<Config>().pending_permission =
-                    Some(krill_proto::agent::Permission::Yolo);
-                edit(cx, move |s| s.yolo_mode = true);
-            });
+        let yolo_seg = layout::segment(
+            p,
+            "admin-yolo-yolo",
+            text::YOLO_MODE_YOLO.get(),
+            s.yolo_mode,
+        )
+        .debug_selector(|| "admin-yolo-yolo".into())
+        .on_click(|_, _, cx| {
+            cx.global_mut::<Config>().pending_permission =
+                Some(krill_proto::agent::Permission::Yolo);
+            edit(cx, move |s| s.yolo_mode = true);
+        });
         let manual_seg = layout::segment(
+            p,
             "admin-yolo-manual",
             text::YOLO_MODE_MANUAL.get(),
             !s.yolo_mode,
@@ -8363,10 +8382,10 @@ impl SettingsView {
             )));
 
         let is_1h = s.prompt_cache_ttl_secs >= 3_600;
-        let ttl_5m = layout::segment("prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
+        let ttl_5m = layout::segment(p, "prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
             .debug_selector(|| "prompt-cache-ttl-5m".into())
             .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 300));
-        let ttl_1h = layout::segment("prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
+        let ttl_1h = layout::segment(p, "prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
             .debug_selector(|| "prompt-cache-ttl-1h".into())
             .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 3_600));
         let cache_timer_card = layout::card(p)
@@ -9738,8 +9757,12 @@ impl SettingsView {
             return;
         }
         self.refresh_service_cache(cx);
-        let default_repo = std::env::var("PWD").unwrap_or_default();
         let store = self.services.worktrees.clone();
+        let default_repo = std::env::var("PWD")
+            .ok()
+            .filter(|pwd| Path::new(pwd).is_absolute() && Path::new(pwd).parent().is_some())
+            .or_else(|| Self::workflow_repo_candidates(&store).into_iter().next())
+            .unwrap_or_default();
         let loaded_repo = Self::normalize_repo_key(&default_repo);
         let default_setup = store.setup_script_for(&default_repo).unwrap_or_default();
         let default_archive = store.archive_script_for(&default_repo).unwrap_or_default();
@@ -9936,6 +9959,23 @@ impl SettingsView {
             symlink_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
         }
         cx.notify();
+    }
+
+    /// 워크플로 탭의 프로젝트 선택 후보. 심볼릭 링크·훅·코멘트·워크트리 부모에 등록된 저장소 중
+    /// 실제 절대 경로만 남긴다(`내 드라이브::workspace:…` 같은 내부 키는 프로젝트가 아니다).
+    fn workflow_repo_candidates(
+        store: &krill_proto::orchestration::WorktreeStore,
+    ) -> std::collections::BTreeSet<String> {
+        store
+            .symlinks
+            .keys()
+            .chain(store.setup_scripts.keys())
+            .chain(store.archive_scripts.keys())
+            .chain(store.comments.keys())
+            .chain(store.parents.values())
+            .filter(|r| Path::new(r).is_absolute())
+            .cloned()
+            .collect()
     }
 
     fn normalize_repo_key(raw: &str) -> Option<String> {
@@ -10259,7 +10299,7 @@ impl SettingsView {
             let id = format!("admin-context-lines-{lines}");
             let label = lines.to_string();
             let active = s.copy_context_lines == lines;
-            layout::segment(gpui::ElementId::Name(id.clone().into()), label, active)
+            layout::segment(p, gpui::ElementId::Name(id.clone().into()), label, active)
                 .debug_selector(move || id.clone())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.copy_context_lines = lines);
@@ -10602,15 +10642,10 @@ impl SettingsView {
             .unwrap_or("—")
             .to_owned();
 
-        let mut known_repos = std::collections::BTreeSet::new();
-        if let Some(cur) = &active_repo {
+        let mut known_repos = Self::workflow_repo_candidates(&wt_store);
+        if let Some(cur) = active_repo.as_ref().filter(|r| Path::new(r).is_absolute()) {
             known_repos.insert(cur.clone());
         }
-        known_repos.extend(wt_store.symlinks.keys().cloned());
-        known_repos.extend(wt_store.setup_scripts.keys().cloned());
-        known_repos.extend(wt_store.archive_scripts.keys().cloned());
-        known_repos.extend(wt_store.comments.keys().cloned());
-        known_repos.extend(wt_store.parents.values().cloned());
         let known_repos_list: Vec<String> = known_repos.into_iter().collect();
 
         let mut repo_context_card = layout::card(p)
@@ -10691,20 +10726,25 @@ impl SettingsView {
 
             let weak = cx.weak_entity();
             let dropdown_repos = known_repos_list.clone();
+            let dropdown_active = active_repo.clone();
             let repo_dropdown = layout::secondary(
                 "admin-workflow-repo-select",
-                format!(
-                    "{} ({})",
-                    text::WORKFLOW_REPO_SELECT.get(),
-                    active_repo_display
-                ),
+                format!("{active_repo_display} \u{25BE}"),
             )
             .debug_selector(|| "admin-workflow-repo-select".into())
             .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.scrollable(true).max_h(px(360.));
                 for repo_choice in &dropdown_repos {
                     let weak = weak.clone();
                     let repo_choice = repo_choice.clone();
-                    menu = menu.item(PopupMenuItem::new(repo_choice.clone()).on_click(
+                    let checked = dropdown_active.as_deref() == Some(repo_choice.as_str());
+                    let name = Path::new(&repo_choice)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(repo_choice.as_str());
+                    let item_label = format!("{name}  {repo_choice}");
+                    menu = menu.item(PopupMenuItem::new(item_label).checked(checked).on_click(
                         move |_, window, cx| {
                             weak.update(cx, |this, cx| {
                                 this.load_repo_hooks_for(&repo_choice, window, cx);
@@ -10722,59 +10762,31 @@ impl SettingsView {
                         .w_full()
                         .min_w_0()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .justify_between()
                         .gap_3()
-                        .child(layout::label(
-                            p,
-                            text::WORKFLOW_REPO_TITLE.get(),
-                            Some(text::WORKFLOW_REPO_DESC.get()),
-                        ))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(text::WORKFLOW_REPO_TITLE.get()),
+                        )
+                        .child(
+                            div()
+                                .id("admin-workflow-repo-input")
+                                .debug_selector(|| "admin-workflow-repo-input".into())
+                                .flex_1()
+                                .min_w_0()
+                                .child(gpui_component::input::Input::new(&repo_input).small()),
+                        )
                         .child(layout::controls().child(repo_dropdown)),
                 )
                 .child(
                     div()
-                        .id("admin-workflow-repo-input")
-                        .debug_selector(|| "admin-workflow-repo-input".into())
-                        .w_full()
-                        .min_w_0()
-                        .child(gpui_component::input::Input::new(&repo_input).small()),
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::WORKFLOW_REPO_DESC.get()),
                 );
-
-            if known_repos_list.len() > 1 {
-                let mut chips = div()
-                    .id("admin-workflow-repo-chips")
-                    .debug_selector(|| "admin-workflow-repo-chips".into())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1p5();
-                for (idx, repo_key) in known_repos_list.iter().enumerate() {
-                    let chip_id = format!("admin-workflow-repo-chip-{idx}");
-                    let is_active = active_repo.as_deref() == Some(repo_key.as_str());
-                    let short = Path::new(repo_key)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(repo_key.as_str())
-                        .to_owned();
-                    let repo_cl = repo_key.clone();
-                    let btn = if is_active {
-                        layout::primary(gpui::ElementId::Name(chip_id.clone().into()), short)
-                    } else {
-                        layout::secondary(gpui::ElementId::Name(chip_id.clone().into()), short)
-                    };
-                    chips = chips.child(btn.debug_selector(move || chip_id.clone()).on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.load_repo_hooks_for(&repo_cl, window, cx);
-                        }),
-                    ));
-                }
-                repo_context_card = repo_context_card.child(chips);
-            }
 
             symlinks_card = symlinks_card
                 .child(

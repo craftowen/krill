@@ -1256,7 +1256,7 @@ fn accounts_tab_puts_add_button_above_cards_and_host_default_first(cx: &mut Test
     fs::remove_dir_all(d).unwrap();
 }
 
-/// OWE-696·697: Orca 감지 계정은 전환·제거 버튼 없이 "Krill에서 실행 불가(Orca 관리)"로 보이고,
+/// OWE-696·697: Orca 감지 계정은 전환 버튼 없이 "Krill에서 실행 불가(Orca 관리)"로 보이되 … 메뉴(목록에서 제거)는 남고,
 /// 데몬에 닿지 못한 화면은 "데몬 연결 필요" 배너와 함께 계정 변경을 거부한다(로컬 파일 쓰기 없음).
 #[gpui::test]
 fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppContext) {
@@ -1302,6 +1302,11 @@ fn orca_accounts_hide_actions_and_offline_view_is_read_only(cx: &mut TestAppCont
     assert!(
         vcx.debug_bounds("admin-remove-account-claude-orca-96f8c826")
             .is_none()
+    );
+    assert!(
+        vcx.debug_bounds("admin-account-menu-claude-orca-96f8c826")
+            .is_some(),
+        "orca account must keep the … menu so it can be removed from Krill"
     );
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
@@ -7694,15 +7699,23 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
     vcx.update(|window, cx| window.draw(cx).clear(cx));
 
     assert!(vcx.debug_bounds("admin-workflow-repo-select").is_some());
-    assert!(vcx.debug_bounds("admin-workflow-repo-chips").is_some());
+    assert!(
+        vcx.debug_bounds("admin-workflow-repo-chips").is_none(),
+        "project picker is a single dropdown row, not a chip list"
+    );
     assert!(vcx.debug_bounds("admin-symlinks-repo-badge").is_some());
     assert!(vcx.debug_bounds("admin-hooks-repo-badge").is_some());
     assert!(vcx.debug_bounds("admin-worktree-symlinks-chips").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
 
-    // repo-b 칩을 클릭하면 훅 입력창이 repo-b로 동기화되고 심볼릭 링크 카드는 repo-b 기준(빈 상태)으로 바뀐다.
-    click_sel(vcx, "admin-workflow-repo-chip-1");
+    // repo-b를 고르면 훅 입력창이 repo-b로 동기화되고 심볼릭 링크 카드는 repo-b 기준(빈 상태)으로 바뀐다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.load_repo_hooks_for(&repo_b, window, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     vcx.update(|_, cx| {
         let form = view.read(cx).workflow_form.as_ref().unwrap();
         assert_eq!(form.setup_script.read(cx).value().as_str(), "cargo check");
@@ -7713,8 +7726,13 @@ fn owe801_workflows_repo_context_symlink_chips_quick_commands_webhooks_and_sched
     });
     assert!(vcx.debug_bounds("admin-worktree-symlinks-empty").is_some());
 
-    // 다시 repo-a 칩을 클릭하면 심볼릭 링크 칩 2개가 나타나고 × 버튼으로 제거할 수 있다.
-    click_sel(vcx, "admin-workflow-repo-chip-0");
+    // 다시 repo-a를 고르면 심볼릭 링크 칩 2개가 나타나고 × 버튼으로 제거할 수 있다.
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| v.load_repo_hooks_for(&repo_a, window, cx));
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
     assert!(vcx.debug_bounds("admin-symlink-chip-0").is_some());
     assert!(vcx.debug_bounds("admin-symlink-chip-1").is_some());
     click_sel(vcx, "admin-symlink-remove-0");
@@ -8151,7 +8169,7 @@ fn ssh_and_remote_krill_have_separate_pages(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("link-client-input-link").is_some());
     assert!(vcx.debug_bounds("admin-ssh-import").is_none());
     assert!(vcx.debug_bounds("link-pairing-modal").is_none());
-    // 탭을 왕복해도 입력 중인 링크·짝짓기 상태를 가진 뷰는 유지된다.
+    // 탭을 왕복해도 입력 중인 링크·페어링 상태를 가진 뷰는 유지된다.
     let pairing = vcx.update(|_, cx| view.read(cx).remote_krill.clone().unwrap());
     vcx.update(|_, cx| {
         view.update(cx, |v, cx| {
@@ -8617,4 +8635,25 @@ fn settings_without_ui_theme_keys_use_default_themes() {
     let s = Settings::parse("ui_theme_dark = \"tidepool\"\nui_theme_light = \"paper\"").unwrap();
     assert_eq!(s.ui_theme_dark, DarkUiTheme::Tidepool);
     assert_eq!(s.ui_theme_light, LightUiTheme::Paper);
+}
+
+/// 워크플로 탭 프로젝트 선택 후보에는 실제 절대 경로만 들어가고
+/// `내 드라이브::workspace:…` 같은 내부 키는 빠진다.
+#[test]
+fn workflow_repo_candidates_keep_only_absolute_paths() {
+    let mut store = krill_proto::orchestration::WorktreeStore::default();
+    store
+        .setup_scripts
+        .insert("/repo/alpha".to_owned(), "bun install".to_owned());
+    store.parents.insert(
+        "/repo/alpha-wt".to_owned(),
+        "내 드라이브::workspace:2de7222e".to_owned(),
+    );
+    store
+        .parents
+        .insert("/repo/beta-wt".to_owned(), "/repo/beta".to_owned());
+    let got: Vec<String> = SettingsView::workflow_repo_candidates(&store)
+        .into_iter()
+        .collect();
+    assert_eq!(got, vec!["/repo/alpha".to_owned(), "/repo/beta".to_owned()]);
 }

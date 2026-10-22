@@ -393,6 +393,27 @@ fn sweep_removes_only_dead_forward_sockets() {
 }
 
 #[test]
+fn machine_key_reuses_recent_result_without_running_ssh() {
+    let dest = "cache-probe.invalid";
+    let key = (ssh_program(), dest.to_owned(), Some(2222));
+    MACHINE_KEYS.lock().unwrap().insert(
+        key.clone(),
+        (Instant::now(), ssh_config_mtime(), "cached@host:1".into()),
+    );
+    assert_eq!(machine_key(dest, Some(2222)), "cached@host:1");
+    // 기한이 지난 항목은 쓰지 않는다(이 대상은 `ssh -G`가 실패해도 입력 그대로가 나온다).
+    // 부팅 직후라 기한 전 시각을 만들 수 없으면 이 확인은 건너뛴다.
+    let Some(stale) = Instant::now().checked_sub(MACHINE_KEY_TTL) else {
+        return;
+    };
+    MACHINE_KEYS
+        .lock()
+        .unwrap()
+        .insert(key, (stale, ssh_config_mtime(), "cached@host:1".into()));
+    assert_ne!(machine_key(dest, Some(2222)), "cached@host:1");
+}
+
+#[test]
 fn machine_key_reads_user_host_port_from_ssh_g() {
     let cfg = "user owen\nhostname 100.65.102.14\nport 22\nidentityfile ~/.ssh/id\n";
     assert_eq!(

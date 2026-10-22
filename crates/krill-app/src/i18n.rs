@@ -886,9 +886,9 @@ catalog! {
         OFF => ("끄기", "Off"),
         READY_SOON => ("준비 중", "Coming soon"),
         KEEP_AWAKE => ("잠자기 방지", "Keep awake"),
-        AWAKE_ON => ("항상 (On)", "Always (On)"),
-        AWAKE_AGENT => ("작업 중 (Agent)", "While working (Agent)"),
-        AWAKE_OFF => ("끄기 (Off)", "Disabled (Off)"),
+        AWAKE_ON => ("항상", "Always"),
+        AWAKE_AGENT => ("작업 중", "While working"),
+        AWAKE_OFF => ("끄기", "Off"),
         OPEN_SETTINGS => ("settings.toml 열기", "Open settings.toml"),
         OPEN_KEYS => ("keys.toml 열기 (키 바인딩)", "Open keys.toml (key bindings)"),
         NO_STATE_DIR => ("상태 디렉터리를 찾지 못해 설정을 저장할 수 없습니다", "Cannot save settings: state directory unavailable"),
@@ -985,7 +985,7 @@ catalog! {
         TAB_TERMINAL_DESC => ("터미널 글꼴, 배경 투명도, 기본 커서 모양, Option 키와 선택 복사를 설정합니다.", "Configure terminal font, background opacity, cursor shape, Option key, and copy on select."),
         TAB_ACCOUNTS_DESC => ("제공자별 로그인 프로필을 관리하고 한도 도달 시 자동 계정 전환을 설정합니다.", "Manage provider sign-in profiles and configure automatic account switching on rate limits."),
         TAB_SSH_DESC => ("SSH 주소·포트·키를 등록하고 연결을 테스트하거나 원격 호스트에 연결합니다.", "Manage SSH addresses, ports, and keys, test connections, and connect to remote hosts."),
-        TAB_REMOTE_KRILL_DESC => ("초대 링크로 다른 Mac의 Krill에 연결하고 이 Mac의 접속 허용과 짝지은 기기를 관리합니다.", "Connect to Krill on another Mac with an invite link, manage incoming access, and review paired devices."),
+        TAB_REMOTE_KRILL_DESC => ("초대 링크로 다른 Mac의 Krill에 연결하고 이 Mac의 접속 허용과 페어링된 기기를 관리합니다.", "Connect to Krill on another Mac with an invite link, manage incoming access, and review paired devices."),
         TAB_WORKFLOWS_DESC => ("멀티 에이전트 오케스트레이션, 스케줄 자동화, 워크트리 훅, 빠른 명령과 웹훅을 관리합니다.", "Manage multi-agent orchestration, scheduled automations, worktree hooks, quick commands, and webhooks."),
         TAB_RESOURCES_DESC => ("메모리 예산, 세션 기록, 보안 키보드 입력, 자가 진단과 워크트리 디스크 용량을 관리합니다.", "Manage memory budget, session history recording, secure keyboard input, diagnostics, and worktree disk space."),
         TAB_MOBILE_DESC => ("QR 코드로 스마트폰을 페어링해 밖에서도 터미널과 에이전트 세션을 제어합니다.", "Pair your phone via QR code to monitor and control terminal and agent sessions remotely."),
@@ -1017,6 +1017,7 @@ catalog! {
         ACCOUNT_SWITCH => ("전환", "Switch"),
         ACCOUNT_IN_USE => ("사용 중", "In use"),
         ACCOUNT_REMOVE_HINT => ("등록을 지우고 Krill이 만든 프로필 폴더(로그인 정보·기록 포함)를 휴지통으로 옮깁니다. 직접 지정한 폴더는 그대로 둡니다. 사용 중인 계정이면 시스템 기본값으로 돌아갑니다.", "Removes the account and moves the Krill-created profile folder (sign-in and history) to the Trash. Folders you chose yourself are kept. If it is in use, Krill falls back to the system default."),
+        ACCOUNT_REMOVE_ORCA_HINT => ("Krill 목록에서만 지웁니다. Orca 앱과 Orca의 로그인 정보는 그대로 둡니다.", "Removes it from Krill's list only. Orca and its sign-in are left untouched."),
         ACCOUNT_REMOVE_TITLE => ("{name} 계정을 제거할까요?", "Remove {name}?"),
         ACCOUNT_MORE => ("계정 작업 더 보기", "More account actions"),
         ACCOUNT_SIGN_IN_TO_USE => ("이 계정을 쓰려면 다시 로그인하세요", "Sign in again to use this account"),
@@ -1474,9 +1475,8 @@ catalog! {
         SCHEDULE_ERR_PRECHECK => ("Precheck 명령은 널 문자 없이 8 KiB 이하여야 합니다.", "Precheck command must not contain NUL bytes and must be at most 8 KiB."),
         SCHEDULE_ACTIVE => ("활성", "Active"),
         SCHEDULE_PAUSED => ("일시정지", "Paused"),
-        WORKFLOW_REPO_TITLE => ("대상 저장소 (Target Repository)", "Target Repository"),
-        WORKFLOW_REPO_DESC => ("아래 '공유 파일 연결'과 '자동 실행 스크립트'가 함께 적용될 Git 저장소입니다. 입력창에 경로를 적거나 칩을 눌러 바꾸세요.", "The Git repository that the 'Shared files' and 'Auto-run scripts' settings below apply to. Type the path or tap a chip to switch."),
-        WORKFLOW_REPO_SELECT => ("저장소 선택", "Select repository"),
+        WORKFLOW_REPO_TITLE => ("적용할 프로젝트", "Project"),
+        WORKFLOW_REPO_DESC => ("아래 '공유 파일 연결'과 '자동 실행 스크립트'는 프로젝트마다 따로 저장됩니다. 여기서 고른 프로젝트의 설정을 보고 고칩니다.", "The shared-file and auto-run script settings below are saved per project. Pick which project to view and edit."),
         QC_DESC => ("자주 쓰는 명령어·프롬프트를 저장해 두었다가 원클릭으로 활성 터미널에 붙여넣습니다. 실행은 직접 Enter를 눌러 확인 후 하세요.", "Saves frequently used commands and prompts for one-click paste into the active terminal. Press Enter yourself to actually run them."),
         QC_NAME_PLACEHOLDER => ("라벨 (예: 테스트 실행)", "Label (e.g. Run tests)"),
         QC_TEXT_PLACEHOLDER => ("명령어 또는 프롬프트 (예: cargo nextest run)", "Command or prompt (e.g. cargo nextest run)"),
@@ -2244,7 +2244,6 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         catalog::settings::TAB_REMOTE_KRILL,
         &[
             "초대",
-            "짝짓기",
             "페어링",
             "다른 Mac",
             "접속 허용",
@@ -2425,7 +2424,7 @@ mod tests {
     }
 }
 
-/// 기기 짝짓기 화면(MK-133b, OWE-669) 다국어 문구 카탈로그.
+/// 기기 페어링 화면(MK-133b, OWE-669) 다국어 문구 카탈로그.
 /// 비개발자용 문구 원칙에 따라 IP·포트·SSH·키 같은 기술 용어를 쓰지 않는다.
 pub mod link_ui {
     use super::Message;
@@ -2471,6 +2470,9 @@ pub mod link_ui {
         TIME_DAYS_AGO => ("{d}일 전", "{d}d ago"),
         LAST_SEEN_NEVER => ("접속 기록 제공 안 됨", "History unavailable"),
         REVOKE_BUTTON => ("연결 끊기", "Disconnect"),
+        RENAME_HOST_BUTTON => ("이름 바꾸기", "Rename"),
+        RENAME_HOST_SAVE => ("저장", "Save"),
+        RENAME_HOST_CANCEL => ("취소", "Cancel"),
         REVOKE_CONFIRM_TITLE => ("'{name}' 기기의 연결을 끊을까요?", "Disconnect '{name}'?"),
         REVOKE_CONFIRM_DETAIL => ("연결을 끊으면 이 기기에서는 더 이상 이 Mac의 작업 화면을 볼 수 없습니다. 다시 연결하려면 새 초대 링크가 필요합니다.", "Once disconnected, this device can no longer view sessions on this Mac. A new invite link will be required to reconnect."),
         REVOKE_CONFIRM_YES => ("연결 끊기", "Disconnect"),
@@ -2493,8 +2495,8 @@ pub mod link_ui {
         USER_MAC_NAME => ("{user}의 Mac", "{user}’s Mac"),
         CONNECT_BUTTON => ("연결", "Connect"),
         CLOSE_BUTTON => ("닫기", "Close"),
-        STATUS_CONNECTING => ("연결 중… 상대 Mac과 짝짓기를 진행하고 있습니다.", "Connecting… Pairing with the other Mac."),
-        STATUS_PAIRED => ("짝짓기 완료! '{name}' 기기와 연결되었습니다.", "Pairing complete! Connected to '{name}'."),
+        STATUS_CONNECTING => ("연결 중… 상대 Mac과 페어링를 진행하고 있습니다.", "Connecting… Pairing with the other Mac."),
+        STATUS_PAIRED => ("페어링 완료! '{name}' 기기와 연결되었습니다.", "Pairing complete! Connected to '{name}'."),
         STATUS_FAILED_PREFIX => ("연결 실패: {reason}", "Connection failed: {reason}"),
         ERR_EXPIRED_LINK => ("만료된 링크입니다. 상대 Mac에서 초대 링크를 새로 만들어 다시 시도해 주세요.", "This invite link has expired. Create a new link on the other Mac and try again."),
         ERR_ALREADY_USED_LINK => ("이미 쓴 링크입니다. 초대 링크는 한 번만 사용할 수 있으니 새로 만들어 주세요.", "This invite link was already used. Each link works once; please create a new one."),
