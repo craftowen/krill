@@ -659,7 +659,8 @@ pub enum UsageRequest {
         provider: ProviderKind,
         from_account_id: String,
     },
-    /// 라벨(과 선택적으로 이메일)만 바꾼다. id·프로필 디렉터리는 그대로다(OWE-705).
+    /// 라벨(과 선택적으로 이메일)만 바꾼다. id는 그대로다(OWE-705). 이메일이 확인된 Claude 임시 이름
+    /// 폴더(`claude-code-profile-n`)는 세션이 쓰지 않으면 krilld가 이메일 이름으로 옮긴다.
     /// `email`이 `None`이면 기존 값을 유지한다. [`FEAT_USAGE_MANAGE`].
     RenameAccount {
         provider: ProviderKind,
