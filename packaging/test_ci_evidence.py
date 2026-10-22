@@ -92,7 +92,7 @@ class ProofTests(unittest.TestCase):
         with self.assertRaisesRegex(EvidenceError, "24-hour"):
             fixture.evidence().proof(fixture.filename, SHA, CANDIDATE_BRANCH)
 
-    def test_aggregate_success_without_actual_arm_and_intel_jobs_is_not_full_validation(self):
+    def test_aggregate_success_without_actual_arm_job_is_not_full_validation(self):
         fixture = Fixture()
         fixture.jobs = [job for job in fixture.jobs if job["name"] in ("changes", "ci-macos")]
         with self.assertRaisesRegex(EvidenceError, "required validation jobs"):

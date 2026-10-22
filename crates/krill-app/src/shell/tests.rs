@@ -8135,3 +8135,42 @@ fn navigation_history_tolerates_corrupt_index_without_panicking(cx: &mut TestApp
         });
     });
 }
+
+/// The disconnect subscription must survive Shell::new returning.
+#[gpui::test]
+fn sidebar_disconnect_subscription_survives_window_initialization(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostManager, HostStatus};
+    cx.update(gpui_component::init);
+    let view = cx.new(|cx| Shell::new(None, cx));
+    let host = krill_app::ssh_hosts::SshHost {
+        id: "disconnect-test".into(),
+        label: "Test host".into(),
+        destination: "test.invalid".into(),
+        port: None,
+        identity_file: None,
+        remote_socket: Some("/tmp/krill-disconnect-test.sock".into()),
+        imported: false,
+        copy_id_first: false,
+    };
+    let manager = HostManager::with_ssh_program(
+        state_path("disconnect-subscription"),
+        "/usr/bin/false".into(),
+    );
+    manager.sync_specs(&krill_app::hosts::specs_from_ssh_hosts(
+        std::slice::from_ref(&host),
+    ));
+    let sidebar = view.update(cx, |shell, _| {
+        shell.host_manager = manager.clone();
+        shell.ssh_hosts = vec![host];
+        shell.sidebar.clone()
+    });
+    assert_eq!(manager.status("disconnect-test"), HostStatus::Connecting);
+    sidebar.update(cx, |_, cx| {
+        cx.emit(sidebar::DisconnectHost(HostId::Remote(
+            "disconnect-test".into(),
+        )));
+    });
+    cx.run_until_parked();
+    assert_eq!(manager.status("disconnect-test"), HostStatus::Disconnected);
+    assert_eq!(manager.tunnel_starts("disconnect-test"), 0);
+}

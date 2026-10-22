@@ -224,3 +224,28 @@ fn duplicate_host_id_alias_shares_the_canonical_slot() {
     assert_eq!(manager.status("studio"), HostStatus::Disconnected);
     assert_eq!(manager.statuses().len(), 1);
 }
+
+#[test]
+fn manual_disconnect_blocks_retries_until_explicit_reconnect() {
+    let fake = FakeSsh::new("manual-disconnect", false);
+    let manager = fake.manager();
+    let host = spec(Some("/tmp/remote.sock"));
+    manager.sync_specs(std::slice::from_ref(&host));
+    manager.disconnect_now("studio");
+    manager.sync_specs(std::slice::from_ref(&host));
+    let error = manager.ensure_tunnel_socket("studio").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+    assert_eq!(manager.status("studio"), HostStatus::Disconnected);
+    assert_eq!(manager.tunnel_starts("studio"), 0);
+    assert!(
+        !fake.dir.join("argv").exists(),
+        "disconnect must not invoke ssh"
+    );
+    manager.reconnect_now("studio");
+    assert_eq!(manager.status("studio"), HostStatus::Connecting);
+    assert!(manager.ensure_tunnel_socket("studio").is_err());
+    assert!(
+        fake.dir.join("argv").exists(),
+        "reconnect allows a new tunnel attempt"
+    );
+}

@@ -209,12 +209,14 @@ jobs:
             echo "tag version (${VERSION}) does not match Cargo.toml (${CARGO_VER})" >&2
             exit 1
           fi
-          # 게시 소스 가드: 태그가 있으면 그 커밋, 없으면 origin/main 끝에서만 만든다.
-          if TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
-            [[ "${TAG_SHA}" == "${GITHUB_SHA}" ]] || { echo "tag ${TAG} points at ${TAG_SHA}, not ${GITHUB_SHA}" >&2; exit 1; }
-          elif [[ "${BUILD_ONLY}" != true ]]; then
-            MAIN_SHA=$(git rev-parse origin/main)
-            [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
+          # Build-only candidates never publish or change tags. Publication keeps the source guard.
+          if [[ "${BUILD_ONLY}" != true ]]; then
+            if TAG_SHA=$(git rev-parse -q --verify "refs/tags/${TAG}^{commit}"); then
+              [[ "${TAG_SHA}" == "${GITHUB_SHA}" ]] || { echo "tag ${TAG} points at ${TAG_SHA}, not ${GITHUB_SHA}" >&2; exit 1; }
+            else
+              MAIN_SHA=$(git rev-parse origin/main)
+              [[ "${MAIN_SHA}" == "${GITHUB_SHA}" ]] || { echo "release builds run on origin/main (${MAIN_SHA}), not ${GITHUB_SHA}" >&2; exit 1; }
+            fi
           fi
           echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
           echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"

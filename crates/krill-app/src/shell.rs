@@ -488,6 +488,7 @@ pub struct Shell {
     _sidebar_close_session: Subscription,
     _sidebar_continue_session: Subscription,
     _sidebar_reconnect: Subscription,
+    _sidebar_disconnect: Subscription,
     _sidebar_relisted: Subscription,
     _sidebar_tabs: Subscription,
     layout: Layout,
@@ -724,7 +725,7 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
-        let _sidebar_disconnect =
+        let sidebar_disconnect =
             cx.subscribe(&sidebar, |this, _, e: &sidebar::DisconnectHost, cx| {
                 if let Some(id) = e.0.remote_id() {
                     if let Some(raw) = id.strip_prefix("iroh:")
@@ -960,6 +961,7 @@ impl Shell {
             _sidebar_close_session: close_session,
             _sidebar_continue_session: continue_session,
             _sidebar_reconnect: sidebar_reconnect,
+            _sidebar_disconnect: sidebar_disconnect,
             _sidebar_relisted: sidebar_relisted,
             _sidebar_tabs: sidebar_tabs,
             layout,
