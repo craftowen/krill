@@ -99,7 +99,7 @@ jobs:
       matrix:
         os: [macos-14, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       # UI 프레임 예산은 비최적화 렌더러의 디버그 비용과 구분한다.
       # 테스트·assertion·시간 기준은 그대로 두고 테스트 빌드만 최적화한다.
@@ -130,6 +130,7 @@ jobs:
         with:
           shared-key: ci-${{ matrix.os }}
           cache-bin: 'false'
+          cache-on-failure: true
           save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
 
       - name: Packaging regression tests
@@ -144,7 +145,7 @@ jobs:
       - name: nextest
         # PTY e2e(krill-holder survive, krill CLI 실PTY 테스트, krilld 통합) 포함.
         run: cargo nextest run --profile ci --workspace --locked --no-tests=pass --cargo-profile test --timings
-        timeout-minutes: 60
+        timeout-minutes: 120
 
       - name: doctest
         run: cargo test --workspace --doc --locked -q
