@@ -92,6 +92,7 @@ async function main(){
  port.scrollLeft=50;const touch=(type,x,y)=>event(port,type,{touches:x==null?[]:[{clientX:x,clientY:y}]});
  touch('touchstart',200,400);let te=touch('touchmove',190,330);assert.equal(te.defaultPrevented,false);touch('touchmove',150,200);assert.equal(port.scrollLeft,50);touch('touchend');
  touch('touchstart',200,400);te=touch('touchmove',190,398);assert(te.defaultPrevented);te=touch('touchmove',120,390);assert(te.defaultPrevented);assert.equal(port.scrollLeft,130);touch('touchend');
+ socket.frame(0x2b,Uint8Array.of(0),T.v(18));socket.autoAck=true;touch('touchstart',200,100);touch('touchmove',200,110);te=touch('touchmove',201,170);assert(te.defaultPrevented);touch('touchend');await flush();assert.match(inputs(socket).join(''),/^(\x1b\[<64;\d+;\d+M)+$/);socket.autoAck=false;socket.sent.length=0;socket.frame(0x2b,Uint8Array.of(0),T.v(0));
  te=event(port,'wheel',{deltaX:30,deltaY:2});assert(te.defaultPrevented);assert.equal(port.scrollLeft,160);event(port,'wheel',{deltaX:1,deltaY:40});assert.equal(port.scrollLeft,160);
  socket.autoAck=true;for(let i=0;i<5;i++){socket.screen(`flow ${i} `+'w'.repeat(70));await advance(16);}await handle.sendKey('enter');assert.equal(port.scrollLeft,160);
  assert.match(handle.text(),/flow 4 w+$/);
