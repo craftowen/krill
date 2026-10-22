@@ -475,6 +475,9 @@ def install_locked(source, after_release=None):
     for name in ("nightly.py", "nightly_assets.py", "ci_evidence.py"):
         shutil.copyfile(source / "packaging" / name, SUPPORT / name)
     shutil.copyfile(source / "packaging/macos/ed25519_manifest.py", SUPPORT / "ed25519_manifest.py")
+    # nightly.py imports `macos.identity_paths`; the installed runner needs the same package layout.
+    (SUPPORT / "macos").mkdir(exist_ok=True)
+    shutil.copyfile(source / "packaging/macos/identity_paths.py", SUPPORT / "macos/identity_paths.py")
     config["key_tool"] = str(SUPPORT / "ed25519_manifest.py")
     write_json(CONFIG, config)
     CONFIG.chmod(0o600)
