@@ -908,9 +908,10 @@ fn provisioning_usage_dispatch_and_access_control() {
     };
     assert_eq!(
         reg.on_usage(&full, Role::Interactive, UsageRequest::GetProvisioning),
-        UsageReply::Provisioning(false)
+        UsageReply::Provisioning(true),
+        "설정 파일이 없으면 기본 켜짐"
     );
-    for enabled in [true, false] {
+    for enabled in [false, true] {
         assert_eq!(
             reg.on_usage(
                 &full,

@@ -127,7 +127,7 @@ pub struct StoredAccount {
     pub profile_dir: String,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountsFile {
     #[serde(default)]
     pub auto_switch: StoredAutoSwitch,
@@ -135,9 +135,24 @@ pub struct AccountsFile {
     pub active: BTreeMap<String, String>,
     #[serde(default)]
     pub accounts: Vec<StoredAccount>,
-    /// OWE-699: 계정 프로필 프로비저닝 opt-in(기본 꺼짐). 프로비저닝은 krilld가 한다 — 앱은 칩 노출만 본다.
-    #[serde(default)]
+    /// OWE-699: 계정 프로필 프로비저닝(키가 없으면 켜짐, krilld와 같은 규칙). 프로비저닝은 krilld가 한다 — 앱은 칩 노출만 본다.
+    #[serde(default = "provisioning_default")]
     pub provisioning: bool,
+}
+
+fn provisioning_default() -> bool {
+    true
+}
+
+impl Default for AccountsFile {
+    fn default() -> Self {
+        Self {
+            auto_switch: StoredAutoSwitch::default(),
+            active: BTreeMap::new(),
+            accounts: Vec::new(),
+            provisioning: provisioning_default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -990,7 +1005,7 @@ fn load_file_result(home: &Path, state_dir: Option<&Path>) -> io::Result<Account
     }
 }
 
-/// OWE-699: `accounts.toml`의 `provisioning`(기본 꺼짐). 깨진 파일은 꺼짐으로 본다.
+/// OWE-699: `accounts.toml`의 `provisioning`(키가 없으면 켜짐). 깨진 파일은 기본값으로 본다.
 pub fn provisioning_enabled(home: &Path, state_dir: Option<&Path>) -> bool {
     load_file(home, state_dir).provisioning
 }
@@ -1934,22 +1949,22 @@ fn as12_accounts_save_preserves_future_nested_fields() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-/// OWE-699: 프로비저닝은 기본 꺼짐이고, 앱이 계정 파일을 다시 써도 켠 값이 유지된다.
+/// OWE-699: 프로비저닝은 키가 없으면 켜짐이고, 명시한 값은 앱이 계정 파일을 다시 써도 유지된다.
 #[cfg(test)]
 #[test]
-fn owe699_provisioning_off_by_default_and_survives_app_save() {
+fn owe699_provisioning_on_by_default_and_survives_app_save() {
     let dir = std::env::temp_dir().join(format!("owe699-app-accounts-{}", std::process::id()));
     std::fs::remove_dir_all(&dir).ok();
     std::fs::create_dir_all(&dir).unwrap();
-    assert!(!provisioning_enabled(&dir, Some(&dir)), "파일 없음 = 꺼짐");
+    assert!(provisioning_enabled(&dir, Some(&dir)), "파일 없음 = 켜짐");
     std::fs::write(dir.join(ACCOUNTS_FILE), "[auto_switch]\nenabled = false\n").unwrap();
-    assert!(!provisioning_enabled(&dir, Some(&dir)), "키 없음 = 꺼짐");
-    std::fs::write(dir.join(ACCOUNTS_FILE), "provisioning = true\n").unwrap();
-    assert!(provisioning_enabled(&dir, Some(&dir)));
+    assert!(provisioning_enabled(&dir, Some(&dir)), "키 없음 = 켜짐");
+    std::fs::write(dir.join(ACCOUNTS_FILE), "provisioning = false\n").unwrap();
+    assert!(!provisioning_enabled(&dir, Some(&dir)));
     let mut file = load_file_result(&dir, Some(&dir)).unwrap();
     file.auto_switch.enabled = false;
     save_file(&dir, Some(&dir), &file).unwrap();
-    assert!(provisioning_enabled(&dir, Some(&dir)));
+    assert!(!provisioning_enabled(&dir, Some(&dir)), "명시한 꺼짐 유지");
     std::fs::remove_dir_all(dir).unwrap();
 }
 
