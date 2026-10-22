@@ -40,12 +40,14 @@ use std::{
 
 /// Drawables queued for display but not yet on screen. With `maximumDrawableCount` 3 and one more
 /// drawable held on screen, reaching this count means `nextDrawable` would block until the
-/// compositor catches up — the main thread then stalls input handling for as long as that takes
-/// (observed 0.5–3.4 s under load, because `allowsNextDrawableTimeout` is off).
+/// compositor catches up, stalling input handling on the main thread meanwhile.
 const MAX_DRAWABLES_IN_FLIGHT: usize = 2;
-/// Presented handlers can stop arriving (hidden window, dropped drawable). When nothing has been
-/// queued for this long the count is treated as stale and the old blocking acquire resynchronises.
-const STALE_BACKLOG: Duration = Duration::from_secs(1);
+/// Presented handlers can stop arriving (hidden window, dropped drawable, a compositor that is not
+/// showing this layer). Skipping must not freeze the window: once nothing has been queued for this
+/// long, acquire anyway; `nextDrawable` itself is bounded by the layer's one-second timeout.
+const STALE_BACKLOG: Duration = Duration::from_millis(250);
+/// `nextDrawable` waits longer than this are logged: they are the stalls users see as freezes.
+const SLOW_DRAWABLE: Duration = Duration::from_millis(100);
 
 /// Counts presented-but-not-yet-on-screen drawables so `draw` can skip instead of blocking.
 #[derive(Default)]
@@ -63,10 +65,16 @@ impl DrawableBacklog {
         if in_flight.1 < MAX_DRAWABLES_IN_FLIGHT {
             return true;
         }
-        let stale = self
-            .last_queued
-            .is_none_or(|at| now.saturating_duration_since(at) >= STALE_BACKLOG);
+        let quiet = self.last_queued.map(|at| now.saturating_duration_since(at));
+        let stale = quiet.is_none_or(|quiet| quiet >= STALE_BACKLOG);
         if stale {
+            if let Some(quiet) = quiet {
+                log::warn!(
+                    "drawables not returned for {}ms ({} in flight); acquiring anyway",
+                    quiet.as_millis(),
+                    in_flight.1,
+                );
+            }
             *in_flight = (in_flight.0.wrapping_add(1), 0);
         }
         stale
@@ -255,7 +263,9 @@ impl MetalRenderer {
         // metal-rs doesn't bind these setters, so view the same object through
         // objc2's typed CAMetalLayer binding.
         let objc2_layer: &objc2_quartz_core::CAMetalLayer = unsafe { &*layer.as_ptr().cast() };
-        objc2_layer.setAllowsNextDrawableTimeout(false);
+        // Apple's default: `nextDrawable` gives up after one second instead of blocking the main
+        // thread for as long as the compositor holds every drawable (Zed #53390).
+        objc2_layer.setAllowsNextDrawableTimeout(true);
         objc2_layer.setNeedsDisplayOnBoundsChange(true);
         // UIKit sizes a view's backing layer itself; only AppKit-hosted
         // layers need to track their superlayer's bounds.
@@ -584,9 +594,13 @@ impl MetalRenderer {
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
-        let drawable = if let Some(drawable) = layer.next_drawable() {
-            drawable
-        } else {
+        let acquire_started = Instant::now();
+        let drawable = layer.next_drawable();
+        let waited = acquire_started.elapsed();
+        if waited > SLOW_DRAWABLE {
+            log::warn!("nextDrawable waited {}ms", waited.as_millis());
+        }
+        let Some(drawable) = drawable else {
             log::error!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
@@ -1816,25 +1830,27 @@ mod tests {
             !backlog.admit(t0),
             "two queued drawables would block nextDrawable"
         );
-        assert!(!backlog.admit(t0 + ms(500)));
+        assert!(!backlog.admit(t0 + STALE_BACKLOG - ms(1)));
         first();
-        assert!(backlog.admit(t0 + ms(600)), "presentation frees a slot");
+        assert!(backlog.admit(t0 + ms(10)), "presentation frees a slot");
 
-        let _third = backlog.queued(t0 + ms(700));
-        assert!(!backlog.admit(t0 + ms(1500)));
+        let t1 = t0 + ms(500);
+        let _third = backlog.queued(t1);
+        assert!(!backlog.admit(t1 + STALE_BACKLOG - ms(1)));
         assert!(
-            backlog.admit(t0 + ms(700) + STALE_BACKLOG),
-            "a count that stops draining is reset rather than skipping forever"
+            backlog.admit(t1 + STALE_BACKLOG),
+            "a count that stops draining is reset rather than freezing the window"
         );
-        let fourth = backlog.queued(t0 + ms(1800));
-        let _fifth = backlog.queued(t0 + ms(1800));
+        let t2 = t1 + STALE_BACKLOG;
+        let fourth = backlog.queued(t2);
+        let _fifth = backlog.queued(t2);
         second();
         assert!(
-            !backlog.admit(t0 + ms(1800)),
+            !backlog.admit(t2),
             "a handler from before the reset does not drain the new count"
         );
         fourth();
-        assert!(backlog.admit(t0 + ms(1800)));
+        assert!(backlog.admit(t2));
     }
 
     #[test]
