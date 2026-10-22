@@ -47,7 +47,7 @@ krill artifacts rm <slug> [--json]
 
 - `share`·`update`는 `<state_dir>/artifact-sharing.enabled` 파일이 있을 때만 동작한다. 없으면 업로드하지 않고 `artifact_sharing_disabled` 오류로 끝난다. 에이전트만이 아니라 이 기기 전체에 적용된다.
 - 켜고 끄는 곳은 앱 **설정 > 아티팩트 > 공개 공유 허용** 스위치다. CLI에는 켜는 명령이 없다. 게이트 정의: [`crates/krill-proto/src/artifacts.rs`](../crates/krill-proto/src/artifacts.rs).
-- **정책 게이트일 뿐 보안 경계가 아니다.** 상태 디렉터리에 쓸 수 있는 프로세스(같은 사용자로 도는 에이전트 포함, 세션에는 `KRILL_STATE_DIR`이 들어 있다)는 파일을 직접 만들어 우회할 수 있다. 에이전트에게는 내장 `minikrill` 스킬이 `artifact_sharing_disabled`를 받으면 재시도·우회하지 말고 사용자에게 묻도록 안내한다.
+- **정책 게이트일 뿐 보안 경계가 아니다.** 상태 디렉터리에 쓸 수 있는 프로세스(같은 사용자로 도는 에이전트 포함, 세션에는 `KRILL_STATE_DIR`이 들어 있다)는 파일을 직접 만들어 우회할 수 있다. 에이전트에게는 내장 `krill` 스킬이 `artifact_sharing_disabled`를 받으면 재시도·우회하지 말고 사용자에게 묻도록 안내한다.
 - **업그레이드 영향**: 이 게이트가 들어간 버전부터 `krill artifacts share`·`update`는 기본으로 거부된다. 앱 없이 CLI만 쓰는 환경에서는 `touch "<state_dir>/artifact-sharing.enabled"`(0600 권장)로 사람이 직접 켠다. 같은 변경으로 지원하지 않는 확장자의 종료 코드가 2에서 1로 바뀌었고, 경로가 붙은 `--api-url`(예: `https://host/prefix`)은 거부된다.
 - `list`·`unshare`·`delete`·`status`는 게이트와 상관없이 동작한다(이미 만든 링크를 회수할 수 있어야 한다). 게이트를 꺼도 기존 링크는 지울 때까지 남는다.
 
