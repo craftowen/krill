@@ -342,6 +342,21 @@ fn demote_drops_hot_history_keeps_screen_and_modes() {
     assert_eq!(e.history_len(), 200);
 }
 
+/// 핫 스크롤백 상한은 [`HOT_LINES`]를 넘지 못하고, 강등을 풀면 만들 때의 상한으로 돌아간다.
+#[test]
+fn hot_history_is_capped_and_restored_on_promote() {
+    let look = fresh();
+    let mut big = Engine::with_history(SIZE, HOT_LINES * 2);
+    big.feed("x\r\n".repeat(HOT_LINES * 2).as_bytes(), Feed::Live, &look);
+    assert_eq!(big.history_len(), HOT_LINES);
+
+    let mut small = Engine::with_history(SIZE, 50);
+    small.demote(&look);
+    small.promote(&look);
+    small.feed("x\r\n".repeat(200).as_bytes(), Feed::Live, &look);
+    assert_eq!(small.history_len(), 50);
+}
+
 /// 열린 sync 구간·미완성 제어열 안에서 강등해도 파서 꼬리를 잃지 않는다(같은 입력의 강등 안 한 엔진과 화면이 같다).
 #[test]
 fn demote_mid_sequence_keeps_parser_tail() {

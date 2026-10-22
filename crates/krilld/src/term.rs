@@ -51,7 +51,8 @@ use krill_proto::theme::{Rgb, Theme};
 
 use crate::appearance::Appearance;
 
-/// 핫 스크롤백 행 수(ARCHITECTURE §4, AGENTS 메모리 예산). 넘는 행은 세그먼트(MK-024)가 맡는다.
+/// 핫 스크롤백 행 수의 고정 상한이자 기본값(ARCHITECTURE §4, AGENTS 메모리 예산). 넘는 행은 세그먼트(MK-024)가 맡는다.
+/// [`Engine::with_history`]로 더 작게 둘 수는 있어도 이보다 크게 둘 수는 없다.
 pub const HOT_LINES: usize = 1_000;
 
 /// 모드 2031(Contour 색 구성 알림).
@@ -198,6 +199,8 @@ pub(crate) struct Engine {
     scan: Parser,
     scheme: RawScan,
     cli_boundary: crate::cli::Boundary,
+    /// 강등이 풀렸을 때의 핫 스크롤백 행 수(≤ [`HOT_LINES`]).
+    hot: usize,
     /// 창 제목(OSC 0·2). [`MAX_TITLE`]에서 자른다.
     title: String,
     /// 살아 있는 바이트([`Feed::Live`])로 울린 벨 수.
@@ -212,16 +215,18 @@ impl Engine {
         Self::with_history(size, HOT_LINES)
     }
 
-    /// 스크롤백 상한을 `history`행으로 둔 엔진(세그먼트 재생용).
+    /// 스크롤백 상한을 `history`행으로 둔 엔진. [`HOT_LINES`]를 넘으면 [`HOT_LINES`]로 자른다(메모리 예산).
     pub(crate) fn with_history(size: WinSize, history: usize) -> Self {
+        let hot = history.min(HOT_LINES);
         let (tx, events) = mpsc::channel();
         Self {
-            term: Term::new(config(history), &Dims(size), Events(tx)),
+            term: Term::new(config(hot), &Dims(size), Events(tx)),
             parser: Processor::new(),
             events,
             scan: Parser::new(),
             scheme: RawScan::default(),
             cli_boundary: crate::cli::Boundary::default(),
+            hot,
             title: String::new(),
             bells: 0,
             clips: 0,
@@ -266,9 +271,9 @@ impl Engine {
         }
     }
 
-    /// 강등을 푼다: 핫 스크롤백을 다시 [`HOT_LINES`]행까지 쌓는다(이전 행은 콜드 페이지로).
+    /// 강등을 푼다: 핫 스크롤백을 다시 만들 때의 상한(≤ [`HOT_LINES`])까지 쌓는다(이전 행은 콜드 페이지로).
     pub(crate) fn promote(&mut self, look: &Appearance) {
-        self.set_history(HOT_LINES, look);
+        self.set_history(self.hot, look);
     }
 
     fn set_history(&mut self, history: usize, look: &Appearance) {
