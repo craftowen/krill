@@ -3,7 +3,8 @@
 //! Coordinates multi-agent runs, task DAGs, worker dispatches, threaded messages,
 //! blocking ask/reply, and decision gates backed by `state_dir/orchestration.json`.
 
-use std::ffi::OsString;
+use krill_proto::os::ffi::OsStrExt;
+use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -33,7 +34,8 @@ usage: krill [--host <user@host>] orchestration <subcommand> [options]
   task-create [--run <run-id>] --title <title> [--desc <text>] [--deps <t1,t2>] [--json]
   task-list [--run <run-id>] [--json]
   task-update <task-id> --status <pending|ready|dispatched|completed|failed|blocked> [--summary <text>] [--json]
-  worker-start [--spec <json|text>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--depth <N>] [--max-depth <N>] [--preamble <full|minimal|none>|--no-preamble] --prompt <text> [--json]
+  worker-start [--spec <json|text>] [--run <run-id>] [--task <task-id>] --worker <name> [--agent <agent>] [--account <id>] [--session <id>] [--cwd <dir>] [--worktree current|<path>|new-child] [--name <name>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>] [--depth <N>] [--max-depth <N>] [--preamble <full|minimal|none>|--no-preamble] --prompt <text> [--json]
+    new-child requires --name, uses the enclosing worktree of --cwd (default: current directory) as parent, and does not support --host.
   send --from <name> [--to <target>] [--type <type>] --summary <text> [--body <text>] [--run <id>] [--task <id>] [--dispatch <id>] [--outcome <succeeded|failed>] [--json]
   check [--to <name>] [--types <t1,t2>] [--unread] [--ack] [--wait] [--timeout-ms <N>] [--json]
   inbox [--to <name>] [--run <id>] [--all] [--json]
@@ -697,8 +699,24 @@ fn cmd_worker_start(state_dir: &Path, args: &[String]) -> io::Result<()> {
     cmd_worker_start_ctx(&OrchCtx::local(state_dir), args)
 }
 
-fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+#[derive(Debug)]
+struct WorkerStartArgs {
+    spec: WorkerStartSpec,
+    explicit_agent: Option<String>,
+    explicit_depth: Option<u32>,
+    explicit_max_depth: Option<u32>,
+    preamble_mode: PreambleMode,
+    auto_create_task: bool,
+    json: bool,
+    child_name: Option<String>,
+    worktree_options: Vec<OsString>,
+}
+
+fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartArgs> {
     let mut spec = WorkerStartSpec::default();
+    let mut new_child = false;
+    let mut child_name: Option<String> = None;
+    let mut worktree_options = Vec::new();
     let mut explicit_agent: Option<String> = None;
     let mut explicit_depth: Option<u32> = None;
     let mut explicit_max_depth: Option<u32> = None;
@@ -753,7 +771,16 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             }
             "--run" => spec.run_id = it.next().cloned(),
             "--task" => spec.task_id = it.next().cloned(),
-            "--worker" | "--name" => spec.worker = it.next().cloned(),
+            "--worker" => spec.worker = it.next().cloned(),
+            "--name" => {
+                let name = take_opt(&mut it, "--name")?.clone();
+                spec.worker = Some(name.clone());
+                child_name = Some(name);
+            }
+            "--base" | "--setup" | "--trust-setup" => {
+                let value = take_opt(&mut it, arg)?;
+                worktree_options.extend([OsString::from(arg), OsString::from(value)]);
+            }
             "--agent" => {
                 explicit_agent = Some(take_opt(&mut it, "--agent")?.clone());
             }
@@ -764,10 +791,11 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 let v = it.next().ok_or_else(|| bad_arg("missing --session"))?;
                 spec.session_id = Some(v.parse::<u64>().map_err(|_| bad_arg("invalid --session"))?);
             }
-            "--cwd" => spec.cwd = it.next().cloned(),
+            "--cwd" => spec.cwd = Some(take_opt(&mut it, "--cwd")?.clone()),
             "--worktree" => {
                 let val = it.next().ok_or_else(|| bad_arg("missing --worktree"))?;
-                if val != "current" {
+                new_child = val == "new-child";
+                if val != "current" && !new_child {
                     spec.cwd = Some(val.clone());
                 }
             }
@@ -798,6 +826,56 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             _ => return Err(bad_arg(format!("unexpected argument {arg}"))),
         }
     }
+    if new_child {
+        if remote {
+            return Err(bad_arg(
+                "--worktree new-child does not support --host; create the remote worktree separately",
+            ));
+        }
+        if child_name
+            .as_deref()
+            .is_none_or(|name| name.trim().is_empty())
+        {
+            return Err(bad_arg("--worktree new-child requires --name <name>"));
+        }
+        if spec.session_id.is_some() {
+            return Err(bad_arg(
+                "--worktree new-child requires a new session; omit --session",
+            ));
+        }
+    } else {
+        child_name = None;
+        if !worktree_options.is_empty() {
+            return Err(bad_arg(
+                "--base, --setup and --trust-setup require --worktree new-child",
+            ));
+        }
+    }
+    Ok(WorkerStartArgs {
+        spec,
+        explicit_agent,
+        explicit_depth,
+        explicit_max_depth,
+        preamble_mode,
+        auto_create_task,
+        json,
+        child_name,
+        worktree_options,
+    })
+}
+
+fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
+    let WorkerStartArgs {
+        mut spec,
+        explicit_agent,
+        explicit_depth,
+        explicit_max_depth,
+        preamble_mode,
+        auto_create_task,
+        json,
+        child_name,
+        worktree_options,
+    } = parse_worker_start(args, ctx.is_remote())?;
     let prompt = spec.prompt.ok_or_else(|| bad_arg("missing --prompt"))?;
     let raw_agent = explicit_agent
         .or(spec.agent)
@@ -817,11 +895,17 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         })
         .unwrap_or(DEFAULT_MAX_WORKER_DEPTH);
 
-    let work_cwd = resolve_worker_cwd(spec.cwd.as_deref(), ctx.is_remote())?;
-    let cwd_str = work_cwd.to_string_lossy().into_owned();
+    let mut work_cwd = resolve_worker_cwd(spec.cwd.as_deref(), ctx.is_remote())?;
+    // setup 옵션 검증도 작업·워크트리 생성 전에 기존 worktree 파서를 통과시킨다.
+    let child_request = child_name
+        .as_deref()
+        .map(|name| {
+            crate::worktree::parse_new_child(&work_cwd, name, &worktree_options).map_err(bad_arg)
+        })
+        .transpose()?;
 
     // 스폰 전에 run/task 유효성과 상태를 먼저 검증해 잘못된 요청이 고아 PTY 세션을 남기지 않게 한다.
-    let mut store = ctx.load_store()?;
+    let store = ctx.load_store()?;
     let worker_name = match spec.worker {
         Some(w) => w,
         None if auto_create_task => {
@@ -843,29 +927,6 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
             .resolve_run_id(None)
             .map_err(|_| bad_arg("missing --run"))?,
     };
-    if spec.task_id.is_none() && auto_create_task {
-        let first_line = prompt.lines().next().unwrap_or_default().trim();
-        let mut derived_title: String = first_line.chars().take(80).collect();
-        if derived_title.is_empty() {
-            derived_title.clone_from(&worker_name);
-        }
-        let created_task = match ctx.try_ipc(
-            &OrchAction::CreateTask {
-                run_id: run_id.clone(),
-                title: derived_title.clone(),
-                description: prompt.clone(),
-                deps: Vec::new(),
-            },
-            Duration::from_secs(2),
-        )? {
-            Some(OrchResponse::Task(t)) => t,
-            _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
-                s.create_task(&run_id, &derived_title, &prompt, Vec::new())
-            })?,
-        };
-        spec.task_id = Some(created_task.id);
-        store = ctx.load_store()?;
-    }
     store.validate_worker_start_with_depth(
         &run_id,
         spec.task_id.as_deref(),
@@ -873,98 +934,142 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
         depth,
         max_depth,
     )?;
-
     let target = ctx.effective_target()?;
     let mut session_id = spec.session_id;
-    // 존재하지 않는 세션을 지정하면 dispatch가 Active 고스트로 남고 stop/release가 영구 실패한다(C1).
-    // mutate 전에 세션 존재를 확인해 고스트 기록 자체를 만들지 않는다.
     if let Some(sid) = session_id {
         ensure_worker_session_exists_on_target(&target, &worker_name, sid)?;
     }
+    let created_child = if let Some(request) = child_request {
+        let created =
+            crate::worktree::create_new_on_target(&target, request).map_err(io::Error::other)?;
+        work_cwd = PathBuf::from(OsStr::from_bytes(&created.path));
+        Some(work_cwd.clone())
+    } else {
+        None
+    };
+    // 생성된 워크트리는 어느 후속 단계가 실패해도 보존하고 경로를 오류에 붙인다.
+    with_created_worktree(created_child.as_deref(), || {
+        let cwd_str = work_cwd.to_string_lossy().into_owned();
+        if spec.task_id.is_none() && auto_create_task {
+            let first_line = prompt.lines().next().unwrap_or_default().trim();
+            let mut derived_title: String = first_line.chars().take(80).collect();
+            if derived_title.is_empty() {
+                derived_title.clone_from(&worker_name);
+            }
+            let created_task = match ctx.try_ipc(
+                &OrchAction::CreateTask {
+                    run_id: run_id.clone(),
+                    title: derived_title.clone(),
+                    description: prompt.clone(),
+                    deps: Vec::new(),
+                },
+                Duration::from_secs(2),
+            )? {
+                Some(OrchResponse::Task(t)) => t,
+                _ => OrchestrationStore::mutate(ctx.state_dir, |s| {
+                    s.create_task(&run_id, &derived_title, &prompt, Vec::new())
+                })?,
+            };
+            spec.task_id = Some(created_task.id);
+        }
 
-    let newly_spawned = session_id.is_none() && !spec.no_spawn;
-    if newly_spawned {
-        let spawned = crate::session::spawn_agent_session_on_target(
-            &target,
-            &agent,
-            spec.account.clone(),
-            &work_cwd,
-        )
-        .map_err(|e| io::Error::other(format!("spawn {agent} worker session: {e}")))?;
-        session_id = Some(spawned);
-    }
-
-    let dispatch_res: io::Result<Dispatch> = match ctx.try_ipc(
-        &OrchAction::StartWorker {
-            run_id: run_id.clone(),
-            task_id: spec.task_id.clone(),
-            worker_name: worker_name.clone(),
-            agent: agent.clone(),
-            session_id,
-            cwd: cwd_str.clone(),
-            prompt: prompt.clone(),
-            depth,
-            max_depth,
-        },
-        Duration::from_secs(2),
-    ) {
-        Ok(Some(OrchResponse::Dispatch(d))) => Ok(d),
-        Ok(_) => OrchestrationStore::mutate(ctx.state_dir, |s| {
-            s.start_worker_with_depth(
-                &run_id,
-                spec.task_id.as_deref(),
-                &worker_name,
+        let newly_spawned = session_id.is_none() && !spec.no_spawn;
+        if newly_spawned {
+            let spawned = crate::session::spawn_agent_session_on_target(
+                &target,
                 &agent,
+                spec.account.clone(),
+                &work_cwd,
+            )
+            .map_err(|e| io::Error::other(format!("spawn {agent} worker session: {e}")))?;
+            session_id = Some(spawned);
+        }
+
+        let dispatch_res: io::Result<Dispatch> = match ctx.try_ipc(
+            &OrchAction::StartWorker {
+                run_id: run_id.clone(),
+                task_id: spec.task_id.clone(),
+                worker_name: worker_name.clone(),
+                agent: agent.clone(),
                 session_id,
-                &cwd_str,
-                &prompt,
+                cwd: cwd_str.clone(),
+                prompt: prompt.clone(),
                 depth,
                 max_depth,
-            )
-        }),
-        Err(e) => Err(e),
-    };
-    let dispatch = match dispatch_res {
-        Ok(d) => d,
-        Err(e) => {
-            if newly_spawned && let Some(sid) = session_id {
-                crate::session::close_session_on_target(&target, sid).ok();
-            }
-            return Err(e);
-        }
-    };
-
-    let delivered: Result<(), String> = dispatch.session_id.map_or(Ok(()), |sid| {
-        let Some(preamble) = format_worker_preamble(&dispatch, preamble_mode) else {
-            return Ok(());
+            },
+            Duration::from_secs(2),
+        ) {
+            Ok(Some(OrchResponse::Dispatch(d))) => Ok(d),
+            Ok(_) => OrchestrationStore::mutate(ctx.state_dir, |s| {
+                s.start_worker_with_depth(
+                    &run_id,
+                    spec.task_id.as_deref(),
+                    &worker_name,
+                    &agent,
+                    session_id,
+                    &cwd_str,
+                    &prompt,
+                    depth,
+                    max_depth,
+                )
+            }),
+            Err(e) => Err(e),
         };
-        if newly_spawned {
-            crate::session::wait_for_spawned_agent_ready(
-                &target,
-                sid,
-                crate::session::BOOT_TIMEOUT,
-            )?;
-        }
-        crate::session::send_session_line(&target, sid, &preamble)?;
-        Ok(())
-    });
+        let dispatch = match dispatch_res {
+            Ok(d) => d,
+            Err(e) => {
+                if newly_spawned && let Some(sid) = session_id {
+                    crate::session::close_session_on_target(&target, sid).ok();
+                }
+                return Err(e);
+            }
+        };
 
-    if json {
-        print_json(&dispatch)?;
-    } else {
-        println!(
-            "{}\t{}\t{}\t{}\tsession={}",
-            dispatch.id,
-            dispatch.worker_name,
-            dispatch.agent,
-            dispatch.status.as_str(),
-            dispatch
-                .session_id
-                .map_or_else(|| "-".to_owned(), |n| n.to_string())
-        );
-    }
-    // 디스패치는 기록됐으니 출력은 남기고, 프롬프트를 못 넣었으면 실패로 끝낸다(`krill send`로 다시 넣을 수 있다).
-    delivered.map_err(|e| io::Error::other(format!("worker {}: {e}", dispatch.worker_name)))
+        let delivered: Result<(), String> = dispatch.session_id.map_or(Ok(()), |sid| {
+            let Some(preamble) = format_worker_preamble(&dispatch, preamble_mode) else {
+                return Ok(());
+            };
+            if newly_spawned {
+                crate::session::wait_for_spawned_agent_ready(
+                    &target,
+                    sid,
+                    crate::session::BOOT_TIMEOUT,
+                )?;
+            }
+            crate::session::send_session_line(&target, sid, &preamble)?;
+            Ok(())
+        });
+
+        if json {
+            print_json(&dispatch)?;
+        } else {
+            println!(
+                "{}\t{}\t{}\t{}\tsession={}",
+                dispatch.id,
+                dispatch.worker_name,
+                dispatch.agent,
+                dispatch.status.as_str(),
+                dispatch
+                    .session_id
+                    .map_or_else(|| "-".to_owned(), |n| n.to_string())
+            );
+        }
+        // 디스패치는 기록됐으니 출력은 남기고, 프롬프트를 못 넣었으면 실패로 끝낸다(`krill send`로 다시 넣을 수 있다).
+        delivered.map_err(|e| io::Error::other(format!("worker {}: {e}", dispatch.worker_name)))
+    })
+}
+
+fn with_created_worktree<T>(
+    created: Option<&Path>,
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    action().map_err(|error| match created {
+        Some(path) => io::Error::new(
+            error.kind(),
+            format!("{error}; created worktree preserved at {}", path.display()),
+        ),
+        None => error,
+    })
 }
 
 /// 로컬 cwd는 데몬에 넘기기 전에 절대 경로·디렉터리로 검증한다. 원격 경로는 로컬에서 읽지 않는다.
@@ -2427,6 +2532,127 @@ mod tests {
             assert!(!dir.join("orchestration.json").exists());
         }
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn worker_start_parses_child_name_setup_and_existing_placements() {
+        let hash = "a".repeat(64);
+        let parsed = parse_worker_start(
+            &args(&[
+                "--spec",
+                "work",
+                "--worktree",
+                "new-child",
+                "--name",
+                "child",
+                "--cwd",
+                "/parent/nested",
+                "--base",
+                "feature",
+                "--setup",
+                "run",
+                "--trust-setup",
+                &hash,
+            ]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(parsed.child_name.as_deref(), Some("child"));
+        assert_eq!(parsed.spec.worker.as_deref(), Some("child"));
+        assert_eq!(parsed.spec.cwd.as_deref(), Some("/parent/nested"));
+        assert_eq!(
+            parsed.worktree_options,
+            [
+                "--base",
+                "feature",
+                "--setup",
+                "run",
+                "--trust-setup",
+                &hash
+            ]
+            .map(OsString::from)
+        );
+        assert!(parsed.auto_create_task);
+        let named = parse_worker_start(
+            &args(&[
+                "--name",
+                "existing-worker",
+                "--worktree",
+                "current",
+                "--cwd",
+                "/explicit",
+            ]),
+            false,
+        )
+        .unwrap();
+        assert!(named.child_name.is_none());
+        assert_eq!(named.spec.worker.as_deref(), Some("existing-worker"));
+        assert_eq!(named.spec.cwd.as_deref(), Some("/explicit"));
+        let path = parse_worker_start(
+            &args(&["--worktree", "/existing", "--worker", "worker"]),
+            false,
+        )
+        .unwrap();
+        assert!(path.child_name.is_none());
+        assert_eq!(path.spec.cwd.as_deref(), Some("/existing"));
+        let current = parse_worker_start(&args(&["--worktree", "current"]), false).unwrap();
+        assert!(current.spec.cwd.is_none());
+    }
+
+    #[test]
+    fn child_placement_rejects_missing_name_remote_host_and_existing_session() {
+        for raw in [
+            vec!["--worktree", "new-child"],
+            vec!["--worktree", "new-child", "--worker", "worker"],
+            vec!["--worktree", "new-child", "--name", " "],
+        ] {
+            let error = parse_worker_start(&args(&raw), false).unwrap_err();
+            assert!(error.to_string().contains("requires --name"), "{error}");
+        }
+        let error =
+            parse_worker_start(&args(&["--worktree", "new-child", "--name", "child"]), true)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("does not support --host"),
+            "{error}"
+        );
+        assert!(
+            parse_worker_start(
+                &args(&[
+                    "--worktree",
+                    "new-child",
+                    "--name",
+                    "child",
+                    "--session",
+                    "1"
+                ]),
+                false
+            )
+            .is_err()
+        );
+        assert!(parse_worker_start(&args(&["--setup", "skip"]), false).is_err());
+    }
+
+    #[test]
+    fn failed_start_preserves_created_child_and_reports_its_path() -> io::Result<()> {
+        let dir =
+            std::env::temp_dir().join(format!("krill-preserved-child-{}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("work"), "preserve")?;
+        let error = with_created_worktree(Some(&dir), || {
+            Err::<(), _>(io::Error::other("spawn failed"))
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("spawn failed"));
+        assert!(error.to_string().contains(&*dir.to_string_lossy()));
+        assert_eq!(std::fs::read_to_string(dir.join("work"))?, "preserve");
+        assert_eq!(
+            with_created_worktree(None, || Err::<(), _>(io::Error::other("original")))
+                .unwrap_err()
+                .to_string(),
+            "original"
+        );
+        std::fs::remove_dir_all(dir)
     }
 
     #[test]

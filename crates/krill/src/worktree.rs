@@ -23,7 +23,7 @@ use crate::remote::Target;
 const USAGE: &str = "usage: krill worktree new <name> [--host <user@host>] [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--host <user@host>] [--repo <path>] [--force] [--trust-archive <hash>]\n       krill worktree list [--repo <path>] [--json]\n       krill worktree show [<path>] [--json]\n       krill worktree current [--json]\n       krill worktree ps [--worktree <path>] [--json]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--trust <hash>] [--json]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedNew {
+pub(super) struct ParsedNew {
     req: NewWorktree,
     parent: Option<PathBuf>,
 }
@@ -94,23 +94,9 @@ pub fn run(raw_args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let parent = parsed.parent;
-    match create_on_target(&target, parsed.req) {
+    match create_new_on_target(&target, parsed) {
         Ok(w) => {
             let created_path = PathBuf::from(OsStr::from_bytes(&w.path));
-            if !target.is_remote()
-                && let Some(parent_path) = parent
-                && let Some(state_dir) = daemon::state_dir()
-                && let Err(e) =
-                    krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
-                        store.set_parent(
-                            &created_path.to_string_lossy(),
-                            Some(&parent_path.to_string_lossy()),
-                        )
-                    })
-            {
-                eprintln!("warning: could not record parent worktree: {e}");
-            }
             println!("{}", created_path.display());
             println!("branch {} (base {})", w.branch, w.base);
             if let Some(id) = w.setup {
@@ -123,6 +109,41 @@ pub fn run(raw_args: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// CLI와 worker-start가 같은 생성·부모 기록 경로를 사용한다.
+pub(super) fn create_new_on_target(target: &Target, parsed: ParsedNew) -> Result<Worktree, String> {
+    let w = create_on_target(target, parsed.req)?;
+    let created_path = PathBuf::from(OsStr::from_bytes(&w.path));
+    if !target.is_remote()
+        && let Some(parent_path) = parsed.parent
+        && let Some(state_dir) = daemon::state_dir()
+        && let Err(e) = krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
+            store.set_parent(
+                &created_path.to_string_lossy(),
+                Some(&parent_path.to_string_lossy()),
+            )
+        })
+    {
+        eprintln!("warning: could not record parent worktree: {e}");
+    }
+    Ok(w)
+}
+
+pub(super) fn parse_new_child(
+    parent: &std::path::Path,
+    name: &str,
+    options: &[OsString],
+) -> Result<ParsedNew, String> {
+    let mut args = vec![
+        OsString::from("new"),
+        OsString::from("--name"),
+        OsString::from(name),
+        OsString::from("--parent"),
+        parent.as_os_str().to_owned(),
+    ];
+    args.extend_from_slice(options);
+    parse_with_remote(&args, false)
 }
 
 #[cfg(test)]
@@ -969,6 +990,56 @@ mod tests {
         .unwrap();
         assert_eq!(without_parent.req.base, None);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn worker_child_uses_worktree_new_parser_and_setup_approval() {
+        let dir = std::env::temp_dir().join(format!("krill-child-parse-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let parent = dir.join("nested");
+        let hash = "a".repeat(64);
+        let options = [
+            "--base",
+            "feature",
+            "--setup",
+            "run",
+            "--trust-setup",
+            &hash,
+        ]
+        .map(OsString::from);
+        let child = parse_new_child(&parent, "child", &options).unwrap();
+        let mut command = vec![
+            OsString::from("new"),
+            OsString::from("child"),
+            OsString::from("--parent"),
+            parent.into_os_string(),
+        ];
+        command.extend_from_slice(&options);
+        assert_eq!(child, parse(&command).unwrap());
+        assert_eq!(child.parent, Some(std::fs::canonicalize(&dir).unwrap()));
+        assert_eq!(child.req.base.as_deref(), Some("feature"));
+        assert_eq!(child.req.setup, Setup::Approve(vec![0xaa; 32]));
+        assert_eq!(
+            parse_new_child(
+                &dir,
+                "child",
+                &[OsString::from("--setup"), OsString::from("skip")]
+            )
+            .unwrap()
+            .req
+            .setup,
+            Setup::Skip
+        );
+        assert!(
+            parse_new_child(
+                &dir,
+                "child",
+                &[OsString::from("--trust-setup"), OsString::from("bad")]
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
