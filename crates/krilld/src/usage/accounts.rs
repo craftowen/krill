@@ -167,8 +167,9 @@ pub struct AccountsFile {
     pub accounts: Vec<StoredAccount>,
     #[serde(default)]
     pub advanced_policy: krill_proto::usage::AdvancedPolicy,
-    /// OWE-699: 계정 프로필 프로비저닝(`super::provision`) opt-in. 기본 꺼짐 — 켜야만 프로필을 건드린다.
-    #[serde(default)]
+    /// OWE-699: 계정 프로필 프로비저닝(`super::provision`). 키가 없으면 켜짐(Orca처럼 스킬·대화 기록 공유,
+    /// 오웬 지시 2026-10-22). 명시한 `provisioning = false`는 그대로 존중한다.
+    #[serde(default = "provisioning_default")]
     pub provisioning: bool,
     /// OWE-719: 기존 자격증명을 읽기만 하는 직접 사용량 조회(오웬 지시로 기본 켜짐).
     #[serde(default = "direct_usage_default")]
@@ -179,6 +180,10 @@ fn direct_usage_default() -> bool {
     true
 }
 
+fn provisioning_default() -> bool {
+    true
+}
+
 impl Default for AccountsFile {
     fn default() -> Self {
         Self {
@@ -186,7 +191,7 @@ impl Default for AccountsFile {
             active: BTreeMap::new(),
             accounts: Vec::new(),
             advanced_policy: krill_proto::usage::AdvancedPolicy::default(),
-            provisioning: false,
+            provisioning: provisioning_default(),
             direct_usage: true,
         }
     }
@@ -2081,7 +2086,8 @@ mod provisioning_regressions {
         let raw = "# future writer\nfuture = 'root'\ndirect_usage = false\n[[accounts]]\nid = 'one'\nprovider = 'claude'\nlabel = 'unchanged'\nprofile_dir = '/tmp/one'\nfuture = 'nested'\n[auto_switch]\nenabled = false\nthreshold_percent = 77\nfuture = 'policy'\n[active]\nclaude = 'one'\n[advanced_policy]\npredict_exhaustion = true\n";
         std::fs::write(&path, raw).unwrap();
         let before: toml::Value = toml::from_str(raw).unwrap();
-        for enabled in [true, false] {
+        // 키가 없으면 이미 켜짐이라, 끈 뒤 다시 켜는 순서로 두 값이 모두 파일에 적히는지 본다.
+        for enabled in [false, true] {
             assert_eq!(
                 set_provisioning(&root, Some(&root), enabled).unwrap(),
                 enabled
@@ -2123,7 +2129,10 @@ mod provisioning_regressions {
         let root = std::env::temp_dir().join(format!("owe722-corrupt-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let path = config_path(&root, Some(&root));
-        assert!(!provisioning(&root, Some(&root)).unwrap());
+        assert!(
+            provisioning(&root, Some(&root)).unwrap(),
+            "파일 없음 = 켜짐"
+        );
         assert!(!path.exists());
         let raw = "provisioning = [broken";
         std::fs::write(&path, raw).unwrap();
@@ -2144,7 +2153,7 @@ pub fn set_provisioning(home: &Path, state_dir: Option<&Path>, enabled: bool) ->
     Ok(file.provisioning)
 }
 
-/// 파일 없음은 기본 꺼짐으로 읽는다. 손상된 설정은 오류로 돌려주며 쓰지 않는다.
+/// 파일 없음은 기본 켜짐으로 읽는다. 손상된 설정은 오류로 돌려주며 쓰지 않는다.
 pub fn provisioning(home: &Path, state_dir: Option<&Path>) -> io::Result<bool> {
     let _guard = lock(&SAVE_LOCK);
     Ok(load_writable(home, state_dir)?.provisioning)

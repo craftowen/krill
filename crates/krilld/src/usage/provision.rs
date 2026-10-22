@@ -1,4 +1,4 @@
-//! 계정 프로필 프로비저닝(OWE-699, MK-139). `accounts.toml`의 `provisioning = true`일 때만 동작한다(기본 꺼짐).
+//! 계정 프로필 프로비저닝(OWE-699, MK-139). `accounts.toml`의 `provisioning`이 켜졌을 때만 동작한다(키가 없으면 켜짐).
 //!
 //! 구조는 Orca `claude-profile-provisioning.ts`·`claude-profile-history.ts`(MIT)를 참고했다(코드 복사 없음).
 //! 참고 출처: Orca, Copyright (c) 2026 Lovecast Inc. (MIT), `.ref/orca/src/main/claude-accounts/`.
@@ -739,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn off_by_default_and_trashing_profile_keeps_host_history() {
+    fn registered_only_and_trashing_profile_keeps_host_history() {
         let home = root("gate");
         let state = home.join("state");
         let host = host_fixture(&home);
@@ -749,7 +749,7 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         let dir = profile.to_str().unwrap();
 
-        // 설정 없음(기본 꺼짐) → 아무것도 하지 않는다.
+        // 설정 없음(기본 켜짐)이어도 등록된 계정이 없으면 아무것도 하지 않는다.
         provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
         assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 0);
 
