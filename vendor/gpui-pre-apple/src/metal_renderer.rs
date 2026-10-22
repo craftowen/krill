@@ -1,5 +1,7 @@
 // Minikrill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
 // 크기 변경 때 미리 만들지 않고 처음 그릴 때 만들며, 경로 없는 프레임을 그리면 놓는다.
+// Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 화면에 아직 안 올라간 드로어블이 꽉 차면 `nextDrawable`에서 메인 스레드를
+// 무기한 막지 않고 그 프레임을 건너뛴다(`DrawableBacklog`). 호출자가 다음 틱에 다시 present한다.
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -25,7 +27,68 @@ use objc2_core_video::{
 };
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+/// Drawables queued for display but not yet on screen. With `maximumDrawableCount` 3 and one more
+/// drawable held on screen, reaching this count means `nextDrawable` would block until the
+/// compositor catches up — the main thread then stalls input handling for as long as that takes
+/// (observed 0.5–3.4 s under load, because `allowsNextDrawableTimeout` is off).
+const MAX_DRAWABLES_IN_FLIGHT: usize = 2;
+/// Presented handlers can stop arriving (hidden window, dropped drawable). When nothing has been
+/// queued for this long the count is treated as stale and the old blocking acquire resynchronises.
+const STALE_BACKLOG: Duration = Duration::from_secs(1);
+
+/// Counts presented-but-not-yet-on-screen drawables so `draw` can skip instead of blocking.
+#[derive(Default)]
+struct DrawableBacklog {
+    // (generation, count): handlers queued before a stale reset belong to an older generation and
+    // must not drain the new count.
+    in_flight: Arc<Mutex<(u64, usize)>>,
+    last_queued: Option<Instant>,
+}
+
+impl DrawableBacklog {
+    /// Whether a drawable can be acquired now without waiting on the compositor.
+    fn admit(&mut self, now: Instant) -> bool {
+        let mut in_flight = self.in_flight.lock();
+        if in_flight.1 < MAX_DRAWABLES_IN_FLIGHT {
+            return true;
+        }
+        let stale = self
+            .last_queued
+            .is_none_or(|at| now.saturating_duration_since(at) >= STALE_BACKLOG);
+        if stale {
+            *in_flight = (in_flight.0.wrapping_add(1), 0);
+        }
+        stale
+    }
+
+    /// Records a drawable about to be presented; the returned guard runs when it reaches the screen.
+    fn queued(&mut self, now: Instant) -> impl Fn() + 'static {
+        self.last_queued = Some(now);
+        let generation = {
+            let mut in_flight = self.in_flight.lock();
+            in_flight.1 += 1;
+            in_flight.0
+        };
+        let in_flight = Arc::clone(&self.in_flight);
+        move || {
+            let mut in_flight = in_flight.lock();
+            if in_flight.0 == generation {
+                in_flight.1 = in_flight.1.saturating_sub(1);
+            }
+        }
+    }
+}
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -115,6 +178,7 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    drawable_backlog: DrawableBacklog,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -389,6 +453,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            drawable_backlog: DrawableBacklog::default(),
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -498,16 +563,22 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    pub fn draw(&mut self, scene: &Scene) {
+    /// Renders and presents `scene`. Returns `false` only when the frame was skipped because the
+    /// compositor still holds every drawable; the caller should present again on the next display
+    /// tick. Failures are logged and not retried, as before.
+    pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
                 log::error!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
+                return true;
             }
         };
+        if !self.drawable_backlog.admit(Instant::now()) {
+            return false;
+        }
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
@@ -520,16 +591,24 @@ impl MetalRenderer {
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
+            return true;
         };
 
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
                 log::error!("failed to render: {error:#}");
-                return;
+                return true;
             }
         };
+
+        let on_screen = self.drawable_backlog.queued(Instant::now());
+        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| on_screen());
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI;
+        // Metal copies the block, so it outlives this frame.
+        unsafe {
+            drawable.add_presented_handler(&*RcBlock::as_ptr(&block).cast());
+        }
 
         if self.presents_with_transaction {
             command_buffer.commit();
@@ -539,6 +618,7 @@ impl MetalRenderer {
             command_buffer.present_drawable(drawable);
             command_buffer.commit();
         }
+        true
     }
 
     fn render_frame(
@@ -1723,6 +1803,39 @@ mod tests {
         CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
         CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
     };
+
+    #[test]
+    fn drawable_backlog_skips_instead_of_blocking_and_recovers_stale_counts() {
+        let mut backlog = DrawableBacklog::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let first = backlog.queued(t0);
+        assert!(backlog.admit(t0), "one queued drawable leaves one free");
+        let second = backlog.queued(t0);
+        assert!(
+            !backlog.admit(t0),
+            "two queued drawables would block nextDrawable"
+        );
+        assert!(!backlog.admit(t0 + ms(500)));
+        first();
+        assert!(backlog.admit(t0 + ms(600)), "presentation frees a slot");
+
+        let _third = backlog.queued(t0 + ms(700));
+        assert!(!backlog.admit(t0 + ms(1500)));
+        assert!(
+            backlog.admit(t0 + ms(700) + STALE_BACKLOG),
+            "a count that stops draining is reset rather than skipping forever"
+        );
+        let fourth = backlog.queued(t0 + ms(1800));
+        let _fifth = backlog.queued(t0 + ms(1800));
+        second();
+        assert!(
+            !backlog.admit(t0 + ms(1800)),
+            "a handler from before the reset does not drain the new count"
+        );
+        fourth();
+        assert!(backlog.admit(t0 + ms(1800)));
+    }
 
     #[test]
     fn render_core_video_surface() {

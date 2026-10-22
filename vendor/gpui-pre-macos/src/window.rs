@@ -1,3 +1,5 @@
+// Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 렌더러가 드로어블을 못 받아 프레임을 건너뛰면(`present_pending`) 다음
+// 디스플레이 틱에 `require_presentation`으로 다시 present한다.
 use crate::{
     BoolExt, MacDisplay, NSRange, NSStringExt, TISCopyCurrentKeyboardInputSource,
     TISGetInputSourceProperty, WindowFrameSource, events::platform_input_from_native,
@@ -667,6 +669,8 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
+    // The last `draw` was skipped because the compositor held every drawable; present again on the next tick.
+    present_pending: bool,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
     activate_callback: Option<Box<dyn FnMut(bool)>>,
@@ -1107,6 +1111,7 @@ impl MacWindow {
                     bounds.size.map(|pixels| pixels.as_f32()),
                     false,
                 ),
+                present_pending: false,
                 request_frame_callback: None,
                 event_callback: None,
                 activate_callback: None,
@@ -2123,7 +2128,7 @@ impl PlatformWindow for MacWindow {
 
     fn draw(&self, scene: &gpui::Scene) {
         let mut this = self.0.lock();
-        this.renderer.draw(scene);
+        this.present_pending = !this.renderer.draw(scene);
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
@@ -3353,8 +3358,10 @@ extern "C" fn step(view: *mut c_void) {
                 (None, FrameRequestSource::NativeCallback),
                 |(at, source)| (Some(at), source),
             );
+        let require_presentation = mem::take(&mut lock.present_pending);
         drop(lock);
         callback(RequestFrameOptions {
+            require_presentation,
             signal_at,
             signal_source,
             ..Default::default()
