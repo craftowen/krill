@@ -2803,6 +2803,25 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     });
     cx.run_until_parked();
 
+    // 렌더가 쓰는 계보 캐시는 rebuild 뒤 원래 계산과 같아야 한다.
+    let lineage = [
+        parent.clone(),
+        child_a.clone(),
+        grandchild.clone(),
+        child_b.clone(),
+        solo.clone(),
+    ];
+    let cache_matches = |s: &Sidebar| {
+        for wt in &lineage {
+            assert_eq!(s.cached_lineage_depth(wt), s.lineage_depth(wt), "{wt:?}");
+            assert_eq!(
+                s.cached_lineage_child_count(wt),
+                s.lineage_children(wt).len(),
+                "{wt:?}"
+            );
+        }
+    };
+
     // 순환 참조 방지 검증: 조상을 자손의 자식으로 지정할 수 없다.
     cx.update(|_, cx| {
         let s = view.read(cx);
@@ -2838,6 +2857,7 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
         assert_eq!(s.lineage_depth(&child_b), 1);
         assert_eq!(s.lineage_children(&child_b).len(), 0);
         assert_eq!(s.lineage_depth(&solo), 0);
+        cache_matches(s);
     });
 
     // 자식 워크트리 카드는 부모 카드보다 오른쪽으로 들여쓰기되고 접기 토글 배지가 렌더링된다.
@@ -2858,6 +2878,21 @@ fn worktree_lineage_hierarchy_fold_sleep_delete_and_persistence(cx: &mut TestApp
     );
     assert!(cx.debug_bounds("worktree-lineage-toggle-0").is_some());
     assert!(cx.debug_bounds("worktree-lineage-toggle-1").is_some());
+
+    // 부모 해제·그룹 변경 뒤에도 렌더용 캐시가 다시 계산된다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.clear_worktree_parent(&grandchild, cx);
+            s.set_group_by(GroupBy::None, cx);
+            cache_matches(s);
+            assert_eq!(s.cached_lineage_depth(&grandchild), 0);
+            assert_eq!(s.cached_lineage_child_count(&child_a), 0);
+            s.set_group_by(GroupBy::Repo, cx);
+            s.set_worktree_parent(grandchild.clone(), child_a.clone(), cx);
+            cache_matches(s);
+        });
+    });
+    cx.run_until_parked();
 
     // 부모를 접으면 자손(child-a, grandchild, child-b)이 숨겨지고 다시 펼치면 복원된다.
     cx.update(|_, cx| {

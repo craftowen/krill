@@ -605,6 +605,9 @@ pub struct Sidebar {
     comments: BTreeMap<PathBuf, String>,
     parents: BTreeMap<PathBuf, PathBuf>,
     collapsed_lineage: BTreeSet<PathBuf>,
+    /// 렌더용 계보 깊이·직계 자식 수. `rebuild`가 행과 함께 다시 계산한다.
+    lineage_depths: BTreeMap<PathBuf, usize>,
+    lineage_child_counts: BTreeMap<PathBuf, usize>,
     sleeping_worktrees: BTreeSet<PathBuf>,
     shown_external: BTreeSet<PathBuf>,
     collapsed: BTreeSet<PathBuf>,
@@ -752,6 +755,8 @@ impl Sidebar {
             comments: BTreeMap::new(),
             parents: lin.parents,
             collapsed_lineage: lin.collapsed_lineage,
+            lineage_depths: BTreeMap::new(),
+            lineage_child_counts: BTreeMap::new(),
             sleeping_worktrees: lin.sleeping_worktrees,
             shown_external: ui.shown_external,
             collapsed: ui.collapsed,
@@ -1914,6 +1919,7 @@ impl Sidebar {
             .cursor
             .map(|i| i.min(self.rows.len().saturating_sub(1)))
             .filter(|_| !self.rows.is_empty());
+        self.index_lineage();
         self.sync_viewport();
         self.card_list.invalidate_heights();
         cx.notify();
