@@ -312,3 +312,119 @@ fn w1_marked_text_is_readable_and_syllables_commit_whole() {
         Some(("😀".to_owned(), 0..2))
     );
 }
+
+// ── T1 IME QA: 늦은 중복 확정(`late_duplicate`)·낙관적 확정(`PENDING_TTL`) 경계 ──
+// 버림 조건은 셋이 모두 맞을 때뿐이다: 위젯이 직접 확정(`commit`·`commit_then`)했고, 그 뒤
+// `setMarkedText:` 없이, 바로 다음 `insertText:`가 같은 글자. 나머지는 모두 새 입력으로 쓴다.
+
+/// 자모 연타(`ㄱㄱㄱ`, `ㅋㅋㅋ`): IME가 같은 글자를 연달아 확정해도 늦은 중복으로 버리지 않는다.
+/// 에코 없이 쌓인 확정 글자 뒤에 새 preedit를 그린다.
+#[test]
+fn qa_rapid_jamo_repeats_are_not_dropped() {
+    let mut p = pane("mark:ㄱ ins:ㄱ mark:ㄱ ins:ㄱ mark:ㄱ ins:ㄱ mark:ㅋ");
+    assert_eq!(p.written(), "ㄱㄱㄱ");
+    assert_eq!(
+        p.ime.pending().map(|x| (x.text, x.columns)),
+        Some(("ㄱㄱㄱ", 6))
+    );
+    assert_eq!(p.ime.overlay().map(|o| o.origin.column), Some(6));
+    // 조합 없이 연달아 오는 같은 글자(받아쓰기·키 반복)도 그대로.
+    p.run("ins:ㅋ ins:ㅋ ins:ㅋ");
+    assert_eq!(p.written(), "ㄱㄱㄱㅋㅋㅋ");
+    assert_eq!(p.discards, 0);
+    // 위젯 확정 직후 같은 자모를 다시 조합하면(setMarkedText 경유) 새 입력이다.
+    assert_eq!(pane("mark:ㄱ commit mark:ㄱ ins:ㄱ").written(), "ㄱㄱ");
+    // 위젯 확정 뒤 늦은 같은 글자는 한 번만 버린다.
+    assert_eq!(pane("mark:ㄱ ret ins:ㄱ ins:ㄱ").written(), "ㄱ\rㄱ");
+}
+
+/// 받침+모음(도깨비불): `한` + `ㅏ` → IME가 `insertText("하")` → `setMarkedText("나")`.
+/// 받침이 다음 음절로 넘어가도 앞 음절만 확정되고 preedit는 그 다음 칸이다.
+#[test]
+fn qa_final_consonant_moves_to_next_syllable() {
+    let mut p = pane("mark:ㅎ mark:하 mark:한 ins:하 mark:나");
+    assert_eq!(p.written(), "하");
+    assert_eq!(
+        p.ime.overlay().map(|o| (o.origin.column, o.text)),
+        Some((2, "나"))
+    );
+    p.run("ins:나");
+    assert_eq!(p.written(), "하나");
+    // 겹받침: `닭` + `ㅏ` → `달` 확정 + `가` 조합.
+    assert_eq!(
+        pane("mark:ㄷ mark:다 mark:달 mark:닭 ins:달 mark:가 ins:가").written(),
+        "달가"
+    );
+    // 위젯이 `한`을 확정한 뒤 IME가 쪼갠 `하`를 늦게 보내면 다른 글자라 새 입력이다
+    // (실기에서는 discardMarkedText·키 소비로 오지 않아야 한다, docs/testing/ime-mk002.md).
+    assert_eq!(pane("mark:한 commit ins:하").written(), "한하");
+}
+
+/// 한자 변환: selectedRange가 있는 preedit를 다른 글자(`韓`·`大韓`)로 대체 확정한다.
+#[test]
+fn qa_hanja_conversion_replaces_preedit() {
+    let mut ime = Ime::default();
+    ime.set_marked("대한", Some(0..2));
+    assert_eq!(ime.candidate_anchor(1), CellPoint { line: 0, column: 2 });
+    let out = ime.insert("大韓");
+    assert_eq!(
+        (out.pty.as_slice(), out.discard_ime),
+        ("大韓".as_bytes(), false)
+    );
+    assert!(!ime.is_composing());
+    assert_eq!(
+        ime.pending().map(|p| (p.text, p.columns)),
+        Some(("大韓", 4))
+    );
+    // 변환 확정 뒤 이어 치는 음절은 한자 다음 칸.
+    ime.set_marked("ㄱ", None);
+    assert_eq!(ime.overlay().map(|o| o.origin.column), Some(4));
+    // 위젯 확정(포커스 이탈) 뒤 IME가 변환 결과를 늦게 보내면 글자가 달라 버리지 않는다.
+    // 원본 `한`과 `韓`이 둘 다 PTY에 간다 — 이 경로는 discardMarkedText가 막는다(MK-002 조건 2).
+    assert_eq!(pane("mark:한 commit ins:韓").written(), "한韓");
+}
+
+/// 포커스 이탈: 확정 + 플랫폼 조합 버림. 이어지는 `unmarkText`·같은 글자 `insertText:`는 중복이 아니다.
+#[test]
+fn qa_focus_loss_commit_and_late_messages() {
+    let p = pane("mark:한 commit");
+    assert_eq!((p.written().as_str(), p.discards), ("한", 1));
+    assert_eq!(p.ime.pending().map(|x| x.text), Some("한"));
+    // discardMarkedText를 무시한 IME가 unmarkText를 보내도 preedit가 비어 쓸 것이 없다.
+    assert_eq!(pane("mark:한 commit unmark").written(), "한");
+    assert_eq!(pane("mark:한 commit ins:한").written(), "한");
+    // 조합이 없을 때의 포커스 이탈은 아무것도 확정하지 않아 다음 같은 글자를 버리지 않는다.
+    let p = pane("ins:한 commit ins:한");
+    assert_eq!((p.written().as_str(), p.discards), ("한한", 0));
+}
+
+/// 탭 전환: 떠나는 탭만 확정하고 `discard_ime`를 낸다. 늦은 중복 방지는 탭(위젯)마다 따로라
+/// 새 탭으로 온 늦은 `insertText:`는 새 입력이다 — 앱이 discardMarkedText를 불러 막는다(AS-02).
+#[test]
+fn qa_tab_switch_isolates_late_duplicate() {
+    let mut old = pane("mark:ㅎ mark:하 mark:한");
+    let mut new = Pane::default();
+    old.run("commit");
+    assert_eq!((old.written().as_str(), old.discards), ("한", 1));
+    assert!(!old.ime.is_composing() && !new.ime.is_composing());
+    new.run("ins:한");
+    assert_eq!(new.written(), "한", "새 탭의 방어는 old 탭 상태와 무관");
+    // 돌아온 탭: 낙관적 글자는 앱이 화면 전환 때 지우고(clear_pending) 새 조합은 커서에 그린다.
+    old.run("echo mark:ㄱ");
+    assert_eq!(old.ime.overlay().map(|o| o.origin.column), Some(0));
+}
+
+/// 만료 기준은 마지막 확정 시각이다. 에코 없이 확정이 이어지면 만료가 미뤄진다.
+#[test]
+fn qa_pending_ttl_restarts_on_each_commit() {
+    let mut ime = Ime::default();
+    assert_eq!(ime.insert("하").pty, "하".as_bytes());
+    let first = ime.pending_at().expect("첫 확정 시각");
+    assert_eq!(ime.insert("나").pty, "나".as_bytes());
+    let last = ime.pending_at().expect("마지막 확정 시각");
+    assert!(last >= first);
+    ime.expire_pending(last + std::time::Duration::from_millis(499));
+    assert_eq!(ime.pending().map(|p| p.text), Some("하나"));
+    ime.expire_pending(last + krill_term::ime::PENDING_TTL);
+    assert_eq!(ime.pending(), None);
+}

@@ -69,8 +69,10 @@ pub struct Pending<'a> {
     pub columns: usize,
 }
 
-/// 확정 에코를 기다리는 최대 시간. PTY→krilld→앱 왕복(수~수십 ms)보다 넉넉하게 잡았다(추정).
-/// 넘으면 화면이 멈춘 것으로 보고 낙관적 글자를 지운다.
+/// 확정 에코를 기다리는 최대 시간(설계 상한, 측정값 아님). 실측 에코는 로컬 key→present p95
+/// 4.54~5.20ms(`docs/boost-2026-10-20-terminal-performance.md` §4), 모바일 터널 키 에코 p90 25ms
+/// (`docs/boost-2026-10-19-mobile-speed.md`)로, 에코 차단선 33ms(ARCHITECTURE §8)의 15배를 둔다.
+/// 넘으면 화면이 멈춘 것으로 보고 낙관적 글자를 지운다. 만료 기준은 마지막 확정 시각이다.
 pub const PENDING_TTL: Duration = Duration::from_millis(500);
 
 /// 터미널 위젯(탭) 하나의 IME 상태.
@@ -82,7 +84,8 @@ pub struct Ime {
     /// 마지막으로 보인 커서. 커서가 숨겨진 동안은 갱신하지 않는다.
     cursor: CellPoint,
     /// 위젯이 직접 확정한 글자. 바로 다음 `insertText:`가 같은 글자면 IME의 늦은 확정이라 버린다.
-    /// `discardMarkedText`가 안 먹거나 IME가 키 처리 뒤에 확정을 보내는 경우의 중복 방지(MK-002 미확인 위험).
+    /// `discardMarkedText`가 안 먹거나 IME가 키 처리 뒤에 확정을 보내는 경우의 중복 방지.
+    /// 같은 글자·`setMarkedText:` 없이 바로 다음일 때만 버린다(실기 조건: `docs/testing/ime-mk002.md`).
     committed: Option<String>,
     /// 에코 대기 중인 확정 글자(원인 1). 같은 줄 커서가 `origin + columns`까지 전진하거나
     /// [`PENDING_TTL`]이 지나면 지운다.
