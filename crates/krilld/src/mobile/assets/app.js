@@ -133,7 +133,7 @@
   restore:saved=>{
    if(!Array.isArray(saved.drafts)||!Array.isArray(saved.terminalDrafts)||saved.drafts.some(row=>!Array.isArray(row)||row.length!==2||!Number.isSafeInteger(row[0])||row[0]<=0||typeof row[1]!=='string')||saved.terminalDrafts.some(row=>!Array.isArray(row)||row.length!==2||typeof row[0]!=='string'||!row[0].startsWith(sessionScope()+"\n")||typeof row[1]!=='string'))throw Error('Invalid update state');
    state.drafts=new Map(saved.drafts);M.terminal.restoreDrafts(saved.terminalDrafts);
-   if(typeof saved.ui?.search==='string')state.ui.search=saved.ui.search;if(typeof saved.ui?.filter==='string')state.ui.filter=saved.ui.filter;if(Array.isArray(saved.ui?.projects)&&saved.ui.projects.every(k=>typeof k==='string'))state.ui.projects=saved.ui.projects;else if(typeof saved.ui?.project==='string'&&saved.ui.project)state.ui.projects=[saved.ui.project];if(Array.isArray(saved.ui?.collapsedGroups)&&saved.ui.collapsedGroups.every(k=>typeof k==='string'))state.ui.collapsedGroups=saved.ui.collapsedGroups;
+   if(typeof saved.ui?.search==='string')state.ui.search=saved.ui.search;if(typeof saved.ui?.filter==='string')state.ui.filter=saved.ui.filter;if(Array.isArray(saved.ui?.projects)&&saved.ui.projects.every(k=>typeof k==='string'))state.ui.projects=saved.ui.projects;else if(typeof saved.ui?.project==='string'&&saved.ui.project)state.ui.projects=[saved.ui.project];
    for(const [id,entries] of saved.disclosures||[])if(Number.isSafeInteger(id)&&Array.isArray(entries))state.chatCache=new Map([...(state.chatCache||[]),[id,{offset:0,items:[],agent:'',bound:false,disclosures:new Map(entries.filter(row=>Array.isArray(row)&&typeof row[0]==='string'&&typeof row[1]==='boolean'))}]]);
    M.updates.restoreView(document,saved.view);
   }
