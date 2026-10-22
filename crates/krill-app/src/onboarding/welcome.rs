@@ -824,6 +824,16 @@ impl Wizard {
                         .on_click(cx.listener(|_, _, _, cx| Self::close(cx))),
                 ),
             )
+            .child(
+                div()
+                    .debug_selector(|| "wizard-next-steps".into())
+                    .ml_3()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::NEXT_STEPS_HINT.get()),
+            )
     }
 
     fn render_check_row(
@@ -954,6 +964,7 @@ impl Wizard {
                                 IconName::ChevronRight
                             })
                             .tooltip(text::DETAILS.get())
+                            .accessibility_label(text::DETAILS.get())
                             .on_click({
                                 let id = id.clone();
                                 cx.listener(move |s, _, _, cx| s.toggle_expand(&id, cx))

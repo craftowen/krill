@@ -4985,6 +4985,9 @@ impl SettingsView {
                         layout::controls()
                             .child(
                                 layout::secondary("zoom-out", "−")
+                                    .accessibility_label(
+                                        text::STEP_DEC.format(&[("name", text::ZOOM.get())]),
+                                    )
                                     .disabled(zoom_at_min)
                                     .debug_selector(|| "zoom-out".into())
                                     .on_click(|_, _, cx| {
@@ -5003,6 +5006,9 @@ impl SettingsView {
                             )
                             .child(
                                 layout::secondary("zoom-in", "+")
+                                    .accessibility_label(
+                                        text::STEP_INC.format(&[("name", text::ZOOM.get())]),
+                                    )
                                     .disabled(zoom_at_max)
                                     .debug_selector(|| "zoom-in".into())
                                     .on_click(|_, _, cx| {
@@ -5209,6 +5215,13 @@ impl SettingsView {
             CheckStatus::UpToDate { version } => {
                 text::UPDATES_UP_TO_DATE.format(&[("version", version)])
             }
+            CheckStatus::ChannelMismatch {
+                configured,
+                offered,
+            } => text::UPDATES_CHANNEL_MISMATCH.format(&[
+                ("configured", configured.as_str()),
+                ("offered", offered.as_str()),
+            ]),
             CheckStatus::Ready(staged) => {
                 text::UPDATES_READY.format(&[("version", &staged.to_version)])
             }
@@ -6032,6 +6045,9 @@ impl SettingsView {
                         layout::controls()
                             .child(
                                 layout::secondary("font-dec", "−")
+                                    .accessibility_label(
+                                        text::STEP_DEC.format(&[("name", text::FONT_SIZE.get())]),
+                                    )
                                     .disabled(font_size <= 10)
                                     .debug_selector(|| "font-dec".into())
                                     .on_click(|_, _, cx| {
@@ -6053,6 +6069,9 @@ impl SettingsView {
                             )
                             .child(
                                 layout::secondary("font-inc", "+")
+                                    .accessibility_label(
+                                        text::STEP_INC.format(&[("name", text::FONT_SIZE.get())]),
+                                    )
                                     .disabled(font_size >= 24)
                                     .debug_selector(|| "font-inc".into())
                                     .on_click(|_, _, cx| {
@@ -6083,6 +6102,9 @@ impl SettingsView {
                     ))
                     .child(
                         Button::new("editor-font-dec")
+                            .accessibility_label(
+                                text::STEP_DEC.format(&[("name", text::EDITOR_FONT_SIZE.get())]),
+                            )
                             .label("−")
                             .debug_selector(|| "editor-font-dec".into())
                             .ghost()
@@ -6101,6 +6123,9 @@ impl SettingsView {
                     )
                     .child(
                         Button::new("editor-font-inc")
+                            .accessibility_label(
+                                text::STEP_INC.format(&[("name", text::EDITOR_FONT_SIZE.get())]),
+                            )
                             .label("+")
                             .debug_selector(|| "editor-font-inc".into())
                             .ghost()
@@ -6128,6 +6153,9 @@ impl SettingsView {
                         layout::controls()
                             .child(
                                 layout::secondary("opacity-dec", "−")
+                                    .accessibility_label(
+                                        text::STEP_DEC.format(&[("name", text::OPACITY.get())]),
+                                    )
                                     .disabled(opacity_val <= 50)
                                     .debug_selector(|| "opacity-dec".into())
                                     .on_click(|_, _, cx| {
@@ -6149,6 +6177,9 @@ impl SettingsView {
                             )
                             .child(
                                 layout::secondary("opacity-inc", "+")
+                                    .accessibility_label(
+                                        text::STEP_INC.format(&[("name", text::OPACITY.get())]),
+                                    )
                                     .disabled(opacity_val >= 100)
                                     .debug_selector(|| "opacity-inc".into())
                                     .on_click(|_, _, cx| {
@@ -7091,6 +7122,7 @@ impl SettingsView {
                     .ghost()
                     .icon(IconName::Ellipsis)
                     .tooltip(text::ACCOUNT_MORE.get())
+                    .accessibility_label(text::ACCOUNT_MORE.get())
                     .debug_selector(move || menu_id.clone())
                     .dropdown_menu(move |mut menu, _, _| {
                         if can_login {

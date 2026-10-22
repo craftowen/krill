@@ -124,6 +124,11 @@ pub enum CheckStatus {
     UpToDate {
         version: String,
     },
+    /// 받은 매니페스트의 채널이 설정 채널과 달라 설치하지 않음.
+    ChannelMismatch {
+        configured: Channel,
+        offered: Channel,
+    },
     Ready(StagedUpdate),
     Error(String),
 }
@@ -955,37 +960,74 @@ pub fn download_and_stage(
 }
 
 /// 번들(`Info.plist` + `updater.toml`)에 대해 매니페스트를 내려받아 `<app_bundle>.staging`까지 준비한다.
-pub fn stage_update_for_bundle(
+fn load_config_and_manifest(
     manifest_url: Option<&str>,
     app_bundle: &Path,
     state_dir: &Path,
-) -> Result<Option<StagedUpdate>, Error> {
+) -> Result<(Config, Manifest), Error> {
     let mut cfg = Config::load_for_bundle(state_dir, Some(app_bundle))?;
     if let Some(url) = manifest_url.map(str::trim).filter(|s| !s.is_empty()) {
         url.clone_into(&mut cfg.url);
         cfg.validate()?;
     }
-    let pk = cfg.public_key_bytes()?;
     let manifest = fetch_manifest(&cfg.url)?;
-    let verifier = CodesignVerifier::from_config(&cfg);
+    Ok((cfg, manifest))
+}
+
+/// 매니페스트 판정까지만 보고 설치 가능할 때만 스테이징한다.
+/// 채널 불일치는 `None`에 묻히지 않고 [`CheckStatus::ChannelMismatch`]로 돌려준다.
+fn decide_and_stage(
+    cfg: &Config,
+    manifest: &Manifest,
+    app_bundle: &Path,
+    state_dir: &Path,
+) -> Result<CheckStatus, Error> {
+    let pk = cfg.public_key_bytes()?;
     let from_version = effective_version(Some(app_bundle));
+    let bucket = rollout_bucket(state_dir);
+    if manifest.evaluate(&pk, &from_version, cfg.channel, PROTO_MAX, bucket)?
+        == Decision::ChannelMismatch
+    {
+        return Ok(CheckStatus::ChannelMismatch {
+            configured: cfg.channel,
+            offered: manifest.channel,
+        });
+    }
+    let verifier = CodesignVerifier::from_config(cfg);
     let staged = download_and_stage(
-        &manifest,
+        manifest,
         &pk,
         &from_version,
         cfg.channel,
         app_bundle,
         &verifier,
-        rollout_bucket(state_dir),
+        bucket,
     )?;
-    Ok(staged.map(|_| StagedUpdate {
-        state_dir: state_dir.to_path_buf(),
-        app_bundle: app_bundle.to_path_buf(),
-        from_version,
-        to_version: manifest.version,
-        manifest_url: cfg.url,
-        relaunched: false,
-    }))
+    Ok(match staged {
+        Some(_) => CheckStatus::Ready(StagedUpdate {
+            state_dir: state_dir.to_path_buf(),
+            app_bundle: app_bundle.to_path_buf(),
+            from_version,
+            to_version: manifest.version.clone(),
+            manifest_url: cfg.url.clone(),
+            relaunched: false,
+        }),
+        None => CheckStatus::UpToDate {
+            version: from_version,
+        },
+    })
+}
+
+pub fn stage_update_for_bundle(
+    manifest_url: Option<&str>,
+    app_bundle: &Path,
+    state_dir: &Path,
+) -> Result<Option<StagedUpdate>, Error> {
+    let (cfg, manifest) = load_config_and_manifest(manifest_url, app_bundle, state_dir)?;
+    match decide_and_stage(&cfg, &manifest, app_bundle, state_dir)? {
+        CheckStatus::Ready(staged) => Ok(Some(staged)),
+        _ => Ok(None),
+    }
 }
 
 /// `manifest_url`의 `latest.json`을 내려받아 `<app_bundle>.staging`까지 준비한다.
@@ -1035,13 +1077,8 @@ pub fn check_and_stage_current_app(state_dir: &Path) -> Result<CheckStatus, Erro
 /// 지정한 `.app` 번들의 업데이트를 점검하고 새 버전이 있으면 스테이징까지 완료한다.
 pub fn check_and_stage_bundle(app_bundle: &Path, state_dir: &Path) -> Result<CheckStatus, Error> {
     let manifest_env = std::env::var("KRILL_UPDATE_MANIFEST_URL").ok();
-    let from_version = effective_version(Some(app_bundle));
-    match stage_update_for_bundle(manifest_env.as_deref(), app_bundle, state_dir)? {
-        Some(staged) => Ok(CheckStatus::Ready(staged)),
-        None => Ok(CheckStatus::UpToDate {
-            version: from_version,
-        }),
-    }
+    let (cfg, manifest) = load_config_and_manifest(manifest_env.as_deref(), app_bundle, state_dir)?;
+    decide_and_stage(&cfg, &manifest, app_bundle, state_dir)
 }
 
 /// 환경 변수(`KRILL_UPDATE_*`) 또는 번들 `Info.plist`/`updater.toml` 설정으로 업데이트를 내려받아 스테이징하고,
@@ -1201,6 +1238,12 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
                 manifest.version,
                 app_bundle.display()
             );
+        } else if decision == Decision::ChannelMismatch {
+            println!(
+                "Update skipped: settings channel ({}) differs from the offered build channel ({}).",
+                cfg.channel.as_str(),
+                manifest.channel.as_str()
+            );
         } else {
             println!("Krill v{from_version} is up to date.");
         }
@@ -1217,6 +1260,12 @@ fn run_update_cli_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Re
                     "latest_version": manifest.version,
                     "updated": false,
                 })
+            );
+        } else if decision == Decision::ChannelMismatch {
+            println!(
+                "Update skipped: settings channel ({}) differs from the offered build channel ({}).",
+                cfg.channel.as_str(),
+                manifest.channel.as_str()
             );
         } else {
             println!("Krill v{from_version} is already up to date.");

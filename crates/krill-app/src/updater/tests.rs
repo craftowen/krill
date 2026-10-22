@@ -289,6 +289,39 @@ fn manifest_parsing_signature_downgrade_channel_rollout_and_url() {
 }
 
 #[test]
+fn channel_mismatch_surfaces_configured_and_offered_without_staging() {
+    // NOTE: RFC 8032 테스트 벡터 키는 public_key_bytes()가 거부하므로 [42; 32]를 쓴다.
+    let sk = [42; 32];
+    let pk = test_public_key(&sk);
+    let mut m = Manifest {
+        version: "0.2.0".to_owned(),
+        url: "https://github.com/craftowen/krill/releases/download/v0.2.0/Krill-0.2.0.zip"
+            .to_owned(),
+        sha256: sha256_hex(b"archive-bytes"),
+        ed25519_sig: String::new(),
+        min_daemon_protocol: 1,
+        channel: Channel::Beta,
+        rollout_pct: 100,
+    };
+    sign_manifest(&mut m, &sk);
+    let cfg = Config {
+        channel: Channel::Stable,
+        public_key: encode_hex(&pk),
+        ..Config::default()
+    };
+    let d = TempGuard(temp_dir("channel-mismatch"));
+    let app = d.0.join("Krill.app");
+    let status = decide_and_stage(&cfg, &m, &app, &d.0).unwrap();
+    assert!(matches!(
+        status,
+        CheckStatus::ChannelMismatch {
+            configured: Channel::Stable,
+            offered: Channel::Beta
+        }
+    ));
+}
+
+#[test]
 fn forged_archive_and_codesign_verification_interface() {
     let d = TempGuard(temp_dir("codesign"));
     let sk = decode_hex::<32>("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60")
