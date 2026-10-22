@@ -713,6 +713,24 @@ impl Sidebar {
                             )
                         },
                     )
+                    .when(*status == HostStatus::Connected && host.is_remote(), |d| {
+                        let disconnect_host = host.clone();
+                        let disconnect_key = host.as_key().to_owned();
+                        d.child(
+                            Button::new(("host-disconnect", index))
+                                .debug_selector(move || format!("host-disconnect-{disconnect_key}"))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .label(text::HOST_DISCONNECT.get())
+                                .accessibility_label(text::HOST_DISCONNECT.get())
+                                .tooltip(text::HOST_DISCONNECT.get())
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    cx.stop_propagation();
+                                    s.disconnect_host(disconnect_host.clone(), cx);
+                                })),
+                        )
+                    })
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.cursor = Some(index);
                         s.fold_host(&fold_host, None, cx);

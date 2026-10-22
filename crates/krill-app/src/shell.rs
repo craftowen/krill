@@ -724,6 +724,20 @@ impl Shell {
                 this.sync(cx);
                 cx.notify();
             });
+        let _sidebar_disconnect =
+            cx.subscribe(&sidebar, |this, _, e: &sidebar::DisconnectHost, cx| {
+                if let Some(id) = e.0.remote_id() {
+                    if let Some(raw) = id.strip_prefix("iroh:")
+                        && let Some(service) = &this.link_hosts
+                    {
+                        service.disconnect(raw);
+                    }
+                    this.host_manager.disconnect_now(id);
+                }
+                this.sync_hosts(cx);
+                this.sync(cx);
+                cx.notify();
+            });
         let sidebar_relisted = cx.subscribe(&sidebar, |this, _, e: &sidebar::Relisted, cx| {
             this.show_reconnected(e.0, cx);
         });

@@ -28,7 +28,7 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
                 } else {
                     HostStatus::Connected
                 },
-                detail: (!revoked).then(|| "직접 연결 · 응답 12ms".into()),
+                detail: (!revoked).then(|| "직접 연결".into()),
                 error: revoked.then(|| crate::i18n::link_ui::ERR_REVOKED.get().into()),
             },
             || {

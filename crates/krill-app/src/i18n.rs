@@ -534,6 +534,7 @@ catalog! {
         HOST_DISCONNECTED => ("끊김", "Disconnected"),
         HOST_RECONNECTING => ("다시 연결하는 중", "Reconnecting"),
         HOST_RECONNECT => ("다시 연결", "Reconnect"),
+        HOST_DISCONNECT => ("연결 해제", "Disconnect"),
         HOST_OFFLINE_GROUP => ("연결 안 된 호스트 {n}개", "{n} unconnected hosts"),
         HOST_REASON_OFFLINE => ("꺼져 있음", "Offline"),
         HOST_REASON_AUTH => ("인증 거부", "Auth rejected"),

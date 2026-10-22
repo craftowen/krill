@@ -21,6 +21,9 @@ pub struct LinkHosts {
     slots: Mutex<BTreeMap<String, Arc<Slot>>>,
     closed: Arc<AtomicBool>,
     repaired: Mutex<BTreeSet<String>>,
+    /// 사용자가 사이드바에서 '연결 해제'를 눌러 수동으로 끊은 호스트.
+    /// `paired`(재연결)로만 풀리며, 그 전까지 자식 기동·자동 재접속을 하지 않는다.
+    suspended: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[derive(Debug)]
@@ -34,6 +37,7 @@ struct Slot {
     restart: AtomicBool,
     starting: AtomicBool,
     owned: Mutex<BTreeSet<u32>>,
+    suspended: Arc<Mutex<BTreeSet<String>>>,
 }
 
 #[derive(Debug)]
@@ -56,6 +60,7 @@ impl LinkHosts {
                 slots: Mutex::new(BTreeMap::new()),
                 closed: Arc::new(AtomicBool::new(false)),
                 repaired: Mutex::new(BTreeSet::new()),
+                suspended: Arc::new(Mutex::new(BTreeSet::new())),
             });
             map.insert(state_dir, Arc::downgrade(&service));
             return service;
@@ -66,6 +71,7 @@ impl LinkHosts {
             slots: Mutex::new(BTreeMap::new()),
             closed: Arc::new(AtomicBool::new(false)),
             repaired: Mutex::new(BTreeSet::new()),
+            suspended: Arc::new(Mutex::new(BTreeSet::new())),
         })
     }
 
@@ -92,12 +98,26 @@ impl LinkHosts {
                         restart: AtomicBool::new(false),
                         starting: AtomicBool::new(false),
                         owned: Mutex::new(BTreeSet::new()),
+                        suspended: self.suspended.clone(),
                     })
                 })
                 .clone();
             let socket = krill_link::host_socket_path(&self.state_dir, &host.id)
                 .map_err(io::Error::other)?;
+            let suspended = self
+                .suspended
+                .lock()
+                .is_ok_and(|ids| ids.contains(&host.id));
+            if suspended
+                && let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade())
+            {
+                lease.stop();
+            }
             let mut info = connection_info(&self.state_dir, &host.id)?;
+            if suspended {
+                info.status = HostStatus::Disconnected;
+                info.error = None;
+            }
             let repaired = self
                 .repaired
                 .lock()
@@ -152,8 +172,29 @@ impl LinkHosts {
             .unwrap_or_default()
     }
 
+    /// 사용자가 사이드바에서 '연결 해제'를 눌렀을 때 자식을 내리고 수동 끊김으로 고정한다.
+    /// `paired`(재연결)로만 풀리며, 그 전까지 자식 기동·자동 재접속을 하지 않는다.
+    pub fn disconnect(&self, id: &str) {
+        if let Ok(mut ids) = self.suspended.lock() {
+            ids.insert(id.to_owned());
+        }
+        let slot = self
+            .slots
+            .lock()
+            .ok()
+            .and_then(|slots| slots.get(id).cloned());
+        if let Some(slot) = slot
+            && let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade())
+        {
+            lease.stop();
+        }
+    }
+
     /// 새 초대로 짝지은 경우 이전 권한 해제 상태의 연결만 새로 시작한다.
     pub fn paired(&self, id: &str) {
+        if let Ok(mut ids) = self.suspended.lock() {
+            ids.remove(id);
+        }
         if let Ok(mut repaired) = self.repaired.lock() {
             repaired.insert(id.to_owned());
         }
@@ -254,6 +295,17 @@ impl Lease {
     fn ensure(&self) -> io::Result<PathBuf> {
         if self.slot.closed.load(Ordering::Acquire) {
             return Err(io::ErrorKind::Interrupted.into());
+        }
+        if self
+            .slot
+            .suspended
+            .lock()
+            .is_ok_and(|ids| ids.contains(&self.slot.host.id))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                text::ERR_UNAVAILABLE.get(),
+            ));
         }
         let socket = krill_link::host_socket_path(&self.slot.state_dir, &self.slot.host.id)
             .map_err(io::Error::other)?;
@@ -401,15 +453,9 @@ pub fn connection_info(state_dir: &Path, id: &str) -> io::Result<HostConnectionI
         krill_link::RouteKind::Relay => Some(text::ROUTE_RELAY.get()),
         krill_link::RouteKind::None => None,
     };
-    let detail = route.map(
-        |route| match status.rtt_ms.filter(|v| v.is_finite() && *v >= 0.) {
-            Some(rtt) => format!(
-                "{route} · {}",
-                text::RTT.format(&[("ms", &format!("{rtt:.0}"))])
-            ),
-            None => route.to_owned(),
-        },
-    );
+    // RTT(응답 xxms)를 표시하면 링크 폴링(1s)마다 detail이 바뀌어
+    // 사이드바가 계속 다시 그려져 깜빡인다. 경로는 유지하고 속도는 표시하지 않는다.
+    let detail = route.map(ToOwned::to_owned);
     Ok(HostConnectionInfo {
         status: if revoked {
             HostStatus::Disconnected
