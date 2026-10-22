@@ -18,7 +18,7 @@ use std::io;
 use std::os::fd::AsFd;
 #[cfg(windows)]
 use std::os::windows::io::AsSocket;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, mpsc};
 use std::thread;
@@ -235,7 +235,9 @@ fn main() -> ExitCode {
         build: krill_proto::BUILD.to_owned(),
         instance_id: u64::from(std::process::id()),
     };
-    if let Err(error) = registry.start_mobile(hello.clone()) {
+    if !owns_mobile(&path) {
+        tracing::info!("mobile gateway skipped: socket is not the state dir default");
+    } else if let Err(error) = registry.start_mobile(hello.clone()) {
         tracing::warn!(kind=?error.kind(), "mobile gateway unavailable");
     }
     let accept = thread::Builder::new()
@@ -258,6 +260,13 @@ fn main() -> ExitCode {
     drop(done);
     tracing::info!("daemon handover complete");
     ExitCode::SUCCESS
+}
+
+/// 상태 폴더의 기본 소켓(`<상태 폴더>/run/krilld.sock`, [`daemon::Paths::dev`])으로 뜬 데몬만 모바일 게이트웨이를 켠다.
+/// 다른 소켓으로 뜬 데몬(테스트·수동 실행)이 같은 상태 폴더의 `mobile-gateway.json`을 쓰면
+/// 실사용 데몬의 터널을 죽이고 같은 릴레이 ID로 붙는다.
+fn owns_mobile(socket: &Path) -> bool {
+    daemon::state_dir().is_some_and(|dir| dir.join("run/krilld.sock") == socket)
 }
 
 /// 환경 변수 `KRILL_TEST_BALLAST_MB`(메비바이트 단위)만큼을 0이 아닌 값으로 채워 쥔다(dirty 페이지라 footprint에 잡힌다). 없거나 잘못된 값이면 빈 Vec.
