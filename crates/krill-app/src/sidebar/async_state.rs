@@ -449,49 +449,12 @@ impl Sidebar {
         self.disk.imported_meta = data.imported_meta;
         // Disk is the SSOT for lineage after preceding writes finish.
         let auto = if self.state_dir().is_some() {
-            let old_parents = self.parents.clone();
             self.parents = data.parents;
-            // Orca처럼 처음 묶인 계보 부모는 접힌 상태로 시작한다(하단 평탄 목록 방지).
-            // 이미 자식이 있던 부모·세션이 있는 자식은 건드리지 않아 펼침 선택을 유지한다.
-            let occupied: std::collections::BTreeSet<&Path> = data
-                .snapshot
-                .sessions
-                .iter()
-                .filter_map(|s| s.worktree.as_deref())
-                .collect();
-            let mut by_parent: std::collections::BTreeMap<&PathBuf, usize> =
-                std::collections::BTreeMap::new();
-            let mut is_new_main: std::collections::BTreeSet<&PathBuf> =
-                std::collections::BTreeSet::new();
-            for (child, parent) in &self.parents {
-                if occupied.contains(child.as_path()) {
-                    continue;
-                }
-                *by_parent.entry(parent).or_default() += 1;
-                if !old_parents.contains_key(child) {
-                    is_new_main.insert(parent);
-                }
-            }
-            let had: std::collections::BTreeSet<&PathBuf> = old_parents.values().collect();
-            let mut lineage_changed = false;
-            for (parent, count) in by_parent {
-                if count < 2 || !is_new_main.contains(parent) {
-                    continue;
-                }
-                if self.collapsed_lineage.contains(parent) {
-                    continue;
-                }
-                // 예전부터 자식이 있던 그룹은 펼침 유지: 이번에 처음 묶인 경우만 접는다.
-                if had.contains(parent) {
-                    continue;
-                }
-                self.collapsed_lineage.insert(parent.clone());
-                lineage_changed = true;
-            }
+            // 계보 부모는 펼친 상태로 시작한다. 접힘은 사용자가 토글로 고른 것만 남는다.
             self.worktree_statuses = data.statuses;
             self.worktree_updated_at = data.updated_at;
             self.issues = data.issues;
-            self.auto_collapse_idle_heavy_repos(&data.imported_paths) || lineage_changed
+            self.auto_collapse_idle_heavy_repos(&data.imported_paths)
         } else {
             false
         };

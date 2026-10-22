@@ -3736,7 +3736,7 @@ impl Shell {
             }
             return;
         }
-        // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace만 Ctrl+U로 보낸다.
+        // Cmd 키는 `tui::key`가 단축키(액션)로 보고 `None`을 돌려준다. Cmd+Backspace·Cmd+←/→만 Ctrl+U·A·E로 보낸다.
         let ks = &e.keystroke;
         let Some(l) = self.focused_live() else { return };
         ime_trace(format_args!(

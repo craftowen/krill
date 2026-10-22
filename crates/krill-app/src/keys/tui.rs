@@ -31,16 +31,24 @@ pub fn is_shell_shortcut(ks: &Keystroke) -> bool {
     false
 }
 
-/// macOS 줄 편집 관례: Cmd+Backspace = Ctrl+U(커서 왼쪽을 줄 시작까지 지움). Terminal·iTerm2·Orca와 같다.
+/// macOS 줄 편집 관례: Cmd+Backspace = Ctrl+U(커서 왼쪽을 줄 시작까지 지움), Cmd+←/→ = Ctrl+A/Ctrl+E
+/// (줄 시작·끝으로 이동). Terminal·iTerm2·Orca와 같다.
 fn platform_alias(ks: &Keystroke) -> Option<Keystroke> {
     let m = ks.modifiers;
-    (m.platform && !m.control && !m.alt && !m.shift && !m.function && ks.key == "backspace").then(
-        || Keystroke {
-            modifiers: Modifiers::control(),
-            key: "u".into(),
-            key_char: None,
-        },
-    )
+    if !m.platform || m.control || m.alt || m.shift || m.function {
+        return None;
+    }
+    let key = match ks.key.as_str() {
+        "backspace" => "u",
+        "left" => "a",
+        "right" => "e",
+        _ => return None,
+    };
+    Some(Keystroke {
+        modifiers: Modifiers::control(),
+        key: key.into(),
+        key_char: None,
+    })
 }
 
 /// 문자 입력은 IME로, 모호한 키·기능 키는 협상한 형식으로 보낸다.
@@ -355,6 +363,10 @@ mod tests {
         );
         assert_eq!(encode("cmd-backspace", 0, Event::Release), None);
         assert_eq!(encode("cmd-shift-backspace", 0, Event::Press), None);
+        // Cmd+←/→ = Ctrl+A/Ctrl+E(줄 시작·끝).
+        assert_eq!(encode("cmd-left", 0, Event::Press).unwrap(), b"\x01");
+        assert_eq!(encode("cmd-right", 0, Event::Press).unwrap(), b"\x05");
+        assert_eq!(encode("cmd-shift-left", 0, Event::Press), None);
         for flags in [0, 5, 7, 31] {
             for ev in [Event::Press, Event::Repeat, Event::Release] {
                 for shortcut in [
