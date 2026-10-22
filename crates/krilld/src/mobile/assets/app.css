@@ -18,6 +18,7 @@
 .session-tab{width:auto;min-width:104px;max-width:168px}.session-tab>.tab-label{flex:1;min-width:0;text-align:left}.session-tab:not([aria-selected=true])>:not(.tab-label){opacity:.7}.agent-icon{width:13px;height:13px;flex:none}.agent-icon.claude{color:var(--agent-claude)}.agent-icon.codex{color:var(--agent-codex)}.agent-icon.agy{color:var(--agent-agy)}.agent-icon.agy .layer{color:var(--agent-agy-crest)}.agent-icon.opencode{color:var(--agent-opencode)}.agent-icon.opencode .layer{color:var(--agent-opencode-core)}.agent-icon.cursor{color:var(--agent-cursor)}.agent-icon.cursor .layer{color:var(--agent-cursor-top)}.agent-icon.custom{display:grid;place-items:center;border-radius:3px;font:600 calc(9px * var(--ui-scale,1))/1 var(--font-mono);color:var(--agent-custom);background:color-mix(in srgb,var(--agent-custom) 14%,transparent);border:1px solid color-mix(in srgb,var(--agent-custom) 45%,transparent)}
 .terminal-scroll{position:relative;overflow-x:hidden;overflow-y:auto;touch-action:pan-y}.terminal-mount[data-fit=true] .terminal-history{white-space:pre-wrap;word-break:break-all}.terminal-mount[data-phase=ready] .terminal-status{display:none}.terminal-mount:is([data-phase=disconnected],[data-phase=error],[data-phase=denied],[data-phase=ended]) .terminal-scroll{opacity:.45}.terminal-mount[data-keyboard-open=true] .command-dock{padding-bottom:0}
 .buffered-command{flex-direction:row;align-items:center;gap:var(--space-sm)}
+.session .terminal-frame{padding:var(--space-sm) var(--space-md) 0}
 /* 터미널 화면 고정: 문서 러버밴드·더블탭 확대를 막고, 히스토리 앞붙임은 terminal.js가 직접 보정하므로 브라우저 스크롤 앵커링을 끈다(이중 보정 점프). 키는 터치 36px. */
 html:has(.session.screen),html:has(.session.screen) body{overscroll-behavior:none}.session.screen{touch-action:manipulation}.terminal-scroll{overflow-anchor:none}.accessory-key,.dismiss-keyboard{min-height:36px}
 .screen-text{min-height:50dvh;font:calc(12px * var(--ui-scale,1))/1.5 var(--font-mono);white-space:pre;overflow:auto;resize:none}
@@ -186,10 +187,12 @@ button.account-row:disabled{opacity:1}
 .workspaces .repo-group>.workspace-row:after{left:calc(var(--space-xl) + var(--space-lg) + var(--space-sm))}
 
 /* Conversation text leads; tool runs and their individual payloads are closed disclosures. */
-.chat-feed{gap:12px;padding:12px 16px}
+.chat-feed{gap:16px;padding:16px}
+.chat-history{justify-content:space-between;padding:4px 8px}.chat-history>span{order:1;flex-basis:100%;font-size:var(--font-meta)}.chat-history>.small,.chat-raw-btn,.chat-composer-bar>.small:first-child{border-color:transparent;background:transparent;color:var(--muted-foreground)}
 .chat-assistant{background:transparent;border:0;border-radius:0;padding:4px 0}
 .chat-user{align-self:flex-end;width:fit-content;max-width:95%;border-color:var(--border)}
-.chat-role{font-size:var(--font-meta);text-transform:none;color:var(--muted-foreground)}
+.chat-role{font-size:var(--font-meta);text-transform:none;color:var(--muted-foreground);display:flex;align-items:center;gap:6px}.chat-role>.agent-icon{width:14px;height:14px}
+.chat-question,.chat-permission{border-color:var(--border);border-left:2px solid var(--status-waiting);border-radius:8px}.chat-question>.chat-role,.chat-permission>.chat-role{color:var(--status-waiting)}.chat-question>button,.chat-permission>button{align-self:flex-start}.chat-opt{justify-content:flex-start}
 .chat-md{font-size:var(--font-body);line-height:1.6;gap:8px}
 .chat-tool-run{border:1px solid var(--border);border-radius:var(--radius-row);color:var(--muted-foreground);background:var(--surface-panel)}
 .chat-tool-summary{padding:8px 10px;font-size:var(--font-meta);cursor:pointer;overflow-wrap:anywhere}
@@ -198,7 +201,7 @@ button.account-row:disabled{opacity:1}
 .chat-tool-call>summary,.chat-tool-result>summary,.chat-reasoning>summary{cursor:pointer;min-height:28px;font-size:var(--font-meta);align-items:center}
 .chat-tool-call>summary{display:list-item}.chat-tool-head>.badge{margin-right:8px}.chat-tool-title{overflow-wrap:anywhere;white-space:normal}
 .chat-tool-call[open]>*+*,.chat-tool-result[open]>*+*{margin-top:8px}
-.chat-live-strip{font-size:var(--font-meta);padding:4px 8px}.chat-live-strip .small,.chat-composer button{min-height:32px}
+.chat-live-strip{font-size:var(--font-meta);padding:4px 8px}.chat-live-strip>[data-state=Waiting]{color:var(--status-waiting)}.chat-live-strip>[data-state=Blocked]{color:var(--status-blocked)}.chat-live-strip>[data-state=Working]{color:var(--status-working)}.chat-live-strip .small,.chat-composer button{min-height:32px}
 .chat-composer{padding:6px 8px calc(6px + env(safe-area-inset-bottom));gap:6px}.chat-input{min-height:44px;max-height:140px;resize:none;padding:8px 10px}
 .chat-composer-bar{justify-content:space-between}.chat-composer-bar .small{padding:6px 12px}
 
