@@ -3,6 +3,7 @@
 //! No terminal bytes, command lines, paths or error Display strings belong at call sites.
 //! Logging is fail-open: callers never depend on initialization succeeding.
 
+mod forward;
 mod subscriber;
 mod writer;
 
@@ -96,6 +97,8 @@ fn directory_in(
 /// File locks are nonblocking; contention and IO errors drop logs, never fail a session.
 /// Files are opened per event so other processes cannot write into a renamed/unlinked archive.
 /// This deliberately uses no thread in the fd-owning holder.
+pub use forward::forward_log_warnings;
+
 pub fn init(component: Component) -> io::Result<()> {
     let dir =
         directory().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no log directory"))?;

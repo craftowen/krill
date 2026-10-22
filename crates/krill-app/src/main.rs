@@ -73,6 +73,7 @@ fn main() -> std::process::ExitCode {
         let startup = cx.background_spawn(async {
             let migrated = krill_proto::daemon::migrate::run();
             krill_log::init(krill_log::Component::App).ok();
+            krill_log::forward_log_warnings();
             tracing::info!(?migrated, "app starting");
             let bounds = krill_app::layout::default_path()
                 .as_deref()
