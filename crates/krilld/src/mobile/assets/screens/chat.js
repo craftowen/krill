@@ -25,7 +25,7 @@ function renderRichText(el,text){
  return wrap;
 }
 function mountChat(root,opts){
- const {ctx,sessionId,onSwitchTerm}=opts;
+ const {ctx,sessionId,onSwitchTerm,agentIcon}=opts,agentName=a=>M.agentName?.(a)||a;
  const {el,button,state}=ctx,drafts=state.drafts||(state.drafts=new Map()),t=ctx.t||((s)=>s),itemLimit=1000;
  const cacheMap=state.chatCache||(state.chatCache=new Map());
  const entry=cacheMap.get(sessionId)||{offset:0,items:[],agent:'',bound:false};
@@ -34,7 +34,7 @@ function mountChat(root,opts){
  const shell=el('div',undefined,'chat-view'),feed=el('div',undefined,'chat-feed'),strip=el('div',undefined,'chat-live-strip'),composer=el('form',undefined,'chat-composer');
  const stripBadge=el('span','IDLE','badge'),stripText=el('span',t('Waiting for transcript…'),'chat-live-text'),rawBtn=button(t('Term →'),()=>onSwitchTerm?.(),'ghost small chat-raw-btn');
  strip.append(stripBadge,stripText,rawBtn);
- const history=el('div',undefined,'chat-actions'),historyText=el('span',undefined,'muted');
+ const history=el('div',undefined,'chat-actions chat-history'),historyText=el('span',undefined,'muted');
  const earlierBtn=button(t('Load earlier messages'),()=>run(loadEarlier),'ghost small');
  const latestBtn=button(t('Back to latest'),()=>{
   if(entry.live){entry.items=entry.live.items;entry.offset=entry.live.offset;entry.live=null;}
@@ -133,13 +133,13 @@ function mountChat(root,opts){
   earlierBtn.disabled=earlierPending;
   latestBtn.hidden=!entry.live;
   historyText.textContent=t(entry.live?'Reading earlier messages; live updates are paused.':'Showing up to 1000 messages. Load earlier messages to read more.');
-  history.hidden=earlierBtn.hidden&&latestBtn.hidden;
+  historyText.hidden=!entry.live;history.hidden=earlierBtn.hidden&&latestBtn.hidden;
   if(stick&&!entry.live)feed.scrollTop=feed.scrollHeight||0;
  }
  function rememberDetails(node,key){node.open=entry.disclosures?.get(key)||false;node.addEventListener('toggle',()=>{entry.disclosures||=new Map();entry.disclosures.set(key,node.open);});}
  function renderCard(item,key){
   const kind=item.kind||'assistant',card=el('article',undefined,`chat-card chat-${kind}`);
-  if(kind==='user'||kind==='assistant')card.append(el('header',kind==='user'?t('You'):(entry.agent||t('Agent')),'chat-role'),renderRichText(el,item.text));
+  if(kind==='user'||kind==='assistant'){const role=el('header',kind==='user'?t('You'):(agentName(entry.agent)||t('Agent')),'chat-role');if(kind==='assistant'&&entry.agent&&agentIcon)role.prepend(agentIcon(entry.agent));card.append(role,renderRichText(el,item.text));}
   else if(kind==='reasoning'||kind==='tool_result'){
    const details=el('details',undefined,kind==='reasoning'?'chat-reasoning':'chat-tool-result');
    rememberDetails(details,key);details.append(el('summary',t(kind==='reasoning'?'Reasoning':item.is_error?'Tool error':'Tool output')),kind==='reasoning'?renderRichText(el,item.text):el('pre',item.text,'chat-code'));card.append(details);
@@ -179,8 +179,8 @@ function mountChat(root,opts){
   });
  }
  function updateStrip(){
-  const sess=state.sessions?.get(sessionId);stripBadge.textContent=sess?.state||'Idle';
-  stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${entry.agent||'agent'} ${t('bound')}`:t('PTY live'));
+  const sess=state.sessions?.get(sessionId);stripBadge.textContent=t(sess?.state||'Unknown');stripBadge.dataset.state=sess?.state||'';
+  stripText.textContent=sess?.lines?.at(-1)||(entry.bound?`${agentName(entry.agent)||'agent'} ${t('bound')}`:t('PTY live'));
  }
  function normalizeItems(res,start){return (res.items||[]).map((item,index)=>({...item,id:item.id||`${start}:${index}`,_pageStart:start}));}
  function clearTranscript(){entry.items=[];entry.pages=[];entry.live=null;entry.agent='';entry.bound=false;cards.clear();toolRuns.clear();feed.replaceChildren();}
