@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use super::backend::{
     Invite, LinkBackend, NearbyMac, PairFailure, PairOutcome, PairedDevice, PairedHost,
-    ServerStatus,
+    ServerStatus, clean_host_name,
 };
 use super::qr::QrMatrixSource;
 use crate::i18n::link_ui as text;
@@ -97,13 +97,19 @@ impl LinkBackend for RealLinkBackend {
         })
     }
 
-    fn pair(&self, link: &str, device_name: &str) -> PairOutcome {
+    fn pair(&self, link: &str, device_name: &str, host_name: &str) -> PairOutcome {
         match run(krill_link::pair_with_server(
             &self.state_dir,
             link,
             device_name,
         )) {
-            Ok(host) => {
+            Ok(mut host) => {
+                if let Some(name) = clean_host_name(host_name) {
+                    match krill_link::rename_host(&self.state_dir, &host.id, &name) {
+                        Ok(renamed) => host = renamed,
+                        Err(_) => return PairOutcome::Failed(PairFailure::Unavailable),
+                    }
+                }
                 self.hosts
                     .get_or_init(|| {
                         crate::hosts::link::LinkHosts::shared(

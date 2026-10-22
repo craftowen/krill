@@ -592,6 +592,41 @@ fn client_close_resets_form_instead_of_closing_window(cx: &mut TestAppContext) {
     });
 }
 
+/// 연결할 Mac 이름을 적으면 상대가 알려준 이름 대신 그 이름으로 저장하고, [지우기]로 비운다.
+#[gpui::test]
+fn client_host_name_overrides_remote_name(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mock = Arc::new(MockLinkBackend::new());
+    let invite = mock.create_invite().unwrap();
+    let backend: Arc<dyn LinkBackend> = mock;
+    let (dialog, vcx) = cx.add_window_view(|window, cx| ClientDialog::new(backend, window, cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-client-input-host-name").is_some());
+    vcx.update(|window, cx| {
+        dialog.update(cx, |d, cx| {
+            d.set_link_value(invite.link.clone(), window, cx);
+            d.set_host_name_value(" 세무사무소 ", window, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    click(vcx, "link-client-connect-btn");
+    vcx.run_until_parked();
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        let ClientPhase::Paired(dev) = dialog.read(cx).phase() else {
+            panic!("expected paired");
+        };
+        assert_eq!(dev.name, "세무사무소");
+    });
+
+    click(vcx, "link-client-close-btn");
+    vcx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+        assert!(dialog.read(cx).host_name_value(cx).is_empty());
+    });
+}
+
 /// 연결 설정은 모달 장식 없이 페이지 본문으로 렌더한다.
 #[gpui::test]
 fn pairing_page_renders_panels_without_modal(cx: &mut TestAppContext) {

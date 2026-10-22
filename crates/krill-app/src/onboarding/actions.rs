@@ -222,8 +222,20 @@ pub(super) fn prepare_hook(
     let executable = stage_helpers(env)?;
     let state = canonical_path(&env.state)?;
     let path = hook_config_path(agent, env)?;
-    if let Some(plan) = Plan::prepare(Action::Install, agent, &path, &state, &executable)
-        .map_err(|e| hook_prepare_error(agent, &e))?
+    // Codex 훅은 `codex app-server`를 띄워 신뢰 해시를 받는다. Finder로 뜬 앱의 PATH에는
+    // Homebrew·npm 경로가 없어 ENOENT가 나므로 로그인 셸 PATH로 찾는다.
+    let search = (agent == TargetAgent::Other(Agent::Codex))
+        .then(|| super::login_path(&env.shell))
+        .flatten();
+    if let Some(plan) = Plan::prepare_with_path(
+        Action::Install,
+        agent,
+        &path,
+        &state,
+        &executable,
+        search.as_deref(),
+    )
+    .map_err(|e| hook_prepare_error(agent, &e))?
     {
         let mut diff = Vec::new();
         plan.write_diff(&mut diff).map_err(|e| e.to_string())?;

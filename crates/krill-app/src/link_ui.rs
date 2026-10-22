@@ -972,13 +972,14 @@ pub struct ClientDialog {
     language: crate::i18n::Language,
     backend: Arc<dyn LinkBackend>,
     link_input: Entity<InputState>,
+    host_name_input: Entity<InputState>,
     device_name_input: Entity<InputState>,
     clipboard_suggestion: Option<String>,
     phase: ClientPhase,
     nearby: Vec<NearbyMac>,
     task: Option<Task<()>>,
     nearby_task: Option<Task<()>>,
-    _subscriptions: [Subscription; 2],
+    _subscriptions: [Subscription; 3],
 }
 
 impl EventEmitter<LinkUiEvent> for ClientDialog {}
@@ -1003,12 +1004,21 @@ impl ClientDialog {
         let initial_name = default_device_name();
         let link_input =
             cx.new(|cx| InputState::new(window, cx).placeholder(text::LINK_PLACEHOLDER.get()));
+        let host_name_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(text::HOST_NAME_PLACEHOLDER.get()));
         let device_name_input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(text::DEVICE_NAME_PLACEHOLDER.get())
                 .default_value(initial_name)
         });
         let enter_link = cx.subscribe(&link_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::PressEnter { .. })
+                && !matches!(this.phase, ClientPhase::Connecting)
+            {
+                this.submit_pair(cx);
+            }
+        });
+        let enter_host_name = cx.subscribe(&host_name_input, |this, _, event: &InputEvent, cx| {
             if matches!(event, InputEvent::PressEnter { .. })
                 && !matches!(this.phase, ClientPhase::Connecting)
             {
@@ -1031,13 +1041,14 @@ impl ClientDialog {
             clipboard_generation: 0,
             backend,
             link_input,
+            host_name_input,
             device_name_input,
             clipboard_suggestion,
             phase: ClientPhase::Idle,
             nearby: Vec::new(),
             task: None,
             nearby_task: None,
-            _subscriptions: [enter_link, enter_name],
+            _subscriptions: [enter_link, enter_host_name, enter_name],
         };
         dialog.refresh_nearby(cx);
         dialog.refresh_clipboard_suggestion(cx);
@@ -1052,6 +1063,11 @@ impl ClientDialog {
     #[must_use]
     pub fn link_value(&self, cx: &App) -> String {
         self.link_input.read(cx).value().to_string()
+    }
+
+    #[must_use]
+    pub fn host_name_value(&self, cx: &App) -> String {
+        self.host_name_input.read(cx).value().to_string()
     }
 
     #[must_use]
@@ -1078,6 +1094,20 @@ impl ClientDialog {
     ) {
         let val = value.into();
         self.link_input.update(cx, |input, cx| {
+            input.set_value(val, window, cx);
+        });
+        cx.notify();
+    }
+
+    /// 연결할 Mac 이름 입력칸 값을 설정한다.
+    pub fn set_host_name_value(
+        &mut self,
+        value: impl Into<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let val = value.into();
+        self.host_name_input.update(cx, |input, cx| {
             input.set_value(val, window, cx);
         });
         cx.notify();
@@ -1164,6 +1194,7 @@ impl ClientDialog {
         self.task = None;
         self.phase = ClientPhase::Idle;
         self.set_link_value("", window, cx);
+        self.set_host_name_value("", window, cx);
         cx.notify();
     }
 
@@ -1205,13 +1236,14 @@ impl ClientDialog {
         }
     }
 
-    /// 입력된 초대 링크와 기기 이름으로 백그라운드 실행기에서 짝짓기(`pair`)를 실행한다.
+    /// 입력된 초대 링크·연결할 Mac 이름·기기 이름으로 백그라운드 실행기에서 짝짓기(`pair`)를 실행한다.
     pub fn submit_pair(&mut self, cx: &mut Context<Self>) {
         if matches!(self.phase, ClientPhase::Connecting) {
             return;
         }
         let link = self.link_input.read(cx).value().trim().to_owned();
         let device_name = sanitize_device_name(&self.device_name_input.read(cx).value());
+        let host_name = self.host_name_input.read(cx).value().to_string();
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         self.phase = ClientPhase::Connecting;
@@ -1220,7 +1252,7 @@ impl ClientDialog {
         self.task = Some(cx.spawn(async move |this, cx| {
             let outcome = cx
                 .background_executor()
-                .spawn(async move { backend.pair(&link, &device_name) })
+                .spawn(async move { backend.pair(&link, &device_name, &host_name) })
                 .await;
             this.update(cx, |dialog, cx| {
                 if dialog.generation != generation {
@@ -1498,6 +1530,20 @@ impl Render for ClientDialog {
                                     )),
                                 ),
                             ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .text_size(crate::ui::TEXT_XS)
+                    .child(crate::ui::field_label(text::HOST_NAME_LABEL.get(), None, p))
+                    .child(
+                        div()
+                            .id("link-client-input-host-name")
+                            .debug_selector(|| "link-client-input-host-name".into())
+                            .child(Input::new(&self.host_name_input).small()),
                     ),
             )
             .child(

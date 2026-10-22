@@ -57,8 +57,9 @@ pub use serve::{
 pub use store::{
     AllowedDevice, DEFAULT_INVITE_TTL, DEVICES_REL_PATH, HOST_ID_MAX_LEN, HOSTS_REL_PATH,
     INVITES_REL_PATH, InviteRecord, InviteToken, InviteVerifyError, RemoteHost, find_host,
-    load_allowed_node_set, load_devices, load_hosts, remove_device, remove_host, save_devices,
-    save_hosts, upsert_device, upsert_host, validate_host_id, verify_and_consume_invite,
+    load_allowed_node_set, load_devices, load_hosts, remove_device, remove_host, rename_host,
+    save_devices, save_hosts, upsert_device, upsert_host, validate_host_id,
+    verify_and_consume_invite,
 };
 
 /// 데이터 터널 ALPN 식별자 (`b"minikrill/link/2"`).

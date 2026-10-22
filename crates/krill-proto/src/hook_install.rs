@@ -7,6 +7,7 @@ mod codex;
 mod json;
 pub mod store;
 
+use std::ffi::OsStr;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
@@ -103,6 +104,19 @@ impl Plan {
         state: &Path,
         exe: &Path,
     ) -> io::Result<Option<Self>> {
+        Self::prepare_with_path(action, agent, path, state, exe, None)
+    }
+
+    /// [`Plan::prepare`] with the `PATH` used to find `codex app-server`.
+    /// GUI apps launched from Finder inherit launchd's minimal `PATH`, so they pass the login shell's.
+    pub fn prepare_with_path(
+        action: Action,
+        agent: TargetAgent,
+        path: &Path,
+        state: &Path,
+        exe: &Path,
+        search: Option<&OsStr>,
+    ) -> io::Result<Option<Self>> {
         let receipt_path = match agent {
             TargetAgent::Claude => state.join("hooks/claude.json"),
             TargetAgent::Other(a) => hooks::receipt(state, a),
@@ -142,7 +156,7 @@ impl Plan {
         let receipt = if action == Action::Install {
             let changes = if agent == TargetAgent::Other(Agent::Codex) {
                 let codex_home = path.parent().ok_or_else(|| error("missing Codex home"))?;
-                codex_plan = Some(codex::Plan::install(codex_home, &command)?);
+                codex_plan = Some(codex::Plan::install(codex_home, &command, search)?);
                 Vec::new()
             } else {
                 let path = path.to_path_buf();
@@ -182,7 +196,7 @@ impl Plan {
                 return Err(error("receipt agent mismatch"));
             }
             if let Some(record) = &receipt.codex {
-                codex_plan = Some(codex::Plan::uninstall(record)?);
+                codex_plan = Some(codex::Plan::uninstall(record, search)?);
             }
             receipt
         };

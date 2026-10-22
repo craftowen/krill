@@ -154,8 +154,9 @@ pub trait LinkBackend: Send + Sync + std::fmt::Debug {
     fn server_status(&self) -> Result<ServerStatus, String>;
     /// 새 1회용 초대 링크와 만료 시각을 발급한다.
     fn create_invite(&self) -> Result<Invite, String>;
-    /// 초대 링크와 이 기기 이름으로 상대 Mac과 짝짓기를 시도한다.
-    fn pair(&self, link: &str, device_name: &str) -> PairOutcome;
+    /// 초대 링크와 이 기기 이름으로 상대 Mac과 짝짓기를 시도한다. `host_name`이 비어 있지
+    /// 않으면 상대 Mac이 알려준 이름 대신 이 이름으로 원격 Mac을 저장한다.
+    fn pair(&self, link: &str, device_name: &str, host_name: &str) -> PairOutcome;
     /// 현재 짝지어진 기기 목록을 조회한다.
     fn devices(&self) -> Result<Vec<PairedDevice>, String>;
     /// 이 Mac이 연결한 원격 Mac 목록과 현재 연결 상태. 조회만 하며 터널을 시작하지 않는다.
@@ -352,7 +353,7 @@ impl LinkBackend for MockLinkBackend {
         Ok(invite)
     }
 
-    fn pair(&self, link: &str, device_name: &str) -> PairOutcome {
+    fn pair(&self, link: &str, device_name: &str, host_name: &str) -> PairOutcome {
         let Ok(mut guard) = self.state.lock() else {
             return PairOutcome::Failed(PairFailure::RemoteMacOffline);
         };
@@ -385,7 +386,10 @@ impl LinkBackend for MockLinkBackend {
         guard.used_links.insert(trimmed.to_owned());
         let seq = guard.next_seq;
         guard.next_seq = guard.next_seq.saturating_add(1);
-        let clean_name = sanitize_device_name(device_name);
+        let clean_name = match clean_host_name(host_name) {
+            Some(name) => name,
+            None => sanitize_device_name(device_name),
+        };
         let now = guard.now_secs;
         let paired = PairedDevice {
             id: format!("paired-{seq}"),
@@ -472,6 +476,13 @@ pub fn sanitize_device_name(raw: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// 사용자가 정한 원격 Mac 이름을 정리한다. 비어 있으면 상대 Mac이 알려준 이름을 쓰도록 `None`.
+#[must_use]
+pub fn clean_host_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw.trim().chars().filter(|c| !c.is_control()).collect();
+    (!cleaned.is_empty()).then_some(cleaned)
 }
 
 /// 남은 초(`remaining_secs`)를 "남은 유효 시간: M분 S초" 형태로 포맷한다.
