@@ -261,6 +261,24 @@ fi
 if [[ -z "$BUMP" ]] && ! python3 docs/licensing/generate_notices.py --check >/dev/null; then
   soft_fail "THIRD_PARTY_NOTICES.md is stale; run python3 docs/licensing/generate_notices.py and commit"
 fi
+# 모바일 PWA: 이 커밋의 에셋 해시가 고정 출처에 없으면 새 데몬의 QR이 404가 되고 PWA가 새 UI로 못 넘어간다
+# (v0.1.30 사고). 실제 게시면 cloud/mobile/deploy.sh(저장소 밖 Cloudflare 배포 도구)로 올린 뒤 다시 확인한다.
+MOBILE_ORIGIN=${KRILL_MOBILE_ORIGIN:-https://krill-mobile.pages.dev}
+MOBILE_CLOUD=${KRILL_MOBILE_CLOUD_DIR:-cloud/mobile}
+mobile_deployed() {
+  [[ $(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "${MOBILE_ORIGIN}/m/$1/manifest.json" 2>/dev/null) == 200 ]]
+}
+if ! MOBILE_HASH=$(python3 packaging/release_check.py mobile-hash) || [[ ! "$MOBILE_HASH" =~ ^[0-9a-f]{16}$ ]]; then
+  hard_fail "cannot compute the mobile PWA asset hash"
+elif ! mobile_deployed "$MOBILE_HASH"; then
+  if [[ "$PREFLIGHT" -eq 0 && "$DRY_RUN" -eq 0 && -x "$MOBILE_CLOUD/deploy.sh" ]]; then
+    echo "==> Deploying mobile PWA ${MOBILE_HASH} to ${MOBILE_ORIGIN}"
+    "$MOBILE_CLOUD/deploy.sh" --repo "$PWD" || true
+    for _ in 1 2 3 4 5 6; do mobile_deployed "$MOBILE_HASH" && break; sleep 5; done
+  fi
+  mobile_deployed "$MOBILE_HASH" ||
+    soft_fail "mobile PWA ${MOBILE_HASH} is not deployed to ${MOBILE_ORIGIN}; run ${MOBILE_CLOUD}/deploy.sh --repo $PWD (or set KRILL_MOBILE_CLOUD_DIR)"
+fi
 # 공개 표면: 소스 tarball(git archive HEAD)과 같은 내용에 내부 문서·비밀이 없어야 한다.
 FORBIDDEN=$(git ls-tree -r --name-only HEAD | grep -E '^(docs/(boost-|reports/)|\.night/)' || true)
 [[ -z "$FORBIDDEN" ]] || hard_fail "internal files are tracked and would ship in the source tarball:"$'\n'"$FORBIDDEN"
