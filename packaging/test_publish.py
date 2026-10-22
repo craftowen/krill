@@ -49,6 +49,9 @@ class PublishGuardTests(unittest.TestCase):
             "else: print('/validated/release/bin')\n")
         (self.work / "packaging/macos").mkdir(exist_ok=True)
         (self.work / "packaging/macos/smoke.py").write_text("# stub; actual packaged smoke is a native release gate\n")
+        # 실제 해석기는 홈의 키체인 별칭을 만들므로 경로 출력만 스텁한다(test_identity_paths가 검증).
+        (self.work / "packaging/macos/identity_paths.py").write_text(
+            "from pathlib import Path\nprint(Path.home() / 'Library/Keychains/krill-codesign.keychain-db')\n")
         (self.work / "packaging/bundle.sh").write_text("#!/bin/bash\nexit 1\n")
         (self.work / "docs/licensing").mkdir(parents=True)
         (self.work / "docs/licensing/generate_notices.py").write_text(
