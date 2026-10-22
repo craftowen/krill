@@ -845,9 +845,9 @@ fn parse_worker_start(args: &[String], remote: bool) -> io::Result<WorkerStartAr
         {
             return Err(bad_arg("--worktree new-child requires --name <name>"));
         }
-        if spec.session_id.is_some() {
+        if spec.session_id.is_some() || spec.no_spawn {
             return Err(bad_arg(
-                "--worktree new-child requires a new session; omit --session",
+                "--worktree new-child requires a new session; omit --session and --no-spawn",
             ));
         }
     } else {
@@ -984,7 +984,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
 
         let newly_spawned = session_id.is_none() && !spec.no_spawn;
         if newly_spawned {
-            let spawned = spawn_with_task_cleanup(ctx, auto_created_task.as_deref(), || {
+            let spawned = fail_task_on_error(ctx, auto_created_task.as_deref(), || {
                 crate::session::spawn_agent_session_on_target(
                     &target,
                     &agent,
@@ -1032,7 +1032,7 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
                 if newly_spawned && let Some(sid) = session_id {
                     crate::session::close_session_on_target(&target, sid).ok();
                 }
-                return Err(e);
+                return fail_task_on_error(ctx, auto_created_task.as_deref(), || Err(e));
             }
         };
 
@@ -1070,13 +1070,13 @@ fn cmd_worker_start_ctx(ctx: &OrchCtx<'_>, args: &[String]) -> io::Result<()> {
     })
 }
 
-/// 세션 생성 전에 CLI가 만든 작업만 정산한다. 기존 작업과 이미 배정된 작업은 이 경로에서 바꾸지 않는다.
-fn spawn_with_task_cleanup(
+/// 디스패치 전에 실패하면 CLI가 자동 생성한 작업만 실패로 정산한다. 기존 작업과 이미 배정된 작업은 바꾸지 않는다.
+fn fail_task_on_error<T>(
     ctx: &OrchCtx<'_>,
     auto_created_task: Option<&str>,
-    spawn: impl FnOnce() -> io::Result<u64>,
-) -> io::Result<u64> {
-    spawn().map_err(|error| {
+    action: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
+    action().map_err(|error| {
         let Some(task_id) = auto_created_task else {
             return error;
         };
@@ -2597,21 +2597,18 @@ mod tests {
             ))
         })?;
         let ctx = OrchCtx::local(&dir);
-        let error = spawn_with_task_cleanup(&ctx, Some(&automatic), || {
-            Err(io::Error::other("injected spawn failure"))
+        let error = fail_task_on_error(&ctx, Some(&automatic), || {
+            Err::<u64, _>(io::Error::other("injected spawn failure"))
         })
         .unwrap_err();
         assert_eq!(error.to_string(), "injected spawn failure");
         assert!(
-            spawn_with_task_cleanup(&ctx, None, || Err(io::Error::other(
+            fail_task_on_error(&ctx, None, || Err::<u64, _>(io::Error::other(
                 "explicit task spawn failure"
             )))
             .is_err()
         );
-        assert_eq!(
-            spawn_with_task_cleanup(&ctx, Some(&successful), || Ok(42))?,
-            42
-        );
+        assert_eq!(fail_task_on_error(&ctx, Some(&successful), || Ok(42))?, 42);
         let store = OrchestrationStore::load(&dir)?;
         let task = store
             .tasks
@@ -2638,8 +2635,8 @@ mod tests {
             );
         }
         assert!(store.dispatches.is_empty());
-        let error = spawn_with_task_cleanup(&ctx, Some("missing-task"), || {
-            Err(io::Error::other("original spawn failure"))
+        let error = fail_task_on_error(&ctx, Some("missing-task"), || {
+            Err::<u64, _>(io::Error::other("original spawn failure"))
         })
         .unwrap_err();
         assert!(error.to_string().contains("original spawn failure"));
@@ -2756,6 +2753,13 @@ mod tests {
                     "--session",
                     "1"
                 ]),
+                false
+            )
+            .is_err()
+        );
+        assert!(
+            parse_worker_start(
+                &args(&["--worktree", "new-child", "--name", "child", "--no-spawn"]),
                 false
             )
             .is_err()

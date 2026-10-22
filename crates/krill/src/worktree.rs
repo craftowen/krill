@@ -243,6 +243,8 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
         }
         None => None,
     };
+    // --repo가 부모와 다른 저장소일 수 있으므로 부모 브랜치 기본값은 --repo가 없을 때만 쓴다.
+    let explicit_repo = repo.is_some();
     let repo = repo
         .or_else(|| resolved_parent.clone())
         .map_or_else(std::env::current_dir, Ok)
@@ -250,7 +252,12 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
     // 데몬의 cwd와 다르므로 요청 전에 절대 경로로 고정한다.
     let repo =
         std::fs::canonicalize(repo).map_err(|e| format!("cannot resolve repository: {e}"))?;
-    let base = base.or_else(|| resolved_parent.as_deref().and_then(parent_branch));
+    let base = base.or_else(|| {
+        resolved_parent
+            .as_deref()
+            .filter(|_| !explicit_repo)
+            .and_then(parent_branch)
+    });
     Ok(ParsedNew {
         req: NewWorktree {
             repo: repo.as_os_str().as_bytes().to_vec(),
@@ -978,6 +985,10 @@ mod tests {
         args.extend([OsString::from("--base"), OsString::from("HEAD~0")]);
         assert_eq!(parse(&args).unwrap().req.base.as_deref(), Some("HEAD~0"));
         args.truncate(4);
+        // --repo를 명시하면 다른 저장소일 수 있어 부모 브랜치를 기준으로 쓰지 않는다.
+        let mut with_repo = args.clone();
+        with_repo.extend([OsString::from("--repo"), dir.clone().into_os_string()]);
+        assert_eq!(parse(&with_repo).unwrap().req.base, None);
         git(&["checkout", "--detach"]);
         assert_eq!(parse(&args).unwrap().req.base, None);
         assert_eq!(parent_branch(&dir.join("missing")), None);
