@@ -1,5 +1,6 @@
 //! OWE-714: 점검 ID별 조치. 파일·시스템 작업은 백그라운드에서, hook 적용은 diff 동의 뒤 실행한다.
 
+use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -219,23 +220,25 @@ pub(super) fn prepare_hook(
     agent: TargetAgent,
     env: &Env,
 ) -> Result<Option<(String, Plan)>, FixError> {
-    let executable = stage_helpers(env)?;
-    let state = canonical_path(&env.state)?;
-    let path = hook_config_path(agent, env)?;
     // Codex 훅은 `codex app-server`를 띄워 신뢰 해시를 받는다. Finder로 뜬 앱의 PATH에는
     // Homebrew·npm 경로가 없어 ENOENT가 나므로 로그인 셸 PATH로 찾는다.
     let search = (agent == TargetAgent::Other(Agent::Codex))
         .then(|| super::login_path(&env.shell))
         .flatten();
-    if let Some(plan) = Plan::prepare_with_path(
-        Action::Install,
-        agent,
-        &path,
-        &state,
-        &executable,
-        search.as_deref(),
-    )
-    .map_err(|e| hook_prepare_error(agent, &e))?
+    prepare_hook_with_path(agent, env, search.as_deref())
+}
+
+fn prepare_hook_with_path(
+    agent: TargetAgent,
+    env: &Env,
+    search: Option<&OsStr>,
+) -> Result<Option<(String, Plan)>, FixError> {
+    let executable = stage_helpers(env)?;
+    let state = canonical_path(&env.state)?;
+    let path = hook_config_path(agent, env)?;
+    if let Some(plan) =
+        Plan::prepare_with_path(Action::Install, agent, &path, &state, &executable, search)
+            .map_err(|e| hook_prepare_error(agent, &e))?
     {
         let mut diff = Vec::new();
         plan.write_diff(&mut diff).map_err(|e| e.to_string())?;
@@ -436,7 +439,13 @@ fn canonical_path(path: &Path) -> Result<PathBuf, String> {
 }
 
 fn hook_config_path(agent: TargetAgent, env: &Env) -> Result<PathBuf, String> {
-    let directory = |key, default| std::env::var_os(key).map_or(default, PathBuf::from);
+    // 테스트는 가짜 홈만 쓴다. 개발자 셸의 CLAUDE_CONFIG_DIR·CODEX_HOME을 따르면 실제 설정에 훅을 쓴다.
+    let directory = |key, default| {
+        if cfg!(test) {
+            return default;
+        }
+        std::env::var_os(key).map_or(default, PathBuf::from)
+    };
     let path = match agent {
         TargetAgent::Claude => {
             directory("CLAUDE_CONFIG_DIR", env.home.join(".claude")).join("settings.json")
@@ -687,7 +696,13 @@ pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
             .spawn(async move {
                 drop(crate::settings::install_all_skills_at(&env.home));
                 stage_helpers(&env).map_err(|e| ("bin.helpers", e))?;
-                install_managed_cli(&env).map_err(|e| ("cli.path", e))
+                let path = super::login_path(&env.shell)
+                    .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
+                install_managed_cli_at(&env, &path).map_err(|e| ("cli.path", e))?;
+                if crate::settings::agent_status_hooks_enabled_at(&env.state) {
+                    install_default_hooks(&env, &path);
+                }
+                Ok(())
             })
             .await;
         match result {
@@ -699,6 +714,78 @@ pub fn auto_prepare(env: Env, cx: &mut App) -> Task<FixOutcome> {
             }
         }
     })
+}
+
+/// 상태 감지 훅을 두는 에이전트와 로그인 셸 PATH에서 찾을 실행 파일 이름.
+const HOOK_AGENTS: [(TargetAgent, &str); 5] = [
+    (TargetAgent::Claude, "claude"),
+    (TargetAgent::Other(Agent::Codex), "codex"),
+    (TargetAgent::Other(Agent::OpenCode), "opencode"),
+    (TargetAgent::Other(Agent::Cursor), "cursor-agent"),
+    (TargetAgent::Other(Agent::Agy), "agy"),
+];
+
+/// 설정의 상태 감지 훅 스위치를 바꾼 직후 백그라운드에서 반영한다. 켜면 설치된 에이전트에 훅을
+/// 설치하고, 끄면 Krill 설치 영수증이 있는 훅만 되돌린다(사용자가 고친 항목은 남는다).
+pub fn apply_hook_preference(env: Env, enabled: bool, cx: &mut App) -> Task<()> {
+    if env.is_isolated_state() {
+        return Task::ready(());
+    }
+    cx.background_executor().spawn(async move {
+        let path = super::login_path(&env.shell)
+            .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
+        if enabled {
+            install_default_hooks(&env, &path);
+        } else {
+            uninstall_default_hooks(&env, &path);
+        }
+    })
+}
+
+/// Krill이 설치한(영수증이 있는) 상태 감지 훅을 되돌린다. 실패는 로그만 남긴다.
+fn uninstall_default_hooks(env: &Env, path: &OsStr) {
+    let state = match canonical_path(&env.state) {
+        Ok(state) => state,
+        Err(error) => {
+            tracing::warn!(%error, "hook uninstall skipped: invalid state directory");
+            return;
+        }
+    };
+    for (agent, _) in HOOK_AGENTS {
+        let result = hook_config_path(agent, env)
+            .map_err(io::Error::other)
+            .and_then(|config| {
+                Plan::prepare_with_path(
+                    Action::Uninstall,
+                    agent,
+                    &config,
+                    &state,
+                    &env.krill,
+                    Some(path),
+                )
+            })
+            .and_then(|plan| plan.map_or(Ok(()), |plan| plan.apply().map(drop)));
+        if let Err(error) = result {
+            tracing::warn!(agent = agent.id(), %error, "hook uninstall skipped");
+        }
+    }
+}
+
+/// 상태 감지 훅은 기본으로 켠다(Orca와 같음). `path`(로그인 셸 PATH)에서 실행 파일이 보이는
+/// 에이전트만 설치하고, 이미 설치 영수증이 있으면 건너뛴다. 실패는 시작을 막지 않고 로그만 남긴다
+/// — 점검 화면의 훅 행이 같은 실패를 조치와 함께 보여 준다.
+fn install_default_hooks(env: &Env, path: &OsStr) {
+    for (agent, program) in HOOK_AGENTS {
+        if krill_proto::agent::which(program, path).is_none() {
+            continue;
+        }
+        let result = prepare_hook_with_path(agent, env, Some(path)).and_then(|prepared| {
+            prepared.map_or(Ok(()), |(_, plan)| apply_hook(plan).map_err(FixError::from))
+        });
+        if let Err(error) = result {
+            tracing::warn!(agent = agent.id(), ?error, "default hook install skipped");
+        }
+    }
 }
 
 mod notifications;

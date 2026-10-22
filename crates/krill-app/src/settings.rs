@@ -136,6 +136,9 @@ pub struct Settings {
     /// 유휴 세션 하이버네이션 opt-in(기본 false, docs/agents/hibernation.md).
     #[serde(default)]
     pub hibernation_enabled: bool,
+    /// 설치된 에이전트의 상태 감지 훅을 앱 시작 때 자동 설치(기본 켬). 끄면 Krill이 설치한 훅을 되돌린다.
+    #[serde(default = "default_true")]
+    pub agent_status_hooks: bool,
     /// 히스토리 세그먼트 기록 일시중지(기본 false).
     #[serde(default)]
     pub recording_paused: bool,
@@ -271,6 +274,7 @@ impl Default for Settings {
             default_agent: "claude".to_owned(),
             yolo_mode: true,
             hibernation_enabled: false,
+            agent_status_hooks: true,
             recording_paused: false,
             secure_keyboard_entry: false,
             auto_restart_update: false,
@@ -1101,6 +1105,16 @@ fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
         sync_workspace_trust_file(dir, settings.workspace_trust_preset_enabled);
     }
     (settings, keys, stamp, errors)
+}
+
+/// `dir`의 `settings.toml`에서 상태 감지 훅 자동 설치가 켜져 있는지. 파일이 없으면 기본값(켬),
+/// 읽기·파싱에 실패하면 사용자 의도를 모르므로 끈 것으로 본다.
+#[must_use]
+pub fn agent_status_hooks_enabled_at(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join(SETTINGS_FILE)) {
+        Ok(s) => Settings::parse(&s).is_ok_and(|s| s.agent_status_hooks),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Whether the initial disk read has completed; absent configuration uses normal defaults.
@@ -8125,6 +8139,29 @@ impl SettingsView {
                 |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
             )));
 
+        // 끄면 Krill이 설치한 훅을 되돌리고, 다시 켜면 설치된 에이전트에 바로 설치한다.
+        let hooks_row = layout::row(p)
+            .child(layout::label(
+                p,
+                text::AGENT_HOOKS_TITLE.get(),
+                Some(text::AGENT_HOOKS_DESC.get()),
+            ))
+            .child(layout::controls().child(layout::switch(
+                p,
+                "agent-hooks-toggle",
+                s.agent_status_hooks,
+                false,
+                |next, _, cx| {
+                    edit(cx, move |s| s.agent_status_hooks = next);
+                    if let Some(env) = (!cfg!(test))
+                        .then(crate::onboarding::Env::current)
+                        .flatten()
+                    {
+                        crate::onboarding::actions::apply_hook_preference(env, next, cx).detach();
+                    }
+                },
+            )));
+
         let auto_setup_row = layout::row(p)
             .child(layout::label(
                 p,
@@ -8199,6 +8236,7 @@ impl SettingsView {
             .child(default_agent_row)
             .child(yolo_row)
             .child(hib_row)
+            .child(hooks_row)
             .child(auto_setup_row);
 
         let builtin_agents = krill_proto::agent::Agents::load(None).unwrap_or_default();
