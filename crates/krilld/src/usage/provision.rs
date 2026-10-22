@@ -2,8 +2,8 @@
 //!
 //! 구조는 Orca `claude-profile-provisioning.ts`·`claude-profile-history.ts`(MIT)를 참고했다(코드 복사 없음).
 //! 참고 출처: Orca, Copyright (c) 2026 Lovecast Inc. (MIT), `.ref/orca/src/main/claude-accounts/`.
-//! 사용자 `~/.claude`와 `~/.claude.json`은 **원본일 뿐**이며 만들거나 바꾸거나 지우지 않는다.
-//! 쓰는 곳은 Krill 프로필 폴더뿐이다. 기존 내용은 보존하고 MCP의 없는 서버 정의만 병합한다(충돌로 보고).
+//! Claude 기록은 `~/.claude`로 모은다. 기존 프로필 기록과 충돌 사본은 백업에 보존한다.
+//! 로그인 정보는 프로필에 남기고 MCP의 없는 서버 정의만 병합한다.
 //! 멱등이라 계정 추가 때와 실행 전마다 다시 불러도 된다.
 
 use std::io;
@@ -12,13 +12,19 @@ use std::path::Path;
 use krill_proto::usage::ProviderKind;
 
 mod agy;
+#[cfg(unix)]
+mod claude_history;
 mod codex;
+#[cfg(unix)]
+mod history_jobs;
+#[cfg(unix)]
+mod history_probe;
 
 // 오웬 승인(OWE-720): 대화 기록 공유, settings.json 최초 한 번 복사, 프로필 기존 내용 보존.
 // Orca CLAUDE_PROFILE_HISTORY_DIRS와의 항목별 비교: 비공개 OWE-720 프로비저닝 비교 기록.
 
 /// 프로필에 `~/.claude/<이름>`을 가리키는 심볼릭 링크로 공유하는 폴더(대화 기록 + 사용자 확장).
-/// 원본 폴더가 없으면 건너뛴다(만들지 않는다).
+/// Unix에서는 원본이 없어도 만들어 첫 실행부터 기록 위치가 갈라지지 않게 한다.
 pub const LINKED: &[&str] = &[
     "projects",        // 세션 JSONL: --resume/-c 대상 대화.
     "session-env",     // 세션별 환경 복원 자료(Orca 기록 공유 목록).
@@ -42,8 +48,7 @@ pub const EXCLUDED: &[&str] = &[
     ".credentials.json",
     ".claude.json",
     ".claude.json.backup",
-    "history.jsonl", // 프롬프트 입력 기록: 동시 append 병합은 별도 과제, 재개 원본은 projects.
-    "sessions",      // 폴더 데몬에 귀속된 실행 중 프로세스 레지스트리(Orca도 공유 해제).
+    "sessions", // 폴더 데몬에 귀속된 실행 중 프로세스 레지스트리(Orca도 공유 해제).
     "statsig",
     "ide",
     "cache",
@@ -87,6 +92,30 @@ pub fn provision_if_enabled(
     if !file.provisioning || !registered {
         return;
     }
+    #[cfg(unix)]
+    if provider == ProviderKind::Claude
+        && claude_history::needs_merge(&home.join(".claude"), Path::new(profile_dir))
+    {
+        let home = home.to_path_buf();
+        let state = state_dir.map(Path::to_path_buf);
+        let profile = profile_dir.to_owned();
+        history_jobs::spawn(Path::new(profile_dir), move || {
+            let current = super::accounts::load_file(&home, state.as_deref());
+            if current.provisioning
+                && current.accounts.iter().any(|account| {
+                    ProviderKind::parse(&account.provider) == Some(provider)
+                        && account.config_dir() == Path::new(&profile)
+                })
+            {
+                provision_now(&home, provider, &profile);
+            }
+        });
+        return;
+    }
+    provision_now(home, provider, profile_dir);
+}
+
+fn provision_now(home: &Path, provider: ProviderKind, profile_dir: &str) {
     let _guard = LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -113,6 +142,20 @@ pub fn provision_if_enabled(
 
 /// `profile`을 사용자 `~/.claude` 공유 프로필로 맞춘다. `profile`이 `~/.claude` 자신이거나 그 안·조상이면 거부한다.
 pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
+    #[cfg(unix)]
+    let idle = || claude_history::quiescent(profile);
+    #[cfg(not(unix))]
+    let idle = || false;
+    provision_claude_inner(home, profile, &idle)
+}
+
+fn provision_claude_inner(
+    home: &Path,
+    profile: &Path,
+    idle: &dyn Fn() -> bool,
+) -> io::Result<Report> {
+    #[cfg(not(unix))]
+    let _ = idle;
     let host = super::accounts::host_default_dir(home, ProviderKind::Claude);
     let mut report = Report::default();
     let profile_real = profile.canonicalize()?;
@@ -131,6 +174,9 @@ pub fn provision_claude(home: &Path, profile: &Path) -> io::Result<Report> {
             "profile overlaps the host claude folder",
         ));
     }
+    #[cfg(unix)]
+    claude_history::share(&host, &profile_real, idle, &mut report)?;
+    #[cfg(not(unix))]
     for &name in LINKED {
         let src = host.join(name);
         if src.is_dir() {
@@ -349,432 +395,5 @@ fn publish(
 
 #[cfg(test)]
 #[cfg(unix)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    fn root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("owe699-{tag}-{}", std::process::id()));
-        std::fs::remove_dir_all(&dir).ok();
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
-    /// 사용자 `~/.claude` 원본 상태(경로→내용)를 통째로 찍는다. 링크·복사 뒤에도 같아야 한다.
-    fn snapshot(dir: &Path) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut stack = vec![dir.to_path_buf()];
-        while let Some(d) = stack.pop() {
-            for e in std::fs::read_dir(&d).unwrap() {
-                let p = e.unwrap().path();
-                if p.is_dir() {
-                    stack.push(p.clone());
-                    out.push((p, Vec::new()));
-                } else {
-                    let bytes = std::fs::read(&p).unwrap();
-                    out.push((p, bytes));
-                }
-            }
-        }
-        out.sort();
-        out
-    }
-
-    fn host_fixture(home: &Path) -> PathBuf {
-        let host = home.join(".claude");
-        std::fs::create_dir_all(host.join("projects").join("-tmp-work")).unwrap();
-        std::fs::write(host.join("projects/-tmp-work/s1.jsonl"), "{}\n").unwrap();
-        std::fs::create_dir_all(host.join("skills").join("krill")).unwrap();
-        std::fs::write(host.join("settings.json"), "{\"theme\":\"dark\"}").unwrap();
-        std::fs::write(host.join("CLAUDE.md"), "# 전역\n").unwrap();
-        std::fs::write(host.join(".credentials.json"), "secret").unwrap();
-        std::fs::write(host.join(".claude.json"), "{}").unwrap();
-        host
-    }
-
-    #[test]
-    fn shares_all_resume_directories_without_touching_host() {
-        let home = root("resume");
-        let host = host_fixture(&home);
-        let names = [
-            "projects",
-            "session-env",
-            "file-history",
-            "shell-snapshots",
-            "todos",
-            "paste-cache",
-            "tasks",
-            "plans",
-            "transcripts",
-        ];
-        for name in names {
-            std::fs::create_dir_all(host.join(name)).unwrap();
-            std::fs::write(host.join(name).join("fixture"), name).unwrap();
-        }
-        let before = snapshot(&host);
-        let profile = home.join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        provision_claude(&home, &profile).unwrap();
-        for name in names {
-            assert_eq!(
-                std::fs::read_link(profile.join(name)).unwrap(),
-                host.join(name)
-            );
-        }
-        assert_eq!(snapshot(&host), before);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn merges_mcp_only_preserving_profile_keys_and_source() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let home = root("mcp");
-        host_fixture(&home);
-        let source = serde_json::json!({
-            "mcpServers": {"shared": {"command": "source"}, "added": {"command": "new"}},
-            "oauthAccount": {"emailAddress": "source@example.test"}, "userID": "source-id",
-            "machineID": "machine", "primaryApiKey": "api-key", "claudeAiOauth": {"accessToken": "secret"},
-            "accessToken": "secret", "refreshToken": "secret", "mcpOAuth": {"secret": true},
-            "cachedUsageUtilization": 1, "projects": {"/tmp": {"hasTrustDialogAccepted": true}},
-            "unknownFutureToken": "secret"
-        });
-        let source_file = home.join(".claude.json");
-        std::fs::write(&source_file, serde_json::to_vec(&source).unwrap()).unwrap();
-        let before = snapshot(&home);
-        let profile = home.join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        let file = profile.join(".claude.json");
-        let own = serde_json::json!({"oauthAccount": {"emailAddress": "own@example.test"},
-            "userID": "own-id", "theme": "own", "mcpServers": {
-                "shared": {"command": "own"}, "own": {"command": "mine"}}});
-        std::fs::write(&file, serde_json::to_vec(&own).unwrap()).unwrap();
-        let first = provision_claude(&home, &profile).unwrap();
-        assert!(first.changed.contains(&".claude.json"));
-        assert!(first.conflicts.contains(&".claude.json"));
-        let actual: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        let mut expected = own;
-        expected["mcpServers"]["added"] = source["mcpServers"]["added"].clone();
-        assert_eq!(actual, expected);
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        let bytes = std::fs::read(&file).unwrap();
-        let modified = std::fs::metadata(&file).unwrap().modified().unwrap();
-        assert!(
-            provision_claude(&home, &profile)
-                .unwrap()
-                .changed
-                .is_empty()
-        );
-        assert_eq!(std::fs::read(&file).unwrap(), bytes);
-        assert_eq!(
-            std::fs::metadata(&file).unwrap().modified().unwrap(),
-            modified
-        );
-        std::fs::remove_dir_all(&profile).unwrap();
-        assert_eq!(snapshot(&home), before);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn seeds_mcp_without_host_config_directory() {
-        use std::os::unix::fs::PermissionsExt as _;
-        let home = root("mcp-only");
-        std::fs::write(
-            home.join(".claude.json"),
-            r#"{"mcpServers":{"local":{"command":"example"}},"oauthAccount":{"userID":"secret"}}"#,
-        )
-        .unwrap();
-        let profile = home.join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        provision_claude(&home, &profile).unwrap();
-        let file = profile.join(".claude.json");
-        let actual: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        assert_eq!(
-            actual,
-            serde_json::json!({"mcpServers":{"local":{"command":"example"}}})
-        );
-        assert_eq!(
-            std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(!home.join(".claude").exists());
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn refuses_damaged_or_linked_profile_mcp_state() {
-        let home = root("mcp-damaged");
-        host_fixture(&home);
-        std::fs::write(
-            home.join(".claude.json"),
-            r#"{"mcpServers":{"local":{"command":"example"}}}"#,
-        )
-        .unwrap();
-        let profile = home.join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        let file = profile.join(".claude.json");
-        for invalid in ["{broken", "[]", "null", r#"{"mcpServers":[]}"#] {
-            std::fs::write(&file, invalid).unwrap();
-            assert!(provision_claude(&home, &profile).is_err());
-            assert_eq!(std::fs::read_to_string(&file).unwrap(), invalid);
-        }
-        std::fs::remove_file(&file).unwrap();
-        std::os::unix::fs::symlink(home.join(".claude.json"), &file).unwrap();
-        let before = std::fs::read(home.join(".claude.json")).unwrap();
-        let report = provision_claude(&home, &profile).unwrap();
-        assert!(report.conflicts.contains(&".claude.json"));
-        assert_eq!(std::fs::read(home.join(".claude.json")).unwrap(), before);
-        assert!(file.symlink_metadata().unwrap().file_type().is_symlink());
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn mcp_merge_respects_claudes_existing_lock() {
-        let home = root("mcp-lock");
-        host_fixture(&home);
-        std::fs::write(
-            home.join(".claude.json"),
-            r#"{"mcpServers":{"local":{"command":"example"}}}"#,
-        )
-        .unwrap();
-        let profile = home.join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        let file = profile.join(".claude.json");
-        std::fs::write(&file, r#"{"userID":"own"}"#).unwrap();
-        let lock = profile.join(".claude.json.lock");
-        std::fs::create_dir(&lock).unwrap();
-        let report = provision_claude(&home, &profile).unwrap();
-        assert!(report.conflicts.contains(&".claude.json"));
-        assert_eq!(
-            std::fs::read_to_string(&file).unwrap(),
-            r#"{"userID":"own"}"#
-        );
-        assert!(lock.is_dir(), "기존 Claude 잠금을 해제하지 않는다");
-        std::fs::remove_dir(&lock).unwrap();
-        provision_claude(&home, &profile).unwrap();
-        assert!(!lock.exists());
-        let actual: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
-        assert_eq!(
-            actual,
-            serde_json::json!({"userID":"own", "mcpServers":{"local":{"command":"example"}}})
-        );
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn atomic_mcp_publication_preserves_newer_state_and_removes_staging_file() {
-        let home = root("mcp-atomic");
-        let file = home.join(".claude.json");
-        std::fs::write(&file, b"newer state").unwrap();
-        assert_eq!(
-            publish_mcp(&file, b"replacement", Some(b"old state"))
-                .unwrap_err()
-                .kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(std::fs::read(&file).unwrap(), b"newer state");
-        assert_eq!(
-            publish_mcp(&file, b"replacement", None).unwrap_err().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        assert_eq!(std::fs::read(&file).unwrap(), b"newer state");
-        assert_eq!(
-            std::fs::read_dir(&home).unwrap().count(),
-            1,
-            "임시 파일은 남기지 않는다"
-        );
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn disabled_registered_profile_never_writes_any_file() {
-        let home = root("mcp-disabled");
-        host_fixture(&home);
-        std::fs::write(
-            home.join(".claude.json"),
-            r#"{"mcpServers":{"local":{"command":"example"}}}"#,
-        )
-        .unwrap();
-        let profile = home.join("profile");
-        std::fs::create_dir(&profile).unwrap();
-        let state = home.join("state");
-        std::fs::create_dir(&state).unwrap();
-        let dir = profile.to_str().unwrap();
-        std::fs::write(state.join("accounts.toml"), format!(
-            "provisioning = false\n[[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{dir}\"\n"
-        )).unwrap();
-        let before = snapshot(&home);
-        // 바이트가 같은 재쓰기·임시 파일 생성 후 삭제도 inode/mtime/ctime으로 잡는다.
-        let metadata = || {
-            use std::os::unix::fs::MetadataExt as _;
-            std::iter::once(home.clone())
-                .chain(before.iter().map(|(path, _)| path.clone()))
-                .map(|path| {
-                    let m = std::fs::symlink_metadata(&path).unwrap();
-                    (
-                        path,
-                        m.ino(),
-                        m.mtime(),
-                        m.mtime_nsec(),
-                        m.ctime(),
-                        m.ctime_nsec(),
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        let before_metadata = metadata();
-        provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
-        assert_eq!(metadata(), before_metadata);
-        assert_eq!(snapshot(&home), before);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn lists_never_overlap() {
-        for name in LINKED.iter().chain(COPIED) {
-            assert!(!EXCLUDED.contains(name), "{name}");
-        }
-    }
-
-    #[test]
-    fn provisions_idempotently_without_touching_host() {
-        let home = root("idem");
-        let host = host_fixture(&home);
-        let before = snapshot(&host);
-        let profile = home.join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
-
-        let first = provision_claude(&home, &profile).unwrap();
-        assert_eq!(
-            first.changed,
-            ["projects", "skills", "settings.json", "CLAUDE.md"]
-        );
-        assert!(first.conflicts.is_empty());
-        assert_eq!(
-            std::fs::read_link(profile.join("projects")).unwrap(),
-            host.join("projects")
-        );
-        assert!(profile.join("projects/-tmp-work/s1.jsonl").is_file());
-        assert_eq!(
-            std::fs::read_to_string(profile.join("CLAUDE.md")).unwrap(),
-            MEMORY_IMPORT
-        );
-        assert!(
-            !profile.join(".credentials.json").exists(),
-            "로그인은 공유하지 않는다"
-        );
-        assert!(!profile.join(".claude.json").exists());
-        assert!(
-            !profile.join("todos").exists(),
-            "원본에 없는 폴더는 만들지 않는다"
-        );
-
-        let again = provision_claude(&home, &profile).unwrap();
-        assert_eq!(
-            again,
-            Report::default(),
-            "두 번째 실행은 아무것도 바꾸지 않는다"
-        );
-        assert_eq!(snapshot(&host), before, "사용자 ~/.claude 원본 불변");
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn migrates_empty_dirs_and_keeps_profile_data() {
-        let home = root("migrate");
-        let host = host_fixture(&home);
-        let before = snapshot(&host);
-        let profile = home.join("profile");
-        // 기존 프로필: 빈 projects(이전 대상), 내용 있는 skills·자체 settings.json·CLAUDE.md(보존).
-        std::fs::create_dir_all(profile.join("projects")).unwrap();
-        std::fs::create_dir_all(profile.join("skills/mine")).unwrap();
-        std::fs::write(profile.join("settings.json"), "{\"mine\":1}").unwrap();
-        std::fs::write(profile.join("CLAUDE.md"), "내 메모\n").unwrap();
-
-        let report = provision_claude(&home, &profile).unwrap();
-        assert_eq!(report.changed, ["projects"]);
-        assert_eq!(report.conflicts, ["skills"]);
-        assert!(
-            profile
-                .join("projects")
-                .symlink_metadata()
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(profile.join("skills/mine").is_dir());
-        assert_eq!(
-            std::fs::read_to_string(profile.join("settings.json")).unwrap(),
-            "{\"mine\":1}"
-        );
-        assert_eq!(
-            std::fs::read_to_string(profile.join("CLAUDE.md")).unwrap(),
-            "내 메모\n"
-        );
-        assert_eq!(snapshot(&host), before);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn refuses_host_folder_and_its_children() {
-        let home = root("refuse");
-        let host = host_fixture(&home);
-        // Orca 감지 계정 경로(`~/.claude/profiles/<slug>`)처럼 원본 안에 있는 프로필.
-        let inner = host.join("profiles").join("x");
-        std::fs::create_dir_all(&inner).unwrap();
-        let before = snapshot(&host);
-        assert!(provision_claude(&home, &host).is_err());
-        assert!(provision_claude(&home, &inner).is_err());
-        assert!(
-            provision_claude(&home, &home).is_err(),
-            "원본의 조상(홈 자체)도 거부한다"
-        );
-        assert_eq!(snapshot(&host), before);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn registered_only_and_trashing_profile_keeps_host_history() {
-        let home = root("gate");
-        let state = home.join("state");
-        let host = host_fixture(&home);
-        let before = snapshot(&host);
-        let profile = home.join("profile");
-        std::fs::create_dir_all(&profile).unwrap();
-        std::fs::create_dir_all(&state).unwrap();
-        let dir = profile.to_str().unwrap();
-
-        // 설정 없음(기본 켜짐)이어도 등록된 계정이 없으면 아무것도 하지 않는다.
-        provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
-        assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 0);
-
-        std::fs::write(state.join("accounts.toml"), "provisioning = true\n").unwrap();
-        provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
-        assert_eq!(
-            std::fs::read_dir(&profile).unwrap().count(),
-            0,
-            "등록 안 된 폴더(예: 데몬 env의 실제 CLAUDE_CONFIG_DIR)는 건드리지 않는다"
-        );
-        std::fs::write(
-            state.join("accounts.toml"),
-            format!(
-                "provisioning = true\n[[accounts]]\nid = \"a\"\nprovider = \"claude\"\nlabel = \"a\"\nprofile_dir = \"{dir}\"\n"
-            ),
-        )
-        .unwrap();
-        provision_if_enabled(&home, Some(&state), ProviderKind::Codex, dir);
-        assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 0, "Claude만");
-        provision_if_enabled(&home, Some(&state), ProviderKind::Claude, dir);
-        assert!(profile.join("projects").exists());
-
-        // 계정 삭제는 프로필을 휴지통으로 옮긴다. 링크만 옮겨지고 원본 대화는 남아야 한다.
-        std::fs::remove_dir_all(&profile).unwrap();
-        assert_eq!(snapshot(&host), before);
-        std::fs::remove_dir_all(home).ok();
-    }
-}
+#[path = "provision/claude_tests.rs"]
+mod tests;
