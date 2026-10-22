@@ -11,12 +11,19 @@ use sha2::{Digest as _, Sha256};
 
 use super::Report;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ForeignLinks {
+    Preserve,
+    Copy,
+}
+
 pub(super) struct Store<'a> {
     pub host: &'a Path,
     pub profile: &'a Path,
     pub directories: &'static [&'static str],
     pub files: &'static [&'static str],
     pub backup_name: &'static str,
+    pub foreign_links: ForeignLinks,
 }
 
 impl Store<'_> {
@@ -28,6 +35,12 @@ impl Store<'_> {
         let (host, profile) = (self.host, self.profile);
         let archive = archive_root(host, profile, self.backup_name);
         self.names().any(|name| {
+            if profile.join(name).is_symlink() {
+                return self.foreign_links == ForeignLinks::Copy
+                    && fs::read_link(profile.join(name)).is_ok_and(|path| path != host.join(name))
+                    && profile.join(name).canonicalize().ok()
+                        != host.join(name).canonicalize().ok();
+            }
             !profile.join(name).is_symlink()
                 && (profile.join(name).symlink_metadata().is_ok()
                     || archive
@@ -73,8 +86,14 @@ impl Store<'_> {
                         .is_some_and(|(a, b)| a == b)
                 {
                     ensure_target(&target, name, self.files)?;
+                } else if self.foreign_links == ForeignLinks::Copy && source.exists() {
+                    if !idle() {
+                        report.conflicts.push(name);
+                        continue;
+                    }
+                    self.import_link(name, &source, &target, &archive)?;
+                    report.changed.push(name);
                 } else {
-                    // 외부/Orca 소유 링크의 대상을 이행하지 않는다.
                     report.conflicts.push(name);
                 }
                 continue;
@@ -115,6 +134,37 @@ impl Store<'_> {
                 std::os::unix::fs::symlink(&target, &source)?;
             }
             report.changed.push(name);
+        }
+        Ok(())
+    }
+    /// 외부 저장소는 읽기만 한다. 사본을 병합한 뒤 Krill 쪽 링크만 바꾼다.
+    fn import_link(
+        &self,
+        name: &str,
+        source: &Path,
+        target: &Path,
+        archive: &Path,
+    ) -> io::Result<()> {
+        let foreign = source.canonicalize()?;
+        let profile = self.profile.canonicalize()?;
+        let host = self.host.canonicalize()?;
+        if foreign.starts_with(&profile)
+            || profile.starts_with(&foreign)
+            || foreign.starts_with(&host)
+            || host.starts_with(&foreign)
+        {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        let backup = archive.join(name);
+        make_archive(self.host, &backup)?;
+        let copy = unused_path(&backup.join("foreign-copy"));
+        copy_tree(&foreign, &copy, 0)?;
+        merge(&copy, target, &backup.join("displaced"), 0)?;
+        let prior = unused_path(&backup.join("previous-link"));
+        fs::rename(source, &prior)?;
+        if let Err(error) = std::os::unix::fs::symlink(target, source) {
+            fs::rename(&prior, source)?;
+            return Err(error);
         }
         Ok(())
     }
@@ -249,5 +299,58 @@ fn merge(source: &Path, target: &Path, displaced: &Path, depth: usize) -> io::Re
         fs::hard_link(source, target)?;
     }
     // 선택되지 않은 incoming도 original 트리에 그대로 보존한다.
+    Ok(())
+}
+
+fn unused_path(base: &Path) -> PathBuf {
+    let mut candidate = base.to_path_buf();
+    let mut sequence = 0_u64;
+    while candidate.symlink_metadata().is_ok() {
+        sequence += 1;
+        candidate = base.with_file_name(format!(
+            "{}.{}",
+            base.file_name().unwrap_or_default().to_string_lossy(),
+            sequence
+        ));
+    }
+    candidate
+}
+
+/// 외부 원본과 inode를 공유하지 않는다. 사본에 쓰더라도 Orca 원본은 바뀌지 않는다.
+fn copy_tree(source: &Path, target: &Path, depth: usize) -> io::Result<()> {
+    if depth > 64 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let metadata = source.symlink_metadata()?;
+    if metadata.is_dir() {
+        real_dir(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_tree(&entry.path(), &target.join(entry.file_name()), depth + 1)?;
+        }
+    } else if metadata.is_file() {
+        let mut input = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(source)?;
+        let before = input.metadata()?;
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(target)?;
+        io::copy(&mut input, &mut output)?;
+        let after = input.metadata()?;
+        if before.len() != after.len() || before.modified()? != after.modified()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "source history changed while copying",
+            ));
+        }
+        output.set_times(std::fs::FileTimes::new().set_modified(before.modified()?))?;
+        output.sync_all()?;
+    } else {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
     Ok(())
 }

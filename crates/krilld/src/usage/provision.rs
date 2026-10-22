@@ -95,9 +95,13 @@ pub fn provision_if_enabled(
         return;
     }
     #[cfg(unix)]
-    if provider == ProviderKind::Claude
-        && claude_history::needs_merge(&home.join(".claude"), Path::new(profile_dir))
-    {
+    if match provider {
+        ProviderKind::Claude => {
+            claude_history::needs_merge(&home.join(".claude"), Path::new(profile_dir))
+        }
+        ProviderKind::Codex => codex::needs_merge(home, Path::new(profile_dir)),
+        _ => false,
+    } {
         let home = home.to_path_buf();
         let state = state_dir.map(Path::to_path_buf);
         let profile = profile_dir.to_owned();
@@ -351,6 +355,7 @@ fn publish_mcp(dst: &Path, bytes: &[u8], original: Option<&[u8]>) -> io::Result<
 }
 
 /// 없으면 링크, 빈 폴더면 링크로 바꾼다(기존 빈 프로필 이전). 같은 링크면 그대로, 그 밖은 충돌.
+#[cfg(not(unix))]
 fn link(src: &Path, dst: &Path, name: &'static str, report: &mut Report) -> io::Result<()> {
     match dst.symlink_metadata() {
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}

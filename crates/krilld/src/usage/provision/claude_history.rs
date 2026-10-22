@@ -2,7 +2,10 @@
 use std::io;
 use std::path::Path;
 
-use super::{LINKED, Report, history_store::Store};
+use super::{
+    LINKED, Report,
+    history_store::{ForeignLinks, Store},
+};
 const HISTORY: &str = "history.jsonl";
 
 fn store<'a>(host: &'a Path, profile: &'a Path) -> Store<'a> {
@@ -12,6 +15,7 @@ fn store<'a>(host: &'a Path, profile: &'a Path) -> Store<'a> {
         directories: LINKED,
         files: &[HISTORY],
         backup_name: "projects-merged-backup",
+        foreign_links: ForeignLinks::Preserve,
     }
 }
 

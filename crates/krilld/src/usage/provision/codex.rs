@@ -8,15 +8,62 @@ use std::path::Path;
 
 use super::Report;
 
-const LINKED: &[&str] = &["sessions", "archived_sessions"];
+const LINKED: &[&str] = &[
+    "sessions",
+    "archived_sessions",
+    "shell_snapshots",
+    "thread-writer-locks",
+];
+#[cfg(unix)]
+const FILES: &[&str] = &["history.jsonl", "session_index.jsonl"];
+
+#[cfg(unix)]
+fn store<'a>(host: &'a Path, profile: &'a Path) -> super::history_store::Store<'a> {
+    super::history_store::Store {
+        host,
+        profile,
+        directories: LINKED,
+        files: FILES,
+        backup_name: "history-merged-backup",
+        foreign_links: super::history_store::ForeignLinks::Copy,
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn needs_merge(home: &Path, profile: &Path) -> bool {
+    store(&home.join(".codex"), profile).needs_merge()
+        || profile.join("config.toml").is_file()
+            && std::fs::read_to_string(profile.join("config.toml"))
+                .ok()
+                .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+                .is_some_and(|config| config.get("sqlite_home").is_none())
+}
+
 const COPIED: &[&str] = &["config.toml", "AGENTS.md"];
 
 pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
+    provision_inner(home, profile, &|| {
+        #[cfg(unix)]
+        {
+            super::history_probe::quiescent(profile, "CODEX_HOME")
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    })
+}
+
+fn provision_inner(home: &Path, profile: &Path, idle: &dyn Fn() -> bool) -> io::Result<Report> {
+    #[cfg(not(unix))]
+    let _ = idle;
     let mut report = Report::default();
     let profile = profile.canonicalize()?;
     let host = match home.join(".codex").canonicalize() {
         Ok(host) => host,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(report),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            home.canonicalize()?.join(".codex")
+        }
         Err(error) => return Err(error),
     };
     if profile.starts_with(&host) || host.starts_with(&profile) {
@@ -36,6 +83,9 @@ pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
             ));
         }
     }
+    #[cfg(unix)]
+    store(&host, &profile).share(idle, &mut report)?;
+    #[cfg(not(unix))]
     for &name in LINKED {
         let src = host.join(name);
         if src.is_dir() {
@@ -48,7 +98,66 @@ pub(super) fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
             copy_once(&src, &profile.join(name), name, &mut report)?;
         }
     }
+    #[cfg(unix)]
+    configure_sqlite_home(&host, &profile, idle, &mut report)?;
     Ok(report)
+}
+
+/// 기존 `SQLite`가 있는 프로필은 직접 합치거나 전환하지 않는다. paginated 대화 본문을 보호한다.
+#[cfg(unix)]
+fn sqlite_transition_blocked(profile: &Path) -> io::Result<bool> {
+    for entry in std::fs::read_dir(profile)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_string_lossy().ends_with(".sqlite") && entry.metadata()?.len() > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(unix)]
+fn configure_sqlite_home(
+    host: &Path,
+    profile: &Path,
+    idle: &dyn Fn() -> bool,
+    report: &mut Report,
+) -> io::Result<()> {
+    let config = profile.join("config.toml");
+    let original = match std::fs::read_to_string(&config) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error),
+    };
+    let parsed: toml::Value = toml::from_str(&original).map_err(io::Error::other)?;
+    if let Some(existing) = parsed.get("sqlite_home") {
+        if existing.as_str().is_none_or(|path| {
+            Path::new(path) != host
+                && Path::new(path).canonicalize().ok() != host.canonicalize().ok()
+        }) {
+            report.conflicts.push("sqlite_home");
+        }
+        return Ok(());
+    }
+    if sqlite_transition_blocked(profile)? || !idle() {
+        report.conflicts.push("sqlite_home");
+        return Ok(());
+    }
+    if config.is_symlink() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let path = toml::Value::String(host.to_string_lossy().into_owned()).to_string();
+    let updated = format!("sqlite_home = {path}\n{original}");
+    // 기존 바이트·주석은 그대로 뒤에 둔다. 원본 설정은 별도 사본으로도 보존한다.
+    if !original.is_empty() {
+        let backup = profile.join("config.toml.krill-history-backup");
+        if !backup.exists() {
+            std::fs::hard_link(&config, backup)?;
+        }
+    }
+    super::super::accounts::write_atomic_0600(&config, updated.as_bytes())?;
+    report.changed.push("sqlite_home");
+    Ok(())
 }
 
 /// `create_new`로 임시 경로의 기존 링크를 거부하고 `hard_link`로 기존 설정을 덮어쓰지 않고 게시한다.
@@ -97,6 +206,10 @@ mod tests {
     use std::path::PathBuf;
     use std::time::SystemTime;
 
+    fn provision(home: &Path, profile: &Path) -> io::Result<Report> {
+        super::provision_inner(home, profile, &|| true)
+    }
+
     fn fixture(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
         let home = std::env::temp_dir().join(format!("owe721-{tag}-{}", std::process::id()));
         std::fs::remove_dir_all(&home).ok();
@@ -104,6 +217,8 @@ mod tests {
         let profile = home.join("profile");
         std::fs::create_dir_all(host.join("sessions/2026/10/17")).unwrap();
         std::fs::create_dir_all(host.join("archived_sessions")).unwrap();
+        std::fs::create_dir_all(host.join("shell_snapshots")).unwrap();
+        std::fs::create_dir_all(host.join("thread-writer-locks")).unwrap();
         std::fs::create_dir_all(&profile).unwrap();
         for (name, text) in [
             ("sessions/2026/10/17/rollout-test.jsonl", "host transcript"),
@@ -150,7 +265,13 @@ mod tests {
         let report = provision(&home, &profile).unwrap();
         assert_eq!(
             report.changed,
-            ["sessions", "archived_sessions", "config.toml", "AGENTS.md"]
+            LINKED
+                .iter()
+                .chain(FILES)
+                .chain(COPIED)
+                .copied()
+                .chain(["sqlite_home"])
+                .collect::<Vec<_>>()
         );
         assert!(report.conflicts.is_empty());
         for name in LINKED {
@@ -168,19 +289,26 @@ mod tests {
                     .file_type()
                     .is_symlink()
             );
-            assert_eq!(
-                std::fs::read(profile.join(name)).unwrap(),
-                std::fs::read(host.join(name)).unwrap()
-            );
+            if *name != "config.toml" {
+                assert_eq!(
+                    std::fs::read(profile.join(name)).unwrap(),
+                    std::fs::read(host.join(name)).unwrap()
+                );
+            }
         }
         assert_eq!(
             std::fs::read(profile.join("auth.json")).unwrap(),
             b"account-secret"
         );
-        for name in ["history.jsonl", "session_index.jsonl", "state_5.sqlite"] {
-            assert!(!profile.join(name).exists());
-        }
-        std::fs::write(profile.join("config.toml"), "model = \"mine\"\n").unwrap();
+        assert!(!profile.join("state_5.sqlite").exists());
+        std::fs::write(
+            profile.join("config.toml"),
+            format!(
+                "sqlite_home = {:?}\nmodel = \"mine\"\n",
+                host.to_string_lossy()
+            ),
+        )
+        .unwrap();
         let profile_before = snapshot(&profile);
         assert_eq!(provision(&home, &profile).unwrap(), Report::default());
         assert_eq!(snapshot(&profile), profile_before);
@@ -196,17 +324,25 @@ mod tests {
         std::fs::create_dir_all(profile.join("sessions")).unwrap();
         std::fs::write(profile.join("sessions/mine.jsonl"), "mine").unwrap();
         std::os::unix::fs::symlink("/missing-owe721", profile.join("archived_sessions")).unwrap();
-        std::fs::write(profile.join("config.toml"), "mine").unwrap();
+        std::fs::write(profile.join("config.toml"), "model = \"mine\"\n").unwrap();
         let before = snapshot(&host);
         let report = provision(&home, &profile).unwrap();
-        assert_eq!(report.conflicts, ["sessions", "archived_sessions"]);
-        assert_eq!(report.changed, ["AGENTS.md"]);
+        assert_eq!(report.conflicts, ["archived_sessions"]);
+        assert!(report.changed.contains(&"sessions"));
         assert_eq!(
             std::fs::read(profile.join("sessions/mine.jsonl")).unwrap(),
             b"mine"
         );
-        assert_eq!(std::fs::read(profile.join("config.toml")).unwrap(), b"mine");
-        assert_eq!(snapshot(&host), before);
+        assert!(
+            std::fs::read_to_string(profile.join("config.toml"))
+                .unwrap()
+                .contains("model = \"mine\"")
+        );
+        for (path, bytes, _) in before {
+            if path.is_file() {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -223,9 +359,9 @@ mod tests {
         }
         assert_eq!(snapshot(&host), before);
         std::fs::remove_dir_all(&host).unwrap();
-        assert_eq!(provision(&home, &profile).unwrap(), Report::default());
-        assert!(!host.exists());
-        assert_eq!(std::fs::read_dir(&profile).unwrap().count(), 0);
+        provision(&home, &profile).unwrap();
+        assert!(host.is_dir());
+        assert!(profile.join("sessions").is_symlink());
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -295,7 +431,11 @@ mod tests {
                 & 0o777,
             0o600
         );
-        assert_eq!(snapshot(&host), before);
+        for (path, bytes, _) in before {
+            if path.is_file() {
+                assert_eq!(std::fs::read(path).unwrap(), bytes);
+            }
+        }
         std::fs::remove_dir_all(home).unwrap();
     }
 
@@ -329,6 +469,89 @@ mod tests {
         let before = snapshot(&home);
         provision_if_enabled(&home, Some(&state), ProviderKind::Antigravity, dir);
         assert_eq!(snapshot(&home), before);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn redirects_orca_history_by_copying_without_modifying_the_orca_source() {
+        let (home, host, profile) = fixture("orca-copy");
+        let source = home.join("orca/codex-accounts/account/home/sessions");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(
+            source.join("krill-session.jsonl"),
+            b"Orca source remains intact",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(&source, profile.join("sessions")).unwrap();
+        let before = snapshot(&home.join("orca"));
+        provision(&home, &profile).unwrap();
+        assert_eq!(
+            std::fs::read_link(profile.join("sessions")).unwrap(),
+            host.canonicalize().unwrap().join("sessions")
+        );
+        assert_eq!(
+            std::fs::read(host.join("sessions/krill-session.jsonl")).unwrap(),
+            b"Orca source remains intact"
+        );
+        assert_eq!(snapshot(&home.join("orca")), before);
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn new_codex_profile_shares_history_and_sqlite_home_without_copying_auth() {
+        let (home, host, profile) = fixture("shared-first");
+        std::fs::remove_dir_all(&host).unwrap();
+        provision(&home, &profile).unwrap();
+        assert_eq!(
+            std::fs::read_link(profile.join("sessions")).unwrap(),
+            host.canonicalize().unwrap().join("sessions")
+        );
+        let config = std::fs::read_to_string(profile.join("config.toml")).unwrap();
+        let config: toml::Value = toml::from_str(&config).unwrap();
+        assert_eq!(
+            config.get("sqlite_home").and_then(toml::Value::as_str),
+            host.canonicalize().unwrap().to_str()
+        );
+        assert!(!profile.join("auth.json").exists());
+        std::fs::remove_dir_all(home).unwrap();
+    }
+    #[test]
+    fn sqlite_setting_preserves_comments_custom_overrides_and_existing_databases() {
+        let (home, host, profile) = fixture("sqlite-policy");
+        let original = "# account comments\nmodel = \"fixture\"\n[features]\nexample = true\n";
+        std::fs::write(profile.join("config.toml"), original).unwrap();
+        provision(&home, &profile).unwrap();
+        let updated = std::fs::read_to_string(profile.join("config.toml")).unwrap();
+        assert!(updated.ends_with(original));
+        assert_eq!(
+            std::fs::read_to_string(profile.join("config.toml.krill-history-backup")).unwrap(),
+            original
+        );
+        assert_eq!(provision(&home, &profile).unwrap(), Report::default());
+        let custom = "# custom home\nsqlite_home = \"/custom/index\"\n";
+        std::fs::write(profile.join("config.toml"), custom).unwrap();
+        assert!(
+            provision(&home, &profile)
+                .unwrap()
+                .conflicts
+                .contains(&"sqlite_home")
+        );
+        assert_eq!(
+            std::fs::read_to_string(profile.join("config.toml")).unwrap(),
+            custom
+        );
+        std::fs::write(profile.join("config.toml"), original).unwrap();
+        std::fs::write(profile.join("state_5.sqlite"), b"private paginated index").unwrap();
+        let report = provision(&home, &profile).unwrap();
+        assert!(report.conflicts.contains(&"sqlite_home"));
+        assert_eq!(
+            std::fs::read_to_string(profile.join("config.toml")).unwrap(),
+            original
+        );
+        assert_eq!(
+            std::fs::read(profile.join("state_5.sqlite")).unwrap(),
+            b"private paginated index"
+        );
+        assert!(!host.join("state_5.sqlite").is_symlink());
         std::fs::remove_dir_all(home).unwrap();
     }
 }
