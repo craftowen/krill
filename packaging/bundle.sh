@@ -123,12 +123,9 @@ ensure_codesign_identity() {
         local pass
         pass=$(cat "$kc_pass_file")
         /usr/bin/security unlock-keychain -p "$pass" "$kc_path" 2>/dev/null || fail "cannot unlock existing signing keychain"
-        # Keep the installed certificate (and its TCC identity) across the rename.
-        for cs_identity in "Krill Local Code Signing" "Minikrill Local Code Signing"; do
-            if /usr/bin/security find-identity -p codesigning "$kc_path" 2>/dev/null | /usr/bin/grep -Fq "\"$cs_identity\""; then
-                return 0
-            fi
-        done
+        if /usr/bin/security find-identity -p codesigning "$kc_path" 2>/dev/null | /usr/bin/grep -Fq "\"$cs_identity\""; then
+            return 0
+        fi
         fail "existing signing certificate unavailable; refusing to replace it"
     fi
     mkdir -p "$(dirname "$kc_path")" "$stage/codesign"

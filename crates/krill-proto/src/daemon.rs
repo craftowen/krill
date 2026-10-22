@@ -42,9 +42,6 @@ use crate::control::{FEAT_UPGRADE, Reply, Request, Upgrade, Upgraded, is_newer};
 use crate::ipc::{self, ClientHello, ClientRole, Negotiated, ServerHello};
 use crate::screen::Msg as _;
 
-pub mod migrate;
-pub use migrate::{LINUX_STATE_PARENT, state_dir_in};
-
 /// 감시 연결에만 초기 holder 상태와 상실 통보를 보낸다. 기존 Hello DTO는 바꾸지 않는다.
 pub const FEAT_HOLDER_WATCH: u64 = 1 << 7;
 /// holder 아래에서 뜬 krilld가 소켓 락을 못 잡고 인계 상대(고아 krilld)도 없을 때의 종료 코드(OWE-589).
@@ -208,10 +205,6 @@ impl HolderStatus {
 pub const BUNDLE_ID: &str = "dev.krill.app";
 /// holder launchd 잡 이름. 헬퍼는 앱과 다른 고유 identifier(CONVENTIONS A3).
 pub const HOLDER_LABEL: &str = "dev.krill.app.holder";
-/// 개명 전 번들 id. 이관 전 상태 디렉터리·옛 launchd 라벨 해제·구버전 원격 소켓 탐색에만 쓴다([`migrate::run`]).
-pub const LEGACY_BUNDLE_ID: &str = "dev.minikrill.app";
-/// 개명 전 holder launchd 잡 이름. 이관 때 해제한다.
-pub const LEGACY_HOLDER_LABEL: &str = "dev.minikrill.app.holder";
 /// holder에게 "launchd 밖에서 떴으니 스스로 setsid하라"고 알리는 첫 인자. launchd 경로에서는 주지 않는다.
 pub const DETACH_ARG: &str = "--detach";
 /// macOS `sockaddr_un.sun_path` 크기(NUL 포함). 소켓 경로는 자르지 않고 오류로 본다(CONVENTIONS A6).
@@ -238,6 +231,27 @@ const RETRY_CAP: Duration = Duration::from_millis(500);
 /// 그보다 길게 잡는다. 넘으면 락을 쥔 채 멈춘 프로세스가 있는 것이다.
 const LOCK_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// `HOME` 기준 상태 디렉터리(`~/Library/Application Support/<번들 id>`).
+#[cfg(not(any(windows, target_os = "linux")))]
+pub fn state_dir_in(home: &Path) -> PathBuf {
+    home.join("Library/Application Support").join(BUNDLE_ID)
+}
+
+/// Windows: `local_app_data`(`%LOCALAPPDATA%`) 아래 `Krill`.
+#[cfg(windows)]
+pub fn state_dir_in(local_app_data: &Path) -> PathBuf {
+    local_app_data.join("Krill")
+}
+
+/// Linux(원격 호스트): `~/.local/share/<번들 id>`.
+#[cfg(target_os = "linux")]
+pub fn state_dir_in(home: &Path) -> PathBuf {
+    home.join(LINUX_STATE_PARENT).join(BUNDLE_ID)
+}
+
+/// Linux 상태 디렉터리의 부모(`HOME` 기준). 원격 소켓 탐색(`krill-hosts`)도 쓴다.
+pub const LINUX_STATE_PARENT: &str = ".local/share";
+
 /// 상태 디렉터리 재정의 환경변수(`KRILL_STATE_DIR`, 개발·테스트 격리). 상태 디렉터리 재정의 여부는 모두 이 함수로 판단한다.
 pub fn state_dir_override() -> Option<OsString> {
     std::env::var_os("KRILL_STATE_DIR")
@@ -245,7 +259,6 @@ pub fn state_dir_override() -> Option<OsString> {
 
 /// 상태 디렉터리. [`state_dir_override`]가 있으면 그것, 없으면 `~/Library/Application Support/<번들 id>`
 /// (Windows는 `%LOCALAPPDATA%\Krill`).
-/// 이관 전(새 디렉터리 없음 + 옛 디렉터리가 실제 디렉터리)에는 옛 번들 id 경로다([`migrate::run`]).
 pub fn state_dir() -> Option<PathBuf> {
     if let Some(dir) = state_dir_override() {
         return Some(PathBuf::from(dir));

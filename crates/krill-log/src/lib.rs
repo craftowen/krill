@@ -81,16 +81,7 @@ fn directory_in(
         base.map(|h| h.join(".local/state/krill/logs"))
     }
     #[cfg(not(any(windows, target_os = "linux")))]
-    base.map(|h| {
-        let logs = h.join("Library/Logs");
-        let (new, old) = (logs.join("Krill"), logs.join("Minikrill"));
-        // MK-170: 이관 전(새 디렉터리 없음 + 옛 디렉터리가 실제 디렉터리)에는 옛 이름에 계속 쓴다.
-        if new.symlink_metadata().is_err() && old.symlink_metadata().is_ok_and(|m| m.is_dir()) {
-            old
-        } else {
-            new
-        }
-    })
+    base.map(|h| h.join("Library/Logs/Krill"))
 }
 
 /// Install INFO/WARN/ERROR events from Krill targets. No spans are retained.
@@ -149,23 +140,13 @@ mod tests {
         );
     }
 
-    /// MK-170: 이관 전에는 옛 `Logs/Minikrill`, 옮겨진 뒤(옛 자리는 링크)에는 `Logs/Krill`.
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
-    #[cfg_attr(not(target_os = "macos"), ignore = "macOS 전용: ~/Library/Logs 이관")]
-    fn directory_follows_bundle_migration() {
-        let home = std::env::temp_dir().join(format!("mk170-log-{}", std::process::id()));
-        std::fs::remove_dir_all(&home).ok();
-        let logs = home.join("Library/Logs");
-        std::fs::create_dir_all(logs.join("Minikrill")).unwrap();
-        let get_home = || Some(home.clone());
+    fn directory_is_library_logs_krill() {
+        let home = PathBuf::from("/Users/u");
         assert_eq!(
-            directory_in(|_| None, get_home),
-            Some(logs.join("Minikrill"))
+            directory_in(|_| None, || Some(home.clone())),
+            Some(home.join("Library/Logs/Krill"))
         );
-        std::fs::rename(logs.join("Minikrill"), logs.join("Krill")).unwrap();
-        std::os::unix::fs::symlink("Krill", logs.join("Minikrill")).unwrap();
-        assert_eq!(directory_in(|_| None, get_home), Some(logs.join("Krill")));
-        std::fs::remove_dir_all(&home).unwrap();
     }
 }

@@ -2146,7 +2146,7 @@ fn normalize_symlink_list(items: impl IntoIterator<Item = String>) -> Vec<String
     out
 }
 
-/// Inspects a repository's `krill.toml` (legacy `minikrill.toml`), `orca.yaml`, `package.json`, and `WorktreeStore`
+/// Inspects a repository's `krill.toml`, `orca.yaml`, `package.json`, and `WorktreeStore`
 /// to summarize configured and suggested `setup` / `archive` hooks and worktree symlinks (MK-174).
 #[must_use]
 pub fn inspect_repo_hooks(repo: &Path, state_dir: Option<&Path>) -> RepoHookSummary {
@@ -2980,7 +2980,7 @@ mod tests {
         fs::create_dir_all(legacy.join("computer-use"))?;
         fs::write(
             legacy.join("computer-use/SKILL.md"),
-            "old\n<!-- minikrill-managed-skill -->\n",
+            "old\n<!-- krill-managed-skill -->\n",
         )?;
         install_skill("computer-use", &legacy)?;
         assert!(!legacy.join("computer-use").exists());
@@ -2989,14 +2989,14 @@ mod tests {
         fs::create_dir_all(legacy.join("mk-orchestration"))?;
         fs::write(
             legacy.join("mk-orchestration/SKILL.md"),
-            "old\n<!-- minikrill-managed-skill -->\n",
+            "old\n<!-- krill-managed-skill -->\n",
         )?;
-        fs::create_dir_all(legacy.join("mk-minikrill"))?;
-        fs::write(legacy.join("mk-minikrill/SKILL.md"), "# someone else\n")?;
+        fs::create_dir_all(legacy.join("mk-krill"))?;
+        fs::write(legacy.join("mk-krill/SKILL.md"), "# someone else\n")?;
         install_skill("orchestration", &legacy)?;
-        install_skill("minikrill", &legacy)?;
+        install_skill("krill", &legacy)?;
         assert!(!legacy.join("mk-orchestration").exists());
-        assert!(legacy.join("mk-minikrill/SKILL.md").is_file());
+        assert!(legacy.join("mk-krill/SKILL.md").is_file());
         #[cfg(unix)]
         {
             std::os::unix::fs::symlink(&foreign_dir, legacy.join("orchestration"))?;

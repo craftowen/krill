@@ -245,17 +245,16 @@ pub fn ssh_program() -> OsString {
     std::env::var_os("KRILL_SSH_BIN").unwrap_or_else(|| OsString::from("ssh"))
 }
 
-/// 원격 상태 디렉터리 후보(`$HOME` 기준, 탐색 순서): macOS 새 번들 → macOS 옛 번들 → Linux.
-fn remote_state_dirs() -> [String; 3] {
+/// 원격 상태 디렉터리 후보(`$HOME` 기준, 탐색 순서): macOS → Linux.
+fn remote_state_dirs() -> [String; 2] {
     [
         format!("Library/Application Support/{}", daemon::BUNDLE_ID),
-        format!("Library/Application Support/{}", daemon::LEGACY_BUNDLE_ID),
         format!("{}/{}", daemon::LINUX_STATE_PARENT, daemon::BUNDLE_ID),
     ]
 }
 
 /// 원격 `$HOME`과 krilld 소켓이 있는 상태 디렉터리를 한 번에 묻는 명령(MK-170). 후보는 [`remote_state_dirs`] 순서로
-/// 찾는다(구버전 원격·이관 전 원격·Linux 호환). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
+/// 찾는다(macOS·Linux). 로그인 셸이 fish·tcsh여도 같게 돌도록 `/bin/sh -c '…'`로 감싼다.
 ///
 /// Linux 원격은 찾기 전에 항상 원격 `krill ls`(`~/.local/bin/krill` → `PATH`)를 한 번 돌린다. 데몬이 없으면 띄우고
 /// (재부팅한 VM), holder만 죽었으면 새 holder로 재결합한다(ARCHITECTURE §4.1). krill이 없거나 실행이 실패하면

@@ -71,10 +71,9 @@ fn main() -> std::process::ExitCode {
         });
         // Resolve startup files and helper paths while the application event loop stays responsive.
         let startup = cx.background_spawn(async {
-            let migrated = krill_proto::daemon::migrate::run();
             krill_log::init(krill_log::Component::App).ok();
             krill_log::forward_log_warnings();
-            tracing::info!(?migrated, "app starting");
+            tracing::info!("app starting");
             let bounds = krill_app::layout::default_path()
                 .as_deref()
                 .and_then(krill_app::layout::Layout::peek_window_bounds);

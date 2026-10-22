@@ -162,8 +162,8 @@ class ReleaseTests(unittest.TestCase):
             self.assertIn(str(cli), result.stdout)
             # Run the real zap resolver against nonempty isolated data. Only the
             # final Trash move is redirected, since Foundation ignores HOME for Trash.
-            # Current bundle id paths plus pre-MK-170 legacy ones (compatibility links after migration).
-            managed = [home / f"Library/{base}" for bundle, logs in [("dev.krill.app", "Krill"), ("dev.minikrill.app", "Minikrill")]
+            bundle, logs = "dev.krill.app", "Krill"
+            managed = [home / f"Library/{base}"
                        for base in [f"Application Support/{bundle}", f"Caches/{bundle}", f"Logs/{logs}",
                                     f"Preferences/{bundle}.plist", f"Saved Application State/{bundle}.savedState"]]
             for path in managed:

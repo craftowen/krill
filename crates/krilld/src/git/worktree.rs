@@ -386,22 +386,17 @@ fn transaction(q: &GitQueue, top: &Path) -> Result<Vec<fs::File>, String> {
         )?,
         "cannot find the common git directory",
     )?;
-    // Lock the legacy name first as well: older daemons must serialize with us.
-    let mut locks = Vec::new();
-    for name in ["minikrill-worktree.lock", "krill-worktree.lock"] {
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(common.join(name))
-            .map_err(|e| format!("cannot open worktree lock: {e}"))?;
-        file.lock()
-            .map_err(|e| format!("cannot lock worktree transaction: {e}"))?;
-        locks.push(file);
-    }
-    Ok(locks)
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(common.join("krill-worktree.lock"))
+        .map_err(|e| format!("cannot open worktree lock: {e}"))?;
+    file.lock()
+        .map_err(|e| format!("cannot lock worktree transaction: {e}"))?;
+    Ok(vec![file])
 }
 
 fn git<I, S>(q: &GitQueue, repo: &Path, args: I) -> Result<Output, String>

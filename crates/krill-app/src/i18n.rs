@@ -363,7 +363,7 @@ catalog! {
         D_CLI_CONFLICT_DETAIL => ("{path}(덮어쓰지 않음)", "{path} (not overwritten)"),
         D_CLI_MISSING => ("PATH에 krill이 없습니다", "krill is not on PATH"),
         D_APP_DUPLICATE => ("Krill 앱 번들이 두 개 설치돼 있습니다", "two Krill app bundles are installed"),
-        D_APP_DUPLICATE_DETAIL => ("{names}이(가) 함께 있습니다(옛 Minikrill.app은 번들 ID dev.minikrill.app이고 호환 링크로 같은 상태 디렉터리를 씁니다). 옛 Minikrill.app을 지우거나 이름을 바꾸세요(자동으로 지우지 않습니다)", "{names} both exist (the old Minikrill.app uses bundle id dev.minikrill.app and reaches the same state directory through a compatibility link); delete or rename the old Minikrill.app (nothing is deleted automatically)"),
+        D_APP_DUPLICATE_DETAIL => ("{names}이(가) 함께 있습니다. 하나를 지우거나 이름을 바꾸세요(자동으로 지우지 않습니다)", "{names} both exist; delete or rename one (nothing is deleted automatically)"),
         D_APP_SINGLE => ("앱 번들이 하나입니다", "single app bundle"),
         D_APP_DEV => ("/Applications에 번들 없음(개발 빌드)", "no /Applications bundle (dev build)"),
         STATUS_SKIPPED => ("건너뜀", "Skipped"),

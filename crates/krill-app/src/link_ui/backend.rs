@@ -427,16 +427,12 @@ pub fn current_epoch_secs() -> u64 {
 }
 
 /// 문자열이 유효한 `krill://pair` 초대 링크인지 검사한다.
-/// 이미 나간 옛 `minikrill://pair?...` 링크도 받는다.
 #[must_use]
 pub fn is_valid_invite_link(raw: &str) -> bool {
     let trimmed = raw.trim();
-    [
-        krill_link::PAIR_URI_PREFIX,
-        krill_link::LEGACY_PAIR_URI_PREFIX,
-    ]
-    .into_iter()
-    .any(|prefix| trimmed.starts_with(prefix) && trimmed.len() > prefix.len())
+    let prefix = krill_link::PAIR_URI_PREFIX;
+    trimmed.starts_with(prefix)
+        && trimmed.len() > prefix.len()
         && !trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
 }
 

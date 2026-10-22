@@ -135,11 +135,6 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
             let name = name.ok_or_else(|| bad_arg("missing skill <name>"))?;
             let trimmed = name.trim();
             let stripped = trimmed.strip_prefix("krill-").unwrap_or(trimmed);
-            let stripped = if stripped == "minikrill" {
-                "krill"
-            } else {
-                stripped
-            };
             let Some(skill) = builtin_skills()
                 .iter()
                 .find(|s| s.name == trimmed || s.name == stripped)
@@ -776,7 +771,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(missing_ref.kind(), io::ErrorKind::NotFound);
         assert!(dispatch_skills(&args(&["install", "--skill"])).is_err());
-        assert!(dispatch_skills(&args(&["install", "minikrill", "--agent", "unknown"])).is_err());
+        assert!(dispatch_skills(&args(&["install", "krill", "--agent", "unknown"])).is_err());
         std::fs::remove_dir_all(dir)
     }
 

@@ -85,7 +85,6 @@ pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
 // Orca's discovery entries must keep their own names and update ownership.
 pub(super) const ORCA_SKILL_NAMES: &[&str] = &["orchestration", "computer-use"];
 const MARKER: &str = "<!-- krill-managed-skill -->";
-const LEGACY_MARKER: &str = "<!-- minikrill-managed-skill -->";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Global discovery roots. agy's CLI-specific root and shared App/IDE root are distinct.
@@ -159,7 +158,6 @@ pub fn sync_builtin_skills_at(home: &Path) -> SkillSyncReport {
 
 pub fn install_skill(name: &str, base_dir: &Path) -> io::Result<PathBuf> {
     let name = name.trim().strip_prefix("krill-").unwrap_or(name.trim());
-    let name = if name == "minikrill" { "krill" } else { name };
     let skill = builtin_skills()
         .iter()
         .find(|s| s.name == name)
@@ -177,15 +175,9 @@ fn prefixed_content(skill: &SkillEntry, prefix: &str) -> String {
 
 fn owned(existing: &str, skill: &SkillEntry) -> bool {
     existing.contains(MARKER)
-        || existing.contains(LEGACY_MARKER)
         || existing == skill.content
         || existing == prefixed_content(skill, "mk-")
         || existing == prefixed_content(skill, "krill-")
-        || (skill.name == "krill"
-            && existing
-                == skill
-                    .content
-                    .replacen("name: krill\n", "name: minikrill\n", 1))
 }
 
 fn candidate_writable(dir: &Path, skill: &SkillEntry) -> io::Result<bool> {
@@ -253,10 +245,7 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
             return Err(invalid("skill reference must not be a symlink"));
         }
         match fs::read_to_string(&path) {
-            Ok(existing)
-                if !existing.contains(MARKER)
-                    || existing.contains(LEGACY_MARKER) && existing != *content =>
-            {
+            Ok(existing) if !existing.contains(MARKER) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "skill reference belongs to another owner",
@@ -275,9 +264,6 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
         changed |= write_if_changed(path, bytes.as_bytes())?;
     }
     let mut stale = vec![base_dir.join(format!("mk-{}", skill.name))];
-    if skill.name == "krill" {
-        stale.extend([base_dir.join("minikrill"), base_dir.join("mk-minikrill")]);
-    }
     if orca_owned {
         stale.push(base_dir.join(skill.name));
     }

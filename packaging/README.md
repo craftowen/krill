@@ -184,7 +184,6 @@ cask의 앱·CLI 연결은 Homebrew가 제거하고, zap은 다음 기본 데이
 - `~/Library/Logs/Krill`
 - `~/Library/Preferences/dev.krill.app.plist`
 - `~/Library/Saved Application State/dev.krill.app.savedState`
-- 개명 전 같은 자리(`dev.minikrill.app`·`Logs/Minikrill`). MK-170 이관 뒤에는 새 경로를 가리키는 호환 링크다.
 
 ## 회귀 검증
 

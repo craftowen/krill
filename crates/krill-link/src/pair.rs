@@ -1,4 +1,4 @@
-//! 짝짓기(`krill-link invite` / `krill-link pair`) 링크 포맷, ALPN `minikrill/pair/1` 핸드셰이크, 속도 제한기.
+//! 짝짓기(`krill-link invite` / `krill-link pair`) 링크 포맷, ALPN `krill/pair/1` 핸드셰이크, 속도 제한기.
 
 use std::collections::VecDeque;
 use std::fmt;
@@ -24,8 +24,6 @@ use crate::{
 
 /// 짝짓기 링크 스킴 접두어.
 pub const PAIR_URI_PREFIX: &str = "krill://pair?";
-/// 개명 전 링크 접두어. 이미 나간 초대 링크를 위해 해석만 받는다.
-pub const LEGACY_PAIR_URI_PREFIX: &str = "minikrill://pair?";
 const TICKET_OPTIONAL_PREFIX: &str = "mklink1:";
 const MAX_PAIR_FRAME_BYTES: usize = 8192;
 
@@ -69,12 +67,11 @@ impl PairLink {
         ))
     }
 
-    /// `krill://pair?...`(옛 `minikrill://pair?...`도) 문자열을 파싱한다. 오류에 토큰이나 링크 원문을 남기지 않는다.
+    /// `krill://pair?...` 문자열을 파싱한다. 오류에 토큰이나 링크 원문을 남기지 않는다.
     pub fn parse(input: &str) -> Result<Self, Error> {
         let trimmed = input.trim();
         let query = trimmed
             .strip_prefix(PAIR_URI_PREFIX)
-            .or_else(|| trimmed.strip_prefix(LEGACY_PAIR_URI_PREFIX))
             .ok_or(Error::InvalidPairLink(
                 "pair link must start with krill://pair?",
             ))?;
@@ -347,7 +344,7 @@ pub async fn create_invite_command(
 }
 
 /// 클라이언트 `krill-link pair <링크> --name <기기 이름>`:
-/// ALPN `minikrill/pair/1`로 서버에 토큰·기기 이름을 보내 검증받고 `link/hosts.toml`에 호스트를 저장한다.
+/// ALPN `krill/pair/1`로 서버에 토큰·기기 이름을 보내 검증받고 `link/hosts.toml`에 호스트를 저장한다.
 pub async fn pair_with_server(
     state_dir: &Path,
     link_str: &str,
@@ -482,15 +479,10 @@ mod tests {
         assert_eq!(parsed.addr, addr);
         assert_eq!(parsed.token.as_str(), raw_tok);
 
-        // OWE-669: 이미 나간 옛 minikrill:// 링크도 같은 값으로 해석된다.
-        let legacy = encoded.replacen("krill://", "minikrill://", 1);
-        let parsed = PairLink::parse(&legacy).unwrap();
-        assert_eq!(parsed.addr, addr);
-        assert_eq!(parsed.token.as_str(), raw_tok);
         assert!(PairLink::parse(&encoded.replacen("krill://", "other://", 1)).is_err());
 
         // 잘못된 토큰이 들어간 링크 파싱 실패 시 오류에 토큰 원문이 남지 않는지 확인
-        let bad = "minikrill://pair?t=00&k=secret_bad_token_value_12345";
+        let bad = "krill://pair?t=00&k=secret_bad_token_value_12345";
         let err = PairLink::parse(bad).unwrap_err();
         assert!(!err.to_string().contains("secret_bad_token_value_12345"));
     }

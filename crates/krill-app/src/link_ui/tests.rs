@@ -485,17 +485,17 @@ fn real_qr_reports_encoding_failure_and_pair_errors_are_specific() {
     );
 }
 
-/// OWE-669: 새 `krill://` 링크와 이미 나간 옛 `minikrill://` 링크를 모두 받고, 접두어만 있는 값은 거절한다.
+/// OWE-669: `krill://` 링크를 받고, 접두어만 있는 값은 거절한다.
 #[test]
-fn invite_link_accepts_new_and_legacy_schemes() {
+fn invite_link_accepts_krill_scheme() {
     assert!(is_valid_invite_link("krill://pair?t=00&k=11"));
-    assert!(is_valid_invite_link("  minikrill://pair?t=00&k=11\n"));
+    assert!(is_valid_invite_link("  krill://pair?t=00&k=11\n"));
     assert!(!is_valid_invite_link("krill://pair?"));
     assert!(!is_valid_invite_link("krill://pairing"));
     assert!(!is_valid_invite_link("https://krill.example/pair?t=00"));
     assert_eq!(
-        extract_clipboard_invite(" minikrill://pair?t=00&k=11 ").as_deref(),
-        Some("minikrill://pair?t=00&k=11")
+        extract_clipboard_invite(" krill://pair?t=00&k=11 ").as_deref(),
+        Some("krill://pair?t=00&k=11")
     );
 }
 

@@ -457,24 +457,7 @@ pub struct Keys {
 
 impl Keys {
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
-        let mut keys: Self = toml::from_str(s)?;
-        for (legacy, current) in [
-            ("minikrill::NewWindow", "krill::NewWindow"),
-            ("minikrill::CloseWindow", "krill::CloseWindow"),
-        ] {
-            for (_, value) in &mut keys.bindings {
-                if value.as_str() == Some(legacy) {
-                    *value = current.into();
-                }
-            }
-            if let Some(disabled) = keys.disabled.remove(legacy) {
-                keys.disabled
-                    .entry(current.into())
-                    .or_default()
-                    .extend(disabled);
-            }
-        }
-        Ok(keys)
+        toml::from_str(s)
     }
 }
 

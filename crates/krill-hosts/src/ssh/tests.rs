@@ -166,13 +166,9 @@ fn remote_socket_for_home_computes_remote_user_path() {
         )
     );
     assert_eq!(
-        remote_socket_for_home(
-            "/Users/remoteuser\r\nLibrary/Application Support/dev.minikrill.app"
-        )
-        .unwrap(),
-        PathBuf::from(
-            "/Users/remoteuser/Library/Application Support/dev.minikrill.app/run/krilld.sock"
-        )
+        remote_socket_for_home("/Users/remoteuser\r\nLibrary/Application Support/dev.krill.app")
+            .unwrap(),
+        sock
     );
     assert_eq!(
         remote_socket_for_home("/home/ubuntu\n.local/share/dev.krill.app").unwrap(),
@@ -290,18 +286,11 @@ fn remote_query_prefers_new_socket_then_legacy() {
     std::fs::create_dir_all(linux.parent().unwrap()).unwrap();
     let _linux = UnixListener::bind(&linux).unwrap();
     assert_eq!(resolve().unwrap(), linux, "Linux remote");
-    std::fs::create_dir_all(sock("dev.minikrill.app").parent().unwrap()).unwrap();
-    let _old = UnixListener::bind(sock("dev.minikrill.app")).unwrap();
-    assert_eq!(
-        resolve().unwrap(),
-        sock("dev.minikrill.app"),
-        "legacy remote"
-    );
     std::fs::create_dir_all(sock("dev.krill.app").parent().unwrap()).unwrap();
     let _new = UnixListener::bind(sock("dev.krill.app")).unwrap();
     assert_eq!(resolve().unwrap(), sock("dev.krill.app"), "new wins");
     if linux_os {
-        assert_eq!(woke(), "ls\nls\nls\nls\n");
+        assert_eq!(woke(), "ls\nls\nls\n");
     }
     std::fs::remove_dir_all(&home).unwrap();
 }

@@ -334,20 +334,6 @@ fn key_override_and_unbind(cx: &mut TestAppContext) {
     });
 }
 
-#[test]
-fn legacy_window_shortcuts_migrate_bindings_and_disabled_defaults() {
-    let keys = Keys::parse(
-        "[bindings]\n'cmd-k' = 'minikrill::NewWindow'\n'cmd-j' = 'minikrill::CloseWindow'\n[disabled]\n'minikrill::NewWindow' = ['cmd-shift-n']\n'krill::NewWindow' = ['cmd-alt-n']\n",
-    ).unwrap();
-    assert_eq!(keys.bindings["cmd-k"].as_str(), Some("krill::NewWindow"));
-    assert_eq!(keys.bindings["cmd-j"].as_str(), Some("krill::CloseWindow"));
-    assert_eq!(
-        keys.disabled["krill::NewWindow"],
-        ["cmd-alt-n", "cmd-shift-n"]
-    );
-    assert!(!keys.disabled.contains_key("minikrill::NewWindow"));
-}
-
 #[gpui::test]
 fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
     let d = dir("reload");
