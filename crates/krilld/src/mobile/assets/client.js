@@ -19,7 +19,7 @@
   // Home Screen relaunches reuse the saved device, even though the start URL contains a spent ticket.
   const pair=ticket&&secret&&!(fragment.has('install')&&saved?.credential)?{ticket,secret}:null;
   const auth=parameters.get('auth'),sensitive=['pair','key','t','r','install'],consumed=sensitive.some(key=>fragment.has(key));for(const key of [...sensitive,'auth'])parameters.delete(key);
-  history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?(pair?'#/pair-confirm':''):location.hash));
+  history.replaceState({},'',location.pathname+(parameters.size?'?'+parameters:'')+(consumed?'':location.hash));
   let credentials=pair?null:saved,directOrigin=location.origin,destinationFixed=fixed;
   const hostId=c=>c.rid?'relay:'+c.rid:c.url?'tunnel:'+c.url:'direct:'+(c.origin||location.origin);
   let updateHandler=null,updatePending=false;

@@ -62,7 +62,6 @@ globalThis.WebSocket=class extends NativeWebSocket {
 """)
                 browser('--init-script', str(fault), 'open', cfg['url'])
                 browser('set','viewport','390','844')
-                browser('find','role','button','click','--name','Pair','--exact')
                 wait('KrillMobile.store.connection.phase==="ready" && recoverySockets.length>=2')
                 assert evaluate('sessionStorage.getItem("interrupted")') == 'yes'
                 assert len(json.loads((Path(cfg['dir'])/'mobile-devices.json').read_text())) == 1
