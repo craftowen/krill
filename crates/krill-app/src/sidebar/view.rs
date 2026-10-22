@@ -484,7 +484,7 @@ impl Sidebar {
         };
         let last = self.session_card_index(index + 1) != Some(parent);
         let depth = if self.row_host(parent).is_local() {
-            self.lineage_depth(path)
+            self.cached_lineage_depth(path)
         } else {
             0
         };
@@ -1128,7 +1128,7 @@ impl Sidebar {
                         let pl = match &session.worktree {
                             Some(tree) => {
                                 let depth = if row_host.is_local() {
-                                    self.lineage_depth(tree)
+                                    self.cached_lineage_depth(tree)
                                 } else {
                                     0
                                 };
@@ -1670,12 +1670,12 @@ impl Sidebar {
         let has_line3 = visible_comment.is_some() || has_agent_pill;
 
         let lineage_depth = if row_host.is_local() {
-            self.lineage_depth(path)
+            self.cached_lineage_depth(path)
         } else {
             0
         };
         let lineage_child_count = if row_host.is_local() {
-            self.lineage_children(path).len()
+            self.cached_lineage_child_count(path)
         } else {
             0
         };
