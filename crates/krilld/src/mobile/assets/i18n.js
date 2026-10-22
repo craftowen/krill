@@ -9,6 +9,7 @@
  "Cancel": "취소",
  "Settings": "설정",
  "Preferences": "환경 설정",
+ "Settings sections": "설정 분류",
  "Appearance": "화면 모드",
  "System": "시스템 설정",
  "System default": "시스템 기본값",
