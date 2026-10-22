@@ -194,7 +194,14 @@ Cask::Utils::Trash.singleton_class.prepend(IsolatedTrash)
 cask = Cask::CaskLoader.load(ARGV.fetch(0))
 artifact = cask.artifacts.find { |item| item.is_a?(Cask::Artifact::Zap) }
 raise "missing zap" unless artifact
-artifact.zap_phase(command: SystemCommand)
+if artifact.respond_to?(:zap_phase)
+  artifact.zap_phase(command: SystemCommand)
+else
+  # Homebrew 7: zap 지시는 즉시·지연 두 단계로 나뉘어 실행된다.
+  [false, true].each do |deferred|
+    Cask::Artifact::AbstractUninstall.dispatch_directives([artifact], command: SystemCommand, deferred:)
+  end
+end
 ''')
             run([brew, "ruby", resolver, cask], env=env)
             for path in managed:
