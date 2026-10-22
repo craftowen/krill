@@ -239,10 +239,10 @@ impl Control {
         let Some(id) = extract_hook_session_id(&p) else {
             return false;
         };
-        let Some(event) = p.get("hook_event_name").and_then(serde_json::Value::as_str) else {
-            return false;
-        };
-        if is_legitimate_session_id_rotation(event, &p) {
+        if p.get("hook_event_name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|event| is_legitimate_session_id_rotation(event, &p))
+        {
             return false;
         }
         let _guard = lock(&self.config);
@@ -352,7 +352,7 @@ impl Control {
             (Some(existing), Some(incoming), Some(p)) if existing != incoming => {
                 match p.get("hook_event_name").and_then(serde_json::Value::as_str) {
                     Some(event) => !is_legitimate_session_id_rotation(event, p),
-                    None => false,
+                    None => true,
                 }
             }
             _ => false,

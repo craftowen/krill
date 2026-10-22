@@ -111,7 +111,7 @@ fn worktree_root_prefers_override_then_home_default() {
         Ok(PathBuf::from("/KRILL_WORKTREES_DIR"))
     );
     let home = |k: &str| (k == "HOME").then(|| OsString::from("/h"));
-    assert_eq!(root_in(home), Ok(PathBuf::from("/h/Minikrill/worktrees")));
+    assert_eq!(root_in(home), Ok(PathBuf::from("/h/Krill/worktrees")));
     assert!(root_in(|_| None).is_err());
     assert_eq!(
         isolated_root_in(Path::new("/state"), override_dir),
@@ -176,7 +176,7 @@ fn bad_names_and_bases_are_refused() {
 fn include_refuses_escape_and_symlinks() {
     let config = r#"
 [worktree]
-include = [".env", "secret", "../outside", "/etc/hosts", "./x", "link", "escape/x", "minikrill.toml", "none"]
+include = [".env", "secret", "../outside", "/etc/hosts", "./x", "link", "escape/x", "krill.toml", "none"]
 "#;
     let f = Fixture::new("include", config);
     fs::write(f.repo.join(".env"), "TOKEN=1").unwrap();
@@ -205,7 +205,7 @@ include = [".env", "secret", "../outside", "/etc/hosts", "./x", "link", "escape/
         ("link", "symlink"),
         ("escape/x", "symlink"),
         ("secret/hosts", "symlink"),
-        ("minikrill.toml", "not ignored"),
+        ("krill.toml", "not ignored"),
     ] {
         assert!(
             w.warnings

@@ -297,9 +297,15 @@ impl ServerHandle {
         if let Some(tx) = self.shutdown_tx.take() {
             tx.send(()).ok();
         }
-        if let Some(jh) = self.join_handle.take() {
+        self.stopped().await;
+    }
+
+    /// 제어 소켓 등을 통한 종료를 기다린다. 대기 취소는 서버를 중지하지 않는다.
+    pub async fn stopped(&mut self) {
+        if let Some(jh) = self.join_handle.as_mut() {
             jh.await.ok();
         }
+        self.join_handle.take();
     }
 }
 
@@ -849,4 +855,38 @@ pub async fn revoke_device_command(state_dir: &Path, target: &str) -> Result<All
 pub fn is_serve_running(state_dir: &Path) -> bool {
     let ctl_path = state_dir.join(SERVE_CTL_SOCK_REL_PATH);
     krill_proto::os::net::UnixStream::connect(ctl_path).is_ok()
+}
+
+/// 로컬 제어 소켓으로 수신 서버를 정상 종료한다. 이미 꺼져 있으면 성공한다.
+pub async fn shutdown_server_command(state_dir: &Path) -> Result<(), Error> {
+    if !is_serve_running(state_dir) {
+        return Ok(());
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut stream = Stream::connect(state_dir.join(SERVE_CTL_SOCK_REL_PATH))
+            .await
+            .map_err(Error::Io)?;
+        let request = serde_json::to_vec(&ControlRequest::Shutdown)
+            .map_err(|_| Error::Protocol("invalid shutdown request"))?;
+        stream.write_all(&request).await.map_err(Error::Io)?;
+        stream.shutdown().await.map_err(Error::Io)?;
+        let mut reply = Vec::new();
+        stream
+            .take(4097)
+            .read_to_end(&mut reply)
+            .await
+            .map_err(Error::Io)?;
+        if !matches!(
+            serde_json::from_slice::<ControlResponse>(&reply),
+            Ok(ControlResponse::Ok { .. })
+        ) {
+            return Err(Error::Protocol("invalid shutdown response"));
+        }
+        while is_serve_running(state_dir) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|_| Error::Timeout("incoming server shutdown"))?
 }

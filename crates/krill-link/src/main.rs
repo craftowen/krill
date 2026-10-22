@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use krill_link::{
     ConnectOptions, Error, LinkConfig, RelaySetting, ServeOptions, create_invite_command,
-    disable_launch_agent, enable_launch_agent, host_status, load_devices, pair_with_server,
-    resolve_state_dir, revoke_device_command, start_server, start_tunnel, status_report,
+    host_status, load_devices, pair_with_server, resolve_state_dir, revoke_device_command,
+    start_server, start_tunnel, status_report,
 };
 
 #[tokio::main]
@@ -35,8 +35,14 @@ async fn run() -> Result<(), String> {
 
     match cmd {
         "serve" => cmd_serve(&state_dir, rest).await.map_err(|e| e.to_string()),
-        "enable" => cmd_enable(&state_dir).map_err(|e| e.to_string()),
-        "disable" => cmd_disable(&state_dir).map_err(|e| e.to_string()),
+        "enable" => tokio::task::spawn_blocking(move || cmd_enable(&state_dir))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string()),
+        "disable" => tokio::task::spawn_blocking(move || cmd_disable(&state_dir))
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| e.to_string()),
         "invite" => cmd_invite(&state_dir, rest)
             .await
             .map_err(|e| e.to_string()),
@@ -131,7 +137,7 @@ async fn cmd_serve(state_dir: &Path, args: &[String]) -> Result<(), Error> {
 
     let mut opts = ServeOptions::new(state_dir.to_path_buf());
     opts.krilld_socket = socket_override;
-    let handle = start_server(opts).await?;
+    let mut handle = start_server(opts).await?;
     writeln!(
         io::stdout(),
         "원격 연결 서버 실행 중 (Remote link server listening): node_id={}",
@@ -140,29 +146,32 @@ async fn cmd_serve(state_dir: &Path, args: &[String]) -> Result<(), Error> {
     .ok();
     io::stdout().flush().ok();
 
-    wait_for_shutdown_signal().await;
+    tokio::select! {
+        () = wait_for_shutdown_signal() => {},
+        () = handle.stopped() => {},
+    }
     handle.shutdown().await;
     Ok(())
 }
 
 fn cmd_enable(state_dir: &Path) -> Result<(), Error> {
     let exe = krill_proto::daemon::sibling_exe("krill-link").map_err(Error::Io)?;
-    let plist_path = enable_launch_agent(&exe, state_dir)?;
+    krill_link::service::enable_server(&exe, state_dir)?;
     writeln!(
         io::stdout(),
-        "원격 연결 백그라운드 서비스 켜짐 (Remote link LaunchAgent enabled): {}",
-        plist_path.display()
+        "원격 연결 백그라운드 서비스 켜짐 (Remote link server enabled): {}",
+        state_dir.display()
     )
     .ok();
     Ok(())
 }
 
 fn cmd_disable(state_dir: &Path) -> Result<(), Error> {
-    let plist_path = disable_launch_agent(state_dir)?;
+    krill_link::service::disable_server(state_dir)?;
     writeln!(
         io::stdout(),
-        "원격 연결 백그라운드 서비스 꺼짐 (Remote link LaunchAgent disabled): {}",
-        plist_path.display()
+        "원격 연결 백그라운드 서비스 꺼짐 (Remote link server disabled): {}",
+        state_dir.display()
     )
     .ok();
     Ok(())

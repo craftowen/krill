@@ -1,5 +1,27 @@
 use super::*;
 
+#[test]
+fn legacy_name_and_marker_upgrade_to_one_canonical_skill() {
+    let base = home("rename");
+    let legacy = base.join("minikrill");
+    fs::create_dir_all(&legacy).unwrap();
+    fs::write(legacy.join("SKILL.md"), format!("old\n{LEGACY_MARKER}\n")).unwrap();
+    fs::write(legacy.join("user-notes.txt"), "keep me").unwrap();
+    let current = install_skill("minikrill", &base).unwrap();
+    assert_eq!(current, base.join("krill/SKILL.md"));
+    let text = fs::read_to_string(&current).unwrap();
+    assert!(text.contains("name: krill\n"));
+    assert!(text.contains(MARKER));
+    assert!(!text.contains(LEGACY_MARKER));
+    assert!(!legacy.join("SKILL.md").exists());
+    assert_eq!(
+        fs::read_to_string(legacy.join("user-notes.txt")).unwrap(),
+        "keep me"
+    );
+    assert_eq!(install_skill("krill", &base).unwrap(), current);
+    fs::remove_dir_all(base).unwrap();
+}
+
 fn home(tag: &str) -> PathBuf {
     let home = std::env::temp_dir().join(format!("krill-skill-{tag}-{}", std::process::id()));
     fs::remove_dir_all(&home).ok();

@@ -27,13 +27,15 @@ fn default_permission_bypasses_approvals_and_manual_remains_available() {
         for (id, flag) in [
             ("claude", "--dangerously-skip-permissions"),
             ("codex", "--dangerously-bypass-approvals-and-sandbox"),
+            ("agy", "--dangerously-skip-permissions"),
+            ("opencode", "--auto"),
         ] {
             assert_eq!(a.profiles[id].argv(a.permission), [id, flag]);
         }
     }
     let a = Agents::load(Some("permission = 'manual'\n")).unwrap();
     assert_eq!(a.permission, Permission::Manual);
-    for id in ["claude", "codex"] {
+    for id in ["claude", "codex", "agy", "opencode"] {
         assert_eq!(a.profiles[id].argv(a.permission), [id]);
     }
 }

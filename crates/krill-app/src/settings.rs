@@ -423,7 +423,24 @@ pub struct Keys {
 
 impl Keys {
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
-        toml::from_str(s)
+        let mut keys: Self = toml::from_str(s)?;
+        for (legacy, current) in [
+            ("minikrill::NewWindow", "krill::NewWindow"),
+            ("minikrill::CloseWindow", "krill::CloseWindow"),
+        ] {
+            for (_, value) in &mut keys.bindings {
+                if value.as_str() == Some(legacy) {
+                    *value = current.into();
+                }
+            }
+            if let Some(disabled) = keys.disabled.remove(legacy) {
+                keys.disabled
+                    .entry(current.into())
+                    .or_default()
+                    .extend(disabled);
+            }
+        }
+        Ok(keys)
     }
 }
 
@@ -2177,10 +2194,7 @@ pub fn agent_hook_target_path(
             TargetAgent::Other(Agent::Cursor),
         )),
         "opencode" => Some((
-            home.join(".config")
-                .join("opencode")
-                .join("plugins")
-                .join("minikrill.js"),
+            krill_proto::user_dirs::opencode_plugin(&home.join(".config/opencode")),
             TargetAgent::Other(Agent::OpenCode),
         )),
         _ => None,
@@ -2195,7 +2209,7 @@ pub fn install_agent_hook_at(
 ) -> std::io::Result<PathBuf> {
     let (target_path, target_agent) = agent_hook_target_path(agent_id, home)
         .ok_or_else(|| std::io::Error::other(format!("unsupported agent: {agent_id}")))?;
-    let staged = home.join(".local/share/minikrill/bin/krill");
+    let staged = krill_proto::user_dirs::share_dir(home).join("bin/krill");
     let exe = if staged.is_file() {
         staged.as_path()
     } else {
@@ -5400,7 +5414,7 @@ impl SettingsView {
         target_mode: ThemeMode,
         active_label: &str,
     ) -> gpui::Stateful<gpui::Div> {
-        const PREVIEW_PROMPT: &str = "krill@mac ~/minikrill ";
+        const PREVIEW_PROMPT: &str = "krill@mac ~/krill ";
         const PREVIEW_BRANCH: &str = "(main)";
         const PREVIEW_CMD: &str = " $ cargo nextest run";
         const PREVIEW_PASS: &str = "     PASS ";
@@ -10343,9 +10357,7 @@ impl SettingsView {
                                     edit(cx, move |s| {
                                         let n = s.webhooks.len().saturating_add(1);
                                         s.webhooks.push(crate::webhook::Endpoint::Ntfy {
-                                            url: format!(
-                                                "http://127.0.0.1:8080/minikrill-hook-{n}"
-                                            ),
+                                            url: format!("http://127.0.0.1:8080/krill-hook-{n}"),
                                         });
                                     });
                                 }),

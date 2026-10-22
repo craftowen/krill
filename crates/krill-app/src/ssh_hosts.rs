@@ -272,7 +272,7 @@ pub fn config_path(state_dir: Option<&Path>) -> PathBuf {
         dir.join(HOSTS_FILE)
     } else {
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
-        home.join(".config").join("minikrill").join(HOSTS_FILE)
+        krill_proto::user_dirs::config_dir(&home).join(HOSTS_FILE)
     }
 }
 

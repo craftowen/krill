@@ -90,7 +90,7 @@ fn shared_install_receipt_backup_and_rollback_preserve_original_bytes_and_mode()
     let backups: Vec<_> = fs::read_dir(&home.0)
         .unwrap()
         .map(Result::unwrap)
-        .filter(|e| e.file_name().to_string_lossy().contains("minikrill-bak"))
+        .filter(|e| e.file_name().to_string_lossy().contains("krill-bak"))
         .collect();
     assert_eq!(backups.len(), 1);
     let backup = backups.first().unwrap();

@@ -4,6 +4,7 @@
 import argparse
 import contextlib
 from ci_evidence import CANDIDATE_BRANCH, Evidence, FailedRun, Pending
+from macos.identity_paths import keychain_path
 from datetime import datetime, timedelta
 import fcntl
 import json
@@ -452,7 +453,7 @@ def install_locked(source, after_release=None):
         raise NightlyError("origin must be a GitHub repository")
     config = {"branch": "dev", "repo": match[1],
               "run_root": str(VOLUME / "nightly"), "target_dir": str(TARGETS / "krill-publish"),
-              "key_file": str(Path.home() / "Library/Keychains/minikrill-codesign.keychain-db.ed25519.key"),
+              "key_file": str(keychain_path(Path.home())) + ".ed25519.key",
               "key_tool": str(source / "packaging/macos/ed25519_manifest.py")}
     cli = shutil.which("orca")
     if not cli:

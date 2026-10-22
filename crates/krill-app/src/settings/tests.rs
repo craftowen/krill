@@ -318,6 +318,20 @@ fn key_override_and_unbind(cx: &mut TestAppContext) {
     });
 }
 
+#[test]
+fn legacy_window_shortcuts_migrate_bindings_and_disabled_defaults() {
+    let keys = Keys::parse(
+        "[bindings]\n'cmd-k' = 'minikrill::NewWindow'\n'cmd-j' = 'minikrill::CloseWindow'\n[disabled]\n'minikrill::NewWindow' = ['cmd-shift-n']\n'krill::NewWindow' = ['cmd-alt-n']\n",
+    ).unwrap();
+    assert_eq!(keys.bindings["cmd-k"].as_str(), Some("krill::NewWindow"));
+    assert_eq!(keys.bindings["cmd-j"].as_str(), Some("krill::CloseWindow"));
+    assert_eq!(
+        keys.disabled["krill::NewWindow"],
+        ["cmd-alt-n", "cmd-shift-n"]
+    );
+    assert!(!keys.disabled.contains_key("minikrill::NewWindow"));
+}
+
 #[gpui::test]
 fn file_changes_apply_without_restart(cx: &mut TestAppContext) {
     let d = dir("reload");
@@ -1019,7 +1033,7 @@ fn m8_orchestration_and_checkpoint_badges_round_trip(_cx: &mut TestAppContext) {
 
     let skills_dir = d.join("skills");
     for name in [
-        "minikrill",
+        "krill",
         "orchestration",
         "worktree-checkpoints",
         "computer-use",
@@ -1113,7 +1127,7 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
     assert_eq!(installed_path, agy_hooks);
     let hooks_val: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(&agy_hooks).unwrap()).unwrap();
-    // CLI(`krill hook install agy`)와 같은 모양: `minikrill` 묶음 키, `hook agy` 포함 명령.
+    // CLI(`krill hook install agy`)와 같은 모양: `krill` 묶음 키, `hook agy` 포함 명령.
     for event in [
         "PreInvocation",
         "PostInvocation",
@@ -1121,7 +1135,7 @@ fn orca_admin_layout_and_antigravity_provider_assets(cx: &mut TestAppContext) {
         "PreToolUse",
         "PostToolUse",
     ] {
-        let entries = hooks_val["minikrill"][event]
+        let entries = hooks_val["krill"][event]
             .as_array()
             .unwrap_or_else(|| panic!("missing hook array for {event}"));
         assert!(!entries.is_empty(), "empty hook array for {event}");
@@ -1591,7 +1605,7 @@ fn hook_install_preserves_unparseable_and_wrong_typed_files() {
             true,
             false,
         ),
-        ("bundle-string", br#"{"minikrill": "nope"}"#, false, true),
+        ("bundle-string", br#"{"krill": "nope"}"#, false, true),
     ];
     for (name, bytes, claude_fails, agy_fails) in cases {
         for (path, install, fails) in [
@@ -1661,7 +1675,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     install_claude_hook(&claude_path).unwrap();
     let claude_out = fs::read_to_string(&claude_path).unwrap();
     let ours = json!({
-        "hooks": [{"type": "command", "name": "minikrill", "command": CLAUDE_HOOK_COMMAND}]
+        "hooks": [{"type": "command", "name": "krill", "command": CLAUDE_HOOK_COMMAND}]
     });
     let expected = json!({
         "theme": "dark",
@@ -1686,7 +1700,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     let backup = fs::read_dir(&root)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .find(|p| p.to_string_lossy().contains(".minikrill-bak-"))
+        .find(|p| p.to_string_lossy().contains(".krill-bak-"))
         .expect("missing hook backup");
     assert_eq!(fs::read_to_string(backup).unwrap(), claude_before);
     // 멱등: 다시 설치해도 바이트가 같고 새 백업이 생기지 않는다.
@@ -1695,7 +1709,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
     assert_eq!(fs::read_to_string(&claude_path).unwrap(), claude_out);
     assert_eq!(fs::read_dir(&root).unwrap().count(), backups_before);
 
-    // Antigravity: `minikrill` 묶음 키에 `hook agy <event>` 완성 명령 + timeout 10.
+    // Antigravity: `krill` 묶음 키에 `hook agy <event>` 완성 명령 + timeout 10.
     let agy_path = root.join("ahy-hooks.json");
     let agy_before = r#"{"user": 1}"#;
     fs::write(&agy_path, agy_before).unwrap();
@@ -1724,7 +1738,7 @@ fn gui_hook_install_matches_cli_shapes_and_preserves_user_hooks() {
         };
         bundle.insert(event.to_owned(), serde_json::Value::Array(vec![entry]));
     }
-    let expected_agy = json!({"user": 1, "minikrill": bundle});
+    let expected_agy = json!({"user": 1, "krill": bundle});
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&agy_out).unwrap(),
         expected_agy
@@ -5832,7 +5846,7 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         ("admin-agent-hook-cursor", ".cursor/hooks.json"),
         (
             "admin-agent-hook-opencode",
-            ".config/opencode/plugins/minikrill.js",
+            ".config/opencode/plugins/krill.js",
         ),
     ] {
         click(vcx, selector);
@@ -5850,9 +5864,9 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
     });
 
     // 2. "모두 자동 설정" 버튼 클릭 시 에이전트 훅과 모든 내장 스킬이 한 번에 설치된다.
-    //    스테이징된 `.local/share/minikrill/bin/krill`이 있으면 그 절대경로를 훅 설정에 기록한다.
+    //    스테이징된 `.local/share/krill/bin/krill`이 있으면 그 절대경로를 훅 설정에 기록한다.
     let d2 = dir("one-click-setup-all-btn");
-    let staged_krill = d2.join(".local/share/minikrill/bin/krill");
+    let staged_krill = d2.join(".local/share/krill/bin/krill");
     fs::create_dir_all(staged_krill.parent().unwrap()).unwrap();
     fs::write(&staged_krill, "#!/bin/sh\nexit 0\n").unwrap();
     vcx.update(|window, cx| {
@@ -5864,14 +5878,14 @@ fn one_click_setup_all_agents_and_skills_and_terminal_install_queue(cx: &mut Tes
         ".claude/settings.json",
         ".gemini/config/hooks.json",
         ".cursor/hooks.json",
-        ".config/opencode/plugins/minikrill.js",
-        ".claude/skills/minikrill/SKILL.md",
+        ".config/opencode/plugins/krill.js",
+        ".claude/skills/krill/SKILL.md",
         ".codex/skills/krill-orchestration/SKILL.md",
         ".gemini/config/skills/worktree-checkpoints/SKILL.md",
         ".gemini/antigravity-cli/skills/krill-orchestration/SKILL.md",
         ".gemini/antigravity-cli/skills/krill-orchestration/references/verification-and-evidence.md",
-        ".cursor/skills/minikrill/SKILL.md",
-        ".config/opencode/skills/minikrill/SKILL.md",
+        ".cursor/skills/krill/SKILL.md",
+        ".config/opencode/skills/krill/SKILL.md",
     ] {
         assert!(
             d2.join(rel_path).is_file(),

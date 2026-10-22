@@ -166,7 +166,7 @@ fn parse(bytes: &[u8]) -> Option<RepositoryTrees> {
         .filter(|p| !p.is_empty() && p.len() <= 4096)
         .filter(|p| {
             !p.split(|b| *b == b'/')
-                .any(|part| part == b".minikrill-preparing")
+                .any(|part| matches!(part, b".krill-preparing" | b".minikrill-preparing"))
         })
         .take(512)
         .map(<[u8]>::to_vec)

@@ -29,7 +29,7 @@ async function browser(){
   const evaluate=async expression=>{const r=await call('Runtime.evaluate',{expression,awaitPromise:true,returnByValue:true});if(r.exceptionDetails)throw Error(r.exceptionDetails.exception?.description||r.exceptionDetails.text);return r.result.value;};
   const open=async url=>{await call('Page.navigate',{url:'about:blank'});await call('Page.navigate',{url});await until(()=>evaluate("document.readyState==='complete'&&!!globalThis.KrillMobile?.app"),'app loaded '+url.split('#')[0]);};
   const click=label=>evaluate(`(()=>{const b=[...document.querySelectorAll('button')].find(b=>b.getAttribute('aria-label')===${JSON.stringify(label)}&&b.offsetParent!==null);if(!b)return false;b.click();return true;})()`);
-  const stored=()=>evaluate("JSON.parse(localStorage.getItem('minikrill-mobile-v2')||'null')");
+  const stored=()=>evaluate("JSON.parse(localStorage.getItem('krill-mobile-v2')||'null')");
   const ready=()=>evaluate("KrillMobile.store.connection.phase==='ready'");
   return {call,evaluate,open,click,stored,ready};
  }

@@ -1,6 +1,6 @@
 use super::*;
 use std::fs;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
 use crate::agent::control::LaunchAccount;
@@ -12,8 +12,19 @@ use krill_proto::os::net::UnixStream;
 
 #[test]
 fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_old() {
-    for (fail, cancel) in [(false, false), (true, false), (false, true)] {
-        let root = Path::new("/tmp").join(format!("kas-{}-{fail}-{cancel}", std::process::id()));
+    for (fail, cancel, automatic, missing_transcript) in [
+        (false, false, false, false),
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (true, false, true, false),
+        (true, false, true, true),
+        (true, false, false, true),
+    ] {
+        let root = Path::new("/tmp").join(format!(
+            "kas-{}-{fail}-{cancel}-{automatic}-{missing_transcript}",
+            std::process::id()
+        ));
         fs::remove_dir_all(&root).ok();
         let state = root.join("state");
         let home = root.join("home");
@@ -46,6 +57,9 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{sid}\"}}}}\n"),
         )
         .unwrap();
+        if missing_transcript {
+            fs::remove_file(&transcript).unwrap();
+        }
         let (daemon_end, holder_end) = UnixStream::pair().unwrap();
         let mut holder_link = Link::new(OwnedFd::from(holder_end));
         for message in [
@@ -77,7 +91,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
                 SessionId(7),
                 &AgentLaunch {
                     profile: "codex".into(),
-                    permission: Permission::Yolo,
+                    permission: Permission::Manual,
                 },
                 Some(sid.into()),
                 root.as_os_str().as_encoded_bytes().to_vec(),
@@ -94,6 +108,9 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
         let expected_home = to.clone();
         let reselect = cancel.then(|| Arc::clone(&reg));
         let mock = std::thread::spawn(move || {
+            if missing_transcript {
+                return None;
+            }
             let packet = holder_link.recv().unwrap().unwrap();
             let ToHolder::Spawn {
                 req, id, argv, env, ..
@@ -103,6 +120,10 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             };
             assert!(argv.iter().any(|arg| arg == b"resume"));
             assert!(argv.iter().any(|arg| arg == sid.as_bytes()));
+            assert!(
+                argv.iter()
+                    .any(|arg| arg == b"--dangerously-bypass-approvals-and-sandbox")
+            );
             assert!(env.iter().any(|(key, value)| key == b"CODEX_HOME"
                 && value == expected_home.as_os_str().as_encoded_bytes()));
             if let Some(reg) = reselect {
@@ -139,16 +160,56 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             holder_link
                 .send(&FromHolder::Done { req }.encode().unwrap(), &[])
                 .unwrap();
+            if !cancel {
+                process
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut bytes = vec![0; CONTINUE_PROMPT.len() + 1];
+                process.read_exact(&mut bytes).unwrap();
+                assert_eq!(bytes, format!("{CONTINUE_PROMPT}\r").as_bytes());
+            }
             // Keep the new PTY open until the parent has committed its handoff.
             Some((id, process))
         });
-        reg.queue_account_switch(ProviderKind::Codex, &target);
-        reg.queue_account_switch(ProviderKind::Codex, "codex-old");
-        assert!(
-            lock(&reg.account_handoffs).is_empty(),
-            "reselecting the running account cancels a queued handoff"
-        );
-        reg.queue_account_switch(ProviderKind::Codex, &target);
+        if automatic {
+            let mut file = accounts::load_file(&home, Some(&state));
+            file.direct_usage = false;
+            file.auto_switch.enabled = true;
+            file.active.insert("codex".into(), "codex-old".into());
+            file.accounts.push(accounts::StoredAccount {
+                id: "codex-old".into(),
+                provider: "codex".into(),
+                label: "Original".into(),
+                email: None,
+                profile_dir: from.display().to_string(),
+            });
+            accounts::save_file(&home, Some(&state), &file).unwrap();
+            for (dir, percent) in [(&from, 95), (&to, 10)] {
+                fs::write(
+                    dir.join("usage_cache.json"),
+                    format!("{{\"five_hour\":{{\"utilization\":{percent}}}}}"),
+                )
+                .unwrap();
+            }
+            let mut snap = super::super::usage_tick::tick(&home, Some(&state), &mut None)
+                .expect("automatic evaluation");
+            assert_eq!(snap.switched.len(), 1);
+            assert_eq!(snap.switched[0].to_id, target);
+            reg.account_switch_snapshot(&mut snap);
+            assert!(
+                snap.details.handoffs.iter().any(|h| {
+                    h.from == SessionId(7) && h.account_id == target && h.to.is_none()
+                })
+            );
+        } else {
+            reg.queue_account_switch(ProviderKind::Codex, &target);
+            reg.queue_account_switch(ProviderKind::Codex, "codex-old");
+            assert!(
+                lock(&reg.account_handoffs).is_empty(),
+                "reselecting the running account cancels a queued handoff"
+            );
+            reg.queue_account_switch(ProviderKind::Codex, &target);
+        }
         reg.process_account_work_in(&home);
         let saved = load(Some(&state));
         if cancel {
@@ -171,7 +232,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
             );
             assert!(lock(&reg.state).closing.contains(&SessionId(7)));
         }
-        assert!(transcript.is_file());
+        assert_eq!(transcript.is_file(), !missing_transcript);
         assert_eq!(
             fs::read_to_string(to.join("auth.json")).unwrap(),
             "selected fixture credentials"
@@ -184,7 +245,7 @@ fn switch_resumes_same_conversation_with_selected_credentials_before_retiring_ol
 }
 
 #[test]
-fn switch_without_transcript_launches_selected_account_and_login_shell_gets_active_env() {
+fn switch_without_transcript_preserves_original_session() {
     let root = Path::new("/tmp").join(format!("kas-fresh-{}", std::process::id()));
     fs::remove_dir_all(&root).ok();
     let state = root.join("state");
@@ -214,7 +275,7 @@ fn switch_without_transcript_launches_selected_account_and_login_shell_gets_acti
     accounts::switch_account(&home, Some(&state), ProviderKind::Codex, &target).unwrap();
 
     let (daemon_end, holder_end) = UnixStream::pair().unwrap();
-    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    let holder_link = Link::new(OwnedFd::from(holder_end));
     for message in [
         FromHolder::Hello {
             version: VERSION,
@@ -258,45 +319,138 @@ fn switch_without_transcript_launches_selected_account_and_login_shell_gets_acti
     let reader = Arc::clone(&reg);
     let reader_worker =
         std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
-    let expected_home = to.clone();
-    let mock = std::thread::spawn(move || {
-        let packet = holder_link.recv().unwrap().unwrap();
-        let ToHolder::Spawn {
-            req, id, argv, env, ..
-        } = ToHolder::decode(packet.frame()).unwrap()
-        else {
-            panic!("expected replacement spawn");
-        };
-        assert!(!argv.iter().any(|arg| arg == b"resume"));
-        assert!(env.iter().any(|(key, value)| key == b"CODEX_HOME"
-            && value == expected_home.as_os_str().as_encoded_bytes()));
-        let (master, mut process) = UnixStream::pair().unwrap();
-        holder_link
-            .send(
-                &FromHolder::Spawned { req, id, pid: 901 }.encode().unwrap(),
-                &[master.as_fd()],
-            )
-            .unwrap();
-        process.write_all(b"fresh selected account\r\n").unwrap();
-        let packet = holder_link.recv().unwrap().unwrap();
-        let ToHolder::Terminate { req, id: old } = ToHolder::decode(packet.frame()).unwrap() else {
-            panic!("expected old process retirement");
-        };
-        assert_eq!(old, SessionId(9));
-        holder_link
-            .send(&FromHolder::Done { req }.encode().unwrap(), &[])
-            .unwrap();
-        Some((id, process))
-    });
     reg.queue_account_switch(ProviderKind::Codex, &target);
     reg.process_account_work_in(&home);
     let saved = load(Some(&state));
     let result = saved.get(&SessionId(9)).unwrap();
-    let new = result.to.expect("durable replacement without transcript");
-    assert_eq!(
-        reg.agents.stored(new).unwrap().unwrap().account.unwrap().id,
-        target
-    );
+    assert!(result.to.is_none());
+    assert!(result.error.is_some());
+    assert!(!lock(&reg.state).closing.contains(&SessionId(9)));
+    drop(holder_link);
+    reader_worker.join().unwrap();
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn recovery_finishes_each_committed_handoff_before_continuing_its_work() {
+    let root = Path::new("/tmp").join(format!("kas-commit-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    let state = root.join("state");
+    fs::create_dir_all(&state).unwrap();
+    let (daemon_end, holder_end) = UnixStream::pair().unwrap();
+    let mut holder_link = Link::new(OwnedFd::from(holder_end));
+    for message in [
+        FromHolder::Hello {
+            version: VERSION,
+            holder_pid: 1,
+            inbox: false,
+        },
+        FromHolder::Ready,
+    ] {
+        holder_link.send(&message.encode().unwrap(), &[]).unwrap();
+    }
+    let mut kept = Vec::new();
+    let mut processes = Vec::new();
+    for id in 1..=4 {
+        let (master, mut process) = UnixStream::pair().unwrap();
+        process
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        process.write_all(b"restored session ready\r\n").unwrap();
+        kept.push(Kept {
+            id: SessionId(id),
+            pid: u32::try_from(700 + id).unwrap(),
+            status: None,
+            master: OwnedFd::from(master),
+        });
+        processes.push(process);
+    }
+    let (holder, link, _, _) = Holder::connect(OwnedFd::from(daemon_end)).unwrap();
+    let reg = Arc::new(Registry::new(Some((holder, kept)), Some(&state)));
+    for id in 1..=4 {
+        reg.agents
+            .remember_session(
+                SessionId(id),
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                Some(format!("fixture-session-{id}")),
+                root.as_os_str().as_encoded_bytes().to_vec(),
+                Some(LaunchAccount {
+                    id: "selected".into(),
+                    env_key: "CODEX_HOME".into(),
+                    dir: String::new(),
+                }),
+            )
+            .unwrap();
+    }
+    for (from, to) in [(1, 2), (3, 4)] {
+        // Same conversation identity is required when adopting a staged replacement.
+        let source = reg.agents.stored(SessionId(from)).unwrap().unwrap();
+        reg.agents
+            .remember_session(
+                SessionId(to),
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                source.session_id,
+                source.cwd,
+                source.account,
+            )
+            .unwrap();
+        lock(&reg.account_handoffs).insert(
+            SessionId(from),
+            SessionHandoff {
+                from: SessionId(from),
+                to: Some(SessionId(to)),
+                account_id: "selected".into(),
+                error: None,
+            },
+        );
+        let prepared = Prepared {
+            from: SessionId(from),
+            to: SessionId(to),
+            account_id: "selected".into(),
+            continue_work: true,
+        };
+        accounts::write_atomic_0600(
+            &prepared_path(&state, prepared.to),
+            &serde_json::to_vec(&prepared).unwrap(),
+        )
+        .unwrap();
+    }
+    reg.save_account_handoffs().unwrap();
+    let reader = Arc::clone(&reg);
+    let reader_worker =
+        std::thread::spawn(move || reader.holder.as_ref().unwrap().run(link, |_, _| {}));
+    let mock = std::thread::spawn(move || {
+        for expected in [SessionId(1), SessionId(3)] {
+            let packet = holder_link.recv().unwrap().unwrap();
+            let ToHolder::Terminate { req, id } = ToHolder::decode(packet.frame()).unwrap() else {
+                panic!("expected original retirement")
+            };
+            assert_eq!(id, expected);
+            holder_link
+                .send(&FromHolder::Done { req }.encode().unwrap(), &[])
+                .unwrap();
+        }
+        for index in [1, 3] {
+            let mut bytes = vec![0; CONTINUE_PROMPT.len() + 1];
+            processes
+                .get_mut(index)
+                .unwrap()
+                .read_exact(&mut bytes)
+                .unwrap();
+            assert_eq!(bytes, format!("{CONTINUE_PROMPT}\r").as_bytes());
+        }
+        processes
+    });
+    reg.recover_account_work(&root.join("home"));
+    assert_eq!(fs::read_dir(state.join(PREPARED_DIR)).unwrap().count(), 0);
+    reg.recover_account_work(&root.join("home"));
     drop(mock.join().unwrap());
     reader_worker.join().unwrap();
     drop(reg);

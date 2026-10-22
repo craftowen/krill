@@ -102,6 +102,8 @@ pub(super) fn checkpoint_parts_from_store(
             .statuses
             .get(&key)
             .and_then(|s| krill_proto::orchestration::WorkspaceStatus::parse(s).ok())
+            // 진행 상태는 그룹화·보드·저장소에 유지하고 카드의 WIP 장식만 생략한다.
+            .filter(|s| *s != krill_proto::orchestration::WorkspaceStatus::InProgress)
             .map(krill_proto::orchestration::WorkspaceStatus::badge_label)
             .map(str::to_owned);
         let pr = store.prs.get(&key).copied();
@@ -2254,7 +2256,6 @@ mod tests {
         );
         for (path, badge) in [
             ("/repo/todo", "TODO"),
-            ("/repo/wip", "WIP"),
             ("/repo/done", "DONE"),
             ("/repo/linked", "OWE-627"),
         ] {
@@ -2269,11 +2270,17 @@ mod tests {
             "/repo/comment-only",
             "/repo/invalid",
             "/repo/unread",
+            "/repo/wip",
             "/tmp/minikrill-review/child",
         ] {
             assert_eq!(checkpoint_badge_for(Some(&sidebar), Path::new(path)), None);
         }
         assert_eq!(checkpoint_badge_for(None, Path::new(full)), None);
+        assert_eq!(
+            WorktreeStore::load_cached(&dir).statuses.get("/repo/wip"),
+            Some(&"in-progress".to_owned()),
+            "hiding the WIP decoration must preserve the saved workspace status"
+        );
         assert_eq!(
             checkpoint_badge_for(Some(Path::new("sidebar.bin")), Path::new(full)),
             None

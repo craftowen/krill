@@ -218,3 +218,16 @@ button.account-row:disabled{opacity:1}
 .accounts .usage-value{width:38px;font-variant-numeric:tabular-nums}.accounts .usage-track{max-width:none}.accounts .account-trailing{align-self:flex-start;margin-top:2px}
 .accounts .account-meta{font-size:var(--font-meta);line-height:1.5}.accounts .account-error{font-size:var(--font-meta);white-space:normal;line-height:1.5}
 .sr-only{position:absolute!important;width:1px!important;height:1px!important;padding:0!important;margin:-1px!important;overflow:hidden!important;clip:rect(0,0,0,0)!important;white-space:nowrap!important;border:0!important}
+
+/* Project/session hierarchy mirrors the desktop sidebar; each terminal opens directly. */
+.home-shortcuts{display:flex;flex-wrap:wrap;gap:var(--space-sm);margin:var(--space-md) 0 var(--space-xl)}
+.home-shortcuts>.secondary{flex:1;min-width:140px;margin:0;display:flex;align-items:center;justify-content:center;gap:var(--space-sm);width:auto}
+.workspace-actions{padding:var(--space-sm) var(--space-md);border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.new-workspace{display:flex;align-items:center;justify-content:center;gap:var(--space-sm);width:100%}
+.workspace-card{margin:var(--space-sm) var(--space-md);border:1px solid var(--border);border-radius:var(--radius-card);overflow:hidden;background:var(--surface-panel)}
+.workspace-card>.workspace-row{padding:var(--space-md);min-height:60px}.workspace-card>.workspace-row:after{display:none}
+.workspace-row>svg.expanded{transform:rotate(90deg)}
+.workspace-sessions{border-top:1px solid var(--border);padding:var(--space-xs) var(--space-sm)}
+.workspace-session{width:100%;display:flex;align-items:center;gap:var(--space-md);min-height:var(--touch-target);padding:var(--space-sm);text-align:left;border-radius:var(--radius-row)}
+.workspace-session .workspace-main>strong{font-weight:500}.workspace-session>svg{width:14px;color:var(--text-muted)}
+.workspace-add-session{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);padding:var(--space-sm);color:var(--muted-foreground)}

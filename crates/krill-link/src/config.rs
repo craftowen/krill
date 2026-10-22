@@ -232,7 +232,7 @@ impl LinkConfig {
                 return trimmed.to_owned();
             }
         }
-        "minikrill-mac".to_owned()
+        "krill-mac".to_owned()
     }
 }
 

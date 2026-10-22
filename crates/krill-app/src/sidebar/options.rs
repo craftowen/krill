@@ -1007,7 +1007,6 @@ impl Sidebar {
         // including when both machines happen to use the same absolute paths.
         let mut options = self.options.clone();
         options.filters.repos.clear();
-        let parents = self.merged_parents();
         let ctx = WorktreeContext {
             meta: Some(&remote.meta),
             prs: Some(&self.prs),
@@ -1016,8 +1015,8 @@ impl Sidebar {
             focused: self.focused,
             automation_worktrees: Some(&self.automation_worktrees),
             cli_worktrees: Some(&self.cli_worktrees),
-            parents: Some(&parents),
-            collapsed_lineage: Some(&self.collapsed_lineage),
+            // Lineage belongs to the local store. Matching absolute paths on a remote
+            // host do not make them descendants of local worktrees.
             sleeping_worktrees: Some(&self.sleeping_worktrees),
             removed_projects: Some(&self.removed_projects),
             project_order: Some(&self.project_order),

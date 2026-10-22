@@ -14,6 +14,15 @@ use krill_hosts::{ExternalHost, HostConnectionInfo, HostStatus, RemoteConnector,
 type Registry = Mutex<BTreeMap<PathBuf, Weak<LinkHosts>>>;
 static SERVICES: OnceLock<Registry> = OnceLock::new();
 
+#[derive(Debug, Default)]
+pub struct ConnectionsChanged(u64);
+impl gpui::Global for ConnectionsChanged {}
+
+pub fn notify_connections_changed(cx: &mut gpui::App) {
+    let generation = cx.try_global::<ConnectionsChanged>().map_or(0, |v| v.0);
+    cx.set_global(ConnectionsChanged(generation.wrapping_add(1)));
+}
+
 #[derive(Debug)]
 pub struct LinkHosts {
     state_dir: PathBuf,
@@ -31,8 +40,10 @@ struct Slot {
     state_dir: PathBuf,
     executable: PathBuf,
     host: krill_link::RemoteHost,
+    identity: Arc<()>,
     lease: Mutex<Weak<Lease>>,
     closed: Arc<AtomicBool>,
+    removed: AtomicBool,
     revoked: AtomicBool,
     restart: AtomicBool,
     starting: AtomicBool,
@@ -77,11 +88,11 @@ impl LinkHosts {
 
     /// 등록과 상태 조회만 수행한다. connect 프로세스를 시작하지 않는다.
     pub fn registrations(&self) -> io::Result<Vec<ExternalHost>> {
-        let hosts = krill_link::load_hosts(&self.state_dir).map_err(io::Error::other)?;
         let mut slots = self
             .slots
             .lock()
             .map_err(|_| io::Error::other("link registry poisoned"))?;
+        let hosts = krill_link::load_hosts(&self.state_dir).map_err(io::Error::other)?;
         slots.retain(|id, _| hosts.iter().any(|h| &h.id == id));
         let mut result = Vec::new();
         for host in hosts {
@@ -92,8 +103,10 @@ impl LinkHosts {
                         state_dir: self.state_dir.clone(),
                         executable: self.executable.clone(),
                         host: host.clone(),
+                        identity: Arc::new(()),
                         lease: Mutex::new(Weak::new()),
                         closed: self.closed.clone(),
+                        removed: AtomicBool::new(false),
                         revoked: AtomicBool::new(false),
                         restart: AtomicBool::new(false),
                         starting: AtomicBool::new(false),
@@ -212,6 +225,35 @@ impl LinkHosts {
         }
     }
 
+    /// 저장된 원격 연결과 앱이 소유한 터널만 정리한다. 원격 세션에는 종료를 보내지 않는다.
+    pub fn disconnect_host(&self, id: &str) -> io::Result<()> {
+        let slot = {
+            let mut slots = self
+                .slots
+                .lock()
+                .map_err(|_| io::Error::other("link registry poisoned"))?;
+            match krill_link::remove_host(&self.state_dir, id) {
+                Ok(_) | Err(krill_link::Error::HostNotFound(_)) => {}
+                Err(err) => return Err(io::Error::other(err)),
+            }
+            let slot = slots.remove(id);
+            if let Some(slot) = &slot {
+                // 이전 창/작업이 보유한 connector도 다시 연결을 시작하지 못한다.
+                slot.removed.store(true, Ordering::Release);
+            }
+            if let Ok(mut repaired) = self.repaired.lock() {
+                repaired.remove(id);
+            }
+            slot
+        };
+        if let Some(slot) = slot
+            && let Some(lease) = slot.lease.lock().ok().and_then(|lease| lease.upgrade())
+        {
+            lease.stop();
+        }
+        Ok(())
+    }
+
     /// 앱 종료 훅의 백그라운드 작업에서 호출한다.
     pub fn shutdown(&self) {
         self.closed.store(true, Ordering::Release);
@@ -268,12 +310,24 @@ impl Slot {
         };
         let connect = lease.clone();
         let errors = lease;
+        let lifetime = self.clone();
         RemoteConnector::new(move || connect.ensure(), |_, _| {})
             .with_error_mapper(move |err| errors.user_error(&err))
+            .with_lifetime(self.identity.clone(), move || {
+                !lifetime.removed.load(Ordering::Acquire)
+                    && !lifetime.closed.load(Ordering::Acquire)
+            })
     }
 }
 
 impl Lease {
+    fn check_available(&self) -> io::Result<()> {
+        if self.slot.closed.load(Ordering::Acquire) || self.slot.removed.load(Ordering::Acquire) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        Ok(())
+    }
+
     fn user_error(&self, err: &io::Error) -> io::Error {
         if connection_info(&self.slot.state_dir, &self.slot.host.id)
             .ok()
@@ -293,9 +347,7 @@ impl Lease {
     }
 
     fn ensure(&self) -> io::Result<PathBuf> {
-        if self.slot.closed.load(Ordering::Acquire) {
-            return Err(io::ErrorKind::Interrupted.into());
-        }
+        self.check_available()?;
         if self
             .slot
             .suspended
@@ -322,6 +374,7 @@ impl Lease {
             .child
             .lock()
             .map_err(|_| io::Error::other(text::ERR_UNAVAILABLE.get()))?;
+        self.check_available()?;
         if restart && let Some(mut process) = child.take() {
             let pid = process.id();
             process.kill().ok();
@@ -367,9 +420,7 @@ impl Lease {
         let _starting = Starting(&self.slot.starting);
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            if self.slot.closed.load(Ordering::Acquire) {
-                return Err(io::ErrorKind::Interrupted.into());
-            }
+            self.check_available()?;
             if let Some(process) = child.as_mut()
                 && process.try_wait()?.is_some()
             {

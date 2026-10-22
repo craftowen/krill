@@ -57,20 +57,15 @@ fn device(d: krill_link::AllowedDevice) -> PairedDevice {
 
 impl LinkBackend for RealLinkBackend {
     fn enable_server(&self) -> Result<ServerStatus, String> {
-        krill_link::enable_launch_agent(&self.executable, &self.state_dir)
-            .map_err(|_| text::ERR_SERVER_CHANGE.get().to_owned())?;
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while !krill_link::is_serve_running(&self.state_dir) {
-            if std::time::Instant::now() >= deadline {
-                return Err(text::ERR_SERVER_NOT_READY.get().to_owned());
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        krill_link::service::enable_server(&self.executable, &self.state_dir).map_err(|error| {
+            tracing::warn!(%error, "failed to enable incoming access");
+            text::ERR_SERVER_CHANGE.get().to_owned()
+        })?;
         self.server_status()
     }
 
     fn disable_server(&self) -> Result<ServerStatus, String> {
-        krill_link::disable_launch_agent(&self.state_dir)
+        krill_link::service::disable_server(&self.state_dir)
             .map_err(|_| text::ERR_SERVER_CHANGE.get().to_owned())?;
         let status = self.server_status()?;
         if status.enabled {
@@ -148,6 +143,19 @@ impl LinkBackend for RealLinkBackend {
                 })
             })
             .collect()
+    }
+
+    fn disconnect_host(&self, id: &str) -> Result<Vec<PairedHost>, String> {
+        self.hosts
+            .get_or_init(|| {
+                crate::hosts::link::LinkHosts::shared(
+                    self.state_dir.clone(),
+                    self.executable.clone(),
+                )
+            })
+            .disconnect_host(id)
+            .map_err(|_| text::ERR_DISCONNECT.get().to_owned())?;
+        self.remote_hosts()
     }
 
     fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String> {

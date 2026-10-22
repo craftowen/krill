@@ -5,11 +5,11 @@ const source=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/client.js
 const enc=new TextEncoder(),flush=async()=>{for(let i=0;i<30;i++)await Promise.resolve();};
 const deferred=()=>{let resolve;const promise=new Promise(done=>resolve=done);return {promise,resolve};};
 function harness(saved=null,href='https://phone.test/m/0123456789abcdef/',useEndpoint=false){
- let now=100000,nextTimer=0;const timers=new Map(),sockets=[],events=[],redirects=[],store=new Map(saved?[['minikrill-mobile-v2',JSON.stringify(saved)]]:[]),url=new URL(href);
+ let now=100000,nextTimer=0;const timers=new Map(),sockets=[],events=[],redirects=[],store=new Map(saved?[['krill-mobile-v2',JSON.stringify(saved)]]:[]),url=new URL(href);
  url.replace=href=>redirects.push(href);
  class Socket{constructor(url){this.url=url;this.handlers={};this.sent=[];this.readyState=0;sockets.push(this);}addEventListener(name,fn){(this.handlers[name]||=[]).push(fn);}removeEventListener(name,fn){this.handlers[name]=(this.handlers[name]||[]).filter(v=>v!==fn);}emit(name,event={}){if(name==='open')this.readyState=1;for(const fn of [...this.handlers[name]||[]])fn(event);}send(data){this.sent.push(data);}close(){this.readyState=3;this.closed=true;}}
- const C={enc,concat:(...bytes)=>Uint8Array.from(bytes.flatMap(b=>Array.from(b))),unhex:()=>new Uint8Array(32),unbase64:()=>new Uint8Array(32),hex:()=> 'aa'.repeat(32),sha256:()=>new Uint8Array(32),Channel:class{seal(b){return b;}open(b){return b;}}};
- const context=vm.createContext({TextEncoder,TextDecoder,Uint8Array,Uint32Array,DataView,URL,URLSearchParams,AbortController,MkCrypto:C,WebSocket:Socket,Date:class extends Date{static now(){return now;}},crypto:{getRandomValues:b=>b},location:url,history:{replaceState(){}},navigator:{},localStorage:{getItem:key=>store.get(key)||null,setItem:(key,value)=>store.set(key,value)},setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});return id;},clearTimeout:id=>timers.delete(id)});
+ const C={enc,concat:(...bytes)=>Uint8Array.from(bytes.flatMap(b=>Array.from(b))),unhex:()=>new Uint8Array(32),unbase64:()=>new Uint8Array(32),hex:b=>Buffer.from(b).toString('hex'),sha256:b=>new Uint8Array(require('node:crypto').createHash('sha256').update(b).digest()),Channel:class{seal(b){return b;}open(b){return b;}}};
+ const context=vm.createContext({TextEncoder,TextDecoder,Uint8Array,Uint32Array,DataView,URL,URLSearchParams,AbortController,MkCrypto:C,WebSocket:Socket,Date:class extends Date{static now(){return now;}},crypto:{getRandomValues:b=>b},location:url,history:{replaceState(){}},navigator:{},localStorage:{getItem:key=>store.get(key)||null,setItem:(key,value)=>store.set(key,value),removeItem:key=>store.delete(key)},setTimeout:(fn,ms)=>{const id=++nextTimer;timers.set(id,{fn,at:now+ms});return id;},clearTimeout:id=>timers.delete(id)});
  vm.runInContext(source,context);
  const endpoint=useEndpoint?context.KrillMobile.transport.bootstrap():null;
  const transport=context.KrillMobile.transport.create({credentials:endpoint?.credentials||{device_id:'aa',credential:'bb'},endpoint,url:'wss://desktop.test/ws',onStatus:s=>events.push(s)});
@@ -31,7 +31,7 @@ for(const stage of [0,1])test(`version mismatch at handshake stage ${stage} paus
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true);let checks=0;h.endpoint.setUpdateHandler(()=>checks++);h.context.fetch=async()=>({ok:true,json:async()=>({hash:'fedcba9876543210',relay:true,url:''})});
  const {pending,socket}=await h.start(stage);socket.emit('close',{code:1012});await pending;assert.equal(checks,1);assert.equal(h.endpoint.updatePending,true);assert.equal(h.transport.updateBusy,false);assert.equal(h.transport.state.retryAt,0);await h.tick(30000);assert.equal(h.sockets.length,1);h.endpoint.clearUpdatePending();h.transport.resume();await flush();assert.equal(h.sockets.length,2);h.transport.close();
 });
-test('replacement cancellation restores saved destination and credential together',()=>{const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),url:'https://saved.trycloudflare.com'},h=harness(saved,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'d'.repeat(32)),endpoint=h.context.KrillMobile.transport.bootstrap();assert.equal(endpoint.replacing,true);assert.match(endpoint.socketUrl(),/\/r\/dddd/);const restored=endpoint.restoreSaved();assert.equal(restored.device_id,saved.device_id);assert.equal(endpoint.socketUrl(),'wss://saved.trycloudflare.com/ws?v=0123456789abcdef');assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).rid,saved.rid);});
+test('replacement cancellation restores saved destination and credential together',()=>{const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),url:'https://saved.trycloudflare.com'},h=harness(saved,'https://phone.test/m/0123456789abcdef/#pair=aa&key=bb&r='+'d'.repeat(32)),endpoint=h.context.KrillMobile.transport.bootstrap();assert.equal(endpoint.replacing,true);assert.match(endpoint.socketUrl(),/\/r\/dddd/);const restored=endpoint.restoreSaved();assert.equal(restored.device_id,saved.device_id);assert.equal(endpoint.socketUrl(),'wss://saved.trycloudflare.com/ws?v=0123456789abcdef');assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).rid,saved.rid);});
 test('device capacity is blocked with cleanup guidance rather than expired QR diagnosis',async()=>{const h=harness(),{pending,socket}=await h.start(2);socket.emit('close',{code:4009});await pending;assert.equal(h.transport.blocked,true);assert.match(h.transport.state.message,/device limit/);assert.doesNotMatch(h.transport.state.message,/expired/);h.transport.close();});
 test('cooldown exposes retryAt and explicit reconnect preserves server backoff',async()=>{const h=harness(),{pending,socket}=await h.start(2);socket.emit('close',{code:1013});await pending;const retryAt=h.transport.state.retryAt;assert.ok(retryAt>100000);assert.equal(h.transport.blocked,false);h.transport.reconnect();await flush();assert.equal(h.sockets.length,1);assert.ok(h.transport.state.retryAt>=retryAt);h.transport.close();});
 test('fresh pairing can recover a blocked transport',async()=>{const h=harness(),{pending,socket}=await h.start(2);socket.emit('close',{code:1008});await pending;assert.equal(h.transport.blocked,true);h.transport.setPair({ticket:'new',secret:'secret'});await flush();assert.equal(h.transport.blocked,false);assert.equal(h.sockets.length,2);h.transport.close();});
@@ -56,13 +56,13 @@ for(const delayed of ['fetch','json'])test(`stale discovery ${delayed} success c
  if(delayed==='json'){fetchResult.resolve(response);await flush();assert.equal(jsonReads,1);}
  h.transport.reconnect();await flush();const replacement=h.sockets.at(-1);assert.notEqual(replacement,socket);
  await h.advance(replacement);h.response(replacement,{sessions:[]});await flush();assert.equal(h.transport.ready,true);
- const routing=h.endpoint.socketUrl(),stored=h.store.get('minikrill-mobile-v2'),credentials=JSON.stringify(h.transport.credentials),endpointCredentials=JSON.stringify(h.endpoint.authenticated({})),events=h.events.length;
+ const routing=h.endpoint.socketUrl(),stored=h.store.get('krill-mobile-v2'),credentials=JSON.stringify(h.transport.credentials),endpointCredentials=JSON.stringify(h.endpoint.authenticated({})),events=h.events.length;
  jsonResult.resolve({hash:'fedcba9876543210',url:'https://stale.trycloudflare.com',relay:false});fetchResult.resolve(response);await pending;await flush();
- assert.equal(h.endpoint.socketUrl(),routing);assert.equal(h.store.get('minikrill-mobile-v2'),stored);assert.equal(JSON.stringify(h.transport.credentials),credentials);assert.equal(JSON.stringify(h.endpoint.authenticated({})),endpointCredentials);assert.deepEqual(h.redirects,[]);assert.equal(jsonReads,delayed==='json'?1:0);assert.equal(signal.aborted,true);assert.equal(replacement.closed,undefined);assert.equal(h.transport.ready,true);assert.equal(h.transport.state.phase,'ready');assert.equal(h.events.length,events);h.transport.close();
+ assert.equal(h.endpoint.socketUrl(),routing);assert.equal(h.store.get('krill-mobile-v2'),stored);assert.equal(JSON.stringify(h.transport.credentials),credentials);assert.equal(JSON.stringify(h.endpoint.authenticated({})),endpointCredentials);assert.deepEqual(h.redirects,[]);assert.equal(jsonReads,delayed==='json'?1:0);assert.equal(signal.aborted,true);assert.equal(replacement.closed,undefined);assert.equal(h.transport.ready,true);assert.equal(h.transport.state.phase,'ready');assert.equal(h.events.length,events);h.transport.close();
 });
 test('closing a connection cancels pending discovery before a late JSON redirect',async()=>{
  const saved={device_id:'a'.repeat(64),credential:'b'.repeat(64),rid:'c'.repeat(32),hash:'0123456789abcdef'},h=harness(saved,undefined,true),jsonResult=deferred();let signal;
- h.context.fetch=async(_url,options)=>{signal=options.signal;return {ok:true,json:()=>jsonResult.promise};};const {pending,socket}=await h.start();socket.emit('error');await flush();const stored=h.store.get('minikrill-mobile-v2');h.transport.close();jsonResult.resolve({hash:'fedcba9876543210',url:'https://stale.trycloudflare.com'});await pending;assert.equal(h.store.get('minikrill-mobile-v2'),stored);assert.deepEqual(h.redirects,[]);assert.equal(signal.aborted,true);assert.equal(h.transport.ready,false);
+ h.context.fetch=async(_url,options)=>{signal=options.signal;return {ok:true,json:()=>jsonResult.promise};};const {pending,socket}=await h.start();socket.emit('error');await flush();const stored=h.store.get('krill-mobile-v2');h.transport.close();jsonResult.resolve({hash:'fedcba9876543210',url:'https://stale.trycloudflare.com'});await pending;assert.equal(h.store.get('krill-mobile-v2'),stored);assert.deepEqual(h.redirects,[]);assert.equal(signal.aborted,true);assert.equal(h.transport.ready,false);
 });
 
 test('pairing a second desktop keeps the first credential and switching restores its destination',()=>{
@@ -77,7 +77,7 @@ test('pairing a second desktop keeps the first credential and switching restores
 test('re-pairing the same relay desktop rotates its credential without adding a duplicate',()=>{
  const h=harness({device_id:'old',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint;
  e.describeHost({display_name:'Same PC'});e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'a'.repeat(32)).use();e.authenticated({device_id:'new',credential:'33'.repeat(32)});
- assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].name,'Same PC');assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).device_id,'new');
+ assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].name,'Same PC');assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'new');
 });
 test('desktop aliases survive snapshots, reconnects, reloads and re-pairing without changing credentials',()=>{
  const saved={device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},h=harness(saved,undefined,true),e=h.endpoint,id=e.profiles()[0].id;
@@ -89,10 +89,10 @@ test('desktop aliases survive snapshots, reconnects, reloads and re-pairing with
 });
 test('renaming an inactive desktop preserves the active host and failed saves preserve its old name',()=>{
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
- e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();e.authenticated({device_id:'second',credential:'22'.repeat(32)});const before=h.store.get('minikrill-mobile-v2');
- e.renameHost(first,'Home PC');assert.equal(e.profiles().find(h=>h.id===first).name,'Home PC');assert.equal(h.store.get('minikrill-mobile-v2'),before);
+ e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();e.authenticated({device_id:'second',credential:'22'.repeat(32)});const before=h.store.get('krill-mobile-v2');
+ e.renameHost(first,'Home PC');assert.equal(e.profiles().find(h=>h.id===first).name,'Home PC');assert.equal(h.store.get('krill-mobile-v2'),before);
  for(const invalid of ['', '  ', 'x'.repeat(81)])assert.throws(()=>e.renameHost(first,invalid),/desktop name/);
- h.context.localStorage.setItem=()=>{throw Error('quota');};assert.throws(()=>e.renameHost(first,'Lost edit'),/Could not save/);assert.equal(e.profiles().find(h=>h.id===first).name,'Home PC');assert.equal(e.profiles().find(h=>h.active).id,'relay:'+'b'.repeat(32));assert.equal(h.store.get('minikrill-mobile-v2'),before);
+ h.context.localStorage.setItem=()=>{throw Error('quota');};assert.throws(()=>e.renameHost(first,'Lost edit'),/Could not save/);assert.equal(e.profiles().find(h=>h.id===first).name,'Home PC');assert.equal(e.profiles().find(h=>h.active).id,'relay:'+'b'.repeat(32));assert.equal(h.store.get('krill-mobile-v2'),before);
 });
 test('uncompleted pairing never changes the persisted active desktop',()=>{
  const h=harness({device_id:'original',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,before=h.store.get('krill-mobile-hosts-v1');
@@ -102,13 +102,27 @@ test('uncompleted pairing never changes the persisted active desktop',()=>{
 test('forgetting an inactive desktop leaves the active authentication intact',()=>{
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
  e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();e.authenticated({device_id:'second',credential:'22'.repeat(32)});const active=e.profiles().find(h=>h.active).id;
- assert.throws(()=>e.forgetHost(active),/Switch/);e.forgetHost(first);assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].id,active);assert.throws(()=>e.selectHost(first),/no longer saved/);assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).device_id,'second');
+ e.forgetHost(first);assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].id,active);assert.throws(()=>e.selectHost(first),/no longer saved/);assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'second');
+});
+test('disconnecting the active or last desktop removes persisted credentials without reviving it on reload',()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
+ e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();e.authenticated({device_id:'second',credential:'22'.repeat(32)});const active=e.profiles().find(h=>h.active).id,stale=e.forHost(active);
+ assert.equal(e.forgetHost(active),first);assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].active,true);assert.equal(e.restoreSaved().device_id,'first');assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'first');stale.describeHost({display_name:'stale'});stale.authenticated({});assert.equal(e.profiles().length,1);
+ assert.equal(e.forgetHost(first),null);assert.equal(e.profiles().length,0);assert.equal(e.restoreSaved(),null);assert.equal(h.store.has('krill-mobile-v2'),false);const reloaded=h.context.KrillMobile.transport.bootstrap();assert.equal(reloaded.profiles().length,0);assert.equal(reloaded.credentials,null);h.transport.close();
+});
+test('a failed disconnect preserves the desktop and credentials and reports the storage error',()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,id=e.profiles()[0].id,before=h.store.get('krill-mobile-v2');h.context.localStorage.setItem=()=>{throw Error('quota');};assert.throws(()=>e.forgetHost(id),/Could not remove/);assert.equal(e.profiles()[0].active,true);assert.equal(e.restoreSaved().device_id,'first');assert.equal(h.store.get('krill-mobile-v2'),before);h.transport.close();
+});
+test('another tab cannot revive a removed pairing through snapshot, authentication or common persistence',async()=>{
+ const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),a=h.endpoint,b=h.context.KrillMobile.transport.bootstrap(),id=a.profiles()[0].id,peer=b.forHost(id);a.forgetHost(id);peer.describeHost({display_name:'stale'});peer.authenticated({});b.describeHost({display_name:'stale root'});assert.throws(()=>b.selectHost(id),/no longer saved/);h.context.fetch=async()=>({ok:true,json:async()=>({hash:'0123456789abcdef',relay:true,url:''})});await peer.locate();b.renameHost(id,'Stale tab rename');assert.equal(h.store.has('krill-mobile-v2'),false);assert.equal(JSON.parse(h.store.get('krill-mobile-hosts-v1')).hosts.length,0);assert.equal(h.context.KrillMobile.transport.bootstrap().profiles().length,0);assert.equal(b.reloadHosts(),true);assert.equal(b.profiles().length,0);
+ // A new explicit QR pairing is allowed; the old peer still cannot save the removed device.
+ b.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'a'.repeat(32)).use();b.authenticated({device_id:'new-device',credential:'33'.repeat(32)});peer.describeHost({display_name:'stale'});assert.equal(b.profiles().length,1);assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'new-device');h.transport.close();
 });
 test('switching while discovery is pending aborts the old route update',async()=>{
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32)},undefined,true),e=h.endpoint,first=e.profiles()[0].id;
  e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();const second=e.authenticated({device_id:'second',credential:'22'.repeat(32)});e.selectHost(first);
  const transport=h.context.KrillMobile.transport.create({credentials:e.selectHost(first),endpoint:e}),lookup=deferred();h.context.fetch=()=>lookup.promise;const pending=transport.connect();await flush();h.sockets.at(-1).emit('error');await flush();transport.close();e.selectHost(second.id);const route=e.socketUrl();lookup.resolve({ok:true,json:async()=>({hash:'fedcba9876543210',url:'https://stale.trycloudflare.com'})});await pending;
- assert.equal(e.socketUrl(),route);assert.deepEqual(h.redirects,[]);assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).device_id,'second');
+ assert.equal(e.socketUrl(),route);assert.deepEqual(h.redirects,[]);assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'second');
 });
 
 test('unavailable storage keeps pairing and host selection usable in memory',()=>{
@@ -131,6 +145,26 @@ test('background discovery/auth cannot replace the active desktop or revive remo
  const h=harness({device_id:'first',credential:'11'.repeat(32),rid:'a'.repeat(32),hash:'0123456789abcdef'},undefined,true),e=h.endpoint,first=e.profiles()[0].id,peer=e.forHost(first);
  e.adopt('https://phone.test/m/0123456789abcdef/#pair=ab&key=secret&r='+'b'.repeat(32)).use();const second=e.authenticated({device_id:'second',credential:'22'.repeat(32)}).id;
  h.context.fetch=async()=>({ok:true,json:async()=>({hash:'fedcba9876543210',url:'https://firstnew.trycloudflare.com'})});await peer.locate();peer.authenticated({});peer.describeHost({display_name:'First renamed'});
- assert.equal(e.profiles().find(p=>p.active).id,second);assert.equal(JSON.parse(h.store.get('minikrill-mobile-v2')).device_id,'second');assert.equal(h.redirects.length,0);assert.match(peer.socketUrl(),/firstnew/);assert.equal(e.profiles().find(p=>p.id===first).name,'First renamed');assert.throws(()=>peer.authenticated({device_id:'second'}),/identity/);
+ assert.equal(e.profiles().find(p=>p.active).id,second);assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'second');assert.equal(h.redirects.length,0);assert.match(peer.socketUrl(),/firstnew/);assert.equal(e.profiles().find(p=>p.id===first).name,'First renamed');assert.throws(()=>peer.authenticated({device_id:'second'}),/identity/);
  e.forgetHost(first);peer.describeHost({display_name:'stale'});peer.authenticated({});assert.equal(e.profiles().length,1);assert.equal(e.profiles()[0].id,second);h.transport.close();
+});
+
+test('storage notifications during a new pairing leave its endpoint and handshake intact',()=>{
+ const line=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes("globalThis.addEventListener('storage'"));let handler,reloads=0,syncs=0,updates=0;
+ const context=vm.createContext({pairing:{ticket:'new-pair'},landing:false,endpoint:{reloadHosts(){reloads++;throw Error('pairing destination must not change');}},pool:{sync(){syncs++;}},update(){updates++;},addEventListener(name,fn){assert.equal(name,'storage');handler=fn;}});vm.runInContext(line,context);handler({key:'krill-mobile-hosts-v1'});context.pairing=null;context.landing=true;handler({key:'krill-mobile-removed-v1:old-device'});assert.equal(reloads,0);assert.equal(syncs,2);assert.equal(updates,2);
+});
+
+test('legacy credential migrates once and never overrides the canonical connection',()=>{
+ const h=harness(),saved={device_id:'legacy',credential:'11'.repeat(32),rid:'a'.repeat(32)};
+ h.store.set('minikrill-mobile-v2',JSON.stringify(saved));
+ const first=h.context.KrillMobile.transport.bootstrap();assert.equal(first.credentials.device_id,'legacy');
+ assert.equal(JSON.parse(h.store.get('krill-mobile-v2')).device_id,'legacy');assert.equal(h.store.has('minikrill-mobile-v2'),false);
+ h.store.set('minikrill-mobile-v2',JSON.stringify({...saved,device_id:'stale'}));
+ assert.equal(h.context.KrillMobile.transport.bootstrap().credentials.device_id,'legacy');h.transport.close();
+});
+test('legacy credential remains usable when migration storage is full',()=>{
+ const h=harness(),saved={device_id:'legacy',credential:'11'.repeat(32),rid:'a'.repeat(32)};
+ h.store.set('minikrill-mobile-v2',JSON.stringify(saved));h.context.localStorage.setItem=()=>{throw Error('quota');};
+ const endpoint=h.context.KrillMobile.transport.bootstrap();assert.equal(endpoint.credentials.device_id,'legacy');
+ assert.equal(h.store.has('minikrill-mobile-v2'),true);assert.equal(h.store.has('krill-mobile-v2'),false);h.transport.close();
 });

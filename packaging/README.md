@@ -52,7 +52,7 @@ bash packaging/publish-github.sh --dry-run        # 조립만(가드 실패는 �
 # 최종 후보에서 같은 env/target으로 전체 게이트·release 메모리/생존 검증 receipt 생성:
 CARGO_TARGET_DIR=/Volumes/krill-build/targets/krill-publish python3 packaging/release_check.py validate \
   --head "$(git rev-parse HEAD)" --directory /Volumes/krill-build/nightly/staging/manual-final \
-  --key-file "$HOME/Library/Keychains/minikrill-codesign.keychain-db.ed25519.key"
+  --key-file "$HOME/Library/Keychains/krill-codesign.keychain-db.ed25519.key"
 bash packaging/publish-github.sh --verified-release /Volumes/krill-build/nightly/staging/manual-final/validation.json
 ```
 

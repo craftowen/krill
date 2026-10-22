@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use gpui::{
     App, AppContext as _, Context, Entity, EventEmitter, FocusHandle, KeyBinding, ScrollStrategy,
-    Subscription, Task, UniformListScrollHandle, Window, actions,
+    Subscription, Task, Window, actions,
 };
 use gpui_component::input::{InputEvent, InputState};
 use krill_proto::SessionId;
@@ -40,6 +40,7 @@ pub mod options;
 mod pr;
 mod startup;
 mod view;
+mod viewport;
 
 pub use async_state::flush_file_io;
 pub use lineage::{MAX_LINEAGE_DEPTH, can_assign_parent};
@@ -78,11 +79,8 @@ actions!(
 );
 
 const KEY_CONTEXT: &str = "Sidebar";
-/// 행 높이(`uniform_list`라 모든 행이 같다).
+/// 기본 세션·프로젝트 행 높이. 상세 카드는 가변 높이 목록에서 별도로 측정한다.
 const ROW_HEIGHT: f32 = 32.;
-/// 가상 리스트로 전환하는 행 수. 이 이상이면 `uniform_list`(고정 높이)라
-/// 워크트리 카드는 고정 높이 컴팩트 변형으로 렌더한다(OWE-900).
-const VIRTUALIZED_ROWS: usize = 100;
 /// 프로젝트(저장소·폴더·그룹) 아래 워크트리·세션 행의 들여쓰기(px). 호스트 > 프로젝트 > 워크트리 단계가 보이게 한다.
 const CHILD_INDENT: f32 = 12.;
 /// 호스트 머리줄이 있을 때(원격 호스트 등록) 그 아래 프로젝트 행의 들여쓰기(px).
@@ -151,6 +149,10 @@ pub type Meta = BTreeMap<PathBuf, Tree>;
 /// IPC boundary: gpui tests supply snapshots without waiting for external IO.
 pub trait Source: Send + Sync {
     fn fetch(&self) -> io::Result<Snapshot>;
+    /// 등록 세대가 바뀐 원격 연결의 캐시·폴링 작업을 교체하기 위한 타깃.
+    fn target(&self) -> Option<&HostTarget> {
+        None
+    }
     /// 워크트리 행의 git 정보. 모르면 비워 둔다(UI가 숨긴다).
     fn meta(&self, _trees: &BTreeMap<PathBuf, Vec<PathBuf>>) -> Meta {
         Meta::new()
@@ -588,6 +590,8 @@ pub struct Sidebar {
     pr_task: Option<Task<()>>,
     pr_service: Option<Arc<crate::pull_request::Service>>,
     rows: Vec<Row>,
+    /// 논리 세션 행 → 카드 머리줄. 렌더 중 계보를 매번 역탐색하지 않는다.
+    card_parents: Vec<Option<usize>>,
     prefs: Preferences,
     options: WorkspaceOptions,
     collapsed_groups: BTreeSet<GroupKey>,
@@ -625,7 +629,7 @@ pub struct Sidebar {
     notice: Option<String>,
     task: Option<Task<()>>,
     source: Option<Arc<dyn Source>>,
-    scroll: UniformListScrollHandle,
+    card_list: viewport::CardList,
     editing: Option<(PathBuf, Entity<InputState>)>,
     edit_subscription: Option<Subscription>,
     orca_import_subscription: Option<Subscription>,
@@ -661,6 +665,8 @@ pub struct Sidebar {
     last_open_in: Option<(Target, PathBuf)>,
     #[cfg(test)]
     rendered_rows: usize,
+    /// 행 스피너 자리. 회전은 셸이 [`Sidebar::spinner_overlay`]로 그려 틱마다 사이드바를 다시 렌더하지 않는다.
+    spinner_slots: crate::ui::status::SpinnerSlots,
     #[cfg(test)]
     renders: usize,
 }
@@ -732,6 +738,7 @@ impl Sidebar {
             pr_task: None,
             pr_service: None,
             rows: Vec::new(),
+            card_parents: Vec::new(),
             prefs,
             options,
             collapsed_groups: ui.collapsed_groups,
@@ -760,7 +767,7 @@ impl Sidebar {
             notice: None,
             task: None,
             source: None,
-            scroll: UniformListScrollHandle::new(),
+            card_list: viewport::CardList::default(),
             editing: None,
             edit_subscription: None,
             orca_import_subscription: None,
@@ -784,6 +791,7 @@ impl Sidebar {
             last_open_in: None,
             #[cfg(test)]
             rendered_rows: 0,
+            spinner_slots: crate::ui::status::SpinnerSlots::default(),
             #[cfg(test)]
             renders: 0,
         }
@@ -1248,8 +1256,14 @@ impl Sidebar {
                         changed |= entry.label != label || entry.status != status;
                         entry.label = label;
                         entry.status = status;
-                        if entry.source.is_none() && s.visible {
-                            entry.source = sources.remove(&spec.id);
+                        let next = sources.remove(&spec.id);
+                        let replaced = entry.source.as_ref().is_some_and(|old| {
+                            old.target()
+                                .zip(next.as_ref().and_then(|s| s.target()))
+                                .is_some_and(|(old, next)| old != next)
+                        });
+                        if (entry.source.is_none() || replaced) && s.visible {
+                            entry.source = next;
                             new_source |= entry.source.is_some();
                         }
                         entry
@@ -1378,6 +1392,9 @@ impl Sidebar {
                                 .as_ref()
                                 .is_some_and(|current| Arc::ptr_eq(current, &source))
                             {
+                                return;
+                            }
+                            if source.target().is_some_and(|target| !target.is_current()) {
                                 return;
                             }
                             let mut changed = false;
@@ -1615,7 +1632,8 @@ impl Sidebar {
         });
         if let Some(i) = idx {
             self.cursor = Some(i);
-            self.scroll.scroll_to_item(i, ScrollStrategy::Nearest);
+            self.sync_viewport();
+            self.scroll_row_into_view(i, ScrollStrategy::Nearest);
             cx.notify();
         }
     }
@@ -1668,6 +1686,32 @@ impl Sidebar {
             .filter(|root| !root.as_os_str().is_empty() && path.starts_with(root))
             .max_by_key(|root| root.as_os_str().len())
             .cloned()
+    }
+
+    /// 선택한 호스트·워크스페이스의 현재 세션. 접힘·필터·탭 분리 여부와 무관하다.
+    /// 기록 보관 세션은 스냅샷에 없으며, 종료 상태와 끊긴 호스트는 포함하지 않는다.
+    #[must_use]
+    pub fn live_sessions_in_workspace(&self, host: &HostId, folder: &Path) -> Vec<SessionId> {
+        if !self.host_connected(host) {
+            return Vec::new();
+        }
+        self.snapshot_for(host)
+            .sessions
+            .iter()
+            .filter(|s| {
+                if s.status.state == AgentState::Exited {
+                    return false;
+                }
+                let Some(path) = s.worktree.as_deref().or(s.cwd.as_deref()) else {
+                    return false;
+                };
+                self.workspace_for_path_on(host, path)
+                    .as_deref()
+                    .unwrap_or(path)
+                    == folder
+            })
+            .map(|s| s.id)
+            .collect()
     }
 
     /// OWE-854: 셸 탭의 사용자 지정 제목을 세션별로 동기화한다. 바뀔 때만 다시 그린다.
@@ -1779,6 +1823,11 @@ impl Sidebar {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        let cursor_item = self.cursor.and_then(|i| {
+            self.rows
+                .get(i)
+                .map(|row| (self.row_host(i).clone(), row.clone()))
+        });
         self.ensure_external_polling(cx);
         if self.remote_hosts.is_empty() {
             self.rows = if self.options.filters.contains_host(&HostId::Local) {
@@ -1847,19 +1896,67 @@ impl Sidebar {
             self.rows = rows;
             self.row_hosts = row_hosts;
         }
+        if let Some((host, row)) = &cursor_item {
+            self.cursor = self.rows.iter().enumerate().find_map(|(i, new_row)| {
+                (self.row_host(i) == host && viewport::same_item(row, new_row)).then_some(i)
+            });
+        }
         if self.cursor.is_none()
             && let Some(sel) = &self.selected_worktree
         {
-            self.cursor = self.rows.iter().position(|r| match r {
-                Row::Worktree(p) | Row::Folder(p) | Row::Repository(p) => p == sel,
-                _ => false,
+            self.cursor = self.rows.iter().enumerate().find_map(|(i, r)| {
+                (cursor_item.as_ref().is_none_or(|(host, _)| self.row_host(i) == host)
+                    && matches!(r, Row::Worktree(p) | Row::Folder(p) | Row::Repository(p) if p == sel))
+                .then_some(i)
             });
         }
         self.cursor = self
             .cursor
             .map(|i| i.min(self.rows.len().saturating_sub(1)))
             .filter(|_| !self.rows.is_empty());
+        self.sync_viewport();
+        self.card_list.invalidate_heights();
         cx.notify();
+    }
+
+    /// Build lightweight row membership once per model/navigation change. Card headers and
+    /// expanded sessions are separate list items, so even one huge card is virtualized.
+    fn sync_viewport(&mut self) {
+        let cursor_session = self.cursor.and_then(|i| match self.rows.get(i)? {
+            Row::Session(session, true) => Some((self.row_host(i), session.worktree.as_ref()?)),
+            _ => None,
+        });
+        let mut parent = None;
+        let mut parents = Vec::with_capacity(self.rows.len());
+        let mut visible = Vec::new();
+        for (i, row) in self.rows.iter().enumerate() {
+            let host = self.row_host(i);
+            let card = match row {
+                Row::Worktree(path) => {
+                    parent = Some((i, host, path));
+                    None
+                }
+                Row::Session(session, true) => parent.filter(|(_, parent_host, path)| {
+                    *parent_host == host && session.worktree.as_ref() == Some(*path)
+                }),
+                _ => {
+                    parent = None;
+                    None
+                }
+            };
+            parents.push(card.map(|(index, _, _)| index));
+            if card.is_none_or(|(_, host, path)| {
+                self.expanded_cards.contains(path) || cursor_session == Some((host, path))
+            }) {
+                visible.push((host.clone(), row.clone(), i));
+            }
+        }
+        self.card_parents = parents;
+        self.card_list.update(visible);
+    }
+
+    fn scroll_row_into_view(&self, index: usize, strategy: ScrollStrategy) {
+        self.card_list.reveal(index, strategy);
     }
 
     #[cfg(test)]
@@ -2124,7 +2221,7 @@ impl Sidebar {
 
     /// Used by keyboard navigation and the native frame-budget benchmark.
     pub fn scroll_to_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.scroll.scroll_to_item(index, ScrollStrategy::Top);
+        self.scroll_row_into_view(index, ScrollStrategy::Top);
         cx.notify();
     }
 
@@ -2134,6 +2231,7 @@ impl Sidebar {
         self.back = Some(back);
         if self.cursor.is_none() && !self.rows.is_empty() {
             self.cursor = self.rows.iter().position(|r| matches!(r, Row::Session(..)));
+            self.sync_viewport();
         }
         window.focus(&handle, cx);
         cx.notify();
@@ -2154,13 +2252,14 @@ impl Sidebar {
             .cursor
             .map_or(0, |i| i.saturating_add_signed(delta).min(last));
         self.cursor = Some(next);
+        self.sync_viewport();
         if let Some(folder) = self.cursor_folder()
             && self.selected_worktree.as_ref() != Some(&folder)
         {
             self.selected_worktree = Some(folder);
             self.write_state(cx);
         }
-        self.scroll.scroll_to_item(next, ScrollStrategy::Nearest);
+        self.scroll_row_into_view(next, ScrollStrategy::Nearest);
         cx.notify();
     }
 
@@ -2197,6 +2296,7 @@ impl Sidebar {
         cx: &mut Context<Self>,
     ) {
         self.cursor = Some(index);
+        self.sync_viewport();
         if let Some(wt) = self.folder_on(&host, id).map(Path::to_path_buf)
             && self.selected_worktree.as_ref() != Some(&wt)
         {

@@ -297,10 +297,20 @@ fn statusline_install_chains_user_command_through_git_bash_and_records_usage() {
 }
 
 #[test]
-fn doctor_json_probes_state_writes_and_skips_daemon() {
+fn doctor_json_no_start_reports_missing_daemon_without_launching() {
     let home = temp_home("doctor");
     fs::create_dir_all(home.join("state").join("run")).unwrap();
-    let out = krill(Path::new(KRILL), &home, &["doctor", "--json", "--no-start"]);
+    // 실행 가능한 헬퍼가 있어도 --no-start는 기동하지 않고 소켓만 확인한다.
+    let bin = home.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    for name in ["krill.exe", "krill-holder.exe", "krilld.exe"] {
+        fs::copy(KRILL, bin.join(name)).unwrap();
+    }
+    let out = krill(
+        &bin.join("krill.exe"),
+        &home,
+        &["doctor", "--json", "--no-start"],
+    );
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
     let check = |id: &str| {
         report["checks"]
@@ -320,8 +330,10 @@ fn doctor_json_probes_state_writes_and_skips_daemon() {
             .contains("owner check skipped"),
         "{state}"
     );
-    // 데몬 기동은 아직 Windows 미지원이라 고장(fail)이 아니라 건너뜀이다.
-    assert_eq!(check("daemon.connect")["status"], "skip");
+    assert_eq!(check("bin.helpers")["status"], "ok");
+    assert_eq!(check("daemon.connect")["status"], "fail");
+    assert!(!out.status.success());
+    assert!(!home.join("state/run/krilld.sock.launch").exists());
     assert!(fs::read_dir(home.join("state")).unwrap().all(|e| {
         !e.unwrap()
             .file_name()

@@ -79,12 +79,19 @@ pub enum HostStatus {
 type EnsureSocketFn = dyn Fn() -> io::Result<PathBuf> + Send + Sync;
 type OutcomeFn = dyn Fn(bool, Option<&io::Error>) + Send + Sync;
 
+#[derive(Clone)]
+struct ConnectorLifetime {
+    key: Arc<()>,
+    current: Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
 /// 원격 전송 계층(SSH 터널, 추후 iroh QUIC 등)이 로컬 포워딩 소켓을 보장하고 연결 결과를 기록하는 훅.
 #[derive(Clone)]
 pub struct RemoteConnector {
     ensure_socket: Arc<EnsureSocketFn>,
     on_outcome: Arc<OutcomeFn>,
     map_error: Option<Arc<dyn Fn(io::Error) -> io::Error + Send + Sync>>,
+    lifetime: Option<ConnectorLifetime>,
 }
 
 impl fmt::Debug for RemoteConnector {
@@ -102,6 +109,7 @@ impl RemoteConnector {
             ensure_socket: Arc::new(ensure_socket),
             on_outcome: Arc::new(on_outcome),
             map_error: None,
+            lifetime: None,
         }
     }
 
@@ -111,6 +119,20 @@ impl RemoteConnector {
         mapper: impl Fn(io::Error) -> io::Error + Send + Sync + 'static,
     ) -> Self {
         self.map_error = Some(Arc::new(mapper));
+        self
+    }
+
+    /// 같은 소켓 경로를 재사용하는 새 등록과 폐기된 등록을 구분한다. 콜백은 IO를 하지 않는다.
+    #[must_use]
+    pub fn with_lifetime(
+        mut self,
+        key: Arc<()>,
+        current: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Self {
+        self.lifetime = Some(ConnectorLifetime {
+            key,
+            current: Arc::new(current),
+        });
         self
     }
 }
@@ -133,6 +155,14 @@ impl PartialEq for HostTarget {
             && self.socket == other.socket
             && self.allow_local_launch == other.allow_local_launch
             && self.local_paths == other.local_paths
+            && match (
+                self.connector.as_ref().and_then(|c| c.lifetime.as_ref()),
+                other.connector.as_ref().and_then(|c| c.lifetime.as_ref()),
+            ) {
+                (Some(a), Some(b)) => Arc::ptr_eq(&a.key, &b.key),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 
@@ -225,12 +255,23 @@ impl HostTarget {
         }
     }
 
+    /// 등록의 연결 세대가 유효한지 메모리만으로 확인한다.
+    pub fn is_current(&self) -> bool {
+        self.connector
+            .as_ref()
+            .and_then(|connector| connector.lifetime.as_ref())
+            .is_none_or(|lifetime| (lifetime.current)())
+    }
+
     /// 호스트 데몬에 연결한다.
     ///
     /// - `allow_local_launch == true` (`Local`): 소켓이 없으면 로컬 `krill-holder`/`krilld`를 기동한다.
     /// - `allow_local_launch == false` (`Remote`): 절대 로컬 `krill-holder`/`krilld`를 띄우지 않고
     ///   포워딩된 소켓에만 Hello 협상을 수행한다.
     pub fn connect(&self, hello: &ClientHello) -> Result<Connection, daemon::Error> {
+        if !self.is_current() {
+            return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
+        }
         if self.allow_local_launch
             && let Some(paths) = &self.local_paths
         {
@@ -252,6 +293,11 @@ impl HostTarget {
         };
         match ssh::dial_tunnel(&socket, hello, ssh::HELLO_TIMEOUT) {
             Ok(conn) => {
+                // ensure_socket 이후 Hello가 지연되는 동안 등록이 해제될 수 있다.
+                if !self.is_current() {
+                    conn.stream.shutdown(std::net::Shutdown::Both).ok();
+                    return Err(daemon::Error::Io(io::ErrorKind::Interrupted.into()));
+                }
                 if let Some(c) = &self.connector {
                     (c.on_outcome)(true, None);
                 }
@@ -359,6 +405,76 @@ mod tests {
         assert_eq!(target.host(), &HostId::Local);
         assert!(target.allow_local_launch());
         assert_eq!(target.local_paths(), Some(&paths));
+    }
+
+    #[test]
+    fn connector_lifetime_distinguishes_repaired_registration_at_the_same_socket() {
+        let target = |key| {
+            HostTarget::remote_with_connector(
+                "studio",
+                PathBuf::from("/tmp/studio.sock"),
+                RemoteConnector::new(|| Ok(PathBuf::from("/tmp/studio.sock")), |_, _| {})
+                    .with_lifetime(key, || true),
+            )
+        };
+        let key = Arc::new(());
+        let first = target(key.clone());
+        assert_eq!(first, target(key));
+        assert_eq!(first, first.clone());
+        assert_ne!(first, target(Arc::new(())));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn disconnect_during_hello_discards_the_inflight_connection() {
+        use std::io::{Read as _, Write as _};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        let dir = std::env::temp_dir().join(format!("krill-hosts-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("remote.sock");
+        std::fs::remove_file(&socket).ok();
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let current = Arc::new(AtomicBool::new(true));
+        let live = current.clone();
+        let path = socket.clone();
+        let target = HostTarget::remote_with_connector(
+            "studio",
+            socket,
+            RemoteConnector::new(move || Ok(path.clone()), |_, _| {})
+                .with_lifetime(Arc::new(()), move || live.load(Ordering::Acquire)),
+        );
+        let (accepted_tx, accepted_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            let hello = krill_proto::ipc::ServerHello {
+                proto_min: krill_proto::ipc::PROTO_MIN,
+                proto_max: krill_proto::ipc::PROTO_MAX,
+                features: krill_proto::ipc::FEATURES,
+                build: "fixture".into(),
+                instance_id: 1,
+            };
+            stream.write_all(&hello.encode().unwrap()).unwrap();
+            assert!(krill_proto::ipc::read_frame(&mut stream).unwrap().is_some());
+            assert_eq!(stream.read(&mut [0]).unwrap(), 0);
+        });
+        let connect = std::thread::spawn(move || {
+            target.connect(&daemon::client_hello(ClientRole::App, "cancel"))
+        });
+        accepted_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        current.store(false, Ordering::Release);
+        release_tx.send(()).unwrap();
+        assert!(
+            matches!(connect.join().unwrap(), Err(daemon::Error::Io(e)) if e.kind() == io::ErrorKind::Interrupted)
+        );
+        server.join().unwrap();
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]

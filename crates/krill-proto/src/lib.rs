@@ -36,6 +36,7 @@ pub mod term_modes;
 pub mod theme;
 pub mod time;
 pub mod usage;
+pub mod user_dirs;
 pub mod worktree_space;
 
 /// krilld가 매기는 세션 식별자. holder는 그대로 되돌려 줄 뿐 해석하지 않는다.

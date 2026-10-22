@@ -546,7 +546,7 @@ fn checks_screen_installs_hook_and_cli_in_app(cx: &mut TestAppContext) {
     wait_for_file(cx, &link, || fs::symlink_metadata(&link).is_ok());
     assert_eq!(
         fs::read_link(&link).unwrap(),
-        f.env.home.join(".local/share/minikrill/bin/krill")
+        f.env.home.join(".local/share/krill/bin/krill")
     );
 }
 
@@ -576,7 +576,7 @@ fn wizard_isolated_state_skips_cli_symlink(cx: &mut TestAppContext) {
     assert!(wizard_window(cx).is_none());
 
     assert!(fs::symlink_metadata(&link).is_err());
-    assert!(!f.env.home.join(".local/share/minikrill/bin").exists());
+    assert!(!f.env.home.join(".local/share/krill/bin").exists());
     assert!(state::load(&f.env.state).completed);
 }
 
@@ -598,7 +598,7 @@ fn wizard_completed_state_only_refreshes_staging(cx: &mut TestAppContext) {
     let cx = open(cx, &f.env);
     assert!(wizard_window(cx).is_none());
     // 스테이징은 돌아간다.
-    let stable_dir = f.env.home.join(".local/share/minikrill/bin");
+    let stable_dir = f.env.home.join(".local/share/krill/bin");
     wait_for_file(cx, &stable_dir.join("krilld"), || {
         stable_dir.join("krilld").is_file()
     });
@@ -738,7 +738,7 @@ fn isolated_state_dir_skips_cli_symlink_step(cx: &mut TestAppContext) {
     assert!(wizard_window(cx).is_none());
     // 격리 상태에서는 CLI 링크·스테이징을 만들지 않는다.
     assert!(fs::symlink_metadata(f.env.home.join(".local/bin/krill")).is_err());
-    assert!(!f.env.home.join(".local/share/minikrill/bin").exists());
+    assert!(!f.env.home.join(".local/share/krill/bin").exists());
     assert!(state::load(&f.env.state).completed);
 }
 
@@ -797,7 +797,7 @@ fn stage_runs_before_hook_records_stable_path_and_refreshes_after_done(cx: &mut 
         f.env.state.join("hooks/cursor.json").exists()
     });
     press(cx, "escape");
-    let stable_dir = f.env.home.join(".local/share/minikrill/bin");
+    let stable_dir = f.env.home.join(".local/share/krill/bin");
     let stable_mk = stable_dir.join("krill");
     for bin in ["krill", "krill-holder", "krilld"] {
         assert!(stable_dir.join(bin).is_file());
@@ -1422,8 +1422,8 @@ fn wizard_fix_all_installs_hooks_and_skills_and_copy_queues_terminal_command(
         ".claude/settings.json",
         ".gemini/config/hooks.json",
         ".cursor/hooks.json",
-        ".config/opencode/plugins/minikrill.js",
-        ".claude/skills/minikrill/SKILL.md",
+        ".config/opencode/plugins/krill.js",
+        ".claude/skills/krill/SKILL.md",
         ".codex/skills/krill-orchestration/SKILL.md",
         ".gemini/config/skills/worktree-checkpoints/SKILL.md",
     ] {
@@ -1438,7 +1438,7 @@ fn wizard_fix_all_installs_hooks_and_skills_and_copy_queues_terminal_command(
         "wizard-fix-all should also install codex hook in background"
     );
     let claude_hook = fs::read_to_string(f.env.home.join(".claude/settings.json")).unwrap();
-    let staged = f.env.home.join(".local/share/minikrill/bin/krill");
+    let staged = f.env.home.join(".local/share/krill/bin/krill");
     assert!(
         claude_hook.contains(&staged.display().to_string()),
         "claude hook should record staged krill path: {claude_hook}"
@@ -1476,12 +1476,7 @@ fn wizard_fix_all_respects_isolated_state_without_polluting_fix_needs(cx: &mut T
     let cx = open_checks_screen(cx, &f.env);
     click(cx, "wizard-fix-all");
     assert!(f.env.home.join(".claude/settings.json").is_file());
-    assert!(
-        f.env
-            .home
-            .join(".claude/skills/minikrill/SKILL.md")
-            .is_file()
-    );
+    assert!(f.env.home.join(".claude/skills/krill/SKILL.md").is_file());
     assert!(!f.env.home.join(".local/bin/krill").exists());
     cx.update(|_, cx| assert!(cx.try_global::<actions::FixNeeds>().is_none()));
 }

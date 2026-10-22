@@ -266,7 +266,10 @@ fn stage_helpers(env: &Env) -> Result<PathBuf, String> {
             return Err(atext::HELPERS_MISSING.format(&[("path", &path.display().to_string())]));
         }
     }
-    safe_managed_dir(&env.home, &env.home.join(".local/share/minikrill/bin"))?;
+    safe_managed_dir(
+        &env.home,
+        &krill_proto::user_dirs::share_dir(&env.home).join("bin"),
+    )?;
     super::stage_binaries(&env.krill, &env.home)
 }
 
@@ -431,11 +434,10 @@ fn hook_config_path(agent: TargetAgent, env: &Env) -> Result<PathBuf, String> {
         }
         TargetAgent::Other(Agent::Cursor) => env.home.join(".cursor/hooks.json"),
         TargetAgent::Other(Agent::Agy) => env.home.join(".gemini/config/hooks.json"),
-        TargetAgent::Other(Agent::OpenCode) => directory(
+        TargetAgent::Other(Agent::OpenCode) => krill_proto::user_dirs::opencode_plugin(&directory(
             "OPENCODE_CONFIG_DIR",
             directory("XDG_CONFIG_HOME", env.home.join(".config")).join("opencode"),
-        )
-        .join("plugins/minikrill.js"),
+        )),
     };
     if !path.is_absolute() {
         return Err(atext::INVALID_PATH.get().to_owned());

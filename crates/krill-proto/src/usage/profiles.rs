@@ -1,7 +1,7 @@
 //! Krill이 만든 계정 프로필 폴더(OWE-704). krilld와 앱의 로컬 경로가 같은 규칙을 쓴다.
 //!
 //! 지우는 대신 휴지통(`~/.Trash`)으로 옮긴다. 로그인 정보·대화 기록이 든 사용자 데이터라
-//! 실수해도 Finder에서 되돌릴 수 있어야 한다. 관리 루트(`~/.config/minikrill/profiles/<provider>/<이름>`)
+//! 실수해도 Finder에서 되돌릴 수 있어야 한다. 관리 루트(`~/.config/krill/profiles/<provider>/<이름>`)
 //! 밖의 폴더(사용자가 직접 지정한 `~/.claude` 등)는 절대 옮기지 않는다. 파일 탐색기의 휴지통 이동은
 //! 워크트리 안으로 범위를 좁힌 별도 함수 [`move_path_to_trash`]를 쓴다.
 
@@ -18,7 +18,7 @@ pub const MAX_CODEX_HOME_BYTES: usize = 59;
 /// Krill 기본 프로필 루트. 계정 추가 시 경로를 비워 두면 `<루트>/<provider>/<slug>`에 만든다.
 #[must_use]
 pub fn managed_root(home: &Path) -> PathBuf {
-    home.join(".config").join("minikrill").join("profiles")
+    crate::user_dirs::config_dir(home).join("profiles")
 }
 
 /// Codex 소켓 길이 제한(`<= 59B`)을 맞추기 위한 단축 관리 루트(`~/.krill/p`).
@@ -73,7 +73,7 @@ pub fn default_profile_dir(home: &Path, provider: ProviderKind, slug: &str) -> P
     }
 }
 
-/// 구 관리 루트(`~/.config/minikrill/profiles/codex/<slug>`)에 생성된 긴 Codex 프로필을
+/// 구 관리 루트(`~/.config/krill/profiles/codex/<slug>`)에 생성된 긴 Codex 프로필을
 /// 단축 경로(`~/.krill/p/codex/<short-key>`)로 무손실 복사·이관한다.
 /// 사용자가 직접 지정한 외부 경로는 건드리지 않는다.
 #[must_use]

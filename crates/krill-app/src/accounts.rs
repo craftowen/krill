@@ -957,7 +957,7 @@ pub fn set_auto_switch_local(
 }
 
 pub fn default_home() -> PathBuf {
-    // 단위 테스트가 실제 사용자 홈(~/.config/minikrill/profiles 등)을 읽거나
+    // 단위 테스트가 실제 사용자 홈(~/.config/krill/profiles 등)을 읽거나
     // 고아 프로필 정리로 휴지통에 옮기지 않게 프로세스별 임시 홈으로 격리한다.
     #[cfg(test)]
     {
@@ -973,7 +973,7 @@ pub fn config_path(home: &Path, state_dir: Option<&Path>) -> PathBuf {
     if let Some(state) = state_dir {
         state.join(ACCOUNTS_FILE)
     } else {
-        home.join(".config").join("minikrill").join(ACCOUNTS_FILE)
+        krill_proto::user_dirs::config_dir(home).join(ACCOUNTS_FILE)
     }
 }
 

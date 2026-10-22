@@ -167,7 +167,7 @@ fn fetch(
     let (token, account) = credentials(provider, dir, host, home, state)?;
     query(provider, &token, account.as_deref(), |config| {
         pipe_command(
-            "/usr/bin/curl",
+            system_curl(),
             &[
                 "-q",
                 "--config",
@@ -236,7 +236,7 @@ pub(crate) fn consume_reset_credit(
     let redeem_id = redeem_request_id()?;
     consume_request(provider, &token, account.as_deref(), &redeem_id, |config| {
         pipe_command(
-            "/usr/bin/curl",
+            system_curl(),
             &[
                 "-q",
                 "--config",
@@ -399,11 +399,7 @@ pub(super) fn read_file(path: &Path) -> Option<Zeroizing<Vec<u8>>> {
 fn opencode_go_override(home: &Path, state: Option<&Path>) -> Option<Zeroizing<String>> {
     let candidates = [
         state.map(|s| s.join("opencode-go-api-key")),
-        Some(
-            home.join(".config")
-                .join("minikrill")
-                .join("opencode-go-api-key"),
-        ),
+        Some(krill_proto::user_dirs::config_dir(home).join("opencode-go-api-key")),
     ];
     for path in candidates.into_iter().flatten() {
         if let Some(raw) = read_file(&path) {
@@ -543,8 +539,30 @@ fn keychain(_: &str, _: &str) -> Option<Zeroizing<Vec<u8>>> {
     None
 }
 
-fn pipe_command(exe: &str, args: &[&str], input: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
-    let mut child = Command::new(exe)
+/// 인증 정보를 전달하므로 PATH를 검색하지 않고 OS 기본 curl을 쓴다.
+fn system_curl() -> PathBuf {
+    if cfg!(windows) {
+        std::env::var_os("SystemRoot")
+            .map_or_else(|| PathBuf::from(r"C:\Windows"), PathBuf::from)
+            .join("System32")
+            .join("curl.exe")
+    } else {
+        PathBuf::from("/usr/bin/curl")
+    }
+}
+
+fn pipe_command(
+    exe: impl AsRef<std::ffi::OsStr>,
+    args: &[&str],
+    input: &[u8],
+) -> Option<Zeroizing<Vec<u8>>> {
+    let mut command = Command::new(exe);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = command
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1374,6 +1392,64 @@ fn agy_exe() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 로그인 정보만 있는 기본 계정도 조회할 수 있다. HTTP 대신 로컬 fixture를 읽어
+    /// 실제 OS curl 실행·stdin 설정 전달·응답 파싱을 네트워크 없이 검증한다.
+    #[test]
+    fn host_account_usage_uses_system_curl_without_statusline_cache() {
+        let root = std::env::temp_dir().join(format!("host-usage-curl-{}", std::process::id()));
+        let dir = root.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".credentials.json"),
+            br#"{"claudeAiOauth":{"accessToken":"host-fixture-only"}}"#,
+        )
+        .unwrap();
+        let response = root.join("usage response.json");
+        std::fs::write(
+            &response,
+            br#"{"five_hour":{"utilization":42},"seven_day":{"utilization":8}}"#,
+        )
+        .unwrap();
+        let path = response.to_str().unwrap().replace('\\', "/");
+        let encoded: String = path
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"/:-._~".contains(&b) {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        let url = format!("file://{}{encoded}", if cfg!(windows) { "/" } else { "" });
+        let (token, account) = credentials(ProviderKind::Claude, &dir, true, &root, None).unwrap();
+        assert_eq!(&*token, "host-fixture-only");
+        let (usage, meters) = query(ProviderKind::Claude, &token, account.as_deref(), |config| {
+            let config =
+                Zeroizing::new(config.replace("https://api.anthropic.com/api/oauth/usage", &url));
+            pipe_command(
+                system_curl(),
+                &[
+                    "-q",
+                    "--config",
+                    "-",
+                    "--silent",
+                    "--fail",
+                    "--max-time",
+                    "2",
+                ],
+                config.as_bytes(),
+            )
+        })
+        .unwrap();
+        assert_eq!(usage.five_hour.unwrap().percent, 42);
+        assert_eq!(usage.seven_day.unwrap().percent, 8);
+        assert!(!meters.meters.is_empty());
+        assert!(!dir.join("statusline_cache.json").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn credential_file_fallback_reads_only_the_selected_profile() {
         let root = std::env::temp_dir().join(format!("owe719-credentials-{}", std::process::id()));

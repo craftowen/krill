@@ -201,39 +201,111 @@ fn c07_cmd_keys_keep_composition() {
 
 #[test]
 fn c08_claude_code_hidden_cursor() {
-    // TUI가 하드웨어 커서를 숨겨도 마지막으로 보인 커서에 오버레이·후보창을 붙인다.
+    // Claude Code(2.1.308 실측)는 시작 때 커서를 보인 채 `CSI 2J`·`CSI H`로 맨 위에 두고 숨긴 뒤,
+    // 매 프레임 끝에 숨은 커서를 입력 칸(`> ` 다음)으로 옮긴다. 오버레이·후보창은 숨은 커서를 따라
+    // 입력 칸에 붙어야 한다(마지막으로 *보인* 커서인 맨 위에 찍히면 안 된다).
     // OWE-615: 음절마다 에코가 와서 낙관적 확정 글자가 확인된다고 가정한다(에코 없이 치면
     // 확정 대기가 쌓여 오버레이가 뒤로 밀리는 게 정상이다).
     const HANGUL_ECHO: &str =
         "mark:ㅎ mark:하 mark:한 ins:한 echo mark:ㄱ mark:그 mark:글 ins:글 echo";
     const ANNYEONG_ECHO: &str = "mark:ㅇ mark:아 mark:안 ins:안 echo mark:ㄴ mark:녀 mark:녕 ins:녕 echo \
                          mark:ㅎ mark:하 ins:하 echo mark:ㅅ mark:세 ins:세 echo mark:ㅇ mark:요";
+    let caret = CellPoint {
+        line: 35,
+        column: 2,
+    };
     let mut p = Pane::default();
-    p.ime.set_cursor(
-        CellPoint {
-            line: 20,
-            column: 4,
-        },
-        true,
-    );
-    p.ime.set_cursor(CellPoint { line: 0, column: 0 }, false);
+    p.ime.set_cursor(CellPoint { line: 0, column: 0 }, true);
+    p.ime.set_cursor(caret, false);
+    p.ime.set_marked("ㅌ", None);
+    assert_eq!(p.ime.overlay().map(|o| o.origin), Some(caret));
+    assert_eq!(p.ime.candidate_anchor(0), caret);
+    p.run("commit echo");
+    // 에코마다 숨은 커서가 입력 칸 끝으로 전진한다("한글 안녕하세" = 13칸 뒤).
     p.run(&format!("{HANGUL_ECHO} sp echo {ANNYEONG_ECHO}"));
+    let end = CellPoint {
+        line: 35,
+        column: 2 + 2 + 13,
+    };
+    p.ime.set_cursor(end, false);
+    assert_eq!(p.ime.overlay().map(|o| o.origin), Some(end));
+    assert_eq!(p.ime.candidate_anchor(0), end);
+    p.run("ret");
+    assert_eq!(p.written(), "ㅌ한글 안녕하세요\r");
+}
+
+#[test]
+fn c08b_hidden_cursor_keeps_pending_shift() {
+    // 확정 직후 에코 전 프레임에서 숨은 커서가 아직 확정 자리에 있어도, 이어지는 조합은 확정 글자 뒤에 붙는다.
+    let caret = CellPoint {
+        line: 35,
+        column: 2,
+    };
+    let mut p = Pane::default();
+    p.ime.set_cursor(caret, false);
+    p.run("mark:ㅎ mark:하 mark:한 ins:한 mark:ㄱ");
+    p.ime.set_cursor(caret, false);
     assert_eq!(
         p.ime.overlay().map(|o| o.origin),
         Some(CellPoint {
-            line: 20,
+            line: 35,
             column: 4
         })
     );
-    assert_eq!(
-        p.ime.candidate_anchor(0),
+    // 에코가 와서 숨은 커서가 전진해도 같은 자리다(이중 이동 없음).
+    p.ime.set_cursor(
         CellPoint {
-            line: 20,
-            column: 4
-        }
+            line: 35,
+            column: 4,
+        },
+        false,
     );
-    p.run("ret");
-    assert_eq!(p.written(), "한글 안녕하세요\r");
+    assert_eq!(
+        p.ime.overlay().map(|o| o.origin),
+        Some(CellPoint {
+            line: 35,
+            column: 4
+        })
+    );
+}
+
+#[test]
+fn provider_carets_anchor_composition_and_confirm_echo() {
+    // 2026-10-22 PTY 조사 좌표(120×40). visible은 하드웨어 커서 표시 여부이며,
+    // Claude·pi처럼 숨겨도 입력 캐럿 좌표는 계속 전진한다.
+    for (provider, line, column, visible) in [
+        ("claude", 35, 2, false),
+        ("codex", 36, 2, true),
+        ("opencode", 22, 26, true),
+        ("antigravity", 17, 2, true),
+        ("pi", 37, 0, false),
+    ] {
+        let mut ime = Ime::default();
+        ime.set_cursor(CellPoint::default(), true);
+        let mut caret = CellPoint { line, column };
+        ime.set_cursor(caret, visible);
+        for syllable in ["한", "글", "가"] {
+            ime.set_marked(syllable, None);
+            assert_eq!(ime.overlay().map(|o| o.origin), Some(caret), "{provider}");
+            assert_eq!(ime.candidate_anchor(0), caret, "{provider}");
+            assert_eq!(ime.insert(syllable).pty, syllable.as_bytes(), "{provider}");
+            ime.set_marked("ㄱ", None);
+            // 에코 전 프레임은 확정 글자와 다음 조합의 위치를 유지한다.
+            ime.set_cursor(caret, visible);
+            assert!(ime.pending().is_some(), "{provider}");
+            caret.column += 2;
+            assert_eq!(ime.overlay().map(|o| o.origin), Some(caret), "{provider}");
+            // 숨은 커서도 에코를 확인해야 이전 글자가 재렌더링 때 겹치지 않는다.
+            ime.set_cursor(caret, visible);
+            assert_eq!(ime.pending(), None, "{provider}");
+            assert_eq!(ime.candidate_anchor(0), caret, "{provider}");
+        }
+        // 입력 중 다른 출력으로 프롬프트가 이동해도 조합과 후보창은 새 입력 칸을 따른다.
+        caret.line -= 1;
+        ime.set_cursor(caret, visible);
+        assert_eq!(ime.overlay().map(|o| o.origin), Some(caret), "{provider}");
+        assert_eq!(ime.candidate_anchor(0), caret, "{provider}");
+    }
 }
 
 #[test]

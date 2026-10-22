@@ -2146,14 +2146,14 @@ fn normalize_symlink_list(items: impl IntoIterator<Item = String>) -> Vec<String
     out
 }
 
-/// Inspects a repository's `minikrill.toml`, `orca.yaml`, `package.json`, and `WorktreeStore`
+/// Inspects a repository's `krill.toml` (legacy `minikrill.toml`), `orca.yaml`, `package.json`, and `WorktreeStore`
 /// to summarize configured and suggested `setup` / `archive` hooks and worktree symlinks (MK-174).
 #[must_use]
 pub fn inspect_repo_hooks(repo: &Path, state_dir: Option<&Path>) -> RepoHookSummary {
     let repo_key = worktree_key(repo);
     let root = Path::new(&repo_key);
 
-    let native_doc = read_small_utf8(&root.join("minikrill.toml"))
+    let native_doc = read_small_utf8(&crate::user_dirs::repo_config(root))
         .and_then(|s| toml::from_str::<NativeTomlDoc>(&s).ok())
         .unwrap_or_default();
     let native_setup_disabled = native_doc
@@ -3236,7 +3236,7 @@ mod tests {
     fn builtin_skills_minikrill_uses_current_cli_flags() -> io::Result<()> {
         let skill = BUILTIN_SKILLS
             .iter()
-            .find(|s| s.name == "minikrill")
+            .find(|s| s.name == "krill")
             .ok_or_else(|| not_found("minikrill skill"))?;
         // `crates/krill/tests/cli.rs`가 같은 명령을 실제 krilld에 돌려 파서와 맞는지 확인한다.
         for cmd in [

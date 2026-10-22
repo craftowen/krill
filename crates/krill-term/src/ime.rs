@@ -9,7 +9,9 @@
 //! 2. 확정 텍스트만 PTY에 UTF-8로 쓴다.
 //! 3. 조합 중 특수 키·붙여넣기는 조합을 먼저 확정한 뒤 보낸다(`한`⏎`글` 재정렬 없음).
 //! 4. 포커스 이탈·탭 전환·창 닫기·창 비활성화 때 확정한다(버리지 않는다).
-//! 5. 후보창은 마지막으로 보인 커서 셀에 붙인다(커서를 숨기는 TUI 대비).
+//! 5. 오버레이·후보창은 그리드 커서 셀에 붙인다. 숨은 커서도 따른다: Claude Code(2.1.308 실측)는 커서를
+//!    숨긴 채 매 프레임 끝에 입력 칸으로 옮긴다. 마지막으로 *보인* 커서만 쓰면 시작 때 `CSI 2J`·`CSI H`로
+//!    맨 위에 남은 자리에 조합 글자가 찍힌다.
 //! 6. 확정(`insertText`) 뒤 데몬 화면 에코가 오기 전까지 확정 글자를 낙관적으로 유지한다.
 //!    `"한"` 조합 중 다음 자모를 치면 IME가 `insertText("한")` → `setMarkedText("ㄱ")`을
 //!    연달아 보내는데, 에코 전 화면에는 `"한"`이 없어 다음 프레임이 `"한"`을 지운 것처럼
@@ -81,7 +83,7 @@ pub struct Ime {
     preedit: String,
     /// `setMarkedText:`의 selectedRange(preedit 안 UTF-16 범위).
     selected: Option<Range<usize>>,
-    /// 마지막으로 보인 커서. 커서가 숨겨진 동안은 갱신하지 않는다.
+    /// 마지막 그리드 커서(숨은 커서 포함, 규칙 5).
     cursor: CellPoint,
     /// 위젯이 직접 확정한 글자. 바로 다음 `insertText:`가 같은 글자면 IME의 늦은 확정이라 버린다.
     /// `discardMarkedText`가 안 먹거나 IME가 키 처리 뒤에 확정을 보내는 경우의 중복 방지.
@@ -159,14 +161,12 @@ impl Ime {
         Output { pty, discard_ime }
     }
 
-    /// 매 프레임 그리드 커서를 알려 준다. 숨겨진 커서는 무시하고 마지막으로 보인 위치를 유지한다.
-    /// 보이는 커서가 확정 자리(`origin + columns`)까지 전진했거나 다른 줄로 가면 에코가 온 것으로 보고
-    /// 낙관적 글자를 지운다.
-    pub fn set_cursor(&mut self, at: CellPoint, visible: bool) {
-        if visible {
-            self.cursor = at;
-            self.confirm_pending(at);
-        }
+    /// 매 프레임 그리드 커서를 알려 준다. 숨은 커서도 오버레이·후보창 기준으로 따른다(규칙 5).
+    /// 커서가 확정 자리(`origin + columns`)까지 전진했거나 다른 줄로 가면 낙관적 글자를 지운다.
+    /// 표시 여부는 에코 판정에 영향을 주지 않는다. 숨은 커서도 입력 칸으로 전진하는 TUI가 있다.
+    pub fn set_cursor(&mut self, at: CellPoint, _visible: bool) {
+        self.cursor = at;
+        self.confirm_pending(at);
     }
 
     /// 에코 만료: [`PENDING_TTL`]이 지난 낙관적 글자를 지운다. 매 프레임·타이머에서 부른다.
@@ -279,7 +279,7 @@ impl Ime {
         self.pending_at = Some(Instant::now());
     }
 
-    /// 보이는 커서가 확정 자리를 지나면 에코가 온 것으로 보고 지운다.
+    /// 커서가 확정 자리를 지나면 에코가 온 것으로 보고 지운다(표시 여부 무관).
     fn confirm_pending(&mut self, at: CellPoint) {
         if self.pending_text.is_empty() {
             return;

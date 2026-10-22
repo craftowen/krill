@@ -4,7 +4,7 @@
 //! 동작(존재하는 파일만, URL 제외, 상대 경로는 세션 cwd 기준, git `a/`·`b/` 접두사)은 Orca의 터미널 파일 링크
 //! (`.ref/orca/src/renderer/src/components/terminal-pane/terminal-file-link-*.ts`, MIT)를 참고했다. 코드 차용 없음.
 //!
-//! 비용: 포인터 아래 행 하나만 본다(보이는 칸 전체를 훑지 않는다). 후보 글자열이 같으면 디스크를 다시 보지 않는다([`Cache`]).
+//! 비용: 포인터 아래 행 하나만 본다. 공백을 포함한 경로 후보는 최대 64개이며 디스크 확인은 호출자의 백그라운드 작업에서 한다.
 
 use std::path::{Path, PathBuf};
 
@@ -266,8 +266,7 @@ struct Candidate {
     end: u16,
 }
 
-fn candidate_at(row: &[Cell], column: u16) -> Option<Candidate> {
-    let chars = row_chars(row);
+fn candidate_at(chars: &[(u16, char, u16)], column: u16) -> Option<Candidate> {
     let hit = chars
         .iter()
         .position(|&(c, _, w)| (c..c.saturating_add(w)).contains(&column))?;
@@ -292,13 +291,110 @@ fn candidate_at(row: &[Cell], column: u16) -> Option<Candidate> {
     {
         last -= 1;
     }
-    let token = chars.get(first..last)?;
+    candidate(chars.get(first..last)?)
+}
+
+fn candidate(token: &[(u16, char, u16)]) -> Option<Candidate> {
     let end = token.last().map(|&(c, _, w)| c.saturating_add(w))?;
     Some(Candidate {
         chars: token.iter().map(|t| t.1).collect(),
         starts: token.iter().map(|t| t.0).collect(),
         end,
     })
+}
+
+/// 따옴표·마크다운 안 경로를 먼저 보고, 공백 경계 조합을 실제 파일 존재 여부로 구분한다.
+fn candidates_at(row: &[Cell], column: u16) -> Vec<Candidate> {
+    const MAX_CANDIDATES: usize = 64;
+    let chars = row_chars(row);
+    let Some(hit) = chars
+        .iter()
+        .position(|&(c, _, w)| (c..c.saturating_add(w)).contains(&column))
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (open, close) in [
+        ('"', '"'),
+        ('\'', '\''),
+        ('`', '`'),
+        ('[', ']'),
+        ('(', ')'),
+        ('“', '”'),
+        ('‘', '’'),
+    ] {
+        let Some(start) = chars
+            .get(..hit)
+            .and_then(|s| s.iter().rposition(|t| t.1 == open))
+        else {
+            continue;
+        };
+        let Some(end) = chars
+            .get(hit + 1..)
+            .and_then(|s| s.iter().position(|t| t.1 == close))
+            .map(|i| hit + 1 + i)
+        else {
+            continue;
+        };
+        let token = &chars[start + 1..end];
+        if !token
+            .iter()
+            .any(|t| t.1.is_control() || is_bidi_control(t.1))
+            && let Some(cand) = candidate(token)
+        {
+            out.push(cand);
+        }
+    }
+    let hard_break = |c: char| breaks(c) && c != ' ';
+    let first = chars[..hit]
+        .iter()
+        .rposition(|t| hard_break(t.1))
+        .map_or(0, |i| i + 1);
+    let last = chars[hit..]
+        .iter()
+        .position(|t| hard_break(t.1))
+        .map_or(chars.len(), |i| hit + i);
+    let mut starts: Vec<_> = (first..=hit)
+        .filter(|&start| {
+            !chars[start].1.is_whitespace() && (start == first || chars[start - 1].1 == ' ')
+        })
+        .collect();
+    starts.sort_by_key(|&start| {
+        (
+            !matches!(chars[start].1, '/' | '~'),
+            std::cmp::Reverse(start),
+        )
+    });
+    starts.truncate(MAX_CANDIDATES);
+    let ends: Vec<_> = (hit + 1..=last)
+        .rev()
+        .filter(|&end| !chars[end - 1].1.is_whitespace() && (end == last || chars[end].1 == ' '))
+        .take(MAX_CANDIDATES)
+        .collect();
+    let mut ranges: Vec<_> = starts
+        .into_iter()
+        .flat_map(|start| ends.iter().map(move |&end| (start, end)))
+        .collect();
+    // 절대·홈 경로를 우선하고 같은 시작점에서는 가장 긴 실재 경로를 고른다.
+    ranges.sort_by_key(|&(start, end)| {
+        (
+            !matches!(chars[start].1, '/' | '~'),
+            std::cmp::Reverse(end - start),
+        )
+    });
+    out.extend(
+        ranges
+            .into_iter()
+            .take(MAX_CANDIDATES)
+            .filter_map(|(start, end)| candidate(&chars[start..end])),
+    );
+    out.truncate(MAX_CANDIDATES - 1);
+    // 컴파일러 형식은 문장부호를 뺀 기존 후보도 남긴다.
+    if let Some(cand) = candidate_at(&chars, column) {
+        out.push(cand);
+    }
+    out.dedup();
+    out
 }
 
 /// `path[:line[:col]]`를 나눈다. 뒤에 붙은 나머지(grep의 `:내용`)는 버린다. 마지막 값은 링크에 드는 글자 수.
@@ -345,7 +441,11 @@ fn trim_cjk_suffix_after_ascii_ext(text: &[char]) -> usize {
 
 /// 찾아 볼 실제 경로들(앞이 우선). URL·빈 경로·제어 문자는 링크가 아니다.
 fn resolve(path: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
-    if path.is_empty() || path.contains("://") || path.starts_with("mailto:") {
+    if path.is_empty()
+        || path.contains("://")
+        || path.starts_with("mailto:")
+        || path.chars().any(|c| c.is_control() || is_bidi_control(c))
+    {
         return Vec::new();
     }
     if path.starts_with('/') {
@@ -369,7 +469,16 @@ fn resolve(path: &str, cwd: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> 
 // ponytail: 한 칸 캐시라 파일이 생기거나 지워진 직후 같은 글자열 위에서는 옛 결과를 본다. 포인터가 다른 글자로 가면 다시 본다.
 #[derive(Debug, Default)]
 pub struct Cache {
-    last: Option<(String, Option<PathBuf>, Option<PathBuf>)>,
+    last: Option<Cached>,
+}
+
+#[derive(Debug)]
+struct Cached {
+    candidates: Vec<Candidate>,
+    column: u16,
+    cwd: Option<PathBuf>,
+    home: Option<PathBuf>,
+    found: Option<PathLink>,
 }
 
 impl Cache {
@@ -387,29 +496,56 @@ impl Cache {
         cwd: Option<&Path>,
         home: Option<&Path>,
     ) -> Option<PathLink> {
-        let cand = candidate_at(row, column)?;
-        let (path, line, col, chars) = split_location(&cand.chars);
-        let cols_end = cand.starts.get(chars).copied().unwrap_or(cand.end);
-        let start = *cand.starts.first()?;
-        if !(start..cols_end).contains(&column) {
-            return None;
+        let candidates = candidates_at(row, column);
+        if self.last.as_ref().is_none_or(|last| {
+            last.candidates != candidates
+                || last.cwd.as_deref() != cwd
+                || last.home.as_deref() != home
+                || (last.column != column
+                    && last.found.as_ref().is_none_or(|link| {
+                        !(link.column..link.column.saturating_add(link.cols)).contains(&column)
+                    }))
+        }) {
+            let found = candidates.iter().find_map(|cand| {
+                let literal: String = cand.chars.iter().collect();
+                let exact = resolve(&literal, cwd, home)
+                    .into_iter()
+                    .find(|p| p.is_file());
+                let (path, line, col, used) = if let Some(path) = exact {
+                    (path, None, None, cand.chars.len())
+                } else {
+                    let (path, line, col, used) = split_location(&cand.chars);
+                    let found = resolve(&path, cwd, home)
+                        .into_iter()
+                        .find(|p| p.is_file())?;
+                    (found, line, col, used)
+                };
+                let end = cand.starts.get(used).copied().unwrap_or(cand.end);
+                let start = *cand.starts.first()?;
+                if !(start..end).contains(&column) {
+                    return None;
+                }
+                Some(PathLink {
+                    column: start,
+                    cols: end - start,
+                    path,
+                    line,
+                    col,
+                })
+            });
+            self.last = Some(Cached {
+                candidates,
+                column,
+                cwd: cwd.map(Path::to_owned),
+                home: home.map(Path::to_owned),
+                found,
+            });
         }
-        let cwd_key = cwd.map(Path::to_owned);
-        let found = match &self.last {
-            Some((p, c, found)) if *p == path && *c == cwd_key => found.clone(),
-            _ => {
-                let found = resolve(&path, cwd, home).into_iter().find(|p| p.is_file());
-                self.last = Some((path, cwd_key, found.clone()));
-                found
-            }
-        }?;
-        Some(PathLink {
-            column: start,
-            cols: cols_end - start,
-            path: found,
-            line,
-            col,
-        })
+        self.last
+            .as_ref()?
+            .found
+            .clone()
+            .filter(|link| (link.column..link.column.saturating_add(link.cols)).contains(&column))
     }
 }
 

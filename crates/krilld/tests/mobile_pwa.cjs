@@ -49,7 +49,7 @@ async function fixedOriginTests(){
  const hash='0123456789abcdef',rid='a'.repeat(32),saved={device_id:'saved',credential:'ab'.repeat(32),rid,url:'https://saved.trycloudflare.com',hash};
  const source=fs.readFileSync(path.join(assets,'client.js'),'utf8');
  function fixture(href,credential=saved,found={url:'https://fresh.trycloudflare.com',hash},{serviceWorker=true}={}){
-  const location=new URL(href),values=new Map(credential?[['minikrill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0;
+  const location=new URL(href),values=new Map(credential?[['krill-mobile-v2',JSON.stringify(credential)]]:[]),requests=[],registrations=[],sockets=[],timers=new Map(),redirects=[];let id=0;
   location.replace=href=>redirects.push(href);
   class Socket extends EventTarget{
    constructor(url){super();this.url=url;this.sent=[];sockets.push(this);}
@@ -59,7 +59,7 @@ async function fixedOriginTests(){
   }
   const context={AbortController,TextEncoder,TextDecoder,Uint8Array,DataView,BigInt,URL,URLSearchParams,location,history:{replaceState(a,b,url){location.href=new URL(url,location).href;}},navigator:serviceWorker?{serviceWorker:{register:url=>{registrations.push(url);return Promise.resolve();}}}:{},localStorage:{getItem:key=>values.get(key),setItem:(key,value)=>values.set(key,value)},fetch:async(url,options)=>{requests.push({url,options});return {ok:true,json:async()=>found};},setTimeout:(fn,ms)=>{timers.set(++id,{fn,ms});return id;},clearTimeout:id=>timers.delete(id),crypto:{getRandomValues:bytes=>bytes.fill(1)},WebSocket:Socket,MkCrypto:C};
   vm.createContext(context);vm.runInContext(source,context);const endpoint=context.KrillMobile.transport.bootstrap();
-  return {context,endpoint,location,values,requests,registrations,sockets,timers,redirects,stored:()=>JSON.parse(values.get('minikrill-mobile-v2'))};
+  return {context,endpoint,location,values,requests,registrations,sockets,timers,redirects,stored:()=>JSON.parse(values.get('krill-mobile-v2'))};
  }
  const flush=async()=>{for(let n=0;n<25;n++)await Promise.resolve();};
  const fixed=`https://krill-mobile.pages.dev/m/${hash}/`;
@@ -90,7 +90,7 @@ async function fixedOriginTests(){
  f=fixture(fixed);t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,credentials:f.endpoint.credentials});t.connect();await flush();f.sockets[0].emit('error');await flush();assert.equal(f.sockets.length,1);assert.equal(t.blocked,false);t.resume();await flush();assert.equal(f.sockets.length,2);t.close();
  // Authentication saves endpoint metadata, and terminal sockets share the main URL.
  f=fixture(fixed+`#pair=ticket&key=${Buffer.alloc(32).toString('base64url')}&t=paired.trycloudflare.com&r=${rid}`,null);
- let authenticated;t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,pair:f.endpoint.pair,onAuthenticated:auth=>{authenticated=auth;f.context.localStorage.setItem('minikrill-mobile-v2',JSON.stringify(auth));}});
+ let authenticated;t=f.context.KrillMobile.transport.create({endpoint:f.endpoint,pair:f.endpoint.pair,onAuthenticated:auth=>{authenticated=auth;f.context.localStorage.setItem('krill-mobile-v2',JSON.stringify(auth));}});
  t.connect();await flush();const socket=f.sockets[0];socket.emit('open');socket.emit('message',JSON.stringify({version:2,challenge:'bc'.repeat(32)}));await flush();
  const server=new C.Channel(new Uint8Array(32),C.concat(C.unhex('bc'.repeat(32)),new Uint8Array(32).fill(1)),false);
  socket.emit('message',server.seal(new TextEncoder().encode(JSON.stringify({device_id:'new-device',credential:'cd'.repeat(32)}))));socket.emit('message',server.seal(frame(1,Buffer.concat([v(1),v(1),v(0)]))));await flush();

@@ -160,7 +160,7 @@ Krill은 여러 Git 워크트리와 폴더에 걸쳐 AI 코딩 에이전트를 �
   - `SIDEBAR_ROW_HEIGHT = 32px` (사이드바 세션 행), `PANEL_ROW_HEIGHT = 26px` (우측 패널 파일·검색 행), `PANEL_TAB_HEIGHT = 24px` (우측 패널 탭), `PANE_HEADER_HEIGHT = 26px` (분할 창 헤더)
   - `PANEL_DEFAULT_WIDTH = 280pt`, `STATUS_BAR_HEIGHT = 24px`, `DIVIDER_HIT_PX = 5pt` (시각적 선은 1pt)
   - 상태바 사용량은 `STATUS_USAGE_CONTROLS_WIDTH = 480px`를 컨트롤에 예약하고, 프로바이더당 `STATUS_USAGE_PROVIDER_WIDTH = 280px` 여유가 있으면 두 사용량 창을 `0% 1h 31m · 92% 1d 19h`처럼 표시한다. 상태바의 창 이름·리셋 안내 문장 없이 `%`와 남은 시간(`m`·`h`·`d`)만 쓰며 앱 언어와 무관하다. UI 줌도 반영하며, 좁으면 최대 사용률 창의 `% + 남은 시간`으로 축약한다. 만료된 창은 이전 사용률을 재사용하지 않고 `— now`, 시각을 모르면 퍼센트만 표시한다.
-  - 사이드바 들여쓰기: 호스트 아래 프로젝트 8px, 프로젝트 아래 카드 12px. 세션 상태 글리프는 카드 상태 칸에 정렬해 제목 아래로 누적 들여쓰지 않으며, 계보 자식의 깊이는 유지한다.
+  - 사이드바 들여쓰기: 호스트 아래 프로젝트 8px, 프로젝트 아래 카드 12px. 루트 행의 상태 칸은 그대로 두고, 하위 세션 상태 글리프는 부모 카드 상태 칸에서 한 단계(12px) 들여써 계층을 보인다. 호스트·워크트리 계보 여백은 한 번만 적용하고 계보 깊이는 유지한다. 상세·컴팩트 카드와 대량 목록은 같은 가상화 경로와 들여쓰기를 쓴다.
   - 상태 요약 겹친 아이콘: `STATUS_GROUP_ICON = 15px`, 겹침 음수 마진 `STATUS_GROUP_OVERLAP = -3px` (`ui::status::summary_element` 전용)
 - **오버레이·보조 창·설정 레이아웃**:
   - 중앙 모달 대화상자 너비: `DIALOG_WIDTH = 512px` (창 폭이 좁으면 양옆 16px 여백 유지), 설정 내 넓은 모달 너비 `SETTINGS_MODAL_WIDTH = 640px`
@@ -219,7 +219,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 ### 6.4 아이콘 및 에이전트 상태 인디케이터 (`ui::icons`, `ui::status`)
 
-- **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Gemini, Antigravity, OpenCode, Cursor 및 Krill 코랄 로고는 외부 이미지 디코더나 네트워크 없이 인라인 벡터(`ui::icons::agent_brand_icon`, `ui::icons::provider_icon`, `ui::icons::agent_menu_icon`, `ui::icons::provider_menu_icon`, `ui::icons::krill_brand_icon`)로 즉시 그린다.
+- **브랜드 아이콘 (`ui::icons`)**: Claude, Codex(OpenAI), Gemini, Antigravity, OpenCode, Cursor, Pi 및 Krill 코랄 로고는 외부 이미지 디코더나 네트워크 없이 인라인 벡터(`ui::icons::agent_brand_icon`, `ui::icons::provider_icon`, `ui::icons::agent_menu_icon`, `ui::icons::provider_menu_icon`, `ui::icons::krill_brand_icon`)로 즉시 그린다.
 - **Krill 브랜드 마크 (`ui::icons::krill_brand_icon(size_px, p)`, `ui::icons::brand_mark_tile(size_px)`)**:
   - 마크는 코랄 크릴 하나로 통일한다(데스크톱·메뉴 막대 모노·모바일·웹). 사용처: 사이드바 헤더("Krill" 앞, `ICON_MD`), 빈 작업 공간 히어로(`brand_mark_tile`, 남색 `#08090e` 둥근 상자 `RADIUS_LG` 안 코랄 마크), 메뉴 막대(모노 크릴), 모바일 PWA·웹 랜딩(같은 크릴 SVG).
   - 색: 다크 바탕 `KRILL_CORAL` `#ff5238`, 라이트 바탕 `KRILL_CORAL_LIGHT` `#d63a24`(흰 바탕 4.68:1; `#ff5238`은 3.09:1). `krill_brand_icon`이 팔레트 바탕에 맞춰 고르고(`ui::icons::krill_coral(p)`), `brand_mark_tile`은 바탕이 늘 남색이라 `#ff5238`을 쓴다.
@@ -234,7 +234,7 @@ Orca와 동일하게 그림자는 꼭 필요한 곳에만 3단계로 제한한�
 
 ### 6.5 프로바이더 아이콘 (Provider & Agent Icons — OWE-875)
 
-프로바이더(`ProviderKind`: Claude, Codex, Antigravity, OpenCode)나 에이전트(`claude`, `codex`, `agy` / `antigravity`, `opencode`, `cursor` / `cursor-agent`, 커스텀 에이전트)가 표기되는 모든 화면 지점은 단색 회색 아이콘이나 텍스트 단독 표기 대신 반드시 [`ui/icons.rs`](../crates/krill-app/src/ui/icons.rs)의 **색상 있는 브랜드 아이콘**과 **토큰화된 아이콘 크기(`ICON_*`)**를 사용한다. `ProviderKind::Gemini`는 제거된 wire tombstone(계정·사용량 화면에 미표시)이라 빈 박스로 두고, 미분류·제거된 에이전트 ID는 앰버 문자 폴백으로 그린다.
+프로바이더(`ProviderKind`: Claude, Codex, Antigravity, OpenCode)나 에이전트(`claude`, `codex`, `agy` / `antigravity`, `opencode`, `cursor` / `cursor-agent`, `pi`, 커스텀 에이전트)가 표기되는 모든 화면 지점은 단색 회색 아이콘이나 텍스트 단독 표기 대신 반드시 [`ui/icons.rs`](../crates/krill-app/src/ui/icons.rs)의 **색상 있는 브랜드 아이콘**과 **토큰화된 아이콘 크기(`ICON_*`)**를 사용한다. `ProviderKind::Gemini`는 제거된 wire tombstone(계정·사용량 화면에 미표시)이라 빈 박스로 두고, 미분류·제거된 에이전트 ID는 앰버 문자 폴백으로 그린다. Pi는 공식 단색 π 마크(`PI_SVG`, Orca MIT 참조의 `pi.dev/favicon.svg` 경로)를 쓰며 호출자의 테마 전경색을 유지한다. 에이전트 ID·전경 프로세스 이름·제목의 독립된 `pi`/`π` 표기를 공용 `ui::status`에서 식별한다.
 
 1. **브랜드 색상 상수 (라이트·다크 모드 공통 시인성 보장)**:
    - **Claude**: `CLAUDE_COLOR` (`#D97757`, 테라코타 스파클)

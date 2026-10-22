@@ -135,6 +135,8 @@ pub enum Fate {
     Full,
     /// 연결한 데몬이 [`FEAT_INPUT`]을 지원하지 않는다.
     Unsupported,
+    /// 새 계정으로 보내려던 입력인데 계정 전환이 실패했다. 원래 계정 세션에 보내지 않는다.
+    AccountSwitchFailed,
 }
 
 /// 화면에 알릴 입력. `bytes`는 해당 입력을 순서대로 이은 것이다.

@@ -18,7 +18,7 @@ use crate::session::lock;
 
 pub const TTL: Duration = Duration::from_secs(300);
 pub const DISK_LIMIT: u64 = 512 * 1024 * 1024;
-const DIRECTORY: &str = ".minikrill-preparing";
+const DIRECTORY: &str = ".krill-preparing";
 const MARKER: &str = "owner.json";
 const RECENT: usize = 128;
 static POOL: OnceLock<Result<Arc<Pool>, String>> = OnceLock::new();
@@ -75,7 +75,12 @@ impl Pool {
         limit: u64,
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(root).map_err(|e| e.to_string())?;
-        let dir = root.join(DIRECTORY);
+        let legacy = root.join(".minikrill-preparing");
+        let dir = if legacy.exists() {
+            legacy
+        } else {
+            root.join(DIRECTORY)
+        };
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -282,7 +287,7 @@ impl Pool {
             "--detach".into(),
             "--no-checkout".into(),
             "--lock".into(),
-            "--reason=minikrill speculative preparation".into(),
+            "--reason=krill speculative preparation".into(),
             path.clone().into_os_string(),
             commit.clone().into(),
         ];
@@ -585,7 +590,11 @@ pub(super) fn existing() -> Option<&'static Pool> {
 }
 
 pub(super) fn recover() -> Result<(), String> {
-    if root()?.join(DIRECTORY).join(MARKER).exists() {
+    let root = root()?;
+    if [DIRECTORY, ".minikrill-preparing"]
+        .iter()
+        .any(|name| root.join(name).join(MARKER).exists())
+    {
         global()?;
     }
     Ok(())

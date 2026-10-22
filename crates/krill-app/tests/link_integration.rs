@@ -270,6 +270,163 @@ fn create(target: &HostTarget, cwd: &Path) -> krill_proto::SessionId {
 }
 
 #[test]
+fn disconnect_remote_mac_stops_owned_tunnel_preserves_ptys_and_blocks_old_targets() {
+    let fixture = Fixture::new();
+    let server = fixture.backend("s");
+    let client = fixture.backend("c");
+    let remote_session = create(&fixture.local("s"), &fixture.base.join("s"));
+    let local_session = create(&fixture.local("c"), &fixture.base.join("c"));
+    let invite = server.create_invite().unwrap();
+    let PairOutcome::Paired(paired) = client.pair(&invite.link, "Client Mac") else {
+        panic!("pair failed");
+    };
+    let service = LinkHosts::shared(fixture.base.join("c"), fixture.bins.join("krill-link"));
+    let manager = HostManager::new();
+    manager.sync_external_hosts(service.registrations().unwrap());
+    let host = HostId::Remote(host_id(&paired.id));
+    let old_target = manager.target_for(&host, None).unwrap();
+    assert!(
+        sidebar::status_source(old_target.clone())
+            .fetch()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|s| s.id == remote_session)
+    );
+    let pid = service.owned_pids()[0];
+    assert!(client.disconnect_host(&paired.id).unwrap().is_empty());
+    assert!(
+        krill_link::load_hosts(&fixture.base.join("c"))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(service.owned_pids().is_empty());
+    assert!(service.registrations().unwrap().is_empty());
+    assert!(
+        old_target
+            .connect(&client_hello(ClientRole::App, "removed"))
+            .is_err()
+    );
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        sidebar::status_source(fixture.local("s"))
+            .fetch()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|s| s.id == remote_session),
+        "remote PTY survives disconnect"
+    );
+    assert!(
+        sidebar::status_source(fixture.local("c"))
+            .fetch()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|s| s.id == local_session),
+        "local PTY survives disconnect"
+    );
+    assert_eq!(
+        server.devices().unwrap().len(),
+        1,
+        "outgoing removal does not revoke inbound permissions"
+    );
+    // 같은 설정 화면을 띄운 다른 창의 중복 제거도 성공한다.
+    assert!(client.disconnect_host(&paired.id).unwrap().is_empty());
+    let invite = server.create_invite().unwrap();
+    let PairOutcome::Paired(repaired) = client.pair(&invite.link, "Client Mac") else {
+        panic!("re-pair failed");
+    };
+    assert_eq!(repaired.id, paired.id);
+    manager.sync_external_hosts(service.registrations().unwrap());
+    let new_target = manager.target_for(&host, None).unwrap();
+    assert!(
+        sidebar::status_source(new_target.clone())
+            .fetch()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|s| s.id == remote_session)
+    );
+    assert!(
+        old_target
+            .connect(&client_hello(ClientRole::App, "old-after-repair"))
+            .is_err()
+    );
+    service.shutdown();
+}
+
+#[test]
+fn settings_disconnect_does_not_kill_a_cli_owned_tunnel() {
+    let mut fixture = Fixture::new();
+    let server = fixture.backend("s");
+    let client = fixture.backend("c");
+    let remote_session = create(&fixture.local("s"), &fixture.base.join("s"));
+    let invite = server.create_invite().unwrap();
+    let PairOutcome::Paired(paired) = client.pair(&invite.link, "Client Mac") else {
+        panic!("pair failed");
+    };
+    let helper = Command::new(fixture.bins.join("krill-link"))
+        .arg("--state-dir")
+        .arg(fixture.base.join("c"))
+        .args(["connect", &paired.id])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let helper_index = fixture.holders.len();
+    fixture.holders.push(helper);
+    until(
+        || {
+            connection_info(&fixture.base.join("c"), &paired.id)
+                .is_ok_and(|s| s.status == krill_hosts::HostStatus::Connected)
+        },
+        "external tunnel startup",
+    );
+    let service = LinkHosts::shared(fixture.base.join("c"), fixture.bins.join("krill-link"));
+    let manager = HostManager::new();
+    manager.sync_external_hosts(service.registrations().unwrap());
+    let target = manager
+        .target_for(&HostId::Remote(host_id(&paired.id)), None)
+        .unwrap();
+    assert!(
+        sidebar::status_source(target.clone())
+            .fetch()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|s| s.id == remote_session)
+    );
+    assert!(service.owned_pids().is_empty());
+    client.disconnect_host(&paired.id).unwrap();
+    assert!(
+        fixture.holders[helper_index].try_wait().unwrap().is_none(),
+        "the app must not terminate a borrowed CLI process"
+    );
+    assert!(
+        target
+            .connect(&client_hello(ClientRole::App, "removed-external"))
+            .is_err()
+    );
+    assert!(
+        sidebar::status_source(fixture.local("s"))
+            .fetch()
+            .unwrap()
+            .sessions
+            .iter()
+            .any(|s| s.id == remote_session)
+    );
+}
+
+#[test]
 fn real_backend_pairs_lists_creates_revokes_and_releases_shared_connect() {
     let fixture = Fixture::new();
     let server = fixture.backend("s");

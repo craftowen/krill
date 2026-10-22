@@ -19,7 +19,7 @@ crc32fast = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 postcard = { workspace = true }
-# 워크트리 설정 minikrill.toml(MK-042)과 setup 신뢰 해시.
+# 워크트리 설정 krill.toml(MK-042)과 setup 신뢰 해시.
 toml = { workspace = true }
 sha2 = { workspace = true }
 serde-saphyr = { workspace = true }

@@ -632,7 +632,7 @@ fn open_pairing_dispatches_to_registered_host(cx: &mut TestAppContext) {
 /// A client can have registered remote Macs without permitting any inbound devices.
 /// The settings panel must show the same remote registrations as the sidebar.
 #[gpui::test]
-fn remote_macs_render_without_inbound_devices_and_refresh(cx: &mut TestAppContext) {
+fn remote_macs_disconnect_with_confirmation_without_inbound_devices(cx: &mut TestAppContext) {
     use super::real::RealLinkBackend;
     cx.update(gpui_component::init);
     let dir = std::env::temp_dir().join(format!("krill-remote-list-{}", std::process::id()));
@@ -653,7 +653,7 @@ fn remote_macs_render_without_inbound_devices_and_refresh(cx: &mut TestAppContex
     ));
     assert!(backend.devices().unwrap().is_empty());
     assert_eq!(backend.remote_hosts().unwrap()[0].name, "Studio Mac");
-    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend.clone(), cx));
     vcx.simulate_resize(size(px(1000.), px(1600.)));
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("link-remote-host-studio").is_some());
@@ -664,10 +664,55 @@ fn remote_macs_render_without_inbound_devices_and_refresh(cx: &mut TestAppContex
         );
         assert!(!panel.read(cx).status.enabled);
     });
-    krill_link::save_hosts(&dir, &[]).unwrap();
+    click(vcx, "link-remote-disconnect-studio");
+    assert_eq!(krill_link::load_hosts(&dir).unwrap().len(), 1);
+    vcx.update(|_, cx| {
+        assert!(panel.read(cx).confirm_disconnect.is_some());
+        panel.update(cx, ServerPanel::cancel_disconnect);
+        assert!(panel.read(cx).confirm_disconnect.is_none());
+    });
+    click(vcx, "link-remote-disconnect-studio");
+    click(vcx, "link-remote-disconnect-studio");
+    assert!(backend.remote_hosts().unwrap().is_empty());
+    assert!(backend.devices().unwrap().is_empty());
+    assert!(vcx.debug_bounds("link-remote-host-studio").is_none());
+    // 오래된 조회 완료나 다음 주기 갱신이 삭제한 행을 되살리지 않는다.
     vcx.executor()
         .advance_clock(std::time::Duration::from_secs(3));
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("link-remote-host-studio").is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[gpui::test]
+fn remote_disconnect_failure_keeps_the_row_and_allows_retry(cx: &mut TestAppContext) {
+    use super::real::RealLinkBackend;
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-remote-failure-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    let host = krill_link::RemoteHost {
+        id: "studio".into(),
+        name: "Studio Mac".into(),
+        node_id: "aa".repeat(32),
+        relay_url: None,
+        addr_hints: Vec::new(),
+        added_at: 1000,
+    };
+    krill_link::save_hosts(&dir, std::slice::from_ref(&host)).unwrap();
+    let backend = Arc::new(RealLinkBackend::new(dir.clone(), "unused-link".into()));
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend, cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    // 손상된 저장 파일에서는 메모리 목록만 지워 성공처럼 보이지 않는다.
+    std::fs::write(dir.join("link/hosts.toml"), "invalid = [").unwrap();
+    click(vcx, "link-remote-disconnect-studio");
+    click(vcx, "link-remote-disconnect-studio");
+    assert!(vcx.debug_bounds("link-remote-host-studio").is_some());
+    assert!(panel.read_with(vcx, |p, _| p.error.is_some()));
+    krill_link::save_hosts(&dir, &[host]).unwrap();
+    click(vcx, "link-remote-disconnect-studio");
+    click(vcx, "link-remote-disconnect-studio");
+    assert!(vcx.debug_bounds("link-remote-host-studio").is_none());
+    assert!(panel.read_with(vcx, |p, _| p.error.is_none()));
     std::fs::remove_dir_all(dir).ok();
 }

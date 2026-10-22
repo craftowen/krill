@@ -6,6 +6,7 @@ pub(super) use identity::from_credentials as identity_from_credentials;
 mod login;
 pub(crate) mod orca_vault;
 mod policy;
+pub(crate) mod switch_work;
 
 use std::collections::BTreeMap;
 use std::io::{self, Write as _};
@@ -134,7 +135,7 @@ fn manually_pinned(
     false
 }
 /// `accounts.toml` 읽기-수정-쓰기 전체를 직렬화하는 프로세스 전역 잠금(K-09). 파일 IO만 안에서 하고
-/// 다른 잠금을 잡지 않는 리프라 잠금 순서 문제가 없다.
+/// 자동전환 작업 알림은 마지막에 발행하며, 작업 큐 잠금 안에서는 이 잠금을 잡지 않는다.
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 /// 원자 쓰기 임시 파일명 중복 방지용 단조 증가 값(K-09). pid와 합쳐 같은 프로세스 스레드끼리도 겹치지 않는다.
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -280,12 +281,12 @@ impl Window {
     }
 }
 
-/// `accounts.toml` 경로: `state_dir`이 주어지면 `<state_dir>/accounts.toml`, 아니면 `<home>/.config/minikrill/accounts.toml`.
+/// `accounts.toml` 경로: `state_dir`이 주어지면 `<state_dir>/accounts.toml`, 아니면 `<home>/.config/krill/accounts.toml`.
 pub fn config_path(home: &Path, state_dir: Option<&Path>) -> PathBuf {
     if let Some(state) = state_dir {
         state.join(ACCOUNTS_FILE)
     } else {
-        home.join(".config").join("minikrill").join(ACCOUNTS_FILE)
+        krill_proto::user_dirs::config_dir(home).join(ACCOUNTS_FILE)
     }
 }
 
@@ -403,7 +404,7 @@ fn write_active_env(home: &Path, state_dir: Option<&Path>, file: &AccountsFile) 
         }
     }
     let target = state_dir.map_or_else(
-        || home.join(".config").join("minikrill").join(ACTIVE_ENV_FILE),
+        || krill_proto::user_dirs::config_dir(home).join(ACTIVE_ENV_FILE),
         |s| s.join(ACTIVE_ENV_FILE),
     );
     write_atomic_0600(&target, lines.as_bytes())
@@ -1229,6 +1230,8 @@ fn refresh_accounts_authenticated(
         }
         switched.clear();
     }
+
+    switch_work::notify(home, state_dir, &switched);
 
     for event in &switched {
         runtime.record(

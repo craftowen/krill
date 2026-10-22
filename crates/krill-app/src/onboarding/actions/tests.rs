@@ -48,7 +48,7 @@ fn missing_helper_is_not_a_successful_repair() {
     let (root, env) = fixture("missing");
     std::fs::remove_file(root.join("source/krilld")).unwrap();
     assert!(stage_helpers(&env).is_err());
-    assert!(!env.home.join(".local/share/minikrill/bin/krill").exists());
+    assert!(!env.home.join(".local/share/krill/bin/krill").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -74,7 +74,7 @@ fn cli_link_is_idempotent_and_never_uses_system_bin() {
     install_managed_cli_at(&env, &path).unwrap();
     assert_eq!(
         std::fs::read_link(managed.join("krill")).unwrap(),
-        env.home.join(".local/share/minikrill/bin/krill")
+        env.home.join(".local/share/krill/bin/krill")
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -327,7 +327,7 @@ fn automatic_setup_only_stages_and_links_without_hooks_or_permissions(
     cx.run_until_parked();
     assert_eq!(*result.borrow(), Some(Ok(())));
     assert!(link.is_file());
-    assert!(home.join(".claude/skills/minikrill/SKILL.md").is_file());
+    assert!(home.join(".claude/skills/krill/SKILL.md").is_file());
     assert!(
         home.join(".codex/skills/krill-orchestration/SKILL.md")
             .is_file()

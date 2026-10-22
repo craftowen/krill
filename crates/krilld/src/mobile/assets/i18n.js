@@ -250,6 +250,7 @@
  "No chat turns recorded yet.": "아직 기록된 대화가 없습니다.",
  "Waiting for agent hook or transcript binding…": "에이전트 상태 또는 대화 기록 연결을 기다리는 중…",
  "Reading earlier messages; live updates are paused.": "이전 대화를 읽는 동안 실시간 갱신이 멈춥니다.",
+ "Could not remove desktop. Try again.": "저장된 컴퓨터를 삭제하지 못했습니다. 다시 시도하세요.",
  "New Workspace": "새 작업 공간",
  "Choose desktop": "컴퓨터 선택",
  "Add this desktop to your saved desktops. You can switch between them from Home.": "이 컴퓨터를 저장된 목록에 추가합니다. 홈에서 컴퓨터를 전환할 수 있습니다.",

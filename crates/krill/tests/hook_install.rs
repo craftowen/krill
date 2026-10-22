@@ -31,7 +31,7 @@ impl Home {
             "claude" => ".claude/settings.json",
             "cursor" => ".cursor/hooks.json",
             "agy" | "antigravity" => ".gemini/config/hooks.json",
-            "opencode" => ".config/opencode/plugins/minikrill.js",
+            "opencode" => ".config/opencode/plugins/krill.js",
             _ => ".codex/config.toml",
         })
     }
@@ -226,7 +226,7 @@ fn unmodified_settings_roundtrip_bytes_and_keep_private_backups() {
         let backups: Vec<_> = fs::read_dir(h.config(agent).parent().unwrap())
             .unwrap()
             .flatten()
-            .filter(|e| e.file_name().to_string_lossy().contains("minikrill-bak"))
+            .filter(|e| e.file_name().to_string_lossy().contains("krill-bak"))
             .collect();
         assert_eq!(backups.len(), 2);
         for b in backups {
@@ -312,9 +312,9 @@ fn opencode_only_owns_its_plugin_and_respects_config_override() {
     c.env("OPENCODE_CONFIG_DIR", &custom)
         .args(["hook", "install", "opencode", "--yes"]);
     success(&output(&mut c, ""));
-    assert!(custom.join("plugins/minikrill.js").exists());
+    assert!(custom.join("plugins/krill.js").exists());
     success(&h.run("uninstall", "opencode", &["--yes"], ""));
-    assert!(!custom.join("plugins/minikrill.js").exists());
+    assert!(!custom.join("plugins/krill.js").exists());
 }
 
 #[test]
@@ -483,7 +483,7 @@ fn opencode_plugin_executes_under_bun_and_does_not_spawn_outside_minikrill() {
     success(&h.run("install", "opencode", &["--yes"], ""));
     let script = h.0.join("probe.mjs");
     fs::write(&script, r"
-import { KrillHook } from './.config/opencode/plugins/minikrill.js';
+import { KrillHook } from './.config/opencode/plugins/krill.js';
 let calls = 0;
 Bun.spawn = (args, options) => {
   calls++;
@@ -519,11 +519,11 @@ fn agy_hook_install_roundtrip_and_pre_tool_use_response() {
     success(&h.run("install", "agy", &["--yes"], ""));
     let installed = h.value("agy");
     assert!(installed.get("orca-status").is_some());
-    assert!(installed["minikrill"]["PreInvocation"].is_array());
-    assert!(installed["minikrill"]["PreToolUse"][0]["hooks"].is_array());
+    assert!(installed["krill"]["PreInvocation"].is_array());
+    assert!(installed["krill"]["PreToolUse"][0]["hooks"].is_array());
 
     // Execute the installed PreToolUse command inside a pane and verify it returns `{"decision":"ask"}`
-    let pre_cmd = installed["minikrill"]["PreToolUse"][0]["hooks"][0]["command"]
+    let pre_cmd = installed["krill"]["PreToolUse"][0]["hooks"][0]["command"]
         .as_str()
         .unwrap();
     let mut cmd = Command::new("/bin/sh");

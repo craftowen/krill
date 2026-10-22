@@ -90,10 +90,17 @@ pub(super) fn prepare(
 
 fn find_transcript(root: &Path, provider: ProviderKind, id: &str) -> io::Result<Option<PathBuf>> {
     let deadline = Instant::now() + Duration::from_secs(3);
+    // Only search provider-owned transcript levels. Claude subagent/workflow trees
+    // can exceed the whole search budget and cannot contain the parent conversation.
+    let max_depth = if provider == ProviderKind::Claude {
+        1
+    } else {
+        3
+    };
     let mut pending = vec![(root.to_path_buf(), 0_u8)];
     let mut nodes = 0_u32;
     while let Some((dir, depth)) = pending.pop() {
-        if depth > 4 || nodes >= 20_000 || Instant::now() > deadline {
+        if nodes >= 20_000 || Instant::now() > deadline {
             return Err(io::ErrorKind::TimedOut.into());
         }
         let entries = match fs::read_dir(&dir) {
@@ -109,7 +116,9 @@ fn find_transcript(root: &Path, provider: ProviderKind, id: &str) -> io::Result<
             let entry = entry?;
             let path = entry.path();
             if entry.file_type()?.is_dir() {
-                pending.push((path, depth.saturating_add(1)));
+                if depth < max_depth {
+                    pending.push((path, depth.saturating_add(1)));
+                }
                 continue;
             }
             let name = entry.file_name();
@@ -440,5 +449,50 @@ esac
         assert!(prepare(ProviderKind::Codex, &root, &source, &target, id, b"").is_err());
         assert!(fs::read_to_string(from.join(&name)).unwrap().contains(id));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn claude_transcript_search_skips_nested_subagent_workflow_dirs() {
+        // Claude Code workflow subagents leave `<project>/<sid>/subagents/workflows/wf_*`, one level
+        // below the search depth. Siblings on both sides keep the test order-independent.
+        let root =
+            std::env::temp_dir().join(format!("krill-deep-transcript-{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let projects = root.join("projects");
+        for project in ["a-deep", "z-deep"] {
+            let deep = projects.join(project).join("sid/subagents/workflows/wf_1");
+            fs::create_dir_all(&deep).unwrap();
+            fs::write(deep.join("agent.jsonl"), "{}").unwrap();
+        }
+        let id = "3b71560c-6c71-4dce-86d0-5ce025eac068";
+        let wanted = projects.join("m-target").join(format!("{id}.jsonl"));
+        fs::create_dir_all(wanted.parent().unwrap()).unwrap();
+        fs::write(&wanted, "{}").unwrap();
+        assert_eq!(
+            find_transcript(&projects, ProviderKind::Claude, id).unwrap(),
+            Some(wanted)
+        );
+        assert_eq!(
+            find_transcript(&projects, ProviderKind::Claude, "missing").unwrap(),
+            None
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn claude_transcript_search_does_not_open_unrelated_subagent_dirs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("krill-unreadable-subagent-{}", std::process::id()));
+        let subagents = root.join("project/sid/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::set_permissions(&subagents, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = find_transcript(&root, ProviderKind::Claude, "missing");
+        // Restore permissions even when the search regresses, so fixture cleanup succeeds.
+        fs::set_permissions(&subagents, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(result.unwrap(), None);
     }
 }

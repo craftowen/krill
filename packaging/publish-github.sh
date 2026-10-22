@@ -186,7 +186,7 @@ DMG_URL="${REPO_URL}/releases/download/${TAG}/Krill-${VERSION}.dmg"
 OUT_DIR="packaging/dist"
 
 HEAD_SHA=$(git rev-parse HEAD)
-KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/minikrill-codesign.keychain-db}"
+KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$(python3 packaging/macos/identity_paths.py)}"
 UPDATE_KEY_FILE="${KRILL_UPDATE_KEY_FILE:-${KC_PATH}.ed25519.key}"
 
 # ---- 게시 가드 ----
@@ -359,7 +359,7 @@ ZIP_SHA256=$(awk '{print $1}' "${ZIP_PATH}.sha256")
 ZIP_URL="${REPO_URL}/releases/download/${TAG}/${ZIP_NAME}"
 MIN_DAEMON_PROTO=$(sed -n 's/^pub const PROTO_MIN: u16 = \([0-9][0-9]*\);/\1/p' crates/krill-proto/src/ipc.rs)
 MIN_DAEMON_PROTO=${MIN_DAEMON_PROTO:-1}
-KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$HOME/Library/Keychains/minikrill-codesign.keychain-db}"
+KC_PATH="${KRILL_CODESIGN_KEYCHAIN:-$(python3 packaging/macos/identity_paths.py)}"
 UPDATE_KEY_FILE="${KRILL_UPDATE_KEY_FILE:-${KC_PATH}.ed25519.key}"
 RELEASE_CHANNEL="stable"
 if [[ "$VERSION" == *-* ]]; then

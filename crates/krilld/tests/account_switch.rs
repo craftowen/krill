@@ -79,19 +79,51 @@ fn control(stream: &mut UnixStream, request: &Request) -> Reply {
 
 #[expect(clippy::panic, reason = "integration-test fixture")]
 fn usage(socket: &Path, request: &UsageRequest) -> AccountsSnapshot {
-    let (mut stream, _) = connect(socket).unwrap();
-    stream.write_all(&request.encode().unwrap()).unwrap();
-    let (kind, raw) = ipc::read_frame(&mut stream).unwrap().unwrap();
-    let reply = UsageReply::decode(kind, &raw).unwrap();
+    let reply = usage_reply(socket, request);
     let UsageReply::Accounts(snapshot) = reply else {
         panic!("account request failed: {reply:?}");
     };
     snapshot
 }
 
+fn usage_reply(socket: &Path, request: &UsageRequest) -> UsageReply {
+    let (mut stream, _) = connect(socket).unwrap();
+    stream.write_all(&request.encode().unwrap()).unwrap();
+    let (kind, raw) = ipc::read_frame(&mut stream).unwrap().unwrap();
+    UsageReply::decode(kind, &raw).unwrap()
+}
+
 #[test]
 fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
-    let root = PathBuf::from(format!("/tmp/kas-it-{}", std::process::id()));
+    switch_survives_daemon_sigkill(false, ProviderKind::Codex, 1);
+}
+
+#[test]
+fn automatic_account_switch_rebinds_running_session_and_survives_daemon_sigkill() {
+    switch_survives_daemon_sigkill(true, ProviderKind::Codex, 1);
+}
+
+#[test]
+fn claude_switch_skips_subagent_workflows_and_survives_daemon_sigkill() {
+    switch_survives_daemon_sigkill(false, ProviderKind::Claude, 1);
+}
+
+#[test]
+fn parallel_switch_bounds_restarts_and_recovers_every_inflight_session() {
+    switch_survives_daemon_sigkill(false, ProviderKind::Codex, 3);
+}
+
+#[expect(clippy::panic, reason = "integration-test fixture")]
+fn switch_survives_daemon_sigkill(automatic: bool, provider: ProviderKind, count: usize) {
+    let name = if provider == ProviderKind::Claude {
+        "claude"
+    } else {
+        "codex"
+    };
+    let root = PathBuf::from(format!(
+        "/tmp/kas-it-{}-{automatic}-{name}-{count}",
+        std::process::id()
+    ));
     fs::remove_dir_all(&root).ok();
     let state = root.join("state");
     let home = root.join("home");
@@ -103,50 +135,95 @@ fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
     fs::create_dir_all(&target).unwrap();
     fs::write(source.join("auth.json"), "source-fixture-only").unwrap();
     fs::write(target.join("auth.json"), "target-fixture-only").unwrap();
+    for (dir, percent) in [(&source, 5), (&target, 10)] {
+        fs::write(
+            dir.join("usage_cache.json"),
+            format!("{{\"five_hour\":{{\"utilization\":{percent}}}}}"),
+        )
+        .unwrap();
+    }
     let wait_ready = target.join("wait-before-ready");
     fs::write(&wait_ready, "").unwrap();
     let conversation = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
-    let transcript = format!("sessions/2026/10/20/rollout-date-{conversation}.jsonl");
+    let transcript = if provider == ProviderKind::Claude {
+        for project in ["a-deep", "m-target", "z-deep"] {
+            fs::create_dir_all(
+                source.join(format!("projects/{project}/sid/subagents/workflows/wf_1")),
+            )
+            .unwrap();
+        }
+        // The old depth-first search visits a decoy before this first directory,
+        // reproducing the production failure independently of filesystem ordering.
+        let project = fs::read_dir(source.join("projects"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name();
+        format!(
+            "projects/{}/{conversation}.jsonl",
+            project.to_str().unwrap()
+        )
+    } else {
+        format!("sessions/2026/10/20/rollout-date-{conversation}.jsonl")
+    };
     fs::write(
         source.join(&transcript),
         format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{conversation}\"}}}}\n"),
     )
     .unwrap();
-    let exe = root.join("codex");
-    fs::write(&exe, "#!/bin/sh\nif [ \"$1\" = login ] && [ \"$2\" = status ]; then printf 'Logged in using ChatGPT\\n' >&2; exit 0; fi\nprintf '%s' \"$CODEX_HOME\" > \"$CODEX_HOME/observed-profile\"\nprintf '%s\\n' \"$@\" > \"$CODEX_HOME/observed-args\"\nwhile [ -f \"$CODEX_HOME/wait-before-ready\" ]; do sleep 0.05; done\nprintf 'selected account ready: %s\\n' \"$CODEX_HOME\"\nwhile IFS= read -r line; do printf 'fixture: %s\\n' \"$line\"; done\n").unwrap();
+    let exe = root.join(name);
+    let script = r#"#!/bin/sh
+if [ "$1" = --version ]; then printf '2.1.0 (Claude Code)\n'; exit 0; fi
+if [ "$1" = auth ] && [ "$2" = status ]; then printf '{"loggedIn":true}\n'; exit 0; fi
+if [ "$1" = login ] && [ "$2" = status ]; then printf 'Logged in using ChatGPT\n' >&2; exit 0; fi
+printf '%s' "$CODEX_HOME" > "$CODEX_HOME/observed-profile"
+printf '%s\n' "$$" >> "$CODEX_HOME/observed-starts"
+printf '%s\n' "$@" > "$CODEX_HOME/observed-args"
+while [ -f "$CODEX_HOME/wait-before-ready" ]; do sleep 0.05; done
+printf 'selected account ready: %s\n' "$CODEX_HOME"
+while IFS= read -r line; do printf '%s\n' "$line" >> "$CODEX_HOME/observed-input"; printf 'fixture: %s\n' "$line"; done
+"#;
+    fs::write(&exe, script.replace("CODEX_HOME", provider.env_var())).unwrap();
     fs::set_permissions(&exe, fs::Permissions::from_mode(0o700)).unwrap();
     let profile = krill_proto::agent::Profile {
-        name: "Fixture Codex".into(),
+        name: format!("Fixture {name}"),
         launch: vec![exe.display().to_string()],
-        yolo_args: Vec::new(),
+        yolo_args: vec![if provider == ProviderKind::Claude {
+            "--dangerously-skip-permissions".into()
+        } else {
+            "--dangerously-bypass-approvals-and-sandbox".into()
+        }],
         install: String::new(),
         env: std::collections::BTreeMap::new(),
     };
-    let mut profiles = krill_proto::agent::set_user_profile(None, "codex", &profile).unwrap();
+    let mut profiles = krill_proto::agent::set_user_profile(None, name, &profile).unwrap();
     // Release authentication probes must use only fixture executables.
-    for provider in ["claude", "agy", "opencode"] {
+    for other in ["claude", "codex", "agy", "opencode"]
+        .into_iter()
+        .filter(|p| *p != name)
+    {
         let mut unavailable = profile.clone();
-        unavailable.launch = vec![
-            root.join("uninstalled")
-                .join(provider)
-                .display()
-                .to_string(),
-        ];
+        unavailable.launch = vec![root.join("uninstalled").join(other).display().to_string()];
         profiles =
-            krill_proto::agent::set_user_profile(Some(&profiles), provider, &unavailable).unwrap();
+            krill_proto::agent::set_user_profile(Some(&profiles), other, &unavailable).unwrap();
     }
     fs::write(state.join(krill_proto::agent::FILE_NAME), profiles).unwrap();
     let account = |id: &str, label: &str, dir: &Path| krilld::usage::accounts::StoredAccount {
         id: id.into(),
-        provider: "codex".into(),
+        provider: name.into(),
         label: label.into(),
         email: None,
         profile_dir: dir.display().to_string(),
     };
-    let a = account("codex-source", "Source", &source);
-    let b = account("codex-target", "Target", &target);
+    let a = account(&format!("{name}-source"), "Source", &source);
+    let b = account(&format!("{name}-target"), "Target", &target);
     let file = krilld::usage::accounts::AccountsFile {
-        active: std::collections::BTreeMap::from([("codex".into(), a.id.clone())]),
+        auto_switch: krilld::usage::accounts::StoredAutoSwitch {
+            enabled: automatic,
+            ..Default::default()
+        },
+        active: std::collections::BTreeMap::from([(name.into(), a.id.clone())]),
         accounts: vec![a.clone(), b.clone()],
         direct_usage: false,
         ..Default::default()
@@ -171,45 +248,92 @@ fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
     };
     let (mut stream, first_generation) = wait_for(|| connect(&socket));
     daemon.generations.push(first_generation);
-    let created = control(
-        &mut stream,
-        &Request::Create(Create {
-            account: Some(a.id),
-            program: Program::Agent { id: "codex".into() },
-            cwd: root.as_os_str().as_encoded_bytes().to_vec(),
-            cols: 80,
-            rows: 24,
-        }),
-    );
-    let Reply::Created { session: old, .. } = created else {
-        panic!("fixture create failed: {created:?}");
-    };
+    let mut originals = Vec::new();
+    for _ in 0..count {
+        let created = control(
+            &mut stream,
+            &Request::Create(Create {
+                account: Some(a.id.clone()),
+                program: Program::Agent { id: name.into() },
+                cwd: root.as_os_str().as_encoded_bytes().to_vec(),
+                cols: 80,
+                rows: 24,
+            }),
+        );
+        let Reply::Created { session: old, .. } = created else {
+            panic!("fixture create failed: {created:?}");
+        };
+        // A real provider normally reports this through its session-start hook.
+        let record = state.join("agent-launches").join(format!("{}.json", old.0));
+        let mut metadata: serde_json::Value =
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        metadata["session_id"] = conversation.into();
+        metadata["permission"] = "manual".into();
+        fs::write(&record, serde_json::to_vec(&metadata).unwrap()).unwrap();
+        originals.push(old);
+    }
+    let old = originals[0];
     wait_for(|| {
-        fs::read_to_string(source.join("observed-profile"))
+        fs::read_to_string(source.join("observed-starts"))
             .ok()
-            .filter(|s| s == source.to_str().unwrap())
+            .filter(|s| s.lines().count() == count)
     });
-    // A real provider normally reports this through its session-start hook.
-    let record = state.join("agent-launches").join(format!("{}.json", old.0));
-    let mut metadata: serde_json::Value =
-        serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
-    metadata["session_id"] = conversation.into();
-    fs::write(&record, serde_json::to_vec(&metadata).unwrap()).unwrap();
-    usage(
-        &socket,
-        &UsageRequest::SwitchAccount {
-            provider: ProviderKind::Codex,
-            account_id: b.id.clone(),
-        },
-    );
+    if automatic {
+        fs::write(
+            source.join("usage_cache.json"),
+            r#"{"five_hour":{"utilization":95}}"#,
+        )
+        .unwrap();
+        // Even the legacy usage response discards the switch event. The common account
+        // evaluator must still wake the worker and resume the existing conversation.
+        assert!(matches!(
+            usage_reply(&socket, &UsageRequest::Get),
+            UsageReply::Current(_)
+        ));
+    } else {
+        usage(
+            &socket,
+            &UsageRequest::SwitchAccount {
+                provider,
+                account_id: b.id.clone(),
+            },
+        );
+    }
     // Crash after the new process starts but before it becomes ready or commits its alias.
     wait_for(|| fs::read_to_string(target.join("observed-profile")).ok());
-    let prepared: serde_json::Value =
-        serde_json::from_slice(&fs::read(state.join("account-replacement.json")).unwrap()).unwrap();
-    let abandoned = prepared
-        .get("to")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap();
+    let inflight = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(2)
+        .min(count);
+    wait_for(|| {
+        fs::read_to_string(target.join("observed-starts"))
+            .ok()
+            .filter(|s| s.lines().count() == inflight)
+    });
+    if count > 1 {
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(
+            fs::read_to_string(target.join("observed-starts"))
+                .unwrap()
+                .lines()
+                .count(),
+            inflight,
+            "blocked restarts must never exceed the worker limit"
+        );
+    }
+    let abandoned: Vec<_> = fs::read_dir(state.join("account-replacements"))
+        .unwrap()
+        .map(|entry| {
+            let prepared: serde_json::Value =
+                serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            prepared["to"].as_u64().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        abandoned.len(),
+        inflight,
+        "each inflight session needs a separate recovery journal"
+    );
     let daemon_pid = Pid::from_raw(i32::try_from(first_generation).unwrap()).unwrap();
     kill_process(daemon_pid, Signal::KILL).unwrap();
     let (mut stream, resumed_generation) =
@@ -223,19 +347,39 @@ fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
         handoff.to
     });
     assert_ne!(new, old);
-    assert_ne!(
-        new.0, abandoned,
+    assert!(
+        !abandoned.contains(&new.0),
         "retry must retire the uncommitted process"
     );
+    let replacements = wait_for(|| {
+        let snapshot = usage(&socket, &UsageRequest::ListAccounts);
+        let mut replacements = Vec::new();
+        for original in &originals {
+            let h = snapshot
+                .details
+                .handoffs
+                .iter()
+                .find(|h| h.from == *original)?;
+            assert!(h.error.is_none(), "{:?}", h.error);
+            replacements.push(h.to?);
+        }
+        Some(replacements)
+    });
+    assert!(replacements.iter().all(|s| !abandoned.contains(&s.0)));
     assert_eq!(
         fs::read_to_string(target.join("observed-profile")).unwrap(),
         target.to_str().unwrap()
     );
+    let resume_arg = if provider == ProviderKind::Claude {
+        format!("--resume={conversation}")
+    } else {
+        conversation.into()
+    };
     assert!(
         fs::read_to_string(target.join("observed-args"))
             .unwrap()
             .lines()
-            .any(|arg| arg == conversation)
+            .any(|arg| arg == resume_arg)
     );
     assert_eq!(
         fs::read(source.join(&transcript)).unwrap(),
@@ -245,6 +389,23 @@ fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
         fs::read_to_string(source.join("auth.json")).unwrap(),
         "source-fixture-only"
     );
+    assert_eq!(
+        fs::read_to_string(target.join("auth.json")).unwrap(),
+        "target-fixture-only"
+    );
+    let continued = wait_for(|| {
+        fs::read_to_string(target.join("observed-input"))
+            .ok()
+            .filter(|s| s.lines().count() == count)
+    });
+    assert!(continued.contains("Continue the existing task from where you left off"));
+    assert_eq!(continued.lines().count(), count);
+    let args = fs::read_to_string(target.join("observed-args")).unwrap();
+    assert!(args.contains(if provider == ProviderKind::Claude {
+        "--dangerously-skip-permissions"
+    } else {
+        "--dangerously-bypass-approvals-and-sandbox"
+    }));
     let snapshot = control(&mut stream, &Request::List);
     let Reply::Sessions(sessions) = snapshot else {
         panic!("session list failed");
@@ -284,9 +445,16 @@ fn running_account_switch_rebinds_credentials_and_survives_daemon_sigkill() {
     };
     assert!(String::from_utf8_lossy(&bytes).contains("selected account ready"));
     assert_eq!(
-        control(&mut stream, &Request::Close { session: new }),
-        Reply::Closed
+        fs::read_to_string(target.join("observed-input")).unwrap(),
+        continued,
+        "a later daemon restart must not submit the continuation twice"
     );
+    for session in replacements {
+        assert_eq!(
+            control(&mut stream, &Request::Close { session }),
+            Reply::Closed
+        );
+    }
     drop(daemon);
     fs::remove_dir_all(root).unwrap();
 }

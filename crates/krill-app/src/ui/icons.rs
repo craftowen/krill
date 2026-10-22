@@ -29,6 +29,11 @@ pub const OPENCODE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns
 /// `OpenCode` 내부 코어 블록 레이어 SVG (`viewBox="0 0 512 512"`).
 pub const OPENCODE_CORE_SVG: &[u8] = br#"<svg viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M320 224V352H192V224H320Z" fill="currentColor"/></svg>"#;
 
+/// Pi 공식 π 마크. Orca `src/renderer/src/lib/agent-icon-glyphs.tsx`의 `PiIcon`
+/// (Copyright (c) 2026 Lovecast Inc., MIT License, 원본 `pi.dev/favicon.svg`).
+/// 공식 단색 마크이므로 호출자의 테마 전경색으로 그린다.
+pub const PI_SVG: &[u8] = br#"<svg viewBox="0 0 800 800" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" fill-rule="evenodd" d="M165.29 165.29 H517.36 V400 H400 V517.36 H282.65 V634.72 H165.29 Z M282.65 282.65 V400 H400 V282.65 Z"/><path fill="currentColor" d="M517.36 400 H634.72 V634.72 H517.36 Z"/></svg>"#;
+
 /// Cursor 공식 아이소메트릭 큐브·커서 마크 SVG (`viewBox="0 0 24 24"`).
 /// Source geometry adapted from `.ref/orca/src/shared/agent-icons/cursor.png` (MIT License).
 pub const CURSOR_SVG: &[u8] = br#"<svg viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path fill="currentColor" fill-rule="evenodd" d="M12 1.75L20.88 6.88V17.12L12 22.25L3.12 17.12V6.88L12 1.75ZM5.4 8.2L12 12.0V19.6L18.6 8.2H5.4Z"/></svg>"#;
@@ -174,6 +179,7 @@ pub fn agent_svg_bytes(agent_id: &str) -> &'static [u8] {
         "claude" => CLAUDE_SVG,
         "codex" => OPENAI_SVG,
         "agy" => ANTIGRAVITY_SVG,
+        "pi" => PI_SVG,
         "cursor" | "cursor-agent" => CURSOR_SVG,
         _ => OPENCODE_SVG,
     }
@@ -207,13 +213,14 @@ pub fn provider_brand_color(provider: ProviderKind, fg: Hsla) -> Hsla {
 
 /// 에이전트 ID 대표 브랜드 색을 돌려준다.
 #[must_use]
-pub fn agent_brand_color(agent_id: &str, _fg: Hsla) -> Hsla {
+pub fn agent_brand_color(agent_id: &str, fg: Hsla) -> Hsla {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => rgb(CLAUDE_COLOR).into(),
         "codex" => rgb(CODEX_COLOR).into(),
         "agy" => rgb(ANTIGRAVITY_BLUE).into(),
         "opencode" => rgb(OPENCODE_COLOR).into(),
         "cursor" | "cursor-agent" => rgb(CURSOR_COLOR).into(),
+        "pi" => fg,
         _ => rgb(CUSTOM_AGENT_COLOR).into(),
     }
 }
@@ -230,10 +237,12 @@ pub fn provider_menu_icon(provider: ProviderKind) -> Icon {
 /// 버튼·팝업 메뉴 항목(`Button::icon`, `PopupMenuItem::icon`, `PopupMenu::submenu_with_icon`)에 넣는 브랜드 색상 적용 에이전트 [`Icon`].
 #[must_use]
 pub fn agent_menu_icon(agent_id: &str) -> Icon {
-    let color = agent_brand_color(agent_id, rgb(CLAUDE_COLOR).into());
-    Icon::default()
-        .data(agent_svg_bytes(agent_id))
-        .text_color(color)
+    let icon = Icon::default().data(agent_svg_bytes(agent_id));
+    if agent_id == "pi" {
+        icon
+    } else {
+        icon.text_color(agent_brand_color(agent_id, rgb(CLAUDE_COLOR).into()))
+    }
 }
 
 /// 프로바이더 공식 로고 아이콘 요소를 만든다(관리자 페이지·상태바 공용).
@@ -249,13 +258,14 @@ pub fn provider_icon(provider: ProviderKind, size_px: f32, _fg: Hsla) -> gpui::D
 }
 
 /// 에이전트 ID에 맞는 공식 브랜드 아이콘 요소를 만든다(관리자 페이지·탭 바·사이드바 공용).
-pub fn agent_brand_icon(agent_id: &str, size_px: f32, _fg: Hsla) -> gpui::Div {
+pub fn agent_brand_icon(agent_id: &str, size_px: f32, fg: Hsla) -> gpui::Div {
     match krill_proto::agent::canonical_id(agent_id) {
         "claude" => svg_box(CLAUDE_SVG, size_px, rgb(CLAUDE_COLOR).into()),
         "codex" => svg_box(OPENAI_SVG, size_px, rgb(CODEX_COLOR).into()),
         "agy" => antigravity_box(size_px),
         "opencode" => opencode_box(size_px),
         "cursor" | "cursor-agent" => cursor_box(size_px),
+        "pi" => svg_box(PI_SVG, size_px, fg),
         other => {
             let brand: Hsla = rgb(CUSTOM_AGENT_COLOR).into();
             let letter = other
@@ -517,6 +527,18 @@ mod tests {
     }
 
     #[test]
+    fn pi_mark_is_shared_by_agent_and_menu_paths_and_keeps_the_theme_foreground() {
+        assert_eq!(agent_svg_bytes("pi"), PI_SVG);
+        assert_ne!(agent_svg_bytes("pi"), OPENCODE_SVG);
+        for p in [&crate::ui::LIGHT, &crate::ui::DARK] {
+            assert_eq!(agent_brand_color("pi", p.foreground), p.foreground);
+        }
+        let svg = std::str::from_utf8(PI_SVG).expect("Pi SVG");
+        assert!(svg.contains("fill-rule=\"evenodd\""));
+        assert!(svg.contains("M517.36 400 H634.72 V634.72 H517.36 Z"));
+    }
+
+    #[test]
     fn all_providers_and_agents_have_chromatic_brand_colors_and_valid_svgs() {
         let fallback = gpui::hsla(0.0, 0.0, 0.5, 1.0);
         for provider in ProviderKind::ALL {
@@ -577,7 +599,7 @@ mod tests {
         (ProviderKind::OpenCode, "gallery-provider-opencode"),
     ];
 
-    const GALLERY_AGENTS: [(&str, f32, &str, &str); 6] = [
+    const GALLERY_AGENTS: [(&str, f32, &str, &str); 7] = [
         (
             "claude",
             ICON_XS,
@@ -591,6 +613,7 @@ mod tests {
             "gallery-menu-codex",
         ),
         ("agy", ICON_MD, "gallery-agent-agy", "gallery-menu-agy"),
+        ("pi", ICON_SM, "gallery-agent-pi", "gallery-menu-pi"),
         (
             "opencode",
             ICON_LG,

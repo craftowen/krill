@@ -6,11 +6,12 @@
 //! 계정 배지 모양만 Orca `CodexRestartChip.tsx:140-155`의 칩 의도를 따르되,
 //! 이어가기는 OWE-699(대화 기록 공유, 오웬 결정 대기)까지 숨긴다.
 
-use std::time::Duration;
+use std::{cell::RefCell, rc::Rc, time::Duration};
 
 use gpui::{
-    Animation, AnimationExt as _, AnyElement, App, Hsla, IntoElement as _, ParentElement as _,
-    Styled as _, Transformation, div, percentage, prelude::FluentBuilder as _, px,
+    Animation, AnimationExt as _, AnyElement, App, Bounds, ContentMask, Hsla,
+    InteractiveElement as _, IntoElement as _, ParentElement as _, Pixels, Styled as _,
+    Transformation, canvas, div, percentage, prelude::FluentBuilder as _, px,
 };
 use gpui_component::{Icon, Sizable as _};
 use gpui_kit_assets::IconName;
@@ -87,6 +88,100 @@ impl Size {
 
 /// 상태 글리프. `unread`면 글리프 대신 호박색 벨을 그린다.
 pub fn status_glyph(state: AgentState, unread: bool, size: Size, cx: &App) -> gpui::Div {
+    glyph_frame(state, unread, size, None, cx)
+}
+
+/// 캐시된 뷰(사이드바) 안의 스피너 자리. 스피너 틱마다 그 뷰 전체가 다시 렌더되지 않도록
+/// 행은 자리(창 좌표·클립·색)만 적고, 회전은 부모 뷰가 [`spinner_overlay`]로 그 위에 그린다.
+#[derive(Debug, Clone, Default)]
+pub struct SpinnerSlots(Rc<RefCell<Vec<SpinnerSlot>>>);
+
+#[derive(Debug)]
+struct SpinnerSlot {
+    bounds: Bounds<Pixels>,
+    mask: ContentMask<Pixels>,
+    color: Hsla,
+}
+
+impl SpinnerSlots {
+    /// 뷰를 다시 렌더할 때 부른다. 재사용된 프레임에서는 지난 자리가 그대로 유효하다.
+    pub fn clear(&self) {
+        self.0.borrow_mut().clear();
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().is_empty()
+    }
+}
+
+/// [`status_glyph`]와 같되, `slots`가 있으면 스피너는 자리만 적는다.
+pub fn status_glyph_slot(
+    state: AgentState,
+    unread: bool,
+    size: Size,
+    slots: Option<&SpinnerSlots>,
+    cx: &App,
+) -> gpui::Div {
+    glyph_frame(state, unread, size, slots, cx)
+}
+
+/// `slots`에 적힌 자리마다 도는 스피너를 그린다. 이 요소를 그리는 뷰(루트)만 틱마다 다시 렌더된다.
+/// 자리를 적은 캐시 뷰보다 뒤(위)에 두고, 그 뷰의 메뉴·모달은 deferred라 이 위에 그려진다.
+pub fn spinner_overlay(slots: &SpinnerSlots) -> impl gpui::IntoElement {
+    let slots = slots.clone();
+    canvas(
+        move |_, window, cx| {
+            let slots = slots.0.borrow();
+            slots
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let mut ring = div()
+                        .id(("spinner-slot", i))
+                        .child(spinning_ring(slot.bounds.size.width.into(), slot.color))
+                        .into_any_element();
+                    window.with_content_mask(Some(slot.mask), |window| {
+                        ring.prepaint_as_root(
+                            slot.bounds.origin,
+                            slot.bounds.size.into(),
+                            window,
+                            cx,
+                        );
+                    });
+                    (slot.mask, ring)
+                })
+                .collect::<Vec<_>>()
+        },
+        |_, mut rings, window, cx| {
+            for (mask, ring) in &mut rings {
+                window.with_content_mask(Some(*mask), |window| ring.paint(window, cx));
+            }
+        },
+    )
+    .absolute()
+}
+
+fn spinning_ring(size_px: f32, color: Hsla) -> AnyElement {
+    icon(RING_SVG, size_px, color)
+        .with_animation(
+            "agent-spinner",
+            Animation::new(Duration::from_secs(1))
+                .repeat_synced()
+                .with_max_fps(SPIN_STEPS)
+                .with_easing(|t| (t * SPIN_STEPS).floor() / SPIN_STEPS),
+            |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
+        )
+        .into_any_element()
+}
+
+fn glyph_frame(
+    state: AgentState,
+    unread: bool,
+    size: Size,
+    slots: Option<&SpinnerSlots>,
+    cx: &App,
+) -> gpui::Div {
     let frame = div()
         .size(px(size.outer()))
         .flex_none()
@@ -101,16 +196,24 @@ pub fn status_glyph(state: AgentState, unread: bool, size: Size, cx: &App) -> gp
         Glyph::Spinner if cx.reduce_motion() => {
             icon(RING_FULL_SVG, size.inner(), color).into_any_element()
         }
-        Glyph::Spinner => icon(RING_SVG, size.inner(), color)
-            .with_animation(
-                "agent-spinner",
-                Animation::new(Duration::from_secs(1))
-                    .repeat_synced()
-                    .with_max_fps(SPIN_STEPS)
-                    .with_easing(|t| (t * SPIN_STEPS).floor() / SPIN_STEPS),
-                |icon, delta| icon.transform(Transformation::rotate(percentage(delta))),
-            )
-            .into_any_element(),
+        Glyph::Spinner => match slots {
+            Some(slots) => {
+                let slots = slots.0.clone();
+                canvas(
+                    move |bounds, window, _| {
+                        slots.borrow_mut().push(SpinnerSlot {
+                            bounds,
+                            mask: window.content_mask(),
+                            color,
+                        });
+                    },
+                    |_, (), _, _| {},
+                )
+                .size(px(size.inner()))
+                .into_any_element()
+            }
+            None => spinning_ring(size.inner(), color),
+        },
         Glyph::Question => Icon::new(IconName::MessageCircleQuestionMark)
             .with_size(px(size.outer()))
             .text_color(color)
@@ -167,6 +270,11 @@ pub fn infer_agent_from_title<'a>(agent: &'a str, title: &str) -> &'a str {
         "opencode"
     } else if lower.contains("cursor") {
         "cursor"
+    } else if lower
+        .split(|c: char| !c.is_alphanumeric() && c != '_' && c != '-')
+        .any(|word| matches!(word, "pi" | "π"))
+    {
+        "pi"
     } else {
         agent
     }
@@ -214,6 +322,7 @@ fn known_agent(agent: &str) -> Option<&'static str> {
         ("opencode", "opencode"),
         ("cursor", "cursor"),
         ("cursor-agent", "cursor"),
+        ("pi", "pi"),
     ]
     .into_iter()
     .find_map(|(alias, id)| name.eq_ignore_ascii_case(alias).then_some(id))
@@ -283,7 +392,8 @@ pub fn summarize<'a>(sessions: &[(AgentState, &'a str)]) -> Summary<'a> {
 }
 
 /// 워크트리 행의 상태 묶음: [글리프][겹친 에이전트 아이콘][+N] … [+N].
-pub fn summary_element(summary: &Summary<'_>, cx: &App) -> gpui::Div {
+/// `slots`는 [`status_glyph_slot`]과 같다.
+pub fn summary_element(summary: &Summary<'_>, slots: Option<&SpinnerSlots>, cx: &App) -> gpui::Div {
     let p = palette(cx);
     let more = |n: usize| {
         div()
@@ -308,7 +418,7 @@ pub fn summary_element(summary: &Summary<'_>, cx: &App) -> gpui::Div {
                 .py_0p5()
                 .rounded(RADIUS_XS)
                 .bg(p.worktree_sidebar_accent.opacity(0.65))
-                .child(status_glyph(g.state, false, Size::Sm, cx))
+                .child(glyph_frame(g.state, false, Size::Sm, slots, cx))
                 .child(
                     div()
                         .flex()
@@ -541,6 +651,9 @@ mod tests {
             ("/opt/bin/codex", "codex"),
             ("C:\\bin\\opencode.exe", "opencode"),
             ("Antigravity", "agy"),
+            ("Pi", "pi"),
+            ("/opt/bin/pi", "pi"),
+            ("C:\\bin\\pi.exe", "pi"),
         ] {
             assert_eq!(infer_agent_from_title(raw, "renamed task"), expected);
         }
@@ -566,6 +679,29 @@ mod tests {
             "my-agent"
         );
         assert!(is_shell_agent("zsh"));
+    }
+
+    #[test]
+    fn pi_identity_uses_explicit_agent_then_foreground_then_a_whole_title_word() {
+        use krill_proto::control::AgentStatus;
+        let mut status = AgentStatus {
+            agent: "pi".into(),
+            foreground: Some("node".into()),
+            ..AgentStatus::UNKNOWN
+        };
+        assert_eq!(infer_agent_from_status(&status, "renamed task"), "pi");
+        status.agent = "zsh".into();
+        status.foreground = Some("/opt/bin/pi".into());
+        assert_eq!(infer_agent_from_status(&status, "renamed task"), "pi");
+        status.foreground = None;
+        for title in ["Pi", "pi — krill", "π coding agent"] {
+            assert_eq!(infer_agent_from_status(&status, title), "pi");
+        }
+        for title in ["pipeline", "spin", "api", "my-pi-task"] {
+            assert_eq!(infer_agent_from_status(&status, title), "zsh");
+        }
+        status.agent = "custom".into();
+        assert_eq!(infer_agent_from_status(&status, "Pi"), "custom");
     }
 
     #[test]

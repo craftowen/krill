@@ -135,6 +135,11 @@ fn dispatch_skills(args: &[String]) -> io::Result<()> {
             let name = name.ok_or_else(|| bad_arg("missing skill <name>"))?;
             let trimmed = name.trim();
             let stripped = trimmed.strip_prefix("krill-").unwrap_or(trimmed);
+            let stripped = if stripped == "minikrill" {
+                "krill"
+            } else {
+                stripped
+            };
             let Some(skill) = builtin_skills()
                 .iter()
                 .find(|s| s.name == trimmed || s.name == stripped)
@@ -692,7 +697,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mk-cli-skills-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         for (name, name_flag, target_flag, dir_flag, target) in [
-            ("minikrill", None, "--target", "--dir", "claude"),
+            ("krill", None, "--target", "--dir", "claude"),
             (
                 "orchestration",
                 Some("--skill"),
@@ -736,11 +741,11 @@ mod tests {
             };
             assert_eq!(
                 std::fs::read_to_string(dir.join(folder).join("SKILL.md"))?,
-                format!("{}\n<!-- minikrill-managed-skill -->\n", content.trim_end())
+                format!("{}\n<!-- krill-managed-skill -->\n", content.trim_end())
             );
         }
-        dispatch_skills(&args(&["get", "minikrill", "--full"]))?;
-        dispatch_skills(&args(&["get", "minikrill", "--full", "--json"]))?;
+        dispatch_skills(&args(&["get", "krill", "--full"]))?;
+        dispatch_skills(&args(&["get", "krill", "--full", "--json"]))?;
         dispatch_skills(&args(&["get", "computer-use", "--full"]))?;
         dispatch_skills(&args(&["get", "computer-use", "--full", "--json"]))?;
         dispatch_skills(&args(&["get", "orchestration", "--references"]))?;

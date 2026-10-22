@@ -1,6 +1,29 @@
 use super::*;
 
 #[test]
+fn krill_config_wins_and_legacy_setup_remains_available() {
+    let f = Fixture::new("rename-config", "");
+    fs::remove_file(f.repo.join(CONFIG)).unwrap();
+    fs::write(
+        f.repo.join("minikrill.toml"),
+        "[worktree]\nsetup = 'legacy'\n",
+    )
+    .unwrap();
+    let Outcome::Untrusted { script, .. } = f.create("old", Setup::Ask).unwrap() else {
+        panic!("legacy setup must still require trust")
+    };
+    assert_eq!(script, "legacy");
+    fs::write(f.repo.join(CONFIG), "[worktree]\nsetup = 'current'\n").unwrap();
+    let Outcome::Untrusted { script, .. } = f.create("new", Setup::Ask).unwrap() else {
+        panic!("current setup must require its own trust")
+    };
+    assert_eq!(script, "current");
+    fs::write(f.repo.join(CONFIG), "invalid [").unwrap();
+    assert!(f.create("invalid", Setup::Ask).is_err());
+    assert!(!f.root.exists());
+}
+
+#[test]
 fn orca_setup_native_precedence_and_manifest_security() {
     let f = Fixture::new("orca", "");
     fs::write(f.repo.join("orca.yaml"), "scripts:\n  setup: |\n    printf 'one'\n    printf 'two'\n  archive: ignored\ndefaultTabs: []\n").unwrap();

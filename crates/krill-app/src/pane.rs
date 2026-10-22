@@ -628,7 +628,6 @@ impl SearchState {
 enum AccountInput {
     Normal,
     Switching,
-    Failed,
     Delivering,
 }
 
@@ -871,10 +870,7 @@ impl<W: Write> Pane<W> {
     }
 
     pub fn account_switching(&self) -> bool {
-        matches!(
-            self.account_input,
-            AccountInput::Switching | AccountInput::Failed
-        )
+        self.account_input == AccountInput::Switching
     }
 
     /// Keep a hidden pane alive until its held prompts have reached the replacement PTY.
@@ -883,23 +879,23 @@ impl<W: Write> Pane<W> {
             || self.account_input == AccountInput::Delivering && self.journal.has_pending_input()
     }
 
-    /// A cancelled switch may continue on the original account. Failed switches keep all held
-    /// bytes for retry, so prompts intended for the new account cannot reach the original one.
+    /// A cancelled switch may continue on the original account. A failed switch drops the held
+    /// bytes with a notice, so prompts intended for the new account never reach the original
+    /// one, and the pane goes back to the preserved original session. The daemon keeps failed
+    /// handoffs in every snapshot, so a pane that is not switching ignores the failure.
     pub fn resume_account_input(&mut self, failed: bool, now: Now) -> Vec<Notice> {
-        if failed {
-            self.account_input = AccountInput::Failed;
-            self.journal.pause();
-            return Vec::new();
-        }
         if !self.account_switching() {
             return Vec::new();
+        }
+        let mut notices = Vec::new();
+        if failed {
+            notices.extend(self.journal.discard_held(input::Fate::AccountSwitchFailed));
         }
         self.account_input = if self.journal.has_pending_input() {
             AccountInput::Delivering
         } else {
             AccountInput::Normal
         };
-        let mut notices = Vec::new();
         if self.out.is_some() {
             let (frames, relink_notices) = self.journal.relink(input::Incarnation::Same, now);
             notices.extend(relink_notices);

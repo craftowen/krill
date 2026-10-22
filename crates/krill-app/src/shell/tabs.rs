@@ -203,6 +203,7 @@ impl Shell {
                 let file_prefix = self.file_tab_prefix(pane, cx);
                 Tab::new()
                     .label(SharedString::from(label.clone()))
+                    .text_size(ui::TEXT_SM)
                     .aria_label(description)
                     .group(CLOSE_GROUP)
                     .debug_selector(move || format!("session-tab-{i}"))

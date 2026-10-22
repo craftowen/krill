@@ -3,12 +3,14 @@
 //! src/renderer/src/store/terminals/terminal-restart-state.ts,
 //! Copyright (c) 2026 Lovecast Inc., MIT License.
 
+mod recovery;
 #[cfg(all(test, unix))]
 mod tests;
 mod transcript;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use krill_proto::SessionId;
@@ -18,15 +20,23 @@ use krill_proto::usage::{AccountsSnapshot, ConnectionStatus, ProviderKind, Sessi
 
 use super::{Peer, Registry, Scope, lock};
 use crate::usage::accounts;
+use crate::usage::accounts::switch_work::SwitchTarget;
 
 const FILE: &str = "account-handoffs.json";
 const PREPARED_FILE: &str = "account-replacement.json";
+const PREPARED_DIR: &str = "account-replacements";
+// Limit simultaneous CLI initialization and spread starts instead of launching every pane at once.
+const RESTART_WORKERS: usize = 2;
+const RESTART_SPACING: Duration = Duration::from_millis(300);
+const CONTINUE_PROMPT: &str = "The account profile was changed and this session was restarted. Continue the existing task from where you left off, using the conversation history and current workspace state. Check what is already done before acting; do not repeat completed work. If the task is complete or you were waiting for user input, remain idle and briefly report that status.";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Prepared {
     from: SessionId,
     to: SessionId,
     account_id: String,
+    #[serde(default)]
+    continue_work: bool,
 }
 
 pub(super) fn load(dir: Option<&Path>) -> BTreeMap<SessionId, SessionHandoff> {
@@ -112,7 +122,21 @@ impl Registry {
     }
 
     pub(super) fn queue_account_switch(&self, provider: ProviderKind, account_id: &str) {
-        let mut pending = lock(&self.account_work.0);
+        let mut pending = lock(&self.account_work.pending);
+        self.prepare_account_switch(provider, account_id);
+        // Remember even an A -> B -> A selection, where A owns every original process.
+        // An in-progress B replacement must observe cancellation before its commit.
+        pending.insert(
+            provider,
+            SwitchTarget {
+                account_id: account_id.into(),
+            },
+        );
+        self.account_work.wake.notify_one();
+    }
+
+    // Called with the work queue locked, after account-file evaluation has finished.
+    fn prepare_account_switch(&self, provider: ProviderKind, account_id: &str) {
         let sessions: Vec<_> = {
             let state = lock(&self.state);
             state
@@ -169,13 +193,14 @@ impl Registry {
         if found || cancelled {
             self.save_account_handoffs().ok();
         }
-        // Remember even an A -> B -> A click, where A already owns every original process.
-        // An in-progress B replacement must observe the cancellation before its commit.
-        pending.insert(provider, account_id.into());
-        self.account_work.1.notify_one();
     }
 
     pub(super) fn account_switch_snapshot(&self, snapshot: &mut AccountsSnapshot) {
+        let pending = lock(&self.account_work.pending);
+        for (provider, target) in pending.iter() {
+            self.prepare_account_switch(*provider, &target.account_id);
+        }
+        drop(pending);
         snapshot.details.handoffs = lock(&self.account_handoffs).values().cloned().collect();
     }
 
@@ -228,11 +253,11 @@ impl Registry {
         {
             return;
         }
-        let pending = lock(&self.account_work.0);
+        let pending = lock(&self.account_work.pending);
         if pending.is_empty() {
             drop(
                 self.account_work
-                    .1
+                    .wake
                     .wait_timeout(pending, timeout)
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             );
@@ -249,23 +274,49 @@ impl Registry {
             return;
         }
         self.recover_account_work(home);
-        let pending = std::mem::take(&mut *lock(&self.account_work.0));
-        let peer = Peer {
-            pid: None,
-            scope: Scope::Full,
+        let pending = {
+            let mut pending = lock(&self.account_work.pending);
+            // Account evaluation publishes only the selected profile. Discover sessions
+            // after it releases the account-file lock, before consuming the queued work.
+            for (provider, target) in pending.iter() {
+                self.prepare_account_switch(*provider, &target.account_id);
+            }
+            std::mem::take(&mut *pending)
         };
-        for (provider, account_id) in pending {
+        let mut jobs = VecDeque::new();
+        for (provider, target) in pending {
             let from: Vec<_> = lock(&self.account_handoffs)
                 .values()
-                .filter(|h| h.account_id == account_id && h.to.is_none() && h.error.is_none())
+                .filter(|h| {
+                    h.account_id == target.account_id && h.to.is_none() && h.error.is_none()
+                })
                 .map(|h| h.from)
                 .collect();
             for old in from {
-                if lock(&self.account_work.0)
-                    .get(&provider)
-                    .is_some_and(|target| target != &account_id)
-                {
+                jobs.push_back((provider, target.account_id.clone(), old));
+            }
+        }
+        let jobs = Mutex::new(jobs);
+        let start = Mutex::new(Instant::now());
+        let worker = || {
+            let peer = Peer {
+                pid: None,
+                scope: Scope::Full,
+            };
+            loop {
+                let Some((provider, account_id, old)) = lock(&jobs).pop_front() else {
                     break;
+                };
+                {
+                    let mut next = lock(&start);
+                    std::thread::sleep(next.saturating_duration_since(Instant::now()));
+                    *next = Instant::now() + RESTART_SPACING;
+                }
+                if lock(&self.account_work.pending)
+                    .get(&provider)
+                    .is_some_and(|target| target.account_id != account_id)
+                {
+                    continue;
                 }
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.handoff_account(&peer, old, provider, &account_id, home)
@@ -301,138 +352,23 @@ impl Registry {
                 drop(handoffs);
                 self.save_account_handoffs().ok();
             }
-        }
-    }
-
-    fn recover_account_work(&self, home: &Path) {
-        if self
-            .account_recovered
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
-            return;
-        }
-        // A crash between Spawned and the durable handoff must not leave a second agent
-        // consuming the selected account while a retry starts another replacement.
-        self.recover_prepared_account();
-        let saved: Vec<_> = lock(&self.account_handoffs).values().cloned().collect();
-        if saved.is_empty() {
-            return;
-        }
-        let state_dir = self.state_dir();
-        let snapshot = accounts::refresh_accounts_with(home, state_dir.as_deref(), false);
-        let peer = Peer {
-            pid: None,
-            scope: Scope::Full,
         };
-        for mut handoff in saved {
-            let (old_live, new_live) = {
-                let state = lock(&self.state);
-                let live = |id: &SessionId| {
-                    state.sessions.contains_key(id)
-                        && !state.exited.contains_key(id)
-                        && !state.closing.contains(id)
-                };
-                (live(&handoff.from), handoff.to.is_some_and(|id| live(&id)))
-            };
-            if !old_live {
-                if handoff.to.is_none() && handoff.error.is_none() {
-                    handoff.error =
-                        Some("Original session has ended; automatic resume cancelled".into());
-                    lock(&self.account_handoffs).insert(handoff.from, handoff);
-                }
-                continue;
-            }
-            if handoff.error.is_some() {
-                continue;
-            }
-            if let Some(new) = handoff.to {
-                if !new_live {
-                    handoff.to = None;
-                    handoff.error = Some(
-                        "Replacement session is unavailable; original session preserved".into(),
-                    );
-                } else if let Err(error) = self.close(&peer, handoff.from) {
-                    self.close(&peer, new).ok();
-                    handoff.to = None;
-                    handoff.error = Some(format!(
-                        "Could not retire original session ({error}); original session preserved"
-                    ));
-                }
-                lock(&self.account_handoffs).insert(handoff.from, handoff);
-            } else if let Some(account) = snapshot
-                .accounts
-                .iter()
-                .find(|a| a.id == handoff.account_id)
-            {
-                lock(&self.account_work.0)
-                    .entry(account.provider)
-                    .or_insert_with(|| account.id.clone());
-            } else {
-                handoff.error =
-                    Some("Selected account is unavailable; original session preserved".into());
-                lock(&self.account_handoffs).insert(handoff.from, handoff);
-            }
-        }
-        self.save_account_handoffs().ok();
-    }
-
-    fn recover_prepared_account(&self) {
-        let Some(dir) = self.state_dir() else { return };
-        let path = dir.join(PREPARED_FILE);
-        let prepared = std::fs::read(&path)
-            .ok()
-            .filter(|raw| raw.len() <= 4096)
-            .and_then(|raw| serde_json::from_slice::<Prepared>(&raw).ok());
-        if let Some(prepared) = prepared {
-            let committed = lock(&self.account_handoffs)
-                .get(&prepared.from)
-                .is_some_and(|h| h.to == Some(prepared.to));
-            let source = self.agents.stored(prepared.from).ok().flatten();
-            let owned = self
-                .agents
-                .stored(prepared.to)
-                .ok()
-                .flatten()
-                .is_some_and(|a| {
-                    a.account.is_some_and(|a| a.id == prepared.account_id)
-                        && source.as_ref().is_none_or(|s| {
-                            s.profile == a.profile
-                                && (s.session_id.is_none() || s.session_id == a.session_id)
-                        })
-                });
-            if !committed && owned {
-                let old_live = {
-                    let state = lock(&self.state);
-                    state.sessions.contains_key(&prepared.from)
-                        && !state.exited.contains_key(&prepared.from)
-                        && !state.closing.contains(&prepared.from)
-                };
-                if old_live {
-                    self.close(
-                        &Peer {
-                            pid: None,
-                            scope: Scope::Full,
-                        },
-                        prepared.to,
-                    )
-                    .ok();
-                } else {
-                    // The original ended independently while the daemon was down. Keep the
-                    // replacement and make it reachable instead of closing the remaining PTY.
-                    lock(&self.account_handoffs).insert(
-                        prepared.from,
-                        SessionHandoff {
-                            from: prepared.from,
-                            to: Some(prepared.to),
-                            account_id: prepared.account_id,
-                            error: None,
-                        },
-                    );
-                    self.save_account_handoffs().ok();
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZero::get)
+            .min(RESTART_WORKERS)
+            .min(lock(&jobs).len());
+        std::thread::scope(|scope| {
+            for _ in 1..workers {
+                // If a thread cannot be created, the calling worker drains the queue.
+                if let Err(error) = std::thread::Builder::new()
+                    .name("account-restart".into())
+                    .spawn_scoped(scope, worker)
+                {
+                    tracing::warn!(kind = ?error.kind(), "account restart worker unavailable");
                 }
             }
-        }
-        std::fs::remove_file(path).ok();
+            worker();
+        });
     }
 
     fn handoff_account(
@@ -533,36 +469,32 @@ impl Registry {
             match transcript::prepare(provider, home, &source, target, session_id, &cwd) {
                 Ok(()) => Some(session_id),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => return Err(super::os(&e)),
+                Err(e) => return Err(prepare_failure(&e)),
             }
         } else {
             None
         };
+        // A profile change must never silently replace ongoing work with a fresh conversation.
+        let resume_sid = resume_sid.ok_or(Failure::BadRequest)?;
         let new = self.next_id();
         lock(&self.account_replacements).insert(new);
         let mut replacement = Replacement {
             registry: self,
             session: new,
             committed: false,
+            continued: false,
         };
-        let (launch, sid, applied) = if let Some(session_id) = resume_sid {
-            crate::agent::resume_in(
-                profile,
-                stored.permission,
-                new,
-                state_dir.as_deref(),
-                Some(session_id),
-                account.as_ref(),
-            )
-        } else {
-            crate::agent::launch_selected_in(
-                profile,
-                stored.permission,
-                new,
-                state_dir.as_deref(),
-                Some(account_id),
-            )
-        }
+        // New launches already default to YOLO. Re-evaluate the current preference rather
+        // than carrying a stale manual permission from before that default was introduced.
+        let permission = agents.permission;
+        let (launch, sid, applied) = crate::agent::resume_in(
+            profile,
+            permission,
+            new,
+            state_dir.as_deref(),
+            Some(resume_sid),
+            account.as_ref(),
+        )
         .map_err(|e| super::os(&e))?;
         if applied.as_ref().is_none_or(|a| a.id != account_id) {
             self.discard_settings(new);
@@ -574,21 +506,22 @@ impl Registry {
                 new,
                 &AgentLaunch {
                     profile: canonical.into(),
-                    permission: stored.permission,
+                    permission,
                 },
                 sid,
                 cwd.clone(),
                 applied,
             )
             .map_err(|e| super::os(&e))?;
+        let prepared = Prepared {
+            from: old,
+            to: new,
+            account_id: account_id.into(),
+            continue_work: true,
+        };
         if let Some(dir) = state_dir.as_deref() {
-            let raw = serde_json::to_vec(&Prepared {
-                from: old,
-                to: new,
-                account_id: account_id.into(),
-            })
-            .map_err(|_| Failure::BadRequest)?;
-            accounts::write_atomic_0600(&dir.join(PREPARED_FILE), &raw)
+            let raw = serde_json::to_vec(&prepared).map_err(|_| Failure::BadRequest)?;
+            accounts::write_atomic_0600(&prepared_path(dir, new), &raw)
                 .map_err(|e| super::os(&e))?;
         }
         let (new, _) = self.spawn_holder(
@@ -627,10 +560,10 @@ impl Registry {
         }
         // Serialize the final commit with a later user selection. A -> B -> C must never
         // strand this pane on B or erase the A -> B handoff.
-        let pending = lock(&self.account_work.0);
+        let pending = lock(&self.account_work.pending);
         if pending
             .get(&provider)
-            .is_some_and(|target| target != account_id)
+            .is_some_and(|target| target.account_id != account_id)
         {
             self.close(peer, new).ok();
             return Err(Failure::BadRequest);
@@ -665,6 +598,14 @@ impl Registry {
         }
         drop(pending);
         replacement.committed = true;
+        // Submit only after retiring the old agent, so restoring history alone does not
+        // leave the replacement idle or start the same task in two live agents.
+        match self.continue_account_work(&prepared) {
+            Ok(()) => replacement.continued = true,
+            Err(error) => {
+                tracing::warn!(kind = ?error.kind(), "account continuation pending recovery");
+            }
+        }
         Ok(new)
     }
 }
@@ -673,6 +614,7 @@ struct Replacement<'a> {
     registry: &'a Registry,
     session: SessionId,
     committed: bool,
+    continued: bool,
 }
 
 impl Drop for Replacement<'_> {
@@ -689,8 +631,30 @@ impl Drop for Replacement<'_> {
                 )
                 .ok();
         }
-        if let Some(dir) = self.registry.state_dir() {
-            std::fs::remove_file(dir.join(PREPARED_FILE)).ok();
+        if (!self.committed || self.continued)
+            && let Some(dir) = self.registry.state_dir()
+        {
+            std::fs::remove_file(prepared_path(&dir, self.session)).ok();
         }
     }
+}
+
+fn prepared_path(dir: &Path, session: SessionId) -> std::path::PathBuf {
+    dir.join(PREPARED_DIR).join(format!("{}.json", session.0))
+}
+
+/// Transcript bridging raises errno-less kinds. Name the cause instead of a generic EIO.
+fn prepare_failure(error: &std::io::Error) -> Failure {
+    use std::io::ErrorKind;
+    if error.raw_os_error().is_some() {
+        return super::os(error);
+    }
+    Failure::Os(match error.kind() {
+        ErrorKind::TimedOut => libc::ETIMEDOUT,
+        ErrorKind::InvalidInput => libc::EINVAL,
+        ErrorKind::AlreadyExists => libc::EEXIST,
+        ErrorKind::FileTooLarge => libc::EFBIG,
+        ErrorKind::BrokenPipe => libc::EPIPE,
+        _ => libc::EIO,
+    })
 }

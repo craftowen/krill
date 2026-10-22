@@ -551,7 +551,7 @@ impl Shell {
         &mut self,
         pane: PaneId,
         position: gpui::Point<Pixels>,
-        open: bool,
+        action: Option<terminal_menu::FileAction>,
         cx: &mut Context<Self>,
     ) -> Option<(u16, PathLink)> {
         let cwd = self.pane_cwd(pane, cx);
@@ -569,7 +569,7 @@ impl Shell {
             column,
             cwd,
         };
-        if open {
+        if let Some(action) = action {
             if let Some(lookup) = &self.files.link_lookup
                 && lookup.key == key
                 && lookup.ready
@@ -597,7 +597,7 @@ impl Shell {
                             .is_some_and(|live| live.pane.session() == session)
                         && let Some(link) = found
                     {
-                        this.open_path_link(link, cx);
+                        this.activate_terminal_file(link, action, cx);
                     }
                 })
                 .ok();
@@ -680,7 +680,12 @@ impl Shell {
         None
     }
 
-    pub(super) fn open_terminal_file(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    pub(super) fn open_terminal_file(
+        &mut self,
+        path: PathBuf,
+        action: terminal_menu::FileAction,
+        cx: &mut Context<Self>,
+    ) {
         let focused = self.layout.focused();
         let session = focused.and_then(|pane| self.live.get(&pane)?.pane.session());
         self.files.link_open_generation = self.files.link_open_generation.wrapping_add(1);
@@ -699,7 +704,17 @@ impl Shell {
                     return;
                 }
                 if is_file {
-                    this.open_file(path, cx);
+                    this.activate_terminal_file(
+                        PathLink {
+                            column: 0,
+                            cols: 0,
+                            path,
+                            line: None,
+                            col: None,
+                        },
+                        action,
+                        cx,
+                    );
                 } else {
                     cx.reveal_path(&path);
                 }
@@ -737,7 +752,7 @@ impl Shell {
             }
             osc_or_url
                 .or_else(|| {
-                    self.path_link_at(pane, position, false, cx)
+                    self.path_link_at(pane, position, None, cx)
                         .map(|(line, link)| Highlight {
                             line,
                             column: link.column,

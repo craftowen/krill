@@ -503,6 +503,20 @@ pub fn upsert_host(state_dir: &Path, mut host: RemoteHost) -> Result<RemoteHost,
     Ok(host)
 }
 
+/// 정확한 등록 ID의 원격 호스트만 삭제한다. 짝짓기와 같은 잠금으로 다른 등록을 보존한다.
+pub fn remove_host(state_dir: &Path, id: &str) -> Result<RemoteHost, Error> {
+    validate_host_id(id)?;
+    let _lock = acquire_store_lock(state_dir)?;
+    let mut hosts = load_hosts(state_dir)?;
+    let index = hosts
+        .iter()
+        .position(|host| host.id == id)
+        .ok_or_else(|| Error::HostNotFound(id.to_owned()))?;
+    let host = hosts.remove(index);
+    save_hosts(state_dir, &hosts)?;
+    Ok(host)
+}
+
 fn disambiguate_host_id(base_id: &str, node_id: &str, existing: &[RemoteHost]) -> String {
     let short_node: String = node_id
         .chars()
@@ -821,6 +835,37 @@ mod tests {
         assert_eq!(load_hosts(&dir).unwrap().len(), 2);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn removing_a_host_preserves_other_hosts_and_inbound_permissions() {
+        let dir = std::env::temp_dir().join(format!("mklink-remove-host-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        let mut hosts = Vec::new();
+        for id in ["studio", "laptop"] {
+            let addr = EndpointAddr::new(SecretKey::generate().public());
+            hosts.push(
+                upsert_host(
+                    &dir,
+                    RemoteHost::from_endpoint_addr(id.into(), id, &addr, 1000),
+                )
+                .unwrap(),
+            );
+        }
+        let device = upsert_device(&dir, SecretKey::generate().public(), "Phone", 1000).unwrap();
+        let before = fs::read(hosts_path(&dir)).unwrap();
+        // 표시 이름이나 모호한 접두어로 다른 연결을 삭제하지 않는다.
+        assert!(matches!(
+            remove_host(&dir, "stud"),
+            Err(Error::HostNotFound(_))
+        ));
+        assert_eq!(fs::read(hosts_path(&dir)).unwrap(), before);
+        assert_eq!(remove_host(&dir, "studio").unwrap(), hosts[0]);
+        assert_eq!(load_hosts(&dir).unwrap(), vec![hosts[1].clone()]);
+        assert_eq!(load_devices(&dir).unwrap(), vec![device]);
+        assert!(remove_host(&dir, "studio").is_err());
+        assert_eq!(load_hosts(&dir).unwrap(), vec![hosts[1].clone()]);
+        fs::remove_dir_all(dir).ok();
     }
 
     #[test]

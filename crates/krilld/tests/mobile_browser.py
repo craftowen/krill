@@ -105,7 +105,7 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 photo.write_bytes(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/a9sAAAAASUVORK5CYII='))
                 browser('upload','.photo-picker',str(photo))
                 wait('document.getElementById("notice").textContent.includes("Photo attached")')
-                uploads=list((Path(cfg['dir'])/'paste/minikrill-paste').glob('mobile-*.jpg'))
+                uploads=list((Path(cfg['dir'])/'paste/krill-paste').glob('mobile-*.jpg'))
                 assert len(uploads)==1 and stat.S_IMODE(uploads[0].stat().st_mode)==0o600
                 original_route=evaluate('location.hash.slice(1)')
                 browser('find','role','button','click','--name','Create Tab','--exact')

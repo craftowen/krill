@@ -162,6 +162,10 @@ pub trait LinkBackend: Send + Sync + std::fmt::Debug {
     fn remote_hosts(&self) -> Result<Vec<PairedHost>, String> {
         Ok(Vec::new())
     }
+    /// 등록된 원격 Mac 연결을 제거한다. 상대 Mac의 세션은 계속 실행된다.
+    fn disconnect_host(&self, _id: &str) -> Result<Vec<PairedHost>, String> {
+        Err(text::ERR_DISCONNECT.get().to_owned())
+    }
     /// 지정한 기기의 연결 권한을 회수(연결 끊기)하고 갱신된 기기 목록을 돌려준다.
     fn revoke(&self, id: &str) -> Result<Vec<PairedDevice>, String>;
     /// 같은 Wi-Fi의 근처 Mac 목록을 조회한다.

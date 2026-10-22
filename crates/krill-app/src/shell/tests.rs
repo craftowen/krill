@@ -625,6 +625,7 @@ fn reconnect_confirmation_waits_for_session_list(cx: &mut TestAppContext) {
 /// 자리 비운 사이 요약은 보존 톤 한 줄로 보이고 누르면 닫힌다.
 #[gpui::test]
 fn away_summary_banner_dismisses_on_click(cx: &mut TestAppContext) {
+    cx.update(|cx| cx.set_reduce_motion(true));
     let (view, cx) = open(cx, state_path("away-summary"));
     cx.update(|_, cx| {
         view.update(cx, |s, cx| {
@@ -634,7 +635,13 @@ fn away_summary_banner_dismisses_on_click(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("away-summary").is_some());
+    for _ in 0..8 {
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+    }
     click(cx, "away-summary");
+    cx.executor().advance_clock(Duration::from_millis(250));
+    cx.run_until_parked();
     assert_eq!(cx.update(|_, cx| view.read(cx).away.clone()), None);
     assert!(cx.debug_bounds("away-summary").is_none());
 }
@@ -2736,8 +2743,8 @@ fn shell_sidebar_worktree_launches_session_and_tracks_visibility(cx: &mut TestAp
     view.update(cx, |s, _| {
         assert_eq!(
             s.layout.tabs().len(),
-            2,
-            "Enter on worktree row must open a new tab"
+            3,
+            "Enter opens a new tab and represents the workspace's existing session"
         );
         let launch = s.launch_for(s.layout.active_tab().focused);
         assert_eq!(launch.cwd, b"/repo/feat-wt");
@@ -2748,7 +2755,7 @@ fn shell_sidebar_worktree_launches_session_and_tracks_visibility(cx: &mut TestAp
     cx.simulate_keystrokes("cmd-shift-0 alt-cmd-1");
     cx.run_until_parked();
     view.update(cx, |s, _| {
-        assert_eq!(s.layout.tabs().len(), 3);
+        assert_eq!(s.layout.tabs().len(), 4);
         let launch = s.launch_for(s.layout.active_tab().focused);
         assert_eq!(launch.cwd, b"/repo/feat-wt");
         assert_eq!(
@@ -2941,6 +2948,75 @@ fn ime_pending_survives_pre_echo_frame_and_shifts_preedit(cx: &mut TestAppContex
         let o = l.ime.overlay().expect("preedit는 에코와 무관하게 유지");
         assert_eq!(o.origin.column, 2);
     });
+}
+
+/// 숨은 입력 캐럿도 IPC 프레임에서 IME 오버레이·후보창·확정 에코로 전달된다.
+#[gpui::test]
+fn ime_hidden_caret_frames_follow_prompt_and_confirm_echo(cx: &mut TestAppContext) {
+    use krill_proto::screen::{Cursor, Op, Revision, Seq, encode_update};
+    use krill_term::ime::CellPoint;
+
+    let (view, cx) = open(cx, state_path("ime-hidden-caret"));
+    let (ours, _theirs) = UnixStream::pair().unwrap();
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let frame = |s: &mut Shell, ops: Vec<Op>, cx: &mut Context<Shell>| {
+        let bytes = &encode_update(Revision(1), Seq(0), ops).unwrap()[0];
+        let (kind, body) = ipc::read_frame(&mut &bytes[..]).unwrap().unwrap();
+        assert!(s.on_frame(pane, kind, &body, cx));
+    };
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.attach_test(pane, SessionId(3), ours, cx);
+            frame(
+                s,
+                vec![
+                    Op::Reset { cols: 20, lines: 4 },
+                    Op::Cursor(Cursor {
+                        line: 0,
+                        column: 0,
+                        visible: true,
+                    }),
+                ],
+                cx,
+            );
+            // Claude·pi는 하드웨어 커서를 숨긴 채 입력 칸 좌표를 보낸다.
+            frame(
+                s,
+                vec![Op::Cursor(Cursor {
+                    line: 3,
+                    column: 2,
+                    visible: false,
+                })],
+                cx,
+            );
+            s.replace_and_mark_text_in_range(None, "한", None, window, cx);
+            let ime = &s.live[&pane].ime;
+            let caret = CellPoint { line: 3, column: 2 };
+            assert_eq!(ime.overlay().map(|o| o.origin), Some(caret));
+            assert_eq!(ime.candidate_anchor(0), caret);
+            s.replace_text_in_range(None, "한", window, cx);
+            s.replace_and_mark_text_in_range(None, "ㄱ", None, window, cx);
+            assert!(s.live[&pane].ime.pending().is_some());
+            // 에코로 숨은 커서가 전진하면 확정 글자를 더 이상 덧그리지 않는다.
+            frame(
+                s,
+                vec![Op::Cursor(Cursor {
+                    line: 3,
+                    column: 4,
+                    visible: false,
+                })],
+                cx,
+            );
+            let ime = &s.live[&pane].ime;
+            assert_eq!(ime.pending(), None);
+            assert_eq!(
+                ime.overlay().map(|o| o.origin),
+                Some(CellPoint { line: 3, column: 4 })
+            );
+            assert_eq!(ime.candidate_anchor(0), CellPoint { line: 3, column: 4 });
+        });
+    });
+    cx.run_until_parked();
 }
 
 /// OWE-615 원인 4: 조합 중 일반 문자 키의 `KeyUp`은 영문 Release 시퀀스가 되므로 보내지 않는다.
@@ -3503,7 +3579,7 @@ fn clipboard_image_and_external_paths_paste_into_focused_pane(cx: &mut TestAppCo
     });
     cx.run_until_parked();
 
-    // 1. Clipboard image paste: saves to $TMPDIR/minikrill-paste/clipboard-<id>.png (0600) and sends path.
+    // 1. Clipboard image paste: saves to $TMPDIR/krill-paste/clipboard-<id>.png (0600) and sends path.
     let png_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     let img = Image::from_bytes(ImageFormat::Png, png_bytes.clone());
     let expected_path = security::save_clipboard_image(&img).unwrap();
@@ -3527,7 +3603,7 @@ fn clipboard_image_and_external_paths_paste_into_focused_pane(cx: &mut TestAppCo
     let (k, b) = krill_proto::ipc::read_frame(&mut theirs).unwrap().unwrap();
     let pasted = String::from_utf8(Input::decode(k, &b).unwrap().bytes).unwrap();
     assert!(
-        pasted.contains("minikrill-paste/clipboard-")
+        pasted.contains("krill-paste/clipboard-")
             && std::path::Path::new(pasted.trim_end())
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
@@ -3565,7 +3641,7 @@ fn clipboard_image_and_external_paths_paste_into_focused_pane(cx: &mut TestAppCo
     let fallback_payload =
         String::from_utf8(security::clipboard_paste_payload(&dead_screenshot).unwrap()).unwrap();
     assert!(
-        fallback_payload.contains("minikrill-paste/clipboard-")
+        fallback_payload.contains("krill-paste/clipboard-")
             && std::path::Path::new(fallback_payload.trim_end())
                 .extension()
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("png")),
@@ -8038,6 +8114,203 @@ fn explicit_close_contended_creation_finishes_off_ui_thread(cx: &mut TestAppCont
 }
 
 #[gpui::test]
+fn shell_accepts_terminal_input_and_clicks_while_working_cards_and_output_advance(
+    cx: &mut TestAppContext,
+) {
+    use krill_proto::control::{AgentState, AgentStatus};
+    use krill_proto::screen::{Cell, Msg as _, Op, Revision, Seq, encode_update};
+    struct Memory(sidebar::Snapshot);
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(self.0.clone())
+        }
+    }
+    let (view, cx) = open(cx, state_path("shell-working-output"));
+    let trees: Vec<PathBuf> = (0..20)
+        .map(|i| PathBuf::from(format!("/tmp/krill-busy-repo/tree-{i:02}")))
+        .collect();
+    let snapshot = sidebar::Snapshot {
+        trees: std::collections::BTreeMap::from([("/tmp/krill-busy-repo".into(), trees.clone())]),
+        sessions: (0..40)
+            .map(|i| sidebar::Session {
+                id: SessionId(i + 1),
+                status: AgentStatus {
+                    state: AgentState::Working,
+                    agent: "codex".into(),
+                    ..AgentStatus::UNKNOWN
+                },
+                worktree: Some(trees[usize::try_from(i / 2).unwrap()].clone()),
+                cwd: Some(trees[usize::try_from(i / 2).unwrap()].clone()),
+                account: None,
+            })
+            .collect(),
+    };
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let pane = view.update(cx, |s, cx| {
+        let pane = s.layout.active_tab().focused;
+        s.attach_test(pane, SessionId(1), ours, cx);
+        s.layout.set_session(pane, SessionId(1));
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(Memory(snapshot)), cx);
+        });
+        s.on_window_active_changed(true, cx);
+        pane
+    });
+    cx.run_until_parked();
+    let rows = view.read_with(cx, |s, cx| s.sidebar.read(cx).row_count());
+    assert!(
+        rows > 20 && rows < 100,
+        "exercise detailed cards with nested Working sessions"
+    );
+    let selectors: Vec<&'static str> = (0..rows)
+        .map(|i| &*format!("worktree-card-{i}").leak())
+        .collect();
+    for tick in 1..=24 {
+        let mut ops = Vec::new();
+        if tick == 1 {
+            ops.push(Op::Reset {
+                cols: 80,
+                lines: 24,
+            });
+        }
+        ops.push(Op::Line {
+            line: 0,
+            cells: format!("terminal output {tick}")
+                .chars()
+                .map(|ch| Cell {
+                    ch,
+                    ..Default::default()
+                })
+                .collect(),
+        });
+        let frames = encode_update(Revision(tick), Seq(0), ops).unwrap();
+        view.update(cx, |s, cx| {
+            for frame in frames {
+                let (kind, body) = ipc::read_frame(&mut &frame[..]).unwrap().unwrap();
+                assert!(s.on_frame(pane, kind, &body, cx));
+            }
+        });
+        cx.executor()
+            .advance_clock(std::time::Duration::from_millis(83));
+        cx.run_until_parked();
+        cx.simulate_input("x");
+        let visible = selectors
+            .iter()
+            .filter(|selector| cx.debug_bounds(selector).is_some())
+            .count();
+        assert!(
+            visible > 0 && visible < 20,
+            "off-screen Working cards stay virtualized: {visible}"
+        );
+    }
+    for _ in 0..24 {
+        let (kind, body) = ipc::read_frame(&mut peer).unwrap().unwrap();
+        assert_eq!(
+            krill_proto::input::Input::decode(kind, &body)
+                .unwrap()
+                .bytes,
+            b"x"
+        );
+    }
+    assert!(!view.read_with(cx, |s, cx| s.history.read(cx).is_open()));
+    click(cx, "agent-history-toggle");
+    assert!(view.read_with(cx, |s, cx| s.history.read(cx).is_open()));
+    click(cx, "agent-history-toggle");
+    assert!(!view.read_with(cx, |s, cx| s.history.read(cx).is_open()));
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(Memory(sidebar::Snapshot::default())), cx);
+        });
+    });
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn disconnected_remote_pane_closes_its_socket_and_retargets_without_losing_held_input(
+    cx: &mut TestAppContext,
+) {
+    use std::io::Read as _;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let (view, cx) = open(cx, state_path("remote-pane-lifetime"));
+    let host = krill_hosts::HostId::Remote("iroh:studio".into());
+    let current = Arc::new(AtomicBool::new(true));
+    let live = current.clone();
+    let target = krill_hosts::HostTarget::remote_with_connector(
+        "iroh:studio",
+        PathBuf::from("/unused"),
+        krill_hosts::RemoteConnector::new(
+            || Err(std::io::ErrorKind::NotConnected.into()),
+            |_, _| {},
+        )
+        .with_lifetime(Arc::new(()), move || live.load(Ordering::Acquire)),
+    );
+    let (ours, mut peer) = UnixStream::pair().unwrap();
+    peer.set_read_timeout(Some(std::time::Duration::from_millis(100)))
+        .unwrap();
+    let pane = view.update(cx, |s, _| {
+        let pane = s.layout.active_tab().focused;
+        s.layout.set_host(pane, host.clone());
+        s.layout.set_session(pane, SessionId(42));
+        s.host_targets.insert(host.clone(), target.clone());
+        let mut live = Live::new(Task::ready(()));
+        live.target = Some(target);
+        live.sock = Some(ours.try_clone().unwrap());
+        live.pane.link(
+            SessionId(42),
+            1,
+            pane::Writer::spawn(ours).unwrap(),
+            krill_proto::input::FEAT_INPUT,
+            Now::get(),
+        );
+        live.pane.pause_account_input();
+        live.pane.input(b"held draft", Now::get());
+        s.live.insert(pane, live);
+        pane
+    });
+    current.store(false, Ordering::Release);
+    view.update(cx, Shell::sync);
+    assert_eq!(
+        peer.read(&mut [0]).unwrap(),
+        0,
+        "only the app socket is shut down"
+    );
+    view.read_with(cx, |s, _| {
+        assert!(s.live[&pane].target.is_none());
+        assert!(s.live[&pane].sock.is_none());
+        assert!(s.live[&pane].pane.keep_account_input());
+        assert_eq!(s.layout.session(pane), Some(SessionId(42)));
+    });
+    let connects = Arc::new(AtomicUsize::new(0));
+    let count = connects.clone();
+    let replacement = krill_hosts::HostTarget::remote_with_connector(
+        "iroh:studio",
+        PathBuf::from("/unused"),
+        krill_hosts::RemoteConnector::new(
+            move || {
+                count.fetch_add(1, Ordering::Relaxed);
+                Err(std::io::ErrorKind::NotConnected.into())
+            },
+            |_, _| {},
+        )
+        .with_lifetime(Arc::new(()), || true),
+    );
+    view.update(cx, |s, cx| {
+        s.host_targets.insert(host, replacement.clone());
+        s.sync(cx);
+        assert_eq!(s.live[&pane].target.as_ref(), Some(&replacement));
+        assert!(s.live[&pane].pane.keep_account_input());
+        assert_eq!(s.layout.session(pane), Some(SessionId(42)));
+    });
+    cx.run_until_parked();
+    assert!(
+        connects.load(Ordering::Relaxed) > 0,
+        "the retained tab uses its replacement connector"
+    );
+}
+
+#[gpui::test]
 fn host_snapshot_does_not_block_menus_or_apply_superseded_sources(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("async-host-snapshot"));
     let host = |id: &str| {
@@ -8295,7 +8568,7 @@ fn cmd_t_uses_selected_local_workspace(cx: &mut TestAppContext) {
             s.sidebar.read(cx).selected_workspace(),
             Some((krill_app::hosts::HostId::Local, wt.clone()))
         );
-        assert_eq!(s.layout.tabs().len(), 2);
+        assert_eq!(s.layout.tabs().len(), 3);
         let pane = s.layout.active_tab().focused;
         assert_eq!(s.layout.host(pane), &krill_app::hosts::HostId::Local);
         assert_eq!(

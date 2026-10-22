@@ -484,3 +484,58 @@ fn hook_transcript_path_and_login_shell_auto_binding_work() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn hooks_without_event_name_cannot_replace_bound_conversation_identity() {
+    let dir = std::env::temp_dir().join(format!("account-bound-hook-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let control = Control::new(Some(&dir));
+    for (session, sid) in [
+        (SessionId(1), "conversation-one"),
+        (SessionId(2), "conversation-two"),
+    ] {
+        control
+            .remember_session(
+                session,
+                &AgentLaunch {
+                    profile: "codex".into(),
+                    permission: Permission::Yolo,
+                },
+                Some(sid.into()),
+                b"/same/project".to_vec(),
+                None,
+            )
+            .unwrap();
+        let foreign =
+            br#"{"conversation_id":"unrelated","transcript_path":"/tmp/unrelated.jsonl"}"#;
+        assert!(control.is_subagent_or_foreign_hook(session, foreign));
+        assert!(control.record_hook_session(session, foreign));
+        let stored = control.stored(session).unwrap().unwrap();
+        assert_eq!(stored.session_id.as_deref(), Some(sid));
+        assert_eq!(stored.transcript_path, None);
+        let same = serde_json::to_vec(&serde_json::json!({"conversation_id": sid})).unwrap();
+        assert!(!control.is_subagent_or_foreign_hook(session, &same));
+        assert!(!control.record_hook_session(session, &same));
+    }
+    let reloaded = Control::new(Some(&dir));
+    assert_eq!(
+        reloaded
+            .stored(SessionId(1))
+            .unwrap()
+            .unwrap()
+            .session_id
+            .as_deref(),
+        Some("conversation-one")
+    );
+    assert_eq!(
+        reloaded
+            .stored(SessionId(2))
+            .unwrap()
+            .unwrap()
+            .session_id
+            .as_deref(),
+        Some("conversation-two")
+    );
+    fs::remove_dir_all(dir).unwrap();
+}

@@ -21,7 +21,9 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 #[cfg(target_os = "macos")]
-const SERVICE: &str = "com.minikrill.segment-key.v2";
+const SERVICE: &str = "com.krill.segment-key.v2";
+#[cfg(target_os = "macos")]
+const LEGACY_SERVICE: &str = "com.minikrill.segment-key.v2";
 #[cfg(target_os = "macos")]
 const NOT_FOUND: i32 = -25300;
 #[cfg(target_os = "macos")]
@@ -113,7 +115,30 @@ impl Key {
             "{:x}",
             Sha256::digest(root.canonicalize()?.as_os_str().as_bytes())
         );
-        match keychain.find_generic_password(SERVICE, &account) {
+        let found = keychain.find_generic_password(SERVICE, &account);
+        if found.as_ref().is_err_and(|e| e.code() == NOT_FOUND) {
+            match keychain.find_generic_password(LEGACY_SERVICE, &account) {
+                Ok((bytes, _)) => {
+                    // Copy the same key; old binaries and cold segments still need it.
+                    let key = Self::from_slice(bytes.as_ref())?;
+                    if let Err(e) = keychain.add_generic_password(SERVICE, &account, bytes.as_ref())
+                        && e.code() == DUPLICATE
+                    {
+                        let (current, _) = keychain
+                            .find_generic_password(SERVICE, &account)
+                            .map_err(keychain_error)?;
+                        if current.as_ref() != bytes.as_ref() {
+                            return Err(io::Error::other("conflicting segment keys"));
+                        }
+                    }
+                    // A read-only old keychain must not make existing data unreadable.
+                    return Ok(Arc::new(key));
+                }
+                Err(e) if e.code() == NOT_FOUND => {}
+                Err(e) => return Err(keychain_error(e)),
+            }
+        }
+        match found {
             Ok((bytes, _)) => Self::from_slice(bytes.as_ref()).map(Arc::new),
             Err(e) if e.code() == NOT_FOUND && !existing => {
                 let mut bytes = Zeroizing::new([0; 32]);
@@ -144,6 +169,7 @@ impl Key {
     }
 
     fn derive(&self, salt: &[u8; SALT_LEN]) -> io::Result<aead::LessSafeKey> {
+        // Part of the on-disk v2 format, independent of the product display name.
         let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, salt).extract(self.0.as_ref());
         let okm = prk
             .expand(&[b"minikrill segment v2"], &aead::AES_256_GCM)

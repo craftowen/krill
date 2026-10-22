@@ -152,7 +152,12 @@ fn walk_space(
         } else if file_type.is_dir() {
             let dir_name = entry.file_name();
             let dir_name_str = dir_name.to_string_lossy();
-            if dir_name_str == ".git" || dir_name_str == ".minikrill-preparing" {
+            if dir_name_str == ".git"
+                || matches!(
+                    dir_name_str.as_ref(),
+                    ".krill-preparing" | ".minikrill-preparing"
+                )
+            {
                 continue;
             }
             if let Some(art) = active_artifact {
@@ -324,7 +329,8 @@ pub fn discover_repositories(state_dir: Option<&Path>) -> Vec<PathBuf> {
             if state_dir.is_some() && state_dir != daemon::state_dir().as_deref() {
                 None
             } else {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Minikrill/worktrees"))
+                std::env::var_os("HOME")
+                    .map(|h| krill_proto::user_dirs::worktrees_root(Path::new(&h)))
             }
         })
         && let Ok(repos_dir) = fs::read_dir(wt_root)
@@ -790,7 +796,7 @@ fn parse_porcelain_worktrees(bytes: &[u8]) -> Vec<GitWorktreeEntry> {
         if let Some(raw_path) = field.strip_prefix(b"worktree ") {
             if raw_path
                 .split(|b| *b == b'/')
-                .any(|part| part == b".minikrill-preparing")
+                .any(|part| matches!(part, b".krill-preparing" | b".minikrill-preparing"))
             {
                 continue;
             }

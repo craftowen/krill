@@ -369,7 +369,7 @@ fn cmd_n_belongs_to_new_worktree_and_new_window_reuses_persisted_shell(
                 .collect()
         };
         assert_eq!(actions_for("cmd-n", cx), ["shell::NewWorktree"]);
-        assert_eq!(actions_for("cmd-shift-n", cx), ["minikrill::NewWindow"]);
+        assert_eq!(actions_for("cmd-shift-n", cx), ["krill::NewWindow"]);
 
         let first = open_shell(cx, Some(path.clone())).unwrap();
         let second = new_window(cx).unwrap();

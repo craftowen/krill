@@ -46,6 +46,8 @@ pub enum LinkUiEvent {
     Paired(PairedDevice),
     /// 기기 연결 권한이 회수(연결 끊기)됨.
     Revoked(String),
+    /// 이 Mac에 저장한 원격 Mac 연결이 제거됨.
+    HostDisconnected(String),
 }
 
 /// "이 Mac에 다른 기기 접속 허용" 서버 패널.
@@ -59,6 +61,7 @@ pub struct ServerPanel {
     devices: Vec<PairedDevice>,
     remote_hosts: Vec<PairedHost>,
     confirm_revoke: Option<PairedDevice>,
+    confirm_disconnect: Option<PairedHost>,
     error: Option<SharedString>,
     busy: bool,
     generation: u64,
@@ -97,6 +100,7 @@ impl ServerPanel {
             devices: Vec::new(),
             remote_hosts: Vec::new(),
             confirm_revoke: None,
+            confirm_disconnect: None,
             error: None,
             busy: false,
             generation: 0,
@@ -366,6 +370,7 @@ impl ServerPanel {
 
     /// 특정 기기의 "연결 끊기(회수)" 버튼을 무장한다. 같은 버튼을 다시 누르면 실행된다.
     pub fn request_revoke(&mut self, device: PairedDevice, cx: &mut Context<Self>) {
+        self.confirm_disconnect = None;
         self.confirm_revoke = Some(device);
         cx.notify();
     }
@@ -408,6 +413,58 @@ impl ServerPanel {
                         cx.emit(LinkUiEvent::Revoked(target_id));
                     }
                     Err(e) => panel.error = Some(e.into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn request_disconnect(&mut self, host: PairedHost, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        self.confirm_revoke = None;
+        self.confirm_disconnect = Some(host);
+        cx.notify();
+    }
+
+    fn cancel_disconnect(&mut self, cx: &mut Context<Self>) {
+        self.confirm_disconnect = None;
+        cx.notify();
+    }
+
+    fn confirm_disconnect_now(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(host) = self.confirm_disconnect.take() else {
+            return;
+        };
+        self.busy = true;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        self.error = None;
+        let backend = self.backend.clone();
+        cx.notify();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let id = host.id.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { backend.disconnect_host(&id) })
+                .await;
+            this.update(cx, |panel, cx| {
+                if panel.generation != generation {
+                    return;
+                }
+                panel.busy = false;
+                match result {
+                    Ok(hosts) => {
+                        panel.remote_hosts = hosts;
+                        crate::hosts::link::notify_connections_changed(cx);
+                        cx.emit(LinkUiEvent::HostDisconnected(host.id));
+                    }
+                    Err(err) => panel.error = Some(err.into()),
                 }
                 cx.notify();
             })
@@ -568,7 +625,11 @@ impl ServerPanel {
         section
     }
 
-    fn render_remote_hosts(&self, p: &crate::ui::Palette) -> gpui::Stateful<gpui::Div> {
+    fn render_remote_hosts(
+        &self,
+        p: &crate::ui::Palette,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
         use crate::i18n::catalog::sidebar as labels;
         let mut section = div()
             .id("link-remote-hosts")
@@ -599,29 +660,89 @@ impl ServerPanel {
                 }
             };
             let selector = format!("link-remote-host-{}", host.id);
+            let button_id = format!("link-remote-disconnect-{}", host.id);
+            let button_selector = button_id.clone();
+            let target = host.clone();
+            let out_id = host.id.clone();
+            let armed = self
+                .confirm_disconnect
+                .as_ref()
+                .is_some_and(|target| target.id == host.id);
             section = section.child(
                 div()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
                     .flex()
-                    .items_center()
+                    .flex_col()
                     .gap_2()
                     .py_2()
-                    .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(crate::ui::TEXT_SM)
-                            .child(host.name.clone()),
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().size(crate::ui::STATE_DOT).rounded_full().bg(color))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .child(host.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(color)
+                                    .child(label),
+                            )
+                            .child(
+                                crate::ui::controls().child(
+                                    crate::ui::danger_confirm(
+                                        gpui::ElementId::Name(button_id.into()),
+                                        text::REVOKE_BUTTON.get(),
+                                        text::REVOKE_CONFIRM_AGAIN.get(),
+                                        armed,
+                                    )
+                                    .disabled(self.busy)
+                                    .debug_selector(move || button_selector.clone())
+                                    .when(armed, |button| {
+                                        button.on_mouse_down_out(cx.listener(
+                                            move |this, _, _, cx| {
+                                                if this
+                                                    .confirm_disconnect
+                                                    .as_ref()
+                                                    .is_some_and(|h| h.id == out_id)
+                                                {
+                                                    this.cancel_disconnect(cx);
+                                                }
+                                            },
+                                        ))
+                                    })
+                                    .on_click(cx.listener(
+                                        move |this, _, _, cx| {
+                                            if this
+                                                .confirm_disconnect
+                                                .as_ref()
+                                                .is_some_and(|h| h.id == target.id)
+                                            {
+                                                this.confirm_disconnect_now(cx);
+                                            } else {
+                                                this.request_disconnect(target.clone(), cx);
+                                            }
+                                        },
+                                    )),
+                                ),
+                            ),
                     )
-                    .child(
-                        div()
-                            .text_size(crate::ui::TEXT_XS)
-                            .text_color(color)
-                            .child(label),
-                    ),
+                    .when(armed, |row| {
+                        row.child(
+                            div()
+                                .text_size(crate::ui::TEXT_XS)
+                                .text_color(p.muted_foreground)
+                                .child(text::REMOTE_DISCONNECT_DETAIL.get()),
+                        )
+                    }),
             );
         }
         section
@@ -826,7 +947,7 @@ impl Render for ServerPanel {
             })
             .when(enabled, |d| d.child(self.render_invite_section(p, cx)))
             .child(self.render_devices_section(p, cx))
-            .child(self.render_remote_hosts(p))
+            .child(self.render_remote_hosts(p, cx))
     }
 }
 
@@ -1108,6 +1229,7 @@ impl ClientDialog {
                 match outcome {
                     PairOutcome::Paired(dev) => {
                         dialog.phase = ClientPhase::Paired(dev.clone());
+                        crate::hosts::link::notify_connections_changed(cx);
                         cx.emit(LinkUiEvent::Paired(dev));
                     }
                     PairOutcome::Failed(reason) => {

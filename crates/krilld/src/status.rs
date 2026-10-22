@@ -352,8 +352,8 @@ pub fn agy_rate_limited(payload: &[u8]) -> bool {
 
 /// Claude `StopFailure` 한도 도달이면 자동전환 평가를 즉시 트리거한다(OWE-710).
 /// 평가는 `accounts::refresh_accounts_on_rate_limit`으로 기존 정책(활성 계정·임계치·히스테리시스·
-/// 수동 선택·후보 제외·`switch_on_rate_limit`)을 그대로 따른다. 실행 중 세션의 env는 바꾸지 않는다
-/// (다음 실행부터 적용 — "실행 중 세션은 계정 유지" 원칙).
+/// 수동 선택·후보 제외·`switch_on_rate_limit`)을 그대로 따른다. 전환이 저장되면
+/// 계정 작업 스레드가 기존 대화를 선택된 계정 프로필로 재개한다.
 /// Claude·Antigravity가 아닌 에이전트·한도 외 오류·비JSON payload면 평가하지 않고 `None`을 돌려준다.
 /// agy는 같은 `rate_limit` 봉투(`Stop`·`PostInvocation`의 `error: "rate_limit"`)로 오면 전환한다(OWE-901).
 pub fn auto_switch_on_rate_limit(

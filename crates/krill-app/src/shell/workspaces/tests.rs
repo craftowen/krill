@@ -276,3 +276,345 @@ fn workspace_tabs_preview_does_not_replace_other_workspace(cx: &mut TestAppConte
         );
     });
 }
+
+struct LiveSnapshot(sidebar::Snapshot);
+impl sidebar::Source for LiveSnapshot {
+    fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+        Ok(self.0.clone())
+    }
+}
+
+fn live_session(id: u64, folder: &str) -> sidebar::Session {
+    sidebar::Session {
+        id: SessionId(id),
+        status: krill_proto::control::AgentStatus::UNKNOWN,
+        worktree: Some(folder.into()),
+        cwd: Some(folder.into()),
+        account: None,
+    }
+}
+
+#[expect(
+    clippy::unwrap_used,
+    reason = "test fixtures always use a workspace with an absolute parent"
+)]
+fn live_snapshot(ids: &[u64], folder: &str) -> sidebar::Snapshot {
+    sidebar::Snapshot {
+        sessions: ids.iter().map(|&id| live_session(id, folder)).collect(),
+        trees: BTreeMap::from([(
+            PathBuf::from(folder).parent().unwrap().to_path_buf(),
+            vec![PathBuf::from(folder)],
+        )]),
+    }
+}
+
+fn click_host_card(view: &gpui::Entity<Shell>, cx: &mut gpui::VisualTestContext, host: &HostId) {
+    click_host_card_at(view, cx, host, 0);
+}
+
+#[expect(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test helper asserts that the requested rendered card exists"
+)]
+fn click_host_card_at(
+    view: &gpui::Entity<Shell>,
+    cx: &mut gpui::VisualTestContext,
+    host: &HostId,
+    ordinal: usize,
+) {
+    let candidates = view.read_with(cx, |s, cx| {
+        let sidebar = s.sidebar.read(cx);
+        (0..sidebar.row_count())
+            .filter(|&i| sidebar.row_host(i) == host)
+            .collect::<Vec<_>>()
+    });
+    let index = candidates
+        .into_iter()
+        .filter(|i| {
+            cx.debug_bounds(format!("worktree-card-{i}").leak())
+                .is_some()
+        })
+        .nth(ordinal)
+        .expect("workspace card for the selected host");
+    let at = cx
+        .debug_bounds(format!("worktree-title-{index}").leak())
+        .unwrap()
+        .center();
+    cx.simulate_click(at, Modifiers::default());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn selecting_workspace_reconciles_detached_and_late_sessions_preserving_layout(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("workspace-live-reconcile");
+    let (view, cx) = open(cx, path.clone());
+    view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            let first = l.active_tab().focused;
+            l.set_session(first, SessionId(101));
+            l.set_launch(
+                first,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: b"/work/a".to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            l.split(Axis::Horizontal);
+            l.set_session(l.active_tab().focused, SessionId(102));
+            l.set_tab_title(0, Some("Keep my split title"));
+            l.toggle_pin_tab(0);
+        });
+        let mut snapshot = live_snapshot(&[101, 102, 103, 103], "/work/a");
+        let mut exited = live_session(104, "/work/a");
+        exited.status.state = krill_proto::control::AgentState::Exited;
+        snapshot.sessions.push(exited);
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(Arc::new(LiveSnapshot(snapshot)), cx);
+        });
+    });
+    cx.run_until_parked();
+    click_host_card(&view, cx, &HostId::Local);
+    let before = view.update(cx, |s, cx| {
+        assert_eq!(
+            s.layout.tabs().len(),
+            2,
+            "one missing live session gets one tab"
+        );
+        assert_eq!(s.layout.sessions_for_host(&HostId::Local).len(), 3);
+        assert_eq!(s.workspace_tabs(cx), vec![0, 1]);
+        assert_eq!(s.layout.tab_title(0), Some("Keep my split title"));
+        s.layout.clone()
+    });
+    // Sidebar polling while the same workspace stays selected adds only new IDs.
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(
+                    &[101, 102, 103, 105],
+                    "/work/a",
+                ))),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        assert_eq!(s.layout.tabs().len(), 3);
+        assert_eq!(s.layout.active(), before.active());
+        assert_eq!(s.layout.focused(), before.focused());
+        assert_eq!(&s.layout.tabs()[0], &before.tabs()[0]);
+        assert_eq!(&s.layout.tabs()[1], &before.tabs()[1]);
+        assert_eq!(s.workspace_tabs(cx), vec![0, 1, 2]);
+        for pane in s.layout.tab_panes(0) {
+            assert_eq!(s.layout.session(pane), before.session(pane));
+        }
+        // Switching worktrees never moves or spawns an existing session.
+        s.sidebar.update(cx, |sidebar, cx| {
+            let mut snapshot = live_snapshot(&[101, 102, 103, 105], "/work/a");
+            snapshot.sessions.push(live_session(201, "/work/b"));
+            snapshot
+                .trees
+                .get_mut(&PathBuf::from("/work"))
+                .unwrap()
+                .push("/work/b".into());
+            sidebar.connect_source(Arc::new(LiveSnapshot(snapshot)), cx);
+        });
+    });
+    cx.run_until_parked();
+    // Click B's actual card, then A's actual card; no direct session helper.
+    click_host_card_at(&view, cx, &HostId::Local, 1);
+    view.update(cx, |s, cx| assert_eq!(s.workspace_tabs(cx).len(), 1));
+    click_host_card_at(&view, cx, &HostId::Local, 0);
+    view.update(cx, |s, cx| {
+        assert_eq!(s.workspace_tabs(cx).len(), 3);
+        s.reconcile_workspace_sessions(cx);
+        assert_eq!(s.layout.tabs().len(), 4);
+        assert_eq!(&s.layout.tabs()[0].root, &before.tabs()[0].root);
+        s.saver.flush();
+    });
+    let expected = layout_of(&view, cx);
+    let restored = cx.update(|_, cx| cx.new(|cx| Shell::new(Some(path), cx)));
+    cx.run_until_parked();
+    restored.update(cx, |s, cx| {
+        assert_eq!(s.layout.tabs(), expected.tabs());
+        assert_eq!(s.layout.focused(), expected.focused());
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(
+                    &[101, 102, 103, 105],
+                    "/work/a",
+                ))),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    restored.update(cx, |s, _| assert_eq!(s.layout.tabs().len(), 4));
+}
+
+#[gpui::test]
+fn selected_remote_workspace_reconciles_same_path_and_ids_without_crossing_hosts(
+    cx: &mut TestAppContext,
+) {
+    use krill_app::hosts::HostStatus;
+    let (view, cx) = open(cx, state_path("workspace-live-hosts"));
+    let remote = HostId::Remote("server".into());
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(&[41, 42], "/work/shared"))),
+                cx,
+            );
+            sidebar.set_remote_snapshot_for_test(
+                "server",
+                HostStatus::Connected,
+                live_snapshot(&[41, 43], "/work/shared"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    click_host_card(&view, cx, &HostId::Local);
+    view.update(cx, |s, _| {
+        assert_eq!(s.layout.sessions_for_host(&HostId::Local).len(), 2);
+        assert!(s.layout.sessions_for_host(&remote).is_empty());
+    });
+    click_host_card(&view, cx, &remote);
+    let before = view.update(cx, |s, cx| {
+        assert_eq!(
+            s.sidebar.read(cx).selected_workspace(),
+            Some((remote.clone(), "/work/shared".into()))
+        );
+        assert_eq!(s.layout.sessions_for_host(&HostId::Local).len(), 2);
+        assert_eq!(s.layout.sessions_for_host(&remote).len(), 2);
+        assert_eq!(s.workspace_tabs(cx).len(), 2);
+        assert!(
+            s.workspace_tabs(cx)
+                .into_iter()
+                .all(|i| s.layout.host(s.layout.tabs()[i].focused) == &remote)
+        );
+        s.layout.clone()
+    });
+    // A reconnect may relist the exact same IDs in another order.
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "server",
+                HostStatus::Disconnected,
+                live_snapshot(&[41, 43], "/work/shared"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.set_remote_snapshot_for_test(
+                "server",
+                HostStatus::Connected,
+                live_snapshot(&[43, 41, 44], "/work/shared"),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| {
+        assert_eq!(s.layout.sessions_for_host(&remote).len(), 3);
+        assert_eq!(s.layout.sessions_for_host(&HostId::Local).len(), 2);
+        assert_eq!(s.layout.focused(), before.focused());
+        assert_eq!(&s.layout.tabs()[..before.tabs().len()], before.tabs());
+    });
+}
+
+#[gpui::test]
+fn terminating_a_workspace_tab_is_not_undone_by_a_stale_sidebar_snapshot(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("workspace-live-close"));
+    view.update(cx, |s, cx| {
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(&[41, 42], "/work/a"))),
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+    click_host_card(&view, cx, &HostId::Local);
+    view.update(cx, |s, cx| {
+        let (tab, _) = s
+            .tab_pane_for_session_on(&HostId::Local, SessionId(42))
+            .unwrap();
+        s.do_close_tab(tab, cx);
+        s.reconcile_workspace_sessions(cx);
+        assert_eq!(
+            s.layout.sessions_for_host(&HostId::Local),
+            vec![SessionId(41)]
+        );
+    });
+    cx.run_until_parked();
+    view.update(cx, |s, _| {
+        assert!(
+            s.tab_pane_for_session_on(&HostId::Local, SessionId(42))
+                .is_none()
+        );
+    });
+}
+
+#[gpui::test]
+fn selecting_workspace_keeps_a_session_in_its_existing_mixed_split(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("workspace-live-mixed-split"));
+    let split = view.update(cx, |s, cx| {
+        s.change(true, cx, |l| {
+            let first = l.active_tab().focused;
+            l.set_launch(
+                first,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: b"/work/b".to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            l.set_session(first, SessionId(201));
+            l.split(Axis::Horizontal);
+            let second = l.active_tab().focused;
+            l.set_launch(
+                second,
+                Create {
+                    account: None,
+                    program: Program::Login,
+                    cwd: b"/work/a".to_vec(),
+                    cols: 80,
+                    rows: 24,
+                },
+            );
+            l.set_session(second, SessionId(101));
+            l.set_tab_title(0, Some("Mixed split"));
+        });
+        s.sidebar.update(cx, |sidebar, cx| {
+            sidebar.connect_source(
+                Arc::new(LiveSnapshot(live_snapshot(&[101, 102], "/work/a"))),
+                cx,
+            );
+        });
+        s.layout.tabs()[0].root.clone()
+    });
+    cx.run_until_parked();
+    click_host_card(&view, cx, &HostId::Local);
+    view.update(cx, |s, cx| {
+        assert_eq!(s.layout.tabs()[0].root, split);
+        assert_eq!(s.layout.tab_title(0), Some("Mixed split"));
+        assert_eq!(s.workspace_tabs(cx), vec![0, 1]);
+        assert_eq!(s.layout.sessions_for_host(&HostId::Local).len(), 3);
+        assert_eq!(
+            s.layout.session(s.layout.focused().unwrap()),
+            Some(SessionId(101))
+        );
+    });
+}

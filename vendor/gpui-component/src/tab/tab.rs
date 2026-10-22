@@ -1,3 +1,4 @@
+// Modified by Krill: preserve explicit tab typography and align decorated tab content.
 use std::{rc::Rc, time::Duration};
 
 use crate::animation::{Lerp, ease_in_out_cubic};
@@ -617,7 +618,8 @@ impl Sizable for Tab {
 }
 
 impl RenderOnce for Tab {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(mut self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let has_font_size = self.base.style().text.font_size.is_some();
         let mut normal_style = self.variant.normal(cx);
         let mut selected_style = self.variant.selected(cx);
         let mut disabled_style = self.variant.disabled(self.selected, cx);
@@ -809,10 +811,12 @@ impl RenderOnce for Tab {
             .flex_shrink_0()
             .h(height)
             .overflow_hidden()
-            .map(|this| match self.size {
-                Size::XSmall => this.text_xs(),
-                Size::Large => this.text_base(),
-                _ => this.text_sm(),
+            .when(!has_font_size, |this| {
+                this.map(|this| match self.size {
+                    Size::XSmall => this.text_xs(),
+                    Size::Large => this.text_base(),
+                    _ => this.text_sm(),
+                })
             })
             .rounded(radius)
             .when(!self.selected && !self.disabled, |this| {

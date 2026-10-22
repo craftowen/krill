@@ -14,7 +14,7 @@ use gpui::{
 use std::path::PathBuf;
 
 actions!(
-    minikrill,
+    krill,
     [
         NewWindow,
         CloseWindow,
@@ -100,6 +100,16 @@ fn main() -> std::process::ExitCode {
                     );
                 }
                 if let Some(state) = krill_proto::daemon::state_dir() {
+                    let incoming_state = state.clone();
+                    cx.background_spawn(async move {
+                        let executable = krill_app::hosts::link::executable();
+                        if let Err(error) =
+                            krill_link::service::ensure_default_server(&executable, &incoming_state)
+                        {
+                            tracing::warn!(%error, "failed to start incoming access");
+                        }
+                    })
+                    .detach();
                     window
                         .update(cx, |shell, window, cx| {
                             shell.arm_update_ready(state.clone());

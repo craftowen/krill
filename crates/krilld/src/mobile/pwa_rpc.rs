@@ -1010,7 +1010,7 @@ fn save_photo(mime: &str, data: &str) -> io::Result<PathBuf> {
     if bytes.is_empty() || bytes.len() > 512 * 1024 {
         return Err(invalid());
     }
-    let dir = std::env::temp_dir().join("minikrill-paste");
+    let dir = std::env::temp_dir().join("krill-paste");
     fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
