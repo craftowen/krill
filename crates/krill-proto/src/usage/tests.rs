@@ -137,7 +137,7 @@ fn multi_account_messages_roundtrip() {
             provider: ProviderKind::Claude,
             label: "Work Max".into(),
             email: Some("owen@example.com".into()),
-            profile_dir: "/Users/owen/.config/minikrill/profiles/claude/work".into(),
+            profile_dir: "/Users/owen/.config/krill/profiles/claude/work".into(),
             active: true,
             host_default: false,
             stale: false,

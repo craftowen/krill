@@ -1,4 +1,4 @@
-// Minikrill 변경(OWE-779, Apache-2.0 §4(b)): Polychrome(4B/px) 기본 아틀라스 크기를 512×512(1MiB)로 잡아
+// Krill 변경(OWE-779, Apache-2.0 §4(b)): Polychrome(4B/px) 기본 아틀라스 크기를 512×512(1MiB)로 잡아
 // 작은 이미지/SVG 한 장에 4MiB(1024×1024) 텍스처가 잡히지 않게 한다.
 use anyhow::{Context as _, Result};
 use derive_more::{Deref, DerefMut};
@@ -132,7 +132,7 @@ impl MetalAtlasTextures {
             width: DevicePixels(1024),
             height: DevicePixels(1024),
         };
-        // Minikrill 변경(OWE-779): BGRA 4B/px는 512×512가 Monochrome 1024×1024와 같은 1MiB다.
+        // Krill 변경(OWE-779): BGRA 4B/px는 512×512가 Monochrome 1024×1024와 같은 1MiB다.
         const DEFAULT_POLYCHROME_SIZE: Size<DevicePixels> = Size {
             width: DevicePixels(512),
             height: DevicePixels(512),

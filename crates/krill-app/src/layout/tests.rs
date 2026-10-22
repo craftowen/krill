@@ -182,7 +182,8 @@ fn bad_files_are_rejected() {
     big.resize(usize::try_from(MAX_FILE_BYTES).unwrap() + 1, 0);
 
     let mut active_out = sample();
-    active_out.active = 10;
+    // `active == tabs.len()`은 보이는 탭 없는 빈 화면이라 유효하다. 그보다 크면 깨진 파일이다.
+    active_out.active = active_out.tabs.len() + 1;
     let mut dup = Layout::default();
     dup.tabs.push(Tab::single(PaneId(0)));
     let mut bad_ratio = Layout::default();
@@ -1115,4 +1116,24 @@ fn last_seen_round_trips_and_old_tail_has_none() {
     assert_eq!(old.last_seen_unix_ns(), None);
     assert_eq!(old.respawn_cwd(pane), Some(&b"/repo/sub"[..]));
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn deactivate_hides_tabs_and_survives_close_and_restore() {
+    let path = temp_path("deactivate");
+    let mut layout = sample();
+    let tabs = layout.tabs.len();
+    layout.deactivate();
+    assert_eq!(layout.focused(), None);
+    assert!(layout.visible().is_empty());
+    layout.close_tab(0);
+    assert_eq!(layout.active(), tabs - 1);
+    assert_eq!(layout.focused(), None);
+    layout.save(&path).unwrap();
+    let restored = Layout::load(&path).unwrap();
+    assert_eq!(restored.focused(), None);
+    assert_eq!(restored.tabs().len(), tabs - 1);
+    layout.new_tab();
+    assert_eq!(layout.active(), tabs - 1);
+    assert!(layout.focused().is_some());
 }

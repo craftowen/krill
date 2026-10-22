@@ -4258,7 +4258,8 @@ impl Shell {
         }
         self.sync_focused_session(cx);
         self.sync_sidebar_custom_titles(cx);
-        if self.folder() != folder {
+        // 빈 워크스페이스 화면은 보던 저장소를 유지한다(홈 폴더로 바꾸지 않는다).
+        if now_focused.is_some() && self.folder() != folder {
             let folder = self.folder();
             self.diff.update(cx, |d, cx| d.set_repo(folder, cx));
         }
@@ -5157,10 +5158,14 @@ impl Shell {
                                                     // OWE-871: 끝난 칸을 닫을 때도 기록·줌 해제는 패인 헤더 ×와 같다.
                                                     this.zoomed_pane = None;
                                                     this.record_closed_pane(id, cx);
-                                                    this.change(true, cx, |layout| {
-                                                        layout.focus(id);
-                                                        layout.close_pane();
-                                                    });
+                                                    this.close_with_policy(
+                                                        close::Policy::Preserve,
+                                                        cx,
+                                                        |layout| {
+                                                            layout.focus(id);
+                                                            layout.close_pane();
+                                                        },
+                                                    );
                                                 })),
                                         ),
                                 )

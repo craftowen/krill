@@ -3233,11 +3233,11 @@ mod tests {
     }
 
     #[test]
-    fn builtin_skills_minikrill_uses_current_cli_flags() -> io::Result<()> {
+    fn builtin_skills_krill_uses_current_cli_flags() -> io::Result<()> {
         let skill = BUILTIN_SKILLS
             .iter()
             .find(|s| s.name == "krill")
-            .ok_or_else(|| not_found("minikrill skill"))?;
+            .ok_or_else(|| not_found("krill skill"))?;
         // `crates/krill/tests/cli.rs`가 같은 명령을 실제 krilld에 돌려 파서와 맞는지 확인한다.
         for cmd in [
             "krill ls --json",

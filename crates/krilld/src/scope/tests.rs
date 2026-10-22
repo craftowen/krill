@@ -587,7 +587,7 @@ fn real_identifier_mismatch_is_denied() {
     let sign = sys::verify_audit_token(&token);
     assert_eq!(sign.identifier.as_deref(), Some("com.example.mk-test-evil"));
     let policy = SigningPolicy {
-        require_identifier: Some("com.example.minikrill".to_owned()),
+        require_identifier: Some("com.example.krill".to_owned()),
         ..Default::default()
     };
     assert!(peer.gate_signing(&policy, Some(&sign), &audit));

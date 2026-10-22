@@ -1,4 +1,4 @@
-// Minikrill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
+// Krill 변경(OWE-665, Apache-2.0 §4(b)): 경로 중간 텍스처(창 크기 BGRA)를 경로가 있는 프레임에서만 쥔다 —
 // 크기 변경 때 미리 만들지 않고 처음 그릴 때 만들며, 경로 없는 프레임을 그리면 놓는다.
 // Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 화면에 아직 안 올라간 드로어블이 꽉 차면 `nextDrawable`에서 메인 스레드를
 // 무기한 막지 않고 그 프레임을 건너뛴다(`DrawableBacklog`). 호출자가 다음 틱에 다시 present한다.
@@ -504,11 +504,11 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.set_drawable_size(CGSize::new(size.width.0 as f64, size.height.0 as f64));
         }
-        // Minikrill 변경(OWE-665): 새 크기의 경로 텍스처는 경로를 처음 그릴 때 만든다.
+        // Krill 변경(OWE-665): 새 크기의 경로 텍스처는 경로를 처음 그릴 때 만든다.
         self.release_path_intermediate_textures();
     }
 
-    // Minikrill 변경(OWE-665)
+    // Krill 변경(OWE-665)
     fn release_path_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_msaa_texture = None;
@@ -828,7 +828,7 @@ impl MetalRenderer {
                 PrimitiveBatch::Paths(range) => {
                     let paths = &scene.paths[range];
                     command_encoder.end_encoding();
-                    // Minikrill 변경(OWE-665): 경로 텍스처 지연 생성.
+                    // Krill 변경(OWE-665): 경로 텍스처 지연 생성.
                     if self.path_intermediate_texture.is_none() {
                         self.update_path_intermediate_textures(viewport_size);
                     }
@@ -890,7 +890,7 @@ impl MetalRenderer {
         }
 
         command_encoder.end_encoding();
-        // Minikrill 변경(OWE-665): 경로 없는 프레임이면 창 크기 경로 텍스처를 놓는다(진행 중 명령 버퍼는 자기 참조를 쥔다).
+        // Krill 변경(OWE-665): 경로 없는 프레임이면 창 크기 경로 텍스처를 놓는다(진행 중 명령 버퍼는 자기 참조를 쥔다).
         if scene.paths.is_empty() {
             self.release_path_intermediate_textures();
         }

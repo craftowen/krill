@@ -677,9 +677,9 @@ prompt = "한글 $(literal); 'quote'"
     assert!(!d.ok(&["schedule", "list"]).contains("literal"));
 }
 
-/// 내장 `minikrill` 스킬 문서가 안내하는 세션 명령을 그대로 실제 krilld에 돌린다.
+/// 내장 `krill` 스킬 문서가 안내하는 세션 명령을 그대로 실제 krilld에 돌린다.
 #[test]
-fn minikrill_skill_session_commands_match_cli() {
+fn krill_skill_session_commands_match_cli() {
     let skill = krill_proto::orchestration::BUILTIN_SKILLS
         .iter()
         .find(|s| s.name == "krill")

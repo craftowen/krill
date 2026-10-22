@@ -4895,7 +4895,7 @@ fn dragging_a_project_reorders_and_persists(cx: &mut TestAppContext) {
 /// 계보 자식은 여전히 부모 바로 아래에 붙는다.
 #[test]
 fn primary_worktree_is_always_first_in_project() {
-    let repo = PathBuf::from("/r/minikrill");
+    let repo = PathBuf::from("/r/krill");
     let brand = PathBuf::from("/r/brand-identity");
     let ci = PathBuf::from("/r/harness-ci");
     let child = PathBuf::from("/r/harness-ci-child");

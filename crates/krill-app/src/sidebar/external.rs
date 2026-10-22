@@ -2217,7 +2217,7 @@ mod tests {
             std::process::id()
         ));
         let sidebar = dir.join("sidebar.bin");
-        let full = "/tmp/minikrill-review";
+        let full = "/tmp/krill-review";
         let store = WorktreeStore {
             comments: BTreeMap::from([("/repo/comment-only".to_owned(), "Review me".to_owned())]),
             statuses: BTreeMap::from([
@@ -2255,8 +2255,7 @@ mod tests {
             Some("REVIEW #128 OWE-626 links 2")
         );
         assert_eq!(
-            checkpoint_badge_for(Some(&sidebar), Path::new("/private/tmp/minikrill-review"))
-                .as_deref(),
+            checkpoint_badge_for(Some(&sidebar), Path::new("/private/tmp/krill-review")).as_deref(),
             Some("REVIEW #128 OWE-626 links 2")
         );
         for (path, badge) in [
@@ -2276,7 +2275,7 @@ mod tests {
             "/repo/invalid",
             "/repo/unread",
             "/repo/wip",
-            "/tmp/minikrill-review/child",
+            "/tmp/krill-review/child",
         ] {
             assert_eq!(checkpoint_badge_for(Some(&sidebar), Path::new(path)), None);
         }
@@ -2592,7 +2591,7 @@ fn orca_project_icon_detection_and_visual_meta_resolution() {
     fs::remove_dir_all(&base).ok();
     let state_dir = base.join("state");
     let repo_local_icon = base.join("aasoft-client");
-    let repo_github = base.join("minikrill");
+    let repo_github = base.join("krill");
     let folder_drive = base.join("gdrive");
     fs::create_dir_all(&state_dir).unwrap();
     fs::create_dir_all(repo_local_icon.join("public")).unwrap();
@@ -2614,7 +2613,7 @@ fn orca_project_icon_detection_and_visual_meta_resolution() {
     fs::write(
         repo_github.join(".git/config"),
         r#"[remote "origin"]
-	url = git@github.com:craftowen/minikrill.git
+	url = git@github.com:craftowen/krill.git
 "#,
     )
     .unwrap();
@@ -2651,7 +2650,7 @@ kind = "git"
 [[projects]]
 id = "p-gh"
 path = "{}"
-display_name = "minikrill"
+display_name = "krill"
 kind = "git"
 
 [[projects]]
@@ -2680,7 +2679,7 @@ kind = "folder"
     assert_eq!(v_local.icon, Some(ProjectIcon::Image(logo_path)));
 
     let v_gh = visuals.get(&repo_github).unwrap();
-    assert_eq!(v_gh.display_name.as_deref(), Some("minikrill"));
+    assert_eq!(v_gh.display_name.as_deref(), Some("krill"));
     assert_eq!(v_gh.icon, Some(ProjectIcon::Image(cached_gh)));
 
     let v_folder = visuals.get(&folder_drive).unwrap();

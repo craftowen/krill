@@ -499,7 +499,7 @@ fn failed_codex_write_keeps_a_recoverable_receipt_and_does_not_claim_success_on_
 }
 
 #[test]
-fn opencode_plugin_executes_under_bun_and_does_not_spawn_outside_minikrill() {
+fn opencode_plugin_executes_under_bun_and_does_not_spawn_outside_krill() {
     let Some(bun) = krill_proto::agent::which("bun", &std::env::var_os("PATH").unwrap_or_default())
     else {
         return;
@@ -566,7 +566,7 @@ fn agy_hook_install_roundtrip_and_pre_tool_use_response() {
     assert_eq!(payload["hook_event_name"], "PreToolUse");
     assert_eq!(payload["tool_name"], "ask_question");
 
-    // Uninstall removes only minikrill bundle and restores original
+    // Uninstall removes only krill bundle and restores original
     success(&h.run("uninstall", "agy", &["--yes"], ""));
     assert_eq!(h.read("agy"), original);
 }

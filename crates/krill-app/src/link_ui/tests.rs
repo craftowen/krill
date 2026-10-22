@@ -378,7 +378,7 @@ fn client_dialog_clipboard_prefill_nearby_and_all_pair_outcomes(cx: &mut TestApp
     // 8. 잘못된 링크 형식 → InvalidLink 실패 사유.
     vcx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
-            d.set_link_value("https://not-minikrill.example", window, cx);
+            d.set_link_value("https://not-krill.example", window, cx);
         });
         window.draw(cx).clear(cx);
     });
@@ -569,7 +569,7 @@ fn client_close_resets_form_instead_of_closing_window(cx: &mut TestAppContext) {
     vcx.run_until_parked();
     vcx.update(|window, cx| {
         dialog.update(cx, |d, cx| {
-            d.set_link_value("https://not-minikrill.example", window, cx);
+            d.set_link_value("https://not-krill.example", window, cx);
         });
         window.draw(cx).clear(cx);
     });

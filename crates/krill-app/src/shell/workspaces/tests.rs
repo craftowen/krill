@@ -167,6 +167,44 @@ fn workspace_tabs_close_single_pane_stays_in_workspace(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
+fn workspace_tabs_closing_last_tab_keeps_empty_workspace(cx: &mut TestAppContext) {
+    let path = state_path("workspace-close-last");
+    let (view, cx) = open(cx, path.clone());
+    let panes = view.update(cx, fixture);
+    view.update(cx, |s, cx| {
+        s.do_close_tab(2, cx);
+        s.do_close_tab(s.layout.active(), cx);
+        // 다른 워크스페이스(B)로 넘어가지 않고 탭 없는 빈 화면으로 남는다.
+        assert_eq!(s.layout.focused(), None);
+        assert!(s.workspace_tabs(cx).is_empty());
+        assert_eq!(s.layout.tabs().len(), 2);
+        assert!(s.layout.pane_exists(panes[1]));
+        assert!(s.layout.pane_exists(panes[3]));
+        assert_eq!(s.closed_sessions, vec![SessionId(102), SessionId(100)]);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("empty-workspace").is_some());
+    assert!(cx.debug_bounds("session-tab-1").is_none());
+    assert!(cx.debug_bounds("session-tab-3").is_none());
+
+    assert_eq!(layout_of(&view, cx).focused(), None);
+    let restored = cx.update(|_, cx| cx.new(|cx| Shell::new(Some(path), cx)));
+    cx.run_until_parked();
+    restored.update(cx, |s, cx| {
+        assert_eq!(s.layout.tabs().len(), 2);
+        assert_eq!(s.layout.focused(), None);
+        assert!(s.workspace_tabs(cx).is_empty());
+    });
+
+    // 빈 화면에서 새 탭을 열면 다시 탭이 생긴다.
+    view.update(cx, |s, cx| {
+        s.new_tab_on_launch_host(cx);
+        assert_eq!(s.layout.tabs().len(), 3);
+        assert!(s.layout.focused().is_some());
+    });
+}
+
+#[gpui::test]
 fn workspace_tabs_close_right_keeps_hidden_tabs_and_current_focus(cx: &mut TestAppContext) {
     let (view, cx) = open(cx, state_path("workspace-close-right"));
     let panes = view.update(cx, fixture);
