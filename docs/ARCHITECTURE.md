@@ -33,7 +33,7 @@
 | `krill-holder` | spawn·waitpid·fd 보관·SCM_RIGHTS·exec 핸드오프. macOS 빌드 1,300줄 이하 + Linux 전용 `sys/linux.rs` 300줄 이하 + Windows 빌드 2,000줄 이하(2026-10-19 개정: macOS 1,250→1,300. 결정 12-2, 2026-10-18 개정: Linux 원격 호스트용 epoll·pidfd 구현 추가. 개정 시점 실측 1,218줄·292줄) | 수 MB(추정) |
 | `krilld` | 에뮬레이터·IPC·디스크·상태·hook·git 큐·전원 | ≤ 60MB @10세션 |
 | `krill-term` | 프레임워크 중립 터미널 그리드 렌더 모델 + IME 상태기계 | — |
-| `krill-app` | gpui UI(사이드바·탭·분할·터미널 위젯·diff) | ≤ 120MB |
+| `krill-app` | gpui UI(사이드바·탭·분할·터미널 위젯·diff) | ≤ 120MB @창 1600×1000pt @2x |
 | `krill` | CLI 단일 바이너리(`krill hook` 포함) | 호출당 RSS < 10MB |
 
 - **제품명·CLI·앱 번들 이름·cask 이름은 `Krill` / `krill`로 통일**(2026-10-16 결정). Homebrew 코어·cask에 `krill` 충돌 없음.
@@ -51,7 +51,7 @@
 | 압축 | T2 zstd-3 디스크 / T3 lz4_flex 메모리 링 | **zstd 하나**(메모리 링·디스크 동일 코덱, 레벨은 S-mem에서 확정) | 실측 압축률 zstd-3 15.5× vs lz4 약 3×. 코덱 하나가 코드·테스트 절반 |
 | UI가 받는 데이터 | T2 키프레임+원본 바이트(UI가 Term 재구성) / T3 화면 스냅샷+dirty row 델타(UI는 Term 없음) | **기본은 T3 델타 방식**, M1 스파이크 S-delta에서 확정 | UI에 Term 미러를 두면 세션당 3.6MB 이상 중복. 질의 응답자가 데몬 하나뿐이라는 원칙(T2-D4)과도 맞다 |
 | 데몬 업그레이드 | T4 세대 공존 + 세션 0 구 데몬 은퇴 / T2 holder 유지, krilld만 교체 | **T2 방식.** krilld는 holder가 새 바이너리로 재기동, holder는 exec 핸드오프. 세대 공존 없음. 앱·CLI는 Hello에서 N-1 호환 | 세대가 하나뿐이면 "고아 데몬 0"이 구조적으로 보장된다 |
-| 메모리 목표 | T1 ≤150MB / T3 ≤180MB(상한 200) / T4 게이트 ≤200 | **목표 180MB(앱 120 + 데몬 60), 출시 차단선 200MB**, 터미널 10개, phys_footprint, 에이전트 프로세스 제외 | T3가 창 drawable(IOSurface)을 실측해 150MB가 비현실적임을 보였다 |
+| 메모리 목표 | T1 ≤150MB / T3 ≤180MB(상한 200) / T4 게이트 ≤200 | **목표 180MB(앱 120 + 데몬 60), 출시 차단선 200MB**, 터미널 10개, phys_footprint, 에이전트 프로세스 제외, 창 1600×1000pt @2x(MK-009). 창 drawable은 창 픽셀 수에 비례하므로 더 큰 창은 이 예산으로 판정하지 않는다(2026-10-22 실측: 2560×1319pt @2x에서 drawable 1장 52.6MB, 3장 약 158MB) | T3가 창 drawable(IOSurface)을 실측해 150MB가 비현실적임을 보였다 |
 | diff 뷰 범위 | T1 v1.x / T3 M2 | **읽기 전용 diff + 변경 파일 목록은 M3(P1)**, 커밋 UI·줄 주석은 M5 | 에이전트 결과를 검토하는 핵심 동선이지만 편집 기능은 범위 밖 |
 | 텔레메트리 | T1 v1 없음 / T4 opt-in | **v1 없음**, M5에서 opt-in(기본 꺼짐) | 두 의견이 양립 |
 
