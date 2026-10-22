@@ -546,6 +546,7 @@ catalog! {
         COORD_BADGE => ("지휘자", "coord"),
         SEARCH_SHORT => ("검색", "Search"),
         NAV_AGENT_DASHBOARD => ("에이전트 대시보드", "Agent Dashboard"),
+        NAV_ARTIFACTS => ("아티팩트", "Artifacts"),
         HIDING_DISCOVERED_ONE => ("감지된 워크트리 1개 숨김", "Hiding 1 discovered worktree"),
         HIDING_DISCOVERED => ("감지된 워크트리 {n}개 숨김", "Hiding {n} discovered worktrees"),
         SHOWING_DISCOVERED_ONE => ("감지된 워크트리 1개 표시 중", "Showing 1 discovered worktree"),
