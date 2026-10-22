@@ -132,7 +132,7 @@ def preflight(config):
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryFile(dir=root) as probe:
         probe.write(b"nightly volume access check")
-    for name in ("git", "gh", "cargo", "cargo-nextest", "cargo-deny", "zsh", "lockf", "codesign"):
+    for name in ("git", "gh", "cargo", "cargo-nextest", "cargo-deny", "zsh", "lockf", "codesign", "sccache"):
         if not shutil.which(name):
             raise NightlyError(f"required tool is missing: {name}")
     env = dict(os.environ, CARGO_TARGET_DIR=str(target))
@@ -159,7 +159,7 @@ class Release:
         self.work = self.root / "repository"
         self.env = dict(os.environ, CARGO_TARGET_DIR=config["target_dir"],
                         KRILL_ALLOW_PROTECTED_PUSH=AUTHORIZATION,
-                        KRILL_UPDATE_KEY_FILE=config["key_file"], CARGO_BUILD_JOBS="4",
+                        KRILL_UPDATE_KEY_FILE=config["key_file"], RUSTC_WRAPPER="sccache", CARGO_BUILD_JOBS="4",
                         CARGO_PROFILE_TEST_OPT_LEVEL="2", CARGO_PROFILE_TEST_DEBUG="line-tables-only")
         # 예약 실행은 유료 VM이나 사람 전용 가드 탈출구를 상속하지 않는다.
         for key in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR", "KRILL_PUBLISH_FORCE",

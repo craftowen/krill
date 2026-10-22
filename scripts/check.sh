@@ -4,7 +4,7 @@ set -euo pipefail
 cd "${0:A:h}/.."
 if [[ ${1-} == -h || ${1-} == --help ]]; then
   print "사용: scripts/check.sh [--memory]
-  fmt · clippy · nextest · doctest · deny · NOTICES 최신 여부 · 공개 표면 검사(scripts/public-surface.sh)
+  fmt+deny+NOTICES+public-surface(병렬) · clippy · nextest(fast+latency) · doctest
   --memory          끝에 scripts/memory-gate.sh(MK-066)까지 돈다
   KRILL_TEST_SLOTS  머신 전체 동시 테스트 실행 수(기본: CPU 코어 수 / 4, 최소 1)"
   exit 0
@@ -20,7 +20,22 @@ trap 'cleanup; exit 142' ALRM
 trap 'cleanup; exit 143' TERM HUP
 run(){ "$@" & wait $!; }
 step(){ print -P "%B== $1%b"; }
-step "fmt";     run cargo fmt --all --check
+# 병렬 1단계: 읽기 전용 검사 4종을 묶고, 하나라도 실패하면 전체 검사를 중단한다.
+# clippy·nextest·doctest는 target/ 락을 공유하므로 순서를 유지한다.
+step "fmt+deny+notices+public-surface (parallel)";
+partlog=$(mktemp -d "${TMPDIR:-/tmp}/mk-check-part-XXXXXX")
+typeset -A partpids
+part(){ local name=$1; shift; "$@" > $partlog/$name.log 2>&1 & partpids[$!]=$name; }
+part fmt cargo fmt --all --check
+part deny cargo deny --locked check --hide-inclusion-graph
+part notices python3 docs/licensing/generate_notices.py --check
+part public-surface bash scripts/public-surface.sh
+partfail=0
+for pid name in ${(kv)partpids}; do
+  if ! wait $pid; then print -P "%B!! $name 실패%b"; sed 's/^/  /' $partlog/$name.log; partfail=1; fi
+done
+rm -rf $partlog
+[[ $partfail -eq 0 ]] || exit 1
 step "clippy";  run cargo clippy --workspace --all-targets --locked -- -D warnings
 # 테스트 실행 슬롯(2026-10-15): 워커 20개가 동시에 전체 테스트를 돌리면 load 150~200이 되어 지연 측정 테스트가
 # 결정적으로 실패했다. 빌드는 각자 하고, 실행만 머신 전체에서 KRILL_TEST_SLOTS개까지 동시에 돈다.
@@ -28,13 +43,13 @@ step "clippy";  run cargo clippy --workspace --all-targets --locked -- -D warnin
 cores=$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || print 4)
 slot(){ local n=${KRILL_TEST_SLOTS:-$(( cores / 4 > 0 ? cores / 4 : 1 ))} k rc; while true; do for k in $(seq 1 $n); do
   rc=0; run lockf -s -t 0 /tmp/mk-test-slot-$k "$@" || rc=$?; [[ $rc -ne 75 ]] && return $rc; done; sleep 3; done; }
-step "test";    run cargo nextest run --workspace --locked --no-tests=pass --no-run
-slot cargo nextest run --workspace --locked --no-tests=pass
+# 테스트 분리: 부하에 민감한 저지연 테스트를 나머지 테스트와 별도 실행한다.
+# 아래 필터는 .config/nextest.toml
+# latency override와 같은 집합이어야 한다(어긋나면 저지연 테스트가 고속 페이즈에서 부하를 맞아 flake 가능).
+step "test build";   run cargo nextest run --workspace --locked --no-tests=pass --no-run
+step "test fast";    slot cargo nextest run --workspace --locked --no-tests=pass -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
+step "test latency"; slot cargo nextest run --workspace --locked --no-tests=pass -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
 step "doctest"; run cargo test --workspace --doc --locked -q
-step "deny";    run cargo deny --locked check --hide-inclusion-graph
-step "notices"; run python3 docs/licensing/generate_notices.py --check
-# 공개 저장소에 나가면 안 되는 경로·내용 검사. 파일이 없으면 건너뛰지 않고 실패한다.
-step "public-surface"; run bash scripts/public-surface.sh
 # --memory: MK-066 메모리 게이트까지(nightly·선택). 병렬 부하에서 흔들려 기본 경로에는 넣지 않는다.
 if [[ ${1-} == --memory ]]; then step "memory"; run scripts/memory-gate.sh; fi
 print -P "%B== check.sh: 전부 통과%b"
