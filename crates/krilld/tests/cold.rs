@@ -652,3 +652,23 @@ fn agent_history_scans_on_request_and_resumes_both_agents() {
     drop(daemon);
     fs::remove_dir_all(dir).ok();
 }
+
+/// 온보딩의 버전 점검이 소켓 이름으로 해석되어 listener 오류를 남기면 안 된다.
+#[test]
+fn daemon_version_probe_does_not_start_listener() {
+    let dir = env::temp_dir().join(format!("krilld-version-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    let out = Command::new(KRILLD)
+        .arg("--version")
+        .env("KRILL_STATE_DIR", &dir)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap().trim(),
+        krill_proto::BUILD
+    );
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+    fs::remove_dir_all(dir).ok();
+}

@@ -38,9 +38,18 @@ use rustix::fs::{FileType, fstat};
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 fn main() -> ExitCode {
-    let Some(path) = std::env::args_os().nth(1).map(PathBuf::from) else {
+    let Some(argument) = std::env::args_os().nth(1) else {
         return ExitCode::from(2);
     };
+    // 앱 시작 점검은 소켓을 열지 않고 버전만 읽는다.
+    if argument == "--version" {
+        use std::io::Write as _;
+        return match writeln!(io::stdout().lock(), "{}", krill_proto::BUILD) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(_) => ExitCode::FAILURE,
+        };
+    }
+    let path = PathBuf::from(argument);
     krill_log::init(krill_log::Component::Daemon).ok();
     tracing::info!("daemon starting");
     // 세션 panic은 `catch_unwind`가 잡지만(P4) 원인은 크래시 로그로 남긴다(MK-067).
