@@ -42,7 +42,7 @@ mod away;
 use krill_proto::os::ffi::OsStringExt as _;
 use krill_proto::os::net::UnixStream;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Shutdown;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -529,6 +529,8 @@ pub struct Shell {
     agent_client: Arc<dyn pane::AgentClient>,
     /// 마지막 입력 알림(누르면 닫힘).
     notice: Option<String>,
+    /// 이미 알린 계정 전환 실패. 데몬이 매 스냅샷마다 같은 실패를 다시 보내도 한 번만 띄운다.
+    handoff_errors: HashSet<String>,
     notifications: notifications::Notifications,
     /// 데몬 재연결 뒤 실제 세션 목록이 도착했다는 확인. [`RECONNECTED_FOR`] 뒤 사라진다.
     reconnected: Option<String>,
@@ -1029,6 +1031,7 @@ impl Shell {
             agent_task: None,
             agent_client: Arc::new(pane::DaemonAgents),
             notice,
+            handoff_errors: HashSet::new(),
             reconnected: None,
             notifications: notifications::Notifications::default(),
             reconnected_task: None,
@@ -2804,6 +2807,7 @@ impl Shell {
                     }
                 } else if let Some(error) = &handoff.error
                     && self.layout.sessions().contains(&handoff.from)
+                    && self.handoff_errors.insert(error.clone())
                 {
                     // Failed switches already released the pane above; input is not held.
                     self.notice = Some(error.clone());
@@ -2814,6 +2818,12 @@ impl Shell {
                 break;
             }
         }
+        self.handoff_errors.retain(|error| {
+            snap.details
+                .handoffs
+                .iter()
+                .any(|h| h.error.as_ref() == Some(error))
+        });
         let pending = snap
             .details
             .handoffs
@@ -4817,28 +4827,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// YOLO 권한 칸 표시. 단일 칸은 패인 헤더가 숨으므로 탭에도 붙인다(OWE-653).
-    fn yolo_badge(&self, pane: PaneId, cx: &App) -> Option<gpui::Div> {
-        let p = krill_app::ui::palette(cx);
-        self.live
-            .get(&pane)
-            .and_then(|l| l.launch.as_ref())
-            .filter(|launch| launch.permission == Permission::Yolo)
-            .map(|_| {
-                div()
-                    .debug_selector(|| "yolo-badge".into())
-                    .flex_none()
-                    .px_1p5()
-                    .py_0p5()
-                    .rounded(krill_app::ui::RADIUS_XS)
-                    .bg(p.warning)
-                    .text_color(p.warning_foreground)
-                    .text_size(krill_app::ui::TEXT_2XS)
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(text::YOLO_BADGE.get())
-            })
-    }
-
     pub(super) fn host_name_for_pane(&self, pane: PaneId, cx: &App) -> Option<String> {
         let krill_app::hosts::HostId::Remote(id) = self.layout.host(pane) else {
             return None;
@@ -4983,7 +4971,6 @@ impl Shell {
         let p = krill_app::ui::palette(cx);
         // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
         // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
-        let yolo_badge = self.yolo_badge(id, cx);
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.zoomed_pane == Some(id);
@@ -5005,7 +4992,6 @@ impl Shell {
             .bg(p.sidebar.opacity(0.92))
             .border_1()
             .border_color(p.border)
-            .children(yolo_badge)
             .children(host_badge)
             .when(zoomed, |d| {
                 d.child(

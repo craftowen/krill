@@ -261,7 +261,6 @@ impl Shell {
                                         // OWE-886: 빈 에이전트도 `status::agent_icon` 하나로 통일(§6.5).
                                         ui::status::agent_icon(agent, ui::ICON_SM, p.foreground),
                                     )
-                                    .children(self.yolo_badge(tab.focused, cx))
                                     .children(account_label.map(|l| {
                                         let short = ui::status::account_initial(l);
                                         let full = l.to_owned();

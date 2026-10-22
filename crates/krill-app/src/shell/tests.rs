@@ -827,9 +827,9 @@ fn tui_modes_keys_ime_mouse_and_cmd_link(cx: &mut TestAppContext) {
     );
 }
 
-/// OWE-488: 배지는 전역 토글 대신 세션의 생성 당시 권한을 쓰고 프로필 버튼은 새 칸에 해당 id를 전달한다.
+/// OWE-488: 프로필 버튼은 새 칸에 해당 id를 전달한다. YOLO 세션에도 배지는 없다.
 #[gpui::test]
-fn agent_button_and_yolo_badge_use_session_permission(cx: &mut TestAppContext) {
+fn agent_button_opens_profile_and_yolo_has_no_badge(cx: &mut TestAppContext) {
     use krill_proto::control::AgentProfile;
 
     let (view, cx) = open(cx, state_path("agents"));
@@ -854,27 +854,10 @@ fn agent_button_and_yolo_badge_use_session_permission(cx: &mut TestAppContext) {
         });
     });
     cx.run_until_parked();
-    assert!(
-        cx.debug_bounds("yolo-badge").is_some(),
-        "YOLO session stays marked with global Manual"
-    );
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.live
-                .get_mut(&pane)
-                .unwrap()
-                .launch
-                .as_mut()
-                .unwrap()
-                .permission = Permission::Manual;
-            s.agents.as_mut().unwrap().permission = Permission::Yolo;
-            cx.notify();
-        });
-    });
-    cx.run_until_parked();
+    // 기본 권한이 YOLO라 탭·패인 헤더에 YOLO 배지를 띄우지 않는다.
     assert!(
         cx.debug_bounds("yolo-badge").is_none(),
-        "Manual session stays unmarked with global YOLO"
+        "YOLO session shows no badge"
     );
     // OWE-576: 새 세션 메뉴의 첫 프로필 단축키(⌥⌘1). 목록 밖 단축키는 아무것도 하지 않는다.
     cx.simulate_keystrokes("alt-cmd-2");

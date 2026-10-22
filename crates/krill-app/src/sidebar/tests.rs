@@ -1940,15 +1940,29 @@ fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppC
         });
         cx.run_until_parked();
         let card = cx.debug_bounds("worktree-card-1").unwrap();
+        let summary = cx.debug_bounds("card-agent-summary-1");
+        let panel = if layout == CardLayout::Detailed {
+            summary.expect("expanded summary panel")
+        } else {
+            card
+        };
         for selector in ["sidebar-session-2", "sidebar-session-3"] {
             let row = cx.debug_bounds(selector).expect("expanded session renders");
             assert!(
-                row.origin.x == card.origin.x && row.size.width == card.size.width,
-                "{layout:?}: {selector} must share the card surface: {card:?}, {row:?}"
+                row.origin.x == panel.origin.x && row.size.width == panel.size.width,
+                "{layout:?}: {selector} must share the summary panel: {panel:?}, {row:?}"
             );
         }
         let first = cx.debug_bounds("sidebar-session-2").unwrap();
         let second = cx.debug_bounds("sidebar-session-3").unwrap();
+        if let Some(summary) = summary {
+            assert_eq!(summary.bottom_left().y, first.origin.y);
+            assert!(first.origin.x > card.origin.x);
+            let bottom = cx.debug_bounds("card-session-surface-3").unwrap();
+            assert_eq!(bottom.origin.x, card.origin.x);
+            assert_eq!(bottom.size.width, card.size.width);
+            assert!(bottom.bottom_left().y > second.bottom_left().y);
+        }
         assert_eq!(card.bottom_left().y, first.origin.y);
         assert_eq!(first.bottom_left().y, second.origin.y);
         assert!(second.bottom_left().y > collapsed.bottom_left().y);
@@ -1975,9 +1989,13 @@ fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppC
             &[SessionId(2)],
             "right-click must open the nested session menu and its first action must open that session"
         );
-        cx.update(|_, cx| {
-            view.update(cx, |s, cx| s.toggle_card_sessions(Path::new("/repo/a"), cx));
-        });
+        if let Some(summary) = summary {
+            cx.simulate_click(summary.center(), Modifiers::default());
+        } else {
+            cx.update(|_, cx| {
+                view.update(cx, |s, cx| s.toggle_card_sessions(Path::new("/repo/a"), cx));
+            });
+        }
         cx.run_until_parked();
         assert!(cx.debug_bounds("sidebar-session-2").is_none());
         assert!(cx.debug_bounds("sidebar-session-3").is_none());
@@ -1989,7 +2007,7 @@ fn expanded_sessions_stay_inside_worktree_card_in_both_layouts(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn virtualized_worktree_sessions_share_card_edges(cx: &mut TestAppContext) {
+fn virtualized_worktree_sessions_share_summary_panel_edges(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
     cx.update(|_, cx| {
@@ -2015,16 +2033,18 @@ fn virtualized_worktree_sessions_share_card_edges(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let header = cx.debug_bounds("worktree-card-0").unwrap();
+    let summary = cx.debug_bounds("card-agent-summary-0").unwrap();
     let first = cx.debug_bounds("sidebar-session-1").unwrap();
     let second = cx.debug_bounds("sidebar-session-2").unwrap();
     for segment in [first, second] {
-        assert_eq!(segment.origin.x, header.origin.x);
-        assert_eq!(segment.size.width, header.size.width);
+        assert_eq!(segment.origin.x, summary.origin.x);
+        assert_eq!(segment.size.width, summary.size.width);
     }
+    assert!(first.origin.x > header.origin.x);
     assert_eq!(
-        header.bottom_left().y,
+        summary.bottom_left().y,
         first.origin.y,
-        "header border must continue into the session list without a gap"
+        "summary border must continue into the session list without a gap"
     );
     assert_eq!(
         first.bottom_left().y,
@@ -4930,7 +4950,7 @@ fn primary_worktree_is_always_first_in_project() {
     }
 }
 
-/// 세션은 부모 상태 칸보다 한 단계 안으로 들여쓰며 호스트·계보 깊이는 한 번만 반영한다.
+/// 상세 세션은 요약 박스 안에, 컴팩트 세션은 한 단계 안에 두고 계보 깊이는 한 번만 반영한다.
 #[gpui::test]
 fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -4987,17 +5007,25 @@ fn nested_session_rows_indent_under_their_card_title(cx: &mut TestAppContext) {
             let title = x(cx, format!("worktree-title-{tree}"));
             let glyph = x(cx, format!("session-state-{sess}"));
             let parent_state = x(cx, format!("worktree-state-{tree}"));
-            assert!(glyph >= parent_state + gpui::px(CHILD_INDENT));
-            assert!(glyph <= parent_state + gpui::px(CHILD_INDENT + 4.));
-            assert!(
-                glyph >= card + gpui::px(8.) && glyph < title,
-                "{layout:?}: session glyph={glyph:?} is nested one step before title={title:?} (card={card:?})"
-            );
             let session_title = x(cx, format!("session-title-{sess}"));
-            assert!(
-                session_title >= title && session_title <= title + gpui::px(36.),
-                "{layout:?}: session name {session_title:?} must stay near card title {title:?}"
-            );
+            if layout == CardLayout::Detailed {
+                let panel = cx
+                    .debug_bounds(format!("card-agent-summary-{tree}").leak())
+                    .unwrap();
+                assert_eq!(glyph, panel.origin.x + gpui::px(7.));
+                assert!(session_title > glyph && session_title < panel.top_right().x);
+            } else {
+                assert!(glyph >= parent_state + gpui::px(CHILD_INDENT));
+                assert!(glyph <= parent_state + gpui::px(CHILD_INDENT + 4.));
+                assert!(
+                    glyph >= card + gpui::px(8.) && glyph < title,
+                    "{layout:?}: session glyph={glyph:?} is nested one step before title={title:?} (card={card:?})"
+                );
+                assert!(
+                    session_title >= title && session_title <= title + gpui::px(36.),
+                    "{layout:?}: session name {session_title:?} must stay near card title {title:?}"
+                );
+            }
         }
         assert!(
             x(cx, format!("session-state-{s2}")) > x(cx, format!("session-state-{s1}")),

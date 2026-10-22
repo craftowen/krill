@@ -4132,17 +4132,6 @@ fn login_pending_without_outcome_times_out(cx: &mut TestAppContext) {
     fs::remove_dir_all(d).ok();
 }
 
-/// OWE-708: 상태바와 계정 카드가 같은 경고(80)·위험(90) 기준을 쓴다.
-#[test]
-fn usage_tone_matches_shared_warn_and_critical_thresholds() {
-    use krill_proto::usage::{CRITICAL_PERCENT, WARN_PERCENT};
-    assert_eq!(usage_tone(WARN_PERCENT - 1), UsageTone::Normal);
-    assert_eq!(usage_tone(WARN_PERCENT), UsageTone::Warn);
-    assert_eq!(usage_tone(CRITICAL_PERCENT - 1), UsageTone::Warn);
-    assert_eq!(usage_tone(CRITICAL_PERCENT), UsageTone::Critical);
-    assert_eq!(usage_tone(100), UsageTone::Critical);
-}
-
 /// OWE-708: 접힌 규칙 요약 한 줄은 지표·임계치·대상·꺼짐을 담는다.
 #[test]
 fn rule_summary_names_metric_threshold_target_and_off() {

@@ -60,9 +60,7 @@ fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut Test
             1
         );
     });
-    // Background snapshot updates do not make warnings expire.
-    cx.executor().advance_clock(Duration::from_secs(30));
-    cx.run_until_parked();
+    // Clicking dismisses before the timer.
     assert!(cx.debug_bounds("notice").is_some());
     let at = cx.debug_bounds("notice").unwrap().center();
     cx.simulate_click(at, Modifiers::default());
@@ -70,6 +68,19 @@ fn notices_overlay_bottom_right_without_resize_focus_or_duplicates(cx: &mut Test
     assert!(view.read_with(cx, |s, _| s.notice.is_none()));
     assert!(cx.debug_bounds("notice").is_none());
     assert_eq!(cx.debug_bounds("terminal-surface").unwrap(), before);
+    // One-shot notices close themselves on the stack's timer.
+    view.update(cx, |s, cx| {
+        s.notice = Some("Session 7: could not resume with selected account".into());
+        cx.notify();
+    });
+    cx.run_until_parked();
+    settle(cx);
+    assert!(cx.debug_bounds("notice").is_some());
+    cx.executor().advance_clock(Duration::from_secs(6));
+    cx.run_until_parked();
+    settle(cx);
+    assert!(view.read_with(cx, |s, _| s.notice.is_none()));
+    assert!(cx.debug_bounds("notice").is_none());
 }
 
 #[gpui::test]

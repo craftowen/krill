@@ -399,7 +399,6 @@ catalog! {
         MANUAL => ("Manual · 매번 확인", "Manual · Ask each time"),
         YOLO => ("YOLO · 확인 건너뜀", "YOLO · Skip approval"),
         YOLO_TOGGLE => ("새 에이전트 세션의 권한을 전환합니다. YOLO는 지원하는 에이전트의 권한 확인을 건너뜁니다. 기존 세션은 바뀌지 않습니다.", "Change permissions for new agent sessions. YOLO skips permission approval for supported agents. Existing sessions keep their permissions."),
-        YOLO_BADGE => ("⚠ YOLO · 권한 확인 우회", "⚠ YOLO · Approval bypassed"),
         COLD => ("프로세스가 끝난 세션의 마지막 화면입니다(읽기 전용).", "Last screen of an ended session (read only)."),
         ENDED => ("세션 종료됨", "Session ended"),
         CLOSE_PANE => ("칸 닫기", "Close pane"),

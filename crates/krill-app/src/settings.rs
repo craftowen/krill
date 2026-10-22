@@ -2066,38 +2066,6 @@ pub fn rule_summary(
     out
 }
 
-/// 사용률 색(OWE-708). 상태바·계정 카드가 같은 기준(경고 [`WARN_PERCENT`]·위험 [`CRITICAL_PERCENT`])을 쓴다.
-///
-/// [`WARN_PERCENT`]: krill_proto::usage::WARN_PERCENT
-/// [`CRITICAL_PERCENT`]: krill_proto::usage::CRITICAL_PERCENT
-#[must_use]
-pub fn usage_color(pct: u8, normal: gpui::Hsla, p: &crate::ui::Palette) -> gpui::Hsla {
-    match usage_tone(pct) {
-        UsageTone::Critical => p.destructive,
-        UsageTone::Warn => p.warning,
-        UsageTone::Normal => normal,
-    }
-}
-
-/// 사용률 단계. 색 판정과 테스트가 공유한다.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsageTone {
-    Normal,
-    Warn,
-    Critical,
-}
-
-#[must_use]
-pub fn usage_tone(pct: u8) -> UsageTone {
-    if pct >= krill_proto::usage::CRITICAL_PERCENT {
-        UsageTone::Critical
-    } else if pct >= krill_proto::usage::WARN_PERCENT {
-        UsageTone::Warn
-    } else {
-        UsageTone::Normal
-    }
-}
-
 /// 계정 카드의 제목·보조 줄. 시스템 기본값(호스트) 계정은 `시스템 기본값[: 이메일]`과 안내문, 저장된 계정은 이메일(없으면 라벨)과 프로필 경로.
 #[must_use]
 pub fn account_heading(acc: &krill_proto::usage::AccountInfo) -> (String, String) {
@@ -6338,15 +6306,11 @@ impl SettingsView {
                     .rounded_full()
                     .bg(p.muted)
                     .overflow_hidden()
-                    .child(div().h_full().w(px(fill_w)).rounded_full().bg(usage_color(
-                        pct,
-                        brand_color,
-                        p,
-                    ))),
+                    .child(div().h_full().w(px(fill_w)).rounded_full().bg(brand_color)),
             )
             .child(
                 mono(div().w(px(34.)).flex().justify_end())
-                    .text_color(usage_color(pct, p.foreground, p))
+                    .text_color(p.foreground)
                     .child(display.text),
             )
             .children(reset.map(|reset| {

@@ -4,6 +4,8 @@
 //! 호스트 섹션 헤더 배치 참고:
 //! `.ref/orca/src/renderer/src/components/sidebar/worktree-list/rows/HostSectionHeader.tsx`
 //! (Copyright (c) 2026 Lovecast Inc., MIT License, `.ref/orca/LICENSE`).
+//! 에이전트 요약·목록의 공통 패널 배치 참고: 같은 MIT 원본의
+//! `WorktreeCardAgents.tsx`·`worktree-card-compact-agents.tsx`.
 
 use std::path::PathBuf;
 
@@ -457,6 +459,49 @@ impl Sidebar {
             0
         };
         let p = ui::palette(cx);
+        let active = self.worktree_card_active(parent, path);
+        if self.options.card_layout == super::CardLayout::Detailed {
+            // 요약 바와 같은 안쪽 경계로 잇는다. 세션별 가상화는 유지하고
+            // 바깥 워크트리 표면과 안쪽 에이전트 패널을 각각 연속해서 그린다.
+            let session = element
+                .h(px(26.))
+                .mx_0()
+                .px_1p5()
+                .rounded_none()
+                .border_l_1()
+                .border_r_1()
+                .border_color(p.worktree_sidebar_border)
+                .when(self.cursor != Some(index), |d| {
+                    d.bg(if active {
+                        p.sidebar.opacity(0.75)
+                    } else {
+                        p.sidebar_accent.opacity(0.65)
+                    })
+                })
+                .when(last, |d| d.border_b_1().rounded_b(ui::RADIUS_XS));
+            return div()
+                .id(("card-session-surface", index))
+                .debug_selector(move || format!("card-session-surface-{index}"))
+                .flex_none()
+                .ml(px(self.worktree_margin(depth)))
+                .mr_1p5()
+                .pl(px(30.))
+                .pr_2p5()
+                .border_l_1()
+                .border_r_1()
+                .border_color(ui::TRANSPARENT)
+                .when(last, |d| {
+                    d.pb_1p5().mb_0p5().border_b_1().rounded_b(ui::RADIUS_MD)
+                })
+                .when(active, |d| {
+                    d.bg(p.worktree_sidebar)
+                        .border_color(p.sidebar_ring.opacity(0.65))
+                })
+                .when(depth > 0 && !active, |d| {
+                    d.border_l_2().border_color(p.worktree_sidebar_border)
+                })
+                .child(session);
+        }
         element
             .h(px(if last { ROW_HEIGHT } else { 26. }))
             .mx_0()
@@ -1322,7 +1367,8 @@ impl Sidebar {
             row_host.clone(),
         );
         let closed = self.collapsed.contains(path);
-        let card_expanded = self.expanded_cards.contains(path);
+        let card_expanded = self.session_card_index(index + 1) == Some(index)
+            && self.card_list.contains_row(index + 1);
         let pinned = self.prefs.get(path).is_some_and(|p| p.pinned);
         let name = self.name(path);
         // 이름을 바꿨으면 브랜치를 옆에 따로 보인다(스크린 리더 및 대량 행 모드).
@@ -2133,12 +2179,15 @@ impl Sidebar {
                                 d.child(
                                     div()
                                         .id(("fold", index))
+                                        .debug_selector(move || format!("card-agent-summary-{index}"))
+                                        .aria_expanded(card_expanded)
                                         .w_full()
                                         .h(px(25.))
                                         .px_1p5()
                                         .rounded(ui::RADIUS_XS)
                                         .border_1()
                                         .border_color(p.worktree_sidebar_border)
+                                        .when(card_expanded, |d| d.border_b_0().rounded_b_none())
                                         .bg(if is_active_worktree {
                                             p.sidebar.opacity(0.75)
                                         } else {

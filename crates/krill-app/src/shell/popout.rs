@@ -529,11 +529,7 @@ fn render_popover_usage_detail(
                         .debug_selector(move || percent_selector.clone())
                         .font_family(ui::FONT_MONO)
                         .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(krill_app::settings::usage_color(
-                            display.percent.unwrap_or(0),
-                            p.foreground,
-                            p,
-                        ))
+                        .text_color(p.foreground)
                         .child(display.text),
                 ),
         )
@@ -606,7 +602,6 @@ fn render_popover_usage_row(
         i64::try_from(krill_app::accounts::display::now()).unwrap_or(i64::MAX),
     );
     let pct = display.percent.unwrap_or(0);
-    let bar_color = krill_app::settings::usage_color(pct, brand_color, p);
     let debug_sel = selector.clone();
     let detail = render_popover_usage_detail(window_label, &selector, win, p);
 
@@ -631,7 +626,7 @@ fn render_popover_usage_row(
                         .h_full()
                         .w(gpui::relative(f32::from(pct) / 100.0))
                         .rounded_full()
-                        .bg(bar_color),
+                        .bg(brand_color),
                 ),
         )
 }
@@ -1671,15 +1666,10 @@ impl Shell {
                     .filter(|a| !a.usage.is_empty())
                     .map_or(compact_label, |a| compact_status_usage(&a.usage, now))
             };
-            let color = match percent {
-                _ if status.as_ref().is_some_and(|s| {
-                    s.status == krill_proto::usage::AccountStatus::RateLimited
-                }) =>
-                {
-                    p.warning
-                }
-                Some(pct) => krill_app::settings::usage_color(pct, p.foreground, p),
-                None => p.muted_foreground,
+            let color = if percent.is_some() {
+                p.foreground
+            } else {
+                p.muted_foreground
             };
             let selector = format!("status-provider-pill-{}", provider.as_str());
             let debug_selector = selector.clone();
