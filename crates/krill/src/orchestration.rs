@@ -212,6 +212,13 @@ pub fn run(raw: &[OsString]) -> ExitCode {
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
+    // 원격에서 지원하지 않는 배치는 SSH 터널을 열기 전에 거부한다.
+    if sub == "worker-start"
+        && let Err(e) = parse_worker_start(rest, host.is_some())
+    {
+        eprintln!("orchestration: {e}\n{USAGE}");
+        return ExitCode::from(2);
+    }
     let target = match Target::establish(host) {
         Ok(t) => t,
         Err(e) => {
@@ -2711,6 +2718,19 @@ mod tests {
 
     #[test]
     fn child_placement_rejects_missing_name_remote_host_and_existing_session() {
+        assert_eq!(
+            run(&[
+                "--host",
+                "invalid-remote",
+                "worker-start",
+                "--worktree",
+                "new-child",
+                "--name",
+                "child"
+            ]
+            .map(OsString::from)),
+            ExitCode::from(2)
+        );
         for raw in [
             vec!["--worktree", "new-child"],
             vec!["--worktree", "new-child", "--worker", "worker"],
