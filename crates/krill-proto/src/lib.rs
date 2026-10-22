@@ -9,6 +9,7 @@
 pub mod account_login;
 pub mod agent;
 pub mod agent_history;
+pub mod artifacts;
 pub mod clipboard;
 pub mod config_document;
 pub mod control;

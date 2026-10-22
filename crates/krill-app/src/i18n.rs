@@ -1835,6 +1835,34 @@ catalog! {
         FOLDER_DESKTOP => ("데스크톱", "Desktop"),
         FOLDER_DOWNLOADS => ("다운로드", "Downloads"),
     }
+    artifacts {
+        TAB => ("아티팩트", "Artifacts"),
+        TAB_DESC => ("HTML·Markdown 파일을 공개 링크(share.krill.page)로 공유하고, 공유한 링크를 관리합니다.", "Share HTML and Markdown files as public links (share.krill.page) and manage the links you shared."),
+        ALLOW_TITLE => ("공개 공유 허용", "Allow public sharing"),
+        ALLOW_DESC => ("이 기기에서 공개 링크를 새로 만들거나 갱신할 수 있게 합니다. 에이전트만이 아니라 이 기기 전체에 적용됩니다. 꺼도 이미 만든 링크는 지울 때까지 남습니다.", "Lets this device create or update public links. Applies to the whole device, not only agents. Turning it off keeps existing links until you delete them."),
+        HOWTO_TITLE => ("사용 방법", "How to use"),
+        HOWTO_BODY => ("1. 위에서 공개 공유를 켭니다.  2. 열린 .html·.md 파일 머리의 공유 버튼을 누르거나 터미널에서 `krill artifacts share <파일>`을 실행합니다.  3. 링크를 복사해 전달합니다.  4. 이 페이지에서 링크를 열거나 지웁니다. 상대 경로 이미지·CSS는 올라가지 않으니 한 파일로 완결된 문서를 쓰세요.", "1. Turn on public sharing above.  2. Press the share button on an open .html or .md file, or run `krill artifacts share <file>` in a terminal.  3. Copy the link and send it.  4. Open or delete links on this page. Relative images and CSS are not uploaded, so use a self-contained file."),
+        LIST_TITLE => ("공유한 아티팩트", "Shared artifacts"),
+        LIST_DESC => ("이 기기의 소유자 토큰으로 만든 공개 링크입니다.", "Public links created with this device's owner token."),
+        REFRESH => ("새로고침", "Refresh"),
+        LOADING => ("불러오는 중…", "Loading…"),
+        EMPTY => ("공유한 아티팩트가 없습니다.", "No shared artifacts yet."),
+        LOAD_MORE => ("더 보기", "Load more"),
+        COPY_LINK => ("링크 복사", "Copy link"),
+        OPEN => ("열기", "Open"),
+        DELETE => ("삭제", "Delete"),
+        EXPIRES => ("만료 {date}", "Expires {date}"),
+        COPIED => ("링크를 복사했습니다: {url}", "Copied link: {url}"),
+        DELETED => ("{name} 링크를 지웠습니다. 더 이상 공개 링크로 열 수 없습니다.", "Deleted {name}. It can no longer be opened from its public link."),
+        ERROR => ("아티팩트 작업 실패: {error}", "Artifact action failed: {error}"),
+        DISABLED => ("이 기기에서 공개 공유가 꺼져 있습니다. 설정 > 아티팩트에서 켜세요.", "Public sharing is off on this device. Turn it on in Settings > Artifacts."),
+        SHARE_BUTTON => ("공유", "Share"),
+        SHARE_TOOLTIP => ("아티팩트로 공유: 공개 링크를 만들거나 기존 링크의 내용을 갱신합니다", "Share as artifact: create a public link or update the existing one"),
+        SHARING => ("공유 중…", "Sharing…"),
+        SHARED => ("공개 링크를 만들고 복사했습니다: {url}", "Created and copied the public link: {url}"),
+        UPDATED => ("공개 링크 내용을 갱신하고 복사했습니다: {url}", "Updated and copied the public link: {url}"),
+        SAVE_FIRST => ("저장하지 않은 변경이 있습니다. 저장한 뒤 공유하세요.", "There are unsaved changes. Save before sharing."),
+    }
     orca_import {
         TITLE => ("Orca 설정·계정·프로젝트 가져오기", "Import settings, accounts & projects from Orca"),
         SUBTITLE => ("이 Mac에서 Orca 데이터를 감지했습니다. 원하는 항목만 골라 재시작 없이 바로 가져옵니다.", "Detected existing Orca data on this Mac. Choose categories to import immediately without restarting."),
@@ -2282,6 +2310,13 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         crate::settings::AdminTab::Shortcuts,
         catalog::settings::SHORTCUTS_TITLE,
         &["단축키", "키 바인딩", "shortcut", "keybinding", "keys.toml"],
+    ),
+    (
+        crate::settings::AdminTab::Artifacts,
+        catalog::artifacts::ALLOW_TITLE,
+        &[
+            "공유", "링크", "공개", "share", "link", "public", "html", "markdown",
+        ],
     ),
     (
         crate::settings::AdminTab::Resources,

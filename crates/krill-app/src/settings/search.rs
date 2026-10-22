@@ -54,6 +54,7 @@ fn tab_title(tab: AdminTab) -> Message {
         AdminTab::Shortcuts => text::TAB_SHORTCUTS,
         AdminTab::Resources => text::TAB_RESOURCES,
         AdminTab::Mobile => crate::i18n::catalog::mobile::TAB,
+        AdminTab::Artifacts => crate::i18n::catalog::artifacts::TAB,
     }
 }
 

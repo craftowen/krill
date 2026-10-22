@@ -1038,3 +1038,50 @@ fn accepted_save_survives_tab_discard_and_quit_barrier_waits(cx: &mut TestAppCon
     assert!(finished.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(fs::read_to_string(file).unwrap(), "xinitial");
 }
+
+/// 아티팩트 공유: .md·.html 파일 머리에만 공유 버튼이 있다. 저장 안 된 변경이 있으면 저장 안내를,
+/// 공개 공유가 꺼져 있으면 CLI를 부르지 않고 설정 > 아티팩트를 연다.
+#[gpui::test]
+fn share_button_only_on_shareable_files_and_gate_opens_settings(cx: &mut TestAppContext) {
+    let dir = TempDir::new("share-artifact");
+    let md = dir.0.join("doc.md");
+    fs::write(&md, "# doc\n").unwrap();
+    let rs = dir.0.join("main.rs");
+    fs::write(&rs, "fn main() {}\n").unwrap();
+    let (view, cx) = open(cx, state_path("files-share-artifact"));
+
+    open_file(&view, &rs, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-share-artifact").is_none());
+
+    let pane = open_file(&view, &md, cx);
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("file-share-artifact").is_some());
+
+    cx.update(|window, cx| view.update(cx, |s, cx| s.set_preview(pane, false, window, cx)));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("x");
+    assert!(dirty(&view, pane, cx));
+    cx.update(|window, cx| view.update(cx, |s, cx| s.share_file_artifact(pane, window, cx)));
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.notice.as_deref(), Some(atext::SAVE_FIRST.get()));
+        assert!(s.settings.is_none());
+    });
+
+    cx.simulate_keystrokes("cmd-s");
+    cx.run_until_parked();
+    assert!(!dirty(&view, pane, cx));
+    cx.update(|window, cx| view.update(cx, |s, cx| s.share_file_artifact(pane, window, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert_eq!(s.notice.as_deref(), Some(atext::DISABLED.get()));
+        let settings = s.settings.as_ref().expect("settings page opened");
+        assert_eq!(
+            settings.read(cx).tab(),
+            krill_app::settings::AdminTab::Artifacts
+        );
+        assert!(s.files.sharing.is_empty());
+    });
+}

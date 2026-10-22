@@ -1838,13 +1838,15 @@ pub enum AdminTab {
     Shortcuts,
     Resources,
     Mobile,
+    /// HTML·Markdown 공개 링크 공유(`krill artifacts`).
+    Artifacts,
 }
 
 // 기본 번들 밖 탭 아이콘. 지정한 SVG만 바이너리에 싣는다.
 gpui_kit_assets::icon_assets!(TabIcons, [Keyboard, Server, Smartphone, Monitor]);
 
 impl AdminTab {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::General,
         Self::Terminal,
         Self::Accounts,
@@ -1854,6 +1856,7 @@ impl AdminTab {
         Self::Workflows,
         Self::Shortcuts,
         Self::Mobile,
+        Self::Artifacts,
         Self::Resources,
     ];
 
@@ -1869,6 +1872,7 @@ impl AdminTab {
             Self::Shortcuts => "admin-tab-shortcuts",
             Self::Resources => "admin-tab-resources",
             Self::Mobile => "admin-tab-mobile",
+            Self::Artifacts => "admin-tab-artifacts",
         }
     }
 
@@ -1884,6 +1888,7 @@ impl AdminTab {
             Self::Shortcuts => text::TAB_SHORTCUTS.get(),
             Self::Resources => text::TAB_RESOURCES.get(),
             Self::Mobile => crate::i18n::catalog::mobile::TAB.get(),
+            Self::Artifacts => crate::i18n::catalog::artifacts::TAB.get(),
         }
     }
 
@@ -1899,6 +1904,7 @@ impl AdminTab {
             Self::Shortcuts => text::SHORTCUTS_DESC,
             Self::Resources => text::TAB_RESOURCES_DESC,
             Self::Mobile => text::TAB_MOBILE_DESC,
+            Self::Artifacts => crate::i18n::catalog::artifacts::TAB_DESC,
         }
     }
 
@@ -1920,6 +1926,7 @@ impl AdminTab {
             Self::Shortcuts => IconName::Keyboard,
             Self::Resources => IconName::CircleCheck,
             Self::Mobile => IconName::Smartphone,
+            Self::Artifacts => IconName::Globe,
         }
     }
 
@@ -2521,6 +2528,7 @@ pub struct SettingsView {
     workflow_form: Option<WorkflowRepoForm>,
     /// 워크스페이스 디스크 용량 분석(Space) 및 워크트리 일괄 클린업 패널(MK-175·OWE-729).
     space: space::Panel,
+    artifacts: artifacts::Panel,
     /// 스케줄 추가/편집 모달 상태(OWE-740).
     schedule_modal: Option<schedules::ScheduleModal>,
     schedule_form_generation: u64,
@@ -2787,6 +2795,7 @@ impl SettingsView {
             shortcuts: shortcuts::Recorder::default(),
             workflow_form: None,
             space: space::Panel::default(),
+            artifacts: artifacts::Panel::default(),
             schedule_modal: None,
             schedule_form_generation: 0,
             schedule_log_generation: 0,
@@ -3061,6 +3070,9 @@ impl SettingsView {
         if tab == AdminTab::Mobile {
             // 진입 시 기기 목록·활성 오퍼를 자동 조회한다(수동 새로고침 전 빈 화면 방지, OWE-880).
             self.mobile_enter(cx);
+        }
+        if tab == AdminTab::Artifacts {
+            self.artifacts_enter(cx);
         }
         if tab == AdminTab::Resources && self.space.report.is_none() && !self.space.scanning {
             self.scan_workspace_space(cx);
@@ -11211,7 +11223,12 @@ impl Render for SettingsView {
             ),
             (
                 text::GROUP_WORKFLOW.get(),
-                &[AdminTab::Workflows, AdminTab::Mobile, AdminTab::Resources],
+                &[
+                    AdminTab::Workflows,
+                    AdminTab::Mobile,
+                    AdminTab::Artifacts,
+                    AdminTab::Resources,
+                ],
             ),
         ];
 
@@ -11478,6 +11495,7 @@ impl Render for SettingsView {
                 AdminTab::Shortcuts => self.render_shortcuts_tab(window, cx),
                 AdminTab::Resources => self.render_resources_tab(&s, cx),
                 AdminTab::Mobile => self.render_mobile_tab(window, cx),
+                AdminTab::Artifacts => self.render_artifacts_tab(cx),
             }
             .w_full()
             .min_w_0();
@@ -11620,6 +11638,7 @@ impl Render for SettingsView {
     }
 }
 
+pub mod artifacts;
 pub(crate) mod layout;
 mod mobile;
 pub mod schedules;

@@ -8454,3 +8454,97 @@ fn async_external_notification_reloads_after_storage_queue_and_poll_is_quiet(
     assert!(!cx.read(|cx| current(cx).notifications));
     fs::remove_dir_all(root).unwrap();
 }
+
+/// 아티팩트 탭: 공개 공유 스위치가 게이트 파일을 켜고 끄며, `krill artifacts list --json` 목록을 그리고
+/// 행 삭제가 `krill artifacts delete <slug> --json`으로 전달된다. 오류 봉투는 배너로 보인다.
+#[gpui::test]
+fn artifacts_tab_lists_toggles_gate_and_deletes(cx: &mut TestAppContext) {
+    use std::sync::{Arc, Mutex};
+
+    let d = dir("artifacts-tab");
+    init(cx, &d);
+    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::default();
+    let fail_list = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let run = {
+        let calls = calls.clone();
+        let fail_list = fail_list.clone();
+        space::CliRunner::new(move |args| {
+            let args: Vec<String> = args
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            calls.lock().unwrap().push(args.clone());
+            let out = match args.get(1).map(String::as_str) {
+                Some("list") if fail_list.load(std::sync::atomic::Ordering::SeqCst) => {
+                    r#"{"error":{"code":"http_500","message":"server returned HTTP 500"}}"#
+                }
+                Some("list") => {
+                    r#"{"artifacts":[{"artifact":{"slug":"s1","title":"Report","sourceContentType":"text/markdown","expiresAt":"2026-12-01T00:00:00Z"},"shareUrl":"https://share.krill.page/a/s1"},{"artifact":{"slug":"s2","originalFileName":"page.html"},"shareUrl":"https://share.krill.page/a/s2"}]}"#
+                }
+                Some("delete") => r#"{"deleted":true,"slug":"s1"}"#,
+                _ => "{}",
+            };
+            Ok(out.as_bytes().to_vec())
+        })
+    };
+
+    let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
+    vcx.simulate_resize(size(px(1200.), px(2000.)));
+    vcx.update(|window, cx| {
+        view.update(cx, |v, cx| {
+            v.set_artifacts_runner(run, cx);
+            v.set_tab(AdminTab::Artifacts, cx);
+        });
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in [
+        "admin-tab-artifacts",
+        "admin-artifacts-sharing",
+        "admin-artifacts-howto",
+        "admin-artifacts-list",
+        "admin-artifact-row-s1",
+        "admin-artifact-row-s2",
+        "admin-artifact-delete-s1",
+    ] {
+        assert!(vcx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    assert!(vcx.debug_bounds("admin-artifacts-error").is_none());
+    assert_eq!(calls.lock().unwrap()[0], ["artifacts", "list", "--json"]);
+
+    // 공개 공유 스위치 = 상태 디렉터리 게이트 파일.
+    let gate = d.join(krill_proto::artifacts::SHARING_ENABLED_FILE);
+    assert!(!gate.exists());
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_artifact_sharing(true, cx)));
+    assert!(gate.is_file());
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.set_artifact_sharing(false, cx)));
+    assert!(!gate.exists());
+
+    vcx.update(|_, cx| view.update(cx, |v, cx| v.delete_artifact("s1".into(), cx)));
+    vcx.run_until_parked();
+    assert!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c == &["artifacts", "delete", "s1", "--json"])
+    );
+    vcx.update(|_, cx| {
+        let v = view.read(cx);
+        assert_eq!(v.artifacts.items.len(), 1);
+        assert_eq!(v.artifacts.items[0].artifact.slug, "s2");
+        assert!(v.artifacts.notice.as_ref().unwrap().contains("Report"));
+    });
+
+    fail_list.store(true, std::sync::atomic::Ordering::SeqCst);
+    vcx.update(|window, cx| {
+        view.update(cx, SettingsView::refresh_artifacts);
+        window.draw(cx).clear(cx);
+    });
+    vcx.run_until_parked();
+    vcx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(vcx.debug_bounds("admin-artifacts-error").is_some());
+
+    fs::remove_dir_all(d).ok();
+}
