@@ -93,6 +93,9 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 shot('action-sheet')
                 browser('find','role','button','click','--name','Send prompt','--exact')
                 browser('fill','#prompt','mobile-reconnect-once')
+                # Observe the user-facing uncertainty notice before a successful
+                # reconnect replaces transient connection status text.
+                evaluate('globalThis.mutationNotices=[];globalThis.noticeObserver=new MutationObserver(()=>{const n=document.getElementById("notice");if(!n.hidden&&n.textContent)mutationNotices.push(n.textContent);});noticeObserver.observe(document.getElementById("notice"),{subtree:true,childList:true,characterData:true,attributes:true});true')
                 evaluate('globalThis.dropNextSend=true;globalThis.beforeDropSockets=recoverySockets.length;document.getElementById("composer").requestSubmit();true')
                 wait('globalThis.droppedSocket?.readyState===3&&recoverySockets.length>beforeDropSockets&&KrillMobile.store.connection.phase==="ready"')
                 until(lambda:'got:mobile-reconnect-once' in cli('read',str(cfg['session'])))
@@ -101,6 +104,8 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 # Host-pool reconnection may replace transient status copy; the
                 # transport must retain the uncertain-mutation update guard.
                 assert evaluate('KrillMobile.app.transport.updateBusy')
+                assert any('not resent' in text for text in evaluate('mutationNotices'))
+                evaluate('noticeObserver.disconnect();true')
                 browser('find','role','button','click','--name','Cancel','--exact')
                 browser('find','role','button','click','--name','Terminal actions','--exact')
                 browser('find','role','button','click','--name','Review in Terminal','--exact')
@@ -146,8 +151,9 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 navigate('/accounts')
                 wait('Array.from(document.querySelectorAll(".account-title")).some(e=>e.textContent==="Mobile fixture")')
                 account='Array.from(document.querySelectorAll(".account-row")).find(e=>e.querySelector(".account-title").textContent==="Mobile fixture")'
-                usage = evaluate('(async()=>{const data=await KrillMobile.app.transport.rpc({action:"accounts"});return data.accounts.find(a=>a.id==="mobile-test-account").usage;})()')
-                expected = [f'{usage[key]["percent"]}%' if usage.get(key) else '—' for key in ['five_hour','seven_day']]
+                # This fixture writes these exact cache values. A backend/UI pair
+                # that both loses usage must fail instead of agreeing on unknown.
+                expected = ['23%', '47%']
                 assert evaluate(f'Array.from(({account}).querySelectorAll(".usage-value")).map(e=>e.textContent)') == expected
                 evaluate(f'({account}).click();true')
                 wait(f'!!({account}).querySelector(".check")')

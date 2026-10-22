@@ -159,7 +159,7 @@ async function connect(url,credential){
   await require('./mobile_session.cjs').main();
   git(['init','-b','mobile-test']);git(['config','user.email','test@example.invalid']);git(['config','user.name','M9 test']);fs.writeFileSync(path.join(repo,'example.txt'),'before\n');git(['add','.']);git(['commit','-m','fixture']);fs.appendFileSync(path.join(repo,'example.txt'),'after\n');
   fs.writeFileSync(path.join(profile,'statusline_cache.json'),JSON.stringify({five_hour:{utilization:23,resets_at:new Date(Date.now()+5*3600000+600000).toISOString()},seven_day:{utilization:47,resets_at:new Date(Date.now()+7*86400000+3600000).toISOString()}}));
-  fs.writeFileSync(path.join(dir,'accounts.toml'),`[active]\nclaude = "claude-host"\n[[accounts]]\nid = "mobile-test-account"\nprovider = "claude"\nlabel = "Mobile fixture"\nprofile_dir = ${JSON.stringify(profile)}\n`);
+  fs.writeFileSync(path.join(dir,'accounts.toml'),`direct_usage = false\n[active]\nclaude = "claude-host"\n[[accounts]]\nid = "mobile-test-account"\nprovider = "claude"\nlabel = "Mobile fixture"\nprofile_dir = ${JSON.stringify(profile)}\n`);
   fs.writeFileSync(path.join(dir,'agents.toml'),'[agent.codex]\nname = "Mock Codex"\nlaunch = ["/bin/sh", "-c", "printf \'mock-agent-ready\\\\n\'; exec /bin/cat"]\n[agent.claude]\nname = "Mock Claude"\nlaunch = ["/bin/sh", "-c", "printf \'mock-agent-ready\\\\n\'; exec /bin/cat"]\n');
   fs.writeFileSync(path.join(dir,'waiting.json'),'{"hook_event_name":"PermissionRequest"}');
   holder=spawn(path.join(bin,'krill-holder'),[daemonBin,path.join(dir,'run/krilld.sock')],{env,stdio:['ignore',log,log]});await until(()=>fs.existsSync(path.join(dir,'run/krilld.sock')));

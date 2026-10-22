@@ -208,6 +208,11 @@ def main():
                     named('Term')
                     named('Chat')
                     capture('chat-content', width, height)
+                    evaluate(f'''(()=>{{const e=KrillMobile.store.chatCache.get({sid});e.items.push({{kind:'reasoning',text:'Inspect the fold transition.'}},{{kind:'tool_call',tool_name:'read_file',title:'Read a long workspace path '.repeat(8),text:'src/mobile/app.css'}},{{kind:'tool_result',text:'Responsive layout verified.'}});return true;}})()''')
+                    named('Term')
+                    named('Chat')
+                    evaluate('document.querySelectorAll(".chat-feed details").forEach(n=>n.open=true);true')
+                    capture('chat-disclosures', width, height)
                     named('Term')
                     navigate('/accounts')
                     wait('!!document.querySelector(".account-row")')
@@ -254,6 +259,49 @@ def main():
                 assert all((b['cols'] > a['cols']) == (b['width'] > a['width'])
                            for a, b in zip(resizing, resizing[1:])), resizing
                 (shots / 'resize.json').write_text(json.dumps(resizing, indent=2))
+                # Real history must keep its anchor when folds arrive without
+                # waiting for a PTY resize ACK. Use an unmounted fixture terminal
+                # so its first history fetch includes the output we just produced.
+                fold_sid = cfg['extraSessions'][0]
+                history_text = '\n'.join(f'fold-history-{i:03d}' for i in range(120)) + '\n'
+                evaluate(f'(async()=>{{await KrillMobile.app.transport.rpc({{action:"prompt",session:{fold_sid},text:{json.dumps(history_text)}}});return true;}})()')
+                def history_ready():
+                    output = subprocess.check_output([str(target / 'debug/krill'), 'read', str(fold_sid)],
+                                                     env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
+                    return 'fold-history-119' in output
+                until(history_ready)
+                fold_route = evaluate(f'"/host/local/group/"+encodeURIComponent(KrillMobile.store.sessions.get({fold_sid}).groupKey)+"/s/{fold_sid}"')
+                browser('set', 'viewport', '344', '882')
+                navigate(fold_route)
+                wait('document.querySelector(".terminal-mount:not([hidden])")?.dataset.phase==="ready"')
+                evaluate('KrillMobile.activeTerminal.setInputMode("buffered");KrillMobile.activeTerminal.fitToPhone(true);true')
+                wait('document.querySelector(".terminal-mount:not([hidden]) .terminal-history").textContent.includes("fold-history-")')
+                browser('fill', '.terminal-mount:not([hidden]) .command-input', 'rapid fold draft 한글')
+                evaluate('document.activeElement.blur();document.querySelector(".terminal-mount:not([hidden]) .terminal-scroll").scrollTop=180;globalThis.foldTerminal=KrillMobile.activeTerminal;true')
+                settle()
+                anchor = evaluate('document.querySelector(".terminal-mount:not([hidden]) .terminal-scroll").scrollTop')
+                history = evaluate('document.querySelector(".terminal-mount:not([hidden]) .terminal-history").textContent')
+                assert anchor > 0
+                fold_hash = evaluate('location.hash')
+                browser('screenshot', str(shots / 'rapid-fold-before.png'))
+                folds = []
+                for width, height in [(690, 830), (344, 882)] * 6:
+                    browser('set', 'viewport', str(width), str(height))
+                    sample = evaluate('(()=>{const root=document.querySelector(".terminal-mount:not([hidden])");return {width:innerWidth,top:root.querySelector(".terminal-scroll").scrollTop,history:root.querySelector(".terminal-history").textContent,draft:root.querySelector(".command-input").value,hash:location.hash,sameTerminal:foldTerminal===KrillMobile.activeTerminal};})()')
+                    assert sample.pop('history') == history
+                    assert sample.pop('hash') == fold_hash
+                    assert sample['sameTerminal'] and sample['draft'] == 'rapid fold draft 한글'
+                    assert abs(sample['top'] - anchor) <= 1, sample
+                    folds.append(sample)
+                for width, height in [(690, 830), (344, 882)]:
+                    browser('set', 'viewport', str(width), str(height))
+                    wait('(()=>{const p=document.querySelector(".terminal-mount:not([hidden]) .terminal-scroll"),g=p.querySelector(".terminal-grid");return Math.round(parseFloat(g.style.width)/8)===Math.floor((p.clientWidth-2)/8);})()')
+                    sample = evaluate('(()=>{const p=document.querySelector(".terminal-mount:not([hidden]) .terminal-scroll"),g=p.querySelector(".terminal-grid");return {width:innerWidth,cols:Math.round(parseFloat(g.style.width)/8),top:p.scrollTop};})()')
+                    assert abs(sample['top'] - anchor) <= 1, sample
+                    folds.append(sample)
+                (shots / 'rapid-fold.json').write_text(json.dumps(folds, indent=2))
+                browser('screenshot', str(shots / 'rapid-fold-after.png'))
+                print('PASS rapid fold x12: live grid, draft, terminal identity, history and scroll anchor', flush=True)
                 if args.phase == 'after':
                     # Readability and wrapping also survive localized large text.
                     navigate('/settings')
