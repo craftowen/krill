@@ -319,6 +319,7 @@ fn channel_mismatch_surfaces_configured_and_offered_without_staging() {
             offered: Channel::Beta
         }
     ));
+    assert!(!app.exists(), "a mismatched channel must not stage an app");
 }
 
 #[test]

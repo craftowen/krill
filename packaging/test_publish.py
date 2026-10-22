@@ -149,7 +149,7 @@ class PublishGuardTests(unittest.TestCase):
                          'echo "$(printf a%.0s {1..64})  x" > "$o/Krill-0.1.0-arm64-adhoc.zip.sha256"',
             "release.sh": 'o=$6; mkdir -p "$o/homebrew-krill"; touch "$o/Krill-0.1.0.dmg" '
                           '"$o/Krill-0.1.0-source.tar.gz" "$o/homebrew-krill/SHA256SUMS"',
-            "install.sh": "", "install-linux.sh": "", "windows/install.ps1": "",
+            "install.sh": "", "windows/install.ps1": "",
             # VERSION PUBLIC_KEY UPDATE_URL OUT_DIR
             "windows/build-vm.sh": 'echo "$2 $3" > "$4/vm-args"; echo zip > "$4/Krill-$1-windows-x64.zip"; '
                                    'echo "$(printf b%.0s {1..64})  x" > "$4/Krill-$1-windows-x64.zip.sha256"',
@@ -196,21 +196,20 @@ class PublishGuardTests(unittest.TestCase):
         head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.work, text=True).strip()
         assets = self.work.parent / "native-assets"
         assets.mkdir()
-        for platform in ("windows", "x86_64", "aarch64"):
+        for platform in ("windows",):
             (assets / f"source-commit-{platform}.txt").write_text(head + "\n")
         windows = assets / "Krill-0.1.0-windows-x64.zip"
         with zipfile.ZipFile(windows, "w") as archive:
             archive.writestr("Krill/Krill.json", json.dumps({
                 "CFBundleShortVersionString": "0.1.0", "KrillUpdatePublicKey": public_key}))
-        for arch in ("x86_64", "aarch64"):
-            (assets / f"krill-0.1.0-linux-{arch}.tar.gz").write_bytes(b"linux")
         for archive in list(assets.glob("*.zip")) + list(assets.glob("*.tar.gz")):
             (assets / f"{archive.name}.sha256").write_text(
                 hashlib.sha256(archive.read_bytes()).hexdigest() + "  " + archive.name + "\n")
         result = self.publish("--dry-run", KRILL_UPDATE_KEY_FILE=str(key), KRILL_RELEASE_ASSET_DIR=str(assets),
                               KRILL_WIN_VM_DIR="", KRILL_GCP_PROJECT="")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertIn("packaging/dist/krill-0.1.0-linux-aarch64.tar.gz", result.stdout)
+        self.assertNotIn("install-linux.sh", result.stdout)
+        self.assertNotIn("linux-aarch64", result.stdout)
         manifest = json.loads((self.work / "packaging/dist/latest-windows.json").read_text())
         self.assertEqual(manifest["sha256"], hashlib.sha256(windows.read_bytes()).hexdigest())
         self.assertEqual(manifest["version"], "0.1.0")

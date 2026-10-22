@@ -27,7 +27,7 @@ class PublicationTests(unittest.TestCase):
         self.key = self.root / 'key'
         self.seed = ed.load_or_create_seed(self.key, create_if_missing=True)
         self.pub = ed.public_key_from_seed(self.seed).hex()
-        for name in ('Krill-0.1.2.dmg', 'install.sh', 'install-linux.sh', 'install.ps1', 'homebrew-krill/SHA256SUMS'):
+        for name in ('Krill-0.1.2.dmg', 'install.sh', 'install.ps1', 'homebrew-krill/SHA256SUMS'):
             path = self.assets / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b'fixture')
@@ -37,10 +37,6 @@ class PublicationTests(unittest.TestCase):
             ('Krill-0.1.2-windows-x64.zip', 'Krill/Krill.json', json.dumps(info).encode())):
             with zipfile.ZipFile(self.assets / name, 'w') as archive:
                 archive.writestr(member, content)
-            self.checksum(name)
-        for arch in ('x86_64', 'aarch64'):
-            name = f'krill-{VERSION}-linux-{arch}.tar.gz'
-            (self.assets / name).write_bytes(b'linux')
             self.checksum(name)
         with tarfile.open(self.assets / f'Krill-{VERSION}-source.tar.gz', 'w:gz', format=tarfile.PAX_FORMAT,
                           pax_headers={'comment': HEAD}) as archive:
@@ -78,7 +74,8 @@ class PublicationTests(unittest.TestCase):
 
     def test_complete_remote_readback_checks_every_asset(self):
         result = self.verify()
-        self.assertEqual(len(result['verified_assets']), 16)
+        self.assertEqual(len(result['verified_assets']), 11)
+        self.assertFalse(any('linux' in name for name in result['verified_assets']))
         self.assertEqual(result['head'], HEAD)
 
     def test_corrupt_download_wrong_plan_signature_and_wrong_tag_fail(self):
@@ -119,7 +116,7 @@ class PublicationTests(unittest.TestCase):
             self.plan_for_assets()
 
     def test_inventory_requires_all_platforms_and_checksum_filename(self):
-        path = self.assets / 'krill-0.1.2-linux-aarch64.tar.gz.sha256'
+        path = self.assets / 'Krill-0.1.2-windows-x64.zip.sha256'
         path.write_text(rv.sha256(self.assets / path.name.removesuffix('.sha256')) + '  ../../bad')
         with self.assertRaisesRegex(ValueError, 'checksum'):
             self.plan_for_assets()

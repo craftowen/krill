@@ -1,5 +1,7 @@
 # 공개 릴리스 (`publish-github.sh`)
 
+지원 플랫폼은 Apple Silicon(M 시리즈) Mac과 Windows x64다. Intel Mac·Linux 빌드/설치/게시 경로는 제거했다. Unix 공통 코드의 Linux 호환 분기는 기존 원격 세션 보존을 위해 남아 있지만 지원·검증·배포 대상이 아니다.
+
 GitHub Releases 게시의 **공식 경로**는 로컬 맥에서 메인테이너가 돌리는 `packaging/publish-github.sh`다.
 `.github/workflows/release.yml`은 수동 예비·Windows 자산 추가용이며 같은 규칙(main 끝 또는 태그 커밋에서만,
 기존 자산 덮어쓰기 없음)을 따른다. 사용자가 배포·릴리스·push를 명시 지시하면 에이전트도 필요한 main·태그 push와 릴리스 생성을 수행한다(AGENTS.md 규칙 9).
@@ -11,7 +13,7 @@ GitHub Releases 게시의 **공식 경로**는 로컬 맥에서 메인테이너�
 
 ```sh
 python3 packaging/nightly.py install       # 이 저장소의 dev를 대상으로 등록·갱신
-python3 packaging/nightly.py install --after-release 0.1.23  # 기존 버전·3개 플랫폼 자산 게시 완료 뒤부터 후보 생성
+python3 packaging/nightly.py install --after-release 0.1.23  # 기존 버전·macOS ARM·Windows 자산 게시 완료 뒤부터 후보 생성
 python3 packaging/nightly.py preflight     # 인증·툴·기존 서명키·외장 볼륨 확인, 빌드·원격 쓰기 없음
 python3 packaging/nightly.py status        # launchd 등록과 최근 실행 결과
 python3 packaging/nightly.py uninstall     # 예약 해제, 로그·검사 기록 보존
@@ -21,11 +23,11 @@ python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
 
 1. 실행 시작에 **원격 `dev`·`main`**을 fetch해 고정한다. 두 커밋이 모두 최신 게시 태그에 포함돼 있으면 생략한다. 원본 체크아웃은 건드리지 않는다. 작업 완료 후 `dev`에 커밋·push해 둔다. 미커밋 파일·push하지 않은 로컬 커밋·미통합 기능 브랜치는 포함하지 않으며 고정 이후 push는 다음 날 대상이다. `--after-release`로 지정한 기존 릴리스가 미게시 상태면 후보 생성도 생략한다.
 2. `/Volumes/krill-build/nightly/repository` 전용 clone에서 통합한다. 병합 충돌은 중단한다. workspace와 최신 게시 버전 중 큰 버전의 patch를 올리고 Cargo.lock·고지문과 함께 **최종 후보 커밋을 먼저** 만든다.
-3. 패키징 회귀 검사와 공개 표면 검사를 먼저 통과하고 고정 후보 `release/nightly`를 lease 조건으로 갱신한다. 강제 갱신 범위는 자동 후보 브랜치 하나이며 main·태그에는 사용하지 않는다. 후보 CI와 `release.yml build_only=true`(Windows/MSVC·Linux 두 아키텍처 네이티브 빌드·설치·생존 스모크)를 시작한다. 유료 VM을 호출하지 않고 서명키의 공개키만 전달한다.
+3. 패키징 회귀 검사와 공개 표면 검사를 먼저 통과하고 고정 후보 `release/nightly`를 lease 조건으로 갱신한다. 강제 갱신 범위는 자동 후보 브랜치 하나이며 main·태그에는 사용하지 않는다. 후보 CI와 `release.yml build_only=true`(Windows/MSVC 네이티브 빌드·설치·생존 스모크)를 시작한다. 유료 VM을 호출하지 않고 서명키의 공개키만 전달한다.
 4. 원격 검사가 진행되는 동안 로컬에서 `scripts/check.sh`·Windows 전체 clippy·release 빌드·10개 터미널 메모리 검사·실제 GUI kill -9/출력 재생·holder 생존/업그레이드 검사를 실행한다. release 테스트를 먼저 컴파일하고 최종 출고 바이너리를 빌드한 다음, Cargo 재빌드 없이 검사한다. 각 게이트 뒤 바이너리 해시가 같아야 한다. 전체 검사 checkpoint와 최종 바이너리 receipt는 SHA·툴체인/컴파일 플래그·검사 범위·해시를 Ed25519로 서명하며 유효 시간은 24시간이다. 재개할 때 서명과 내용을 다시 확인한다. 23시간이 지났거나 툴체인/플래그/공개키가 바뀌면 새 SHA 후보를 만들어 검사한다. 손상된 서명은 차단한다. 같은 SHA에서 실패·취소된 CI는 다음 실행 시 전체 workflow를 한 번 재시작하며, 실행 중/성공한 native 빌드는 재사용한다.
-5. 후보의 Linux·macOS ARM/Intel 필수 잡과 Windows/Linux 빌드가 모두 실제로 성공해야 한다. 판정은 저장소·워크플로 경로/ID·SHA·브랜치·최신 실행/attempt·잡 결과를 확인한다. 다른 PR·누락·skipped 잡은 전체 검사 증거가 아니다. 같은 HEAD의 네이티브 자산을 내려받아 출처 커밋·체크섬·Windows 버전/공개키를 검증한다. 자산 이름에 attempt를 넣고 GitHub의 artifact ID·SHA-256으로 ZIP 자체도 검증한다.
+5. 후보의 저장소 검사·macOS ARM 필수 잡과 Windows 빌드가 모두 실제로 성공해야 한다. 판정은 저장소·워크플로 경로/ID·SHA·브랜치·최신 실행/attempt·잡 결과를 확인한다. 다른 PR·누락·skipped 잡은 전체 검사 증거가 아니다. 같은 HEAD의 네이티브 자산을 내려받아 출처 커밋·체크섬·Windows 버전/공개키를 검증한다. 자산 이름에 attempt를 넣고 GitHub의 artifact ID·SHA-256으로 ZIP 자체도 검증한다.
 6. `main`이 그대로이고 후보가 깨끗하면 fast-forward push한다. main CI는 **동일 SHA 후보의 전체 검사 증거**가 있을 때만 그 결과를 재사용한다. 증거가 없거나 API 판정에 실패하면 전체 CI를 실행한다. 플랫폼·툴체인·컴파일 플래그별 의존성 캐시는 후보 브랜치에서 다음 날에도 재사용한다. PR 캐시 저장은 막고 검사 자체는 생략하지 않는다. 최적화 수준·LTO·테스트 기준은 낮추지 않는다.
-7. `publish-github.sh --verified-release <receipt>`는 고정된 출고 바이너리를 검증해 번들로 복사하고 서명·DMG 조립한다. 이 경로는 임의 `--bin-dir` 게시와 다르며 서명된 전체 검사 증거가 필수다. 코드 서명을 정규화한 사본의 해시로 출고 바이너리와 최종 서명 번들의 동일성을 확인하고, 서명 번들의 CLI/GUI·앱/데몬 kill -9 생존 스모크도 통과해야 한다. 전체 사이클에서 실행기가 기존 BSD 게시 락을 직접 보유하고 자신이 시작한 작업을 정리한 뒤 해제한다. 최종 태그와 16개 게시 자산을 다시 내려받아 해시·버전·업데이트 서명·소스 커밋까지 확인한 뒤에만 게시 성공으로 기록한다. 기존 태그·릴리스는 덮어쓰지 않는다.
+7. `publish-github.sh --verified-release <receipt>`는 고정된 출고 바이너리를 검증해 번들로 복사하고 서명·DMG 조립한다. 이 경로는 임의 `--bin-dir` 게시와 다르며 서명된 전체 검사 증거가 필수다. 코드 서명을 정규화한 사본의 해시로 출고 바이너리와 최종 서명 번들의 동일성을 확인하고, 서명 번들의 CLI/GUI·앱/데몬 kill -9 생존 스모크도 통과해야 한다. 전체 사이클에서 실행기가 기존 BSD 게시 락을 직접 보유하고 자신이 시작한 작업을 정리한 뒤 해제한다. 최종 태그와 11개 게시 자산을 다시 내려받아 해시·버전·업데이트 서명·소스 커밋까지 확인한 뒤에만 게시 성공으로 기록한다. 기존 태그·릴리스는 덮어쓰지 않는다.
    Windows 스모크는 `smoke-ci.ps1`이 WMI로 테스트 프로세스를 Actions 러너 Job 밖에서 실행한다. 설치·CLI 자동 기동·입출력·데몬 kill 검증은 기존 `smoke.ps1`로 수행하며 테스트 경로의 프로세스만 정리한다.
 
 실패하면 새 릴리스를 게시하지 않고 단계·대상 HEAD·오류를 기록한다. `main` 반영 뒤 CI나 게시가 실패하면 그 검증 커밋은 `main`에 남을 수 있다. 게시 중 네트워크가 끊어지면 태그만 남는 등 일부 원격 쓰기가 끝났을 수 있으며, 다음 실행도 기존 태그·자산을 덮어쓰지 않는다. 게시 계획·readback은 clone 밖 `/Volumes/krill-build/nightly/publications/<SHA>/`에 보존한다. 원격 릴리스 생성 뒤 readback만 실패한 경우 다음 실행은 기존 자산을 다운로드해 검증하는 단계만 재개한다. 태그만 남은 경우는 중단하고 운영자가 상태를 확인한다.
@@ -38,7 +40,7 @@ python3 "$HOME/Library/Application Support/dev.krill.nightly/nightly.py" run
 
 회귀 검증: `python3 -m unittest discover -s packaging -p 'test_*.py'`, `actionlint`, `shellcheck packaging/publish-github.sh`.
 
-`dev` push에서는 Linux/macOS 전체 CI를 실행하지 않는다. 개발 중에는 변경 범위 검사만 하며, 전체 원격 CI는 `release/**` 야간 후보·`main` push와 PR에서 실행한다.
+`dev` push에서는 macOS 전체 CI를 실행하지 않는다. 개발 중에는 변경 범위 검사만 하며, 전체 원격 CI는 `release/**` 야간 후보·`main` push와 PR에서 실행한다.
 
 ## 수동 게시
 
@@ -69,7 +71,7 @@ Claude Code에서는 원격 명령의 첫 줄에 `# KRILL_ALLOW_REMOTE: <사용�
 |---|---|---|
 | `/tmp/krill-publish.lock` `lockf` — 이 맥에서 동시에 한 번만(dry-run·preflight 포함) | 즉시 종료(75) | 없음 |
 | `git fetch origin` 후 HEAD == `origin/main` | 중단 | `KRILL_PUBLISH_FORCE` |
-| 동일 SHA main의 필수 Linux·macOS 잡 또는 검증된 후보 재사용 증거 | 중단 | 없음 |
+| 동일 SHA main의 필수 저장소 검사·macOS 잡 또는 검증된 후보 재사용 증거 | 중단 | 없음 |
 | HEAD의 GitHub check-runs가 모두 `success`(또는 `skipped`), 0개면 실패 | 중단 | `KRILL_PUBLISH_FORCE` |
 | `THIRD_PARTY_NOTICES.md`가 최신(`generate_notices.py --check`) | 중단 | `KRILL_PUBLISH_FORCE` |
 | 원격 태그(`git ls-remote --tags`)·GitHub 릴리스가 이미 있음 — 빌드 뒤 태그 직전에 한 번 더 확인 | 중단 | 없음(버전을 올린다) |
@@ -235,7 +237,7 @@ python3 packaging/macos/test_pipeline.py
 기본 결과는 `packaging/dist/Krill.app`, `Krill-<version>-<arch>-adhoc.zip`,
 그 ZIP의 `.sha256`이다. DMG·Homebrew(MK-072)는 `packaging/dist/Krill.app`을 입력으로 쓴다.
 버전은 루트 `Cargo.toml`의 `[workspace.package].version`에서 읽고 현재는 `숫자.숫자.숫자` 형식만 허용한다.
-아키텍처는 입력 Mach-O에서 읽으며 네 바이너리 모두 같은 `arm64` 또는 `x86_64`여야 한다.
+아키텍처는 입력 Mach-O에서 읽으며 네 바이너리 모두 `arm64`여야 한다.
 소스 바이너리는 변경하지 않는다. 기존 앱·동명 ZIP·체크섬을 덮어쓰지 않으므로, 재실행 시 새 `--output` 경로를 지정한다.
 Cargo 출력에서 실제 실행 파일 경로를 읽어 `CARGO_TARGET_DIR` 및 Cargo target 설정도 반영한다.
 Cargo 호출은 `perl -e 'alarm shift; exec @ARGV' 300` 제한을 적용하고, 실패 시 패키징도 실패한다.
@@ -294,27 +296,3 @@ macOS 27.0.1 arm64, Homebrew rustc 1.98.1, Command Line Tools 환경에서:
 - Bash 구문 검사와 workflow YAML 파싱, 수동 트리거만 존재하는지 확인했다.
 
 `release` 프로필의 실제 전체 빌드와 GitHub Actions 원격 실행은 이 기록에 포함하지 않는다.
-
-## Linux 원격 호스트 바이너리
-
-Linux 머신은 GUI 없이 Mac 앱이 SSH로 붙는 원격 호스트다. `krill`·`krill-holder`·`krilld`만 묶는다.
-
-```sh
-# Linux 머신에서 직접: dist/krill-VERSION-linux-ARCH.tar.gz(+ .sha256)
-bash packaging/linux/build.sh VERSION
-bash packaging/linux/smoke.sh packaging/dist/krill-VERSION-linux-ARCH.tar.gz   # 임시 HOME 설치·세션·kill -9 생존
-# 맥에서: GCP 임시 VM(Ubuntu 22.04, x86_64·aarch64)으로 빌드·스모크 후 VM 삭제(유료)
-KRILL_GCP_PROJECT=<project> bash packaging/linux/build-gcp.sh VERSION
-```
-
-`publish-github.sh`는 `KRILL_GCP_PROJECT`가 있으면 위 GCP 빌드를 돌리고, Linux tar.gz와
-`install-linux.sh`를 릴리스 자산에 넣는다. 원격 머신 설치는 `install-linux.sh`(→ `~/.local/bin`).
-`KRILL_WIN_VM_DIR`가 있으면 Windows zip·`latest-windows.json`·`install.ps1`도 넣는다([windows/README.md](windows/README.md)).
-
-원격 Linux 요구사항(2026-10-18 실측):
-- glibc 2.34 이상(Ubuntu 22.04+, Debian 12+, RHEL/Rocky 9+), 커널 5.9 이상. Rocky 8(glibc 2.28)에서는
-  `install-linux.sh`가 설치 전에 멈추고 원인을 알린다.
-- systemd-logind `KillUserProcesses=yes`이면 데몬을 깨운 ssh 로그인이 끝나는 순간 데몬이 죽어 연결할 수 없다
-  (Ubuntu 22.04 GCP VM에서 재현). `KillExcludeUsers=<사용자>`를 넣으면 해결된다(같은 VM에서 확인).
-  Ubuntu·Debian·RHEL 기본값은 `no`.
-- 이미 설치된 머신에 다시 설치하면 `krill update`가 실행 중인 데몬을 세션을 유지한 채 교체한다.

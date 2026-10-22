@@ -44,6 +44,7 @@ cask "krill" do
   desc "Persistent parallel coding agent sessions"
   homepage {ruby_string(homepage)}
 
+  depends_on arch: :arm64
   auto_updates true
 
   preflight_steps do
@@ -94,6 +95,7 @@ class Krill < Formula
 
   depends_on "rust" => :build
   depends_on :macos
+  depends_on arch: :arm64
   conflicts_with "krill", because: "both install an krill executable"
 
   def install

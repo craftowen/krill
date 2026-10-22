@@ -31,10 +31,9 @@ Options:
   --preflight        게시 가드만 실행하고 끝낸다(하나라도 실패하면 1)
 
 Environment:
-  KRILL_GCP_PROJECT=<id>      Linux tar.gz를 GCP 임시 VM에서 빌드해 자산에 넣는다(packaging/linux/build-gcp.sh)
   KRILL_WIN_VM_DIR=<dir>      Windows zip을 상시 Windows VM에서 빌드해 latest-windows.json·install.ps1과 함께 넣는다
                              (packaging/windows/build-vm.sh)
-  KRILL_RELEASE_ASSET_DIR=<dir> 같은 HEAD의 Windows/Linux 네이티브 빌드·스모크 산출물(야간 배포용).
+  KRILL_RELEASE_ASSET_DIR=<dir> 같은 HEAD의 Windows 네이티브 빌드·스모크 산출물(야간 배포용).
                              source-commit·체크섬·Windows 공개키 확인 후 가져온다. VM 빌드 옵션과 함께 쓰지 않는다.
   KRILL_PUBLISH_FORCE=<사유>  사람 전용 탈출구. 대화형 터미널에서 태그를 직접 입력해야 하며 사유를 출력한다.
                              이미 게시된 태그·릴리스, 로컬 태그 불일치, 공개 표면 위반은 덮어쓰지 못한다
@@ -378,19 +377,11 @@ python3 packaging/macos/ed25519_manifest.py sign \
 
 cp packaging/install.sh "$OUT_DIR/install.sh"
 chmod 755 "$OUT_DIR/install.sh"
-cp packaging/install-linux.sh "$OUT_DIR/install-linux.sh"
-chmod 755 "$OUT_DIR/install-linux.sh"
-# Linux 원격 호스트 바이너리: KRILL_GCP_PROJECT가 있으면 GCP 임시 VM에서 빌드·스모크 테스트 후 VM을 지운다.
-if [[ -n "${KRILL_GCP_PROJECT:-}" ]]; then
-  bash packaging/linux/build-gcp.sh "$VERSION" "$OUT_DIR"
-fi
 if [[ -n "${KRILL_RELEASE_ASSET_DIR:-}" ]]; then
   ASSET_PUBLIC_KEY=$(python3 packaging/macos/ed25519_manifest.py keygen --key-file "$UPDATE_KEY_FILE")
   python3 packaging/nightly_assets.py --directory "$KRILL_RELEASE_ASSET_DIR" --output "$OUT_DIR" \
     --version "$VERSION" --commit "$HEAD_SHA" --public-key "$ASSET_PUBLIC_KEY"
 fi
-LINUX_ASSETS=("$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz "$OUT_DIR"/krill-"${VERSION}"-linux-*.tar.gz.sha256)
-[[ "${#LINUX_ASSETS[@]}" -gt 0 ]] || echo "warning: no Linux tarballs (set KRILL_GCP_PROJECT to build them)" >&2
 # Windows zip: KRILL_WIN_VM_DIR가 있으면 상시 Windows VM을 켜서 빌드·스모크 후 끈다(packaging/windows/README.md).
 # 매니페스트는 macOS와 같은 키로 맥에서 서명한다. latest.json은 스키마상 항목 하나라 Windows는 latest-windows.json을 따로 둔다.
 if [[ -n "${KRILL_WIN_VM_DIR:-}" ]]; then
@@ -435,8 +426,6 @@ ASSETS=(
   "$OUT_DIR/homebrew-krill/SHA256SUMS"
   "$OUT_DIR/latest.json"
   "$OUT_DIR/install.sh"
-  "$OUT_DIR/install-linux.sh"
-  ${LINUX_ASSETS[@]+"${LINUX_ASSETS[@]}"}
   ${WINDOWS_ASSETS[@]+"${WINDOWS_ASSETS[@]}"}
 )
 

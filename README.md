@@ -10,7 +10,8 @@ Orca 기능을 참고해 순수 Rust로 만드는 초경량 앱이다.
 
 ## 요구 사항
 
-- macOS (Apple Silicon. 릴리스 번들은 arm64만 배포하며, Intel Mac은 소스 빌드), Command Line Tools
+- 지원 플랫폼: macOS Apple Silicon(M 시리즈)·Windows x64. Intel Mac·Linux는 지원하지 않습니다.
+- 아래 macOS 소스 빌드에는 Command Line Tools가 필요합니다.
 - Rust 1.98 이상 (MSRV는 루트 `Cargo.toml`, Homebrew rustc 권장, rustup 불필요)
 - Python 3.9 이상 (릴리스 조립 스크립트용)
 

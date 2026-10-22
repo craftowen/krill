@@ -289,7 +289,7 @@ pub fn remote_socket_for_home(remote_home: &str) -> io::Result<PathBuf> {
     let found = lines.next().map(str::trim);
     if found == Some(MISSING_MARK) {
         return Err(io::Error::other(
-            "krill is not installed on the remote host (expected ~/.local/bin/krill; see install-linux.sh)",
+            "krill is not installed on the remote host; Linux hosts are no longer supported",
         ));
     }
     if let Some(detail) = found.and_then(|l| l.strip_prefix(WAKE_FAILED_MARK)) {

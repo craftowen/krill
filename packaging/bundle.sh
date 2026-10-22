@@ -94,7 +94,7 @@ for binary in krill-app krill krill-holder krilld krill-link; do
     /usr/bin/file -b "$bin_dir/$binary" | /usr/bin/grep -q 'Mach-O' || fail "not a Mach-O executable: $binary"
 done
 arch=$(/usr/bin/lipo -archs "$bin_dir/krill-app")
-case "$arch" in arm64|x86_64) ;; *) fail "one arm64 or x86_64 architecture is required: $arch" ;; esac
+case "$arch" in arm64) ;; *) fail "Apple Silicon (arm64) is required: $arch" ;; esac
 for binary in krill krill-holder krilld krill-link; do
     [ "$(/usr/bin/lipo -archs "$bin_dir/$binary")" = "$arch" ] || fail "architecture mismatch: $binary"
 done
@@ -102,7 +102,7 @@ archive="Krill-$version-$arch-adhoc.zip"
 mkdir -p "$output"
 output=$(cd "$output" && pwd)
 if [ -n "$install_app" ]; then
-    rm -rf "$output/Krill.app" "$output/$archive" "$output/$archive.sha256"
+    rm -rf "$output/Krill.app" "${output:?}/${archive:?}" "${output:?}/${archive:?}.sha256"
 else
     for artifact in Krill.app "$archive" "$archive.sha256"; do
         [ ! -e "$output/$artifact" ] && [ ! -L "$output/$artifact" ] || fail "output already exists: $output/$artifact"

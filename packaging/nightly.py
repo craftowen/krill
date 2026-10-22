@@ -235,11 +235,10 @@ class Release:
             self.update(status="skipped", reason=f"waiting for the existing v{floor} release owner")
             return None
         if floor and latest == f"v{floor}":
-            required = {f"Krill-{floor}.dmg", f"Krill-{floor}-windows-x64.zip", "latest.json", "latest-windows.json",
-                        f"krill-{floor}-linux-x86_64.tar.gz", f"krill-{floor}-linux-aarch64.tar.gz"}
+            required = {f"Krill-{floor}.dmg", f"Krill-{floor}-windows-x64.zip", "latest.json", "latest-windows.json"}
             available = {asset["name"] for asset in published_release.get("assets", [])}
             if not required.issubset(available):
-                self.update(status="skipped", reason=f"waiting for v{floor} macOS/Windows/Linux release assets")
+                self.update(status="skipped", reason=f"waiting for v{floor} macOS/Windows release assets")
                 return None
         pending_file = self.state_dir / "pending.json"
         pending = json.loads(pending_file.read_text()) if pending_file.exists() else {}
@@ -254,15 +253,14 @@ class Release:
                               "--head", published, "--repo", self.config["repo"],
                               "--public-key", self.state["public_key"], "--output", audit / "public-verification.json", timeout=1800)
             proof = json.loads((audit / "public-verification.json").read_text())
-            if proof.get("head") != published or len(proof.get("verified_assets", [])) != 16:
+            if proof.get("head") != published or len(proof.get("verified_assets", [])) != 11:
                 raise NightlyError("recovered publication readback does not match the complete candidate")
             write_json(audit / "public-verification.json", proof)
             self.update(status="published", tag=latest, publication=proof, readback_recovered=True)
             pending_file.unlink()
             return None
         if all(self.ancestor(sha, published) for sha in (remote, main)):
-            required = {f"Krill-{latest[1:]}.dmg", f"Krill-{latest[1:]}-windows-x64.zip", "latest.json", "latest-windows.json",
-                        f"krill-{latest[1:]}-linux-x86_64.tar.gz", f"krill-{latest[1:]}-linux-aarch64.tar.gz"}
+            required = {f"Krill-{latest[1:]}.dmg", f"Krill-{latest[1:]}-windows-x64.zip", "latest.json", "latest-windows.json"}
             if not required.issubset({asset["name"] for asset in published_release.get("assets", [])}):
                 raise NightlyError("latest release is incomplete; refusing a no-change success")
             self.update(status="skipped", reason="no committed changes since the last published release")
@@ -366,7 +364,7 @@ class Release:
         from nightly_assets import download_artifact, import_assets
         attempt = results["release.yml"]["attempt"]
         artifacts = []
-        for name in (f"krill-windows-{version}", f"krill-linux-{version}-x86_64", f"krill-linux-{version}-aarch64"):
+        for name in (f"krill-windows-{version}",):
             artifacts.append(download_artifact(self.config["repo"], build_id, attempt,
                              f"{name}-attempt-{attempt}", assets, sha))
         self.update(artifacts=artifacts)
@@ -391,7 +389,7 @@ class Release:
         self.run("/bin/bash", "packaging/publish-github.sh", "--repo", self.config["repo"],
                  "--verified-release", receipt, timeout=7200)
         verification = json.loads((self.root / "publications" / sha / "public-verification.json").read_text())
-        if verification.get("head") != sha or verification.get("tag") != f"v{version}" or len(verification.get("verified_assets", [])) != 16:
+        if verification.get("head") != sha or verification.get("tag") != f"v{version}" or len(verification.get("verified_assets", [])) != 11:
             raise NightlyError("publication readback is missing or does not match the complete candidate")
         self.update(publication=verification)
         (self.state_dir / "pending.json").unlink(missing_ok=True)

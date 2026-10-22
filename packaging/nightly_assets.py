@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""같은 후보 HEAD에서 빌드·스모크한 Windows/Linux 산출물만 게시 디렉터리로 가져온다."""
+"""같은 후보 HEAD에서 빌드·스모크한 Windows 산출물만 게시 디렉터리로 가져온다."""
 
 import argparse
 import hashlib
@@ -70,9 +70,8 @@ def import_assets(directory, output, version, commit, public_key):
         raise ValueError("invalid source commit")
     if not re.fullmatch(r"[0-9a-f]{64}", public_key):
         raise ValueError("invalid update public key")
-    archives = [f"Krill-{version}-windows-x64.zip"] + [
-        f"krill-{version}-linux-{arch}.tar.gz" for arch in ("x86_64", "aarch64")]
-    sources = [directory / f"source-commit-{platform}.txt" for platform in ("windows", "x86_64", "aarch64")]
+    archives = [f"Krill-{version}-windows-x64.zip"]
+    sources = [directory / f"source-commit-{platform}.txt" for platform in ("windows",)]
     for source in sources:
         if source.is_symlink() or source.read_text().strip() != commit:
             raise ValueError(f"{source.name} artifact source does not match {commit}")

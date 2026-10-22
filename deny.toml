@@ -1,6 +1,6 @@
 # cargo-deny 0.20.2에서 검증(docs/research/C1-final.md §3.4). 실행: cargo deny --locked check
 [graph]
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
+targets = ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"]
 all-features = false
 
 [advisories]

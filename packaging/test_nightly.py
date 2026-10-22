@@ -31,14 +31,10 @@ class AssetTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.assets, self.output = self.root / "assets", self.root / "out"
         self.assets.mkdir()
-        for platform in ("windows", "x86_64", "aarch64"):
+        for platform in ("windows",):
             (self.assets / f"source-commit-{platform}.txt").write_text(SHA + "\r\n")
         self.windows = self.assets / "Krill-0.1.2-windows-x64.zip"
         self.write_zip(PUB)
-        for arch in ("x86_64", "aarch64"):
-            archive = self.assets / f"krill-0.1.2-linux-{arch}.tar.gz"
-            archive.write_bytes(b"native-linux")
-            self.checksum(archive)
 
     def write_zip(self, key):
         with zipfile.ZipFile(self.windows, "w") as archive:
@@ -58,10 +54,11 @@ class AssetTests(unittest.TestCase):
         final = self.root / "publish"
         import_assets(self.output, final, "0.1.2", SHA, PUB)
         self.assertEqual((final / self.windows.name).read_bytes(), self.windows.read_bytes())
-        self.assertEqual(len(list(final.iterdir())), 9)
+        self.assertEqual(len(list(final.iterdir())), 3)
+        self.assertFalse(any("linux" in path.name for path in final.iterdir()))
 
     def test_wrong_head_does_not_copy_any_assets(self):
-        (self.assets / "source-commit-aarch64.txt").write_text(BASE)
+        (self.assets / "source-commit-windows.txt").write_text(BASE)
         with self.assertRaisesRegex(ValueError, "source does not match"):
             self.run_import()
         self.assertFalse(self.output.exists())
@@ -185,7 +182,7 @@ class PublicationTests(unittest.TestCase):
             return self.dirty
         if "packaging/publish-github.sh" in args:
             nightly.write_json(self.release.root / "publications" / SHA / "public-verification.json",
-                {"head": SHA, "tag": "v0.1.2", "verified_assets": [str(n) for n in range(16)]})
+                {"head": SHA, "tag": "v0.1.2", "verified_assets": [str(n) for n in range(11)]})
         return ""
 
     def fake_ci(self, _sha, branch, _workflows):
@@ -214,7 +211,7 @@ class PublicationTests(unittest.TestCase):
         self.assertLess(dispatch, validate)
         self.assertLess(validate, self.calls.index(("wait-ci", "release/nightly-test")))
         self.assertTrue(any(any(arg.startswith("--force-with-lease=") for arg in call) for call in self.calls if call[:1] == ("git",) and len(call) > 1))
-        self.assertEqual(self.downloader.call_count, 3)
+        self.assertEqual(self.downloader.call_count, 1)
         self.assertTrue(all(call.args[3].endswith("-attempt-2") for call in self.downloader.call_args_list))
 
     def test_resumed_failed_ci_is_restarted_once_without_failed_job_filter(self):
@@ -428,7 +425,7 @@ class RecoveryTests(unittest.TestCase):
                     if 'packaging/release_verify.py' in args:
                         if not valid: raise nightly.NightlyError('partial remote publication')
                         nightly.write_json(audit / 'public-verification.json', {'head': SHA, 'tag': 'v0.1.2',
-                                           'verified_assets': list(range(16))})
+                                           'verified_assets': list(range(11))})
                     return ''
                 release.run = run
                 if valid:

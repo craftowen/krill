@@ -32,7 +32,7 @@ class Fixture:
         if filename == "release.yml":
             self.jobs += [{"name": name, "run_id": identifier, "run_attempt": 2, "head_sha": SHA,
                            "status": "completed", "conclusion": "skipped"}
-                          for name in ("release", "publish-windows", "publish-linux")]
+                          for name in ("release", "publish-windows")]
         self.calls = []
 
     def read(self, endpoint, paginate=False):

@@ -33,11 +33,7 @@ def create_plan(directory, head, version, repository, key_file, all_platforms=Fa
         raise ValueError("expected exactly one macOS release zip")
     files = [directory / f"Krill-{version}.dmg", mac[0], Path(str(mac[0]) + ".sha256"),
              directory / f"Krill-{version}-source.tar.gz", directory / "homebrew-krill/SHA256SUMS",
-             directory / "latest.json", directory / "install.sh", directory / "install-linux.sh"]
-    for arch in ("x86_64", "aarch64"):
-        archive = directory / f"krill-{version}-linux-{arch}.tar.gz"
-        if all_platforms or archive.exists():
-            files.extend((archive, Path(str(archive) + ".sha256")))
+             directory / "latest.json", directory / "install.sh"]
     windows = directory / f"Krill-{version}-windows-x64.zip"
     if all_platforms or windows.exists():
         files.extend((windows, Path(str(windows) + ".sha256"), directory / "latest-windows.json", directory / "install.ps1"))

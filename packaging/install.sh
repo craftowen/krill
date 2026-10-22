@@ -52,6 +52,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$(uname -s)" == "Darwin" ]] || { echo "macOS only" >&2; exit 2; }
+[[ "$(uname -m)" == "arm64" ]] || { echo "Krill supports Apple Silicon Macs only" >&2; exit 2; }
 command -v shasum >/dev/null || { echo "shasum not found" >&2; exit 2; }
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/krill-install.XXXXXXXX")"
@@ -62,7 +63,7 @@ if [[ "${MODE}" == "release" ]]; then
     ARCH="$(uname -m)"
     case "${ARCH}" in
         arm64) ;;
-        x86_64) echo "release bundles are arm64 only; on Intel Macs install from source: --from-source --tag main" >&2; exit 2 ;;
+        x86_64) echo "Intel Macs are not supported" >&2; exit 2 ;;
         *) echo "unsupported architecture: ${ARCH}" >&2; exit 2 ;;
     esac
 

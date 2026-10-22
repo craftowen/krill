@@ -1,9 +1,4 @@
-# Krill CI — Linux 고속 게이트 (OWE-382, MK-017). 모든 PR에서 항상 실행.
-# fmt · clippy · nextest(Linux에서 빌드되는 데몬 쪽 크레이트) · cargo deny(macOS·Linux 대상) ·
-# 공개 표면 점검 · 서드파티 고지 최신 여부.
-# macOS 전체(clippy·nextest·PTY e2e)는 ci-macos.yml이 테스트 입력 변경 시만 실행한다
-# (macOS 분 절약, 2026-10-15 오웬 결정).
-# 로컬 재현은 scripts/check.sh.
+# Repository hygiene only. Product builds run on macOS ARM and Windows.
 name: ci
 
 on:
@@ -16,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-linux-${{ github.ref }}
+  group: ci-hygiene-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -24,7 +19,7 @@ env:
 
 jobs:
   reuse:
-    name: reuse-linux-ci
+    name: reuse-hygiene-ci
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -41,42 +36,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: python3 packaging/ci_evidence.py reuse --workflow ci.yml
 
-  linux:
-    name: linux
+  hygiene:
+    name: hygiene
     needs: reuse
     if: needs.reuse.outputs.reuse != 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
-
-      - name: PTY 테스트 의존성 (zsh)
-        # 로그인 rc·에이전트 실행·전경 프로세스 테스트가 /bin/zsh를 실제로 띄운다.
-        run: |
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y zsh
-
-      - name: Rust 1.98 + clippy
-        uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.98"
-          components: rustfmt, clippy
-
-      - name: nextest · cargo-deny
-        uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
-        with:
-          tool: cargo-nextest,cargo-deny
-
-      - name: Restore Rust dependencies
-        id: cache
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
-        with:
-          shared-key: ci-linux
-          cache-bin: 'false'
-          save-if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/nightly') }}
-
       - name: Release pipeline regressions
         run: |
           python3 packaging/test_ci_evidence.py
@@ -85,57 +54,12 @@ jobs:
           python3 packaging/test_nightly.py
           python3 packaging/test_publish.py
 
-      - name: fmt
-        run: cargo fmt --all --check
-
-      # krill-holder sys/linux.rs 등 Linux 전용 unsafe·cfg 코드는 macOS 잡이 컴파일하지 않는다(레드팀 P1-4).
-      - name: clippy (krill-proto·krill-term·krill-holder·krilld·krill)
-        run: cargo clippy -p krill-proto -p krill-term -p krill-holder -p krilld -p krill --all-targets --locked -- -D warnings
-        timeout-minutes: 30
-
-      - name: nextest (krill-proto·krill-term·krill-holder·krilld·krill)
-        run: cargo nextest run --profile ci -p krill-proto -p krill-term -p krill-holder -p krilld -p krill --locked --no-tests=pass --timings
-        timeout-minutes: 30
-
-      - name: doctest (krill-proto·krill-term)
-        run: cargo test -p krill-proto -p krill-term --doc --locked -q
-        timeout-minutes: 10
-
-      - name: cargo deny
-        # deny.toml [graph] 타깃은 apple-darwin이지만 검사는 메타데이터
-        # 해석이라 Linux에서도 동일하게 통과한다. macOS 잡(ci-macos.yml)은
-        # 중복 실행하지 않는다.
-        run: cargo deny --locked check --hide-inclusion-graph
-
-      - name: cargo deny (Linux 대상)
-        # Linux에서만 끌려오는 의존성의 advisories·licenses·sources를 본다. krill-app(gpui)은 Linux 빌드 대상이 아니다.
-        # cargo-deny 0.20.2의 --target은 한 번만 받으므로 대상별로 돌린다.
-        # bans는 빼는데, 타깃을 좁히면 macOS 전용 워크스페이스 의존성(objc2 등 13개)이 unused로 오탐되고 위 단계가 이미 본다.
-        run: |
-          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
-            cargo deny --locked --target "$t" --exclude krill-app check --hide-inclusion-graph advisories licenses sources
-          done
-
-      - name: 공개 표면 점검
-        run: scripts/public-surface.sh
-
-      - name: 서드파티 고지 최신 여부
-        run: python3 docs/licensing/generate_notices.py --check
-
-      - name: Preserve test and build evidence
-        if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: ci-linux-${{ github.sha }}-${{ github.run_attempt }}
-          path: |
-            target/nextest/ci/junit.xml
-            target/cargo-timings/
-          if-no-files-found: warn
-          retention-days: 14
+      - name: Public surface
+        run: bash scripts/public-surface.sh
 
   ci:
     name: ci
-    needs: [reuse, linux]
+    needs: [reuse, hygiene]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -143,7 +67,7 @@ jobs:
         env:
           PROOF: ${{ needs.reuse.result }}
           REUSED: ${{ needs.reuse.outputs.reuse }}
-          LINUX: ${{ needs.linux.result }}
+          HYGIENE: ${{ needs.hygiene.result }}
         run: |
           [ "$PROOF" = success ]
-          if [ "$REUSED" = true ]; then [ "$LINUX" = skipped ]; else [ "$LINUX" = success ]; fi
+          if [ "$REUSED" = true ]; then [ "$HYGIENE" = skipped ]; else [ "$HYGIENE" = success ]; fi

@@ -1,5 +1,8 @@
 # Krill 아키텍처 v1 (2026-10-14)
 
+> 2026-10-22 지원 정책: 출고·검증 대상은 Apple Silicon Mac(arm64)과 Windows x64다. Intel Mac·Linux의 제품 빌드 CI·패키징·설치 자산은 제거했다. 아래의 Linux 구현·측정 기록은 기존 호환 코드의 설명이며 현재 지원 플랫폼을 뜻하지 않는다.
+
+
 근거 문서: `docs/planning/T1-final.md`(기능·범위), `T2-final.md`(세션 데몬), `T3-final.md`(UI·터미널·IME), `T4-final.md`(에이전트·Git·운영). 각 결정 옆 `T2-D3` 같은 표기는 해당 보고서의 결정 번호다. 수치에 "추정"이 없으면 이 맥미니 실측이다.
 
 ## 1. 한 장 요약

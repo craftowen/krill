@@ -14,12 +14,11 @@ from urllib.parse import urlencode
 
 CANDIDATE_BRANCH = "release/nightly"
 CHECKS = {
-    "ci.yml": {"linux"},
-    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest · doctest (macos-14)",
-                     "clippy · nextest · doctest (macos-15-intel)"},
-    "release.yml": {"build-windows", "Linux x86_64", "Linux aarch64"},
+    "ci.yml": {"hygiene"},
+    "ci-macos.yml": {"changes", "ci-macos", "clippy · nextest · doctest (macos-14)"},
+    "release.yml": {"build-windows"},
 }
-REUSE_JOBS = {"ci.yml": "reuse-linux-ci", "ci-macos.yml": "reuse-macos-ci"}
+REUSE_JOBS = {"ci.yml": "reuse-hygiene-ci", "ci-macos.yml": "reuse-macos-ci"}
 
 
 class EvidenceError(RuntimeError):
@@ -129,7 +128,7 @@ class Evidence:
                  "attempt": run["run_attempt"], "mode": "full", "jobs": sorted(CHECKS[filename])}
         if full:
             if filename == "release.yml" and any(names.get(name, {}).get("conclusion") != "skipped"
-                                                   for name in ("release", "publish-windows", "publish-linux")):
+                                                   for name in ("release", "publish-windows")):
                 raise EvidenceError("native candidate build must not publish")
             return proof
         reuse_name = REUSE_JOBS.get(filename)
