@@ -1260,6 +1260,14 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
     use krill_proto::doctor::{Check, Fix, FixKind, Level, Status as DoctorStatus};
     use std::path::PathBuf;
 
+    // 오케스트레이션 스냅샷 폴이 실제 상태 디렉터리를 읽으면 실행 머신에 따라
+    // 툴팁 카운트가 바뀌므로(OWE-788 회귀 방지) 빈 임시 상태 디렉터리로 격리한다.
+    let state_dir = std::env::temp_dir().join(format!("popout-orch-{}", std::process::id()));
+    std::fs::remove_dir_all(&state_dir).ok();
+    std::fs::create_dir_all(&state_dir).unwrap();
+    cx.update(|cx| {
+        krill_app::settings::init_at(Some(state_dir.clone()), cx);
+    });
     let (shell, handle) = open(cx);
     cx.update(|cx| {
         krill_app::onboarding::store_snapshot(
@@ -1418,6 +1426,7 @@ fn status_bar_right_items_render_compact_icons_and_show_hover_tooltips(cx: &mut 
         vcx.debug_bounds("resources-popover").is_some(),
         "clicking resources-toggle opens resources popover"
     );
+    std::fs::remove_dir_all(&state_dir).ok();
 }
 
 /// OWE-851: 상태바 메뉴가 열려 있는 동안은 다른 버튼의 호버 툴팁을 숨겨 팝오버 글자를 가리지 않는다.

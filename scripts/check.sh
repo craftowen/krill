@@ -47,8 +47,8 @@ slot(){ local n=${KRILL_TEST_SLOTS:-$(( cores / 4 > 0 ? cores / 4 : 1 ))} k rc; 
 # 아래 필터는 .config/nextest.toml
 # latency override와 같은 집합이어야 한다(어긋나면 저지연 테스트가 고속 페이즈에서 부하를 맞아 flake 가능).
 step "test build";   run cargo nextest run --workspace --locked --no-tests=pass --no-run
-step "test fast";    slot cargo nextest run --workspace --locked --no-tests=pass -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
-step "test latency"; slot cargo nextest run --workspace --locked --no-tests=pass -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
+step "test fast";    slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'not (binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff))'
+step "test latency"; slot cargo nextest run --workspace --locked --no-tests=pass --no-fail-fast -E 'binary(survive) | binary(reconnect) | binary(wait) | binary(attach) | binary(holder) | test(survive) | test(/_ms$/) | test(within_budget) | test(krilld_kill) | test(exec_handoff)'
 step "doctest"; run cargo test --workspace --doc --locked -q
 # --memory: MK-066 메모리 게이트까지(nightly·선택). 병렬 부하에서 흔들려 기본 경로에는 넣지 않는다.
 if [[ ${1-} == --memory ]]; then step "memory"; run scripts/memory-gate.sh; fi
