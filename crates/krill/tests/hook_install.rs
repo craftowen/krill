@@ -397,6 +397,31 @@ fn codex_rpc_install_preview_remove_preserves_user_trust_and_config() {
     assert!(h.read("codex").starts_with("# user comment"));
 }
 
+/// Finder로 뜬 앱은 launchd PATH라 `codex`를 못 찾는다. 호출자가 준 PATH로 찾아야 한다.
+#[test]
+fn codex_rpc_uses_the_caller_supplied_search_path() {
+    use krill_proto::hook_install::{Action, Plan, TargetAgent};
+    use std::path::Path;
+    let h = Home::new();
+    h.write("codex", "# original\n");
+    let bin = h.fake_codex();
+    let receipt = Plan::prepare_with_path(
+        Action::Install,
+        TargetAgent::Other(Agent::Codex),
+        &h.config("codex"),
+        &h.0.join("state"),
+        Path::new(MK),
+        Some(bin.as_os_str()),
+    )
+    .unwrap()
+    .unwrap()
+    .apply()
+    .unwrap();
+    assert!(receipt.complete);
+    let installed: toml::Value = toml::from_str(&h.read("codex")).unwrap();
+    assert!(!installed["hooks"]["state"].as_table().unwrap().is_empty());
+}
+
 #[test]
 fn codex_trust_conflicts_are_rejected_and_user_modified_hash_is_preserved() {
     let h = Home::new();

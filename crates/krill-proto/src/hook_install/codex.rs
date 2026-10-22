@@ -2,6 +2,7 @@
 //! No hooks.json edits, auth copies, overlay homes, or bypass-hook-trust flags.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::io::{self, BufRead as _, BufReader, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -30,10 +31,10 @@ pub struct Plan {
 }
 
 impl Plan {
-    pub fn install(home: &Path, command: &str) -> io::Result<Self> {
+    pub fn install(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<Self> {
         let path = home.join("config.toml");
         let original = store::read(&path)?;
-        let mut rpc = Rpc::start(home, command)?;
+        let mut rpc = Rpc::start(home, command, search)?;
         let version = rpc.version(&path)?;
         // Match the bytes to the versioned snapshot before computing the patch.
         if store::read(&path)? != original {
@@ -107,13 +108,13 @@ impl Plan {
         })
     }
 
-    pub fn uninstall(record: &Record) -> io::Result<Self> {
+    pub fn uninstall(record: &Record, search: Option<&OsStr>) -> io::Result<Self> {
         let home = record
             .path
             .parent()
             .ok_or_else(|| error("missing Codex home"))?;
         let original = store::read(&record.path)?;
-        let mut rpc = Rpc::start(home, &record.command)?;
+        let mut rpc = Rpc::start(home, &record.command, search)?;
         let version = rpc.version(&record.path)?;
         if store::read(&record.path)? != original {
             return Err(error("Codex configuration changed during discovery"));
@@ -212,15 +213,26 @@ impl Drop for Rpc {
 }
 
 impl Rpc {
-    fn start(home: &Path, command: &str) -> io::Result<Self> {
-        let mut child = Command::new("codex")
+    fn start(home: &Path, command: &str, search: Option<&OsStr>) -> io::Result<Self> {
+        let mut codex = Command::new("codex");
+        if let Some(search) = search {
+            codex.env("PATH", search);
+        }
+        let mut child = codex
             .arg("app-server")
             .args(hooks::codex_args(command))
             .env("CODEX_HOME", home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .spawn()?;
+            .spawn()
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(e.kind(), "codex executable not found in PATH")
+                } else {
+                    e
+                }
+            })?;
         let stdin = child
             .stdin
             .take()

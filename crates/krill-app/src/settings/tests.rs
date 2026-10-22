@@ -8,6 +8,22 @@ use super::*;
 actions!(test, [Probe]);
 
 #[test]
+fn agent_status_hooks_default_on_and_fail_closed_on_unreadable_settings() {
+    let dir = std::env::temp_dir().join(format!("mk-agent-hooks-{}", std::process::id()));
+    fs::remove_dir_all(&dir).ok();
+    fs::create_dir_all(&dir).unwrap();
+    assert!(Settings::default().agent_status_hooks);
+    assert!(agent_status_hooks_enabled_at(&dir));
+    fs::write(dir.join(SETTINGS_FILE), "yolo_mode = false\n").unwrap();
+    assert!(agent_status_hooks_enabled_at(&dir));
+    fs::write(dir.join(SETTINGS_FILE), "agent_status_hooks = false\n").unwrap();
+    assert!(!agent_status_hooks_enabled_at(&dir));
+    fs::write(dir.join(SETTINGS_FILE), "agent_status_hooks = [").unwrap();
+    assert!(!agent_status_hooks_enabled_at(&dir));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn new_agent_sessions_default_to_yolo_unless_manual_is_explicit() {
     assert!(Settings::default().yolo_mode);
     assert!(toml::from_str::<Settings>("").unwrap().yolo_mode);

@@ -1167,6 +1167,8 @@ catalog! {
         YOLO_DESC => ("켜면(자동 승인) 에이전트가 파일 수정·명령 실행 전에 묻지 않고 바로 진행합니다. 빠르고 손이 덜 가지만 원치 않는 변경이 생길 수 있습니다. 끄면(매번 확인) 중요한 작업마다 확인을 요청합니다.", "When on (Auto-approve), agents edit files and run commands without asking. Faster but riskier. When off (Ask every time), they ask for approval on sensitive actions."),
         HIBERNATION_TITLE => ("유휴 세션 동면", "Idle hibernation"),
         HIBERNATION_DESC => ("오랫동안 안 쓴 백그라운드 세션을 메모리에서 내려 디스크에 보관해 메모리를 아낍니다. 다시 열면 화면 그대로 복원됩니다.", "Offloads long-idle background sessions from memory to disk to save RAM. Reopening restores the screen as it was."),
+        AGENT_HOOKS_TITLE => ("에이전트 상태 감지 훅", "Agent status hooks"),
+        AGENT_HOOKS_DESC => ("설치된 에이전트(Claude·Codex·OpenCode·Cursor·agy) 설정에 훅을 넣어 작업 중·입력 대기·완료 상태와 알림을 보여 줍니다. 끄면 Krill이 넣은 훅을 되돌립니다.", "Adds hooks to installed agents (Claude, Codex, OpenCode, Cursor, agy) so Krill can show working, waiting and done states and notify you. Turning it off removes the hooks Krill added."),
         PROFILES_COUNT => ("프로필 {count}개", "{count} profile(s)"),
         WEBHOOK_ADD_LOCAL => ("+ 로컬 웹훅 추가", "+ Add local webhook"),
         WEBHOOK_CLEAR => ("웹훅 비우기", "Clear webhooks"),
@@ -2188,6 +2190,11 @@ pub(crate) const SETTINGS_SEARCH_INDEX: &[(crate::settings::AdminTab, Message, &
         crate::settings::AdminTab::Agents,
         catalog::settings::AUTO_SETUP_ALL_TITLE,
         &["자동 설정", "원클릭", "auto setup", "one click"],
+    ),
+    (
+        crate::settings::AdminTab::Agents,
+        catalog::settings::AGENT_HOOKS_TITLE,
+        &["훅", "상태 감지", "hook", "status"],
     ),
     (
         crate::settings::AdminTab::RemoteKrill,

@@ -300,26 +300,38 @@ fn only_real_permission_denial_publishes_a_deduplicated_need(cx: &mut gpui::Test
     });
 }
 
-#[gpui::test]
-fn automatic_setup_only_stages_and_links_without_hooks_or_permissions(
-    cx: &mut gpui::TestAppContext,
-) {
+/// 로그인 셸 PATH에 `cursor-agent`만 보이는 픽스처. 돌려주는 값은 그 PATH다.
+fn with_cursor_on_login_path(root: &Path, env: &mut Env) -> std::ffi::OsString {
     use std::os::unix::fs::PermissionsExt as _;
-    let (root, mut env) = fixture("auto");
+    let agents = root.join("agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    let cursor = agents.join("cursor-agent");
+    std::fs::write(&cursor, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&cursor, std::fs::Permissions::from_mode(0o755)).unwrap();
     let shell = root.join("shell");
     std::fs::write(
         &shell,
         format!(
-            "#!/bin/sh\nprintf '__MK_PATH__=%s\\n' '{}'\n",
-            env.home.join(".local/bin").display()
+            "#!/bin/sh\nprintf '__MK_PATH__=%s:%s\\n' '{}' '{}'\n",
+            env.home.join(".local/bin").display(),
+            agents.display()
         ),
     )
     .unwrap();
     std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
     env.shell = shell.into_os_string();
+    std::env::join_paths([env.home.join(".local/bin"), agents]).unwrap()
+}
+
+#[gpui::test]
+fn automatic_setup_installs_hooks_only_for_agents_on_login_path(cx: &mut gpui::TestAppContext) {
+    let (root, mut env) = fixture("auto");
+    // 로그인 셸 PATH에 cursor-agent만 있다. 나머지 에이전트 훅은 건드리지 않아야 한다.
+    let path = with_cursor_on_login_path(&root, &mut env);
     let home = env.home.clone();
     let link = env.home.join(".local/bin/krill");
     let state = env.state.clone();
+    let kept = env.clone();
     let result = cx.update(|cx| {
         let task = auto_prepare(env, cx);
         collect_result(task, cx)
@@ -336,9 +348,49 @@ fn automatic_setup_only_stages_and_links_without_hooks_or_permissions(
         home.join(".gemini/config/skills/worktree-checkpoints/SKILL.md")
             .is_file()
     );
-    assert!(!state.join("hooks").exists());
+    assert!(state.join("hooks/cursor.json").is_file());
+    assert!(
+        std::fs::read_to_string(home.join(".cursor/hooks.json"))
+            .unwrap()
+            .contains("hook cursor")
+    );
+    assert!(!state.join("hooks/claude.json").exists());
+    assert!(!state.join("hooks/codex.json").exists());
+    assert!(!home.join(".gemini/config/hooks.json").exists());
     cx.update(|cx| assert!(cx.try_global::<FixNeeds>().is_none()));
     assert!(!cx.has_pending_prompt());
+
+    // 설정에서 끄면 Krill이 넣은 훅과 영수증을 되돌린다.
+    uninstall_default_hooks(&kept, &path);
+    assert!(!state.join("hooks/cursor.json").exists());
+    assert!(
+        !std::fs::read_to_string(home.join(".cursor/hooks.json"))
+            .unwrap_or_default()
+            .contains("hook cursor")
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[gpui::test]
+fn automatic_setup_skips_hooks_when_disabled_in_settings(cx: &mut gpui::TestAppContext) {
+    let (root, mut env) = fixture("auto-off");
+    with_cursor_on_login_path(&root, &mut env);
+    std::fs::create_dir_all(&env.state).unwrap();
+    std::fs::write(
+        env.state.join("settings.toml"),
+        "agent_status_hooks = false\n",
+    )
+    .unwrap();
+    let home = env.home.clone();
+    let state = env.state.clone();
+    let result = cx.update(|cx| {
+        let task = auto_prepare(env, cx);
+        collect_result(task, cx)
+    });
+    cx.run_until_parked();
+    assert_eq!(*result.borrow(), Some(Ok(())));
+    assert!(!state.join("hooks").exists());
+    assert!(!home.join(".cursor/hooks.json").exists());
     std::fs::remove_dir_all(root).unwrap();
 }
 
