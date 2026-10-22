@@ -375,7 +375,7 @@ pub fn remove_device(state_dir: &Path, target: &str) -> Result<AllowedDevice, Er
 // 2. 원격 호스트 목록 (`link/hosts.toml`)
 // ============================================================================
 
-/// 클라이언트가 짝지은 원격 서버 호스트 한 건 (`link/hosts.toml`).
+/// 클라이언트가 페어링한 원격 서버 호스트 한 건 (`link/hosts.toml`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RemoteHost {
     /// 호스트 ID (`run/hosts/<id>.sock` 파일명에 사용).
@@ -390,7 +390,7 @@ pub struct RemoteHost {
     /// 서버 직접 IP 주소(`ip:port`) 힌트 목록.
     #[serde(default)]
     pub addr_hints: Vec<String>,
-    /// 짝짓기 시각 (Unix epoch 초).
+    /// 페어링 시각 (Unix epoch 초).
     #[serde(default)]
     pub added_at: u64,
 }

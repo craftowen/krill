@@ -40,7 +40,7 @@ impl Fixture {
         let state = dir.join("state");
         fs::create_dir_all(&repo).unwrap();
         fs::write(
-            repo.join("minikrill.toml"),
+            repo.join("krill.toml"),
             "[worktree]\ninclude = ['.env']\nsetup = 'printf one > setup-result'\n",
         )
         .unwrap();
@@ -193,7 +193,7 @@ fn cli_new_worktree_starts_session_in_the_created_path() {
     assert_eq!(untrusted.status.code(), Some(1), "{untrusted:?}");
     assert!(String::from_utf8_lossy(&untrusted.stderr).contains("setup approval required"));
     assert!(!f.dir.join("worktrees").exists());
-    fs::write(f.repo.join("minikrill.toml"), "[worktree]\n").unwrap();
+    fs::write(f.repo.join("krill.toml"), "[worktree]\n").unwrap();
     fs::write(
         f.state.join("agents.toml"),
         "[agent.cwd_probe]\nname = 'Cwd probe'\nlaunch = ['/bin/pwd', '-P']\n",
@@ -265,7 +265,7 @@ fn cli_creates_and_rechecks_setup_then_runs_in_a_session() {
     let known = output_path(&f.krill(&["trusted"]));
     setup_result(&known, "one");
     fs::write(
-        f.repo.join("minikrill.toml"),
+        f.repo.join("krill.toml"),
         "[worktree]\nsetup = 'printf two > setup-result'\n",
     )
     .unwrap();
@@ -296,7 +296,7 @@ fn cli_creates_and_rechecks_setup_then_runs_in_a_session() {
         )
         .unwrap();
     drop(detached);
-    let completed = f.dir.join("worktrees/레포/disconnected/minikrill.toml");
+    let completed = f.dir.join("worktrees/레포/disconnected/krill.toml");
     let deadline = Instant::now() + Duration::from_secs(5);
     while !completed.is_file() {
         assert!(
@@ -599,7 +599,7 @@ fn cli_changes_queries_daemon_and_preserves_feature_gate() {
 #[test]
 fn orca_repository_copies_env_and_automatically_runs_trusted_setup_with_aliases() {
     let f = Fixture::new("orca-compat");
-    fs::remove_file(f.repo.join("minikrill.toml")).unwrap();
+    fs::remove_file(f.repo.join("krill.toml")).unwrap();
     fs::write(f.repo.join(".worktreeinclude"), "# local secrets\n.env\n").unwrap();
     fs::write(
         f.repo.join("orca.yaml"),

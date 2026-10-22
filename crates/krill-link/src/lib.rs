@@ -44,10 +44,9 @@ pub use launchd::{
     launch_agent_plist_path, link_label, link_plist,
 };
 pub use pair::{
-    DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_FAILURES, DEFAULT_RATE_WINDOW, InviteOutput,
-    LEGACY_PAIR_URI_PREFIX, PAIR_URI_PREFIX, PairLink, PairRateLimiter, PairWireRequest,
-    PairWireResponse, create_invite_command, decode_addr_ticket, encode_addr_ticket,
-    generate_invite_for_addr, pair_with_server,
+    DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_FAILURES, DEFAULT_RATE_WINDOW, InviteOutput, PAIR_URI_PREFIX,
+    PairLink, PairRateLimiter, PairWireRequest, PairWireResponse, create_invite_command,
+    decode_addr_ticket, encode_addr_ticket, generate_invite_for_addr, pair_with_server,
 };
 pub use qr::{QrMatrix, encode_qr, render_qr_unicode};
 pub use serve::{
@@ -62,11 +61,11 @@ pub use store::{
     verify_and_consume_invite,
 };
 
-/// 데이터 터널 ALPN 식별자 (`b"minikrill/link/2"`).
-pub const ALPN_LINK: &[u8] = b"minikrill/link/2";
+/// 데이터 터널 ALPN 식별자 (`b"krill/link/2"`).
+pub const ALPN_LINK: &[u8] = b"krill/link/2";
 
-/// 기기 짝짓기 ALPN 식별자 (`b"minikrill/pair/1"`).
-pub const ALPN_PAIR: &[u8] = b"minikrill/pair/1";
+/// 기기 페어링 ALPN 식별자 (`b"krill/pair/1"`).
+pub const ALPN_PAIR: &[u8] = b"krill/pair/1";
 
 /// Legacy v1 preamble (v2 rejects the old ALPN instead of silently losing resume).
 pub const STREAM_INIT_BYTE: u8 = 0x00;
@@ -77,7 +76,7 @@ pub const STREAM_READY_BYTE: u8 = 0x00;
 /// Legacy v1 upstream error response.
 pub const STREAM_ERR_UPSTREAM: u8 = 0x01;
 
-/// 상태 디렉터리를 결정한다 (`override_dir` → `KRILL_STATE_DIR` → `~/Library/Application Support/dev.krill.app`(이관 전이면 옛 `dev.minikrill.app`)).
+/// 상태 디렉터리를 결정한다 (`override_dir` → `KRILL_STATE_DIR` → `~/Library/Application Support/dev.krill.app`).
 pub fn resolve_state_dir(override_dir: Option<&Path>) -> Result<PathBuf, Error> {
     if let Some(d) = override_dir {
         return Ok(d.to_path_buf());

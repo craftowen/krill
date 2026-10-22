@@ -11,9 +11,9 @@
  function bootstrap(){
   const match=/^\/m\/([0-9a-f]{16})\/$/.exec(location.pathname),fixed=!!match,hash=match?.[1];
   const parameters=new URLSearchParams(location.search),fragment=new URLSearchParams(location.hash.slice(1)),ticket=fragment.get('pair'),secret=fragment.get('key');
-  const STORE='krill-mobile-v2',LEGACY_STORE='minikrill-mobile-v2',HOSTS='krill-mobile-hosts-v1',REMOVED='krill-mobile-removed-v1:';
+  const STORE='krill-mobile-v2',HOSTS='krill-mobile-hosts-v1',REMOVED='krill-mobile-removed-v1:';
   const removalKey=host=>REMOVED+C.hex(C.sha256(C.enc.encode(JSON.stringify([host.id,host.device_id,host.credential])))),removed=host=>{try{return !!host&&localStorage.getItem(removalKey(host))==='1';}catch{return false;}},validHost=h=>typeof h?.id==='string'&&typeof h.device_id==='string'&&typeof h.credential==='string';
-  let saved,book;try{const current=localStorage.getItem(STORE),legacy=current===null?localStorage.getItem(LEGACY_STORE):null;saved=JSON.parse(current||legacy||'null');if(legacy!==null&&saved){try{localStorage.setItem(STORE,legacy);if(localStorage.getItem(STORE)===legacy)localStorage.removeItem(LEGACY_STORE);}catch{}}}catch{saved=null;}
+  let saved,book;try{saved=JSON.parse(localStorage.getItem(STORE)||'null');}catch{saved=null;}
   try{book=JSON.parse(localStorage.getItem(HOSTS)||'null');}catch{}const hosts=Array.isArray(book?.hosts)?book.hosts.filter(h=>validHost(h)&&!removed(h)):[];
   let active=hosts.find(h=>h.id===book?.active)||hosts[0]||null;if(Array.isArray(book?.hosts))saved=active;
   // Home Screen relaunches reuse the saved device, even though the start URL contains a spent ticket.

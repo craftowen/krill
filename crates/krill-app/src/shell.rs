@@ -563,7 +563,7 @@ pub struct Shell {
     )>,
     /// OWE-903 온보딩 모달(메인 창 안 `ui::modal_backdrop`).
     onboarding: Option<overlays::OnboardingModal>,
-    /// OWE-903 짝짓기 모달(메인 창 안 `ui::modal_backdrop`).
+    /// OWE-903 페어링 모달(메인 창 안 `ui::modal_backdrop`).
     /// OWE-903 렌더에서 지연 생성할 모달 요청.
     pending: overlays::PendingOverlays,
     /// 인앱 에이전트 대시보드 모달.
@@ -5304,7 +5304,18 @@ impl Shell {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, e: &gpui::MouseUpEvent, _, cx| {
+                    // 끌지 않은 맨 클릭이 평문 URL 위면 브라우저로 연다(⌘ 없이도).
+                    let clicked = !e.modifiers.modified()
+                        && this.live.get(&id).is_some_and(|l| {
+                            l.selecting
+                                && l.selecting_kind == SelectKind::Char
+                                && l.selection.is_some_and(|s| s.anchor == s.head)
+                        });
                     if this.select_end(id, cx) {
+                        if clicked && let Some((_, uri)) = this.plain_url_at(id, e.position) {
+                            cx.open_url(&uri);
+                            return;
+                        }
                         // 선택 시 복사(OWE-658): 남은 선택이 있으면 ⌘C와 같은 경로로 복사한다.
                         if krill_app::settings::copy_on_select(cx) {
                             this.copy(cx);
@@ -5483,7 +5494,7 @@ impl Render for Shell {
         );
         self.window = Some(window.window_handle());
         self.sync_notifications(window, cx);
-        // OWE-903: 라이브러리에서 들어온 온보딩·짝짓기 모달 요청을 엔티티로 만든다.
+        // OWE-903: 라이브러리에서 들어온 온보딩·페어링 모달 요청을 엔티티로 만든다.
         self.open_pending_overlays(window, cx);
         // OWE-855: 인앱 설정(SettingsView::render)이 메인 창 제목을 "설정"으로 덮은 뒤,
         // 복귀·워크트리 전환 시에도 복원되지 않는다. 메인 창은 렌더마다 제목을 고정해
@@ -6066,7 +6077,7 @@ impl Render for Shell {
                     .as_ref()
                     .map(|(dialog, _)| dialog.clone()),
             )
-            // OWE-903: 온보딩·짝짓기는 메인 창 안 모달로 그린다(별도 OS 창 없음).
+            // OWE-903: 온보딩·페어링은 메인 창 안 모달로 그린다(별도 OS 창 없음).
             .children(self.onboarding.as_ref().map(|modal| modal.view.clone()))
             .children(self.dashboard.clone())
             .children(self.quick_open_palette())

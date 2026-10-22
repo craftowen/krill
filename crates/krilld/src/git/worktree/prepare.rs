@@ -75,12 +75,7 @@ impl Pool {
         limit: u64,
     ) -> Result<Arc<Self>, String> {
         fs::create_dir_all(root).map_err(|e| e.to_string())?;
-        let legacy = root.join(".minikrill-preparing");
-        let dir = if legacy.exists() {
-            legacy
-        } else {
-            root.join(DIRECTORY)
-        };
+        let dir = root.join(DIRECTORY);
         match fs::DirBuilder::new().mode(0o700).create(&dir) {
             Ok(()) => {}
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
@@ -591,10 +586,7 @@ pub(super) fn existing() -> Option<&'static Pool> {
 
 pub(super) fn recover() -> Result<(), String> {
     let root = root()?;
-    if [DIRECTORY, ".minikrill-preparing"]
-        .iter()
-        .any(|name| root.join(name).join(MARKER).exists())
-    {
+    if root.join(DIRECTORY).join(MARKER).exists() {
         global()?;
     }
     Ok(())

@@ -23,7 +23,7 @@ use crate::remote::Target;
 const USAGE: &str = "usage: krill worktree new <name> [--host <user@host>] [--repo <path>] [--parent <path>] [--base <ref>] [--setup run|skip] [--trust-setup <hash>]\n       krill worktree rm <path> [--host <user@host>] [--repo <path>] [--force] [--trust-archive <hash>]\n       krill worktree list [--repo <path>] [--json]\n       krill worktree show [<path>] [--json]\n       krill worktree current [--json]\n       krill worktree ps [--worktree <path>] [--json]\n       krill worktree cleanup [--repo <path>] [--pr merged|closed|merged-or-closed|any] [--merged] [--closed] [--idle-days <7|14|30|N>] [--exclude-dirty|--include-dirty|--force] [--dry-run] [--yes] [--json]\n       krill worktree space [--repo <path>] [--json]\n       krill worktree set [--comment <text>] [--workspace-status <todo|in-progress|in-review|completed|none>] [--unread|--read] [--pr <number>] [--issue <key>] [--reference <url>] [--parent <path>|--clear-parent] [--worktree <path>] [--session <id>] [--json]\n       krill worktree symlink <list|add|rm> [<path>] [--repo <path>] [--json]\n       krill worktree hooks [--repo <path>] [--setup <cmd>] [--archive <cmd>] [--clear-setup] [--clear-archive] [--trust <hash>] [--json]";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ParsedNew {
+pub(super) struct ParsedNew {
     req: NewWorktree,
     parent: Option<PathBuf>,
 }
@@ -94,23 +94,9 @@ pub fn run(raw_args: &[OsString]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let parent = parsed.parent;
-    match create_on_target(&target, parsed.req) {
+    match create_new_on_target(&target, parsed) {
         Ok(w) => {
             let created_path = PathBuf::from(OsStr::from_bytes(&w.path));
-            if !target.is_remote()
-                && let Some(parent_path) = parent
-                && let Some(state_dir) = daemon::state_dir()
-                && let Err(e) =
-                    krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
-                        store.set_parent(
-                            &created_path.to_string_lossy(),
-                            Some(&parent_path.to_string_lossy()),
-                        )
-                    })
-            {
-                eprintln!("warning: could not record parent worktree: {e}");
-            }
             println!("{}", created_path.display());
             println!("branch {} (base {})", w.branch, w.base);
             if let Some(id) = w.setup {
@@ -123,6 +109,41 @@ pub fn run(raw_args: &[OsString]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// CLI와 worker-start가 같은 생성·부모 기록 경로를 사용한다.
+pub(super) fn create_new_on_target(target: &Target, parsed: ParsedNew) -> Result<Worktree, String> {
+    let w = create_on_target(target, parsed.req)?;
+    let created_path = PathBuf::from(OsStr::from_bytes(&w.path));
+    if !target.is_remote()
+        && let Some(parent_path) = parsed.parent
+        && let Some(state_dir) = daemon::state_dir()
+        && let Err(e) = krill_proto::orchestration::WorktreeStore::mutate(&state_dir, |store| {
+            store.set_parent(
+                &created_path.to_string_lossy(),
+                Some(&parent_path.to_string_lossy()),
+            )
+        })
+    {
+        eprintln!("warning: could not record parent worktree: {e}");
+    }
+    Ok(w)
+}
+
+pub(super) fn parse_new_child(
+    parent: &std::path::Path,
+    name: &str,
+    options: &[OsString],
+) -> Result<ParsedNew, String> {
+    let mut args = vec![
+        OsString::from("new"),
+        OsString::from("--name"),
+        OsString::from(name),
+        OsString::from("--parent"),
+        parent.as_os_str().to_owned(),
+    ];
+    args.extend_from_slice(options);
+    parse_with_remote(&args, false)
 }
 
 #[cfg(test)]
@@ -222,6 +243,8 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
         }
         None => None,
     };
+    // --repo가 부모와 다른 저장소일 수 있으므로 부모 브랜치 기본값은 --repo가 없을 때만 쓴다.
+    let explicit_repo = repo.is_some();
     let repo = repo
         .or_else(|| resolved_parent.clone())
         .map_or_else(std::env::current_dir, Ok)
@@ -229,6 +252,12 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
     // 데몬의 cwd와 다르므로 요청 전에 절대 경로로 고정한다.
     let repo =
         std::fs::canonicalize(repo).map_err(|e| format!("cannot resolve repository: {e}"))?;
+    let base = base.or_else(|| {
+        resolved_parent
+            .as_deref()
+            .filter(|_| !explicit_repo)
+            .and_then(parent_branch)
+    });
     Ok(ParsedNew {
         req: NewWorktree {
             repo: repo.as_os_str().as_bytes().to_vec(),
@@ -238,6 +267,22 @@ fn parse_with_remote(args: &[OsString], remote: bool) -> Result<ParsedNew, Strin
         },
         parent: resolved_parent,
     })
+}
+
+/// 명시한 기준 ref가 없을 때만 부모의 현재 브랜치를 쓴다. detached HEAD·조회 실패는 데몬 기본값으로 폴백한다.
+fn parent_branch(parent: &std::path::Path) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(parent)
+        .args(["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let branch = String::from_utf8(output.stdout).ok()?;
+    let branch = branch.trim();
+    (!branch.is_empty()).then(|| branch.to_owned())
 }
 
 fn utf8(s: &OsStr) -> Result<&str, String> {
@@ -897,6 +942,115 @@ mod tests {
         assert_eq!(parsed.req.repo, canon_parent.as_os_str().as_bytes());
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parent_branch_is_default_but_explicit_base_and_detached_head_are_preserved() {
+        let dir = std::env::temp_dir().join(format!("krill-parent-base-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-b", "parent-feature"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "initial",
+        ]);
+        let mut args = vec![
+            OsString::from("new"),
+            OsString::from("child"),
+            OsString::from("--parent"),
+            dir.join("nested").into_os_string(),
+        ];
+        let parsed = parse(&args).unwrap();
+        assert_eq!(parsed.req.base.as_deref(), Some("parent-feature"));
+        assert_eq!(parsed.parent, Some(std::fs::canonicalize(&dir).unwrap()));
+        args.extend([OsString::from("--base"), OsString::from("HEAD~0")]);
+        assert_eq!(parse(&args).unwrap().req.base.as_deref(), Some("HEAD~0"));
+        args.truncate(4);
+        // --repo를 명시하면 다른 저장소일 수 있어 부모 브랜치를 기준으로 쓰지 않는다.
+        let mut with_repo = args.clone();
+        with_repo.extend([OsString::from("--repo"), dir.clone().into_os_string()]);
+        assert_eq!(parse(&with_repo).unwrap().req.base, None);
+        git(&["checkout", "--detach"]);
+        assert_eq!(parse(&args).unwrap().req.base, None);
+        assert_eq!(parent_branch(&dir.join("missing")), None);
+        let without_parent = parse(&[
+            OsString::from("new"),
+            OsString::from("top-level"),
+            OsString::from("--repo"),
+            dir.clone().into_os_string(),
+        ])
+        .unwrap();
+        assert_eq!(without_parent.req.base, None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn worker_child_uses_worktree_new_parser_and_setup_approval() {
+        let dir = std::env::temp_dir().join(format!("krill-child-parse-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("nested")).unwrap();
+        let parent = dir.join("nested");
+        let hash = "a".repeat(64);
+        let options = [
+            "--base",
+            "feature",
+            "--setup",
+            "run",
+            "--trust-setup",
+            &hash,
+        ]
+        .map(OsString::from);
+        let child = parse_new_child(&parent, "child", &options).unwrap();
+        let mut command = vec![
+            OsString::from("new"),
+            OsString::from("child"),
+            OsString::from("--parent"),
+            parent.into_os_string(),
+        ];
+        command.extend_from_slice(&options);
+        assert_eq!(child, parse(&command).unwrap());
+        assert_eq!(child.parent, Some(std::fs::canonicalize(&dir).unwrap()));
+        assert_eq!(child.req.base.as_deref(), Some("feature"));
+        assert_eq!(child.req.setup, Setup::Approve(vec![0xaa; 32]));
+        assert_eq!(
+            parse_new_child(
+                &dir,
+                "child",
+                &[OsString::from("--setup"), OsString::from("skip")]
+            )
+            .unwrap()
+            .req
+            .setup,
+            Setup::Skip
+        );
+        assert!(
+            parse_new_child(
+                &dir,
+                "child",
+                &[OsString::from("--trust-setup"), OsString::from("bad")]
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

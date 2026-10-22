@@ -287,7 +287,7 @@ fn client_dialog_clipboard_prefill_nearby_and_all_pair_outcomes(cx: &mut TestApp
     });
     assert!(vcx.debug_bounds("link-clipboard-suggestion").is_none());
 
-    // 3. 연결 클릭 → 짝짓기 성공(Paired).
+    // 3. 연결 클릭 → 페어링 성공(Paired).
     click(vcx, "link-client-connect-btn");
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
@@ -485,17 +485,17 @@ fn real_qr_reports_encoding_failure_and_pair_errors_are_specific() {
     );
 }
 
-/// OWE-669: 새 `krill://` 링크와 이미 나간 옛 `minikrill://` 링크를 모두 받고, 접두어만 있는 값은 거절한다.
+/// OWE-669: `krill://` 링크를 받고, 접두어만 있는 값은 거절한다.
 #[test]
-fn invite_link_accepts_new_and_legacy_schemes() {
+fn invite_link_accepts_krill_scheme() {
     assert!(is_valid_invite_link("krill://pair?t=00&k=11"));
-    assert!(is_valid_invite_link("  minikrill://pair?t=00&k=11\n"));
+    assert!(is_valid_invite_link("  krill://pair?t=00&k=11\n"));
     assert!(!is_valid_invite_link("krill://pair?"));
     assert!(!is_valid_invite_link("krill://pairing"));
     assert!(!is_valid_invite_link("https://krill.example/pair?t=00"));
     assert_eq!(
-        extract_clipboard_invite(" minikrill://pair?t=00&k=11 ").as_deref(),
-        Some("minikrill://pair?t=00&k=11")
+        extract_clipboard_invite(" krill://pair?t=00&k=11 ").as_deref(),
+        Some("krill://pair?t=00&k=11")
     );
 }
 
@@ -521,7 +521,7 @@ fn paste_fills_link_without_auto_submit(cx: &mut TestAppContext) {
         assert_eq!(d.link_value(cx), "krill://pair?invite=paste-no-submit");
         assert_eq!(d.phase(), &ClientPhase::Idle);
     });
-    // 사용자가 [연결]을 눌러야 짝짓기가 시작된다.
+    // 사용자가 [연결]을 눌러야 페어링이 시작된다.
     click(vcx, "link-client-connect-btn");
     vcx.update(|window, cx| {
         window.draw(cx).clear(cx);
@@ -641,7 +641,7 @@ fn pairing_page_renders_panels_without_modal(cx: &mut TestAppContext) {
     assert!(vcx.debug_bounds("link-client-input-link").is_some());
 }
 
-/// OWE-903: 짝짓기 진입점은 호스트에 위임하고, 호스트가 없으면 조용히 무시한다(별도 창 없음).
+/// OWE-903: 페어링 진입점은 호스트에 위임하고, 호스트가 없으면 조용히 무시한다(별도 창 없음).
 #[gpui::test]
 fn open_pairing_dispatches_to_registered_host(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
@@ -712,10 +712,60 @@ fn remote_macs_disconnect_with_confirmation_without_inbound_devices(cx: &mut Tes
     assert!(backend.devices().unwrap().is_empty());
     assert!(vcx.debug_bounds("link-remote-host-studio").is_none());
     // 오래된 조회 완료나 다음 주기 갱신이 삭제한 행을 되살리지 않는다.
+
+    krill_link::save_hosts(&dir, &[]).unwrap();
     vcx.executor()
         .advance_clock(std::time::Duration::from_secs(3));
     vcx.run_until_parked();
     assert!(vcx.debug_bounds("link-remote-host-studio").is_none());
+    std::fs::remove_dir_all(dir).ok();
+}
+
+#[gpui::test]
+fn remote_macs_rename_from_the_list(cx: &mut TestAppContext) {
+    use super::real::RealLinkBackend;
+    cx.update(gpui_component::init);
+    let dir = std::env::temp_dir().join(format!("krill-remote-rename-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).unwrap();
+    let host = krill_link::RemoteHost {
+        id: "studio".into(),
+        name: "Studio Mac".into(),
+        node_id: "aa".repeat(32),
+        relay_url: None,
+        addr_hints: Vec::new(),
+        added_at: 1000,
+    };
+    krill_link::save_hosts(&dir, &[host]).unwrap();
+    let backend = Arc::new(RealLinkBackend::new(
+        dir.clone(),
+        std::path::PathBuf::from("unused-link"),
+    ));
+    assert!(backend.devices().unwrap().is_empty());
+    assert_eq!(backend.remote_hosts().unwrap()[0].name, "Studio Mac");
+    let (panel, vcx) = cx.add_window_view(|_, cx| ServerPanel::new(backend.clone(), cx));
+    vcx.simulate_resize(size(px(1000.), px(1600.)));
+    vcx.run_until_parked();
+    assert!(vcx.debug_bounds("link-remote-host-studio").is_some());
+    // 목록에서 바로 이름을 바꾼다: Escape는 취소, [저장]은 이 Mac의 hosts.toml에 반영.
+    click(vcx, "link-remote-rename-studio");
+    vcx.update(|_, cx| assert_eq!(panel.read(cx).renaming_host(), Some("studio")));
+    vcx.simulate_keystrokes("escape");
+    vcx.run_until_parked();
+    vcx.update(|_, cx| assert_eq!(panel.read(cx).renaming_host(), None));
+
+    click(vcx, "link-remote-rename-studio");
+    vcx.update(|window, cx| {
+        let input = panel.read(cx).renaming.as_ref().unwrap().input.clone();
+        input.update(cx, |input, cx| input.set_value("세무사무소", window, cx));
+    });
+    click(vcx, "link-remote-rename-save");
+    vcx.update(|_, cx| {
+        let panel = panel.read(cx);
+        assert_eq!(panel.renaming_host(), None);
+        assert_eq!(panel.remote_hosts[0].name, "세무사무소");
+    });
+    assert_eq!(krill_link::load_hosts(&dir).unwrap()[0].name, "세무사무소");
     std::fs::remove_dir_all(dir).ok();
 }
 

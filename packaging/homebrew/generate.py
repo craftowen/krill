@@ -64,11 +64,6 @@ cask "krill" do
     "~/Library/Logs/Krill",
     "~/Library/Preferences/dev.krill.app.plist",
     "~/Library/Saved Application State/dev.krill.app.savedState",
-    "~/Library/Application Support/dev.minikrill.app",
-    "~/Library/Caches/dev.minikrill.app",
-    "~/Library/Logs/Minikrill",
-    "~/Library/Preferences/dev.minikrill.app.plist",
-    "~/Library/Saved Application State/dev.minikrill.app.savedState",
   ]
 
   caveats <<~EOS

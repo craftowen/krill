@@ -214,9 +214,8 @@ impl RemoteInfo {
 /// `krill-os`·`krill-arch`·`krill-home`·`krill-version`·`krill-sock` 라벨 행만 출력한다.
 pub fn probe_command() -> String {
     format!(
-        "/bin/sh -c 'printf \"krill-os=%s\\n\" \"$(uname -s)\"; printf \"krill-arch=%s\\n\" \"$(uname -m)\"; printf \"krill-home=%s\\n\" \"$HOME\"; if [ -f \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" ]; then printf \"krill-version=%s\\n\" \"$(cat \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" 2>/dev/null)\"; elif command -v krill >/dev/null 2>&1; then printf \"krill-version=%s\\n\" \"unmanaged\"; else printf \"krill-version=%s\\n\" \"missing\"; fi; for b in {} {}; do if [ -S \"$HOME/Library/Application Support/$b/run/krilld.sock\" ]; then printf \"krill-sock=%s\\n\" \"$b\"; break; fi; done'",
-        daemon::BUNDLE_ID,
-        daemon::LEGACY_BUNDLE_ID
+        "/bin/sh -c 'printf \"krill-os=%s\\n\" \"$(uname -s)\"; printf \"krill-arch=%s\\n\" \"$(uname -m)\"; printf \"krill-home=%s\\n\" \"$HOME\"; if [ -f \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" ]; then printf \"krill-version=%s\\n\" \"$(cat \"$HOME/{REMOTE_BIN_DIR}/{REMOTE_VERSION_FILE}\" 2>/dev/null)\"; elif command -v krill >/dev/null 2>&1; then printf \"krill-version=%s\\n\" \"unmanaged\"; else printf \"krill-version=%s\\n\" \"missing\"; fi; b={}; if [ -S \"$HOME/Library/Application Support/$b/run/krilld.sock\" ]; then printf \"krill-sock=%s\\n\" \"$b\"; fi'",
+        daemon::BUNDLE_ID
     )
 }
 
@@ -275,7 +274,7 @@ pub fn parse_probe(output: &str) -> io::Result<RemoteInfo> {
     };
     let socket_bundle = sock
         .map(|s| s.trim().to_owned())
-        .filter(|s| *s == daemon::BUNDLE_ID || *s == daemon::LEGACY_BUNDLE_ID);
+        .filter(|s| *s == daemon::BUNDLE_ID);
     Ok(RemoteInfo {
         platform: RemotePlatform {
             os: parse_os(&os_raw),

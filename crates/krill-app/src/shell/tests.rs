@@ -5437,6 +5437,15 @@ fn status_provider_usage_menu_renders_orca_progress_bars_and_opens_in_app_accoun
         );
     }
 
+    // Orca처럼 팝업은 하단바 위로 열리고 바를 덮지 않는다.
+    let bar = cx.debug_bounds("status-bar").unwrap();
+    let card = cx.debug_bounds("status-provider-card-claude").unwrap();
+    let last = cx.debug_bounds("status-provider-open-accounts").unwrap();
+    assert!(
+        card.top() >= px(0.) && last.bottom() <= bar.top(),
+        "provider popover must sit above the status bar: {card:?} {last:?} vs {bar:?}"
+    );
+
     // host_default must be sorted above other accounts.
     let host_row = cx
         .debug_bounds("status-provider-account-claude-host_default")
@@ -5743,24 +5752,37 @@ fn default_tab_can_be_closed_leaving_zero_tabs(cx: &mut TestAppContext) {
     assert!(layout_of(&view, cx).tabs().is_empty());
 }
 
-/// 사이드바 상단 네비게이션은 실제로 구현된 '에이전트 대시보드'만 표시하고,
-/// 아직 없는 기능(작업·아티팩트·스킬·자동화·모바일)은 표기하지 않는다.
+/// 사이드바 상단 네비게이션은 실제로 구현된 '에이전트 대시보드'와 그 아래 '아티팩트'만 표시하고,
+/// 아직 없는 기능(작업·스킬·자동화·모바일)은 표기하지 않는다. 아티팩트를 누르면 설정 > 아티팩트가 열린다.
 #[gpui::test]
 fn sidebar_nav_shows_only_implemented_agent_dashboard(cx: &mut TestAppContext) {
-    let (_view, cx) = open(cx, state_path("sidebar-nav-items"));
+    let (view, cx) = open(cx, state_path("sidebar-nav-items"));
     cx.run_until_parked();
 
+    let dashboard = cx
+        .debug_bounds("nav-agent-dashboard")
+        .expect("implemented Agent Dashboard nav item must be rendered");
+    let artifacts = cx
+        .debug_bounds("nav-artifacts")
+        .expect("Artifacts nav item must be rendered");
     assert!(
-        cx.debug_bounds("nav-agent-dashboard").is_some(),
-        "implemented Agent Dashboard nav item must be rendered"
+        artifacts.origin.y >= dashboard.origin.y + dashboard.size.height,
+        "Artifacts sits right below Agent Dashboard"
     );
-    for unimplemented in [
-        "nav-tasks",
-        "nav-artifacts",
-        "nav-skills",
-        "nav-automations",
-        "nav-mobile",
-    ] {
+    cx.simulate_click(artifacts.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let settings = view
+            .read(cx)
+            .settings
+            .as_ref()
+            .expect("settings page opened");
+        assert_eq!(
+            settings.read(cx).tab(),
+            krill_app::settings::AdminTab::Artifacts
+        );
+    });
+    for unimplemented in ["nav-tasks", "nav-skills", "nav-automations", "nav-mobile"] {
         assert!(
             cx.debug_bounds(unimplemented).is_none(),
             "unimplemented sidebar nav item {unimplemented} must not be rendered"

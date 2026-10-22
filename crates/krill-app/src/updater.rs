@@ -485,7 +485,7 @@ impl Manifest {
     /// 인코딩해 `ed25519_sig`에 기록한다(앱 바이너리는 검증만 수행하며 서명 생성 코드를 포함하지 않는다).
     pub fn signing_payload(&self) -> Vec<u8> {
         format!(
-            "minikrill-update-v1\nversion={}\nurl={}\nsha256={}\nmin_daemon_protocol={}\nchannel={}\nrollout_pct={}\n",
+            "krill-update-v1\nversion={}\nurl={}\nsha256={}\nmin_daemon_protocol={}\nchannel={}\nrollout_pct={}\n",
             self.version,
             self.url,
             self.sha256.to_ascii_lowercase(),

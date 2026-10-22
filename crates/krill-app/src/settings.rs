@@ -20,6 +20,8 @@ use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::{Disableable as _, ThemeMode};
 use serde::{Deserialize, Serialize};
 
+use crate::ui::{DarkUiTheme, LightUiTheme};
+
 pub use crate::i18n::Language;
 
 const SETTINGS_FILE: &str = "settings.toml";
@@ -71,6 +73,10 @@ pub enum KeepAwake {
 #[serde(default)]
 pub struct Settings {
     pub theme: ThemeChoice,
+    /// 다크 모드에서 쓸 앱 색 조합.
+    pub ui_theme_dark: crate::ui::DarkUiTheme,
+    /// 라이트 모드에서 쓸 앱 색 조합.
+    pub ui_theme_light: crate::ui::LightUiTheme,
     pub language: Language,
     /// UI 배율(1.0 = 100%). 적용할 때 `ZOOM_MIN..=ZOOM_MAX`로 자른다.
     /// 레거시 `zoom` 키는 첫 로드 시 `terminal_font_size`로 이관하고 `ui_zoom = 1.0`으로 초기화한다(OWE-843).
@@ -136,6 +142,9 @@ pub struct Settings {
     /// 유휴 세션 하이버네이션 opt-in(기본 false, docs/agents/hibernation.md).
     #[serde(default)]
     pub hibernation_enabled: bool,
+    /// 설치된 에이전트의 상태 감지 훅을 앱 시작 때 자동 설치(기본 켬). 끄면 Krill이 설치한 훅을 되돌린다.
+    #[serde(default = "default_true")]
+    pub agent_status_hooks: bool,
     /// 히스토리 세그먼트 기록 일시중지(기본 false).
     #[serde(default)]
     pub recording_paused: bool,
@@ -248,6 +257,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: ThemeChoice::Dark,
+            ui_theme_dark: crate::ui::DarkUiTheme::Deep,
+            ui_theme_light: crate::ui::LightUiTheme::Classic,
             language: Language::Ko,
             zoom: 1.0,
             notifications: true,
@@ -271,6 +282,7 @@ impl Default for Settings {
             default_agent: "claude".to_owned(),
             yolo_mode: true,
             hibernation_enabled: false,
+            agent_status_hooks: true,
             recording_paused: false,
             secure_keyboard_entry: false,
             auto_restart_update: false,
@@ -293,6 +305,28 @@ fn has_legacy_zoom(s: &str) -> bool {
 }
 
 impl Settings {
+    /// 다크 앱 테마를 바꾼다. 다크 터미널 테마가 이전 앱 테마의 짝이면 새 테마의 짝으로 함께 바꾼다.
+    pub fn set_ui_theme_dark(&mut self, theme: crate::ui::DarkUiTheme) {
+        let paired = self.ui_theme_dark.terminal_theme_name();
+        if crate::ui::canonical_terminal_theme_name(&self.terminal_theme_dark) == paired {
+            theme
+                .terminal_theme_name()
+                .clone_into(&mut self.terminal_theme_dark);
+        }
+        self.ui_theme_dark = theme;
+    }
+
+    /// 라이트 앱 테마를 바꾼다. 라이트 터미널 테마가 이전 앱 테마의 짝이면 새 테마의 짝으로 함께 바꾼다.
+    pub fn set_ui_theme_light(&mut self, theme: crate::ui::LightUiTheme) {
+        let paired = self.ui_theme_light.terminal_theme_name();
+        if crate::ui::canonical_terminal_theme_name(&self.terminal_theme_light) == paired {
+            theme
+                .terminal_theme_name()
+                .clone_into(&mut self.terminal_theme_light);
+        }
+        self.ui_theme_light = theme;
+    }
+
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
         let mut parsed: Self = toml::from_str(s)?;
         parsed.terminal_font_size = parsed
@@ -423,24 +457,7 @@ pub struct Keys {
 
 impl Keys {
     pub fn parse(s: &str) -> Result<Self, toml::de::Error> {
-        let mut keys: Self = toml::from_str(s)?;
-        for (legacy, current) in [
-            ("minikrill::NewWindow", "krill::NewWindow"),
-            ("minikrill::CloseWindow", "krill::CloseWindow"),
-        ] {
-            for (_, value) in &mut keys.bindings {
-                if value.as_str() == Some(legacy) {
-                    *value = current.into();
-                }
-            }
-            if let Some(disabled) = keys.disabled.remove(legacy) {
-                keys.disabled
-                    .entry(current.into())
-                    .or_default()
-                    .extend(disabled);
-            }
-        }
-        Ok(keys)
+        toml::from_str(s)
     }
 }
 
@@ -1101,6 +1118,16 @@ fn read_config(dir: Option<&Path>, mut settings: Settings) -> LoadedConfig {
         sync_workspace_trust_file(dir, settings.workspace_trust_preset_enabled);
     }
     (settings, keys, stamp, errors)
+}
+
+/// `dir`의 `settings.toml`에서 상태 감지 훅 자동 설치가 켜져 있는지. 파일이 없으면 기본값(켬),
+/// 읽기·파싱에 실패하면 사용자 의도를 모르므로 끈 것으로 본다.
+#[must_use]
+pub fn agent_status_hooks_enabled_at(dir: &Path) -> bool {
+    match std::fs::read_to_string(dir.join(SETTINGS_FILE)) {
+        Ok(s) => Settings::parse(&s).is_ok_and(|s| s.agent_status_hooks),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 /// Whether the initial disk read has completed; absent configuration uses normal defaults.
@@ -4876,21 +4903,35 @@ impl SettingsView {
     fn render_general_tab(s: &Settings, cx: &mut Context<Self>) -> gpui::Div {
         let p = crate::ui::palette(cx);
         let theme_button = |id: &'static str, label: &'static str, choice: ThemeChoice| {
-            layout::segment(id, label, s.theme == choice)
+            layout::segment(p, id, label, s.theme == choice)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.theme = choice);
                 })
         };
+        let dark_theme_button = |id: &'static str, label: &'static str, theme: DarkUiTheme| {
+            layout::segment(p, id, label, s.ui_theme_dark == theme)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| {
+                    edit(cx, move |s| s.set_ui_theme_dark(theme));
+                })
+        };
+        let light_theme_button = |id: &'static str, label: &'static str, theme: LightUiTheme| {
+            layout::segment(p, id, label, s.ui_theme_light == theme)
+                .debug_selector(move || id.into())
+                .on_click(move |_, _, cx| {
+                    edit(cx, move |s| s.set_ui_theme_light(theme));
+                })
+        };
         let awake_button = |id: &'static str, label: &'static str, mode: KeepAwake| {
-            layout::segment(id, label, s.keep_awake == mode)
+            layout::segment(p, id, label, s.keep_awake == mode)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.keep_awake = mode);
                 })
         };
         let language_button = |id: &'static str, label: &'static str, language: Language| {
-            layout::segment(id, label, s.language == language)
+            layout::segment(p, id, label, s.language == language)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| {
                     set_language(language, cx);
@@ -4949,6 +4990,62 @@ impl SettingsView {
                             ]
                             .into_iter()
                             .map(|(id, l, choice)| theme_button(id, l, choice)),
+                        )),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(text::DARK_THEME.get(), text::DARK_THEME_DESC.get()))
+                    .child(
+                        layout::controls().child(layout::segmented_control(
+                            p,
+                            [
+                                (
+                                    "ui-theme-deep",
+                                    text::UI_THEME_DEEP.get(),
+                                    DarkUiTheme::Deep,
+                                ),
+                                (
+                                    "ui-theme-abyss",
+                                    text::UI_THEME_ABYSS.get(),
+                                    DarkUiTheme::Abyss,
+                                ),
+                                (
+                                    "ui-theme-tidepool",
+                                    text::UI_THEME_TIDEPOOL.get(),
+                                    DarkUiTheme::Tidepool,
+                                ),
+                                (
+                                    "ui-theme-glow",
+                                    text::UI_THEME_GLOW.get(),
+                                    DarkUiTheme::Glow,
+                                ),
+                            ]
+                            .into_iter()
+                            .map(|(id, l, theme)| dark_theme_button(id, l, theme)),
+                        )),
+                    ),
+            )
+            .child(
+                row()
+                    .child(label(text::LIGHT_THEME.get(), text::LIGHT_THEME_DESC.get()))
+                    .child(
+                        layout::controls().child(layout::segmented_control(
+                            p,
+                            [
+                                (
+                                    "ui-theme-classic",
+                                    text::UI_THEME_CLASSIC.get(),
+                                    LightUiTheme::Classic,
+                                ),
+                                (
+                                    "ui-theme-paper",
+                                    text::UI_THEME_PAPER.get(),
+                                    LightUiTheme::Paper,
+                                ),
+                            ]
+                            .into_iter()
+                            .map(|(id, l, theme)| light_theme_button(id, l, theme)),
                         )),
                     ),
             )
@@ -5609,7 +5706,7 @@ impl SettingsView {
             ]
             .into_iter()
             .map(|(id, title, m)| {
-                layout::segment(id, title, target_mode == m)
+                layout::segment(p, id, title, target_mode == m)
                     .debug_selector(move || id.into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.terminal_theme_target = Some(m);
@@ -5978,7 +6075,7 @@ impl SettingsView {
                 menu
             });
         let cursor_button = |id: &'static str, title: &'static str, shape: TerminalCursorShape| {
-            layout::segment(id, title, s.terminal_cursor_shape == shape)
+            layout::segment(p, id, title, s.terminal_cursor_shape == shape)
                 .debug_selector(move || id.into())
                 .on_click(move |_, _, cx| edit(cx, move |s| s.terminal_cursor_shape = shape))
         };
@@ -6353,7 +6450,7 @@ impl SettingsView {
         });
         let rule_button =
             |id: String, label: SharedString, selected: bool, next: AutoSwitchRule| {
-                layout::segment(SharedString::from(id.clone()), label, selected)
+                layout::segment(p, SharedString::from(id.clone()), label, selected)
                     .disabled(self.account_rule_pending)
                     .debug_selector(move || id.clone())
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -6781,6 +6878,8 @@ impl SettingsView {
                     | ProviderKind::OpenCode
             );
         let manageable = !acc.host_default && !orca;
+        // Orca 감지 계정은 실행·이름 변경은 못 해도 Krill 목록에서 지울 수는 있다.
+        let removable = !acc.host_default;
         // OWE-881: 이 계정이 브라우저 로그인 대기 중이면 진행 문구와 [취소]만 보인다.
         let logging_in = self
             .login_pending
@@ -7080,7 +7179,7 @@ impl SettingsView {
                 })),
             );
         }
-        if can_login || manageable {
+        if can_login || removable {
             let menu_id = format!("admin-account-menu-{}", acc.id);
             let view = cx.entity().downgrade();
             let menu_acc = acc.clone();
@@ -7126,17 +7225,21 @@ impl SettingsView {
                                             .ok();
                                     },
                                 ));
+                        }
+                        if removable {
                             let (view, id) = (view.clone(), menu_acc.id.clone());
-                            menu = menu.separator().item(
-                                PopupMenuItem::new(text::ACCOUNT_REMOVE.get()).on_click(
+                            if can_login || manageable {
+                                menu = menu.separator();
+                            }
+                            menu =
+                                menu.item(PopupMenuItem::new(text::ACCOUNT_REMOVE.get()).on_click(
                                     move |_, _, cx| {
                                         view.update(cx, |this, cx| {
                                             this.start_remove(id.clone(), cx);
                                         })
                                         .ok();
                                     },
-                                ),
-                            );
+                                ));
                         }
                         menu
                     }),
@@ -7217,7 +7320,12 @@ impl SettingsView {
             .accounts_snapshot
             .accounts
             .iter()
-            .find(|a| a.id == id && !a.host_default && !crate::accounts::orca_managed(a))?;
+            .find(|a| a.id == id && !a.host_default)?;
+        let hint = if crate::accounts::orca_managed(acc) {
+            text::ACCOUNT_REMOVE_ORCA_HINT.get()
+        } else {
+            text::ACCOUNT_REMOVE_HINT.get()
+        };
         let p = crate::ui::palette(cx);
         let (provider, rm_acc) = (acc.provider, acc.id.clone());
         let cancel_id = format!("admin-remove-cancel-{}", acc.id);
@@ -7263,7 +7371,7 @@ impl SettingsView {
                         div()
                             .text_size(crate::ui::TEXT_XS)
                             .text_color(p.muted_foreground)
-                            .child(text::ACCOUNT_REMOVE_HINT.get()),
+                            .child(hint),
                     ),
             )
             .child(
@@ -7780,6 +7888,7 @@ impl SettingsView {
                 let selected = policy.threshold_percent == pct;
                 let policy_cl = policy.clone();
                 layout::segment(
+                    p,
                     gpui::ElementId::Name(id_str.clone().into()),
                     format!("{pct}%"),
                     selected,
@@ -7894,6 +8003,7 @@ impl SettingsView {
                 let selected = adv.cooldown_secs / 60 == mins;
                 let adv_cl = adv.clone();
                 layout::segment(
+                    p,
                     gpui::ElementId::Name(id_str.clone().into()),
                     crate::i18n::catalog::shell::ACCOUNT_COOLDOWN_MINUTES
                         .format(&[("minutes", &mins.to_string())]),
@@ -8077,14 +8187,20 @@ impl SettingsView {
             );
 
         // YOLO 토글은 `settings.toml` 저장과 함께 셸이 데몬에 적용할 권한 요청을 남긴다(Orca AgentPermissionsSetting 세그먼트).
-        let yolo_seg = layout::segment("admin-yolo-yolo", text::YOLO_MODE_YOLO.get(), s.yolo_mode)
-            .debug_selector(|| "admin-yolo-yolo".into())
-            .on_click(|_, _, cx| {
-                cx.global_mut::<Config>().pending_permission =
-                    Some(krill_proto::agent::Permission::Yolo);
-                edit(cx, move |s| s.yolo_mode = true);
-            });
+        let yolo_seg = layout::segment(
+            p,
+            "admin-yolo-yolo",
+            text::YOLO_MODE_YOLO.get(),
+            s.yolo_mode,
+        )
+        .debug_selector(|| "admin-yolo-yolo".into())
+        .on_click(|_, _, cx| {
+            cx.global_mut::<Config>().pending_permission =
+                Some(krill_proto::agent::Permission::Yolo);
+            edit(cx, move |s| s.yolo_mode = true);
+        });
         let manual_seg = layout::segment(
+            p,
             "admin-yolo-manual",
             text::YOLO_MODE_MANUAL.get(),
             !s.yolo_mode,
@@ -8123,6 +8239,29 @@ impl SettingsView {
                 s.hibernation_enabled,
                 false,
                 |next, _, cx| edit(cx, move |s| s.hibernation_enabled = next),
+            )));
+
+        // 끄면 Krill이 설치한 훅을 되돌리고, 다시 켜면 설치된 에이전트에 바로 설치한다.
+        let hooks_row = layout::row(p)
+            .child(layout::label(
+                p,
+                text::AGENT_HOOKS_TITLE.get(),
+                Some(text::AGENT_HOOKS_DESC.get()),
+            ))
+            .child(layout::controls().child(layout::switch(
+                p,
+                "agent-hooks-toggle",
+                s.agent_status_hooks,
+                false,
+                |next, _, cx| {
+                    edit(cx, move |s| s.agent_status_hooks = next);
+                    if let Some(env) = (!cfg!(test))
+                        .then(crate::onboarding::Env::current)
+                        .flatten()
+                    {
+                        crate::onboarding::actions::apply_hook_preference(env, next, cx).detach();
+                    }
+                },
             )));
 
         let auto_setup_row = layout::row(p)
@@ -8199,6 +8338,7 @@ impl SettingsView {
             .child(default_agent_row)
             .child(yolo_row)
             .child(hib_row)
+            .child(hooks_row)
             .child(auto_setup_row);
 
         let builtin_agents = krill_proto::agent::Agents::load(None).unwrap_or_default();
@@ -8242,10 +8382,10 @@ impl SettingsView {
             )));
 
         let is_1h = s.prompt_cache_ttl_secs >= 3_600;
-        let ttl_5m = layout::segment("prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
+        let ttl_5m = layout::segment(p, "prompt-cache-ttl-5m", text::CACHE_TTL_5M.get(), !is_1h)
             .debug_selector(|| "prompt-cache-ttl-5m".into())
             .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 300));
-        let ttl_1h = layout::segment("prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
+        let ttl_1h = layout::segment(p, "prompt-cache-ttl-1h", text::CACHE_TTL_1H.get(), is_1h)
             .debug_selector(|| "prompt-cache-ttl-1h".into())
             .on_click(|_, _, cx| edit(cx, move |s| s.prompt_cache_ttl_secs = 3_600));
         let cache_timer_card = layout::card(p)
@@ -9617,8 +9757,12 @@ impl SettingsView {
             return;
         }
         self.refresh_service_cache(cx);
-        let default_repo = std::env::var("PWD").unwrap_or_default();
         let store = self.services.worktrees.clone();
+        let default_repo = std::env::var("PWD")
+            .ok()
+            .filter(|pwd| Path::new(pwd).is_absolute() && Path::new(pwd).parent().is_some())
+            .or_else(|| Self::workflow_repo_candidates(&store).into_iter().next())
+            .unwrap_or_default();
         let loaded_repo = Self::normalize_repo_key(&default_repo);
         let default_setup = store.setup_script_for(&default_repo).unwrap_or_default();
         let default_archive = store.archive_script_for(&default_repo).unwrap_or_default();
@@ -9815,6 +9959,23 @@ impl SettingsView {
             symlink_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
         }
         cx.notify();
+    }
+
+    /// 워크플로 탭의 프로젝트 선택 후보. 심볼릭 링크·훅·코멘트·워크트리 부모에 등록된 저장소 중
+    /// 실제 절대 경로만 남긴다(`내 드라이브::workspace:…` 같은 내부 키는 프로젝트가 아니다).
+    fn workflow_repo_candidates(
+        store: &krill_proto::orchestration::WorktreeStore,
+    ) -> std::collections::BTreeSet<String> {
+        store
+            .symlinks
+            .keys()
+            .chain(store.setup_scripts.keys())
+            .chain(store.archive_scripts.keys())
+            .chain(store.comments.keys())
+            .chain(store.parents.values())
+            .filter(|r| Path::new(r).is_absolute())
+            .cloned()
+            .collect()
     }
 
     fn normalize_repo_key(raw: &str) -> Option<String> {
@@ -10138,7 +10299,7 @@ impl SettingsView {
             let id = format!("admin-context-lines-{lines}");
             let label = lines.to_string();
             let active = s.copy_context_lines == lines;
-            layout::segment(gpui::ElementId::Name(id.clone().into()), label, active)
+            layout::segment(p, gpui::ElementId::Name(id.clone().into()), label, active)
                 .debug_selector(move || id.clone())
                 .on_click(move |_, _, cx| {
                     edit(cx, move |s| s.copy_context_lines = lines);
@@ -10481,15 +10642,10 @@ impl SettingsView {
             .unwrap_or("—")
             .to_owned();
 
-        let mut known_repos = std::collections::BTreeSet::new();
-        if let Some(cur) = &active_repo {
+        let mut known_repos = Self::workflow_repo_candidates(&wt_store);
+        if let Some(cur) = active_repo.as_ref().filter(|r| Path::new(r).is_absolute()) {
             known_repos.insert(cur.clone());
         }
-        known_repos.extend(wt_store.symlinks.keys().cloned());
-        known_repos.extend(wt_store.setup_scripts.keys().cloned());
-        known_repos.extend(wt_store.archive_scripts.keys().cloned());
-        known_repos.extend(wt_store.comments.keys().cloned());
-        known_repos.extend(wt_store.parents.values().cloned());
         let known_repos_list: Vec<String> = known_repos.into_iter().collect();
 
         let mut repo_context_card = layout::card(p)
@@ -10570,20 +10726,25 @@ impl SettingsView {
 
             let weak = cx.weak_entity();
             let dropdown_repos = known_repos_list.clone();
+            let dropdown_active = active_repo.clone();
             let repo_dropdown = layout::secondary(
                 "admin-workflow-repo-select",
-                format!(
-                    "{} ({})",
-                    text::WORKFLOW_REPO_SELECT.get(),
-                    active_repo_display
-                ),
+                format!("{active_repo_display} \u{25BE}"),
             )
             .debug_selector(|| "admin-workflow-repo-select".into())
             .dropdown_menu(move |mut menu, _, _| {
+                menu = menu.scrollable(true).max_h(px(360.));
                 for repo_choice in &dropdown_repos {
                     let weak = weak.clone();
                     let repo_choice = repo_choice.clone();
-                    menu = menu.item(PopupMenuItem::new(repo_choice.clone()).on_click(
+                    let checked = dropdown_active.as_deref() == Some(repo_choice.as_str());
+                    let name = Path::new(&repo_choice)
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(repo_choice.as_str());
+                    let item_label = format!("{name}  {repo_choice}");
+                    menu = menu.item(PopupMenuItem::new(item_label).checked(checked).on_click(
                         move |_, window, cx| {
                             weak.update(cx, |this, cx| {
                                 this.load_repo_hooks_for(&repo_choice, window, cx);
@@ -10601,59 +10762,31 @@ impl SettingsView {
                         .w_full()
                         .min_w_0()
                         .flex()
-                        .flex_wrap()
                         .items_center()
-                        .justify_between()
                         .gap_3()
-                        .child(layout::label(
-                            p,
-                            text::WORKFLOW_REPO_TITLE.get(),
-                            Some(text::WORKFLOW_REPO_DESC.get()),
-                        ))
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(crate::ui::TEXT_SM)
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .child(text::WORKFLOW_REPO_TITLE.get()),
+                        )
+                        .child(
+                            div()
+                                .id("admin-workflow-repo-input")
+                                .debug_selector(|| "admin-workflow-repo-input".into())
+                                .flex_1()
+                                .min_w_0()
+                                .child(gpui_component::input::Input::new(&repo_input).small()),
+                        )
                         .child(layout::controls().child(repo_dropdown)),
                 )
                 .child(
                     div()
-                        .id("admin-workflow-repo-input")
-                        .debug_selector(|| "admin-workflow-repo-input".into())
-                        .w_full()
-                        .min_w_0()
-                        .child(gpui_component::input::Input::new(&repo_input).small()),
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::WORKFLOW_REPO_DESC.get()),
                 );
-
-            if known_repos_list.len() > 1 {
-                let mut chips = div()
-                    .id("admin-workflow-repo-chips")
-                    .debug_selector(|| "admin-workflow-repo-chips".into())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_wrap()
-                    .items_center()
-                    .gap_1p5();
-                for (idx, repo_key) in known_repos_list.iter().enumerate() {
-                    let chip_id = format!("admin-workflow-repo-chip-{idx}");
-                    let is_active = active_repo.as_deref() == Some(repo_key.as_str());
-                    let short = Path::new(repo_key)
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or(repo_key.as_str())
-                        .to_owned();
-                    let repo_cl = repo_key.clone();
-                    let btn = if is_active {
-                        layout::primary(gpui::ElementId::Name(chip_id.clone().into()), short)
-                    } else {
-                        layout::secondary(gpui::ElementId::Name(chip_id.clone().into()), short)
-                    };
-                    chips = chips.child(btn.debug_selector(move || chip_id.clone()).on_click(
-                        cx.listener(move |this, _, window, cx| {
-                            this.load_repo_hooks_for(&repo_cl, window, cx);
-                        }),
-                    ));
-                }
-                repo_context_card = repo_context_card.child(chips);
-            }
 
             symlinks_card = symlinks_card
                 .child(

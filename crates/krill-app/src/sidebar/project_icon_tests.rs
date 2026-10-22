@@ -10,6 +10,23 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
+fn jpeg_remote_icon_is_cached() {
+    // GitHub 아바타처럼 `.png` URL이 JPEG를 돌려줘도 캐시에 남아야 같은 URL을 다시 받지 않는다.
+    let jpeg: &[u8] = &[0xFF, 0xD8, 0xFF, 0xDB, 0, 0x43, 0, 8, 6, 6, 7, 6];
+    assert!(has_valid_icon_bytes(jpeg));
+    assert!(!has_valid_icon_bytes(&[0xFF, 0xD8]));
+    let dir = fixture("jpeg");
+    let url = "https://github.com/owner.png?size=64";
+    let target = cached_icon_path_for_url(&dir, url);
+    write_cached_icon_bytes(&target, jpeg).unwrap();
+    assert_eq!(
+        resolve_or_fetch_remote_icon(url, &dir),
+        Some(crate::ui::icons::ProjectIcon::Image(target))
+    );
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn ico_project_icon_detection() {
     let repo = fixture("ico");
     assert!(has_valid_icon_bytes(ICO));

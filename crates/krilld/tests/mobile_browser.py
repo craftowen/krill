@@ -65,7 +65,7 @@ globalThis.WebSocket=class extends NativeWebSocket {
                 wait('KrillMobile.store.connection.phase==="ready" && recoverySockets.length>=2')
                 assert evaluate('sessionStorage.getItem("interrupted")') == 'yes'
                 assert len(json.loads((Path(cfg['dir'])/'mobile-devices.json').read_text())) == 1
-                assert evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("minikrill-mobile-v2"),hash:location.hash})') == {'secure':False,'subtle':'undefined','paired':True,'hash':'#/'}
+                assert evaluate('({secure:isSecureContext,subtle:typeof crypto.subtle,paired:!!localStorage.getItem("krill-mobile-v2"),hash:location.hash})') == {'secure':False,'subtle':'undefined','paired':True,'hash':'#/'}
                 assert evaluate('document.querySelector(".host-card").getBoundingClientRect().bottom<innerHeight')
                 shot('home')
                 browser('click','.host-main')

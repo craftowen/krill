@@ -19,7 +19,7 @@ fn ids(items: &[Item], query: &str) -> Vec<u64> {
 fn fuzzy_order_hangul_and_needs_you() {
     let items = [
         item(1, "claude 1 · krill · 작업 중", false),
-        item(2, "codex 2 · 미니크릴 · 입력 대기", true),
+        item(2, "codex 2 · 미니카 · 입력 대기", true),
         item(3, "claude 3 · mk-owe-422 · 완료", false),
         item(4, "claude 4 · main · 입력 대기", true),
     ];

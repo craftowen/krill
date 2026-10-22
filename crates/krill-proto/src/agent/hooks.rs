@@ -211,11 +211,7 @@ pub fn install_claude_json(before: Option<&str>, command: &str) -> io::Result<St
             .ok_or_else(|| merge_error("Claude hook handler must be an object"))?
             .insert("name".into(), json!("krill"));
         let entry = json!({"hooks": [handler]});
-        let mut legacy = entry.clone();
-        if let Some(name) = legacy.pointer_mut("/hooks/0/name") {
-            *name = json!("minikrill");
-        }
-        if !entries.contains(&entry) && !entries.contains(&legacy) {
+        if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
@@ -230,15 +226,8 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
         .as_object_mut()
         .ok_or_else(|| merge_error("settings must be an object"))?;
     if agent == Agent::Agy {
-        // A pre-receipt installation may still own the old bundle name.
-        // Keep it in place to avoid duplicate callbacks and preserve rollback.
-        let key = if root.contains_key("minikrill") && !root.contains_key("krill") {
-            "minikrill"
-        } else {
-            "krill"
-        };
         let bundle = root
-            .entry(key)
+            .entry("krill")
             .or_insert(json!({}))
             .as_object_mut()
             .ok_or_else(|| merge_error("hooks.krill must be an object"))?;
@@ -285,14 +274,8 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
         } else {
             json!({"hooks": [{"type": "command", "name": "krill", "command": command}]})
         };
-        let mut legacy = entry.clone();
-        if agent != Agent::Cursor
-            && let Some(name) = legacy.pointer_mut("/hooks/0/name")
-        {
-            *name = json!("minikrill");
-        }
         // 영수증 없이 같은 항목이 있으면 사용자 소유로 보고 가져오지 않는다.
-        if !entries.contains(&entry) && !entries.contains(&legacy) {
+        if !entries.contains(&entry) {
             entries.push(entry);
         }
     }
@@ -302,24 +285,6 @@ pub fn install_agent_json(before: Option<&str>, agent: Agent, command: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn legacy_hook_names_do_not_duplicate_callbacks() {
-        let current = install_claude_json(None, "managed command").unwrap();
-        let legacy = current.replace("\"name\": \"krill\"", "\"name\": \"minikrill\"");
-        let updated = install_claude_json(Some(&legacy), "managed command").unwrap();
-        assert_eq!(
-            parse_hook_json(Some(&updated)).unwrap(),
-            parse_hook_json(Some(&legacy)).unwrap()
-        );
-        let current = install_agent_json(None, Agent::Agy, "managed command").unwrap();
-        let legacy = current.replacen("\"krill\":", "\"minikrill\":", 1);
-        let updated = install_agent_json(Some(&legacy), Agent::Agy, "managed command").unwrap();
-        assert_eq!(
-            parse_hook_json(Some(&updated)).unwrap(),
-            parse_hook_json(Some(&legacy)).unwrap()
-        );
-    }
 
     #[test]
     fn codex_overrides_parse_as_toml_and_do_not_contain_pane_identity() {

@@ -1,4 +1,4 @@
-//! 내장 터미널 테마 카탈로그(Krill 기본 `Krill Deep` + Orca 호환 30종)·커스텀 테마·Ghostty/Warp 테마 가져오기(OWE-956).
+//! 내장 터미널 테마 카탈로그(Krill 기본 `Krill Deep` + Orca 호환 30종 + 앱 테마 짝 Krill 4종)·커스텀 테마·Ghostty/Warp 테마 가져오기(OWE-956).
 //!
 //! 출처: `.ref/orca/src/shared/terminal-themes/` (`defaults.ts`, `popular-dark-core.ts`,
 //! `popular-dark-extended.ts`, `popular-light.ts`, `classic.ts`),
@@ -16,6 +16,11 @@ use super::theme::{TERMINAL_DARK, TERMINAL_GHOSTTY_DARK, TERMINAL_LIGHT, rgba_by
 pub const DEFAULT_TERMINAL_THEME_DARK: &str = "Krill Deep";
 /// 기본 라이트 터미널 테마 이름(Orca `DEFAULT_TERMINAL_THEME_LIGHT`).
 pub const DEFAULT_TERMINAL_THEME_LIGHT: &str = "Builtin Tango Light";
+/// 앱 테마 `심연`·`조수`·`발광`·`종이`와 짝인 Krill 고유 터미널 테마 이름.
+pub const KRILL_ABYSS: &str = "Krill Abyss";
+pub const KRILL_TIDEPOOL: &str = "Krill Tidepool";
+pub const KRILL_GLOW: &str = "Krill Glow";
+pub const KRILL_PAPER: &str = "Krill Paper";
 /// 사용자 가져오기 테마 선택값 접두사(`custom:<id>`).
 pub const CUSTOM_TERMINAL_THEME_PREFIX: &str = "custom:";
 /// 사용자 가져오기 테마 최대 보관 개수(Orca `MAX_TERMINAL_CUSTOM_THEMES`).
@@ -76,7 +81,7 @@ const fn builtin(
     }
 }
 
-/// 내장 터미널 테마 카탈로그: Krill 기본 `Krill Deep` 다음에 Orca 내장 30종
+/// 내장 터미널 테마 카탈로그: Krill 기본 `Krill Deep` 다음에 Orca 내장 30종, 끝에 앱 테마 짝 Krill 4종
 /// (`.ref/orca/src/shared/terminal-themes/index.ts` 정본 순서).
 pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
     // 0: Krill 고유 다크 기본
@@ -798,6 +803,107 @@ pub const BUILTIN_TERMINAL_THEMES: &[BuiltinTerminalTheme] = &[
             0x00ff_6ac1,
             0x009a_edfe,
             0x00ef_f0eb,
+        ],
+    ),
+    // Krill 앱 테마(`DarkUiTheme`·`LightUiTheme`)의 짝 터미널 테마.
+    builtin(
+        KRILL_ABYSS,
+        true,
+        0x0000_0000,
+        0x00e6_e6e6,
+        0x00ff_5238,
+        [
+            0x001a_1a1a,
+            0x00ff_5f5f,
+            0x00a8_d26b,
+            0x00e8_c66a,
+            0x008a_b4f8,
+            0x00c4_9ae0,
+            0x006f_d3c8,
+            0x00c8_c8c8,
+            0x005c_5c5c,
+            0x00ff_7b7b,
+            0x00bc_e37f,
+            0x00f2_d58a,
+            0x00a5_c5ff,
+            0x00d4_b0ee,
+            0x008a_e6db,
+            0x00f5_f5f5,
+        ],
+    ),
+    builtin(
+        KRILL_TIDEPOOL,
+        true,
+        0x0026_2c38,
+        0x00d8_dee9,
+        0x0088_c0d0,
+        [
+            0x003b_4252,
+            0x00bf_616a,
+            0x00a3_be8c,
+            0x00eb_cb8b,
+            0x0081_a1c1,
+            0x00b4_8ead,
+            0x0088_c0d0,
+            0x00e5_e9f0,
+            0x004c_566a,
+            0x00d0_8770,
+            0x00b4_d19c,
+            0x00f0_d6a0,
+            0x0094_b4d4,
+            0x00c6_a3c0,
+            0x008f_bcbb,
+            0x00ec_eff4,
+        ],
+    ),
+    builtin(
+        KRILL_GLOW,
+        true,
+        0x0006_0a12,
+        0x00db_efff,
+        0x002d_e2e6,
+        [
+            0x000d_1626,
+            0x00ff_6b8b,
+            0x005a_f2b0,
+            0x00ff_d84d,
+            0x006c_b6ff,
+            0x00b9_8cff,
+            0x002d_e2e6,
+            0x00c9_dced,
+            0x003a_4e66,
+            0x00ff_8fa6,
+            0x008a_f7c8,
+            0x00ff_e27a,
+            0x0094_caff,
+            0x00cd_aeff,
+            0x007f_f0f2,
+            0x00f2_faff,
+        ],
+    ),
+    builtin(
+        KRILL_PAPER,
+        false,
+        0x00fb_f9f4,
+        0x0024_211d,
+        0x00e5_482f,
+        [
+            0x0024_211d,
+            0x00c6_2828,
+            0x003f_7d20,
+            0x009a_6a00,
+            0x001f_5fae,
+            0x007b_3fa8,
+            0x000e_7c86,
+            0x00bf_b8a8,
+            0x0077_715f,
+            0x00e5_3935,
+            0x004e_9a2a,
+            0x00b0_7d00,
+            0x002f_74c9,
+            0x0095_50c2,
+            0x0015_97a0,
+            0x00ec_e6da,
         ],
     ),
 ];
@@ -1859,8 +1965,8 @@ mod tests {
 
     #[test]
     fn builtin_catalog_has_krill_deep_and_all_30_orca_themes_with_unique_names() {
-        // Krill Deep + Orca 30종.
-        assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 31);
+        // Krill Deep + Orca 30종 + 앱 테마 짝 Krill 4종.
+        assert_eq!(BUILTIN_TERMINAL_THEMES.len(), 35);
         assert_eq!(BUILTIN_TERMINAL_THEMES[0].name, "Krill Deep");
         assert_eq!(BUILTIN_TERMINAL_THEMES[0].theme, TERMINAL_DARK);
         assert_eq!(

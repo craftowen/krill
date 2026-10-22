@@ -95,10 +95,8 @@ fn run(raw: Vec<std::ffi::OsString>) -> ExitCode {
             .get(1)
             .is_some_and(|s| s == "install" || s == "uninstall");
     if !hook_run && !statusline_run {
-        // MK-170: 경로를 정하기 전에 옛 번들 id 데이터를 옮긴다(옛 holder가 살아 있으면 그대로 둔다).
-        let migrated = daemon::migrate::run();
         krill_log::init(krill_log::Component::Cli).ok();
-        tracing::info!(?migrated, "cli starting");
+        tracing::info!("cli starting");
         // Hook/statusline hot paths and isolated runtimes must not mutate the host's skills.
         if !cfg!(test)
             && daemon::state_dir_override().is_none()

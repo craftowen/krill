@@ -713,7 +713,7 @@ impl SettingsView {
             p,
             pr_filters.iter().map(|&(mode, id_str, label)| {
                 let active = self.space.filter.pr_filter == mode;
-                layout::segment(id_str, label, active)
+                layout::segment(p, id_str, label, active)
                     .debug_selector(move || id_str.into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_cleanup_pr_filter(mode, cx);
@@ -762,7 +762,7 @@ impl SettingsView {
             idle_presets.iter().map(|&(preset, id_str, label)| {
                 let days = preset.days();
                 let active = self.space.filter.min_idle_days == days;
-                layout::segment(id_str, label, active)
+                layout::segment(p, id_str, label, active)
                     .debug_selector(move || id_str.into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.set_cleanup_idle_days(days, cx);

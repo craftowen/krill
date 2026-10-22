@@ -165,8 +165,11 @@ class Release:
         # 예약 실행은 유료 VM이나 사람 전용 가드 탈출구를 상속하지 않는다.
         for key in ("KRILL_GCP_PROJECT", "KRILL_WIN_VM_DIR", "KRILL_PUBLISH_FORCE",
                     "KRILL_RELEASE_SIGNING_KEY", "KRILL_RELEASE_ASSET_DIR", "KRILL_PUBLISH_LOCKED",
-                    "KRILL_PUBLICATION_AUDIT_DIR"):
+                    "KRILL_PUBLICATION_AUDIT_DIR", "KRILL_MOBILE_CLOUD_DIR"):
             self.env.pop(key, None)
+        # 전용 clone에는 저장소 밖 cloud/가 없다. 설치한 체크아웃의 모바일 PWA 배포 도구를 게시 가드에 넘긴다.
+        if config.get("mobile_cloud"):
+            self.env["KRILL_MOBILE_CLOUD_DIR"] = config["mobile_cloud"]
         self.state = {"started_at": datetime.now().astimezone().isoformat(), "status": "running"}
 
     def update(self, **values):
@@ -454,7 +457,8 @@ def install_locked(source, after_release=None):
     config = {"branch": "dev", "repo": match[1],
               "run_root": str(VOLUME / "nightly"), "target_dir": str(TARGETS / "krill-publish"),
               "key_file": str(keychain_path(Path.home())) + ".ed25519.key",
-              "key_tool": str(source / "packaging/macos/ed25519_manifest.py")}
+              "key_tool": str(source / "packaging/macos/ed25519_manifest.py"),
+              "mobile_cloud": str(source / "cloud/mobile")}
     cli = shutil.which("orca")
     if not cli:
         raise NightlyError("Orca CLI is required to run on the external build volume from a scheduled job")

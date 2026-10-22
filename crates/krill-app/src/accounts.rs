@@ -138,6 +138,9 @@ pub struct AccountsFile {
     /// OWE-699: 계정 프로필 프로비저닝(키가 없으면 켜짐, krilld와 같은 규칙). 프로비저닝은 krilld가 한다 — 앱은 칩 노출만 본다.
     #[serde(default = "provisioning_default")]
     pub provisioning: bool,
+    /// Krill 목록에서 지운 Orca 감지 계정 id(krilld와 같은 필드).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_accounts: Vec<String>,
 }
 
 fn provisioning_default() -> bool {
@@ -151,6 +154,7 @@ impl Default for AccountsFile {
             active: BTreeMap::new(),
             accounts: Vec::new(),
             provisioning: provisioning_default(),
+            hidden_accounts: Vec::new(),
         }
     }
 }
@@ -438,6 +442,16 @@ pub fn request_local(
             account_id,
         } => {
             let mut file = load_file_result(home, state_dir)?;
+            if account_id.starts_with(ORCA_ID_PREFIX) {
+                if !file.hidden_accounts.contains(account_id) {
+                    file.hidden_accounts.push(account_id.clone());
+                }
+                if file.active.get(provider.as_str()) == Some(account_id) {
+                    file.active.remove(provider.as_str());
+                }
+                save_file(home, state_dir, &file)?;
+                return Ok(refresh_local(home, state_dir));
+            }
             let idx = file
                 .accounts
                 .iter()
@@ -1156,6 +1170,9 @@ pub fn refresh_local(home: &Path, state_dir: Option<&Path>) -> AccountsSnapshot 
                 Some(uuid) if !uuid.is_empty() => format!("{ORCA_ID_PREFIX}{}", slugify(uuid)),
                 _ => format!("{ORCA_ID_PREFIX}{idx}-{}", slugify(&label)),
             };
+            if file.hidden_accounts.contains(&id) {
+                continue;
+            }
             all.push(AccountInfo {
                 id,
                 provider: ProviderKind::Claude,
@@ -1706,6 +1723,7 @@ mod as_regression_tests {
                     profile_dir: backup.display().to_string(),
                 }],
                 provisioning: false,
+                hidden_accounts: Vec::new(),
             };
             save_file(&home, Some(&state), &file).unwrap();
             let path = config_path(&home, Some(&state));

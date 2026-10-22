@@ -39,7 +39,7 @@ crates/krill-holder/  # PTY 부모·fd 보관·exec 핸드오프. macOS 빌드 1
 crates/krilld/        # 세션 데몬: alacritty_terminal·IPC·zstd 세그먼트·hook·상태·git 큐·모바일 게이트웨이
 crates/krill-term/    # 프레임워크 중립 그리드 렌더 모델 + IME 상태기계(gpui 실패 시 교체 대비)
 crates/krill-hosts/   # 원격 호스트 연결 계층(SSH 소켓 포워딩·피어 관리)
-crates/krill-link/    # iroh P2P 원격 터널·기기 짝짓기
+crates/krill-link/    # iroh P2P 원격 터널·기기 페어링
 crates/krill-log/     # 상한 회전 운영 로거
 crates/krill-app/     # gpui UI (디자인 토큰·프리미티브·아이콘·상태는 src/ui/, 규범은 docs/STYLEGUIDE.md)
 crates/krill/         # CLI 단일 바이너리(`krill`, `krill hook` 포함)

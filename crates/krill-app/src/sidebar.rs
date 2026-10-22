@@ -1870,7 +1870,7 @@ impl Sidebar {
                         .filters
                         .contains_host(&HostId::Remote(r.id.clone()))
                 })
-                // 짝지은 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 짝짓기 등)와 함께 그대로 보인다.
+                // 페어링된 기기(iroh 등록)는 일부러 연결한 것이라 끊겨도 안내(다시 페어링 등)와 함께 그대로 보인다.
                 .partition(|r| {
                     r.status != HostStatus::Connected
                         && r.snapshot.sessions.is_empty()

@@ -176,6 +176,9 @@ pub struct AccountsFile {
     /// OWE-719: 기존 자격증명을 읽기만 하는 직접 사용량 조회(오웬 지시로 기본 켜짐).
     #[serde(default = "direct_usage_default")]
     pub direct_usage: bool,
+    /// Krill 목록에서 지운 Orca 감지 계정 id. Orca 캐시 파일은 Orca 소유라 건드리지 않고 여기서 숨긴다.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hidden_accounts: Vec<String>,
 }
 
 fn direct_usage_default() -> bool {
@@ -195,6 +198,7 @@ impl Default for AccountsFile {
             advanced_policy: krill_proto::usage::AdvancedPolicy::default(),
             provisioning: provisioning_default(),
             direct_usage: true,
+            hidden_accounts: Vec::new(),
         }
     }
 }
@@ -914,6 +918,9 @@ fn refresh_accounts_authenticated(
             // OWE-696: 캐시 행 uuid로 안정 id를 만든다(순번이 바뀌어도 같은 계정). uuid가 없는
             // 구버전 캐시만 순번 id. Orca 프로필 폴더는 Krill이 모르므로 경로를 비워 실행 불가로 둔다.
             let id = orca_detected_id(idx, &row);
+            if file.hidden_accounts.contains(&id) {
+                continue;
+            }
             if !row.id.is_empty() {
                 orca_uuids.insert(id.clone(), row.id.clone());
             }
@@ -1734,6 +1741,10 @@ pub fn delete_account(
             "cannot remove host default account",
         ));
     }
+    if is_orca_detected(account_id) {
+        hide_orca_account(home, state_dir, provider, account_id)?;
+        return Ok(refresh_accounts(home, state_dir));
+    }
     let dir = {
         let _guard = lock(&SAVE_LOCK);
         let mut file = load_writable(home, state_dir)?;
@@ -1763,6 +1774,28 @@ pub fn delete_account(
         tracing::warn!(error = %e, "account profile left as orphan");
     }
     Ok(refresh_accounts(home, state_dir))
+}
+
+fn is_orca_detected(account_id: &str) -> bool {
+    account_id.starts_with("claude-orca-")
+}
+
+/// Orca 감지 계정 삭제 = Krill 목록에서 숨김. Orca 프로필·캐시는 Orca 소유라 지우지 않는다.
+fn hide_orca_account(
+    home: &Path,
+    state_dir: Option<&Path>,
+    provider: ProviderKind,
+    account_id: &str,
+) -> io::Result<()> {
+    let _guard = lock(&SAVE_LOCK);
+    let mut file = load_writable(home, state_dir)?;
+    if !file.hidden_accounts.iter().any(|id| id == account_id) {
+        file.hidden_accounts.push(account_id.to_owned());
+    }
+    if file.active.get(provider.as_str()).map(String::as_str) == Some(account_id) {
+        file.active.remove(provider.as_str());
+    }
+    save_inner(home, state_dir, &file)
 }
 
 // 세션이 같은 폴더를 symlink·정규화된 경로로 기록했어도 보호한다.

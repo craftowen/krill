@@ -130,7 +130,8 @@ impl Tunnel {
                     let enabled = fixed_available(Some(&pub_cfg), |u| http_status(u) == Some(200));
                     prepare(
                         &url,
-                        enabled.then_some(&pub_cfg),
+                        Some(&pub_cfg),
+                        enabled,
                         &ready,
                         &fixed,
                         &stop,
@@ -322,7 +323,8 @@ impl Tunnel {
                                 ) {
                                     prepare(
                                         &found,
-                                        publication.as_ref().filter(|_| enabled),
+                                        publication.as_ref(),
+                                        enabled,
                                         &ready,
                                         &fixed,
                                         &stop,
@@ -629,17 +631,19 @@ fn fixed_available(
         ))
     })
 }
-/// 판정이 끝난 뒤 ready를 공개한다. `publication`은 고정 출처가 확인됐을 때만 온다.
+/// 판정이 끝난 뒤 ready를 공개한다. `enabled`는 고정 출처에 현재 에셋 해시가 배포됐는지다(QR 출처 선택).
+/// `/r/<rid>` 게시는 배포 여부와 무관하게 한다: 이미 짝지은 PWA가 새 터널을 찾아야 하고,
+/// 미배포 해시는 PWA 업데이트 준비(`updates.js` prepare)가 404로 거른다.
 /// 게시 실패는 연결 준비를 막지 않고 취소 가능한 백오프로 재시도한다.
 fn prepare(
     url: &str,
     publication: Option<&Publication>,
+    enabled: bool,
     ready: &AtomicBool,
     fixed: &AtomicBool,
     stop: &Stop,
     mut put: impl FnMut(&Publication, &str) -> bool,
 ) {
-    let enabled = publication.is_some();
     if stop.cancelled() {
         return;
     }
@@ -875,20 +879,22 @@ mod tests {
             let p = publication();
             prepare(
                 "https://fixture.trycloudflare.com",
-                enabled.then_some(&p),
+                Some(&p),
+                enabled,
                 &ready,
                 &fixed,
                 &Stop::default(),
                 |_, _| {
                     assert!(ready.load(Ordering::Acquire));
-                    assert!(fixed.load(Ordering::Acquire));
+                    assert_eq!(fixed.load(Ordering::Acquire), enabled);
                     puts += 1;
                     true
                 },
             );
             assert!(ready.load(Ordering::Acquire));
             assert_eq!(fixed.load(Ordering::Acquire), enabled);
-            assert_eq!(puts, usize::from(enabled));
+            // 미배포여도 `/r/<rid>`는 게시한다(짝지은 PWA가 새 터널을 찾는다).
+            assert_eq!(puts, 1);
         }
     }
     #[test]
@@ -901,6 +907,7 @@ mod tests {
             prepare(
                 "https://fixture.trycloudflare.com",
                 Some(&publication()),
+                true,
                 &AtomicBool::new(false),
                 &AtomicBool::new(false),
                 &stop,

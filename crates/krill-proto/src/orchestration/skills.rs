@@ -20,8 +20,8 @@ pub struct SkillEntry {
 pub const BUILTIN_SKILLS: &[SkillEntry] = &[
     SkillEntry {
         name: "krill",
-        description: "Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the `krill` CLI.",
-        content: "---\nname: krill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, and ports via the krill CLI.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n\n## Artifacts (public share links)\n\n- Share one self-contained `.html`/`.htm`/`.md`/`.markdown` file (max 2 MiB) as a public link: `krill artifacts share <file> --json` (re-running on the same path updates the same link). Relative images/CSS are not uploaded.\n- Check a file's link without network: `krill artifacts status <file> --json`. Manage links: `krill artifacts list --json`, `krill artifacts unshare <file>`, `krill artifacts delete <slug>`.\n- Public sharing is off by default and only a human can turn it on (Krill app: Settings > Artifacts). If a command returns `{\"error\":{\"code\":\"artifact_sharing_disabled\"}}`, do not retry or work around it: ask the user to enable it, or deliver the file locally.\n- Never print or paste edit/owner tokens from the Krill state directory.\n",
+        description: "Operate Krill sessions, worktrees, checkpoints, references, handoffs, ports, and artifacts (public HTML/Markdown share links, 크릴 아티팩트) via the `krill` CLI.",
+        content: "---\nname: krill\ndescription: Operate Krill sessions, worktrees, checkpoints, references, handoffs, ports, and artifacts via the krill CLI. Use for \"krill artifact\", \"크릴 아티팩트\", sharing an HTML or Markdown page as a public link, or managing shared links.\n---\n\n# Krill (`krill`) CLI Skill\n\n- List/manage sessions: `krill ls --json`, `krill new --cwd <dir> --agent <profile>` (or `krill new --cwd <dir> -- <program> <args>...`), `krill send <session_id> --text \"<text>\" --enter`, `krill read <session_id> --lines 80`, `krill wait <session_id> --for idle --timeout 30`, `krill kill <session_id>`\n- Worktree checkpoints: `krill set --comment \"...\" --workspace-status in-progress --pr 42 --issue OWE-100 --reference https://...`\n- References: `krill reference list`, `krill reference add <url>`, `krill reference find <query>`\n- Handoff context to another agent: `krill handoff --from <id> --to-agent codex --prompt \"Continue verification\"`\n- Detect listening ports: `krill ports --json`\n\n## Artifacts (public share links)\n\n- Share one self-contained `.html`/`.htm`/`.md`/`.markdown` file (max 2 MiB) as a public link: `krill artifacts share <file> --json` (re-running on the same path updates the same link). Relative images/CSS are not uploaded.\n- Check a file's link without network: `krill artifacts status <file> --json`. Manage links: `krill artifacts list --json`, `krill artifacts unshare <file>`, `krill artifacts delete <slug>`.\n- Public sharing is off by default and only a human can turn it on (Krill app: Settings > Artifacts). If a command returns `{\"error\":{\"code\":\"artifact_sharing_disabled\"}}`, do not retry or work around it: ask the user to enable it, or deliver the file locally.\n- Never print or paste edit/owner tokens from the Krill state directory.\n",
     },
     SkillEntry {
         name: "orchestration",
@@ -85,7 +85,6 @@ pub fn skill_references(name: &str) -> &'static [(&'static str, &'static str)] {
 // Orca's discovery entries must keep their own names and update ownership.
 pub(super) const ORCA_SKILL_NAMES: &[&str] = &["orchestration", "computer-use"];
 const MARKER: &str = "<!-- krill-managed-skill -->";
-const LEGACY_MARKER: &str = "<!-- minikrill-managed-skill -->";
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Global discovery roots. agy's CLI-specific root and shared App/IDE root are distinct.
@@ -159,7 +158,6 @@ pub fn sync_builtin_skills_at(home: &Path) -> SkillSyncReport {
 
 pub fn install_skill(name: &str, base_dir: &Path) -> io::Result<PathBuf> {
     let name = name.trim().strip_prefix("krill-").unwrap_or(name.trim());
-    let name = if name == "minikrill" { "krill" } else { name };
     let skill = builtin_skills()
         .iter()
         .find(|s| s.name == name)
@@ -177,15 +175,9 @@ fn prefixed_content(skill: &SkillEntry, prefix: &str) -> String {
 
 fn owned(existing: &str, skill: &SkillEntry) -> bool {
     existing.contains(MARKER)
-        || existing.contains(LEGACY_MARKER)
         || existing == skill.content
         || existing == prefixed_content(skill, "mk-")
         || existing == prefixed_content(skill, "krill-")
-        || (skill.name == "krill"
-            && existing
-                == skill
-                    .content
-                    .replacen("name: krill\n", "name: minikrill\n", 1))
 }
 
 fn candidate_writable(dir: &Path, skill: &SkillEntry) -> io::Result<bool> {
@@ -253,10 +245,7 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
             return Err(invalid("skill reference must not be a symlink"));
         }
         match fs::read_to_string(&path) {
-            Ok(existing)
-                if !existing.contains(MARKER)
-                    || existing.contains(LEGACY_MARKER) && existing != *content =>
-            {
+            Ok(existing) if !existing.contains(MARKER) => {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "skill reference belongs to another owner",
@@ -275,9 +264,6 @@ fn install(skill: &SkillEntry, base_dir: &Path) -> io::Result<(PathBuf, bool)> {
         changed |= write_if_changed(path, bytes.as_bytes())?;
     }
     let mut stale = vec![base_dir.join(format!("mk-{}", skill.name))];
-    if skill.name == "krill" {
-        stale.extend([base_dir.join("minikrill"), base_dir.join("mk-minikrill")]);
-    }
     if orca_owned {
         stale.push(base_dir.join(skill.name));
     }
