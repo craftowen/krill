@@ -1024,6 +1024,95 @@ impl Sidebar {
         self.selected_worktree.as_deref()
     }
 
+    /// Orca `activeWorktreeId` 패리티: 마지막으로 선택된 워크스페이스(호스트 + 경로).
+    /// Cmd+T·새 에이전트는 실행 위치 메뉴가 아니라 여기서 호스트·작업 디렉터리를 가져온다.
+    /// 원격은 연결된 호스트만 돌려준다(끊긴 호스트면 예전처럼 실행 위치 메뉴로 폴백한다).
+    #[must_use]
+    pub fn selected_workspace(&self) -> Option<(HostId, PathBuf)> {
+        let path = self.selected_worktree.clone()?;
+        // 커서가 선택 경로를 가리키면 그 행의 호스트가 우선(로컬·원격 동명 경로 구분).
+        if let Some(i) = self.cursor
+            && self.cursor_folder().as_ref() == Some(&path)
+        {
+            let host = self.row_host(i).clone();
+            if self.host_connected(&host) {
+                return Some((host, path));
+            }
+            return None;
+        }
+        // 커서 밖 선택(복원된 상태 등)은 스냅샷에서 소유 호스트를 찾는다.
+        // 여러 호스트에 동명 경로가 있으면 판단을 미루고 None(실행 위치 메뉴 폴백).
+        let mut found: Option<HostId> = None;
+        for remote in &self.remote_hosts {
+            if remote.status == HostStatus::Connected
+                && Self::snapshot_contains(&remote.snapshot, &path)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(HostId::Remote(remote.id.clone()));
+            }
+        }
+        if let Some(host) = found {
+            if Self::snapshot_contains(&self.snapshot, &path) {
+                return None;
+            }
+            return Some((host, path));
+        }
+        if Self::snapshot_contains(&self.snapshot, &path) {
+            return Some((HostId::Local, path));
+        }
+        None
+    }
+
+    fn host_connected(&self, host: &HostId) -> bool {
+        match host {
+            HostId::Local => true,
+            HostId::Remote(id) => self
+                .remote_hosts
+                .iter()
+                .any(|r| &r.id == id && r.status == HostStatus::Connected),
+        }
+    }
+
+    /// 테스트에서 원격 호스트 스냅샷·상태를 직접 주입한다.
+    #[doc(hidden)]
+    pub fn set_remote_snapshot_for_test(
+        &mut self,
+        id: &str,
+        status: HostStatus,
+        snapshot: Snapshot,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(remote) = self.remote_hosts.iter_mut().find(|r| r.id == id) {
+            remote.status = status;
+            remote.snapshot = snapshot;
+        } else {
+            self.remote_hosts.push(RemoteHost {
+                id: id.to_owned(),
+                label: id.to_owned(),
+                status,
+                snapshot,
+                meta: Meta::new(),
+                source: None,
+                error: None,
+            });
+        }
+        self.rebuild(cx);
+    }
+
+    fn snapshot_contains(snapshot: &Snapshot, path: &Path) -> bool {
+        snapshot
+            .trees
+            .keys()
+            .chain(snapshot.trees.values().flatten())
+            .any(|root| root == path)
+            || snapshot.sessions.iter().any(|s| {
+                s.worktree.as_ref() == Some(&path.to_path_buf())
+                    || s.cwd.as_ref() == Some(&path.to_path_buf())
+            })
+    }
+
     /// 선택된 워크트리/폴더 경로를 갱신하고 영속화한다(OWE-842).
     pub fn select_worktree(&mut self, path: Option<PathBuf>, cx: &mut Context<Self>) {
         if !self.disk.initialized {

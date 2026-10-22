@@ -5003,3 +5003,120 @@ fn ports_badge_text_folds_overflow_into_count() {
     assert_eq!(ports_badge_text(&[1, 2, 3, 4, 5], 3), ":1 :2 :3 +2");
     assert_eq!(ports_badge_text(&[1, 2, 3, 4], usize::MAX), ":1 :2 :3 :4");
 }
+
+/// Orca `activeWorktreeId` 패리티: `selected_workspace`가 Cmd+T·새 에이전트용 (호스트, 경로)를 푼다.
+/// 커서 행이 우선(동명 경로 구분)이고, 커서 밖 선택은 스냅샷 소유자로 찾는다.
+/// 끊긴 원격·양쪽 동명·어디에도 없음은 None(실행 위치 메뉴 폴백)이다.
+#[gpui::test]
+fn selected_workspace_resolves_host_and_path(cx: &mut TestAppContext) {
+    use std::collections::BTreeMap;
+
+    cx.update(|cx| {
+        gpui_component::init(cx);
+    });
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let shared = PathBuf::from("/shared/repo/wt");
+    let remote_only = PathBuf::from("/remote/repo/wt-1");
+    let local_only = PathBuf::from("/local/repo/wt-2");
+    let nowhere = PathBuf::from("/어디에도/없음");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.snapshot = Snapshot {
+                sessions: Vec::new(),
+                trees: BTreeMap::from([
+                    (PathBuf::from("/shared"), vec![shared.clone()]),
+                    (PathBuf::from("/local/repo"), vec![local_only.clone()]),
+                ]),
+            };
+            s.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Connected,
+                Snapshot {
+                    sessions: Vec::new(),
+                    trees: BTreeMap::from([
+                        (PathBuf::from("/shared"), vec![shared.clone()]),
+                        (PathBuf::from("/remote/repo"), vec![remote_only.clone()]),
+                    ]),
+                },
+                cx,
+            );
+        });
+    });
+    cx.run_until_parked();
+
+    // 1. 커서 없는 복원 상태: 원격 전용 경로는 원격 호스트다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.cursor = None;
+            s.select_worktree(Some(remote_only.clone()), cx);
+            assert_eq!(
+                s.selected_workspace(),
+                Some((HostId::Remote("studio".into()), remote_only.clone()))
+            );
+        });
+    });
+    // 2. 로컬 전용 경로는 로컬이다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_worktree(Some(local_only.clone()), cx);
+            assert_eq!(
+                s.selected_workspace(),
+                Some((HostId::Local, local_only.clone()))
+            );
+        });
+    });
+    // 3. 양쪽 동명 경로는 커서 없이 판단하지 않는다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_worktree(Some(shared.clone()), cx);
+            assert_eq!(s.selected_workspace(), None);
+        });
+    });
+    // 4. 커서가 원격 행을 가리키면 동명 경로도 원격이다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            let studio = HostId::Remote("studio".into());
+            let idx = s
+                .rows
+                .iter()
+                .position(|r| matches!(r, Row::Worktree(p) if p == &shared))
+                .and_then(|_| {
+                    s.rows.iter().enumerate().position(|(i, r)| {
+                        s.row_hosts.get(i) == Some(&studio)
+                            && matches!(r, Row::Worktree(p) if p == &shared)
+                    })
+                })
+                .expect("remote worktree row");
+            s.cursor = Some(idx);
+            s.select_worktree(Some(shared.clone()), cx);
+            assert_eq!(s.selected_workspace(), Some((studio, shared.clone())));
+        });
+    });
+    // 5. 원격이 끊기면 커서가 가리켜도 None이다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.set_remote_snapshot_for_test(
+                "studio",
+                HostStatus::Disconnected,
+                Snapshot {
+                    sessions: Vec::new(),
+                    trees: BTreeMap::from([(
+                        PathBuf::from("/remote/repo"),
+                        vec![remote_only.clone()],
+                    )]),
+                },
+                cx,
+            );
+            s.cursor = None;
+            s.select_worktree(Some(remote_only.clone()), cx);
+            assert_eq!(s.selected_workspace(), None);
+        });
+    });
+    // 6. 어디에도 없는 경로는 None이다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.select_worktree(Some(nowhere.clone()), cx);
+            assert_eq!(s.selected_workspace(), None);
+        });
+    });
+}

@@ -8136,7 +8136,7 @@ fn navigation_history_tolerates_corrupt_index_without_panicking(cx: &mut TestApp
     });
 }
 
-/// The disconnect subscription must survive Shell::new returning.
+/// The disconnect subscription must survive `Shell::new` returning.
 #[gpui::test]
 fn sidebar_disconnect_subscription_survives_window_initialization(cx: &mut TestAppContext) {
     use krill_app::hosts::{HostId, HostManager, HostStatus};
@@ -8173,4 +8173,135 @@ fn sidebar_disconnect_subscription_survives_window_initialization(cx: &mut TestA
     cx.run_until_parked();
     assert_eq!(manager.status("disconnect-test"), HostStatus::Disconnected);
     assert_eq!(manager.tunnel_starts("disconnect-test"), 0);
+}
+
+/// 원격 워크스페이스를 고른 뒤 Cmd+T·새 에이전트는 그 원격 호스트·경로에서 새 세션을 연다
+/// (Orca `createNewTerminalTab(activeWorktreeId)` 패리티).
+#[gpui::test]
+fn cmd_t_and_new_agent_use_selected_remote_workspace(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+    use std::collections::BTreeMap;
+    let (view, cx) = open(cx, state_path("cmd-t-remote-ws"));
+    let studio_id = HostId::Remote("studio-mac".into());
+    let wt = PathBuf::from("/remote/repo/wt-1");
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.host_manager.sync_specs(&[RemoteHostSpec {
+                id: "studio-mac".into(),
+                label: "Mac Studio".into(),
+                address: "owen@studio.local".into(),
+                port: None,
+                identity_file: None,
+                remote_socket: None,
+            }]);
+            s.sidebar.update(cx, |sb, cx| {
+                sb.set_remote_snapshot_for_test(
+                    "studio-mac",
+                    HostStatus::Connected,
+                    sidebar::Snapshot {
+                        sessions: Vec::new(),
+                        trees: BTreeMap::from([(PathBuf::from("/remote/repo"), vec![wt.clone()])]),
+                    },
+                    cx,
+                );
+                // 카드 클릭과 같은 효과: 선택이 바뀌면 실행 위치가 원격으로 따라간다.
+                sb.select_worktree(Some(wt.clone()), cx);
+            });
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            assert_eq!(
+                s.sidebar.read(cx).selected_workspace(),
+                Some((studio_id.clone(), wt.clone()))
+            );
+            assert_eq!(
+                s.launch_host, studio_id,
+                "workspace selection syncs the execution location"
+            );
+        });
+    });
+    // Cmd+T: 같은 원격 호스트의 같은 워크트리에서 새 탭이 열린다.
+    cx.simulate_keystrokes("cmd-t");
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            assert_eq!(s.layout.tabs().len(), 2);
+            let pane = s.layout.active_tab().focused;
+            assert_eq!(s.layout.host(pane), &studio_id);
+            assert_eq!(
+                s.launch_for(pane).cwd,
+                wt.as_os_str().as_bytes(),
+                "cmd-t must open the selected remote worktree, not the remote default dir"
+            );
+        });
+    });
+    // 새 에이전트도 같은 원격 워크트리에서 시작한다.
+    cx.update(|_, cx| {
+        view.update(cx, |s, cx| {
+            s.new_agent("codex".into(), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |s, _| {
+            assert_eq!(s.layout.tabs().len(), 3);
+            let pane = s.layout.active_tab().focused;
+            assert_eq!(s.layout.host(pane), &studio_id);
+            assert_eq!(s.launch_for(pane).cwd, wt.as_os_str().as_bytes());
+            assert!(matches!(
+                &s.launch_for(pane).program,
+                Program::Agent { id } if id == "codex"
+            ));
+        });
+    });
+}
+
+/// 로컬 워크스페이스를 고른 뒤 Cmd+T는 그 경로에서 새 탭을 연다(홈 폴백이 아니다).
+#[gpui::test]
+fn cmd_t_uses_selected_local_workspace(cx: &mut TestAppContext) {
+    struct Memory;
+    impl sidebar::Source for Memory {
+        fn fetch(&self) -> std::io::Result<sidebar::Snapshot> {
+            Ok(sidebar::Snapshot {
+                sessions: vec![sidebar::Session {
+                    id: krill_proto::SessionId(7),
+                    status: krill_proto::control::AgentStatus::UNKNOWN,
+                    worktree: Some("/repo/tree".into()),
+                    cwd: Some("/repo/tree".into()),
+                    account: None,
+                }],
+                ..sidebar::Snapshot::default()
+            })
+        }
+    }
+    let (view, cx) = open(cx, state_path("cmd-t-local-ws"));
+    let wt = PathBuf::from("/repo/tree");
+    view.update(cx, |this, cx| {
+        this.sidebar.update(cx, |s, cx| {
+            s.connect_source(std::sync::Arc::new(Memory), cx);
+        });
+    });
+    cx.run_until_parked();
+    view.update(cx, |this, cx| {
+        this.sidebar.update(cx, |s, cx| {
+            s.select_worktree(Some(wt.clone()), cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.simulate_keystrokes("cmd-t");
+    view.update(cx, |s, cx| {
+        assert_eq!(
+            s.sidebar.read(cx).selected_workspace(),
+            Some((krill_app::hosts::HostId::Local, wt.clone()))
+        );
+        assert_eq!(s.layout.tabs().len(), 2);
+        let pane = s.layout.active_tab().focused;
+        assert_eq!(s.layout.host(pane), &krill_app::hosts::HostId::Local);
+        assert_eq!(
+            s.launch_for(pane).cwd,
+            wt.as_os_str().as_bytes(),
+            "cmd-t must open the selected local worktree, not home"
+        );
+    });
 }

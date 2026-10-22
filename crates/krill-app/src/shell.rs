@@ -70,7 +70,7 @@ use krill_app::terminal::{
 };
 use krill_app::{keys, platform};
 use krill_proto::agent::Permission;
-use krill_proto::control::{AgentLaunch, AgentSettings, AgentState};
+use krill_proto::control::{AgentLaunch, AgentSettings};
 use krill_proto::daemon::{self, Paths};
 use krill_proto::input::{Notice, Now};
 use krill_proto::ipc::{self, ClientRole};
@@ -619,6 +619,9 @@ pub struct Shell {
     link_hosts: Option<Arc<krill_app::hosts::link::LinkHosts>>,
     link_poll: Option<Task<()>>,
     pub(super) launch_host: krill_app::hosts::HostId,
+    /// 마지막으로 실행 위치에 반영한 워크스페이스 선택(Orca `activeWorktreeId` 패리티).
+    /// 메뉴에서 고른 실행 위치는 다음 선택 변경까지 유지한다.
+    last_synced_selection: Option<(krill_app::hosts::HostId, PathBuf)>,
     /// 상태바 포트 감지 메모(AS-24): 세션별 마지막 화면 텍스트와 감지 결과.
     /// 렌더마다 모든 칸의 화면 텍스트에 정규식을 돌리지 않고 텍스트가 바뀔 때만 다시 감지한다.
     ports_cache: std::cell::RefCell<HashMap<u64, popout::PortCache>>,
@@ -681,18 +684,30 @@ impl Shell {
         });
         let sidebar_tabs = cx.observe(&sidebar, |this, sidebar, cx| {
             this.sync_live_cwds(sidebar.read(cx));
+            // Orca `activeWorktreeId` 패리티: 워크스페이스 선택이 바뀌면 다음 Cmd+T·새 에이전트의
+            // 실행 위치도 그 호스트를 따른다. 메뉴에서 직접 고른 실행 위치는 선택이 다시 바뀔 때까지 둔다.
+            if let Some(selected) = sidebar.read(cx).selected_workspace()
+                && this.last_synced_selection.as_ref() != Some(&selected)
+            {
+                this.last_synced_selection = Some(selected.clone());
+                this.launch_host = selected.0;
+            }
             cx.notify();
         });
         let selection = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::Selected, cx| {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
                 .unwrap_or(krill_app::hosts::HostId::Local);
+            // Orca `activeWorktreeId` 패리티: 워크스페이스를 고르면 다음 Cmd+T·새 에이전트의
+            // 실행 위치도 그 호스트를 따른다.
+            this.launch_host = host.clone();
             this.open_session_on(host, e.0, cx);
         });
         let new_session = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::NewSession, cx| {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
                 .unwrap_or(krill_app::hosts::HostId::Local);
+            this.launch_host = host.clone();
             let initial_prompt = sidebar.update(cx, |s, _| s.take_initial_prompt(&e.cwd));
             this.new_folder_tab_on(host, &e.cwd, e.program.clone(), cx);
             if let Some(prompt) = initial_prompt
@@ -1051,6 +1066,7 @@ impl Shell {
             link_hosts: None,
             link_poll: None,
             launch_host: krill_app::hosts::HostId::Local,
+            last_synced_selection: None,
             ports_cache: std::cell::RefCell::default(),
             settings: None,
             role: WindowRole::Main,
@@ -2179,6 +2195,14 @@ impl Shell {
 
     pub(super) fn new_tab_on_launch_host(&mut self, cx: &mut Context<Self>) {
         let host = self.launch_host.clone();
+        // Orca `createNewTerminalTab(activeWorktreeId)` 패리티: 선택된 워크스페이스가
+        // 실행 위치와 같은 호스트면 그 경로에서 새 세션을 시작한다.
+        if let Some((sel_host, folder)) = self.sidebar.read(cx).selected_workspace()
+            && sel_host == host
+        {
+            self.new_folder_tab_on(host, &folder, Program::Login, cx);
+            return;
+        }
         self.change(true, cx, |l| {
             l.new_tab();
             if host.is_remote()
@@ -3083,7 +3107,8 @@ impl Shell {
         }));
     }
 
-    /// 새 탭에서 에이전트를 지금 보이는 폴더(MK-055)로 띄운다. 선택된 실행 위치가 원격이면 원격 기본 디렉터리에서 시작한다.
+    /// 새 탭에서 에이전트를 선택된 워크스페이스(MK-055 + Orca `activeWorktreeId` 패리티)로 띄운다.
+    /// 선택이 실행 위치와 같은 호스트면 그 경로에서, 원격인데 포커스가 다른 호스트면 원격 기본 디렉터리에서 시작한다.
     fn new_agent(&mut self, id: String, cx: &mut Context<Self>) {
         self.new_agent_with_optional_account(id, None, cx);
     }
@@ -3095,7 +3120,15 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         let host = self.launch_host.clone();
-        let cwd = if host.is_remote()
+        let selected = self
+            .sidebar
+            .read(cx)
+            .selected_workspace()
+            .filter(|(sel_host, _)| sel_host == &host)
+            .map(|(_, folder)| folder);
+        let cwd = if let Some(folder) = selected {
+            folder
+        } else if host.is_remote()
             && self
                 .layout
                 .focused()
@@ -4874,177 +4907,110 @@ impl Shell {
         let is_split = self.layout.visible().len() > 1;
         let show_header = is_split || self.layout.host(id).is_remote();
         let p = krill_app::ui::palette(cx);
-        let pane_title = self.pane_label(id, cx);
+        // Orca 패리티(`TerminalPaneHeaderOverlay` chromeless): 자동 제목·상태 글리프·
+        // 에이전트 아이콘은 탭 바가 이미 보이므로 페인에 중복하지 않는다.
         let yolo_badge = self.yolo_badge(id, cx);
         let host_badge = self.host_badge(id, "pane-host-badge", cx);
-        // OWE-886: 탭 바와 같은 식별자(상태 글리프 + 에이전트 브랜드 아이콘, STYLEGUIDE §6.4·§7.4).
-        let host = self.layout.host(id);
-        let session = self
-            .layout
-            .session(id)
-            .and_then(|sid| self.sidebar.read(cx).session_on(host, sid));
-        let launch_agent = match self.layout.launch(id).map(|l| &l.program) {
-            Some(Program::Agent { id }) => tabs::launch_agent_id(id),
-            _ => "",
-        };
-        let agent = session.map_or(launch_agent, |s| {
-            if s.status.agent.is_empty() {
-                launch_agent
-            } else {
-                &s.status.agent
-            }
-        });
-        let state = session.map_or(AgentState::Unknown, |s| s.status.state);
-        let pane_fg = if focused {
-            p.sidebar_foreground
-        } else {
-            p.muted_foreground
-        };
         // OWE-871: 확대(줌) 상태면 헤더에 배지와 해제 버튼을 보인다.
         let zoomed = self.zoomed_pane == Some(id);
+        // Orca chromeless 패리티: 제목 행(26px 전체 폭 바) 대신 터미널 우상단
+        // 투명 오버레이 칩에 배지와 컨트롤만 둔다. 첫 행을 가리지 않고 자리를
+        // 차지하지 않으며, 탭 바와 제목이 이중으로 뜨지 않는다.
         let pane_header = div()
             .debug_selector(move || format!("pane-header-{}", id.get()))
-            .h(px(26.))
-            .px_2()
+            .absolute()
+            .top(px(4.))
+            .right(px(4.))
             .flex_none()
             .flex()
             .items_center()
-            .justify_between()
-            .gap_2()
-            .bg(p.sidebar)
-            .border_b_1()
+            .gap_0p5()
+            .px_1()
+            .py_0p5()
+            .rounded(krill_app::ui::RADIUS_SM)
+            .bg(p.sidebar.opacity(0.92))
+            .border_1()
             .border_color(p.border)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(
-                        krill_app::ui::status::status_glyph(
-                            state,
-                            false,
-                            krill_app::ui::status::Size::Md,
-                            cx,
-                        )
-                        .debug_selector(move || format!("pane-state-{}", id.get())),
-                    )
-                    .child(krill_app::ui::status::agent_icon(
-                        agent,
-                        krill_app::ui::ICON_SM,
-                        pane_fg,
-                    ))
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(krill_app::ui::TEXT_XS)
-                            .font_weight(if focused {
-                                gpui::FontWeight::SEMIBOLD
-                            } else {
-                                gpui::FontWeight::NORMAL
-                            })
-                            .text_color(if focused {
-                                p.sidebar_foreground
-                            } else {
-                                p.muted_foreground
-                            })
-                            .child(pane_title),
-                    )
-                    .children(yolo_badge)
-                    .children(host_badge)
-                    .when(zoomed, |d| {
-                        d.child(
-                            div()
-                                .id(("pane-zoom-badge", id.get()))
-                                .debug_selector(move || format!("pane-zoom-badge-{}", id.get()))
-                                .aria_label(text::ZOOMED_BADGE.get())
-                                .flex_none()
-                                .px_1()
-                                .rounded(krill_app::ui::RADIUS_XS)
-                                .bg(p.muted)
-                                .font_family(krill_app::ui::FONT_UI)
-                                .text_size(krill_app::ui::TEXT_2XS)
-                                .text_color(p.muted_foreground)
-                                .child(text::ZOOMED_BADGE.get()),
-                        )
-                        .child(krill_app::ui::button_with_tooltip(
-                            krill_app::ui::ghost(
-                                ("pane-unzoom", id.get()),
-                                text::PANE_UNZOOM.get(),
-                            )
-                            .debug_selector(move || format!("pane-unzoom-{}", id.get()))
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.zoomed_pane = None;
-                                    cx.notify();
-                                },
-                            )),
-                            format!("pane-unzoom-{}", id.get()),
-                            text::PANE_UNZOOM.get(),
-                        ))
-                    }),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_none()
-                    .items_center()
-                    .gap_0p5()
-                    .child(krill_app::ui::button_with_tooltip(
-                        Button::new(("pane-split-right", id.get()))
-                            .icon(IconName::PanelRight)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                                this.zoomed_pane = None;
-                                this.change(true, cx, |l| {
-                                    l.focus(id);
-                                    l.split(Axis::Horizontal);
-                                });
-                            })),
-                        format!("pane-split-right-{}", id.get()),
-                        text::SPLIT_RIGHT.get(),
-                    ))
-                    .child(krill_app::ui::button_with_tooltip(
-                        Button::new(("pane-split-down", id.get()))
-                            .icon(IconName::PanelBottom)
-                            .ghost()
-                            .xsmall()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
-                                this.zoomed_pane = None;
-                                this.change(true, cx, |l| {
-                                    l.focus(id);
-                                    l.split(Axis::Vertical);
-                                });
-                            })),
-                        format!("pane-split-down-{}", id.get()),
-                        text::SPLIT_DOWN.get(),
-                    ))
-                    .when(is_split, |d| {
-                        d.child(krill_app::ui::button_with_tooltip(
-                            Button::new(("pane-close", id.get()))
-                                .debug_selector(move || format!("pane-close-{}", id.get()))
-                                .icon(IconName::Close)
-                                .ghost()
-                                .xsmall()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
-                                    // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
-                                    this.maybe_close_pane(id, cx);
-                                })),
-                            format!("pane-close-{}", id.get()),
-                            text::CLOSE_PANE.get(),
-                        ))
-                    }),
-            );
+            .children(yolo_badge)
+            .children(host_badge)
+            .when(zoomed, |d| {
+                d.child(
+                    div()
+                        .id(("pane-zoom-badge", id.get()))
+                        .debug_selector(move || format!("pane-zoom-badge-{}", id.get()))
+                        .aria_label(text::ZOOMED_BADGE.get())
+                        .flex_none()
+                        .px_1()
+                        .rounded(krill_app::ui::RADIUS_XS)
+                        .bg(p.muted)
+                        .font_family(krill_app::ui::FONT_UI)
+                        .text_size(krill_app::ui::TEXT_2XS)
+                        .text_color(p.muted_foreground)
+                        .child(text::ZOOMED_BADGE.get()),
+                )
+                .child(krill_app::ui::button_with_tooltip(
+                    krill_app::ui::ghost(("pane-unzoom", id.get()), text::PANE_UNZOOM.get())
+                        .debug_selector(move || format!("pane-unzoom-{}", id.get()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.zoomed_pane = None;
+                            cx.notify();
+                        })),
+                    format!("pane-unzoom-{}", id.get()),
+                    text::PANE_UNZOOM.get(),
+                ))
+            })
+            .child(krill_app::ui::button_with_tooltip(
+                Button::new(("pane-split-right", id.get()))
+                    .icon(IconName::PanelRight)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
+                        this.zoomed_pane = None;
+                        this.change(true, cx, |l| {
+                            l.focus(id);
+                            l.split(Axis::Horizontal);
+                        });
+                    })),
+                format!("pane-split-right-{}", id.get()),
+                text::SPLIT_RIGHT.get(),
+            ))
+            .child(krill_app::ui::button_with_tooltip(
+                Button::new(("pane-split-down", id.get()))
+                    .icon(IconName::PanelBottom)
+                    .ghost()
+                    .xsmall()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        // OWE-871: 분할하면 확대 상태는 푼다(분할 액션과 같은 규칙).
+                        this.zoomed_pane = None;
+                        this.change(true, cx, |l| {
+                            l.focus(id);
+                            l.split(Axis::Vertical);
+                        });
+                    })),
+                format!("pane-split-down-{}", id.get()),
+                text::SPLIT_DOWN.get(),
+            ))
+            .when(is_split, |d| {
+                d.child(krill_app::ui::button_with_tooltip(
+                    Button::new(("pane-close", id.get()))
+                        .debug_selector(move || format!("pane-close-{}", id.get()))
+                        .icon(IconName::Close)
+                        .ghost()
+                        .xsmall()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            // OWE-871: ⌘W와 같이 닫은 기록을 남기고 확대 상태를 푼다.
+                            // OWE-872: 실행 중이면 확인 대화상자를 먼저 띄운다.
+                            this.maybe_close_pane(id, cx);
+                        })),
+                    format!("pane-close-{}", id.get()),
+                    text::CLOSE_PANE.get(),
+                ))
+            });
         let body = match self.live.get(&id) {
             Some(l) if l.pane.session().is_some() => {
                 let mut el = TerminalElement::new(l.pane.shown(), self.terminal_theme)
@@ -5175,8 +5141,6 @@ impl Shell {
             .text_color(p.muted_foreground)
             .flex()
             .flex_col()
-            // OWE-653 / MK-131: 단일 로컬 칸은 탭이 이미 제목을 보이므로 헤더 줄을 숨기고, 분할 칸이거나 원격 칸이면 헤더를 보인다.
-            .when(show_header, |d| d.child(pane_header))
             .child(
                 div()
                     .flex_1()
@@ -5189,7 +5153,10 @@ impl Shell {
                             .relative()
                             .child(body)
                             .children(self.fit_probe(id, cx))
-                            .children(self.scroll_chrome(id, cx)),
+                            .children(self.scroll_chrome(id, cx))
+                            // Orca 패리티: 페인 헤더는 자리를 차지하는 행이 아니라
+                            // 터미널 위 투명 오버레이 칩이다(OWE-653 / MK-131).
+                            .children(show_header.then_some(pane_header)),
                     )
                     .children(self.render_pane_chat_overlay(id, window, cx)),
             )
