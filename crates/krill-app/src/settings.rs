@@ -4426,27 +4426,6 @@ impl SettingsView {
         }
     }
 
-    /// Linux 피어는 접속 사용자를 알 수 없어 바로 저장하지 않는다. 입력 폼에 이름·주소를 채우고 사용자를 붙이라고 안내한다.
-    pub fn fill_tailscale_peer(
-        &mut self,
-        peer: &crate::ssh_hosts::TailscalePeer,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.ensure_ssh_form(window, cx);
-        if let Some(form) = &self.ssh_form {
-            let (label, address) = (form.label.clone(), form.address.clone());
-            label.update(cx, |s, cx| s.set_value(peer.hostname.clone(), window, cx));
-            address.update(cx, |s, cx| s.set_value(peer.address.clone(), window, cx));
-        }
-        self.ssh_status = Some(
-            text::SSH_DISCOVERED_LINUX_HINT
-                .format(&[("label", &peer.hostname), ("address", &peer.address)])
-                .into(),
-        );
-        cx.notify();
-    }
-
     pub fn connect_ssh_host(&mut self, host: crate::ssh_hosts::SshHost, cx: &mut Context<Self>) {
         let cmd = crate::ssh_hosts::build_connect_command(&host)
             .trim()
@@ -9028,28 +9007,16 @@ impl SettingsView {
                 });
                 let btn_id = format!("admin-ssh-add-peer-{idx}");
                 let peer_cl = peer.clone();
-                let mut addr_detail = match &peer.ipv4 {
+                let addr_detail = match &peer.ipv4 {
                     Some(ip) if ip != &peer.address => format!("{} ({ip})", peer.address),
                     _ => peer.address.clone(),
                 };
-                if peer.linux {
-                    addr_detail.push_str(" · Linux");
-                }
                 let action_btn = if already_added {
                     layout::ghost(
                         gpui::ElementId::Name(btn_id.clone().into()),
                         text::SSH_DISCOVERED_ADDED.get(),
                     )
                     .debug_selector(move || btn_id.clone())
-                } else if peer.linux {
-                    layout::primary(
-                        gpui::ElementId::Name(btn_id.clone().into()),
-                        text::SSH_DISCOVERED_FILL.get(),
-                    )
-                    .debug_selector(move || btn_id.clone())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.fill_tailscale_peer(&peer_cl, window, cx);
-                    }))
                 } else {
                     layout::secondary(
                         gpui::ElementId::Name(btn_id.clone().into()),

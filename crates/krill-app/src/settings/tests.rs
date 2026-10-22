@@ -3200,7 +3200,6 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
                     dns_name: "owen-studio.tailnet.ts.net".into(),
                     ipv4: Some("100.100.1.9".into()),
                     address: "owen-studio.tailnet.ts.net".into(),
-                    linux: false,
                 }],
                 cx,
             );
@@ -3217,43 +3216,6 @@ fn owe668_ssh_tab_form_tailscale_and_onboarding_flow(cx: &mut TestAppContext) {
                 .iter()
                 .any(|h| h.destination == "owen-studio.tailnet.ts.net")
         );
-    });
-
-    // Linux 발견 기기: 접속 사용자를 모르니 저장하지 않고 입력 폼을 채워 안내한다.
-    vcx.update(|window, cx| {
-        view.update(cx, |v, cx| {
-            v.set_tailscale_peers(
-                vec![crate::ssh_hosts::TailscalePeer {
-                    hostname: "oci-arm".into(),
-                    dns_name: "oci-arm.tailnet.ts.net".into(),
-                    ipv4: Some("100.71.56.82".into()),
-                    address: "oci-arm.tailnet.ts.net".into(),
-                    linux: true,
-                }],
-                cx,
-            );
-        });
-        window.draw(cx).clear(cx);
-    });
-    click(vcx, "admin-ssh-add-peer-0");
-    vcx.update(|_, cx| {
-        let v = view.read(cx);
-        assert_eq!(
-            v.ssh_hosts().len(),
-            2,
-            "Linux 피어는 한 번 눌러 저장하지 않는다"
-        );
-        let address = v
-            .ssh_form
-            .as_ref()
-            .unwrap()
-            .address
-            .read(cx)
-            .value()
-            .to_string();
-        assert_eq!(address, "oci-arm.tailnet.ts.net");
-        let status = v.ssh_status.as_ref().unwrap().to_string();
-        assert!(status.contains("ubuntu@oci-arm.tailnet.ts.net"), "{status}");
     });
 
     // 연결 테스트 실패 1: Connection refused → 원격 로그인 켜기 안내 노출, 등록 버튼 숨김.
