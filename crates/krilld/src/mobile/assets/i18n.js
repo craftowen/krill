@@ -24,6 +24,8 @@
  "Open workspaces": "작업 공간 열기",
  "Workspace Options": "작업 공간 필터",
  "Filter projects": "프로젝트 필터",
+ "{0} projects": "프로젝트 {0}개",
+ "Apply": "적용",
  "Filter workspace status": "작업 공간 상태 필터",
  "All projects": "모든 프로젝트",
  "Clear filters": "필터 초기화",
