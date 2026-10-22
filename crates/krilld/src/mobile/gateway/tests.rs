@@ -1402,13 +1402,17 @@ fn daemon_restart_readopts_loopback_port_and_live_cloudflared_pid_in_zero_ms() {
 }
 
 #[test]
-fn missing_relay_pwa_falls_back_without_issuing_a_dead_fixed_origin_qr() {
+fn missing_relay_pwa_fails_fast_without_quick_tunnel_fallback() {
+    fn must_not_start_tunnel(_: u16) -> io::Result<super::super::tunnel::Tunnel> {
+        panic!("relay failure must not start a quick tunnel")
+    }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let (_registry, gateway) = start();
     {
         let mut state = lock(&gateway.shared.state);
         state.publication.origin = format!("http://{}", listener.local_addr().unwrap());
         state.relay_enabled = true;
+        state.tunnel_start = Some(must_not_start_tunnel);
     }
     let server = thread::spawn(move || {
         let (mut socket, _) = listener.accept().unwrap();
@@ -1425,15 +1429,20 @@ fn missing_relay_pwa_falls_back_without_issuing_a_dead_fixed_origin_qr() {
             .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
             .unwrap();
     });
-    let MobileReply::PairingOffer { url, .. } = gateway.request(MobileRequest::MintPairingTicket {
+    let started = Instant::now();
+    let MobileReply::Failed(message) = gateway.request(MobileRequest::MintPairingTicket {
         mode: ConnectMode::Tunnel,
         custom_address: None,
         rotate: true,
     }) else {
-        panic!("expected fallback offer")
+        panic!("expected relay error")
     };
-    assert!(url.starts_with("https://fixture-mobile.trycloudflare.com/#pair="));
-    assert!(!url.contains("&r="));
+    assert!(
+        message.contains("릴레이") || message.contains("배포"),
+        "{message}"
+    );
+    assert!(started.elapsed() < MINT_WAIT);
+    assert!(lock(&gateway.shared.state).tunnel.is_none());
     server.join().unwrap();
 }
 

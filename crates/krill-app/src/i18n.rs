@@ -142,7 +142,7 @@ catalog! {
         TAILSCALE => ("Tailscale (외부 사설망 · VPN)", "Tailscale (private network · VPN)"),
         TAILSCALE_DESC => ("같은 Tailscale 사설망 기기에서 접속합니다. Android에서는 VPN 활성화 시 삼성페이 등과 충돌할 수 있습니다.", "Connect over your Tailscale private network. On Android, an active VPN may conflict with Samsung Pay."),
         TUNNEL => ("릴레이 서버 (외부 접속 권장 · 무계정)", "Relay server (Recommended · no account)"),
-        TUNNEL_DESC => ("암호화된 릴레이로 셀룰러·외부 Wi-Fi에서 접속합니다. 릴레이 연결 실패 시 퀵터널을 백그라운드로 준비합니다.", "Connect over an encrypted relay from cellular or external Wi-Fi. If the relay fails, a Quick Tunnel starts in the background."),
+        TUNNEL_DESC => ("암호화된 릴레이로 셀룰러·외부 Wi-Fi에서 접속합니다.", "Connect over an encrypted relay from cellular or external Wi-Fi."),
         PREPARING => ("모바일 연결 준비 중…", "Preparing mobile connection…"),
         PREPARING_DESC => ("백그라운드에서 연결하고 있습니다. 다른 연결 방식을 선택하거나 앱을 계속 사용할 수 있습니다.", "Connecting in the background. You can choose another connection mode or keep using the app."),
         AUTO => ("네트워크 자동 선택", "Auto-select network"),
