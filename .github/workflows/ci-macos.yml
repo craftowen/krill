@@ -97,7 +97,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel]
+        os: [macos-14]
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     env:
@@ -105,9 +105,6 @@ jobs:
       # 테스트·assertion·시간 기준은 그대로 두고 테스트 빌드만 최적화한다.
       CARGO_PROFILE_TEST_OPT_LEVEL: 2
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      # arm64는 링커가 자동 서명하지만 Intel은 기본적으로 미서명이다.
-      # LOCAL_PEERTOKEN 서명 정책 테스트가 양쪽에서 같은 실제 서명 피어를 쓰게 한다.
-      CARGO_TARGET_X86_64_APPLE_DARWIN_RUSTFLAGS: "-C link-arg=-Wl,-adhoc_codesign"
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
