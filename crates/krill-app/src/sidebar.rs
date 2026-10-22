@@ -544,6 +544,11 @@ pub struct RenameSession(pub SessionId);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconnectHost(pub HostId);
 
+/// 연결된 원격 호스트 섹션에서 '연결 해제'를 눌렀을 때 내보내는 이벤트.
+/// 셸이 터널·링크 자식을 내리고 수동 끊김으로 고정한다(`reconnect`로만 복구).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DisconnectHost(pub HostId);
+
 /// 로컬 데몬 재연결 뒤 처음 받은 로컬 세션 목록의 세션 수.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Relisted(pub usize);
@@ -667,6 +672,7 @@ impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
 impl EventEmitter<OpenFolder> for Sidebar {}
 impl EventEmitter<ReconnectHost> for Sidebar {}
+impl EventEmitter<DisconnectHost> for Sidebar {}
 impl EventEmitter<Relisted> for Sidebar {}
 
 impl std::fmt::Debug for Sidebar {
@@ -1041,6 +1047,20 @@ impl Sidebar {
             self.collapsed_hosts.insert(host.clone());
         }
         self.persist(cx);
+    }
+
+    /// 연결된 원격 호스트의 '연결 해제' 버튼을 눌렀을 때 상태를 `Disconnected`로 바꾸고 해제를 요청한다.
+    /// 터널·링크 자식은 셸(`DisconnectHost` 구독)이 내리며, `reconnect_host`로만 다시 붙는다.
+    pub fn disconnect_host(&mut self, host: HostId, cx: &mut Context<Self>) {
+        if let HostId::Remote(id) = &host
+            && let Some(r) = self.remote_hosts.iter_mut().find(|r| r.id == *id)
+        {
+            r.status = HostStatus::Disconnected;
+        }
+        self.rebuild(cx);
+        cx.emit(DisconnectHost(host));
+        self.remote_task = None;
+        self.start_remote_polling(cx);
     }
 
     /// 끊긴 원격 호스트의 '다시 연결' 버튼을 눌렀을 때 상태를 `Connecting`으로 바꾸고 재연결을 요청한다.

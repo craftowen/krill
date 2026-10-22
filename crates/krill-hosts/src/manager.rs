@@ -109,6 +109,9 @@ struct RemoteSlot {
     last_error: Option<String>,
     tunnel_starts: usize,
     generation: u64,
+    /// 사용자가 사이드바에서 '연결 해제'를 눌러 수동으로 끊은 상태.
+    /// `reconnect_now`로만 풀린다. 켜져 있으면 자동 재연결·폴링 재접속을 하지 않는다.
+    suspended: bool,
 }
 
 impl RemoteSlot {
@@ -126,6 +129,7 @@ impl RemoteSlot {
             last_error: None,
             tunnel_starts: 0,
             generation: 0,
+            suspended: false,
         }
     }
 
@@ -332,7 +336,32 @@ impl HostManager {
         s.generation = s.generation.wrapping_add(1);
         s.tunnel = None;
         s.next_retry_at = None;
+        s.failures = 0;
+        s.last_error = None;
+        s.suspended = false;
         s.status = HostStatus::Connecting;
+    }
+
+    /// 사용자가 사이드바에서 '연결 해제'를 눌렀을 때 터널을 내리고 수동 끊김으로 고정한다.
+    /// `reconnect_now`로만 풀리며, 그 전까지 자동 재연결·폴링 재접속을 하지 않는다.
+    pub fn disconnect_now(&self, id: &str) {
+        if let Ok(mut external) = self.external.lock()
+            && let Some(host) = external.get_mut(id)
+        {
+            host.info.status = HostStatus::Disconnected;
+            return;
+        }
+        let Some(slot) = self.slot(id) else {
+            return;
+        };
+        let Ok(mut s) = slot.lock() else {
+            return;
+        };
+        s.generation = s.generation.wrapping_add(1);
+        s.tunnel = None;
+        s.next_retry_at = None;
+        s.suspended = true;
+        s.status = HostStatus::Disconnected;
     }
 
     /// 지정한 [`HostId`]에 대한 전송 무관 [`HostTarget`]을 돌려준다.
@@ -405,6 +434,14 @@ impl HostManager {
         let mut s = slot
             .lock()
             .map_err(|_| io::Error::other("remote host slot poisoned"))?;
+
+        if s.suspended {
+            s.status = HostStatus::Disconnected;
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "remote host disconnected",
+            ));
+        }
 
         if let Some(t) = &mut s.tunnel
             && !t.is_alive()
@@ -501,6 +538,10 @@ impl HostManager {
         let Ok(mut s) = slot.lock() else {
             return;
         };
+        if s.suspended {
+            s.status = HostStatus::Disconnected;
+            return;
+        }
         if ok {
             s.failures = 0;
             s.next_retry_at = None;
