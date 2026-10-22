@@ -56,6 +56,57 @@ struct DrawableBacklog {
     // must not drain the new count.
     in_flight: Arc<Mutex<(u64, usize)>>,
     last_queued: Option<Instant>,
+    stats: Arc<Mutex<FrameStats>>,
+}
+
+/// One second of presentation outcomes. Logged only when something was off, so a frozen window
+/// leaves a record of whether frames were skipped, dropped by the compositor, or shown late.
+#[derive(Default)]
+struct FrameStats {
+    since: Option<Instant>,
+    rendered: u32,
+    skipped: u32,
+    shown: u32,
+    // `presentedTime == 0`: the drawable never reached the screen.
+    dropped: u32,
+    slowest_shown: Duration,
+    stale_resets: u32,
+    size_changes: u32,
+    last_size: Option<(i32, i32)>,
+}
+
+impl FrameStats {
+    /// Returns the summary line for a finished one-second window that had anything unusual.
+    fn roll(&mut self, now: Instant) -> Option<String> {
+        let since = *self.since.get_or_insert(now);
+        if now.saturating_duration_since(since) < Duration::from_secs(1) {
+            return None;
+        }
+        let unusual = self.skipped > 0
+            || self.dropped > 0
+            || self.stale_resets > 0
+            || self.size_changes > 0
+            || self.slowest_shown >= SLOW_DRAWABLE;
+        let line = unusual.then(|| {
+            format!(
+                "frames in {}ms: rendered {}, skipped {}, shown {}, dropped {}, slowest shown {}ms, stale resets {}, size changes {}",
+                now.saturating_duration_since(since).as_millis(),
+                self.rendered,
+                self.skipped,
+                self.shown,
+                self.dropped,
+                self.slowest_shown.as_millis(),
+                self.stale_resets,
+                self.size_changes,
+            )
+        });
+        *self = FrameStats {
+            since: Some(now),
+            last_size: self.last_size,
+            ..FrameStats::default()
+        };
+        line
+    }
 }
 
 impl DrawableBacklog {
@@ -67,33 +118,54 @@ impl DrawableBacklog {
         }
         let quiet = self.last_queued.map(|at| now.saturating_duration_since(at));
         let stale = quiet.is_none_or(|quiet| quiet >= STALE_BACKLOG);
+        let mut stats = self.stats.lock();
         if stale {
-            if let Some(quiet) = quiet {
-                log::warn!(
-                    "drawables not returned for {}ms ({} in flight); acquiring anyway",
-                    quiet.as_millis(),
-                    in_flight.1,
-                );
-            }
+            stats.stale_resets += u32::from(quiet.is_some());
             *in_flight = (in_flight.0.wrapping_add(1), 0);
+        } else {
+            stats.skipped += 1;
         }
         stale
     }
 
     /// Records a drawable about to be presented; the returned guard runs when it reaches the screen.
-    fn queued(&mut self, now: Instant) -> impl Fn() + 'static {
+    fn queued(&mut self, now: Instant) -> impl Fn(f64) + 'static {
         self.last_queued = Some(now);
+        self.stats.lock().rendered += 1;
         let generation = {
             let mut in_flight = self.in_flight.lock();
             in_flight.1 += 1;
             in_flight.0
         };
         let in_flight = Arc::clone(&self.in_flight);
-        move || {
-            let mut in_flight = in_flight.lock();
-            if in_flight.0 == generation {
-                in_flight.1 = in_flight.1.saturating_sub(1);
+        let stats = Arc::clone(&self.stats);
+        move |presented_time| {
+            {
+                let mut in_flight = in_flight.lock();
+                if in_flight.0 == generation {
+                    in_flight.1 = in_flight.1.saturating_sub(1);
+                }
             }
+            let mut stats = stats.lock();
+            if presented_time > 0.0 {
+                stats.shown += 1;
+                stats.slowest_shown = stats.slowest_shown.max(now.elapsed());
+            } else {
+                stats.dropped += 1;
+            }
+        }
+    }
+
+    /// Notes the drawable size and logs the previous second's outcomes if they were unusual.
+    fn observe_frame(&self, size: (i32, i32), now: Instant) {
+        let mut stats = self.stats.lock();
+        if stats.last_size.is_some_and(|last| last != size) {
+            stats.size_changes += 1;
+        }
+        stats.last_size = Some(size);
+        if let Some(line) = stats.roll(now) {
+            drop(stats);
+            log::warn!("{line}");
         }
     }
 }
@@ -586,14 +658,17 @@ impl MetalRenderer {
                 return true;
             }
         };
-        if !self.drawable_backlog.admit(Instant::now()) {
-            return false;
-        }
         let viewport_size = layer.drawable_size();
         let viewport_size: Size<DevicePixels> = size(
             (viewport_size.width.ceil() as i32).into(),
             (viewport_size.height.ceil() as i32).into(),
         );
+        let now = Instant::now();
+        self.drawable_backlog
+            .observe_frame((viewport_size.width.0, viewport_size.height.0), now);
+        if !self.drawable_backlog.admit(now) {
+            return false;
+        }
         let acquire_started = Instant::now();
         let drawable = layer.next_drawable();
         let waited = acquire_started.elapsed();
@@ -617,7 +692,12 @@ impl MetalRenderer {
         };
 
         let on_screen = self.drawable_backlog.queued(Instant::now());
-        let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| on_screen());
+        let block = RcBlock::new(move |presented: ptr::NonNull<AnyObject>| {
+            // SAFETY: Metal passes the presented `MTLDrawable`; `presentedTime` is a plain getter.
+            let presented_time: f64 =
+                unsafe { objc2::msg_send![presented.as_ptr(), presentedTime] };
+            on_screen(presented_time)
+        });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI;
         // Metal copies the block, so it outlives this frame.
         unsafe {
@@ -1819,6 +1899,27 @@ mod tests {
     };
 
     #[test]
+    fn frame_stats_log_only_unusual_seconds() {
+        let mut backlog = DrawableBacklog::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        backlog.observe_frame((100, 100), t0);
+        backlog.queued(t0)(1.0);
+        assert_eq!(
+            backlog.stats.lock().roll(t0 + ms(1000)),
+            None,
+            "a clean second is quiet"
+        );
+        backlog.queued(t0)(0.0);
+        backlog.observe_frame((200, 100), t0 + ms(1100));
+        let line = backlog.stats.lock().roll(t0 + ms(2000)).unwrap();
+        assert!(
+            line.contains("dropped 1") && line.contains("size changes 1"),
+            "{line}"
+        );
+    }
+
+    #[test]
     fn drawable_backlog_skips_instead_of_blocking_and_recovers_stale_counts() {
         let mut backlog = DrawableBacklog::default();
         let t0 = Instant::now();
@@ -1831,7 +1932,7 @@ mod tests {
             "two queued drawables would block nextDrawable"
         );
         assert!(!backlog.admit(t0 + STALE_BACKLOG - ms(1)));
-        first();
+        first(1.0);
         assert!(backlog.admit(t0 + ms(10)), "presentation frees a slot");
 
         let t1 = t0 + ms(500);
@@ -1844,12 +1945,12 @@ mod tests {
         let t2 = t1 + STALE_BACKLOG;
         let fourth = backlog.queued(t2);
         let _fifth = backlog.queued(t2);
-        second();
+        second(1.0);
         assert!(
             !backlog.admit(t2),
             "a handler from before the reset does not drain the new count"
         );
-        fourth();
+        fourth(1.0);
         assert!(backlog.admit(t2));
     }
 
