@@ -454,14 +454,7 @@ fn credentials(
         return Some((Zeroizing::new(env_key), None));
     }
     let raw = if provider == ProviderKind::Claude {
-        let user = std::env::var("USER")
-            .ok()
-            .filter(|s| {
-                !s.is_empty()
-                    && s.bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
-            })
-            .unwrap_or_else(|| "claude-code-user".into());
+        let user = claude_keychain_user();
         let mut dirs = vec![dir.to_path_buf()];
         if let Ok(canonical) = dir.canonicalize()
             && canonical != dir
@@ -498,7 +491,20 @@ fn parse_credentials(
     (!token.is_empty()).then(|| (Zeroizing::new(token), account))
 }
 
-fn claude_service(dir: Option<&Path>) -> Option<String> {
+/// Claude Code가 키체인 항목 account로 쓰는 사용자 이름.
+pub(crate) fn claude_keychain_user() -> String {
+    std::env::var("USER")
+        .ok()
+        .filter(|s| {
+            !s.is_empty()
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+        .unwrap_or_else(|| "claude-code-user".into())
+}
+
+/// Claude Code 자격증명 키체인 서비스 이름. 프로필 폴더면 경로(NFC) SHA-256 앞 8자를 붙인다.
+pub(crate) fn claude_service(dir: Option<&Path>) -> Option<String> {
     let Some(dir) = dir else {
         return Some("Claude Code-credentials".into());
     };

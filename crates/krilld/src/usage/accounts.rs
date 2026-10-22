@@ -7,6 +7,8 @@ mod login;
 pub(crate) mod orca_vault;
 mod policy;
 pub(crate) mod switch_work;
+mod profile_name;
+pub use profile_name::{Keychain, Vault, adopt_email_dirs};
 
 use std::collections::BTreeMap;
 use std::io::{self, Write as _};
