@@ -1347,6 +1347,7 @@ impl Registry {
             .as_deref()
             .and_then(|d| crate::agent::claude::session_id(d, old));
         if let Some(s) = &stored
+            && c.cwd.is_empty()
             && !s.cwd.is_empty()
         {
             c.cwd.clone_from(&s.cwd);
@@ -1428,6 +1429,10 @@ impl Registry {
                 }
             },
         };
+        if let Some(store) = &self.store {
+            // holder Spawn 전에 연결을 남겨 데몬이 응답 전에 죽어도 이력을 잇는다.
+            store.inherit_history(session, old).map_err(|e| os(&e))?;
+        }
         let (session, pid) =
             self.spawn_holder(peer, holder, session, argv, env, c.cwd, c.cols, c.rows)?;
         let (has_old, exited_old) = {

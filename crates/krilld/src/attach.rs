@@ -296,6 +296,7 @@ fn requests(
                     history = Some(history_worker::Worker::start(
                         tap.clone(),
                         Arc::clone(conn),
+                        features,
                     )?);
                 }
                 if let Some(worker) = &history {
@@ -329,12 +330,19 @@ fn requests(
 }
 
 /// 지연 히스토리: 요청한 범위의 스크롤백 행. 콜드 페이지를 못 읽으면 빈 응답.
-fn history(tap: &Tap, req: &HistoryRequest) -> HistoryRows {
+fn history(tap: &Tap, req: &HistoryRequest, features: u64) -> HistoryRows {
     let count = usize::from(req.count.min(MAX_HISTORY_ROWS));
     let skip = usize::try_from(req.skip).unwrap_or(usize::MAX);
     let cold = tap.store().and_then(|s| s.history(tap.id()).ok());
+    let archive = (features & krill_proto::control::FEAT_RESUME_HISTORY != 0)
+        .then(|| tap.store().and_then(|s| s.archive(tap.id()).ok()))
+        .flatten();
     let (total, rows) = match req.source {
         Source::Hot => tap.history(skip, count),
+        Source::Cold { page } if archive.is_some() => archive
+            .as_ref()
+            .and_then(|history| history.rows(usize::try_from(page).ok()?, skip, count).ok())
+            .unwrap_or_default(),
         Source::Cold { page } => cold
             .as_ref()
             .and_then(|history| history.rows(usize::try_from(page).ok()?, skip, count).ok())
@@ -343,7 +351,11 @@ fn history(tap: &Tap, req: &HistoryRequest) -> HistoryRows {
     let mut reply = HistoryRows {
         req: req.req,
         total: u32::try_from(total).unwrap_or(u32::MAX),
-        pages: cold.map_or(0, |h| u32::try_from(h.len()).unwrap_or(u32::MAX)),
+        pages: u32::try_from(archive.as_ref().map_or_else(
+            || cold.as_ref().map_or(0, crate::store::History::len),
+            crate::store::archive::Archive::len,
+        ))
+        .unwrap_or(u32::MAX),
         skip: req.skip,
         rows,
     };

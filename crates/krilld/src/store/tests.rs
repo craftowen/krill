@@ -931,3 +931,52 @@ fn clear_scrollback_excludes_prior_rows_and_preserves_new_output_and_screen() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn resumed_history_respects_clear_and_keeps_live_ancestors_during_gc() {
+    let root = tmp("resume-archive-gc");
+    let store = Store::open(
+        &root,
+        Limits {
+            keep_closed: Duration::ZERO,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    let mut old = store.recorder(SessionId(1), SIZE).unwrap();
+    old.append(b"old-screen\r\n");
+    old.seal();
+    drop(old);
+    let written = store.written();
+    store.set_paused(true);
+    store.inherit_history(SessionId(2), SessionId(1)).unwrap();
+    assert_eq!(
+        store.written(),
+        written,
+        "계보 연결은 새 터미널 원본을 기록하지 않는다"
+    );
+    store.set_paused(false);
+    let mut new = store.recorder(SessionId(2), SIZE).unwrap();
+    new.append(b"new-screen\r\n");
+    new.seal();
+    drop(new);
+    store
+        .gc(&[SessionId(2)], SystemTime::now() + Duration::from_secs(1))
+        .unwrap();
+    assert!(store.session_dir(SessionId(1)).exists());
+    assert_eq!(store.archive(SessionId(2)).unwrap().len(), 3);
+    assert!(store.clear_cold_scrollback(SessionId(2)));
+    assert_eq!(store.history_chain(SessionId(2)), [SessionId(2)]);
+    store
+        .gc(&[SessionId(2)], SystemTime::now() + Duration::from_secs(1))
+        .unwrap();
+    assert!(!store.session_dir(SessionId(1)).exists());
+    // 손상된 순환 링크는 유한한 경로에서 멈춘다.
+    fs::remove_file(store.session_dir(SessionId(2)).join(super::CLEARED_FILE)).unwrap();
+    store.inherit_history(SessionId(1), SessionId(2)).unwrap();
+    assert_eq!(
+        store.history_chain(SessionId(2)),
+        [SessionId(2), SessionId(1)]
+    );
+    fs::remove_dir_all(root).ok();
+}

@@ -656,3 +656,24 @@ fn selecting_workspace_keeps_a_session_in_its_existing_mixed_split(cx: &mut Test
         );
     });
 }
+
+/// 재부팅 직후 데몬 목록이 비어도 저장된 에이전트 칸을 찾아야 하며 Login 탭을 만들면 안 된다.
+#[gpui::test]
+fn reboot_empty_sidebar_opens_saved_agent_workspace_without_creating_shell(
+    cx: &mut TestAppContext,
+) {
+    let path = state_path("reboot-workspace");
+    let (view, cx) = open(cx, path.clone());
+    let panes = view.update(cx, fixture);
+    let saved = layout_of(&view, cx);
+    assert!(!saved.visible().contains(&panes[1]));
+    view.update(cx, |s, cx| {
+        s.open_saved_workspace(HostId::Local, Path::new("/workspace/b"), cx);
+    });
+    cx.run_until_parked();
+    let layout = layout_of(&view, cx);
+    assert_eq!(layout.tabs().len(), saved.tabs().len());
+    assert_eq!(layout.session(panes[1]), Some(SessionId(101)));
+    assert!(layout.visible().contains(&panes[1]));
+    assert_eq!(layout.sessions(), saved.sessions());
+}

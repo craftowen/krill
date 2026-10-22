@@ -504,6 +504,7 @@ pub struct Shell {
     saver: persist::Saver,
     layout_loading: bool,
     restore_session: Option<(krill_app::hosts::HostId, krill_proto::SessionId)>,
+    restore_workspace: Option<(krill_app::hosts::HostId, PathBuf)>,
     local_generation: u64,
     ssh_generation: u64,
     orch_snapshot: Arc<krill_proto::orchestration::OrchestrationStore>,
@@ -521,6 +522,7 @@ pub struct Shell {
     live: HashMap<PaneId, Live>,
     pane_liveness: Option<Task<()>>,
     creations: HashMap<PaneId, Arc<std::sync::Mutex<close::Creation>>>,
+    restoring_sessions: std::collections::HashSet<krill_proto::SessionId>,
     /// 칸마다 마지막으로 본 창 제목(탭 이름). 숨긴 칸도 남긴다.
     titles: HashMap<PaneId, String>,
     agents: Option<AgentSettings>,
@@ -717,6 +719,10 @@ impl Shell {
             this.launch_host = host.clone();
             this.open_session_on(host, e.0, cx);
         });
+        cx.subscribe(&sidebar, |this, _, e: &sidebar::OpenWorkspace, cx| {
+            this.open_saved_workspace(e.host.clone(), &e.cwd, cx);
+        })
+        .detach();
         let new_session = cx.subscribe(&sidebar, |this, sidebar, e: &sidebar::NewSession, cx| {
             let host = sidebar
                 .update(cx, |s, _| s.take_action_host())
@@ -1009,6 +1015,7 @@ impl Shell {
             panel_collapsed,
             layout_loading: path.is_some(),
             restore_session: None,
+            restore_workspace: None,
             path,
             saver: persist::Saver::new(cx),
             local_generation: 0,
@@ -1025,6 +1032,7 @@ impl Shell {
             live: HashMap::new(),
             pane_liveness: None,
             creations: HashMap::new(),
+            restoring_sessions: std::collections::HashSet::new(),
             titles: HashMap::new(),
             agents: None,
             agents_busy: false,
@@ -1180,6 +1188,9 @@ impl Shell {
                 this.reconcile_workspace_sessions(cx);
                 if let Some((host, session)) = this.restore_session.take() {
                     this.open_session_on(host, session, cx);
+                }
+                if let Some((host, folder)) = this.restore_workspace.take() {
+                    this.open_saved_workspace(host, &folder, cx);
                 }
                 if edited_while_loading {
                     this.save();
@@ -1815,12 +1826,7 @@ impl Shell {
         if let Some(id) = entry.session_id {
             self.open_session(id, cx);
         } else {
-            self.new_folder_tab_on(
-                krill_app::hosts::HostId::Local,
-                &entry.path,
-                Program::Login,
-                cx,
-            );
+            self.open_saved_workspace(krill_app::hosts::HostId::Local, &entry.path, cx);
         }
     }
 
@@ -3195,6 +3201,7 @@ impl Shell {
             return;
         }
         let visible = self.layout.visible();
+        self.restore_hidden_sessions(&visible, cx);
         let layout = &self.layout;
         self.creations.retain(|p, _| layout.pane_exists(*p));
         self.live.retain(|p, live| {
@@ -3228,6 +3235,13 @@ impl Shell {
         }
         let mut any_terminal = false;
         for p in visible {
+            if self
+                .layout
+                .session(p)
+                .is_some_and(|id| self.restoring_sessions.contains(&id))
+            {
+                continue;
+            }
             if self.layout.file(p).is_some() {
                 continue; // 파일 칸은 세션에 붙지 않는다(MK-119)
             }

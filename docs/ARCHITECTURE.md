@@ -125,6 +125,7 @@ Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.so
 | FEAT_UPGRADE | `1 << 36` | `krill_proto::control` (krilld 업그레이드 요청 `Request::Upgrade`/`Reply::Upgrade` 한 쌍, MK-062 지휘자 배정) |
 | FEAT_RESOURCES | `1 << 38` | `krill_proto::resources` (Resource Manager `Request::Resources`/`Reply::Resources` 한 쌍, OWE-436 지휘자 배정) |
 | FEAT_GIT_SYNC | `1 << 41` | `krill_proto::ipc` (Git 원격 동기화 `Edit::Push`·`Pull`·`Sync`·`CommitAndPush`, MK-184·OWE-738 지휘자 배정; 구 피어에는 전송 금지) |
+| FEAT_RESUME_HISTORY | `1 << 30` | `krill_proto::control` (재개 전 세그먼트·마지막 화면의 지연 HISTORY 페이지, 지휘자 배정 2026-10-23; 미협상 피어는 기존 임시 prior 유지, 새 kind·DTO 없음) |
 | FEAT_RESUME | `1 << 42` | `krill_proto::control` (세션 재개 요청 `Request::Resume`/`Reply::Resumed` 한 쌍, MK-052·OWE-417 지휘자 배정) |
 | FEAT_GIT_WATCH | `1 << 44` | `krill_proto::control` (FSEvents 변경 감시·가시성 제어 `Request::GitWatch`/`Reply::GitWatch` 한 쌍, OWE-585 지휘자 배정) |
 | FEAT_HEARTBEAT | `1 << 45` | `krill_proto::daemon` (앱 감시 연결 ping/pong, OWE-586 지휘자 배정) |

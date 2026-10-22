@@ -112,6 +112,15 @@ pub fn load_cold(target: impl Into<HostTarget>, session: SessionId) -> Option<Co
     }
 }
 
+/// 새 데몬이 재개 이력을 디스크에서 제공하는지 확인한다. 구 데몬의 숨은 칸은 보일 때 복원한다.
+///
+/// # Errors
+/// 데몬에 연결하거나 feature를 협상하지 못했다.
+pub fn supports_resume_history(target: impl Into<HostTarget>) -> io::Result<bool> {
+    let (_, features) = reconnect(&target.into(), FEAT_CONTROL)?;
+    Ok(features & krill_proto::control::FEAT_RESUME_HISTORY != 0)
+}
+
 /// 세션 `session`의 데몬 쪽 핫·콜드 스크롤백을 제어 연결로 비운다(OWE-873b).
 /// 구버전 krilld가 [`FEAT_CLEAR_SCROLLBACK`]을 광고하지 않으면 요청을 보내지 않고 `Ok(false)`를 돌려준다.
 ///
@@ -208,9 +217,18 @@ pub fn ensure_session_in(
             "krilld does not support session forking; update the daemon",
         ));
     }
-    let create = Request::Create(create.clone());
+    // 디스크 출력이 없거나 기록을 껐어도 옛 에이전트 ID는 Resume으로 이어야 한다.
+    let create = match want.filter(|_| features & FEAT_RESUME != 0) {
+        Some(session) => Request::Resume {
+            session,
+            create: create.clone(),
+        },
+        None => Request::Create(create.clone()),
+    };
     match call(&create)? {
-        Reply::Created { session, .. } => Ok(Found::Live(session, true)),
+        Reply::Created { session, .. } | Reply::Resumed { session, .. } => {
+            Ok(Found::Live(session, true))
+        }
         Reply::Failed(f) => Err(io::Error::other(f.to_string())),
         _ => Err(io::ErrorKind::InvalidData.into()),
     }
@@ -791,7 +809,10 @@ impl<W: Write> Pane<W> {
         } else {
             input::Incarnation::Changed
         };
-        let prior_from_cold = if same == input::Incarnation::Changed && was_cold {
+        let prior_from_cold = if same == input::Incarnation::Changed
+            && was_cold
+            && features & krill_proto::control::FEAT_RESUME_HISTORY == 0
+        {
             Some(self.collect_cold_prior())
         } else {
             None

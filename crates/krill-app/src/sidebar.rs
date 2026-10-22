@@ -543,6 +543,13 @@ pub struct NewSession {
     pub program: Program,
 }
 
+/// 라이브 목록이 비어도 저장된 레이아웃의 칸을 먼저 찾아 워크스페이스를 연다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenWorkspace {
+    pub host: HostId,
+    pub cwd: PathBuf,
+}
+
 /// OWE-854: 사이드바 세션 행 메뉴의 '세션 종료…'. 셸이 확인 후 데몬에 `Request::Close`를 보낸다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CloseSession(pub SessionId);
@@ -689,6 +696,7 @@ pub struct Sidebar {
 
 impl EventEmitter<Selected> for Sidebar {}
 impl EventEmitter<NewSession> for Sidebar {}
+impl EventEmitter<OpenWorkspace> for Sidebar {}
 impl EventEmitter<CloseSession> for Sidebar {}
 impl EventEmitter<ContinueSession> for Sidebar {}
 impl EventEmitter<RenameSession> for Sidebar {}
@@ -2391,7 +2399,12 @@ impl Sidebar {
         {
             self.select_session_on(index, host, sess_id, cx);
         } else {
-            self.new_session_on(host, path, Program::Login, window, cx);
+            cx.emit(OpenWorkspace { host, cwd: path });
+            if let Some(window) = window {
+                self.leave(window, cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 

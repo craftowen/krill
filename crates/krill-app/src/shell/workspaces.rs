@@ -3,6 +3,7 @@
 
 use super::*;
 use krill_app::hosts::HostId;
+use std::path::Path;
 
 #[cfg(all(test, unix))]
 mod tests;
@@ -75,6 +76,122 @@ impl Shell {
         self.save();
         self.refresh_detached(cx);
         cx.notify();
+    }
+
+    pub(super) fn open_saved_workspace(
+        &mut self,
+        host: HostId,
+        folder: &Path,
+        cx: &mut Context<Self>,
+    ) {
+        if self.layout_loading {
+            self.restore_workspace = Some((host, folder.to_path_buf()));
+            return;
+        }
+        self.dashboard = None;
+        self.sync_sidebar_visibility(cx);
+        self.close_settings(None, cx);
+        let workspace = Workspace {
+            host: host.clone(),
+            folder: folder.to_path_buf(),
+        };
+        if let Some(index) =
+            (0..self.layout.tabs().len()).find(|i| self.tab_contains_workspace(*i, &workspace, cx))
+        {
+            self.change(true, cx, |l| {
+                l.activate(index);
+            });
+        } else {
+            self.new_folder_tab_on(host, folder, Program::Login, cx);
+        }
+    }
+
+    /// 숨은 로컬 칸도 재부팅 복원 대상이다. 화면 스트림은 열지 않아 MK-035 예산을 유지한다.
+    pub(super) fn restore_hidden_sessions(&mut self, visible: &[PaneId], cx: &mut Context<Self>) {
+        if self.role != WindowRole::Main {
+            return;
+        }
+        let Some(target) = self.local_target() else {
+            return;
+        };
+        let visible_sessions: Vec<_> = visible
+            .iter()
+            .filter_map(|p| self.layout.session(*p))
+            .collect();
+        let candidates: Vec<_> = (0..self.layout.tabs().len())
+            .flat_map(|i| self.layout.tab_panes(i))
+            .filter(|p| self.layout.host(*p).is_local() && self.layout.file(*p).is_none())
+            .filter_map(|p| self.layout.session(p).map(|id| (p, id)))
+            .filter(|(_, id)| {
+                !visible_sessions.contains(id)
+                    && self
+                        .sidebar
+                        .read(cx)
+                        .session_on(&HostId::Local, *id)
+                        .is_none()
+            })
+            .collect();
+        for (pane_id, old) in candidates {
+            if !self.restoring_sessions.insert(old) {
+                continue;
+            }
+            let mut launch = self.launch_for(pane_id);
+            if let Some(cwd) = self.layout.respawn_cwd(pane_id) {
+                launch.cwd = cwd.to_vec();
+            }
+            let target = target.clone();
+            let creation = Arc::clone(self.creations.entry(pane_id).or_default());
+            cx.spawn(async move |this, cx| {
+                let got = cx
+                    .background_executor()
+                    .spawn(async move {
+                        if !pane::supports_resume_history(&target)? {
+                            return Ok(None);
+                        }
+                        let found = pane::ensure_session_in(&target, Some(old), &launch)?;
+                        let (session, created) = match found {
+                            pane::Found::Live(id, created) => (id, created),
+                            pane::Found::Cold(id, _) => {
+                                (pane::resume_session_in(&target, Some(id), &launch)?, true)
+                            }
+                        };
+                        if created && !close::Creation::publish(&creation, session) {
+                            close::send(
+                                &krill_app::resources::daemon_call_for(Some(target)),
+                                session,
+                            )?;
+                            return Err(std::io::ErrorKind::Interrupted.into());
+                        }
+                        Ok::<_, std::io::Error>(Some(session))
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    this.restoring_sessions.remove(&old);
+                    let session = match got {
+                        Ok(Some(new)) => {
+                            if new != old {
+                                this.layout.rebind_session(&HostId::Local, old, new);
+                                this.save();
+                            }
+                            new
+                        }
+                        // 실패·구 데몬이면 옛 ID를 유지한다. 선택돼 있었다면 콜드 폴백을 보여준다.
+                        _ => old,
+                    };
+                    if this
+                        .layout
+                        .visible()
+                        .iter()
+                        .any(|p| this.layout.session(*p) == Some(session))
+                    {
+                        this.sync(cx);
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     fn tab_workspace(&self, index: usize, cx: &App) -> Option<Workspace> {

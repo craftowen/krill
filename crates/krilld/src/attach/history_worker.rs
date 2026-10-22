@@ -66,8 +66,10 @@ pub(super) struct Worker {
 }
 
 impl Worker {
-    pub(super) fn start(tap: Tap, conn: Arc<Conn>) -> io::Result<Self> {
-        Self::spawn(tap.id(), conn, move |req| super::history(&tap, req))
+    pub(super) fn start(tap: Tap, conn: Arc<Conn>, features: u64) -> io::Result<Self> {
+        Self::spawn(tap.id(), conn, move |req| {
+            super::history(&tap, req, features)
+        })
     }
 
     fn spawn(

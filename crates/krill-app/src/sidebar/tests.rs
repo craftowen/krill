@@ -3053,7 +3053,6 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     cx: &mut TestAppContext,
 ) {
     use gpui::Modifiers;
-    use krill_proto::control::Program;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -3065,7 +3064,7 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(900.)));
 
     let selected: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
-    let launched: Rc<RefCell<Vec<(HostId, NewSession)>>> = Rc::new(RefCell::new(Vec::new()));
+    let launched: Rc<RefCell<Vec<OpenWorkspace>>> = Rc::new(RefCell::new(Vec::new()));
 
     let sel_out = selected.clone();
     let _sub_sel = cx.update(|_, cx| {
@@ -3078,11 +3077,8 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
     });
     let new_out = launched.clone();
     let _sub_new = cx.update(|_, cx| {
-        cx.subscribe(&view, move |s, event: &NewSession, cx| {
-            let host = s
-                .update(cx, |s, _| s.take_action_host())
-                .unwrap_or(HostId::Local);
-            new_out.borrow_mut().push((host, event.clone()));
+        cx.subscribe(&view, move |_, event: &OpenWorkspace, _| {
+            new_out.borrow_mut().push(event.clone());
         })
     });
 
@@ -3201,13 +3197,10 @@ fn remote_worktree_card_click_selects_or_spawns_on_remote_host_in_both_layouts(
 
         assert_eq!(
             launched.borrow().as_slice(),
-            &[(
-                studio_id.clone(),
-                NewSession {
-                    cwd: wt_without_remote_sess.clone(),
-                    program: Program::Login,
-                }
-            )],
+            &[OpenWorkspace {
+                host: studio_id.clone(),
+                cwd: wt_without_remote_sess.clone(),
+            }],
             "clicking remote worktree card without remote session in {layout:?} must spawn on studio host even if local has same path"
         );
     }
@@ -3891,7 +3884,6 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
 ) {
     use crate::pull_request::Status as PrStatus;
     use gpui::{Modifiers, px, size};
-    use krill_proto::control::Program;
     use krill_proto::orchestration::WorktreeStore;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -3946,10 +3938,10 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
             selected_got.borrow_mut().push(ev.0);
         })
     });
-    let launched_events: Rc<RefCell<Vec<NewSession>>> = Rc::new(RefCell::new(Vec::new()));
+    let launched_events: Rc<RefCell<Vec<OpenWorkspace>>> = Rc::new(RefCell::new(Vec::new()));
     let launched_got = launched_events.clone();
     let _sub_new = vcx.update(|_, cx| {
-        cx.subscribe(&view, move |_, ev: &NewSession, _| {
+        cx.subscribe(&view, move |_, ev: &OpenWorkspace, _| {
             launched_got.borrow_mut().push(ev.clone());
         })
     });
@@ -4134,9 +4126,9 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     vcx.run_until_parked();
     assert_eq!(
         launched_events.borrow().as_slice(),
-        &[NewSession {
+        &[OpenWorkspace {
+            host: HostId::Local,
             cwd: PathBuf::from("/repo/wt-001"),
-            program: Program::Login,
         }]
     );
     fs::remove_dir_all(dir).ok();

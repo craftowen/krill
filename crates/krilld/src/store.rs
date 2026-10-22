@@ -18,6 +18,7 @@
 // 완전 복원되지 않는다. 미완성 제어열·sync 버퍼가 있는 경계는 키프레임을 생략하고 이전 워밍업을 쓴다.
 // MK-006 엔진 전체 상태 내보내기가 들어오면 이 제한을 없앤다.
 
+pub(crate) mod archive;
 mod crypto;
 mod privacy;
 mod recorder;
@@ -438,6 +439,10 @@ impl Store {
         if !self.recording || !self.sessions.exists() {
             return Ok(());
         }
+        // 재개 이력은 새 라이브 세션의 일부다. closed 보존 기간만으로 조상을 지우지 않는다.
+        // 전역 디스크 상한은 기존대로 적용한다.
+        let live: std::collections::HashSet<_> =
+            live.iter().flat_map(|id| self.history_chain(*id)).collect();
         let mut files = Vec::new();
         let mut total = 0;
         let entries = match fs::read_dir(&self.sessions) {
