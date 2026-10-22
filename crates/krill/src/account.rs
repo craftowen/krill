@@ -471,15 +471,15 @@ fn request(req: &UsageRequest) -> Result<AccountsSnapshot, String> {
     }
 }
 
-/// Codex banked rate-limit reset 크레딧 1개를 소진한다. 소진 결과와 소진 직후
-/// 계정 스냅샷을 함께 보여준다(데몬 `ConsumeResetCredit` 패리티).
+/// 리셋 크레딧 1개를 소진한다. 소진 결과와 소진 직후 계정 스냅샷을 함께 보여준다
+/// (데몬 `ConsumeResetCredit` 패리티). Codex banked reset와 Claude 주간 세션 리셋·프로모션 grant를 지원한다.
 fn run_consume_reset(provider: &str, id: &str, json: bool) -> ExitCode {
     let Some(provider) = ProviderKind::parse(provider) else {
         eprintln!("account: unknown provider '{provider}' (expected claude|codex|agy|opencode)");
         return ExitCode::from(2);
     };
-    if provider != ProviderKind::Codex {
-        eprintln!("account: reset credits are codex-only");
+    if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
+        eprintln!("account: reset credits are only available for codex and claude");
         return ExitCode::from(2);
     }
     let req = UsageRequest::ConsumeResetCredit {

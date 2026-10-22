@@ -1495,9 +1495,9 @@ pub fn switch_account(
     Ok(refresh_accounts_with(home, state_dir, false))
 }
 
-/// Codex banked reset 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다.
-/// Codex만 지원한다. 소진 성공(`Reset`·`AlreadyRedeemed`)에는 로컬 한도 기록을 지워
-/// 자동전환이 다시 평가하게 하고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
+/// 리셋 크레딧 1개를 소진해 해당 계정의 사용량 창을 초기화한다. Codex(banked reset)와
+/// Claude(주간 세션 리셋·프로모션 grant)를 지원한다. 소진 성공(`Reset`·`AlreadyRedeemed`)에는
+/// 로컬 한도 기록을 지워 자동전환이 다시 평가하게 하고, 소진 전 캐시를 버린 뒤 스냅샷을 새로고침한다.
 /// 네트워크·자격증명 실패는 `Err`다(호출자가 자동 재시도하지 않는다: 멱등 키가 호출마다 새 값이라
 /// 재시도가 새 소진이 된다. 타임아웃은 크레딧부터 다시 확인한다).
 pub fn consume_reset_credit(
@@ -1506,10 +1506,10 @@ pub fn consume_reset_credit(
     provider: ProviderKind,
     account_id: &str,
 ) -> io::Result<(AccountsSnapshot, ResetConsumeOutcome, u64)> {
-    if provider != ProviderKind::Codex {
+    if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "reset credits are only available for codex",
+            "reset credits are only available for codex and claude",
         ));
     }
     let snap = refresh_accounts_with(home, state_dir, false);
@@ -1530,9 +1530,12 @@ pub fn consume_reset_credit(
         ));
     }
     let dir = PathBuf::from(&target.profile_dir);
-    let Some((outcome, windows)) =
+    let outcome_windows = if provider == ProviderKind::Codex {
         super::direct::consume_reset_credit(provider, &dir, target.host_default, home, state_dir)
-    else {
+    } else {
+        consume_claude_reset(home, state_dir, &dir, target.host_default)
+    };
+    let Some((outcome, windows)) = outcome_windows else {
         return Err(io::Error::other("사용량 초기화 실패(크레딧부터 다시 확인)"));
     };
     if matches!(
@@ -1543,6 +1546,27 @@ pub fn consume_reset_credit(
     }
     super::direct::evict_profile(home, provider, &dir);
     Ok((refresh_accounts(home, state_dir), outcome, windows))
+}
+
+/// Claude 소진 한 걸음: 조직 조회 → 제공 프로그램 확인 → 소진. 제공 없음은 `NoCredit`으로,
+/// 단계 실패는 `Err`로 돌려준다(재시도 유도).
+fn consume_claude_reset(
+    home: &Path,
+    state_dir: Option<&Path>,
+    dir: &Path,
+    host: bool,
+) -> Option<(ResetConsumeOutcome, u64)> {
+    let token = super::direct::claude_token(dir, host, home, state_dir)?;
+    let org = super::direct::claude_org_uuid(&token, super::direct::get_text)?;
+    match super::direct::claude_offered_program(&token, super::direct::get_text)? {
+        Some(program) => super::direct::claude_claim_reset(
+            &token,
+            &org,
+            program,
+            super::direct::post_json_status,
+        ),
+        None => Some((ResetConsumeOutcome::NoCredit, 0)),
+    }
 }
 
 /// 새 계정 프로필 등록(MK-107). `profile_dir`이 비어 있으면 기본 프로필 경로를 자동 생성한다.

@@ -165,23 +165,39 @@ fn fetch(
     state: Option<&Path>,
 ) -> Option<(Usage, krill_proto::usage::AccountMeters)> {
     let (token, account) = credentials(provider, dir, host, home, state)?;
-    query(provider, &token, account.as_deref(), |config| {
-        pipe_command(
-            system_curl(),
-            &[
-                "-q",
-                "--config",
-                "-",
-                "--silent",
-                "--fail",
-                "--max-time",
-                "10",
-                "--max-filesize",
-                "524288",
-            ],
-            config.as_bytes(),
-        )
-    })
+    let mut out = query(provider, &token, account.as_deref(), get_text)?;
+    // Claude 리셋(주간 세션·프로모션)은 일반 사용량과 같은 주기로 프로브한다.
+    // 프로브 실패는 조용히 건너뛰고 기존 미터를 유지한다.
+    if provider == ProviderKind::Claude
+        && let Some(count) = claude_reset_count(&token, get_text)
+    {
+        out.1.meters.push(krill_proto::usage::UsageMeter {
+            key: krill_proto::usage::RESET_CREDITS_METER_KEY.into(),
+            label: krill_proto::usage::RESET_CREDITS_METER_LABEL.into(),
+            window: None,
+            value: Some(count.to_string()),
+        });
+    }
+    Some(out)
+}
+
+/// curl GET 전송. 설정·본문에 비밀(토큰)은 로그에 남기지 않는다.
+pub(super) fn get_text(config: &str) -> Option<Zeroizing<Vec<u8>>> {
+    pipe_command(
+        system_curl(),
+        &[
+            "-q",
+            "--config",
+            "-",
+            "--silent",
+            "--fail",
+            "--max-time",
+            "10",
+            "--max-filesize",
+            "524288",
+        ],
+        config.as_bytes(),
+    )
 }
 
 fn query(
@@ -311,6 +327,255 @@ fn parse_consume_response(text: &str) -> Option<(ResetConsumeOutcome, u64)> {
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
     Some((outcome, windows))
+}
+
+/// Claude 리셋 프로브 종류. 서버가 아는 쿼리만 쓴다.
+#[derive(Clone, Copy)]
+enum ClaudeResetProbe {
+    /// 주간 세션 리셋(`juniper_tide`).
+    Juniper,
+    /// 프로모션 grant(`cedar_ember`).
+    Cedar,
+}
+
+/// Claude 소진 프로그램. 서버가 아는 값만 쓴다.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaudeResetProgram {
+    Juniper,
+    Cedar,
+}
+
+impl ClaudeResetProgram {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Juniper => "juniper_tide",
+            Self::Cedar => "cedar_ember",
+        }
+    }
+}
+
+/// Claude 리셋 2종 프로브 합산(주간 세션 제공 1 + 사용 가능 grant). 하나라도 실패하면
+/// `None`(기존 미터를 유지하고 다음 주기에 다시 시도한다).
+pub(super) fn claude_reset_count(
+    token: &str,
+    send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<u64> {
+    let status = send(&claude_probe_config(token, ClaudeResetProbe::Juniper)?)?;
+    let juniper = u64::from(parse_juniper_status(std::str::from_utf8(&status).ok()?)?);
+    let cedar_body = send(&claude_probe_config(token, ClaudeResetProbe::Cedar)?)?;
+    let cedar = parse_cedar_status(std::str::from_utf8(&cedar_body).ok()?, now_secs())?;
+    Some(juniper.saturating_add(cedar))
+}
+
+/// 소진 시점에 제공 중인 프로그램. 바깥은 `None`(프로브 실패)과 제공 없음(`Some(None)`)을
+/// 구분한다. 실패는 `Err`(재시도 유도), 제공 없음은 `NoCredit`으로 답한다.
+pub(super) fn claude_offered_program(
+    token: &str,
+    send: impl Fn(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<Option<ClaudeResetProgram>> {
+    let status = send(&claude_probe_config(token, ClaudeResetProbe::Juniper)?)?;
+    if parse_juniper_status(std::str::from_utf8(&status).ok()?)? {
+        return Some(Some(ClaudeResetProgram::Juniper));
+    }
+    let cedar_body = send(&claude_probe_config(token, ClaudeResetProbe::Cedar)?)?;
+    let usable = parse_cedar_status(std::str::from_utf8(&cedar_body).ok()?, now_secs())?;
+    Some(if usable > 0 {
+        Some(ClaudeResetProgram::Cedar)
+    } else {
+        None
+    })
+}
+
+/// Claude 리셋 상태 조회 설정. 프로브마다 고정 쿼리를 쓴다.
+fn claude_probe_config(token: &str, probe: ClaudeResetProbe) -> Option<Zeroizing<String>> {
+    if !check_credential_text(token, None) {
+        return None;
+    }
+    let query = match probe {
+        ClaudeResetProbe::Juniper => "at_wall=1&skip_spend=1",
+        ClaudeResetProbe::Cedar => "cedar_ember=1&skip_spend=1",
+    };
+    Some(Zeroizing::new(format!(
+        "url = \"https://api.anthropic.com/api/oauth/usage?{query}\"\nrequest = \"GET\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Accept: application/json\"\n"
+    )))
+}
+
+/// `juniper_tide` 블록의 주간 세션 리셋 제공 여부. `None`은 읽을 수 없음이다.
+fn parse_juniper_status(text: &str) -> Option<bool> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let block = json.get("juniper_tide")?;
+    if block.is_null() {
+        return Some(false);
+    }
+    let offered = block.get("eligible").and_then(serde_json::Value::as_bool) == Some(true)
+        && block.get("arm").and_then(serde_json::Value::as_str) == Some("reset")
+        && block.get("available").and_then(serde_json::Value::as_bool) == Some(true);
+    Some(offered)
+}
+
+/// `cedar_ember` 블록의 사용 가능 grant 합. `None`은 읽을 수 없음이다.
+fn parse_cedar_status(text: &str, now: i64) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let block = json.get("cedar_ember")?;
+    if block.is_null() {
+        return Some(0);
+    }
+    if block.get("eligible").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Some(0);
+    }
+    let mut total = 0_u64;
+    for grant in block.get("grants").and_then(serde_json::Value::as_array)? {
+        if grant.get("usable_now").and_then(serde_json::Value::as_bool) != Some(true) {
+            continue;
+        }
+        if grant.get("paused").and_then(serde_json::Value::as_bool) == Some(true) {
+            continue;
+        }
+        let left = grant
+            .get("resets_left")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if left == 0 {
+            continue;
+        }
+        if let Some(start) = grant
+            .get("starts_at")
+            .and_then(serde_json::Value::as_str)
+        {
+            let Some(start) = krill_proto::time::parse_reset_epoch(start) else {
+                continue;
+            };
+            if start > now {
+                continue;
+            }
+        }
+        if let Some(end) = grant.get("ends_at").and_then(serde_json::Value::as_str) {
+            let Some(end) = krill_proto::time::parse_reset_epoch(end) else {
+                continue;
+            };
+            if end <= now {
+                continue;
+            }
+        }
+        total = total.saturating_add(left);
+    }
+    Some(total)
+}
+
+/// 소진 경로용 Claude 토큰. 프로필·프로브·소진이 같은 자격증명을 쓴다.
+pub(super) fn claude_token(
+    dir: &Path,
+    host: bool,
+    home: &Path,
+    state: Option<&Path>,
+) -> Option<Zeroizing<String>> {
+    credentials(ProviderKind::Claude, dir, host, home, state).map(|(token, _)| token)
+}
+
+/// Claude OAuth 프로필의 조직 UUID. 소진 POST 경로에 쓴다.
+pub(super) fn claude_org_uuid(
+    token: &str,
+    send: impl FnOnce(&str) -> Option<Zeroizing<Vec<u8>>>,
+) -> Option<String> {
+    if !check_credential_text(token, None) {
+        return None;
+    }
+    let config = Zeroizing::new(format!(
+        "url = \"https://api.anthropic.com/api/oauth/profile\"\nrequest = \"GET\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Accept: application/json\"\n"
+    ));
+    let body = send(&config)?;
+    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
+    let uuid = json.pointer("/organization/uuid")?.as_str()?;
+    (!uuid.is_empty()
+        && uuid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+    .then(|| uuid.to_owned())
+}
+
+/// Claude 리셋 소진. 성공하면 `(결과, 초기화된 창 수)`. 멱등 키가 없어 재시도 금지:
+/// 타임아웃 후 재소진은 서버의 `already_used` 가드로 막힌다.
+pub(super) fn claude_claim_reset(
+    token: &str,
+    org_uuid: &str,
+    program: ClaudeResetProgram,
+    send: impl FnOnce(&str) -> Option<(u16, Zeroizing<Vec<u8>>)>,
+) -> Option<(ResetConsumeOutcome, u64)> {
+    if !check_credential_text(token, None) {
+        return None;
+    }
+    if org_uuid.is_empty()
+        || !org_uuid
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    {
+        return None;
+    }
+    let config = Zeroizing::new(format!(
+        "url = \"https://api.anthropic.com/api/organizations/{org_uuid}/reset_rate_limits\"\nrequest = \"POST\"\nheader = \"Authorization: Bearer {token}\"\nheader = \"User-Agent: claude-code/2.1.0\"\nheader = \"anthropic-beta: oauth-2025-04-20\"\nheader = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\ndata = '{{\"program\": \"{}\"}}'\n",
+        program.as_str()
+    ));
+    let (status, body) = send(&config)?;
+    if status == 429 || status == 401 || status == 403 {
+        return None;
+    }
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    match serde_json::from_slice::<serde_json::Value>(&body)
+        .ok()?
+        .get("result")?
+        .as_str()?
+    {
+        "reset" => Some((ResetConsumeOutcome::Reset, 1)),
+        "already_used" => Some((ResetConsumeOutcome::AlreadyRedeemed, 0)),
+        "not_limited" => Some((ResetConsumeOutcome::NothingToReset, 0)),
+        "ineligible" | "unavailable" => Some((ResetConsumeOutcome::NoCredit, 0)),
+        _ => None,
+    }
+}
+
+/// JSON POST 후 `(상태 코드, 본문)`. `--fail`을 쓰지 않아 429·401도 구분한다.
+pub(super) fn post_json_status(config: &str) -> Option<(u16, Zeroizing<Vec<u8>>)> {
+    let mut child = Command::new("/usr/bin/curl")
+        .args([
+            "-q",
+            "--config",
+            "-",
+            "--silent",
+            "--max-time",
+            "8",
+            "--max-filesize",
+            "524288",
+            "-w",
+            "\n%{http_code}",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(config.as_bytes())
+        .ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = std::str::from_utf8(&output.stdout).ok()?;
+    let (body, code) = text.rsplit_once('\n')?;
+    let code: u16 = code.trim().parse().ok()?;
+    Some((code, Zeroizing::new(body.as_bytes().to_vec())))
+}
+
+fn now_secs() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 /// 멱등 키(UUID v4). `ring`은 이미 `krilld` 직접 의존성이다(새 크레이트 없음).

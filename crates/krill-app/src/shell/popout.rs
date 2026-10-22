@@ -737,7 +737,8 @@ fn append_reset_credit_rows(
     reset_armed: Option<&(ProviderKind, String)>,
     weak: &WeakEntity<Shell>,
 ) -> PopupMenu {
-    if provider != ProviderKind::Codex {
+    // Codex banked reset와 Claude 주간 세션 리셋·프로모션 grant가 같은 행을 쓴다.
+    if provider != ProviderKind::Codex && provider != ProviderKind::Claude {
         return menu;
     }
     let Some(account) = active else {

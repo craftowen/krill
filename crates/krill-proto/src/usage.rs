@@ -13,7 +13,8 @@ pub const FEAT_USAGE: u64 = 1 << 17;
 pub const FEAT_PROVIDER_DETAILS: u64 = 1 << 15;
 mod details;
 pub use details::{
-    AccountMeters, ProviderDetails, RESET_CREDITS_METER_KEY, SessionHandoff, UsageMeter,
+    AccountMeters, ProviderDetails, RESET_CREDITS_METER_KEY, RESET_CREDITS_METER_LABEL,
+    SessionHandoff, UsageMeter,
 };
 /// Create 계정 선택·고급 정책·이력·모델별 창(OWE-712 지휘자 배정).
 pub const FEAT_ACCOUNT_POLICY: u64 = 1 << 61;
