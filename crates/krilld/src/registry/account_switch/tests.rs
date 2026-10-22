@@ -302,3 +302,71 @@ fn switch_without_transcript_launches_selected_account_and_login_shell_gets_acti
     drop(reg);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn completion_snapshot_waits_for_durable_handoff_and_failed_writes_restore_pending() {
+    use std::sync::mpsc;
+    let root = Path::new("/tmp").join(format!("kas-durable-{}", std::process::id()));
+    fs::remove_dir_all(&root).ok();
+    fs::create_dir_all(&root).unwrap();
+    let reg = Arc::new(Registry::new(None, Some(&root)));
+    let pending = SessionHandoff {
+        from: SessionId(7),
+        to: None,
+        account_id: "fixture-account".into(),
+        error: None,
+    };
+    lock(&reg.account_handoffs).insert(pending.from, pending.clone());
+    let completed = SessionHandoff {
+        to: Some(SessionId(8)),
+        ..pending.clone()
+    };
+    let (entered, writing) = mpsc::channel();
+    let (release, proceed) = mpsc::channel();
+    let writer_reg = Arc::clone(&reg);
+    let writer = std::thread::spawn(move || {
+        writer_reg
+            .commit_account_handoff(completed, |handoffs| {
+                entered.send(()).unwrap();
+                proceed.recv().unwrap();
+                writer_reg.write_account_handoffs(handoffs)
+            })
+            .unwrap();
+    });
+    writing.recv_timeout(Duration::from_secs(3)).unwrap();
+    let (started, reading) = mpsc::channel();
+    let (done, result) = mpsc::channel();
+    let reader_reg = Arc::clone(&reg);
+    let reader = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        let mut snapshot = AccountsSnapshot::default();
+        reader_reg.account_switch_snapshot(&mut snapshot);
+        done.send(snapshot.details.handoffs).unwrap();
+    });
+    reading.recv_timeout(Duration::from_secs(3)).unwrap();
+    let before_commit = result.recv_timeout(Duration::from_millis(50));
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    reader.join().unwrap();
+    assert!(
+        matches!(before_commit, Err(mpsc::RecvTimeoutError::Timeout)),
+        "completion must remain hidden during the write"
+    );
+    let published = result.recv_timeout(Duration::from_secs(3)).unwrap();
+    assert_eq!(published[0].to, Some(SessionId(8)));
+    assert_eq!(load(Some(&root))[&SessionId(7)].to, Some(SessionId(8)));
+    lock(&reg.account_handoffs).insert(pending.from, pending.clone());
+    assert!(
+        reg.commit_account_handoff(
+            SessionHandoff {
+                to: Some(SessionId(9)),
+                ..pending
+            },
+            |_| Err(std::io::ErrorKind::PermissionDenied.into()),
+        )
+        .is_err()
+    );
+    assert_eq!(lock(&reg.account_handoffs)[&SessionId(7)].to, None);
+    drop(reg);
+    fs::remove_dir_all(root).unwrap();
+}

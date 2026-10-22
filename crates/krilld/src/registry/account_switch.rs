@@ -180,10 +180,17 @@ impl Registry {
     }
 
     fn save_account_handoffs(&self) -> std::io::Result<()> {
+        self.write_account_handoffs(&lock(&self.account_handoffs))
+    }
+
+    fn write_account_handoffs(
+        &self,
+        handoffs: &BTreeMap<SessionId, SessionHandoff>,
+    ) -> std::io::Result<()> {
         let Some(dir) = self.state_dir() else {
             return Ok(());
         };
-        let handoffs: Vec<_> = lock(&self.account_handoffs).values().cloned().collect();
+        let handoffs: Vec<_> = handoffs.values().collect();
         let result = serde_json::to_vec(&handoffs)
             .map_err(std::io::Error::other)
             .and_then(|raw| accounts::write_atomic_0600(&dir.join(FILE), &raw));
@@ -191,6 +198,26 @@ impl Registry {
             tracing::warn!(kind = ?error.kind(), "account handoff state save failed");
         }
         result
+    }
+
+    // Readers must not observe completion until its recovery record is durable.
+    fn commit_account_handoff(
+        &self,
+        handoff: SessionHandoff,
+        persist: impl FnOnce(&BTreeMap<SessionId, SessionHandoff>) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let mut handoffs = lock(&self.account_handoffs);
+        let from = handoff.from;
+        let previous = handoffs.insert(from, handoff);
+        if let Err(error) = persist(&handoffs) {
+            if let Some(previous) = previous {
+                handoffs.insert(from, previous);
+            } else {
+                handoffs.remove(&from);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Wait for a user switch, waking immediately instead of waiting for the quota tick.
@@ -608,20 +635,16 @@ impl Registry {
             self.close(peer, new).ok();
             return Err(Failure::BadRequest);
         }
-        lock(&self.account_handoffs).insert(
-            old,
+        // Publish completion and retire the old PTY only after persistence succeeds.
+        if let Err(error) = self.commit_account_handoff(
             SessionHandoff {
                 from: old,
                 to: Some(new),
                 account_id: account_id.into(),
                 error: None,
             },
-        );
-        // Persist the replacement before retiring the old PTY, so a daemon crash can recover it.
-        if let Err(error) = self.save_account_handoffs() {
-            if let Some(handoff) = lock(&self.account_handoffs).get_mut(&old) {
-                handoff.to = None;
-            }
+            |handoffs| self.write_account_handoffs(handoffs),
+        ) {
             self.close(peer, new).ok();
             return Err(super::os(&error));
         }
