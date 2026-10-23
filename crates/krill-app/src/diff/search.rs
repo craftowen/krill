@@ -963,7 +963,7 @@ fn find_rg_binary() -> Option<PathBuf> {
     None
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn search_with_rg_limits(
     rg_bin: &Path,
     root: &Path,

@@ -146,6 +146,41 @@ mod win {
     use windows_sys::Win32::UI::Shell::ShellExecuteW;
     use windows_sys::Win32::UI::WindowsAndMessaging::{MB_OK, SW_SHOWNORMAL};
 
+    pub(super) fn preferred_locale() -> Option<String> {
+        use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
+
+        let mut count = 0;
+        let mut length = 0;
+        // SAFETY: count and length are writable u32 values; a null buffer with zero
+        // length requests the required UTF-16 buffer size without writing language data.
+        let ok = unsafe {
+            GetUserPreferredUILanguages(
+                MUI_LANGUAGE_NAME,
+                &raw mut count,
+                std::ptr::null_mut(),
+                &raw mut length,
+            )
+        };
+        if ok == 0 || count == 0 || length == 0 {
+            return None;
+        }
+        let mut buffer = vec![0; usize::try_from(length).ok()?];
+        // SAFETY: buffer has length writable UTF-16 units and lives through the call;
+        // count and length are valid output pointers, and length initially holds its capacity.
+        let ok = unsafe {
+            GetUserPreferredUILanguages(
+                MUI_LANGUAGE_NAME,
+                &raw mut count,
+                buffer.as_mut_ptr(),
+                &raw mut length,
+            )
+        };
+        if ok == 0 || count == 0 {
+            return None;
+        }
+        super::super::locale::first_preferred_locale(buffer.get(..usize::try_from(length).ok()?)?)
+    }
+
     pub(super) fn hwnd(window: &Window) -> Option<HWND> {
         match HasWindowHandle::window_handle(window).ok()?.as_raw() {
             RawWindowHandle::Win32(h) => Some(h.hwnd.get() as HWND),
@@ -241,36 +276,5 @@ pub mod menu_bar {
 }
 
 pub(crate) fn preferred_locale() -> Option<String> {
-    use windows_sys::Win32::Globalization::{GetUserPreferredUILanguages, MUI_LANGUAGE_NAME};
-
-    let mut count = 0;
-    let mut length = 0;
-    // SAFETY: count and length are writable u32 values; a null buffer with zero
-    // length requests the required UTF-16 buffer size without writing language data.
-    let ok = unsafe {
-        GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &raw mut count,
-            std::ptr::null_mut(),
-            &raw mut length,
-        )
-    };
-    if ok == 0 || count == 0 || length == 0 {
-        return None;
-    }
-    let mut buffer = vec![0; usize::try_from(length).ok()?];
-    // SAFETY: buffer has length writable UTF-16 units and lives through the call;
-    // count and length are valid output pointers, and length initially holds its capacity.
-    let ok = unsafe {
-        GetUserPreferredUILanguages(
-            MUI_LANGUAGE_NAME,
-            &raw mut count,
-            buffer.as_mut_ptr(),
-            &raw mut length,
-        )
-    };
-    if ok == 0 || count == 0 {
-        return None;
-    }
-    super::locale::first_preferred_locale(buffer.get(..usize::try_from(length).ok()?)?)
+    win::preferred_locale()
 }
