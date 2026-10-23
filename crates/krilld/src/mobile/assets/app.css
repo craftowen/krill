@@ -166,9 +166,9 @@ button.account-row:disabled{opacity:1}
 .session.screen>.page-header .icon-button{width:32px;min-width:32px;height:32px;min-height:32px}
 .session .mode-toggle,.session-tabs,.session-tab,.tab-add{min-height:32px}.session-tab{padding-top:6px;padding-bottom:6px}.session .mode-toggle{padding:4px 8px}
 .keybar{align-items:center;padding:4px;gap:4px}
-.accessory-key,.dismiss-keyboard,.keybar>.photo-attach{min-width:32px;min-height:32px;height:32px;padding:4px 8px;border-radius:var(--radius-row);font-size:var(--font-meta)}
+.accessory-key,.dismiss-keyboard,.buffered-command>.photo-attach{min-width:32px;min-height:32px;height:32px;padding:4px 8px;border-radius:var(--radius-row);font-size:var(--font-meta)}
 .dismiss-keyboard{margin:4px 0 4px 4px;display:grid;place-items:center}
-.keybar>.photo-attach{width:32px;background:var(--surface-raised);color:var(--muted-foreground)}
+.buffered-command>.photo-attach{width:32px;background:transparent;color:var(--muted-foreground)}.buffered-command>.photo-attach:active{background:var(--surface-raised);color:var(--foreground)}
 .edit-keys{font:600 var(--font-body) var(--font-mono);border:1px solid var(--border)}
 .input-row{padding:4px 8px;min-height:42px}.buffered-command{align-items:flex-end}
 .buffered-command>.command-input{height:34px;min-height:34px;max-height:108px;line-height:22px;padding:6px 10px;resize:none;overflow-y:auto;font-family:var(--font-mono)}
@@ -361,7 +361,7 @@ button.account-row:disabled{opacity:1}
 .live-capture{top:auto;bottom:0;left:0;min-height:1px;max-height:1px;resize:none}
 @media(max-width:599px){
  .terminal-mount[data-input-mode=buffered] .direct-toggle{font-family:inherit}
- .accessory-key,.dismiss-keyboard,.keybar>.photo-attach{min-height:var(--touch-target);height:var(--touch-target);min-width:var(--touch-target)}
+ .accessory-key,.dismiss-keyboard,.buffered-command>.photo-attach{min-height:var(--touch-target);height:var(--touch-target);min-width:var(--touch-target)}
  .command-send{width:var(--touch-target);height:var(--touch-target);min-width:var(--touch-target)}
  .session .terminal-frame{padding:var(--space-xs) var(--space-xs) 0}
 }
