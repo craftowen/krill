@@ -671,7 +671,8 @@ struct MacWindowState {
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
     renderer: renderer::Renderer,
-    // The last `draw` was skipped because the compositor held every drawable; present again on the next tick.
+    // The last `draw` was not presented (the compositor held every drawable, or acquiring/rendering failed and
+    // is retried with backoff); present again on the next tick.
     present_pending: bool,
     // When the display link last delivered a frame tick, and how many stalls in a row the watchdog saw.
     last_step_at: Option<std::time::Instant>,

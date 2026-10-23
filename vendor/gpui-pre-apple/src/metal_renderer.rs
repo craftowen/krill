@@ -2,6 +2,8 @@
 // 크기 변경 때 미리 만들지 않고 처음 그릴 때 만들며, 경로 없는 프레임을 그리면 놓는다.
 // Minikrill 변경(앱 멈춤, Apache-2.0 §4(b)): 화면에 아직 안 올라간 드로어블이 꽉 차면 `nextDrawable`에서 메인 스레드를
 // 무기한 막지 않고 그 프레임을 건너뛴다(`DrawableBacklog`). 호출자가 다음 틱에 다시 present한다.
+// Krill 변경(앱 멈춤, Apache-2.0 §4(b)): 표시 신호(presented handler)를 GPU 완료 뒤 50ms만 기다리고 자리를 회수하며,
+// 늦거나 안 온 신호를 초당 요약에 남긴다. 드로어블 획득·렌더 실패는 버리지 않고 백오프로 다시 present한다(연속 5회 상한).
 use crate::metal_atlas::MetalAtlas;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
@@ -42,25 +44,79 @@ use std::{
 /// drawable held on screen, reaching this count means `nextDrawable` would block until the
 /// compositor catches up, stalling input handling on the main thread meanwhile.
 const MAX_DRAWABLES_IN_FLIGHT: usize = 2;
-/// Presented handlers can stop arriving (hidden window, dropped drawable, a compositor that is not
-/// showing this layer). Skipping must not freeze the window: once nothing has been queued for this
-/// long, acquire anyway; `nextDrawable` itself is bounded by the layer's one-second timeout.
+/// How long a drawable the GPU has finished may wait for its presented handler before its slot is
+/// reclaimed. The compositor shows a finished drawable within a vsync or two, so a handler still
+/// missing after this is late or lost (hidden window, dropped drawable, a compositor that is not
+/// showing this layer); skipping on would leave the window frozen while the next drawable is
+/// likely free already. Acquiring early costs at most a `nextDrawable` wait, which is logged.
+const PRESENT_GRACE: Duration = Duration::from_millis(50);
+/// Reclaims a drawable whose GPU completion was never reported either. `nextDrawable` itself is
+/// bounded by the layer's one-second timeout.
 const STALE_BACKLOG: Duration = Duration::from_millis(250);
 /// `nextDrawable` waits longer than this are logged: they are the stalls users see as freezes.
 const SLOW_DRAWABLE: Duration = Duration::from_millis(100);
+/// After a failed acquire or render, `draw` waits this long before trying again, doubling per
+/// failure in a row up to `MAX_RETRY_BACKOFF`. A nil `nextDrawable` can come after its one-second
+/// timeout, so retrying every tick could hold the main thread most of the time.
+const RETRY_BACKOFF: Duration = Duration::from_millis(50);
+const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+/// Failures in a row after which `draw` drops the frame instead of asking for a retry; the next
+/// scene change tries again once the backoff has passed.
+const MAX_PRESENT_RETRIES: u32 = 5;
 
-/// Counts presented-but-not-yet-on-screen drawables so `draw` can skip instead of blocking.
+/// A presented drawable whose presented handler has not run yet.
+struct Queued {
+    id: u64,
+    queued_at: Instant,
+    gpu_done_at: Option<Instant>,
+}
+
+impl Queued {
+    fn lost(&self, now: Instant) -> bool {
+        match self.gpu_done_at {
+            Some(done) => now.saturating_duration_since(done) >= PRESENT_GRACE,
+            None => now.saturating_duration_since(self.queued_at) >= STALE_BACKLOG,
+        }
+    }
+}
+
+#[derive(Default)]
+struct InFlight {
+    next_id: u64,
+    queued: Vec<Queued>,
+}
+
+/// Tracks presented-but-not-yet-on-screen drawables so `draw` can skip instead of blocking.
 #[derive(Default)]
 struct DrawableBacklog {
-    // (generation, count): handlers queued before a stale reset belong to an older generation and
-    // must not drain the new count.
-    in_flight: Arc<Mutex<(u64, usize)>>,
-    last_queued: Option<Instant>,
+    in_flight: Arc<Mutex<InFlight>>,
     stats: Arc<Mutex<FrameStats>>,
+    failures: PresentFailures,
+}
+
+/// Failed acquires or renders in a row, so `draw` retries on later ticks without hammering
+/// `nextDrawable`.
+#[derive(Default)]
+struct PresentFailures {
+    streak: u32,
+    last: Option<Instant>,
+}
+
+impl PresentFailures {
+    /// While backing off after a failure, `Some(retry)`: `draw` should not try now, and `retry`
+    /// tells whether to ask for another attempt on a later tick.
+    fn hold(&self, now: Instant) -> Option<bool> {
+        let last = self.last?;
+        let backoff = RETRY_BACKOFF
+            .saturating_mul(1 << self.streak.saturating_sub(1).min(16))
+            .min(MAX_RETRY_BACKOFF);
+        (now.saturating_duration_since(last) < backoff).then_some(self.streak < MAX_PRESENT_RETRIES)
+    }
 }
 
 /// One second of presentation outcomes. Logged only when something was off, so a frozen window
-/// leaves a record of whether frames were skipped, dropped by the compositor, or shown late.
+/// leaves a record of whether frames were skipped, dropped by the compositor, shown late, or
+/// waited on presented handlers that came late or never.
 #[derive(Default)]
 struct FrameStats {
     since: Option<Instant>,
@@ -70,35 +126,51 @@ struct FrameStats {
     // `presentedTime == 0`: the drawable never reached the screen.
     dropped: u32,
     slowest_shown: Duration,
-    stale_resets: u32,
+    // Slots taken back from drawables whose presented handler had not run in time.
+    reclaimed: u32,
+    // Presented handlers that ran after their slot was reclaimed.
+    late_handlers: u32,
+    failures: u32,
+    last_error: Option<String>,
     size_changes: u32,
     last_size: Option<(i32, i32)>,
 }
 
 impl FrameStats {
     /// Returns the summary line for a finished one-second window that had anything unusual.
-    fn roll(&mut self, now: Instant) -> Option<String> {
+    /// `oldest_pending` is how long the oldest drawable still in flight has waited for its handler.
+    fn roll(&mut self, now: Instant, oldest_pending: Duration) -> Option<String> {
         let since = *self.since.get_or_insert(now);
         if now.saturating_duration_since(since) < Duration::from_secs(1) {
             return None;
         }
         let unusual = self.skipped > 0
             || self.dropped > 0
-            || self.stale_resets > 0
+            || self.reclaimed > 0
+            || self.late_handlers > 0
+            || self.failures > 0
             || self.size_changes > 0
-            || self.slowest_shown >= SLOW_DRAWABLE;
+            || self.slowest_shown >= SLOW_DRAWABLE
+            || oldest_pending >= SLOW_DRAWABLE;
         let line = unusual.then(|| {
-            format!(
-                "frames in {}ms: rendered {}, skipped {}, shown {}, dropped {}, slowest shown {}ms, stale resets {}, size changes {}",
+            let mut line = format!(
+                "frames in {}ms: rendered {}, skipped {}, shown {}, dropped {}, slowest shown {}ms, reclaimed {}, late handlers {}, oldest pending {}ms, failures {}, size changes {}",
                 now.saturating_duration_since(since).as_millis(),
                 self.rendered,
                 self.skipped,
                 self.shown,
                 self.dropped,
                 self.slowest_shown.as_millis(),
-                self.stale_resets,
+                self.reclaimed,
+                self.late_handlers,
+                oldest_pending.as_millis(),
+                self.failures,
                 self.size_changes,
-            )
+            );
+            if let Some(error) = &self.last_error {
+                line.push_str(&format!(", last failure: {error}"));
+            }
+            line
         });
         *self = FrameStats {
             since: Some(now),
@@ -113,57 +185,95 @@ impl DrawableBacklog {
     /// Whether a drawable can be acquired now without waiting on the compositor.
     fn admit(&mut self, now: Instant) -> bool {
         let mut in_flight = self.in_flight.lock();
-        if in_flight.1 < MAX_DRAWABLES_IN_FLIGHT {
-            return true;
-        }
-        let quiet = self.last_queued.map(|at| now.saturating_duration_since(at));
-        let stale = quiet.is_none_or(|quiet| quiet >= STALE_BACKLOG);
+        let before = in_flight.queued.len();
+        in_flight.queued.retain(|queued| !queued.lost(now));
+        let reclaimed = before - in_flight.queued.len();
+        let admitted = in_flight.queued.len() < MAX_DRAWABLES_IN_FLIGHT;
+        drop(in_flight);
         let mut stats = self.stats.lock();
-        if stale {
-            stats.stale_resets += u32::from(quiet.is_some());
-            *in_flight = (in_flight.0.wrapping_add(1), 0);
-        } else {
-            stats.skipped += 1;
-        }
-        stale
+        stats.reclaimed += reclaimed as u32;
+        stats.skipped += u32::from(!admitted);
+        admitted
     }
 
-    /// Records a drawable about to be presented; the returned guard runs when it reaches the screen.
-    fn queued(&mut self, now: Instant) -> impl Fn(f64) + 'static {
-        self.last_queued = Some(now);
+    /// Records a drawable about to be presented. Returns the guards to run when the GPU finishes
+    /// it and when it reaches the screen.
+    fn queued(&mut self, now: Instant) -> (impl Fn(Instant) + 'static, impl Fn(f64) + 'static) {
+        self.failures = PresentFailures::default();
         self.stats.lock().rendered += 1;
-        let generation = {
+        let id = {
             let mut in_flight = self.in_flight.lock();
-            in_flight.1 += 1;
-            in_flight.0
+            let id = in_flight.next_id;
+            in_flight.next_id += 1;
+            in_flight.queued.push(Queued {
+                id,
+                queued_at: now,
+                gpu_done_at: None,
+            });
+            id
+        };
+        let in_flight = Arc::clone(&self.in_flight);
+        let gpu_done = move |at| {
+            if let Some(queued) = in_flight.lock().queued.iter_mut().find(|q| q.id == id) {
+                queued.gpu_done_at = Some(at);
+            }
         };
         let in_flight = Arc::clone(&self.in_flight);
         let stats = Arc::clone(&self.stats);
-        move |presented_time| {
-            {
+        let on_screen = move |presented_time| {
+            let reclaimed = {
                 let mut in_flight = in_flight.lock();
-                if in_flight.0 == generation {
-                    in_flight.1 = in_flight.1.saturating_sub(1);
+                match in_flight.queued.iter().position(|q| q.id == id) {
+                    Some(index) => {
+                        in_flight.queued.remove(index);
+                        false
+                    }
+                    None => true,
                 }
-            }
+            };
             let mut stats = stats.lock();
+            stats.late_handlers += u32::from(reclaimed);
             if presented_time > 0.0 {
                 stats.shown += 1;
                 stats.slowest_shown = stats.slowest_shown.max(now.elapsed());
             } else {
                 stats.dropped += 1;
             }
+        };
+        (gpu_done, on_screen)
+    }
+
+    /// Records a failed acquire or render; returns whether the frame should be retried later.
+    fn failed(&mut self, now: Instant, error: String) -> bool {
+        self.failures.streak = self.failures.streak.saturating_add(1);
+        self.failures.last = Some(now);
+        if self.failures.streak == MAX_PRESENT_RETRIES {
+            log::error!(
+                "giving up on this frame after {MAX_PRESENT_RETRIES} failures in a row: {error}"
+            );
         }
+        let mut stats = self.stats.lock();
+        stats.failures += 1;
+        stats.last_error = Some(error);
+        self.failures.streak < MAX_PRESENT_RETRIES
     }
 
     /// Notes the drawable size and logs the previous second's outcomes if they were unusual.
     fn observe_frame(&self, size: (i32, i32), now: Instant) {
+        let oldest_pending = self
+            .in_flight
+            .lock()
+            .queued
+            .iter()
+            .map(|queued| now.saturating_duration_since(queued.queued_at))
+            .max()
+            .unwrap_or_default();
         let mut stats = self.stats.lock();
         if stats.last_size.is_some_and(|last| last != size) {
             stats.size_changes += 1;
         }
         stats.last_size = Some(size);
-        if let Some(line) = stats.roll(now) {
+        if let Some(line) = stats.roll(now, oldest_pending) {
             drop(stats);
             log::warn!("{line}");
         }
@@ -645,9 +755,10 @@ impl MetalRenderer {
         // nothing to do
     }
 
-    /// Renders and presents `scene`. Returns `false` only when the frame was skipped because the
-    /// compositor still holds every drawable; the caller should present again on the next display
-    /// tick. Failures are logged and not retried, as before.
+    /// Renders and presents `scene`. Returns `false` when the frame was not presented and the caller
+    /// should present again on the next display tick: the compositor still holds every drawable,
+    /// or acquiring or rendering failed and is being retried with backoff. Failures are counted in
+    /// the per-second frame summary; after `MAX_PRESENT_RETRIES` in a row the frame is dropped.
     pub fn draw(&mut self, scene: &Scene) -> bool {
         let layer = match &self.layer {
             Some(l) => l.clone(),
@@ -666,6 +777,9 @@ impl MetalRenderer {
         let now = Instant::now();
         self.drawable_backlog
             .observe_frame((viewport_size.width.0, viewport_size.height.0), now);
+        if let Some(retry) = self.drawable_backlog.failures.hold(now) {
+            return !retry;
+        }
         if !self.drawable_backlog.admit(now) {
             return false;
         }
@@ -676,22 +790,25 @@ impl MetalRenderer {
             log::warn!("nextDrawable waited {}ms", waited.as_millis());
         }
         let Some(drawable) = drawable else {
-            log::error!(
-                "failed to retrieve next drawable, drawable size: {:?}",
-                viewport_size
-            );
-            return true;
+            let error = format!("no next drawable, drawable size: {viewport_size:?}");
+            return !self.drawable_backlog.failed(Instant::now(), error);
         };
 
         let command_buffer = match self.render_frame(scene, drawable.texture(), viewport_size) {
             Ok(command_buffer) => command_buffer,
             Err(error) => {
-                log::error!("failed to render: {error:#}");
-                return true;
+                let error = format!("render failed: {error:#}");
+                return !self.drawable_backlog.failed(Instant::now(), error);
             }
         };
 
-        let on_screen = self.drawable_backlog.queued(Instant::now());
+        let (gpu_done, on_screen) = self.drawable_backlog.queued(Instant::now());
+        let completed = RcBlock::new(move |_: ptr::NonNull<AnyObject>| gpu_done(Instant::now()));
+        // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI;
+        // Metal copies the block, so it outlives this frame.
+        unsafe {
+            command_buffer.add_completed_handler(&*RcBlock::as_ptr(&completed).cast());
+        }
         let block = RcBlock::new(move |presented: ptr::NonNull<AnyObject>| {
             // SAFETY: Metal passes the presented `MTLDrawable`; `presentedTime` is a plain getter.
             let presented_time: f64 =
@@ -1904,54 +2021,130 @@ mod tests {
         let t0 = Instant::now();
         let ms = Duration::from_millis;
         backlog.observe_frame((100, 100), t0);
-        backlog.queued(t0)(1.0);
+        backlog.queued(t0).1(1.0);
         assert_eq!(
-            backlog.stats.lock().roll(t0 + ms(1000)),
+            backlog.stats.lock().roll(t0 + ms(1000), Duration::ZERO),
             None,
             "a clean second is quiet"
         );
-        backlog.queued(t0)(0.0);
+        backlog.queued(t0).1(0.0);
         backlog.observe_frame((200, 100), t0 + ms(1100));
-        let line = backlog.stats.lock().roll(t0 + ms(2000)).unwrap();
+        let line = backlog
+            .stats
+            .lock()
+            .roll(t0 + ms(2000), SLOW_DRAWABLE)
+            .unwrap();
         assert!(
-            line.contains("dropped 1") && line.contains("size changes 1"),
+            line.contains("dropped 1")
+                && line.contains("size changes 1")
+                && line.contains("oldest pending 100ms"),
             "{line}"
         );
     }
 
     #[test]
-    fn drawable_backlog_skips_instead_of_blocking_and_recovers_stale_counts() {
+    fn drawable_backlog_skips_instead_of_blocking_and_reclaims_missing_handlers() {
         let mut backlog = DrawableBacklog::default();
         let t0 = Instant::now();
         let ms = Duration::from_millis;
-        let first = backlog.queued(t0);
+        let (first_done, first) = backlog.queued(t0);
         assert!(backlog.admit(t0), "one queued drawable leaves one free");
-        let second = backlog.queued(t0);
+        let (second_done, _second) = backlog.queued(t0);
         assert!(
             !backlog.admit(t0),
             "two queued drawables would block nextDrawable"
         );
-        assert!(!backlog.admit(t0 + STALE_BACKLOG - ms(1)));
         first(1.0);
         assert!(backlog.admit(t0 + ms(10)), "presentation frees a slot");
 
-        let t1 = t0 + ms(500);
-        let _third = backlog.queued(t1);
-        assert!(!backlog.admit(t1 + STALE_BACKLOG - ms(1)));
+        let (third_done, third) = backlog.queued(t0 + ms(20));
+        second_done(t0 + ms(30));
+        third_done(t0 + ms(30));
+        assert!(!backlog.admit(t0 + ms(30) + PRESENT_GRACE - ms(1)));
         assert!(
-            backlog.admit(t1 + STALE_BACKLOG),
-            "a count that stops draining is reset rather than freezing the window"
+            backlog.admit(t0 + ms(30) + PRESENT_GRACE),
+            "a finished drawable whose handler is missing gives its slot back within the grace"
         );
-        let t2 = t1 + STALE_BACKLOG;
-        let fourth = backlog.queued(t2);
-        let _fifth = backlog.queued(t2);
-        second(1.0);
+        third(1.0);
+        first_done(t0);
+        let stats = backlog.stats.lock();
+        assert_eq!(
+            (stats.skipped, stats.reclaimed, stats.late_handlers),
+            (2, 2, 1),
+            "skips, reclaimed slots and the handler that came after its reclaim are all counted"
+        );
+    }
+
+    #[test]
+    fn drawable_backlog_reclaims_unfinished_drawables_only_after_the_stale_fallback() {
+        let mut backlog = DrawableBacklog::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let _first = backlog.queued(t0);
+        let _second = backlog.queued(t0);
         assert!(
-            !backlog.admit(t2),
-            "a handler from before the reset does not drain the new count"
+            !backlog.admit(t0 + PRESENT_GRACE),
+            "the GPU has not finished either drawable, so the compositor cannot have shown them"
         );
-        fourth(1.0);
-        assert!(backlog.admit(t2));
+        assert!(!backlog.admit(t0 + STALE_BACKLOG - ms(1)));
+        assert!(backlog.admit(t0 + STALE_BACKLOG));
+    }
+
+    #[test]
+    fn failed_presents_retry_with_backoff_then_give_up_until_the_next_change() {
+        let mut backlog = DrawableBacklog::default();
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        backlog.observe_frame((100, 100), t0);
+        assert_eq!(backlog.failures.hold(t0), None);
+        assert!(backlog.failed(t0, "no next drawable".into()), "retry");
+        assert_eq!(backlog.failures.hold(t0 + ms(49)), Some(true));
+        assert_eq!(backlog.failures.hold(t0 + RETRY_BACKOFF), None);
+        let mut at = t0;
+        for streak in 2..MAX_PRESENT_RETRIES {
+            at += ms(1000);
+            assert!(backlog.failed(at, "no next drawable".into()));
+            let backoff = RETRY_BACKOFF * (1 << (streak - 1));
+            assert_eq!(backlog.failures.hold(at + backoff - ms(1)), Some(true));
+            assert_eq!(backlog.failures.hold(at + backoff), None);
+        }
+        at += ms(1000);
+        assert!(
+            !backlog.failed(at, "render failed".into()),
+            "the cap drops the frame instead of retrying forever"
+        );
+        assert_eq!(
+            backlog.failures.hold(at + ms(799)),
+            Some(false),
+            "a capped streak still backs off"
+        );
+        assert_eq!(backlog.failures.hold(at + ms(800)), None);
+        at += ms(1000);
+        assert!(!backlog.failed(at, "render failed".into()));
+        assert_eq!(
+            backlog.failures.hold(at + MAX_RETRY_BACKOFF - ms(1)),
+            Some(false)
+        );
+        assert_eq!(
+            backlog.failures.hold(at + MAX_RETRY_BACKOFF),
+            None,
+            "the backoff stops doubling at its cap"
+        );
+        let line = backlog
+            .stats
+            .lock()
+            .roll(at + ms(5000), Duration::ZERO)
+            .unwrap();
+        assert!(
+            line.contains("failures 6") && line.contains("last failure: render failed"),
+            "{line}"
+        );
+        let _ = backlog.queued(at);
+        assert_eq!(
+            backlog.failures.hold(at),
+            None,
+            "a presented frame ends the streak"
+        );
     }
 
     #[test]
