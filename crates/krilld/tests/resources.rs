@@ -164,7 +164,14 @@ fn resources_match_footprint_and_restart_keeps_sessions() {
         thread::sleep(Duration::from_millis(20));
     }
     fs::write(dir.join("probe"), vec![1u8; 100_000]).unwrap();
+    // The client is this test process. Warm the measurement subprocess and query decoding
+    // before sampling it; their first allocations otherwise change the process being measured.
+    let client_pid = std::process::id();
+    let _ = footprint_tool(client_pid);
+    let _ = resources(&mut c, Action::Query);
     let r = resources(&mut c, Action::Query);
+    // Compare the client before launching footprint/pgrep for the other processes.
+    within_10pct("client", r.client.unwrap(), footprint_tool(client_pid));
     let usage = r.sessions.iter().find(|s| s.session == session).unwrap();
     assert_eq!(usage.processes, 2, "sh + sleep");
     let tree: u64 = [root]
@@ -175,11 +182,6 @@ fn resources_match_footprint_and_restart_keeps_sessions() {
     within_10pct("session", usage.footprint, tree);
     within_10pct("krilld", r.daemon, footprint_tool(krilld));
     within_10pct("holder", r.holder.unwrap(), footprint_tool(holder_pid));
-    within_10pct(
-        "client",
-        r.client.unwrap(),
-        footprint_tool(std::process::id()),
-    );
     eprintln!("MK-071 disk: shown={}", r.disk);
     assert!(r.disk >= 100_000, "state dir includes the probe file");
 
