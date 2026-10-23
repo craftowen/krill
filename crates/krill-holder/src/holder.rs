@@ -84,6 +84,7 @@ pub fn run(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
     raise_nofile();
     let kq = sys::kq::kqueue()?;
     fcntl_setfd(&kq, FdFlags::CLOEXEC)?;
+    sys::catch_stop_signals();
     let mut h = Holder {
         krilld_path,
         krilld_args: args.collect(),
@@ -119,16 +120,13 @@ fn raise_nofile() {
 
 impl Holder {
     fn event_loop(&mut self) -> io::Result<()> {
-        let sigchld = Event::new(
-            EventFilter::Signal {
-                signal: Signal::CHILD,
-                times: 0,
-            },
-            EventFlags::ADD,
-            std::ptr::null_mut(),
-        );
+        let mut changes: Vec<Event> = [Signal::CHILD, Signal::TERM, Signal::HUP, Signal::INT]
+            .map(|signal| {
+                let filter = EventFilter::Signal { signal, times: 0 };
+                Event::new(filter, EventFlags::ADD, std::ptr::null_mut())
+            })
+            .into();
         let mut events = Vec::with_capacity(8);
-        let mut changes = vec![sigchld];
         if self.reap() {
             return Ok(()); // 중복 기동: 건강한 데몬이 있어 끝낸다
         }
@@ -160,6 +158,14 @@ impl Holder {
                 .map(|at| at.saturating_duration_since(Instant::now()));
             sys::wait(self.kq.as_fd(), &changes, &mut events, timeout)?;
             changes.clear();
+            // 종료 신호: 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
+            let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
+            if stop != 0 {
+                let (signal, from, sessions) =
+                    (stop >> 32, stop & 0xffff_ffff, self.sessions.len());
+                tracing::warn!(signal, from, sessions, "holder stopping");
+                return Ok(());
+            }
             // 읽기를 먼저 처리한다. 이 묶음 안에서 링크는 닫힐 수만 있고 새로 생기지 않는다.
             if events
                 .iter()

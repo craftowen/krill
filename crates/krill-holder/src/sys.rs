@@ -10,6 +10,7 @@ use std::os::fd::BorrowedFd;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::Command;
+use std::sync::atomic::Ordering;
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
@@ -27,7 +28,7 @@ pub use rustix::event::kqueue as kq;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{children, close_inherited, kq, start_time, wait};
+pub use linux::{catch_stop_signals, children, close_inherited, kq, start_time, wait};
 
 /// 자식이 새 세션을 만들고(setsid) stdin(PTY slave)을 제어 터미널로 잡게 한다(MK-004 결정 3).
 pub fn set_controlling_tty(cmd: &mut Command) {
@@ -40,6 +41,28 @@ pub fn set_controlling_tty(cmd: &mut Command) {
     // SAFETY: 훅은 setsid·ioctl 시스템 호출만 한다(async-signal-safe, 할당·락 없음, CONVENTIONS U7).
     unsafe {
         cmd.pre_exec(hook);
+    }
+}
+
+/// 받은 종료 신호와 보낸 pid(`신호 << 32 | pid`, 없으면 0). macOS 처리기만 적는다(Linux는 기본 동작으로 끝난다).
+pub static STOPPED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+#[cfg(target_os = "macos")]
+/// 종료 신호(TERM·HUP·INT) 처리기. 적기만 하고 종료는 이벤트 루프가 `EVFILT_SIGNAL`로 깨어 로그를 남긴 뒤 한다.
+/// `SIG_IGN`과 달리 exec 때 기본값으로 돌아가 krilld·세션에 물려지지 않는다. `SA_RESTART`: 링크 IO가 EINTR로 안 깨진다.
+pub fn catch_stop_signals() {
+    extern "C" fn note(signal: libc::c_int, info: *mut libc::siginfo_t, _: *mut libc::c_void) {
+        // SAFETY: SA_SIGINFO 처리기에 커널이 넘긴 siginfo다(널이면 0). 원자 저장만 한다(async-signal-safe, panic 없음).
+        let from = unsafe { info.as_ref() }.map_or(0, |i| i.si_pid);
+        STOPPED.store(i64::from(signal) << 32 | i64::from(from), Ordering::Relaxed);
+    }
+    let action = libc::sigaction {
+        sa_sigaction: note as *const () as libc::sighandler_t,
+        sa_mask: 0,
+        sa_flags: libc::SA_SIGINFO | libc::SA_RESTART,
+    };
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        // SAFETY: `action`은 유효한 sigaction이고 이전 값은 받지 않는다. 실패하면 그 신호는 기본 동작(로그 없이 종료)으로 남는다.
+        unsafe { libc::sigaction(signal, &raw const action, std::ptr::null_mut()) };
     }
 }
 
