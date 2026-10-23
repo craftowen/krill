@@ -2,6 +2,10 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Split terminal": "분할",
+ "Open beside this terminal": "옆 칸에 열기",
+ "Close pane": "칸 닫기",
+ "No other terminals available.": "다른 터미널이 없습니다.",
  "Sessions": "세션",
  "Toggle session list": "세션 목록 접기/펴기",
  "Recent sessions": "최근 세션",

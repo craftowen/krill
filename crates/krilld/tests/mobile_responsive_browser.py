@@ -129,7 +129,7 @@ def main():
 
                 # First-launch states before consuming the one-time pairing ticket.
                 init = Path(scratch) / 'preferences.js'
-                init.write_text('localStorage.setItem("krill-mobile-ui-v1",JSON.stringify({language:"en",appearance:"dark"}));')
+                init.write_text('if(!localStorage.getItem("krill-mobile-ui-v1"))localStorage.setItem("krill-mobile-ui-v1",JSON.stringify({language:"en",appearance:"dark"}));const NativeSocket=WebSocket;globalThis.tabletSockets=[];globalThis.WebSocket=class extends NativeSocket{constructor(...args){super(...args);tabletSockets.push(this);}};')
                 browser('--init-script', str(init), 'open', cfg['base'])
                 wait('!!globalThis.KrillMobile?.app')
                 for width, height in VIEWPORTS:
@@ -253,10 +253,10 @@ def main():
                                       (507, 1180), (320, 740), (844, 390), (390, 844)]:
                     browser('set', 'viewport', str(width), str(height))
                     wait('Math.round(parseFloat(document.querySelector(".terminal-grid").style.width)/8)===Math.floor((document.querySelector(".terminal-scroll").clientWidth-2)/8)')
-                    resizing.append(evaluate('({width:innerWidth,height:innerHeight,cols:Math.round(parseFloat(document.querySelector(".terminal-grid").style.width)/8),rows:Math.round(parseFloat(document.querySelector(".terminal-grid").style.height)/18)})'))
+                    resizing.append(evaluate('({width:innerWidth,height:innerHeight,portWidth:document.querySelector(".terminal-scroll").clientWidth,cols:Math.round(parseFloat(document.querySelector(".terminal-grid").style.width)/8),rows:Math.round(parseFloat(document.querySelector(".terminal-grid").style.height)/18)})'))
                     assert evaluate('document.querySelector(".command-input").value') == 'fold draft 한글'
                     assert evaluate('location.hash') == resize_route
-                assert all((b['cols'] > a['cols']) == (b['width'] > a['width'])
+                assert all((b['cols'] > a['cols']) == (b['portWidth'] > a['portWidth'])
                            for a, b in zip(resizing, resizing[1:])), resizing
                 (shots / 'resize.json').write_text(json.dumps(resizing, indent=2))
                 # Real history must keep its anchor when folds arrive without
@@ -285,7 +285,7 @@ def main():
                 fold_hash = evaluate('location.hash')
                 browser('screenshot', str(shots / 'rapid-fold-before.png'))
                 folds = []
-                for width, height in [(690, 830), (344, 882)] * 6:
+                for width, height in [(1180, 820), (830, 690), (1032, 1376), (344, 882)] * 3:
                     browser('set', 'viewport', str(width), str(height))
                     sample = evaluate('(()=>{const root=document.querySelector(".terminal-mount:not([hidden])");return {width:innerWidth,top:root.querySelector(".terminal-scroll").scrollTop,history:root.querySelector(".terminal-history").textContent,draft:root.querySelector(".command-input").value,hash:location.hash,sameTerminal:foldTerminal===KrillMobile.activeTerminal};})()')
                     assert sample.pop('history') == history
@@ -302,6 +302,16 @@ def main():
                 (shots / 'rapid-fold.json').write_text(json.dumps(folds, indent=2))
                 browser('screenshot', str(shots / 'rapid-fold-after.png'))
                 print('PASS rapid fold x12: live grid, draft, terminal identity, history and scroll anchor', flush=True)
+                # Tablet shell, independent terminal panes and real daemon lifetime.
+                def cli(*command):
+                    return subprocess.check_output([str(target / 'debug/krill'), *command],
+                        env=dict(os.environ, KRILL_STATE_DIR=cfg['dir']), text=True)
+
+                def pane_ready():
+                    wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===2')
+                    wait('[...document.querySelectorAll(".terminal-mount .terminal-scroll")].every(p=>Math.round(parseFloat(p.querySelector(".terminal-grid").style.width)/8)===Math.floor((p.clientWidth-2)/8))')
+
+                other = cfg['extraSessions'][0]
                 if args.phase == 'after':
                     # Readability and wrapping also survive localized large text.
                     navigate('/settings')
@@ -317,12 +327,112 @@ def main():
                             if name == 'accounts':
                                 wait('!!document.querySelector(".account-row")')
                             capture(name + '-ko-large-light', width, height)
+                            if name == 'session' and width >= 1000:
+                                named('분할')
+                                evaluate(f'[...document.querySelectorAll(".sheet-action")].find(n=>n.textContent.endsWith("#{other}")).click();true')
+                                pane_ready()
+                                capture('tablet-split-ko-large-light', width, height)
+                                named('칸 닫기')
                         click('.session .mode-toggle')
                         capture('chat-ko-large-light', width, height)
                         click('.session .page-header .icon-button:last-child')
                         capture('dialog-ko-large-light', width, height)
                         close()
                         click('.session .mode-toggle')
+                # Keep the original 608 captures before any split reload or new input.
+                navigate('/settings')
+                click('[data-focus-key="preference-language-en"]')
+                click('[data-focus-key="preference-appearance-dark"]')
+                click('[data-focus-key="preference-uiTextScale-1"]')
+                tablet = []
+                evaluate('KrillMobile.store.ui.search="no-matching-workspace";KrillMobile.store.ui.filter="attention";true')
+                for width, height in VIEWPORTS:
+                    browser('set', 'viewport', str(width), str(height))
+                    navigate(route)
+                    wait('!!KrillMobile.activeTerminal')
+                    assert evaluate('!!document.querySelector(".tablet-sidebar").getClientRects().length') == (width >= 1000)
+                    if width < 1000:
+                        continue
+                    evaluate('globalThis.tabletSidebar=document.querySelector(".tablet-sidebar");true')
+                    click(f'.tablet-sidebar .session-row[data-session="{other}"]')
+                    wait(f'location.hash.endsWith("/s/{other}")')
+                    assert evaluate('tabletSidebar===document.querySelector(".tablet-sidebar")')
+                    assert evaluate(f'document.querySelector(".session-tab[aria-selected=true]").dataset.session==="{other}"')
+                    navigate(route)
+                    wait('!!KrillMobile.activeTerminal')
+                    capture('tablet-sidebar', width, height)
+                    tablet.append({'width': width, 'height': height, 'sidebarPreserved': True})
+                evaluate('KrillMobile.store.ui.search="";KrillMobile.store.ui.filter="all";true')
+                browser('set', 'viewport', '1180', '820')
+                navigate(route)
+                wait('document.querySelector(".terminal-mount")?.dataset.phase==="ready"')
+                evaluate('globalThis.sidebarTerminal=KrillMobile.activeTerminal;true')
+                named('Toggle session list')
+                assert evaluate('!document.querySelector(".tablet-sidebar").getClientRects().length')
+                named('Toggle session list')
+                browser('set', 'viewport', '830', '690')
+                browser('set', 'viewport', '1180', '820')
+                assert evaluate('sidebarTerminal===KrillMobile.activeTerminal')
+                named('Split terminal')
+                capture('tablet-split-picker', 1180, 820)
+                assert not evaluate(f'[...document.querySelectorAll(".sheet-action")].some(n=>n.textContent.endsWith("#{sid}"))')
+                evaluate(f'[...document.querySelectorAll(".sheet-action")].find(n=>n.textContent.endsWith("#{other}")).click();true')
+                pane_ready()
+                assert evaluate('getComputedStyle(document.querySelector(".terminal-pane[data-active=true]"),"::after").borderTopWidth') == '2px'
+                assert evaluate('document.getElementById("notice").hidden || !document.getElementById("notice").textContent.includes("Wait for the live terminal")')
+                assert evaluate('!document.querySelector(".primary-pane .command-dock").getClientRects().length && !!document.querySelector(".secondary-pane .command-dock").getClientRects().length')
+                capture('tablet-split-columns-active-second', 1180, 820)
+                assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'row'
+                second_handle = 'globalThis.secondHandle=KrillMobile.activeTerminal;true'
+                evaluate(second_handle)
+                evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
+                browser('fill', '.secondary-pane .command-input', 'tablet-second-only')
+                evaluate('document.querySelector(".secondary-pane .buffered-command").requestSubmit();true')
+                until(lambda: 'tablet-second-only' in cli('read', str(other)))
+                assert 'tablet-second-only' not in cli('read', str(sid))
+                browser('click', '.primary-pane .terminal-scroll')
+                assert evaluate('secondHandle!==KrillMobile.activeTerminal')
+                evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
+                browser('fill', '.primary-pane .command-input', 'tablet-first-only')
+                evaluate('document.querySelector(".primary-pane .buffered-command").requestSubmit();true')
+                until(lambda: 'tablet-first-only' in cli('read', str(sid)))
+                assert 'tablet-first-only' not in cli('read', str(other))
+                browser('fill', '.primary-pane .command-input', 'primary fold draft 한글')
+                evaluate('document.querySelector(".secondary-pane .command-input").value="second fold draft 한글";globalThis.firstHandle=KrillMobile.activeTerminal;globalThis.splitSocketCount=tabletSockets.filter(s=>s.readyState===1).length;true')
+                capture('tablet-split-columns-active-first', 1180, 820)
+                browser('set', 'viewport', '830', '690')
+                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                wait('tabletSockets.filter(s=>s.readyState===1).length===splitSocketCount-1')
+                assert evaluate('firstHandle===KrillMobile.activeTerminal')
+                assert evaluate('document.querySelector(".primary-pane .command-input").value') == 'primary fold draft 한글'
+                browser('set', 'viewport', '1180', '820')
+                pane_ready()
+                assert evaluate('firstHandle===KrillMobile.activeTerminal')
+                assert evaluate('document.querySelector(".secondary-pane .command-input").value') == 'second fold draft 한글'
+                browser('click', '.secondary-pane .terminal-scroll')
+                evaluate('globalThis.secondHandle=KrillMobile.activeTerminal;true')
+                browser('set', 'viewport', '830', '690')
+                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                assert evaluate('secondHandle===KrillMobile.activeTerminal')
+                browser('set', 'viewport', '1180', '820')
+                pane_ready()
+                assert evaluate('document.querySelector(".primary-pane .command-input").value') == 'primary fold draft 한글'
+                browser('set', 'viewport', '1032', '1376')
+                pane_ready()
+                assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'column'
+                capture('tablet-split-rows', 1032, 1376)
+                browser('reload')
+                pane_ready()
+                assert evaluate(f'document.querySelector(".secondary-pane").dataset.session==="{other}"')
+                capture('tablet-split-restored', 1032, 1376)
+                named('Close pane')
+                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                assert evaluate('!document.querySelector(".secondary-pane")')
+                assert str(other) in [line.split('\t')[0] for line in cli('ls').splitlines()]
+                assert 'tablet-second-only' in cli('read', str(other))
+                (shots / 'tablet.json').write_text(json.dumps({'sidebar': tablet, 'inputIsolated': True,
+                    'paneCloseKeepsPty': True, 'narrowKeepsActiveHandle': True, 'splitRestored': True}, indent=2))
+                print('PASS tablet sidebar, split geometry, isolated input, PTY survival, folding drafts and reload', flush=True)
                 assert not browser('errors').strip(), browser('errors')
             finally:
                 subprocess.run(['agent-browser', '--session', session, 'close'], capture_output=True, timeout=15)
