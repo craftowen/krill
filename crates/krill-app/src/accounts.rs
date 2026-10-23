@@ -288,7 +288,8 @@ fn exchange(paths: &Paths, req: &UsageRequest) -> Result<UsageReply, String> {
         | krill_proto::usage::FEAT_USAGE_MANAGE
         | krill_proto::usage::FEAT_ACCOUNT_POLICY
         | krill_proto::usage::FEAT_ACCOUNT_CONNECTION
-        | krill_proto::usage::FEAT_USAGE_RESET;
+        | krill_proto::usage::FEAT_USAGE_RESET
+        | krill_proto::usage::FEAT_USAGE_REFRESH;
     let mut conn = daemon::connect(paths, &hello).map_err(|e| e.to_string())?;
     if conn.negotiated.features & FEAT_USAGE == 0 {
         return Err("FEAT_USAGE not negotiated".to_owned());
@@ -325,9 +326,10 @@ pub fn request_local(
             io::ErrorKind::Unsupported,
             "account handoff cancellation requires the daemon",
         )),
-        UsageRequest::Get | UsageRequest::ListAccounts | UsageRequest::ListOrphanProfiles => {
-            Ok(refresh_local(home, state_dir))
-        }
+        UsageRequest::Get
+        | UsageRequest::ListAccounts
+        | UsageRequest::RefreshUsage
+        | UsageRequest::ListOrphanProfiles => Ok(refresh_local(home, state_dir)),
         UsageRequest::SwitchAccount {
             provider,
             account_id,

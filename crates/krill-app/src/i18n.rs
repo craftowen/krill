@@ -390,6 +390,7 @@ catalog! {
         D_GIT_OK => ("git이 설치돼 있습니다", "git is installed"),
         D_GIT_WARN => ("git이 설치돼 있지 않습니다", "git is not installed"),
         D_GIT_WARN_DETAIL => ("`git --version` 실행 실패(Xcode 명령행 도구를 설치하세요)", "`git --version` failed (install Xcode Command Line Tools)"),
+        D_GIT_WARN_DETAIL_WIN => ("`git --version` 실행 실패(Git for Windows를 설치하세요)", "`git --version` failed (install Git for Windows)"),
         D_AGENTS_FOUND => ("에이전트 {n}개 감지", "{n} agent(s) found"),
         D_AGENTS_NONE => ("감지된 에이전트가 없습니다", "no agent detected"),
         D_AGENTS_NONE_DETAIL => ("로그인 셸 PATH에서 기본 프로필 에이전트를 찾지 못했습니다", "no built-in profile agent found on the login shell PATH"),

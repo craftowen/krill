@@ -40,6 +40,8 @@ pub const FEAT_USAGE_MANAGE: u64 = 1 << 59;
 /// Codex banked rate-limit reset 크레딧 소진 요청·응답. 협상하지 않은 데몬에는 보내지 않는다
 /// (구 데몬은 모르는 variant를 `BadRequest`로 거부한다).
 pub const FEAT_USAGE_RESET: u64 = 1 << 49;
+/// 수동 '사용량 새로고침' [`UsageRequest::RefreshUsage`]. 협상하지 않은 데몬에는 `ListAccounts`를 보낸다.
+pub const FEAT_USAGE_REFRESH: u64 = 1 << 20;
 /// 상태바 경고 기준 사용률(MK-084 완료 조건: 80% 경고). krilld와 UI가 같은 값을 쓴다.
 pub const WARN_PERCENT: u8 = 80;
 /// 상태바·계정 카드 위험 색 기준 사용률(OWE-708). [`WARN_PERCENT`] 이상은 경고, 이 값 이상은 위험.
@@ -706,6 +708,9 @@ pub enum UsageRequest {
     CancelAccountSwitch {
         session: crate::SessionId,
     },
+    /// 사용자가 누른 사용량 새로고침 → [`UsageReply::Accounts`]. `ListAccounts`와 달리 조회 주기·
+    /// Retry-After를 무시하고 바로 다시 조회한다. [`FEAT_USAGE_REFRESH`]를 협상한 피어에만 보낸다.
+    RefreshUsage,
 }
 
 impl UsageRequest {
@@ -735,6 +740,7 @@ impl UsageRequest {
             self,
             Self::Get
                 | Self::ListAccounts
+                | Self::RefreshUsage
                 | Self::ListOrphanProfiles
                 | Self::GetProvisioning
                 | Self::ImportOrcaAntigravity { dry_run: true, .. }
@@ -766,6 +772,10 @@ impl UsageRequest {
             Self::ConsumeResetCredit { provider, .. } => {
                 features |= FEAT_USAGE_RESET;
                 Some(*provider)
+            }
+            Self::RefreshUsage => {
+                features |= FEAT_USAGE_REFRESH;
+                None
             }
             Self::RenameAccount { provider, .. } | Self::DeleteAccount { provider, .. } => {
                 features |= FEAT_USAGE_MANAGE;

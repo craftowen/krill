@@ -2026,6 +2026,10 @@ impl Registry {
                     }
                 }
             }
+            UsageRequest::RefreshUsage => {
+                crate::usage::direct::refresh_manual(&home, state_ref);
+                UsageReply::Accounts(accounts::refresh_accounts(&home, state_ref))
+            }
             UsageRequest::SwitchAccount {
                 provider,
                 account_id,

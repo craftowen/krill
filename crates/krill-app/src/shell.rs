@@ -2538,10 +2538,17 @@ impl Shell {
                 .spawn({
                     let paths = paths.clone();
                     async move {
+                        // 사용자가 누른 새로고침만 조회 주기를 무시한다. 구 데몬은 `ListAccounts`로.
                         krill_app::accounts::request_ipc(
                             &paths,
-                            &krill_proto::usage::UsageRequest::ListAccounts,
+                            &krill_proto::usage::UsageRequest::RefreshUsage,
                         )
+                        .or_else(|_| {
+                            krill_app::accounts::request_ipc(
+                                &paths,
+                                &krill_proto::usage::UsageRequest::ListAccounts,
+                            )
+                        })
                     }
                 })
                 .await;

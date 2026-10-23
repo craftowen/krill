@@ -1720,7 +1720,7 @@ fn wrap_account(
     let hint = format!(
         "{}: not installed. install: {}",
         profile.program().unwrap_or_default(),
-        profile.install
+        profile.install_command()
     );
     argv.extend(
         ["-l", "-i", "-c", PREFLIGHT, "mk-agent", &hint]

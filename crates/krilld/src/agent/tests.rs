@@ -113,6 +113,7 @@ fn profile(launch: &[&str]) -> Profile {
         launch: launch.iter().map(|s| (*s).to_owned()).collect(),
         yolo_args: vec![],
         install: "brew install mk-nope".into(),
+        install_windows: String::new(),
         env: std::collections::BTreeMap::new(),
     }
 }

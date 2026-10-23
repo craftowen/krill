@@ -409,8 +409,19 @@ fn git(facts: &Facts) -> Check {
             Level::Recommended,
             Status::Warn,
             "git is not installed",
-            "`git --version` failed (install Xcode Command Line Tools)",
-            fix(FixKind::Copy, "xcode-select --install"),
+            if cfg!(windows) {
+                "`git --version` failed (install Git for Windows)"
+            } else {
+                "`git --version` failed (install Xcode Command Line Tools)"
+            },
+            fix(
+                FixKind::Copy,
+                if cfg!(windows) {
+                    "winget install --id Git.Git -e"
+                } else {
+                    "xcode-select --install"
+                },
+            ),
         ),
     }
 }
