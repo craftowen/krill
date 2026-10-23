@@ -4861,6 +4861,8 @@ fn owe719_usage_window_labels_never_wrap(cx: &mut TestAppContext) {
 
     let d = dir("owe719-usage-label");
     init(cx, &d);
+    cx.update(|cx| set_language(Language::Ko, cx));
+    cx.run_until_parked();
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
     vcx.simulate_resize(size(px(1400.), px(4000.)));
     vcx.update(|_, cx| {
@@ -6999,10 +7001,23 @@ fn owe796_agents_tab_collapsible_catalog_pill_default_and_cache_ttl(cx: &mut Tes
 fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notifications_disabled(
     cx: &mut TestAppContext,
 ) {
+    general_terminal_controls_in_language(cx, Language::En);
+}
+
+#[gpui::test]
+fn general_and_terminal_controls_remain_clickable_in_korean(cx: &mut TestAppContext) {
+    general_terminal_controls_in_language(cx, Language::Ko);
+}
+
+fn general_terminal_controls_in_language(cx: &mut TestAppContext, language: Language) {
     let d = dir("owe798-general-terminal");
     init(cx, &d);
+    cx.update(|cx| set_language(language, cx));
+    cx.run_until_parked();
     let (view, vcx) = cx.add_window_view(|_, cx| SettingsView::new(cx));
-    vcx.simulate_resize(size(px(820.), px(5000.)));
+    // At 200% English descriptions wrap above the zoom row. Keep every click in
+    // the test viewport; debug_bounds also reports offscreen scroll content.
+    vcx.simulate_resize(size(px(820.), px(10000.)));
     vcx.run_until_parked();
 
     let bounds = |vcx: &mut gpui::VisualTestContext, s: &'static str| {
@@ -7060,6 +7075,7 @@ fn owe798_general_and_terminal_tabs_sections_steppers_and_subordinate_notificati
     vcx.run_until_parked();
     click(vcx, "zoom-in");
     vcx.update(|_, cx| assert!((current(cx).zoom() - ZOOM_MAX).abs() < 1e-4));
+    assert!(bounds(vcx, "zoom-reset").bottom() <= px(10000.));
     click(vcx, "zoom-reset");
     vcx.update(|_, cx| assert!((current(cx).zoom() - 1.0).abs() < 1e-4));
 

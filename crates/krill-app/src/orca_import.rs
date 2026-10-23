@@ -1847,6 +1847,7 @@ mod tests {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::settings::init_at(Some(fx.state_dir.clone()), cx);
+            crate::settings::set_language(crate::i18n::Language::Ko, cx);
         });
 
         // 1. When no Orca dir exists, render_banner returns None

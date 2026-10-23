@@ -5290,6 +5290,9 @@ impl Shell {
                         .size_full()
                         .flex()
                         .flex_col()
+                        .when(show_header, |d| {
+                            d.pt(krill_app::ui::PANE_HEADER_HEIGHT + krill_app::ui::SPACE_2)
+                        })
                         // OWE-653: 배너는 테두리 있는 띠로, 문구는 본문 색·왼쪽, 버튼은 오른쪽 끝(다시 시작=주 버튼).
                         .child(
                             div()
@@ -5317,6 +5320,8 @@ impl Shell {
                                     div()
                                         .flex()
                                         .flex_none()
+                                        .max_w_full()
+                                        .flex_wrap()
                                         .items_center()
                                         .gap_1()
                                         .child(

@@ -559,7 +559,11 @@ fn daemon_link_shows_banner(cx: &mut TestAppContext) {
     );
     cx.update(|_, cx| view.update(cx, |s, cx| s.set_link(Link::Down, cx)));
     cx.run_until_parked();
-    assert!(banner(cx).unwrap().contains("다시 연결"));
+    assert!(
+        banner(cx)
+            .unwrap()
+            .contains(krill_app::i18n::catalog::link::RECONNECTING.get())
+    );
     cx.update(|_, cx| view.update(cx, |s, cx| s.set_link(Link::Up, cx)));
     cx.run_until_parked();
     assert_eq!(banner(cx), None);
@@ -1113,8 +1117,8 @@ fn jump_palette_opens_session(cx: &mut TestAppContext) {
     assert!(!is_open(cx));
 
     cx.simulate_keystrokes("cmd-j");
-    // 입력 대기("대기")로 거르면 세션 9 하나.
-    cx.simulate_input("대기");
+    // 현재 언어의 입력 대기 상태로 거르면 세션 9 하나.
+    cx.simulate_input(krill_app::i18n::catalog::sidebar::STATE_1.get());
     cx.simulate_keystrokes("enter");
     assert!(!is_open(cx));
     let l = layout_of(&view, cx);
@@ -2597,7 +2601,18 @@ fn unreadable_layout_disables_saving(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn close_ended_pane_targets_its_own_pane(cx: &mut TestAppContext) {
+    close_ended_pane_in_language(cx, krill_app::i18n::Language::En);
+}
+
+#[gpui::test]
+fn close_ended_pane_targets_its_own_pane_in_korean(cx: &mut TestAppContext) {
+    close_ended_pane_in_language(cx, krill_app::i18n::Language::Ko);
+}
+
+fn close_ended_pane_in_language(cx: &mut TestAppContext, language: krill_app::i18n::Language) {
     let (view, cx) = open(cx, state_path("close-ended-pane"));
+    cx.update(|_, cx| krill_app::settings::set_language(language, cx));
+    cx.run_until_parked();
     let ended = layout_of(&view, cx).active_tab().focused;
     let (ours, _theirs) = UnixStream::pair().unwrap();
     view.update(cx, |s, cx| {
@@ -2607,7 +2622,17 @@ fn close_ended_pane_targets_its_own_pane(cx: &mut TestAppContext) {
     });
     cx.run_until_parked();
     let other = layout_of(&view, cx).active_tab().focused;
+    let banner = cx.debug_bounds("session-ended").unwrap();
+    let header = cx.debug_bounds("pane-header-0").unwrap();
+    assert!(
+        banner.top() >= header.bottom(),
+        "{banner:?} overlaps {header:?}"
+    );
     let button = cx.debug_bounds("close-ended-pane").unwrap();
+    assert!(
+        button.right() <= banner.right(),
+        "{button:?} exceeds {banner:?}"
+    );
     cx.simulate_mouse_down(button.center(), MouseButton::Left, Modifiers::default());
     cx.simulate_mouse_up(button.center(), MouseButton::Left, Modifiers::default());
     cx.run_until_parked();
@@ -7440,8 +7465,8 @@ fn command_palette_digit_runs_settings_action(cx: &mut TestAppContext) {
         krill_app::jump::Mode::Commands
     );
 
-    // "설정"으로 거르면 설정 열기 액션 1행만 남는다.
-    cx.simulate_input("설정");
+    // 현재 언어의 설정 열기 액션으로 거르면 1행만 남는다.
+    cx.simulate_input(krill_app::i18n::catalog::jump::ACT_OPEN_SETTINGS.get());
     cx.run_until_parked();
     assert_eq!(
         cx.update(|_, cx| view.read(cx).jump.as_ref().unwrap().0.read(cx).row_count()),
