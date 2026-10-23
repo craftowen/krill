@@ -1072,16 +1072,6 @@ impl Render for Dialog {
         }
         let p = crate::ui::palette(cx);
         let busy = self.generating || self.submitting;
-        let ai_label = if self.generating {
-            text::AI_GENERATING.get()
-        } else {
-            text::AI_GENERATE.get()
-        };
-        let submit_label = if self.submitting {
-            text::SUBMITTING.get()
-        } else {
-            text::SUBMIT.get()
-        };
         let card = div()
             .id("pr-dialog")
             .debug_selector(|| "pr-dialog".into())
@@ -1133,16 +1123,18 @@ impl Render for Dialog {
                             ),
                     )
                     .child(
-                        Button::new("pr-ai-generate")
-                            .debug_selector(|| "pr-ai-generate".into())
-                            .small()
-                            .outline()
-                            .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
-                            .label(ai_label)
-                            .disabled(busy)
-                            .on_click(
-                                cx.listener(|d, _, window, cx| d.generate_with_ai(window, cx)),
-                            ),
+                        crate::ui::button_with_reserved_label(
+                            "pr-ai-generate",
+                            text::AI_GENERATE.get(),
+                            text::AI_GENERATING.get(),
+                            self.generating,
+                        )
+                        .debug_selector(|| "pr-ai-generate".into())
+                        .small()
+                        .outline()
+                        .icon(Icon::default().data(crate::ui::icons::SPARKLES_SVG))
+                        .disabled(busy)
+                        .on_click(cx.listener(|d, _, window, cx| d.generate_with_ai(window, cx))),
                     ),
             )
             .child(
@@ -1186,12 +1178,16 @@ impl Render for Dialog {
                             .on_click(cx.listener(|_, _, _, cx| cx.emit(Event::Close))),
                     )
                     .child(
-                        Button::new("pr-dialog-submit")
-                            .debug_selector(|| "pr-dialog-submit".into())
-                            .primary()
-                            .label(submit_label)
-                            .disabled(busy)
-                            .on_click(cx.listener(|d, _, _, cx| d.submit(cx))),
+                        crate::ui::button_with_reserved_label(
+                            "pr-dialog-submit",
+                            text::SUBMIT.get(),
+                            text::SUBMITTING.get(),
+                            self.submitting,
+                        )
+                        .debug_selector(|| "pr-dialog-submit".into())
+                        .primary()
+                        .disabled(busy)
+                        .on_click(cx.listener(|d, _, _, cx| d.submit(cx))),
                     ),
             );
         crate::ui::modal_backdrop(window.viewport_size(), card)

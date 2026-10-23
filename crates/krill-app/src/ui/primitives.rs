@@ -289,6 +289,42 @@ pub fn segment(
     }
 }
 
+/// 두 문구 중 넓은 쪽의 공간을 항상 예약하는 버튼(STYLEGUIDE §7.3).
+///
+/// 스타일·크기·아이콘은 반환한 버튼에 지정한다. 숨긴 문구는 레이아웃에만 참여하고
+/// 그리지 않는다. 셀·텍스트에 접근성 역할과 ID를 주지 않아 별도 노드를 만들지 않으며,
+/// 버튼의 접근성 라벨은 현재 보이는 문구와 일치한다.
+pub fn button_with_reserved_label(
+    id: impl Into<ElementId>,
+    label: impl Into<SharedString>,
+    alternate: impl Into<SharedString>,
+    alternate_active: bool,
+) -> Button {
+    let label = label.into();
+    let alternate = alternate.into();
+    let cell = |text: SharedString, shown: bool| {
+        div()
+            .row_start(1)
+            .col_start(1)
+            .flex()
+            .justify_center()
+            .when(!shown, Styled::invisible)
+            .child(text)
+    };
+    Button::new(id)
+        .accessibility_label(if alternate_active {
+            alternate.clone()
+        } else {
+            label.clone()
+        })
+        .child(
+            div()
+                .grid()
+                .child(cell(label, !alternate_active))
+                .child(cell(alternate, alternate_active)),
+        )
+}
+
 /// 2단계 확인이 있는 파괴적 동작 버튼(Orca UX Rule 1 공간 사전 예약 적용).
 ///
 /// 기본 문구(`label`)와 무장 문구(`confirm`)를 같은 1×1 grid 칸에 겹쳐 그려 폭을 넓은 쪽으로 고정한다.
@@ -299,25 +335,9 @@ pub fn danger_confirm(
     confirm: &'static str,
     armed: bool,
 ) -> Button {
-    let cell = |text: &'static str, shown: bool| {
-        div()
-            .row_start(1)
-            .col_start(1)
-            .flex()
-            .justify_center()
-            .when(!shown, Styled::invisible)
-            .child(text)
-    };
-    Button::new(id)
+    button_with_reserved_label(id, label, confirm, armed)
         .small()
         .danger()
-        .accessibility_label(if armed { confirm } else { label })
-        .child(
-            div()
-                .grid()
-                .child(cell(label, !armed))
-                .child(cell(confirm, armed)),
-        )
 }
 
 /// 단축키 조합을 키캡 모양으로 그린다(Orca `ShortcutKeyCombo` / `KeyCap` 대응).
@@ -488,6 +508,90 @@ pub fn button_with_tooltip_when(
 mod tests {
     use super::*;
     use crate::ui::{DARK, LIGHT};
+    use gpui_component::button::ButtonVariants;
+
+    struct ReservedLabelProbe {
+        label: SharedString,
+        alternate: SharedString,
+        busy: bool,
+        danger: bool,
+    }
+
+    impl gpui::Render for ReservedLabelProbe {
+        fn render(
+            &mut self,
+            _: &mut gpui::Window,
+            _: &mut gpui::Context<Self>,
+        ) -> impl IntoElement {
+            let button = button_with_reserved_label(
+                "reserved-label",
+                self.label.clone(),
+                self.alternate.clone(),
+                self.busy,
+            )
+            .small()
+            .when(self.danger, ButtonVariants::danger)
+            .when(!self.danger, ButtonVariants::primary)
+            .debug_selector(|| "reserved-label".into());
+            div()
+                .w(px(600.))
+                .flex()
+                .justify_end()
+                .gap_2()
+                .child(ghost("reserved-close", "닫기").debug_selector(|| "reserved-close".into()))
+                .child(button)
+        }
+    }
+
+    /// 짧아지는 진행 문구와 길어지는 진행 문구 모두 실제 버튼 폭과 옆 버튼 위치를 유지한다.
+    #[gpui::test]
+    fn reserved_label_keeps_button_and_sibling_bounds(cx: &mut gpui::TestAppContext) {
+        use crate::i18n::{Language, catalog};
+
+        cx.update(gpui_component::init);
+        let pairs = [
+            (
+                catalog::artifacts::SHARE_BUTTON,
+                catalog::artifacts::SHARING,
+            ),
+            (
+                catalog::pull_request::AI_GENERATE,
+                catalog::pull_request::AI_GENERATING,
+            ),
+            (
+                catalog::pull_request::SUBMIT,
+                catalog::pull_request::SUBMITTING,
+            ),
+        ];
+        for language in [Language::Ko, Language::En] {
+            for (label, alternate) in pairs {
+                // 순서를 바꿔 넓은 쪽이 어느 상태든 같은 공간을 예약하는지 확인한다.
+                for reverse in [false, true] {
+                    let mut labels = [label.in_language(language), alternate.in_language(language)];
+                    if reverse {
+                        labels.swap(0, 1);
+                    }
+                    let (view, vcx) = cx.add_window_view(|_, _| ReservedLabelProbe {
+                        label: labels[0].into(),
+                        alternate: labels[1].into(),
+                        busy: false,
+                        danger: reverse,
+                    });
+                    vcx.run_until_parked();
+                    let before = vcx.debug_bounds("reserved-label").expect("버튼 bounds");
+                    let close_before = vcx.debug_bounds("reserved-close").expect("닫기 bounds");
+                    assert!(before.size.width > px(0.));
+                    view.update(vcx, |probe, cx| {
+                        probe.busy = true;
+                        cx.notify();
+                    });
+                    vcx.run_until_parked();
+                    assert_eq!(vcx.debug_bounds("reserved-label"), Some(before));
+                    assert_eq!(vcx.debug_bounds("reserved-close"), Some(close_before));
+                }
+            }
+        }
+    }
 
     #[test]
     fn badge_tones_derive_distinct_semantic_colors_in_light_and_dark() {

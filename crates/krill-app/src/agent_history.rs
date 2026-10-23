@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Sizable as _};
 use krill_proto::SessionId;
@@ -857,23 +857,23 @@ impl Render for Panel {
                                 .child(text::TITLE.get()),
                         )
                         .child(
-                            Button::new("agent-history-refresh")
-                                .icon(gpui_component::IconName::RefreshCw)
-                                .label(if self.busy {
-                                    text::BUSY.get()
+                            crate::ui::button_with_reserved_label(
+                                "agent-history-refresh",
+                                text::REFRESH.get(),
+                                text::BUSY.get(),
+                                self.busy,
+                            )
+                            .icon(gpui_component::IconName::RefreshCw)
+                            .ghost()
+                            .xsmall()
+                            .debug_selector(|| "agent-history-refresh".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.has_vault_filters() || this.vault.is_some() {
+                                    this.search_vault(cx);
                                 } else {
-                                    text::REFRESH.get()
-                                })
-                                .ghost()
-                                .xsmall()
-                                .debug_selector(|| "agent-history-refresh".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.has_vault_filters() || this.vault.is_some() {
-                                        this.search_vault(cx);
-                                    } else {
-                                        this.run(Action::Scan, cx);
-                                    }
-                                })),
+                                    this.run(Action::Scan, cx);
+                                }
+                            })),
                         ),
                 )
                 .child(search_bar)

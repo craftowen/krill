@@ -5271,6 +5271,8 @@ impl SettingsView {
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
+        use gpui_component::Sizable as _;
+
         use crate::updater::{CheckStatus, UpdateState};
         let p = crate::ui::palette(cx);
         let row = || layout::row(p);
@@ -5305,16 +5307,18 @@ impl SettingsView {
                 None
             }
         });
-        let check_btn_label = if is_checking {
-            text::UPDATES_CHECKING.get()
-        } else {
-            text::UPDATES_CHECK.get()
-        };
-        let check_btn = layout::secondary("settings-update-check", check_btn_label)
-            .debug_selector(|| "settings-update-check".into())
-            .on_click(|_, _, cx| {
-                trigger_manual_update_check(cx);
-            });
+        let check_btn = crate::ui::button_with_reserved_label(
+            "settings-update-check",
+            text::UPDATES_CHECK.get(),
+            text::UPDATES_CHECKING.get(),
+            is_checking,
+        )
+        .small()
+        .outline()
+        .debug_selector(|| "settings-update-check".into())
+        .on_click(|_, _, cx| {
+            trigger_manual_update_check(cx);
+        });
         let mut controls = layout::controls().child(
             div()
                 .text_size(crate::ui::TEXT_SM)
@@ -7123,16 +7127,15 @@ impl SettingsView {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if logging_in {
             let cancel_id = format!("admin-cancel-login-{}", acc.id);
-            let cancel_label = if cancelling {
-                text::ACCOUNT_LOGIN_CANCELLING.get()
-            } else {
-                text::ACCOUNT_LOGIN_CANCEL.get()
-            };
             actions = actions.child(
-                layout::secondary(
+                crate::ui::button_with_reserved_label(
                     gpui::ElementId::Name(cancel_id.clone().into()),
-                    cancel_label,
+                    text::ACCOUNT_LOGIN_CANCEL.get(),
+                    text::ACCOUNT_LOGIN_CANCELLING.get(),
+                    cancelling,
                 )
+                .small()
+                .outline()
                 .icon(IconName::Close)
                 .disabled(cancelling)
                 .debug_selector(move || cancel_id.clone())
@@ -9587,18 +9590,19 @@ impl SettingsView {
                     .child(connect_or_disconnect_btn)
                     .child({
                         let testing = self.is_ssh_test_pending(&host.id);
-                        let test_label = if testing {
-                            text::SSH_TESTING.get()
-                        } else {
-                            text::SSH_TEST.get()
-                        };
-                        layout::secondary(gpui::ElementId::Name(test_id.clone().into()), test_label)
-                            .small()
-                            .disabled(testing)
-                            .debug_selector(move || test_id.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.test_ssh_host(host_cl.clone(), cx);
-                            }))
+                        crate::ui::button_with_reserved_label(
+                            gpui::ElementId::Name(test_id.clone().into()),
+                            text::SSH_TEST.get(),
+                            text::SSH_TESTING.get(),
+                            testing,
+                        )
+                        .outline()
+                        .small()
+                        .disabled(testing)
+                        .debug_selector(move || test_id.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.test_ssh_host(host_cl.clone(), cx);
+                        }))
                     })
                     .child(probe_btn);
                 if install_running {

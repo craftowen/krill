@@ -11,7 +11,7 @@ use std::ffi::OsString;
 use std::path::Path;
 
 use gpui::{App, ClipboardItem, Context, FontWeight, SharedString, div, prelude::*, px};
-use gpui_component::Disableable as _;
+use gpui_component::{Disableable as _, Sizable as _};
 use gpui_kit_assets::IconName;
 use krill_proto::artifacts::{
     ErrorOutput, ListEntry, ListPage, SHARING_DISABLED_CODE, ShareOutcome,
@@ -304,11 +304,6 @@ impl SettingsView {
                     .child(text::HOWTO_BODY.get()),
             );
 
-        let refresh_label = if self.artifacts.loading {
-            text::LOADING.get()
-        } else {
-            text::REFRESH.get()
-        };
         let header = layout::row(p)
             .flex_wrap()
             .child(
@@ -317,11 +312,18 @@ impl SettingsView {
             )
             .child(
                 layout::controls().child(
-                    layout::secondary("admin-artifacts-refresh", refresh_label)
-                        .icon(IconName::RefreshCw)
-                        .disabled(self.artifacts.loading)
-                        .debug_selector(|| "admin-artifacts-refresh".into())
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_artifacts(cx))),
+                    crate::ui::button_with_reserved_label(
+                        "admin-artifacts-refresh",
+                        text::REFRESH.get(),
+                        text::LOADING.get(),
+                        self.artifacts.loading,
+                    )
+                    .small()
+                    .outline()
+                    .icon(IconName::RefreshCw)
+                    .disabled(self.artifacts.loading)
+                    .debug_selector(|| "admin-artifacts-refresh".into())
+                    .on_click(cx.listener(|this, _, _, cx| this.refresh_artifacts(cx))),
                 ),
             );
 
