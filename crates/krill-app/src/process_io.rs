@@ -2,8 +2,8 @@
 //! inherited by its descendants, so never join a blocking pipe reader/writer.
 
 use std::io::{self, Read, Write};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 const MAX_PIPE_WORKERS: usize = 16;
@@ -17,10 +17,22 @@ impl Drop for Slot {
 }
 
 #[derive(Debug)]
-pub(crate) struct PipeTask<T>(mpsc::Receiver<io::Result<T>>);
+pub(crate) struct PipeTask<T>(mpsc::Receiver<io::Result<T>>, Arc<AtomicBool>);
+
+impl<T> Drop for PipeTask<T> {
+    fn drop(&mut self) {
+        self.1.store(true, Ordering::Release);
+    }
+}
 
 impl<T: Send + 'static> PipeTask<T> {
     pub(crate) fn spawn(work: impl FnOnce() -> io::Result<T> + Send + 'static) -> io::Result<Self> {
+        Self::spawn_cancellable(move |_| work())
+    }
+
+    fn spawn_cancellable(
+        work: impl FnOnce(Arc<AtomicBool>) -> io::Result<T> + Send + 'static,
+    ) -> io::Result<Self> {
         PIPE_WORKERS
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
                 (count < MAX_PIPE_WORKERS).then_some(count + 1)
@@ -28,13 +40,15 @@ impl<T: Send + 'static> PipeTask<T> {
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "child pipe workers busy"))?;
         let slot = Slot;
         let (send, recv) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         std::thread::Builder::new()
             .name("child-pipe".into())
             .spawn(move || {
                 let _slot = slot;
-                send.send(work()).ok();
+                send.send(work(worker_cancelled)).ok();
             })?;
-        Ok(Self(recv))
+        Ok(Self(recv, cancelled))
     }
 
     pub(crate) fn try_finish(&self) -> Option<io::Result<T>> {
@@ -90,10 +104,13 @@ pub(crate) fn read(
 ) -> io::Result<PipeTask<PipeRead>> {
     #[cfg(unix)]
     nonblocking(&pipe)?;
-    PipeTask::spawn(move || {
+    PipeTask::spawn_cancellable(move |cancelled| {
         let limit = usize::try_from(limit).unwrap_or(usize::MAX);
         let mut bytes = Vec::new();
         loop {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             if Instant::now() >= deadline {
                 return Ok(PipeRead {
                     bytes,
@@ -133,9 +150,12 @@ pub(crate) fn write(
 ) -> io::Result<PipeTask<()>> {
     #[cfg(unix)]
     nonblocking(&pipe)?;
-    PipeTask::spawn(move || {
+    PipeTask::spawn_cancellable(move |cancelled| {
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
             if Instant::now() >= deadline {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,

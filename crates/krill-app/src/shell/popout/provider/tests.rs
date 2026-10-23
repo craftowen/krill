@@ -179,7 +179,7 @@ fn comparison_aligns_columns_and_details_does_not_switch_or_close_menu(
         host.active = true;
         let mut saved = profile("saved", Some("same@example.com"));
         saved.label = "Saved workspace profile".into();
-        s.accounts_snapshot.accounts =
+        std::sync::Arc::make_mut(&mut s.accounts_snapshot).accounts =
             vec![host, saved, profile("other", Some("other@example.com"))];
         cx.notify();
     });

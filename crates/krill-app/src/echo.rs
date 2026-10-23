@@ -34,7 +34,15 @@ impl EchoDraw {
 
     /// 이 터미널의 화면을 바꿨다(`Terminal::set_screen` 뒤). 키 뒤 [`WINDOW`] 안의 첫 화면이면 창을 지금 그린다.
     pub fn screen_changed(&mut self, window: AnyWindowHandle, cx: &App) {
-        if self.take(Instant::now()) {
+        let now = Instant::now();
+        let arrival = self.key_at.map(|at| now.saturating_duration_since(at));
+        if self.take(now) {
+            if let Some(elapsed) = arrival {
+                tracing::trace!(
+                    echo_screen_arrival_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX),
+                    "input echo screen arrived"
+                );
+            }
             #[cfg(target_os = "macos")]
             let _work = crate::responsiveness::work("echo.draw_now");
             platform::draw_now(window, cx);

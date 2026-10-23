@@ -233,8 +233,8 @@ pub fn survey(env: &Env) -> Survey {
                 version: exe.as_deref().and_then(agent::version),
                 exe,
                 id,
+                install: p.install_command().to_owned(),
                 name: p.name,
-                install: p.install,
             }
         })
         .collect();
@@ -335,12 +335,15 @@ fn mk_hook(krill: &Path, path: &OsStr, agent: Agent, flag: &str) -> Result<Strin
             .get()
             .replace("{path}", &krill.display().to_string()));
     }
-    let out = crate::platform::background_command(krill)
-        .args(["hook", "install", agent.id(), flag])
-        .env("PATH", path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| format!("krill: {e}"))?;
+    let out = crate::settings::child::output(
+        crate::platform::background_command(krill)
+            .args(["hook", "install", agent.id(), flag])
+            .env("PATH", path)
+            .stdin(Stdio::null()),
+        Duration::from_secs(30),
+        1_048_576,
+    )
+    .map_err(|e| format!("krill: {e}"))?;
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
@@ -684,12 +687,15 @@ fn quick_helpers(env: &Env) -> Check {
 }
 
 fn command_version(binary: &Path) -> Option<String> {
-    let out = crate::platform::background_command(binary)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let out = crate::settings::child::output(
+        crate::platform::background_command(binary)
+            .arg("--version")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null()),
+        Duration::from_secs(10),
+        65536,
+    )
+    .ok()?;
     out.status.success().then(|| {
         let line = String::from_utf8_lossy(&out.stdout);
         line.lines().next().map(str::trim).map(str::to_owned)
@@ -845,6 +851,7 @@ const DOCTOR_TEXT: &[crate::i18n::Message] = &[
     ctext::D_GIT_OK,
     ctext::D_GIT_WARN,
     ctext::D_GIT_WARN_DETAIL,
+    ctext::D_GIT_WARN_DETAIL_WIN,
     ctext::D_AGENTS_NONE,
     ctext::D_AGENTS_NONE_DETAIL,
     ctext::D_VERSION_UNKNOWN,
@@ -986,11 +993,14 @@ pub(super) fn run_doctor_settled(staged_krill: &Path, wait: Duration) -> Vec<Che
 /// 읽는다(OWE-714: fail 1건이 보고서 전체를 "점검 실행 실패"로 덮던 결함). 보고서를 못 읽을
 /// 때만 원인(실행 불가·종료 코드·stderr 첫 줄·형식 불일치)을 담은 `bin.helpers` fail 1건이다.
 pub(super) fn run_doctor_checks(staged_krill: &Path) -> Vec<Check> {
-    let output = crate::platform::background_command(staged_krill)
-        .args(["doctor", "--json", "--no-start"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::piped())
-        .output();
+    let output = crate::settings::child::output(
+        crate::platform::background_command(staged_krill)
+            .args(["doctor", "--json", "--no-start"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::piped()),
+        Duration::from_secs(60),
+        4_194_304,
+    );
     let out = match output {
         Ok(out) => out,
         Err(e) => {

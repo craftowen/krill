@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{App, Context, Entity, EventEmitter, Subscription, Task, Window, div, prelude::*};
-use gpui_component::button::{Button, ButtonVariants as _};
+use gpui_component::button::ButtonVariants as _;
 use gpui_component::input::{Input, InputState};
 use gpui_component::{Disableable as _, Sizable as _};
 use krill_proto::SessionId;
@@ -190,6 +190,7 @@ pub struct Panel {
     error: Option<String>,
     task: Option<Task<()>>,
     list_state: gpui::ListState,
+    list_hits: Arc<Vec<VaultHit>>,
 }
 
 impl std::fmt::Debug for Panel {
@@ -234,6 +235,7 @@ impl Panel {
             error: None,
             task: None,
             list_state: gpui::ListState::new(0, gpui::ListAlignment::Top, gpui::px(100.)),
+            list_hits: Arc::default(),
         }
     }
 
@@ -589,6 +591,8 @@ impl Panel {
 
 impl Panel {
     fn render_hit(&mut self, i: usize, hit: &VaultHit, cx: &mut Context<Self>) -> gpui::Div {
+        #[cfg(target_os = "macos")]
+        let _work = crate::responsiveness::work("history.row");
         let p = crate::ui::palette(cx);
         let from_vault = self.vault.is_some();
         let matching_entry = (!from_vault)
@@ -816,10 +820,11 @@ impl Render for Panel {
 
             let count = hits.len();
             // Keep list identity and scroll state while only constructing visible rows.
-            if self.list_state.item_count() != count {
+            if self.list_hits.as_ref() != &hits {
                 self.list_state.reset(count);
+                self.list_hits = Arc::new(hits);
             }
-            let hits = Arc::new(hits);
+            let hits = Arc::clone(&self.list_hits);
             let weak = cx.entity().downgrade();
             content = content.child(
                 gpui::list(self.list_state.clone(), move |i, _, cx| {
@@ -885,23 +890,23 @@ impl Render for Panel {
                                 .child(text::TITLE.get()),
                         )
                         .child(
-                            Button::new("agent-history-refresh")
-                                .icon(gpui_component::IconName::RefreshCw)
-                                .label(if self.busy {
-                                    text::BUSY.get()
+                            crate::ui::button_with_reserved_label(
+                                "agent-history-refresh",
+                                text::REFRESH.get(),
+                                text::BUSY.get(),
+                                self.busy,
+                            )
+                            .icon(gpui_component::IconName::RefreshCw)
+                            .ghost()
+                            .xsmall()
+                            .debug_selector(|| "agent-history-refresh".into())
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if this.has_vault_filters() || this.vault.is_some() {
+                                    this.search_vault(cx);
                                 } else {
-                                    text::REFRESH.get()
-                                })
-                                .ghost()
-                                .xsmall()
-                                .debug_selector(|| "agent-history-refresh".into())
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.has_vault_filters() || this.vault.is_some() {
-                                        this.search_vault(cx);
-                                    } else {
-                                        this.run(Action::Scan, cx);
-                                    }
-                                })),
+                                    this.run(Action::Scan, cx);
+                                }
+                            })),
                         ),
                 )
                 .child(search_bar)

@@ -116,7 +116,15 @@ impl Outbox {
         Ok(())
     }
     fn send_close(&self, conn_id: u32, code: u16) {
-        self.send_mux(MUX_CLOSE, conn_id, &code.to_be_bytes()).ok();
+        if self
+            .send_mux(MUX_CLOSE, conn_id, &code.to_be_bytes())
+            .is_err()
+        {
+            // A close must never disappear behind a full queue. Reset the relay
+            // rather than leave its remote client waiting for a dead bridge.
+            self.tx.close();
+            lock(&self.wake).write_all(&[1]).ok();
+        }
     }
 }
 
@@ -479,6 +487,9 @@ fn run_once(
 
     let res = (|| -> io::Result<()> {
         while !stop.cancelled() {
+            if out_rx.is_closed() {
+                return Err(io::ErrorKind::ConnectionAborted.into());
+            }
             drain_outbox(&mut transport, &out_rx)?;
             let mut decoded = 0usize;
             while decoded < 64 {
@@ -661,6 +672,7 @@ fn handle_mux_frame(
                 .name("mobile-relay-ws".into())
                 .stack_size(STACK)
                 .spawn(move || {
+                    let _close = rx.close_guard();
                     crate::alloc::mobile_thread().ok();
                     let code = match serve_mux_client(
                         conn_id, challenge, &rx, &close_tx, local, server, &out, &sh, id, &reg, &h,
@@ -885,6 +897,63 @@ fn serve_mux_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_required_close_resets_a_saturated_relay_queue() {
+        let (wake, _receiver) = UnixStream::pair().unwrap();
+        wake.set_nonblocking(true).unwrap();
+        let queue = Arc::new(Mailbox::new(8, 8, 1));
+        queue.send(1, vec![0; 8], 8).unwrap();
+        let outbox = Outbox {
+            tx: Arc::clone(&queue),
+            wake: Arc::new(Mutex::new(wake)),
+        };
+        outbox.send_close(2, 1013);
+        assert!(queue.is_closed());
+        assert!(queue.is_empty());
+    }
+    #[test]
+    fn receive_turns_are_bounded_and_preserve_large_frame_and_eof() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let payload = vec![0x5a; MAX_PLAINTEXT];
+        let expected = payload.clone();
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            ws::write(&mut socket, ws::BINARY, &payload).unwrap();
+            ws::write(&mut socket, ws::TEXT, b"next frame").unwrap();
+        });
+        let socket = TcpStream::connect(address).unwrap();
+        let mut transport = Transport::Plain(socket);
+        let mut buffer = Vec::new();
+        let mut frames = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(Instant::now() < deadline);
+            let before = buffer.len();
+            let (alive, _) = transport.read_available(&mut buffer).unwrap();
+            assert!(buffer.len() - before <= READ_BUDGET);
+            assert!(buffer.len() <= MAX_RX_BUFFER);
+            while let Some(frame) =
+                ws::try_decode_unmasked(&mut buffer, MAX_PLAINTEXT + 64).unwrap()
+            {
+                frames.push(frame);
+            }
+            if !alive {
+                break;
+            }
+            thread::yield_now();
+        }
+        server.join().unwrap();
+        assert!(buffer.is_empty());
+        assert_eq!(
+            frames,
+            vec![(ws::BINARY, expected), (ws::TEXT, b"next frame".to_vec())]
+        );
+    }
+
     #[test]
     fn tls_large_frames_drain_buffer_and_preserve_next_message() {
         // Public, test-only localhost certificate/key, with no production use.

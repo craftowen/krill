@@ -248,7 +248,7 @@ pub fn markdown(id: impl Into<ElementId>, source: impl Into<SharedString>, cx: &
 /// CSV/TSV 표. 머리 행은 고정, 나머지는 `uniform_list`로 보이는 행만 그린다. 가로는 열 너비 합만큼 스크롤.
 #[derive(Debug)]
 pub struct CsvView {
-    table: Table,
+    table: Arc<Table>,
     widths: Vec<f32>,
     scroll: UniformListScrollHandle,
 }
@@ -257,7 +257,7 @@ impl CsvView {
     pub fn new(table: Table) -> Self {
         let widths = column_widths(&table);
         Self {
-            table,
+            table: Arc::new(table),
             widths,
             scroll: UniformListScrollHandle::new(),
         }
@@ -273,7 +273,7 @@ fn column_widths(table: &Table) -> Vec<f32> {
                 .iter()
                 .take(CSV_WIDTH_SAMPLE_ROWS)
                 .filter_map(|row| row.get(col))
-                .map(|cell| cell.chars().count())
+                .map(|cell| cell.chars().take(CSV_MAX_CHARS).count())
                 .max()
                 .unwrap_or(0)
                 .clamp(CSV_MIN_CHARS, CSV_MAX_CHARS);
@@ -284,7 +284,8 @@ fn column_widths(table: &Table) -> Vec<f32> {
         .collect()
 }
 
-fn csv_row(cells: &[String], widths: &[f32], border: gpui::Hsla) -> gpui::Div {
+fn csv_row(table: &Arc<Table>, row: usize, widths: &[f32], border: gpui::Hsla) -> gpui::Div {
+    let cells = table.rows.get(row).map_or(&[][..], Vec::as_slice);
     div()
         .flex()
         .items_center()
@@ -292,14 +293,34 @@ fn csv_row(cells: &[String], widths: &[f32], border: gpui::Hsla) -> gpui::Div {
         .border_b_1()
         .border_color(border)
         .children(widths.iter().enumerate().map(|(i, &w)| {
+            let source = Arc::clone(table);
             div()
+                .id((
+                    "csv-cell",
+                    row.saturating_mul(table.columns).saturating_add(i),
+                ))
+                .cursor_pointer()
+                .tooltip(|window, cx| {
+                    gpui_component::tooltip::Tooltip::new(crate::i18n::catalog::shell::COPY.get())
+                        .build(window, cx)
+                })
+                .on_click(move |_, _, cx| {
+                    if let Some(value) = source.rows.get(row).and_then(|r| r.get(i)) {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(value.clone()));
+                    }
+                })
                 .flex_none()
                 .w(px(w))
                 .px_2()
                 .border_r_1()
                 .border_color(border)
                 .truncate()
-                .child(cells.get(i).cloned().unwrap_or_default())
+                .child(
+                    cells
+                        .get(i)
+                        .map(|value| value.chars().take(512).collect::<String>())
+                        .unwrap_or_default(),
+                )
         }))
 }
 
@@ -309,8 +330,8 @@ impl Render for CsvView {
         let border = pal.border;
         let total: f32 = self.widths.iter().sum();
         let body_rows = self.table.rows.len().saturating_sub(1);
-        let header = self.table.rows.first().map_or_else(div, |cells| {
-            csv_row(cells, &self.widths, border)
+        let header = self.table.rows.first().map_or_else(div, |_| {
+            csv_row(&self.table, 0, &self.widths, border)
                 .bg(pal.muted)
                 .font_weight(gpui::FontWeight::SEMIBOLD)
         });
@@ -320,8 +341,8 @@ impl Render for CsvView {
             cx.processor(move |v, range: std::ops::Range<usize>, _, _| {
                 range
                     .filter_map(|i| {
-                        let cells = v.table.rows.get(i + 1)?;
-                        Some(csv_row(cells, &v.widths, border))
+                        v.table.rows.get(i + 1)?;
+                        Some(csv_row(&v.table, i + 1, &v.widths, border))
                     })
                     .collect()
             }),
@@ -368,33 +389,86 @@ impl Render for CsvView {
 #[derive(Debug)]
 pub struct NotebookPreview {
     notebook: Notebook,
-    rows: Vec<(usize, Option<usize>)>,
+    rows: Vec<(usize, Option<usize>, std::ops::Range<usize>)>,
+    errors: std::collections::BTreeMap<(usize, usize), String>,
 }
 impl NotebookPreview {
     pub fn new(notebook: Notebook) -> Self {
-        let rows = notebook
-            .cells
-            .iter()
-            .enumerate()
-            .flat_map(|(cell, value)| {
-                std::iter::once((cell, None))
-                    .chain((0..value.outputs.len()).map(move |output| (cell, Some(output))))
-            })
-            .collect();
-        Self { notebook, rows }
+        let mut rows = Vec::new();
+        let mut errors = std::collections::BTreeMap::new();
+        for (cell, value) in notebook.cells.iter().enumerate() {
+            let chunks = if value.kind == CellKind::Markdown {
+                std::iter::once(0..value.source.len()).collect()
+            } else {
+                preview_chunks(&value.source)
+            };
+            for range in chunks {
+                rows.push((cell, None, range));
+            }
+            for (output, value) in value.outputs.iter().enumerate() {
+                match value {
+                    Output::Stream { text, .. } | Output::Text(text) => {
+                        for range in preview_chunks(text) {
+                            rows.push((cell, Some(output), range));
+                        }
+                    }
+                    Output::Error { name, message } => {
+                        let text = format!("{name}: {message}");
+                        for range in preview_chunks(&text) {
+                            rows.push((cell, Some(output), range));
+                        }
+                        errors.insert((cell, output), text);
+                    }
+                    Output::Omitted(_) => rows.push((cell, Some(output), 0..0)),
+                }
+            }
+        }
+        Self {
+            notebook,
+            rows,
+            errors,
+        }
     }
 }
+// A single unbroken line must not make one virtual row arbitrarily expensive.
+fn preview_chunks(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut chars = 0usize;
+    let mut lines = 0usize;
+    for (index, ch) in text.char_indices() {
+        chars += 1;
+        lines += usize::from(ch == '\n');
+        if chars >= 2_048 || lines >= 32 {
+            let end = index + ch.len_utf8();
+            rows.push(start..end);
+            start = end;
+            chars = 0;
+            lines = 0;
+        }
+    }
+    if start < text.len() || rows.is_empty() {
+        rows.push(start..text.len());
+    }
+    rows
+}
+
 struct NotebookList {
     source: Arc<NotebookPreview>,
     state: gpui::ListState,
 }
 
-fn notebook_row(preview: &NotebookPreview, index: usize, cx: &App) -> AnyElement {
+fn notebook_row(
+    preview: &NotebookPreview,
+    index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
     let pal = crate::ui::palette(cx);
-    let Some(&(cell_index, output_index)) = preview.rows.get(index) else {
+    let Some((cell_index, output_index, range)) = preview.rows.get(index) else {
         return div().into_any_element();
     };
-    let Some(cell) = preview.notebook.cells.get(cell_index) else {
+    let Some(cell) = preview.notebook.cells.get(*cell_index) else {
         return div().into_any_element();
     };
     let mono = |value: String| {
@@ -405,32 +479,70 @@ fn notebook_row(preview: &NotebookPreview, index: usize, cx: &App) -> AnyElement
             .child(value)
     };
     let body = if let Some(index) = output_index {
-        match cell.outputs.get(index) {
+        match cell.outputs.get(*index) {
             Some(Output::Stream { text, .. } | Output::Text(text)) => {
-                mono(text.clone()).into_any_element()
+                mono(text.get(range.clone()).unwrap_or_default().to_owned()).into_any_element()
             }
-            Some(Output::Error { name, message }) => mono(format!("{name}: {message}"))
-                .text_color(pal.destructive)
-                .into_any_element(),
+            Some(Output::Error { .. }) => mono(
+                preview
+                    .errors
+                    .get(&(*cell_index, *index))
+                    .and_then(|value| value.get(range.clone()))
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+            .text_color(pal.destructive)
+            .into_any_element(),
             Some(Output::Omitted(mime)) => div()
                 .text_size(crate::ui::TEXT_XS)
                 .text_color(pal.muted_foreground)
-                .child(text::IPYNB_OUTPUT_OMITTED.format(&[("mime", mime)]))
+                .child(
+                    text::IPYNB_OUTPUT_OMITTED
+                        .format(&[("mime", &mime.chars().take(256).collect::<String>())]),
+                )
                 .into_any_element(),
             None => div().into_any_element(),
         }
     } else {
         let source = match cell.kind {
-            CellKind::Markdown => div()
-                .child(TextView::markdown(cell_index, cell.source.clone()))
-                .into_any_element(),
-            CellKind::Code | CellKind::Raw => mono(cell.source.clone())
-                .p_2()
-                .rounded(crate::ui::RADIUS_SM)
-                .bg(pal.muted)
-                .into_any_element(),
+            CellKind::Markdown => {
+                let long = cell.source.chars().take(2_049).count() > 2_048;
+                let expanded =
+                    window.use_keyed_state(("notebook-markdown-expand", index), cx, |_, _| false);
+                let show_all = *expanded.read(cx);
+                let source = if !long || show_all {
+                    cell.source.clone()
+                } else {
+                    cell.source.chars().take(2_048).collect()
+                };
+                div()
+                    .child(TextView::markdown(index, source))
+                    .when(long && !show_all, |view| {
+                        view.child(
+                            Button::new(("notebook-markdown-more", index))
+                                .label(crate::i18n::catalog::jump::SEE_MORE.get())
+                                .on_click(move |_, _, cx| {
+                                    expanded.update(cx, |value, cx| {
+                                        *value = true;
+                                        cx.notify();
+                                    });
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
+            CellKind::Code | CellKind::Raw => mono(
+                cell.source
+                    .get(range.clone())
+                    .unwrap_or_default()
+                    .to_owned(),
+            )
+            .p_2()
+            .rounded(crate::ui::RADIUS_SM)
+            .bg(pal.muted)
+            .into_any_element(),
         };
-        let prompt = (cell.kind == CellKind::Code).then(|| {
+        let prompt = (cell.kind == CellKind::Code && range.start == 0).then(|| {
             div()
                 .font_family(crate::ui::FONT_MONO)
                 .text_size(crate::ui::TEXT_XS)
@@ -489,8 +601,8 @@ pub fn notebook(
         })
         .when(count != 0, |view| {
             view.child(
-                gpui::list(list_state, move |index, _, cx| {
-                    notebook_row(&preview, index, cx)
+                gpui::list(list_state, move |index, window, cx| {
+                    notebook_row(&preview, index, window, cx)
                 })
                 .size_full(),
             )
@@ -577,4 +689,70 @@ pub fn spawn_open(path: PathBuf, command: fn(&Path) -> Command, cx: &App) {
         }
     })
     .detach();
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn notebook_chunks_keep_every_utf8_byte_and_bound_single_long_rows() {
+        for text in [
+            "한글🙂".repeat(10_000),
+            "line\n".repeat(5_000),
+            String::new(),
+        ] {
+            let ranges = preview_chunks(&text);
+            let rebuilt: String = ranges
+                .iter()
+                .map(|range| text.get(range.clone()).unwrap())
+                .collect();
+            assert_eq!(rebuilt, text);
+            for range in ranges {
+                assert!(text.get(range).unwrap().chars().count() <= 2_048);
+            }
+        }
+    }
+
+    #[test]
+    fn notebook_long_output_and_error_are_split_but_markdown_keeps_one_document() {
+        let preview = NotebookPreview::new(Notebook {
+            cells: vec![super::super::ipynb::Cell {
+                kind: CellKind::Markdown,
+                source: "# Heading\n".repeat(1_000),
+                execution_count: None,
+                outputs: vec![
+                    Output::Text("🙂".repeat(10_000)),
+                    Output::Error {
+                        name: "Error".into(),
+                        message: "m".repeat(10_000),
+                    },
+                ],
+            }],
+        });
+        assert_eq!(
+            preview
+                .rows
+                .iter()
+                .filter(|(_, output, _)| output.is_none())
+                .count(),
+            1
+        );
+        assert!(
+            preview
+                .rows
+                .iter()
+                .filter(|(_, output, _)| *output == Some(0))
+                .count()
+                > 1
+        );
+        assert!(
+            preview
+                .rows
+                .iter()
+                .filter(|(_, output, _)| *output == Some(1))
+                .count()
+                > 1
+        );
+    }
 }

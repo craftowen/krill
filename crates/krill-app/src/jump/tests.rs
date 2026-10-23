@@ -612,3 +612,96 @@ fn jump_palette_windowing_across_chats_and_worktrees(cx: &mut TestAppContext) {
         assert!(p.selected_list_child_index().is_some());
     });
 }
+
+#[test]
+fn file_search_cached_filename_ranking_and_empty_order_are_stable() {
+    let mut items = vec![
+        item(1, "src/needle/other.rs", false),
+        item(2, "src/needle.rs", false),
+        item(3, "needle.rs", false),
+    ];
+    for item in &mut items {
+        item.is_file = true;
+    }
+    assert_eq!(search(&items, "needle"), vec![1, 2, 0]);
+    assert_eq!(search(&items, ""), vec![0, 1, 2]);
+    assert!(
+        search_controlled(&items, "needle", &std::sync::atomic::AtomicBool::new(true)).is_empty()
+    );
+    items[2].label = "other.rs".into();
+    items[2].title = "other.rs".into();
+    items[2].rebuild_search_chars();
+    assert!(!search(&items, "needle").contains(&2));
+}
+
+#[gpui::test]
+fn async_item_publication_restores_file_path_after_recent_ids_are_reassigned(
+    cx: &mut TestAppContext,
+) {
+    let files = ["deleted.txt", "needle-target.rs", "needle-other.rs"].map(PathBuf::from);
+    let (view, events, cx) = open(cx, crate::editor::quick_open::items(&files));
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.query = "needle".into();
+            p.recompute_all_matches(cx);
+            p.selected = p
+                .matches
+                .iter()
+                .position(|&i| p.items[i].label == "needle-target.rs")
+                .unwrap();
+            let mut scanned = vec![
+                PathBuf::from("needle-target.rs"),
+                PathBuf::from("needle-other.rs"),
+            ];
+            scanned.extend((0..2200).map(|i| PathBuf::from(format!("needle-extra-{i}.rs"))));
+            p.set_items(crate::editor::quick_open::items(&scanned), cx);
+            assert!(p.pending_item_selection.is_some());
+            p.confirm(cx);
+        });
+    });
+    assert!(
+        events.borrow().is_empty(),
+        "Enter while results are pending must not open a replacement row"
+    );
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            assert!(p.pending_item_selection.is_none());
+            let (Section::Sessions, pos) = p.row_at(p.selected).unwrap() else {
+                panic!("file section")
+            };
+            assert_eq!(p.items[p.matches[pos]].label, "needle-target.rs");
+            p.confirm(cx);
+        });
+    });
+    assert_eq!(events.borrow().as_slice(), &[Event::Confirm(SessionId(0))]);
+}
+
+#[gpui::test]
+fn async_item_publication_does_not_override_new_keyboard_selection(cx: &mut TestAppContext) {
+    let (view, _, cx) = open(
+        cx,
+        vec![item(1, "needle-a", false), item(2, "needle-b", false)],
+    );
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.query = "needle".into();
+            p.recompute_all_matches(cx);
+            p.selected = 1;
+            p.set_items(
+                (1..=2200)
+                    .map(|i| item(i, &format!("needle-{i}"), false))
+                    .collect(),
+                cx,
+            );
+            assert!(p.pending_item_selection.is_some());
+            p.step(1, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        let p = view.read(cx);
+        assert_eq!(p.selected, 0);
+        assert!(p.pending_item_selection.is_none());
+    });
+}

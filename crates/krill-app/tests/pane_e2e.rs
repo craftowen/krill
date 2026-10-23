@@ -124,7 +124,10 @@ impl App {
                 texts(&self.pane)
             );
             if let Ok((k, b)) = self.frames.recv_timeout(left) {
-                self.pane.frame(k, &b).unwrap();
+                let events = self.pane.frame(k, &b).unwrap();
+                if let Some(notice) = events.history_notice {
+                    eprintln!("history notice while waiting for {what}: {notice}");
+                }
             }
         }
     }
@@ -201,10 +204,13 @@ fn child() {
     // 응답 없는 500ms가 히스토리의 끝은 아니다. 모든 페이지를 요청해 가장 오래된 행을 기다린다.
     app.pane.scroll(10_000);
     app.has_row("L1");
-    // 한 행씩 내려오며 새로 드러난 마지막 행만 모은다(받아 둔 행이라 요청 없음).
-    // 한 화면씩 이동하면 바닥에서 이동량이 줄어 마지막 화면의 일부를 두 번 세게 된다.
+    // Collect one newly exposed row per step, including asynchronous sparse
+    // cache misses. A retained viewport must not masquerade as a completed move.
     let mut all = texts(&app.pane);
-    while app.pane.scroll(-1) {
+    while app.pane.scroll_offset() > 0 {
+        let target = app.pane.scroll_offset() - 1;
+        app.pane.scroll(-1);
+        app.until("next history row", |pane| pane.scroll_offset() == target);
         all.push(texts(&app.pane).pop().unwrap());
     }
     let numbers: Vec<usize> = all

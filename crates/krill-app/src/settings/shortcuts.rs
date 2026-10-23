@@ -754,13 +754,26 @@ impl SettingsView {
             .try_global::<Config>()
             .map_or_else(Vec::new, |c| pairs(&c.defaults));
 
+        let indexed = |pairs: &[Pair]| {
+            let mut index: std::collections::BTreeMap<&'static str, Vec<String>> =
+                std::collections::BTreeMap::new();
+            for (action, key) in pairs {
+                let keys = index.entry(*action).or_default();
+                if !keys.contains(key) {
+                    keys.push(key.clone());
+                }
+            }
+            index
+        };
+        let live_index = indexed(&live);
+        let default_index = indexed(&defaults);
         let mut total_count = 0usize;
         let mut modified_count = 0usize;
         let mut visible_count = 0usize;
 
         for &(action, _) in ACTIONS {
-            let current = keys_of(&live, action);
-            let default = keys_of(&defaults, action);
+            let current = live_index.get(action).cloned().unwrap_or_default();
+            let default = default_index.get(action).cloned().unwrap_or_default();
             if current.is_empty() && default.is_empty() {
                 continue;
             }
@@ -777,8 +790,8 @@ impl SettingsView {
                 if action_category(action) != cat {
                     continue;
                 }
-                let current = keys_of(&live, action);
-                let default = keys_of(&defaults, action);
+                let current = live_index.get(action).cloned().unwrap_or_default();
+                let default = default_index.get(action).cloned().unwrap_or_default();
                 if current.is_empty() && default.is_empty() {
                     continue;
                 }

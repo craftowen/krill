@@ -6,7 +6,7 @@ use krill_proto::os::fs::{DirBuilderExt, OpenOptionsExt};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use krill_proto::SessionId;
 use krill_proto::agent::rules::{PUBLIC_KEY_FILE_NAME, RULES_FILE_NAME, RulesPayload, ScreenRules};
@@ -108,12 +108,12 @@ impl Control {
     pub fn screen_rules(&self) -> ScreenRules {
         let _guard = lock(&self.config);
         self.signed()
-            .map(|signed| signed.screen)
+            .map(|signed| signed.screen.clone())
             .unwrap_or_default()
     }
 
     /// 서명 규칙(있고 서명이 맞을 때). 없거나 틀리면 `None` → 호출자는 내장을 유지한다.
-    fn signed(&self) -> Option<RulesPayload> {
+    fn signed(&self) -> Option<Arc<RulesPayload>> {
         let dir = self.dir.as_ref()?;
         let key_path = dir.join(PUBLIC_KEY_FILE_NAME);
         let rules_path = dir.join(RULES_FILE_NAME);
@@ -132,7 +132,7 @@ impl Control {
         let public = krill_proto::agent::rules::decode_public_key(&key_text)?;
         let bytes = fs::read(&rules_path).ok()?;
         let payload = match krill_proto::agent::rules::load_signed(&public, &bytes) {
-            Ok(signed) => Some(signed),
+            Ok(signed) => Some(Arc::new(signed)),
             Err(e) => {
                 tracing::warn!("signed agent rules rejected, keeping builtin: {e}");
                 None

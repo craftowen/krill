@@ -141,7 +141,7 @@ fn hanging_git_times_out_reaps_child_and_queue_proceeds() {
     ));
     let queue = GitQueue::with_program(git, 1).unwrap();
     let hung = queue.submit(&dir.0, ["hang"]);
-    let expired = queue.submit(&dir.0, ["next"]);
+    let queued = queue.submit(&dir.0, ["next"]);
     let err = hung.recv().unwrap().expect_err("hanging git must time out");
     assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err:?}");
     let pids: Vec<i32> = fs::read_to_string(&pid_file)
@@ -162,10 +162,11 @@ fn hanging_git_times_out_reaps_child_and_queue_proceeds() {
         );
     }
 
-    assert_eq!(
-        expired.recv().unwrap().unwrap_err().kind(),
-        io::ErrorKind::TimedOut
-    );
+    // Queue residence has its own budget: one hung predecessor must not
+    // expire the already accepted command behind it.
+    let out = queued.recv().unwrap().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"ok:next\n");
     let out = queue.submit(&dir.0, ["next"]).recv().unwrap().unwrap();
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stdout, b"ok:next\n");
@@ -227,7 +228,7 @@ fn cross_review_term_reaps_descendants_when_parent_exits_first() {
     use std::os::unix::process::CommandExt as _;
     let dir = Dir::new("cross-term-child");
     let mut parent = Command::new("/bin/sh")
-        .args(["-c", "sh -c 'trap \"\" TERM; echo $$ > survivor; exec sleep 30' & while [ ! -f survivor ]; do sleep 0.01; done; trap 'exit 0' TERM; wait"])
+        .args(["-c", "trap 'exit 0' TERM; sh -c 'trap \"\" TERM; echo $$ > survivor.tmp; mv survivor.tmp survivor; exec sleep 30' & wait"])
         .current_dir(&dir.0).process_group(0).spawn().unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let path = dir.0.join("survivor");
@@ -342,5 +343,54 @@ fn speculative_checkout_stops_on_disk_growth_and_reaps_child() {
         .unwrap();
     assert!(
         rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_err()
+    );
+}
+
+#[test]
+fn generic_queue_rejects_excess_pending_before_mutation_starts() {
+    let dir = Dir::new("admission");
+    let queue = GitQueue::with_program(PathBuf::from("git"), 0).unwrap();
+    let pending: Vec<_> = (0..MAX_REPO_PENDING)
+        .map(|_| queue.submit(&dir.0, ["status"]))
+        .collect();
+    assert!(queue.submit(&dir.0, ["status"]).recv().is_err());
+    assert_eq!(lock(&queue.shared.state).pending.len(), MAX_REPO_PENDING);
+    drop(queue);
+    assert!(pending.into_iter().all(|reply| reply.recv().is_err()));
+}
+
+#[test]
+fn output_drain_yields_and_refuses_oversized_retained_output() {
+    let mut source = std::io::repeat(b'x');
+    let mut retained = Vec::new();
+    let mut buffer = [0; 8192];
+    assert!(!drain(&mut source, &mut retained, &mut buffer).unwrap());
+    assert_eq!(retained.len(), DRAIN_BYTES);
+    retained.resize(MAX_OUTPUT_BYTES, b'x');
+    assert_eq!(
+        drain(&mut source, &mut retained, &mut buffer)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidData
+    );
+    assert_eq!(retained.len(), MAX_OUTPUT_BYTES);
+}
+
+#[test]
+fn output_budget_abort_allows_git_to_remove_its_lock() {
+    let dir = Dir::new("output-cap-term");
+    let held = dir.0.join("index.lock");
+    let git =
+        dir.script("touch index.lock; trap 'rm -f index.lock; exit 0' TERM; yes output-budget");
+    let queue = GitQueue::with_program(git, 1).unwrap();
+    let error = queue
+        .submit(&dir.0, ["locking"])
+        .recv()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    assert!(
+        !held.exists(),
+        "output-limit cleanup left an owned Git lock behind"
     );
 }

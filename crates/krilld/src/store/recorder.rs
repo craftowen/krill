@@ -375,6 +375,11 @@ impl Recorder {
         let written = open.enc.write_all(&self.encoded);
         self.encoded.fill(0);
         self.encoded.clear();
+        // A one-off large keyframe must not pin its largest allocation for the
+        // remaining lifetime of a quiet session.
+        if self.encoded.capacity() > 256 * 1024 {
+            self.encoded = Vec::new();
+        }
         written?;
         open.enc.flush()?;
         if let Some(crypto) = &mut open.crypto {

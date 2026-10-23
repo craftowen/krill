@@ -184,3 +184,21 @@ fn monitor_is_singleton_and_respects_disabled_notifications(cx: &mut TestAppCont
     assert!(cx.shown_system_notifications().is_empty());
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+gpui::actions!(shell, [Quit]);
+
+#[gpui::test]
+fn windowless_quit_routes_through_global_shell_action(cx: &mut TestAppContext) {
+    let dispatched = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = dispatched.clone();
+    cx.update(|cx| {
+        assert!(cx.windows().is_empty());
+        cx.on_action(move |_: &Quit, _| observed.set(true));
+        request_quit(cx);
+    });
+    cx.run_until_parked();
+    assert!(
+        dispatched.get(),
+        "windowless Quit must use the durable global shutdown path"
+    );
+}

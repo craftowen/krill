@@ -1477,11 +1477,50 @@ pub fn system_appearance_changed(appearance: gpui::WindowAppearance, cx: &mut Ap
 
 /// 현재 설정을 테마와 열린 모든 창의 rem 크기에 반영한다. 액션·클릭 처리 중에는 그 창이 빌려져 있어
 /// `update`가 실패하므로 호출자는 `cx.defer`로 부른다.
+#[derive(Default)]
+struct AppliedAppearance(
+    Option<(
+        ThemeChoice,
+        Language,
+        f32,
+        u8,
+        crate::ui::DarkUiTheme,
+        crate::ui::LightUiTheme,
+    )>,
+);
+impl Global for AppliedAppearance {}
+
 fn apply(cx: &mut App) {
     crate::alert::sync_settings(cx);
     let s = current(cx);
-    crate::i18n::set_language(s.language, cx);
-    crate::menu_bar::refresh_language(cx);
+    if !cx.has_global::<AppliedAppearance>() {
+        cx.set_global(AppliedAppearance::default());
+    }
+    let previous = cx.global::<AppliedAppearance>().0;
+    let next = (
+        s.theme,
+        s.language,
+        s.zoom(),
+        s.editor_font_size(),
+        s.ui_theme_dark,
+        s.ui_theme_light,
+    );
+    cx.global_mut::<AppliedAppearance>().0 = Some(next);
+    let language_changed = previous.is_none_or(|p| p.1 != next.1);
+    let appearance_changed = previous.is_none_or(|p| {
+        p.0 != next.0
+            || p.2.to_bits() != next.2.to_bits()
+            || p.3 != next.3
+            || p.4 != next.4
+            || p.5 != next.5
+    });
+    if language_changed {
+        crate::i18n::set_language(s.language, cx);
+        crate::menu_bar::refresh_language(cx);
+    }
+    if !language_changed && !appearance_changed {
+        return;
+    }
     let mode = match s.theme {
         ThemeChoice::Light => ThemeMode::Light,
         ThemeChoice::Dark => ThemeMode::Dark,
@@ -2297,7 +2336,12 @@ pub fn agent_install_command(agent_id: &str) -> Option<String> {
     let id = krill_proto::agent::canonical_id(agent_id);
     krill_proto::agent::Agents::load(None)
         .ok()
-        .and_then(|agents| agents.profiles.get(id).map(|p| p.install.clone()))
+        .and_then(|agents| {
+            agents
+                .profiles
+                .get(id)
+                .map(|p| p.install_command().to_owned())
+        })
         .filter(|s| !s.trim().is_empty())
 }
 
@@ -2506,7 +2550,12 @@ type AgentsFileCache = (Option<(Option<SystemTime>, Option<String>)>, bool);
 pub struct SettingsView {
     _observe: Subscription,
     tab: AdminTab,
+    visible: bool,
+    account_probe_pending: bool,
+    account_file_stamp: Vec<Option<AdminFileStamp>>,
     mobile: mobile::Panel,
+    /// 사이드바 'Krill 모바일'에서 연 단독 페이지 모드. 설정 내비 없이 페어링 화면만 그린다.
+    mobile_page: bool,
     remote_krill: Option<gpui::Entity<crate::link_ui::PairingView>>,
     accounts_snapshot: krill_proto::usage::AccountsSnapshot,
     account_error: Option<SharedString>,
@@ -2613,17 +2662,25 @@ pub struct SettingsView {
     )>,
     /// Ghostty·Warp 테마 가져오기 상태 메시지(OWE-956). 두 번째 값은 경고/실패 여부.
     terminal_theme_status: Option<(SharedString, bool)>,
+    terminal_theme_swatches: std::collections::BTreeMap<
+        usize,
+        (
+            crate::ui::CustomTerminalTheme,
+            Option<krill_proto::theme::Theme>,
+        ),
+    >,
     /// 설정 창 루트 포커스. 아무것도 포커스되지 않으면 ⌘F 문맥([`SEARCH_CONTEXT`])이 키 경로에 없다.
     file_jobs: std::collections::BTreeMap<&'static str, u64>,
     file_revision: u64,
     services: ServiceCache,
+    service_stamp: Option<Vec<Option<AdminFileStamp>>>,
     services_pending: bool,
     services_checked: Option<std::time::Instant>,
     services_poll: Option<gpui::Task<()>>,
     focus: gpui::FocusHandle,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ServiceCache {
     worktrees: std::sync::Arc<krill_proto::orchestration::WorktreeStore>,
     orchestration: std::sync::Arc<krill_proto::orchestration::OrchestrationStore>,
@@ -2632,11 +2689,120 @@ struct ServiceCache {
     runs: Vec<krill_proto::schedule::ScheduleRun>,
 }
 
+impl ServiceCache {
+    fn script_for(
+        &self,
+        scripts: &std::collections::BTreeMap<String, String>,
+        raw: &str,
+    ) -> Option<String> {
+        let resolved = self.aliases.get(raw).map_or(raw, String::as_str);
+        scripts
+            .get(resolved)
+            .or_else(|| scripts.get(raw))
+            .cloned()
+            .filter(|script| !script.trim().is_empty())
+    }
+    fn setup_script_for(&self, raw: &str) -> Option<String> {
+        self.script_for(&self.worktrees.setup_scripts, raw)
+    }
+    fn archive_script_for(&self, raw: &str) -> Option<String> {
+        self.script_for(&self.worktrees.archive_scripts, raw)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AdminFileStamp {
+    modified: SystemTime,
+    len: u64,
+    identity: u64,
+}
+fn admin_stamp(path: &Path) -> Option<AdminFileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt as _;
+        meta.ino()
+    };
+    #[cfg(not(unix))]
+    let identity = meta
+        .created()
+        .ok()
+        .and_then(|at| at.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    Some(AdminFileStamp {
+        modified: meta.modified().ok()?,
+        len: meta.len(),
+        identity,
+    })
+}
+fn account_stamps(dir: Option<&Path>) -> Vec<Option<AdminFileStamp>> {
+    [
+        ACCOUNTS_FILE,
+        HOSTS_FILE,
+        "link/hosts.toml",
+        "link/devices.toml",
+    ]
+    .iter()
+    .map(|name| dir.and_then(|dir| admin_stamp(&dir.join(name))))
+    .collect()
+}
+fn service_stamps(dir: &Path) -> Vec<Option<AdminFileStamp>> {
+    [
+        krill_proto::orchestration::COMMENTS_FILE,
+        krill_proto::orchestration::ORCH_FILE,
+        krill_proto::schedule::FILE,
+        krill_proto::schedule::RUNS,
+        krill_proto::schedule::PREVIOUS_RUNS,
+    ]
+    .iter()
+    .map(|name| admin_stamp(&dir.join(name)))
+    .collect()
+}
+
+fn duplicate_account_labels(
+    accounts: &[krill_proto::usage::AccountInfo],
+    identities: &std::collections::BTreeMap<String, crate::accounts::Identity>,
+) -> std::collections::BTreeMap<String, String> {
+    let mut groups = std::collections::BTreeMap::new();
+    for account in accounts {
+        if let Some(identity) = identities.get(&account.id) {
+            groups
+                .entry((
+                    account.provider.as_str(),
+                    identity.email.to_ascii_lowercase(),
+                    identity.org_id.clone(),
+                ))
+                .or_insert_with(Vec::new)
+                .push(account);
+        }
+    }
+    let mut labels = std::collections::BTreeMap::new();
+    for group in groups.values_mut() {
+        group.sort_by_key(|account| !account.host_default);
+        let mut seen = std::collections::BTreeSet::new();
+        let preferred: Vec<_> = group
+            .iter()
+            .filter(|account| seen.insert(account.id.as_str()))
+            .take(2)
+            .collect();
+        for account in group.iter() {
+            if let Some(other) = preferred.iter().find(|other| other.id != account.id) {
+                labels.insert(
+                    account.id.clone(),
+                    if other.host_default {
+                        text::ACCOUNT_DUPLICATE_HOST.get().to_owned()
+                    } else {
+                        text::ACCOUNT_DUPLICATE.format(&[("label", &other.label)])
+                    },
+                );
+            }
+        }
+    }
+    labels
+}
+
 fn canonical_repo_key(raw: &str) -> String {
-    std::fs::canonicalize(raw)
-        .unwrap_or_else(|_| PathBuf::from(raw))
-        .display()
-        .to_string()
+    krill_proto::orchestration::worktree_key(Path::new(raw))
 }
 
 /// ⌘F([`FocusSearch`])가 설정 창 안에서만 동작하게 하는 키 문맥. 셸의 터미널 찾기 ⌘F와 겹치지 않는다.
@@ -2730,6 +2896,7 @@ struct WorkflowRepoForm {
     loaded_repo: Option<String>,
     loaded_setup: String,
     loaded_archive: String,
+    refresh_hooks: bool,
     status: Option<(SharedString, bool)>,
     _subs: Vec<Subscription>,
 }
@@ -2802,11 +2969,15 @@ impl SettingsView {
         crate::orca_import::ensure_scanned(cx);
         let mut view = Self {
             _observe: cx.observe_global::<Config>(|this, cx| {
-                this.services_checked = None;
-                this.refresh_accounts_async(cx);
+                this.refresh_accounts_if_changed(cx);
+                cx.notify();
             }),
             tab: AdminTab::General,
+            visible: true,
+            account_probe_pending: false,
+            account_file_stamp: Vec::new(),
             mobile: mobile::Panel::default(),
+            mobile_page: false,
             remote_krill: None,
             accounts_snapshot: krill_proto::usage::AccountsSnapshot::default(),
             account_error: None,
@@ -2870,9 +3041,11 @@ impl SettingsView {
             terminal_theme_target: None,
             terminal_theme_search: None,
             terminal_theme_status: None,
+            terminal_theme_swatches: std::collections::BTreeMap::new(),
             file_jobs: std::collections::BTreeMap::default(),
             file_revision: 0,
             services: ServiceCache::default(),
+            service_stamp: None,
             services_pending: false,
             services_checked: None,
             services_poll: None,
@@ -2883,8 +3056,7 @@ impl SettingsView {
                 cx.background_executor().timer(POLL).await;
                 if this
                     .update(cx, |this, cx| {
-                        if this.tab == AdminTab::Workflows {
-                            this.services_checked = None;
+                        if this.visible && this.tab == AdminTab::Workflows {
                             this.refresh_service_cache(cx);
                         }
                     })
@@ -3014,7 +3186,12 @@ impl SettingsView {
                     return;
                 }
                 this.file_jobs.remove(key);
-                this.services_checked = None;
+                if matches!(
+                    key,
+                    "worktree-edit" | "schedule-edit" | "schedule-run" | "orchestration-reset"
+                ) {
+                    this.services_checked = None;
+                }
                 finish(this, result, cx);
                 cx.notify();
             })
@@ -3024,44 +3201,59 @@ impl SettingsView {
     }
 
     fn refresh_service_cache(&mut self, cx: &mut Context<Self>) {
-        if self.services_pending || self.services_checked.is_some_and(|at| at.elapsed() < POLL) {
+        if self.services_pending {
             return;
         }
-        self.services_pending = true;
         let dir = state_dir(cx);
         let revision = self.file_revision;
+        let previous_stamp = self.service_stamp.clone();
         let repo = self
             .workflow_form
             .as_ref()
-            .map(|form| form.repo_path.read(cx).value().to_string());
+            .map(|form| form.repo_path.read(cx).value().trim().to_owned());
+        let known_repo = repo
+            .as_ref()
+            .is_none_or(|r| self.services.aliases.contains_key(r));
+        if known_repo && self.services_checked.is_some_and(|at| at.elapsed() < POLL) {
+            return;
+        }
+        self.services_pending = true;
         cx.spawn(async move |this, cx| {
-            let cache = cx
+            let (stamp, cache) = cx
                 .background_executor()
                 .spawn(async move {
                     let Some(dir) = dir else {
-                        return ServiceCache::default();
+                        return (None, None);
                     };
-                    ServiceCache {
-                        worktrees: std::sync::Arc::new(
-                            krill_proto::orchestration::WorktreeStore::load(&dir)
-                                .unwrap_or_default(),
-                        ),
-                        orchestration: std::sync::Arc::new(
-                            krill_proto::orchestration::OrchestrationStore::load(&dir)
-                                .unwrap_or_default(),
-                        ),
-                        aliases: repo
-                            .into_iter()
-                            .map(|raw| {
-                                let canonical = canonical_repo_key(&raw);
-                                (raw, canonical)
-                            })
-                            .collect(),
-                        schedules: krill_proto::schedule::Schedules::load(&dir)
-                            .unwrap_or_default()
-                            .schedule,
-                        runs: krill_proto::schedule::load_coalesced_runs(&dir).unwrap_or_default(),
+                    let stamp = service_stamps(&dir);
+                    if previous_stamp.as_ref() == Some(&stamp) && known_repo {
+                        return (Some(stamp), None);
                     }
+                    (
+                        Some(stamp),
+                        Some(ServiceCache {
+                            worktrees: std::sync::Arc::new(
+                                krill_proto::orchestration::WorktreeStore::load(&dir)
+                                    .unwrap_or_default(),
+                            ),
+                            orchestration: std::sync::Arc::new(
+                                krill_proto::orchestration::OrchestrationStore::load(&dir)
+                                    .unwrap_or_default(),
+                            ),
+                            aliases: repo
+                                .into_iter()
+                                .map(|raw| {
+                                    let canonical = canonical_repo_key(&raw);
+                                    (raw, canonical)
+                                })
+                                .collect(),
+                            schedules: krill_proto::schedule::Schedules::load(&dir)
+                                .unwrap_or_default()
+                                .schedule,
+                            runs: krill_proto::schedule::load_coalesced_runs(&dir)
+                                .unwrap_or_default(),
+                        }),
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -3069,12 +3261,32 @@ impl SettingsView {
                 if this.file_revision != revision {
                     return;
                 }
-                this.services = cache;
                 this.services_checked = Some(std::time::Instant::now());
-                if let Some(form) = &mut this.workflow_form {
-                    form.loaded_repo = None;
+                let worktrees_changed = this.service_stamp.as_ref().and_then(|s| s.first())
+                    != stamp.as_ref().and_then(|s| s.first());
+                this.service_stamp = stamp;
+                if let Some(cache) = cache {
+                    let aliases_changed = this.services.aliases != cache.aliases;
+                    this.services = cache;
+                    if (worktrees_changed || aliases_changed)
+                        && let Some(form) = &mut this.workflow_form
+                    {
+                        form.refresh_hooks = true;
+                    }
+                    cx.notify();
                 }
-                cx.notify();
+                // The repository can change while a background load is running. Resolve
+                // its filesystem identity off-thread before the next form projection.
+                let missing_alias = this.workflow_form.as_ref().is_some_and(|form| {
+                    !this
+                        .services
+                        .aliases
+                        .contains_key(form.repo_path.read(cx).value().trim())
+                });
+                if missing_alias && state_dir(cx).is_some() {
+                    this.services_checked = None;
+                    this.refresh_service_cache(cx);
+                }
             })
             .ok();
         })
@@ -3083,6 +3295,19 @@ impl SettingsView {
 
     pub fn tab(&self) -> AdminTab {
         self.tab
+    }
+
+    pub fn mobile_page(&self) -> bool {
+        self.mobile_page
+    }
+
+    /// 단독 모바일 페이지 모드를 켜거나 끈다. 켤 때는 모바일 탭으로 전환한다.
+    pub fn set_mobile_page(&mut self, on: bool, cx: &mut Context<Self>) {
+        if on && self.tab != AdminTab::Mobile {
+            self.set_tab(AdminTab::Mobile, cx);
+        }
+        self.mobile_page = on;
+        cx.notify();
     }
 
     pub fn focus_handle(&self) -> gpui::FocusHandle {
@@ -3122,8 +3347,34 @@ impl SettingsView {
             .unwrap_or_default()
     }
 
+    /// Shell calls this when its in-app settings page is hidden or foregrounded.
+    pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if let Some(view) = &self.remote_krill {
+            view.update(cx, |view, cx| {
+                view.set_visible(visible && self.tab == AdminTab::RemoteKrill, cx);
+            });
+        }
+        if visible {
+            if self.tab == AdminTab::Mobile {
+                self.mobile_enter(cx);
+            }
+            if self.tab == AdminTab::Workflows {
+                self.refresh_service_cache(cx);
+            }
+        }
+    }
+
     pub fn set_tab(&mut self, tab: AdminTab, cx: &mut Context<Self>) {
         self.tab = tab;
+        if let Some(view) = &self.remote_krill {
+            view.update(cx, |view, cx| {
+                view.set_visible(self.visible && tab == AdminTab::RemoteKrill, cx);
+            });
+        }
         self.disarm(cx);
         self.shortcuts = shortcuts::Recorder::default();
         if tab == AdminTab::Ssh && !self.tailscale_loaded {
@@ -3379,6 +3630,29 @@ impl SettingsView {
     /// 요청은 합쳐 하나로만 돌린다. 손상된 `accounts.toml`은 오류로 알린다(AS-04).
     /// 실제 상태 디렉터리에서는 데몬 `ListAccounts` 응답만 쓰고(상태바와 같은 값), 데몬에
     /// 닿지 못하면 로컬 파일을 읽기 전용으로 보인다(OWE-697).
+    fn refresh_accounts_if_changed(&mut self, cx: &mut Context<Self>) {
+        if self.account_probe_pending {
+            return;
+        }
+        self.account_probe_pending = true;
+        let dir = state_dir(cx);
+        cx.spawn(async move |this, cx| {
+            let stamp = cx
+                .background_executor()
+                .spawn(async move { account_stamps(dir.as_deref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.account_probe_pending = false;
+                if this.account_file_stamp != stamp {
+                    this.account_file_stamp = stamp;
+                    this.refresh_accounts_async(cx);
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     fn refresh_accounts_async(&mut self, cx: &mut Context<Self>) {
         if self.accounts_refresh_pending {
             return;
@@ -3426,13 +3700,21 @@ impl SettingsView {
                         .unwrap_or_else(|| crate::accounts::refresh_local(&home, dir.as_deref()));
                     let hosts = crate::ssh_hosts::load_hosts(dir.as_deref());
                     let problem = crate::accounts::load_problem(&home, dir.as_deref());
-                    (snapshot, hosts, problem, offline, orphans)
+                    (
+                        snapshot,
+                        hosts,
+                        problem,
+                        offline,
+                        orphans,
+                        account_stamps(dir.as_deref()),
+                    )
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.accounts_refresh_pending = false;
                 this.accounts_offline = loaded.3;
                 this.orphan_profiles = loaded.4;
+                this.account_file_stamp = loaded.5;
                 if daemon && !loaded.3 {
                     this.probe_identities(cx);
                 }
@@ -4143,16 +4425,27 @@ impl SettingsView {
             .map(|(id, _)| id.clone())
             .collect();
         let dir = state_dir(cx);
-        if let Ok(hosts) = crate::ssh_hosts::remove_hosts(dir.as_deref(), &ids) {
-            self.ssh_hosts = hosts;
-            self.ssh_duplicates.clear();
-            for id in &ids {
-                self.ssh_host_statuses.remove(id);
-                self.ssh_remote_infos.remove(id);
-            }
-            cx.defer(notify_external_change);
-            cx.notify();
-        }
+        let expected = self.ssh_hosts.clone();
+        self.file_job(
+            "ssh-edit",
+            move || crate::ssh_hosts::remove_hosts_if_current(dir.as_deref(), &ids, &expected),
+            move |this, result, cx| {
+                match result {
+                    Ok(hosts) => {
+                        let live: std::collections::BTreeSet<_> =
+                            hosts.iter().map(|h| h.id.clone()).collect();
+                        this.ssh_hosts = hosts;
+                        this.ssh_duplicates.clear();
+                        this.ssh_host_statuses.retain(|id, _| live.contains(id));
+                        this.ssh_remote_infos.retain(|id, _| live.contains(id));
+                        cx.defer(notify_external_change);
+                    }
+                    Err(error) => this.ssh_status = Some(error.to_string().into()),
+                }
+                cx.notify();
+            },
+            cx,
+        );
     }
 
     pub fn remove_ssh_host(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -5307,6 +5600,8 @@ impl SettingsView {
     }
 
     fn render_update_rows(s: &Settings, cx: &mut Context<Self>) -> [gpui::Div; 2] {
+        use gpui_component::Sizable as _;
+
         use crate::updater::{CheckStatus, UpdateState};
         let p = crate::ui::palette(cx);
         let row = || layout::row(p);
@@ -5341,16 +5636,18 @@ impl SettingsView {
                 None
             }
         });
-        let check_btn_label = if is_checking {
-            text::UPDATES_CHECKING.get()
-        } else {
-            text::UPDATES_CHECK.get()
-        };
-        let check_btn = layout::secondary("settings-update-check", check_btn_label)
-            .debug_selector(|| "settings-update-check".into())
-            .on_click(|_, _, cx| {
-                trigger_manual_update_check(cx);
-            });
+        let check_btn = crate::ui::button_with_reserved_label(
+            "settings-update-check",
+            text::UPDATES_CHECK.get(),
+            text::UPDATES_CHECKING.get(),
+            is_checking,
+        )
+        .small()
+        .outline()
+        .debug_selector(|| "settings-update-check".into())
+        .on_click(|_, _, cx| {
+            trigger_manual_update_check(cx);
+        });
         let mut controls = layout::controls().child(
             div()
                 .text_size(crate::ui::TEXT_SM)
@@ -5778,6 +6075,18 @@ impl SettingsView {
             .flex_col()
             .gap_1();
 
+        self.terminal_theme_swatches
+            .retain(|index, _| *index < s.terminal_custom_themes.len());
+        for (index, theme) in s.terminal_custom_themes.iter().enumerate() {
+            let unchanged = self
+                .terminal_theme_swatches
+                .get(&index)
+                .is_some_and(|(previous, _)| previous == theme);
+            if !unchanged {
+                self.terminal_theme_swatches
+                    .insert(index, (theme.clone(), theme.to_terminal_theme()));
+            }
+        }
         let custom_matches: Vec<(usize, &crate::ui::CustomTerminalTheme)> = s
             .terminal_custom_themes
             .iter()
@@ -5830,11 +6139,15 @@ impl SettingsView {
                     "warp" => text::TERMINAL_THEME_SOURCE_WARP.get(),
                     _ => text::TERMINAL_THEME_SOURCE_CUSTOM.get(),
                 };
-                let parsed_theme = ct.to_terminal_theme().unwrap_or(if want_dark {
-                    crate::ui::TERMINAL_DARK
-                } else {
-                    crate::ui::TERMINAL_LIGHT
-                });
+                let parsed_theme = self
+                    .terminal_theme_swatches
+                    .get(&idx)
+                    .and_then(|(_, theme)| *theme)
+                    .unwrap_or(if want_dark {
+                        crate::ui::TERMINAL_DARK
+                    } else {
+                        crate::ui::TERMINAL_LIGHT
+                    });
                 let swatch = Self::render_terminal_theme_swatch(p, &parsed_theme);
                 let row_sel = row_id.clone();
                 let del_sel = del_id.clone();
@@ -6914,6 +7227,8 @@ impl SettingsView {
     fn render_account_row(
         &self,
         acc: &krill_proto::usage::AccountInfo,
+        status: Option<&krill_proto::usage::AccountStatusInfo>,
+        duplicate: Option<String>,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         use gpui_component::menu::{DropdownMenu as _, PopupMenuItem};
@@ -6924,11 +7239,7 @@ impl SettingsView {
         let provider = acc.provider;
         let orca = crate::accounts::orca_managed(acc);
         let snap = &self.accounts_snapshot;
-        let usage = crate::accounts::display::account(
-            acc,
-            snap.statuses.iter().find(|s| s.account_id == acc.id),
-            crate::accounts::display::now(),
-        );
+        let usage = crate::accounts::display::account(acc, status, crate::accounts::display::now());
         let conn = crate::accounts::display::connection(snap, acc, &usage);
         let needs_login = conn == Some(ConnectionStatus::NeedsLogin);
         let can_login = !orca
@@ -6971,14 +7282,6 @@ impl SettingsView {
         } else {
             self.account_detail(acc, heading)
         };
-        let duplicate =
-            crate::accounts::duplicate_of(acc, &snap.accounts, &self.identities.0).map(|other| {
-                if other.host_default {
-                    text::ACCOUNT_DUPLICATE_HOST.get().to_owned()
-                } else {
-                    text::ACCOUNT_DUPLICATE.format(&[("label", &other.label)])
-                }
-            });
         let brand = crate::ui::icons::provider_brand_color(provider, p.accent);
 
         // 아바타(이름 첫 글자) + 오른쪽 아래 상태 점. 툴팁·접근성 설명에 연결·사용량 상태와 갱신 시각.
@@ -7185,16 +7488,15 @@ impl SettingsView {
             .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation());
         if logging_in {
             let cancel_id = format!("admin-cancel-login-{}", acc.id);
-            let cancel_label = if cancelling {
-                text::ACCOUNT_LOGIN_CANCELLING.get()
-            } else {
-                text::ACCOUNT_LOGIN_CANCEL.get()
-            };
             actions = actions.child(
-                layout::secondary(
+                crate::ui::button_with_reserved_label(
                     gpui::ElementId::Name(cancel_id.clone().into()),
-                    cancel_label,
+                    text::ACCOUNT_LOGIN_CANCEL.get(),
+                    text::ACCOUNT_LOGIN_CANCELLING.get(),
+                    cancelling,
                 )
+                .small()
+                .outline()
                 .icon(IconName::Close)
                 .disabled(cancelling)
                 .debug_selector(move || cancel_id.clone())
@@ -7521,6 +7823,14 @@ impl SettingsView {
             ),
         ];
 
+        let duplicates =
+            duplicate_account_labels(&self.accounts_snapshot.accounts, &self.identities.0);
+        let mut status_index = std::collections::BTreeMap::new();
+        for status in &self.accounts_snapshot.statuses {
+            status_index
+                .entry(status.account_id.clone())
+                .or_insert_with(|| status.clone());
+        }
         let mut not_installed = Vec::new();
         for (provider, title, subtitle) in providers {
             let mut accounts: Vec<_> = self
@@ -7746,7 +8056,12 @@ impl SettingsView {
                 );
             }
             for acc in &accounts {
-                list = list.child(self.render_account_row(acc, cx));
+                list = list.child(self.render_account_row(
+                    acc,
+                    status_index.get(acc.id.as_str()),
+                    duplicates.get(&acc.id).cloned(),
+                    cx,
+                ));
             }
             // 이 기기에서 추가한 계정이 없으면 Orca처럼 점선 빈 상태 안내를 보인다.
             if !accounts
@@ -9650,18 +9965,19 @@ impl SettingsView {
                     .child(connect_or_disconnect_btn)
                     .child({
                         let testing = self.is_ssh_test_pending(&host.id);
-                        let test_label = if testing {
-                            text::SSH_TESTING.get()
-                        } else {
-                            text::SSH_TEST.get()
-                        };
-                        layout::secondary(gpui::ElementId::Name(test_id.clone().into()), test_label)
-                            .small()
-                            .disabled(testing)
-                            .debug_selector(move || test_id.clone())
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.test_ssh_host(host_cl.clone(), cx);
-                            }))
+                        crate::ui::button_with_reserved_label(
+                            gpui::ElementId::Name(test_id.clone().into()),
+                            text::SSH_TEST.get(),
+                            text::SSH_TESTING.get(),
+                            testing,
+                        )
+                        .outline()
+                        .small()
+                        .disabled(testing)
+                        .debug_selector(move || test_id.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.test_ssh_host(host_cl.clone(), cx);
+                        }))
                     })
                     .child(probe_btn);
                 if install_running {
@@ -9827,8 +10143,14 @@ impl SettingsView {
             .or_else(|| Self::workflow_repo_candidates(&store).into_iter().next())
             .unwrap_or_default();
         let loaded_repo = Self::normalize_repo_key(&default_repo);
-        let default_setup = store.setup_script_for(&default_repo).unwrap_or_default();
-        let default_archive = store.archive_script_for(&default_repo).unwrap_or_default();
+        let default_setup = self
+            .services
+            .setup_script_for(&default_repo)
+            .unwrap_or_default();
+        let default_archive = self
+            .services
+            .archive_script_for(&default_repo)
+            .unwrap_or_default();
         let loaded_setup = default_setup.clone();
         let loaded_archive = default_archive.clone();
         let repo_path = cx.new(|cx| {
@@ -9881,20 +10203,9 @@ impl SettingsView {
                 this.sync_workflow_repo_hooks(window, cx);
             },
         );
-        let setup_obs = cx.observe(&setup_script, |this, inp, cx| {
-            if let Some(form) = &mut this.workflow_form
-                && Self::normalize_repo_key(&form.repo_path.read(cx).value()) == form.loaded_repo
-            {
-                form.loaded_setup = inp.read(cx).value().to_string();
-            }
-        });
-        let archive_obs = cx.observe(&archive_script, |this, inp, cx| {
-            if let Some(form) = &mut this.workflow_form
-                && Self::normalize_repo_key(&form.repo_path.read(cx).value()) == form.loaded_repo
-            {
-                form.loaded_archive = inp.read(cx).value().to_string();
-            }
-        });
+        // Input observers notify only; saved disk baselines must never advance with an unsent edit.
+        let setup_obs = cx.observe(&setup_script, |_, _, cx| cx.notify());
+        let archive_obs = cx.observe(&archive_script, |_, _, cx| cx.notify());
         self.workflow_form = Some(WorkflowRepoForm {
             repo_path,
             symlink_path,
@@ -9909,6 +10220,7 @@ impl SettingsView {
             loaded_repo,
             loaded_setup,
             loaded_archive,
+            refresh_hooks: false,
             status: None,
             _subs: vec![repo_obs, repo_sub, setup_obs, archive_obs],
         });
@@ -9920,7 +10232,16 @@ impl SettingsView {
         };
         let raw_repo = form.repo_path.read(cx).value().to_string();
         let next_repo = Self::normalize_repo_key(&raw_repo);
-        if next_repo == form.loaded_repo {
+        if next_repo
+            .as_ref()
+            .is_some_and(|repo| !self.services.aliases.contains_key(repo))
+            && state_dir(cx).is_some()
+        {
+            self.refresh_service_cache(cx);
+            return;
+        }
+        let navigating = next_repo != form.loaded_repo;
+        if !navigating && !form.refresh_hooks {
             return;
         }
         let prev_setup = form.loaded_setup.clone();
@@ -9932,37 +10253,35 @@ impl SettingsView {
         let symlink_inp = form.symlink_path.clone();
 
         self.refresh_service_cache(cx);
-        let store = self.services.worktrees.clone();
         let repo_setup = next_repo
             .as_deref()
-            .and_then(|key| {
-                store.setup_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
-            })
+            .and_then(|key| self.services.setup_script_for(key))
             .unwrap_or_default();
         let repo_archive = next_repo
             .as_deref()
-            .and_then(|key| {
-                store.archive_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
-            })
+            .and_then(|key| self.services.archive_script_for(key))
             .unwrap_or_default();
 
         let target_setup = if cur_setup == prev_setup {
-            repo_setup
+            repo_setup.clone()
         } else {
             cur_setup.clone()
         };
         let target_archive = if cur_archive == prev_archive {
-            repo_archive
+            repo_archive.clone()
         } else {
             cur_archive.clone()
         };
 
         if let Some(form) = &mut self.workflow_form {
-            form.pending_repo_path = None;
+            if navigating {
+                form.pending_repo_path = None;
+                form.status = None;
+            }
             form.loaded_repo = next_repo;
-            form.loaded_setup.clone_from(&target_setup);
-            form.loaded_archive.clone_from(&target_archive);
-            form.status = None;
+            form.loaded_setup = repo_setup;
+            form.loaded_archive = repo_archive;
+            form.refresh_hooks = false;
         }
         if cur_setup != target_setup {
             setup_inp.update(cx, |inp, cx| inp.set_value(target_setup, window, cx));
@@ -9970,7 +10289,7 @@ impl SettingsView {
         if cur_archive != target_archive {
             archive_inp.update(cx, |inp, cx| inp.set_value(target_archive, window, cx));
         }
-        if !symlink_inp.read(cx).value().is_empty() {
+        if navigating && !symlink_inp.read(cx).value().is_empty() {
             symlink_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
         }
         cx.notify();
@@ -9993,24 +10312,23 @@ impl SettingsView {
         let symlink_inp = form.symlink_path.clone();
         let next_repo = Self::normalize_repo_key(repo_raw);
         self.refresh_service_cache(cx);
-        let store = self.services.worktrees.clone();
         let repo_setup = next_repo
             .as_deref()
-            .and_then(|key| {
-                store.setup_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
-            })
+            .and_then(|key| self.services.setup_script_for(key))
             .unwrap_or_default();
         let repo_archive = next_repo
             .as_deref()
-            .and_then(|key| {
-                store.archive_script_for(self.services.aliases.get(key).map_or(key, String::as_str))
-            })
+            .and_then(|key| self.services.archive_script_for(key))
             .unwrap_or_default();
+        let resolved = next_repo
+            .as_ref()
+            .is_none_or(|repo| self.services.aliases.contains_key(repo));
         if let Some(form) = &mut self.workflow_form {
             form.pending_repo_path = None;
-            form.loaded_repo = next_repo;
+            form.loaded_repo = if resolved { next_repo } else { None };
             form.loaded_setup.clone_from(&repo_setup);
             form.loaded_archive.clone_from(&repo_archive);
+            form.refresh_hooks = !resolved;
             form.status = None;
         }
         if repo_inp.read(cx).value().as_str() != repo_raw {
@@ -10021,6 +10339,7 @@ impl SettingsView {
         if !symlink_inp.read(cx).value().is_empty() {
             symlink_inp.update(cx, |inp, cx| inp.set_value("", window, cx));
         }
+        self.refresh_service_cache(cx);
         cx.notify();
     }
 
@@ -10039,6 +10358,31 @@ impl SettingsView {
             .filter(|r| Path::new(r).is_absolute())
             .cloned()
             .collect()
+    }
+
+    fn workflow_hooks_ready(&self, cx: &App) -> bool {
+        self.workflow_form.as_ref().is_some_and(|form| {
+            let repo = form.repo_path.read(cx).value();
+            let repo = repo.trim();
+            !repo.is_empty()
+                && self.services.aliases.contains_key(repo)
+                && form.loaded_repo.as_deref() == Some(repo)
+        })
+    }
+
+    fn save_workflow_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_workflow_repo_hooks(window, cx);
+        if !self.workflow_hooks_ready(cx) {
+            return;
+        }
+        let Some(form) = &self.workflow_form else {
+            return;
+        };
+        let repo = form.repo_path.read(cx).value().to_string();
+        let setup = form.setup_script.read(cx).value().to_string();
+        let archive = form.archive_script.read(cx).value().to_string();
+        self.save_repo_hooks_for(&repo, Some(&setup), Some(&archive), cx)
+            .ok();
     }
 
     fn normalize_repo_key(raw: &str) -> Option<String> {
@@ -10916,8 +11260,11 @@ impl SettingsView {
             let symlink_rows: Vec<(String, String)> = if let Some(repo_key) = active_repo.as_deref()
             {
                 wt_store
-                    .symlinks_for(repo_key)
+                    .symlinks
+                    .get(repo_key)
                     .into_iter()
+                    .flatten()
+                    .cloned()
                     .map(|rel| (repo_key.to_owned(), rel))
                     .collect()
             } else {
@@ -11042,7 +11389,11 @@ impl SettingsView {
                         .child(
                             layout::ghost("admin-repo-hooks-clear", text::HOOKS_CLEAR.get())
                                 .debug_selector(|| "admin-repo-hooks-clear".into())
+                                .disabled(!self.workflow_hooks_ready(cx))
                                 .on_click(cx.listener(|this, _, window, cx| {
+                                    if !this.workflow_hooks_ready(cx) {
+                                        return;
+                                    }
                                     let Some(form) = &this.workflow_form else {
                                         return;
                                     };
@@ -11060,21 +11411,9 @@ impl SettingsView {
                         .child(
                             layout::primary("admin-repo-hooks-save", text::HOOKS_SAVE.get())
                                 .debug_selector(|| "admin-repo-hooks-save".into())
+                                .disabled(!self.workflow_hooks_ready(cx))
                                 .on_click(cx.listener(|this, _, window, cx| {
-                                    this.sync_workflow_repo_hooks(window, cx);
-                                    let Some(form) = &this.workflow_form else {
-                                        return;
-                                    };
-                                    let repo = form.repo_path.read(cx).value().to_string();
-                                    let setup = form.setup_script.read(cx).value().to_string();
-                                    let archive = form.archive_script.read(cx).value().to_string();
-                                    this.save_repo_hooks_for(
-                                        &repo,
-                                        Some(&setup),
-                                        Some(&archive),
-                                        cx,
-                                    )
-                                    .ok();
+                                    this.save_workflow_form(window, cx);
                                 })),
                         ),
                 );
@@ -11083,10 +11422,12 @@ impl SettingsView {
                 wt_store.setup_scripts.keys().cloned().collect();
             hook_repos.extend(wt_store.archive_scripts.keys().cloned());
             for (idx, repo_key) in hook_repos.into_iter().enumerate() {
-                let setup_val = wt_store
+                let setup_val = self
+                    .services
                     .setup_script_for(&repo_key)
                     .unwrap_or_else(|| "—".to_owned());
-                let archive_val = wt_store
+                let archive_val = self
+                    .services
                     .archive_script_for(&repo_key)
                     .unwrap_or_else(|| "—".to_owned());
                 let summary = format!("{repo_key} · setup={setup_val} · archive={archive_val}");
@@ -11390,10 +11731,29 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use gpui_component::{Icon, IconName, Sizable as _};
+        if self.mobile_page {
+            return self.render_mobile_page(cx).into_any_element();
+        }
         window.set_window_title(text::TITLE.get());
         let (s, error) = cx.try_global::<Config>().map_or_else(
             || (Settings::default(), None),
-            |c| (c.settings.clone(), c.error.clone()),
+            |c| {
+                (
+                    if matches!(
+                        self.tab,
+                        AdminTab::General
+                            | AdminTab::Terminal
+                            | AdminTab::Agents
+                            | AdminTab::Workflows
+                            | AdminTab::Resources
+                    ) {
+                        c.settings.clone()
+                    } else {
+                        Settings::default()
+                    },
+                    c.error.clone(),
+                )
+            },
         );
         let p = crate::ui::palette(cx);
         let current_tab = self.tab;
@@ -11825,9 +12185,11 @@ impl Render for SettingsView {
                     ),
                 ),
             )
+            .into_any_element()
     }
 }
 
+pub(crate) mod child;
 pub(crate) mod layout;
 mod mobile;
 pub mod schedules;

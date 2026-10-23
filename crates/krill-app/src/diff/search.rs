@@ -77,6 +77,7 @@ const MAX_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// 폴백 워커가 스캔할 최대 파일 수.
 const MAX_FALLBACK_FILES: usize = 10_000;
+const MAX_FALLBACK_READ_BYTES: u64 = MAX_TOTAL_READ_BYTES;
 
 /// `rg --json` 표준 출력 최대 바이트 상한(16 MiB).
 const MAX_RG_STDOUT_BYTES: usize = 16 * 1024 * 1024;
@@ -516,15 +517,24 @@ impl LineMatcher {
         })
     }
 
-    fn find_spans(&self, raw_line: &str) -> Vec<(usize, usize)> {
+    fn find_spans(
+        &self,
+        raw_line: &str,
+        budget: &mut SearchBudget,
+        limit: usize,
+    ) -> Vec<(usize, usize)> {
         let line_chars: Vec<(usize, char)> = raw_line.char_indices().collect();
         let n = line_chars.len();
         let mut out = Vec::new();
         let mut i = 0usize;
         let mut line_steps = 0usize;
 
-        while i < n {
+        while i < n && out.len() < limit {
+            if i.is_multiple_of(64) && budget.stopped() {
+                break;
+            }
             if line_steps >= MAX_REGEX_STEPS_PER_LINE {
+                budget.truncated = true;
                 break;
             }
             let matched_end = match self {
@@ -963,6 +973,29 @@ fn find_rg_binary() -> Option<PathBuf> {
     None
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "Owning the task cancels its pipe IO on every return path via Drop"
+)]
+fn finish_search_pipe<T: Send + 'static>(
+    task: crate::process_io::PipeTask<T>,
+    deadline: Instant,
+    cancel: &AtomicBool,
+) -> std::io::Result<T> {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        if let Some(result) = task.try_finish() {
+            return result;
+        }
+        if Instant::now() >= deadline {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+}
+
 #[cfg(all(test, unix))]
 pub(crate) fn search_with_rg_limits(
     rg_bin: &Path,
@@ -1093,8 +1126,7 @@ fn search_with_rg_control(
     child.0.kill().ok();
     child.0.wait().ok();
 
-    let captured = reader
-        .finish(deadline + Duration::from_millis(50))
+    let captured = finish_search_pipe(reader, deadline + Duration::from_millis(50), cancel)
         .map_err(|error| RgError::Execution(error.to_string()))?;
     timed_out |= captured.timed_out;
     let mut output = captured.bytes;
@@ -1288,10 +1320,10 @@ fn search_worktree_fallback_with_matcher(
 
     let mut files = Vec::new();
     let mut total_matches = 0usize;
-    let mut truncated = budget.truncated;
+    let mut truncated = false;
 
     for (path, relative_path) in candidates {
-        if budget.stopped() {
+        if budget.stopped() || budget.bytes >= MAX_FALLBACK_READ_BYTES {
             truncated = true;
             break;
         }
@@ -1317,7 +1349,7 @@ fn search_worktree_fallback_with_matcher(
         if !meta.is_file() || meta.len() > MAX_SEARCH_FILE_BYTES {
             continue;
         }
-        if budget.bytes.saturating_add(meta.len()) > MAX_TOTAL_READ_BYTES {
+        if budget.bytes.saturating_add(meta.len()) > MAX_FALLBACK_READ_BYTES {
             truncated = true;
             break;
         }
@@ -1326,7 +1358,10 @@ fn search_worktree_fallback_with_matcher(
         };
         let mut bytes = Vec::new();
         if file
-            .take(MAX_SEARCH_FILE_BYTES + 1)
+            .take(
+                (MAX_SEARCH_FILE_BYTES + 1)
+                    .min(MAX_FALLBACK_READ_BYTES.saturating_sub(budget.bytes)),
+            )
             .read_to_end(&mut bytes)
             .is_err()
         {
@@ -1353,7 +1388,11 @@ fn search_worktree_fallback_with_matcher(
                 break;
             }
             let line_number = u32::try_from(line_idx.saturating_add(1)).unwrap_or(u32::MAX);
-            for (byte_start, byte_end) in matcher.find_spans(raw_line) {
+            for (byte_start, byte_end) in matcher.find_spans(
+                raw_line,
+                budget,
+                max_results.saturating_sub(total_matches).saturating_add(1),
+            ) {
                 if total_matches >= max_results {
                     truncated = true;
                     break;
@@ -1382,10 +1421,17 @@ fn search_worktree_fallback_with_matcher(
         }
     }
 
+    tracing::debug!(
+        nodes = budget.nodes,
+        read_bytes = budget.bytes,
+        total_matches,
+        truncated = truncated || budget.truncated,
+        "fallback search budget"
+    );
     SearchResult {
         files,
         total_matches,
-        truncated,
+        truncated: truncated || budget.truncated || budget.bytes >= MAX_FALLBACK_READ_BYTES,
     }
 }
 
@@ -1520,9 +1566,10 @@ fn query_git_ignored_set_control(
     child.0.kill().ok();
     child.0.wait().ok();
     if let Some(w) = writer {
-        w.finish(deadline + Duration::from_millis(50)).ok();
+        finish_search_pipe(w, deadline + Duration::from_millis(50), cancel).ok();
     }
-    let Ok(captured) = reader.finish(deadline + Duration::from_millis(50)) else {
+    let Ok(captured) = finish_search_pipe(reader, deadline + Duration::from_millis(50), cancel)
+    else {
         return BTreeSet::new();
     };
     let mut stdout_bytes = captured.bytes;
@@ -2734,4 +2781,79 @@ fn match_row_context_menu(
                 cx.write_to_clipboard(ClipboardItem::new_string(rel_str.clone()));
             }),
     )
+}
+
+#[cfg(test)]
+mod performance_tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_rg_does_not_spawn_even_a_missing_binary() {
+        let result = search_with_rg_control(
+            Path::new("/missing-rg"),
+            Path::new("/repo"),
+            &SearchOptions {
+                query: "needle".into(),
+                ..SearchOptions::default()
+            },
+            Duration::from_secs(5),
+            1_024,
+            &AtomicBool::new(true),
+        )
+        .unwrap();
+        assert!(result.truncated);
+        assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn fallback_node_and_deadline_budgets_stop_before_more_io() {
+        let mut budget = SearchBudget::new(Arc::new(AtomicBool::new(false)));
+        budget.nodes = 50_000;
+        assert!(budget.node());
+        assert!(budget.truncated);
+        let mut budget = SearchBudget::new(Arc::new(AtomicBool::new(false)));
+        budget.deadline = Instant::now();
+        assert!(
+            collect_candidate_files(Path::new("/missing-root"), 10_000, &mut budget).is_empty()
+        );
+        assert!(budget.truncated);
+    }
+
+    #[test]
+    fn cancellation_stops_matching_inside_a_long_line() {
+        let matcher = LineMatcher::compile(&SearchOptions {
+            query: "needle".into(),
+            ..SearchOptions::default()
+        })
+        .unwrap();
+        let mut budget = SearchBudget::new(Arc::new(AtomicBool::new(true)));
+        assert!(
+            matcher
+                .find_spans(&"a".repeat(100_000), &mut budget, 100)
+                .is_empty()
+        );
+        assert!(budget.truncated);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod cancelled_pipe_tests {
+    use super::*;
+    #[test]
+    fn cancellation_after_leader_exit_does_not_wait_for_an_inherited_pipe_deadline() {
+        let (read, _held_writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let task = crate::process_io::read(read, 1024, deadline).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&cancelled);
+        let trigger = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            flag.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = finish_search_pipe(task, deadline, &cancelled);
+        trigger.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
 }

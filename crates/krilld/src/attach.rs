@@ -48,6 +48,7 @@ use crate::session::lock;
 pub use crate::session::{Pulse, Read, Tap};
 use crate::store::Piece;
 
+mod history_view;
 mod history_worker;
 pub(crate) mod roles;
 mod search_worker;
@@ -314,6 +315,21 @@ fn requests(
             (kind::RESYNC, Stream::Screen { .. }) => {
                 conn.resync.store(true, Ordering::SeqCst);
                 tap.wake();
+            }
+            (kind::HISTORY_VIEW, Stream::Screen { .. })
+                if features & krill_proto::screen::FEAT_HISTORY_VIEW != 0 =>
+            {
+                let req = krill_proto::screen::HistoryViewRequest::decode(k, &body)?;
+                if history.is_none() {
+                    history = Some(history_worker::Worker::start(
+                        tap.clone(),
+                        Arc::clone(conn),
+                        features,
+                    )?);
+                }
+                if let Some(worker) = &history {
+                    worker.submit_view(req)?;
+                }
             }
             (kind::HISTORY, Stream::Screen { .. }) => {
                 let req = HistoryRequest::decode(k, &body)?;
@@ -668,16 +684,16 @@ fn best_shift(prev: &[Vec<Cell>], next: &[Vec<Cell>]) -> i16 {
     // Up to eight evenly spaced anchors, with at most eight matches per anchor.
     for anchor in 0..8usize.min(len) {
         let row = anchor * (len - 1) / 7usize.min(len.saturating_sub(1)).max(1);
-        let Some(next_row) = next.get(row) else {
+        let Some(cells) = next.get(row).filter(|cells| !cells.is_empty()) else {
             continue;
         };
-        if next_row.is_empty() {
+        let Some(hash) = hn.get(row) else {
             continue;
-        }
+        };
         for (old, _) in hp
             .iter()
             .enumerate()
-            .filter(|(old, hash)| hn.get(row) == Some(*hash) && prev.get(*old) == Some(next_row))
+            .filter(|(old, old_hash)| *old_hash == hash && prev.get(*old) == Some(cells))
             .take(8)
         {
             if let Ok(n) =

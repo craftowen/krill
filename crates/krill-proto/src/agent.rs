@@ -28,6 +28,7 @@ name = "Claude Code"
 launch = ["claude"]
 yolo_args = ["--dangerously-skip-permissions"]
 install = "curl -fsSL https://claude.ai/install.sh | bash"
+install_windows = "irm https://claude.ai/install.ps1 | iex"
 
 [agent.codex]
 name = "Codex"
@@ -40,12 +41,14 @@ name = "OpenCode"
 launch = ["opencode"]
 yolo_args = ["--auto"]
 install = "curl -fsSL https://opencode.ai/install | bash"
+install_windows = "npm install -g opencode-ai"
 
 [agent.cursor]
 name = "Cursor CLI"
 launch = ["cursor-agent"]
 yolo_args = ["--force"]
 install = "curl https://cursor.com/install -fsS | bash"
+install_windows = "irm 'https://cursor.com/install?win32=true' | iex"
 
 [agent.agy]
 name = "Antigravity"
@@ -67,6 +70,7 @@ install = "pipx install aider-chat"
 name = "Goose"
 launch = ["goose"]
 install = "curl -fsSL https://github.com/block/goose/releases/download/stable/download_cli.sh | bash"
+install_windows = "irm https://raw.githubusercontent.com/block/goose/main/download_cli.ps1 | iex"
 
 [agent.copilot]
 name = "GitHub Copilot CLI"
@@ -174,6 +178,9 @@ pub struct Profile {
     /// 미설치일 때 보여 줄 설치 명령.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub install: String,
+    /// Windows에서 `install` 대신 보여 줄 `PowerShell` 설치 명령. 비면 `install`을 쓴다.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub install_windows: String,
     /// 자식 환경에 덮어쓰는 값(OWE-657). 없으면 기존 `agents.toml`과 같다.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
@@ -183,6 +190,16 @@ impl Profile {
     /// PATH에서 찾는 프로그램.
     pub fn program(&self) -> Option<&str> {
         self.launch.first().map(String::as_str)
+    }
+
+    /// 이 플랫폼에서 보여 줄 설치 명령.
+    #[must_use]
+    pub fn install_command(&self) -> &str {
+        if cfg!(windows) && !self.install_windows.is_empty() {
+            &self.install_windows
+        } else {
+            &self.install
+        }
     }
 
     /// 실행 argv. `yolo_args`는 [`Permission::Yolo`]일 때만 붙는다.

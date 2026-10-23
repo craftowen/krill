@@ -256,9 +256,20 @@ impl SettingsView {
         let call = Arc::clone(&self.mobile.call);
         self.mobile.timer = Some(cx.spawn(async move |this, cx| {
             loop {
-                let generation = this
-                    .read_with(cx, |this, _| this.mobile.generation)
-                    .unwrap_or(0);
+                let Ok((generation, poll)) = this.read_with(cx, |this, _| {
+                    (
+                        this.mobile.generation,
+                        this.visible && this.tab == super::AdminTab::Mobile
+                            || this.mobile.pairing_pending()
+                            || this.mobile.offer.is_some(),
+                    )
+                }) else {
+                    return;
+                };
+                if !poll {
+                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                    continue;
+                }
                 let call = Arc::clone(&call);
                 let data = cx
                     .background_executor()
@@ -520,30 +531,7 @@ impl SettingsView {
 
         if let Some((url, expires, qr)) = &self.mobile.offer {
             let seconds = expires.saturating_sub(krill_proto::mobile::client::now_ms()) / 1000;
-            let matrix = qr.clone();
-            let visual = gpui::canvas(
-                |_, _, _| (),
-                move |bounds, (), window, _| {
-                    window.paint_quad(gpui::fill(bounds, crate::ui::theme::QR_LIGHT));
-                    let cell = bounds.size.width / 65.;
-                    for y in 0..SIZE {
-                        for x in 0..SIZE {
-                            if matrix.dark(x, y) {
-                                let x = f32::from(u16::try_from(x).unwrap_or(0)) + 4.;
-                                let y = f32::from(u16::try_from(y).unwrap_or(0)) + 4.;
-                                window.paint_quad(gpui::fill(
-                                    gpui::Bounds::new(
-                                        bounds.origin + gpui::point(cell * x, cell * y),
-                                        gpui::size(cell, cell),
-                                    ),
-                                    crate::ui::theme::QR_DARK,
-                                ));
-                            }
-                        }
-                    }
-                },
-            )
-            .size(px(220.));
+            let visual = qr_canvas(qr.clone()).size(px(220.));
             let copied = self.mobile.copied_url.as_deref() == Some(url.as_str());
             let copy_label = if copied {
                 text::COPIED.get()
@@ -761,6 +749,379 @@ impl SettingsView {
         div().child(root)
     }
 }
+/// QR 행렬을 흰 바탕(조용한 영역 4칸 포함)에 그린다.
+fn qr_canvas(matrix: Qr) -> gpui::Canvas<()> {
+    gpui::canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            window.paint_quad(gpui::fill(bounds, crate::ui::theme::QR_LIGHT));
+            let cell = bounds.size.width / 65.;
+            for y in 0..SIZE {
+                for x in 0..SIZE {
+                    if matrix.dark(x, y) {
+                        let x = f32::from(u16::try_from(x).unwrap_or(0)) + 4.;
+                        let y = f32::from(u16::try_from(y).unwrap_or(0)) + 4.;
+                        window.paint_quad(gpui::fill(
+                            gpui::Bounds::new(
+                                bounds.origin + gpui::point(cell * x, cell * y),
+                                gpui::size(cell, cell),
+                            ),
+                            crate::ui::theme::QR_DARK,
+                        ));
+                    }
+                }
+            }
+        },
+    )
+}
+
+impl SettingsView {
+    /// 사이드바 'Krill 모바일' 단독 페이지(Orca 모바일 페이지 구성 참고). 왼쪽은 경로 선택·QR 카드,
+    /// 오른쪽은 실제 페어링된 휴대폰 목록을 휴대폰 틀 안에 보여 준다. 기기 해제 등 관리는 설정 탭으로 넘긴다.
+    pub(super) fn render_mobile_page(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        use gpui_component::{
+            Sizable as _,
+            button::{Button, ButtonVariants as _},
+        };
+        let p = crate::ui::palette(cx);
+        let busy = self.mobile.pending || self.mobile.pairing_pending();
+
+        let mut modes = div().flex().gap_1p5();
+        for (mode, id, label) in [
+            (
+                ConnectMode::Tunnel,
+                "mobile-page-tunnel",
+                text::PAGE_TUNNEL.get(),
+            ),
+            (
+                ConnectMode::Tailscale,
+                "mobile-page-tailscale",
+                text::PAGE_TAILSCALE.get(),
+            ),
+        ] {
+            modes = modes.child(
+                layout::segment(p, id, label, self.mobile.mode == mode)
+                    .disabled(self.mobile.pending)
+                    .debug_selector(move || id.into())
+                    .on_click(cx.listener(move |this, _, _, cx| this.mobile_pair(mode, None, cx))),
+            );
+        }
+        let mode_desc = if self.mobile.mode == ConnectMode::Tailscale {
+            text::TAILSCALE_DESC.get()
+        } else {
+            text::TUNNEL_DESC.get()
+        };
+
+        let qr_size = px(168.);
+        let qr_box = if let Some((_, _, qr)) = &self.mobile.offer {
+            div()
+                .id("mobile-page-qr")
+                .debug_selector(|| "mobile-page-qr".into())
+                .flex_none()
+                .p_2()
+                .rounded(crate::ui::RADIUS_LG)
+                .bg(crate::ui::theme::QR_LIGHT)
+                .child(qr_canvas(qr.clone()).size(qr_size))
+        } else {
+            div()
+                .id("mobile-page-qr-empty")
+                .debug_selector(|| "mobile-page-qr-empty".into())
+                .flex_none()
+                .size(qr_size + px(16.))
+                .rounded(crate::ui::RADIUS_LG)
+                .border_1()
+                .border_dashed()
+                .border_color(p.border)
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_3()
+                .text_center()
+                .text_size(crate::ui::TEXT_XS)
+                .text_color(p.muted_foreground)
+                .child(if busy {
+                    text::PREPARING.get()
+                } else {
+                    text::NEW_QR.get()
+                })
+        };
+
+        let mut actions = div().flex().flex_wrap().items_center().gap_2();
+        if let Some((url, expires, _)) = &self.mobile.offer {
+            let copied = self.mobile.copied_url.as_deref() == Some(url.as_str());
+            let link = url.clone();
+            let seconds = expires.saturating_sub(krill_proto::mobile::client::now_ms()) / 1000;
+            actions = actions
+                .child(
+                    layout::secondary(
+                        "mobile-page-copy",
+                        if copied {
+                            text::COPIED.get()
+                        } else {
+                            text::COPY.get()
+                        },
+                    )
+                    .icon(if copied {
+                        IconName::Check
+                    } else {
+                        IconName::Copy
+                    })
+                    .debug_selector(|| "mobile-page-copy".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(link.clone()));
+                        this.mobile.copied = true;
+                        this.mobile.copied_url = Some(link.clone());
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    div()
+                        .text_size(crate::ui::TEXT_XS)
+                        .text_color(p.muted_foreground)
+                        .child(format!(
+                            "{} {:02}:{:02}",
+                            text::EXPIRES.get(),
+                            seconds / 60,
+                            seconds % 60
+                        )),
+                );
+        }
+        actions = actions.child(div().flex_1()).child(
+            layout::primary("mobile-page-new-qr", text::NEW_QR.get())
+                .disabled(busy)
+                .debug_selector(|| "mobile-page-new-qr".into())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.mobile_pair(this.mobile.mode, this.mobile.address.clone(), cx);
+                })),
+        );
+
+        let card = layout::card(p)
+            .id("mobile-page-card")
+            .debug_selector(|| "mobile-page-card".into())
+            .w(px(460.))
+            .max_w_full()
+            .p_5()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .child(
+                div()
+                    .flex()
+                    .gap_5()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_LG)
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(text::PAGE_TITLE.get()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .text_color(p.muted_foreground)
+                                    .child(text::PAGE_DESC.get()),
+                            )
+                            .child(modes)
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(mode_desc),
+                            ),
+                    )
+                    .child(qr_box),
+            )
+            .child(actions)
+            .children(self.mobile.error.clone().map(|error| {
+                crate::ui::error_banner(p, error)
+                    .id("mobile-page-error")
+                    .debug_selector(|| "mobile-page-error".into())
+            }))
+            .child(
+                div().flex().child(
+                    layout::ghost("mobile-page-manage", text::PAGE_MANAGE.get())
+                        .icon(IconName::Settings)
+                        .debug_selector(|| "mobile-page-manage".into())
+                        .on_click(|_, _, cx| {
+                            super::open_window_at_tab(super::AdminTab::Mobile, cx);
+                        }),
+                ),
+            );
+
+        let now = krill_proto::mobile::client::now_ms();
+        let mut devices = div().flex().flex_col().gap_2();
+        let mut any = false;
+        for device in self
+            .mobile
+            .devices
+            .iter()
+            .filter(|d| d.revoked_at_ms.is_none())
+        {
+            any = true;
+            let connected = self.mobile.connected.contains(&device.device_id);
+            devices = devices.child(
+                div()
+                    .p_3()
+                    .rounded(crate::ui::RADIUS_MD)
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.background)
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(crate::ui::icons::svg_icon(
+                        crate::ui::icons::SMARTPHONE_SVG,
+                        crate::ui::ICON_LG,
+                        p.muted_foreground,
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_size(crate::ui::TEXT_SM)
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .truncate()
+                                    .child(device.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .text_size(crate::ui::TEXT_XS)
+                                    .text_color(p.muted_foreground)
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .size(crate::ui::STATE_DOT)
+                                            .rounded_full()
+                                            .bg(if connected {
+                                                p.success
+                                            } else {
+                                                p.muted_foreground
+                                            }),
+                                    )
+                                    .child(
+                                        div().truncate().child(device_line(device, connected, now)),
+                                    ),
+                            ),
+                    ),
+            );
+        }
+        if !any {
+            devices = devices.child(
+                div()
+                    .text_size(crate::ui::TEXT_XS)
+                    .text_color(p.muted_foreground)
+                    .child(text::PAGE_PHONE_EMPTY.get()),
+            );
+        }
+        let phone = div()
+            .id("mobile-page-phone")
+            .debug_selector(|| "mobile-page-phone".into())
+            .flex_none()
+            .w(px(300.))
+            .h(px(560.))
+            .p_2()
+            .rounded(px(44.))
+            .border_1()
+            .border_color(p.border)
+            .bg(p.sidebar)
+            .child(
+                div()
+                    .size_full()
+                    .rounded(px(36.))
+                    .border_1()
+                    .border_color(p.border)
+                    .bg(p.card)
+                    .px_4()
+                    .py_6()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .text_size(crate::ui::TEXT_LG)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(crate::ui::icons::svg_icon(
+                                crate::ui::icons::SMARTPHONE_SVG,
+                                crate::ui::ICON_LG,
+                                p.foreground,
+                            ))
+                            .child(text::PAGE_BRAND.get()),
+                    )
+                    .child(
+                        div()
+                            .text_size(crate::ui::TEXT_XS)
+                            .text_color(p.muted_foreground)
+                            .child(text::PAGE_PHONE_TITLE.get()),
+                    )
+                    .child(devices),
+            );
+
+        div()
+            .id("mobile-page")
+            .debug_selector(|| "mobile-page".into())
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|_, ev: &gpui::KeyDownEvent, window, cx| {
+                if ev.keystroke.key == "escape" && !ev.keystroke.modifiers.modified() {
+                    cx.stop_propagation();
+                    super::close_settings_page_for(Some(cx.entity_id()), window, cx);
+                }
+            }))
+            .size_full()
+            .relative()
+            .overflow_y_scroll()
+            .bg(p.background)
+            .text_color(p.foreground)
+            .font_family(crate::ui::FONT_UI)
+            .text_size(crate::ui::TEXT_MD)
+            .child(
+                div()
+                    .min_h_full()
+                    .p_8()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .justify_center()
+                    .gap_x(px(72.))
+                    .gap_y_8()
+                    .child(card)
+                    .child(phone),
+            )
+            .child(
+                div().absolute().top_3().right_3().child(
+                    Button::new("mobile-page-close")
+                        .icon(IconName::Close)
+                        .ghost()
+                        .small()
+                        .tooltip(text::PAGE_CLOSE.get())
+                        .debug_selector(|| "mobile-page-close".into())
+                        .on_click(cx.listener(|_, _, window, cx| {
+                            super::close_settings_page_for(Some(cx.entity_id()), window, cx);
+                        })),
+                ),
+            )
+    }
+}
+
 /// 기기 행 상태 줄. 오프라인 표기는 `OFFLINE`을 쓰고(`PAIRED` 중복 금지),
 /// 접속 기록이 없으면 `NEVER`, 경과는 분/시간/일 단위로 표기한다(OWE-880).
 fn device_line(device: &PairedMobileDevice, connected: bool, now: u64) -> String {

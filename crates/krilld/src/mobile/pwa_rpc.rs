@@ -55,6 +55,7 @@ pub(super) struct Backend {
     catalog_cache: Mutex<Option<CatalogSnapshot>>,
 }
 type FileStamp = Option<crate::agent::control::cache::Stamp>;
+type SnapshotDependencies = (Vec<PathBuf>, Vec<FileStamp>);
 
 struct DashboardSnapshot {
     revision: u64,
@@ -702,7 +703,8 @@ impl Backend {
         *cached = None;
         let base_paths = self.snapshot_paths(&Value::Null);
         let before = file_stamps(&base_paths);
-        let mut data = self.snapshot()?;
+        let mut catalog_used = None;
+        let mut data = self.snapshot(&mut catalog_used)?;
         let bytes = serde_json::to_vec(&data).map_err(io::Error::other)?;
         let etag: String = hex(ring::digest::digest(&ring::digest::SHA256, &bytes).as_ref())
             .chars()
@@ -711,13 +713,12 @@ impl Backend {
         if let Some(object) = data.as_object_mut() {
             object.insert("etag".into(), etag.clone().into());
         }
-        let mut paths = self.snapshot_paths(&data);
-        if let Some(catalog) = crate::session::lock(&self.catalog_cache).as_ref() {
-            paths.extend(catalog.paths.iter().cloned());
-        }
-        let stamps = file_stamps(&paths);
-        // Never stamp a body built across a terminal/status mutation with the newer revision.
-        if registry.dashboard_revision() == revision && before == file_stamps(&base_paths) {
+        // Validate the dependency identity actually used by this body. A newer
+        // catalog or a fresh post-build stamp cannot authenticate an older body.
+        if let Some((paths, stamps)) = self.snapshot_dependencies(&data, catalog_used.as_ref())
+            && registry.dashboard_revision() == revision
+            && before == file_stamps(&base_paths)
+        {
             *cached = Some(DashboardSnapshot {
                 revision,
                 paths,
@@ -734,6 +735,22 @@ impl Backend {
         }
     }
 
+    fn snapshot_dependencies(
+        &self,
+        data: &Value,
+        used: Option<&Arc<super::workspaces::Catalog>>,
+    ) -> Option<SnapshotDependencies> {
+        let used = used?;
+        let (catalog_paths, catalog_stamps) = crate::session::lock(&self.catalog_cache)
+            .as_ref()
+            .filter(|cached| Arc::ptr_eq(&cached.catalog, used))
+            .map(|cached| (cached.paths.clone(), cached.stamps.clone()))?;
+        let mut paths = self.snapshot_paths(data);
+        paths.extend(catalog_paths);
+        let stamps = file_stamps(&paths);
+        stamps.ends_with(&catalog_stamps).then_some((paths, stamps))
+    }
+
     fn snapshot_paths(&self, data: &Value) -> Vec<PathBuf> {
         let mut paths = Vec::new();
         if let Some(dir) = &self.dir {
@@ -744,8 +761,6 @@ impl Backend {
                 "session-titles.json",
                 "orchestration.json",
                 "agents.toml",
-                "agent-rules.pub",
-                "agent-rules.bin",
                 "agent-launches",
             ] {
                 paths.push(dir.join(name));
@@ -814,7 +829,10 @@ impl Backend {
         catalog
     }
 
-    fn snapshot(&self) -> io::Result<Value> {
+    fn snapshot(
+        &self,
+        catalog_used: &mut Option<Arc<super::workspaces::Catalog>>,
+    ) -> io::Result<Value> {
         // 세션마다 요청이 2~3개라 요청마다 스레드·소켓·Hello를 새로 만들면 세션 수의 몇 배가 된다. 한 연결로 묶는다.
         let mut wire = self.wire()?;
         let mut control = |request: &Request| ask(&mut wire, request);
@@ -833,6 +851,7 @@ impl Backend {
             },
         };
         let catalog = self.catalog(&sidebar.repositories);
+        *catalog_used = Some(Arc::clone(&catalog));
         let truncated = sessions.len() > 64;
         let rows: Vec<_> = sessions
             .into_iter()
@@ -1926,5 +1945,115 @@ mod tests {
         fn photo_decoder_never_panics(text in ".{0,2048}") {
             decode_base64(&text).ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+    #[test]
+    fn near_limit_workflow_snapshot_roundtrips_on_rpc_stack() {
+        let worker = std::thread::Builder::new().stack_size(super::super::gateway::RPC_STACK).spawn(|| {
+            let registry = Arc::new(Registry::new(None, None));
+            let backend = Backend::new(Arc::downgrade(&registry), None, ServerHello {
+                proto_min: 1, proto_max: 1, features: ipc::FEATURES, build: "stack-fixture".into(), instance_id: 1,
+            });
+            let sessions: Vec<_> = (1..=64).map(|id| json!({"id":id,"title":"fixture","state":"Working","lines":["one","two","three"]})).collect();
+            let data = json!({"sessions":sessions,"padding":"x".repeat(ipc::MAX_FRAME - 20_000),"etag":"stack"});
+            *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
+                revision: registry.dashboard_revision(), paths: Vec::new(), stamps: Vec::new(), at: Instant::now(), data, etag: "stack".into(),
+            });
+            let reply = backend.request("{\"action\":\"snapshot\"}");
+            assert!(reply.len() > ipc::MAX_FRAME - 20_000);
+            assert!(reply.len() < ipc::MAX_FRAME - 32);
+            let value: Value = serde_json::from_str(&reply).unwrap();
+            assert_eq!(value["ok"], true);
+            assert_eq!(value["data"]["sessions"].as_array().unwrap().len(), 64);
+            let encoded = krill_proto::mobile::MobileReply::Workflow(reply.clone()).encode().unwrap();
+            let (kind, body) = ipc::read_frame(&mut encoded.as_slice()).unwrap().unwrap();
+            assert_eq!(krill_proto::mobile::MobileReply::decode(kind, &body).unwrap(), krill_proto::mobile::MobileReply::Workflow(reply));
+            // A large request is rejected against this isolated empty registry;
+            // it never reaches a PTY or an external service.
+            let request = json!({"action":"prompt","session":1,"text":"x".repeat(749_000)}).to_string();
+            assert!(request.len() < 750_000);
+            let failure: Value = serde_json::from_str(&backend.request(&request)).unwrap();
+            assert_eq!(failure["ok"], false);
+        }).unwrap();
+        worker.join().unwrap();
+    }
+    #[test]
+    fn unchanged_snapshot_returns_before_opening_any_control_socket() {
+        let registry = Arc::new(Registry::new(None, None));
+        let backend = Backend::new(
+            Arc::downgrade(&registry),
+            None,
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        *crate::session::lock(&backend.snapshot_cache) = Some(DashboardSnapshot {
+            revision: registry.dashboard_revision(),
+            paths: Vec::new(),
+            stamps: Vec::new(),
+            at: Instant::now(),
+            data: json!({"sessions":[],"etag":"same"}),
+            etag: "same".into(),
+        });
+        assert_eq!(
+            backend.snapshot_since(Some("same")).unwrap(),
+            json!({"unchanged":true,"etag":"same"})
+        );
+    }
+
+    #[test]
+    fn catalog_stamp_reuses_unchanged_source_and_observes_atomic_preferences_edit() {
+        let dir = std::env::temp_dir().join(format!("catalog-stamp-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("projects.toml"), "").unwrap();
+        let backend = Backend::new(
+            Weak::new(),
+            Some(&dir),
+            ServerHello {
+                proto_min: 1,
+                proto_max: 1,
+                features: ipc::FEATURES,
+                build: "test".into(),
+                instance_id: 1,
+            },
+        );
+        let first = backend.catalog(&[]);
+        let same = backend.catalog(&[]);
+        assert!(Arc::ptr_eq(&first, &same));
+        assert!(
+            backend
+                .snapshot_dependencies(&Value::Null, Some(&first))
+                .is_some()
+        );
+        let replacement = dir.join("projects.new");
+        fs::write(&replacement, "\n").unwrap();
+        fs::rename(replacement, dir.join("projects.toml")).unwrap();
+        // A body built with the old catalog must not adopt the new file stamps.
+        assert!(
+            backend
+                .snapshot_dependencies(&Value::Null, Some(&first))
+                .is_none()
+        );
+        assert!(!Arc::ptr_eq(&first, &backend.catalog(&[])));
+        assert!(
+            backend
+                .snapshot_dependencies(&Value::Null, Some(&first))
+                .is_none()
+        );
+        *crate::session::lock(&backend.catalog_cache) = None;
+        assert!(
+            backend
+                .snapshot_dependencies(&Value::Null, Some(&same))
+                .is_none()
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 }
