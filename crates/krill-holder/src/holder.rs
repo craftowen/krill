@@ -131,6 +131,14 @@ impl Holder {
             return Ok(()); // 중복 기동: 건강한 데몬이 있어 끝낸다
         }
         loop {
+            // 종료 신호(기동 직후·대기 중 모두 루프 맨 앞에서 본다): 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
+            let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
+            if stop != 0 {
+                let (signal, from, sessions) =
+                    (stop >> 32, stop & 0xffff_ffff, self.sessions.len());
+                tracing::warn!(signal, from, sessions, "holder stopping");
+                return Ok(());
+            }
             if self.restart_at.is_some_and(|at| at <= Instant::now()) {
                 self.restart_at = None;
                 self.spawn_krilld();
@@ -158,14 +166,6 @@ impl Holder {
                 .map(|at| at.saturating_duration_since(Instant::now()));
             sys::wait(self.kq.as_fd(), &changes, &mut events, timeout)?;
             changes.clear();
-            // 종료 신호: 사유를 남기고 끝낸다. 세션은 master fd를 쥔 krilld가 고아로 이어 받는다(rejoin). SIGKILL은 못 남긴다.
-            let stop = sys::STOPPED.load(std::sync::atomic::Ordering::Relaxed);
-            if stop != 0 {
-                let (signal, from, sessions) =
-                    (stop >> 32, stop & 0xffff_ffff, self.sessions.len());
-                tracing::warn!(signal, from, sessions, "holder stopping");
-                return Ok(());
-            }
             // 읽기를 먼저 처리한다. 이 묶음 안에서 링크는 닫힐 수만 있고 새로 생기지 않는다.
             if events
                 .iter()
