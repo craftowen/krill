@@ -73,7 +73,21 @@ fn main() -> std::process::ExitCode {
         let startup = cx.background_spawn(async {
             krill_log::init(krill_log::Component::App).ok();
             krill_log::forward_log_warnings();
-            tracing::info!("app starting");
+            // Which build is this (installed app vs. a test/nightly binary) and which state it shares.
+            let redacted = |path: Option<PathBuf>| {
+                path.map(|p| krill_proto::diag::redact(&p.to_string_lossy()))
+            };
+            let executable = std::env::current_exe().ok();
+            let bundle = executable
+                .as_deref()
+                .and_then(|exe| krill_app::updater::current_app_bundle_in(None, exe));
+            tracing::info!(
+                version = krill_app::updater::effective_version(bundle.as_deref()),
+                executable = redacted(executable),
+                state_dir = redacted(krill_proto::daemon::state_dir()),
+                state_override = krill_proto::daemon::state_dir_override().is_some(),
+                "app starting"
+            );
             let bounds = krill_app::layout::default_path()
                 .as_deref()
                 .and_then(krill_app::layout::Layout::peek_window_bounds);
