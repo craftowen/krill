@@ -313,7 +313,7 @@ impl Paths {
 /// launchers and shell integrations, without a lossy Unicode round trip. Other
 /// device namespaces stay verbatim (stripping them would change their meaning).
 #[cfg(windows)]
-fn executable_path(path: &Path) -> PathBuf {
+pub(crate) fn executable_path(path: &Path) -> PathBuf {
     use std::path::{Component, Prefix};
     let mut components = path.components();
     let base = match components.next() {

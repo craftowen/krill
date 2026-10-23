@@ -670,6 +670,18 @@ fn read_cli_states_with(cli_bin: &Path) -> BTreeMap<PathBuf, super::external::Ex
     states_from_json(text)
 }
 
+/// 예전 Windows 데몬은 `canonicalize`한 워크트리를 `\\?\C:\x`로 보냈다. 셸 cwd(`C:\x`)와 맞추고 이름도
+/// 읽히게 접두사를 뗀다. 다른 장치 이름공간(`\\?\Volume{..}`)은 뜻이 바뀌므로 그대로 둔다.
+fn strip_verbatim(bytes: Vec<u8>) -> Vec<u8> {
+    if let Some(share) = bytes.strip_prefix(b"\\\\?\\UNC\\") {
+        return [b"\\\\", share].concat();
+    }
+    match bytes.strip_prefix(b"\\\\?\\") {
+        Some(rest @ [drive, b':', ..]) if drive.is_ascii_alphabetic() => rest.to_vec(),
+        _ => bytes,
+    }
+}
+
 fn fetch_from(
     stream: &mut UnixStream,
     external: &BTreeMap<PathBuf, super::external::ExternalHit>,
@@ -696,7 +708,7 @@ fn fetch_from(
         Ok(Reply::SessionAccounts(list)) => list.into_iter().map(|a| (a.session, a)).collect(),
         Ok(_) | Err(_) => BTreeMap::new(),
     };
-    let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(bytes));
+    let path = |bytes: Vec<u8>| PathBuf::from(std::ffi::OsString::from_vec(strip_verbatim(bytes)));
     let mut trees: BTreeMap<_, _> = data
         .repositories
         .into_iter()
@@ -750,8 +762,9 @@ fn fetch_from(
                 trees
                     .values()
                     .flatten()
-                    .filter(|p| cwd.starts_with(p))
-                    .max_by_key(|p| p.components().count())
+                    .filter(|p| super::path_within(cwd, p))
+                    // Windows 호스트 경로는 이 OS에서 한 덩어리라 구성 요소 수 대신 길이로 가장 깊은 것을 고른다.
+                    .max_by_key(|p| p.as_os_str().len())
                     .cloned()
             });
             Session {
@@ -784,6 +797,20 @@ mod tests {
         {"kind":"interactive","id":"f6","sessionId":"s-f6","name":"fg","cwd":"/repo/f","pid":16,"startedAt":1005,"state":"working","status":"busy","waitingFor":""},
         {"kind":"background","name":"noid","cwd":"/repo/g","state":"working","status":"busy"}
     ]"#;
+
+    #[test]
+    fn windows_verbatim_prefix_is_dropped_only_for_drives_and_shares() {
+        assert_eq!(strip_verbatim(br"\\?\C:\Users\x".to_vec()), br"C:\Users\x");
+        assert_eq!(
+            strip_verbatim(br"\\?\UNC\srv\share\x".to_vec()),
+            br"\\srv\share\x"
+        );
+        assert_eq!(
+            strip_verbatim(br"\\?\Volume{1}\x".to_vec()),
+            br"\\?\Volume{1}\x"
+        );
+        assert_eq!(strip_verbatim(b"/repo".to_vec()), b"/repo");
+    }
 
     #[test]
     fn states_from_json_maps_cli_stdout_and_skips_unusable_rows() {
