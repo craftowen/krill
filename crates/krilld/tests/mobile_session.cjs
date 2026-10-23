@@ -17,13 +17,13 @@ class Element extends EventTarget {
 const longPressCode=fs.readFileSync(path.join(__dirname,'../src/mobile/assets/app.js'),'utf8').split('\n').find(l=>l.includes('function longPress('));
 function fixture(sessions=[{id:7,state:'Working',branch:null}],snapshot,tablet=false){
  const timers=new Map(),mounts=[],buttons=[],sheets=[],calls=[],routes=[],remembered=[],abort=new AbortController(),wide=new EventTarget();wide.matches=tablet;let clock=0,id=0;
- const sandbox={AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;},focus(){h.focused++;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
+ let resize;const sandbox={ResizeObserver:class{constructor(fn){resize=fn;}observe(){}disconnect(){}},AbortController,abort,matchMedia:()=>wide,document:{createElementNS:(_,tag)=>new Element(tag)},setTimeout:(fn,ms)=>{timers.set(++id,{fn,at:clock+ms});return id;},clearTimeout:id=>timers.delete(id),KrillMobile:{terminal:{mount(root,options){const h={options,focused:0,unmounted:false,fitToPhone:()=>Promise.resolve(),setInputActive(active){h.inputActive=active;},focus(){h.focused++;},unmount(){h.unmounted=true;options.onStatus({phase:'disconnected',message:'Disconnected'});}};mounts.push(h);options.onStatus({phase:'connecting'});return h;}}}};
  vm.createContext(sandbox);vm.runInContext(longPressCode,sandbox);vm.runInContext(fs.readFileSync(path.join(__dirname,'../src/mobile/assets/screens/session.js'),'utf8'),sandbox);
  const group={key:'g',label:'Workspace',sessions},state={groups:new Map([['g',group]]),sessions:new Map(sessions.map(s=>[s.id,s])),connection:{phase:'ready'},preferences:{},drafts:new Map(),snapshot};
  const el=(...args)=>new Element(...args),ctx={el,state,route:{groupKey:'g',sessionId:7},signal:abort.signal,button(label,action,cls){const b=el('button',label,cls);b.action=action;buttons.push(b);return b;},header(){const h=el('header'),copy=el('div');copy.append(el('h1'));h.append(copy);return h;},icon:()=>el('svg'),dot:status=>el('span',undefined,`status-dot ${String(status).toLowerCase()}`),longPress:sandbox.longPress,groupRoute:()=>'',go(r){routes.push(r);},rerender(){},savePreferences(p){Object.assign(state.preferences,p);},rememberSession:(s,g)=>remembered.push([s.id,g.key]),error(){},photo(){},transport:{},sheet:(title,entries,_,render)=>{entries.title=title;entries.render=render;sheets.push(entries);},closeSheet(){},rpc:async request=>calls.push(request),refresh:async()=>{}};
  const root=el('main'),view=sandbox.KrillMobile.screens.session(root,ctx);
  function advance(ms){clock+=ms;for(const [key,t] of [...timers])if(t.at<=clock){timers.delete(key);t.fn();}}
- return {view,state,ctx,abort,wide,root,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered};
+ return {resize:width=>resize([{contentRect:{width}}]),view,state,ctx,abort,wide,root,sandbox,longPress:sandbox.longPress,mounts,timers,advance,buttons,sheets,calls,routes,remembered};
 }
 async function main(){
  {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true),M=f.sandbox.KrillMobile;
@@ -41,6 +41,16 @@ async function main(){
   f.buttons.find(b=>b.textContent==='Close pane').action();assert(f.mounts.at(-1).unmounted);assert(!restored.unmounted);assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);f.view.cleanup();
   assert(f.mounts.every(h=>h.unmounted));assert.equal(f.timers.size,0);
  }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const panels=f.root.descendants().find(n=>n.className==='session-panels'),control=f.buttons.find(b=>b.className==='ghost split-direction');
+  const select=value=>{control.action();const body=new Element('div');f.sheets.at(-1).render(body);const choices=body.descendants().filter(n=>n.dataset.direction);assert.equal(choices.filter(n=>n.attrs['aria-pressed']==='true').length,1);choices.find(n=>n.dataset.direction===value).action();};
+  f.resize(799);assert.equal(panels.dataset.layout,'rows');f.resize(800);assert.equal(panels.dataset.layout,'columns');
+  select('rows');f.resize(1200);assert.equal(panels.dataset.layout,'rows');assert.equal(f.state.preferences.tabletSplits.tabletSplit.direction,'rows');
+  select('columns');f.resize(720);assert.equal(panels.dataset.layout,'rows');assert.equal(control.dataset.fallback,'true');f.resize(721);assert.equal(panels.dataset.layout,'columns');assert.equal(control.dataset.fallback,'false');
+  select('auto');assert.equal(panels.dataset.layout,'rows');f.view.cleanup();
+ }
+ console.log('PASS split direction selection, current choice, persisted state, automatic threshold and minimum pane width');
  console.log('PASS tablet split excludes duplicate PTY, preserves active pane on folding, reconnects after main transport and closes only the view');
  let f=fixture();assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onStatus({phase:'disconnected'});for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);
  f=fixture();f.mounts[0].options.onStatus({phase:'disconnected'});f.state.connection.phase='disconnected';f.view.update();f.advance(60000);assert.equal(f.mounts.length,1);f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,2);f.view.cleanup();

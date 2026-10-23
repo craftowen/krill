@@ -311,3 +311,12 @@ button.account-row:disabled{opacity:1}
 
 .tablet-body h1:focus{outline:none}
 .is-split>.terminal-pane[data-active=true]::after{content:"";position:absolute;inset:0;border:2px solid var(--accent);pointer-events:none;z-index:1}
+
+/* Split choices share the existing modal surface and touch target. */
+.split-controls{display:flex;flex:none;min-width:0;border-bottom:1px solid var(--border);background:var(--surface-panel)}
+.split-direction{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);min-width:0;text-align:left;font-size:var(--font-meta)}
+.split-direction svg,.split-direction-choice svg{flex:none;width:18px;height:18px}
+.split-direction-choices{display:flex;flex-direction:column;gap:var(--space-xs)}
+.split-direction-choice{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);text-align:left}
+.split-direction-choice[aria-pressed=true]{color:var(--accent);background:var(--surface-raised);box-shadow:inset 2px 0 var(--accent)}
+@media(max-width:999px){.split-controls{display:none}}

@@ -2,6 +2,11 @@
 (()=>{
  const M=globalThis.KrillMobile||={};let language='en';
  const ko={
+ "Split direction": "분할 방향",
+ "Automatic": "자동",
+ "Side by side": "좌우",
+ "Stacked": "위아래",
+ "Stacked: panes would be too narrow": "위아래로 표시: 칸 너비 부족",
  "Split terminal": "분할",
  "Open beside this terminal": "옆 칸에 열기",
  "Close pane": "칸 닫기",

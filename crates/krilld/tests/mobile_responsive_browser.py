@@ -311,6 +311,15 @@ def main():
                     wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===2')
                     wait('[...document.querySelectorAll(".terminal-mount .terminal-scroll")].every(p=>Math.round(parseFloat(p.querySelector(".terminal-grid").style.width)/8)===Math.floor((p.clientWidth-2)/8))')
 
+                def direction(value):
+                    click('.split-direction')
+                    assert evaluate(f'document.querySelector(".split-direction-choice[data-direction={value}]").getAttribute("aria-pressed")') in ('true', 'false')
+                    click(f'.split-direction-choice[data-direction={value}]')
+                    pane_ready()
+
+                def pane_sizes():
+                    return evaluate('[...document.querySelectorAll(".terminal-pane")].map(n=>{const p=n.querySelector(".terminal-scroll"),g=p.querySelector(".terminal-grid");return {width:n.clientWidth,portWidth:p.clientWidth,portHeight:p.clientHeight,cols:Math.round(parseFloat(g.style.width)/8),rows:Math.round(parseFloat(g.style.height)/18)};})')
+
                 other = cfg['extraSessions'][0]
                 if args.phase == 'after':
                     # Readability and wrapping also survive localized large text.
@@ -387,6 +396,38 @@ def main():
                 assert evaluate('!document.querySelector(".primary-pane .command-dock").getClientRects().length && !!document.querySelector(".secondary-pane .command-dock").getClientRects().length')
                 capture('tablet-split-columns-active-second', 1180, 820)
                 assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'row'
+                layouts = []
+                for width, height in [(1032, 1376), (1080, 790), (1180, 820), (1376, 1032), (1040, 820), (1042, 820)]:
+                    browser('set', 'viewport', str(width), str(height))
+                    for value in ['auto', 'columns', 'rows']:
+                        direction(value)
+                        expected = 'columns' if (value == 'auto' and width - 320 >= 800) or (value == 'columns' and width - 320 >= 721) else 'rows'
+                        assert evaluate('document.querySelector(".session-panels").dataset.layout') == expected
+                        assert evaluate('document.querySelector(".split-direction").dataset.fallback') == str(value == 'columns' and expected == 'rows').lower()
+                        sizes = pane_sizes()
+                        for size in sizes:
+                            assert size['cols'] == (size['portWidth'] - 2) // 8, size
+                            assert size['rows'] == max(10, min(200, size['portHeight'] // 18)), size
+                        layouts.append({'viewport': [width, height], 'direction': value, 'actual': expected, 'panes': sizes})
+                        capture('tablet-direction-' + value, width, height)
+                    direction('columns')
+                    named('Hide session list')
+                    pane_ready()
+                    assert evaluate('document.querySelector(".session-panels").dataset.layout') == 'columns'
+                    for size in pane_sizes():
+                        assert size['cols'] == (size['portWidth'] - 2) // 8
+                        assert size['rows'] == max(10, min(200, size['portHeight'] // 18))
+                    named('Show session list')
+                    pane_ready()
+                (shots / 'directions.json').write_text(json.dumps(layouts, indent=2))
+                direction('rows')
+                browser('reload')
+                pane_ready()
+                assert evaluate('document.querySelector(".split-direction").dataset.direction') == 'rows'
+                assert evaluate('document.querySelector(".session-panels").dataset.layout') == 'rows'
+                direction('auto')
+                browser('set', 'viewport', '1180', '820')
+                pane_ready()
                 second_handle = 'globalThis.secondHandle=KrillMobile.activeTerminal;true'
                 evaluate(second_handle)
                 evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
