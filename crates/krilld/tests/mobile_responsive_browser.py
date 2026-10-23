@@ -335,13 +335,15 @@ def main():
                             navigate(path)
                             if name == 'accounts':
                                 wait('!!document.querySelector(".account-row")')
+                            if name == 'session':
+                                evaluate('document.querySelectorAll(".terminal-scroll").forEach(n=>n.scrollTop=0);true')
                             capture(name + '-ko-large-light', width, height)
                             if name == 'session' and width >= 1000:
                                 named('분할')
                                 evaluate(f'[...document.querySelectorAll(".sheet-action")].find(n=>n.textContent.endsWith("#{other}")).click();true')
                                 pane_ready()
                                 capture('tablet-split-ko-large-light', width, height)
-                                named('칸 닫기')
+                                click('.secondary-pane .pane-close')
                         click('.session .mode-toggle')
                         capture('chat-ko-large-light', width, height)
                         click('.session .page-header .icon-button:last-child')
@@ -396,6 +398,41 @@ def main():
                 assert evaluate('!document.querySelector(".primary-pane .command-dock").getClientRects().length && !!document.querySelector(".secondary-pane .command-dock").getClientRects().length')
                 capture('tablet-split-columns-active-second', 1180, 820)
                 assert evaluate('getComputedStyle(document.querySelector(".session-panels")).flexDirection') == 'row'
+                assert evaluate('document.querySelectorAll(".is-split > .terminal-pane > .pane-header").length') == 2
+                assert evaluate('[...document.querySelectorAll(".pane-title")].every(n=>n.querySelector(".status-dot")&&n.querySelector(".pane-label").textContent.includes(" · ")&&n.querySelector(".pane-active"))')
+                assert evaluate('document.querySelector(".secondary-pane .pane-title").getAttribute("aria-pressed")') == 'true'
+                assert evaluate('getComputedStyle(document.querySelector(".secondary-pane .pane-active")).visibility') == 'visible'
+                assert evaluate(f'document.querySelector(`.session-tab[data-session="{sid}"]`).disabled')
+                # A third PTY in the same workspace lets the tab strip replace either active pane.
+                third = int(cli('new', '--cwd', cfg['repo'], '--', '/bin/sh', '-c', "printf 'TAB READY\\n'; exec /bin/cat"))
+                wait(f'KrillMobile.store.sessions.has({third})')
+                click(f'.session-tab[data-session="{third}"]')
+                pane_ready()
+                assert evaluate(f'document.querySelector(".secondary-pane").dataset.session==="{third}"')
+                assert evaluate(f'document.querySelector(".primary-pane").dataset.session==="{sid}"')
+                evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
+                browser('fill', '.secondary-pane .command-input', 'active-secondary-tab-only')
+                evaluate('document.querySelector(".secondary-pane .buffered-command").requestSubmit();true')
+                until(lambda: 'active-secondary-tab-only' in cli('read', str(third)))
+                assert 'active-secondary-tab-only' not in cli('read', str(sid))
+                assert 'active-secondary-tab-only' not in cli('read', str(other))
+                click(f'.session-tab[data-session="{other}"]')
+                pane_ready()
+                click('.primary-pane .pane-title')
+                assert evaluate('document.querySelector(".primary-pane .pane-title").getAttribute("aria-pressed")') == 'true'
+                assert evaluate(f'document.querySelector(`.session-tab[data-session="{other}"]`).disabled')
+                click(f'.session-tab[data-session="{third}"]')
+                pane_ready()
+                assert evaluate(f'document.querySelector(".primary-pane").dataset.session==="{third}"')
+                assert evaluate(f'document.querySelector(".secondary-pane").dataset.session==="{other}"')
+                evaluate('KrillMobile.activeTerminal.setInputMode("buffered");true')
+                browser('fill', '.primary-pane .command-input', 'active-primary-tab-only')
+                evaluate('document.querySelector(".primary-pane .buffered-command").requestSubmit();true')
+                until(lambda: 'active-primary-tab-only' in cli('read', str(third)))
+                assert 'active-primary-tab-only' not in cli('read', str(other))
+                click(f'.session-tab[data-session="{sid}"]')
+                pane_ready()
+                click('.secondary-pane .pane-title')
                 layouts = []
                 for width, height in [(1032, 1376), (1080, 790), (1180, 820), (1376, 1032), (1040, 820), (1042, 820)]:
                     browser('set', 'viewport', str(width), str(height))
@@ -470,13 +507,23 @@ def main():
                 pane_ready()
                 assert evaluate(f'document.querySelector(".secondary-pane").dataset.session==="{other}"')
                 capture('tablet-split-restored', 1032, 1376)
-                named('Close pane')
+                count_before_close = len(cli('ls').splitlines())
+                click('.secondary-pane .pane-close')
                 wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
                 assert evaluate('!document.querySelector(".secondary-pane")')
+                assert len(cli('ls').splitlines()) == count_before_close
                 assert str(other) in [line.split('\t')[0] for line in cli('ls').splitlines()]
                 assert 'tablet-second-only' in cli('read', str(other))
+                named('Split terminal')
+                evaluate(f'[...document.querySelectorAll(".sheet-action")].find(n=>n.textContent.endsWith("#{other}")).click();true')
+                pane_ready()
+                click('.primary-pane .pane-close')
+                wait('document.querySelectorAll(".terminal-mount[data-phase=ready]").length===1')
+                assert evaluate(f'location.hash.endsWith("/s/{other}")')
+                assert len(cli('ls').splitlines()) == count_before_close
+                assert 'tablet-first-only' in cli('read', str(sid))
                 (shots / 'tablet.json').write_text(json.dumps({'sidebar': tablet, 'inputIsolated': True,
-                    'paneCloseKeepsPty': True, 'narrowKeepsActiveHandle': True, 'splitRestored': True}, indent=2))
+                    'paneCloseKeepsPty': True, 'narrowKeepsActiveHandle': True, 'splitRestored': True, 'activePaneTabs': True, 'symmetricHeaders': True, 'bothPaneCloseKeepCount': count_before_close}, indent=2))
                 print('PASS tablet sidebar, split geometry, isolated input, PTY survival, folding drafts and reload', flush=True)
                 assert not browser('errors').strip(), browser('errors')
             finally:

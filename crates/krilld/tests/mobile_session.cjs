@@ -38,7 +38,7 @@ async function main(){
   width(true);const next=f.mounts.at(-1);next.options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,1);
   f.state.connection.phase='disconnected';f.view.update();f.advance(1000);const count=f.mounts.length;assert(next.unmounted);assert.equal(f.timers.size,0);
   f.state.connection.phase='ready';f.view.update();assert.equal(f.mounts.length,count+1);assert.equal(f.mounts.at(-1).options.sessionId,8);
-  f.buttons.find(b=>b.textContent==='Close pane').action();assert(f.mounts.at(-1).unmounted);assert(!restored.unmounted);assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);f.view.cleanup();
+  f.root.descendants().find(n=>n.className==='terminal-pane secondary-pane').descendants().find(n=>n.textContent==='Close pane').action();assert(f.mounts.at(-1).unmounted);assert(!restored.unmounted);assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);f.view.cleanup();
   assert(f.mounts.every(h=>h.unmounted));assert.equal(f.timers.size,0);
  }
  {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);
@@ -50,6 +50,22 @@ async function main(){
   select('columns');f.resize(720);assert.equal(panels.dataset.layout,'rows');assert.equal(control.dataset.fallback,'true');f.resize(721);assert.equal(panels.dataset.layout,'columns');assert.equal(control.dataset.fallback,'false');
   select('auto');assert.equal(panels.dataset.layout,'rows');f.view.cleanup();
  }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Waiting'},{id:9,state:'Done'}],undefined,true);
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();
+  const pane=cls=>f.root.descendants().find(n=>n.className==='terminal-pane '+cls),tabs=()=>f.root.descendants().filter(n=>n.className==='session-tab');
+  assert.equal(pane('primary-pane').descendants().filter(n=>n.className==='pane-header').length,1);assert.equal(pane('secondary-pane').descendants().filter(n=>n.className==='pane-header').length,1);
+  assert.equal(pane('secondary-pane').descendants().find(n=>n.className==='ghost pane-title').attrs['aria-pressed'],'true');
+  assert.equal(tabs().find(n=>n.dataset.session===7).disabled,true);tabs().find(n=>n.dataset.session===9).action();
+  assert.equal(f.mounts.at(-1).options.sessionId,9);assert.equal(pane('secondary-pane').dataset.session,9);assert.equal(f.routes.length,0);
+  pane('primary-pane').descendants().find(n=>n.className==='ghost pane-title').action();assert.equal(f.sandbox.KrillMobile.activeTerminal.options.sessionId,7);
+  assert.equal(tabs().find(n=>n.dataset.session===9).disabled,true);tabs().find(n=>n.dataset.session===8).action();assert.equal(f.routes.length,1);
+  pane('primary-pane').descendants().find(n=>n.textContent==='Close pane').action();assert.equal(f.calls.length,0);assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,2);f.view.cleanup();
+ }
+ {const f=fixture([{id:7,state:'Working'},{id:8,state:'Working'}],undefined,true);f.sandbox.KrillMobile.chat={mount(){return {};}};
+  f.buttons.find(b=>b.textContent==='Split terminal').action();f.sheets.at(-1)[0].action();f.buttons.find(b=>b.className==='ghost small mode-toggle').action();
+  assert.equal(f.state.preferences.sessionViewModes[8],'chat');assert.equal(f.state.preferences.tabletSplits.tabletSplit,null);assert.equal(f.routes.length,1);assert.equal(f.calls.length,0);f.view.cleanup();
+ }
+ console.log('PASS symmetric pane headers, active labels and tab replacement, duplicate PTY disabled and primary close preserves PTY');
  console.log('PASS split direction selection, current choice, persisted state, automatic threshold and minimum pane width');
  console.log('PASS tablet split excludes duplicate PTY, preserves active pane on folding, reconnects after main transport and closes only the view');
  let f=fixture();assert.deepEqual(f.remembered.at(-1),[7,'g']);assert.equal(f.mounts.length,1);f.mounts[0].options.onStatus({phase:'ready'});f.mounts[0].options.onStatus({phase:'disconnected'});for(let n=0;n<10;n++)f.view.update();assert.equal(f.timers.size,1);f.advance(999);assert.equal(f.mounts.length,1);f.advance(1);assert.equal(f.mounts.length,2);f.mounts[1].options.onStatus({phase:'disconnected'});f.advance(1999);assert.equal(f.mounts.length,2);f.advance(1);assert.equal(f.mounts.length,3);f.mounts[2].options.onStatus({phase:'disconnected'});f.view.cleanup();f.advance(60000);assert.equal(f.mounts.length,3);f.mounts[0].options.onStatus({phase:'disconnected'});assert.equal(f.timers.size,0);

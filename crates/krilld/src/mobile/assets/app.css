@@ -320,3 +320,11 @@ button.account-row:disabled{opacity:1}
 .split-direction-choice{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target);text-align:left}
 .split-direction-choice[aria-pressed=true]{color:var(--accent);background:var(--surface-raised);box-shadow:inset 2px 0 var(--accent)}
 @media(max-width:999px){.split-controls{display:none}}
+
+/* Matching pane headers make the active tab strip's target explicit. */
+.pane-title{display:flex;align-items:center;gap:var(--space-sm);min-height:var(--touch-target)}
+.pane-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0;flex:1}
+.pane-active{font-size:var(--font-meta);color:var(--accent);flex:none;visibility:hidden}
+.pane-title[aria-pressed=true] .pane-active{visibility:visible}
+.is-split>.terminal-pane[data-active=true]>.pane-header{background:var(--surface-raised);box-shadow:inset 0 -2px var(--accent)}
+.session-tabs[data-active-pane]::before{content:attr(aria-label);display:flex;align-items:center;flex:none;padding-inline:var(--space-sm);font-size:var(--font-meta);color:var(--accent);max-width:35%;white-space:normal}
