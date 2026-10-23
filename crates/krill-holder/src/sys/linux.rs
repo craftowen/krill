@@ -290,3 +290,6 @@ mod tests {
         assert!(children(parent).contains(&me));
     }
 }
+
+/// Linux는 종료 신호 처리기를 걸지 않는다(기본 동작으로 끝나고 보낸 pid는 0).
+pub fn catch_stop_signals() {}

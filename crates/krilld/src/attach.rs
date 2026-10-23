@@ -107,7 +107,7 @@ pub fn serve(
 ) -> io::Result<()> {
     let (_, negotiated) = crate::ipc::handshake(&mut stream, hello)?;
     if negotiated.features & FEAT_SCREEN == 0 {
-        return watch(stream);
+        return watch(stream, None);
     }
     stream.set_read_timeout(Some(ATTACH_TIMEOUT))?;
     let (role, first) = roles::first(&mut stream, negotiated.features)?;
@@ -127,16 +127,38 @@ pub fn serve(
     )
 }
 
+/// 앱 감시 연결의 ping이 [`krill_proto::daemon::INTERVAL`]보다 이만큼 이상 늦으면 앱 프로세스 전체 정지를 의심해
+/// 기록한다(앱 안 감시 스레드도 같이 멈추면 앱 로그에는 남지 않는다).
+const APP_PING_LATE: Duration = Duration::from_secs(2);
+
+/// 직전 ping(`prev`)에서 `now`까지가 예상 간격보다 [`APP_PING_LATE`] 이상 늦었으면 늦은 만큼.
+/// `Instant`는 깨어 있는 시계라 시스템 잠자기는 늦음으로 세지 않는다. krilld 자신이 멈춰도 늦음으로 보인다.
+fn ping_late(prev: Option<Instant>, now: Instant) -> Option<Duration> {
+    let gap = now.duration_since(prev?);
+    let late = gap.checked_sub(krill_proto::daemon::INTERVAL)?;
+    (late >= APP_PING_LATE).then_some(late)
+}
+
 /// 감시 연결(MK-026, OWE-586): 클라이언트가 닫을 때까지 열어 두고, 오는 프레임에는 [`Refused::BadRequest`]로
 /// 답한다. [`krill_proto::daemon::PING`]에는 nonce를 되돌린 [`krill_proto::daemon::PONG`]으로 답해 EOF 없이 멈춘
-/// 데몬 감시(앱 감시 연결 하트비트)에 응한다.
+/// 데몬 감시(앱 감시 연결 하트비트)에 응한다. `app`은 앱(App 역할) 연결의 피어 pid다 — ping이 크게 늦으면 기록한다.
 /// krilld가 죽으면 커널이 닫아 클라이언트가 바로 안다.
-pub fn watch(mut stream: UnixStream) -> io::Result<()> {
+pub fn watch(mut stream: UnixStream, app: Option<u32>) -> io::Result<()> {
     stream.set_read_timeout(None)?;
+    let mut last_ping = None;
     while let Some((kind, body)) = ipc::read_frame(&mut stream)? {
         if kind == krill_proto::daemon::PING
             && let Ok(nonce) = krill_proto::daemon::ping_nonce(kind, &body)
         {
+            let now = Instant::now();
+            if let (Some(app_pid), Some(late)) = (app, ping_late(last_ping.replace(now), now)) {
+                let late_ms = u64::try_from(late.as_millis()).unwrap_or(u64::MAX);
+                tracing::warn!(
+                    app_pid,
+                    late_ms,
+                    "app heartbeat late; app process may have stalled"
+                );
+            }
             stream.write_all(&krill_proto::daemon::pong(nonce)?)?;
         } else {
             stream.write_all(&Refused::BadRequest.encode()?)?;
