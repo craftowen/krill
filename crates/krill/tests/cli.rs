@@ -59,7 +59,7 @@ impl Daemon {
             .arg(bin.join("krilld"))
             .arg(&socket)
             .env("KRILL_CLOUDFLARED_BIN", dir.join("cloudflared-test"))
-            // 가짜 터널의 폴백 계약은 공개 PWA 배포 여부·실제 릴레이에 의존하지 않는다.
+            // 외부 릴레이·공개 PWA 배포 상태에 의존하지 않는 격리된 모바일 게이트웨이.
             .env("KRILL_MOBILE_ORIGIN", "http://127.0.0.1:0")
             .env("KRILL_STATE_DIR", &dir)
             .envs(
@@ -1256,24 +1256,26 @@ fn mobile_cli_pair_list_revoke_and_tunnel_contract() {
     let script = d.dir.join("cloudflared-test");
     fs::write(
         &script,
-        "#!/bin/sh\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 120\n",
+        "#!/bin/sh\n: > \"${0%/*}/cloudflared-started\"\nprintf 'https://cli-mobile.trycloudflare.com\\n' >&2\nexec /bin/sleep 120\n",
     )
     .unwrap();
     fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
-    let offer: serde_json::Value =
-        serde_json::from_str(&d.ok(&["mobile", "pair", "--tunnel", "--json"])).unwrap();
-    let url = offer
-        .get("PairingOffer")
-        .unwrap()
-        .get("url")
-        .unwrap()
-        .as_str()
-        .unwrap();
-    // 가짜 터널은 HTTP 준비 확인을 통과하지 못하므로 MINT_WAIT(45초) 뒤 터널 출처 URL로 강등된다.
-    assert!(url.starts_with("https://cli-mobile.trycloudflare.com/#pair="));
-    assert!(url.contains("&key="));
-    let status = d.ok(&["mobile", "serve"]);
-    assert!(status.contains("cli-mobile.trycloudflare.com"));
+    // 릴레이가 없으면 오류를 반환하고, 설치된 퀵터널로 폴백하지 않는다.
+    let out = d.run(&["mobile", "pair", "--tunnel", "--json"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("모바일 릴레이에 연결하지 못했습니다"));
+    assert!(out.stdout.is_empty());
+    let status: krill_proto::mobile::MobileReply =
+        serde_json::from_str(&d.ok(&["mobile", "serve"])).unwrap();
+    assert!(matches!(
+        status,
+        krill_proto::mobile::MobileReply::GatewayStatus {
+            mode: krill_proto::mobile::ConnectMode::Tunnel,
+            tunnel_url: None,
+            ..
+        }
+    ));
+    assert!(!d.dir.join("cloudflared-started").exists());
     d.ok(&["mobile", "revoke", "--all"]);
 }
 

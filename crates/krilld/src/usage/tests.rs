@@ -540,7 +540,9 @@ fn unknown_usage_is_never_auto_switch_target() {
         &fresh.display().to_string(),
     )
     .unwrap();
-    assert!(fs::read_dir(&fresh).unwrap().next().is_none());
+    // 기본 프로비저닝은 공유 기록 링크를 만들지만, 계정별 사용량 근거는 만들지 않는다.
+    assert!(!fresh.join(CLAUDE_CACHE).exists());
+    assert!(!fresh.join("usage_cache.json").exists());
     let host = home.join(".claude");
     fs::create_dir_all(&host).unwrap();
     fs::write(
