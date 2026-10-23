@@ -49,6 +49,7 @@ fn profile(program: &Path) -> Profile {
         launch: vec![program.to_str().unwrap().into()],
         yolo_args: vec!["--dangerously-skip-permissions".into()],
         install: String::new(),
+        install_windows: String::new(),
         env: std::collections::BTreeMap::new(),
     }
 }

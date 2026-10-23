@@ -180,6 +180,10 @@ struct Live {
     /// 붙지 못한 이유(연결 전까지 칸에 보인다).
     error: Option<String>,
     launch: Option<AgentLaunch>,
+    /// 이 칸이 새로 만든 세션에 붙은 때. 붙어 있던 세션에 다시 붙으면 바뀌지 않는다.
+    started: Option<Instant>,
+    /// 에이전트 세션이 [`EARLY_EXIT`] 안에 끝났다. 종료 띠에 이유 안내를 보인다.
+    exited_early: bool,
     /// 마우스 선택(MK-033, 보이는 화면 좌표). 입력·스크롤하면 지운다.
     selection: Option<Selection>,
     /// 선택을 마쳤을 때 그 자리 글자(AS-17: 출력 스크롤·리사이즈·재접속으로 내용이
@@ -191,7 +195,17 @@ struct Live {
     selecting_kind: SelectKind,
     task: Task<()>,
     creation: Arc<std::sync::Mutex<close::Creation>>,
+    /// 만든 때. 붙기 전 [`CONNECTING_GRACE`] 동안은 문구 없이 빈 터미널로 보인다.
+    born: Instant,
 }
+
+/// 새 에이전트 세션이 이 시간 안에 끝나면 시작 실패로 보고 이유를 안내한다.
+// ponytail: 시간만 본다(종료 코드는 앱까지 오지 않는다). 미설치·로그인 실패를 구분하려면 Closed에 종료 코드를 싣는다.
+const EARLY_EXIT: Duration = Duration::from_secs(10);
+
+/// 새 칸이 세션에 붙기 전 "연결 중" 문구를 숨기는 시간. 즉시 반응 규칙(STYLEGUIDE): 보통의 붙기(수십 ms)는
+/// 빈 터미널이 곧바로 프롬프트로 바뀌는 것으로 보이고, 정말 늦을 때만 문구가 뜬다.
+const CONNECTING_GRACE: Duration = Duration::from_secs(1);
 
 impl Live {
     fn new(task: Task<()>) -> Self {
@@ -207,12 +221,15 @@ impl Live {
             scroll_rem: 0.,
             error: None,
             launch: None,
+            started: None,
+            exited_early: false,
             selection: None,
             selection_text: None,
             selecting: false,
             selecting_kind: SelectKind::Char,
             task,
             creation: Arc::default(),
+            born: Instant::now(),
         }
     }
 
@@ -2583,10 +2600,17 @@ impl Shell {
                 .spawn({
                     let paths = paths.clone();
                     async move {
+                        // 사용자가 누른 새로고침만 조회 주기를 무시한다. 구 데몬은 `ListAccounts`로.
                         krill_app::accounts::request_ipc(
                             &paths,
-                            &krill_proto::usage::UsageRequest::ListAccounts,
+                            &krill_proto::usage::UsageRequest::RefreshUsage,
                         )
+                        .or_else(|_| {
+                            krill_app::accounts::request_ipc(
+                                &paths,
+                                &krill_proto::usage::UsageRequest::ListAccounts,
+                            )
+                        })
                     }
                 })
                 .await;
@@ -3476,6 +3500,7 @@ impl Shell {
                     live.target = Some(target);
                     live.creation = Arc::clone(self.creations.entry(p).or_default());
                     entry.insert(live);
+                    Self::redraw_after_grace(cx);
                 }
                 Entry::Occupied(mut entry) => {
                     let live = entry.get_mut();
@@ -3499,6 +3524,15 @@ impl Shell {
             })
             .detach();
         }
+    }
+
+    /// [`CONNECTING_GRACE`]가 지나도 못 붙은 칸이 "연결 중" 문구를 그리도록 한 번 다시 그린다.
+    fn redraw_after_grace(cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(CONNECTING_GRACE).await;
+            this.update(cx, |_, cx| cx.notify()).ok();
+        })
+        .detach();
     }
 
     /// 칸 하나의 IO 태스크: 세션을 정해 붙고, 프레임을 읽어 UI에 넘기고, 끊기면 다시 붙는다. 칸이 안 보이게 되면
@@ -3667,7 +3701,8 @@ impl Shell {
             {
                 l.pane.show_cold(cold_session, cold).ok();
             }
-            if self.layout.session(pane) != Some(session) {
+            let fresh = self.layout.session(pane) != Some(session);
+            if fresh {
                 if self.layout.host(pane).is_local() {
                     self.layout.clear_session(pane);
                 }
@@ -3677,10 +3712,10 @@ impl Shell {
                 self.save();
                 self.refresh_detached(cx);
             }
-            linked.map(|l| (session, l))
+            linked.map(|l| (session, l, fresh))
         });
         match got {
-            Ok((session, linked)) => self.linked(pane, session, linked, cx),
+            Ok((session, linked, fresh)) => self.linked(pane, session, linked, fresh, cx),
             Err(e) => {
                 let permanent = is_permanent_error(&e);
                 let old = self.layout.session(pane);
@@ -3701,7 +3736,7 @@ impl Shell {
                                 )
                                 .ok();
                         }
-                        l.error = Some(e.to_string());
+                        l.error = Some(start_error_text(&e));
                         cx.notify();
                         if permanent { Next::Gone } else { Next::Retry }
                     }
@@ -3785,6 +3820,7 @@ impl Shell {
                 live.target = Some(target);
                 live.creation = Arc::clone(self.creations.entry(pane).or_default());
                 self.live.insert(pane, live);
+                Self::redraw_after_grace(cx);
             }
             cx.notify();
         } else {
@@ -3799,6 +3835,7 @@ impl Shell {
         pane: PaneId,
         session: krill_proto::SessionId,
         linked: pane::Linked,
+        fresh: bool,
         cx: &mut Context<Self>,
     ) -> Next {
         self.start_pane_liveness(cx);
@@ -3806,6 +3843,10 @@ impl Shell {
             return Next::Gone;
         };
         l.error = None;
+        if fresh {
+            l.started = Some(Instant::now());
+        }
+        l.exited_early = false;
         if let Some(launch) = &linked.launch {
             krill_app::onboarding::actions::note_agent_session(&launch.profile, cx);
         }
@@ -3852,6 +3893,8 @@ impl Shell {
             cx.notify();
         }
         if ev.closed {
+            l.exited_early =
+                l.launch.is_some() && l.started.is_some_and(|t| t.elapsed() < EARLY_EXIT);
             l.cut();
             l.error = None;
             l.ime = Ime::default();
@@ -5404,10 +5447,17 @@ impl Shell {
                                 .text_size(krill_app::ui::TEXT_XS)
                                 .flex_wrap()
                                 .debug_selector(|| "session-ended".into())
-                                .child(div().min_w_0().child(if l.pane.is_closed() {
-                                    text::ENDED.get()
+                                .child(div().min_w_0().child(if !l.pane.is_closed() {
+                                    text::COLD.get().to_owned()
+                                } else if let Some(launch) =
+                                    l.launch.as_ref().filter(|_| l.exited_early)
+                                {
+                                    let agent = self
+                                        .agent_profile_name(&launch.profile)
+                                        .unwrap_or(&launch.profile);
+                                    text::AGENT_EXITED_EARLY.format(&[("agent", agent)])
                                 } else {
-                                    text::COLD.get()
+                                    text::ENDED.get().to_owned()
                                 }))
                                 .child(
                                     div()
@@ -5465,6 +5515,10 @@ impl Shell {
                 } else {
                     el.into_any_element()
                 }
+            }
+            // 붙기 직전의 새 칸은 빈 터미널로 곧바로 보인다(즉시 반응 규칙). 오류는 바로 알린다.
+            Some(l) if l.error.is_none() && l.born.elapsed() < CONNECTING_GRACE => {
+                div().into_any_element()
             }
             Some(l) => div()
                 .text_size(krill_app::ui::TEXT_XS)
@@ -6385,7 +6439,6 @@ impl Render for Shell {
                                 .flex()
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))
-                                .child(self.render_agents(cx))
                                 .child(
                                     div().flex_1().min_h_0().child(
                                         self.sidebar
@@ -6396,6 +6449,7 @@ impl Render for Shell {
                                 // 사이드바 스피너는 여기(셸)서 돌려 틱마다 사이드바를 다시 렌더하지 않는다.
                                 .child(self.sidebar.read(cx).spinner_overlay())
                                 .child(self.detached.clone())
+                                .child(self.render_agents(cx))
                                 .child(Self::render_sidebar_footer(cx)),
                         )
                         .child(divider(
@@ -6943,6 +6997,20 @@ fn is_permanent_error(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::InvalidData
             | std::io::ErrorKind::Unsupported
     )
+}
+
+/// 세션을 만들거나 붙지 못한 이유를 칸에 보일 문구로 바꾼다. 아는 krilld 거절은 다음 할 일을 담은 문구로,
+/// 나머지는 원문 그대로 둔다.
+fn start_error_text(err: &std::io::Error) -> String {
+    use krill_proto::control::Failure;
+    let raw = err.to_string();
+    if raw == Failure::NoHolder.to_string() {
+        text::START_NO_HOLDER.get().to_owned()
+    } else if raw == Failure::UnknownAgent.to_string() {
+        text::START_UNKNOWN_AGENT.get().to_owned()
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]

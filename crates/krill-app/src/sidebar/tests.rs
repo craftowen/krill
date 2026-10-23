@@ -44,7 +44,7 @@ fn iroh_group_renders_transport_status_and_revoked_guidance(cx: &mut TestAppCont
     view.update(vcx, |sidebar, cx| sidebar.sync_remote_hosts(&manager, cx));
     vcx.run_until_parked();
     vcx.update(|window, cx| window.draw(cx).clear(cx));
-    assert!(vcx.debug_bounds("host-header-local").is_some());
+    assert!(vcx.debug_bounds("host-header-local").is_none());
     assert!(vcx.debug_bounds("host-header-iroh:studio").is_some());
     assert!(vcx.debug_bounds("host-route-iroh:studio").is_some());
     manager.sync_external_hosts(vec![registration(true)]);
@@ -196,10 +196,24 @@ fn needs_you_precedes_pins_and_collapsed_worktrees() {
             name: "한글 이름 🦐".into(),
         },
     )]);
-    let rows = rows(
+    let collapsed = BTreeSet::from([PathBuf::from("/repo/a")]);
+    let options = WorkspaceOptions {
+        group_by: GroupBy::None,
+        ..Default::default()
+    };
+    let rows = options::rows_with_options(
         &snapshot,
         &prefs,
-        &BTreeSet::from([PathBuf::from("/repo/a")]),
+        &collapsed,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        &options,
+        &options::WorktreeContext::default(),
+    );
+    let project_rows = super::rows(&snapshot, &prefs, &collapsed);
+    assert!(
+        !project_rows.contains(&Row::NeedsYou),
+        "project mode keeps attention inside projects and the toolbar bell"
     );
     assert!(matches!(
         rows[0],
@@ -356,8 +370,6 @@ fn rows_expose_voiceover_names_roles_and_press(cx: &mut TestAppContext) {
     assert_eq!(
         labels,
         [
-            text::NEEDS_YOU.get(),
-            "claude · a, 입력 대기",
             "저장소 repo 1",
             "워크트리 a, 입력 대기",
             "세션",
@@ -1705,12 +1717,9 @@ fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppC
         })
     };
     // 세션이 남은 끊긴 호스트(kak)는 그대로 보이고, 세션 없는 끊긴 호스트 둘만 묶인다.
-    assert_eq!(headers(cx), ["local", "oci", "kak", "offline:2"]);
+    assert_eq!(headers(cx), ["oci", "kak", "offline:2"]);
     cx.update(|_, cx| view.update(cx, |s, cx| s.toggle_offline_hosts(None, cx)));
-    assert_eq!(
-        headers(cx),
-        ["local", "oci", "kak", "offline:2", "mbp", "seol"]
-    );
+    assert_eq!(headers(cx), ["oci", "kak", "offline:2", "mbp", "seol"]);
 
     assert_eq!(
         super::view::disconnect_reason("ssh: connect to host x port 22: Operation timed out"),
@@ -1730,244 +1739,156 @@ fn idle_remote_hosts_fold_into_one_row_with_disconnect_reasons(cx: &mut TestAppC
     );
 }
 
-/// MK-131(OWE-667): 원격 호스트가 설정되면 최상단 `'내 Mac'` 섹션과 원격 호스트 섹션으로 묶이고,
-/// 각 호스트 헤더에 연결 상태 점(`연결됨` / `연결 중` / `끊김`)과 세션 수 배지·접기/펼치기가 동작하며,
-/// 끊긴 호스트는 마지막으로 알려진 세션 목록을 흐리게(`is_row_dimmed`) 유지하고 `'다시 연결'` 버튼을 제공한다.
+/// Projects remain the root even with remote hosts; session IDs and selection stay host-scoped.
 #[gpui::test]
-fn multi_host_sidebar_groups_local_and_remote_with_status_collapse_dimming_and_reconnect(
-    cx: &mut TestAppContext,
-) {
+fn project_first_sidebar_keeps_remote_selection_and_reconnect_scoped(cx: &mut TestAppContext) {
     use gpui::Modifiers;
     use std::cell::RefCell;
     use std::rc::Rc;
-
-    cx.update(|cx| {
-        gpui_component::init(cx);
-        bind_keys(cx);
-    });
+    cx.update(gpui_component::init);
     let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
-    let activated: Rc<RefCell<Vec<(HostId, SessionId)>>> = Rc::new(RefCell::new(Vec::new()));
-    let reconnected: Rc<RefCell<Vec<HostId>>> = Rc::new(RefCell::new(Vec::new()));
-
-    let act_out = activated.clone();
-    let _sub_act = cx.update(|_, cx| {
-        cx.subscribe(&view, move |s, event: &Selected, cx| {
-            let host = s
-                .update(cx, |s, _| s.take_action_host())
-                .unwrap_or(HostId::Local);
-            act_out.borrow_mut().push((host, event.0));
+    cx.simulate_resize(gpui::size(gpui::px(360.), gpui::px(1000.)));
+    let remote = HostId::Remote("studio".into());
+    let selected = Rc::new(RefCell::new(Vec::new()));
+    let out = selected.clone();
+    let _sub = cx.update(|_, cx| {
+        cx.subscribe(&view, move |sidebar, event: &Selected, cx| {
+            let host = sidebar.update(cx, |s, _| s.take_action_host()).unwrap();
+            out.borrow_mut().push((host, event.0));
         })
     });
-    let recon_out = reconnected.clone();
-    let _sub_recon = cx.update(|_, cx| {
+    view.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![session(1, AgentState::Working, Some("/repo/mobile-ui"))],
+            trees: BTreeMap::from([("/repo".into(), vec!["/repo/mobile-ui".into()])]),
+        };
+        s.focused = Some(SessionId(1));
+        s.custom_titles.insert(SessionId(1), "Local title".into());
+        s.remote_hosts = vec![RemoteHost {
+            id: "studio".into(),
+            label: "Studio".into(),
+            status: HostStatus::Connected,
+            snapshot: s.snapshot.clone(),
+            meta: Meta::new(),
+            source: None,
+            error: None,
+        }];
+        // Stale host folds must not hide projects after switching to project navigation.
+        s.collapsed_hosts.extend([HostId::Local, remote.clone()]);
+        s.rebuild(cx);
+    });
+    cx.run_until_parked();
+    let (local_tree, remote_repo, remote_tree) = cx.update(|_, cx| {
+        let s = view.read(cx);
+        assert!(!s.rows.iter().any(|r| matches!(r, Row::HostHeader { .. })));
+        assert!(matches!(&s.rows[0], Row::Repository(p) if p == Path::new("/repo")));
+        assert_eq!(s.host_indent().to_bits(), 0_f32.to_bits());
+        assert_eq!(
+            s.host_badge_for(&HostId::Local, Path::new("/repo/mobile-ui")),
+            None
+        );
+        assert_eq!(
+            s.host_badge_for(&remote, Path::new("/repo/mobile-ui")),
+            None
+        );
+        let find = |host: &HostId, repo| {
+            s.rows
+                .iter()
+                .enumerate()
+                .position(|(i, r)| {
+                    s.row_host(i) == host
+                        && if repo {
+                            matches!(r, Row::Repository(_))
+                        } else {
+                            matches!(r, Row::Worktree(_))
+                        }
+                })
+                .unwrap()
+        };
+        (
+            find(&HostId::Local, false),
+            find(&remote, true),
+            find(&remote, false),
+        )
+    });
+    let sel = |prefix: &str, index| -> &'static str { format!("{prefix}-{index}").leak() };
+    assert!(cx.debug_bounds(sel("project-host", remote_repo)).is_some());
+    let bounds = cx.debug_bounds(sel("card-session", remote_tree)).unwrap();
+    cx.simulate_click(bounds.center(), Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        selected.borrow().as_slice(),
+        &[(remote.clone(), SessionId(1))]
+    );
+    view.read_with(cx, |s, _| {
+        assert!(!s.worktree_card_active(local_tree, Path::new("/repo/mobile-ui")));
+        assert!(s.worktree_card_active(remote_tree, Path::new("/repo/mobile-ui")));
+        assert!(!s.is_card_expanded(Path::new("/repo/mobile-ui")));
+        let remote_session = &s.remote_hosts[0].snapshot.sessions[0];
+        assert_ne!(s.session_label_on(&remote, remote_session).0, "Local title");
+    });
+    let reconnected = Rc::new(RefCell::new(Vec::new()));
+    let out = reconnected.clone();
+    let _sub = cx.update(|_, cx| {
         cx.subscribe(&view, move |_, event: &ReconnectHost, _| {
-            recon_out.borrow_mut().push(event.0.clone());
+            out.borrow_mut().push(event.0.clone());
         })
     });
-
-    let studio_id = HostId::Remote("studio".into());
-    let mini_id = HostId::Remote("mini".into());
-
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.snapshot = Snapshot {
-                sessions: vec![session(1, AgentState::Working, Some("/local/repo/main"))],
-                trees: BTreeMap::from([(
-                    PathBuf::from("/local/repo"),
-                    vec![PathBuf::from("/local/repo/main")],
-                )]),
-            };
-            s.remote_hosts = vec![
-                RemoteHost {
-                    id: "studio".into(),
-                    label: "Mac Studio".into(),
-                    status: HostStatus::Connected,
-                    snapshot: Snapshot {
-                        sessions: vec![
-                            session(1, AgentState::Done, Some("/remote/studio/wt")),
-                            session(2, AgentState::Working, Some("/remote/studio/wt")),
-                        ],
-                        trees: BTreeMap::from([(
-                            PathBuf::from("/remote/studio"),
-                            vec![PathBuf::from("/remote/studio/wt")],
-                        )]),
-                    },
-                    meta: Meta::new(),
-                    source: None,
-                    error: None,
-                },
-                RemoteHost {
-                    id: "mini".into(),
-                    label: "M4 Mini".into(),
-                    status: HostStatus::Disconnected,
-                    snapshot: Snapshot {
-                        sessions: vec![session(7, AgentState::Waiting, Some("/remote/mini/wt"))],
-                        trees: BTreeMap::from([(
-                            PathBuf::from("/remote/mini"),
-                            vec![PathBuf::from("/remote/mini/wt")],
-                        )]),
-                    },
-                    meta: Meta::new(),
-                    source: None,
-                    error: None,
-                },
-            ];
-            s.rebuild(cx);
-        });
+    view.update(cx, |s, cx| {
+        s.remote_hosts[0].status = HostStatus::Disconnected;
+        s.rebuild(cx);
     });
     cx.run_until_parked();
-
-    // 1. 최상단에 '내 Mac' 헤더, 그 아래 'studio', 'mini' 호스트 헤더가 순서대로 배치된다.
-    let rows_now = cx.update(|_, cx| view.read(cx).rows.clone());
-    let local_hdr = rows_now
-        .iter()
-        .position(|r| {
-            matches!(
-                r,
-                Row::HostHeader {
-                    host: HostId::Local,
-                    ..
-                }
-            )
-        })
-        .expect("local host header");
-    let studio_hdr = rows_now
-        .iter()
-        .position(|r| matches!(r, Row::HostHeader { host, .. } if *host == studio_id))
-        .expect("studio host header");
-    let mini_hdr = rows_now
-        .iter()
-        .position(|r| matches!(r, Row::HostHeader { host, .. } if *host == mini_id))
-        .expect("mini host header");
-    assert_eq!(local_hdr, 0);
-    assert!(local_hdr < studio_hdr && studio_hdr < mini_hdr);
-
-    // 2. 각 호스트 헤더에 상태 점과 세션 수 배지가 렌더링되고, 끊긴 호스트('mini')에만 '다시 연결' 버튼이 보인다.
-    for selector in [
-        "host-header-local",
-        "host-status-local",
-        "host-count-local",
-        "host-header-studio",
-        "host-status-studio",
-        "host-count-studio",
-        "host-header-mini",
-        "host-status-mini",
-        "host-count-mini",
-        "host-reconnect-mini",
-    ] {
-        assert!(
-            cx.debug_bounds(selector).is_some(),
-            "missing selector {selector}"
-        );
-    }
-    assert!(cx.debug_bounds("host-reconnect-local").is_none());
-    assert!(cx.debug_bounds("host-reconnect-studio").is_none());
-
-    // 호스트 > 프로젝트 > 워크트리가 단계마다 오른쪽으로 들여 쓰여 구분된다.
-    let repo_row = rows_now
-        .iter()
-        .position(|r| matches!(r, Row::Repository(p) if p == Path::new("/local/repo")))
-        .expect("local repo row");
-    let tree_row = rows_now
-        .iter()
-        .position(|r| matches!(r, Row::Worktree(p) if p == Path::new("/local/repo/main")))
-        .expect("local worktree row");
-    let repo_sel: &'static str = format!("repo-header-{repo_row}").leak();
-    let tree_sel: &'static str = format!("worktree-card-{tree_row}").leak();
-    let (host_x, repo_x, tree_x) = (
-        cx.debug_bounds("host-header-local").expect("host").origin.x,
-        cx.debug_bounds(repo_sel).expect("repo").origin.x,
-        cx.debug_bounds(tree_sel).expect("worktree").origin.x,
-    );
-    assert!(
-        host_x + gpui::px(HOST_CHILD_INDENT) <= repo_x && repo_x + gpui::px(CHILD_INDENT) <= tree_x,
-        "indent host={host_x:?} repo={repo_x:?} worktree={tree_x:?}"
-    );
-    // 촘촘한(Compact) 카드도 같은 단계로 들여 쓴다.
-    cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(CardLayout::Compact, cx)));
-    cx.run_until_parked();
-    let compact_x = cx
-        .debug_bounds(tree_sel)
-        .expect("compact worktree")
-        .origin
-        .x;
-    assert!(
-        repo_x + gpui::px(CHILD_INDENT) <= compact_x,
-        "compact indent repo={repo_x:?} worktree={compact_x:?}"
-    );
-    cx.update(|_, cx| view.update(cx, |s, cx| s.set_card_layout(CardLayout::Detailed, cx)));
-    cx.run_until_parked();
-
-    // 3. 끊긴 호스트('mini') 아래의 행들은 흐리게(dimmed) 표시되고, 연결된 호스트('local', 'studio') 행들은 흐리지 않다.
-    cx.update(|_, cx| {
-        let s = view.read(cx);
-        assert!(!s.is_row_dimmed(local_hdr + 1));
-        assert!(!s.is_row_dimmed(studio_hdr + 1));
-        assert!(
-            s.is_row_dimmed(mini_hdr + 1),
-            "disconnected remote host rows must remain dimmed"
-        );
-    });
-
-    // 4. 같은 SessionId(1)이 로컬과 원격('studio') 양쪽에 있어도 원격 세션 행을 클릭하면 원격 HostId가 전달된다.
-    let studio_session_idx = rows_now
-        .iter()
-        .enumerate()
-        .position(|(i, r)| {
-            i > studio_hdr
-                && i < mini_hdr
-                && matches!(r, Row::Session(s, _) if s.id == SessionId(1))
-        })
-        .expect("studio session 1 row");
-    cx.update(|_, cx| {
-        view.update(cx, |s, cx| {
-            s.select_session(studio_session_idx, SessionId(1), cx);
-        });
-    });
-    cx.run_until_parked();
-    assert_eq!(
-        activated.borrow().as_slice(),
-        &[(studio_id.clone(), SessionId(1))]
-    );
-
-    // 5. 호스트 헤더 접기/펼치기: 'studio' 헤더를 접으면 'studio' 하위 행만 숨고 '내 Mac'과 'mini'는 유지된다.
-    let studio_header_bounds = cx.debug_bounds("host-header-studio").unwrap();
-    cx.simulate_click(studio_header_bounds.center(), Modifiers::default());
-    cx.run_until_parked();
-    let folded_rows = cx.update(|_, cx| view.read(cx).rows.clone());
-    assert!(folded_rows.len() < rows_now.len());
-    let studio_hdr_after = folded_rows
-        .iter()
-        .position(|r| matches!(r, Row::HostHeader { host, .. } if *host == studio_id))
+    assert!(view.read_with(cx, |s, _| s.is_row_dimmed(remote_tree)));
+    let reconnect = cx
+        .debug_bounds(sel("project-reconnect", remote_repo))
         .unwrap();
-    let mini_hdr_after = folded_rows
-        .iter()
-        .position(|r| matches!(r, Row::HostHeader { host, .. } if *host == mini_id))
-        .unwrap();
-    assert_eq!(
-        studio_hdr_after + 1,
-        mini_hdr_after,
-        "collapsing studio header must hide all rows under studio"
-    );
-
-    // 다시 클릭하면 펼쳐진다.
-    let studio_header_bounds = cx.debug_bounds("host-header-studio").unwrap();
-    cx.simulate_click(studio_header_bounds.center(), Modifiers::default());
+    cx.simulate_click(reconnect.center(), Modifiers::default());
     cx.run_until_parked();
-    assert_eq!(cx.update(|_, cx| view.read(cx).rows.len()), rows_now.len());
-
-    // 6. 끊긴 호스트의 '다시 연결' 버튼 클릭 시 ReconnectHost 이벤트가 나가고 상태가 Connecting으로 바뀐다.
-    let reconnect_btn = cx.debug_bounds("host-reconnect-mini").unwrap();
-    cx.simulate_click(reconnect_btn.center(), Modifiers::default());
-    cx.run_until_parked();
-    assert_eq!(
-        reconnected.borrow().as_slice(),
-        std::slice::from_ref(&mini_id)
+    assert_eq!(reconnected.borrow().as_slice(), &[remote]);
+    assert!(
+        selected.borrow().len() == 1,
+        "reconnect must not activate or fold the project"
     );
-    cx.update(|_, cx| {
-        let s = view.read(cx);
-        let mini = s.remote_hosts.iter().find(|h| h.id == "mini").unwrap();
-        assert_eq!(mini.status, HostStatus::Connecting);
+}
+
+#[gpui::test]
+fn project_toolbar_unread_reveals_folded_project_and_lineage(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    let out = Rc::new(RefCell::new(Vec::new()));
+    let events = out.clone();
+    let _sub = cx.update(|_, cx| {
+        cx.subscribe(&view, move |_, event: &Selected, _| {
+            events.borrow_mut().push(event.0);
+        })
+    });
+    view.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![session(42, AgentState::Done, Some("/repo/child"))],
+            trees: BTreeMap::from([(
+                "/repo".into(),
+                vec!["/repo/parent".into(), "/repo/child".into()],
+            )]),
+        };
+        s.parents
+            .insert("/repo/child".into(), "/repo/parent".into());
+        s.collapsed.insert("/repo".into());
+        s.collapsed_lineage.insert("/repo/parent".into());
+        s.unread.insert(SessionId(42));
+        s.rebuild(cx);
+    });
+    cx.run_until_parked();
+    let bell = cx.debug_bounds("sidebar-unread").unwrap();
+    cx.simulate_click(bell.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(*out.borrow(), vec![SessionId(42)]);
+    view.read_with(cx, |s, _| {
+        assert!(!s.is_collapsed(Path::new("/repo")));
+        assert!(!s.is_lineage_collapsed(Path::new("/repo/parent")));
+        assert_eq!(s.selected_worktree(), Some(Path::new("/repo/child")));
     });
 }
 
@@ -3795,7 +3716,7 @@ fn owe900_imported_idle_worktrees_render_as_cards_and_all_projects_visible(
     }
     // 저장소 헤더와 워크트리 수 배지가 보인다(rows[0] = 첫 프로젝트, 워크트리 8개).
     assert!(cx.debug_bounds("repo-header-0").is_some());
-    assert!(cx.debug_bounds("repo-count-0").is_some());
+    assert!(cx.debug_bounds("repo-count-0").is_none());
 }
 
 /// OWE-900: 세션 없는 워크트리가 10개를 넘는 프로젝트는 접힌 상태로 시작한다.
@@ -4018,8 +3939,8 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
 
     // row 1: 핀 고정된 기본 워크트리(`repo`, `main`), row 2: `wt_feature`
     assert!(
-        vcx.debug_bounds("worktree-branch-1").is_none(),
-        "default branch card where card_title == branch_subtitle ('main') must not duplicate branch on row 2"
+        vcx.debug_bounds("worktree-branch-1").is_some(),
+        "the default workspace uses its folder name and keeps the actual branch on row 2"
     );
     let default_badge = vcx
         .debug_bounds("worktree-default-badge-1")
@@ -4089,8 +4010,8 @@ fn owe_846_worktree_card_actions_branch_dedupe_badges_and_virtualized_click(
     let feature_pin = selector("worktree-pin", feature_idx);
     let repo_rename = selector("worktree-rename", repo_idx);
     assert!(
-        vcx.debug_bounds(repo_branch).is_none(),
-        "compact layout must also suppress duplicate branch when card_title == branch_subtitle"
+        vcx.debug_bounds(repo_branch).is_some(),
+        "compact layout keeps the branch separate from the default workspace name"
     );
     assert!(
         vcx.debug_bounds(feature_branch).is_some(),
@@ -5377,6 +5298,34 @@ fn init_sidebar_test_settings(cx: &mut TestAppContext, name: &str, settings: &st
         crate::settings::init_at(Some(dir), cx);
     });
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn terminal_focus_moves_the_single_workspace_selection(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, _| Sidebar::new_loaded(None));
+    view.update(cx, |s, cx| {
+        s.snapshot = Snapshot {
+            sessions: vec![
+                session(1, AgentState::Working, Some("/repo/a")),
+                session(2, AgentState::Working, Some("/repo/b")),
+            ],
+            trees: BTreeMap::from([("/repo".into(), vec!["/repo/a".into(), "/repo/b".into()])]),
+        };
+        s.rebuild(cx);
+        s.set_focused(Some(SessionId(1)), cx);
+        s.set_focused(Some(SessionId(2)), cx);
+        let active: Vec<_> = s
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, r)| match r {
+                Row::Worktree(p) if s.worktree_card_active(i, p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(active, vec![PathBuf::from("/repo/b")]);
+    });
 }
 
 #[gpui::test]

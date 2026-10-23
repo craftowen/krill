@@ -329,6 +329,7 @@ fn feature_registry_matches_architecture_and_frozen_values() {
         ),
         ("FEAT_GIT_EDIT", crate::control::FEAT_GIT_EDIT, 48),
         ("FEAT_USAGE_RESET", crate::usage::FEAT_USAGE_RESET, 49),
+        ("FEAT_USAGE_REFRESH", crate::usage::FEAT_USAGE_REFRESH, 25),
         (
             "FEAT_AGENT_HISTORY",
             crate::agent_history::FEAT_AGENT_HISTORY,

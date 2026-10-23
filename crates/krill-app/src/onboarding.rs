@@ -233,8 +233,8 @@ pub fn survey(env: &Env) -> Survey {
                 version: exe.as_deref().and_then(agent::version),
                 exe,
                 id,
+                install: p.install_command().to_owned(),
                 name: p.name,
-                install: p.install,
             }
         })
         .collect();
@@ -851,6 +851,7 @@ const DOCTOR_TEXT: &[crate::i18n::Message] = &[
     ctext::D_GIT_OK,
     ctext::D_GIT_WARN,
     ctext::D_GIT_WARN_DETAIL,
+    ctext::D_GIT_WARN_DETAIL_WIN,
     ctext::D_AGENTS_NONE,
     ctext::D_AGENTS_NONE_DETAIL,
     ctext::D_VERSION_UNKNOWN,

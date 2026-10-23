@@ -86,6 +86,59 @@ fn environment_resolves_main_root_and_nested_worktree_without_losing_bytes() {
 }
 
 #[test]
+fn environment_fast_path_matches_git() {
+    let f = Fixture::new("env-fast", "");
+    let (w, _) = f.created("빠른", Setup::Skip);
+    let top = path(&w);
+    fs::create_dir_all(f.repo.join("a/b")).unwrap();
+    fs::create_dir_all(top.join("nested")).unwrap();
+    let alias = f.dir.join("alias");
+    symlink(&top, &alias).unwrap();
+    // `git init`은 config에 `bare = false`를 쓴다. 이 줄로 빠른 경로를 놓치면 안 된다.
+    assert!(
+        fs::read_to_string(f.repo.join(".git/config"))
+            .unwrap()
+            .contains("bare = false")
+    );
+    for cwd in [
+        f.repo.clone(),
+        f.repo.join("a/b"),
+        top.clone(),
+        top.join("nested"),
+        alias.join("nested"),
+    ] {
+        let Some(compat::Discovered::Repo { root, worktree }) = compat::discover(&cwd) else {
+            panic!("fast path must resolve {}", cwd.display());
+        };
+        let git = compat::environment_in(&f.queue, &cwd).unwrap();
+        let value = |key: &[u8]| git.iter().find(|(k, _)| k == key).unwrap().1.clone();
+        assert_eq!(
+            root.as_os_str().as_bytes(),
+            value(b"KRILL_ROOT_PATH"),
+            "{}",
+            cwd.display()
+        );
+        assert_eq!(
+            worktree.as_os_str().as_bytes(),
+            value(b"KRILL_WORKTREE_PATH"),
+            "{}",
+            cwd.display()
+        );
+        assert_eq!(compat::environment(&cwd), git, "{}", cwd.display());
+    }
+    assert_eq!(compat::discover(&f.dir), Some(compat::Discovered::NotRepo));
+    assert!(compat::environment_in(&f.queue, &f.dir).is_err());
+    assert!(compat::environment(&f.dir).is_empty());
+}
+
+#[test]
+fn environment_fast_path_defers_unusual_layouts_to_git() {
+    let f = Fixture::new("env-defer", "");
+    f.git(&["config", "core.worktree", f.repo.to_str().unwrap()]);
+    assert!(compat::discover(&f.repo).is_none());
+}
+
+#[test]
 fn worktree_symlinks_create_traverse_and_remove_cleanly() {
     let f = Fixture::new(
         "symlinks",

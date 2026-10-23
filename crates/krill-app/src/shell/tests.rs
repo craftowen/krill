@@ -2867,7 +2867,7 @@ fn restart_keeps_session_until_resumed_and_stops_on_permanent_failure(cx: &mut T
             assert_eq!(s.layout.session(pane), Some(old));
             let l = &s.live[&pane];
             assert!(l.pane.is_cold());
-            assert_eq!(l.error.as_deref(), Some("unknown agent profile"));
+            assert_eq!(l.error.as_deref(), Some(text::START_UNKNOWN_AGENT.get()));
         });
     });
     cx.run_until_parked();
@@ -4629,6 +4629,56 @@ fn ended_banner_aligns_buttons_to_the_right(cx: &mut TestAppContext) {
     );
 }
 
+/// 새로 띄운 에이전트가 곧바로 끝나면 시작 실패로 표시한다. 셸·오래 돈 세션은 그냥 "세션 종료됨".
+#[gpui::test]
+fn agent_exiting_right_after_start_is_flagged(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("agent-early-exit"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let agent = krill_proto::control::AgentLaunch {
+        profile: "codex".into(),
+        permission: krill_proto::agent::Permission::Manual,
+    };
+    let cases = [
+        (Some(agent.clone()), Some(Instant::now()), true),
+        (None, Some(Instant::now()), false),
+        (Some(agent.clone()), None, false),
+        (
+            Some(agent),
+            Instant::now().checked_sub(EARLY_EXIT * 2),
+            false,
+        ),
+    ];
+    for (i, (launch, started, early)) in cases.into_iter().enumerate() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        view.update(cx, |s, cx| {
+            let session = krill_proto::SessionId(90 + i as u64);
+            s.layout.set_session(pane, session);
+            s.attach_test(pane, session, ours, cx);
+            let l = s.live.get_mut(&pane).unwrap();
+            l.launch = launch;
+            l.started = started;
+            assert!(!s.on_frame(pane, krill_proto::screen::kind::CLOSED, &[0], cx));
+            assert_eq!(s.live[&pane].exited_early, early, "case {i}");
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-ended").is_some());
+    }
+}
+
+#[test]
+fn known_start_failures_get_next_steps() {
+    use krill_proto::control::Failure;
+    let no_holder = std::io::Error::other(Failure::NoHolder.to_string());
+    assert_eq!(start_error_text(&no_holder), text::START_NO_HOLDER.get());
+    let unknown = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        Failure::UnknownAgent.to_string(),
+    );
+    assert_eq!(start_error_text(&unknown), text::START_UNKNOWN_AGENT.get());
+    let other = std::io::Error::other("disk full");
+    assert_eq!(start_error_text(&other), "disk full");
+}
+
 /// MK-131(OWE-667): 새 세션 메뉴의 실행 위치(내 Mac 기본값 + 연결된 원격 호스트) 선택과
 /// 원격 세션 패인의 탭·패인 헤더 호스트 배지 표시, 분할 시 호스트 상속을 검증한다.
 #[gpui::test]
@@ -4714,14 +4764,14 @@ fn multi_host_shell_execution_locations_host_badges_and_sidebar_grouping(cx: &mu
         );
     });
 
-    // 사이드바에 '내 Mac'과 'Mac Studio' 호스트 섹션 헤더가 동시에 표시된다. 아직 연결 전이고 세션이 없는
-    // 'Mac Studio'는 '연결 안 된 호스트' 묶음 안에 있으므로 펼쳐서 본다.
+    // 로컬 프로젝트는 호스트 섹션으로 감싸지 않는다. 프로젝트가 아직 없는 원격 호스트는
+    // 상태 확인·재연결 동작을 위해 헤더를 유지한다.
     cx.update(|_, cx| {
         let sidebar = view.read(cx).sidebar.clone();
         sidebar.update(cx, |s, cx| s.toggle_offline_hosts(Some(true), cx));
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("host-header-local").is_some());
+    assert!(cx.debug_bounds("host-header-local").is_none());
     assert!(cx.debug_bounds("host-header-studio-mac").is_some());
 
     // 로컬 탭에는 호스트 배지가 없고, 원격 탭과 원격 패인 헤더에는 호스트 배지가 표시된다.
@@ -6934,8 +6984,8 @@ fn new_session_menu_keeps_shortcut_with_single_account_and_applies_launch_host_f
     cx.run_until_parked();
 
     // 1. 계정이 1개일 때 '+' 메뉴를 열면 하위 메뉴로 대체되지 않고 ⌥⌘1 단축키가 바로 표시된다.
-    // '+' 버튼은 검색 행 호버 때만 보이므로(hover-reveal) 먼저 행 위로 마우스를 올린다.
-    // 행 자체에는 debug_selector가 없어 트리거 좌표로 호버한다(트리거는 행 안에 있다).
+    // 하단 '+' 메뉴는 버튼 위로 열려 초기 포인터가 항목을 덮지 않아야 한다.
+    // 트리거에 마우스를 둔 채 키보드로 이동해도 첫 두 항목 순서가 유지되는지 확인한다.
     // 참고: 팝업 컨테이너의 "popup-menu" id는 이 gpui 버전의 debug_bounds에 잡히지 않아
     // 메뉴가 열렸음은 항목의 kbd 힌트("kbd:alt-cmd-1" 등)로 확인한다.
     let hover_at = cx
@@ -8976,6 +9026,36 @@ fn account_failure_recovery_holds_input_and_dismissed_notice_stays_dismissed(
         }
     };
     assert_eq!(bytes, b"held prompt\r");
+}
+
+/// 프로젝트 추가 대화상자는 연결된 원격 호스트를 실행 위치로 고르게 한다(Orca처럼).
+#[gpui::test]
+fn add_project_offers_connected_hosts(cx: &mut TestAppContext) {
+    use krill_app::hosts::{HostId, HostStatus, RemoteHostSpec};
+
+    let (view, cx) = open(cx, state_path("add-project-hosts"));
+    let remote = HostId::Remote("studio".into());
+    cx.update(|window, cx| {
+        view.update(cx, |s, cx| {
+            s.host_statuses = vec![(
+                RemoteHostSpec {
+                    id: "studio".into(),
+                    label: "Mac Studio".into(),
+                    address: "owen@studio.local".into(),
+                    port: None,
+                    identity_file: None,
+                    remote_socket: None,
+                },
+                HostStatus::Connected,
+            )];
+            s.launch_host = remote.clone();
+            s.open_add_project(window, cx);
+        });
+    });
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("add-project-host-local").is_some());
+    assert!(cx.debug_bounds("add-project-host-studio").is_some());
 }
 
 #[gpui::test]

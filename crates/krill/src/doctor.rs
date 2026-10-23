@@ -491,8 +491,8 @@ fn collect_agents(path: &OsString) -> Vec<AgentFact> {
                 version: exe.as_deref().and_then(agent::version),
                 exe,
                 id,
+                install: p.install_command().to_owned(),
                 name: p.name,
-                install: p.install,
             }
         })
         .collect()
@@ -502,7 +502,12 @@ fn collect_agents(path: &OsString) -> Vec<AgentFact> {
 fn builtin_install_hint() -> String {
     Agents::load(None)
         .ok()
-        .and_then(|agents| agents.profiles.get("claude").map(|p| p.install.clone()))
+        .and_then(|agents| {
+            agents
+                .profiles
+                .get("claude")
+                .map(|p| p.install_command().to_owned())
+        })
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "curl -fsSL https://claude.ai/install.sh | bash".to_owned())
 }

@@ -123,7 +123,9 @@ impl Shell {
 
     pub(super) fn open_add_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_dashboard(None, cx);
-        let dialog = cx.new(|cx| add_project::Dialog::new(window, cx));
+        let hosts = self.execution_locations(cx);
+        let initial = self.launch_host.clone();
+        let dialog = cx.new(|cx| add_project::Dialog::new_with_hosts(window, cx, hosts, initial));
         let events = cx.subscribe_in(
             &dialog,
             window,

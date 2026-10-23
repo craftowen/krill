@@ -15,7 +15,8 @@ use krill_proto::{
     control::AgentState,
     screen::Screen,
     usage::{
-        AccountInfo, AccountsSnapshot, AutoSwitchMetric, AutoSwitchRule, ProviderKind, UsageRequest,
+        AccountInfo, AccountStatus, AccountsSnapshot, AutoSwitchMetric, AutoSwitchRule,
+        ProviderKind, UsageRequest,
     },
 };
 
@@ -633,12 +634,128 @@ fn status_window_label(win: Option<&krill_proto::usage::Window>, now: u64) -> St
     }
 }
 
-fn expanded_account_usage(usage: &krill_proto::usage::Snapshot, now: u64) -> String {
-    format!(
-        "{} · {}",
-        status_window_label(usage.five_hour.as_ref(), now),
-        status_window_label(usage.seven_day.as_ref(), now),
-    )
+/// 툴팁·접근성용 한 줄: 보이는 기간마다 `라벨 사용률 리셋`. 기간이 없으면 "—".
+fn expanded_account_usage(windows: &[StatusWindow<'_>], now: u64) -> String {
+    if windows.is_empty() {
+        return "—".into();
+    }
+    windows
+        .iter()
+        .map(|w| format!("{} {}", w.label, status_window_label(Some(w.window), now)))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// 상태바 칩이 그리는 한 기간. `label`은 언어와 무관한 짧은 표기(`5h`·`7d`·`30d`·미터 이름)다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatusWindow<'a> {
+    label: String,
+    window: &'a krill_proto::usage::Window,
+}
+
+/// 상태바 칩에 그릴 기간(Orca `StatusBar` 규칙). 보고된 기간만 그리고, 보고되지 않은 기간을
+/// 빈 막대·"—"로 채우지 않는다.
+///
+/// 프로바이더별 특징:
+/// - Claude: 5시간·주간 두 창. 모델별 주간 풀은 경고 수준일 때만 [`status_hot_meter`]로 덧붙인다.
+/// - Codex: 데몬이 창 길이(300분·10080분)로 5시간·주간을 가른다. Pro처럼 주간 한도만
+///   보고하는 요금제는 주간만 보인다.
+/// - Antigravity: `/usage`의 5시간·주간. 모델 그룹 풀은 hot meter로 덧붙인다.
+/// - `OpenCode` Go: 5시간·주간·월간. 월간은 앞의 두 창이 모두 없을 때만 보인다.
+///
+/// 계정 사용량에 두 창이 모두 없으면 미터 꼬리에서 5시간·주간 → 월간 → 가장 높은 기간 한도
+/// 순으로 고른다(Orca의 월간·버킷 폴백).
+fn status_windows<'a>(
+    snap: &'a AccountsSnapshot,
+    account: &'a AccountInfo,
+) -> Vec<StatusWindow<'a>> {
+    let mut out: Vec<_> = [
+        ("5h", account.usage.five_hour.as_ref()),
+        ("7d", account.usage.seven_day.as_ref()),
+    ]
+    .into_iter()
+    .filter_map(|(label, window)| {
+        window.map(|window| StatusWindow {
+            label: label.into(),
+            window,
+        })
+    })
+    .collect();
+    if !out.is_empty() {
+        return out;
+    }
+    let Some(meters) = snap.meters_for(&account.id) else {
+        return out;
+    };
+    let windows: Vec<_> = meters
+        .meters
+        .iter()
+        .filter(|m| m.value.is_none())
+        .filter_map(|m| Some((m.label.as_str(), m.window.as_ref()?)))
+        .collect();
+    let pick = |label: &str| windows.iter().find(|(l, _)| *l == label);
+    out.extend(
+        ["5h", "7d"]
+            .into_iter()
+            .filter_map(pick)
+            .map(|(label, window)| StatusWindow {
+                label: (*label).into(),
+                window,
+            }),
+    );
+    if out.is_empty()
+        && let Some((label, window)) =
+            pick("30d").or_else(|| windows.iter().max_by_key(|(_, w)| w.percent))
+    {
+        out.push(StatusWindow {
+            label: (*label).into(),
+            window,
+        });
+    }
+    out
+}
+
+/// 상태바 칩 상태(Orca `StatusBar` 분기: 불러오는 중 `···`, 조회 불가 `--`, 실패 경고).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PillState {
+    /// 기간 수치를 그린다. `warn`이면 마지막 조회가 실패해 값이 오래됐을 수 있어 경고 아이콘을 붙인다.
+    Usage { warn: bool },
+    /// 새로고침 중이고 아직 값이 없다.
+    Loading,
+    /// 값도 실패 사유도 없다(모름·오래됨·계정 없음).
+    Unavailable,
+    /// 값 없이 실패했다. 넓은 상태바에서는 사유를 함께 쓴다.
+    Failed(krill_app::i18n::Message),
+}
+
+fn pill_state(status: Option<AccountStatus>, has_windows: bool, refreshing: bool) -> PillState {
+    use krill_app::i18n::catalog::settings as settings_text;
+    if has_windows {
+        return PillState::Usage {
+            warn: matches!(
+                status,
+                Some(AccountStatus::NeedsLogin | AccountStatus::Error)
+            ),
+        };
+    }
+    if refreshing {
+        return PillState::Loading;
+    }
+    match status {
+        Some(AccountStatus::NeedsLogin) => PillState::Failed(settings_text::ACCOUNT_LOGIN_REQUIRED),
+        Some(AccountStatus::Error) => PillState::Failed(settings_text::ACCOUNT_STATUS_ERROR),
+        Some(AccountStatus::RateLimited) => {
+            PillState::Failed(settings_text::ACCOUNT_STATUS_LIMITED)
+        }
+        _ => PillState::Unavailable,
+    }
+}
+
+fn status_alert_icon(p: &ui::Palette) -> gpui_component::Icon {
+    gpui_component::Icon::default()
+        .data(ui::icons::TRIANGLE_ALERT_SVG)
+        .with_size(gpui_component::Size::XSmall)
+        .text_color(p.muted_foreground)
 }
 
 /// 한 기간의 사용률(모르면·리셋 지남이면 `None`)과 리셋까지 남은 시간. `short`면 가장 큰 단위만(`9h 3m` → `9h`).
@@ -708,21 +825,18 @@ fn status_window_segment(
         .children(reset.map(|r| div().text_color(p.muted_foreground).child(r)))
 }
 
-/// 5시간·주간 밖 한도(모델별 풀 등)가 경고 수준이고 보이는 두 기간보다 높으면 그 이름과 사용률.
+/// 칩에 보이는 기간 밖 한도(모델별 풀 등)가 경고 수준이고 보이는 기간보다 높으면 그 이름과 사용률.
 fn status_hot_meter(
     snap: &AccountsSnapshot,
     account: &AccountInfo,
     now: u64,
 ) -> Option<(String, u8)> {
     let now = i64::try_from(now).unwrap_or(i64::MAX);
-    let shown = [
-        account.usage.five_hour.as_ref(),
-        account.usage.seven_day.as_ref(),
-    ]
-    .into_iter()
-    .filter_map(|w| krill_app::accounts::display::window(w, now).percent)
-    .max()
-    .unwrap_or(0);
+    let shown = status_windows(snap, account)
+        .into_iter()
+        .filter_map(|w| krill_app::accounts::display::window(Some(w.window), now).percent)
+        .max()
+        .unwrap_or(0);
     snap.meters_for(&account.id)?
         .meters
         .iter()
@@ -1214,9 +1328,13 @@ impl Shell {
                     now,
                 )
             });
-            let expanded_label = active
-                .map(|a| expanded_account_usage(&a.usage, now))
-                .unwrap_or_default();
+            let windows = active.map_or_else(Vec::new, |a| status_windows(&snap, a));
+            let state = pill_state(
+                status.as_ref().map(|s| s.status),
+                !windows.is_empty(),
+                self.usage_refresh.is_some(),
+            );
+            let expanded_label = expanded_account_usage(&windows, now);
             let hot = active.and_then(|a| status_hot_meter(&snap, a, now));
             let color = if percent.is_some() {
                 p.foreground
@@ -1250,37 +1368,43 @@ impl Shell {
                 if expanded { "expanded" } else { "compact" },
                 provider.as_str()
             );
-            // 프로바이더마다 5시간·주간 막대 쌍과 각 사용률·리셋(하단바 B안). 좁으면 막대를
-            // 줄이고 리셋을 가장 큰 단위 하나로 접는다.
+            // 프로바이더마다 보고된 기간의 막대와 사용률·리셋(하단바 B안). 좁으면 막대를
+            // 줄이고 리셋을 가장 큰 단위 하나로 접는다. 값이 없으면 Orca처럼 상태 표시만 둔다.
             let short = !expanded;
-            let usage = active.map(|a| a.usage.clone()).unwrap_or_default();
+            let detail = div()
+                .debug_selector(move || detail_selector.clone())
+                .flex()
+                .items_center()
+                .gap_2();
+            let detail = match state {
+                PillState::Usage { warn } => detail
+                    .children(
+                        windows
+                            .iter()
+                            .map(|w| status_window_segment(Some(w.window), now, short, p)),
+                    )
+                    .children(hot.map(|(label, pct)| {
+                        div()
+                            .text_color(p.foreground)
+                            .child(format!("{label} {pct}%"))
+                    }))
+                    .when(warn, |d| d.child(status_alert_icon(p))),
+                PillState::Loading => {
+                    detail.child(div().text_color(p.muted_foreground).child("···"))
+                }
+                PillState::Unavailable => {
+                    detail.child(div().text_color(p.muted_foreground).child("--"))
+                }
+                PillState::Failed(reason) => {
+                    detail.child(status_alert_icon(p)).when(expanded, |d| {
+                        d.child(div().text_color(p.muted_foreground).child(reason.get()))
+                    })
+                }
+            };
             let pill_btn = pill_btn
                 .accessibility_label(description.clone())
                 .child(ui::icons::provider_icon(provider, ui::ICON_SM, color))
-                .child(
-                    div()
-                        .debug_selector(move || detail_selector.clone())
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(status_window_segment(
-                            usage.five_hour.as_ref(),
-                            now,
-                            short,
-                            p,
-                        ))
-                        .child(status_window_segment(
-                            usage.seven_day.as_ref(),
-                            now,
-                            short,
-                            p,
-                        ))
-                        .children(hot.map(|(label, pct)| {
-                            div()
-                                .text_color(p.foreground)
-                                .child(format!("{label} {pct}%"))
-                        })),
-                );
+                .child(detail);
             let reset_armed = self.reset_armed.clone();
             provider_pills = provider_pills.child(
                 ui::button_with_tooltip_when(tooltips_on, pill_btn, selector, description)

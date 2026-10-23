@@ -1631,8 +1631,17 @@ fn expanded_usage_keeps_both_windows_and_never_invents_zero() {
             resets_at: None,
         }),
     };
-    assert_eq!(expanded_account_usage(&usage, 1000), "23% · 76%");
-    assert_eq!(expanded_account_usage(&Snapshot::default(), 1000), "— · —");
+    let snap = krill_proto::usage::AccountsSnapshot::default();
+    let account = usage_account(ProviderKind::Claude, usage);
+    assert_eq!(
+        expanded_account_usage(&status_windows(&snap, &account), 1000),
+        "5h 23% · 7d 76%"
+    );
+    let empty = usage_account(ProviderKind::Claude, Snapshot::default());
+    assert_eq!(
+        expanded_account_usage(&status_windows(&snap, &empty), 1000),
+        "—"
+    );
     let expired = Window {
         percent: 99,
         resets_at: Some("900".into()),
@@ -1724,14 +1733,17 @@ fn status_usage_is_percent_and_live_compact_duration_in_both_languages() {
             resets_at: Some((now + 154_800).to_string()),
         }),
     };
+    let snap = krill_proto::usage::AccountsSnapshot::default();
+    let account = usage_account(ProviderKind::Codex, usage.clone());
+    let windows = status_windows(&snap, &account);
     // Formatting is deliberately independent of the app's selected language.
     assert_eq!(
-        expanded_account_usage(&usage, now),
-        "0% 1h 31m · 92% 1d 19h"
+        expanded_account_usage(&windows, now),
+        "5h 0% 1h 31m · 7d 92% 1d 19h"
     );
     assert_eq!(
-        expanded_account_usage(&usage, now + 60),
-        "0% 1h 30m · 92% 1d 18h"
+        expanded_account_usage(&windows, now + 60),
+        "5h 0% 1h 30m · 7d 92% 1d 18h"
     );
     // 좁은 창은 막대 쌍을 유지하고 리셋만 가장 큰 단위로 접는다.
     assert_eq!(
@@ -1798,4 +1810,124 @@ fn status_hot_meter_shows_only_a_higher_warning_pool() {
     );
     snap.details.accounts[0].meters = vec![meter("Gemini", 70)];
     assert_eq!(status_hot_meter(&snap, &account, now), None);
+}
+
+fn usage_account(provider: ProviderKind, usage: krill_proto::usage::Snapshot) -> AccountInfo {
+    AccountInfo {
+        id: provider.as_str().into(),
+        provider,
+        label: provider.display_name().into(),
+        email: None,
+        profile_dir: "/tmp/status-windows".into(),
+        active: true,
+        host_default: false,
+        stale: false,
+        usage,
+    }
+}
+
+/// Orca처럼 보고된 기간만 그린다: Codex Pro의 주간 단독 한도는 빈 5시간 칸 없이 주간만.
+#[test]
+fn status_windows_show_only_reported_limits_per_provider() {
+    use krill_proto::usage::{AccountMeters, AccountsSnapshot, Snapshot, UsageMeter, Window};
+    let win = |percent| Window {
+        percent,
+        resets_at: None,
+    };
+    let labels = |windows: &[StatusWindow<'_>]| {
+        windows
+            .iter()
+            .map(|w| (w.label.clone(), w.window.percent))
+            .collect::<Vec<_>>()
+    };
+    let mut snap = AccountsSnapshot::default();
+    let weekly_only = usage_account(
+        ProviderKind::Codex,
+        Snapshot {
+            five_hour: None,
+            seven_day: Some(win(31)),
+        },
+    );
+    let windows = status_windows(&snap, &weekly_only);
+    assert_eq!(labels(&windows), [("7d".to_owned(), 31)]);
+    assert_eq!(expanded_account_usage(&windows, 1000), "7d 31%");
+
+    let meter = |label: &str, percent| UsageMeter {
+        key: label.into(),
+        label: label.into(),
+        window: Some(win(percent)),
+        value: None,
+    };
+    // OpenCode Go: 5시간·주간이 없을 때만 월간을 보인다.
+    let opencode = usage_account(ProviderKind::OpenCode, Snapshot::default());
+    snap.details.accounts.push(AccountMeters {
+        account_id: opencode.id.clone(),
+        plan: None,
+        meters: vec![meter("30d", 40)],
+    });
+    assert_eq!(
+        labels(&status_windows(&snap, &opencode)),
+        [("30d".to_owned(), 40)]
+    );
+    snap.details.accounts[0].meters = vec![meter("30d", 40), meter("7d", 12)];
+    assert_eq!(
+        labels(&status_windows(&snap, &opencode)),
+        [("7d".to_owned(), 12)]
+    );
+    // 기간 이름이 없는 모델 풀만 있으면 가장 높은 풀 하나를 보이고, hot meter로 겹쳐 붙이지 않는다.
+    snap.details.accounts[0].meters = vec![meter("Gemini · 7d", 90), meter("Flash · 7d", 20)];
+    assert_eq!(
+        labels(&status_windows(&snap, &opencode)),
+        [("Gemini · 7d".to_owned(), 90)]
+    );
+    assert_eq!(status_hot_meter(&snap, &opencode, 1000), None);
+}
+
+/// 값이 없을 때 Orca처럼 불러오는 중·조회 불가·실패를 구분하고, 실패 뒤 남은 값에는 경고를 붙인다.
+#[test]
+fn status_pill_state_follows_orca_failure_rules() {
+    use krill_app::i18n::catalog::settings as settings_text;
+    assert_eq!(
+        pill_state(Some(AccountStatus::Ok), true, false),
+        PillState::Usage { warn: false }
+    );
+    assert_eq!(
+        pill_state(Some(AccountStatus::Error), true, true),
+        PillState::Usage { warn: true }
+    );
+    assert_eq!(
+        pill_state(Some(AccountStatus::NeedsLogin), true, false),
+        PillState::Usage { warn: true }
+    );
+    assert_eq!(
+        pill_state(Some(AccountStatus::RateLimited), true, false),
+        PillState::Usage { warn: false }
+    );
+    assert_eq!(
+        pill_state(Some(AccountStatus::Error), false, true),
+        PillState::Loading
+    );
+    assert_eq!(pill_state(None, false, false), PillState::Unavailable);
+    for status in [
+        AccountStatus::Unknown,
+        AccountStatus::Stale,
+        AccountStatus::Ok,
+    ] {
+        assert_eq!(
+            pill_state(Some(status), false, false),
+            PillState::Unavailable
+        );
+    }
+    assert_eq!(
+        pill_state(Some(AccountStatus::Error), false, false),
+        PillState::Failed(settings_text::ACCOUNT_STATUS_ERROR)
+    );
+    assert_eq!(
+        pill_state(Some(AccountStatus::NeedsLogin), false, false),
+        PillState::Failed(settings_text::ACCOUNT_LOGIN_REQUIRED)
+    );
+    assert_eq!(
+        pill_state(Some(AccountStatus::RateLimited), false, false),
+        PillState::Failed(settings_text::ACCOUNT_STATUS_LIMITED)
+    );
 }
