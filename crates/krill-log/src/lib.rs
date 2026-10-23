@@ -41,8 +41,9 @@ impl Component {
     }
 }
 
-/// Explicit override isolates tests; production uses `LocalAppData` on Windows
-/// and the Console.app-visible directory on macOS (XDG state on Linux).
+/// Explicit override isolates tests (nextest runs fall back to a temp directory);
+/// production uses `LocalAppData` on Windows and the Console.app-visible directory
+/// on macOS (XDG state on Linux).
 pub fn directory() -> Option<PathBuf> {
     directory_in(
         |key| std::env::var_os(key),
@@ -66,6 +67,10 @@ fn directory_in(
 ) -> Option<PathBuf> {
     if let Some(dir) = get("KRILL_LOG_DIR") {
         return Some(PathBuf::from(dir));
+    }
+    // nextest가 띄운 테스트와 그 자식(holder·krilld·앱)은 운영 로그를 더럽히지 않는다(`NEXTEST`는 nextest가 늘 1로 둔다).
+    if get("NEXTEST").is_some() {
+        return Some(std::env::temp_dir().join("krill-test-logs"));
     }
     #[cfg(windows)]
     let base = get("LOCALAPPDATA").map(PathBuf::from).or_else(home);
@@ -110,6 +115,29 @@ mod tests {
             Some(PathBuf::from("/KRILL_LOG_DIR"))
         );
         assert_eq!(directory_in(|_| None, || None), None);
+    }
+
+    #[test]
+    fn nextest_runs_never_use_the_production_directory() {
+        let nextest = |k: &str| (k == "NEXTEST").then(|| OsString::from("1"));
+        let home = PathBuf::from("/h");
+        assert_eq!(
+            directory_in(nextest, || Some(home.clone())),
+            Some(std::env::temp_dir().join("krill-test-logs"))
+        );
+        let both = |k: &str| match k {
+            "NEXTEST" => Some(OsString::from("1")),
+            "KRILL_LOG_DIR" => Some(OsString::from("/x")),
+            _ => None,
+        };
+        assert_eq!(directory_in(both, || None), Some(PathBuf::from("/x")));
+        // 실제 테스트 프로세스(이 테스트도 nextest 아래에서 돈다)가 운영 경로를 고르지 않는다.
+        if std::env::var_os("NEXTEST").is_some() && std::env::var_os("KRILL_LOG_DIR").is_none() {
+            assert_eq!(
+                directory(),
+                Some(std::env::temp_dir().join("krill-test-logs"))
+            );
+        }
     }
 
     #[cfg(not(windows))]

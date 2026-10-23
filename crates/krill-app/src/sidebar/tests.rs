@@ -1221,7 +1221,7 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
         holder: PathBuf::new(),
         krilld: PathBuf::new(),
     };
-    let sidebar_sock = ipc::Socket::new(paths.clone());
+    let sidebar_sock = ipc::Socket::threaded(paths.clone());
     let trees = BTreeMap::from([(repo.clone(), vec![repo.clone()])]);
 
     // 1. 사이드바가 5회 연속 fetch() + meta()를 호출해도 UDS 연결은 딱 1개만 열려야 한다(500ms마다 2개씩 총 10개 금지).
@@ -1293,6 +1293,7 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
     // 3. 왼쪽 사이드바를 접어 `set_visible(false)`를 보내도 새 UDS를 열지 않고,
     // 오른쪽 diff 패널의 감시는 살아 있어 새 파일 추가가 diff에 감지되어야 한다.
     sidebar_sock.set_visible(false);
+    sidebar_sock.settle();
     assert_eq!(
         accepts.load(Ordering::SeqCst),
         2,
@@ -1303,6 +1304,32 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
         krill_proto::git::GitWatchReply::Unchanged { pending: false },
         "collapsing sidebar must not reset or force-recreate diff panel's active watch"
     );
+    // 원격 폴링 경로(`poll_snapshot`)는 호스트 전용 스레드에서 연결을 열고, 이어지는 fetch와 같은 연결을 쓰며
+    // 결과도 fetch + meta와 같다.
+    let (snap, meta) = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(sidebar_sock.poll_snapshot())
+        .unwrap();
+    // 레지스트리는 실행 환경의 다른 저장소도 보여 주고 그 변경 수는 git 감시가 비동기로 채운다. 그래서 두 번 읽은
+    // 값을 통째로 비교하지 않고 저장소 목록과 브랜치만 비교한다.
+    let again = sidebar_sock.meta(&snap.trees);
+    let shape = |m: &BTreeMap<PathBuf, _>| {
+        m.iter()
+            .map(|(k, t): (&PathBuf, &Tree)| (k.clone(), t.branch.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        snap.trees.keys().collect::<Vec<_>>(),
+        sidebar_sock
+            .fetch()
+            .unwrap()
+            .trees
+            .keys()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(shape(&meta), shape(&again));
+    assert_eq!(accepts.load(Ordering::SeqCst), 3);
 
     fs::remove_dir_all(root).ok();
 }

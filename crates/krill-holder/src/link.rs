@@ -130,13 +130,7 @@ impl Link {
                 r => break r,
             }
         };
-        let got = match got {
-            Ok(g) => g,
-            Err(e) => {
-                self.buf.truncate(old);
-                return Err(e.into());
-            }
-        };
+        let got = got.inspect_err(|_| self.buf.truncate(old))?;
         self.buf.truncate(old.saturating_add(got.bytes));
         for m in cmsg.drain() {
             if let RecvAncillaryMessage::ScmRights(it) = m {

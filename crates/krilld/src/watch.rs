@@ -33,7 +33,8 @@ impl Watch {
         }
     }
 
-    pub(crate) fn serve(&self, mut stream: UnixStream) -> io::Result<()> {
+    /// `app`: 앱 연결의 피어 pid([`crate::attach::watch`]가 하트비트 지연을 기록한다).
+    pub(crate) fn serve(&self, mut stream: UnixStream, app: Option<u32>) -> io::Result<()> {
         stream.set_write_timeout(Some(Duration::from_millis(100)))?;
         let id = {
             let mut st = lock(&self.state);
@@ -46,7 +47,7 @@ impl Watch {
             st.clients.insert(id, stream.try_clone()?);
             id
         };
-        let result = crate::attach::watch(stream);
+        let result = crate::attach::watch(stream, app);
         lock(&self.state).clients.remove(&id);
         result
     }
@@ -84,7 +85,7 @@ mod tests {
                 .set_read_timeout(Some(Duration::from_secs(1)))
                 .unwrap();
             let w = Arc::clone(&watch);
-            servers.push(thread::spawn(move || w.serve(server)));
+            servers.push(thread::spawn(move || w.serve(server, None)));
             let (kind, body) = krill_proto::ipc::read_frame(&mut client).unwrap().unwrap();
             assert_eq!(
                 HolderStatus::decode(kind, &body).unwrap(),
@@ -107,7 +108,7 @@ mod tests {
         }
         assert!(lock(&watch.state).clients.is_empty());
         let (mut late, server) = UnixStream::pair().unwrap();
-        watch.serve(server).unwrap();
+        watch.serve(server, None).unwrap();
         let (kind, body) = krill_proto::ipc::read_frame(&mut late).unwrap().unwrap();
         assert_eq!(
             HolderStatus::decode(kind, &body).unwrap(),
@@ -120,7 +121,7 @@ mod tests {
         let watch = Arc::new(Watch::new(HolderStatus::Linked));
         let (mut client, server) = UnixStream::pair().unwrap();
         let w = Arc::clone(&watch);
-        let serving = thread::spawn(move || w.serve(server));
+        let serving = thread::spawn(move || w.serve(server, None));
         krill_proto::ipc::read_frame(&mut client).unwrap();
         drop(client);
         serving.join().unwrap().ok();

@@ -275,6 +275,128 @@ fn concurrent_orphan_recovery_launches_once() {
     assert!(ps(daemon.holder, "stat").contains('s'));
 }
 
+/// `krill <args>`를 격리한 상태·로그 디렉터리로 돌린다.
+fn cli(dir: &Path, args: &[&str]) -> Output {
+    Command::new(MK)
+        .args(args)
+        .env("KRILL_STATE_DIR", dir)
+        .env("KRILL_LOG_DIR", dir.join("logs"))
+        .output()
+        .unwrap()
+}
+
+/// 세션 `id` 화면에 `text`가 나올 때까지 읽는다(세션이 살아 있고 이어 받았다는 뜻).
+fn wait_screen(dir: &Path, id: &str, text: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let out = cli(dir, &["read", id]);
+        if stdout(&out).contains(text) {
+            return;
+        }
+        assert!(std::time::Instant::now() < deadline, "{id}: {out:?}");
+        thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// 2026-10-23 07:19 사건(앱 Quit 직후 holder 소멸) 회귀: holder를 띄운 쪽(앱 자리의 `krill new`)이 끝나고 그
+/// 프로세스 그룹이 신호로 정리돼도(launchd가 앱 잡을 거두는 경우) holder·krilld·세션은 그대로다. 세션을 띄운
+/// 뒤에도 holder에 제어 터미널이 붙지 않아 터미널 SIGHUP을 받을 수 없다.
+#[test]
+fn launcher_quit_keeps_holder_and_sessions() {
+    use std::os::unix::process::CommandExt as _;
+    let dir = state_dir("quit");
+    let launcher = Command::new(MK)
+        .args([
+            "new",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo quit-ready; exec sleep 600",
+        ])
+        .env("KRILL_STATE_DIR", &dir)
+        .env("KRILL_LOG_DIR", dir.join("logs"))
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let group = launcher.id();
+    let out = launcher.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let id = stdout(&out).trim().to_owned();
+    for sig in ["-TERM", "-HUP", "-KILL"] {
+        // 띄운 쪽 그룹이 비어 있으면 실패한다(holder가 그 그룹을 떠났다는 뜻) — 결과는 보지 않는다.
+        Command::new("/bin/kill")
+            .args([sig, "--", &format!("-{group}")])
+            .stderr(Stdio::null())
+            .status()
+            .ok();
+    }
+    let again = doctor(&dir);
+    let text = stdout(&again);
+    assert!(again.status.success(), "{text}");
+    assert!(
+        !text.contains("(launched)"),
+        "holder was relaunched: {text}"
+    );
+    let d = Daemon::new(instance(&text), dir.to_path_buf());
+    assert!(matches!(ps(d.holder, "tty").as_str(), "??" | "?"));
+    wait_screen(&dir, &id, "quit-ready");
+}
+
+/// holder가 종료 신호로 끝나면 신호와 보낸 pid를 운영 로그에 남기고, 세션은 고아 krilld가 쥐었다가 다음
+/// holder·krilld로 이어진다(재결합). SIGKILL 경로는 `concurrent_orphan_recovery_launches_once`가 본다.
+#[cfg(target_os = "macos")]
+#[test]
+fn holder_signal_is_logged_and_sessions_survive() {
+    let dir = state_dir("sigterm");
+    let out = cli(
+        &dir,
+        &[
+            "new",
+            "--",
+            "/bin/sh",
+            "-c",
+            "echo term-ready; exec sleep 600",
+        ],
+    );
+    assert!(out.status.success(), "{out:?}");
+    let id = stdout(&out).trim().to_owned();
+    let first = doctor(&dir);
+    let mut d = Daemon::new(instance(&stdout(&first)), dir.to_path_buf());
+    let mut kill = Command::new("/bin/kill")
+        .args(["-TERM", &d.holder.to_string()])
+        .spawn()
+        .unwrap();
+    let sender = kill.id();
+    assert!(kill.wait().unwrap().success());
+    let log = dir.join("logs/krill-holder.log");
+    let want = format!("holder stopping signal=15 from={sender} sessions=1");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !fs::read_to_string(&log).unwrap_or_default().contains(&want) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            fs::read_to_string(&log)
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let handoff = dir.join("run/krilld.sock.hnd");
+    while !handoff.exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "orphan did not prepare handoff"
+        );
+        thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let recovered = doctor(&dir);
+    let text = stdout(&recovered);
+    assert!(recovered.status.success(), "{text}");
+    d.krilld = instance(&text);
+    d.holder = ps(d.krilld, "ppid").parse().unwrap();
+    wait_screen(&dir, &id, "term-ready");
+}
+
 #[test]
 fn failure_is_reported() {
     let dir = state_dir(&"x".repeat(100));

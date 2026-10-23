@@ -27,9 +27,13 @@ impl Logger {
 impl Subscriber for Logger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
         let target = metadata.target().split("::").next().unwrap_or_default();
+        // `krill_log`: forwarded `log` warnings (gpui render path) keep their origin in a `source` field.
         metadata.is_event()
             && *metadata.level() <= Level::INFO
-            && matches!(target, "krill_app" | "krilld" | "krill_holder" | "krill")
+            && matches!(
+                target,
+                "krill_app" | "krilld" | "krill_holder" | "krill" | "krill_log"
+            )
     }
 
     fn new_span(&self, _: &Attributes<'_>) -> Id {

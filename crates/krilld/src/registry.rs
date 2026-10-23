@@ -484,10 +484,11 @@ impl Registry {
                 | krill_proto::mobile::FEAT_MOBILE)
             == 0
         {
+            let app = peer.pid.filter(|_| client.role == ipc::ClientRole::App);
             if n.features & FEAT_HOLDER_WATCH != 0 {
-                return self.watch.serve(s);
+                return self.watch.serve(s, app);
             }
-            return attach::watch(s);
+            return attach::watch(s, app);
         }
         // macOS는 닫힌 피어의 setsockopt를 EINVAL로 거부한다(OWE-487). 이미 받은 요청은 처리해야 한다.
         s.set_read_timeout(Some(if mobile {
