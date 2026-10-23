@@ -279,6 +279,8 @@ impl Shell {
             "new-session",
             text::NEW_SESSION.get(),
         )
+        // This trigger lives in the footer. Opening above it keeps the initial
+        // pointer outside the menu, so hover cannot change keyboard selection.
         .dropdown_menu(move |mut menu, window, cx| {
             menu = menu
                 .action_context(focus.clone())
@@ -392,7 +394,8 @@ impl Shell {
                         this.update(cx, |_, cx| Self::choose_folder(cx)).ok();
                     }),
             )
-        });
+        })
+        .anchor(gpui::Anchor::BottomLeft);
 
         div()
             .id("agents")
