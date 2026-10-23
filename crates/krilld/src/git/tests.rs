@@ -286,23 +286,25 @@ fn speculative_checkout_cancels_queued_and_running_children() {
         1024,
     );
     let deadline = Instant::now() + Duration::from_secs(2);
-    while !pid_file.exists() {
-        assert!(Instant::now() < deadline);
+    let pid = loop {
+        // Redirection creates the file before echo writes the PID. Its existence alone
+        // does not mean the child has published a complete, valid process identifier.
+        if let Some(pid) = fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            break pid;
+        }
+        assert!(Instant::now() < deadline, "child PID was not published");
         thread::sleep(Duration::from_millis(5));
-    }
-    let pid = fs::read_to_string(&pid_file)
-        .unwrap()
-        .trim()
-        .parse::<i32>()
-        .unwrap();
+    };
     cancel.store(true, Ordering::Release);
     assert_eq!(
         rx.recv().unwrap().unwrap_err().kind(),
         io::ErrorKind::Interrupted
     );
-    assert!(
-        rustix::process::test_kill_process(rustix::process::Pid::from_raw(pid).unwrap()).is_err()
-    );
+    assert!(rustix::process::test_kill_process(pid).is_err());
     assert!(
         queue
             .submit(&dir.0, ["next"])
