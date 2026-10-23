@@ -552,7 +552,8 @@ pub struct Panel {
     watch_gen: u64,
     force_next: bool,
     patch_gen: u64,
-    patch_loaded_gen: u64,
+    pending_patch_gen: Option<u64>,
+    displayed_patch: Option<(Vec<u8>, Comparison)>,
     patch_task: Option<Task<()>>,
     patch_loading_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
@@ -640,7 +641,8 @@ impl Panel {
             watch_gen: 0,
             force_next: false,
             patch_gen: 0,
-            patch_loaded_gen: 0,
+            pending_patch_gen: None,
+            displayed_patch: None,
             patch_task: None,
             patch_loading_task: None,
             watch_task: None,
@@ -679,10 +681,9 @@ impl Panel {
             return;
         }
         self.pending_diff_path = None;
-        self.patch_gen = self.patch_gen.wrapping_add(1);
-        self.patch_task = None;
-        self.patch_loading_task = None;
+        self.invalidate_patch();
         self.message = text::EMPTY.get().into();
+        self.displayed_patch = None;
         self.state.update(cx, |s, cx| s.set_files([], cx));
         cx.notify();
     }
@@ -797,10 +798,9 @@ impl Panel {
         self.loaded = false;
         self.watch_gen = 0;
         self.force_next = false;
-        self.patch_gen = self.patch_gen.wrapping_add(1);
-        self.patch_task = None;
-        self.patch_loading_task = None;
+        self.invalidate_patch();
         self.message = text::EMPTY.get().into();
+        self.displayed_patch = None;
         self.state.update(cx, |s, cx| s.set_files([], cx));
         if self.visible {
             self.refresh_branch_sync(cx);
@@ -814,7 +814,7 @@ impl Panel {
 
     /// 오른쪽 패널 가시성을 바꾼다(OWE-585). 숨기면 즉시 감시를 끄고 진행 중인 git 자식을 회수한다.
     /// OWE-898: 숨길 때 진행 중인 패치·Checks 조회도 취소해 최대 4MiB 패치 버퍼와 검사 결과가
-    /// 백그라운드에 머물지 않게 한다(표시 중인 패치 화면은 유지).
+    /// 백그라운드에 머물지 않게 한다. 완료된 화면은 유지하고, 다른 파일·비교 모드로 전환 중이면 선택을 해제한다.
     pub fn set_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
         if self.visible == visible {
             return;
@@ -827,10 +827,23 @@ impl Panel {
             self.start_watch(cx);
         } else {
             self.watch_task = None;
-            // 진행 중인 패치·Checks는 무효화만 하고 표시 중인 내용은 둔다.
-            self.patch_gen = self.patch_gen.wrapping_add(1);
-            self.patch_task = None;
-            self.patch_loading_task = None;
+            // 완료된 내용은 보존한다. 전환 중이면 새 선택과 이전 본문을 함께 해제한다.
+            let selected_patch = self
+                .selected
+                .and_then(|index| self.changes.files.get(index))
+                .map(|file| (file.path.as_slice(), self.comparison));
+            let displayed_patch = self
+                .displayed_patch
+                .as_ref()
+                .map(|(path, comparison)| (path.as_slice(), *comparison));
+            if self.patch_pending() && selected_patch != displayed_patch {
+                self.clear_selection(cx);
+            } else {
+                if self.patch_pending() {
+                    self.message.clear();
+                }
+                self.invalidate_patch();
+            }
             self.checks.generation = self.checks.generation.wrapping_add(1);
             self.checks.task = None;
             self.checks.loading = false;
@@ -975,11 +988,10 @@ impl Panel {
                             self.select(idx, cx);
                         } else {
                             let had_selection = self.selected.take().is_some();
-                            self.patch_gen = self.patch_gen.wrapping_add(1);
-                            self.patch_task = None;
-                            self.patch_loading_task = None;
+                            self.invalidate_patch();
                             self.message = text::EMPTY.get().into();
                             if had_selection {
+                                self.displayed_patch = None;
                                 self.state.update(cx, |s, cx| s.set_files([], cx));
                             }
                             cx.notify();
@@ -990,8 +1002,10 @@ impl Panel {
                         self.repo_error = None;
                         self.changes = changes;
                         let had_selection = self.selected.take().is_some();
+                        self.invalidate_patch();
                         self.message = text::EMPTY.get().into();
                         if had_selection {
+                            self.displayed_patch = None;
                             self.state.update(cx, |s, cx| s.set_files([], cx));
                         }
                         cx.notify();
@@ -1006,10 +1020,12 @@ impl Panel {
                 self.loaded = true;
                 if changed {
                     let had_selection = self.selected.take().is_some();
+                    self.invalidate_patch();
                     self.changes = Changes::default();
                     self.repo_error = Some(error);
                     self.message = text::EMPTY.get().into();
                     if had_selection {
+                        self.displayed_patch = None;
                         self.state.update(cx, |s, cx| s.set_files([], cx));
                     }
                     cx.notify();
@@ -1155,13 +1171,21 @@ impl Panel {
     }
 
     fn patch_pending(&self) -> bool {
-        self.patch_loaded_gen != self.patch_gen
+        self.pending_patch_gen.is_some()
+    }
+
+    fn invalidate_patch(&mut self) {
+        self.patch_gen = self.patch_gen.wrapping_add(1);
+        self.pending_patch_gen = None;
+        self.patch_task = None;
+        self.patch_loading_task = None;
     }
 
     fn begin_patch_load(&mut self, index: usize, cx: &mut Context<Self>) -> u64 {
         self.selected = Some(index);
-        self.patch_gen = self.patch_gen.wrapping_add(1);
+        self.invalidate_patch();
         let generation = self.patch_gen;
+        self.pending_patch_gen = Some(generation);
         // 화면은 유지하되 이전 파일의 패치를 적용하는 hunk·줄 편집은 즉시 막는다.
         self.raw_patch.clear();
         self.active_hunk = 0;
@@ -1169,7 +1193,7 @@ impl Panel {
         self.patch_loading_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(PATCH_LOADING_DELAY).await;
             this.update(cx, |this, cx| {
-                if this.patch_gen == generation && this.patch_pending() {
+                if this.pending_patch_gen == Some(generation) {
                     this.message = text::LOADING.get().into();
                     cx.notify();
                 }
@@ -1200,10 +1224,17 @@ impl Panel {
         if self.patch_gen != generation {
             return;
         }
-        self.patch_loaded_gen = generation;
+        self.pending_patch_gen = None;
         self.patch_loading_task = None;
         match result {
             Ok((raw, files)) => {
+                self.displayed_patch = if files.is_empty() {
+                    None
+                } else {
+                    self.selected
+                        .and_then(|index| self.changes.files.get(index))
+                        .map(|file| (file.path.clone(), self.comparison))
+                };
                 self.raw_patch = raw;
                 self.active_hunk = 0;
                 self.message = if files.is_empty() {
@@ -1216,6 +1247,7 @@ impl Panel {
             Err(e) => {
                 self.raw_patch.clear();
                 self.message = patch_error_message(&e);
+                self.displayed_patch = None;
                 self.state.update(cx, |s, cx| s.set_files([], cx));
             }
         }
@@ -1529,10 +1561,9 @@ impl Panel {
                                             this.select(index, cx);
                                         } else {
                                             this.selected = None;
-                                            this.patch_gen = this.patch_gen.wrapping_add(1);
-                                            this.patch_task = None;
-                                            this.patch_loading_task = None;
+                                            this.invalidate_patch();
                                             this.message = text::EMPTY.get().into();
+                                            this.displayed_patch = None;
                                             this.state.update(cx, |s, cx| s.set_files([], cx));
                                             cx.notify();
                                         }
