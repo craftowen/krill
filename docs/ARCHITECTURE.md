@@ -3,7 +3,7 @@
 > 2026-10-22 지원 정책: 출고·검증 대상은 Apple Silicon Mac(arm64)과 Windows x64다. Intel Mac·Linux의 제품 빌드 CI·패키징·설치 자산은 제거했다. 아래의 Linux 구현·측정 기록은 기존 호환 코드의 설명이며 현재 지원 플랫폼을 뜻하지 않는다.
 
 
-근거 문서: `docs/planning/T1-final.md`(기능·범위), `T2-final.md`(세션 데몬), `T3-final.md`(UI·터미널·IME), `T4-final.md`(에이전트·Git·운영). 각 결정 옆 `T2-D3` 같은 표기는 해당 보고서의 결정 번호다. 수치에 "추정"이 없으면 이 맥미니 실측이다.
+기능·세션 데몬·터미널·에이전트 운영의 내부 설계 검토를 통합한 규범 문서다. `T2-D3` 같은 표기는 내부 결정 번호다. 수치에 "추정"이 없으면 기록된 Mac mini 환경의 실측이다.
 
 ## 1. 한 장 요약
 
@@ -80,9 +80,9 @@
 | holder·krilld 동시 소실, 재부팅 | 죽는다 | 레이아웃은 위와 같이 복원. 죽은 세션 자리마다 최신 cwd(셸 내부 `cd` 반영, 폴더·`launches`와 분리 보관)·셸 설정으로 새 터미널을 자동 재스폰하고 이전 세그먼트 화면·스크롤백을 새 세션 위쪽 히스토리로 보존(재스폰 실패·holder 없음 때만 읽기 전용 콜드 화면). 에이전트 세션은 `Request::Resume`으로 대화 재개 | OWE-842 | 죽는다. 마지막 화면 읽기 전용 복원(OWE-836). 재부팅·로그오프는 미확인 |
 | 맥 잠자기 | 산다 | 무손실 | 깨어난 뒤 자동 재접속 | 미확인(잠자기·절전 미측정) |
 
-Windows 열은 2026-10-19 GCP Windows Server 2022 VM 실측(release, 헤드리스 앱 프로세스 — `docs/research/windows-spike-OWE-826.md`·`-832`·`-833-8`·`-836`·`-913`)이다. Windows 10/11 데스크톱·GUI 앱·대화형 로그온은 아직 미확인이라 Windows 배포 전 실기 재확인이 필요하다(PRD 플랫폼 절).
+Windows 열은 2026-10-19 GCP Windows Server 2022 VM 실측(release, 헤드리스 앱 프로세스)이다. Windows 10/11 데스크톱·GUI 앱·대화형 로그온은 아직 미확인이라 Windows 배포 전 실기 재확인이 필요하다(PRD 플랫폼 절).
 
-Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.sock>`을 띄워 POSIX 원격 krilld에 붙는다(OWE-915). ssh.exe의 Unix 소켓 `-L`과 로컬 TCP 포워딩은 쓰지 않는다. 세 stdio의 자식 끝도 overlapped named pipe로 열며, HOME 조회·관리형 SSH 명령도 같은 경로를 쓴다. GCP Windows Server 2022 → Mac 전용 sshd에서 기존 세션 Hello·Attach·원본 출력 수신과 터널 제거 뒤 같은 세션 PID 생존을 확인했다(`docs/research/windows-spike-OWE-915.md`). Windows 앱 강제 종료 뒤 SSH 재연결·원격 krilld 크래시 생존을 이번 SSH 스파이크에서 별도로 재측정하지는 않았다.
+Windows SSH 클라이언트는 로컬 AF_UNIX 연결마다 `ssh -T -W <원격.sock>`을 띄워 POSIX 원격 krilld에 붙는다(OWE-915). ssh.exe의 Unix 소켓 `-L`과 로컬 TCP 포워딩은 쓰지 않는다. 세 stdio의 자식 끝도 overlapped named pipe로 열며, HOME 조회·관리형 SSH 명령도 같은 경로를 쓴다. GCP Windows Server 2022 → Mac 전용 sshd에서 기존 세션 Hello·Attach·원본 출력 수신과 터널 제거 뒤 같은 세션 PID 생존을 확인했다(내부 Windows SSH 검증 기록). Windows 앱 강제 종료 뒤 SSH 재연결·원격 krilld 크래시 생존을 이번 SSH 스파이크에서 별도로 재측정하지는 않았다.
 
 ### 4.2 성능 설계
 
@@ -222,7 +222,7 @@ PWA는 `/`, `/manifest.json`, `/app.js`, `/app.css`, `/icon.svg`를 gzip 사전 
 - **렌더**: 같은 스타일 연속 셀을 run으로 묶어 gpui 텍스트 시스템으로 그림, 셀 폭 강제, 배경 병합, vsync당 1회. **Zed 터미널 코드는 GPL-3.0이라 클린룸 구현**(구조만 참고).
 - **IME**: preedit는 UI 상태로만 두고 커서 셀 위 오버레이, PTY에는 확정 텍스트만, 포커스 이탈·탭 전환 시 확정.
 - **vendor 패치**: 글리프 아틀라스 nearest 샘플링(한글 획 번짐, Zed #57777), `maximumDrawableCount` 3→2(장당 25.6MB).
-- **범위 밖**: 파일 에디터, 내장 브라우저, 네이티브 채팅, 자체 STT, 터미널 인라인 이미지 프로토콜(Kitty Graphics·Sixel·iTerm2 — `alacritty_terminal` 범위 밖이며, MK-102는 `libghostty-vt` C API 재평가 문서화(`docs/research/MK-102-libghostty-vt.md`)이고 클립보드 이미지 붙여넣기는 파일 경로 삽입(MK-110)으로 처리).
+- **범위 밖**: 파일 에디터, 내장 브라우저, 네이티브 채팅, 자체 STT, 터미널 인라인 이미지 프로토콜(Kitty Graphics·Sixel·iTerm2 — `alacritty_terminal` 범위 밖이며, MK-102는 `libghostty-vt` C API 재평가 문서화이고 클립보드 이미지 붙여넣기는 파일 경로 삽입(MK-110)으로 처리).
 
 ## 6. 에이전트·Git (T4)
 

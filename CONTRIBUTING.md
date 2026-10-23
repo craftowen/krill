@@ -2,7 +2,7 @@
 
 [한국어](CONTRIBUTING.ko.md)
 
-Start with the [README](README.md) and [Getting started](docs/GETTING_STARTED.md), then read [AGENTS.md](AGENTS.md), [Architecture](docs/ARCHITECTURE.md), [Roadmap](docs/ROADMAP.md), [Code conventions](docs/CONVENTIONS.md), and [UI style guide](docs/STYLEGUIDE.md). These design and repository rules currently remain in Korean. Architecture, Roadmap, Conventions, and Style Guide take precedence over research records in `docs/planning/` and `docs/research/`.
+Start with the [README](README.md) and [Getting started](docs/GETTING_STARTED.md), then read [AGENTS.md](AGENTS.md), [Architecture](docs/ARCHITECTURE.md), [Roadmap](docs/ROADMAP.md), [Code conventions](docs/CONVENTIONS.md), and [UI style guide](docs/STYLEGUIDE.md). These design and repository rules currently remain in Korean. Architecture, Roadmap, Conventions, and Style Guide define the public repository rules. Internal investigation records stay local.
 
 ## Workflow
 

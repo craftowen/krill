@@ -1,6 +1,6 @@
 # Krill 코드 컨벤션 v1 (2026-10-14)
 
-근거: `docs/research/C1-final.md`(Rust·Cargo·Clippy·cargo-deny·Apple·Tauri·gpui 공식 문서, 설정은 이 맥 rustc 1.98.1·cargo-deny 0.20.2로 실측), `docs/research/C2-final.md`(Zed·Alacritty·WezTerm·zellij·shpool·Helix·uv·ripgrep·tokio·GitButler 등 저장소 비교). 규칙 번호(W1, U2 …)는 C1-final §2와 같다.
+이 문서는 Rust·Cargo·Clippy·cargo-deny와 플랫폼·상위 프로젝트 문서를 검토해 정한 저장소 규칙이다. 내부 조사 원문은 공개하지 않으며, 아래 규칙 번호를 코드와 검토의 기준으로 사용한다.
 
 강도: **MUST** = 어기면 병합 안 됨(대부분 `scripts/check.sh`가 기계로 막음). **SHOULD** = 어길 때 `reason`이나 커밋 설명에 이유. **MAY** = 선택.
 

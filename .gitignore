@@ -7,3 +7,12 @@ node_modules/
 cloud/
 docs/reports/
 docs/boost-*.md
+
+# Internal planning, investigations, measurements and QA records stay local.
+/docs/planning/
+/docs/benchmarks/
+/docs/testing/
+/docs/marketing/
+/docs/deep-research-*.md
+/docs/research/*
+!/docs/research/orca-mobile-ui-spec.md

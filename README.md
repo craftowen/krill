@@ -66,7 +66,7 @@ For copyable GUI, CLI, and source-build walkthroughs, see [Getting started](GETT
 | `krilld` crash | Can continue because the holder retains the PTY/handles | Bytes read but not yet recorded may be lost; recovery marks a Gap |
 | Both session services stop, or the machine reboots | Does not survive | Saved history is not a live process; agent conversation resume is a separate action |
 
-This is continuity across app restarts, not a guarantee against every form of data loss. Platform-specific recovery and validation limits are defined in [Architecture §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범). Existing measurements and their workload limits are in [the benchmark record](docs/benchmarks/MK-074.md); they do not establish a general performance comparison or an app-plus-daemon memory result.
+This is continuity across app restarts, not a guarantee against every form of data loss. Platform-specific recovery and validation limits are defined in [Architecture §4.1](docs/ARCHITECTURE.md#41-장애별-보장-범위-규범).
 
 ## Build and contribute
 
