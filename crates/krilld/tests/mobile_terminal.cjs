@@ -46,6 +46,9 @@ async function main(){
  const expected=['\x1b','\t','\r','\x1b[Z',' ','\x7f','\x1b[3~','\x1b[A','\x1b[B','\x1b[D','\x1b[C','\x03','\x04','\x0c','\x1a','\x12','\x01','\x05','\x17','\x15'];
  let {root,handle,socket}=await mount();socket.autoAck=true;
  for(const k of api.keys)await handle.sendKey(k.id);assert.deepEqual(inputs(socket),expected);console.log('PASS exact 20-key order and bytes');
+ // Switching visible panes invalidates a late IME commit, deferred keys, repeat and paste review.
+ const inactiveCapture=find(root,'live-capture');handle.focus();event(inactiveCapture,'compositionstart');inactiveCapture.value='late';const deferred=handle.sendKey('enter');const rejected=assert.rejects(deferred,/Input target changed/);const inactiveCount=inputs(socket).length;handle.setInputActive(false);await rejected;assert.equal(find(root,'command-input').value,'late');event(inactiveCapture,'compositionend',{data:'final'});assert.equal(find(root,'command-input').value,'final');inactiveCapture.value='late';event(inactiveCapture,'input');event(inactiveCapture,'paste',{clipboardData:{getData:()=> 'wrong-pane'}});await assert.rejects(handle.sendKey('escape'),/Resume/);await flush();assert.equal(inputs(socket).length,inactiveCount);assert.equal(inactiveCapture.value,'');
+ handle.setInputActive(true);handle.setInputMode('direct');handle.focus();inactiveCapture.value='active';event(inactiveCapture,'input');await flush();assert.equal(inputs(socket).at(-1),'active');console.log('PASS inactive pane discards late IME, deferred keys, paste and direct input');
  assert.equal(handle.toggleShift(),true);assert.equal(key(root,'shift').getAttribute('aria-pressed'),'true');await handle.sendKey('tab');assert.equal(inputs(socket).at(-1),'\x1b[Z');assert.equal(key(root,'shift').getAttribute('aria-pressed'),'false');
  event(key(root,'shift'),'click');await handle.sendKey('arrowUp');assert.equal(inputs(socket).at(-1),'\x1b[1;2A');
  console.log('PASS Shift modifier');
