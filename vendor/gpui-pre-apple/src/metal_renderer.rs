@@ -1745,28 +1745,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exhausted_drawables_keep_foreground_responsive_and_recover() {
+    fn delayed_drawable_acquisition_keeps_foreground_responsive_and_recovers() {
         let mut renderer = objc2::rc::autoreleasepool(|_| {
             let mut renderer = MetalRenderer::new(Arc::new(Mutex::new(Default::default())), false);
             renderer.update_drawable_size(size(DevicePixels(64), DevicePixels(64)));
             renderer
         });
-        let layer = renderer.layer.as_ref().unwrap().clone();
-        // Retain three CAMetalLayer surfaces to exercise delayed acquisition and
-        // recovery without touching the running app. This is not the full tailspin scenario.
-        let held: Vec<_> = (0..3)
-            .map(|_| objc2::rc::autoreleasepool(|_| layer.next_drawable().unwrap().to_owned()))
-            .collect();
+        // Gate the actual acquisition worker rather than assuming a detached CAMetalLayer
+        // exhausts its pool after a fixed number of nextDrawable calls.
+        let (entered, started) = std::sync::mpsc::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let mut gate = Some(gate);
+        renderer.drawable_acquisition = Some(
+            acquisition::Acquisition::new(move |layer: metal::MetalLayer| {
+                if let Some(gate) = gate.take() {
+                    entered.send(()).unwrap();
+                    gate.recv().unwrap();
+                }
+                objc2::rc::autoreleasepool(|_| layer.next_drawable().map(ToOwned::to_owned))
+            })
+            .unwrap(),
+        );
         let scene = Scene::default();
-        for _ in 0..10 {
-            let start = Instant::now();
+        assert!(!renderer.draw(&scene));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let start = Instant::now();
+        for _ in 0..1000 {
             assert!(!renderer.draw(&scene));
-            assert!(start.elapsed() < Duration::from_millis(250));
-            std::thread::sleep(Duration::from_millis(5));
         }
-        drop(held);
+        assert!(start.elapsed() < Duration::from_millis(250));
+        release.send(()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !renderer.draw(&scene) {
+        while !objc2::rc::autoreleasepool(|_| renderer.draw(&scene)) {
             assert!(Instant::now() < deadline, "presentation did not recover");
             std::thread::sleep(Duration::from_millis(5));
         }
