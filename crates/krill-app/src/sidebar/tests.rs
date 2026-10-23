@@ -1311,8 +1311,24 @@ fn sidebar_reuses_uds_connection_and_hub_refcounts_sidebar_and_diff_watches() {
         .unwrap()
         .block_on(sidebar_sock.poll_snapshot())
         .unwrap();
-    assert_eq!(snap, sidebar_sock.fetch().unwrap());
-    assert_eq!(meta, sidebar_sock.meta(&snap.trees));
+    // 레지스트리는 실행 환경의 다른 저장소도 보여 주고 그 변경 수는 git 감시가 비동기로 채운다. 그래서 두 번 읽은
+    // 값을 통째로 비교하지 않고 저장소 목록과 브랜치만 비교한다.
+    let again = sidebar_sock.meta(&snap.trees);
+    let shape = |m: &BTreeMap<PathBuf, _>| {
+        m.iter()
+            .map(|(k, t): (&PathBuf, &Tree)| (k.clone(), t.branch.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        snap.trees.keys().collect::<Vec<_>>(),
+        sidebar_sock
+            .fetch()
+            .unwrap()
+            .trees
+            .keys()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(shape(&meta), shape(&again));
     assert_eq!(accepts.load(Ordering::SeqCst), 3);
 
     fs::remove_dir_all(root).ok();
