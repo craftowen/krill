@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import secrets
 import subprocess
 import tempfile
 import unittest
@@ -82,6 +83,25 @@ class HookTests(unittest.TestCase):
     def test_feature_branch_needs_no_protected_ref_reason(self):
         result = self.push("refs/heads/feature")
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_ci_refuses_missing_gitleaks(self):
+        empty_path = self.root / "empty-path"
+        empty_path.mkdir()
+        result = subprocess.run(
+            ["/bin/bash", str(ROOT / "scripts/public-surface.sh"), str(self.work)],
+            env={**self.env, "CI": "true", "PATH": str(empty_path)},
+            capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("CI requires gitleaks", result.stderr)
+
+    def test_other_token_in_websocket_fixture_is_not_allowlisted(self):
+        source = self.work / "crates/krilld/src/mobile/ws.rs"
+        source.parent.mkdir(parents=True)
+        source.write_text(f'api_key = "{secrets.token_hex(32)}"\n')
+        self.commit()
+        result = self.push("refs/heads/feature")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("공개 표면 점검 실패", result.stderr)
 
     def guard(self, command=None, path=None, **env):
         payload = {"cwd": str(self.work), "tool_name": "Bash" if command is not None else "Edit",

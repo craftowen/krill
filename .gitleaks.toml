@@ -7,6 +7,19 @@ title = "krill"
 [extend]
 useDefault = true
 
+# RFC 6455 공개 WebSocket nonce와 RFC 8032의 금지 키 회귀 입력만 허용한다.
+# 경로 전체를 제외하지 않으므로 같은 파일의 다른 키는 계속 검출한다.
+[[rules]]
+id = "generic-api-key"
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''crates/krilld/src/mobile/(ws\.rs|gateway/tests\.rs)$''']
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
+[[rules.allowlists]]
+condition = "AND"
+paths = ['''packaging/macos/test_pipeline\.py$''']
+regexes = ['''^9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60$''']
+
 # 개인 메일 주소. 2026-10-19 기준 현재 트리에서 docs/ARTIFACTS.md의 Cloudflare 계정 메일이 실제로 노출됐다.
 # 메인테이너 주소를 하나하나 적으면 이 파일이 곧 유출이 되므로, 개인 메일 도메인 전체를 막고
 # 서드파티 저작권 표기(THIRD_PARTY_NOTICES.md·docs/licensing·vendor)만 허용한다.
