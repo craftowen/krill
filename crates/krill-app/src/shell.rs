@@ -6280,7 +6280,6 @@ impl Render for Shell {
                                 .flex()
                                 .flex_col()
                                 .child(self.render_sidebar_header(window, cx))
-                                .child(self.render_agents(cx))
                                 .child(
                                     div().flex_1().min_h_0().child(
                                         self.sidebar
@@ -6291,6 +6290,7 @@ impl Render for Shell {
                                 // 사이드바 스피너는 여기(셸)서 돌려 틱마다 사이드바를 다시 렌더하지 않는다.
                                 .child(self.sidebar.read(cx).spinner_overlay())
                                 .child(self.detached.clone())
+                                .child(self.render_agents(cx))
                                 .child(Self::render_sidebar_footer(cx)),
                         )
                         .child(divider(

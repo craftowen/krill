@@ -236,11 +236,8 @@ impl DiskSnapshot {
                 parents.insert(child, parent);
             }
         }
-        // Orca처럼 같은 저장소의 연결 워크트리를 본 워크트리 자식으로 묶는다.
-        // 명시적 부모가 없을 때만 추론하므로 사용자 지정·해제는 유지된다.
-        for (child, parent) in external::infer_repo_main_lineage(&snapshot.trees, &parents) {
-            parents.insert(child, parent);
-        }
+        // Sharing a repository is not a parent-child relationship. Only explicit
+        // lineage (including imported Orca relationships) may nest workspaces.
         for (key, value) in &store.statuses {
             if let Ok(status) = krill_proto::orchestration::WorkspaceStatus::parse(value) {
                 statuses.insert(PathBuf::from(key), status);
@@ -574,6 +571,36 @@ impl Sidebar {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn linked_worktrees_are_project_siblings_unless_parent_is_explicit() {
+        let dir =
+            std::env::temp_dir().join(format!("krill-project-lineage-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        WorktreeStore::mutate(&dir, |store| {
+            store.set_parent("/repo/child", Some("/repo/mobile-ui"))
+        })
+        .unwrap();
+        let snapshot = Snapshot {
+            sessions: Vec::new(),
+            trees: BTreeMap::from([(
+                "/repo".into(),
+                vec![
+                    "/repo".into(),
+                    "/repo/mobile-ui".into(),
+                    "/repo/windows".into(),
+                    "/repo/child".into(),
+                ],
+            )]),
+        };
+        let data = DiskSnapshot::load(Some(&dir.join("sidebar.bin")), snapshot, Meta::new());
+        assert_eq!(
+            data.parents,
+            BTreeMap::from([("/repo/child".into(), "/repo/mobile-ui".into())])
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[gpui::test]
     fn blocked_write_queue_keeps_ui_running_and_saves_in_order(cx: &mut gpui::TestAppContext) {

@@ -81,7 +81,7 @@ actions!(
 const KEY_CONTEXT: &str = "Sidebar";
 /// 기본 세션·프로젝트 행 높이. 상세 카드는 가변 높이 목록에서 별도로 측정한다.
 const ROW_HEIGHT: f32 = 32.;
-/// 프로젝트(저장소·폴더·그룹) 아래 워크트리·세션 행의 들여쓰기(px). 호스트 > 프로젝트 > 워크트리 단계가 보이게 한다.
+/// 프로젝트(저장소·폴더·그룹) 아래 워크트리·세션 행의 들여쓰기(px).
 const CHILD_INDENT: f32 = 12.;
 /// 호스트 머리줄이 있을 때(원격 호스트 등록) 그 아래 프로젝트 행의 들여쓰기(px).
 const HOST_CHILD_INDENT: f32 = 8.;
@@ -702,6 +702,7 @@ pub struct Sidebar {
     auto_titles: BTreeMap<SessionId, String>,
     /// 활성 Claude 프롬프트 캐시 카운트다운의 마지막 1초 틱(`now_ns / 1e9`, OWE-737).
     last_cache_tick_sec: Option<u64>,
+    last_activity_minute: Option<u64>,
     /// 테스트용 시각 고정(ns, OWE-737).
     now_override_ns: Option<u64>,
     /// 셸의 포커스 칸 세션(OWE-662 미확인 판정).
@@ -839,6 +840,7 @@ impl Sidebar {
             titles: BTreeMap::new(),
             auto_titles: BTreeMap::new(),
             last_cache_tick_sec: None,
+            last_activity_minute: None,
             now_override_ns: None,
             focused: None,
             unread: BTreeSet::new(),
@@ -1663,8 +1665,52 @@ impl Sidebar {
             self.selected_worktree = Some(wt);
             self.write_state(cx);
         }
+        if changed
+            && let Some(path) = session
+                .and_then(|id| self.folder_on(&HostId::Local, id))
+                .map(Path::to_path_buf)
+        {
+            self.cursor = self.rows.iter().enumerate().position(|(i, row)| {
+                self.row_host(i).is_local()
+                    && matches!(row, Row::Worktree(p) | Row::Folder(p) if p == &path)
+            });
+            self.sync_viewport();
+        }
         if changed || cleared {
             cx.notify();
+        }
+    }
+
+    /// The toolbar bell opens the next unread completion and reveals its project.
+    fn open_next_unread(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|s| self.unread.contains(&s.id) || needs_you(&s.status))
+            .map(|s| s.id)
+        else {
+            return;
+        };
+        if let Some(path) = self.folder_on(&HostId::Local, id).map(Path::to_path_buf) {
+            self.collapsed.remove(&path);
+            self.expand_lineage_ancestors(&path);
+            for (repo, trees) in &self.snapshot.trees {
+                if trees.contains(&path) {
+                    self.collapsed.remove(repo);
+                    if external::is_claude_worktree(&path) {
+                        self.shown_external.insert(repo.clone());
+                    }
+                }
+            }
+            self.persist(cx);
+        }
+        let index = self.rows.iter().enumerate().position(|(i, r)| {
+            self.row_host(i).is_local() && matches!(r, Row::Session(s, _) if s.id == id)
+        });
+        if let Some(index) = index {
+            self.select_session_on(index, HostId::Local, id, cx);
+            self.scroll_row_into_view(index, ScrollStrategy::Nearest);
         }
     }
 
@@ -1846,6 +1892,15 @@ impl Sidebar {
         })
     }
 
+    fn activity_minute(&self, now_ns: u64) -> Option<u64> {
+        self.snapshot
+            .sessions
+            .iter()
+            .chain(self.remote_hosts.iter().flat_map(|r| &r.snapshot.sessions))
+            .any(|s| s.status.since_unix_ns > 0)
+            .then_some(now_ns / 60_000_000_000)
+    }
+
     fn has_active_cache_timer(&self, now_ns: u64, cx: &App) -> bool {
         let settings = crate::settings::current(cx);
         if !settings.prompt_cache_timer_enabled {
@@ -1878,7 +1933,7 @@ impl Sidebar {
     }
 
     fn host_indent(&self) -> f32 {
-        if self.remote_hosts.is_empty() {
+        if self.remote_hosts.is_empty() || self.options.group_by == GroupBy::Repo {
             0.
         } else {
             HOST_CHILD_INDENT
@@ -1922,17 +1977,21 @@ impl Sidebar {
             let mut rows = Vec::new();
             let mut row_hosts = Vec::new();
             if self.options.filters.contains_host(&HostId::Local) {
-                rows.push(Row::HostHeader {
-                    host: HostId::Local,
-                    label: text::HOST_LOCAL
-                        .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
-                        .get()
-                        .to_owned(),
-                    status: self.local_status,
-                    sessions: self.snapshot.sessions.len(),
-                });
-                row_hosts.push(HostId::Local);
-                if !self.collapsed_hosts.contains(&HostId::Local) {
+                if self.options.group_by != GroupBy::Repo {
+                    rows.push(Row::HostHeader {
+                        host: HostId::Local,
+                        label: text::HOST_LOCAL
+                            .mac_or(crate::i18n::catalog::other_os::HOST_LOCAL)
+                            .get()
+                            .to_owned(),
+                        status: self.local_status,
+                        sessions: self.snapshot.sessions.len(),
+                    });
+                    row_hosts.push(HostId::Local);
+                }
+                if self.options.group_by == GroupBy::Repo
+                    || !self.collapsed_hosts.contains(&HostId::Local)
+                {
                     let local_rows = self.local_rows();
                     row_hosts.extend(std::iter::repeat_n(HostId::Local, local_rows.len()));
                     rows.extend(local_rows);
@@ -1951,6 +2010,7 @@ impl Sidebar {
                 .partition(|r| {
                     r.status != HostStatus::Connected
                         && r.snapshot.sessions.is_empty()
+                        && r.snapshot.trees.is_empty()
                         && !self.remote_info.contains_key(&r.id)
                 });
             for (i, remote) in live_hosts.iter().chain(&idle_hosts).enumerate() {
@@ -1962,15 +2022,23 @@ impl Sidebar {
                         break;
                     }
                 }
-                rows.push(Row::HostHeader {
-                    host: host.clone(),
-                    label: remote.label.clone(),
-                    status: remote.status,
-                    sessions: remote.snapshot.sessions.len(),
-                });
-                row_hosts.push(host.clone());
-                if !self.collapsed_hosts.contains(&host) {
-                    let r_rows = self.remote_rows(remote);
+                let r_rows = self.remote_rows(remote);
+                // Projects are the root navigation. A remote connection without any
+                // projects still needs a reachable status/reconnect surface.
+                let project_roots = self.options.group_by == GroupBy::Repo
+                    && r_rows
+                        .iter()
+                        .any(|r| matches!(r, Row::Repository(_) | Row::Folder(_)));
+                if !project_roots {
+                    rows.push(Row::HostHeader {
+                        host: host.clone(),
+                        label: remote.label.clone(),
+                        status: remote.status,
+                        sessions: remote.snapshot.sessions.len(),
+                    });
+                    row_hosts.push(host.clone());
+                }
+                if project_roots || !self.collapsed_hosts.contains(&host) {
                     row_hosts.extend(std::iter::repeat_n(host, r_rows.len()));
                     rows.extend(r_rows);
                 }
@@ -2102,6 +2170,7 @@ impl Sidebar {
                         crate::alert::sync_snapshot(&self.snapshot, cx);
                     }
                     let now_ns = self.now_unix_ns();
+                    self.last_activity_minute = self.activity_minute(now_ns);
                     self.last_cache_tick_sec = self
                         .has_active_cache_timer(now_ns, cx)
                         .then_some(now_ns / 1_000_000_000);
@@ -2111,12 +2180,15 @@ impl Sidebar {
                         self.rebuild(cx);
                     }
                 } else {
-                    let visuals_changed = false;
                     let now_ns = self.now_unix_ns();
+                    let activity_minute = self.activity_minute(now_ns);
                     let next_tick = self
                         .has_active_cache_timer(now_ns, cx)
                         .then_some(now_ns / 1_000_000_000);
-                    if visuals_changed || self.last_cache_tick_sec != next_tick {
+                    if self.last_activity_minute != activity_minute
+                        || self.last_cache_tick_sec != next_tick
+                    {
+                        self.last_activity_minute = activity_minute;
                         self.last_cache_tick_sec = next_tick;
                         cx.notify();
                     }

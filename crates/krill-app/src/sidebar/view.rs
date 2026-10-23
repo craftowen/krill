@@ -13,8 +13,8 @@ use gpui::{AnyElement, Context, Focusable as _, Window, div, prelude::*, px};
 use gpui_component::button::{Button, ButtonVariants as _};
 use gpui_component::checkbox::Checkbox;
 use gpui_component::input::Input;
-use gpui_component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
-use gpui_component::{Icon, IconName, Sizable as _};
+use gpui_component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_component::{Disableable as _, Icon, IconName, Sizable as _};
 use krill_proto::SessionId;
 use krill_proto::control::{AgentProfile, Program};
 
@@ -32,7 +32,7 @@ use crate::ui::status::{self, Size};
 /// 카드 테두리 2 + 안쪽 여백 10 − 세션 행 바깥 여백 4.
 const CARD_SESSION_INSET: f32 = 8.;
 /// 폴더 행의 아이콘 아래에 세션 상태를 정렬한다(이름 아래로 중복 들여쓰지 않는다).
-const FOLDER_SESSION_INSET: f32 = 34.;
+const FOLDER_SESSION_INSET: f32 = 8.;
 
 #[derive(Clone)]
 struct TreeMenuMeta {
@@ -441,37 +441,116 @@ fn row_menu(
 }
 
 impl Sidebar {
+    /// Connection context lives next to its project, never above the project tree.
+    fn project_host_control(
+        &self,
+        index: usize,
+        host: &HostId,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(remote) = host
+            .remote_id()
+            .and_then(|id| self.remote_hosts.iter().find(|r| r.id == id))
+        else {
+            return div().into_any_element();
+        };
+        let p = ui::palette(cx);
+        let reason = remote.error.as_deref().map(disconnect_reason);
+        let (tone, state) = host_status_tone(remote.status, false, reason, p);
+        let info = host.remote_id().and_then(|id| self.remote_info.get(id));
+        let tip = format!(
+            "{} · {}{}",
+            remote.label,
+            state,
+            info.and_then(|i| i.error.as_ref().or(i.detail.as_ref()))
+                .map(|detail| format!(" · {detail}"))
+                .unwrap_or_default()
+        );
+        let badge = div()
+            .id(("project-host", index))
+            .debug_selector(move || format!("project-host-{index}"))
+            .flex_none()
+            .max_w(px(100.))
+            .flex()
+            .items_center()
+            .gap_1()
+            .text_size(ui::TEXT_2XS)
+            .text_color(p.muted_foreground)
+            .child(
+                div()
+                    .size(ui::STATE_DOT)
+                    .rounded_full()
+                    .flex_none()
+                    .bg(tone),
+            )
+            .child(div().min_w_0().truncate().child(remote.label.clone()))
+            .tooltip(move |window, cx| {
+                gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+            });
+        if remote.status == HostStatus::Disconnected {
+            let host = host.clone();
+            badge
+                .child(
+                    Button::new(("project-reconnect", index))
+                        .ghost()
+                        .xsmall()
+                        .debug_selector(move || format!("project-reconnect-{index}"))
+                        .icon(IconName::RefreshCw)
+                        .accessibility_label(text::HOST_RECONNECT.get())
+                        .tooltip(text::HOST_RECONNECT.get())
+                        .on_click(cx.listener(move |s, _, _, cx| {
+                            cx.stop_propagation();
+                            s.reconnect_host(host.clone(), cx);
+                        })),
+                )
+                .into_any_element()
+        } else if remote.status == HostStatus::Connected {
+            let host = host.clone();
+            badge
+                .child(
+                    div()
+                        .invisible()
+                        .group_hover(ROW_GROUP, Styled::visible)
+                        .child(
+                            Button::new(("project-disconnect", index))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Close)
+                                .accessibility_label(text::HOST_DISCONNECT.get())
+                                .tooltip(text::HOST_DISCONNECT.get())
+                                .on_click(cx.listener(move |s, _, _, cx| {
+                                    cx.stop_propagation();
+                                    s.disconnect_host(host.clone(), cx);
+                                })),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            badge.into_any_element()
+        }
+    }
+
     /// Rebuilt with the row model; lookup stays constant-time while scrolling a large card.
     pub(super) fn session_card_index(&self, index: usize) -> Option<usize> {
         self.card_parents.get(index).copied().flatten()
     }
 
-    fn worktree_card_active(&self, index: usize, path: &std::path::Path) -> bool {
-        let host = self.row_host(index);
-        let snapshot = self.snapshot_for(host);
-        let focused_wt = self
+    pub(super) fn worktree_card_active(&self, index: usize, path: &std::path::Path) -> bool {
+        // A selected workspace owns the entire selection surface. Old terminal focus
+        // must not leave another project (or a same-ID remote session) highlighted.
+        if let Some(cursor) = self.cursor
+            && let Some(folder) = self.cursor_folder()
+        {
+            return self.row_host(index) == self.row_host(cursor) && folder == path;
+        }
+        if let Some(focused) = self
             .focused
-            .and_then(|id| self.folder_on(host, id))
-            .filter(|wt| {
-                snapshot
-                    .trees
-                    .values()
-                    .any(|list| list.iter().any(|t| t == wt))
-            });
-        self.cursor == Some(index)
-            || focused_wt == Some(path)
-            || (focused_wt.is_none()
-                && self.cursor.is_none()
-                && self.selected_worktree.as_deref().map_or_else(
-                    || {
-                        snapshot
-                            .trees
-                            .keys()
-                            .next()
-                            .is_some_and(|first| first == path)
-                    },
-                    |sel| sel == path,
-                ))
+            .and_then(|id| self.folder_on(&HostId::Local, id))
+        {
+            return self.row_host(index).is_local() && focused == path;
+        }
+        self.selected_workspace()
+            .is_some_and(|(host, folder)| self.row_host(index) == &host && folder == path)
     }
 
     /// 카드 머리줄과 세션을 따로 가상화하되 표면·테두리는 끊김 없이 잇는다.
@@ -540,10 +619,13 @@ impl Sidebar {
                     d.bg(p.worktree_sidebar)
                         .border_color(p.sidebar_ring.opacity(0.65))
                 })
-                .when(depth > 0 && !active, |d| {
-                    d.border_l_2().border_color(p.worktree_sidebar_border)
-                })
-                .child(session);
+                .child(session)
+                .when(last && self.row_host(parent).is_local(), |d| {
+                    d.children(
+                        self.lineage_toggle_element(parent, path, cx)
+                            .map(|toggle| div().pt_1().flex().child(toggle)),
+                    )
+                });
         }
         element
             .h(px(if last { ROW_HEIGHT } else { 26. }))
@@ -560,9 +642,6 @@ impl Sidebar {
             .when(self.worktree_card_active(parent, path), |d| {
                 d.bg(p.worktree_sidebar)
                     .border_color(p.sidebar_ring.opacity(0.65))
-            })
-            .when(depth > 0 && !self.worktree_card_active(parent, path), |d| {
-                d.border_l_2().border_color(p.worktree_sidebar_border)
             })
     }
 
@@ -628,6 +707,7 @@ impl Sidebar {
         };
         let repo_heading = |d: gpui::Stateful<gpui::Div>| {
             d.h(ui::SIDEBAR_HEADER_HEIGHT)
+                .mt_2()
                 .px_2()
                 .mx_1()
                 .rounded(ui::RADIUS_SM)
@@ -941,26 +1021,6 @@ impl Sidebar {
                             .text_color(p.sidebar_accent_foreground)
                     })
                     .child(
-                        Button::new(("repo-fold", index))
-                            .ghost()
-                            .xsmall()
-                            .icon(if closed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .accessibility_label(if closed {
-                                text::UNFOLD.get()
-                            } else {
-                                text::FOLD.get()
-                            })
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                cx.stop_propagation();
-                                s.cursor = Some(index);
-                                s.fold(&fold_btn, None, cx);
-                            })),
-                    )
-                    .child(
                         div()
                             .debug_selector(move || format!("repo-icon-{index}"))
                             .child(ui::icons::project_header_icon(
@@ -987,20 +1047,42 @@ impl Sidebar {
                                 basename(path)
                             }),
                     )
-                    .when(wt_count > 0, |d| {
+                    .when(closed && wt_count > 0, |d| {
                         d.child(
                             div()
                                 .debug_selector(move || format!("repo-count-{index}"))
                                 .flex_none()
-                                .px_1()
-                                .rounded(ui::RADIUS_XS)
-                                .bg(p.muted)
-                                .font_family(ui::FONT_MONO)
                                 .text_size(ui::TEXT_2XS)
                                 .text_color(p.muted_foreground)
                                 .child(wt_count.to_string()),
                         )
                     })
+                    .child(self.project_host_control(index, &row_host, cx))
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover(ROW_GROUP, Styled::visible)
+                            .child(
+                                Button::new(("repo-fold", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(if closed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .accessibility_label(if closed {
+                                        text::UNFOLD.get()
+                                    } else {
+                                        text::FOLD.get()
+                                    })
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.cursor = Some(index);
+                                        s.fold(&fold_btn, None, cx);
+                                    })),
+                            ),
+                    )
                     .when(row_host.is_local(), |d| {
                         d.child(
                             div()
@@ -1060,26 +1142,6 @@ impl Sidebar {
                         d.bg(p.sidebar_accent)
                             .text_color(p.sidebar_accent_foreground)
                     })
-                    .child(
-                        Button::new(("folder-fold", index))
-                            .ghost()
-                            .xsmall()
-                            .icon(if closed {
-                                IconName::ChevronRight
-                            } else {
-                                IconName::ChevronDown
-                            })
-                            .accessibility_label(if closed {
-                                text::UNFOLD.get()
-                            } else {
-                                text::FOLD.get()
-                            })
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                cx.stop_propagation();
-                                s.cursor = Some(index);
-                                s.fold(&fold_btn, None, cx);
-                            })),
-                    )
                     .child(ui::icons::project_header_icon(
                         row_host
                             .is_local()
@@ -1103,6 +1165,32 @@ impl Sidebar {
                             } else {
                                 basename(path)
                             }),
+                    )
+                    .child(self.project_host_control(index, &row_host, cx))
+                    .child(
+                        div()
+                            .invisible()
+                            .group_hover(ROW_GROUP, Styled::visible)
+                            .child(
+                                Button::new(("folder-fold", index))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(if closed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .accessibility_label(if closed {
+                                        text::UNFOLD.get()
+                                    } else {
+                                        text::FOLD.get()
+                                    })
+                                    .on_click(cx.listener(move |s, _, _, cx| {
+                                        cx.stop_propagation();
+                                        s.cursor = Some(index);
+                                        s.fold(&fold_btn, None, cx);
+                                    })),
+                            ),
                     )
                     .child(
                         div()
@@ -1141,7 +1229,7 @@ impl Sidebar {
                 let id = session.id;
                 let unread = row_host.is_local() && self.is_unread(id);
                 let state = state_text(session.status.state);
-                let (name, detail) = self.session_label(session);
+                let (name, detail) = self.session_label_on(&row_host, session);
                 let inferred = session
                     .status
                     .badge()
@@ -1254,6 +1342,18 @@ impl Sidebar {
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .child(name),
                     )
+                    .when(session.status.since_unix_ns > 0, |d| {
+                        d.child(
+                            div()
+                                .flex_none()
+                                .text_size(ui::TEXT_2XS)
+                                .text_color(p.muted_foreground)
+                                .child(crate::jump::format_age_ns(
+                                    session.status.since_unix_ns,
+                                    self.now_unix_ns(),
+                                )),
+                        )
+                    })
                     .children(
                         row_host
                             .is_local()
@@ -1426,9 +1526,67 @@ impl Sidebar {
             .min_w_0()
             .truncate()
             .text_size(title_size)
-            .font_weight(gpui::FontWeight::SEMIBOLD)
+            .font_weight(gpui::FontWeight::NORMAL)
             .child(card_title)
             .into_any_element()
+    }
+
+    fn lineage_toggle_element(
+        &self,
+        index: usize,
+        path: &std::path::Path,
+        cx: &Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let p = ui::palette(cx);
+        let lineage_child_count = self.cached_lineage_child_count(path);
+        let lineage_collapsed = self.is_lineage_collapsed(path);
+        (lineage_child_count > 0).then(|| {
+            let fold_path = path.to_path_buf();
+            let count_str = lineage_child_count.to_string();
+            let tip = if lineage_collapsed {
+                text::UNFOLD_CHILDREN.format(&[("n", &count_str)])
+            } else {
+                text::FOLD_CHILDREN.format(&[("n", &count_str)])
+            };
+            div()
+                .id(("lineage-fold", index))
+                .role(gpui::Role::Button)
+                .aria_expanded(!lineage_collapsed)
+                .debug_selector(move || format!("worktree-lineage-toggle-{index}"))
+                .aria_label(tip.clone())
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_0p5()
+                .px_1()
+                .py(px(1.))
+                .rounded_full()
+                .border_1()
+                .border_color(p.worktree_sidebar_border)
+                .hover(|d| d.bg(p.accent).text_color(p.foreground))
+                .active(|d| d.bg(p.sidebar_accent))
+                .text_size(ui::TEXT_2XS)
+                .font_family(ui::FONT_MONO)
+                .text_color(p.muted_foreground)
+                .cursor_pointer()
+                .child(
+                    Icon::new(if lineage_collapsed {
+                        IconName::ChevronRight
+                    } else {
+                        IconName::ChevronDown
+                    })
+                    .with_size(ui::ICON_XS)
+                    .text_color(p.muted_foreground),
+                )
+                .child(text::CHILD_COUNT.format(&[("n", &count_str)]))
+                .tooltip(move |window, cx| {
+                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
+                })
+                .on_click(cx.listener(move |s, _, _, cx| {
+                    cx.stop_propagation();
+                    s.toggle_lineage(&fold_path, cx);
+                }))
+        })
     }
 
     /// 워크트리 카드 왼쪽 여백(px): 프로젝트 > 워크트리 들여쓰기 + 호스트 들여쓰기 + 계보 깊이(단계당 14px).
@@ -1504,19 +1662,19 @@ impl Sidebar {
         {
             custom.to_owned()
         } else if is_default_tree {
-            raw_branch.unwrap_or(&folder_name).to_owned()
+            custom_name.unwrap_or(&folder_name).to_owned()
         } else if let Some(b) =
             raw_branch.filter(|b| !krill_proto::git::is_default_branch_or_worktree_name(b))
         {
-            b.rsplit('/').next().unwrap_or(b).replace('-', " ")
+            b.rsplit('/').next().unwrap_or(b).to_owned()
         } else if let Some(auto) = auto_title {
             auto.to_owned()
         } else if let Some(custom) = custom_name {
             custom.to_owned()
         } else if let Some(b) = raw_branch {
-            b.rsplit('/').next().unwrap_or(b).replace('-', " ")
+            b.rsplit('/').next().unwrap_or(b).to_owned()
         } else {
-            folder_name.replace('-', " ")
+            folder_name.clone()
         };
         let branch_subtitle = raw_branch.map_or_else(|| folder_name, str::to_owned);
         let dirty = self
@@ -1590,7 +1748,11 @@ impl Sidebar {
             div()
                 .size(ui::STATE_DOT)
                 .rounded_full()
-                .bg(p.muted_foreground.opacity(0.5))
+                .bg(if tree_session_count > 0 {
+                    p.success
+                } else {
+                    p.muted_foreground.opacity(0.5)
+                })
                 .into_any_element()
         };
 
@@ -1698,11 +1860,7 @@ impl Sidebar {
         });
 
         let props = self.options.card_properties;
-        let show_branch_subtitle = props.branch
-            && !branch_subtitle.is_empty()
-            && !card_title
-                .trim()
-                .eq_ignore_ascii_case(branch_subtitle.trim());
+        let show_branch_subtitle = props.branch && !branch_subtitle.is_empty();
         let pr_badge = props
             .pr
             .then(|| {
@@ -1828,57 +1986,11 @@ impl Sidebar {
         } else {
             0
         };
-        let lineage_child_count = if row_host.is_local() {
-            self.cached_lineage_child_count(path)
-        } else {
-            0
-        };
-        let lineage_collapsed = row_host.is_local() && self.is_lineage_collapsed(path);
         let left_margin = px(self.worktree_margin(lineage_depth));
-        let lineage_toggle_btn = (lineage_child_count > 0).then(|| {
-            let fold_path = path.to_path_buf();
-            let count_str = lineage_child_count.to_string();
-            let tip = if lineage_collapsed {
-                text::UNFOLD_CHILDREN.format(&[("n", &count_str)])
-            } else {
-                text::FOLD_CHILDREN.format(&[("n", &count_str)])
-            };
-            div()
-                .id(("lineage-fold", index))
-                .debug_selector(move || format!("worktree-lineage-toggle-{index}"))
-                .aria_label(tip.clone())
-                .flex_none()
-                .flex()
-                .items_center()
-                .gap_0p5()
-                .px_1()
-                .py(px(1.))
-                .rounded(ui::RADIUS_XS)
-                .bg(p.worktree_sidebar_accent)
-                .hover(|d| d.bg(p.accent).text_color(p.foreground))
-                .active(|d| d.bg(p.sidebar_accent))
-                .text_size(ui::TEXT_2XS)
-                .font_family(ui::FONT_MONO)
-                .text_color(p.muted_foreground)
-                .cursor_pointer()
-                .child(
-                    Icon::new(if lineage_collapsed {
-                        IconName::ChevronRight
-                    } else {
-                        IconName::ChevronDown
-                    })
-                    .with_size(ui::ICON_XS)
-                    .text_color(p.muted_foreground),
-                )
-                .child(count_str)
-                .tooltip(move |window, cx| {
-                    gpui_component::tooltip::Tooltip::new(tip.clone()).build(window, cx)
-                })
-                .on_click(cx.listener(move |s, _, _, cx| {
-                    cx.stop_propagation();
-                    s.toggle_lineage(&fold_path, cx);
-                }))
-        });
+        let lineage_toggle_btn = row_host
+            .is_local()
+            .then(|| self.lineage_toggle_element(index, path, cx))
+            .flatten();
 
         let is_editing_this = self.editing.as_ref().is_some_and(|(p, _)| p == path);
         // Card headers and session rows have separate list entries at every size.
@@ -2059,8 +2171,7 @@ impl Sidebar {
         // 2행 왼쪽: 브랜치가 제목과 다르면 브랜치, 아니면 코멘트를 끌어올린다.
         let line2_comment = (!show_branch_subtitle).then_some(visible_comment).flatten();
         let tail_comment = visible_comment.filter(|_| line2_comment.is_none());
-        let has_line2 = !is_editing_this
-            && (show_branch_subtitle || line2_comment.is_some() || lineage_toggle_btn.is_some());
+        let has_line2 = !is_editing_this && (show_branch_subtitle || line2_comment.is_some());
         let has_line3 = tail_comment.is_some() || has_agent_pill;
         let checkpoint_pill = card_checkpoint_parts.as_ref().map(|parts| {
             let label = parts.label(has_issue_badge);
@@ -2109,7 +2220,7 @@ impl Sidebar {
                             .flex()
                             .items_center()
                             .gap_1p5()
-                            .child(self.card_title_el(path, card_title, ui::TEXT_SM, index, cx))
+                            .child(self.card_title_el(path, card_title, ui::TEXT_MD, index, cx))
                             .when(is_default_tree && !is_editing_this, |d| {
                                 d.child(
                                     div()
@@ -2174,7 +2285,7 @@ impl Sidebar {
                                             .w_full()
                                             .min_w_0()
                                             .truncate()
-                                            .text_size(ui::TEXT_XS)
+                                            .text_size(ui::TEXT_SM)
                                             .text_color(p.muted_foreground)
                                             .child(branch_subtitle),
                                     )
@@ -2192,8 +2303,7 @@ impl Sidebar {
                                             .child(el)
                                     }),
                                 ),
-                        )
-                        .children(lineage_toggle_btn),
+                        ),
                 )
             })
             // 배지 줄: 체크포인트·캐시 타이머·호스트·이슈·포트·PR (있을 때만)
@@ -2230,22 +2340,29 @@ impl Sidebar {
                         .flex_col()
                         .gap_1()
                         .children(
-                            super::external::render_comment(tail_comment, p.muted_foreground)
-                                .map(|el| {
+                            super::external::render_comment(tail_comment, p.muted_foreground).map(
+                                |el| {
                                     div()
                                         .debug_selector(move || format!("worktree-comment-{index}"))
                                         .child(el)
-                                }),
+                                },
+                            ),
                         )
                         .when(has_agent_pill, |d| {
                             if let Some(sess) = single_session {
-                                let (sess_name, _) = self.session_label(sess);
-                                let sess_unread = self.is_unread(sess.id);
+                                let (sess_name, _) = self.session_label_on(&row_host, sess);
+                                let sess_unread = row_host.is_local() && self.is_unread(sess.id);
                                 let sess_id = sess.id;
+                                let sess_host = row_host.clone();
                                 d.child(
                                     div()
                                         .id(("fold", index))
                                         .debug_selector(move || format!("card-session-{index}"))
+                                        .role(gpui::Role::Button)
+                                        .aria_label(format!(
+                                            "{} · {sess_name}",
+                                            text::OPEN_SESSION.get()
+                                        ))
                                         .w_full()
                                         .h(px(20.))
                                         .px_1()
@@ -2263,7 +2380,10 @@ impl Sidebar {
                                             cx,
                                         ))
                                         .child(status::agent_icon(
-                                            status::infer_agent_from_status(&sess.status, &sess_name),
+                                            status::infer_agent_from_status(
+                                                &sess.status,
+                                                &sess_name,
+                                            ),
                                             ui::ICON_SM,
                                             p.muted_foreground,
                                         ))
@@ -2276,19 +2396,24 @@ impl Sidebar {
                                                 .text_color(p.muted_foreground)
                                                 .child(sess_name),
                                         )
+                                        .when(sess.status.since_unix_ns > 0, |d| {
+                                            d.child(
+                                                div()
+                                                    .flex_none()
+                                                    .text_size(ui::TEXT_2XS)
+                                                    .text_color(p.muted_foreground)
+                                                    .child(crate::jump::format_age_ns(
+                                                        sess.status.since_unix_ns,
+                                                        self.now_unix_ns(),
+                                                    )),
+                                            )
+                                        })
                                         .on_click(cx.listener(move |s, _, _, cx| {
                                             cx.stop_propagation();
                                             // OWE-854: 1개 세션 줄은 펼치기 토글이 아니라 해당 세션 선택이다.
-                                            let idx = s
-                                                .rows
-                                                .iter()
-                                                .position(|r| {
-                                                    matches!(r, Row::Session(item, _) if item.id == sess_id)
-                                                })
-                                                .unwrap_or(index);
                                             s.select_session_on(
-                                                idx,
-                                                s.row_host(idx).clone(),
+                                                index,
+                                                sess_host.clone(),
                                                 sess_id,
                                                 cx,
                                             );
@@ -2298,7 +2423,15 @@ impl Sidebar {
                                 d.child(
                                     div()
                                         .id(("fold", index))
-                                        .debug_selector(move || format!("card-agent-summary-{index}"))
+                                        .debug_selector(move || {
+                                            format!("card-agent-summary-{index}")
+                                        })
+                                        .role(gpui::Role::Button)
+                                        .aria_label(if card_expanded {
+                                            text::FOLD.get()
+                                        } else {
+                                            text::UNFOLD.get()
+                                        })
                                         .aria_expanded(card_expanded)
                                         .w_full()
                                         .h(px(22.))
@@ -2307,11 +2440,7 @@ impl Sidebar {
                                         .border_1()
                                         .border_color(p.worktree_sidebar_border)
                                         .when(card_expanded, |d| d.border_b_0().rounded_b_none())
-                                        .bg(if is_active_worktree {
-                                            p.sidebar.opacity(0.75)
-                                        } else {
-                                            p.sidebar_accent.opacity(0.65)
-                                        })
+                                        .bg(p.sidebar_accent.opacity(0.25))
                                         .hover(|d| d.bg(p.sidebar_accent))
                                         .flex()
                                         .items_center()
@@ -2392,14 +2521,8 @@ impl Sidebar {
                     .border_color(p.sidebar_ring.opacity(0.65))
             })
             .when(!is_active_worktree, |d| {
-                let d = d
-                    .border_color(ui::TRANSPARENT)
-                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)));
-                if lineage_depth > 0 {
-                    d.border_l_2().border_color(p.worktree_sidebar_border)
-                } else {
-                    d
-                }
+                d.border_color(ui::TRANSPARENT)
+                    .hover(|d| d.bg(p.sidebar_accent.opacity(0.45)))
             })
             .text_color(p.worktree_sidebar_foreground)
             .cursor_pointer()
@@ -2407,6 +2530,11 @@ impl Sidebar {
             .flex_col()
             .gap_0p5()
             .child(self.with_row_menu(index, &Row::Worktree(path.to_path_buf()), header, cx))
+            .children(
+                lineage_toggle_btn
+                    .filter(|_| !card_expanded)
+                    .map(|toggle| div().pl(px(20.)).pt_1().flex().child(toggle)),
+            )
             .on_click(cx.listener(move |s, _, _window, cx| {
                 s.activate_worktree_card(index, row_host.clone(), card_path.clone(), true, cx);
             }))
@@ -2883,7 +3011,19 @@ impl Render for Sidebar {
         let setup_prompt = self.render_setup_prompt_card(cx);
         let rename = self.render_rename(cx);
         let delete_confirm = self.render_delete_confirm(window, cx);
-        let default_repo = self.snapshot.trees.keys().next().cloned();
+        let projects: Vec<_> = self
+            .snapshot
+            .trees
+            .keys()
+            .filter(|repo| !self.removed_projects.contains(*repo))
+            .map(|repo| (repo.clone(), self.project_header_name(repo)))
+            .collect();
+        let unread = self
+            .snapshot
+            .sessions
+            .iter()
+            .filter(|s| self.unread.contains(&s.id) || super::needs_you(&s.status))
+            .count();
         div()
             .id("sidebar")
             .when(
@@ -2952,6 +3092,21 @@ impl Render for Sidebar {
                             .gap_1()
                             .text_color(p.muted_foreground)
                             .child(
+                                Button::new("sidebar-unread")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Bell)
+                                    .debug_selector(|| "sidebar-unread".into())
+                                    .accessibility_label(format!(
+                                        "{} ({unread})",
+                                        text::NEEDS_YOU.get()
+                                    ))
+                                    .tooltip(text::NEEDS_YOU.get())
+                                    .disabled(unread == 0)
+                                    .on_click(cx.listener(|s, _, _, cx| s.open_next_unread(cx))),
+                            )
+                            .child(self.render_options_button(cx))
+                            .child(
                                 Button::new("sidebar-add-folder")
                                     .ghost()
                                     .xsmall()
@@ -2964,7 +3119,8 @@ impl Render for Sidebar {
                                         cx.listener(|_, _, _, cx| cx.emit(super::OpenFolder)),
                                     ),
                             )
-                            .when_some(default_repo, |d, repo| {
+                            .when(!projects.is_empty(), |d| {
+                                let sidebar = cx.weak_entity();
                                 d.child(
                                     Button::new("sidebar-new-worktree")
                                         .ghost()
@@ -2972,21 +3128,30 @@ impl Render for Sidebar {
                                         .icon(IconName::Plus)
                                         .accessibility_label(text::NEW_WORKTREE.get())
                                         .tooltip(text::NEW_WORKTREE.get())
-                                        .on_click(cx.listener(move |s, _, window, cx| {
-                                            s.new_worktree(repo.clone(), window, cx);
-                                        })),
+                                        .dropdown_menu(move |mut menu, _, _| {
+                                            for (repo, name) in &projects {
+                                                let sidebar = sidebar.clone();
+                                                let repo = repo.clone();
+                                                menu = menu.item(
+                                                    PopupMenuItem::new(name.clone())
+                                                        .icon(IconName::FolderOpen)
+                                                        .on_click(move |_, window, cx| {
+                                                            sidebar
+                                                                .update(cx, |s, cx| {
+                                                                    s.new_worktree(
+                                                                        repo.clone(),
+                                                                        window,
+                                                                        cx,
+                                                                    );
+                                                                })
+                                                                .ok();
+                                                        }),
+                                                );
+                                            }
+                                            menu
+                                        }),
                                 )
-                            })
-                            .child(self.render_options_button(cx))
-                            .child(
-                                Button::new("sidebar-refresh")
-                                    .ghost()
-                                    .xsmall()
-                                    .icon(IconName::RefreshCw)
-                                    .accessibility_label(text::REFRESH.get())
-                                    .tooltip(text::REFRESH.get())
-                                    .on_click(cx.listener(|s, _, _, cx| s.refresh(cx))),
-                            ),
+                            }),
                     ),
             )
             .children(self.error.clone().map(|e| {
