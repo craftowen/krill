@@ -41,6 +41,9 @@ pub(super) fn snapshot(
     for (session, pid, live) in entries {
         // OS cwd and Git IO never run under the shared metadata cache lock.
         let observed = live.as_ref().and_then(|tap| tap.cwd(*pid));
+        // Windows cwd is the shell's report (`C:/x`, `c:\x\`); match canonical worktree paths.
+        #[cfg(windows)]
+        let observed = observed.map(|path| krill_proto::os::canonicalize(&path).unwrap_or(path));
         let path = {
             let mut cache = lock(cache);
             if let Some(path) = observed {
@@ -165,7 +168,7 @@ fn repository_key(cwd: &Path) -> PathBuf {
             let common = std::fs::read_to_string(dir.join("commondir"))
                 .ok()
                 .map_or(dir.clone(), |text| dir.join(text.trim()));
-            return common.canonicalize().unwrap_or(common);
+            return krill_proto::os::canonicalize(&common).unwrap_or(common);
         }
     }
     cwd.to_owned()
@@ -254,12 +257,13 @@ fn parse(bytes: &[u8]) -> Option<RepositoryTrees> {
     let repo = worktrees.first()?.clone();
     // Canonical paths make subdirectories and APFS /var -> /private/var agree with cwd.
     for tree in &mut worktrees {
-        if let Ok(path) = PathBuf::from(std::ffi::OsString::from_vec(tree.clone())).canonicalize() {
+        if let Ok(path) = krill_proto::os::canonicalize(&PathBuf::from(
+            std::ffi::OsString::from_vec(tree.clone()),
+        )) {
             *tree = path.as_os_str().as_bytes().to_vec();
         }
     }
-    let repo = PathBuf::from(std::ffi::OsString::from_vec(repo))
-        .canonicalize()
+    let repo = krill_proto::os::canonicalize(&PathBuf::from(std::ffi::OsString::from_vec(repo)))
         .ok()
         .map_or_else(
             || worktrees.first().cloned().unwrap_or_default(),

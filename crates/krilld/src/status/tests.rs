@@ -695,3 +695,23 @@ fn foreground_process_distinguishes_root_shell_and_child_command() {
     });
     assert!(resolved.is_some_and(|name| !name.is_empty()));
 }
+
+/// 네이티브 설치 Claude Code(`…/claude/versions/<버전>`)는 짧은 이름이 버전 번호라도 `claude`다.
+#[cfg(unix)]
+#[test]
+fn process_name_maps_versioned_claude_binary() {
+    let root = std::env::temp_dir().join(format!("krill-claude-ver-{}", std::process::id()));
+    // 경로가 다르면 버전 같은 이름도 그대로 둔다.
+    for (dir, want) in [("claude/versions", "claude"), ("other/versions", "2.1.309")] {
+        let dir = root.join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("2.1.309");
+        std::fs::copy("/bin/sleep", &exe).unwrap();
+        let mut child = std::process::Command::new(&exe).arg("5").spawn().unwrap();
+        let name = crate::sys::process_name(child.id());
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(name.unwrap(), want);
+    }
+    std::fs::remove_dir_all(&root).unwrap();
+}

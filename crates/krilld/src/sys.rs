@@ -35,6 +35,30 @@ mod windows;
 #[cfg(windows)]
 pub use windows::*;
 
+/// 네이티브 설치 Claude Code는 실행 파일이 `…/claude/versions/<버전>`이라 커널의 짧은 이름이
+/// 버전 번호(`2.1.309`)다. 그 경로면 `claude`로 바꿔 이름만 보는 에이전트 감지가 놓치지 않게 한다.
+/// 숫자로 시작하는 이름에서만 경로를 조회해 평소 폴링 비용을 늘리지 않는다.
+#[cfg(unix)]
+fn versioned_agent_name(
+    name: String,
+    exe: impl FnOnce() -> io::Result<std::path::PathBuf>,
+) -> String {
+    if !name.starts_with(|c: char| c.is_ascii_digit()) {
+        return name;
+    }
+    let Ok(exe) = exe() else {
+        return name;
+    };
+    let mut dirs = exe.ancestors().skip(1).map(std::path::Path::file_name);
+    if dirs.next() == Some(Some("versions".as_ref()))
+        && dirs.next() == Some(Some("claude".as_ref()))
+    {
+        "claude".to_owned()
+    } else {
+        name
+    }
+}
+
 /// UTC cron calendar fields `[분, 시, 일, 월(1~12), 요일(일=0)]`, independent of process timezone and daylight saving.
 /// 그레고리력 날짜 계산(Howard Hinnant `civil_from_days`)이라 OS 호출이 없다.
 #[expect(
