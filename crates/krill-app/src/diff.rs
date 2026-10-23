@@ -60,6 +60,7 @@ pub use edit::{
 const TIMEOUT: Duration = Duration::from_secs(5);
 const WATCH_POLL: Duration = Duration::from_millis(100);
 const WATCH_POLL_INACTIVE: Duration = Duration::from_millis(500);
+const PATCH_LOADING_DELAY: Duration = Duration::from_secs(1);
 
 pub use crate::i18n::catalog::diff as text;
 
@@ -551,7 +552,9 @@ pub struct Panel {
     watch_gen: u64,
     force_next: bool,
     patch_gen: u64,
+    patch_loaded_gen: u64,
     patch_task: Option<Task<()>>,
+    patch_loading_task: Option<Task<()>>,
     watch_task: Option<Task<()>>,
     source: Option<Arc<dyn Source>>,
     _observe: Subscription,
@@ -637,7 +640,9 @@ impl Panel {
             watch_gen: 0,
             force_next: false,
             patch_gen: 0,
+            patch_loaded_gen: 0,
             patch_task: None,
+            patch_loading_task: None,
             watch_task: None,
             source: None,
             _observe: observe,
@@ -676,6 +681,7 @@ impl Panel {
         self.pending_diff_path = None;
         self.patch_gen = self.patch_gen.wrapping_add(1);
         self.patch_task = None;
+        self.patch_loading_task = None;
         self.message = text::EMPTY.get().into();
         self.state.update(cx, |s, cx| s.set_files([], cx));
         cx.notify();
@@ -793,6 +799,7 @@ impl Panel {
         self.force_next = false;
         self.patch_gen = self.patch_gen.wrapping_add(1);
         self.patch_task = None;
+        self.patch_loading_task = None;
         self.message = text::EMPTY.get().into();
         self.state.update(cx, |s, cx| s.set_files([], cx));
         if self.visible {
@@ -823,6 +830,7 @@ impl Panel {
             // 진행 중인 패치·Checks는 무효화만 하고 표시 중인 내용은 둔다.
             self.patch_gen = self.patch_gen.wrapping_add(1);
             self.patch_task = None;
+            self.patch_loading_task = None;
             self.checks.generation = self.checks.generation.wrapping_add(1);
             self.checks.task = None;
             self.checks.loading = false;
@@ -969,6 +977,7 @@ impl Panel {
                             let had_selection = self.selected.take().is_some();
                             self.patch_gen = self.patch_gen.wrapping_add(1);
                             self.patch_task = None;
+                            self.patch_loading_task = None;
                             self.message = text::EMPTY.get().into();
                             if had_selection {
                                 self.state.update(cx, |s, cx| s.set_files([], cx));
@@ -1105,13 +1114,7 @@ impl Panel {
         let Some(mut file) = self.changes.files.get(index).cloned() else {
             return;
         };
-        self.patch_gen = self.patch_gen.wrapping_add(1);
-        let generation = self.patch_gen;
-        self.selected = Some(index);
-        self.raw_patch.clear();
-        self.active_hunk = 0;
-        self.message = text::LOADING.get().into();
-        self.state.update(cx, |s, cx| s.set_files([], cx));
+        let generation = self.begin_patch_load(index, cx);
         let (repo, comparison) = (self.repo.clone(), self.comparison);
         let probe = self.pending_diff_path.as_ref() == Some(&file.path)
             && file.staged.is_none()
@@ -1144,26 +1147,78 @@ impl Panel {
                 if probe && let Some(file) = this.changes.files.get_mut(index) {
                     file.status = status;
                 }
-                match result {
-                    Ok((raw, files)) => {
-                        this.raw_patch = raw;
-                        this.active_hunk = 0;
-                        this.message = if files.is_empty() {
-                            text::NO_PATCH.get().into()
-                        } else {
-                            String::new()
-                        };
-                        this.state.update(cx, |s, cx| s.set_files(files, cx));
-                    }
-                    Err(e) => {
-                        this.raw_patch.clear();
-                        this.message = patch_error_message(&e);
-                    }
-                }
-                cx.notify();
+                this.finish_patch_load(generation, result, cx);
             })
             .ok();
         }));
+        cx.notify();
+    }
+
+    fn patch_pending(&self) -> bool {
+        self.patch_loaded_gen != self.patch_gen
+    }
+
+    fn begin_patch_load(&mut self, index: usize, cx: &mut Context<Self>) -> u64 {
+        self.selected = Some(index);
+        self.patch_gen = self.patch_gen.wrapping_add(1);
+        let generation = self.patch_gen;
+        // 화면은 유지하되 이전 파일의 패치를 적용하는 hunk·줄 편집은 즉시 막는다.
+        self.raw_patch.clear();
+        self.active_hunk = 0;
+        self.message.clear();
+        self.patch_loading_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(PATCH_LOADING_DELAY).await;
+            this.update(cx, |this, cx| {
+                if this.patch_gen == generation && this.patch_pending() {
+                    this.message = text::LOADING.get().into();
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+        generation
+    }
+
+    fn begin_patch_comment(
+        &mut self,
+        range: gpui_component::diff::DiffLineRange,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.patch_pending() {
+            self.begin_comment(range, window, cx);
+        }
+    }
+
+    fn finish_patch_load(
+        &mut self,
+        generation: u64,
+        result: io::Result<(String, Vec<DiffFile>)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.patch_gen != generation {
+            return;
+        }
+        self.patch_loaded_gen = generation;
+        self.patch_loading_task = None;
+        match result {
+            Ok((raw, files)) => {
+                self.raw_patch = raw;
+                self.active_hunk = 0;
+                self.message = if files.is_empty() {
+                    text::NO_PATCH.get().into()
+                } else {
+                    String::new()
+                };
+                self.state.update(cx, |s, cx| s.set_files(files, cx));
+            }
+            Err(e) => {
+                self.raw_patch.clear();
+                self.message = patch_error_message(&e);
+                self.state.update(cx, |s, cx| s.set_files([], cx));
+            }
+        }
         cx.notify();
     }
 
@@ -1476,6 +1531,7 @@ impl Panel {
                                             this.selected = None;
                                             this.patch_gen = this.patch_gen.wrapping_add(1);
                                             this.patch_task = None;
+                                            this.patch_loading_task = None;
                                             this.message = text::EMPTY.get().into();
                                             this.state.update(cx, |s, cx| s.set_files([], cx));
                                             cx.notify();
@@ -1767,6 +1823,8 @@ impl Panel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        use gpui_component::Disableable as _;
+
         let p = crate::ui::palette(cx);
         let code = status_code(file.status, self.comparison);
         let color = crate::ui::git_status_color(file.status, cx);
@@ -1933,6 +1991,7 @@ impl Panel {
                     .label(viewed_label)
                     .xsmall()
                     .ghost()
+                    .disabled(self.patch_pending())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_file_viewed(&path_bytes, cx);
                     })),
@@ -1963,20 +2022,37 @@ impl Panel {
                 )
             });
         let weak = cx.entity().downgrade();
-        let content = if self.message.is_empty() {
+        let content = if self.message.is_empty() || self.patch_pending() {
             div()
                 .id("diff-viewer")
                 .debug_selector(|| "diff-viewer".into())
+                .relative()
                 .flex_1()
                 .min_h_0()
                 .child(Diff::new(&self.state).size_full().on_add_annotation(
                     move |range, window, cx| {
                         weak.update(cx, |this, cx| {
-                            this.begin_comment(range.clone(), window, cx);
+                            this.begin_patch_comment(range.clone(), window, cx);
                         })
                         .ok();
                     },
                 ))
+                .when(self.message == text::LOADING.get(), |d| {
+                    d.child(
+                        div()
+                            .id("diff-patch-loading")
+                            .debug_selector(|| "diff-patch-loading".into())
+                            .absolute()
+                            .top_0()
+                            .right_0()
+                            .px_2()
+                            .py_1()
+                            .bg(p.sidebar)
+                            .text_color(p.muted_foreground)
+                            .text_size(crate::ui::TEXT_XS)
+                            .child(text::LOADING.get()),
+                    )
+                })
                 .into_any_element()
         } else {
             Self::render_empty_state(

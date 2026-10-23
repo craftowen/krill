@@ -1456,7 +1456,7 @@ fn open_diff_file_renders_untracked_file_and_apply_watch_recomputes_provisional_
         });
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while cx.debug_bounds("diff-viewer").is_none() {
+    while cx.update(|_, cx| view.read(cx).patch_pending()) {
         assert!(
             Instant::now() < deadline,
             "open_diff_file must render untracked file diff without waiting for next watch cycle"
@@ -1512,7 +1512,7 @@ fn open_diff_file_renders_untracked_file_and_apply_watch_recomputes_provisional_
         });
     });
     let deadline = Instant::now() + Duration::from_secs(10);
-    while cx.debug_bounds("diff-viewer").is_none() {
+    while cx.update(|_, cx| view.read(cx).patch_pending()) {
         assert!(
             Instant::now() < deadline,
             "apply_watch Keep on provisional entry must recompute patch for untracked file"
@@ -2372,4 +2372,174 @@ fn changed_file_rows_expose_list_item_role_label_and_selection(cx: &mut gpui::Te
     assert_eq!(role, Some(gpui::Role::ListItem));
     assert_eq!(pos, Some(2));
     assert_eq!(selected, Some(false));
+}
+
+fn loading_patch(path: &str) -> (String, Vec<DiffFile>) {
+    let raw = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+    );
+    let files = DiffFile::parse(&raw).unwrap();
+    (raw, files)
+}
+
+/// OWE-1027: 표시 중인 내용과 새 선택을 서로 다른 세대로 취급한다.
+#[gpui::test]
+fn patch_switch_keeps_content_until_result_and_blocks_stale_actions(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut panel = Panel::unconnected(PathBuf::from("/repo"), cx);
+        panel.changes.files = vec![Repo::file(b"old.rs", *b".M"), Repo::file(b"new.rs", *b".M")];
+        panel.loaded = true;
+        panel.selected = Some(0);
+        panel.finish_patch_load(0, Ok(loading_patch("old.rs")), cx);
+        panel
+    });
+    cx.run_until_parked();
+    let generation = cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.select(1, cx);
+            // 외부 git IO 대신 아래에서 결과를 직접 전달해 완료 시점을 제어한다.
+            p.patch_task = None;
+            p.patch_gen
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-viewer").is_some());
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+    assert!(cx.debug_bounds("diff-stage-hunk").is_none());
+    cx.update(|window, cx| {
+        view.update(cx, |p, cx| {
+            assert_eq!(p.selected, Some(1));
+            assert_eq!(p.state.read(cx).files()[0].path().as_ref(), "old.rs");
+            assert!(p.message.is_empty());
+            assert!(p.raw_patch.is_empty());
+            p.stage_hunk(0, cx);
+            assert!(!p.editing.busy);
+            p.begin_patch_comment(
+                gpui_component::diff::DiffLineRange::new(
+                    "old.rs",
+                    gpui_component::diff::DiffSide::Modified,
+                    1,
+                    1,
+                ),
+                window,
+                cx,
+            );
+            assert!(!p.review.has_active_ui());
+            p.finish_patch_load(generation, Ok(loading_patch("new.rs")), cx);
+            assert_eq!(p.state.read(cx).files()[0].path().as_ref(), "new.rs");
+            assert!(!p.patch_pending());
+            assert!(!p.raw_patch.is_empty());
+            assert!(p.message.is_empty());
+        });
+    });
+    cx.executor().advance_clock(PATCH_LOADING_DELAY);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+}
+
+#[gpui::test]
+fn patch_loading_waits_one_second_and_keeps_previous_diff(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut panel = Panel::unconnected(PathBuf::from("/repo"), cx);
+        panel.changes.files = vec![Repo::file(b"new.rs", *b".M")];
+        panel.loaded = true;
+        panel.finish_patch_load(0, Ok(loading_patch("old.rs")), cx);
+        panel.begin_patch_load(0, cx);
+        panel
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(
+        PATCH_LOADING_DELAY
+            .checked_sub(Duration::from_millis(1))
+            .unwrap(),
+    );
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+    cx.executor().advance_clock(Duration::from_millis(1));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_some());
+    assert!(cx.debug_bounds("diff-viewer").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            assert_eq!(p.message, text::LOADING.get());
+            assert_eq!(p.state.read(cx).files()[0].path().as_ref(), "old.rs");
+            p.finish_patch_load(p.patch_gen, Ok(loading_patch("new.rs")), cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+}
+
+#[gpui::test]
+fn first_patch_completes_without_loading_flash(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut panel = Panel::unconnected(PathBuf::from("/repo"), cx);
+        panel.changes.files = vec![Repo::file(b"new.rs", *b".M")];
+        panel.loaded = true;
+        panel.begin_patch_load(0, cx);
+        panel
+    });
+    cx.run_until_parked();
+    cx.executor().advance_clock(Duration::from_millis(99));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            assert!(p.state.read(cx).files().is_empty());
+            assert!(p.message.is_empty());
+            p.finish_patch_load(p.patch_gen, Ok(loading_patch("new.rs")), cx);
+        });
+    });
+    cx.executor().advance_clock(PATCH_LOADING_DELAY);
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+    assert!(cx.debug_bounds("diff-viewer").is_some());
+}
+
+#[gpui::test]
+fn patch_loading_ignores_previous_generation_results_and_timers(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let (view, cx) = cx.add_window_view(|_, cx| {
+        let mut panel = Panel::unconnected(PathBuf::from("/repo"), cx);
+        panel.changes.files = vec![Repo::file(b"new.rs", *b".M")];
+        panel.loaded = true;
+        panel.finish_patch_load(0, Ok(loading_patch("old.rs")), cx);
+        panel.begin_patch_load(0, cx);
+        // 이미 실행 대기 중인 이전 타이머도 취소에 의존하지 않고 세대를 확인한다.
+        panel.patch_loading_task.take().unwrap().detach();
+        panel
+    });
+    cx.run_until_parked();
+    let old_generation = cx.update(|_, cx| view.read(cx).patch_gen);
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    let generation = cx.update(|_, cx| view.update(cx, |p, cx| p.begin_patch_load(0, cx)));
+    cx.run_until_parked();
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.finish_patch_load(old_generation, Ok(loading_patch("stale.rs")), cx);
+            p.finish_patch_load(old_generation, Err(io::Error::other("stale error")), cx);
+            assert_eq!(p.state.read(cx).files()[0].path().as_ref(), "old.rs");
+            assert!(p.message.is_empty());
+            assert!(p.patch_pending());
+        });
+    });
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_none());
+    cx.executor().advance_clock(Duration::from_millis(500));
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("diff-patch-loading").is_some());
+    cx.update(|_, cx| {
+        view.update(cx, |p, cx| {
+            p.finish_patch_load(generation, Ok(loading_patch("new.rs")), cx);
+            p.finish_patch_load(old_generation, Ok(loading_patch("stale.rs")), cx);
+            assert_eq!(p.state.read(cx).files()[0].path().as_ref(), "new.rs");
+            assert!(p.message.is_empty());
+            assert!(!p.patch_pending());
+        });
+    });
 }
