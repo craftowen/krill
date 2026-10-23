@@ -2867,7 +2867,7 @@ fn restart_keeps_session_until_resumed_and_stops_on_permanent_failure(cx: &mut T
             assert_eq!(s.layout.session(pane), Some(old));
             let l = &s.live[&pane];
             assert!(l.pane.is_cold());
-            assert_eq!(l.error.as_deref(), Some("unknown agent profile"));
+            assert_eq!(l.error.as_deref(), Some(text::START_UNKNOWN_AGENT.get()));
         });
     });
     cx.run_until_parked();
@@ -4615,6 +4615,56 @@ fn ended_banner_aligns_buttons_to_the_right(cx: &mut TestAppContext) {
     assert!(
         f32::from(restart.left()) > f32::from(banner.left()) + f32::from(banner.size.width) / 2.
     );
+}
+
+/// 새로 띄운 에이전트가 곧바로 끝나면 시작 실패로 표시한다. 셸·오래 돈 세션은 그냥 "세션 종료됨".
+#[gpui::test]
+fn agent_exiting_right_after_start_is_flagged(cx: &mut TestAppContext) {
+    let (view, cx) = open(cx, state_path("agent-early-exit"));
+    let pane = layout_of(&view, cx).active_tab().focused;
+    let agent = krill_proto::control::AgentLaunch {
+        profile: "codex".into(),
+        permission: krill_proto::agent::Permission::Manual,
+    };
+    let cases = [
+        (Some(agent.clone()), Some(Instant::now()), true),
+        (None, Some(Instant::now()), false),
+        (Some(agent.clone()), None, false),
+        (
+            Some(agent),
+            Instant::now().checked_sub(EARLY_EXIT * 2),
+            false,
+        ),
+    ];
+    for (i, (launch, started, early)) in cases.into_iter().enumerate() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        view.update(cx, |s, cx| {
+            let session = krill_proto::SessionId(90 + i as u64);
+            s.layout.set_session(pane, session);
+            s.attach_test(pane, session, ours, cx);
+            let l = s.live.get_mut(&pane).unwrap();
+            l.launch = launch;
+            l.started = started;
+            assert!(!s.on_frame(pane, krill_proto::screen::kind::CLOSED, &[0], cx));
+            assert_eq!(s.live[&pane].exited_early, early, "case {i}");
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("session-ended").is_some());
+    }
+}
+
+#[test]
+fn known_start_failures_get_next_steps() {
+    use krill_proto::control::Failure;
+    let no_holder = std::io::Error::other(Failure::NoHolder.to_string());
+    assert_eq!(start_error_text(&no_holder), text::START_NO_HOLDER.get());
+    let unknown = std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        Failure::UnknownAgent.to_string(),
+    );
+    assert_eq!(start_error_text(&unknown), text::START_UNKNOWN_AGENT.get());
+    let other = std::io::Error::other("disk full");
+    assert_eq!(start_error_text(&other), "disk full");
 }
 
 /// MK-131(OWE-667): 새 세션 메뉴의 실행 위치(내 Mac 기본값 + 연결된 원격 호스트) 선택과
