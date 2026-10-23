@@ -87,6 +87,14 @@ pub(super) fn launch_agent_id(id: &str) -> &str {
 }
 
 impl Shell {
+    /// 에이전트 프로필 ID의 표시 이름. 설정을 아직 못 읽었거나 없는 프로필이면 `None`.
+    pub(super) fn agent_profile_name(&self, id: &str) -> Option<&str> {
+        self.agents
+            .as_ref()
+            .and_then(|a| a.profiles.iter().find(|p| p.id == id))
+            .map(|p| p.name.as_str())
+    }
+
     /// 탭·패인 헤더 제목. 데몬 스냅샷에 세션이 있으면 사이드바와 같은 규칙(`sidebar::session_label`:
     /// 터미널 제목 → 에이전트 → 폴더 → "세션 n")을 쓰고, 아직 없으면 제목 → 실행한 에이전트 이름 → "새 터미널".
     pub(super) fn pane_label(&self, pane: PaneId, cx: &App) -> String {
@@ -103,13 +111,7 @@ impl Shell {
             return sidebar::session_label(session, title).0;
         }
         let launched = match self.layout.launch(pane).map(|l| &l.program) {
-            Some(Program::Agent { id }) => {
-                let agent_id = launch_agent_id(id);
-                self.agents
-                    .as_ref()
-                    .and_then(|a| a.profiles.iter().find(|p| p.id == agent_id))
-                    .map(|p| p.name.as_str())
-            }
+            Some(Program::Agent { id }) => self.agent_profile_name(launch_agent_id(id)),
             _ => None,
         };
         title

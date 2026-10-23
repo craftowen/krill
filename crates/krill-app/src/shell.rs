@@ -179,6 +179,10 @@ struct Live {
     /// 붙지 못한 이유(연결 전까지 칸에 보인다).
     error: Option<String>,
     launch: Option<AgentLaunch>,
+    /// 이 칸이 새로 만든 세션에 붙은 때. 붙어 있던 세션에 다시 붙으면 바뀌지 않는다.
+    started: Option<Instant>,
+    /// 에이전트 세션이 [`EARLY_EXIT`] 안에 끝났다. 종료 띠에 이유 안내를 보인다.
+    exited_early: bool,
     /// 마우스 선택(MK-033, 보이는 화면 좌표). 입력·스크롤하면 지운다.
     selection: Option<Selection>,
     /// 선택을 마쳤을 때 그 자리 글자(AS-17: 출력 스크롤·리사이즈·재접속으로 내용이
@@ -191,6 +195,10 @@ struct Live {
     task: Task<()>,
     creation: Arc<std::sync::Mutex<close::Creation>>,
 }
+
+/// 새 에이전트 세션이 이 시간 안에 끝나면 시작 실패로 보고 이유를 안내한다.
+// ponytail: 시간만 본다(종료 코드는 앱까지 오지 않는다). 미설치·로그인 실패를 구분하려면 Closed에 종료 코드를 싣는다.
+const EARLY_EXIT: Duration = Duration::from_secs(10);
 
 impl Live {
     fn new(task: Task<()>) -> Self {
@@ -206,6 +214,8 @@ impl Live {
             scroll_rem: 0.,
             error: None,
             launch: None,
+            started: None,
+            exited_early: false,
             selection: None,
             selection_text: None,
             selecting: false,
@@ -3455,7 +3465,8 @@ impl Shell {
             {
                 l.pane.show_cold(cold_session, cold).ok();
             }
-            if self.layout.session(pane) != Some(session) {
+            let fresh = self.layout.session(pane) != Some(session);
+            if fresh {
                 if self.layout.host(pane).is_local() {
                     self.layout.clear_session(pane);
                 }
@@ -3465,10 +3476,10 @@ impl Shell {
                 self.save();
                 self.refresh_detached(cx);
             }
-            linked.map(|l| (session, l))
+            linked.map(|l| (session, l, fresh))
         });
         match got {
-            Ok((session, linked)) => self.linked(pane, session, linked, cx),
+            Ok((session, linked, fresh)) => self.linked(pane, session, linked, fresh, cx),
             Err(e) => {
                 let permanent = is_permanent_error(&e);
                 let old = self.layout.session(pane);
@@ -3489,7 +3500,7 @@ impl Shell {
                                 )
                                 .ok();
                         }
-                        l.error = Some(e.to_string());
+                        l.error = Some(start_error_text(&e));
                         cx.notify();
                         if permanent { Next::Gone } else { Next::Retry }
                     }
@@ -3587,6 +3598,7 @@ impl Shell {
         pane: PaneId,
         session: krill_proto::SessionId,
         linked: pane::Linked,
+        fresh: bool,
         cx: &mut Context<Self>,
     ) -> Next {
         self.start_pane_liveness(cx);
@@ -3594,6 +3606,10 @@ impl Shell {
             return Next::Gone;
         };
         l.error = None;
+        if fresh {
+            l.started = Some(Instant::now());
+        }
+        l.exited_early = false;
         if let Some(launch) = &linked.launch {
             krill_app::onboarding::actions::note_agent_session(&launch.profile, cx);
         }
@@ -3632,6 +3648,8 @@ impl Shell {
             return false;
         };
         if ev.closed {
+            l.exited_early =
+                l.launch.is_some() && l.started.is_some_and(|t| t.elapsed() < EARLY_EXIT);
             l.cut();
             l.error = None;
             l.ime = Ime::default();
@@ -5137,10 +5155,17 @@ impl Shell {
                                 .text_size(krill_app::ui::TEXT_XS)
                                 .flex_wrap()
                                 .debug_selector(|| "session-ended".into())
-                                .child(div().min_w_0().child(if l.pane.is_closed() {
-                                    text::ENDED.get()
+                                .child(div().min_w_0().child(if !l.pane.is_closed() {
+                                    text::COLD.get().to_owned()
+                                } else if let Some(launch) =
+                                    l.launch.as_ref().filter(|_| l.exited_early)
+                                {
+                                    let agent = self
+                                        .agent_profile_name(&launch.profile)
+                                        .unwrap_or(&launch.profile);
+                                    text::AGENT_EXITED_EARLY.format(&[("agent", agent)])
                                 } else {
-                                    text::COLD.get()
+                                    text::ENDED.get().to_owned()
                                 }))
                                 .child(
                                     div()
@@ -6559,6 +6584,20 @@ fn is_permanent_error(err: &std::io::Error) -> bool {
             | std::io::ErrorKind::InvalidData
             | std::io::ErrorKind::Unsupported
     )
+}
+
+/// 세션을 만들거나 붙지 못한 이유를 칸에 보일 문구로 바꾼다. 아는 krilld 거절은 다음 할 일을 담은 문구로,
+/// 나머지는 원문 그대로 둔다.
+fn start_error_text(err: &std::io::Error) -> String {
+    use krill_proto::control::Failure;
+    let raw = err.to_string();
+    if raw == Failure::NoHolder.to_string() {
+        text::START_NO_HOLDER.get().to_owned()
+    } else if raw == Failure::UnknownAgent.to_string() {
+        text::START_UNKNOWN_AGENT.get().to_owned()
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]
