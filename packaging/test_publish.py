@@ -11,6 +11,9 @@ import tempfile
 import unittest
 import zipfile
 
+# 임시 저장소가 사용자 전역 git 설정(예: tag.gpgSign=true면 경량 태그가 실패)을 따르지 않게 한다.
+os.environ["GIT_CONFIG_GLOBAL"] = os.devnull
+
 HERE = Path(__file__).resolve().parent
 
 FAKE_GH = """#!/bin/bash
