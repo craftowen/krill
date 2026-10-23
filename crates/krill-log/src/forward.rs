@@ -79,4 +79,28 @@ mod tests {
         assert!(!forward.admit(7), "a flood within one second is capped");
         assert!(forward.admit(8), "the next second starts a fresh budget");
     }
+
+    #[test]
+    fn forwarded_warning_reaches_the_operating_log_with_its_source() {
+        let dir = std::env::temp_dir().join(format!("krill-log-forward-{}", std::process::id()));
+        let writer = crate::RollingLog::open(&dir, crate::Component::App).unwrap();
+        let forward = Forward {
+            window: AtomicU64::new(0),
+        };
+        tracing::subscriber::with_default(crate::subscriber::Logger::new(writer), || {
+            log::Log::log(
+                &forward,
+                &log::Record::builder()
+                    .level(log::Level::Warn)
+                    .target("gpui_macos::window")
+                    .args(format_args!("nextDrawable waited"))
+                    .build(),
+            );
+        });
+        let text = std::fs::read_to_string(dir.join("krill-app.log")).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(text.contains("WARN"), "{text}");
+        assert!(text.contains(r#"source="gpui_macos::window""#), "{text}");
+        assert!(text.contains("nextDrawable waited"), "{text}");
+    }
 }
