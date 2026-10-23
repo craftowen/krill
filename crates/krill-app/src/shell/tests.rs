@@ -6889,8 +6889,8 @@ fn new_session_menu_keeps_shortcut_with_single_account_and_applies_launch_host_f
     cx.run_until_parked();
 
     // 1. 계정이 1개일 때 '+' 메뉴를 열면 하위 메뉴로 대체되지 않고 ⌥⌘1 단축키가 바로 표시된다.
-    // '+' 버튼은 검색 행 호버 때만 보이므로(hover-reveal) 먼저 행 위로 마우스를 올린다.
-    // 행 자체에는 debug_selector가 없어 트리거 좌표로 호버한다(트리거는 행 안에 있다).
+    // 하단 '+' 메뉴는 버튼 위로 열려 초기 포인터가 항목을 덮지 않아야 한다.
+    // 트리거에 마우스를 둔 채 키보드로 이동해도 첫 두 항목 순서가 유지되는지 확인한다.
     // 참고: 팝업 컨테이너의 "popup-menu" id는 이 gpui 버전의 debug_bounds에 잡히지 않아
     // 메뉴가 열렸음은 항목의 kbd 힌트("kbd:alt-cmd-1" 등)로 확인한다.
     let hover_at = cx
