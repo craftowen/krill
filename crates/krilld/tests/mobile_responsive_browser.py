@@ -367,9 +367,13 @@ def main():
                 navigate(route)
                 wait('document.querySelector(".terminal-mount")?.dataset.phase==="ready"')
                 evaluate('globalThis.sidebarTerminal=KrillMobile.activeTerminal;true')
-                named('Toggle session list')
+                assert evaluate('document.querySelector(".tablet-sidebar-toggle").title') == 'Hide session list'
+                assert evaluate('document.querySelector(".tablet-sidebar-toggle path").getAttribute("d")') != evaluate('document.querySelector(".tablet-sidebar .page-header button path").getAttribute("d")')
+                named('Hide session list')
                 assert evaluate('!document.querySelector(".tablet-sidebar").getClientRects().length')
-                named('Toggle session list')
+                assert evaluate('document.querySelector(".tablet-sidebar-toggle").title') == 'Show session list'
+                assert evaluate('document.querySelector(".tablet-sidebar-toggle").getAttribute("aria-expanded")') == 'false'
+                named('Show session list')
                 browser('set', 'viewport', '830', '690')
                 browser('set', 'viewport', '1180', '820')
                 assert evaluate('sidebarTerminal===KrillMobile.activeTerminal')
