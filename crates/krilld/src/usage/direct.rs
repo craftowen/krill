@@ -23,11 +23,16 @@ static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMa
 static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
 /// 실패·429 뒤 다음 조회 가능 시각과 연속 실패 수. 이 시각 전에는 같은 프로필을 다시 조회하지 않는다.
 static RETRY: Mutex<BTreeMap<Key, (Instant, u32)>> = Mutex::new(BTreeMap::new());
-const INTERVAL: Duration = Duration::from_secs(60);
-const REQUEST_INTERVAL: Duration = Duration::from_secs(5);
-const CACHE_TTL: Duration = Duration::from_secs(180);
 // 아래 값은 Orca(MIT) rate-limits/service/service-types.ts·usage-retry-after.ts를 따른다.
-// 사용량 엔드포인트는 예산이 빡빡해 실패를 촘촘히 재시도하면 429로 굳는다.
+// 사용량 엔드포인트는 예산이 빡빡하고 사용량은 참고용이라, 촘촘히 조회하기보다 최근 값을 쓴다.
+/// 주기 틱의 조회 간격.
+const POLL_INTERVAL: Duration = Duration::from_mins(15);
+/// `ListAccounts`·창 활성화 같은 자동 요청이 다시 조회하기 전 최소 간격.
+const MIN_REFETCH: Duration = Duration::from_mins(5);
+/// Claude 세션 statusline 값이 이보다 새로우면 자동 조회를 건너뛴다.
+const LIVE_FRESH: Duration = MIN_REFETCH;
+/// 이보다 오래된 정상 값은 버린다.
+const CACHE_TTL: Duration = Duration::from_mins(30);
 /// 실패 재시도 간격: 30초부터 실패마다 두 배, 15분 상한.
 const FAILURE_RETRY: Duration = Duration::from_secs(30);
 const MAX_FAILURE_RETRY: Duration = Duration::from_mins(15);
@@ -65,15 +70,20 @@ fn alive(at: Instant, usage: &ProfileUsage) -> bool {
 
 /// OWE-702의 주기 틱이 호출한다. 네트워크·자격증명 IO는 별도 스레드에서만 수행한다.
 pub fn refresh(home: &Path, state: Option<&Path>) {
-    refresh_with_interval(home, state, INTERVAL, false);
+    refresh_with(home, state, POLL_INTERVAL, false);
 }
 
-/// `ListAccounts`·계정 변경 요청이 호출한다. 수동 새로고침이 60초/300초 틱 간격에 막히지 않게 짧은 쿨다운만 둔다.
+/// `ListAccounts`·계정 변경 요청이 호출한다. 앱 폴링·창 전환이 몰려도 5분에 한 번만 조회한다.
 pub fn refresh_on_request(home: &Path, state: Option<&Path>) {
-    refresh_with_interval(home, state, REQUEST_INTERVAL, true);
+    refresh_with(home, state, MIN_REFETCH, false);
 }
 
-fn refresh_with_interval(home: &Path, state: Option<&Path>, interval: Duration, interactive: bool) {
+/// 사용자가 누른 '사용량 새로고침'. Orca처럼 주기·Retry-After·statusline 대기를 모두 무시하고 바로 조회한다.
+pub fn refresh_manual(home: &Path, state: Option<&Path>) {
+    refresh_with(home, state, Duration::ZERO, true);
+}
+
+fn refresh_with(home: &Path, state: Option<&Path>, interval: Duration, force: bool) {
     let file = accounts::load_file(home, state);
     if !file.direct_usage {
         lock(&CACHE).retain(|(h, _, _), _| h != home);
@@ -84,7 +94,7 @@ fn refresh_with_interval(home: &Path, state: Option<&Path>, interval: Duration, 
     if cfg!(test) || (cfg!(debug_assertions) && std::env::var_os("KRILL_TEST_OFFLINE").is_some()) {
         return;
     } // 실제 자격증명·네트워크는 단위 테스트에서 금지.
-    agy::refresh(home, state, &file, interactive);
+    agy::refresh(home, state, &file, interval);
     let profiles = [
         ProviderKind::Claude,
         ProviderKind::Codex,
@@ -109,9 +119,11 @@ fn refresh_with_interval(home: &Path, state: Option<&Path>, interval: Duration, 
         }
         let key = (home.to_path_buf(), provider, dir);
         // 실패·429는 `RETRY` 시각만 보고, 정상 값은 주기(`interval`)만 본다.
-        if lock(&RETRY)
-            .get(&key)
-            .is_some_and(|(until, _)| Instant::now() < *until)
+        if !force
+            && (lock(&RETRY)
+                .get(&key)
+                .is_some_and(|(until, _)| Instant::now() < *until)
+                || live_fresh(provider, &key.2))
             || lock(&CACHE)
                 .get(&key)
                 .is_some_and(|(at, u)| u.error.is_none() && !u.stale && at.elapsed() < interval)
@@ -194,6 +206,18 @@ enum Fetched {
     /// HTTP 429와 Retry-After. 같은 토큰을 다른 도구(Claude Code·Orca)와 함께 쓰면 자주 걸린다.
     RateLimited(Option<Duration>),
     Failed,
+}
+
+/// 실행 중인 Claude 세션이 statusline으로 방금 사용량을 남겼는가. 같은 값을 API로 또 받지 않는다.
+fn live_fresh(provider: ProviderKind, dir: &Path) -> bool {
+    provider == ProviderKind::Claude
+        && accounts::claude_statusline_usage(dir)
+            .and_then(|u| u.updated_at)
+            .is_some_and(|at| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .is_ok_and(|now| now.as_secs().saturating_sub(at) < LIVE_FRESH.as_secs())
+            })
 }
 
 /// `streak`번째 연속 실패 뒤 기다릴 시간(30초·60초·…·15분).
@@ -1061,9 +1085,7 @@ pub(crate) mod agy {
     static CACHE: Mutex<BTreeMap<Key, (Instant, ProfileUsage)>> = Mutex::new(BTreeMap::new());
     static PENDING: Mutex<BTreeSet<Key>> = Mutex::new(BTreeSet::new());
     /// 주기 실행 간격(5분)·캐시 유효(10분). 5h·주간 창에는 충분하고 agy 실행 부담을 낮춘다.
-    const INTERVAL: Duration = Duration::from_secs(300);
-    const REQUEST_INTERVAL: Duration = Duration::from_secs(15);
-    const TTL: Duration = Duration::from_secs(600);
+    const TTL: Duration = super::CACHE_TTL;
     /// `agy -p /usage` 실행 타임아웃(agy 자체 `--print-timeout 20s`보다 길게).
     const TIMEOUT: Duration = Duration::from_secs(30);
     /// `/usage`를 지원하는 최소 agy 버전(OWE-901).
@@ -1108,16 +1130,11 @@ pub(crate) mod agy {
         home: &Path,
         state: Option<&Path>,
         file: &accounts::AccountsFile,
-        interactive: bool,
+        interval: Duration,
     ) {
         if cfg!(test) || latched() {
             return;
         }
-        let interval = if interactive {
-            REQUEST_INTERVAL
-        } else {
-            INTERVAL
-        };
         let mut profiles = vec![(
             accounts::host_default_dir(home, ProviderKind::Antigravity),
             true,
@@ -2224,6 +2241,58 @@ mod tests {
         );
         mark_rate_limited(&mut cache, &key);
         assert!(cache.is_empty());
+    }
+
+    /// Orca 패리티: 방금 쓴 statusline 값이 있으면 자동 조회를 건너뛰고, 직접 조회 값보다 새롭거나
+    /// 조회가 실패했으면 statusline 값을 보여 준다.
+    #[test]
+    fn live_statusline_beats_older_or_failed_direct_usage() {
+        let root = std::env::temp_dir().join(format!("krill-live-usage-{}", std::process::id()));
+        let home = root.join("home");
+        let dir = home.join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("statusline_cache.json"),
+            r#"{"five_hour":{"utilization":44,"resets_at":"2026-10-23T10:30:00.000Z"}}"#,
+        )
+        .unwrap();
+        assert!(live_fresh(ProviderKind::Claude, &dir));
+        assert!(!live_fresh(ProviderKind::Codex, &dir));
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let key = (home.clone(), ProviderKind::Claude, dir.clone());
+        let direct = |percent, updated_at| ProfileUsage {
+            usage: Usage {
+                five_hour: Some(Window {
+                    percent,
+                    resets_at: None,
+                }),
+                seven_day: None,
+            },
+            updated_at: Some(updated_at),
+            ..ProfileUsage::default()
+        };
+        let five_hour = || {
+            accounts::read_profile_usage(&home, ProviderKind::Claude, &dir, "Host", None, true)
+                .usage
+                .five_hour
+                .map(|w| w.percent)
+        };
+        lock(&CACHE).insert(key.clone(), (Instant::now(), direct(2, now - 600)));
+        assert_eq!(five_hour(), Some(44));
+        lock(&CACHE).insert(key.clone(), (Instant::now(), direct(2, now + 600)));
+        assert_eq!(five_hour(), Some(2));
+        let failed = ProfileUsage {
+            error: Some("갱신 실패".into()),
+            updated_at: Some(now + 600),
+            ..ProfileUsage::default()
+        };
+        lock(&CACHE).insert(key.clone(), (Instant::now(), failed));
+        assert_eq!(five_hour(), Some(44));
+        lock(&CACHE).remove(&key);
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -458,6 +458,19 @@ fn runnable(a: &AccountInfo) -> bool {
     a.host_default || Path::new(&a.profile_dir).is_dir()
 }
 
+/// Claude 프로필의 statusline 캐시 파일 값. 수정 시각이 `updated_at`이다.
+pub(crate) fn claude_statusline_usage(profile_dir: &Path) -> Option<ProfileUsage> {
+    [CLAUDE_CACHE, "usage_cache.json"].iter().find_map(|name| {
+        let path = profile_dir.join(name);
+        let usage = parse_claude(&std::fs::read_to_string(&path).ok()?);
+        (!usage.is_empty()).then(|| ProfileUsage {
+            usage,
+            updated_at: mtime_secs(&path),
+            ..ProfileUsage::default()
+        })
+    })
+}
+
 /// 프로필 디렉터리에서 해당 프로바이더 계정의 5h/7d 사용량·상태 근거를 읽는다.
 /// 실제로 읽은 파일의 수정 시각을 `updated_at`에 담고, 프로필 파일이 없고
 /// Orca 캐시 행에서 받았을 때만 `error`·`detail`이 든다.
@@ -469,27 +482,20 @@ pub fn read_profile_usage(
     email: Option<&str>,
     host_default: bool,
 ) -> ProfileUsage {
-    if let Some(usage) = super::direct::cached(home, provider, profile_dir) {
-        return usage;
+    let direct = super::direct::cached(home, provider, profile_dir);
+    // Orca 패리티: 실행 중인 세션의 statusline 값이 직접 조회 값보다 새롭거나 조회가 실패했으면 그것을 쓴다.
+    let live = (provider == ProviderKind::Claude)
+        .then(|| claude_statusline_usage(profile_dir))
+        .flatten();
+    match (direct, live) {
+        (Some(d), Some(l)) if l.updated_at > d.updated_at || d.usage.is_empty() => return l,
+        (Some(d), _) => return d,
+        (None, Some(l)) => return l,
+        (None, None) => {}
     }
     match provider {
         ProviderKind::Gemini => ProfileUsage::default(),
         ProviderKind::Claude => {
-            for name in [CLAUDE_CACHE, "usage_cache.json"] {
-                let path = profile_dir.join(name);
-                if let Ok(s) = std::fs::read_to_string(&path) {
-                    let u = parse_claude(&s);
-                    if !u.is_empty() {
-                        return ProfileUsage {
-                            usage: u,
-                            stale: false,
-                            updated_at: mtime_secs(&path),
-                            error: None,
-                            detail: None,
-                        };
-                    }
-                }
-            }
             // 멀티계정 캐시(`orca-usage-cache.json`)에서 일치하는 계정을 찾는다.
             let orca_path = if profile_dir.join(ORCA_CACHE).exists() {
                 profile_dir.join(ORCA_CACHE)

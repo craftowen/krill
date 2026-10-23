@@ -1089,6 +1089,17 @@ fn connection_tail_has_frozen_bytes_and_prior_policy_decoder_can_skip_it() {
 }
 
 #[test]
+fn refresh_usage_request_is_appended_read_and_feature_gated() {
+    // enum 끝(discriminant 18), 본문 없음.
+    fixture(&UsageRequest::RefreshUsage, &[2, 0, 0, 0, 0x41, 18]);
+    assert!(UsageRequest::RefreshUsage.is_read());
+    assert_eq!(
+        UsageRequest::RefreshUsage.required_features(),
+        FEAT_USAGE | FEAT_USAGE_REFRESH
+    );
+}
+
+#[test]
 fn reset_credit_request_reply_roundtrip_and_feature_gate() {
     // 요청은 enum 끝에 붙는다(Codex discriminant 1, 계정 id "a").
     fixture(
